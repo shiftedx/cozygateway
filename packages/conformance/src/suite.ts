@@ -279,6 +279,36 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
       }
     });
 
+    // Spec section 3: `not_found` means "no such resource (device, thread, agent, message)".
+    // A request naming a nonexistent thread resolves to that code, not a validation error.
+    describe("not found", () => {
+      it(
+        "GET messages of a nonexistent thread is 404 not_found",
+        async () => {
+          const { token } = await pairDevice("not-found-reader");
+          const res = await authFetch(token, "/threads/no-such-thread-id/messages");
+          expect(res.status).toBe(404);
+          expect(assertValid(ErrorBodySchema, await res.json()).error.code).toBe("not_found");
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      it(
+        "PATCH rename of a nonexistent thread is 404 not_found",
+        async () => {
+          const { token } = await pairDevice("not-found-renamer");
+          const res = await authFetch(token, "/threads/no-such-thread-id", {
+            method: "PATCH",
+            headers: JSON_HEADERS,
+            body: JSON.stringify({ title: "rename a ghost" }),
+          });
+          expect(res.status).toBe(404);
+          expect(assertValid(ErrorBodySchema, await res.json()).error.code).toBe("not_found");
+        },
+        TEST_TIMEOUT_MS,
+      );
+    });
+
     // Spec section 4: DELETE /devices/:id revokes at once; the revoked token stops working
     // while other devices are unaffected.
     describe("device lifecycle", () => {
@@ -469,6 +499,67 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
         },
         TEST_TIMEOUT_MS,
       );
+
+      // Spec section 8: "The gateway answers an unknown or malformed CLIENT frame with an
+      // `error` frame." The frame is non-fatal (section 3): the socket stays open and usable.
+      it(
+        "answers an unknown client frame with an error frame and keeps the socket open",
+        async () => {
+          const { token } = await pairDevice("ws-unknown-frame");
+          const thread = await createThread(token, "unknown client frame");
+          const socket = await authedSocket(token);
+          try {
+            socket.ws.send(JSON.stringify({ type: "bogus" }));
+            await waitFor(socket, () => socket.frames.some((f) => f.type === "error"), "error frame");
+            const errorFrame = socket.frames.find((f) => f.type === "error");
+            assertValid(ErrorFrameSchema, errorFrame);
+
+            // The socket survived: a follow-up sync round trip still completes.
+            socket.ws.send(JSON.stringify({ type: "sync", threads: { [thread.id]: 0 } }));
+            await waitFor(socket, () => socket.frames.some((f) => f.type === "synced"), "synced");
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+    });
+
+    // Spec section 5: POST /push/register accepts a PushRegisterRequest from a paired device.
+    // The contract freezes the request shape; the response is only required to succeed.
+    describe("push registration", () => {
+      it(
+        "POST /push/register accepts a valid registration",
+        async () => {
+          const { token } = await pairDevice("push-registrar");
+          const res = await authFetch(token, "/push/register", {
+            method: "POST",
+            headers: JSON_HEADERS,
+            body: JSON.stringify({
+              pushId: "push-1",
+              relayUrl: "https://relay.example.com",
+              pushKey: "0123456789abcdef",
+            }),
+          });
+          expect(res.ok).toBe(true);
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      it(
+        "a malformed push registration is 400 invalid_request",
+        async () => {
+          const { token } = await pairDevice("push-malformed");
+          const res = await authFetch(token, "/push/register", {
+            method: "POST",
+            headers: JSON_HEADERS,
+            body: JSON.stringify({ pushId: "push-1" }),
+          });
+          expect(res.status).toBe(400);
+          expect(assertValid(ErrorBodySchema, await res.json()).error.code).toBe("invalid_request");
+        },
+        TEST_TIMEOUT_MS,
+      );
     });
 
     // Spec section 6 + 7: for one turn the order is user committed, one-or-more drafts (the
@@ -579,6 +670,8 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
     // Spec section 7 + section 6 reconnect prose: a [[fail]] turn completes as a committed
     // system message carrying marker "turn.failed" plus a turn_failed error frame, with no
     // done frame; the thread stays usable afterward.
+    // Note: the "no done frame" and "turn_failed error frame" assertions extend beyond the
+    // literal section 7 text and are scoped to the reference backend's frozen behavior.
     describe("turn failure", () => {
       it(
         "fails a [[fail]] turn with a turn.failed system commit and a turn_failed error, staying usable",
