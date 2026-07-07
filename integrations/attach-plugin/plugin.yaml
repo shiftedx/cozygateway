@@ -1,0 +1,37 @@
+name: cozygateway
+label: CozyGateway
+kind: platform
+version: 0.1.0
+description: >
+  Live-session platform adapter for the agent harness. Dials OUT to a gateway's
+  /attach WebSocket, authenticates header-only with a bearer token, and streams
+  the model's reply as typed rich blocks (draft frames) followed by a single
+  committed reply. Outbound-only: nothing listens on the agent host. Needs only
+  the `websockets` package.
+author: cozygateway
+# These keys are surfaced by the harness config UI; a str or a {name, ...} dict
+# are both accepted by the manifest parser.
+requires_env:
+  - name: COZYGATEWAY_URL
+    description: "The gateway base URL to attach to (e.g. http://gateway.local:8080)."
+    prompt: "Gateway URL"
+    password: false
+  - name: COZYGATEWAY_TOKEN
+    description: "The attach bearer token (header-only, revocable). Never goes in a URL."
+    prompt: "Attach token"
+    password: true
+# Ignored by the manifest parser (which reads only the keys above) but kept as
+# documentation of the optional environment the adapter honours.
+optional_env:
+  - name: COZYGATEWAY_CA_FILE
+    description: "Path to a CA bundle, if the gateway serves TLS with a private cert."
+    prompt: "CA cert path (or empty)"
+    password: false
+  - name: COZYGATEWAY_RECONNECT_INITIAL_SECONDS
+    description: "Initial reconnect backoff in seconds (default 0.5)."
+    prompt: "Reconnect initial seconds"
+    password: false
+  - name: COZYGATEWAY_RECONNECT_MAX_SECONDS
+    description: "Maximum reconnect backoff in seconds (default 30)."
+    prompt: "Reconnect max seconds"
+    password: false
