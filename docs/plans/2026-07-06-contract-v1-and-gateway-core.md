@@ -14,7 +14,7 @@
 - NEVER import from or reference the CozyLabs repo in code. Reading CozyLabs sources for reference is allowed; copied shapes are re-licensed clean under MIT here.
 - Pure ESM everywhere (`"type": "module"`). Relative imports use `.ts` extensions (the base tsconfig rewrites them on emit).
 - `erasableSyntaxOnly` is on: no TS enums, no namespaces, no parameter properties.
-- No `as` casts in tests; build typed literals instead (shoehorn conventions). The one allowed exception is `as const`.
+- Never fabricate test DATA with `as` casts; build typed literals instead (shoehorn conventions). Allowed narrowing uses of `as`: `as const`, narrowing a parsed `unknown` (e.g. `await res.json()` or `JSON.parse`) to a response shape, and post-`instanceof` narrowing; the plan's test code shows the pattern.
 - No em-dashes in any public-facing copy (README, contract spec, package descriptions, error messages).
 - "works with OpenClaw" nominative framing only; never "Claw" in a name. Never name coding-agent harnesses in public copy.
 - Every commit message and code comment states constraints, not narration.

@@ -8,3 +8,4 @@ coverage/
 *.db-shm
 .DS_Store
 .env
+.superpowers/
