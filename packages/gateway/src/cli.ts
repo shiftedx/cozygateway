@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { hostname } from "node:os";
 import { parseArgs } from "node:util";
 
 import { loadConfig } from "./config.ts";
@@ -35,7 +34,7 @@ export async function runCli(argv: string[]): Promise<number> {
     const code = newSetupCode();
     storage.createSetupCode(code, Date.now() + SETUP_CODE_TTL_MS);
     storage.close();
-    const payload = { gatewayUrl: `http://${hostname()}:${config.port}`, setupCode: code };
+    const payload = { gatewayUrl: `http://127.0.0.1:${config.port}`, setupCode: code };
     console.log(JSON.stringify(payload));
     console.log(`Setup code ${code} is valid for 10 minutes. Scan or type it in the app.`);
     return 0;

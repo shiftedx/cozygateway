@@ -47,7 +47,7 @@ cozygateway pair --config cozygateway.config.json
 This prints a JSON line like:
 
 ```json
-{ "gatewayUrl": "http://my-mac.local:8787", "setupCode": "AB3C-9XYZ" }
+{ "gatewayUrl": "http://127.0.0.1:8787", "setupCode": "AB3C-9XYZ" }
 ```
 
 followed by a plain-language reminder that the code expires in ten minutes. The app turns
@@ -69,9 +69,10 @@ checks an implementation against it end to end.
 Your threads and message history live in SQLite, on your machine, at whatever `dbPath` you
 configure. The gateway reads plaintext to drive your agent and stream replies back, and it
 never sends that content anywhere else: there is no cloud relay, no third-party server, and no
-telemetry in the loop. TLS termination for the phone link is handled by the companion app at
-release time; running `cozygateway serve` directly, as shown above, is plain HTTP and is meant
-for a trusted local network or a tunnel you control while you are getting set up.
+telemetry in the loop. TLS for the phone link is planned; it is not implemented yet. In v0.1,
+`cozygateway serve` binds `127.0.0.1` only, plain HTTP, and answers on loopback alone. Reaching
+it from a phone requires a tunnel or reverse proxy that you set up and control; the gateway does
+not expose itself on your network by itself.
 
 ## Configuration reference
 

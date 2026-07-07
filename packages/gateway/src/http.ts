@@ -212,5 +212,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
     return c.json({ ok: true });
   });
 
+  app.notFound((c) => c.json(errorBody("not_found", "no such route"), 404));
+  app.onError((err, c) => c.json(errorBody("internal", "unexpected gateway fault"), 500));
+
   return app;
 }

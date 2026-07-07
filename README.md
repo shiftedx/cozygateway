@@ -2,7 +2,7 @@
 
 Chat with your self-hosted AI agent from your phone, without handing your data to anyone.
 
-cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and drives agent backends through adapters. Hermes and OpenClaw adapters ship at launch (works with OpenClaw; not affiliated with or endorsed by the OpenClaw project).
+cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and drives agent backends through a small adapter interface. A reference echo backend ships today, for trying the gateway out before wiring up a real one. Additional backend adapters are planned.
 
 ## What it does
 
@@ -14,18 +14,18 @@ cozygateway is a single self-hosted Node process you run next to your agent. It 
 
 ## Status
 
-Pre-alpha. Contract v1 is being frozen; see `contract/` for the wire spec and `docs/plans/` for the implementation plan.
+Contract v1 is frozen (see `contract/v1.md`). The reference gateway and its conformance suite are built and passing. Next up: the phone app, the push relay, TLS for the phone link, and real backend adapters, all planned.
 
 ## Repo layout
 
 - `contract/`: the human-readable, versioned wire contract spec.
 - `packages/contract`: TypeBox schemas and TypeScript types for the contract (publishable as `cozygateway-contract`).
-- `packages/gateway`: the gateway process (coming with contract v1).
-- `packages/conformance`: contract conformance suite that runs against any gateway implementation (coming with contract v1).
+- `packages/gateway`: the gateway process, implementing contract v1.
+- `packages/conformance`: contract conformance suite that runs against any gateway implementation, validated against the reference gateway.
 
 ## Privacy model
 
-Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS with trust-on-first-use certificate pinning protects the phone link. The push relay, when it ships, carries ciphertext only and is open source so you can host your own.
+Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS with trust-on-first-use certificate pinning for the phone link is planned; see `packages/gateway/README.md` for the current, loopback-only reachability model. The push relay, when it ships, carries ciphertext only and is open source so you can host your own.
 
 ## Development
 

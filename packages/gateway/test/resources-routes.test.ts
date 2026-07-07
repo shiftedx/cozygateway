@@ -180,3 +180,53 @@ describe("push registration", () => {
     expect(res.status).toBe(200);
   });
 });
+
+describe("unexpected faults", () => {
+  it("404s an unknown route with an ErrorBody, even with valid auth", async () => {
+    const { authed } = await setup();
+    const res = await authed("/no/such/route");
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("not_found");
+    expect(typeof body.error.message).toBe("string");
+  });
+
+  it("500s a thrown, unclassified error as an internal ErrorBody", async () => {
+    const storage = openStorage(":memory:");
+    storage.upsertAgent({ id: "mock", name: "Mock", avatar: null, backend: "mock" });
+    const app = createApp({
+      storage,
+      config,
+      gatewayInfo: { name: "g", version: "0.1.0", contract: "v1" },
+      presenceOf: () => "online",
+      submitUserMessage: (): Message => {
+        throw new Error("boom");
+      },
+      onDeviceRevoked: () => {},
+      now: () => 1_000,
+    });
+    const code = newSetupCode();
+    storage.createSetupCode(code, 1_000 + SETUP_CODE_TTL_MS);
+    const pairRes = await app.request("/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setupCode: code, deviceName: "phone" }),
+    });
+    const { deviceToken } = (await pairRes.json()) as { deviceToken: string };
+    const created = await app.request("/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${deviceToken}` },
+      body: JSON.stringify({ agentId: "mock" }),
+    });
+    const thread = (await created.json()) as { id: string };
+    const res = await app.request(`/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${deviceToken}` },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "x" }] }),
+    });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("internal");
+    expect(typeof body.error.message).toBe("string");
+  });
+});
