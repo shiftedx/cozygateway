@@ -56,15 +56,21 @@ export class TurnRunner {
     this.#hub.broadcast({ type: "committed", threadId, seq: userMessage.seq, message: userMessage });
 
     const agentName = this.#storage.agentById(thread.agentId)?.name ?? thread.agentId;
+    // Invariant: #runTurn never rejects, so `next` never rejects and storing it as-is can
+    // never surface an unhandled rejection; closeAll drains these real chain promises.
     const previous = this.#queues.get(threadId) ?? Promise.resolve();
-    const next = previous.then(() => this.#runTurn(threadId, thread.agentId, agentName, adapter, blocks));
+    const next = previous.then(() => this.#runTurn(threadId, agentName, adapter, blocks));
     this.#queues.set(threadId, next);
+    void next.then(() => {
+      if (this.#queues.get(threadId) === next) this.#queues.delete(threadId);
+    });
     return userMessage;
   }
 
+  /** Runs one agent turn. NEVER rejects: an adapter failure is converted into a turn.failed
+   *  marker plus an error frame, and a double fault on that failure path is swallowed. */
   async #runTurn(
     threadId: string,
-    agentId: string,
     agentName: string,
     adapter: BackendAdapter,
     blocks: RichBlock[],
@@ -97,23 +103,31 @@ export class TurnRunner {
         },
       });
     } catch (err) {
-      const failure = this.#storage.appendMessage(
-        threadId,
-        {
-          role: "system",
-          blocks: [{ type: "paragraph", text: "The agent turn failed. Send again to retry." }],
-          turnId,
-          marker: "turn.failed",
-        },
-        this.#now(),
-      );
-      this.#hub.broadcast({ type: "committed", threadId, seq: failure.seq, message: failure });
-      const message = err instanceof Error ? err.message : "unknown failure";
-      this.#hub.broadcast({ type: "error", code: "turn_failed", message, threadId });
+      try {
+        const failure = this.#storage.appendMessage(
+          threadId,
+          {
+            role: "system",
+            blocks: [{ type: "paragraph", text: "The agent turn failed. Send again to retry." }],
+            turnId,
+            marker: "turn.failed",
+          },
+          this.#now(),
+        );
+        this.#hub.broadcast({ type: "committed", threadId, seq: failure.seq, message: failure });
+        const message = err instanceof Error ? err.message : "unknown failure";
+        this.#hub.broadcast({ type: "error", code: "turn_failed", message, threadId });
+      } catch {
+        // Double fault (e.g. storage already closed): swallow to keep the never-rejects
+        // invariant; the per-thread chain must stay unbreakable.
+      }
     }
   }
 
   async closeAll(): Promise<void> {
+    // Drain every per-thread chain first so no in-flight onCommit races storage.close().
+    await Promise.allSettled([...this.#queues.values()]);
+    this.#queues.clear();
     for (const sessionPromise of this.#sessions.values()) {
       try {
         const session = await sessionPromise;
