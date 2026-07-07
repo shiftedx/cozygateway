@@ -16,7 +16,10 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # build first: workspace packages resolve cozygateway-contract through its
+      # exports map, which points at dist/, so a fresh checkout needs the build
+      # before typecheck or test can resolve the package
+      - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
-      - run: pnpm build
       - run: pnpm --filter cozygateway-contract lint:package
