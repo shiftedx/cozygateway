@@ -7,3 +7,4 @@ export const CONTRACT_VERSION = "v1";
 export * from "./validate.ts";
 export * from "./rich-blocks.ts";
 export * from "./resources.ts";
+export * from "./rest.ts";
