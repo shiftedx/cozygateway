@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Node engines: `>=24`. Local dev on this machine: prefix `PATH=/opt/homebrew/opt/node@26/bin:$PATH` (default node is 22).
-- NEVER import from or reference the CozyLabs repo in code. Reading CozyLabs sources for reference is allowed; copied shapes are re-licensed clean under MIT here.
+- NEVER import from or reference the originating private codebase in code. Reading its sources for reference is allowed; copied shapes are re-licensed clean under MIT here.
 - Pure ESM everywhere (`"type": "module"`). Relative imports use `.ts` extensions (the base tsconfig rewrites them on emit).
 - `erasableSyntaxOnly` is on: no TS enums, no namespaces, no parameter properties.
 - Never fabricate test DATA with `as` casts; build typed literals instead (shoehorn conventions). Allowed narrowing uses of `as`: `as const`, narrowing a parsed `unknown` (e.g. `await res.json()` or `JSON.parse`) to a response shape, and post-`instanceof` narrowing; the plan's test code shows the pattern.
@@ -283,7 +283,7 @@ describe("resource schemas", () => {
       id: "a1",
       name: "Sage",
       avatar: "owl",
-      backend: "hermes",
+      backend: "mock",
       presence: "online",
     };
     expect(check(AgentSchema, agent)).toBe(true);
@@ -3392,7 +3392,7 @@ git commit -m "feat(conformance): black-box contract v1 suite, green against the
 
 ## Out of scope for this plan (next plans, in order)
 
-1. Hermes adapter (attach mode against a live Hermes; study CozyLabs `packages/mcp-gateway/src/session/` + `packages/companion/src/profile-runtime.ts` as reference, re-license clean).
+1. First real backend adapter (attach mode against a live agent runtime; study the originating codebase's gateway session and profile runtime modules as reference, re-license clean).
 2. Push relay service + gateway push origination (replace `nullNotifier`).
 3. OpenClaw adapter (pinned protocol v4, canary CI).
 4. TLS + TOFU serving in the gateway CLI (config already reserves nothing; add `tls: {certPath, keyPath}` when the iOS work starts).

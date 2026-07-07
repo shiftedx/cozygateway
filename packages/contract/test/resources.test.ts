@@ -10,7 +10,7 @@ describe("resource schemas", () => {
       id: "a1",
       name: "Sage",
       avatar: "owl",
-      backend: "hermes",
+      backend: "mock",
       presence: "online",
     };
     expect(check(AgentSchema, agent)).toBe(true);
