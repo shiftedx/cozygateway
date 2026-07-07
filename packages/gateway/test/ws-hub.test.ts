@@ -106,6 +106,54 @@ describe("sync replay", () => {
   });
 });
 
+describe("frame discipline", () => {
+  it("answers an unknown frame after auth with error and keeps the connection open", async () => {
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((f) => f.type === "ready"));
+
+    ws.send(JSON.stringify({ type: "bogus" }));
+    await until(() => seen.some((f) => f.type === "error" && f.code === "invalid_request"));
+
+    ws.send(JSON.stringify({ type: "sync", threads: { t1: 0 } }));
+    await until(() => seen.some((f) => f.type === "synced"));
+    expect(hub.hasClients()).toBe(true);
+    ws.close();
+  });
+
+  it("closes 1008 when a valid non-auth frame arrives before auth", async () => {
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "sync", threads: { t1: 0 } }));
+    const [code] = (await once(ws, "close")) as [number];
+    expect(code).toBe(1008);
+    expect(seen.some((f) => f.type === "error" && f.code === "unauthorized")).toBe(true);
+  });
+
+  it("answers a second auth frame with error and keeps the connection open", async () => {
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((f) => f.type === "ready"));
+
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() =>
+      seen.some(
+        (f) => f.type === "error" && f.code === "invalid_request" && f.message === "already authenticated",
+      ),
+    );
+
+    ws.send(JSON.stringify({ type: "sync", threads: { t1: 0 } }));
+    await until(() => seen.some((f) => f.type === "synced"));
+    expect(hub.hasClients()).toBe(true);
+    ws.close();
+  });
+});
+
 describe("broadcast + revocation", () => {
   it("delivers broadcasts to authed clients and closes revoked devices", async () => {
     const ws = connect();
@@ -120,6 +168,7 @@ describe("broadcast + revocation", () => {
     hub.closeDevice("d1");
     const [code] = (await once(ws, "close")) as [number];
     expect(code).toBe(1008);
-    expect(hub.hasClients()).toBe(false);
+    // The server-side close event can land a tick after the client-side one.
+    await until(() => !hub.hasClients());
   });
 });

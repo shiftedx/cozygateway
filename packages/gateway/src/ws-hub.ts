@@ -39,6 +39,8 @@ export class WsHub {
   attach(server: Server, path = "/ws"): void {
     const wss = new WebSocketServer({ server, path });
     this.#wss = wss;
+    // Swallow server-level errors: an unhandled 'error' event would crash the process.
+    wss.on("error", () => {});
     wss.on("connection", (socket) => this.#onConnection(socket));
   }
 
@@ -48,6 +50,14 @@ export class WsHub {
 
   #onConnection(socket: WebSocket): void {
     let client: Client | undefined;
+    // A ws socket with no 'error' listener crashes the process on the first socket error.
+    socket.on("error", () => {
+      try {
+        socket.close(1008, "socket error");
+      } catch {
+        socket.terminate();
+      }
+    });
     const authTimer = setTimeout(() => {
       if (client === undefined) socket.close(1008, "auth timeout");
     }, this.#authTimeoutMs);
@@ -70,7 +80,10 @@ export class WsHub {
       }
 
       if (frame.type === "auth") {
-        if (client !== undefined) return;
+        if (client !== undefined) {
+          this.#send(socket, { type: "error", code: "invalid_request", message: "already authenticated" });
+          return;
+        }
         const device = this.#storage.deviceByTokenHash(hashToken(frame.token));
         if (device === undefined) {
           this.#send(socket, { type: "error", code: "unauthorized", message: "unknown device token" });
