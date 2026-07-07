@@ -24,6 +24,25 @@ importers:
         specifier: ^3.0.0
         version: 3.2.7(@types/node@24.13.2)
 
+  packages/conformance:
+    dependencies:
+      cozygateway-contract:
+        specifier: workspace:*
+        version: link:../contract
+      vitest:
+        specifier: '>=3'
+        version: 3.2.7(@types/node@24.13.2)
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.0
+        version: 8.18.1
+      cozygateway:
+        specifier: workspace:*
+        version: link:../gateway
+
   packages/contract:
     dependencies:
       '@sinclair/typebox':

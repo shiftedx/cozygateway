@@ -1,0 +1,31 @@
+{
+  "name": "cozygateway-conformance",
+  "version": "0.1.0",
+  "description": "Black-box conformance suite for the cozygateway wire contract v1. Point it at any gateway implementation exposing the reference echo backend.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shiftedx/cozygateway.git",
+    "directory": "packages/conformance"
+  },
+  "engines": { "node": ">=24" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "cozygateway-contract": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0",
+    "cozygateway": "workspace:*"
+  },
+  "peerDependencies": {
+    "vitest": ">=3"
+  }
+}
