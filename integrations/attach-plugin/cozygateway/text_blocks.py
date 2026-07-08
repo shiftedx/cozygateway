@@ -49,12 +49,33 @@ def normalize_text_to_blocks(text: str) -> List[RichBlock]:
     """Parse running assistant ``text`` (markdown) into the closed block union.
 
     Dispatch order per line: blank, fence, math, heading, table, list, paragraph.
+
+    A thin wrapper over :func:`_normalize_lines`, which is the single dispatch
+    implementation shared with :class:`IncrementalNormalizer` (it also reports the
+    top-level blank-line boundaries that make incremental caching safe). Kept
+    unchanged in shape and behavior so every existing caller and fixture is
+    byte-identical to before that class existed.
     """
     if not text:
         return []
+    blocks, _boundaries = _normalize_lines(re.sub(r"\r\n?", "\n", text).split("\n"))
+    return blocks
 
-    lines = re.sub(r"\r\n?", "\n", text).split("\n")
+
+def _normalize_lines(lines: List[str]) -> Tuple[List[RichBlock], List[int]]:
+    """Core dispatch loop over an already-split, already ``\\n``-normalized ``lines``.
+
+    Returns ``(blocks, boundaries)``. ``boundaries`` are the line indices of every
+    blank line processed at the TOP level of the dispatch loop (i.e. one this
+    function's own blank-line branch handled directly, as opposed to one swallowed
+    verbatim inside an open fenced-code or display-math body). Immediately after
+    such a line the loop holds no residual state: ``para`` is empty and no
+    fence/math/table/list is open, so blocks built from ``lines[: i + 1]`` can
+    never change no matter what lines are appended afterward -- this is exactly
+    the stability invariant :class:`IncrementalNormalizer` caches on.
+    """
     blocks: List[RichBlock] = []
+    boundaries: List[int] = []
     para: List[str] = []
 
     def flush_paragraph() -> None:
@@ -68,9 +89,11 @@ def normalize_text_to_blocks(text: str) -> List[RichBlock]:
     while index < total:
         line = lines[index]
 
-        # Blank line: paragraph boundary.
+        # Blank line: paragraph boundary, and (at this, the outer loop's own
+        # dispatch) a top-level stability boundary.
         if line.strip() == "":
             flush_paragraph()
+            boundaries.append(index)
             index += 1
             continue
 
@@ -149,7 +172,7 @@ def normalize_text_to_blocks(text: str) -> List[RichBlock]:
         index += 1
 
     flush_paragraph()
-    return blocks
+    return blocks, boundaries
 
 
 def _list_marker(line: str) -> Optional[Tuple[bool, str]]:
@@ -188,3 +211,90 @@ def _split_table_row(line: str) -> List[str]:
     stripped = re.sub(r"^\|", "", stripped)
     stripped = re.sub(r"\|$", "", stripped)
     return [cell.strip() for cell in stripped.split("|")]
+
+
+class IncrementalNormalizer:
+    """Per-turn cache that makes repeated draft-flush normalization proportional to
+    newly arrived text instead of the whole accumulated reply.
+
+    A draft flush hands this the FULL accumulated text every time (full-replace
+    wire semantics; see ``adapter.send_draft`` and ``contract/attach-v0.md`` --
+    unchanged by this cache). Calling :func:`normalize_text_to_blocks` on that
+    whole string on every flush is what makes a reply of n chunks cost O(n^2)
+    total: this class instead remembers the already-normalized STABLE prefix (the
+    text and blocks) and only re-normalizes the still-changeable tail.
+
+    Stability rule (conservative by design; see the module docstring's dispatch
+    order): given append-only growth, splitting ``text`` by ``\\n`` leaves every
+    line but the last permanently fixed (only the last line can still grow, by
+    more characters or by the arrival of a ``\\n`` that finalizes it and starts a
+    new one). Of those fixed lines, one that ``_normalize_lines`` processes as a
+    blank line AT THE TOP of its dispatch loop (not swallowed verbatim inside an
+    open fenced-code or math body) is a point where the parser holds no residual
+    state at all -- no open paragraph, fence, math, table, or list. Blocks built
+    from everything up to and including that line can never change no matter what
+    is appended afterward, so they are cached; anything after it (including an
+    unclosed fence/table/list, or a line the parser still needs a lookahead line
+    to classify, e.g. a table header awaiting its separator row) stays in the
+    unstable tail and is re-normalized on every flush until its own later
+    top-level blank line seals it. A reply with no blank lines at all (a single
+    huge paragraph or one giant unclosed fence) has no stable prefix and falls
+    back to full re-normalization every flush, exactly like before this class
+    existed -- the same degenerate case the original implementation already had.
+
+    Also defends against a non-append update (the terminal ``send()`` path may
+    hand this a ``final_text`` that is not simply the last drafted text extended):
+    if the new text does not start with the previously seen text, the cache
+    resets to empty and this call falls back to a full re-normalization, which is
+    always correct, just not accelerated.
+    """
+
+    __slots__ = ("_prev_norm", "_stable_len", "_stable_blocks")
+
+    def __init__(self) -> None:
+        self._prev_norm: str = ""
+        self._stable_len: int = 0
+        self._stable_blocks: List[RichBlock] = []
+
+    def update(self, text: str) -> List[RichBlock]:
+        """Return the full block list for ``text`` (byte-identical to
+        ``normalize_text_to_blocks(text)``), doing work proportional only to the
+        text that changed since the last call."""
+        norm = re.sub(r"\r\n?", "\n", text) if text else ""
+
+        if self._stable_len > len(norm) or not norm.startswith(self._prev_norm):
+            # Not a pure append (shrunk, replaced, or otherwise diverged): the
+            # cached prefix is no longer provably a prefix of this text at all.
+            self._stable_len = 0
+            self._stable_blocks = []
+        self._prev_norm = norm
+
+        self._advance_stable_prefix(norm)
+
+        tail = norm[self._stable_len :]
+        tail_blocks, _ = _normalize_lines(tail.split("\n")) if tail else ([], [])
+        return self._stable_blocks + tail_blocks
+
+    def _advance_stable_prefix(self, norm: str) -> None:
+        """Grow ``self._stable_len`` / ``self._stable_blocks`` as far as the
+        newly-known tail allows, scanning only the tail (not the whole text)."""
+        tail = norm[self._stable_len :]
+        if not tail:
+            return
+        lines = tail.split("\n")
+        if len(lines) <= 1:
+            return  # tail is one partial line; it IS the volatile last line
+        # The whole text's last line is always volatile (more characters may
+        # still land on it); drop it before looking for a stability boundary.
+        fixed_lines = lines[:-1]
+        _, boundaries = _normalize_lines(fixed_lines)
+        if not boundaries:
+            return
+        boundary_line = boundaries[-1]
+        promoted_len = sum(len(line) + 1 for line in fixed_lines[: boundary_line + 1])
+        if promoted_len <= 0:
+            return
+        promoted_text = tail[:promoted_len]
+        promoted_blocks, _ = _normalize_lines(promoted_text.split("\n"))
+        self._stable_blocks = self._stable_blocks + promoted_blocks
+        self._stable_len += promoted_len
