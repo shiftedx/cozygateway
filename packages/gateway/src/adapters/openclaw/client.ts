@@ -7,6 +7,7 @@ import {
   TICK_TIMEOUT_CLOSE_CODE,
   buildConnectRequest,
   parseServerFrame,
+  type ChatDeltaEvent,
   type ServerFrame,
 } from "./protocol.ts";
 import { signChallenge, type DeviceIdentity } from "./device-auth.ts";
@@ -29,6 +30,41 @@ import { signChallenge, type DeviceIdentity } from "./device-auth.ts";
 const OPERATOR_ROLE = "operator";
 const OPERATOR_SCOPES = ["operator.read", "operator.write"];
 const CLIENT_PLATFORM = "server";
+
+// ASSUMPTION (Task 8 to verify): the verified wire facts pin `deltaText`/`message`/`replace` on
+// the delta payload (see `ChatDeltaEventSchema` in protocol.ts) but not a session-identifying
+// field name, so this reads `sessionKey` (matching the outbound `chat.send` request's own
+// `params.sessionKey`) off the event payload as an open/unknown field rather than widening the
+// pinned schema on a guess. If the live study pins a different field name (e.g. `session` or
+// `conversationId`), this is the single site to update.
+function sessionKeyOf(event: ChatDeltaEvent): string | undefined {
+  const payload = event.payload as unknown as Record<string, unknown>;
+  return typeof payload["sessionKey"] === "string" ? (payload["sessionKey"] as string) : undefined;
+}
+
+// ASSUMPTION (Task 8 to verify): a streamed reply ends when an event for the
+// session carries a terminal marker (e.g. payload.done === true or a distinct
+// "chat.final"/state value). Until verified, treat the first event bearing this
+// marker as end-of-turn; the fake server sends the same shape the study records.
+function isReplyEnd(event: ChatDeltaEvent): boolean {
+  const payload = event.payload as unknown as Record<string, unknown>;
+  return payload["done"] === true;
+}
+
+/** `replace ? deltaText : prev + deltaText`, except the server's own cumulative `message`
+ *  snapshot wins outright when present: an empty string means "no cumulative snapshot on this
+ *  event" (the field is required by `ChatDeltaEventSchema` but may be sent empty), anything else
+ *  is treated as authoritative and returned as-is, bypassing local accumulation entirely. */
+function accumulateDelta(prev: string, event: ChatDeltaEvent): string {
+  if (event.payload.message.length > 0) return event.payload.message;
+  return event.payload.replace === true ? event.payload.deltaText : prev + event.payload.deltaText;
+}
+
+export interface SessionHandlers {
+  onDelta(snapshot: string): void;
+  onDone(): void;
+  onError(message: string): void;
+}
 
 export interface ReconnectPolicy {
   minMs: number;
@@ -82,9 +118,22 @@ export interface OpenClawClient {
    *  response arrives. Rejects immediately, without sending anything, unless the client is
    *  currently `online`. */
   request(method: string, params: unknown): Promise<unknown>;
-  /** Registers a handler for delta/tick/other events observed after `hello-ok`. Multiple
-   *  handlers may be registered; none can be removed. */
+  /** Registers a handler for tick/other non-session-scoped events observed after `hello-ok`.
+   *  Multiple handlers may be registered; none can be removed. Chat delta/reply-end events are
+   *  NOT delivered here (see `subscribeSession`): they are session-scoped and go exclusively
+   *  through the per-session subscription, so a generic `onEvent` listener can never observe
+   *  another session's streamed content. */
   onEvent(handler: (frame: ServerFrame) => void): void;
+  /** Registers interest in ONE OpenClaw chat session's streamed deltas. The client drops any
+   *  delta/reply-end event whose session id does not match a currently subscribed session (the
+   *  openclaw#32579 broadcast-bug guard and a cross-operator privacy guard, since the same root
+   *  token can observe other operators' session traffic on this connection) before any parsing
+   *  beyond the envelope -- dropped events are never delivered and never logged with content.
+   *  `onDelta` fires with the running accumulated snapshot (see `accumulateDelta`); `onDone`
+   *  fires exactly once, on the first event carrying the reply-end marker (see `isReplyEnd`),
+   *  after which further deltas for this session are ignored; `onError` fires if the connection
+   *  drops before the session reaches its reply-end marker. Returns an unsubscribe function. */
+  subscribeSession(sessionKey: string, handlers: SessionHandlers): () => void;
   onStateChange(handler: (state: ClientState) => void): void;
   /** Begins the connect+reconnect loop. Idempotent: a second call while already started is a
    *  no-op. */
@@ -114,6 +163,13 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
   const eventHandlers: Array<(frame: ServerFrame) => void> = [];
   const stateHandlers: Array<(state: ClientState) => void> = [];
   const pending = new Map<string, { resolve: (value: unknown) => void; reject: (err: Error) => void }>();
+
+  interface SessionSubscriptionState {
+    handlers: SessionHandlers;
+    snapshot: string;
+    done: boolean;
+  }
+  const sessionSubscriptions = new Map<string, SessionSubscriptionState>();
 
   function setState(next: ClientState): void {
     if (state === next) return;
@@ -220,9 +276,28 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
         else entry.reject(new Error(`openclaw request failed: ${frame.error.details.code}`));
         return;
       }
-      case "tick":
-      case "delta": {
+      case "tick": {
         for (const handler of eventHandlers) handler(frame);
+        return;
+      }
+      case "delta": {
+        const sessionKey = sessionKeyOf(frame);
+        const sub = sessionKey === undefined ? undefined : sessionSubscriptions.get(sessionKey);
+        if (sub === undefined) {
+          // Foreign/unsubscribed session (openclaw#32579 broadcast-bug guard and cross-operator
+          // privacy guard): drop before any further parsing. Deliberately no content in this log
+          // line -- not even the session id -- since the guard exists precisely because this
+          // connection's root token can observe other operators' session traffic.
+          log("dropped a chat delta for a session with no active subscription");
+          return;
+        }
+        if (sub.done) return; // reply already ended for this session; ignore trailing deltas.
+        sub.snapshot = accumulateDelta(sub.snapshot, frame);
+        sub.handlers.onDelta(sub.snapshot);
+        if (isReplyEnd(frame)) {
+          sub.done = true;
+          sub.handlers.onDone();
+        }
         return;
       }
     }
@@ -241,8 +316,21 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
 
   function handleClosed(code: number): void {
     clearTickTimer();
+    // Reset so a reconnect does not arm the tick watchdog with the previous connection's
+    // interval before the new hello-ok assigns its own (the interval is connection-specific and
+    // only known again once a fresh hello-ok arrives).
+    tickIntervalMs = undefined;
     ws = undefined;
     failAllPending(new Error("openclaw client disconnected before a response arrived"));
+
+    // Additive to the brief's four required scenarios: a session whose reply had not yet reached
+    // its terminal marker when the socket dropped gets a generic onError, so a caller mid-stream
+    // is not left silently stalled forever. The subscription itself is left in place (not
+    // removed) since the same sessionKey is worth resuming after reconnect; never includes
+    // wire/token content.
+    for (const sub of sessionSubscriptions.values()) {
+      if (!sub.done) sub.handlers.onError("openclaw connection dropped before the reply ended");
+    }
 
     if (closed) return;
     if (versionMismatch) {
@@ -287,6 +375,13 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
 
     onEvent(handler: (frame: ServerFrame) => void): void {
       eventHandlers.push(handler);
+    },
+
+    subscribeSession(sessionKey: string, handlers: SessionHandlers): () => void {
+      sessionSubscriptions.set(sessionKey, { handlers, snapshot: "", done: false });
+      return () => {
+        sessionSubscriptions.delete(sessionKey);
+      };
     },
 
     onStateChange(handler: (state: ClientState) => void): void {

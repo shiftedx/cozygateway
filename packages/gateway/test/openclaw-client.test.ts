@@ -260,7 +260,7 @@ describe("close()", () => {
 });
 
 describe("onEvent", () => {
-  it("forwards tick and delta events once online", async () => {
+  it("forwards tick events once online", async () => {
     const server = await fakeServer({ tickIntervalMs: 20 });
     const c = client(server.url);
     const events: ServerFrame[] = [];
@@ -268,5 +268,150 @@ describe("onEvent", () => {
     c.start();
     await until(() => c.state() === "online");
     await until(() => events.some((e) => e.kind === "tick"), 2_000);
+  });
+});
+
+/** Builds a `chat.delta` wire event with the exact payload shape the client's ASSUMPTION-tagged
+ *  `sessionKeyOf`/`isReplyEnd` helpers read: `sessionKey` identifies the session, `message`
+ *  defaults to "" (meaning "no cumulative snapshot on this event", per `accumulateDelta`'s
+ *  contract), and `done: true` is the reply-end marker. */
+function deltaFrame(input: {
+  sessionKey: string;
+  deltaText: string;
+  message?: string;
+  replace?: boolean;
+  done?: boolean;
+}): Record<string, unknown> {
+  return {
+    type: "event",
+    event: "chat.delta",
+    payload: {
+      sessionKey: input.sessionKey,
+      deltaText: input.deltaText,
+      message: input.message ?? "",
+      ...(input.replace !== undefined ? { replace: input.replace } : {}),
+      ...(input.done !== undefined ? { done: input.done } : {}),
+    },
+  };
+}
+
+describe("subscribeSession: per-session delta filtering", () => {
+  it("delivers deltas only to their own subscribed session, and drops an unsubscribed session's event", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const aDeltas: string[] = [];
+    const bDeltas: string[] = [];
+    c.subscribeSession("session-a", { onDelta: (s) => aDeltas.push(s), onDone: () => {}, onError: () => {} });
+    const unsubscribeB = c.subscribeSession("session-b", {
+      onDelta: (s) => bDeltas.push(s),
+      onDone: () => {},
+      onError: () => {},
+    });
+
+    server.sendEvent(deltaFrame({ sessionKey: "session-a", deltaText: "Hello" }));
+    server.sendEvent(deltaFrame({ sessionKey: "session-c", deltaText: "never subscribed" }));
+    server.sendEvent(deltaFrame({ sessionKey: "session-b", deltaText: "World" }));
+
+    await until(() => aDeltas.length >= 1 && bDeltas.length >= 1);
+    // Give the (dropped) foreign-session event ample time to have arrived, if it were wrongly
+    // delivered, before asserting it never was.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(aDeltas).toEqual(["Hello"]);
+    expect(bDeltas).toEqual(["World"]);
+
+    // Unsubscribing stops further delivery to that session's handlers.
+    unsubscribeB();
+    server.sendEvent(deltaFrame({ sessionKey: "session-b", deltaText: " again" }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bDeltas).toEqual(["World"]);
+  });
+});
+
+describe("subscribeSession: accumulateDelta replace/append semantics", () => {
+  it("replace:true replaces the accumulated snapshot; replace absent/false appends", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: string[] = [];
+    c.subscribeSession("s1", { onDelta: (s) => snapshots.push(s), onDone: () => {}, onError: () => {} });
+
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Hello" })); // absent -> append
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: " World", replace: false })); // false -> append
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Replaced", replace: true })); // true -> replace
+
+    await until(() => snapshots.length >= 3);
+    expect(snapshots).toEqual(["Hello", "Hello World", "Replaced"]);
+  });
+});
+
+describe("subscribeSession: cumulative message wins over local accumulation", () => {
+  it("uses the server's cumulative message snapshot when present, agreeing with it exactly", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: string[] = [];
+    c.subscribeSession("s1", { onDelta: (s) => snapshots.push(s), onDone: () => {}, onError: () => {} });
+
+    server.sendEvent(
+      deltaFrame({ sessionKey: "s1", deltaText: "ignored-local-delta", message: "authoritative snapshot" }),
+    );
+
+    await until(() => snapshots.length >= 1);
+    expect(snapshots[0]).toBe("authoritative snapshot");
+  });
+});
+
+describe("subscribeSession: reply-end fires onDone exactly once", () => {
+  it("fires onDone once on the terminal marker and ignores deltas received after it", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: string[] = [];
+    let doneCount = 0;
+    c.subscribeSession("s1", {
+      onDelta: (s) => snapshots.push(s),
+      onDone: () => {
+        doneCount += 1;
+      },
+      onError: () => {},
+    });
+
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Hi", done: true }));
+    // A second terminal event and a plain trailing delta must both be ignored: onDone must not
+    // fire again, and onDelta must not observe either.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Hi", done: true }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: " more after end" }));
+
+    await until(() => snapshots.length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(snapshots).toEqual(["Hi"]);
+    expect(doneCount).toBe(1);
+  });
+});
+
+describe("subscribeSession: onError on disconnect before reply-end", () => {
+  it("fires onError, without token content, when the connection drops mid-reply", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const errors: string[] = [];
+    c.subscribeSession("s1", { onDelta: () => {}, onDone: () => {}, onError: (message) => errors.push(message) });
+
+    server.dropAll();
+    await until(() => errors.length >= 1);
+    expect(errors[0]).not.toContain(TOKEN);
   });
 });

@@ -43,6 +43,10 @@ export interface FakeOpenClawServer {
   closeCodes(): number[];
   /** Force-closes every currently open socket (server-initiated drop knob for scenario c). */
   dropAll(code?: number): void;
+  /** Broadcasts an arbitrary JSON-serializable frame to every currently open socket. Used by
+   *  Task 5's chat-delta/reply-end tests to construct exact wire shapes (session id, deltaText,
+   *  message, replace, the reply-end marker) without a dedicated per-scenario knob. */
+  sendEvent(frame: Record<string, unknown>): void;
   /** Merges into the live behavior config; affects subsequent connections/messages. */
   setBehavior(patch: Partial<FakeOpenClawServerBehavior>): void;
   close(): Promise<void>;
@@ -203,6 +207,12 @@ export async function startFakeOpenClawServer(
     closeCodes: () => [...closeCodes],
     dropAll(code?: number): void {
       for (const ws of sockets) ws.close(code);
+    },
+    sendEvent(frame: Record<string, unknown>): void {
+      const raw = JSON.stringify(frame);
+      for (const ws of sockets) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(raw);
+      }
     },
     setBehavior(patch: Partial<FakeOpenClawServerBehavior>): void {
       cfg = { ...cfg, ...patch, dropOnMethod: patch.dropOnMethod ?? cfg.dropOnMethod };
