@@ -10,7 +10,7 @@ cozygateway is a single self-hosted Node process you run next to your agent. It 
 - Threads: multiple renameable DM threads per agent, each bound to its own backend session.
 - Streaming: agent replies stream live as typed rich content blocks over one WebSocket.
 - History: SQLite-backed message history with strict per-thread ordering and gap replay.
-- Push (planned): encrypted notifications through a ciphertext-only relay you can self-host.
+- Push: encrypted notifications through a ciphertext-only relay you can self-host (platform push transports land with the phone app).
 
 ## Status
 
@@ -28,7 +28,7 @@ cozygateway is a single self-hosted Node process you run next to your agent. It 
 
 ## Privacy model
 
-Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS with trust-on-first-use certificate pinning for the phone link is planned; see `packages/gateway/README.md` for the current, loopback-only reachability model. The push relay, when it ships, carries ciphertext only and is open source so you can host your own.
+Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS with trust-on-first-use certificate pinning for the phone link is planned; see `packages/gateway/README.md` for the current, loopback-only reachability model. The push relay carries ciphertext only and is open source so you can host your own.
 
 ## Development
 
