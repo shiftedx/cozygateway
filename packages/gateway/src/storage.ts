@@ -67,6 +67,12 @@ export interface ThreadRow {
   lastMessageAt: number | null;
   archivedAt: number | null;
 }
+export interface PushRegistrationRow {
+  deviceId: string;
+  pushId: string;
+  relayUrl: string;
+  pushKey: string;
+}
 
 interface MessageDbRow {
   threadId: string;
@@ -272,6 +278,19 @@ export class Storage {
            relay_url = excluded.relay_url, push_key = excluded.push_key`,
       )
       .run(deviceId, reg.pushId, reg.relayUrl, reg.pushKey);
+  }
+
+  pushRegistrations(): PushRegistrationRow[] {
+    return this.#db
+      .prepare(
+        `SELECT device_id AS deviceId, push_id AS pushId, relay_url AS relayUrl, push_key AS pushKey
+         FROM push_registrations ORDER BY device_id`,
+      )
+      .all() as unknown as PushRegistrationRow[];
+  }
+
+  deletePushRegistration(deviceId: string): void {
+    this.#db.prepare("DELETE FROM push_registrations WHERE device_id = ?").run(deviceId);
   }
 
   close(): void {
