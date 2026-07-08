@@ -8,6 +8,8 @@ import { openStorage, type Storage } from "./storage.ts";
 import { buildAdapters } from "./adapters/registry.ts";
 import { AttachIngress } from "./adapters/attach/ingress.ts";
 import { AttachRouter, collectAttachTokens } from "./adapters/attach/adapter.ts";
+import type { OpenClawClient } from "./adapters/openclaw/client.ts";
+import { parseOpenClawOptions } from "./adapters/openclaw/config.ts";
 import { createApp } from "./http.ts";
 import { WsHub } from "./ws-hub.ts";
 import { TurnRunner } from "./turns.ts";
@@ -64,6 +66,16 @@ export async function startGateway(
     });
   }
 
+  // The openclaw backend dials OUT (one OpenClawClient per configured agent, no shared ingress).
+  // Token resolution still fails closed BEFORE the listener opens, mirroring collectAttachTokens's
+  // placement for attach: a misconfigured openclaw agent (missing/invalid options, unset token
+  // env) throws here, before any client dials out or the port is bound.
+  const openclawAgents = config.agents.filter((a) => a.backend === "openclaw");
+  for (const agent of openclawAgents) {
+    parseOpenClawOptions(agent, process.env);
+  }
+  const openclawClients = new Map<string, OpenClawClient>();
+
   const adapters = buildAdapters(
     config.agents,
     attachIngress === undefined
@@ -72,6 +84,21 @@ export async function startGateway(
           endpoint: attachIngress,
           env: process.env,
           register: (agentId, adapter) => router.register(agentId, adapter),
+        },
+    openclawAgents.length === 0
+      ? undefined
+      : {
+          env: process.env,
+          register: (agentId, client) => {
+            openclawClients.set(agentId, client);
+            client.onStateChange((state) =>
+              hub.broadcast({
+                type: "presence",
+                agentId,
+                state: state === "online" ? "online" : "absent",
+              }),
+            );
+          },
         },
   );
   const runner = new TurnRunner({
@@ -131,6 +158,9 @@ export async function startGateway(
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
       // runner's per-thread chains settle before closeAll drains them.
       attachIngress?.close();
+      // Same ordering for openclaw: close every dial-out client (cancels any pending reconnect
+      // timer and fails in-flight turns) before the HTTP server stops and the runner drains.
+      await Promise.all([...openclawClients.values()].map((client) => client.close()));
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
