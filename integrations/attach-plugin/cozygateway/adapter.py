@@ -40,7 +40,7 @@ from .attach_client import (
     AttachSupersededError,
     TurnFrame,
 )
-from .text_blocks import normalize_text_to_blocks
+from .text_blocks import IncrementalNormalizer
 from .tool_chips import ToolChipTracker
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,11 @@ class AttachAdapter:
         # Per-turn accumulated text (the last full flush) and tool-chip tracker.
         self._turn_text: Dict[str, str] = {}
         self._tool_chips: Dict[str, ToolChipTracker] = {}
+        # Per-turn incremental block-normalization cache: makes repeated draft
+        # flushes over a long streaming reply proportional to newly arrived text
+        # rather than re-normalizing the whole accumulated reply every time (see
+        # IncrementalNormalizer). Wire output stays byte-identical full-replace.
+        self._normalizers: Dict[str, IncrementalNormalizer] = {}
         # Whether any draft for a turn has carried visible content yet.
         self._content_seen: Dict[str, bool] = {}
         # Strong refs to fire-and-forget tasks; the loop keeps only a weak ref to a
@@ -155,6 +160,17 @@ class AttachAdapter:
         task = loop.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _normalize(self, turn_id: str, text: str) -> List[Any]:
+        """Normalize ``text`` to blocks via this turn's incremental cache.
+
+        Byte-identical to calling ``normalize_text_to_blocks(text)`` directly, but
+        does work proportional to what changed since the last call for this turn
+        (see :class:`IncrementalNormalizer`). One instance per turn id, so a
+        second concurrent turn never shares (or corrupts) another's cache.
+        """
+        normalizer = self._normalizers.setdefault(turn_id, IncrementalNormalizer())
+        return normalizer.update(text)
 
     # -- connection lifecycle -------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -364,7 +380,7 @@ class AttachAdapter:
             # the transport (success keeps drafts flowing).
             return SendResult(success=True)
         self._turn_text[turn_id] = content
-        blocks = normalize_text_to_blocks(content)
+        blocks = self._normalize(turn_id, content)
         chips = self._chips(turn_id)
         if not blocks and not chips:
             return SendResult(success=True)  # nothing materialized yet
@@ -416,7 +432,7 @@ class AttachAdapter:
         """Push one draft carrying the current text plus tool chips. Never raises."""
         if self._client is None:
             return
-        blocks = normalize_text_to_blocks(self._turn_text.get(turn_id, ""))
+        blocks = self._normalize(turn_id, self._turn_text.get(turn_id, ""))
         chips = self._chips(turn_id)
         if not blocks and not chips:
             return
@@ -461,7 +477,7 @@ class AttachAdapter:
             final_text = content if (content and content.strip()) else self._turn_text.get(
                 turn_id, ""
             )
-            blocks = normalize_text_to_blocks(final_text)
+            blocks = self._normalize(turn_id, final_text)
             chips = self._chips(turn_id)
             had_content = self._content_seen.get(turn_id, False)
             if blocks or chips:
@@ -499,6 +515,7 @@ class AttachAdapter:
         """Drop a turn's per-turn state once it commits, fails, or is dropped."""
         self._turn_text.pop(turn_id, None)
         self._tool_chips.pop(turn_id, None)
+        self._normalizers.pop(turn_id, None)
         self._content_seen.pop(turn_id, None)
         if self._active_turn.get(chat_id) == turn_id:
             self._active_turn.pop(chat_id, None)
