@@ -237,4 +237,33 @@ describe("RelayNotifier", () => {
     expect(sent.find((s) => s.body.pushId === "p1")).toBeDefined();
     storage.close();
   });
+
+  it("defers the send one macrotask so the recheck observes presence flipped by an already-queued event", async () => {
+    // Race regression for issue #11, deterministic form. The real race: a WS auth frame is
+    // already sitting in the socket's event queue when a commit fires, so the commit-time
+    // snapshot misses the device, but the hub processes the auth (a macrotask) before the
+    // deferred send runs its recheck. The queued setImmediate below stands in for that queued
+    // auth frame: it is scheduled BEFORE notify() is called, exactly like an auth frame that
+    // arrived before the commit, and only it flips presence to connected. This test fails if
+    // #send rechecks synchronously instead of yielding one macrotask first: the recheck would
+    // read `connected === false` and the POST would fire.
+    const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
+    const { impl, sent } = fetchStub(() => 202);
+    let connected = false;
+    const notifier = new RelayNotifier({
+      storage,
+      fetchImpl: impl,
+      log: () => {},
+      isDeviceConnected: () => connected,
+    });
+    setImmediate(() => {
+      connected = true; // the "auth frame" ahead of the deferred send in the macrotask queue
+    });
+    notifier.notify({ threadId: "t", agentName: "A", preview: "p" }, new Set()); // snapshot misses d1
+    expect(connected).toBe(false); // the commit-time decision really did run before the flip
+    await settle();
+    expect(sent).toHaveLength(0);
+    expect(storage.pushRegistrations().map((r) => r.deviceId)).toEqual(["d1"]); // no pruning on skip
+    storage.close();
+  });
 });

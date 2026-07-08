@@ -77,12 +77,20 @@ export class RelayNotifier implements Notifier {
   }
 
   async #send(registration: PushRegistrationRow, payload: PushPayload): Promise<void> {
-    const ciphertext = encryptPushPayload(registration.pushKey, payload);
-    const url = `${registration.relayUrl.replace(/\/+$/, "")}/notify`;
+    // Yield one macrotask before the presence recheck. Without this yield the recheck would
+    // run in the same synchronous span as notify()'s commit-time snapshot and could never
+    // observe anything newer. setImmediate callbacks run after pending I/O callbacks, so a WS
+    // auth frame already sitting in the socket's event queue at commit time gets processed
+    // first and the recheck below sees the device as connected. Only this fire-and-forget
+    // send path defers; the commit-time notify decision in the turn runner stays fully
+    // synchronous, and one macrotask of extra push latency is invisible at human scale.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     // Late recheck, narrowing (not closing) the race window: the device may have connected
     // since notify()'s commit-time snapshot was taken. Skip the send without touching the
     // registration row, which is prunable only on a relay 404, not on this kind of skip.
     if (this.#isDeviceConnected?.(registration.deviceId) === true) return;
+    const ciphertext = encryptPushPayload(registration.pushKey, payload);
+    const url = `${registration.relayUrl.replace(/\/+$/, "")}/notify`;
     const res = await this.#fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
