@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createRelayApp } from "../src/http.ts";
 import { openRelayStorage, type RelayStorage } from "../src/storage.ts";
@@ -171,6 +171,46 @@ describe("POST /notify", () => {
     expect(deliveries).toEqual([{ token: "https://x.example/hook", ciphertext: "CIPHER" }]);
   });
 
+  it("returns 202 before a genuinely slow transport's delivery has actually completed", async () => {
+    // Unlike the harness's default transport (whose `deliver` resolves synchronously in the
+    // same microtask), this transport has a real internal delay via a timer, so a 202 that
+    // beats it proves the response is truly detached from delivery, not just from an
+    // artificially-async-but-instant stub.
+    const DELAY_MS = 40;
+    const deliveries: Delivery[] = [];
+    const slowStorage = openRelayStorage(":memory:");
+    cleanups.push(() => slowStorage.close());
+    const slowApp = createRelayApp({
+      storage: slowStorage,
+      transports: {
+        webhook: {
+          deliver: (token, ciphertext) =>
+            new Promise<void>((resolve) => {
+              setTimeout(() => {
+                deliveries.push({ token, ciphertext });
+                resolve();
+              }, DELAY_MS);
+            }),
+        },
+      },
+      dailyCap: 500,
+      maxRegistrations: 10000,
+      version: "test",
+      now: () => Date.now(),
+      log: () => {},
+      restrictEgress: false,
+    });
+    const pushId = await registeredPushId(slowApp);
+    const start = Date.now();
+    const res = await notify(slowApp, { pushId, ciphertext: "SLOW" });
+    expect(res.status).toBe(202);
+    // The 202 landed comfortably before the transport's own delay could have elapsed.
+    expect(Date.now() - start).toBeLessThan(DELAY_MS);
+    expect(deliveries).toHaveLength(0);
+    await new Promise((resolve) => setTimeout(resolve, DELAY_MS + 40));
+    expect(deliveries).toEqual([{ token: "https://x.example/hook", ciphertext: "SLOW" }]);
+  });
+
   it("404s an unknown push id", async () => {
     const { app } = harness();
     const res = await notify(app, { pushId: "nope", ciphertext: "C" });
@@ -247,5 +287,19 @@ describe("envelope faults", () => {
     const res = await app.request("/health");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ name: "cozygateway-relay", version: "test" });
+  });
+
+  it("500s with the internal error envelope when a route handler throws unexpectedly", async () => {
+    const { app, storage } = harness();
+    const pushId = await registeredPushId(app);
+    // Force the documented onError 500 path (contract/push-v0.md) via a storage seam that
+    // throws, rather than weakening any production code to make this reachable.
+    vi.spyOn(storage, "registrationByPushId").mockImplementation(() => {
+      throw new Error("storage exploded");
+    });
+    const res = await notify(app, { pushId, ciphertext: "C" });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("internal");
   });
 });

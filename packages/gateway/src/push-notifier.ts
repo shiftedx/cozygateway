@@ -5,6 +5,20 @@ import { encryptPushPayload, type PushPayload } from "./push-crypto.ts";
 export const PREVIEW_MAX_CHARS = 200;
 const NOTIFY_TIMEOUT_MS = 10_000;
 
+/** Slices `text` to at most `maxUnits` UTF-16 code units, but never mid-surrogate-pair. A
+ *  plain `.slice(0, maxUnits)` can land the cut between a surrogate pair's high and low half,
+ *  producing a lone high surrogate that serializes as U+FFFD (replacement character) instead
+ *  of the astral character it started. If the unit at the cut boundary is a high surrogate,
+ *  its low half was about to be dropped anyway, so drop the high half too and land one unit
+ *  earlier, on a real code-point boundary. */
+function truncateAtCodePointBoundary(text: string, maxUnits: number): string {
+  if (text.length <= maxUnits) return text;
+  let end = maxUnits;
+  const boundaryUnit = text.charCodeAt(end - 1);
+  if (boundaryUnit >= 0xd800 && boundaryUnit <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
 export interface RelayNotifierDeps {
   storage: Storage;
   fetchImpl?: typeof fetch;
@@ -37,7 +51,7 @@ export class RelayNotifier implements Notifier {
     const payload: PushPayload = {
       threadId: event.threadId,
       agentName: event.agentName,
-      preview: event.preview.slice(0, PREVIEW_MAX_CHARS),
+      preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),
     };
     for (const registration of registrations) {
       void this.#send(registration, payload).catch((err: unknown) => {

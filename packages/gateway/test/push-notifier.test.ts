@@ -97,15 +97,43 @@ describe("RelayNotifier", () => {
     storage.close();
   });
 
+  it("truncates on a code-point boundary instead of splitting a surrogate pair", async () => {
+    const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
+    const { impl, sent } = fetchStub(() => 202);
+    // U+1F600 is an astral character encoded as a high/low surrogate pair. Placed so its high
+    // surrogate lands exactly at UTF-16 index PREVIEW_MAX_CHARS - 1, a naive `.slice(0,
+    // PREVIEW_MAX_CHARS)` cuts between the pair, leaving a lone high surrogate that would
+    // serialize as U+FFFD (replacement character) instead of dropping the whole character.
+    const astral = "\u{1f600}";
+    const preview = "x".repeat(PREVIEW_MAX_CHARS - 1) + astral + "y".repeat(50);
+    expect(preview.charCodeAt(PREVIEW_MAX_CHARS - 1)).toBeGreaterThanOrEqual(0xd800);
+    expect(preview.charCodeAt(PREVIEW_MAX_CHARS - 1)).toBeLessThanOrEqual(0xdbff);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify({
+      threadId: "t",
+      agentName: "A",
+      preview,
+    });
+    await settle();
+    const delivered = decrypt("k", sent[0]?.body.ciphertext ?? "").preview;
+    expect(delivered).toBe("x".repeat(PREVIEW_MAX_CHARS - 1));
+    expect(delivered).not.toContain("�");
+    expect(/[\ud800-\udbff]$/.test(delivered)).toBe(false);
+    storage.close();
+  });
+
   it("prunes exactly the registration a relay 404s and keeps the others", async () => {
     const storage = seeded([
       { deviceId: "d1", pushId: "p1", relayUrl: "http://gone.test", pushKey: "k1" },
       { deviceId: "d2", pushId: "p2", relayUrl: "http://alive.test", pushKey: "k2" },
     ]);
-    const { impl } = fetchStub((url) => (url.startsWith("http://gone.test") ? 404 : 202));
+    const { impl, sent } = fetchStub((url) => (url.startsWith("http://gone.test") ? 404 : 202));
     new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify({ threadId: "t", agentName: "A", preview: "p" });
     await settle();
     expect(storage.pushRegistrations().map((r) => r.deviceId)).toEqual(["d2"]);
+    // Self-contained: the surviving registration's POST actually fired, rather than relying on
+    // the separate fan-out test above to establish that.
+    expect(sent.find((s) => s.body.pushId === "p2")).toBeDefined();
+    expect(sent.some((s) => s.body.pushId === "p1")).toBe(true);
     storage.close();
   });
 
