@@ -6,6 +6,7 @@ import { createMiddleware } from "hono/factory";
 import { Value } from "@sinclair/typebox/value";
 import type { Static, TSchema } from "@sinclair/typebox";
 
+import { isBlockedLiteralHost, stripIpv6Brackets } from "./egress.ts";
 import { NotifyRequestSchema, RegisterRequestSchema, relayError } from "./schemas.ts";
 import { utcDay, type RelayStorage } from "./storage.ts";
 import type { Transport } from "./transports.ts";
@@ -17,6 +18,10 @@ export interface RelayAppDeps {
   dailyCap: number;
   version: string;
   now: () => number;
+  /** When true, `POST /register` rejects a webhook URL whose host is a literal IP in a
+   *  restricted range (loopback, link-local, private, unspecified). A DNS-name host is
+   *  not resolved here; it is vetted again at delivery time (design decision, issue #8). */
+  restrictEgress: boolean;
   log?: (message: string) => void;
 }
 
@@ -27,6 +32,12 @@ function isHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** True when `value` is an http(s) URL whose host is a literal IP in a restricted range. */
+function isBlockedWebhookUrl(value: string): boolean {
+  const hostname = stripIpv6Brackets(new URL(value).hostname);
+  return isBlockedLiteralHost(hostname);
 }
 
 export function createRelayApp(deps: RelayAppDeps): Hono {
@@ -65,6 +76,9 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
     }
     if (parsed.platform === "webhook" && !isHttpUrl(parsed.token)) {
       return c.json(relayError("invalid_request", "webhook token must be an http(s) URL"), 400);
+    }
+    if (parsed.platform === "webhook" && deps.restrictEgress && isBlockedWebhookUrl(parsed.token)) {
+      return c.json(relayError("invalid_request", "webhook token resolves to a restricted address range"), 400);
     }
     const pushId = randomBytes(16).toString("base64url");
     deps.storage.saveRegistration({
