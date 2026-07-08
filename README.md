@@ -2,7 +2,7 @@
 
 Chat with your self-hosted AI agent from your phone, without handing your data to anyone.
 
-cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and drives agent backends through a small adapter interface. A reference echo backend ships today, for trying the gateway out before wiring up a real one. Additional backend adapters are planned.
+cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and drives agent backends through a small adapter interface. Two backends ship today: a reference echo backend for trying the gateway out, and an `attach` backend that lets an agent harness dial in over a small WebSocket protocol and answer turns live.
 
 ## What it does
 
@@ -14,7 +14,7 @@ cozygateway is a single self-hosted Node process you run next to your agent. It 
 
 ## Status
 
-Contract v1 is frozen (see `contract/v1.md`). The reference gateway and its conformance suite are built and passing. Next up: the phone app, the push relay, TLS for the phone link, and real backend adapters, all planned.
+Contract v1 is frozen (see `contract/v1.md`). The reference gateway and its conformance suite are built and passing. Next up: the phone app, the push relay, TLS for the phone link, and further backend adapters, all planned. The `attach` backend and its adapter-facing protocol (`contract/attach-v0.md`, v0, not yet frozen) shipped with a reference harness plugin in `integrations/`.
 
 ## Repo layout
 
@@ -22,6 +22,7 @@ Contract v1 is frozen (see `contract/v1.md`). The reference gateway and its conf
 - `packages/contract`: TypeBox schemas and TypeScript types for the contract (publishable as `cozygateway-contract`).
 - `packages/gateway`: the gateway process, implementing contract v1.
 - `packages/conformance`: contract conformance suite that runs against any gateway implementation, validated against the reference gateway.
+- `integrations/attach-plugin`: a reference plugin for agent harnesses that support Python platform plugins, speaking the attach v0 protocol.
 
 ## Privacy model
 
