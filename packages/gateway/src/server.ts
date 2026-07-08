@@ -25,7 +25,21 @@ export interface RunningGateway {
   close(): Promise<void>;
 }
 
-export async function startGateway(config: GatewayConfig): Promise<RunningGateway> {
+export interface StartGatewayOptions {
+  /** Overrides the push notifier's fire-and-forget failure log sink. Not part of
+   *  `GatewayConfig` (which is JSON-schema-validated and loadable from disk) since a log
+   *  function isn't serializable; this is a programmatic-only seam. Defaults to the
+   *  notifier's own stderr writer, so production behavior is unchanged when omitted. Exists
+   *  for hosts (e.g. the conformance suite's reference gateway) that intentionally register
+   *  an unroutable relay and want to observe or silence the resulting failure log instead of
+   *  it reaching real stderr (design decision, issue #10). */
+  notifierLog?: (message: string) => void;
+}
+
+export async function startGateway(
+  config: GatewayConfig,
+  options: StartGatewayOptions = {},
+): Promise<RunningGateway> {
   const storage = openStorage(config.dbPath);
   for (const agent of config.agents) {
     storage.upsertAgent({ id: agent.id, name: agent.name, avatar: agent.avatar ?? null, backend: agent.backend });
@@ -64,7 +78,7 @@ export async function startGateway(config: GatewayConfig): Promise<RunningGatewa
     storage,
     hub,
     adapters,
-    notifier: new RelayNotifier({ storage }),
+    notifier: new RelayNotifier({ storage, log: options.notifierLog }),
     now: () => Date.now(),
   });
 
