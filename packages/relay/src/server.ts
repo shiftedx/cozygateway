@@ -8,12 +8,17 @@ import { webhookTransport } from "./transports.ts";
 
 export const RELAY_VERSION = "0.1.0";
 export const DEFAULT_DAILY_CAP = 500;
+/** Generous for a self-host, finite against an unauthenticated registration flood ahead
+ *  of the auth-hook slot landing (design decision, issue #9). */
+export const DEFAULT_MAX_REGISTRATIONS = 10000;
 
 export interface RelayConfig {
   port: number;
   host: string;
   dbPath: string;
   dailyCap: number;
+  /** Total-row cap on `registrations` (design decision, issue #9). */
+  maxRegistrations: number;
   /** Restrict webhook egress to public addresses (design decision, issue #8). See
    *  `parseCliConfig` in `cli.ts` for how the CLI derives this default from `host`. */
   restrictEgress: boolean;
@@ -32,6 +37,7 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
     storage,
     transports: { webhook: webhookTransport({ restrictEgress: config.restrictEgress }) },
     dailyCap: config.dailyCap,
+    maxRegistrations: config.maxRegistrations,
     version: RELAY_VERSION,
     now: () => Date.now(),
     restrictEgress: config.restrictEgress,

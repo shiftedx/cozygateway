@@ -19,6 +19,7 @@ function harness(overrides?: {
   failDelivery?: boolean;
   nowRef?: { value: number };
   restrictEgress?: boolean;
+  maxRegistrations?: number;
 }): { app: ReturnType<typeof createRelayApp>; storage: RelayStorage; deliveries: Delivery[] } {
   const storage = openRelayStorage(":memory:");
   cleanups.push(() => storage.close());
@@ -34,6 +35,7 @@ function harness(overrides?: {
     storage,
     transports: { webhook: transport },
     dailyCap: overrides?.dailyCap ?? 500,
+    maxRegistrations: overrides?.maxRegistrations ?? 10000,
     version: "test",
     now: () => nowRef.value,
     log: () => {},
@@ -137,6 +139,26 @@ describe("POST /register", () => {
       expect(res.status).toBe(201);
     });
   });
+
+  describe("with a low maxRegistrations", () => {
+    it("refuses a new registration beyond the cap with a typed 429 envelope", async () => {
+      const { app } = harness({ maxRegistrations: 2 });
+      expect((await registeredPushId(app)).length).toBeGreaterThan(0);
+      expect((await registeredPushId(app)).length).toBeGreaterThan(0);
+      const res = await register(app, { platform: "webhook", token: "https://x.example/hook" });
+      expect(res.status).toBe(429);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("over_cap");
+    });
+
+    it("does not consume the cap on a malformed or rejected request", async () => {
+      const { app } = harness({ maxRegistrations: 1 });
+      const bad = await register(app, { platform: "smoke-signal", token: "x" });
+      expect(bad.status).toBe(400);
+      // The cap of 1 is still fully available since the malformed request never got in.
+      expect((await register(app, { platform: "webhook", token: "https://x.example/hook" })).status).toBe(201);
+    });
+  });
 });
 
 describe("POST /notify", () => {
@@ -184,6 +206,20 @@ describe("POST /notify", () => {
     const pushId = await registeredPushId(app);
     const res = await notify(app, { pushId, ciphertext: "x".repeat(8193) });
     expect(res.status).toBe(400);
+  });
+
+  it("lazily sweeps notify_counts rows older than the retention window on notify", async () => {
+    const nowRef = { value: Date.UTC(2026, 6, 1, 12, 0, 0) };
+    const { app, storage } = harness({ nowRef });
+    const pushId = await registeredPushId(app);
+    expect((await notify(app, { pushId, ciphertext: "C" })).status).toBe(202);
+    const oldDay = "2026-07-01";
+    expect(storage.notifyCount(pushId, oldDay)).toBe(1);
+
+    // Jump forward well past the retention window and notify again; the sweep runs inline.
+    nowRef.value = Date.UTC(2026, 6, 20, 0, 0, 0);
+    expect((await notify(app, { pushId, ciphertext: "C" })).status).toBe(202);
+    expect(storage.notifyCount(pushId, oldDay)).toBe(0);
   });
 });
 

@@ -61,7 +61,14 @@ beforeEach(async () => {
   if (addr === null || typeof addr !== "object") throw new Error("no receiver address");
   receiverUrl = `http://127.0.0.1:${addr.port}/push`;
 
-  relay = await startRelay({ port: 0, host: "127.0.0.1", dbPath: ":memory:", dailyCap: 500, restrictEgress: false });
+  relay = await startRelay({
+    port: 0,
+    host: "127.0.0.1",
+    dbPath: ":memory:",
+    dailyCap: 500,
+    maxRegistrations: 10000,
+    restrictEgress: false,
+  });
   gateway = await startGateway({
     name: "push-e2e",
     port: 0,
