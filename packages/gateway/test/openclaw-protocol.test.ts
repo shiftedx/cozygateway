@@ -10,8 +10,6 @@ import {
   TickEventSchema,
   parseServerFrame,
   buildConnectRequest,
-  buildChatSendRequest,
-  buildSessionsCreateRequest,
 } from "../src/adapters/openclaw/protocol.ts";
 import { check } from "cozygateway-contract";
 
@@ -236,20 +234,5 @@ describe("outbound request builders", () => {
     const req = buildConnectRequest({ id: "req-2", token: "t" });
     expect(req.params.device).toBeUndefined();
     expect(req.params.auth.token).toBe("t");
-  });
-
-  it("buildChatSendRequest places sessionKey and text under params", () => {
-    const req = buildChatSendRequest({ id: "req-3", sessionKey: "sess-1", text: "hello" });
-    expect(req).toEqual({
-      type: "req",
-      id: "req-3",
-      method: "chat.send",
-      params: { sessionKey: "sess-1", text: "hello" },
-    });
-  });
-
-  it("buildSessionsCreateRequest returns a typed request with a caller-supplied id", () => {
-    const req = buildSessionsCreateRequest({ id: "req-4" });
-    expect(req).toEqual({ type: "req", id: "req-4", method: "sessions.create", params: {} });
   });
 });

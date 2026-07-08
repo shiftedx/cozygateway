@@ -233,48 +233,11 @@ export function buildConnectRequest(input: ConnectRequestInput): ConnectRequest 
   };
 }
 
-export interface ChatSendRequestInput {
-  id: string;
-  sessionKey: string;
-  text: string;
-}
-
-export interface ChatSendRequest {
-  type: "req";
-  id: string;
-  method: "chat.send";
-  params: { sessionKey: string; text: string };
-}
-
-export function buildChatSendRequest(input: ChatSendRequestInput): ChatSendRequest {
-  return {
-    type: "req",
-    id: input.id,
-    method: "chat.send",
-    params: { sessionKey: input.sessionKey, text: input.text },
-  };
-}
-
-export interface SessionsCreateRequestInput {
-  id: string;
-  /** The verified wire facts confirm the method name and its `sessionKey`-bearing response but
-   *  not the request params shape, so this stays an open bag (empty by default) pending the
-   *  live study (Task 8). */
-  params?: Record<string, unknown>;
-}
-
-export interface SessionsCreateRequest {
-  type: "req";
-  id: string;
-  method: "sessions.create";
-  params: Record<string, unknown>;
-}
-
-export function buildSessionsCreateRequest(input: SessionsCreateRequestInput): SessionsCreateRequest {
-  return {
-    type: "req",
-    id: input.id,
-    method: "sessions.create",
-    params: input.params ?? {},
-  };
-}
+/** `chat.send`/`sessions.create` (and any other post-handshake method) deliberately have NO typed
+ *  request builder here, unlike `buildConnectRequest`: the client's `request(method, params)` is
+ *  a single generic send path shared across every method the adapter calls today and any the
+ *  protocol adds later, and it mints the frame's `id` itself (see `client.ts`). A typed builder
+ *  per method would either duplicate that id-minting outside the client (two sources of truth for
+ *  frame construction) or force `request()`'s signature away from "any method, any params" toward
+ *  something method-aware, for no behavioral gain: `connect` alone is special enough (fixed
+ *  role/scopes/protocol bounds, an optional signed `device` block) to earn its own builder. */

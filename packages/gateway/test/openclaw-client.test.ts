@@ -192,6 +192,50 @@ describe("scenario (e): tick silence beyond tickIntervalMs*2 closes with 4000 an
   });
 });
 
+describe("scenario (g): handshake deadline bounds connecting -> online", () => {
+  // Real timers, like every other reconnect/backoff scenario in this file: the assertions below
+  // use generous margins (a fresh connection observed well within 3s of a 60ms deadline) rather
+  // than pinning exact timing, so ordinary scheduling jitter cannot flake them.
+
+  it("a gateway that never sends hello-ok times out the handshake and forces a reconnect", async () => {
+    const server = await fakeServer({ neverSendChallenge: true });
+    const c = client(server.url, { handshakeTimeoutMs: 60 });
+    const states = trackStates(c);
+    c.start();
+
+    await until(() => server.totalConnections() >= 1);
+    expect(c.state()).toBe("connecting");
+
+    // The handshake deadline must force a close and a fresh connection attempt: proof the client
+    // did not sit in "connecting" forever with no watchdog.
+    await until(() => server.totalConnections() >= 2, 3_000);
+    expect(states).toContain("connecting");
+    // hello-ok never arrives from this server, so "online" must never appear either.
+    expect(states).not.toContain("online");
+    expect(c.state()).toBe("connecting");
+  });
+
+  it("a bad_signature connect rejection without a socket close still trips the handshake deadline", async () => {
+    const logLines: string[] = [];
+    const server = await fakeServer({ forceBadSignature: true });
+    const c = client(server.url, { handshakeTimeoutMs: 60, logSink: (line) => logLines.push(line) });
+    c.start();
+
+    // The rejection must be observable: a content-free diagnostic log line naming the error code,
+    // never the token or the server's own `.reason` text.
+    await until(() => logLines.some((l) => l.includes("bad_signature")), 3_000);
+    for (const line of logLines) {
+      expect(line).not.toContain(TOKEN);
+      expect(line).not.toContain("device signature did not verify");
+    }
+
+    // Nothing on the server side ever closes this socket: only the client's OWN handshake
+    // deadline can be what eventually forces the close and reconnect.
+    await until(() => server.totalConnections() >= 2, 3_000);
+    expect(c.state()).not.toBe("online");
+  });
+});
+
 describe("scenario (f): the token never appears in any log line or thrown error message", () => {
   it("stays out of logs across a normal connect, a protocol mismatch, and a mid-turn drop", async () => {
     const logLines: string[] = [];

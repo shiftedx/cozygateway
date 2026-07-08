@@ -30,6 +30,17 @@ export interface FakeOpenClawServerBehavior {
    *  frame is sent (connection-failure knob for scenario c's backoff-growth assertion). Consumed
    *  one per connection. */
   failNextConnections?: number;
+  /** when true, the server accepts the socket but never sends `connect.challenge` (and so never
+   *  reaches `hello-ok` either): the connection just sits open and silent. Reproduces a gateway
+   *  that opens the socket but never completes the handshake, exercising the client's own
+   *  handshake-deadline watchdog rather than any other fake-server behavior (Fix 1 scenario a). */
+  neverSendChallenge?: boolean;
+  /** when true, every signed `connect` request (one carrying a `device` block) is rejected with
+   *  `bad_signature`, WITHOUT closing the socket, regardless of whether the signature would
+   *  actually verify. Reproduces an auth rejection a server answers but never follows with a
+   *  close, so the client's handshake-deadline watchdog (not a socket-close event) is what has to
+   *  notice the stall (Fix 1 scenario b). */
+  forceBadSignature?: boolean;
 }
 
 export interface FakeOpenClawServer {
@@ -41,6 +52,11 @@ export interface FakeOpenClawServer {
   /** Close codes the server observed, in arrival order, one per socket that has closed so far
    *  (e.g. 4000 for a client-initiated tick-timeout close). */
   closeCodes(): number[];
+  /** `sessionKey` values the server has handed back from `sessions.create`, in call order. Lets a
+   *  test read back the SAME key it should tag a subsequent `sendEvent` chat-delta frame with,
+   *  exercising the assumed-same-field/value across `sessions.create`'s response and the delta
+   *  event's session-identifying field. */
+  sessionKeys(): string[];
   /** Force-closes every currently open socket (server-initiated drop knob for scenario c). */
   dropAll(code?: number): void;
   /** Broadcasts an arbitrary JSON-serializable frame to every currently open socket. Used by
@@ -63,6 +79,8 @@ export async function startFakeOpenClawServer(
     silent: initial.silent ?? false,
     dropOnMethod: initial.dropOnMethod ?? [],
     failNextConnections: initial.failNextConnections ?? 0,
+    neverSendChallenge: initial.neverSendChallenge ?? false,
+    forceBadSignature: initial.forceBadSignature ?? false,
   };
 
   const http: Server = createServer();
@@ -70,6 +88,7 @@ export async function startFakeOpenClawServer(
   const sockets = new Set<WebSocket>();
   let totalConnections = 0;
   const closeCodes: number[] = [];
+  const sessionKeys: string[] = [];
 
   wss.on("connection", (ws) => {
     totalConnections += 1;
@@ -102,7 +121,11 @@ export async function startFakeOpenClawServer(
     ws.on("close", stopTicks);
 
     const nonce = randomUUID();
-    ws.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce, ts: Date.now() } }));
+    if (!cfg.neverSendChallenge) {
+      ws.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce, ts: Date.now() } }));
+    }
+    // else: the socket stays open and silent forever from the server's side; the client is left
+    // waiting on a challenge that never arrives, so hello-ok never arrives either.
 
     ws.on("message", (data) => {
       let parsed: unknown;
@@ -138,6 +161,22 @@ export async function startFakeOpenClawServer(
         const scopes = Array.isArray(params["scopes"]) ? (params["scopes"] as string[]) : [];
         const client = params["client"] as { platform?: string } | undefined;
         const platform = client?.platform ?? "server";
+
+        if (cfg.forceBadSignature) {
+          // Deterministic auth rejection WITHOUT closing the socket, regardless of whether the
+          // signature would actually verify: reproduces a server that answers `connect` with an
+          // error frame but never follows it with a close, without depending on corrupting the
+          // client's real signing (which the test has no hook into).
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: { details: { code: "bad_signature", reason: "device signature did not verify" } },
+            }),
+          );
+          return;
+        }
 
         const expectedPayload = buildAuthPayloadV3({
           identity: { id: device.id, publicKey: device.publicKey, privateKey: "" },
@@ -189,6 +228,13 @@ export async function startFakeOpenClawServer(
         return;
       }
 
+      if (frame.method === "sessions.create") {
+        const sessionKey = randomUUID();
+        sessionKeys.push(sessionKey);
+        ws.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { sessionKey } }));
+        return;
+      }
+
       // Generic ok-echo for any other correlated request (e.g. chat.send).
       ws.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: {} }));
     });
@@ -205,6 +251,7 @@ export async function startFakeOpenClawServer(
     connectionCount: () => sockets.size,
     totalConnections: () => totalConnections,
     closeCodes: () => [...closeCodes],
+    sessionKeys: () => [...sessionKeys],
     dropAll(code?: number): void {
       for (const ws of sockets) ws.close(code);
     },

@@ -45,6 +45,10 @@ export interface SignChallengeResult {
 /** ASSUMPTION (Task 8 to verify against buildDeviceAuthPayloadV3 on a live gateway):
  *  canonical payload = ["v3", identity.id, "operator", scopes.join(","), token, nonce, platform, "server"].join("\n")
  *
+ *  Note: "operator" above is illustrative of the role SLOT, not a hardcoded literal -- the
+ *  function below substitutes `input.role`/`input.platform` (and every other field) from the
+ *  caller's actual input at call time, exactly like the rest of the array.
+ *
  *  This is the ONE function pinning the exact byte construction of the OpenClaw v3 device-auth
  *  payload. The construction is not publicly documented, so it is isolated here: if Task 8's
  *  live study finds the server disagrees, only this function (and by extension this file) needs

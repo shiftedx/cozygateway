@@ -73,6 +73,10 @@ export interface ReconnectPolicy {
 
 export const DEFAULT_RECONNECT_POLICY: ReconnectPolicy = { minMs: 500, maxMs: 15000 };
 
+/** Default bound on how long a single connection attempt may sit between "connecting" and
+ *  "online" before the handshake watchdog gives up on it (see `OpenClawClientOptions.handshakeTimeoutMs`). */
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+
 /** Pure exponential-backoff-with-jitter calculation, exported so its growth and cap can be
  *  unit-tested independent of any socket. `attempt` is 1-based (the first reconnect after a
  *  drop). The jitter band is narrow (+/-10% of the base) and the base itself doubles per
@@ -100,6 +104,16 @@ export interface OpenClawClientOptions {
   protocolVersion?: number;
   /** default { minMs: 500, maxMs: 15000 } */
   reconnect?: ReconnectPolicy;
+  /** Bounds a single connection attempt's "connecting" -> "online" handshake (socket open through
+   *  challenge/hello-ok). Nothing else watches this window: `tickTimer` only arms after hello-ok,
+   *  and `reconnectTimer` only arms once the socket has already closed. Without this bound, a
+   *  gateway that opens the socket but never completes the handshake (or that answers `connect`
+   *  with an error frame it never follows with a socket close, e.g. `bad_signature`) leaves the
+   *  client stuck "connecting" forever with no watchdog, no reconnect, and no surfaced error. On
+   *  expiry the client force-closes the socket so the normal reconnect-with-backoff path (or the
+   *  version-mismatch fail-closed path, if that already latched) runs exactly as it would for any
+   *  other disconnect. default 10000 (`DEFAULT_HANDSHAKE_TIMEOUT_MS`) */
+  handshakeTimeoutMs?: number;
   /** injectable clock for tests */
   now?: () => number;
   /** Every log line goes through this sink instead of a raw console/stderr write scattered
@@ -145,6 +159,7 @@ export interface OpenClawClient {
 
 export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClient {
   const reconnectPolicy = opts.reconnect ?? DEFAULT_RECONNECT_POLICY;
+  const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const expectedProtocol = opts.protocolVersion ?? PROTOCOL_VERSION;
   const now = opts.now ?? Date.now;
   const logLine = opts.logSink ?? ((line: string) => void process.stderr.write(line));
@@ -159,6 +174,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
   let tickIntervalMs: number | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let tickTimer: ReturnType<typeof setTimeout> | undefined;
+  let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
 
   const eventHandlers: Array<(frame: ServerFrame) => void> = [];
   const stateHandlers: Array<(state: ClientState) => void> = [];
@@ -201,6 +217,27 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
   function clearReconnectTimer(): void {
     if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
     reconnectTimer = undefined;
+  }
+
+  function clearHandshakeTimer(): void {
+    if (handshakeTimer !== undefined) clearTimeout(handshakeTimer);
+    handshakeTimer = undefined;
+  }
+
+  /** Armed once per connection attempt (see `connect()`). If `online` is not reached before it
+   *  fires, the attempt is abandoned: force-close the socket so the ordinary "close" handling
+   *  (`handleClosed`) takes over -- normal backoff reconnect, or the version-mismatch
+   *  fail-closed/no-retry path if that already latched -- exactly as it would for a real drop.
+   *  Never fires after `clearHandshakeTimer()` has run (on reaching online, on socket close, or on
+   *  client `close()`), so it cannot double-close or misfire post-handshake. */
+  function armHandshakeTimer(): void {
+    clearHandshakeTimer();
+    handshakeTimer = setTimeout(() => {
+      handshakeTimer = undefined;
+      log(`handshake did not reach online within ${handshakeTimeoutMs}ms; closing (handshake timeout)`);
+      ws?.close();
+    }, handshakeTimeoutMs);
+    handshakeTimer.unref();
   }
 
   function handleMessage(data: unknown): void {
@@ -252,6 +289,10 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
         return;
       }
       case "hello-ok": {
+        // The handshake has concluded one way or another (accepted below, or rejected next line):
+        // either way the "connecting must eventually resolve" bound this timer exists for has been
+        // met, so it must not also fire once we're past this point.
+        clearHandshakeTimer();
         if (frame.payload.protocol !== expectedProtocol) {
           log(
             `server reported protocol ${frame.payload.protocol}, expected ${expectedProtocol}; ` +
@@ -271,7 +312,17 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
       }
       case "response": {
         const entry = pending.get(frame.id);
-        if (entry === undefined) return; // unknown, stale, or foreign correlation id: ignore
+        if (entry === undefined) {
+          // Not a reply to any live request() call. The one case worth surfacing is a *rejected*
+          // connect attempt (e.g. bad_signature): the connect frame's id is never added to
+          // `pending` (see `request()`), so an auth rejection lands here rather than being
+          // resolved/rejected through the normal request path. Some servers answer this way
+          // WITHOUT closing the socket, which would otherwise leave the rejection completely
+          // unobserved until (or unless) the handshake deadline eventually forces a close. Log
+          // only the error `code` -- never `.reason`, which may echo request content back.
+          if (!frame.ok) log(`connect (or other unmatched request) rejected: ${frame.error.details.code}`);
+          return;
+        }
         pending.delete(frame.id);
         if (frame.ok) entry.resolve(frame.payload);
         else entry.reject(new Error(`openclaw request failed: ${frame.error.details.code}`));
@@ -318,6 +369,10 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
 
   function handleClosed(code: number): void {
     clearTickTimer();
+    // Whatever closed the socket (server drop, tick timeout, an intentional close(), or this very
+    // connection attempt's own handshake deadline), the attempt is over: no handshake watchdog
+    // should be left armed for a connection that no longer exists.
+    clearHandshakeTimer();
     // Reset so a reconnect does not arm the tick watchdog with the previous connection's
     // interval before the new hello-ok assigns its own (the interval is connection-specific and
     // only known again once a fresh hello-ok arrives).
@@ -354,6 +409,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
     if (closed) return;
     const socket = new WebSocket(opts.url);
     ws = socket;
+    armHandshakeTimer();
 
     socket.on("open", () => {
       // The token-only first attempt: accepted directly by a server configured to trust it,
@@ -410,6 +466,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
       closed = true;
       clearReconnectTimer();
       clearTickTimer();
+      clearHandshakeTimer();
       failAllPending(new Error("openclaw client is closing"));
       // Drop every session subscription so handler references from a permanently-closed client
       // cannot linger (and, per the guard added above, so any close-triggered handleClosed sees
