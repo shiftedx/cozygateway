@@ -29,7 +29,7 @@ beforeEach(async () => {
     authTimeoutMs: 200,
   });
   server = createServer();
-  hub.attach(server);
+  server.on("upgrade", (req, socket, head) => hub.handleUpgrade(req, socket, head));
   server.listen(0);
   await once(server, "listening");
   const address = server.address();

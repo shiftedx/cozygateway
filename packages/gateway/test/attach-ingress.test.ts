@@ -51,7 +51,7 @@ beforeEach(async () => {
   const port = address !== null && typeof address === "object" ? address.port : 0;
   url = `ws://127.0.0.1:${port}`;
   ingress = new AttachIngress({ tokens: new Map([["tok-a", "a1"]]), events: recorder() });
-  ingress.attach(server);
+  server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
 });
 
 afterEach(async () => {

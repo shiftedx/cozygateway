@@ -1,4 +1,5 @@
-import type { Server } from "node:http";
+import type { IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
 
 import { WebSocketServer, WebSocket } from "ws";
 import {
@@ -22,7 +23,7 @@ export class WsHub {
   readonly #now: () => number;
   readonly #authTimeoutMs: number;
   readonly #clients = new Set<Client>();
-  #wss: WebSocketServer | undefined;
+  readonly #wss: WebSocketServer;
 
   constructor(deps: {
     storage: Storage;
@@ -34,14 +35,18 @@ export class WsHub {
     this.#gatewayInfo = deps.gatewayInfo;
     this.#now = deps.now;
     this.#authTimeoutMs = deps.authTimeoutMs ?? 10_000;
+    // noServer: true means this WebSocketServer never attaches its own 'upgrade' listener; the
+    // caller routes matching requests to handleUpgrade() below. See upgrade-dispatcher.ts.
+    this.#wss = new WebSocketServer({ noServer: true });
+    // Swallow server-level errors: an unhandled 'error' event would crash the process.
+    this.#wss.on("error", () => {});
+    this.#wss.on("connection", (socket) => this.#onConnection(socket));
   }
 
-  attach(server: Server, path = "/ws"): void {
-    const wss = new WebSocketServer({ server, path });
-    this.#wss = wss;
-    // Swallow server-level errors: an unhandled 'error' event would crash the process.
-    wss.on("error", () => {});
-    wss.on("connection", (socket) => this.#onConnection(socket));
+  /** Completes a WebSocket handshake for an upgrade request already routed to this hub by
+   *  pathname. */
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req));
   }
 
   #send(socket: WebSocket, frame: ServerFrame): void {
@@ -137,6 +142,6 @@ export class WsHub {
 
   close(): void {
     for (const client of this.#clients) client.socket.close(1001, "server shutdown");
-    this.#wss?.close();
+    this.#wss.close();
   }
 }

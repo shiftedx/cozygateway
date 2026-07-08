@@ -214,6 +214,49 @@ describe("attach backend end to end", () => {
     expect(body.messages.some((m) => m.role === "agent")).toBe(false);
   });
 
+  it("rejects an upgrade to an unknown path with an HTTP error instead of hanging", async () => {
+    const ws = track(new WebSocket(`${gateway.url.replace("http", "ws")}/nope`));
+    const [err] = (await once(ws, "error")) as [Error];
+    expect(err.message).toMatch(/Unexpected server response: 404/);
+  });
+
+  it("serves /ws and /attach concurrently on the same server without cross-corruption", async () => {
+    const deviceToken = await pairDevice();
+    const clientFrames: ServerFrame[] = [];
+
+    // Dial both endpoints at the same time: this is exactly the race the shared noServer
+    // dispatcher has to get right (two WebSocketServer instances on one http.Server).
+    const [clientWs, harnessWs] = await Promise.all([
+      openClientWs(deviceToken, clientFrames),
+      attachFakeHarness(),
+    ]);
+    expect(clientWs.readyState).toBe(WebSocket.OPEN);
+    expect(harnessWs.readyState).toBe(WebSocket.OPEN);
+    // Poll presence via REST rather than the client's frame stream: since both sockets dial
+    // concurrently, the presence broadcast can fire before the client finishes authenticating,
+    // and a broadcast only reaches already-authenticated clients.
+    const start = Date.now();
+    for (;;) {
+      const res = await fetch(`${gateway.url}/agents`, {
+        headers: { authorization: `Bearer ${deviceToken}` },
+      });
+      const agents = (await res.json()) as Array<{ id: string; presence: string }>;
+      if (agents.find((a) => a.id === "helper")?.presence === "online") break;
+      if (Date.now() - start > 3_000) throw new Error("timeout waiting for presence online");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    const threadId = await createThread(deviceToken);
+    const sendRes = await fetch(`${gateway.url}/threads/${threadId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${deviceToken}` },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "concurrent dial" }] }),
+    });
+    expect(sendRes.status).toBe(200);
+    await until(() => clientFrames.some((f) => f.type === "done"));
+    expect(clientFrames.some((f) => f.type === "draft")).toBe(true);
+  });
+
   it("startGateway fails closed when the token env var is missing", async () => {
     delete process.env[TOKEN_ENV];
     await expect(
