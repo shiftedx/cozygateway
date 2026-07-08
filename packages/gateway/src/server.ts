@@ -11,7 +11,8 @@ import { AttachIngress } from "./adapters/attach/ingress.ts";
 import { AttachRouter, collectAttachTokens } from "./adapters/attach/adapter.ts";
 import { createApp } from "./http.ts";
 import { WsHub } from "./ws-hub.ts";
-import { TurnRunner, nullNotifier } from "./turns.ts";
+import { TurnRunner } from "./turns.ts";
+import { RelayNotifier } from "./push-notifier.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 
 export const GATEWAY_VERSION = "0.1.0";
@@ -77,7 +78,13 @@ export async function startGateway(config: GatewayConfig): Promise<RunningGatewa
           register: (agentId, adapter) => router.register(agentId, adapter),
         },
   );
-  const runner = new TurnRunner({ storage, hub, adapters, notifier: nullNotifier, now: () => Date.now() });
+  const runner = new TurnRunner({
+    storage,
+    hub,
+    adapters,
+    notifier: new RelayNotifier({ storage }),
+    now: () => Date.now(),
+  });
 
   const app = createApp({
     storage,

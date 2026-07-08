@@ -1,16 +1,16 @@
 {
-  "name": "cozygateway",
+  "name": "cozygateway-relay",
   "version": "0.1.0",
-  "description": "Self-hosted gateway that turns your AI agent into a chat contact on your phone. Speaks the cozygateway wire contract; drives backends through adapters.",
+  "description": "Push relay for cozygateway: maps opaque push ids to delivery transports and forwards encrypted notification payloads it cannot read.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/shiftedx/cozygateway.git",
-    "directory": "packages/gateway"
+    "directory": "packages/relay"
   },
   "engines": { "node": ">=24" },
-  "bin": { "cozygateway": "dist/cli.js" },
+  "bin": { "cozy-push-relay": "dist/cli.js" },
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
   "files": ["dist"],
   "scripts": {
@@ -21,12 +21,6 @@
   "dependencies": {
     "@hono/node-server": "^1.13.0",
     "@sinclair/typebox": "^0.34.0",
-    "cozygateway-contract": "workspace:*",
-    "hono": "^4.6.0",
-    "ws": "^8.18.0"
-  },
-  "devDependencies": {
-    "@types/ws": "^8.5.0",
-    "cozygateway-relay": "workspace:*"
+    "hono": "^4.6.0"
   }
 }

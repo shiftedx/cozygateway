@@ -10,23 +10,25 @@ cozygateway is a single self-hosted Node process you run next to your agent. It 
 - Threads: multiple renameable DM threads per agent, each bound to its own backend session.
 - Streaming: agent replies stream live as typed rich content blocks over one WebSocket.
 - History: SQLite-backed message history with strict per-thread ordering and gap replay.
-- Push (planned): encrypted notifications through a ciphertext-only relay you can self-host.
+- Push: encrypted notifications through a ciphertext-only relay you can self-host (platform push transports land with the phone app).
 
 ## Status
 
-Contract v1 is frozen (see `contract/v1.md`). The reference gateway and its conformance suite are built and passing. Next up: the phone app, the push relay, TLS for the phone link, and further backend adapters, all planned. The `attach` backend and its adapter-facing protocol (`contract/attach-v0.md`, v0, not yet frozen) shipped with a reference harness plugin in `integrations/`.
+- Shipped: contract v1 (frozen), reference gateway, conformance suite, attach backend adapter, push relay + encrypted push origination (`contract/push-v0.md`).
+- Planned: the phone app, platform push transports (APNs), TLS for the phone link, additional backend adapters.
 
 ## Repo layout
 
 - `contract/`: the human-readable, versioned wire contract spec.
 - `packages/contract`: TypeBox schemas and TypeScript types for the contract (publishable as `cozygateway-contract`).
 - `packages/gateway`: the gateway process, implementing contract v1.
+- `packages/relay`: the push relay service (opaque push ids in, ciphertext through).
 - `packages/conformance`: contract conformance suite that runs against any gateway implementation, validated against the reference gateway.
 - `integrations/attach-plugin`: a reference plugin for agent harnesses that support Python platform plugins, speaking the attach v0 protocol.
 
 ## Privacy model
 
-Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS with trust-on-first-use certificate pinning for the phone link is planned; see `packages/gateway/README.md` for the current, loopback-only reachability model. The push relay, when it ships, carries ciphertext only and is open source so you can host your own.
+Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS with trust-on-first-use certificate pinning for the phone link is planned; see `packages/gateway/README.md` for the current, loopback-only reachability model. The push relay carries ciphertext only and is open source so you can host your own.
 
 ## Development
 

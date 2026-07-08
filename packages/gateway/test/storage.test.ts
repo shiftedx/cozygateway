@@ -85,6 +85,25 @@ describe("messages", () => {
   });
 });
 
+describe("push registrations", () => {
+  it("lists and deletes push registrations", () => {
+    const storage = openStorage(":memory:");
+    storage.createDevice({ id: "d1", name: "phone", tokenHash: "h1", createdAt: 1 });
+    storage.createDevice({ id: "d2", name: "tablet", tokenHash: "h2", createdAt: 2 });
+    storage.savePushRegistration("d1", { pushId: "p1", relayUrl: "https://r.example", pushKey: "k1" });
+    storage.savePushRegistration("d2", { pushId: "p2", relayUrl: "https://r.example/", pushKey: "k2" });
+    expect(storage.pushRegistrations()).toEqual([
+      { deviceId: "d1", pushId: "p1", relayUrl: "https://r.example", pushKey: "k1" },
+      { deviceId: "d2", pushId: "p2", relayUrl: "https://r.example/", pushKey: "k2" },
+    ]);
+    storage.deletePushRegistration("d1");
+    expect(storage.pushRegistrations()).toEqual([
+      { deviceId: "d2", pushId: "p2", relayUrl: "https://r.example/", pushKey: "k2" },
+    ]);
+    storage.deletePushRegistration("d1");
+  });
+});
+
 describe("threads", () => {
   it("archives out of the list but keeps lookup", () => {
     const storage = seeded();
