@@ -39,15 +39,21 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
   });
   const address = server.address();
   const port = address !== null && typeof address === "object" ? address.port : config.port;
+  let closed = false;
   return {
     url: `http://${config.host}:${port}`,
     port,
     storage,
     close: async () => {
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      });
-      storage.close();
+      if (closed) return;
+      closed = true;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      } finally {
+        storage.close();
+      }
     },
   };
 }
