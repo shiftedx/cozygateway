@@ -1,0 +1,26 @@
+{
+  "name": "cozygateway-relay",
+  "version": "0.1.0",
+  "description": "Push relay for cozygateway: maps opaque push ids to delivery transports and forwards encrypted notification payloads it cannot read.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shiftedx/cozygateway.git",
+    "directory": "packages/relay"
+  },
+  "engines": { "node": ">=24" },
+  "bin": { "cozy-push-relay": "dist/cli.js" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "@sinclair/typebox": "^0.34.0",
+    "hono": "^4.6.0"
+  }
+}
