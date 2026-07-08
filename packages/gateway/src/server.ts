@@ -1,5 +1,4 @@
-import type { IncomingMessage, Server } from "node:http";
-import { EventEmitter } from "node:events";
+import type { Server } from "node:http";
 
 import { serve } from "@hono/node-server";
 import type { GatewayInfo } from "cozygateway-contract";
@@ -14,26 +13,9 @@ import { WsHub } from "./ws-hub.ts";
 import { TurnRunner } from "./turns.ts";
 import { RelayNotifier } from "./push-notifier.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
+import { createUpgradeDispatcher, type UpgradeHandler } from "./upgrade-dispatcher.ts";
 
 export const GATEWAY_VERSION = "0.1.0";
-
-/** ws attaches its own 'upgrade' listener per WebSocketServer instance constructed with
- *  {server, path}. With two such instances on ONE real http.Server, Node still invokes BOTH
- *  listeners for every upgrade request; the non-matching one's default path check fails and it
- *  aborts the handshake by writing to (and destroying) the socket the OTHER instance already
- *  claimed, corrupting that connection. This facade forwards 'upgrade' only for its own path, so
- *  the hub's and the attach ingress's WebSocketServer instances never see each other's
- *  connections. See the ws README, "Multiple servers sharing a single HTTP/S server". */
-function upgradeOnlyFor(server: Server, path: string): Server {
-  const facade = new EventEmitter();
-  server.on("listening", (...args: unknown[]) => facade.emit("listening", ...args));
-  server.on("error", (...args: unknown[]) => facade.emit("error", ...args));
-  server.on("upgrade", (req: IncomingMessage, socket: unknown, head: unknown) => {
-    const pathname = (req.url ?? "").split("?")[0];
-    if (pathname === path) facade.emit("upgrade", req, socket, head);
-  });
-  return facade as unknown as Server;
-}
 
 export interface RunningGateway {
   url: string;
@@ -101,8 +83,19 @@ export async function startGateway(config: GatewayConfig): Promise<RunningGatewa
       resolve(s as Server);
     });
   });
-  hub.attach(upgradeOnlyFor(server, "/ws"));
-  attachIngress?.attach(upgradeOnlyFor(server, "/attach"));
+  // Two ws WebSocketServer instances constructed with {server, path} on the SAME http.Server
+  // would each attach their own 'upgrade' listener, and Node invokes both for every request; the
+  // non-matching one's default path check fails and it aborts the handshake, corrupting the
+  // socket the OTHER instance already claimed. Both are constructed with {noServer: true}
+  // instead, so this is the only 'upgrade' listener on the server: it dispatches by pathname, and
+  // a path matching neither endpoint gets a clean HTTP error instead of hanging.
+  const routes = new Map<string, UpgradeHandler>([
+    ["/ws", (req, socket, head) => hub.handleUpgrade(req, socket, head)],
+  ]);
+  if (attachIngress !== undefined) {
+    routes.set("/attach", (req, socket, head) => attachIngress.handleUpgrade(req, socket, head));
+  }
+  server.on("upgrade", createUpgradeDispatcher(routes));
   const address = server.address();
   const port = address !== null && typeof address === "object" ? address.port : config.port;
 

@@ -1,4 +1,5 @@
-import type { IncomingMessage, Server } from "node:http";
+import type { IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
 import { timingSafeEqual } from "node:crypto";
 
 import { WebSocketServer, WebSocket } from "ws";
@@ -30,19 +31,23 @@ export class AttachIngress {
   readonly #tokens: Map<string, string>;
   readonly #events: AttachEvents;
   readonly #current = new Map<string, WebSocket>();
-  #wss: WebSocketServer | undefined;
+  readonly #wss: WebSocketServer;
 
   constructor(deps: { tokens: Map<string, string>; events: AttachEvents }) {
     this.#tokens = deps.tokens;
     this.#events = deps.events;
+    // noServer: true means this WebSocketServer never attaches its own 'upgrade' listener; the
+    // caller routes matching requests to handleUpgrade() below. See upgrade-dispatcher.ts.
+    this.#wss = new WebSocketServer({ noServer: true });
+    // Swallow server-level errors: an unhandled 'error' event would crash the process.
+    this.#wss.on("error", () => {});
+    this.#wss.on("connection", (socket, req) => this.#onConnection(socket, req));
   }
 
-  attach(server: Server, path = "/attach"): void {
-    const wss = new WebSocketServer({ server, path });
-    this.#wss = wss;
-    // Swallow server-level errors: an unhandled 'error' event would crash the process.
-    wss.on("error", () => {});
-    wss.on("connection", (socket, req) => this.#onConnection(socket, req));
+  /** Completes a WebSocket handshake for an upgrade request already routed to this ingress by
+   *  pathname. */
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req));
   }
 
   #agentForRequest(req: IncomingMessage): string | undefined {
@@ -121,6 +126,6 @@ export class AttachIngress {
   close(): void {
     for (const socket of this.#current.values()) socket.close(1001, "server shutdown");
     this.#current.clear();
-    this.#wss?.close();
+    this.#wss.close();
   }
 }
