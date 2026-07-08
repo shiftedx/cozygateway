@@ -18,7 +18,8 @@ What it speaks:
 
 Two fatal close conditions are surfaced as distinct exceptions:
 
-* :class:`AttachAuthError` -- the dial was rejected (HTTP 401 / policy). The
+* :class:`AttachAuthError` -- the dial was rejected (HTTP 401), or the socket
+  closed with code 1008 (policy: bad or revoked token). Either way the
   credential is bad; there is no point retrying.
 * :class:`AttachSupersededError` -- the socket closed with code 4000, meaning a
   newer connection now owns this agent. Retrying would fight that owner, so the
@@ -41,6 +42,10 @@ logger = logging.getLogger(__name__)
 # The gateway closes the socket with this code when a newer connection supersedes
 # this one; the adapter treats it as terminal.
 SUPERSEDED_CLOSE_CODE = 4000
+
+# The gateway closes the socket with this code when the bearer token is bad or
+# revoked; fatal, no redial with the same credentials.
+POLICY_CLOSE_CODE = 1008
 
 
 class AttachAuthError(RuntimeError):
@@ -331,7 +336,9 @@ class AttachClient:
 
         Each decoded frame is dispatched to ``on_turn`` (dropped if malformed or not
         a turn). Returns normally on a benign close. Raises
-        :class:`AttachSupersededError` if the socket closed with code 4000.
+        :class:`AttachSupersededError` if the socket closed with code 4000, or
+        :class:`AttachAuthError` if the socket closed with code 1008 (policy: bad
+        or revoked token).
         """
         if self._ws is None:
             return
@@ -339,13 +346,20 @@ class AttachClient:
             async for raw in self._ws:
                 self._dispatch_inbound(raw)
         except Exception as exc:  # noqa: BLE001 - classify the close code
-            if _close_code(exc) == SUPERSEDED_CLOSE_CODE:
+            code = _close_code(exc)
+            if code == SUPERSEDED_CLOSE_CODE:
                 self._closed = True
                 raise AttachSupersededError("connection superseded by a newer attach") from exc
+            if code == POLICY_CLOSE_CODE:
+                self._closed = True
+                raise AttachAuthError("attach rejected (policy close 1008)") from exc
         finally:
             self._closed = True
-        if getattr(self._ws, "close_code", None) == SUPERSEDED_CLOSE_CODE:
+        close_code = getattr(self._ws, "close_code", None)
+        if close_code == SUPERSEDED_CLOSE_CODE:
             raise AttachSupersededError("connection superseded by a newer attach")
+        if close_code == POLICY_CLOSE_CODE:
+            raise AttachAuthError("attach rejected (policy close 1008)")
 
     def _dispatch_inbound(self, raw: Any) -> None:
         on_turn = self._config.on_turn
