@@ -18,6 +18,7 @@ function harness(overrides?: {
   dailyCap?: number;
   failDelivery?: boolean;
   nowRef?: { value: number };
+  restrictEgress?: boolean;
 }): { app: ReturnType<typeof createRelayApp>; storage: RelayStorage; deliveries: Delivery[] } {
   const storage = openRelayStorage(":memory:");
   cleanups.push(() => storage.close());
@@ -36,6 +37,7 @@ function harness(overrides?: {
     version: "test",
     now: () => nowRef.value,
     log: () => {},
+    restrictEgress: overrides?.restrictEgress ?? false,
   });
   return { app, storage, deliveries };
 }
@@ -92,6 +94,48 @@ describe("POST /register", () => {
     expect(res.status).toBe(501);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("unsupported_platform");
+  });
+
+  describe("with restrictEgress on", () => {
+    it("rejects a literal loopback webhook URL", async () => {
+      const { app } = harness({ restrictEgress: true });
+      const res = await register(app, { platform: "webhook", token: "http://127.0.0.1:9999/hook" });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("invalid_request");
+    });
+
+    it("rejects a literal RFC1918 private webhook URL", async () => {
+      const { app } = harness({ restrictEgress: true });
+      const res = await register(app, { platform: "webhook", token: "http://10.1.2.3/hook" });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects a literal link-local webhook URL", async () => {
+      const { app } = harness({ restrictEgress: true });
+      const res = await register(app, { platform: "webhook", token: "http://169.254.169.254/hook" });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects a literal IPv6 loopback webhook URL", async () => {
+      const { app } = harness({ restrictEgress: true });
+      const res = await register(app, { platform: "webhook", token: "http://[::1]:9999/hook" });
+      expect(res.status).toBe(400);
+    });
+
+    it("still accepts a public-looking webhook URL (a DNS name is vetted at delivery time)", async () => {
+      const { app } = harness({ restrictEgress: true });
+      const res = await register(app, { platform: "webhook", token: "https://x.example/hook" });
+      expect(res.status).toBe(201);
+    });
+  });
+
+  describe("with restrictEgress off (default)", () => {
+    it("accepts a literal loopback webhook URL unchanged", async () => {
+      const { app } = harness({ restrictEgress: false });
+      const res = await register(app, { platform: "webhook", token: "http://127.0.0.1:9999/hook" });
+      expect(res.status).toBe(201);
+    });
   });
 });
 

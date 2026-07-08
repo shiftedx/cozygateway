@@ -14,6 +14,9 @@ export interface RelayConfig {
   host: string;
   dbPath: string;
   dailyCap: number;
+  /** Restrict webhook egress to public addresses (design decision, issue #8). See
+   *  `parseCliConfig` in `cli.ts` for how the CLI derives this default from `host`. */
+  restrictEgress: boolean;
 }
 
 export interface RunningRelay {
@@ -27,10 +30,11 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
   const storage = openRelayStorage(config.dbPath);
   const app = createRelayApp({
     storage,
-    transports: { webhook: webhookTransport() },
+    transports: { webhook: webhookTransport({ restrictEgress: config.restrictEgress }) },
     dailyCap: config.dailyCap,
     version: RELAY_VERSION,
     now: () => Date.now(),
+    restrictEgress: config.restrictEgress,
   });
   const server = await new Promise<Server>((resolve) => {
     const s = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () => {

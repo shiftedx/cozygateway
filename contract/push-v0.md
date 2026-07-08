@@ -22,8 +22,11 @@ codes `invalid_request`, `not_found`, `over_cap`, `unsupported_platform`, `inter
 Request: `{"platform": "webhook" | "apns", "token": string}`
 
 - `webhook`: `token` is an `http(s)` URL. Delivery is `POST <token>` with body
-  `{"ciphertext": string}`. The URL is registrant-supplied and untrusted: relay
-  operators should restrict outbound delivery targets (private ranges, loopback).
+  `{"ciphertext": string}`. The URL is registrant-supplied and untrusted. In restricted-
+  egress mode (default on for a non-loopback relay bind; see the relay README), a
+  literal-IP `token` host in a blocked range (loopback, link-local, private, or
+  unspecified) is rejected here with `invalid_request`; a DNS-name host is instead
+  vetted at delivery time, once resolved.
 - `apns`: recognized, not yet available; returns 501 `unsupported_platform`.
 
 Response: 201 `{"pushId": string}`. The pushId is 16 random bytes, base64url. It is
@@ -36,7 +39,9 @@ Request: `{"pushId": string, "ciphertext": string}` (`ciphertext` max 8192 chars
 
 Response: 202 `{}` once the notify is accepted and handed to the transport. Delivery is
 best-effort; the relay does not queue or retry in v0, and a delivery failure still
-returns 202 and still counts against the cap.
+returns 202 and still counts against the cap. A delivery refused by restricted-egress
+mode (the resolved address is in a blocked range) is handled the same way as any other
+delivery failure.
 
 - Unknown pushId: 404 `not_found`. A gateway receiving this should delete its stored
   registration for that device.

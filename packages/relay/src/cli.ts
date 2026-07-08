@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 
+import { isLoopbackBindHost } from "./egress.ts";
 import { DEFAULT_DAILY_CAP, RELAY_VERSION, startRelay, type RelayConfig } from "./server.ts";
 
-const USAGE = "usage: cozy-push-relay [--port 8788] [--host 127.0.0.1] [--db relay.db] [--daily-cap 500]";
+const USAGE =
+  "usage: cozy-push-relay [--port 8788] [--host 127.0.0.1] [--db relay.db] [--daily-cap 500] " +
+  "[--restrict-egress | --no-restrict-egress]";
 
 export function parseCliConfig(argv: string[]): RelayConfig {
   const { values } = parseArgs({
@@ -13,13 +16,26 @@ export function parseCliConfig(argv: string[]): RelayConfig {
       host: { type: "string", default: "127.0.0.1" },
       db: { type: "string", default: "relay.db" },
       "daily-cap": { type: "string", default: String(DEFAULT_DAILY_CAP) },
+      "restrict-egress": { type: "boolean", default: false },
+      "no-restrict-egress": { type: "boolean", default: false },
     },
   });
   const port = Number(values.port);
   const dailyCap = Number(values["daily-cap"]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid --port "${values.port}"`);
   if (!Number.isInteger(dailyCap) || dailyCap < 1) throw new Error(`invalid --daily-cap "${values["daily-cap"]}"`);
-  return { port, host: values.host, dbPath: values.db, dailyCap };
+  if (values["restrict-egress"] === true && values["no-restrict-egress"] === true) {
+    throw new Error("--restrict-egress and --no-restrict-egress are mutually exclusive");
+  }
+  // Default: restriction on for a non-loopback bind (a hosted relay), off for loopback
+  // (the self-host dev default), design decision, issue #8. Either flag overrides it.
+  const restrictEgress =
+    values["restrict-egress"] === true
+      ? true
+      : values["no-restrict-egress"] === true
+        ? false
+        : !isLoopbackBindHost(values.host);
+  return { port, host: values.host, dbPath: values.db, dailyCap, restrictEgress };
 }
 
 export async function runCli(argv: string[]): Promise<number> {
