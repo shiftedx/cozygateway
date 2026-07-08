@@ -1773,7 +1773,7 @@ Expected: `OK`, no output before it. Remove any `__pycache__` directories afterw
 
 - [ ] **Step 2: Copy-hygiene gate**
 
-Grep the plugin directory for the private names listed in the internal execution ledger (the task brief carries the exact pattern; it is deliberately not reproduced in this public document). Expected: the ONLY matches are the two interop session-context constants in `adapter.py`, each commented "harness-defined identifier"; nothing in prose. Also verify no em-dash characters: `grep -rn $'—' integrations/attach-plugin/ contract/attach-v0.md README.md` must produce no matches.
+Grep the plugin directory for the private names listed in the internal execution ledger (the task brief carries the exact pattern; it is deliberately not reproduced in this public document). Expected: the ONLY matches are the two interop session-context constants in `adapter.py`, each commented "harness-defined identifier"; nothing in prose. Also verify no em-dash characters (U+2014): `grep -rn $'\u2014' integrations/attach-plugin/ contract/attach-v0.md README.md docs/plans/` must produce no matches.
 
 - [ ] **Step 3: Protocol-fidelity spot check against contract/attach-v0.md**
 
