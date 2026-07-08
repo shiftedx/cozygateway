@@ -131,12 +131,20 @@ export function createAttachAdapter(deps: {
             );
             timer.unref();
             turns.set(turnId, { threadId, handlers, latest: undefined, timer, resolve, reject });
-            const sent = deps.endpoint.sendTurn(deps.agentId, {
-              kind: "turn",
-              threadId,
-              turnId,
-              text: blocksToText(blocks),
-            });
+            let sent: boolean;
+            try {
+              sent = deps.endpoint.sendTurn(deps.agentId, {
+                kind: "turn",
+                threadId,
+                turnId,
+                text: blocksToText(blocks),
+              });
+            } catch {
+              // A throw from sendTurn takes the same immediate-failure path as a false return:
+              // the pending entry is removed now, not left to linger until the per-turn timeout.
+              failTurn(turnId, `agent "${deps.agentId}" is not attached`);
+              return;
+            }
             if (!sent) failTurn(turnId, `agent "${deps.agentId}" is not attached`);
           });
         },
