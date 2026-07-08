@@ -85,7 +85,42 @@ class SeenTurnsBoundedTests(unittest.IsolatedAsyncioTestCase):
             adapter._attach_init(types.SimpleNamespace(extra={}))
         finally:
             os.environ.pop("COZYGATEWAY_SEEN_TURNS_MAX", None)
-        self.assertGreater(adapter._seen_turns_max, 0)
+        # Pin the actual documented default (512), not just "some positive value",
+        # so a silent change to the constant fails this test.
+        self.assertEqual(adapter._seen_turns_max, 512)
+
+    async def test_unsealed_duplicate_boundary_is_pinned_to_the_cap(self):
+        """Pins the exact window boundary for a turn that never seals (still in
+        flight), per the honest guarantee documented on ``_seen_turns``: a
+        duplicate is deduped through exactly cap-1 intervening distinct arrivals,
+        and is treated as new (re-executed) once a cap-th intervening arrival has
+        pushed it out of the retention window.
+        """
+        cap = 4
+        adapter = _make_adapter(seen_turns_max=cap)
+        original = TurnFrame(thread_id="chat-1", turn_id="turn-original", text="hi")
+        adapter._on_turn(original)  # never sealed -- still "in flight"
+        self.assertEqual(len(adapter.spawned), 1)
+
+        # cap - 1 intervening distinct arrivals: the original is still inside the
+        # retention window (dict holds exactly `cap` entries, none evicted yet).
+        for i in range(cap - 1):
+            adapter._on_turn(TurnFrame(thread_id="chat-1", turn_id=f"turn-{i}", text="hi"))
+        self.assertEqual(len(adapter.spawned), cap)
+
+        # A redelivery of the still-in-flight original is still deduped.
+        adapter._on_turn(original)
+        self.assertEqual(len(adapter.spawned), cap)
+
+        # The cap-th intervening distinct arrival evicts the original from the
+        # window (it was the oldest entry).
+        adapter._on_turn(TurnFrame(thread_id="chat-1", turn_id="turn-cap", text="hi"))
+        self.assertEqual(len(adapter.spawned), cap + 1)
+
+        # Past the window: the same still-in-flight turn now reads as new and is
+        # re-executed, exactly as documented.
+        adapter._on_turn(original)
+        self.assertEqual(len(adapter.spawned), cap + 2)
 
 
 if __name__ == "__main__":
