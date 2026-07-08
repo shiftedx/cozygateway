@@ -9,10 +9,33 @@ ciphertext construction.
 
     npx cozygateway-relay
     # or, from a checkout:
-    node dist/cli.js --port 8788 --host 127.0.0.1 --db relay.db --daily-cap 500
+    node dist/cli.js --port 8788 --host 127.0.0.1 --db relay.db --daily-cap 500 \
+      --max-registrations 10000
 
 The relay binds `127.0.0.1` by default. A hosted instance runs behind its own
 TLS-terminating reverse proxy; that proxy is out of scope here.
+
+## Storage growth caps
+
+Two independent bounds keep the sqlite file from growing without limit:
+
+- **Registration cap** (`--max-registrations`, default 10000): a total-row cap on
+  `registrations`. The reserved auth-hook middleware slot (see below) is the intended
+  long-term gate on who can register at all; this cap protects the window before that
+  lands, so an unauthenticated flood cannot grow the DB past a fixed size. Exceeding it
+  refuses the new registration with `429 over_cap`. Refreshing an existing `pushId`
+  (re-registering the same id, e.g. a future token-refresh flow) is never refused by the
+  cap, since it does not add a row. There is deliberately no per-source-IP registration
+  rate limit in this cap; the auth-hook slot is where that kind of finer-grained gating
+  belongs once it lands.
+- **`notify_counts` retention**: rows are kept for `NOTIFY_COUNT_RETENTION_DAYS` (7 UTC
+  days) and then swept. The sweep is lazy: it runs inline on every `POST /notify` call
+  rather than on a timer, which keeps the relay dependency-free and trivial to shut down.
+  Since the daily cap only ever consults the current UTC day, 7 days is a deliberately
+  generous window purely for bounding disk growth.
+
+Both defaults are chosen to keep current self-host behavior unobtrusive: a single-user
+loopback relay will never come close to either bound in normal use.
 
 ## Egress restriction
 

@@ -2,11 +2,11 @@
 import { parseArgs } from "node:util";
 
 import { isLoopbackBindHost } from "./egress.ts";
-import { DEFAULT_DAILY_CAP, RELAY_VERSION, startRelay, type RelayConfig } from "./server.ts";
+import { DEFAULT_DAILY_CAP, DEFAULT_MAX_REGISTRATIONS, RELAY_VERSION, startRelay, type RelayConfig } from "./server.ts";
 
 const USAGE =
   "usage: cozy-push-relay [--port 8788] [--host 127.0.0.1] [--db relay.db] [--daily-cap 500] " +
-  "[--restrict-egress | --no-restrict-egress]";
+  `[--max-registrations ${DEFAULT_MAX_REGISTRATIONS}] [--restrict-egress | --no-restrict-egress]`;
 
 export function parseCliConfig(argv: string[]): RelayConfig {
   const { values } = parseArgs({
@@ -16,14 +16,19 @@ export function parseCliConfig(argv: string[]): RelayConfig {
       host: { type: "string", default: "127.0.0.1" },
       db: { type: "string", default: "relay.db" },
       "daily-cap": { type: "string", default: String(DEFAULT_DAILY_CAP) },
+      "max-registrations": { type: "string", default: String(DEFAULT_MAX_REGISTRATIONS) },
       "restrict-egress": { type: "boolean", default: false },
       "no-restrict-egress": { type: "boolean", default: false },
     },
   });
   const port = Number(values.port);
   const dailyCap = Number(values["daily-cap"]);
+  const maxRegistrations = Number(values["max-registrations"]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid --port "${values.port}"`);
   if (!Number.isInteger(dailyCap) || dailyCap < 1) throw new Error(`invalid --daily-cap "${values["daily-cap"]}"`);
+  if (!Number.isInteger(maxRegistrations) || maxRegistrations < 1) {
+    throw new Error(`invalid --max-registrations "${values["max-registrations"]}"`);
+  }
   if (values["restrict-egress"] === true && values["no-restrict-egress"] === true) {
     throw new Error("--restrict-egress and --no-restrict-egress are mutually exclusive");
   }
@@ -35,7 +40,7 @@ export function parseCliConfig(argv: string[]): RelayConfig {
       : values["no-restrict-egress"] === true
         ? false
         : !isLoopbackBindHost(values.host);
-  return { port, host: values.host, dbPath: values.db, dailyCap, restrictEgress };
+  return { port, host: values.host, dbPath: values.db, dailyCap, maxRegistrations, restrictEgress };
 }
 
 export async function runCli(argv: string[]): Promise<number> {

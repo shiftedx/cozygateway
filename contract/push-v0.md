@@ -33,6 +33,10 @@ Response: 201 `{"pushId": string}`. The pushId is 16 random bytes, base64url. It
 unguessable and knowing it is the de-facto capability to notify that registration.
 Registering again mints a new pushId; old ids keep working until deleted.
 
+- Total-registration cap (default 10000, configurable): 429 `over_cap` once the relay's
+  total registration count reaches the configured bound. Bounds an unauthenticated
+  registration flood ahead of the reserved auth-hook slot.
+
 ### POST /notify
 
 Request: `{"pushId": string, "ciphertext": string}` (`ciphertext` max 8192 chars).
@@ -46,6 +50,9 @@ delivery failure.
 - Unknown pushId: 404 `not_found`. A gateway receiving this should delete its stored
   registration for that device.
 - Per-pushId daily cap (default 500, UTC calendar day): 429 `over_cap`.
+- The relay retains per-day notify counts for 7 UTC days and prunes older rows lazily
+  (inline on notify, not on a timer); this is an internal storage-growth bound and has no
+  observable effect on the cap, which only ever consults the current day.
 
 ### DELETE /register/:pushId
 

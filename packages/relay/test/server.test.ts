@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { DEFAULT_DAILY_CAP, RELAY_VERSION, startRelay, type RunningRelay } from "../src/server.ts";
+import { DEFAULT_DAILY_CAP, DEFAULT_MAX_REGISTRATIONS, RELAY_VERSION, startRelay, type RunningRelay } from "../src/server.ts";
 
 let relay: RunningRelay | undefined;
 afterEach(async () => {
@@ -15,6 +15,7 @@ describe("startRelay", () => {
       host: "127.0.0.1",
       dbPath: ":memory:",
       dailyCap: DEFAULT_DAILY_CAP,
+      maxRegistrations: DEFAULT_MAX_REGISTRATIONS,
       restrictEgress: false,
     });
     expect(relay.url).toBe(`http://127.0.0.1:${relay.port}`);
@@ -35,6 +36,7 @@ describe("startRelay", () => {
       host: "0.0.0.0",
       dbPath: ":memory:",
       dailyCap: DEFAULT_DAILY_CAP,
+      maxRegistrations: DEFAULT_MAX_REGISTRATIONS,
       restrictEgress: true,
     });
     const res = await fetch(`${relay.url}/register`, {
@@ -47,12 +49,35 @@ describe("startRelay", () => {
     expect(body.error.code).toBe("invalid_request");
   });
 
+  it("refuses registration over the wired maxRegistrations cap", async () => {
+    relay = await startRelay({
+      port: 0,
+      host: "127.0.0.1",
+      dbPath: ":memory:",
+      dailyCap: DEFAULT_DAILY_CAP,
+      maxRegistrations: 1,
+      restrictEgress: false,
+    });
+    const registerOnce = () =>
+      fetch(`${relay?.url}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ platform: "webhook", token: "https://x.example/hook" }),
+      });
+    expect((await registerOnce()).status).toBe(201);
+    const res = await registerOnce();
+    expect(res.status).toBe(429);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("over_cap");
+  });
+
   it("close() is idempotent and always releases storage", async () => {
     relay = await startRelay({
       port: 0,
       host: "127.0.0.1",
       dbPath: ":memory:",
       dailyCap: DEFAULT_DAILY_CAP,
+      maxRegistrations: DEFAULT_MAX_REGISTRATIONS,
       restrictEgress: false,
     });
     await relay.close();

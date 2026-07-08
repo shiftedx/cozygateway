@@ -16,6 +16,10 @@ export interface RelayAppDeps {
   /** Keyed by platform. A platform with no transport is recognized but unavailable (501). */
   transports: Readonly<Record<string, Transport | undefined>>;
   dailyCap: number;
+  /** Total-row cap on `registrations`. Bounds unauthenticated flood growth ahead of the
+   *  auth-hook slot landing (design decision, issue #9). Refreshing an existing pushId
+   *  never counts against it. */
+  maxRegistrations: number;
   version: string;
   now: () => number;
   /** When true, `POST /register` rejects a webhook URL whose host is a literal IP in a
@@ -81,12 +85,13 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
       return c.json(relayError("invalid_request", "webhook token resolves to a restricted address range"), 400);
     }
     const pushId = randomBytes(16).toString("base64url");
-    deps.storage.saveRegistration({
-      pushId,
-      platform: parsed.platform,
-      token: parsed.token,
-      createdAt: deps.now(),
-    });
+    const saved = deps.storage.saveRegistration(
+      { pushId, platform: parsed.platform, token: parsed.token, createdAt: deps.now() },
+      deps.maxRegistrations,
+    );
+    if (!saved) {
+      return c.json(relayError("over_cap", "registration cap reached for this relay"), 429);
+    }
     return c.json({ pushId }, 201);
   });
 
@@ -95,7 +100,12 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
     if (parsed === undefined) return c.json(relayError("invalid_request", "malformed notify body"), 400);
     const registration = deps.storage.registrationByPushId(parsed.pushId);
     if (registration === undefined) return c.json(relayError("not_found", "unknown push id"), 404);
-    const day = utcDay(deps.now());
+    const now = deps.now();
+    // Lazy retention sweep: no timer, so the relay stays dependency-free and trivial to shut
+    // down (design decision, issue #9). Piggybacks on the existing notify traffic that already
+    // reads/writes notify_counts.
+    deps.storage.pruneNotifyCounts(now);
+    const day = utcDay(now);
     if (deps.storage.notifyCount(registration.pushId, day) >= deps.dailyCap) {
       return c.json(relayError("over_cap", "daily notification cap reached for this push id"), 429);
     }
