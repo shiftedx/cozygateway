@@ -72,6 +72,59 @@ describe("attach protocol schemas", () => {
     ).toBe(true);
     expect(check(AttachTurnFrameSchema, { kind: "turn", threadId: "t1", turnId: "turn-1" })).toBe(false);
   });
+
+  describe("open-object tolerance (unknown extra fields ignored)", () => {
+    it("tolerates unknown fields on a draft update frame", () => {
+      expect(
+        check(AttachInboundFrameSchema, {
+          threadId: "t1",
+          fromTheFuture: true,
+          update: {
+            kind: "draft",
+            turnId: "turn-1",
+            blocks: [{ type: "paragraph", text: "hi", futureField: "x" }],
+            toolCalls: [{ id: "search#1", name: "search", status: "running", extra: "chip-color" }],
+            unknownFrameField: 42,
+          },
+        }),
+      ).toBe(true);
+    });
+
+    it("tolerates unknown fields on a done update frame", () => {
+      expect(
+        check(AttachInboundFrameSchema, {
+          threadId: "t1",
+          update: { kind: "done", turnId: "turn-1", extraneous: "ignored" },
+        }),
+      ).toBe(true);
+    });
+
+    it("tolerates unknown fields on a failed update frame", () => {
+      expect(
+        check(AttachInboundFrameSchema, {
+          threadId: "t1",
+          update: {
+            kind: "failed",
+            turnId: "turn-1",
+            message: "model unreachable",
+            errorCode: "TIMEOUT",
+          },
+        }),
+      ).toBe(true);
+    });
+
+    it("tolerates unknown fields on the outbound turn frame", () => {
+      expect(
+        check(AttachTurnFrameSchema, {
+          kind: "turn",
+          threadId: "t1",
+          turnId: "turn-1",
+          text: "hello",
+          futureMetadata: { retryOf: "turn-0" },
+        }),
+      ).toBe(true);
+    });
+  });
 });
 
 describe("blocksToText", () => {

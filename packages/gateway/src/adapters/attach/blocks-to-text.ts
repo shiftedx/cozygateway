@@ -42,6 +42,13 @@ export function blocksToText(blocks: RichBlock[]): string {
       case "attachment":
         parts.push(`[attachment: ${block.name}]`);
         break;
+      default: {
+        // Exhaustiveness guard: if RichBlock gains a new kind, `block` here is no longer `never`
+        // and this line fails to typecheck, catching the gap at compile time instead of
+        // silently dropping the new kind's content at render time.
+        const unreachable: never = block;
+        throw new Error(`blocksToText: unhandled block type ${(unreachable as { type: string }).type}`);
+      }
     }
   }
   return parts.join("\n\n");
