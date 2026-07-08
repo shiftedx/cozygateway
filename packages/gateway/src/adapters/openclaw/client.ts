@@ -195,6 +195,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
       log(`no frames received within ${intervalMs * 2}ms of the last one; closing (tick timeout)`);
       ws?.close(TICK_TIMEOUT_CLOSE_CODE);
     }, intervalMs * 2);
+    tickTimer.unref();
   }
 
   function clearReconnectTimer(): void {
@@ -312,6 +313,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
       reconnectTimer = undefined;
       connect();
     }, delay);
+    reconnectTimer.unref();
   }
 
   function handleClosed(code: number): void {
