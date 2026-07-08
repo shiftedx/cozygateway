@@ -17,7 +17,9 @@ TLS-terminating reverse proxy; that proxy is out of scope here.
 ## Transports
 
 `webhook` ships today: delivery is a `POST` of `{"ciphertext": ...}` to the registered
-URL. Platform push transports (APNs) are planned; registering `platform: "apns"`
+URL. Registered URLs are operator-untrusted input: a hosted relay should restrict
+outbound delivery (block loopback, link-local, and private ranges) at the network layer
+or in a fronting proxy. Platform push transports (APNs) are planned; registering `platform: "apns"`
 returns 501 until then.
 
 ## State

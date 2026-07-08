@@ -22,7 +22,8 @@ codes `invalid_request`, `not_found`, `over_cap`, `unsupported_platform`, `inter
 Request: `{"platform": "webhook" | "apns", "token": string}`
 
 - `webhook`: `token` is an `http(s)` URL. Delivery is `POST <token>` with body
-  `{"ciphertext": string}`.
+  `{"ciphertext": string}`. The URL is registrant-supplied and untrusted: relay
+  operators should restrict outbound delivery targets (private ranges, loopback).
 - `apns`: recognized, not yet available; returns 501 `unsupported_platform`.
 
 Response: 201 `{"pushId": string}`. The pushId is 16 random bytes, base64url. It is
