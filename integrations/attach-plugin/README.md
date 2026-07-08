@@ -23,6 +23,11 @@ Optional: `COZYGATEWAY_CA_FILE` (private-CA TLS, unused on the current plaintext
 loopback gateway), `COZYGATEWAY_RECONNECT_INITIAL_SECONDS` (0.5),
 `COZYGATEWAY_RECONNECT_MAX_SECONDS` (30).
 
+Also set `COZYGATEWAY_HOME_CHANNEL=thread` (any non-empty value works). Some harnesses
+prompt to pick a "home channel" the first time a new platform delivers a message, and that
+one-time prompt would consume a turn as the committed reply. The variable name derives
+from the platform name, so it marks every thread as home and suppresses the prompt.
+
 Dependencies: Python 3.10+ and the `websockets` package.
 
 ## Behavior
