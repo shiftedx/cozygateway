@@ -109,6 +109,15 @@ describe("real OpenClawClient + real createOpenClawAdapter against a faked serve
       // exercising the assumed-same-field/value across the two ASSUMPTION sites (client.ts's
       // sessionKeyOf and adapter.ts's sessionKeyFromCreateResponse).
       server.sendEvent(deltaFrame({ sessionKey, deltaText, done: i === chunks.length - 1 }));
+      // The adapter's draft flush is a TRAILING timer (draftFlushMs, 20 here), not a leading one:
+      // a burst of deltas with no real gap between them can all land inside one flush window with
+      // nothing forcing a flush until `onDone`. Space non-terminal deltas out past draftFlushMs so
+      // the trailing timer actually fires between them, independent of `onDone`'s own
+      // flush-pending-draft-before-commit safeguard (see adapter.ts) -- this keeps the drafts
+      // assertion below deterministic rather than dependent on incidental event-delivery timing.
+      if (i < chunks.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
     }
 
     await turn;
@@ -120,5 +129,10 @@ describe("real OpenClawClient + real createOpenClawAdapter against a faked serve
     // The throttle actually engaged at least once before the final commit: this is a streamed
     // turn, not a single synchronous flush.
     expect(observed.drafts.length).toBeGreaterThan(0);
+    // And the last draft observed before commit reflects the full accumulated snapshot, matching
+    // the eventual commit content: `onDone` always flushes a still-pending trailing timer with the
+    // CURRENT snapshot before it commits (see adapter.ts), so this holds regardless of the exact
+    // number of intermediate flushes.
+    expect(observed.drafts.at(-1)?.blocks).toEqual(normalizeMarkdownToBlocks(fullText));
   });
 });

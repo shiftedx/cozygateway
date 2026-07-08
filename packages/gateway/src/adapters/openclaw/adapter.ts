@@ -25,10 +25,11 @@ export interface OpenClawAdapterDeps {
   draftFlushMs?: number;
 }
 
-/** ASSUMPTION (Task 8 to verify, matching the same stance as client.ts's sessionKeyOf/protocol.ts's
- *  SessionsCreateRequest doc comment): the verified wire facts confirm `sessions.create` returns a
- *  `sessionKey` but not its exact response envelope shape beyond that, so this reads it off the
- *  resolved payload as an open/unknown field rather than asserting a wider shape on a guess. */
+/** ASSUMPTION (Task 8 to verify, matching the same stance as client.ts's sessionKeyOf): the
+ *  verified wire facts confirm `sessions.create` returns a `sessionKey` but not its exact response
+ *  envelope shape beyond that (see `OkResponseSchema` in protocol.ts, which deliberately leaves the
+ *  payload an open record for exactly this reason), so this reads `sessionKey` off the resolved
+ *  payload as an open/unknown field rather than asserting a wider shape on a guess. */
 function sessionKeyFromCreateResponse(payload: unknown): string {
   const record = payload as Record<string, unknown> | null | undefined;
   const sessionKey = record?.["sessionKey"];
