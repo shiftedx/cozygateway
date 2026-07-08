@@ -78,7 +78,11 @@ export async function startGateway(
     storage,
     hub,
     adapters,
-    notifier: new RelayNotifier({ storage, log: options.notifierLog }),
+    notifier: new RelayNotifier({
+      storage,
+      log: options.notifierLog,
+      isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
+    }),
     now: () => Date.now(),
   });
 

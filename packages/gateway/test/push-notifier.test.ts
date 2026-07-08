@@ -51,11 +51,14 @@ describe("RelayNotifier", () => {
   it("is a no-op with zero registrations", async () => {
     const storage = seeded([]);
     const { impl, sent } = fetchStub(() => 202);
-    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify({
-      threadId: "t",
-      agentName: "A",
-      preview: "p",
-    });
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify(
+      {
+        threadId: "t",
+        agentName: "A",
+        preview: "p",
+      },
+      new Set(),
+    );
     await settle();
     expect(sent).toHaveLength(0);
     storage.close();
@@ -67,11 +70,14 @@ describe("RelayNotifier", () => {
       { deviceId: "d2", pushId: "p2", relayUrl: "http://relay-b.test/", pushKey: "key-2" },
     ]);
     const { impl, sent } = fetchStub(() => 202);
-    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify({
-      threadId: "t1",
-      agentName: "Agent",
-      preview: "hello",
-    });
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify(
+      {
+        threadId: "t1",
+        agentName: "Agent",
+        preview: "hello",
+      },
+      new Set(),
+    );
     await settle();
     expect(sent.map((s) => s.url).sort()).toEqual(["http://relay-a.test/notify", "http://relay-b.test/notify"]);
     const forP1 = sent.find((s) => s.body.pushId === "p1");
@@ -87,11 +93,14 @@ describe("RelayNotifier", () => {
   it("truncates the preview to PREVIEW_MAX_CHARS", async () => {
     const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
     const { impl, sent } = fetchStub(() => 202);
-    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify({
-      threadId: "t",
-      agentName: "A",
-      preview: "x".repeat(PREVIEW_MAX_CHARS + 50),
-    });
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify(
+      {
+        threadId: "t",
+        agentName: "A",
+        preview: "x".repeat(PREVIEW_MAX_CHARS + 50),
+      },
+      new Set(),
+    );
     await settle();
     expect(decrypt("k", sent[0]?.body.ciphertext ?? "").preview).toBe("x".repeat(PREVIEW_MAX_CHARS));
     storage.close();
@@ -108,11 +117,14 @@ describe("RelayNotifier", () => {
     const preview = "x".repeat(PREVIEW_MAX_CHARS - 1) + astral + "y".repeat(50);
     expect(preview.charCodeAt(PREVIEW_MAX_CHARS - 1)).toBeGreaterThanOrEqual(0xd800);
     expect(preview.charCodeAt(PREVIEW_MAX_CHARS - 1)).toBeLessThanOrEqual(0xdbff);
-    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify({
-      threadId: "t",
-      agentName: "A",
-      preview,
-    });
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify(
+      {
+        threadId: "t",
+        agentName: "A",
+        preview,
+      },
+      new Set(),
+    );
     await settle();
     const delivered = decrypt("k", sent[0]?.body.ciphertext ?? "").preview;
     expect(delivered).toBe("x".repeat(PREVIEW_MAX_CHARS - 1));
@@ -127,7 +139,10 @@ describe("RelayNotifier", () => {
       { deviceId: "d2", pushId: "p2", relayUrl: "http://alive.test", pushKey: "k2" },
     ]);
     const { impl, sent } = fetchStub((url) => (url.startsWith("http://gone.test") ? 404 : 202));
-    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify({ threadId: "t", agentName: "A", preview: "p" });
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify(
+      { threadId: "t", agentName: "A", preview: "p" },
+      new Set(),
+    );
     await settle();
     expect(storage.pushRegistrations().map((r) => r.deviceId)).toEqual(["d2"]);
     // Self-contained: the surviving registration's POST actually fired, rather than relying on
@@ -142,7 +157,7 @@ describe("RelayNotifier", () => {
       const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
       const { impl } = fetchStub(() => outcome);
       const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {} });
-      expect(() => notifier.notify({ threadId: "t", agentName: "A", preview: "p" })).not.toThrow();
+      expect(() => notifier.notify({ threadId: "t", agentName: "A", preview: "p" }, new Set())).not.toThrow();
       await settle();
       expect(storage.pushRegistrations()).toHaveLength(1);
       storage.close();
@@ -154,6 +169,72 @@ describe("RelayNotifier", () => {
     storage.close(); // closed db: pushRegistrations() will throw inside notify
     const { impl } = fetchStub(() => 202);
     const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {} });
-    expect(() => notifier.notify({ threadId: "t", agentName: "A", preview: "p" })).not.toThrow();
+    expect(() => notifier.notify({ threadId: "t", agentName: "A", preview: "p" }, new Set())).not.toThrow();
+  });
+
+  it("skips registrations for connected devices, still sends to disconnected ones", async () => {
+    const storage = seeded([
+      { deviceId: "d1", pushId: "p1", relayUrl: "http://relay-a.test", pushKey: "key-1" },
+      { deviceId: "d2", pushId: "p2", relayUrl: "http://relay-b.test", pushKey: "key-2" },
+    ]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify(
+      { threadId: "t", agentName: "A", preview: "p" },
+      new Set(["d1"]), // d1 has a live socket at commit time; d2 does not
+    );
+    await settle();
+    expect(sent.some((s) => s.body.pushId === "p1")).toBe(false);
+    const forP2 = sent.find((s) => s.body.pushId === "p2");
+    expect(forP2).toBeDefined();
+    expect(decrypt("key-2", forP2?.body.ciphertext ?? "")).toEqual({ threadId: "t", agentName: "A", preview: "p" });
+    storage.close();
+  });
+
+  it("is a no-op when every registration's device is in the connected set", async () => {
+    const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notify(
+      { threadId: "t", agentName: "A", preview: "p" },
+      new Set(["d1"]),
+    );
+    await settle();
+    expect(sent).toHaveLength(0);
+    storage.close();
+  });
+
+  it("late isDeviceConnected check suppresses the send without pruning the registration", async () => {
+    // Narrows (rather than closes) the race from issue #11: the commit-time snapshot passed
+    // to notify() missed this device (it isn't in the Set below), but the live isDeviceConnected
+    // recheck immediately before the fetch reports it connected by then. The send must be
+    // skipped, and unlike a relay 404 this is not a reason to prune the registration: the
+    // device is fine, it just doesn't need a push anymore.
+    const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
+    const { impl, sent } = fetchStub(() => 202);
+    const notifier = new RelayNotifier({
+      storage,
+      fetchImpl: impl,
+      log: () => {},
+      isDeviceConnected: (deviceId) => deviceId === "d1",
+    });
+    notifier.notify({ threadId: "t", agentName: "A", preview: "p" }, new Set()); // stale snapshot: d1 absent
+    await settle();
+    expect(sent).toHaveLength(0);
+    expect(storage.pushRegistrations().map((r) => r.deviceId)).toEqual(["d1"]);
+    storage.close();
+  });
+
+  it("still sends when isDeviceConnected is provided but reports the device disconnected", async () => {
+    const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
+    const { impl, sent } = fetchStub(() => 202);
+    const notifier = new RelayNotifier({
+      storage,
+      fetchImpl: impl,
+      log: () => {},
+      isDeviceConnected: () => false,
+    });
+    notifier.notify({ threadId: "t", agentName: "A", preview: "p" }, new Set());
+    await settle();
+    expect(sent.find((s) => s.body.pushId === "p1")).toBeDefined();
+    storage.close();
   });
 });

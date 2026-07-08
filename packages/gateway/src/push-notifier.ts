@@ -23,6 +23,12 @@ export interface RelayNotifierDeps {
   storage: Storage;
   fetchImpl?: typeof fetch;
   log?: (message: string) => void;
+  /** Live per-device presence check (see `WsHub.isDeviceConnected`). Optional: when omitted,
+   *  `#send` skips the late recheck and relies solely on the `connectedDeviceIds` snapshot
+   *  `notify()` was called with. Wired in at server assembly to narrow the race where a
+   *  device's socket becomes live between the commit-time snapshot and the fire-and-forget
+   *  send actually going out (issue #11). */
+  isDeviceConnected?: (deviceId: string) => boolean;
 }
 
 /** Posts encrypted notification payloads to each registered device's relay.
@@ -32,14 +38,19 @@ export class RelayNotifier implements Notifier {
   readonly #storage: Storage;
   readonly #fetch: typeof fetch;
   readonly #log: (message: string) => void;
+  readonly #isDeviceConnected: ((deviceId: string) => boolean) | undefined;
 
   constructor(deps: RelayNotifierDeps) {
     this.#storage = deps.storage;
     this.#fetch = deps.fetchImpl ?? fetch;
     this.#log = deps.log ?? ((message: string) => process.stderr.write(`${message}\n`));
+    this.#isDeviceConnected = deps.isDeviceConnected;
   }
 
-  notify(event: { threadId: string; agentName: string; preview: string }): void {
+  notify(
+    event: { threadId: string; agentName: string; preview: string },
+    connectedDeviceIds: ReadonlySet<string>,
+  ): void {
     let registrations: PushRegistrationRow[];
     try {
       registrations = this.#storage.pushRegistrations();
@@ -47,13 +58,16 @@ export class RelayNotifier implements Notifier {
       this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
-    if (registrations.length === 0) return;
+    // Per-device targeting (issue #11): a device with a live socket at commit time gets its
+    // update over the WS instead, so it is excluded here rather than pushed to redundantly.
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    if (targets.length === 0) return;
     const payload: PushPayload = {
       threadId: event.threadId,
       agentName: event.agentName,
       preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),
     };
-    for (const registration of registrations) {
+    for (const registration of targets) {
       void this.#send(registration, payload).catch((err: unknown) => {
         this.#log(
           `push: notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
@@ -65,6 +79,10 @@ export class RelayNotifier implements Notifier {
   async #send(registration: PushRegistrationRow, payload: PushPayload): Promise<void> {
     const ciphertext = encryptPushPayload(registration.pushKey, payload);
     const url = `${registration.relayUrl.replace(/\/+$/, "")}/notify`;
+    // Late recheck, narrowing (not closing) the race window: the device may have connected
+    // since notify()'s commit-time snapshot was taken. Skip the send without touching the
+    // registration row, which is prunable only on a relay 404, not on this kind of skip.
+    if (this.#isDeviceConnected?.(registration.deviceId) === true) return;
     const res = await this.#fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },

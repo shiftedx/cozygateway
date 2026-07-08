@@ -7,14 +7,17 @@ import type { BackendAdapter, BackendSession } from "./adapters/types.ts";
 import { BackendUnavailable } from "./errors.ts";
 
 export interface Notifier {
-  notify(event: { threadId: string; agentName: string; preview: string }): void;
+  notify(
+    event: { threadId: string; agentName: string; preview: string },
+    connectedDeviceIds: ReadonlySet<string>,
+  ): void;
 }
 
 export const nullNotifier: Notifier = { notify: () => {} };
 
 interface Hub {
   broadcast(frame: ServerFrame): void;
-  hasClients(): boolean;
+  connectedDeviceIds(): ReadonlySet<string>;
 }
 
 function preview(blocks: RichBlock[]): string {
@@ -94,9 +97,14 @@ export class TurnRunner {
             this.#now(),
           );
           this.#hub.broadcast({ type: "committed", threadId, seq: message.seq, message });
-          if (!this.#hub.hasClients()) {
-            this.#notifier.notify({ threadId, agentName, preview: preview(final.blocks) });
-          }
+          // Always notify: which devices get pushed is the notifier's decision (it filters
+          // against this same-tick presence snapshot), not the turn runner's. This keeps the
+          // commit-time decision synchronous and non-blocking while letting per-device
+          // presence, not a single global flag, decide who gets a push.
+          this.#notifier.notify(
+            { threadId, agentName, preview: preview(final.blocks) },
+            this.#hub.connectedDeviceIds(),
+          );
         },
         onDone: () => {
           this.#hub.broadcast({ type: "done", threadId, turnId });
