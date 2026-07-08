@@ -172,3 +172,82 @@ describe("broadcast + revocation", () => {
     await until(() => !hub.hasClients());
   });
 });
+
+describe("per-device presence", () => {
+  it("reports connectedDeviceIds/isDeviceConnected once auth completes, and clears them on close", async () => {
+    expect(hub.connectedDeviceIds().has("d1")).toBe(false);
+    expect(hub.isDeviceConnected("d1")).toBe(false);
+
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((f) => f.type === "ready"));
+
+    expect(hub.connectedDeviceIds()).toEqual(new Set(["d1"]));
+    expect(hub.isDeviceConnected("d1")).toBe(true);
+
+    ws.close();
+    await until(() => !hub.isDeviceConnected("d1"));
+    expect(hub.connectedDeviceIds().has("d1")).toBe(false);
+  });
+
+  it("connectedDeviceIds returns a fresh snapshot: mutating the hub afterward doesn't change it", async () => {
+    const before = hub.connectedDeviceIds();
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((f) => f.type === "ready"));
+
+    expect(before.has("d1")).toBe(false); // the earlier snapshot is untouched
+    expect(hub.connectedDeviceIds().has("d1")).toBe(true); // a fresh call sees the new state
+    ws.close();
+  });
+
+  it("keeps a device connected while any of its sockets remain open (counts, not a boolean flip)", async () => {
+    const wsA = connect();
+    const seenA = frames(wsA);
+    await once(wsA, "open");
+    wsA.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seenA.some((f) => f.type === "ready"));
+
+    const wsB = connect();
+    const seenB = frames(wsB);
+    await once(wsB, "open");
+    wsB.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seenB.some((f) => f.type === "ready"));
+
+    expect(hub.isDeviceConnected("d1")).toBe(true);
+
+    wsA.close();
+    // Give the server-side close event for wsA a chance to land; the device must still read
+    // as connected because wsB (the second socket for the same device) is still open.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(hub.isDeviceConnected("d1")).toBe(true);
+    expect(hub.connectedDeviceIds()).toEqual(new Set(["d1"]));
+
+    wsB.close();
+    await until(() => !hub.isDeviceConnected("d1"));
+  });
+
+  it("releases the device on an abnormal close (socket error) and on revocation via closeDevice", async () => {
+    const wsErr = connect();
+    const seenErr = frames(wsErr);
+    await once(wsErr, "open");
+    wsErr.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seenErr.some((f) => f.type === "ready"));
+    expect(hub.isDeviceConnected("d1")).toBe(true);
+    wsErr.terminate(); // abnormal close, not a clean 1000/1008 handshake
+    await until(() => !hub.isDeviceConnected("d1"));
+
+    const wsRevoked = connect();
+    const seenRevoked = frames(wsRevoked);
+    await once(wsRevoked, "open");
+    wsRevoked.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seenRevoked.some((f) => f.type === "ready"));
+    expect(hub.isDeviceConnected("d1")).toBe(true);
+    hub.closeDevice("d1");
+    await until(() => !hub.isDeviceConnected("d1"));
+  });
+});

@@ -23,6 +23,10 @@ export class WsHub {
   readonly #now: () => number;
   readonly #authTimeoutMs: number;
   readonly #clients = new Set<Client>();
+  // Counts sockets per device rather than a boolean, so a second socket for the same device
+  // (e.g. a reconnect racing a still-closing prior connection) doesn't get "undone" by the
+  // first socket's close.
+  readonly #deviceCounts = new Map<string, number>();
   readonly #wss: WebSocketServer;
 
   constructor(deps: {
@@ -99,6 +103,7 @@ export class WsHub {
         this.#storage.touchDevice(device.id, this.#now());
         client = { socket, deviceId: device.id };
         this.#clients.add(client);
+        this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
         this.#send(socket, { type: "ready", deviceId: device.id, gateway: this.#gatewayInfo });
         return;
       }
@@ -119,8 +124,20 @@ export class WsHub {
 
     socket.on("close", () => {
       clearTimeout(authTimer);
-      if (client !== undefined) this.#clients.delete(client);
+      if (client !== undefined) {
+        this.#clients.delete(client);
+        this.#releaseDevice(client.deviceId);
+      }
     });
+  }
+
+  /** Decrements a device's live-socket count, dropping the map entry once it reaches zero.
+   *  Multiple sockets for the same device (see `#deviceCounts`) keep the device connected
+   *  until every one of them has closed. */
+  #releaseDevice(deviceId: string): void {
+    const count = (this.#deviceCounts.get(deviceId) ?? 1) - 1;
+    if (count <= 0) this.#deviceCounts.delete(deviceId);
+    else this.#deviceCounts.set(deviceId, count);
   }
 
   broadcast(frame: ServerFrame): void {
@@ -132,6 +149,18 @@ export class WsHub {
 
   hasClients(): boolean {
     return this.#clients.size > 0;
+  }
+
+  /** A fresh snapshot of every device with at least one live socket, taken synchronously.
+   *  Callers that hold onto the returned set are unaffected by connections/disconnections
+   *  that happen afterward. */
+  connectedDeviceIds(): ReadonlySet<string> {
+    return new Set(this.#deviceCounts.keys());
+  }
+
+  /** Live (not snapshotted) check: whether `deviceId` has at least one open socket right now. */
+  isDeviceConnected(deviceId: string): boolean {
+    return (this.#deviceCounts.get(deviceId) ?? 0) > 0;
   }
 
   closeDevice(deviceId: string): void {
