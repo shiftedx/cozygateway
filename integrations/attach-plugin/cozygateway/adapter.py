@@ -30,6 +30,7 @@ import math
 import os
 import random
 import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .attach_client import (
@@ -76,6 +77,18 @@ def _env_float(name: str, default: float) -> float:
     return value if (math.isfinite(value) and value > 0) else default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back on unset/garbage."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class AttachAdapter:
     """The platform methods, mixed into a concrete adapter subclass by the factory.
 
@@ -113,8 +126,22 @@ class AttachAdapter:
         # Per-thread active turn id: set on inject, read by the draft / terminal
         # surfaces, dropped when the turn ends.
         self._active_turn: Dict[str, str] = {}
-        # (threadId, turnId) already seen or in flight: a repeat is dropped.
-        self._seen_turns: Set[Tuple[str, str]] = set()
+        # (threadId, turnId) already seen or in flight: a repeat is dropped, but
+        # only within a bounded retention window -- see below.
+        #
+        # Bounded oldest-first: an OrderedDict used as an ordered set (values are
+        # unused). A turn's entry is NOT dropped the moment it seals (done/failed);
+        # it stays until evicted by the cap. That gives a re-dial replaying a
+        # just-sealed turn (or one still in flight) a WINDOW-BOUNDED dedupe
+        # guarantee, not an unconditional one: the replay is deduped as long as
+        # fewer than `_seen_turns_max` other distinct turns have arrived since the
+        # original. Once that many intervening distinct turns have arrived, the
+        # entry is evicted and a later replay is treated as a new turn (and would
+        # re-execute, even if the original is still in flight). This trades an
+        # unbounded-duration redelivery guarantee for bounded memory over a
+        # long-lived process.
+        self._seen_turns: OrderedDict[Tuple[str, str], None] = OrderedDict()
+        self._seen_turns_max: int = _env_int("COZYGATEWAY_SEEN_TURNS_MAX", 512)
         # Per-turn accumulated text (the last full flush) and tool-chip tracker.
         self._turn_text: Dict[str, str] = {}
         self._tool_chips: Dict[str, ToolChipTracker] = {}
@@ -255,13 +282,21 @@ class AttachAdapter:
         """Bound to the client's ``on_turn``: schedule the inject as a task.
 
         Runs on the drain loop; the actual inject is fired-and-forgotten so a slow
-        turn never blocks the socket. Deduplicated on (threadId, turnId).
+        turn never blocks the socket. Deduplicated on (threadId, turnId) within a
+        bounded retention window: the dedupe set is capped, evicting the oldest
+        entry once it overflows, so a replay arriving after `_seen_turns_max` other
+        distinct turns is treated as new rather than deduped (see ``_seen_turns``
+        for the exact boundary).
         """
         key = (turn.thread_id, turn.turn_id)
         if key in self._seen_turns:
+            # Not moved to MRU here: a duplicate delivery does not extend its own
+            # retention window.
             logger.debug("attach: dropping duplicate turn %s", key)
             return
-        self._seen_turns.add(key)
+        self._seen_turns[key] = None
+        while len(self._seen_turns) > self._seen_turns_max:
+            self._seen_turns.popitem(last=False)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
