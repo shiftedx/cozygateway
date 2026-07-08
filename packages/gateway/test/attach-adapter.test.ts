@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { RichBlock } from "cozygateway-contract";
 
 import {
@@ -147,6 +147,36 @@ describe("createAttachAdapter", () => {
       /not attached/,
     );
     expect(adapter.presence()).toBe("absent");
+  });
+
+  it("fails a turn immediately when sendTurn throws, with no pending entry left behind", async () => {
+    vi.useFakeTimers();
+    try {
+      const endpoint = fakeEndpoint();
+      let capturedFrame: AttachTurnFrame | undefined;
+      endpoint.sendTurn = (_agentId, frame) => {
+        capturedFrame = frame;
+        throw new Error("socket write exploded");
+      };
+      const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
+      const session = await adapter.startSession("t1");
+      const { handlers, observed } = observer();
+
+      const turn = session.send([{ type: "paragraph", text: "hi" }], handlers);
+      // The rejection must arrive on the microtask queue, never by advancing the fake clock:
+      // proof this is not the 600s (here 1s) per-turn timeout firing.
+      await expect(turn).rejects.toThrow(/not attached/);
+      expect(capturedFrame).toBeDefined();
+
+      // The timer started for this turn must already be cleared: no leaked pending timer.
+      expect(vi.getTimerCount()).toBe(0);
+
+      // No pending entry survives: a late update for the same turnId is dropped, not processed.
+      adapter.handleUpdate("t1", { kind: "done", turnId: capturedFrame!.turnId });
+      expect(observed.done).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sends a rendered turn frame and completes on draft/done", async () => {
