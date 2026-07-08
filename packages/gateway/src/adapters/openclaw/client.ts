@@ -328,8 +328,15 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
     // is not left silently stalled forever. The subscription itself is left in place (not
     // removed) since the same sessionKey is worth resuming after reconnect; never includes
     // wire/token content.
-    for (const sub of sessionSubscriptions.values()) {
-      if (!sub.done) sub.handlers.onError("openclaw connection dropped before the reply ended");
+    //
+    // Skipped entirely on an intentional close() (closed is already true here by the time this
+    // fires): delivering "dropped before the reply ended" after the caller itself asked to close
+    // would be a misleading onError for a clean shutdown. Pending request() calls still fail via
+    // failAllPending above, unconditionally -- only this session-level onError is suppressed.
+    if (!closed) {
+      for (const sub of sessionSubscriptions.values()) {
+        if (!sub.done) sub.handlers.onError("openclaw connection dropped before the reply ended");
+      }
     }
 
     if (closed) return;
@@ -402,6 +409,10 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
       clearReconnectTimer();
       clearTickTimer();
       failAllPending(new Error("openclaw client is closing"));
+      // Drop every session subscription so handler references from a permanently-closed client
+      // cannot linger (and, per the guard added above, so any close-triggered handleClosed sees
+      // nothing left to iterate even before its own `closed` check runs).
+      sessionSubscriptions.clear();
 
       const socket = ws;
       if (socket !== undefined && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
