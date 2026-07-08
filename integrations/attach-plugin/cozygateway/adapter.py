@@ -175,7 +175,10 @@ class AttachAdapter:
         (see :class:`IncrementalNormalizer`). One instance per turn id, so a
         second concurrent turn never shares (or corrupts) another's cache.
         """
-        normalizer = self._normalizers.setdefault(turn_id, IncrementalNormalizer())
+        normalizer = self._normalizers.get(turn_id)
+        if normalizer is None:
+            normalizer = IncrementalNormalizer()
+            self._normalizers[turn_id] = normalizer
         return normalizer.update(text)
 
     # -- connection lifecycle -------------------------------------------------

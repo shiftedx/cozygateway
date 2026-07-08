@@ -160,10 +160,11 @@ describe("push e2e: gateway -> relay -> webhook", () => {
     ws.on("message", (data: Buffer) => frames.push(JSON.parse(data.toString()) as ServerFrame));
     ws.send(JSON.stringify({ type: "auth", token: deviceToken }));
     // The gateway only counts this socket as a connected client once the hub has
-    // processed the auth frame and answered "ready" (see ws-hub.test.ts). The push
-    // gate (turns.ts) checks hasClients() at commit time, so we must not send the
-    // message until the hub has actually registered this client, or the check can
-    // race the auth handshake and the test would pass for the wrong reason.
+    // processed the auth frame and answered "ready" (see ws-hub.test.ts). The turn
+    // runner always calls notify() at commit time, passing the hub's connected-device
+    // snapshot; RelayNotifier filters out any device present in that snapshot. So we
+    // must not send the message until the hub has actually registered this client, or
+    // the snapshot can miss it and the test would pass for the wrong reason.
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("timed out waiting for ready")), 2_000);
       const check = (): void => {

@@ -147,10 +147,6 @@ export class WsHub {
     }
   }
 
-  hasClients(): boolean {
-    return this.#clients.size > 0;
-  }
-
   /** A fresh snapshot of every device with at least one live socket, taken synchronously.
    *  Callers that hold onto the returned set are unaffected by connections/disconnections
    *  that happen afterward. */

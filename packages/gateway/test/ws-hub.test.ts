@@ -68,7 +68,7 @@ describe("auth", () => {
     await once(ws, "open");
     ws.send(JSON.stringify({ type: "auth", token }));
     await until(() => seen.some((f) => f.type === "ready"));
-    expect(hub.hasClients()).toBe(true);
+    expect(hub.isDeviceConnected("d1")).toBe(true);
     ws.close();
   });
 
@@ -119,7 +119,7 @@ describe("frame discipline", () => {
 
     ws.send(JSON.stringify({ type: "sync", threads: { t1: 0 } }));
     await until(() => seen.some((f) => f.type === "synced"));
-    expect(hub.hasClients()).toBe(true);
+    expect(hub.isDeviceConnected("d1")).toBe(true);
     ws.close();
   });
 
@@ -149,7 +149,7 @@ describe("frame discipline", () => {
 
     ws.send(JSON.stringify({ type: "sync", threads: { t1: 0 } }));
     await until(() => seen.some((f) => f.type === "synced"));
-    expect(hub.hasClients()).toBe(true);
+    expect(hub.isDeviceConnected("d1")).toBe(true);
     ws.close();
   });
 });
@@ -169,7 +169,7 @@ describe("broadcast + revocation", () => {
     const [code] = (await once(ws, "close")) as [number];
     expect(code).toBe(1008);
     // The server-side close event can land a tick after the client-side one.
-    await until(() => !hub.hasClients());
+    await until(() => !hub.isDeviceConnected("d1"));
   });
 });
 

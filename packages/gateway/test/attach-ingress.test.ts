@@ -188,10 +188,12 @@ describe("AttachIngress", () => {
     const secondOpen = once(second, "open");
 
     // Ordering proof, each step awaited on the actual production event, no sleeps or polling:
-    // 1. The ingress supersedes synchronously inside the new connection's own handler, and
-    //    reports the old connection's disconnect there -- strictly before it even writes the
-    //    new connection's upgrade response. That makes this the earliest observable proof of
-    //    the handover, and it is guaranteed to resolve before both awaits below.
+    // 1. ws writes the new connection's 101 upgrade response to the socket before invoking the
+    //    'connection' callback, so by the time that callback runs the ingress's supersede (and
+    //    the old connection's disconnect) happens after the new socket's upgrade bytes are
+    //    already on the wire -- the client just hasn't parsed them into an 'open' event yet.
+    //    disconnectedOnce is still the earliest event this test can observe, and it is
+    //    guaranteed to resolve before both awaits below.
     await disconnectedOnce;
     // 2. The old socket actually receives the supersede close, and with the frozen code.
     const [code] = (await firstClose) as [number];
@@ -207,9 +209,10 @@ describe("AttachIngress", () => {
     expect(recorded.presence).toEqual([{ agentId: "a1", state: "online" }]);
     expect(ingress.isAttached("a1")).toBe(true);
 
-    // Prove the handover is live end-to-end, and -- by awaiting one more full round trip on the
-    // surviving connection -- give any late, incorrect presence flip every remaining chance to
-    // surface before the final invariant check below.
+    // Prove the handover is live end-to-end. The load-bearing assertions already ran above;
+    // this extra round trip on the surviving connection is best-effort, not a barrier -- it
+    // just gives a late, incorrect presence flip a bit more room to surface before the final
+    // invariant check below.
     const received: unknown[] = [];
     second.on("message", (data) => received.push(JSON.parse(String(data))));
     expect(
