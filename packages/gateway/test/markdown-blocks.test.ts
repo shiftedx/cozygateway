@@ -26,4 +26,10 @@ describe("normalizeMarkdownToBlocks direct unit cases", () => {
     const blocks: RichBlock[] = normalizeMarkdownToBlocks("- [x] done");
     expect(blocks).toEqual([{ type: "list", items: [{ text: "done", checked: true }], ordered: false }]);
   });
+
+  it("emits a code block with no language key for a bare fence", () => {
+    const blocks: RichBlock[] = normalizeMarkdownToBlocks("```\ncode\n```\n");
+    expect(blocks).toEqual([{ type: "code", code: "code" }]);
+    expect("language" in blocks[0]!).toBe(false);
+  });
 });
