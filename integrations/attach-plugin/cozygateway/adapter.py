@@ -55,6 +55,12 @@ PLATFORM_NAME = "cozygateway"
 SESSION_PLATFORM_KEY = "HERMES_SESSION_PLATFORM"  # harness-defined identifier
 SESSION_CHAT_ID_KEY = "HERMES_SESSION_CHAT_ID"  # harness-defined identifier
 
+# The harness's pre_tool_call / post_tool_call hook payload carries the tool
+# call's real per-call id under this key (empty string when the harness has none
+# to give). Present on both legs, it lets a chip's open and close pair exactly;
+# see tool_chips.ToolChipTracker for the name#n fallback used otherwise.
+TOOL_CALL_ID_KEY = "tool_call_id"  # harness-defined identifier
+
 # A neutral inbound identity for the injected message. The turn was already
 # authorized by the gateway that issued the token, so the adapter marks it
 # role-authorized to pass the harness's per-message authorization gate.
@@ -396,7 +402,12 @@ class AttachAdapter:
 
     # -- tool-chip tap --------------------------------------------------------
     def observe_tool_event(
-        self, chat_id: str, phase: str, tool_name: str, detail: Optional[str]
+        self,
+        chat_id: str,
+        phase: str,
+        tool_name: str,
+        detail: Optional[str],
+        call_id: Optional[str] = None,
     ) -> None:
         """Sync entry from the agent worker thread (the native tool hooks). Never raises.
 
@@ -408,13 +419,19 @@ class AttachAdapter:
             return
         try:
             asyncio.run_coroutine_threadsafe(
-                self._apply_tool_event(chat_id, str(phase), str(tool_name), detail), loop
+                self._apply_tool_event(chat_id, str(phase), str(tool_name), detail, call_id),
+                loop,
             )
         except Exception:  # noqa: BLE001 - a dead loop must degrade silently
             logger.debug("attach: observe_tool_event schedule failed", exc_info=True)
 
     async def _apply_tool_event(
-        self, chat_id: str, phase: str, tool_name: str, detail: Optional[str]
+        self,
+        chat_id: str,
+        phase: str,
+        tool_name: str,
+        detail: Optional[str],
+        call_id: Optional[str] = None,
     ) -> None:
         """Fold one tool event into this turn's tracker, then emit a draft."""
         turn_id = self._active_turn.get(chat_id)
@@ -422,9 +439,9 @@ class AttachAdapter:
             return
         tracker = self._tool_chips.setdefault(turn_id, ToolChipTracker())
         if phase == "start":
-            tracker.open(tool_name, detail)
+            tracker.open(tool_name, detail, call_id=call_id)
         else:
-            tracker.close(tool_name, ok=(phase != "error"), detail=detail)
+            tracker.close(tool_name, ok=(phase != "error"), detail=detail, call_id=call_id)
         self._content_seen[turn_id] = True
         await self._emit_tool_draft(chat_id, turn_id)
 
@@ -600,12 +617,26 @@ def _preview(value: Any, limit: int = 200) -> Optional[str]:
     return text[:limit]
 
 
+def _tool_call_id(kwargs: Dict[str, Any]) -> Optional[str]:
+    """The harness's real per-call id from a hook payload, or None if absent.
+
+    The harness always passes the key (see ``TOOL_CALL_ID_KEY``), defaulting it to
+    ``""`` when it has no id to give, so an empty/blank value means "no id" the
+    same as a missing key.
+    """
+    raw = kwargs.get(TOOL_CALL_ID_KEY)
+    if not raw:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
 def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
     """Forward one native tool hook firing to the active adapters. Never raises.
 
     Runs on the agent tool worker thread. Filters to this platform's turns via the
-    session context and hands ``(chat_id, phase, tool_name, detail)`` to every
-    active adapter, which hops it back onto its own loop.
+    session context and hands ``(chat_id, phase, tool_name, detail, call_id)`` to
+    every active adapter, which hops it back onto its own loop.
     """
     try:
         platform, chat_id = _current_turn_platform_and_chat()
@@ -619,6 +650,7 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
         tool_name = str(kwargs.get("tool_name") or "")
         if not tool_name:
             return
+        call_id = _tool_call_id(kwargs)
         if phase == "start":
             detail = _preview(kwargs.get("args"))
         elif str(kwargs.get("status") or "").lower() == "error":
@@ -628,7 +660,7 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
             detail = _preview(kwargs.get("result"))
             phase = "complete"
         for adapter in adapters:
-            adapter.observe_tool_event(chat_id, phase, tool_name, detail)
+            adapter.observe_tool_event(chat_id, phase, tool_name, detail, call_id)
     except Exception:  # noqa: BLE001 - a chip must never crash the tool loop
         logger.debug("attach: tool-hook dispatch failed", exc_info=True)
 
