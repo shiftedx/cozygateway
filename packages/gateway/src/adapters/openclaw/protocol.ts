@@ -134,6 +134,56 @@ export const TickEventSchema = Type.Object({
 });
 export type TickEvent = Static<typeof TickEventSchema>;
 
+/** Agent progress event. The envelope (sessionKey + stream) is required; `data` stays an open
+ *  record because only tool items are ever read, via `toolItemOf` below. PINNED by live capture
+ *  (openclaw@2026.6.11, 2026-07-09, docs/specs/2026-07-09-openclaw-tool-chips-design.md):
+ *  `sessionKey` rides every agent event, and streams observed are `lifecycle`, `assistant`,
+ *  `item`, and `compaction`. */
+export const AgentEventSchema = Type.Object({
+  type: Type.Literal("event"),
+  event: Type.Literal("agent"),
+  payload: Type.Object({
+    sessionKey: Type.String(),
+    stream: Type.String(),
+    data: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  }),
+  seq: Type.Optional(Type.Number()),
+  stateVersion: Type.Optional(Type.Number()),
+});
+export type AgentEvent = Static<typeof AgentEventSchema>;
+
+/** One OpenClaw tool call lifecycle edge, narrowed from an agent item frame. */
+export interface AgentToolItem {
+  toolCallId: string;
+  name: string;
+  phase: "start" | "end";
+  failed: boolean;
+}
+
+/** THE one named site owning the tool-frame wire fact. PINNED by live capture (openclaw@2026.6.11,
+ *  2026-07-09): tool activity rides `event:"agent"` with `stream:"item"` and `data.kind:"tool"`,
+ *  as a start/end pair keyed by `data.toolCallId`; a failed call ends with `status:"failed"` and
+ *  an `error` string. The protocol docs' `stream:"tool"` and `session.tool` were NEVER observed
+ *  live and are deliberately not parsed. `title`/`meta`/`error` carry argument-derived content
+ *  (file names, host paths) and are never surfaced by this narrowing. */
+export function toolItemOf(event: AgentEvent): AgentToolItem | undefined {
+  if (event.payload.stream !== "item") return undefined;
+  const data = event.payload.data;
+  if (data === undefined || data["kind"] !== "tool") return undefined;
+  const phase = data["phase"];
+  if (phase !== "start" && phase !== "end") return undefined;
+  const toolCallId =
+    typeof data["toolCallId"] === "string" && data["toolCallId"].length > 0
+      ? data["toolCallId"]
+      : typeof data["itemId"] === "string" && data["itemId"].length > 0
+        ? data["itemId"]
+        : undefined;
+  if (toolCallId === undefined) return undefined;
+  const name = typeof data["name"] === "string" && data["name"].length > 0 ? data["name"] : "tool";
+  const failed = data["status"] === "failed" || data["error"] !== undefined;
+  return { toolCallId, name, phase, failed };
+}
+
 /** The tagged union `parseServerFrame` returns. Each variant is the original frame's fields plus
  *  a `kind` tag, so e.g. a hello-ok frame still exposes `.payload` directly (no extra nesting). */
 export type ServerFrame =
@@ -141,6 +191,7 @@ export type ServerFrame =
   | (ConnectChallengeEvent & { kind: "challenge" })
   | (ResponseFrame & { kind: "response" })
   | (ChatEvent & { kind: "chat" })
+  | (AgentEvent & { kind: "agent" })
   | (TickEvent & { kind: "tick" });
 
 /** Discriminates on `type` ("res"/"event"), then for responses on `payload.type` (hello-ok vs a
@@ -161,6 +212,7 @@ export function parseServerFrame(raw: unknown): ServerFrame | undefined {
     if (check(ConnectChallengeEventSchema, raw)) return { ...raw, kind: "challenge" };
     if (check(TickEventSchema, raw)) return { ...raw, kind: "tick" };
     if (check(ChatEventSchema, raw)) return { ...raw, kind: "chat" };
+    if (check(AgentEventSchema, raw)) return { ...raw, kind: "agent" };
     return undefined;
   }
 

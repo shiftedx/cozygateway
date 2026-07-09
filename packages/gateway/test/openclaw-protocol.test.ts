@@ -8,8 +8,10 @@ import {
   ResponseFrameSchema,
   ChatEventSchema,
   TickEventSchema,
+  AgentEventSchema,
   parseServerFrame,
   buildConnectRequest,
+  toolItemOf,
 } from "../src/adapters/openclaw/protocol.ts";
 import { check } from "cozygateway-contract";
 
@@ -264,5 +266,135 @@ describe("outbound request builders", () => {
     const req = buildConnectRequest({ id: "req-2", token: "t" });
     expect(req.params.device).toBeUndefined();
     expect(req.params.auth.token).toBe("t");
+  });
+});
+
+/** Live-captured tool item frames (openclaw@2026.6.11, 2026-07-09; see
+ *  docs/specs/2026-07-09-openclaw-tool-chips-design.md). */
+function agentToolFrame(data: Record<string, unknown>): Record<string, unknown> {
+  return {
+    type: "event",
+    event: "agent",
+    payload: {
+      runId: "cabc10f1-b12f-486b-8a3d-dc8d70480b86",
+      sessionKey: "agent:main:dashboard:b8400f2f",
+      stream: "item",
+      data,
+      seq: 3,
+      ts: 1783629483751,
+      isHeartbeat: false,
+    },
+    seq: 4,
+  };
+}
+
+const TOOL_START = {
+  itemId: "tool:790639779",
+  phase: "start",
+  kind: "tool",
+  title: "read from magic-number.txt",
+  status: "running",
+  name: "read",
+  meta: "from magic-number.txt",
+  toolCallId: "790639779",
+  startedAt: 1783629483750,
+};
+
+const TOOL_END_OK = { ...TOOL_START, phase: "end", status: "completed", endedAt: 1783629483774 };
+
+const TOOL_END_FAILED = {
+  ...TOOL_START,
+  phase: "end",
+  status: "failed",
+  error: "ENOENT: no such file or directory, access '/workspace/totally-missing-xyz.txt'",
+  endedAt: 1783629574578,
+};
+
+describe("parseServerFrame: agent events", () => {
+  it("parses a live-captured agent item frame as kind agent", () => {
+    const frame = parseServerFrame(agentToolFrame(TOOL_START));
+    expect(frame?.kind).toBe("agent");
+    if (frame?.kind === "agent") {
+      expect(frame.payload.sessionKey).toBe("agent:main:dashboard:b8400f2f");
+      expect(frame.payload.stream).toBe("item");
+    }
+  });
+
+  it("parses an agent lifecycle frame (no data requirements beyond the envelope)", () => {
+    const frame = parseServerFrame({
+      type: "event",
+      event: "agent",
+      payload: { sessionKey: "s1", stream: "lifecycle", data: { phase: "start" } },
+    });
+    expect(frame?.kind).toBe("agent");
+  });
+
+  it("rejects an agent frame with no sessionKey (falls through to unrecognized)", () => {
+    const frame = parseServerFrame({
+      type: "event",
+      event: "agent",
+      payload: { stream: "item", data: TOOL_START },
+    });
+    expect(frame).toBeUndefined();
+  });
+});
+
+describe("toolItemOf", () => {
+  function agentEvent(payload: Record<string, unknown>) {
+    const frame = parseServerFrame({ type: "event", event: "agent", payload });
+    if (frame?.kind !== "agent") throw new Error("fixture did not parse as agent");
+    return frame;
+  }
+
+  it("narrows a live-captured start frame: running phase, not failed", () => {
+    const item = toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: TOOL_START }));
+    expect(item).toEqual({ toolCallId: "790639779", name: "read", phase: "start", failed: false });
+  });
+
+  it("narrows a completed end frame as not failed", () => {
+    const item = toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: TOOL_END_OK }));
+    expect(item).toEqual({ toolCallId: "790639779", name: "read", phase: "end", failed: false });
+  });
+
+  it("narrows a failed end frame as failed (status failed)", () => {
+    const item = toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: TOOL_END_FAILED }));
+    expect(item?.failed).toBe(true);
+  });
+
+  it("treats an error field as failure even without status failed", () => {
+    const data = { ...TOOL_END_OK, status: "completed", error: "boom" };
+    const item = toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data }));
+    expect(item?.failed).toBe(true);
+  });
+
+  it("maps an unknown end status without an error field to not-failed", () => {
+    const data = { ...TOOL_END_OK, status: "some-future-status" };
+    const item = toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data }));
+    expect(item).toEqual({ toolCallId: "790639779", name: "read", phase: "end", failed: false });
+  });
+
+  it("falls back to itemId when toolCallId is missing, and yields undefined when both are missing", () => {
+    const noToolCallId: Record<string, unknown> = { ...TOOL_START };
+    delete noToolCallId["toolCallId"];
+    const viaItemId = toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: noToolCallId }));
+    expect(viaItemId?.toolCallId).toBe("tool:790639779");
+
+    const noIds: Record<string, unknown> = { ...noToolCallId };
+    delete noIds["itemId"];
+    expect(toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: noIds }))).toBeUndefined();
+  });
+
+  it("falls back to a generic name when name is missing", () => {
+    const noName: Record<string, unknown> = { ...TOOL_START };
+    delete noName["name"];
+    const item = toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: noName }));
+    expect(item?.name).toBe("tool");
+  });
+
+  it("yields undefined for non-item streams, non-tool kinds, unknown phases, and missing data", () => {
+    expect(toolItemOf(agentEvent({ sessionKey: "s1", stream: "assistant", data: { ...TOOL_START } }))).toBeUndefined();
+    expect(toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: { ...TOOL_START, kind: "message" } }))).toBeUndefined();
+    expect(toolItemOf(agentEvent({ sessionKey: "s1", stream: "item", data: { ...TOOL_START, phase: "middle" } }))).toBeUndefined();
+    expect(toolItemOf(agentEvent({ sessionKey: "s1", stream: "item" }))).toBeUndefined();
   });
 });

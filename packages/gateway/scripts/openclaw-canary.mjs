@@ -10,7 +10,9 @@
 //   node packages/gateway/scripts/openclaw-canary.mjs
 //
 // Optional: OPENCLAW_CANARY_AGENT_ID (scope the session to one agent),
-//           OPENCLAW_CANARY_TIMEOUT_MS (reply budget, default 120000).
+//           OPENCLAW_CANARY_TIMEOUT_MS (reply budget, default 120000),
+//           OPENCLAW_CANARY_MESSAGE (override the chat message sent),
+//           OPENCLAW_CANARY_EXPECT_TOOL=1 (assert a tool chip reaches a terminal status).
 import { randomUUID } from "node:crypto";
 
 import { createOpenClawClient } from "../src/adapters/openclaw/client.ts";
@@ -27,6 +29,9 @@ if (!url || !token) {
 
 const agentId = process.env.OPENCLAW_CANARY_AGENT_ID;
 const replyTimeoutMs = Number(process.env.OPENCLAW_CANARY_TIMEOUT_MS ?? 120000);
+const message =
+  process.env.OPENCLAW_CANARY_MESSAGE ?? "Reply with exactly the word PONG and nothing else.";
+const expectTool = process.env.OPENCLAW_CANARY_EXPECT_TOOL === "1";
 
 function fail(message) {
   console.error(`FAIL: ${message}`);
@@ -59,6 +64,7 @@ try {
   let text = "";
   let done = false;
   let errored;
+  const toolSnapshots = [];
   client.subscribeSession(sessionKey, {
     onDelta: (snapshot) => {
       text = snapshot;
@@ -69,11 +75,14 @@ try {
     onError: (message) => {
       errored = message;
     },
+    onToolCalls: (toolCalls) => {
+      toolSnapshots.push(toolCalls);
+    },
   });
 
   await client.request("chat.send", {
     sessionKey,
-    message: "Reply with exactly the word PONG and nothing else.",
+    message,
     idempotencyKey: randomUUID(),
   });
   console.log("OK: chat.send accepted; awaiting streamed reply...");
@@ -83,6 +92,17 @@ try {
   if (text.trim().length === 0) fail("the streamed reply was empty");
 
   console.log(`PASS: non-empty streamed reply (${text.length} chars): ${JSON.stringify(text.slice(0, 200))}`);
+
+  if (expectTool) {
+    const sawRunning = toolSnapshots.some((calls) => calls.some((c) => c.status === "running"));
+    const lastSnapshot = toolSnapshots[toolSnapshots.length - 1] ?? [];
+    const terminal = lastSnapshot.filter((c) => c.status === "ok" || c.status === "error");
+    if (!sawRunning || terminal.length === 0) {
+      fail(`expected a tool chip to reach a terminal status (snapshots: ${toolSnapshots.length})`);
+    }
+    console.log(`OK: tool chips observed (${toolSnapshots.length} snapshots, ${terminal.length} terminal).`);
+  }
+
   await client.close();
   process.exit(0);
 } catch (err) {

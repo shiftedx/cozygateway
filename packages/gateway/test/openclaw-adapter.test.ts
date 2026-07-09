@@ -3,7 +3,12 @@ import type { RichBlock } from "cozygateway-contract";
 
 import { createOpenClawAdapter, DEFAULT_TURN_TIMEOUT_SECONDS } from "../src/adapters/openclaw/adapter.ts";
 import type { TurnHandlers } from "../src/adapters/types.ts";
-import type { ClientState, OpenClawClient, SessionHandlers } from "../src/adapters/openclaw/client.ts";
+import type {
+  ClientState,
+  OpenClawClient,
+  SessionHandlers,
+  SessionToolCall,
+} from "../src/adapters/openclaw/client.ts";
 import type { ServerFrame } from "../src/adapters/openclaw/protocol.ts";
 
 /** A plain-object fake implementing the full `OpenClawClient` interface, with test-only helper
@@ -76,6 +81,10 @@ class FakeOpenClawClient implements OpenClawClient {
     this.subscriptions.get(sessionKey)?.onError(message);
   }
 
+  emitToolCalls(sessionKey: string, toolCalls: SessionToolCall[]): void {
+    this.subscriptions.get(sessionKey)?.onToolCalls(toolCalls);
+  }
+
   isSubscribed(sessionKey: string): boolean {
     return this.subscriptions.has(sessionKey);
   }
@@ -113,8 +122,9 @@ describe("createOpenClawAdapter", () => {
     expect(adapter.presence()).toBe("absent");
   });
 
-  // (a) a full turn yields throttled rich drafts then one commit+done, drafts carry toolCalls: [].
-  it("streams throttled drafts then commits, with toolCalls always empty, flushing the pending draft before commit", async () => {
+  // (a) a full turn yields throttled rich drafts then one commit+done; drafts carry the current
+  // chip snapshot, empty here because no tools ran.
+  it("streams throttled drafts then commits, with drafts carrying the current chip snapshot (empty when no tools ran), flushing the pending draft before commit", async () => {
     vi.useFakeTimers();
     try {
       const client = new FakeOpenClawClient();
@@ -285,5 +295,70 @@ describe("createOpenClawAdapter", () => {
 
   it("uses DEFAULT_TURN_TIMEOUT_SECONDS as 600", () => {
     expect(DEFAULT_TURN_TIMEOUT_SECONDS).toBe(600);
+  });
+});
+
+describe("tool chips on drafts", () => {
+  it("drafts carry the latest chip snapshot, a chip-only transition still flushes, and the commit carries none", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeOpenClawClient();
+      const adapter = createOpenClawAdapter({ agentId: "a1", client, turnTimeoutMs: 60_000 });
+      const session = await adapter.startSession("thread-1");
+      const { handlers, observed } = observer();
+
+      const turn = session.send([{ type: "paragraph", text: "go" }], handlers);
+      const sessionKey = client.sessionKeys[0]!;
+
+      client.emitDelta(sessionKey, "working");
+      client.emitToolCalls(sessionKey, [{ id: "t1", name: "read", status: "running" }]);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(observed.drafts).toHaveLength(1);
+      expect(observed.drafts[0]!.toolCalls).toEqual([{ id: "t1", name: "read", status: "running" }]);
+
+      // Chip-only transition, no new text: must still produce a fresh draft.
+      client.emitToolCalls(sessionKey, [{ id: "t1", name: "read", status: "ok" }]);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(observed.drafts).toHaveLength(2);
+      expect(observed.drafts[1]!.toolCalls).toEqual([{ id: "t1", name: "read", status: "ok" }]);
+
+      // Text-only repeat of the same chips: dedupe still applies to unchanged text+chips.
+      await vi.advanceTimersByTimeAsync(300);
+      expect(observed.drafts).toHaveLength(2);
+
+      client.emitDelta(sessionKey, "working done");
+      client.emitDone(sessionKey);
+      await turn;
+      // The pre-commit flush carries the final text and the final chip states.
+      const last = observed.drafts[observed.drafts.length - 1]!;
+      expect(last.toolCalls).toEqual([{ id: "t1", name: "read", status: "ok" }]);
+      // Commit is blocks-only (contract: chips are draft-scoped and die at commit).
+      expect(observed.commits).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores tool snapshots after the turn settled", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeOpenClawClient();
+      const adapter = createOpenClawAdapter({ agentId: "a1", client, turnTimeoutMs: 60_000 });
+      const session = await adapter.startSession("thread-1");
+      const { handlers, observed } = observer();
+
+      const turn = session.send([{ type: "paragraph", text: "go" }], handlers);
+      const sessionKey = client.sessionKeys[0]!;
+      client.emitDelta(sessionKey, "hi");
+      client.emitDone(sessionKey);
+      await turn;
+
+      const draftsAfterCommit = observed.drafts.length;
+      client.emitToolCalls(sessionKey, [{ id: "late", name: "read", status: "running" }]);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(observed.drafts).toHaveLength(draftsAfterCommit);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -118,3 +118,16 @@ the recorded event names as the starting evidence.
 
 Raw capture (hello-ok, sessions.create, streamed `chat` deltas + final) and the parity
 vector generator output were recorded during the live study on 2026-07-09.
+
+## Addendum (2026-07-09): tool events as actually observed
+
+The tool-chips live study (docs/specs/2026-07-09-openclaw-tool-chips-design.md) corrected
+section (e)'s hypothesis. Across real tool-using turns against the same gateway version:
+
+- Tool activity rides `event:"agent"` with `stream:"item"` and `data.kind:"tool"`, as a
+  start/end pair keyed by `data.toolCallId` (`phase:"start"` with `status:"running"`, then
+  `phase:"end"` with `status:"completed"`, or `status:"failed"` plus an `error` string).
+- `stream:"tool"` was never observed. `session.tool` remains advertised in
+  `hello-ok.features.events` but never fired; neither is parsed by the adapter.
+- The item's `title`, `meta`, and `error` strings carry argument-derived content (file names,
+  full host paths) and are never forwarded to chips.

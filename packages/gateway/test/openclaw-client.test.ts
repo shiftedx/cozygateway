@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createOpenClawClient, computeReconnectDelay, type OpenClawClient } from "../src/adapters/openclaw/client.ts";
+import {
+  createOpenClawClient,
+  computeReconnectDelay,
+  type OpenClawClient,
+  type SessionToolCall,
+} from "../src/adapters/openclaw/client.ts";
 import { generateDeviceIdentity } from "../src/adapters/openclaw/device-auth.ts";
 import type { ServerFrame } from "../src/adapters/openclaw/protocol.ts";
 import { startFakeOpenClawServer, type FakeOpenClawServer } from "./support/fake-openclaw-server.ts";
@@ -349,11 +354,17 @@ describe("subscribeSession: per-session delta filtering", () => {
 
     const aDeltas: string[] = [];
     const bDeltas: string[] = [];
-    c.subscribeSession("session-a", { onDelta: (s) => aDeltas.push(s), onDone: () => {}, onError: () => {} });
+    c.subscribeSession("session-a", {
+      onDelta: (s) => aDeltas.push(s),
+      onDone: () => {},
+      onError: () => {},
+      onToolCalls: () => {},
+    });
     const unsubscribeB = c.subscribeSession("session-b", {
       onDelta: (s) => bDeltas.push(s),
       onDone: () => {},
       onError: () => {},
+      onToolCalls: () => {},
     });
 
     server.sendEvent(deltaFrame({ sessionKey: "session-a", deltaText: "Hello" }));
@@ -384,7 +395,12 @@ describe("subscribeSession: accumulateDelta replace/append semantics", () => {
     await until(() => c.state() === "online");
 
     const snapshots: string[] = [];
-    c.subscribeSession("s1", { onDelta: (s) => snapshots.push(s), onDone: () => {}, onError: () => {} });
+    c.subscribeSession("s1", {
+      onDelta: (s) => snapshots.push(s),
+      onDone: () => {},
+      onError: () => {},
+      onToolCalls: () => {},
+    });
 
     server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Hello" })); // absent -> append
     server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: " World", replace: false })); // false -> append
@@ -403,7 +419,12 @@ describe("subscribeSession: the cumulative message struct is ignored for text", 
     await until(() => c.state() === "online");
 
     const snapshots: string[] = [];
-    c.subscribeSession("s1", { onDelta: (s) => snapshots.push(s), onDone: () => {}, onError: () => {} });
+    c.subscribeSession("s1", {
+      onDelta: (s) => snapshots.push(s),
+      onDone: () => {},
+      onError: () => {},
+      onToolCalls: () => {},
+    });
 
     // Each event carries the cumulative assistant message as an OBJECT (as the real wire does);
     // the running text must come from deltaText alone, never from the message struct.
@@ -442,6 +463,7 @@ describe("subscribeSession: reply-end fires onDone exactly once", () => {
         doneCount += 1;
       },
       onError: () => {},
+      onToolCalls: () => {},
     });
 
     server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Hi", done: true }));
@@ -471,6 +493,7 @@ describe("subscribeSession: reply-end fires onDone exactly once", () => {
         doneCount += 1;
       },
       onError: (message) => errors.push(message),
+      onToolCalls: () => {},
     });
 
     // Partial text streamed, then the turn ERRORS (or is aborted) mid-reply.
@@ -501,6 +524,7 @@ describe("subscribeSession: reply-end fires onDone exactly once", () => {
         finalSnapshot = snapshots.at(-1);
       },
       onError: () => {},
+      onToolCalls: () => {},
     });
 
     server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Complete answer" }));
@@ -520,10 +544,158 @@ describe("subscribeSession: onError on disconnect before reply-end", () => {
     await until(() => c.state() === "online");
 
     const errors: string[] = [];
-    c.subscribeSession("s1", { onDelta: () => {}, onDone: () => {}, onError: (message) => errors.push(message) });
+    c.subscribeSession("s1", {
+      onDelta: () => {},
+      onDone: () => {},
+      onError: (message) => errors.push(message),
+      onToolCalls: () => {},
+    });
 
     server.dropAll();
     await until(() => errors.length >= 1);
     expect(errors[0]).not.toContain(TOKEN);
+  });
+});
+
+/** Agent tool item frame in the live-pinned wire shape (see protocol tests / the design spec). */
+function toolFrame(input: {
+  sessionKey: string;
+  toolCallId: string;
+  name?: string;
+  phase: "start" | "end";
+  failed?: boolean;
+}): Record<string, unknown> {
+  return {
+    type: "event",
+    event: "agent",
+    payload: {
+      sessionKey: input.sessionKey,
+      stream: "item",
+      data: {
+        itemId: `tool:${input.toolCallId}`,
+        kind: "tool",
+        phase: input.phase,
+        toolCallId: input.toolCallId,
+        name: input.name ?? "read",
+        status: input.phase === "start" ? "running" : input.failed ? "failed" : "completed",
+        ...(input.failed ? { error: "ENOENT: secret-path" } : {}),
+      },
+    },
+  };
+}
+
+describe("subscribeSession: tool call snapshots", () => {
+  it("folds start/end pairs into running -> ok chips, and failed ends into error chips", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: SessionToolCall[][] = [];
+    c.subscribeSession("s1", {
+      onDelta: () => {},
+      onDone: () => {},
+      onError: () => {},
+      onToolCalls: (calls) => snapshots.push(calls),
+    });
+
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "t1", phase: "start" }));
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "t1", phase: "end" }));
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "t2", name: "exec", phase: "start" }));
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "t2", phase: "end", failed: true }));
+
+    await until(() => snapshots.length >= 4);
+    expect(snapshots[0]).toEqual([{ id: "t1", name: "read", status: "running" }]);
+    expect(snapshots[1]).toEqual([{ id: "t1", name: "read", status: "ok" }]);
+    expect(snapshots[2]).toEqual([
+      { id: "t1", name: "read", status: "ok" },
+      { id: "t2", name: "exec", status: "running" },
+    ]);
+    expect(snapshots[3]).toEqual([
+      { id: "t1", name: "read", status: "ok" },
+      { id: "t2", name: "exec", status: "error" },
+    ]);
+  });
+
+  it("keeps insertion order stable and each snapshot a fresh array", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: SessionToolCall[][] = [];
+    c.subscribeSession("s1", {
+      onDelta: () => {},
+      onDone: () => {},
+      onError: () => {},
+      onToolCalls: (calls) => snapshots.push(calls),
+    });
+
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "a", phase: "start" }));
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "b", phase: "start" }));
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "a", phase: "end" }));
+
+    await until(() => snapshots.length >= 3);
+    // "a" keeps its first-seen position after its end frame overwrites its status.
+    expect(snapshots[2]!.map((call) => call.id)).toEqual(["a", "b"]);
+    // Fresh array per callback: mutating an earlier snapshot cannot corrupt a later one.
+    expect(snapshots[0]).not.toBe(snapshots[1]);
+    expect(snapshots[0]).toEqual([{ id: "a", name: "read", status: "running" }]);
+  });
+
+  it("drops tool frames for unsubscribed sessions silently, with no content in any log line", async () => {
+    const logged: string[] = [];
+    const server = await fakeServer();
+    const c = client(server.url, { logSink: (line) => logged.push(line) });
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: SessionToolCall[][] = [];
+    c.subscribeSession("mine", {
+      onDelta: () => {},
+      onDone: () => {},
+      onError: () => {},
+      onToolCalls: (calls) => snapshots.push(calls),
+    });
+
+    server.sendEvent(toolFrame({ sessionKey: "theirs", toolCallId: "foreign-tool", phase: "start" }));
+    server.sendEvent(toolFrame({ sessionKey: "mine", toolCallId: "t1", phase: "start" }));
+
+    await until(() => snapshots.length >= 1);
+    expect(snapshots[0]).toEqual([{ id: "t1", name: "read", status: "running" }]);
+    // The foreign frame's content must appear nowhere in the log (silent drop; the chat drop
+    // line already flags foreign traffic, and agent frames are several-per-turn noise).
+    const allLogs = logged.join("\n");
+    expect(allLogs).not.toContain("foreign-tool");
+    expect(allLogs).not.toContain("theirs");
+  });
+
+  it("ignores tool frames after the reply ended and non-tool agent streams entirely", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: SessionToolCall[][] = [];
+    let done = false;
+    c.subscribeSession("s1", {
+      onDelta: () => {},
+      onDone: () => {
+        done = true;
+      },
+      onError: () => {},
+      onToolCalls: (calls) => snapshots.push(calls),
+    });
+
+    server.sendEvent({
+      type: "event",
+      event: "agent",
+      payload: { sessionKey: "s1", stream: "lifecycle", data: { phase: "start" } },
+    });
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "hi", done: true }));
+    await until(() => done);
+    server.sendEvent(toolFrame({ sessionKey: "s1", toolCallId: "late", phase: "start" }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(snapshots).toEqual([]);
   });
 });
