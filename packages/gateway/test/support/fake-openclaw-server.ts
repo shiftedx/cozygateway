@@ -4,7 +4,11 @@ import { randomUUID, verify } from "node:crypto";
 
 import { WebSocketServer, WebSocket } from "ws";
 
-import { buildAuthPayloadV3, importDevicePublicKey } from "../../src/adapters/openclaw/device-auth.ts";
+import {
+  buildAuthPayloadV3,
+  decodeSignature,
+  importDevicePublicKey,
+} from "../../src/adapters/openclaw/device-auth.ts";
 import { PROTOCOL_VERSION } from "../../src/adapters/openclaw/protocol.ts";
 
 /** In-process fake OpenClaw v4 gateway server for `OpenClawClient` tests. Speaks the recorded
@@ -159,8 +163,13 @@ export async function startFakeOpenClawServer(
 
         const role = typeof params["role"] === "string" ? (params["role"] as string) : "operator";
         const scopes = Array.isArray(params["scopes"]) ? (params["scopes"] as string[]) : [];
-        const client = params["client"] as { platform?: string } | undefined;
+        const client = params["client"] as
+          | { id?: string; mode?: string; platform?: string; deviceFamily?: string }
+          | undefined;
+        const clientId = client?.id ?? "gateway-client";
+        const clientMode = client?.mode ?? "backend";
         const platform = client?.platform ?? "server";
+        const deviceFamily = client?.deviceFamily ?? "server";
 
         if (cfg.forceBadSignature) {
           // Deterministic auth rejection WITHOUT closing the socket, regardless of whether the
@@ -178,21 +187,27 @@ export async function startFakeOpenClawServer(
           return;
         }
 
-        const expectedPayload = buildAuthPayloadV3({
-          identity: { id: device.id, publicKey: device.publicKey, privateKey: "" },
-          nonce: device.nonce,
-          token,
-          role,
-          scopes,
-          platform,
-        });
+        const expectedPayload = buildAuthPayloadV3(
+          {
+            identity: { id: device.id, publicKey: device.publicKey, privateKey: "" },
+            nonce: device.nonce,
+            token,
+            role,
+            scopes,
+            clientId,
+            clientMode,
+            platform,
+            deviceFamily,
+          },
+          device.signedAt,
+        );
         let verified = false;
         try {
           verified = verify(
             null,
             Buffer.from(expectedPayload),
             importDevicePublicKey(device.publicKey),
-            Buffer.from(device.signature, "base64"),
+            decodeSignature(device.signature),
           );
         } catch {
           verified = false;
@@ -218,7 +233,7 @@ export async function startFakeOpenClawServer(
               type: "hello-ok",
               protocol: cfg.protocolVersion,
               server: { version: "fake-1.0", connId: randomUUID() },
-              features: { methods: ["chat.send", "sessions.create"], events: ["tick", "chat.delta"] },
+              features: { methods: ["chat.send", "sessions.create"], events: ["tick", "chat"] },
               auth: { role, scopes },
               policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: cfg.tickIntervalMs },
             },
@@ -229,9 +244,11 @@ export async function startFakeOpenClawServer(
       }
 
       if (frame.method === "sessions.create") {
+        // PINNED (Task 8): sessions.create returns the session key under `key`; that same value is
+        // what chat/agent events carry as `sessionKey` and what chat.send takes as params.sessionKey.
         const sessionKey = randomUUID();
         sessionKeys.push(sessionKey);
-        ws.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { sessionKey } }));
+        ws.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { key: sessionKey } }));
         return;
       }
 

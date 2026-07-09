@@ -36,6 +36,11 @@ export interface StartGatewayOptions {
    *  an unroutable relay and want to observe or silence the resulting failure log instead of
    *  it reaching real stderr (design decision, issue #10). */
   notifierLog?: (message: string) => void;
+  /** Overrides the sink for the OpenClaw backend's startup root-token caveat (one line per
+   *  configured openclaw agent). Defaults to stderr. The line NEVER contains the token value,
+   *  only the env var NAME it rides. Exists so tests can assert the caveat text (and the token's
+   *  absence from it) without scraping real stderr. */
+  openclawLog?: (message: string) => void;
 }
 
 export async function startGateway(
@@ -71,8 +76,15 @@ export async function startGateway(
   // placement for attach: a misconfigured openclaw agent (missing/invalid options, unset token
   // env) throws here, before any client dials out or the port is bound.
   const openclawAgents = config.agents.filter((a) => a.backend === "openclaw");
+  const openclawLog = options.openclawLog ?? ((message: string) => void process.stderr.write(`${message}\n`));
   for (const agent of openclawAgents) {
-    parseOpenClawOptions(agent, process.env);
+    const parsed = parseOpenClawOptions(agent, process.env);
+    // Root-token caveat: an OpenClaw operator token is ROOT on the target gateway. Name the agent,
+    // the target, and the env var the token rides -- but never the token value itself.
+    openclawLog(
+      `[openclaw] agent "${agent.id}": connecting as OPERATOR to ${parsed.url}. ` +
+        `The operator token is ROOT on the target OpenClaw gateway; it rides env "${agent.options?.["tokenEnv"] as string}" and is never logged.`,
+    );
   }
   const openclawClients = new Map<string, OpenClawClient>();
 

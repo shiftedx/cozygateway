@@ -6,7 +6,7 @@ import {
   ConnectChallengeEventSchema,
   HelloOkResponseSchema,
   ResponseFrameSchema,
-  ChatDeltaEventSchema,
+  ChatEventSchema,
   TickEventSchema,
   parseServerFrame,
   buildConnectRequest,
@@ -52,27 +52,47 @@ describe("parseServerFrame", () => {
     }
   });
 
-  it("parses a chat delta event carrying deltaText, cumulative message, and replace", () => {
+  it("parses a chat delta event carrying sessionKey, state, deltaText, and replace", () => {
     const frame = parseServerFrame({
       type: "event",
-      event: "chat.delta",
-      payload: { deltaText: "ello", message: "Hello", replace: false },
+      event: "chat",
+      payload: {
+        sessionKey: "s1",
+        state: "delta",
+        deltaText: "ello",
+        replace: false,
+        message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+      },
     });
-    expect(frame?.kind).toBe("delta");
-    if (frame?.kind === "delta") {
+    expect(frame?.kind).toBe("chat");
+    if (frame?.kind === "chat") {
+      expect(frame.payload.sessionKey).toBe("s1");
+      expect(frame.payload.state).toBe("delta");
       expect(frame.payload.deltaText).toBe("ello");
-      expect(frame.payload.message).toBe("Hello");
       expect(frame.payload.replace).toBe(false);
     }
   });
 
-  it("tolerates a chat delta event without the optional replace field", () => {
+  it("parses a terminal (final) chat event as the reply-end marker", () => {
     const frame = parseServerFrame({
       type: "event",
-      event: "chat.delta",
-      payload: { deltaText: "hi", message: "hi" },
+      event: "chat",
+      payload: { sessionKey: "s1", state: "final", stopReason: "stop" },
     });
-    expect(frame?.kind).toBe("delta");
+    expect(frame?.kind).toBe("chat");
+    if (frame?.kind === "chat") {
+      expect(frame.payload.state).toBe("final");
+      expect(frame.payload.deltaText).toBeUndefined();
+    }
+  });
+
+  it("rejects a chat event with an unknown state", () => {
+    const frame = parseServerFrame({
+      type: "event",
+      event: "chat",
+      payload: { sessionKey: "s1", state: "bogus" },
+    });
+    expect(frame).toBeUndefined();
   });
 
   it("parses a tick event", () => {
@@ -135,10 +155,10 @@ describe("parseServerFrame", () => {
 
     const delta = parseServerFrame({
       type: "event",
-      event: "chat.delta",
-      payload: { deltaText: "a", message: "a", replace: true, extra: "y" },
+      event: "chat",
+      payload: { sessionKey: "s1", state: "delta", deltaText: "a", replace: true, extra: "y" },
     });
-    expect(delta?.kind).toBe("delta");
+    expect(delta?.kind).toBe("chat");
   });
 
   it("returns undefined for a frame with an unknown type", () => {
@@ -193,14 +213,18 @@ describe("schema guards directly", () => {
     expect(check(ResponseFrameSchema, { type: "res", id: "1", ok: false })).toBe(false);
   });
 
-  it("check() accepts ChatDeltaEvent and TickEvent shapes", () => {
+  it("check() accepts ChatEvent and TickEvent shapes", () => {
     expect(
-      check(ChatDeltaEventSchema, {
+      check(ChatEventSchema, {
         type: "event",
-        event: "chat.delta",
-        payload: { deltaText: "a", message: "a" },
+        event: "chat",
+        payload: { sessionKey: "s1", state: "delta", deltaText: "a" },
       }),
     ).toBe(true);
+    // A non-"chat" event name is not a ChatEvent.
+    expect(
+      check(ChatEventSchema, { type: "event", event: "agent", payload: { sessionKey: "s1", state: "delta" } }),
+    ).toBe(false);
     expect(check(TickEventSchema, { type: "event", event: "tick" })).toBe(true);
     expect(check(TickEventSchema, { type: "event", event: "not-tick" })).toBe(false);
   });
@@ -228,6 +252,12 @@ describe("outbound request builders", () => {
     expect(req.params.role).toBe("operator");
     expect(req.params.device?.nonce).toBe("n1");
     expect(req.params.device?.id).toBe("device-1");
+    // The client block presents a valid client identity whose fields the signature covers; mode is
+    // a real client mode ("backend"), distinct from the connection role ("operator").
+    expect(req.params.client.id).toBe("gateway-client");
+    expect(req.params.client.mode).toBe("backend");
+    expect(req.params.client.platform).toBe("server");
+    expect(req.params.client.deviceFamily).toBe("server");
   });
 
   it("buildConnectRequest omits device when not supplied (token-only connect attempt)", () => {

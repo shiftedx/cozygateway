@@ -83,6 +83,43 @@ not expose itself on your network by itself.
 | `dbPath` | string | `cozygateway.db` | SQLite file path (or `:memory:` for ephemeral runs). |
 | `agents` | array | required, at least one | Agents this gateway exposes, each with `id`, `name`, an optional `avatar`, a `backend`, and adapter-specific `options`. |
 
+## Backends
+
+Each agent names a `backend`. Alongside the built-in backends, cozygateway works with OpenClaw:
+a `backend: "openclaw"` agent dials OUT to a running OpenClaw gateway (WebSocket protocol v4,
+operator role) and relays a turn's streamed reply back over the cozygateway contract.
+
+```json5
+{
+  id: "sage",
+  name: "Sage",
+  backend: "openclaw",
+  options: {
+    url: "wss://host:port",        // the OpenClaw gateway's WebSocket URL
+    tokenEnv: "OPENCLAW_TOKEN",    // NAME of the env var holding the operator token
+    turnTimeoutSeconds: 600,        // optional, default 600
+    protocolVersion: 4,             // optional, default 4
+  },
+}
+```
+
+**Root-token caveat.** An OpenClaw operator token is ROOT on the target OpenClaw gateway: it can
+read and drive every session on it. cozygateway therefore takes the token by the NAME of an
+environment variable (`tokenEnv`), never inline in the config file, fails closed at startup if
+that variable is unset, logs a one-line caveat naming the agent and env var (never the token
+value) when it constructs the client, and never writes the token to any log or error. Treat the
+env var as a root secret.
+
+The connection authenticates with a per-run Ed25519 device key answering the gateway's
+`connect.challenge` (device-auth v3); a fresh operator device is accepted with the gateway token
+and needs no pairing step. Streamed assistant text is relayed as rich blocks. Tool-call chips are
+not yet surfaced for OpenClaw threads (turns are text-only for now).
+
+The exact OpenClaw wire facts this backend depends on were pinned by a live study against a real
+gateway; see `docs/specs/2026-07-08-openclaw-wire-study.md`. A non-gating live canary
+(`packages/gateway/scripts/openclaw-canary.mjs`, run when `OPENCLAW_CANARY_URL` and the token env
+are set) dials a real gateway and asserts a non-empty streamed reply.
+
 ## Commands
 
 - `cozygateway serve --config <path>`: start the gateway and run until interrupted.

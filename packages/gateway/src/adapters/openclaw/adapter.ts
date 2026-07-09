@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { PresenceState, RichBlock } from "cozygateway-contract";
 
 import { normalizeMarkdownToBlocks } from "../../markdown-blocks.ts";
@@ -25,18 +27,18 @@ export interface OpenClawAdapterDeps {
   draftFlushMs?: number;
 }
 
-/** ASSUMPTION (Task 8 to verify, matching the same stance as client.ts's sessionKeyOf): the
- *  verified wire facts confirm `sessions.create` returns a `sessionKey` but not its exact response
- *  envelope shape beyond that (see `OkResponseSchema` in protocol.ts, which deliberately leaves the
- *  payload an open record for exactly this reason), so this reads `sessionKey` off the resolved
- *  payload as an open/unknown field rather than asserting a wider shape on a guess. */
+/** PINNED (Task 8, docs/specs/2026-07-08-openclaw-wire-study.md): `sessions.create` returns the
+ *  session key under `key` (e.g. `{ ok:true, key:"agent:main:dashboard:...", sessionId, ... }`).
+ *  That same value is what the `chat`/`agent` events carry as `sessionKey` and what `chat.send`
+ *  takes as `params.sessionKey`. We read `key`, tolerating a `sessionKey` alias since the response
+ *  envelope stays an open record (see `OkResponseSchema` in protocol.ts). */
 function sessionKeyFromCreateResponse(payload: unknown): string {
   const record = payload as Record<string, unknown> | null | undefined;
-  const sessionKey = record?.["sessionKey"];
-  if (typeof sessionKey !== "string" || sessionKey.length === 0) {
-    throw new Error("openclaw sessions.create response did not include a sessionKey");
+  const key = record?.["key"] ?? record?.["sessionKey"];
+  if (typeof key !== "string" || key.length === 0) {
+    throw new Error("openclaw sessions.create response did not include a session key");
   }
-  return sessionKey;
+  return key;
 }
 
 /** One OpenClaw agent's BackendAdapter. Sessions are per thread (lazily created once, then
@@ -158,8 +160,15 @@ export function createOpenClawAdapter(deps: OpenClawAdapterDeps): BackendAdapter
               },
             });
 
+            // PINNED (Task 8): chat.send takes `sessionKey`, `message`, and a required
+            // `idempotencyKey`; it returns `{runId, status:"started"}` and the reply streams as
+            // `chat` events on the session subscription above.
             deps.client
-              .request("chat.send", { sessionKey, text: blocksToText(blocks) })
+              .request("chat.send", {
+                sessionKey,
+                message: blocksToText(blocks),
+                idempotencyKey: randomUUID(),
+              })
               .catch(() => {
                 failTurn("the openclaw connection dropped mid-turn");
               });

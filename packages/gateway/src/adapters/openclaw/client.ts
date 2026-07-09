@@ -7,7 +7,7 @@ import {
   TICK_TIMEOUT_CLOSE_CODE,
   buildConnectRequest,
   parseServerFrame,
-  type ChatDeltaEvent,
+  type ChatEvent,
   type ServerFrame,
 } from "./protocol.ts";
 import { signChallenge, type DeviceIdentity } from "./device-auth.ts";
@@ -21,43 +21,47 @@ import { signChallenge, type DeviceIdentity } from "./device-auth.ts";
  *  goes through `opts.logSink` (default `process.stderr.write`) with a short, hand-written
  *  description, never a serialized frame or raw error from the wire. */
 
-/** These three values MUST match what `buildConnectRequest` (protocol.ts) embeds in the signed
- *  connect request's `params`, since the server (and this client) reconstruct the same
- *  device-auth payload (`buildAuthPayloadV3`, device-auth.ts) from those exact fields to verify
- *  the signature. `buildConnectRequest` hardcodes role "operator" and these two scopes, and
- *  defaults `client.platform` to "server" when unset (as it always is here, since
- *  `OpenClawClientOptions` carries no platform override). */
+/** These values MUST match what `buildConnectRequest` (protocol.ts) embeds in the signed connect
+ *  request's `params`, since the server (and this client) reconstruct the same device-auth payload
+ *  (`buildAuthPayloadV3`, device-auth.ts) from `client.id`/`client.mode`/`role`/`scopes`/
+ *  `client.platform`/`client.deviceFamily` to verify the signature. `buildConnectRequest` defaults
+ *  these same values, so the two sites agree by construction. `CLIENT_MODE` is a real OpenClaw
+ *  client mode ("backend"), distinct from the connection `role` ("operator"). */
 const OPERATOR_ROLE = "operator";
 const OPERATOR_SCOPES = ["operator.read", "operator.write"];
+const CLIENT_ID = "gateway-client";
+const CLIENT_MODE = "backend";
 const CLIENT_PLATFORM = "server";
+const DEVICE_FAMILY = "server";
 
-// ASSUMPTION (Task 8 to verify): the verified wire facts pin `deltaText`/`message`/`replace` on
-// the delta payload (see `ChatDeltaEventSchema` in protocol.ts) but not a session-identifying
-// field name, so this reads `sessionKey` (matching the outbound `chat.send` request's own
-// `params.sessionKey`) off the event payload as an open/unknown field rather than widening the
-// pinned schema on a guess. If the live study pins a different field name (e.g. `session` or
-// `conversationId`), this is the single site to update.
-function sessionKeyOf(event: ChatDeltaEvent): string | undefined {
-  const payload = event.payload as unknown as Record<string, unknown>;
-  return typeof payload["sessionKey"] === "string" ? (payload["sessionKey"] as string) : undefined;
+/** The session-identifying field on a `chat` event. PINNED (Task 8): every `chat`/`agent` event
+ *  carries `sessionKey`; this matches the outbound `chat.send.params.sessionKey`. */
+function sessionKeyOf(event: ChatEvent): string | undefined {
+  return typeof event.payload.sessionKey === "string" ? event.payload.sessionKey : undefined;
 }
 
-// ASSUMPTION (Task 8 to verify): a streamed reply ends when an event for the
-// session carries a terminal marker (e.g. payload.done === true or a distinct
-// "chat.final"/state value). Until verified, treat the first event bearing this
-// marker as end-of-turn; the fake server sends the same shape the study records.
-function isReplyEnd(event: ChatDeltaEvent): boolean {
-  const payload = event.payload as unknown as Record<string, unknown>;
-  return payload["done"] === true;
+/** A streamed reply ends when a `chat` event's `state` is terminal. PINNED (Task 8): `delta`
+ *  streams the turn; `final` (also `error`/`aborted`) ends it. There is no `payload.done` flag. */
+function isReplyEnd(event: ChatEvent): boolean {
+  return event.payload.state === "final" || event.payload.state === "error" || event.payload.state === "aborted";
 }
 
-/** `replace ? deltaText : prev + deltaText`, except the server's own cumulative `message`
- *  snapshot wins outright when present: an empty string means "no cumulative snapshot on this
- *  event" (the field is required by `ChatDeltaEventSchema` but may be sent empty), anything else
- *  is treated as authoritative and returned as-is, bypassing local accumulation entirely. */
-function accumulateDelta(prev: string, event: ChatDeltaEvent): string {
-  if (event.payload.message.length > 0) return event.payload.message;
-  return event.payload.replace === true ? event.payload.deltaText : prev + event.payload.deltaText;
+/** Running assistant text from `deltaText` alone. PINNED (Task 8): `message` is the cumulative
+ *  assistant message STRUCT (an object), not a text snapshot, so it is never read for text here.
+ *  `replace:true` replaces the running text; otherwise the delta appends. An event with no
+ *  `deltaText` (e.g. a terminal `final`) is a strict no-op that leaves the accumulated text
+ *  unchanged, even under `replace:true` -- an empty replace must never wipe a completed reply. */
+function accumulateDelta(prev: string, event: ChatEvent): string {
+  const deltaText = event.payload.deltaText;
+  if (deltaText === undefined) return prev;
+  return event.payload.replace === true ? deltaText : prev + deltaText;
+}
+
+/** Whether a terminal `chat` state is a FAILURE (the turn did not complete normally). PINNED
+ *  (Task 8): `final` is success; `error`/`aborted` are terminal failures that must surface as an
+ *  error, not be committed as a normal reply. See `isReplyEnd`. */
+function isReplyFailure(event: ChatEvent): boolean {
+  return event.payload.state === "error" || event.payload.state === "aborted";
 }
 
 export interface SessionHandlers {
@@ -272,12 +276,19 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
           token: opts.token,
           role: OPERATOR_ROLE,
           scopes: OPERATOR_SCOPES,
+          clientId: CLIENT_ID,
+          clientMode: CLIENT_MODE,
           platform: CLIENT_PLATFORM,
+          deviceFamily: DEVICE_FAMILY,
         });
         const req = buildConnectRequest({
           id: randomUUID(),
           token: opts.token,
           nonce: signed.nonce,
+          clientId: CLIENT_ID,
+          clientMode: CLIENT_MODE,
+          platform: CLIENT_PLATFORM,
+          deviceFamily: DEVICE_FAMILY,
           device: {
             id: opts.identity.id,
             publicKey: opts.identity.publicKey,
@@ -332,7 +343,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
         for (const handler of eventHandlers) handler(frame);
         return;
       }
-      case "delta": {
+      case "chat": {
         const sessionKey = sessionKeyOf(frame);
         const sub = sessionKey === undefined ? undefined : sessionSubscriptions.get(sessionKey);
         if (sub === undefined) {
@@ -340,7 +351,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
           // privacy guard): drop before any further parsing. Deliberately no content in this log
           // line -- not even the session id -- since the guard exists precisely because this
           // connection's root token can observe other operators' session traffic.
-          log("dropped a chat delta for a session with no active subscription");
+          log("dropped a chat event for a session with no active subscription");
           return;
         }
         if (sub.done) return; // reply already ended for this session; ignore trailing deltas.
@@ -348,7 +359,11 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
         sub.handlers.onDelta(sub.snapshot);
         if (isReplyEnd(frame)) {
           sub.done = true;
-          sub.handlers.onDone();
+          // A terminal `error`/`aborted` is a FAILED turn, not a finished reply: surface it as an
+          // error so the caller never commits partial/truncated content as a normal completion.
+          // Only a `final` state commits. The state name is a controlled enum, never wire content.
+          if (isReplyFailure(frame)) sub.handlers.onError(`openclaw turn ended in state "${frame.payload.state}"`);
+          else sub.handlers.onDone();
         }
         return;
       }

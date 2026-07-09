@@ -315,26 +315,27 @@ describe("onEvent", () => {
   });
 });
 
-/** Builds a `chat.delta` wire event with the exact payload shape the client's ASSUMPTION-tagged
- *  `sessionKeyOf`/`isReplyEnd` helpers read: `sessionKey` identifies the session, `message`
- *  defaults to "" (meaning "no cumulative snapshot on this event", per `accumulateDelta`'s
- *  contract), and `done: true` is the reply-end marker. */
+/** Builds a `chat` wire event in the shape PINNED by the Task 8 live study: `sessionKey` identifies
+ *  the session, `state` is `delta` while streaming or `final` (the reply-end marker) when `done` is
+ *  set, `deltaText` is the incremental chunk, and `message` (when present) is the cumulative
+ *  assistant STRUCT (an object) that `accumulateDelta` deliberately ignores for text. */
 function deltaFrame(input: {
   sessionKey: string;
-  deltaText: string;
-  message?: string;
+  deltaText?: string;
+  messageObject?: unknown;
   replace?: boolean;
   done?: boolean;
+  state?: "delta" | "final" | "error" | "aborted";
 }): Record<string, unknown> {
   return {
     type: "event",
-    event: "chat.delta",
+    event: "chat",
     payload: {
       sessionKey: input.sessionKey,
-      deltaText: input.deltaText,
-      message: input.message ?? "",
+      state: input.state ?? (input.done ? "final" : "delta"),
+      ...(input.deltaText !== undefined ? { deltaText: input.deltaText } : {}),
       ...(input.replace !== undefined ? { replace: input.replace } : {}),
-      ...(input.done !== undefined ? { done: input.done } : {}),
+      ...(input.messageObject !== undefined ? { message: input.messageObject } : {}),
     },
   };
 }
@@ -394,8 +395,8 @@ describe("subscribeSession: accumulateDelta replace/append semantics", () => {
   });
 });
 
-describe("subscribeSession: cumulative message wins over local accumulation", () => {
-  it("uses the server's cumulative message snapshot when present, agreeing with it exactly", async () => {
+describe("subscribeSession: the cumulative message struct is ignored for text", () => {
+  it("accumulates from deltaText and never reads the message object as text", async () => {
     const server = await fakeServer();
     const c = client(server.url);
     c.start();
@@ -404,12 +405,25 @@ describe("subscribeSession: cumulative message wins over local accumulation", ()
     const snapshots: string[] = [];
     c.subscribeSession("s1", { onDelta: (s) => snapshots.push(s), onDone: () => {}, onError: () => {} });
 
+    // Each event carries the cumulative assistant message as an OBJECT (as the real wire does);
+    // the running text must come from deltaText alone, never from the message struct.
     server.sendEvent(
-      deltaFrame({ sessionKey: "s1", deltaText: "ignored-local-delta", message: "authoritative snapshot" }),
+      deltaFrame({
+        sessionKey: "s1",
+        deltaText: "Hel",
+        messageObject: { role: "assistant", content: [{ type: "text", text: "Hel" }] },
+      }),
+    );
+    server.sendEvent(
+      deltaFrame({
+        sessionKey: "s1",
+        deltaText: "lo",
+        messageObject: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+      }),
     );
 
-    await until(() => snapshots.length >= 1);
-    expect(snapshots[0]).toBe("authoritative snapshot");
+    await until(() => snapshots.length >= 2);
+    expect(snapshots).toEqual(["Hel", "Hello"]);
   });
 });
 
@@ -441,6 +455,60 @@ describe("subscribeSession: reply-end fires onDone exactly once", () => {
 
     expect(snapshots).toEqual(["Hi"]);
     expect(doneCount).toBe(1);
+  });
+
+  it("routes a terminal error/aborted state to onError, never onDone (no partial commit as success)", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    let doneCount = 0;
+    const errors: string[] = [];
+    c.subscribeSession("s1", {
+      onDelta: () => {},
+      onDone: () => {
+        doneCount += 1;
+      },
+      onError: (message) => errors.push(message),
+    });
+
+    // Partial text streamed, then the turn ERRORS (or is aborted) mid-reply.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "partial answer" }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", state: "error" }));
+
+    await until(() => errors.length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(doneCount).toBe(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("error");
+    // The error message names only the state, never streamed content.
+    expect(errors[0]).not.toContain("partial answer");
+  });
+
+  it("does not wipe the accumulated reply on a terminal frame with replace:true and no deltaText", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const snapshots: string[] = [];
+    let finalSnapshot: string | undefined;
+    c.subscribeSession("s1", {
+      onDelta: (s) => snapshots.push(s),
+      onDone: () => {
+        finalSnapshot = snapshots.at(-1);
+      },
+      onError: () => {},
+    });
+
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Complete answer" }));
+    // A terminal final with replace:true but NO deltaText must not reset the snapshot to empty.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", state: "final", replace: true }));
+
+    await until(() => finalSnapshot !== undefined);
+    expect(finalSnapshot).toBe("Complete answer");
   });
 });
 

@@ -26,14 +26,14 @@ async function until(predicate: () => boolean, timeoutMs = 3_000): Promise<void>
 }
 
 function deltaFrame(input: { sessionKey: string; deltaText: string; done?: boolean }): Record<string, unknown> {
+  // The Task-8-pinned `chat` event: `state` streams `delta` then a terminal `final` (reply-end).
   return {
     type: "event",
-    event: "chat.delta",
+    event: "chat",
     payload: {
       sessionKey: input.sessionKey,
+      state: input.done ? "final" : "delta",
       deltaText: input.deltaText,
-      message: "",
-      ...(input.done !== undefined ? { done: input.done } : {}),
     },
   };
 }

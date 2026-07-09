@@ -107,6 +107,32 @@ describe("openclaw wiring", () => {
     ).rejects.toThrow(new RegExp(TOKEN_ENV));
   });
 
+  it("logs a root-token caveat naming the agent and token env at startup, without the token value", async () => {
+    const secretToken = "super-secret-root-token-value";
+    process.env[TOKEN_ENV] = secretToken;
+    const url = await unreachableWsUrl();
+    const lines: string[] = [];
+    const oc = await startGateway(
+      {
+        name: "openclaw-caveat",
+        port: 0,
+        dbPath: ":memory:",
+        agents: [{ id: "oc1", name: "OC1", backend: "openclaw", options: { url, tokenEnv: TOKEN_ENV } }],
+      },
+      { openclawLog: (message) => lines.push(message) },
+    );
+    try {
+      const caveat = lines.find((l) => l.includes('agent "oc1"'));
+      expect(caveat).toBeDefined();
+      expect(caveat).toMatch(/ROOT/);
+      expect(caveat).toContain(TOKEN_ENV);
+      // The caveat names the env var, never the token value.
+      expect(lines.join("\n")).not.toContain(secretToken);
+    } finally {
+      await oc.close();
+    }
+  });
+
   it("starts with an unreachable url and reports presence as online or absent, never unknown", async () => {
     process.env[TOKEN_ENV] = "server-test-openclaw-token";
     const url = await unreachableWsUrl();

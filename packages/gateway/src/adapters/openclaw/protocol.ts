@@ -91,27 +91,37 @@ export type ErrorResponse = Static<typeof ErrorResponseSchema>;
 export const ResponseFrameSchema = Type.Union([OkResponseSchema, ErrorResponseSchema]);
 export type ResponseFrame = Static<typeof ResponseFrameSchema>;
 
-/** Streamed assistant-turn delta. `deltaText` is the incremental chunk; `message` is the
- *  cumulative snapshot so far; `replace:true` means `deltaText` REPLACES the snapshot rather
- *  than appending to it. Reply-end signaling is out of scope for this task (Task 5's concern).
- *
- *  ASSUMPTION (Task 8 to verify): the verified wire facts confirm the delta PAYLOAD shape but
- *  not the exact `event` name the server uses for it, so `event` stays an open string here and
- *  `parseServerFrame` discriminates this frame kind structurally, by the presence of a string
- *  `payload.deltaText`, rather than by asserting a specific event name. If the live study pins
- *  the name, tighten `event` to a literal then. */
-export const ChatDeltaEventSchema = Type.Object({
+/** Streamed assistant-turn event. PINNED by the Task 8 live wire study
+ *  (docs/specs/2026-07-08-openclaw-wire-study.md): the event name is literally `chat`, and a
+ *  single `chat` event carries the whole turn lifecycle discriminated by `payload.state`
+ *  (`delta` while streaming, then a terminal `final`/`error`/`aborted`). `sessionKey` is the
+ *  session-identifying field. On a `delta`, `deltaText` is the incremental chunk and `replace:true`
+ *  means it REPLACES the running text rather than appending; `message` is the cumulative assistant
+ *  message STRUCT (an object), not a text snapshot, so running text is built from `deltaText`
+ *  alone. A terminal event may omit `deltaText` and carries an optional `stopReason`. */
+export const ChatEventSchema = Type.Object({
   type: Type.Literal("event"),
-  event: Type.String(),
+  event: Type.Literal("chat"),
   payload: Type.Object({
-    deltaText: Type.String(),
-    message: Type.String(),
+    sessionKey: Type.String(),
+    state: Type.Union([
+      Type.Literal("delta"),
+      Type.Literal("final"),
+      Type.Literal("error"),
+      Type.Literal("aborted"),
+    ]),
+    runId: Type.Optional(Type.String()),
+    agentId: Type.Optional(Type.String()),
+    seq: Type.Optional(Type.Number()),
+    deltaText: Type.Optional(Type.String()),
     replace: Type.Optional(Type.Boolean()),
+    message: Type.Optional(Type.Unknown()),
+    stopReason: Type.Optional(Type.String()),
   }),
   seq: Type.Optional(Type.Number()),
   stateVersion: Type.Optional(Type.Number()),
 });
-export type ChatDeltaEvent = Static<typeof ChatDeltaEventSchema>;
+export type ChatEvent = Static<typeof ChatEventSchema>;
 
 /** Periodic keepalive event; payload shape is not pinned by the verified wire facts beyond
  *  "periodic keepalive", so it stays open. */
@@ -130,13 +140,13 @@ export type ServerFrame =
   | (HelloOkResponse & { kind: "hello-ok" })
   | (ConnectChallengeEvent & { kind: "challenge" })
   | (ResponseFrame & { kind: "response" })
-  | (ChatDeltaEvent & { kind: "delta" })
+  | (ChatEvent & { kind: "chat" })
   | (TickEvent & { kind: "tick" });
 
 /** Discriminates on `type` ("res"/"event"), then for responses on `payload.type` (hello-ok vs a
- *  generic ok/error response) and for events on `event` (connect.challenge, tick) with a
- *  structural fallback to the delta shape (see the ASSUMPTION above `ChatDeltaEventSchema`).
- *  Returns `undefined` for anything that fails every known shape, including an unknown `type`. */
+ *  generic ok/error response) and for events on the literal `event` name (connect.challenge, tick,
+ *  chat). Returns `undefined` for anything that fails every known shape, including an unknown
+ *  `type`. */
 export function parseServerFrame(raw: unknown): ServerFrame | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const envelope = raw as { type?: unknown };
@@ -150,7 +160,7 @@ export function parseServerFrame(raw: unknown): ServerFrame | undefined {
   if (envelope.type === "event") {
     if (check(ConnectChallengeEventSchema, raw)) return { ...raw, kind: "challenge" };
     if (check(TickEventSchema, raw)) return { ...raw, kind: "tick" };
-    if (check(ChatDeltaEventSchema, raw)) return { ...raw, kind: "delta" };
+    if (check(ChatEventSchema, raw)) return { ...raw, kind: "chat" };
     return undefined;
   }
 
@@ -178,9 +188,15 @@ export interface ConnectRequestInput {
    *  is supplied (a token-only connect attempt, before any challenge has been issued). */
   nonce?: string;
   device?: ConnectDeviceInput;
+  /** Connects as a valid client identity (default `gateway-client` in `backend` mode). The
+   *  signature covers `client.id`/`client.mode`/`client.platform`/`client.deviceFamily`, so these
+   *  MUST match what `signChallenge` signed (see the constants in client.ts). `mode` is a real
+   *  OpenClaw client mode (e.g. `backend`), NOT the connection `role` (`operator`). */
   clientId?: string;
+  clientMode?: string;
   clientVersion?: string;
   platform?: string;
+  deviceFamily?: string;
 }
 
 export interface ConnectRequest {
@@ -190,7 +206,7 @@ export interface ConnectRequest {
   params: {
     minProtocol: number;
     maxProtocol: number;
-    client: { id: string; version: string; platform: string; mode: "operator" };
+    client: { id: string; version: string; platform: string; deviceFamily: string; mode: string };
     role: "operator";
     scopes: string[];
     auth: { token: string };
@@ -199,7 +215,9 @@ export interface ConnectRequest {
 }
 
 /** Builds the first frame an operator client sends. Places the token at `params.auth.token`,
- *  pins `minProtocol === maxProtocol === PROTOCOL_VERSION`, and fixes `role: "operator"`. */
+ *  pins `minProtocol === maxProtocol === PROTOCOL_VERSION`, and fixes `role: "operator"`. The
+ *  `client` block presents a valid client identity (`gateway-client`/`backend` by default) whose
+ *  id/mode/platform/deviceFamily are exactly the values the device-auth signature covers. */
 export function buildConnectRequest(input: ConnectRequestInput): ConnectRequest {
   const device =
     input.device !== undefined
@@ -220,10 +238,11 @@ export function buildConnectRequest(input: ConnectRequestInput): ConnectRequest 
       minProtocol: PROTOCOL_VERSION,
       maxProtocol: PROTOCOL_VERSION,
       client: {
-        id: input.clientId ?? "cozygateway",
+        id: input.clientId ?? "gateway-client",
         version: input.clientVersion ?? "0.0.0",
         platform: input.platform ?? "server",
-        mode: "operator",
+        deviceFamily: input.deviceFamily ?? "server",
+        mode: input.clientMode ?? "backend",
       },
       role: "operator",
       scopes: ["operator.read", "operator.write"],
