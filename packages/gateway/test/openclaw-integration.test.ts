@@ -135,4 +135,66 @@ describe("real OpenClawClient + real createOpenClawAdapter against a faked serve
     // number of intermediate flushes.
     expect(observed.drafts.at(-1)?.blocks).toEqual(normalizeMarkdownToBlocks(fullText));
   });
+
+  it("surfaces tool chips end-to-end: wire agent frames -> client fold -> adapter drafts", async () => {
+    const server = await startFakeOpenClawServer();
+    servers.push(server);
+
+    const client = createOpenClawClient({
+      url: server.url,
+      token: "SECRET-INTEGRATION-TOKEN",
+      identity: generateDeviceIdentity(),
+      reconnect: { minMs: 15, maxMs: 80 },
+    });
+    clients.push(client);
+    client.start();
+    await until(() => client.state() === "online");
+
+    const adapter = createOpenClawAdapter({
+      agentId: "integration-agent",
+      client,
+      turnTimeoutMs: 5_000,
+      draftFlushMs: 20,
+    });
+    const session = await adapter.startSession("thread-1");
+    const sessionKey = server.sessionKeys()[0]!;
+
+    const { handlers, observed } = observer();
+    const turn = session.send([{ type: "paragraph", text: "use a tool" }], handlers);
+
+    function toolItemFrame(phase: "start" | "end"): Record<string, unknown> {
+      return {
+        type: "event",
+        event: "agent",
+        payload: {
+          sessionKey,
+          stream: "item",
+          data: {
+            itemId: "tool:1",
+            kind: "tool",
+            phase,
+            toolCallId: "1",
+            name: "read",
+            status: phase === "start" ? "running" : "completed",
+          },
+        },
+      };
+    }
+
+    server.sendEvent(toolItemFrame("start"));
+    // Space past draftFlushMs (20) so the running-status draft actually flushes before the end
+    // frame overwrites the chip (same trailing-timer reasoning as the full-turn test above).
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    server.sendEvent(toolItemFrame("end"));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    server.sendEvent(deltaFrame({ sessionKey, deltaText: "The answer.", done: true }));
+    await turn;
+
+    const chipDrafts = observed.drafts.filter((d) => d.toolCalls.length > 0);
+    expect(chipDrafts.length).toBeGreaterThanOrEqual(2);
+    expect(chipDrafts[0]!.toolCalls).toEqual([{ id: "1", name: "read", status: "running" }]);
+    expect(chipDrafts.at(-1)!.toolCalls).toEqual([{ id: "1", name: "read", status: "ok" }]);
+    expect(observed.commits).toHaveLength(1);
+    expect(observed.done).toBe(1);
+  });
 });
