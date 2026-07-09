@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { once } from "node:events";
 
 import { WebSocket } from "ws";
@@ -62,5 +63,107 @@ describe("startGateway end to end", () => {
     const commits = seen.filter((f) => f.type === "committed");
     expect(commits.map((f) => (f.type === "committed" ? f.message.role : ""))).toEqual(["user", "agent"]);
     ws.close();
+  });
+});
+
+/** A `ws://` URL guaranteed to refuse connections: binds an ephemeral TCP server, reads its
+ *  port, then closes it immediately so nothing is listening there when the openclaw client
+ *  dials out. Deterministic and fast (an immediate ECONNREFUSED), unlike guessing at an
+ *  unassigned port a test environment could coincidentally have something else listening on.
+ *  The openclaw client's own reconnect loop never has to reach a live handshake for this test:
+ *  it only needs to observe that startup succeeds and presence settles to something other than
+ *  "unknown" (see `createOpenClawAdapter.presence`, which reports "absent" for any non-"online"
+ *  client state, including "connecting"). */
+async function unreachableWsUrl(): Promise<string> {
+  const probe = createServer();
+  probe.listen(0, "127.0.0.1");
+  await once(probe, "listening");
+  const addr = probe.address();
+  if (addr === null || typeof addr !== "object") throw new Error("no probe address");
+  const port = addr.port;
+  await new Promise<void>((resolve, reject) => probe.close((err) => (err ? reject(err) : resolve())));
+  return `ws://127.0.0.1:${port}`;
+}
+
+describe("openclaw wiring", () => {
+  const TOKEN_ENV = "SERVER_TEST_OPENCLAW_TOKEN";
+
+  afterEach(() => {
+    delete process.env[TOKEN_ENV];
+  });
+
+  it("fails closed before binding when the token env var is unset (no open port)", async () => {
+    delete process.env[TOKEN_ENV];
+    const url = await unreachableWsUrl();
+    await expect(
+      startGateway({
+        name: "openclaw-fail-closed",
+        port: 0,
+        dbPath: ":memory:",
+        agents: [
+          { id: "oc1", name: "OC1", backend: "openclaw", options: { url, tokenEnv: TOKEN_ENV } },
+        ],
+      }),
+    ).rejects.toThrow(new RegExp(TOKEN_ENV));
+  });
+
+  it("logs a root-token caveat naming the agent and token env at startup, without the token value", async () => {
+    const secretToken = "super-secret-root-token-value";
+    process.env[TOKEN_ENV] = secretToken;
+    const url = await unreachableWsUrl();
+    const lines: string[] = [];
+    const oc = await startGateway(
+      {
+        name: "openclaw-caveat",
+        port: 0,
+        dbPath: ":memory:",
+        agents: [{ id: "oc1", name: "OC1", backend: "openclaw", options: { url, tokenEnv: TOKEN_ENV } }],
+      },
+      { openclawLog: (message) => lines.push(message) },
+    );
+    try {
+      const caveat = lines.find((l) => l.includes('agent "oc1"'));
+      expect(caveat).toBeDefined();
+      expect(caveat).toMatch(/ROOT/);
+      expect(caveat).toContain(TOKEN_ENV);
+      // The caveat names the env var, never the token value.
+      expect(lines.join("\n")).not.toContain(secretToken);
+    } finally {
+      await oc.close();
+    }
+  });
+
+  it("starts with an unreachable url and reports presence as online or absent, never unknown", async () => {
+    process.env[TOKEN_ENV] = "server-test-openclaw-token";
+    const url = await unreachableWsUrl();
+    const oc = await startGateway({
+      name: "openclaw-unreachable",
+      port: 0,
+      dbPath: ":memory:",
+      agents: [
+        { id: "oc1", name: "OC1", backend: "openclaw", options: { url, tokenEnv: TOKEN_ENV } },
+      ],
+    });
+    try {
+      const code = oc.issueSetupCode();
+      const pairRes = await fetch(`${oc.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: code, deviceName: "openclaw test phone" }),
+      });
+      expect(pairRes.status).toBe(200);
+      const { deviceToken } = (await pairRes.json()) as { deviceToken: string };
+
+      const agentsRes = await fetch(`${oc.url}/agents`, {
+        headers: { authorization: `Bearer ${deviceToken}` },
+      });
+      expect(agentsRes.status).toBe(200);
+      const agentsBody = (await agentsRes.json()) as Array<{ id: string; presence: string }>;
+      const oc1 = agentsBody.find((a) => a.id === "oc1");
+      expect(oc1).toBeDefined();
+      expect(["online", "absent"]).toContain(oc1?.presence);
+    } finally {
+      await oc.close();
+    }
   });
 });

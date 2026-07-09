@@ -1,0 +1,260 @@
+{
+  "ends_mid_word_no_trailing_newline": {
+    "text": "para one\n\npara two starts and cuts off mid-w",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "para one"
+      },
+      {
+        "type": "paragraph",
+        "text": "para two starts and cuts off mid-w"
+      }
+    ]
+  },
+  "fence_closes_later": {
+    "text": "before fence\n\n```python\ndef f():\n    pass\n```\n\nafter fence\n",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "before fence"
+      },
+      {
+        "type": "code",
+        "code": "def f():\n    pass",
+        "language": "python"
+      },
+      {
+        "type": "paragraph",
+        "text": "after fence"
+      }
+    ]
+  },
+  "fence_never_closes": {
+    "text": "unterminated fence:\n\n```python\ndef f():\n    pass\n",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "unterminated fence:"
+      },
+      {
+        "type": "code",
+        "code": "def f():\n    pass\n",
+        "language": "python"
+      }
+    ]
+  },
+  "list_then_paragraph": {
+    "text": "para one\n\npara two continues\nacross lines\n\n- [ ] todo\n- [x] done\n\ntrailing paragraph\n",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "para one"
+      },
+      {
+        "type": "paragraph",
+        "text": "para two continues\nacross lines"
+      },
+      {
+        "type": "list",
+        "items": [
+          {
+            "text": "todo",
+            "checked": false
+          },
+          {
+            "text": "done",
+            "checked": true
+          }
+        ],
+        "ordered": false
+      },
+      {
+        "type": "paragraph",
+        "text": "trailing paragraph"
+      }
+    ]
+  },
+  "lone_pipe_row_never_a_table": {
+    "text": "trailing partial table row: | a | b\n\nMore text after.\n",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "trailing partial table row: | a | b"
+      },
+      {
+        "type": "paragraph",
+        "text": "More text after."
+      }
+    ]
+  },
+  "math_block": {
+    "text": "$$\na^2 + b^2 = c^2\n$$\n\nAfter math.\n",
+    "blocks": [
+      {
+        "type": "math",
+        "latex": "a^2 + b^2 = c^2"
+      },
+      {
+        "type": "paragraph",
+        "text": "After math."
+      }
+    ]
+  },
+  "math_never_closes": {
+    "text": "before math\n\n$$\na^2 + b^2\n",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "before math"
+      },
+      {
+        "type": "math",
+        "latex": "a^2 + b^2"
+      }
+    ]
+  },
+  "mixed_everything": {
+    "text": "# Heading\n\nSome paragraph text\nspanning two lines.\n\n- item one\n- item two\n\n1. first\n2. second\n\n```python\nprint(1)\n```\n\nAfter code.\n\n| x | y |\n|---|---|\n| 1 | 2 |\n\n## Second heading\n\nFinal paragraph.\n",
+    "blocks": [
+      {
+        "type": "heading",
+        "level": 1,
+        "text": "Heading"
+      },
+      {
+        "type": "paragraph",
+        "text": "Some paragraph text\nspanning two lines."
+      },
+      {
+        "type": "list",
+        "items": [
+          {
+            "text": "item one"
+          },
+          {
+            "text": "item two"
+          }
+        ],
+        "ordered": false
+      },
+      {
+        "type": "list",
+        "items": [
+          {
+            "text": "first"
+          },
+          {
+            "text": "second"
+          }
+        ],
+        "ordered": true
+      },
+      {
+        "type": "code",
+        "code": "print(1)",
+        "language": "python"
+      },
+      {
+        "type": "paragraph",
+        "text": "After code."
+      },
+      {
+        "type": "table",
+        "header": [
+          "x",
+          "y"
+        ],
+        "rows": [
+          [
+            "1",
+            "2"
+          ]
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Second heading"
+      },
+      {
+        "type": "paragraph",
+        "text": "Final paragraph."
+      }
+    ]
+  },
+  "near_fence_marker_not_a_fence": {
+    "text": "Almost a fence ``, not quite.\n\nMore text.\n",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "Almost a fence ``, not quite."
+      },
+      {
+        "type": "paragraph",
+        "text": "More text."
+      }
+    ]
+  },
+  "no_blank_lines_at_all": {
+    "text": "one giant paragraph with no breaks anywhere in it at all",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "one giant paragraph with no breaks anywhere in it at all"
+      }
+    ]
+  },
+  "ordered_list_task_items": {
+    "text": "1. [ ] first\n2. [x] second\n3. plain third\n\ndone\n",
+    "blocks": [
+      {
+        "type": "list",
+        "items": [
+          {
+            "text": "first",
+            "checked": false
+          },
+          {
+            "text": "second",
+            "checked": true
+          },
+          {
+            "text": "plain third"
+          }
+        ],
+        "ordered": true
+      },
+      {
+        "type": "paragraph",
+        "text": "done"
+      }
+    ]
+  },
+  "table_header_becomes_table": {
+    "text": "Intro line.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nAfter table text.\n",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "Intro line."
+      },
+      {
+        "type": "table",
+        "header": [
+          "a",
+          "b"
+        ],
+        "rows": [
+          [
+            "1",
+            "2"
+          ]
+        ]
+      },
+      {
+        "type": "paragraph",
+        "text": "After table text."
+      }
+    ]
+  }
+}
