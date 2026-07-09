@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { PresenceState, RichBlock } from "cozygateway-contract";
+import type { PresenceState, RichBlock, ToolCall } from "cozygateway-contract";
 
 import { normalizeMarkdownToBlocks } from "../../markdown-blocks.ts";
 import type { BackendAdapter, BackendSession, TurnHandlers } from "../types.ts";
@@ -92,7 +92,9 @@ export function createOpenClawAdapter(deps: OpenClawAdapterDeps): BackendAdapter
           return new Promise<void>((resolve, reject) => {
             let settled = false;
             let snapshot = "";
+            let toolCalls: ToolCall[] = [];
             let lastFlushedSnapshot: string | undefined;
+            let lastFlushedToolCallsKey: string | undefined;
             let flushTimer: ReturnType<typeof setTimeout> | undefined;
 
             const clearFlushTimer = (): void => {
@@ -102,9 +104,13 @@ export function createOpenClawAdapter(deps: OpenClawAdapterDeps): BackendAdapter
 
             const flushDraft = (): void => {
               clearFlushTimer();
-              if (snapshot === lastFlushedSnapshot) return;
+              // Dedupe on text AND chips: a chip-only transition (running -> ok with no new
+              // text) must still emit a draft, and an unchanged text+chips pair must not.
+              const toolCallsKey = JSON.stringify(toolCalls);
+              if (snapshot === lastFlushedSnapshot && toolCallsKey === lastFlushedToolCallsKey) return;
               lastFlushedSnapshot = snapshot;
-              handlers.onDraft({ blocks: normalizeMarkdownToBlocks(snapshot), toolCalls: [] });
+              lastFlushedToolCallsKey = toolCallsKey;
+              handlers.onDraft({ blocks: normalizeMarkdownToBlocks(snapshot), toolCalls });
             };
 
             const scheduleFlush = (): void => {
@@ -157,6 +163,14 @@ export function createOpenClawAdapter(deps: OpenClawAdapterDeps): BackendAdapter
               },
               onError: () => {
                 failTurn("the openclaw connection dropped mid-turn");
+              },
+              onToolCalls: (calls) => {
+                if (settled) return;
+                // 1:1 map from the client's neutral chip shape to the contract ToolCall; the
+                // detail field is DELIBERATELY never set (the wire's title/meta/error strings
+                // carry argument-derived content from a root-token wire; see the design spec).
+                toolCalls = calls.map((call) => ({ id: call.id, name: call.name, status: call.status }));
+                scheduleFlush();
               },
             });
 
