@@ -7,6 +7,7 @@ import {
   TICK_TIMEOUT_CLOSE_CODE,
   buildConnectRequest,
   parseServerFrame,
+  toolItemOf,
   type ChatEvent,
   type ServerFrame,
 } from "./protocol.ts";
@@ -64,10 +65,24 @@ function isReplyFailure(event: ChatEvent): boolean {
   return event.payload.state === "error" || event.payload.state === "aborted";
 }
 
+/** One tool call's chip-shaped state for a subscribed session. Deliberately a LOCAL type,
+ *  not the cozygateway contract's ToolCall: the wire client stays contract-free; the adapter
+ *  maps this 1:1 (and never sets a detail). Statuses fold from the live-pinned wire facts:
+ *  phase start -> running; phase end -> error when failed, else ok. */
+export interface SessionToolCall {
+  id: string;
+  name: string;
+  status: "running" | "ok" | "error";
+}
+
 export interface SessionHandlers {
   onDelta(snapshot: string): void;
   onDone(): void;
   onError(message: string): void;
+  /** Fires with the session's FULL chip snapshot (fresh array, first-seen order) each time a
+   *  subscribed session's tool call starts or ends. Same privacy gate as onDelta: frames for
+   *  unsubscribed sessions are dropped before any content is read. */
+  onToolCalls(toolCalls: SessionToolCall[]): void;
 }
 
 export interface ReconnectPolicy {
@@ -188,6 +203,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
     handlers: SessionHandlers;
     snapshot: string;
     done: boolean;
+    toolCalls: Map<string, SessionToolCall>;
   }
   const sessionSubscriptions = new Map<string, SessionSubscriptionState>();
 
@@ -367,6 +383,27 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
         }
         return;
       }
+      case "agent": {
+        // Same gate as "chat", same reason (openclaw#32579 broadcast bug + cross-operator
+        // privacy: this connection's root token can observe other operators' traffic): look up
+        // the subscription BEFORE reading anything beyond the envelope. Unlike the chat drop,
+        // this one is silent: agent frames arrive several per turn (lifecycle, assistant echo,
+        // compaction) and the chat drop line already flags foreign traffic.
+        const sub = sessionSubscriptions.get(frame.payload.sessionKey);
+        if (sub === undefined) return;
+        if (sub.done) return; // reply already ended; ignore trailing tool frames.
+        const item = toolItemOf(frame);
+        if (item === undefined) return; // non-tool stream or unusable item: not our concern.
+        const status = item.phase === "start" ? "running" : item.failed ? "error" : "ok";
+        // Preserve the name recorded at "start": the wire's name is PINNED stable across a call's
+        // start/end pair (protocol.ts), but a later frame is not guaranteed to repeat it, and an
+        // end frame's item must never regress an already-known name back to a fallback value.
+        const name = sub.toolCalls.get(item.toolCallId)?.name ?? item.name;
+        sub.toolCalls.set(item.toolCallId, { id: item.toolCallId, name, status });
+        // Fresh array per delivery so a caller can hold a snapshot without later folds mutating it.
+        sub.handlers.onToolCalls([...sub.toolCalls.values()]);
+        return;
+      }
     }
   }
 
@@ -458,7 +495,7 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
     },
 
     subscribeSession(sessionKey: string, handlers: SessionHandlers): () => void {
-      sessionSubscriptions.set(sessionKey, { handlers, snapshot: "", done: false });
+      sessionSubscriptions.set(sessionKey, { handlers, snapshot: "", done: false, toolCalls: new Map() });
       return () => {
         sessionSubscriptions.delete(sessionKey);
       };

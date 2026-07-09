@@ -69,6 +69,7 @@ try {
     onError: (message) => {
       errored = message;
     },
+    onToolCalls: () => {},
   });
 
   await client.request("chat.send", {
