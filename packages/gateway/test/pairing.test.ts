@@ -48,6 +48,41 @@ describe("GET /health", () => {
     const body = (await res.json()) as { contract: string };
     expect(body.contract).toBe("v1");
   });
+
+  // Issue #16: http.ts just echoes deps.gatewayInfo verbatim in both /health and /pair, so
+  // whatever capabilities shape the caller supplied (absent, or a populated vendor map) must
+  // survive the round trip unchanged.
+  it("echoes an absent capabilities field verbatim (a pre-#16 gatewayInfo shape)", async () => {
+    const { app } = makeApp();
+    const body = (await (await app.request("/health")).json()) as { capabilities?: unknown };
+    expect(body.capabilities).toBeUndefined();
+  });
+
+  it("echoes a populated com.cozylabs.* capabilities map verbatim in /health and /pair", async () => {
+    const storage = openStorage(":memory:");
+    const app = createApp({
+      storage,
+      config,
+      gatewayInfo: {
+        name: "test-gateway",
+        version: "0.1.0",
+        contract: "v1",
+        capabilities: { "com.cozylabs.test": 1 },
+      },
+      presenceOf: () => "online",
+      submitUserMessage: () => {
+        throw new Error("not under test");
+      },
+      onDeviceRevoked: () => {},
+      now: () => 1_000,
+    });
+    const health = (await (await app.request("/health")).json()) as { capabilities?: unknown };
+    expect(health.capabilities).toEqual({ "com.cozylabs.test": 1 });
+
+    const pairRes = await pair(app, storage);
+    const paired = (await pairRes.json()) as { gateway: { capabilities?: unknown } };
+    expect(paired.gateway.capabilities).toEqual({ "com.cozylabs.test": 1 });
+  });
 });
 
 describe("POST /pair", () => {

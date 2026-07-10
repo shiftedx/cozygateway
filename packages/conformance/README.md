@@ -12,9 +12,19 @@ and the `cozygateway-contract` schemas, never from any gateway's source code. Th
 and writes only the public REST and WebSocket surface, so a green run is evidence the
 implementation matches the contract, not that it shares the reference code.
 
-The suite covers eleven groups: health, pairing, the auth wall, device lifecycle, agents,
-thread lifecycle, message round trip and seq discipline, WebSocket lifecycle, streaming order,
-reconnect dedup, and turn failure.
+The suite covers twelve groups: health, capabilities, pairing, the auth wall, device lifecycle,
+agents, thread lifecycle, message round trip and seq discipline, WebSocket lifecycle, streaming
+order, reconnect dedup, and turn failure.
+
+The capabilities group checks the additive `GatewayInfo.capabilities` block (contract v1.md
+section 5, issue #16) generically: that it agrees across `GET /health`, the pair response, and
+the `ready` frame when present, and that the wire schema tolerates it being entirely absent
+(older gateways) or carrying capability ids the suite has never heard of. It never pins a
+specific capability id, so it stays portable across any gateway under test, including one that
+advertises no capabilities at all. This repo's own reference-gateway runner additionally proves
+one fake `com.cozylabs.*` vendor capability travels end to end (see "Running the reference
+gateway's own conformance" below); that check is specific to the reference gateway's fixture and
+intentionally lives outside the portable suite.
 
 ## The reference echo backend
 

@@ -85,6 +85,12 @@ A breaking change is a new contract version, signalled by a new value of the `co
 in `GatewayInfo`. See section 8 of [`contract/v1.md`](../../contract/v1.md) for the full
 evolution policy.
 
+`GatewayInfo.capabilities` (a map of capability id to integer version) is the standing
+mechanism for both additive extension and vendor namespacing: ids under `com.cozylabs.*` are
+vendor extensions that ride this same transport, auth, and framing but are documented and
+versioned independently of `v1`. The field is optional, so a client must tolerate it being
+absent as well as carrying ids it does not recognize. See section 5 of `contract/v1.md`.
+
 ## License
 
 MIT

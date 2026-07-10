@@ -51,7 +51,15 @@ export async function startGateway(
   for (const agent of config.agents) {
     storage.upsertAgent({ id: agent.id, name: agent.name, avatar: agent.avatar ?? null, backend: agent.backend });
   }
-  const gatewayInfo: GatewayInfo = { name: config.name, version: GATEWAY_VERSION, contract: "v1" };
+  // capabilities is always present, empty when unconfigured, so the shape is uniform across
+  // /health, the pair response, and the ready frame (contract v1.md section 5). Absence is a
+  // valid wire shape too (older gateways), but this implementation always advertises the field.
+  const gatewayInfo: GatewayInfo = {
+    name: config.name,
+    version: GATEWAY_VERSION,
+    contract: "v1",
+    capabilities: config.capabilities ?? {},
+  };
   const hub = new WsHub({ storage, gatewayInfo, now: () => Date.now() });
 
   // The attach ingress exists only when an attach agent is configured. Token resolution fails

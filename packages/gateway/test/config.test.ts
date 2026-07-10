@@ -41,4 +41,32 @@ describe("loadConfig", () => {
     });
     expect(() => loadConfig(path)).toThrow(/duplicate agent id/i);
   });
+
+  // Issue #16: capabilities is an optional gateway-level config field, surfaced as
+  // GatewayInfo.capabilities.
+  it("loads a config with no capabilities field (older-shape config keeps working)", () => {
+    const path = writeConfig({
+      name: "test-gateway",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+    });
+    expect(loadConfig(path).capabilities).toBeUndefined();
+  });
+
+  it("loads a populated capabilities map, preserving vendor ids verbatim", () => {
+    const path = writeConfig({
+      name: "test-gateway",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      capabilities: { "com.cozylabs.test": 1 },
+    });
+    expect(loadConfig(path).capabilities).toEqual({ "com.cozylabs.test": 1 });
+  });
+
+  it("rejects a non-integer capability version", () => {
+    const path = writeConfig({
+      name: "g",
+      agents: [{ id: "a", name: "A", backend: "mock" }],
+      capabilities: { "com.cozylabs.test": "one" },
+    });
+    expect(() => loadConfig(path)).toThrow(ContractViolation);
+  });
 });

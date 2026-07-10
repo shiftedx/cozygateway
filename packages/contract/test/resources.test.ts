@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import type { Agent, Message, Thread } from "../src/resources.ts";
-import { AgentSchema, ERROR_CODES, MessageSchema, ThreadSchema } from "../src/resources.ts";
+import type { Agent, GatewayInfo, Message, Thread } from "../src/resources.ts";
+import { AgentSchema, ERROR_CODES, GatewayInfoSchema, MessageSchema, ThreadSchema } from "../src/resources.ts";
 import { check } from "../src/validate.ts";
 
 describe("resource schemas", () => {
@@ -63,5 +63,50 @@ describe("resource schemas", () => {
     expect(ERROR_CODES).toContain("unauthorized");
     expect(ERROR_CODES).toContain("not_found");
     expect(ERROR_CODES).toContain("invalid_request");
+  });
+
+  // Issue #16: GatewayInfo.capabilities is an additive v1.x field. A receiver must tolerate it
+  // present, absent (pre-#16 gateways), and populated with ids it has never heard of.
+  describe("GatewayInfo.capabilities", () => {
+    it("accepts a populated capabilities map, including a com.cozylabs.* vendor id", () => {
+      const info: GatewayInfo = {
+        name: "g",
+        version: "1.0.0",
+        contract: "v1",
+        capabilities: { "com.cozylabs.test": 1 },
+      };
+      expect(check(GatewayInfoSchema, info)).toBe(true);
+    });
+
+    it("accepts a GatewayInfo with no capabilities field at all (a gateway that predates it)", () => {
+      const legacy = { name: "g", version: "0.9.0", contract: "v1" };
+      expect(check(GatewayInfoSchema, legacy)).toBe(true);
+    });
+
+    it("accepts an empty capabilities map", () => {
+      const info: GatewayInfo = { name: "g", version: "1.0.0", contract: "v1", capabilities: {} };
+      expect(check(GatewayInfoSchema, info)).toBe(true);
+    });
+
+    it("tolerates a capability id a client has never heard of, mixed with a known one", () => {
+      const info: GatewayInfo = {
+        name: "g",
+        version: "1.0.0",
+        contract: "v1",
+        capabilities: { "com.cozylabs.test": 1, "com.cozylabs.some-future-thing": 42 },
+      };
+      expect(check(GatewayInfoSchema, info)).toBe(true);
+    });
+
+    it("rejects a non-integer capability version", () => {
+      expect(
+        check(GatewayInfoSchema, {
+          name: "g",
+          version: "1.0.0",
+          contract: "v1",
+          capabilities: { "com.cozylabs.test": "one" },
+        }),
+      ).toBe(false);
+    });
   });
 });

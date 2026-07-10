@@ -32,6 +32,7 @@ import {
   SyncedFrameSchema,
   ThreadSchema,
   assertValid,
+  check,
 } from "cozygateway-contract";
 
 /** Everything the suite needs to reach one gateway under test. A host supplies these. */
@@ -197,6 +198,72 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
         },
         TEST_TIMEOUT_MS,
       );
+    });
+
+    // Spec section 5: GatewayInfo.capabilities is an additive v1.x field (issue #16). It rides
+    // in three positions (GET /health, the pair response, and the ready frame) as one shared
+    // shape. These assertions are deliberately generic, never pinned to any one implementation's
+    // own capability ids, so this describe block stays portable across gateways under test: a
+    // third-party gateway that advertises no capabilities at all, or a different vendor's ids
+    // entirely, still passes.
+    describe("capabilities", () => {
+      it(
+        "GatewayInfo.capabilities, when present, agrees across health, pair, and ready, and is a map of positive-integer versions",
+        async () => {
+          const health = assertValid(GatewayInfoSchema, await (await fetch(`${env.baseUrl()}/health`)).json());
+
+          const setupCode = await env.issueSetupCode();
+          const pairRes = await fetch(`${env.baseUrl()}/pair`, {
+            method: "POST",
+            headers: JSON_HEADERS,
+            body: JSON.stringify({ setupCode, deviceName: "capabilities-reader" }),
+          });
+          expect(pairRes.status).toBe(200);
+          const paired = assertValid(PairResponseSchema, await pairRes.json());
+
+          const socket = await authedSocket(paired.deviceToken);
+          try {
+            const ready = framesOfType(socket.frames, "ready")[0];
+            expect(ready).toBeDefined();
+            if (ready === undefined) throw new Error("no ready frame");
+
+            // Absence is valid on any of the three (an older gateway, or one implementation
+            // choosing to omit an empty map); the requirement is only internal agreement.
+            expect(paired.gateway.capabilities).toEqual(health.capabilities);
+            expect(ready.gateway.capabilities).toEqual(health.capabilities);
+
+            if (health.capabilities !== undefined) {
+              for (const version of Object.values(health.capabilities)) {
+                expect(Number.isInteger(version)).toBe(true);
+                expect(version).toBeGreaterThanOrEqual(1);
+              }
+            }
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      // Pure schema-level checks: no live gateway is required to prove the wire TYPE itself
+      // tolerates an absent block and unrecognized ids. This is what makes the field additive:
+      // a v1.0 client, or any client that has never heard of a given capability id, keeps
+      // working, because GatewayInfo was already an open object and this field changes nothing
+      // about the fields that came before it.
+      it("the GatewayInfo schema accepts a gateway that predates the capabilities field entirely", () => {
+        const legacy = { name: "legacy-gateway", version: "0.9.0", contract: "v1" };
+        expect(check(GatewayInfoSchema, legacy)).toBe(true);
+      });
+
+      it("the GatewayInfo schema tolerates capability ids a client has never heard of", () => {
+        const withUnknown = {
+          name: "n",
+          version: "1.0.0",
+          contract: "v1",
+          capabilities: { "com.cozylabs.test": 1, "com.example.totally-unrecognized": 42 },
+        };
+        expect(check(GatewayInfoSchema, withUnknown)).toBe(true);
+      });
     });
 
     // Spec section 4: pairing binds a device and mints a single-use-consuming token.
