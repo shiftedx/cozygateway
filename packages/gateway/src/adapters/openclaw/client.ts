@@ -47,15 +47,73 @@ function isReplyEnd(event: ChatEvent): boolean {
   return event.payload.state === "final" || event.payload.state === "error" || event.payload.state === "aborted";
 }
 
-/** Running assistant text from `deltaText` alone. PINNED (Task 8): `message` is the cumulative
- *  assistant message STRUCT (an object), not a text snapshot, so it is never read for text here.
- *  `replace:true` replaces the running text; otherwise the delta appends. An event with no
- *  `deltaText` (e.g. a terminal `final`) is a strict no-op that leaves the accumulated text
- *  unchanged, even under `replace:true` -- an empty replace must never wipe a completed reply. */
+/** FALLBACK running assistant text from `deltaText` alone, used only when a frame carries no
+ *  usable `message` snapshot (see `messageTextOf`). `replace:true` replaces the running text;
+ *  otherwise the delta appends. An event with no `deltaText` (e.g. a terminal `final`) is a strict
+ *  no-op that leaves the accumulated text unchanged, even under `replace:true` -- an empty replace
+ *  must never wipe a completed reply. Message-bearing frames DO NOT reach here: they are folded by
+ *  `foldMessageSnapshot` against the wire's own per-message cumulative text (issue #15). */
 function accumulateDelta(prev: string, event: ChatEvent): string {
   const deltaText = event.payload.deltaText;
   if (deltaText === undefined) return prev;
   return event.payload.replace === true ? deltaText : prev + deltaText;
+}
+
+/** THE one named site owning the `message`-snapshot wire fact, promoted (issue #15) from the
+ *  Task-8-era "never read for text" stance to load-bearing, but TOLERANTLY: every step is
+ *  runtime-guarded and any deviation degrades to `undefined` (the caller then falls back to
+ *  `accumulateDelta`). PINNED by the issue-#15 wire study (clean-capture section 2a): a `chat`
+ *  event's `payload.message` is the cumulative ASSISTANT-message struct
+ *  `{ role, content: [{ type, text }], timestamp }`, and `content[0].text` is a real,
+ *  monotonically-growing cumulative snapshot of THAT one message alone (NOT the whole turn). It is
+ *  `Type.Unknown()` in the schema (an unpinned third-party shape) and MUST stay tolerantly decoded:
+ *  a shape change on a future OpenClaw version silently reverts this frame to the delta fallback,
+ *  never throws. Only the FIRST content block's text is read; other block kinds are not our
+ *  concern here (tool activity rides `agent` frames, see `toolItemOf`). */
+function messageTextOf(event: ChatEvent): string | undefined {
+  const message = event.payload.message;
+  if (typeof message !== "object" || message === null) return undefined;
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content) || content.length === 0) return undefined;
+  const first = content[0];
+  if (typeof first !== "object" || first === null) return undefined;
+  const text = (first as { text?: unknown }).text;
+  return typeof text === "string" ? text : undefined;
+}
+
+/** Per-turn text accumulation, partitioned by assistant MESSAGE (issue #15). `snapshot` is the
+ *  current message being streamed; `segments` are earlier messages of the SAME turn already sealed
+ *  at a detected boundary. A turn used to be one flat `snapshot`, which folded two interleaved
+ *  message streams into one doubled string (issue #15 root cause). */
+interface MessageAccumulation {
+  segments: string[];
+  snapshot: string;
+}
+
+/** The committed/draft view of a turn: sealed segments plus the in-flight current message, joined
+ *  by a blank line (open question 3: a legitimate multi-message tool turn keeps every message).
+ *  Empty parts are dropped so a fresh (`""`) current message never appends a trailing separator,
+ *  and a message-absent turn stays byte-identical to the old flat `snapshot` (issue #15 test c). */
+function joinTurnText(acc: MessageAccumulation): string {
+  return [...acc.segments, acc.snapshot].filter((part) => part.length > 0).join("\n\n");
+}
+
+/** Fold one frame's wire-authoritative per-message cumulative text into the accumulation (issue
+ *  #15, fix point 1+2). Replace semantics for the current message, guarded monotonically:
+ *  - the wire text is a STRICT PREFIX of what we hold: an out-of-order older frame of the same
+ *    message; ignore it (never regress the snapshot).
+ *  - the wire text REGRESSES (shorter) and is NOT a prefix: the held message is complete, so seal
+ *    it as a segment and start the new message from the wire text (a message boundary).
+ *  - otherwise (wire text at least as long): authoritative replace for the current message. */
+function foldMessageSnapshot(acc: MessageAccumulation, wireText: string): void {
+  const held = acc.snapshot;
+  if (wireText.length < held.length) {
+    if (held.startsWith(wireText)) return;
+    acc.segments.push(held);
+    acc.snapshot = wireText;
+    return;
+  }
+  acc.snapshot = wireText;
 }
 
 /** Whether a terminal `chat` state is a FAILURE (the turn did not complete normally). PINNED
@@ -201,7 +259,14 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
 
   interface SessionSubscriptionState {
     handlers: SessionHandlers;
+    /** The current assistant message's running text; earlier sealed messages live in `segments`
+     *  (see `MessageAccumulation`). Kept as `snapshot` so both fields fold through the shared
+     *  `foldMessageSnapshot`/`joinTurnText` helpers by structural typing. */
     snapshot: string;
+    segments: string[];
+    /** The `runId` most recently observed on this session's chat events. A change is a genuine
+     *  duplicate/replayed run on the same sessionKey (issue #15, fix point 3): last run wins. */
+    lastRunId: string | undefined;
     done: boolean;
     toolCalls: Map<string, SessionToolCall>;
   }
@@ -371,8 +436,27 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
           return;
         }
         if (sub.done) return; // reply already ended for this session; ignore trailing deltas.
-        sub.snapshot = accumulateDelta(sub.snapshot, frame);
-        sub.handlers.onDelta(sub.snapshot);
+
+        // Secondary guard (issue #15, fix point 3): a runId change on the SAME sessionKey is a
+        // genuine duplicate/replayed run (not one turn's normal deltas, which keep one constant
+        // runId end to end -- pinned by the wire study). Last run wins: discard everything
+        // accumulated so far BEFORE folding this frame, then adopt the new runId.
+        const runId = typeof frame.payload.runId === "string" ? frame.payload.runId : undefined;
+        if (runId !== undefined) {
+          if (sub.lastRunId !== undefined && sub.lastRunId !== runId) {
+            sub.segments = [];
+            sub.snapshot = "";
+          }
+          sub.lastRunId = runId;
+        }
+
+        // Primary path (issue #15, fix point 1+2): when the frame carries a well-formed per-message
+        // cumulative `message` snapshot, that wire text is authoritative for the current message
+        // (with boundary detection); otherwise fall back to delta append/replace (fix point 4).
+        const wireText = messageTextOf(frame);
+        if (wireText !== undefined) foldMessageSnapshot(sub, wireText);
+        else sub.snapshot = accumulateDelta(sub.snapshot, frame);
+        sub.handlers.onDelta(joinTurnText(sub));
         if (isReplyEnd(frame)) {
           sub.done = true;
           // A terminal `error`/`aborted` is a FAILED turn, not a finished reply: surface it as an
@@ -495,7 +579,14 @@ export function createOpenClawClient(opts: OpenClawClientOptions): OpenClawClien
     },
 
     subscribeSession(sessionKey: string, handlers: SessionHandlers): () => void {
-      sessionSubscriptions.set(sessionKey, { handlers, snapshot: "", done: false, toolCalls: new Map() });
+      sessionSubscriptions.set(sessionKey, {
+        handlers,
+        snapshot: "",
+        segments: [],
+        lastRunId: undefined,
+        done: false,
+        toolCalls: new Map(),
+      });
       return () => {
         sessionSubscriptions.delete(sessionKey);
       };
