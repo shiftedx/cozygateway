@@ -3,7 +3,7 @@ import { once } from "node:events";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ServerFrame } from "cozygateway-contract";
+import type { GatewayInfo, ServerFrame } from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 
@@ -63,6 +63,64 @@ describe("startGateway end to end", () => {
     const commits = seen.filter((f) => f.type === "committed");
     expect(commits.map((f) => (f.type === "committed" ? f.message.role : ""))).toEqual(["user", "agent"]);
     ws.close();
+  });
+});
+
+// Issue #16: GatewayInfo.capabilities travels through GET /health, the pair response, and the
+// ready frame -- one shared object, so wiring it once in startGateway covers all three.
+describe("GatewayInfo.capabilities wiring", () => {
+  it("defaults to an empty map when the config sets no capabilities", async () => {
+    const gw = await startGateway({
+      name: "no-caps",
+      port: 0,
+      dbPath: ":memory:",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities).toEqual({});
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it("surfaces a configured com.cozylabs.* vendor capability identically in health, pair, and ready", async () => {
+    const gw = await startGateway({
+      name: "with-caps",
+      port: 0,
+      dbPath: ":memory:",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      capabilities: { "com.cozylabs.test": 1, "com.cozylabs.some-unrecognized-thing": 7 },
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities).toEqual({ "com.cozylabs.test": 1, "com.cozylabs.some-unrecognized-thing": 7 });
+
+      const code = gw.issueSetupCode();
+      const pairRes = await fetch(`${gw.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: code, deviceName: "caps phone" }),
+      });
+      const paired = (await pairRes.json()) as { deviceToken: string; gateway: GatewayInfo };
+      expect(paired.gateway.capabilities).toEqual(health.capabilities);
+
+      const frames: ServerFrame[] = [];
+      const ws = new WebSocket(`${gw.url.replace("http", "ws")}/ws`);
+      ws.on("message", (d) => frames.push(JSON.parse(String(d)) as ServerFrame));
+      await once(ws, "open");
+      ws.send(JSON.stringify({ type: "auth", token: paired.deviceToken }));
+      const start = Date.now();
+      while (!frames.some((f) => f.type === "ready")) {
+        if (Date.now() - start > 5_000) throw new Error(`timeout; saw ${JSON.stringify(frames)}`);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      ws.close();
+      const ready = frames.find((f) => f.type === "ready");
+      expect(ready?.type === "ready" ? ready.gateway.capabilities : undefined).toEqual(health.capabilities);
+    } finally {
+      await gw.close();
+    }
   });
 });
 

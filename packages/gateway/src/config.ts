@@ -17,6 +17,10 @@ const GatewayConfigSchema = Type.Object({
   port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
   dbPath: Type.String({ minLength: 1, default: "cozygateway.db" }),
   agents: Type.Array(AgentConfigSchema, { minItems: 1 }),
+  /** Capability id -> integer version, surfaced verbatim as GatewayInfo.capabilities (contract
+   *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
+   *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
+  capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
 });
 export type GatewayConfig = Static<typeof GatewayConfigSchema>;
 

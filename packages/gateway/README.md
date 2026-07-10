@@ -82,6 +82,7 @@ not expose itself on your network by itself.
 | `port` | integer | `8787` | TCP port to listen on. |
 | `dbPath` | string | `cozygateway.db` | SQLite file path (or `:memory:` for ephemeral runs). |
 | `agents` | array | required, at least one | Agents this gateway exposes, each with `id`, `name`, an optional `avatar`, a `backend`, and adapter-specific `options`. |
+| `capabilities` | object | `{}` | Map of capability id to integer version, surfaced verbatim as `GatewayInfo.capabilities` (the `GET /health` response, the pair response, and the `ready` frame all carry it). Ids under `com.cozylabs.*` are vendor extensions, versioned independently of the contract; see contract/v1.md section 5. |
 
 ## Backends
 

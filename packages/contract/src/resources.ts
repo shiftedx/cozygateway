@@ -44,10 +44,15 @@ export const DeviceSchema = Type.Object({
 });
 export type Device = Static<typeof DeviceSchema>;
 
+/** `capabilities` maps a capability id to its integer version. Optional: absent on gateways
+ *  that predate this field, and a receiver must tolerate both that absence and ids it does not
+ *  recognize. Ids under `com.cozylabs.*` are vendor extensions, documented and versioned
+ *  independently of the frozen `contract: "v1"` value; see contract/v1.md section 5. */
 export const GatewayInfoSchema = Type.Object({
   name: Type.String(),
   version: Type.String(),
   contract: Type.Literal("v1"),
+  capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
 });
 export type GatewayInfo = Static<typeof GatewayInfoSchema>;
 

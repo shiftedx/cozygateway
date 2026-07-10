@@ -1,8 +1,9 @@
 /** In-repo runner: the reference gateway proves it speaks contract v1 by running the exact
  *  same black-box conformance suite a third party would run. The gateway is exercised only
  *  over HTTP + WebSocket; the suite (src/) never imports gateway internals. */
-import { afterAll, beforeAll, expect } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startGateway, type RunningGateway } from "cozygateway";
+import type { GatewayInfo } from "cozygateway-contract";
 
 import { registerConformanceSuite } from "../src/suite.ts";
 
@@ -18,6 +19,11 @@ let gateway: RunningGateway;
 // untouched: a real gateway with no override still writes straight to stderr).
 const notifierLogLines: string[] = [];
 
+// Issue #16: the reference gateway advertises one fake vendor capability so this file (not the
+// portable suite in src/, which stays generic across arbitrary gateways under test) can prove a
+// com.cozylabs.* capability travels end to end: configured here, read back below.
+const FAKE_VENDOR_CAPABILITY = "com.cozylabs.test";
+
 beforeAll(async () => {
   gateway = await startGateway(
     {
@@ -25,6 +31,7 @@ beforeAll(async () => {
       port: 0,
       dbPath: ":memory:",
       agents: [{ id: "conformance-echo", name: "Echo", backend: "mock" }],
+      capabilities: { [FAKE_VENDOR_CAPABILITY]: 1 },
     },
     { notifierLog: (message) => notifierLogLines.push(message) },
   );
@@ -43,4 +50,16 @@ registerConformanceSuite({
   baseUrl: () => gateway.url,
   issueSetupCode: () => Promise.resolve(gateway.issueSetupCode()),
   echoAgentId: "conformance-echo",
+});
+
+// This end-to-end check is specific to the reference gateway's own fixture (a fake
+// com.cozylabs.test vendor capability), so it lives here rather than in the portable
+// registerConformanceSuite: a legitimate third-party gateway has no reason to implement this
+// exact made-up id, and the shared suite must not require it (see src/suite.ts's own generic
+// "capabilities" describe block for the assertions every gateway is held to).
+describe("reference gateway vendor capability (issue #16)", () => {
+  it("advertises the configured com.cozylabs.test capability end to end via GET /health", async () => {
+    const info = (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
+    expect(info.capabilities?.[FAKE_VENDOR_CAPABILITY]).toBe(1);
+  });
 });
