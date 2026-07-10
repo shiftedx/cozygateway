@@ -331,6 +331,7 @@ function deltaFrame(input: {
   replace?: boolean;
   done?: boolean;
   state?: "delta" | "final" | "error" | "aborted";
+  runId?: string;
 }): Record<string, unknown> {
   return {
     type: "event",
@@ -341,8 +342,15 @@ function deltaFrame(input: {
       ...(input.deltaText !== undefined ? { deltaText: input.deltaText } : {}),
       ...(input.replace !== undefined ? { replace: input.replace } : {}),
       ...(input.messageObject !== undefined ? { message: input.messageObject } : {}),
+      ...(input.runId !== undefined ? { runId: input.runId } : {}),
     },
   };
+}
+
+/** The cumulative assistant-message struct the real wire carries on a `chat` event, with the
+ *  given per-message cumulative text at `content[0].text` (see `messageTextOf` in client.ts). */
+function assistantMessage(text: string): unknown {
+  return { role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() };
 }
 
 describe("subscribeSession: per-session delta filtering", () => {
@@ -411,8 +419,8 @@ describe("subscribeSession: accumulateDelta replace/append semantics", () => {
   });
 });
 
-describe("subscribeSession: the cumulative message struct is ignored for text", () => {
-  it("accumulates from deltaText and never reads the message object as text", async () => {
+describe("subscribeSession: the cumulative message snapshot is authoritative for text (issue #15)", () => {
+  it("follows message.content[0].text, not deltaText, when a well-formed message is present", async () => {
     const server = await fakeServer();
     const c = client(server.url);
     c.start();
@@ -426,25 +434,139 @@ describe("subscribeSession: the cumulative message struct is ignored for text", 
       onToolCalls: () => {},
     });
 
-    // Each event carries the cumulative assistant message as an OBJECT (as the real wire does);
-    // the running text must come from deltaText alone, never from the message struct.
-    server.sendEvent(
-      deltaFrame({
-        sessionKey: "s1",
-        deltaText: "Hel",
-        messageObject: { role: "assistant", content: [{ type: "text", text: "Hel" }] },
-      }),
-    );
-    server.sendEvent(
-      deltaFrame({
-        sessionKey: "s1",
-        deltaText: "lo",
-        messageObject: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
-      }),
-    );
+    // Since issue #15 the per-message cumulative `message` snapshot is authoritative (fix point 1).
+    // To prove the accumulator follows it (not merely that the two happen to agree), deltaText here
+    // is deliberately garbled while message.content[0].text carries the true cumulative text: the
+    // running snapshot must track the message, never the deltaText.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "XXX", messageObject: assistantMessage("Hel") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "YYY", messageObject: assistantMessage("Hello") }));
 
     await until(() => snapshots.length >= 2);
     expect(snapshots).toEqual(["Hel", "Hello"]);
+  });
+});
+
+describe("subscribeSession: message-partitioned accumulation (issue #15 regression fixtures)", () => {
+  /** A complete, well-formed answer used across the interleaving fixtures. */
+  const X = "The magic number in `magic-number.txt` is **7431**.";
+
+  /** Subscribes and returns collectors: every onDelta snapshot, plus the snapshot captured at the
+   *  moment onDone fires (the value the adapter commits, since onDone reads the last onDelta). */
+  function collect(c: OpenClawClient, sessionKey: string): { deltas: string[]; committed: () => string | undefined } {
+    const deltas: string[] = [];
+    let committed: string | undefined;
+    c.subscribeSession(sessionKey, {
+      onDelta: (s) => deltas.push(s),
+      onDone: () => {
+        committed = deltas.at(-1);
+      },
+      onError: () => {},
+      onToolCalls: () => {},
+    });
+    return { deltas, committed: () => committed };
+  }
+
+  it("(a) converges the A1,B1,A2,B2 interleaving incident to the clean text, not the doubled string", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const { committed } = collect(c, "s1");
+    const runId = "run-shared";
+    // Two independent 2-chunk reconstructions of the SAME final text X, split at different offsets
+    // (3 and 37), whose deltas arrive INTERLEAVED as A1,B1,A2,B2 -- the exact shape that folded into
+    // the 102-char doubled string in the study's section 2b. Each frame carries its own stream's
+    // cumulative message.content[0].text, and all share one runId + sessionKey.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, deltaText: X.slice(0, 3), messageObject: assistantMessage(X.slice(0, 3)) })); // A1
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, deltaText: X.slice(0, 37), messageObject: assistantMessage(X.slice(0, 37)) })); // B1
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, deltaText: X.slice(3), messageObject: assistantMessage(X) })); // A2
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, deltaText: X.slice(37), messageObject: assistantMessage(X) })); // B2
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, messageObject: assistantMessage(X), done: true }));
+
+    await until(() => committed() !== undefined);
+    expect(committed()).toBe(X);
+    expect(committed()).toHaveLength(51);
+    // The specific pre-fix corruption must not recur.
+    expect(committed()).not.toBe(
+      "TheThe magic number in `magic-number.txt magic number in `magic-number.txt` is **7431**.` is **7431**.",
+    );
+  });
+
+  it("(b) two different runIds on one sessionKey: last run wins, no concatenation", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const { committed } = collect(c, "s1");
+    // Run 1 streams a full message, with no terminal marker; run 2 (a genuine duplicate/replayed
+    // run on the same sessionKey) then starts under a DIFFERENT runId and must discard run 1 whole.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId: "r1", messageObject: assistantMessage("First") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId: "r1", messageObject: assistantMessage("First answer") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId: "r2", messageObject: assistantMessage("Second") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId: "r2", messageObject: assistantMessage("Second answer") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId: "r2", messageObject: assistantMessage("Second answer"), done: true }));
+
+    await until(() => committed() !== undefined);
+    expect(committed()).toBe("Second answer");
+    expect(committed()).not.toContain("First");
+  });
+
+  it("(c) message absent on all frames: byte-identical to the delta append/replace fallback", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const { deltas, committed } = collect(c, "s1");
+    // No `message`, no `runId`: the fallback path must behave exactly as the old flat accumulator.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Hello" })); // append
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: " World", replace: false })); // append
+    server.sendEvent(deltaFrame({ sessionKey: "s1", deltaText: "Replaced", replace: true, done: true })); // replace + end
+
+    await until(() => committed() !== undefined);
+    expect(deltas).toEqual(["Hello", "Hello World", "Replaced"]);
+    expect(committed()).toBe("Replaced");
+  });
+
+  it("(d) legitimate two-message turn: both messages committed, joined by a blank line, in order", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const { committed } = collect(c, "s1");
+    const runId = "run-multi"; // one constant runId across the whole turn (boundary is message-driven, not runId-driven).
+    // Message 1 grows to completion...
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, messageObject: assistantMessage("Let me") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, messageObject: assistantMessage("Let me check that") }));
+    // ...then message 2's snapshot regresses AND is not a prefix of message 1: a real boundary.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, messageObject: assistantMessage("The answer") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, messageObject: assistantMessage("The answer is 42") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", runId, messageObject: assistantMessage("The answer is 42"), done: true }));
+
+    await until(() => committed() !== undefined);
+    expect(committed()).toBe("Let me check that\n\nThe answer is 42");
+  });
+
+  it("(e) out-of-order older frame (wire text a strict prefix of held): ignored, no regression", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const { deltas, committed } = collect(c, "s1");
+    server.sendEvent(deltaFrame({ sessionKey: "s1", messageObject: assistantMessage("Hello world") }));
+    // A strict prefix of what we hold: an out-of-order older frame of the SAME message. It must be
+    // ignored -- neither regress the snapshot nor open a new segment.
+    server.sendEvent(deltaFrame({ sessionKey: "s1", messageObject: assistantMessage("Hello") }));
+    server.sendEvent(deltaFrame({ sessionKey: "s1", messageObject: assistantMessage("Hello world"), done: true }));
+
+    await until(() => committed() !== undefined);
+    expect(committed()).toBe("Hello world");
+    // The snapshot never dipped to "Hello": every delivered draft stayed at the full held text.
+    expect(deltas).toEqual(["Hello world", "Hello world", "Hello world"]);
   });
 });
 
