@@ -268,6 +268,111 @@ describe("attach backend end to end", () => {
       }),
     ).rejects.toThrow(new RegExp(TOKEN_ENV));
   });
+
+  it("delivers a mid-turn steer to the harness and commits the continued reply", async () => {
+    const deviceToken = await pairDevice();
+    const frames: ServerFrame[] = [];
+    await openClientWs(deviceToken, frames);
+
+    // A harness that answers a turn with one draft then hangs, and on a steer frame finishes the
+    // turn with a final draft (echoing the steer text) + done under the same turnId.
+    const harness = track(
+      new WebSocket(`${gateway.url.replace("http", "ws")}/attach`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      }),
+    );
+    await once(harness, "open");
+    harness.on("message", (data) => {
+      const frame = JSON.parse(String(data)) as { kind: string; threadId: string; turnId: string; text?: string };
+      const send = (update: unknown) => harness.send(JSON.stringify({ threadId: frame.threadId, update }));
+      if (frame.kind === "turn") {
+        send({ kind: "draft", turnId: frame.turnId, blocks: [{ type: "paragraph", text: "working" }] });
+      } else if (frame.kind === "steer") {
+        send({ kind: "draft", turnId: frame.turnId, blocks: [{ type: "paragraph", text: `ok: ${frame.text}` }] });
+        send({ kind: "done", turnId: frame.turnId });
+      }
+    });
+    await until(() => frames.some((f) => f.type === "presence" && f.state === "online"));
+
+    const threadId = await createThread(deviceToken);
+    await fetch(`${gateway.url}/threads/${threadId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${deviceToken}` },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "start" }] }),
+    });
+    await until(() => frames.some((f) => f.type === "draft"));
+
+    // Mid-turn send: routes to steer (attach declares steer), committed with delivery "steer".
+    await fetch(`${gateway.url}/threads/${threadId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${deviceToken}` },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "also Y" }] }),
+    });
+    await until(() => frames.some((f) => f.type === "done"));
+
+    const committed = frames.filter(
+      (f): f is Extract<ServerFrame, { type: "committed" }> => f.type === "committed",
+    );
+    const steered = committed.map((f) => f.message).find((m) => m.role === "user" && m.delivery === "steer");
+    expect(steered).toBeDefined();
+    const agentReply = committed.map((f) => f.message).find((m) => m.role === "agent");
+    expect(agentReply?.blocks).toEqual([{ type: "paragraph", text: "ok: also Y" }]);
+    // All drafts and the agent commit share one turnId (no new turn was minted for the steer).
+    const turnIds = new Set(
+      frames.filter((f) => f.type === "draft").map((f) => (f.type === "draft" ? f.turnId : "")),
+    );
+    expect(turnIds.size).toBe(1);
+  });
+
+  it("interrupts an in-flight attach turn into a turn.interrupted marker plus done", async () => {
+    const deviceToken = await pairDevice();
+    const frames: ServerFrame[] = [];
+    await openClientWs(deviceToken, frames);
+
+    // A harness that answers with one draft and then hangs (never done): the interrupt is what
+    // ends the turn.
+    const harness = track(
+      new WebSocket(`${gateway.url.replace("http", "ws")}/attach`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      }),
+    );
+    await once(harness, "open");
+    harness.on("message", (data) => {
+      const frame = JSON.parse(String(data)) as { kind: string; threadId: string; turnId: string };
+      if (frame.kind === "turn") {
+        harness.send(
+          JSON.stringify({
+            threadId: frame.threadId,
+            update: { kind: "draft", turnId: frame.turnId, blocks: [{ type: "paragraph", text: "thinking" }] },
+          }),
+        );
+      }
+    });
+    await until(() => frames.some((f) => f.type === "presence" && f.state === "online"));
+
+    const threadId = await createThread(deviceToken);
+    await fetch(`${gateway.url}/threads/${threadId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${deviceToken}` },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "run forever" }] }),
+    });
+    await until(() => frames.some((f) => f.type === "draft"));
+
+    const res = await fetch(`${gateway.url}/threads/${threadId}/interrupt`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${deviceToken}` },
+    });
+    expect(res.status).toBe(202);
+    await until(() => frames.some((f) => f.type === "done"));
+
+    const history = await fetch(`${gateway.url}/threads/${threadId}/messages`, {
+      headers: { authorization: `Bearer ${deviceToken}` },
+    });
+    const body = (await history.json()) as { messages: Message[] };
+    expect(body.messages.some((m) => m.marker === "turn.interrupted")).toBe(true);
+    expect(body.messages.some((m) => m.role === "agent")).toBe(false);
+    expect(frames.some((f) => f.type === "error")).toBe(false);
+  });
 });
 
 describe("buildAdapters attach branch", () => {

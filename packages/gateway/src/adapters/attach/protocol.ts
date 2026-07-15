@@ -52,3 +52,30 @@ export const AttachTurnFrameSchema = Type.Object({
   text: Type.String(),
 });
 export type AttachTurnFrame = Static<typeof AttachTurnFrameSchema>;
+
+/** Gateway-to-plugin: deliver blocks mid-turn into an in-flight turn (native steer). Carries the
+ *  EXISTING turnId so the continuing reply still anchors to the original turn. */
+export const AttachSteerFrameSchema = Type.Object({
+  kind: Type.Literal("steer"),
+  threadId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+  text: Type.String(),
+});
+export type AttachSteerFrame = Static<typeof AttachSteerFrameSchema>;
+
+/** Gateway-to-plugin: hard-interrupt an in-flight turn (native interrupt). No content. */
+export const AttachInterruptFrameSchema = Type.Object({
+  kind: Type.Literal("interrupt"),
+  threadId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+});
+export type AttachInterruptFrame = Static<typeof AttachInterruptFrameSchema>;
+
+/** The closed set of gateway-to-plugin frames. Objects stay open, but an unknown `kind` is
+ *  invalid, mirroring the inbound stance. */
+export const AttachOutboundFrameSchema = Type.Union([
+  AttachTurnFrameSchema,
+  AttachSteerFrameSchema,
+  AttachInterruptFrameSchema,
+]);
+export type AttachOutboundFrame = Static<typeof AttachOutboundFrameSchema>;

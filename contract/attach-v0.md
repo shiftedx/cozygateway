@@ -44,6 +44,23 @@ One kind, the turn start:
 The gateway may start turns on different threads concurrently. Turns within one thread are
 serialized by the gateway (a thread never has two in-flight turns).
 
+Steer (mid-turn injection into the in-flight turn):
+
+    {"kind": "steer", "threadId": "<id>", "turnId": "<id>", "text": "<prompt text>"}
+
+- Sent only while a turn is already in flight for `threadId`. It carries the SAME `turnId` as the
+  in-flight turn; the plugin injects `text` as another inbound message so the harness steers the
+  running turn natively (agent-side `busy_input_mode: steer`). The continued reply keeps streaming
+  under the original `turnId`; the plugin does NOT start a new turn or seal anything for the steer.
+
+Interrupt (hard stop of the in-flight turn):
+
+    {"kind": "interrupt", "threadId": "<id>", "turnId": "<id>"}
+
+- Sent to stop the in-flight turn (the harness's native interrupt). The gateway independently fails
+  the turn on its side and records a `turn.interrupted` system message, so the plugin need only
+  trigger the native stop; any late frames for `turnId` are dropped by the gateway.
+
 ### Plugin to gateway
 
 Every frame:

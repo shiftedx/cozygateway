@@ -10,7 +10,11 @@ import {
   type AttachAdapter,
   type TurnEndpoint,
 } from "../src/adapters/attach/adapter.ts";
-import type { AttachTurnFrame } from "../src/adapters/attach/protocol.ts";
+import type {
+  AttachInterruptFrame,
+  AttachSteerFrame,
+  AttachTurnFrame,
+} from "../src/adapters/attach/protocol.ts";
 import type { TurnHandlers } from "../src/adapters/types.ts";
 
 const agent = (id: string, options?: Record<string, unknown>) => ({
@@ -89,16 +93,30 @@ describe("collectAttachTokens", () => {
 interface FakeEndpoint extends TurnEndpoint {
   attached: boolean;
   frames: AttachTurnFrame[];
+  steerFrames: AttachSteerFrame[];
+  interruptFrames: AttachInterruptFrame[];
 }
 
 function fakeEndpoint(): FakeEndpoint {
   const endpoint: FakeEndpoint = {
     attached: true,
     frames: [],
+    steerFrames: [],
+    interruptFrames: [],
     isAttached: () => endpoint.attached,
-    sendTurn: (agentId, frame) => {
+    sendTurn: (_agentId, frame) => {
       if (!endpoint.attached) return false;
       endpoint.frames.push(frame);
+      return true;
+    },
+    sendSteer: (_agentId, frame) => {
+      if (!endpoint.attached) return false;
+      endpoint.steerFrames.push(frame);
+      return true;
+    },
+    sendInterrupt: (_agentId, frame) => {
+      if (!endpoint.attached) return false;
+      endpoint.interruptFrames.push(frame);
       return true;
     },
   };
@@ -298,6 +316,50 @@ describe("createAttachAdapter", () => {
     adapter.handleUpdate("ta", { kind: "done", turnId: a.frame.turnId });
     await a.turn;
     expect(a.observed.commits).toEqual([[{ type: "paragraph", text: "a done" }]]);
+  });
+
+  it("declares steer mid-turn delivery", () => {
+    const adapter = createAttachAdapter({ agentId: "a1", endpoint: fakeEndpoint(), turnTimeoutMs: 1_000 });
+    expect(adapter.midTurnDelivery).toBe("steer");
+  });
+
+  it("steer sends a steer frame under the in-flight turnId without settling the turn", async () => {
+    const endpoint = fakeEndpoint();
+    const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
+    const { session, turn, observed, frame } = await startTurn(adapter, endpoint, "t1");
+    await session.steer?.([{ type: "paragraph", text: "also do X" }]);
+
+    expect(endpoint.steerFrames).toEqual([
+      { kind: "steer", threadId: "t1", turnId: frame.turnId, text: "also do X" },
+    ]);
+    // The turn is still in flight: a later draft + done still commits.
+    adapter.handleUpdate("t1", {
+      kind: "draft",
+      turnId: frame.turnId,
+      blocks: [{ type: "paragraph", text: "did X" }],
+    });
+    adapter.handleUpdate("t1", { kind: "done", turnId: frame.turnId });
+    await turn;
+    expect(observed.commits).toEqual([[{ type: "paragraph", text: "did X" }]]);
+  });
+
+  it("interrupt sends an interrupt frame and rejects the in-flight turn", async () => {
+    const endpoint = fakeEndpoint();
+    const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
+    const { session, turn, frame } = await startTurn(adapter, endpoint, "t1");
+    await session.interrupt?.();
+    expect(endpoint.interruptFrames).toEqual([{ kind: "interrupt", threadId: "t1", turnId: frame.turnId }]);
+    await expect(turn).rejects.toThrow(/interrupted/);
+  });
+
+  it("steer and interrupt are no-ops when no turn is in flight for the thread", async () => {
+    const endpoint = fakeEndpoint();
+    const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
+    const session = await adapter.startSession("t1");
+    await session.steer?.([{ type: "paragraph", text: "x" }]);
+    await session.interrupt?.();
+    expect(endpoint.steerFrames).toHaveLength(0);
+    expect(endpoint.interruptFrames).toHaveLength(0);
   });
 });
 
