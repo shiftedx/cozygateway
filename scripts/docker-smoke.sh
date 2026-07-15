@@ -5,7 +5,7 @@ set -euo pipefail
 
 IMAGE="cozygateway:smoke"
 NAME="cozygateway-smoke-$$"
-PORT=8787
+PORT=18787
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 cleanup() {
