@@ -24,7 +24,9 @@ import {
   ErrorBodySchema,
   ErrorFrameSchema,
   GatewayInfoSchema,
+  InterruptResponseSchema,
   ListMessagesResponseSchema,
+  MessageSchema,
   PairResponseSchema,
   ReadyFrameSchema,
   SendMessageResponseSchema,
@@ -794,6 +796,62 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
         },
         TEST_TIMEOUT_MS,
       );
+    });
+
+    // Spec section 5: POST /threads/:id/interrupt. On an idle thread it is a no-op returning 204;
+    // auth is required exactly as for every other route. Steer behavior is out of scope for the
+    // portable suite (the reference echo backend is queue-only), so only the contract-level shape
+    // and the idle no-op are asserted here.
+    describe("mid-turn interrupt", () => {
+      it(
+        "POST interrupt without a token is 401 unauthorized",
+        async () => {
+          const res = await fetch(`${env.baseUrl()}/threads/anything/interrupt`, { method: "POST" });
+          expect(res.status).toBe(401);
+          expect(assertValid(ErrorBodySchema, await res.json()).error.code).toBe("unauthorized");
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      it(
+        "POST interrupt on a nonexistent thread is 404 not_found",
+        async () => {
+          const { token } = await pairDevice("interrupt-404");
+          const res = await authFetch(token, "/threads/no-such-thread/interrupt", { method: "POST" });
+          expect(res.status).toBe(404);
+          expect(assertValid(ErrorBodySchema, await res.json()).error.code).toBe("not_found");
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      it(
+        "POST interrupt on an idle thread is 204 with no body",
+        async () => {
+          const { token } = await pairDevice("interrupt-idle");
+          const thread = await createThread(token, "idle interrupt");
+          const res = await authFetch(token, `/threads/${thread.id}/interrupt`, { method: "POST" });
+          expect(res.status).toBe(204);
+          expect(await res.text()).toBe("");
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      it("the InterruptResponse and delivery shapes are valid additive v1.x contract types", () => {
+        // Pure schema checks: no backend dependency. A v1.0 client that predates delivery keeps
+        // working because MessageSchema stays OPEN, and the 202 body shape is fixed.
+        expect(check(InterruptResponseSchema, { status: "interrupting" })).toBe(true);
+        const userMsg = {
+          threadId: "t",
+          seq: 1,
+          role: "user" as const,
+          blocks: [{ type: "paragraph", text: "x" }],
+          delivery: "steer" as const,
+          createdAt: 0,
+        };
+        expect(check(MessageSchema, userMsg)).toBe(true);
+        const { delivery: _drop, ...withoutDelivery } = userMsg;
+        expect(check(MessageSchema, withoutDelivery)).toBe(true);
+      });
     });
   });
 }
