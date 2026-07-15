@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS messages (
   blocks_json TEXT NOT NULL,
   turn_id TEXT,
   marker TEXT,
+  delivery TEXT,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (thread_id, seq)
 ) STRICT, WITHOUT ROWID;
@@ -81,6 +82,7 @@ interface MessageDbRow {
   blocksJson: string;
   turnId: string | null;
   marker: string | null;
+  delivery: string | null;
   createdAt: number;
 }
 
@@ -93,7 +95,8 @@ function toMessage(row: MessageDbRow): Message {
     createdAt: row.createdAt,
   };
   if (row.turnId !== null) message.turnId = row.turnId;
-  if (row.marker === "turn.failed") message.marker = "turn.failed";
+  if (row.marker === "turn.failed" || row.marker === "turn.interrupted") message.marker = row.marker;
+  if (row.delivery === "turn" || row.delivery === "steer") message.delivery = row.delivery;
   return message;
 }
 
@@ -207,7 +210,13 @@ export class Storage {
 
   appendMessage(
     threadId: string,
-    entry: { role: MessageRole; blocks: RichBlock[]; turnId?: string; marker?: "turn.failed" },
+    entry: {
+      role: MessageRole;
+      blocks: RichBlock[];
+      turnId?: string;
+      marker?: "turn.failed" | "turn.interrupted";
+      delivery?: "turn" | "steer";
+    },
     createdAt: number,
   ): Message {
     this.#db.exec("BEGIN IMMEDIATE");
@@ -217,8 +226,8 @@ export class Storage {
         .get(threadId) as { next: number };
       this.#db
         .prepare(
-          `INSERT INTO messages (thread_id, seq, role, blocks_json, turn_id, marker, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (thread_id, seq, role, blocks_json, turn_id, marker, delivery, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           threadId,
@@ -227,6 +236,7 @@ export class Storage {
           JSON.stringify(entry.blocks),
           entry.turnId ?? null,
           entry.marker ?? null,
+          entry.delivery ?? null,
           createdAt,
         );
       this.#db.prepare("UPDATE threads SET last_message_at = ? WHERE id = ?").run(createdAt, threadId);
@@ -240,6 +250,7 @@ export class Storage {
       };
       if (entry.turnId !== undefined) message.turnId = entry.turnId;
       if (entry.marker !== undefined) message.marker = entry.marker;
+      if (entry.delivery !== undefined) message.delivery = entry.delivery;
       return message;
     } catch (err) {
       this.#db.exec("ROLLBACK");
@@ -251,7 +262,7 @@ export class Storage {
     const rows = this.#db
       .prepare(
         `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
-                marker, created_at AS createdAt
+                marker, delivery, created_at AS createdAt
          FROM messages WHERE thread_id = ? AND seq > ? ORDER BY seq`,
       )
       .all(threadId, sinceSeq) as unknown as MessageDbRow[];
@@ -262,7 +273,7 @@ export class Storage {
     const rows = this.#db
       .prepare(
         `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
-                marker, created_at AS createdAt
+                marker, delivery, created_at AS createdAt
          FROM messages WHERE thread_id = ? AND seq < ?
          ORDER BY seq DESC LIMIT ?`,
       )
@@ -303,5 +314,12 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // Additive migration for a DB created before the delivery column existed. ALTER TABLE ADD
+  // COLUMN throws "duplicate column name" on an up-to-date DB, which is the no-op we want.
+  try {
+    db.exec("ALTER TABLE messages ADD COLUMN delivery TEXT");
+  } catch {
+    // column already present: nothing to do
+  }
   return new Storage(db);
 }

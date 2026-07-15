@@ -3,7 +3,7 @@ import type { ServerFrame } from "cozygateway-contract";
 
 import { openStorage } from "../src/storage.ts";
 import { TurnRunner, nullNotifier, type Notifier } from "../src/turns.ts";
-import { createMockAdapter } from "../src/adapters/mock.ts";
+import { createMockAdapter, createSteerMockAdapter } from "../src/adapters/mock.ts";
 import type { BackendAdapter, BackendSession } from "../src/adapters/types.ts";
 import { BackendUnavailable } from "../src/errors.ts";
 
@@ -254,5 +254,106 @@ describe("TurnRunner", () => {
     release();
     await closing;
     expect(frames.some((f) => f.type === "committed" && f.message.role === "agent")).toBe(true);
+  });
+});
+
+function steerSetup() {
+  const storage = openStorage(":memory:");
+  storage.upsertAgent({ id: "s1", name: "Steer", avatar: null, backend: "mock-steer" });
+  storage.createThread({ id: "t1", agentId: "s1", title: "T", createdAt: 1 });
+  const frames: ServerFrame[] = [];
+  const runner = new TurnRunner({
+    storage,
+    hub: { broadcast: (f) => frames.push(f), connectedDeviceIds: () => new Set() },
+    adapters: new Map<string, BackendAdapter>([["s1", createSteerMockAdapter()]]),
+    notifier: nullNotifier,
+    now: () => 42,
+  });
+  return { storage, frames, runner };
+}
+
+const draftTurnIds = (fs: ServerFrame[]): string[] =>
+  fs.filter((f): f is Extract<ServerFrame, { type: "draft" }> => f.type === "draft").map((d) => d.turnId);
+
+describe("TurnRunner mid-turn delivery", () => {
+  it("steers a mid-turn send into the in-flight turn under the same turnId, delivery steer", async () => {
+    const { storage, frames, runner } = steerSetup();
+    const first = runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    expect(first.delivery).toBeUndefined();
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+
+    const steered = runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]);
+    expect(steered.delivery).toBe("steer");
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "done"));
+
+    expect(new Set(draftTurnIds(frames)).size).toBe(1); // no new turnId minted for the steer
+    const agentCommit = frames.find((f) => f.type === "committed" && f.message.role === "agent");
+    expect(agentCommit?.type === "committed" ? agentCommit.message.blocks : undefined).toEqual([
+      { type: "paragraph", text: "Working: one + two" },
+    ]);
+    // The steer user message persisted with delivery "steer"; the first with none.
+    const users = storage.messagesSince("t1", 0).filter((m) => m.role === "user");
+    expect(users.map((m) => m.delivery)).toEqual([undefined, "steer"]);
+  });
+
+  it("interrupt on a steer-capable in-flight turn commits turn.interrupted then done, no error frame", async () => {
+    const { storage, frames, runner } = steerSetup();
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+
+    expect(runner.interrupt("t1")).toBe("interrupting");
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "done"));
+
+    const sys = storage.messagesSince("t1", 0).find((m) => m.marker === "turn.interrupted");
+    expect(sys?.role).toBe("system");
+    expect(frames.some((f) => f.type === "error")).toBe(false);
+    const types = frames.map((f) => f.type);
+    const sysIdx = frames.findIndex((f) => f.type === "committed" && f.message.role === "system");
+    expect(types.lastIndexOf("done")).toBeGreaterThan(sysIdx);
+  });
+
+  it("interrupt on an idle thread returns idle and broadcasts nothing new", () => {
+    const { frames, runner } = steerSetup();
+    expect(runner.interrupt("t1")).toBe("idle");
+    expect(frames).toHaveLength(0);
+  });
+
+  it("a mid-turn send that loses the race (turn already done) queues normally with delivery absent", async () => {
+    // The mock echo (queue backend) finishes its turn synchronously-ish; a second send after the
+    // first turn's done sees no in-flight record and queues, committing with delivery absent.
+    const { frames, runner } = setup();
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.filter((f) => f.type === "done").length === 1);
+    const second = runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]);
+    expect(second.delivery).toBeUndefined();
+  });
+
+  it("interrupt on a queue-only in-flight turn returns unsupported and emits interrupt_unsupported", async () => {
+    const storage = openStorage(":memory:");
+    storage.upsertAgent({ id: "slow", name: "Slow", avatar: null, backend: "gated" });
+    storage.createThread({ id: "t1", agentId: "slow", title: "T", createdAt: 1 });
+    let release = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const frames: ServerFrame[] = [];
+    const runner = new TurnRunner({
+      storage,
+      hub: { broadcast: (f) => frames.push(f), connectedDeviceIds: () => new Set() },
+      adapters: new Map<string, BackendAdapter>([["slow", gatedAdapter(gate)]]),
+      notifier: nullNotifier,
+      now: () => 42,
+    });
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+
+    expect(runner.interrupt("t1")).toBe("unsupported");
+    const err = frames.find((f) => f.type === "error");
+    expect(err?.type === "error" ? err.code : undefined).toBe("interrupt_unsupported");
+    expect(err?.type === "error" ? err.message : undefined).toBe("interrupt unsupported");
+    // The turn is NOT interrupted: it still completes normally when released.
+    release();
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "committed" && f.message.role === "agent"));
+    expect(storage.messagesSince("t1", 0).some((m) => m.marker === "turn.interrupted")).toBe(false);
   });
 });
