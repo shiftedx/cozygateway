@@ -38,6 +38,8 @@ from .attach_client import (
     AttachClient,
     AttachClientConfig,
     AttachSupersededError,
+    InterruptFrame,
+    SteerFrame,
     TurnFrame,
 )
 from .text_blocks import IncrementalNormalizer
@@ -202,6 +204,8 @@ class AttachAdapter:
                 token=self.token,
                 ca_file=self.ca_file,
                 on_turn=self._on_turn,
+                on_steer=self._on_steer,
+                on_interrupt=self._on_interrupt,
             )
         )
         try:
@@ -355,6 +359,67 @@ class AttachAdapter:
             logger.debug("attach: handle_message raised", exc_info=True)
             await self._safe_failed(turn.thread_id, turn.turn_id, "turn error")
             self._cleanup_turn(turn.thread_id, turn.turn_id)
+
+    # -- mid-turn steer -------------------------------------------------------
+    def _on_steer(self, frame: SteerFrame) -> None:
+        """Bound to the client's ``on_steer``: schedule the injection as a task."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_steer(frame))
+
+    async def _handle_steer(self, frame: SteerFrame) -> None:
+        """Inject a mid-turn steer as another inbound message on the same thread.
+
+        Deliberately does NOT touch ``_active_turn``, ``_seen_turns``, or seal anything: with the
+        agent-side config ``busy_input_mode=steer``, the harness's busy handler routes this
+        injection into the running turn natively, and the continued reply keeps streaming under
+        the original ``turn_id`` (still held in ``_active_turn[thread_id]``).
+        """
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        source = self.build_source(  # type: ignore[attr-defined]
+            chat_id=frame.thread_id,
+            chat_type="dm",
+            user_name=INBOUND_USER,
+            user_id=INBOUND_USER,
+            role_authorized=True,
+        )
+        # A distinct message_id for the injected message; the running turn's reply anchor is left
+        # untouched so continued drafts still anchor to the original turn.
+        event = MessageEvent(text=frame.text, source=source, message_id=f"{frame.turn_id}:steer")
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a steer must never crash the drain loop
+            logger.debug("attach: steer injection raised", exc_info=True)
+
+    # -- hard interrupt -------------------------------------------------------
+    def _on_interrupt(self, frame: InterruptFrame) -> None:
+        """Bound to the client's ``on_interrupt``: schedule the native stop as a task."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_interrupt(frame))
+
+    async def _handle_interrupt(self, frame: InterruptFrame) -> None:
+        """Trigger the harness's native interrupt for the thread's running turn.
+
+        The gateway independently records ``turn.interrupted`` on its side, so this only needs to
+        stop the live run. The interrupt seam is harness-provided and imported lazily so this
+        module stays importable without the harness (mirrors ``_handle_turn``). A harness build
+        without an interrupt seam degrades to a best-effort no-op.
+        """
+        try:
+            from gateway.run import interrupt_session  # harness-defined identifier
+        except Exception:  # noqa: BLE001 - no native interrupt seam in this harness build
+            logger.debug("attach: native interrupt unavailable", exc_info=True)
+            return
+        try:
+            await interrupt_session(frame.thread_id)
+        except Exception:  # noqa: BLE001 - best-effort stop
+            logger.debug("attach: interrupt raised", exc_info=True)
 
     # -- streaming drafts -----------------------------------------------------
     def supports_draft_streaming(
