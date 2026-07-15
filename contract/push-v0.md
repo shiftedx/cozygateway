@@ -27,7 +27,11 @@ Request: `{"platform": "webhook" | "apns", "token": string}`
   literal-IP `token` host in a blocked range (loopback, link-local, private, or
   unspecified) is rejected here with `invalid_request`; a DNS-name host is instead
   vetted at delivery time, once resolved.
-- `apns`: recognized, not yet available; returns 501 `unsupported_platform`.
+- `apns`: token-based APNs (ES256 provider JWT) when the relay is configured with an APNs key
+  (env: APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC, APNS_ENVIRONMENT); `token` is the
+  hex device token. When APNs is not configured, an `apns` registration returns 501
+  `unsupported_platform`. The push payload is an alert with `mutable-content: 1` carrying the opaque
+  ciphertext under the top-level custom key `c`; the relay never decrypts it.
 
 Response: 201 `{"pushId": string}`. The pushId is 16 random bytes, base64url. It is
 unguessable and knowing it is the de-facto capability to notify that registration.

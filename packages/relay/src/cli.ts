@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 
+import { apnsConfigFromEnv } from "./apns.ts";
 import { isLoopbackBindHost } from "./egress.ts";
 import { DEFAULT_DAILY_CAP, DEFAULT_MAX_REGISTRATIONS, RELAY_VERSION, startRelay, type RelayConfig } from "./server.ts";
 
@@ -47,6 +49,7 @@ export async function runCli(argv: string[]): Promise<number> {
   let config: RelayConfig;
   try {
     config = parseCliConfig(argv);
+    config.apns = apnsConfigFromEnv(process.env, (p) => readFileSync(p, "utf8"));
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     console.error(USAGE);

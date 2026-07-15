@@ -46,3 +46,27 @@ Relay:
 The gateway serves plaintext over `0.0.0.0` inside the container. Keep it on a trusted network
 (the homelab LAN) or behind your own TLS-terminating reverse proxy; TLS with certificate pinning
 for the phone link is planned upstream.
+
+## Push over APNs (optional)
+
+The relay is webhook-only by default. To deliver real iOS push, configure APNs token auth and
+mount your `.p8` key:
+
+1. In the Apple developer portal, create an APNs auth key (`.p8`), and note the key id, your team
+   id, and the app bundle id (`com.cozylabs.cozychat`).
+2. Put the `.p8` on the host and uncomment the relay `.p8` volume in `docker-compose.yml`.
+3. Set in `.env`: `APNS_KEY_P8_HOST_PATH`, `APNS_KEY_P8_PATH=/keys/apns.p8`, `APNS_KEY_ID`,
+   `APNS_TEAM_ID`, `APNS_TOPIC=com.cozylabs.cozychat`, `APNS_ENVIRONMENT` (`development` for a dev
+   build, `production` for TestFlight/App Store).
+
+Relay APNs environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `APNS_KEY_P8_PATH` | in-container path to the mounted `.p8` (e.g. `/keys/apns.p8`) |
+| `APNS_KEY_ID` | the APNs auth key id |
+| `APNS_TEAM_ID` | your Apple developer team id |
+| `APNS_TOPIC` | the app bundle id (`com.cozylabs.cozychat`) |
+| `APNS_ENVIRONMENT` | `development` or `production` |
+
+When any of these is set they must all be set, or the relay fails to start.
