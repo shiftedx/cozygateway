@@ -1,0 +1,16 @@
+node_modules
+**/node_modules
+**/dist
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+.git
+.github
+docs
+**/test
+**/*.test.ts
+.superpowers
+coverage
+*.tsbuildinfo
+.DS_Store

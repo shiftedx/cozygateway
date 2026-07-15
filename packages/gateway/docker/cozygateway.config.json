@@ -1,0 +1,4 @@
+{
+  "name": "cozygateway",
+  "agents": [{ "id": "echo", "name": "Echo", "backend": "mock" }]
+}
