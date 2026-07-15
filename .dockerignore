@@ -17,3 +17,5 @@ coverage
 .env
 .env.*
 !.env.example
+*.p8
+secrets/
