@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { PairRequest, SendMessageRequest } from "../src/rest.ts";
 import {
   CreateThreadRequestSchema,
+  InterruptResponseSchema,
   PairRequestSchema,
   RenameThreadRequestSchema,
   SendMessageRequestSchema,
@@ -32,5 +33,13 @@ describe("REST schemas", () => {
     const ok: SendMessageRequest = { blocks: [{ type: "paragraph", text: "hi" }] };
     expect(check(SendMessageRequestSchema, ok)).toBe(true);
     expect(check(SendMessageRequestSchema, { blocks: [] })).toBe(false);
+  });
+});
+
+describe("InterruptResponseSchema", () => {
+  it("accepts the interrupting status body and rejects anything else", () => {
+    expect(check(InterruptResponseSchema, { status: "interrupting" })).toBe(true);
+    expect(check(InterruptResponseSchema, { status: "idle" })).toBe(false);
+    expect(check(InterruptResponseSchema, {})).toBe(false);
   });
 });

@@ -110,3 +110,34 @@ describe("resource schemas", () => {
     });
   });
 });
+
+describe("contract v1.x additive message fields", () => {
+  const base = {
+    threadId: "t1",
+    seq: 1,
+    role: "user" as const,
+    blocks: [{ type: "paragraph", text: "hi" }],
+    createdAt: 0,
+  };
+
+  it("accepts a user message with no delivery (delivery absent means turn)", () => {
+    expect(check(MessageSchema, base)).toBe(true);
+  });
+
+  it("accepts delivery 'turn' and 'steer' and rejects any other value", () => {
+    expect(check(MessageSchema, { ...base, delivery: "turn" })).toBe(true);
+    expect(check(MessageSchema, { ...base, delivery: "steer" })).toBe(true);
+    expect(check(MessageSchema, { ...base, delivery: "queue" })).toBe(false);
+  });
+
+  it("accepts both turn.failed and turn.interrupted markers on a system message", () => {
+    const sys = { ...base, role: "system" as const, turnId: "x" };
+    expect(check(MessageSchema, { ...sys, marker: "turn.failed" })).toBe(true);
+    expect(check(MessageSchema, { ...sys, marker: "turn.interrupted" })).toBe(true);
+    expect(check(MessageSchema, { ...sys, marker: "turn.aborted" })).toBe(false);
+  });
+
+  it("lists interrupt_unsupported as a known error code", () => {
+    expect(ERROR_CODES).toContain("interrupt_unsupported");
+  });
+});

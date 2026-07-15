@@ -52,3 +52,10 @@ export const PushRegisterRequestSchema = Type.Object({
   pushKey: Type.String({ minLength: 1 }),
 });
 export type PushRegisterRequest = Static<typeof PushRegisterRequestSchema>;
+
+/** Response body of POST /threads/:id/interrupt when a turn was in flight and the interrupt was
+ *  dispatched (HTTP 202). An idle thread returns HTTP 204 with no body instead. */
+export const InterruptResponseSchema = Type.Object({
+  status: Type.Literal("interrupting"),
+});
+export type InterruptResponse = Static<typeof InterruptResponseSchema>;
