@@ -357,3 +357,35 @@ describe("TurnRunner mid-turn delivery", () => {
     expect(storage.messagesSince("t1", 0).some((m) => m.marker === "turn.interrupted")).toBe(false);
   });
 });
+
+describe("TurnRunner stop-phrase send path", () => {
+  it("a whole-message stop interrupts the in-flight steer turn AND queues a normal next turn", async () => {
+    const { storage, frames, runner } = steerSetup();
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "long task" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+
+    // "stop" commits as a normal user message (delivery absent) and interrupts the in-flight turn.
+    const stop = runner.submitUserMessage("t1", [{ type: "paragraph", text: "stop" }]);
+    expect(stop.delivery).toBeUndefined();
+
+    await untilFrames(frames, (fs) =>
+      fs.some((f) => f.type === "committed" && f.message.marker === "turn.interrupted"),
+    );
+    // The stop message itself becomes the next queued turn (mock-steer draws "Working: stop").
+    await untilFrames(frames, (fs) =>
+      fs.some((f) => f.type === "draft" && f.blocks.some((b) => b.type === "paragraph" && b.text === "Working: stop")),
+    );
+    const users = storage.messagesSince("t1", 0).filter((m) => m.role === "user");
+    expect(users.map((m) => m.delivery)).toEqual([undefined, undefined]);
+  });
+
+  it("a message that merely contains 'stop' steers instead of interrupting", async () => {
+    const { frames, runner } = steerSetup();
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+    const sent = runner.submitUserMessage("t1", [
+      { type: "paragraph", text: "stop adding comments to every file" },
+    ]);
+    expect(sent.delivery).toBe("steer");
+  });
+});

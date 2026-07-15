@@ -5,6 +5,7 @@ import type { Message, RichBlock, ServerFrame } from "cozygateway-contract";
 import type { Storage } from "./storage.ts";
 import type { BackendAdapter, BackendSession } from "./adapters/types.ts";
 import { BackendUnavailable } from "./errors.ts";
+import { isStopPhrase, stopCandidateFromBlocks } from "./stop-phrase.ts";
 
 export interface Notifier {
   notify(
@@ -69,6 +70,15 @@ export class TurnRunner {
       throw new BackendUnavailable(`no adapter for agent "${thread.agentId}"`);
     }
     const agentName = this.#storage.agentById(thread.agentId)?.name ?? thread.agentId;
+
+    // Stop-phrase detection (whole-message only). A match routes to the interrupt path AND still
+    // commits the user message normally (delivery absent), so it becomes the next queued turn.
+    const candidate = stopCandidateFromBlocks(blocks);
+    if (candidate !== undefined && isStopPhrase(candidate)) {
+      const active = this.#inflight.get(threadId);
+      if (active !== undefined) this.#dispatchInterrupt(threadId, active);
+      return this.#commitAndQueue(threadId, agentName, adapter, blocks);
+    }
 
     // Mid-turn steer: an in-flight, steer-capable turn takes the message immediately, under its
     // existing turnId, and the user message commits with delivery "steer". The in-flight check is
