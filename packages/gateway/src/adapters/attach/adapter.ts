@@ -116,6 +116,7 @@ export function createAttachAdapter(deps: {
 
   return {
     backend: "attach",
+    midTurnDelivery: "steer",
 
     async startSession(threadId: string): Promise<BackendSession> {
       return {
