@@ -57,9 +57,11 @@ Interrupt (hard stop of the in-flight turn):
 
     {"kind": "interrupt", "threadId": "<id>", "turnId": "<id>"}
 
-- Sent to stop the in-flight turn (the harness's native interrupt). The gateway independently fails
-  the turn on its side and records a `turn.interrupted` system message, so the plugin need only
-  trigger the native stop; any late frames for `turnId` are dropped by the gateway.
+- Sent to stop the in-flight turn. The plugin triggers the harness's native hard stop by injecting
+  a `/stop` command message (a bypass command, so it interrupts the running turn rather than
+  queueing). The gateway independently fails the turn on its side and records a `turn.interrupted`
+  system message, so the plugin need only trigger the native stop; any late frames for `turnId` are
+  dropped by the gateway.
 
 ### Plugin to gateway
 

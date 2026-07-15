@@ -404,22 +404,39 @@ class AttachAdapter:
         self._spawn_background(loop, self._handle_interrupt(frame))
 
     async def _handle_interrupt(self, frame: InterruptFrame) -> None:
-        """Trigger the harness's native interrupt for the thread's running turn.
+        """Hard-stop the thread's running turn via an injected native ``/stop`` command.
 
-        The gateway independently records ``turn.interrupted`` on its side, so this only needs to
-        stop the live run. The interrupt seam is harness-provided and imported lazily so this
-        module stays importable without the harness (mirrors ``_handle_turn``). A harness build
-        without an interrupt seam degrades to a best-effort no-op.
+        The harness exposes no callable interrupt entry point; its real hard-stop seam is an
+        injected ``/stop`` slash-command message. ``stop`` is a member of the harness's
+        ``ACTIVE_SESSION_BYPASS_COMMANDS``, so a ``/stop`` message delivered through
+        ``handle_message`` on a busy session bypasses the queue and dispatches the harness's
+        native interrupt-and-clear path (hard-stopping the run); on an idle session it is a
+        clean no-op. This is the same injected-command seam ``_handle_steer`` rides to inject
+        steer text, so it needs no extra harness import and this module stays importable
+        without the harness on the path.
+
+        The gateway independently records ``turn.interrupted`` on its side, so this only needs
+        to stop the live run. A failed inject must never crash the drain loop, so it degrades to
+        a best-effort no-op (debug-log-and-return).
         """
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        source = self.build_source(  # type: ignore[attr-defined]
+            chat_id=frame.thread_id,
+            chat_type="dm",
+            user_name=INBOUND_USER,
+            user_id=INBOUND_USER,
+            role_authorized=True,
+        )
+        # A slash command, not a turn: the injected text must be exactly "/stop" (the harness
+        # recognizes the command from the message text via MessageEvent.get_command), and no
+        # reply anchor is attached -- a command carries no turn-derived message_id, and the
+        # running turn's anchor is left untouched.
+        event = MessageEvent(text="/stop", source=source)
         try:
-            from gateway.run import interrupt_session  # harness-defined identifier
-        except Exception:  # noqa: BLE001 - no native interrupt seam in this harness build
-            logger.debug("attach: native interrupt unavailable", exc_info=True)
-            return
-        try:
-            await interrupt_session(frame.thread_id)
-        except Exception:  # noqa: BLE001 - best-effort stop
-            logger.debug("attach: interrupt raised", exc_info=True)
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - an interrupt must never crash the drain loop
+            logger.debug("attach: interrupt injection raised", exc_info=True)
 
     # -- streaming drafts -----------------------------------------------------
     def supports_draft_streaming(
