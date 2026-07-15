@@ -148,7 +148,7 @@ export async function startGateway(
   });
 
   const server = await new Promise<Server>((resolve) => {
-    const s = serve({ fetch: app.fetch, port: config.port, hostname: "127.0.0.1" }, () => {
+    const s = serve({ fetch: app.fetch, port: config.port, hostname: config.host ?? "127.0.0.1" }, () => {
       resolve(s as Server);
     });
   });
@@ -169,7 +169,7 @@ export async function startGateway(
   const port = address !== null && typeof address === "object" ? address.port : config.port;
 
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: `http://${config.host ?? "127.0.0.1"}:${port}`,
     port,
     storage,
     issueSetupCode: () => {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ContractViolation } from "cozygateway-contract";
 
-import { loadConfig } from "../src/config.ts";
+import { applyEnvOverrides, loadConfig, type GatewayConfig } from "../src/config.ts";
 
 function writeConfig(value: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), "cozygateway-config-"));
@@ -68,5 +68,38 @@ describe("loadConfig", () => {
       capabilities: { "com.cozylabs.test": "one" },
     });
     expect(() => loadConfig(path)).toThrow(ContractViolation);
+  });
+});
+
+const base: GatewayConfig = {
+  name: "g",
+  port: 8787,
+  dbPath: "cozygateway.db",
+  agents: [{ id: "echo", name: "Echo", backend: "mock" }],
+};
+
+describe("applyEnvOverrides", () => {
+  it("overrides host, port, and dbPath from the environment", () => {
+    const next = applyEnvOverrides(base, {
+      COZYGATEWAY_HOST: "0.0.0.0",
+      COZYGATEWAY_PORT: "9000",
+      COZYGATEWAY_DB_PATH: "/data/cozygateway.db",
+    });
+    expect(next.host).toBe("0.0.0.0");
+    expect(next.port).toBe(9000);
+    expect(next.dbPath).toBe("/data/cozygateway.db");
+    // The original is not mutated.
+    expect(base.host).toBeUndefined();
+    expect(base.port).toBe(8787);
+  });
+
+  it("leaves the config unchanged when the env vars are unset or empty", () => {
+    expect(applyEnvOverrides(base, {})).toEqual(base);
+    expect(applyEnvOverrides(base, { COZYGATEWAY_HOST: "", COZYGATEWAY_PORT: "" })).toEqual(base);
+  });
+
+  it("throws on a non-integer or out-of-range COZYGATEWAY_PORT", () => {
+    expect(() => applyEnvOverrides(base, { COZYGATEWAY_PORT: "not-a-port" })).toThrow(/COZYGATEWAY_PORT/);
+    expect(() => applyEnvOverrides(base, { COZYGATEWAY_PORT: "70000" })).toThrow(/COZYGATEWAY_PORT/);
   });
 });

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 
-import { loadConfig } from "./config.ts";
+import { applyEnvOverrides, loadConfig } from "./config.ts";
 import { openStorage } from "./storage.ts";
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
@@ -17,7 +17,7 @@ export async function runCli(argv: string[]): Promise<number> {
   const configPath = values.config;
 
   if (command === "serve") {
-    const config = loadConfig(configPath);
+    const config = applyEnvOverrides(loadConfig(configPath), process.env);
     const gateway = await startGateway(config);
     console.log(`cozygateway ${GATEWAY_VERSION} listening on ${gateway.url}`);
     await new Promise<void>((resolve) => {
@@ -29,7 +29,7 @@ export async function runCli(argv: string[]): Promise<number> {
   }
 
   if (command === "pair") {
-    const config = loadConfig(configPath);
+    const config = applyEnvOverrides(loadConfig(configPath), process.env);
     const storage = openStorage(config.dbPath);
     const code = newSetupCode();
     storage.createSetupCode(code, Date.now() + SETUP_CODE_TTL_MS);
