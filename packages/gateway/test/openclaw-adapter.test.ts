@@ -362,3 +362,18 @@ describe("tool chips on drafts", () => {
     }
   });
 });
+
+describe("openclaw mid-turn delivery capability", () => {
+  it("declares queue and exposes no steer/interrupt on its session", async () => {
+    const client = new FakeOpenClawClient();
+    const adapter = createOpenClawAdapter({
+      agentId: "oc1",
+      client,
+      turnTimeoutMs: DEFAULT_TURN_TIMEOUT_SECONDS * 1000,
+    });
+    expect(adapter.midTurnDelivery).toBe("queue");
+    const session = await adapter.startSession("t1");
+    expect(session.steer).toBeUndefined();
+    expect(session.interrupt).toBeUndefined();
+  });
+});
