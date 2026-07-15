@@ -139,6 +139,10 @@ export async function startGateway(
     gatewayInfo,
     presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",
     submitUserMessage: (threadId, blocks) => runner.submitUserMessage(threadId, blocks),
+    // The runner's "unsupported" outcome collapses to "interrupting" here: a turn WAS in
+    // flight, so REST answers 202, and the runner has already emitted the interrupt_unsupported
+    // error frame over the WebSocket.
+    interruptThread: (threadId) => (runner.interrupt(threadId) === "idle" ? "idle" : "interrupting"),
     onDeviceRevoked: (deviceId) => hub.closeDevice(deviceId),
     now: () => Date.now(),
   });
