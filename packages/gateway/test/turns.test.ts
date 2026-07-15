@@ -21,6 +21,7 @@ function gatedAdapter(gate: Promise<void>): BackendAdapter {
   };
   return {
     backend: "gated",
+    midTurnDelivery: "queue",
     async startSession() {
       return session;
     },

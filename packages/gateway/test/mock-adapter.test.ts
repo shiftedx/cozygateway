@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RichBlock, ToolCall } from "cozygateway-contract";
 
-import { createMockAdapter } from "../src/adapters/mock.ts";
+import { createMockAdapter, createSteerMockAdapter } from "../src/adapters/mock.ts";
 import { buildAdapters } from "../src/adapters/registry.ts";
 
 function record() {
@@ -59,5 +59,52 @@ describe("registry", () => {
     const adapters = buildAdapters([{ id: "m", name: "M", backend: "mock" }]);
     expect(adapters.get("m")?.backend).toBe("mock");
     expect(() => buildAdapters([{ id: "x", name: "X", backend: "warp" }])).toThrow(/unknown backend/);
+  });
+});
+
+describe("createMockAdapter capability", () => {
+  it("declares queue mid-turn delivery and exposes no steer/interrupt", async () => {
+    const adapter = createMockAdapter();
+    expect(adapter.midTurnDelivery).toBe("queue");
+    const session = await adapter.startSession("t1");
+    expect(session.steer).toBeUndefined();
+    expect(session.interrupt).toBeUndefined();
+  });
+});
+
+describe("createSteerMockAdapter", () => {
+  it("declares steer, stays in flight after send, then a steer folds text and commits", async () => {
+    const adapter = createSteerMockAdapter();
+    expect(adapter.midTurnDelivery).toBe("steer");
+    const session = await adapter.startSession("t1");
+    const rec = record();
+    let settled = false;
+    const turn = session.send([{ type: "paragraph", text: "one" }], rec.handlers).then(() => {
+      settled = true;
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(settled).toBe(false); // stays in flight, only the initial draft so far
+    expect(rec.events).toEqual(["draft"]);
+    expect(rec.drafts[0]).toEqual([{ type: "paragraph", text: "Working: one" }]);
+
+    await session.steer?.([{ type: "paragraph", text: "two" }]);
+    await turn;
+    expect(rec.events).toEqual([
+      "draft",
+      "draft",
+      `commit:${JSON.stringify([{ type: "paragraph", text: "Working: one + two" }])}`,
+      "done",
+    ]);
+  });
+
+  it("rejects the in-flight send when interrupt is called, with no commit or done", async () => {
+    const adapter = createSteerMockAdapter();
+    const session = await adapter.startSession("t1");
+    const rec = record();
+    const turn = session.send([{ type: "paragraph", text: "one" }], rec.handlers);
+    await new Promise((r) => setTimeout(r, 5));
+    await session.interrupt?.();
+    await expect(turn).rejects.toThrow(/interrupted/);
+    expect(rec.events).toEqual(["draft"]);
   });
 });
