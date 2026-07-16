@@ -27,7 +27,11 @@ for i in $(seq 1 30); do
 done
 
 echo "==> minting a setup code inside the container"
-PAIR_JSON="$(docker exec "$NAME" node dist/cli.js pair --config /app/cozygateway.config.json | head -1)"
+# Capture the full pair output first, then take the first line locally. Piping the docker exec
+# straight into `head -1` makes head close the pipe after one line; any further CLI output then
+# hits SIGPIPE, and under `set -o pipefail` the 141 kills the whole smoke (seen on Linux CI).
+PAIR_OUTPUT="$(docker exec "$NAME" node dist/cli.js pair --config /app/cozygateway.config.json)"
+PAIR_JSON="$(printf '%s\n' "$PAIR_OUTPUT" | head -1)"
 SETUP_CODE="$(printf '%s' "$PAIR_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).setupCode))")"
 if [ -z "$SETUP_CODE" ]; then echo "failed to mint a setup code"; docker logs "$NAME"; exit 1; fi
 
