@@ -26,6 +26,7 @@ async function setup(opts?: { backendDown?: boolean }) {
       if (opts?.backendDown === true) throw new BackendUnavailable("backend down");
       return storage.appendMessage(threadId, { role: "user", blocks }, 500);
     },
+    interruptThread: () => "idle",
     onDeviceRevoked: () => {},
     now: () => 1_000,
   });
@@ -202,6 +203,7 @@ describe("unexpected faults", () => {
       submitUserMessage: (): Message => {
         throw new Error("boom");
       },
+      interruptThread: () => "idle",
       onDeviceRevoked: () => {},
       now: () => 1_000,
     });

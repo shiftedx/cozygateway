@@ -3,6 +3,9 @@ import { check } from "cozygateway-contract";
 
 import {
   AttachInboundFrameSchema,
+  AttachInterruptFrameSchema,
+  AttachOutboundFrameSchema,
+  AttachSteerFrameSchema,
   AttachTurnFrameSchema,
 } from "../src/adapters/attach/protocol.ts";
 import { blocksToText } from "../src/adapters/attach/blocks-to-text.ts";
@@ -161,5 +164,23 @@ describe("blocksToText", () => {
 
   it("renders an empty block list as an empty string", () => {
     expect(blocksToText([])).toBe("");
+  });
+});
+
+describe("attach outbound steer/interrupt frames", () => {
+  it("accepts a well-formed steer frame and rejects a missing turnId", () => {
+    expect(check(AttachSteerFrameSchema, { kind: "steer", threadId: "t", turnId: "u", text: "hi" })).toBe(true);
+    expect(check(AttachSteerFrameSchema, { kind: "steer", threadId: "t", text: "hi" })).toBe(false);
+  });
+
+  it("accepts a well-formed interrupt frame and rejects a wrong kind", () => {
+    expect(check(AttachInterruptFrameSchema, { kind: "interrupt", threadId: "t", turnId: "u" })).toBe(true);
+    expect(check(AttachInterruptFrameSchema, { kind: "steer", threadId: "t", turnId: "u" })).toBe(false);
+  });
+
+  it("the outbound union accepts turn, steer, and interrupt frames", () => {
+    expect(check(AttachOutboundFrameSchema, { kind: "turn", threadId: "t", turnId: "u", text: "x" })).toBe(true);
+    expect(check(AttachOutboundFrameSchema, { kind: "steer", threadId: "t", turnId: "u", text: "x" })).toBe(true);
+    expect(check(AttachOutboundFrameSchema, { kind: "interrupt", threadId: "t", turnId: "u" })).toBe(true);
   });
 });

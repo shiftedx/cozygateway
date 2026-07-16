@@ -23,6 +23,7 @@ function makeApp(now = () => 1_000) {
     submitUserMessage: () => {
       throw new Error("not under test");
     },
+    interruptThread: () => "idle",
     onDeviceRevoked: (id) => revoked.push(id),
     now,
   });
@@ -73,6 +74,7 @@ describe("GET /health", () => {
       submitUserMessage: () => {
         throw new Error("not under test");
       },
+      interruptThread: () => "idle",
       onDeviceRevoked: () => {},
       now: () => 1_000,
     });

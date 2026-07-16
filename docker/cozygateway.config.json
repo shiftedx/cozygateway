@@ -1,0 +1,11 @@
+{
+  "name": "cozygateway",
+  "agents": [
+    {
+      "id": "hermes",
+      "name": "Hermes",
+      "backend": "attach",
+      "options": { "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN" }
+    }
+  ]
+}

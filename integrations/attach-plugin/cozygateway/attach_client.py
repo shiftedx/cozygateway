@@ -216,12 +216,61 @@ def parse_turn_frame(frame: Any) -> Optional[TurnFrame]:
 
 
 @dataclass
+class SteerFrame:
+    """A parsed inbound ``steer`` frame: inject text into the running turn ``turn_id`` on
+    ``thread_id``. Carries the SAME ``turn_id`` as the in-flight turn."""
+
+    thread_id: str
+    turn_id: str
+    text: str
+
+
+@dataclass
+class InterruptFrame:
+    """A parsed inbound ``interrupt`` frame: hard-stop the running turn ``turn_id`` on
+    ``thread_id``."""
+
+    thread_id: str
+    turn_id: str
+
+
+def parse_steer_frame(frame: Any) -> Optional[SteerFrame]:
+    """Parse a decoded inbound frame into a :class:`SteerFrame`, or None to drop it."""
+    if not isinstance(frame, dict) or frame.get("kind") != "steer":
+        return None
+    thread_id = frame.get("threadId")
+    turn_id = frame.get("turnId")
+    text = frame.get("text")
+    if not isinstance(thread_id, str) or not thread_id:
+        return None
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    if not isinstance(text, str):
+        return None
+    return SteerFrame(thread_id=thread_id, turn_id=turn_id, text=text)
+
+
+def parse_interrupt_frame(frame: Any) -> Optional[InterruptFrame]:
+    """Parse a decoded inbound frame into an :class:`InterruptFrame`, or None to drop it."""
+    if not isinstance(frame, dict) or frame.get("kind") != "interrupt":
+        return None
+    thread_id = frame.get("threadId")
+    turn_id = frame.get("turnId")
+    if not isinstance(thread_id, str) or not thread_id:
+        return None
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    return InterruptFrame(thread_id=thread_id, turn_id=turn_id)
+
+
+@dataclass
 class AttachClientConfig:
     """Connection inputs for :class:`AttachClient`.
 
     ``gateway_url`` is the gateway's HTTP(S) base; the ``/attach`` WS path hangs off
     its origin. ``token`` is presented header-only. ``on_turn`` receives each parsed
-    inbound :class:`TurnFrame`. ``connect_factory`` is a test seam.
+    inbound :class:`TurnFrame`. ``on_steer`` and ``on_interrupt`` receive their parsed
+    frame kinds. ``connect_factory`` is a test seam.
     """
 
     gateway_url: str
@@ -229,6 +278,8 @@ class AttachClientConfig:
     path: str = "/attach"
     ca_file: Optional[str] = None
     on_turn: Optional[Callable[[TurnFrame], None]] = None
+    on_steer: Optional[Callable[[SteerFrame], None]] = None
+    on_interrupt: Optional[Callable[[InterruptFrame], None]] = None
     # Test seam: an async factory (ws_url, headers, ssl_ctx) -> connection.
     connect_factory: Optional[Callable[..., Any]] = None
 
@@ -361,23 +412,36 @@ class AttachClient:
         if close_code == POLICY_CLOSE_CODE:
             raise AttachAuthError("attach rejected (policy close 1008)")
 
+    @staticmethod
+    def _safe_call(handler: Callable[[Any], None], arg: Any) -> None:
+        try:
+            handler(arg)
+        except Exception:  # noqa: BLE001 - a handler error must never kill the drain loop
+            logger.debug("attach: inbound handler raised", exc_info=True)
+
     def _dispatch_inbound(self, raw: Any) -> None:
-        on_turn = self._config.on_turn
-        if on_turn is None:
-            return
         try:
             frame = json.loads(raw)
         except Exception:  # noqa: BLE001 - malformed inbound frame, drop
             logger.debug("attach: dropping non-JSON inbound frame")
             return
-        turn = parse_turn_frame(frame)
-        if turn is None:
-            logger.debug("attach: dropping unknown/malformed inbound frame")
+        kind = frame.get("kind") if isinstance(frame, dict) else None
+        if kind == "turn":
+            turn = parse_turn_frame(frame)
+            if turn is not None and self._config.on_turn is not None:
+                self._safe_call(self._config.on_turn, turn)
             return
-        try:
-            on_turn(turn)
-        except Exception:  # noqa: BLE001 - a handler error must never kill the drain loop
-            logger.debug("attach: on_turn handler raised", exc_info=True)
+        if kind == "steer":
+            steer = parse_steer_frame(frame)
+            if steer is not None and self._config.on_steer is not None:
+                self._safe_call(self._config.on_steer, steer)
+            return
+        if kind == "interrupt":
+            interrupt = parse_interrupt_frame(frame)
+            if interrupt is not None and self._config.on_interrupt is not None:
+                self._safe_call(self._config.on_interrupt, interrupt)
+            return
+        logger.debug("attach: dropping unknown/malformed inbound frame")
 
     async def close(self) -> None:
         self._closed = True

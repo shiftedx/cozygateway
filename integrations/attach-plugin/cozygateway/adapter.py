@@ -38,6 +38,8 @@ from .attach_client import (
     AttachClient,
     AttachClientConfig,
     AttachSupersededError,
+    InterruptFrame,
+    SteerFrame,
     TurnFrame,
 )
 from .text_blocks import IncrementalNormalizer
@@ -202,6 +204,8 @@ class AttachAdapter:
                 token=self.token,
                 ca_file=self.ca_file,
                 on_turn=self._on_turn,
+                on_steer=self._on_steer,
+                on_interrupt=self._on_interrupt,
             )
         )
         try:
@@ -355,6 +359,84 @@ class AttachAdapter:
             logger.debug("attach: handle_message raised", exc_info=True)
             await self._safe_failed(turn.thread_id, turn.turn_id, "turn error")
             self._cleanup_turn(turn.thread_id, turn.turn_id)
+
+    # -- mid-turn steer -------------------------------------------------------
+    def _on_steer(self, frame: SteerFrame) -> None:
+        """Bound to the client's ``on_steer``: schedule the injection as a task."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_steer(frame))
+
+    async def _handle_steer(self, frame: SteerFrame) -> None:
+        """Inject a mid-turn steer as another inbound message on the same thread.
+
+        Deliberately does NOT touch ``_active_turn``, ``_seen_turns``, or seal anything: with the
+        agent-side config ``busy_input_mode=steer``, the harness's busy handler routes this
+        injection into the running turn natively, and the continued reply keeps streaming under
+        the original ``turn_id`` (still held in ``_active_turn[thread_id]``).
+        """
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        source = self.build_source(  # type: ignore[attr-defined]
+            chat_id=frame.thread_id,
+            chat_type="dm",
+            user_name=INBOUND_USER,
+            user_id=INBOUND_USER,
+            role_authorized=True,
+        )
+        # A distinct message_id for the injected message; the running turn's reply anchor is left
+        # untouched so continued drafts still anchor to the original turn.
+        event = MessageEvent(text=frame.text, source=source, message_id=f"{frame.turn_id}:steer")
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a steer must never crash the drain loop
+            logger.debug("attach: steer injection raised", exc_info=True)
+
+    # -- hard interrupt -------------------------------------------------------
+    def _on_interrupt(self, frame: InterruptFrame) -> None:
+        """Bound to the client's ``on_interrupt``: schedule the native stop as a task."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_interrupt(frame))
+
+    async def _handle_interrupt(self, frame: InterruptFrame) -> None:
+        """Hard-stop the thread's running turn via an injected native ``/stop`` command.
+
+        The harness exposes no callable interrupt entry point; its real hard-stop seam is an
+        injected ``/stop`` slash-command message. ``stop`` is a member of the harness's
+        ``ACTIVE_SESSION_BYPASS_COMMANDS``, so a ``/stop`` message delivered through
+        ``handle_message`` on a busy session bypasses the queue and dispatches the harness's
+        native interrupt-and-clear path (hard-stopping the run); on an idle session it is a
+        clean no-op. This is the same injected-command seam ``_handle_steer`` rides to inject
+        steer text, so it needs no extra harness import and this module stays importable
+        without the harness on the path.
+
+        The gateway independently records ``turn.interrupted`` on its side, so this only needs
+        to stop the live run. A failed inject must never crash the drain loop, so it degrades to
+        a best-effort no-op (debug-log-and-return).
+        """
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        source = self.build_source(  # type: ignore[attr-defined]
+            chat_id=frame.thread_id,
+            chat_type="dm",
+            user_name=INBOUND_USER,
+            user_id=INBOUND_USER,
+            role_authorized=True,
+        )
+        # A slash command, not a turn: the injected text must be exactly "/stop" (the harness
+        # recognizes the command from the message text via MessageEvent.get_command), and no
+        # reply anchor is attached -- a command carries no turn-derived message_id, and the
+        # running turn's anchor is left untouched.
+        event = MessageEvent(text="/stop", source=source)
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - an interrupt must never crash the drain loop
+            logger.debug("attach: interrupt injection raised", exc_info=True)
 
     # -- streaming drafts -----------------------------------------------------
     def supports_draft_streaming(

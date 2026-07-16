@@ -139,12 +139,16 @@ export async function startGateway(
     gatewayInfo,
     presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",
     submitUserMessage: (threadId, blocks) => runner.submitUserMessage(threadId, blocks),
+    // The runner's "unsupported" outcome collapses to "interrupting" here: a turn WAS in
+    // flight, so REST answers 202, and the runner has already emitted the interrupt_unsupported
+    // error frame over the WebSocket.
+    interruptThread: (threadId) => (runner.interrupt(threadId) === "idle" ? "idle" : "interrupting"),
     onDeviceRevoked: (deviceId) => hub.closeDevice(deviceId),
     now: () => Date.now(),
   });
 
   const server = await new Promise<Server>((resolve) => {
-    const s = serve({ fetch: app.fetch, port: config.port, hostname: "127.0.0.1" }, () => {
+    const s = serve({ fetch: app.fetch, port: config.port, hostname: config.host ?? "127.0.0.1" }, () => {
       resolve(s as Server);
     });
   });
@@ -165,7 +169,7 @@ export async function startGateway(
   const port = address !== null && typeof address === "object" ? address.port : config.port;
 
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: `http://${config.host ?? "127.0.0.1"}:${port}`,
     port,
     storage,
     issueSetupCode: () => {

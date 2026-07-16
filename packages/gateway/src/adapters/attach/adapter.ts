@@ -4,7 +4,12 @@ import type { PresenceState, RichBlock } from "cozygateway-contract";
 
 import type { AgentConfig } from "../../config.ts";
 import type { BackendAdapter, BackendSession, TurnHandlers } from "../types.ts";
-import type { AttachTurnFrame, AttachUpdate } from "./protocol.ts";
+import type {
+  AttachInterruptFrame,
+  AttachSteerFrame,
+  AttachTurnFrame,
+  AttachUpdate,
+} from "./protocol.ts";
 import { blocksToText } from "./blocks-to-text.ts";
 
 /** The slice of the ingress a turn needs. A seam so adapter tests run with no sockets;
@@ -12,6 +17,8 @@ import { blocksToText } from "./blocks-to-text.ts";
 export interface TurnEndpoint {
   isAttached(agentId: string): boolean;
   sendTurn(agentId: string, frame: AttachTurnFrame): boolean;
+  sendSteer(agentId: string, frame: AttachSteerFrame): boolean;
+  sendInterrupt(agentId: string, frame: AttachInterruptFrame): boolean;
 }
 
 /** A BackendAdapter that also receives routed ingress events for its agent. */
@@ -101,11 +108,15 @@ export function createAttachAdapter(deps: {
   turnTimeoutMs: number;
 }): AttachAdapter {
   const turns = new Map<string, InflightTurn>();
+  // One in-flight turn per thread (the runner serializes per thread); steer/interrupt look the
+  // active turnId up by threadId.
+  const inflightByThread = new Map<string, string>();
 
   const settle = (turnId: string): InflightTurn | undefined => {
     const turn = turns.get(turnId);
     if (turn === undefined) return undefined;
     turns.delete(turnId);
+    if (inflightByThread.get(turn.threadId) === turnId) inflightByThread.delete(turn.threadId);
     clearTimeout(turn.timer);
     return turn;
   };
@@ -116,6 +127,7 @@ export function createAttachAdapter(deps: {
 
   return {
     backend: "attach",
+    midTurnDelivery: "steer",
 
     async startSession(threadId: string): Promise<BackendSession> {
       return {
@@ -131,6 +143,7 @@ export function createAttachAdapter(deps: {
             );
             timer.unref();
             turns.set(turnId, { threadId, handlers, latest: undefined, timer, resolve, reject });
+            inflightByThread.set(threadId, turnId);
             let sent: boolean;
             try {
               sent = deps.endpoint.sendTurn(deps.agentId, {
@@ -147,6 +160,31 @@ export function createAttachAdapter(deps: {
             }
             if (!sent) failTurn(turnId, `agent "${deps.agentId}" is not attached`);
           });
+        },
+        async steer(steerBlocks: RichBlock[]): Promise<void> {
+          const turnId = inflightByThread.get(threadId);
+          if (turnId === undefined) return; // race: no in-flight turn for this thread
+          // The plugin injects this as another inbound message; with the agent-side Hermes config
+          // busy_input_mode=steer, injection steers the running turn natively. The reply continues
+          // under the EXISTING turnId (no new turn), so no local turn bookkeeping changes here.
+          deps.endpoint.sendSteer(deps.agentId, {
+            kind: "steer",
+            threadId,
+            turnId,
+            text: blocksToText(steerBlocks),
+          });
+        },
+        async interrupt(): Promise<void> {
+          const turnId = inflightByThread.get(threadId);
+          if (turnId === undefined) return;
+          // Fire the native interrupt to the plugin (best-effort), then fail the in-flight turn so
+          // the runner (which set its interrupting flag first) records turn.interrupted.
+          try {
+            deps.endpoint.sendInterrupt(deps.agentId, { kind: "interrupt", threadId, turnId });
+          } catch {
+            // a socket write failure still proceeds to fail the turn locally
+          }
+          failTurn(turnId, "interrupted by user");
         },
         async close(): Promise<void> {},
       };

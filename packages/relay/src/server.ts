@@ -2,6 +2,7 @@ import type { Server } from "node:http";
 
 import { serve } from "@hono/node-server";
 
+import { apnsTransport, type ApnsConfig } from "./apns.ts";
 import { createRelayApp } from "./http.ts";
 import { openRelayStorage, type RelayStorage } from "./storage.ts";
 import { webhookTransport } from "./transports.ts";
@@ -22,6 +23,8 @@ export interface RelayConfig {
   /** Restrict webhook egress to public addresses (design decision, issue #8). See
    *  `parseCliConfig` in `cli.ts` for how the CLI derives this default from `host`. */
   restrictEgress: boolean;
+  /** When set, the relay serves the "apns" platform; unset means webhook-only. */
+  apns?: ApnsConfig;
 }
 
 export interface RunningRelay {
@@ -33,9 +36,13 @@ export interface RunningRelay {
 
 export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
   const storage = openRelayStorage(config.dbPath);
+  const transports: Record<string, ReturnType<typeof webhookTransport> | undefined> = {
+    webhook: webhookTransport({ restrictEgress: config.restrictEgress }),
+  };
+  if (config.apns !== undefined) transports.apns = apnsTransport(config.apns);
   const app = createRelayApp({
     storage,
-    transports: { webhook: webhookTransport({ restrictEgress: config.restrictEgress }) },
+    transports,
     dailyCap: config.dailyCap,
     maxRegistrations: config.maxRegistrations,
     version: RELAY_VERSION,

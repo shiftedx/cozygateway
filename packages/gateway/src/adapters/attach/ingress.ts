@@ -5,7 +5,13 @@ import { timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { check } from "cozygateway-contract";
 
-import { AttachInboundFrameSchema, type AttachTurnFrame, type AttachUpdate } from "./protocol.ts";
+import {
+  AttachInboundFrameSchema,
+  type AttachInterruptFrame,
+  type AttachSteerFrame,
+  type AttachTurnFrame,
+  type AttachUpdate,
+} from "./protocol.ts";
 
 /** What the ingress reports upward. The server maps presence transitions to contract v1
  *  presence frames; the router maps updates/disconnects to the owning agent's adapter. */
@@ -114,13 +120,27 @@ export class AttachIngress {
     return this.#current.get(agentId)?.readyState === WebSocket.OPEN;
   }
 
-  /** Deliver a turn frame to the agent's live connection. False when there is none (the
-   *  adapter fails the turn fast rather than queueing). */
-  sendTurn(agentId: string, frame: AttachTurnFrame): boolean {
+  #send(agentId: string, frame: AttachTurnFrame | AttachSteerFrame | AttachInterruptFrame): boolean {
     const socket = this.#current.get(agentId);
     if (socket === undefined || socket.readyState !== WebSocket.OPEN) return false;
     socket.send(JSON.stringify(frame));
     return true;
+  }
+
+  /** Deliver a turn frame to the agent's live connection. False when there is none (the adapter
+   *  fails the turn fast rather than queueing). */
+  sendTurn(agentId: string, frame: AttachTurnFrame): boolean {
+    return this.#send(agentId, frame);
+  }
+
+  /** Deliver a steer frame (mid-turn injection). False when no live connection. */
+  sendSteer(agentId: string, frame: AttachSteerFrame): boolean {
+    return this.#send(agentId, frame);
+  }
+
+  /** Deliver an interrupt frame (native stop). False when no live connection. */
+  sendInterrupt(agentId: string, frame: AttachInterruptFrame): boolean {
+    return this.#send(agentId, frame);
   }
 
   close(): void {

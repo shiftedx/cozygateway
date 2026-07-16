@@ -30,6 +30,7 @@ export interface AppDeps {
   gatewayInfo: GatewayInfo;
   presenceOf: (agentId: string) => PresenceState;
   submitUserMessage: (threadId: string, blocks: RichBlock[]) => Message;
+  interruptThread: (threadId: string) => "interrupting" | "idle";
   onDeviceRevoked: (deviceId: string) => void;
   now: () => number;
 }
@@ -203,6 +204,14 @@ export function createApp(deps: AppDeps): Hono<Env> {
       }
       throw err;
     }
+  });
+
+  app.post("/threads/:id/interrupt", requireDevice, (c) => {
+    const thread = deps.storage.threadById(c.req.param("id"));
+    if (thread === undefined) return c.json(errorBody("not_found", "no such thread"), 404);
+    const outcome = deps.interruptThread(thread.id);
+    if (outcome === "idle") return c.body(null, 204);
+    return c.json({ status: "interrupting" }, 202);
   });
 
   app.post("/push/register", requireDevice, async (c) => {

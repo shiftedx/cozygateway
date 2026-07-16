@@ -12,6 +12,7 @@ export const ERROR_CODES = [
   "thread_archived",
   "backend_unavailable",
   "turn_failed",
+  "interrupt_unsupported",
   "internal",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -83,14 +84,20 @@ export type MessageRole = Static<typeof MessageRoleSchema>;
 
 /** A committed, durable message. `seq` is per-thread, gapless, starts at 1, allocated by the
  *  gateway in commit order; clients dedupe by per-thread high-water mark. `marker` flags
- *  synthetic system messages (today only "turn.failed"). */
+ *  synthetic system messages ("turn.failed" for a turn that did not finish, "turn.interrupted"
+ *  for a turn a user deliberately stopped). `delivery` is only ever set on role "user"
+ *  messages: absent (or "turn") means the message started or queued its own turn; "steer" means
+ *  it was delivered mid-turn into an already in-flight turn (contract v1.x additive). */
 export const MessageSchema = Type.Object({
   threadId: Type.String(),
   seq: Type.Integer({ minimum: 1 }),
   role: MessageRoleSchema,
   blocks: Type.Array(RichBlockSchema),
   turnId: Type.Optional(Type.String()),
-  marker: Type.Optional(Type.Literal("turn.failed")),
+  marker: Type.Optional(
+    Type.Union([Type.Literal("turn.failed"), Type.Literal("turn.interrupted")]),
+  ),
+  delivery: Type.Optional(Type.Union([Type.Literal("turn"), Type.Literal("steer")])),
   createdAt: Type.Integer(),
 });
 export type Message = Static<typeof MessageSchema>;

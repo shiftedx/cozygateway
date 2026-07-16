@@ -75,6 +75,7 @@ export function createOpenClawAdapter(deps: OpenClawAdapterDeps): BackendAdapter
 
   return {
     backend: "openclaw",
+    midTurnDelivery: "queue",
 
     presence(): PresenceState {
       return deps.client.state() === "online" ? "online" : "absent";
