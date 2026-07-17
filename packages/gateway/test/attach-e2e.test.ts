@@ -19,6 +19,7 @@ beforeEach(async () => {
     name: "attach-e2e",
     port: 0,
     dbPath: ":memory:",
+    turnTimeoutSeconds: 0,
     agents: [
       {
         id: "helper",
@@ -264,6 +265,7 @@ describe("attach backend end to end", () => {
         name: "bad",
         port: 0,
         dbPath: ":memory:",
+        turnTimeoutSeconds: 0,
         agents: [{ id: "x", name: "X", backend: "attach", options: { tokenEnv: TOKEN_ENV } }],
       }),
     ).rejects.toThrow(new RegExp(TOKEN_ENV));

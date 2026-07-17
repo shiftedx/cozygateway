@@ -17,6 +17,11 @@ const GatewayConfigSchema = Type.Object({
   port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
   host: Type.Optional(Type.String({ minLength: 1 })),
   dbPath: Type.String({ minLength: 1, default: "cozygateway.db" }),
+  /** Per-turn wall-clock bound in seconds. A turn that runs longer than this is interrupted
+   *  server-side via the ordinary interrupt path (the same one a manual stop uses), so a device
+   *  that disconnects mid-turn cannot leave the agent looping tool calls forever. 0 disables the
+   *  bound. Config-file only; not env-driven (see applyEnvOverrides). */
+  turnTimeoutSeconds: Type.Integer({ minimum: 0, default: 600 }),
   agents: Type.Array(AgentConfigSchema, { minItems: 1 }),
   /** Capability id -> integer version, surfaced verbatim as GatewayInfo.capabilities (contract
    *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
@@ -29,7 +34,7 @@ export function loadConfig(path: string): GatewayConfig {
   const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
   const withDefaults =
     typeof raw === "object" && raw !== null
-      ? { port: 8787, dbPath: "cozygateway.db", ...raw }
+      ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 600, ...raw }
       : raw;
   const config = assertValid(GatewayConfigSchema, withDefaults);
   const seen = new Set<string>();

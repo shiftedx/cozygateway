@@ -30,6 +30,7 @@ beforeAll(async () => {
       name: "conformance-reference",
       port: 0,
       dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
       agents: [{ id: "conformance-echo", name: "Echo", backend: "mock" }],
       capabilities: { [FAKE_VENDOR_CAPABILITY]: 1 },
     },

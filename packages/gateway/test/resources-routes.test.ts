@@ -11,6 +11,7 @@ const config: GatewayConfig = {
   name: "g",
   port: 8787,
   dbPath: ":memory:",
+  turnTimeoutSeconds: 0,
   agents: [{ id: "mock", name: "Mock", backend: "mock" }],
 };
 

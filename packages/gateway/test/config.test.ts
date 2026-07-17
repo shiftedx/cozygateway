@@ -69,12 +69,50 @@ describe("loadConfig", () => {
     });
     expect(() => loadConfig(path)).toThrow(ContractViolation);
   });
+
+  // Issue #1460: turnTimeoutSeconds is a gateway-level wall-clock bound on a single agent turn,
+  // defaulting to 600 via the same schema-default-plus-pre-validation-spread mechanism as port.
+  it("defaults turnTimeoutSeconds to 600 when absent", () => {
+    const path = writeConfig({
+      name: "test-gateway",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+    });
+    expect(loadConfig(path).turnTimeoutSeconds).toBe(600);
+  });
+
+  it("accepts an explicit turnTimeoutSeconds from the config file", () => {
+    const path = writeConfig({
+      name: "test-gateway",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      turnTimeoutSeconds: 120,
+    });
+    expect(loadConfig(path).turnTimeoutSeconds).toBe(120);
+  });
+
+  it("accepts turnTimeoutSeconds of 0 (disables the bound)", () => {
+    const path = writeConfig({
+      name: "test-gateway",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      turnTimeoutSeconds: 0,
+    });
+    expect(loadConfig(path).turnTimeoutSeconds).toBe(0);
+  });
+
+  it("rejects a negative turnTimeoutSeconds", () => {
+    const path = writeConfig({
+      name: "g",
+      agents: [{ id: "a", name: "A", backend: "mock" }],
+      turnTimeoutSeconds: -1,
+    });
+    expect(() => loadConfig(path)).toThrow(ContractViolation);
+  });
 });
 
 const base: GatewayConfig = {
   name: "g",
   port: 8787,
   dbPath: "cozygateway.db",
+  turnTimeoutSeconds: 600,
   agents: [{ id: "echo", name: "Echo", backend: "mock" }],
 };
 

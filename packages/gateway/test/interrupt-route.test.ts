@@ -13,6 +13,7 @@ beforeEach(async () => {
     name: "interrupt-e2e",
     port: 0,
     dbPath: ":memory:",
+    turnTimeoutSeconds: 0,
     agents: [
       { id: "echo", name: "Echo", backend: "mock" },
       { id: "steer", name: "Steer", backend: "mock-steer" },

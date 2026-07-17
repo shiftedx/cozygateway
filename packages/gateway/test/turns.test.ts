@@ -1,10 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerFrame } from "cozygateway-contract";
 
 import { openStorage } from "../src/storage.ts";
 import { TurnRunner, nullNotifier, type Notifier } from "../src/turns.ts";
 import { createMockAdapter, createSteerMockAdapter } from "../src/adapters/mock.ts";
-import type { BackendAdapter, BackendSession } from "../src/adapters/types.ts";
+import type { BackendAdapter, BackendSession, TurnHandlers } from "../src/adapters/types.ts";
 import { BackendUnavailable } from "../src/errors.ts";
 
 /** An adapter whose turn stalls on `gate`: it drafts immediately (so a test can observe the
@@ -387,5 +387,189 @@ describe("TurnRunner stop-phrase send path", () => {
       { type: "paragraph", text: "stop adding comments to every file" },
     ]);
     expect(sent.delivery).toBe("steer");
+  });
+});
+
+/** A steer-capable, interruptible session whose send() never settles on its own. The test drives
+ *  settlement explicitly: rejectSend() mirrors the attach adapter failing the in-flight send when
+ *  it is interrupted; finishSend() mirrors a clean completion (commit + done, then resolve).
+ *  interrupt is a spy so a test can assert exactly how many times the runner called it. */
+function controllableSteerAdapter() {
+  let rejectSend: (err: Error) => void = () => {};
+  let resolveSend: () => void = () => {};
+  let handlers: TurnHandlers | undefined;
+  const interrupt = vi.fn(async () => {});
+  const session: BackendSession = {
+    send(blocks, h) {
+      handlers = h;
+      h.onDraft({ blocks, toolCalls: [] });
+      return new Promise<void>((resolve, reject) => {
+        resolveSend = resolve;
+        rejectSend = reject;
+      });
+    },
+    async steer() {},
+    interrupt,
+    async close() {},
+  };
+  const adapter: BackendAdapter = {
+    backend: "controllable-steer",
+    midTurnDelivery: "steer",
+    async startSession() {
+      return session;
+    },
+    presence: () => "online",
+  };
+  return {
+    adapter,
+    interrupt,
+    rejectSend: (err: Error) => rejectSend(err),
+    finishSend: () => {
+      handlers?.onCommit({ blocks: [{ type: "paragraph", text: "done" }] });
+      handlers?.onDone();
+      resolveSend();
+    },
+  };
+}
+
+/** A queue-only session (no steer, no interrupt) whose send() never settles on its own. Proves the
+ *  wall-clock timer is never armed for a backend that cannot be interrupted, so expiry emits no
+ *  interrupt_unsupported frame. */
+function controllableQueueAdapter() {
+  const session: BackendSession = {
+    send(blocks, h) {
+      h.onDraft({ blocks, toolCalls: [] });
+      return new Promise<void>(() => {
+        // never settles on its own
+      });
+    },
+    async close() {},
+  };
+  const adapter: BackendAdapter = {
+    backend: "controllable-queue",
+    midTurnDelivery: "queue",
+    async startSession() {
+      return session;
+    },
+    presence: () => "online",
+  };
+  return { adapter };
+}
+
+function wallClockSetup(adapter: BackendAdapter, turnTimeoutMs: number) {
+  const storage = openStorage(":memory:");
+  storage.upsertAgent({ id: "a1", name: "A", avatar: null, backend: adapter.backend });
+  storage.createThread({ id: "t1", agentId: "a1", title: "T", createdAt: 1 });
+  const frames: ServerFrame[] = [];
+  const runner = new TurnRunner({
+    storage,
+    hub: { broadcast: (f) => frames.push(f), connectedDeviceIds: () => new Set() },
+    adapters: new Map<string, BackendAdapter>([["a1", adapter]]),
+    notifier: nullNotifier,
+    now: () => 42,
+    turnTimeoutMs,
+  });
+  return { storage, frames, runner };
+}
+
+/** Flush the microtask queue so the runner's async turn reaches its in-flight state (session
+ *  started, timer armed, send() awaited). Promises are not faked by vi.useFakeTimers(). */
+async function flushMicrotasks() {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+}
+
+describe("TurnRunner wall-clock bound", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("interrupts a steer-capable turn that outruns the bound, committing the time-limit marker and a done frame", async () => {
+    const fake = controllableSteerAdapter();
+    const { storage, frames, runner } = wallClockSetup(fake.adapter, 600_000);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "go" }]);
+    await flushMicrotasks();
+
+    // Not yet expired: the timer has not fired.
+    expect(fake.interrupt).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(fake.interrupt).toHaveBeenCalledTimes(1);
+
+    // The attach adapter's interrupt() fails the in-flight send; mirror that failure here.
+    fake.rejectSend(new Error("interrupted"));
+    await flushMicrotasks();
+
+    const marker = storage.messagesSince("t1", 0).find((m) => m.marker === "turn.interrupted");
+    expect(marker?.role).toBe("system");
+    expect(marker?.blocks[0]).toEqual({
+      type: "paragraph",
+      text: "The turn exceeded the time limit and was interrupted.",
+    });
+    expect(frames.some((f) => f.type === "committed" && f.message.marker === "turn.interrupted")).toBe(true);
+    expect(frames.some((f) => f.type === "done")).toBe(true);
+    expect(frames.some((f) => f.type === "error")).toBe(false);
+  });
+
+  it("does not interrupt or emit extra frames when the turn completes before the bound", async () => {
+    const fake = controllableSteerAdapter();
+    const { frames, runner } = wallClockSetup(fake.adapter, 600_000);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "go" }]);
+    await flushMicrotasks();
+
+    fake.finishSend();
+    await flushMicrotasks();
+    expect(frames.some((f) => f.type === "done")).toBe(true);
+    const frameCountAfterDone = frames.length;
+
+    await vi.advanceTimersByTimeAsync(10_000_000);
+    expect(fake.interrupt).not.toHaveBeenCalled();
+    expect(frames).toHaveLength(frameCountAfterDone);
+  });
+
+  it("never arms the timer when turnTimeoutMs is 0 (disabled)", async () => {
+    const fake = controllableSteerAdapter();
+    const { frames, runner } = wallClockSetup(fake.adapter, 0);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "go" }]);
+    await flushMicrotasks();
+
+    await vi.advanceTimersByTimeAsync(10_000_000);
+    expect(fake.interrupt).not.toHaveBeenCalled();
+    expect(frames.some((f) => f.type === "done")).toBe(false);
+    expect(frames.some((f) => f.type === "committed" && f.message.marker === "turn.interrupted")).toBe(false);
+  });
+
+  it("never arms the timer for a queue-only backend, so expiry emits no interrupt_unsupported frame", async () => {
+    const fake = controllableQueueAdapter();
+    const { frames, runner } = wallClockSetup(fake.adapter, 600_000);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "go" }]);
+    await flushMicrotasks();
+
+    await vi.advanceTimersByTimeAsync(10_000_000);
+    expect(frames.some((f) => f.type === "error" && f.code === "interrupt_unsupported")).toBe(false);
+    expect(frames.some((f) => f.type === "done")).toBe(false);
+  });
+
+  it("uses the plain interrupted text for a manual interrupt and does not double-fire the timer afterward", async () => {
+    const fake = controllableSteerAdapter();
+    const { storage, frames, runner } = wallClockSetup(fake.adapter, 600_000);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "go" }]);
+    await flushMicrotasks();
+
+    expect(runner.interrupt("t1")).toBe("interrupting");
+    // The attach adapter's interrupt() fails the in-flight send; mirror that failure here.
+    fake.rejectSend(new Error("interrupted by user"));
+    await flushMicrotasks();
+
+    const marker = storage.messagesSince("t1", 0).find((m) => m.marker === "turn.interrupted");
+    expect(marker?.blocks[0]).toEqual({ type: "paragraph", text: "The turn was interrupted." });
+    expect(fake.interrupt).toHaveBeenCalledTimes(1);
+
+    // The bound must not fire a second interrupt on the already-finished turn.
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(fake.interrupt).toHaveBeenCalledTimes(1);
+    expect(frames.filter((f) => f.type === "done")).toHaveLength(1);
   });
 });
