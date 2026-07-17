@@ -73,6 +73,7 @@ beforeEach(async () => {
     name: "push-e2e",
     port: 0,
     dbPath: ":memory:",
+    turnTimeoutSeconds: 0,
     agents: [{ id: "echo", name: "Echo", backend: "mock" }],
   });
 });

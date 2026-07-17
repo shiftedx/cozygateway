@@ -14,6 +14,7 @@ beforeEach(async () => {
     name: "e2e",
     port: 0,
     dbPath: ":memory:",
+    turnTimeoutSeconds: 0,
     agents: [{ id: "mock", name: "Mock", backend: "mock" }],
   });
 });
@@ -74,6 +75,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       name: "no-caps",
       port: 0,
       dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
       agents: [{ id: "mock", name: "Mock", backend: "mock" }],
     });
     try {
@@ -89,6 +91,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       name: "with-caps",
       port: 0,
       dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
       agents: [{ id: "mock", name: "Mock", backend: "mock" }],
       capabilities: { "com.cozylabs.test": 1, "com.cozylabs.some-unrecognized-thing": 7 },
     });
@@ -158,6 +161,7 @@ describe("openclaw wiring", () => {
         name: "openclaw-fail-closed",
         port: 0,
         dbPath: ":memory:",
+        turnTimeoutSeconds: 0,
         agents: [
           { id: "oc1", name: "OC1", backend: "openclaw", options: { url, tokenEnv: TOKEN_ENV } },
         ],
@@ -175,6 +179,7 @@ describe("openclaw wiring", () => {
         name: "openclaw-caveat",
         port: 0,
         dbPath: ":memory:",
+        turnTimeoutSeconds: 0,
         agents: [{ id: "oc1", name: "OC1", backend: "openclaw", options: { url, tokenEnv: TOKEN_ENV } }],
       },
       { openclawLog: (message) => lines.push(message) },
@@ -198,6 +203,7 @@ describe("openclaw wiring", () => {
       name: "openclaw-unreachable",
       port: 0,
       dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
       agents: [
         { id: "oc1", name: "OC1", backend: "openclaw", options: { url, tokenEnv: TOKEN_ENV } },
       ],

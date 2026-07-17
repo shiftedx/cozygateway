@@ -81,6 +81,7 @@ not expose itself on your network by itself.
 | `name` | string | required | Human-readable gateway name, surfaced to clients as `GatewayInfo.name`. |
 | `port` | integer | `8787` | TCP port to listen on. |
 | `dbPath` | string | `cozygateway.db` | SQLite file path (or `:memory:` for ephemeral runs). |
+| `turnTimeoutSeconds` | integer | `600` | Per-turn wall-clock bound, in seconds. A single agent turn that runs longer than this is interrupted server-side through the ordinary interrupt path (the same one a manual stop uses), so a device that disconnects mid-turn cannot leave the agent looping tool calls forever. `0` disables the bound. Applies to every interruptible backend; config-file only, not env-driven. Distinct from the openclaw backend's per-agent `options.turnTimeoutSeconds` below. |
 | `agents` | array | required, at least one | Agents this gateway exposes, each with `id`, `name`, an optional `avatar`, a `backend`, and adapter-specific `options`. |
 | `capabilities` | object | `{}` | Map of capability id to integer version, surfaced verbatim as `GatewayInfo.capabilities` (the `GET /health` response, the pair response, and the `ready` frame all carry it). Ids under `com.cozylabs.*` are vendor extensions, versioned independently of the contract; see contract/v1.md section 5. |
 

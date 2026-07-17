@@ -131,6 +131,7 @@ export async function startGateway(
       isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
     }),
     now: () => Date.now(),
+    turnTimeoutMs: config.turnTimeoutSeconds * 1000,
   });
 
   const app = createApp({

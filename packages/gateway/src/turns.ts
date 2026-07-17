@@ -31,6 +31,9 @@ interface Inflight {
   session: BackendSession;
   steerCapable: boolean;
   interrupting: boolean;
+  /** Set when the wall-clock bound (not a manual stop) triggered the interrupt, so the turn's
+   *  system marker carries the time-limit text instead of the plain interrupted text. */
+  timedOut: boolean;
 }
 
 function preview(blocks: RichBlock[]): string {
@@ -44,6 +47,7 @@ export class TurnRunner {
   readonly #adapters: Map<string, BackendAdapter>;
   readonly #notifier: Notifier;
   readonly #now: () => number;
+  readonly #turnTimeoutMs: number;
   readonly #sessions = new Map<string, Promise<BackendSession>>();
   readonly #queues = new Map<string, Promise<void>>();
   readonly #inflight = new Map<string, Inflight>();
@@ -54,12 +58,16 @@ export class TurnRunner {
     adapters: Map<string, BackendAdapter>;
     notifier: Notifier;
     now: () => number;
+    /** Per-turn wall-clock bound in milliseconds. 0 (the default when omitted) disables the bound.
+     *  server.ts passes config.turnTimeoutSeconds * 1000. */
+    turnTimeoutMs?: number;
   }) {
     this.#storage = deps.storage;
     this.#hub = deps.hub;
     this.#adapters = deps.adapters;
     this.#notifier = deps.notifier;
     this.#now = deps.now;
+    this.#turnTimeoutMs = deps.turnTimeoutMs ?? 0;
   }
 
   submitUserMessage(threadId: string, blocks: RichBlock[]): Message {
@@ -156,6 +164,7 @@ export class TurnRunner {
   ): Promise<void> {
     const turnId = randomUUID();
     let record: Inflight | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       let sessionPromise = this.#sessions.get(threadId);
       if (sessionPromise === undefined) {
@@ -168,8 +177,24 @@ export class TurnRunner {
         session,
         steerCapable: adapter.midTurnDelivery === "steer" && session.steer !== undefined,
         interrupting: false,
+        timedOut: false,
       };
       this.#inflight.set(threadId, record);
+      // Wall-clock bound: a turn whose device vanished (or whose driver timed out) must not run
+      // forever looping tool calls. On expiry, fire the SAME interrupt path a manual stop uses.
+      // Only arm when the session can actually be interrupted, so a queue-only backend never gets
+      // a spurious interrupt_unsupported frame from the timer. unref() keeps the timer from holding
+      // the process open. The finally clears it, so a turn that settles first never fires it.
+      if (this.#turnTimeoutMs > 0 && record.steerCapable && record.session.interrupt !== undefined) {
+        const armed = record;
+        timer = setTimeout(() => {
+          if (this.#inflight.get(threadId) === armed && !armed.interrupting) {
+            armed.timedOut = true;
+            this.#dispatchInterrupt(threadId, armed);
+          }
+        }, this.#turnTimeoutMs);
+        timer.unref();
+      }
       await session.send(blocks, {
         onDraft: (update) => {
           this.#hub.broadcast({ type: "draft", threadId, turnId, blocks: update.blocks, toolCalls: update.toolCalls });
@@ -192,6 +217,7 @@ export class TurnRunner {
       });
     } catch (err) {
       const interrupted = record?.interrupting === true;
+      const timedOut = record?.timedOut === true;
       try {
         const system = this.#storage.appendMessage(
           threadId,
@@ -200,7 +226,11 @@ export class TurnRunner {
             blocks: [
               {
                 type: "paragraph",
-                text: interrupted ? "The turn was interrupted." : "The agent turn failed. Send again to retry.",
+                text: timedOut
+                  ? "The turn exceeded the time limit and was interrupted."
+                  : interrupted
+                    ? "The turn was interrupted."
+                    : "The agent turn failed. Send again to retry.",
               },
             ],
             turnId,
@@ -220,6 +250,7 @@ export class TurnRunner {
         // Double fault (e.g. storage already closed): swallow to keep the never-rejects invariant.
       }
     } finally {
+      if (timer !== undefined) clearTimeout(timer);
       if (this.#inflight.get(threadId) === record) this.#inflight.delete(threadId);
     }
   }
