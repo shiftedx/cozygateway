@@ -8,7 +8,7 @@ import type { Static, TSchema } from "@sinclair/typebox";
 
 import { isBlockedLiteralHost, stripIpv6Brackets } from "./egress.ts";
 import { NotifyRequestSchema, RegisterRequestSchema, relayError } from "./schemas.ts";
-import { utcDay, type RelayStorage } from "./storage.ts";
+import { DEFAULT_REGISTRATION_TTL_DAYS, utcDay, type RelayStorage } from "./storage.ts";
 import type { Transport } from "./transports.ts";
 
 export interface RelayAppDeps {
@@ -20,6 +20,11 @@ export interface RelayAppDeps {
    *  auth-hook slot landing (design decision, issue #9). Refreshing an existing pushId
    *  never counts against it. */
   maxRegistrations: number;
+  /** TTL in days for `registrations` rows, from `created_at` (issue #28). Swept lazily on
+   *  /register (before the cap check, so expired rows free headroom) and /notify (before the
+   *  lookup, so an expired id 404s on the request itself, the signal the gateway's own prune
+   *  loop listens for). Defaults to DEFAULT_REGISTRATION_TTL_DAYS. */
+  registrationTtlDays?: number;
   version: string;
   now: () => number;
   /** When true, `POST /register` rejects a webhook URL whose host is a literal IP in a
@@ -46,6 +51,7 @@ function isBlockedWebhookUrl(value: string): boolean {
 
 export function createRelayApp(deps: RelayAppDeps): Hono {
   const log = deps.log ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const registrationTtlDays = deps.registrationTtlDays ?? DEFAULT_REGISTRATION_TTL_DAYS;
   const app = new Hono();
 
   // Auth hook: the hosted instance's future unlock check lands in this single middleware slot.
@@ -84,9 +90,13 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
     if (parsed.platform === "webhook" && deps.restrictEgress && isBlockedWebhookUrl(parsed.token)) {
       return c.json(relayError("invalid_request", "webhook token resolves to a restricted address range"), 400);
     }
+    const now = deps.now();
+    // Lazy TTL sweep BEFORE the cap check, so rows past their TTL free cap headroom instead
+    // of 429ing a genuinely new device (issue #28).
+    deps.storage.pruneRegistrations(now, registrationTtlDays);
     const pushId = randomBytes(16).toString("base64url");
     const saved = deps.storage.saveRegistration(
-      { pushId, platform: parsed.platform, token: parsed.token, createdAt: deps.now() },
+      { pushId, platform: parsed.platform, token: parsed.token, createdAt: now },
       deps.maxRegistrations,
     );
     if (!saved) {
@@ -98,9 +108,11 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   app.post("/notify", async (c) => {
     const parsed = parseBody(NotifyRequestSchema, await readBody(c));
     if (parsed === undefined) return c.json(relayError("invalid_request", "malformed notify body"), 400);
+    const now = deps.now();
+    // TTL sweep BEFORE the lookup: an expired registration 404s on this very request (issue #28).
+    deps.storage.pruneRegistrations(now, registrationTtlDays);
     const registration = deps.storage.registrationByPushId(parsed.pushId);
     if (registration === undefined) return c.json(relayError("not_found", "unknown push id"), 404);
-    const now = deps.now();
     // Lazy retention sweep: no timer, so the relay stays dependency-free and trivial to shut
     // down (design decision, issue #9). Piggybacks on the existing notify traffic that already
     // reads/writes notify_counts.
