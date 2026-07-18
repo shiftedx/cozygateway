@@ -5,10 +5,12 @@ import { parseArgs } from "node:util";
 import { apnsConfigFromEnv } from "./apns.ts";
 import { isLoopbackBindHost } from "./egress.ts";
 import { DEFAULT_DAILY_CAP, DEFAULT_MAX_REGISTRATIONS, RELAY_VERSION, startRelay, type RelayConfig } from "./server.ts";
+import { DEFAULT_REGISTRATION_TTL_DAYS } from "./storage.ts";
 
 const USAGE =
   "usage: cozy-push-relay [--port 8788] [--host 127.0.0.1] [--db relay.db] [--daily-cap 500] " +
-  `[--max-registrations ${DEFAULT_MAX_REGISTRATIONS}] [--restrict-egress | --no-restrict-egress]`;
+  `[--max-registrations ${DEFAULT_MAX_REGISTRATIONS}] [--registration-ttl-days ${DEFAULT_REGISTRATION_TTL_DAYS}] ` +
+  "[--restrict-egress | --no-restrict-egress]";
 
 export function parseCliConfig(argv: string[]): RelayConfig {
   const { values } = parseArgs({
@@ -19,6 +21,7 @@ export function parseCliConfig(argv: string[]): RelayConfig {
       db: { type: "string", default: "relay.db" },
       "daily-cap": { type: "string", default: String(DEFAULT_DAILY_CAP) },
       "max-registrations": { type: "string", default: String(DEFAULT_MAX_REGISTRATIONS) },
+      "registration-ttl-days": { type: "string", default: String(DEFAULT_REGISTRATION_TTL_DAYS) },
       "restrict-egress": { type: "boolean", default: false },
       "no-restrict-egress": { type: "boolean", default: false },
     },
@@ -31,6 +34,10 @@ export function parseCliConfig(argv: string[]): RelayConfig {
   if (!Number.isInteger(maxRegistrations) || maxRegistrations < 1) {
     throw new Error(`invalid --max-registrations "${values["max-registrations"]}"`);
   }
+  const registrationTtlDays = Number(values["registration-ttl-days"]);
+  if (!Number.isInteger(registrationTtlDays) || registrationTtlDays < 1) {
+    throw new Error(`invalid --registration-ttl-days "${values["registration-ttl-days"]}"`);
+  }
   if (values["restrict-egress"] === true && values["no-restrict-egress"] === true) {
     throw new Error("--restrict-egress and --no-restrict-egress are mutually exclusive");
   }
@@ -42,7 +49,7 @@ export function parseCliConfig(argv: string[]): RelayConfig {
       : values["no-restrict-egress"] === true
         ? false
         : !isLoopbackBindHost(values.host);
-  return { port, host: values.host, dbPath: values.db, dailyCap, maxRegistrations, restrictEgress };
+  return { port, host: values.host, dbPath: values.db, dailyCap, maxRegistrations, registrationTtlDays, restrictEgress };
 }
 
 export async function runCli(argv: string[]): Promise<number> {
