@@ -33,6 +33,13 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
  *  purely to bound disk growth (design decision, issue #9). */
 export const NOTIFY_COUNT_RETENTION_DAYS = 7;
 
+/** Default TTL for `registrations` rows, measured from `created_at`, NOT last use. Clients
+ *  mint a fresh pushId every launch and never refresh an existing one (the app documents
+ *  "old ids keep working until the relay prunes them"), so age is the only meaningful signal.
+ *  Evicting a still-live id self-heals end to end: the gateway's next notify gets 404 and
+ *  prunes its own row, and the device re-registers on next launch (issue #28). */
+export const DEFAULT_REGISTRATION_TTL_DAYS = 30;
+
 export class RelayStorage {
   readonly #db: DatabaseSync;
 
@@ -77,6 +84,15 @@ export class RelayStorage {
 
   deleteRegistration(pushId: string): void {
     this.#db.prepare("DELETE FROM registrations WHERE push_id = ?").run(pushId);
+  }
+
+  /** Deletes `registrations` rows whose `created_at` is more than `ttlDays` before `nowMs`.
+   *  Returns the number of rows removed. Called lazily from the /register and /notify routes,
+   *  no timer, same pattern as `pruneNotifyCounts` (issues #9 and #28). */
+  pruneRegistrations(nowMs: number, ttlDays: number): number {
+    const cutoff = nowMs - ttlDays * MS_PER_DAY;
+    const result = this.#db.prepare("DELETE FROM registrations WHERE created_at < ?").run(cutoff);
+    return Number(result.changes);
   }
 
   notifyCount(pushId: string, day: string): number {
