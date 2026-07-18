@@ -20,6 +20,9 @@ export interface RelayConfig {
   dailyCap: number;
   /** Total-row cap on `registrations` (design decision, issue #9). */
   maxRegistrations: number;
+  /** TTL in days for relay registrations, from created_at (issue #28). Defaults to
+   *  DEFAULT_REGISTRATION_TTL_DAYS when omitted. */
+  registrationTtlDays?: number;
   /** Restrict webhook egress to public addresses (design decision, issue #8). See
    *  `parseCliConfig` in `cli.ts` for how the CLI derives this default from `host`. */
   restrictEgress: boolean;
@@ -45,6 +48,7 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
     transports,
     dailyCap: config.dailyCap,
     maxRegistrations: config.maxRegistrations,
+    registrationTtlDays: config.registrationTtlDays,
     version: RELAY_VERSION,
     now: () => Date.now(),
     restrictEgress: config.restrictEgress,

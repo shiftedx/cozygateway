@@ -20,6 +20,7 @@ function harness(overrides?: {
   nowRef?: { value: number };
   restrictEgress?: boolean;
   maxRegistrations?: number;
+  registrationTtlDays?: number;
 }): { app: ReturnType<typeof createRelayApp>; storage: RelayStorage; deliveries: Delivery[] } {
   const storage = openRelayStorage(":memory:");
   cleanups.push(() => storage.close());
@@ -40,6 +41,7 @@ function harness(overrides?: {
     now: () => nowRef.value,
     log: () => {},
     restrictEgress: overrides?.restrictEgress ?? false,
+    registrationTtlDays: overrides?.registrationTtlDays,
   });
   return { app, storage, deliveries };
 }
@@ -270,6 +272,46 @@ describe("DELETE /register/:pushId", () => {
     expect((await app.request(`/register/${pushId}`, { method: "DELETE" })).status).toBe(204);
     expect((await app.request(`/register/${pushId}`, { method: "DELETE" })).status).toBe(204);
     expect((await notify(app, { pushId, ciphertext: "C" })).status).toBe(404);
+  });
+});
+
+describe("registration TTL (issue #28)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  it("an expired registration 404s on notify", async () => {
+    const nowRef = { value: Date.UTC(2026, 6, 7, 12, 0, 0) };
+    const { app } = harness({ nowRef });
+    const reg = await register(app, { platform: "webhook", token: "https://push.example/hook" });
+    expect(reg.status).toBe(201);
+    const { pushId } = (await reg.json()) as { pushId: string };
+    nowRef.value += 31 * DAY;
+    const res = await notify(app, { pushId, ciphertext: "abc" });
+    expect(res.status).toBe(404);
+  });
+
+  it("a registration inside the TTL still notifies", async () => {
+    const nowRef = { value: Date.UTC(2026, 6, 7, 12, 0, 0) };
+    const { app } = harness({ nowRef });
+    const reg = await register(app, { platform: "webhook", token: "https://push.example/hook" });
+    const { pushId } = (await reg.json()) as { pushId: string };
+    nowRef.value += 29 * DAY;
+    const res = await notify(app, { pushId, ciphertext: "abc" });
+    expect(res.status).toBe(202);
+  });
+
+  it("expired rows free cap headroom for a new register", async () => {
+    const nowRef = { value: Date.UTC(2026, 6, 7, 12, 0, 0) };
+    const { app } = harness({ nowRef, maxRegistrations: 1 });
+    expect(
+      (await register(app, { platform: "webhook", token: "https://push.example/hook" })).status,
+    ).toBe(201);
+    expect(
+      (await register(app, { platform: "webhook", token: "https://push.example/hook" })).status,
+    ).toBe(429);
+    nowRef.value += 31 * DAY;
+    expect(
+      (await register(app, { platform: "webhook", token: "https://push.example/hook" })).status,
+    ).toBe(201);
   });
 });
 

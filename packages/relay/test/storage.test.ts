@@ -153,3 +153,39 @@ describe("relay storage", () => {
     });
   });
 });
+
+describe("pruneRegistrations (issue #28)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  it("deletes only rows strictly older than the TTL and returns the removed count", () => {
+    const storage = memoryStorage();
+    const now = Date.UTC(2026, 6, 17, 12, 0, 0);
+    storage.saveRegistration(
+      { pushId: "stale", platform: "webhook", token: "https://x.example/hook", createdAt: now - 31 * DAY },
+      MAX_REGISTRATIONS,
+    );
+    storage.saveRegistration(
+      { pushId: "boundary", platform: "webhook", token: "https://x.example/hook", createdAt: now - 30 * DAY },
+      MAX_REGISTRATIONS,
+    );
+    storage.saveRegistration(
+      { pushId: "fresh", platform: "apns", token: "tok", createdAt: now - 1 * DAY },
+      MAX_REGISTRATIONS,
+    );
+    expect(storage.pruneRegistrations(now, 30)).toBe(1);
+    expect(storage.registrationByPushId("stale")).toBeUndefined();
+    expect(storage.registrationByPushId("boundary")).toBeDefined();
+    expect(storage.registrationByPushId("fresh")).toBeDefined();
+  });
+
+  it("removes nothing when all rows are inside the TTL", () => {
+    const storage = memoryStorage();
+    const now = Date.UTC(2026, 6, 17, 12, 0, 0);
+    storage.saveRegistration(
+      { pushId: "young", platform: "webhook", token: "https://x.example/hook", createdAt: now - DAY },
+      MAX_REGISTRATIONS,
+    );
+    expect(storage.pruneRegistrations(now, 30)).toBe(0);
+    expect(storage.registrationByPushId("young")).toBeDefined();
+  });
+});

@@ -92,6 +92,7 @@ describe("parseCliConfig", () => {
       dbPath: "relay.db",
       dailyCap: 500,
       maxRegistrations: 10000,
+      registrationTtlDays: 30,
       restrictEgress: false,
     });
   });
@@ -109,6 +110,8 @@ describe("parseCliConfig", () => {
         "5",
         "--max-registrations",
         "10",
+        "--registration-ttl-days",
+        "7",
       ]),
     ).toEqual({
       port: 0,
@@ -116,6 +119,7 @@ describe("parseCliConfig", () => {
       dbPath: ":memory:",
       dailyCap: 5,
       maxRegistrations: 10,
+      registrationTtlDays: 7,
       restrictEgress: true,
     });
   });
@@ -124,6 +128,9 @@ describe("parseCliConfig", () => {
     expect(() => parseCliConfig(["--port", "abc"])).toThrow("invalid --port");
     expect(() => parseCliConfig(["--daily-cap", "0"])).toThrow("invalid --daily-cap");
     expect(() => parseCliConfig(["--max-registrations", "0"])).toThrow("invalid --max-registrations");
+    expect(() => parseCliConfig(["--registration-ttl-days", "0"])).toThrow(
+      "invalid --registration-ttl-days",
+    );
   });
 
   it("--restrict-egress forces restriction on even on a loopback bind", () => {
@@ -133,6 +140,7 @@ describe("parseCliConfig", () => {
       dbPath: "relay.db",
       dailyCap: 500,
       maxRegistrations: 10000,
+      registrationTtlDays: 30,
       restrictEgress: true,
     });
   });
@@ -144,6 +152,7 @@ describe("parseCliConfig", () => {
       dbPath: "relay.db",
       dailyCap: 500,
       maxRegistrations: 10000,
+      registrationTtlDays: 30,
       restrictEgress: false,
     });
   });
