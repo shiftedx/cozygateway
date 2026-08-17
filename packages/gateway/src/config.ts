@@ -12,6 +12,23 @@ const AgentConfigSchema = Type.Object({
 });
 export type AgentConfig = Static<typeof AgentConfigSchema>;
 
+/** Optional Hermes bridge (vendor extension com.cozylabs.bots). Configured like the openclaw
+ *  backend: the config file carries the gateway URL and the NAME of the environment variable
+ *  holding the credential, never the credential itself. Present means the `/bots` routes exist
+ *  and the capability is advertised; absent means neither. */
+const HermesBridgeConfigSchema = Type.Object({
+  /** The Hermes gateway WebSocket URL, e.g. ws://homelab:8790/api/ws */
+  url: Type.String({ minLength: 1 }),
+  /** NAME of the env var holding the session token (loopback) or ws ticket (public bind). */
+  tokenEnv: Type.String({ minLength: 1 }),
+  /** Which upgrade-URL query parameter the credential rides. Default "token". */
+  authParam: Type.Optional(Type.Union([Type.Literal("token"), Type.Literal("ticket")])),
+  /** Canonical Bot Chats are created hidden so they stay out of the global Sessions list, which
+   *  is what the desktop plugin defaults to. */
+  hideBotChats: Type.Optional(Type.Boolean()),
+});
+export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
+
 const GatewayConfigSchema = Type.Object({
   name: Type.String({ minLength: 1 }),
   port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
@@ -27,6 +44,7 @@ const GatewayConfigSchema = Type.Object({
    *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
    *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
+  hermes: Type.Optional(HermesBridgeConfigSchema),
 });
 export type GatewayConfig = Static<typeof GatewayConfigSchema>;
 
@@ -68,5 +86,12 @@ export function applyEnvOverrides(
   }
   const dbPath = env["COZYGATEWAY_DB_PATH"];
   if (dbPath !== undefined && dbPath.length > 0) next.dbPath = dbPath;
+  // Container-friendly override for the hermes bridge's TARGET only. It never carries the
+  // credential: that still rides the env var named by hermes.tokenEnv. Ignored when no bridge is
+  // configured, so setting it cannot switch the bots surface on by accident.
+  const hermesUrl = env["COZYGATEWAY_HERMES_URL"];
+  if (hermesUrl !== undefined && hermesUrl.length > 0 && next.hermes !== undefined) {
+    next.hermes = { ...next.hermes, url: hermesUrl };
+  }
   return next;
 }

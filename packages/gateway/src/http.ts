@@ -23,9 +23,15 @@ import type { GatewayConfig } from "./config.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
+import type { BotsSurface } from "./hermes-bridge/bridge.ts";
+import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 
 export interface AppDeps {
   storage: Storage;
+  /** The bots bridge, present only when a hermes bridge is configured. When absent the `/bots`
+   *  routes are not registered at all and the capability is not advertised, so an app probing
+   *  `GatewayInfo.capabilities` sees the truth. */
+  bots?: BotsSurface;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
   presenceOf: (agentId: string) => PresenceState;
@@ -220,6 +226,9 @@ export function createApp(deps: AppDeps): Hono<Env> {
     deps.storage.savePushRegistration(c.get("deviceId"), parsed.value);
     return c.json({ ok: true });
   });
+
+  // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
+  if (deps.bots !== undefined) registerBotRoutes(app, requireDevice, deps.bots);
 
   app.notFound((c) => c.json(errorBody("not_found", "no such route"), 404));
   app.onError((err, c) => c.json(errorBody("internal", "unexpected gateway fault"), 500));

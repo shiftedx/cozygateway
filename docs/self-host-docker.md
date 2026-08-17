@@ -34,6 +34,22 @@ Gateway:
 | `COZYGATEWAY_PORT` | `8787` | listen port |
 | `COZYGATEWAY_DB_PATH` | `cozygateway.db` (image sets `/data/cozygateway.db`) | SQLite path |
 | `COZYGATEWAY_ATTACH_TOKEN` | (required for the attach config) | bearer token the plugin presents on `/attach` |
+| `COZYGATEWAY_HERMES_URL` | (config value) | retargets the optional hermes bots bridge; ignored when no bridge is configured |
+
+### Optional: the hermes bots bridge
+
+Add a `hermes` block to the config file to turn on the bots surface (`/bots`, the `bot_roster` and
+`bot_presence` frames, and the `com.cozylabs.bots` capability; see `contract/ext-bots-v1.md`):
+
+```json
+{
+  "hermes": { "url": "ws://homelab:8790/api/ws", "tokenEnv": "COZYGATEWAY_HERMES_TOKEN" }
+}
+```
+
+The config file carries the env var NAME, never the credential. Startup fails closed when that
+variable is unset. Use `"authParam": "ticket"` when the Hermes gateway is on a public bind and
+issues single-use ws tickets instead of session tokens.
 
 Relay:
 

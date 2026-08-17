@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 
-import type { Message, MessageRole, RichBlock } from "cozygateway-contract";
+import type { BotSummary, Message, MessageRole, RichBlock } from "cozygateway-contract";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
@@ -45,6 +45,26 @@ CREATE TABLE IF NOT EXISTS push_registrations (
   push_id TEXT NOT NULL,
   relay_url TEXT NOT NULL,
   push_key TEXT NOT NULL
+) STRICT;
+-- Bots bridge cache (vendor extension com.cozylabs.bots, contract/ext-bots-v1.md). These three
+-- tables are a CACHE of Hermes state, never the source of truth: the roster snapshot lets GET
+-- /bots answer a cold app instantly while a refresh runs in the background, and bot_chat_pins
+-- holds the canonical "Bot Chat" pointer for profiles whose ui_meta does not carry one yet.
+CREATE TABLE IF NOT EXISTS bot_roster (
+  name TEXT PRIMARY KEY,
+  summary_json TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS bot_meta (
+  name TEXT PRIMARY KEY,
+  meta_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS bot_chat_pins (
+  name TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
 ) STRICT;
 `;
 
@@ -302,6 +322,70 @@ export class Storage {
 
   deletePushRegistration(deviceId: string): void {
     this.#db.prepare("DELETE FROM push_registrations WHERE device_id = ?").run(deviceId);
+  }
+
+  /** Replaces the whole cached roster in one transaction, preserving the order it was built in
+   *  (`position`), and mirrors each bot's `ui_meta` blob into `bot_meta`. A full replace, not a
+   *  merge: a profile that disappeared from Hermes must disappear from the cache too. */
+  replaceBotRoster(bots: Array<{ name: string; summary: BotSummary }>, updatedAt: number): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("DELETE FROM bot_roster").run();
+      const insert = this.#db.prepare(
+        "INSERT INTO bot_roster (name, summary_json, position, updated_at) VALUES (?, ?, ?, ?)",
+      );
+      const meta = this.#db.prepare(
+        `INSERT INTO bot_meta (name, meta_json, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET meta_json = excluded.meta_json, updated_at = excluded.updated_at`,
+      );
+      bots.forEach((bot, index) => {
+        insert.run(bot.name, JSON.stringify(bot.summary), index, updatedAt);
+        if (bot.summary.meta !== null) meta.run(bot.name, JSON.stringify(bot.summary.meta), updatedAt);
+      });
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** The cached roster in build order, plus the stamp of the refresh that produced it (null when
+   *  no refresh has ever landed). */
+  botRoster(): { bots: BotSummary[]; updatedAt: number | null } {
+    const rows = this.#db
+      .prepare("SELECT summary_json AS summaryJson, updated_at AS updatedAt FROM bot_roster ORDER BY position")
+      .all() as unknown as Array<{ summaryJson: string; updatedAt: number }>;
+    return {
+      bots: rows.map((row) => JSON.parse(row.summaryJson) as BotSummary),
+      updatedAt: rows.length === 0 ? null : rows[0]!.updatedAt,
+    };
+  }
+
+  botChatPin(name: string): string | undefined {
+    const row = this.#db.prepare("SELECT session_id AS sessionId FROM bot_chat_pins WHERE name = ?").get(name) as
+      | { sessionId: string }
+      | undefined;
+    return row?.sessionId;
+  }
+
+  botChatPins(): Map<string, string> {
+    const rows = this.#db
+      .prepare("SELECT name, session_id AS sessionId FROM bot_chat_pins")
+      .all() as unknown as Array<{ name: string; sessionId: string }>;
+    return new Map(rows.map((row) => [row.name, row.sessionId]));
+  }
+
+  setBotChatPin(name: string, sessionId: string, updatedAt: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_chat_pins (name, session_id, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at`,
+      )
+      .run(name, sessionId, updatedAt);
+  }
+
+  clearBotChatPin(name: string): void {
+    this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
   }
 
   close(): void {

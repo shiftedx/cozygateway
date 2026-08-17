@@ -1,7 +1,7 @@
 import type { Server } from "node:http";
 
 import { serve } from "@hono/node-server";
-import type { GatewayInfo } from "cozygateway-contract";
+import { BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type GatewayInfo } from "cozygateway-contract";
 
 import type { GatewayConfig } from "./config.ts";
 import { openStorage, type Storage } from "./storage.ts";
@@ -16,6 +16,9 @@ import { TurnRunner } from "./turns.ts";
 import { RelayNotifier } from "./push-notifier.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { createUpgradeDispatcher, type UpgradeHandler } from "./upgrade-dispatcher.ts";
+import { createHermesClient } from "./hermes-bridge/client.ts";
+import { parseHermesOptions } from "./hermes-bridge/config.ts";
+import { HermesBridge } from "./hermes-bridge/bridge.ts";
 
 export const GATEWAY_VERSION = "0.1.0";
 
@@ -54,13 +57,41 @@ export async function startGateway(
   // capabilities is always present, empty when unconfigured, so the shape is uniform across
   // /health, the pair response, and the ready frame (contract v1.md section 5). Absence is a
   // valid wire shape too (older gateways), but this implementation always advertises the field.
+  //
+  // The bots bridge advertises itself the sanctioned way: a vendor capability id, versioned
+  // independently of the frozen contract literal. The wire value is the integer version the
+  // capabilities map is typed for (contract/v1.md section 5); the design's "{ v: 1 }" shorthand
+  // means exactly this version 1. Only advertised when a hermes bridge is actually configured.
+  const hermesOptions = config.hermes === undefined ? undefined : parseHermesOptions(config.hermes, process.env);
   const gatewayInfo: GatewayInfo = {
     name: config.name,
     version: GATEWAY_VERSION,
     contract: "v1",
-    capabilities: config.capabilities ?? {},
+    capabilities: {
+      ...(config.capabilities ?? {}),
+      ...(hermesOptions === undefined ? {} : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION }),
+    },
   };
   const hub = new WsHub({ storage, gatewayInfo, now: () => Date.now() });
+
+  // Dial-out JSON-RPC client to the Hermes gateway plus the cache/refresh/focus machinery on top
+  // of it. Credential resolution already happened above, before the port is bound, so a
+  // misconfigured bridge fails startup instead of half-starting.
+  let bridge: HermesBridge | undefined;
+  if (hermesOptions !== undefined) {
+    const client = createHermesClient({
+      url: hermesOptions.url,
+      token: hermesOptions.token,
+      authParam: hermesOptions.authParam,
+    });
+    bridge = new HermesBridge({
+      client,
+      storage,
+      broadcast: (frame) => hub.broadcast(frame),
+      now: () => Date.now(),
+      hideBotChats: hermesOptions.hideBotChats,
+    });
+  }
 
   // The attach ingress exists only when an attach agent is configured. Token resolution fails
   // closed BEFORE the listener opens, so a misconfigured gateway never half-starts.
@@ -138,6 +169,7 @@ export async function startGateway(
     storage,
     config,
     gatewayInfo,
+    ...(bridge === undefined ? {} : { bots: bridge }),
     presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",
     submitUserMessage: (threadId, blocks) => runner.submitUserMessage(threadId, blocks),
     // The runner's "unsupported" outcome collapses to "interrupting" here: a turn WAS in
@@ -166,6 +198,9 @@ export async function startGateway(
     routes.set("/attach", (req, socket, head) => attachIngress.handleUpgrade(req, socket, head));
   }
   server.on("upgrade", createUpgradeDispatcher(routes));
+  // Started after the listener is up so the first roster refresh cannot race the hub it
+  // broadcasts through.
+  bridge?.start();
   const address = server.address();
   const port = address !== null && typeof address === "object" ? address.port : config.port;
 
@@ -186,6 +221,8 @@ export async function startGateway(
       // Same ordering for openclaw: close every dial-out client (cancels any pending reconnect
       // timer and fails in-flight turns) before the HTTP server stops and the runner drains.
       await Promise.all([...openclawClients.values()].map((client) => client.close()));
+      // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
+      await bridge?.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });

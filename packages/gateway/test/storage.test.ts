@@ -118,3 +118,59 @@ describe("threads", () => {
     expect(storage.renameThread("missing", "x")).toBe(false);
   });
 });
+
+describe("bots cache", () => {
+  const summary = (name: string, over: Record<string, unknown> = {}) => ({
+    name,
+    displayName: name,
+    handle: name,
+    description: null,
+    hasAvatar: false,
+    group: null,
+    pinned: false,
+    active: false,
+    lastActiveAt: null,
+    chatSessionId: null,
+    preview: { kind: "empty" as const, text: "" },
+    meta: null,
+    ...over,
+  });
+
+  it("stores the roster in build order and fully replaces it on the next refresh", () => {
+    const storage = openStorage(":memory:");
+    storage.replaceBotRoster(
+      [
+        { name: "b", summary: summary("b") },
+        { name: "a", summary: summary("a") },
+      ],
+      500,
+    );
+    expect(storage.botRoster().bots.map((bot) => bot.name)).toEqual(["b", "a"]);
+    expect(storage.botRoster().updatedAt).toBe(500);
+
+    // A profile that disappeared from Hermes must disappear from the cache, not linger.
+    storage.replaceBotRoster([{ name: "a", summary: summary("a") }], 600);
+    expect(storage.botRoster().bots.map((bot) => bot.name)).toEqual(["a"]);
+    expect(storage.botRoster().updatedAt).toBe(600);
+  });
+
+  it("reports an empty cache with a null stamp", () => {
+    const storage = openStorage(":memory:");
+    expect(storage.botRoster()).toEqual({ bots: [], updatedAt: null });
+  });
+
+  it("keeps canonical chat pins per bot, upserting and clearing", () => {
+    const storage = openStorage(":memory:");
+    storage.setBotChatPin("scout", "sess-1", 1);
+    storage.setBotChatPin("luna", "sess-2", 1);
+    storage.setBotChatPin("scout", "sess-3", 2);
+    expect(storage.botChatPin("scout")).toBe("sess-3");
+    expect([...storage.botChatPins().entries()].sort()).toEqual([
+      ["luna", "sess-2"],
+      ["scout", "sess-3"],
+    ]);
+    storage.clearBotChatPin("scout");
+    expect(storage.botChatPin("scout")).toBeUndefined();
+    storage.clearBotChatPin("scout");
+  });
+});

@@ -5,6 +5,7 @@
 import { type Static, Type } from "@sinclair/typebox";
 
 import { RichBlockSchema } from "./rich-blocks.ts";
+import { BotPresenceFrameSchema, BotRosterFrameSchema } from "./ext-bots.ts";
 import {
   GatewayInfoSchema,
   MessageSchema,
@@ -85,5 +86,9 @@ export const ServerFrameSchema = Type.Union([
   DoneFrameSchema,
   PresenceFrameSchema,
   ErrorFrameSchema,
+  // Vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Emitted only by a gateway
+  // that advertises the capability; clients that do not know it ignore unknown frame types.
+  BotRosterFrameSchema,
+  BotPresenceFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

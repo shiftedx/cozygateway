@@ -9,3 +9,5 @@ export * from "./rich-blocks.ts";
 export * from "./resources.ts";
 export * from "./rest.ts";
 export * from "./ws.ts";
+/** Vendor extension, versioned independently of the frozen core: contract/ext-bots-v1.md. */
+export * from "./ext-bots.ts";
