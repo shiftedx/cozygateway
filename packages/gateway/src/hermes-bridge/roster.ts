@@ -168,9 +168,15 @@ export function botActivityAt(profile: ParsedProfile): number {
 }
 
 export interface RosterBuildOptions extends PresenceContext {
-  /** Canonical-chat pins the gateway holds locally, by profile name. A local pin wins over
-   *  `meta.chat` only when the server blob carries none: an omitted `chat` on the server side is
-   *  an authoritative deletion (dissection 3.2), so it must not be resurrected from cache. */
+  /** Canonical-chat pins the gateway holds locally, by profile name. Consulted ONLY for a profile
+   *  that carries no `ui_meta["hermes-bots"]` blob at all. The merge is a key-wise replace of that
+   *  whole object (dissection 3.2): once the server carries a blob, an absent `chat` key means the
+   *  pin is absent, and an authoritative deletion must not be resurrected from cache.
+   *
+   *  Consequence in v1: the gateway does not write pins back to `ui_meta` yet, so a chat first
+   *  opened from the phone against a bot the desktop has already configured is re-adopted (by
+   *  canonical title) on each open rather than read out of this map. That is the correct-by-3.2
+   *  behavior, and it goes away when writeback lands. */
   pins: ReadonlyMap<string, string>;
 }
 
@@ -180,9 +186,10 @@ export interface RosterBuildOptions extends PresenceContext {
 export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions): BotSummary[] {
   const rows = profiles.map((profile) => {
     const meta = profile.meta;
-    const serverChat = asString(meta?.["chat"]);
-    const hasChatKey = meta !== null && "chat" in meta;
-    const chatSessionId = serverChat ?? (hasChatKey ? null : (opts.pins.get(profile.name) ?? null));
+    // Key-wise replace, per dissection 3.2: a server blob is the whole truth about `chat`, key
+    // present or not. The local pin only covers a profile the server carries no blob for.
+    const chatSessionId =
+      meta === null ? (opts.pins.get(profile.name) ?? null) : (asString(meta["chat"]) ?? null);
     const group = asString(meta?.["group"])?.trim();
     const summary: BotSummary = {
       name: profile.name,

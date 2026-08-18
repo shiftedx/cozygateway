@@ -88,8 +88,11 @@ export interface CanonicalChatDeps {
   /** New canonical chats are born hidden so they do not clutter the global Sessions list. The
    *  desktop defaults this to true; older gateways ignore the unknown param harmlessly. */
   hideBotChats: boolean;
-  /** The pin the server's own `ui_meta` carries for this bot, when the roster knows one. It wins
-   *  over the local pin: the server blob is the cross-machine source of truth. */
+  /** The pin the server's own `ui_meta` carries for this bot. Three-valued, and the difference
+   *  matters: a string is the server's pin, `null` is the server saying the pin is CLEARED (the
+   *  desktop's `saveBotMeta(name, {chat: null})`, dissection 3.2), and `undefined` is the server
+   *  knowing nothing at all. Only `undefined` falls back to the local pin; a `null` clear is
+   *  authoritative and must not be resurrected from cache. */
   serverPin?: string | null;
   /** How many sessions to consider when adopting. The desktop uses 100. */
   listLimit?: number;
@@ -138,7 +141,9 @@ export async function resolveCanonicalChat(
   deps: CanonicalChatDeps,
 ): Promise<CanonicalChatResult> {
   const limit = deps.listLimit ?? 100;
-  const pin = deps.serverPin ?? deps.pins.get(name);
+  // `??` would be wrong here: it collapses an explicit server clear (null) back onto the local
+  // pin, which is exactly the resurrection dissection 3.2 forbids.
+  const pin = deps.serverPin !== undefined ? deps.serverPin : deps.pins.get(name);
   const rows = await listBotSessions(deps.rpc, name, limit);
 
   if (rows.length === 0) {

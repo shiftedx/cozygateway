@@ -108,6 +108,20 @@ Resolve-or-create the canonical Bot Chat. The gateway lists the bot's sessions a
 
 The returned `sessionId` is the STORED session id.
 
+Three v1 properties worth knowing before writing a client:
+
+- **The server's pin wins, key-wise.** `ui_meta["hermes-bots"]` is the cross-machine source of
+  truth for `chat`: once a profile carries that blob, an absent `chat` key and an explicit
+  `chat: null` both mean "no pin", and the gateway's local record is never used to fill the gap.
+  Only a profile with no bot blob at all falls back to that local record. `GET /bots` and this
+  route read the pin the same way, so they cannot disagree.
+- **The pin is not written back yet.** In v1 a chat first opened from the phone is recorded only in
+  the gateway's SQLite, never pushed to `ui_meta`, so it is invisible to the desktop as a pin until
+  writeback lands. In practice both sides re-adopt the session titled `Bot Chat`, so they land in
+  the same chat anyway.
+- **This GET has side effects.** On a bot with no history it creates a session and submits the
+  kickoff prompt, which costs tokens. Do not use it as a prefetch and do not retry it blindly.
+
 ### GET /bots/:name/sessions
 
 ```
@@ -126,8 +140,10 @@ body { screen: "roster" | "routines" | null }
 The app declares what it is looking at. The bridge polls Hermes at the desktop's own cadences
 (roster every 5 s, routines every 20 s) only while some device is focused on that screen, and
 idles completely otherwise. A focus declaration expires by itself after 60 s of silence, so a
-device that disappears cannot pin the bridge into polling forever. Where Hermes offers a change
-broadcast the bridge refreshes on the event instead, which is cheaper than any poll.
+device that disappears cannot pin the bridge into polling forever: an app that wants to keep the
+roster warm must re-POST inside that 60 s window. Where Hermes offers a change broadcast the bridge
+refreshes on the event instead, which is cheaper than any poll; a change that arrives while a
+refresh is already running costs exactly one more refresh, after it.
 
 ### Errors
 

@@ -175,6 +175,34 @@ describe("GET /bots", () => {
     expect(server.callsOf("profiles.list").length).toBeGreaterThanOrEqual(1);
   });
 
+  it("runs one trailing refresh for a change that lands while a refresh is in flight", async () => {
+    // profiles.list is answered by hand, one release at a time, so "the second change was not
+    // dropped" is proven rather than raced. Nothing is focused, so no poll can paper over it.
+    const releases: Array<() => void> = [];
+    const rosters = [[scoutRow], [scoutRow, { ...scoutRow, name: "luna" }]];
+    const { bridge, server } = await setup({
+      methods: {
+        "profiles.list": (_params, ctx) => {
+          const index = releases.length;
+          releases.push(() => ctx.reply(profilesListResult(rosters[Math.min(index, rosters.length - 1)]!)));
+          return NO_REPLY;
+        },
+      },
+    });
+
+    await until(() => releases.length === 1, 4_000);
+    // A second change lands while the first refresh is still on the wire.
+    const inflight = bridge.refresh("second change");
+    expect(server.callsOf("profiles.list")).toHaveLength(1);
+    releases[0]!();
+    await inflight;
+
+    await until(() => releases.length === 2, 4_000);
+    releases[1]!();
+    await until(() => bridge.roster().bots.length === 2, 4_000);
+    expect(bridge.roster().bots.map((bot) => bot.name)).toEqual(["scout", "luna"]);
+  });
+
   it("does not broadcast when a refresh produces an unchanged roster", async () => {
     const { bridge, frames } = await setup({
       methods: { "profiles.list": () => profilesListResult([scoutRow]) },
@@ -308,6 +336,55 @@ describe("GET /bots/:name/chat", () => {
     const [a, b] = await Promise.all([authed("/bots/scout/chat"), authed("/bots/scout/chat")]);
     expect(await a.json()).toEqual(await b.json());
     expect(server.callsOf("session.create")).toHaveLength(1);
+  });
+
+  it("agrees with GET /bots when the server pin is set, cleared, or absent", async () => {
+    // One roster carrying all three shapes at once, each with a stale local pin behind it. The
+    // two routes must read the same pin, or a phone lands in a chat /bots says does not exist.
+    const row = (name: string, meta: Record<string, unknown> | null): Record<string, unknown> => ({
+      name,
+      description: null,
+      has_avatar: false,
+      last_session: { last_active: Math.round(NOW / 1000) - 5 },
+      ...(meta === null ? {} : { ui_meta: { "hermes-bots": meta } }),
+    });
+    const { authed, bridge, storage } = await setup({
+      methods: {
+        "profiles.list": () =>
+          profilesListResult([
+            row("set", { chat: "server-pinned" }),
+            row("cleared", { chat: null }),
+            row("absent", null),
+          ]),
+        "session.list": () => ({
+          sessions: [
+            { id: "server-pinned", title: "An older chat" },
+            { id: "canonical", title: CANONICAL_CHAT_TITLE },
+            { id: "local-pinned", title: "Older still" },
+          ],
+        }),
+      },
+    });
+    await until(() => bridge.roster().bots.length === 3, 4_000);
+    for (const name of ["set", "cleared", "absent"]) storage.setBotChatPin(name, "local-pinned", NOW);
+    // The cache is what /bots serves, so rebuild it now that the local pins exist.
+    await bridge.refresh("local pins set");
+
+    const listed = (await (await authed("/bots")).json()) as {
+      bots: Array<{ name: string; chatSessionId: string | null }>;
+    };
+    const byName = new Map(listed.bots.map((bot) => [bot.name, bot.chatSessionId]));
+    expect(byName.get("set")).toBe("server-pinned");
+    // Cleared on the server, and a blob with no chat key at all, are both authoritative absences.
+    expect(byName.get("cleared")).toBeNull();
+    expect(byName.get("absent")).toBe("local-pinned");
+
+    const chatOf = async (name: string): Promise<string> =>
+      ((await (await authed(`/bots/${name}/chat`)).json()) as { sessionId: string }).sessionId;
+    expect(await chatOf("set")).toBe("server-pinned");
+    // The cleared bot must NOT be handed the local pin back; it re-adopts by canonical title.
+    expect(await chatOf("cleared")).toBe("canonical");
+    expect(await chatOf("absent")).toBe("local-pinned");
   });
 
   it("passes an unknown-method rejection through verbatim", async () => {

@@ -160,21 +160,26 @@ describe("roster build", () => {
     });
   });
 
-  it("uses the local pin only when the server blob carries no chat key at all", () => {
+  it("uses the local pin only for a profile the server carries no bot blob for", () => {
     const pins = new Map([
-      ["nopin", "local-1"],
-      ["cleared", "local-2"],
+      ["blobless", "local-1"],
+      ["keyless", "local-2"],
+      ["cleared", "local-3"],
     ]);
     const { profiles } = parseProfilesList({
       profiles: [
-        profileRow({ name: "nopin", ui_meta: { "hermes-bots": { title: "No Pin" } } }),
+        profileRow({ name: "blobless" }),
+        profileRow({ name: "keyless", ui_meta: { "hermes-bots": { title: "No Pin" } } }),
         profileRow({ name: "cleared", ui_meta: { "hermes-bots": { chat: null } } }),
       ],
     });
     const roster = buildRoster(profiles, { ...idle, pins });
     const byName = new Map(roster.map((bot) => [bot.name, bot]));
-    expect(byName.get("nopin")!.chatSessionId).toBe("local-1");
-    // An omitted chat on the server is an authoritative deletion: the cache must not resurrect it.
+    expect(byName.get("blobless")!.chatSessionId).toBe("local-1");
+    // The merge is a key-wise replace of the whole bot blob (dissection 3.2): with a blob present,
+    // an absent `chat` key and an explicit `chat: null` are the same authoritative absence, and
+    // neither may be resurrected from the cache.
+    expect(byName.get("keyless")!.chatSessionId).toBeNull();
     expect(byName.get("cleared")!.chatSessionId).toBeNull();
   });
 

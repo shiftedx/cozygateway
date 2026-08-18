@@ -93,6 +93,8 @@ export class HermesBridge implements BotsSurface {
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
   #debounceTimer: ReturnType<typeof setTimeout> | undefined;
   #refreshing: Promise<void> | undefined;
+  /** Set when a refresh was asked for while one was already running; drives the trailing run. */
+  #refreshDirty = false;
   #closed = false;
   #lastRosterJson = "";
   #lastActiveJson = "";
@@ -153,11 +155,20 @@ export class HermesBridge implements BotsSurface {
     this.#debounceTimer.unref();
   }
 
-  /** Single-flight roster refresh. Failures are logged and swallowed: the cache keeps serving,
-   *  which is exactly the desktop's "showing the last good list" behavior. */
+  /** Single-flight roster refresh, with a trailing run. A change that lands while a refresh is
+   *  already on the wire describes state that refresh cannot have seen, so it sets a dirty flag
+   *  and the in-flight run re-runs exactly once when it finishes. Without it a burst of
+   *  `sessions.changed` under a slow `profiles.list` leaves the cache stale until the next poll,
+   *  and with nothing focused there is no next poll.
+   *
+   *  Failures are logged and swallowed: the cache keeps serving, which is exactly the desktop's
+   *  "showing the last good list" behavior. */
   async refresh(reason: string): Promise<void> {
     if (this.#closed) return;
-    if (this.#refreshing !== undefined) return this.#refreshing;
+    if (this.#refreshing !== undefined) {
+      this.#refreshDirty = true;
+      return this.#refreshing;
+    }
     const run = (async () => {
       try {
         const result = await this.#client.request("profiles.list", {});
@@ -179,6 +190,10 @@ export class HermesBridge implements BotsSurface {
         this.#log(`roster refresh failed (${reason}): ${detail}`);
       } finally {
         this.#refreshing = undefined;
+        if (this.#refreshDirty && !this.#closed) {
+          this.#refreshDirty = false;
+          void this.refresh(`${reason} (trailing)`);
+        }
       }
     })();
     this.#refreshing = run;
@@ -218,6 +233,9 @@ export class HermesBridge implements BotsSurface {
         });
       } finally {
         this.#busyDepth = Math.max(0, this.#busyDepth - 1);
+        // Nothing is routed once the last turn drains, so the busy leg of the presence rule stops
+        // being attributed to whichever bot happened to resolve last.
+        if (this.#busyDepth === 0) this.#routedProfile = null;
         this.#chatInflight.delete(name);
         this.refreshSoon("canonical chat resolved");
       }
@@ -245,13 +263,16 @@ export class HermesBridge implements BotsSurface {
     await this.#client.close();
   }
 
-  /** The cached `ui_meta` pin for a bot, when the roster snapshot carries one. Reading it here
-   *  keeps the "server blob wins" rule (dissection 3.2) in one place. */
+  /** The cached `ui_meta` pin for a bot. Three-valued, and it must agree key-for-key with what
+   *  `buildRoster` reports, or `GET /bots` and `GET /bots/:name/chat` answer differently for the
+   *  same bot: `undefined` only when the server carries no bot blob at all (or the bot is not in
+   *  the cache yet), the pin when the blob names one, and `null` otherwise, because a blob without
+   *  a `chat` key is an authoritative clear (dissection 3.2). */
   #serverPinOf(name: string): string | null | undefined {
     const cached = this.#storage.botRoster().bots.find((bot) => bot.name === name);
     if (cached === undefined) return undefined;
     const meta = cached.meta;
-    if (meta === null || !("chat" in meta)) return undefined;
+    if (meta === null) return undefined;
     return typeof meta["chat"] === "string" ? meta["chat"] : null;
   }
 
