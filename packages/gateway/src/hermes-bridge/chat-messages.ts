@@ -115,7 +115,12 @@ export function mapChatMessage(
   if (!RENDERED_ROLES.has(role)) return undefined;
   const text = extractMessageText(record);
   if (text.length === 0) return undefined;
-  const id = asId(record["id"]) ?? asId(record["message_id"]) ?? `${sessionId}#${index}`;
+  // `row_id` is what a live 0.20.4 dashboard actually stamps on a transcript row (rows there carry
+  // `role`, `text`, `timestamp` and `row_id`, and no `id` at all). Reading it is worth more than
+  // tidiness: it is a REAL identity, so the anchors that ride on message ids survive a compaction,
+  // where the synthesized `<session>#<index>` fallback is renumbered by one.
+  const id =
+    asId(record["id"]) ?? asId(record["message_id"]) ?? asId(record["row_id"]) ?? `${sessionId}#${index}`;
   return { id, role, text, at: messageTimestamp(record) };
 }
 
@@ -138,6 +143,9 @@ export function parseChatSnapshot(result: unknown, sessionId: string): ChatSnaps
     // count and no messages, and that is the cheap baseline a turn poll diffs against.
     messageCount:
       typeof rawCount === "number" && Number.isFinite(rawCount) ? Math.max(0, Math.round(rawCount)) : rawMessages.length,
+    // Compared against `true` rather than coerced: a live 0.20.4 dashboard sends `inflight: null`
+    // on an idle session and omits the key entirely on an `omit_messages` reply, and both of those
+    // mean "not in flight".
     running: record?.["running"] === true,
     inflight: record?.["inflight"] === true,
   };

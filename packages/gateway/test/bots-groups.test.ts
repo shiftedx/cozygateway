@@ -59,9 +59,14 @@ async function until(predicate: () => boolean, timeoutMs = 5_000): Promise<void>
 
 interface FakeSession {
   stored: string;
+  /** The CURRENT runtime handle. Rotated on every `session.resume`, exactly as a live dashboard
+   *  rotates it, so a caller that pins the one `session.create` returned is caught. */
   runtime: string;
   profile: string;
   title: string;
+  /** False until the first prompt lands. An unpersisted session has no row, so `session.resume`
+   *  cannot find it under any id (dissection 14.5). */
+  persisted: boolean;
   messages: Array<Record<string, unknown>>;
 }
 
@@ -96,14 +101,24 @@ interface FakeGroupOptions {
   /** Holds the FIRST `session.create` open instead of answering it, so a test can act inside the
    *  window where a member's session is still resolving. Released through `releaseSession()`. */
   holdFirstSession?: boolean;
+  /** Milliseconds a created session stays UNRESUMABLE after its first prompt lands, i.e. how long
+   *  the lazy row takes to be written. Every id answers "session not found" in that window, which
+   *  is precisely what a live 0.20.4 dashboard does and precisely what broke the first turn of
+   *  every room. Default 0. */
+  persistDelayMs?: number;
 }
 
-/** A Hermes with several profiles and lazily created, title-addressable sessions.
+/** A Hermes with several profiles and lazily created sessions.
  *
- *  Strict about the two session ids for the same reason the 1:1 fake is: `prompt.submit` only
- *  accepts the RUNTIME id, `session.resume` answers on the stored id, and `session.resume` must also
- *  resolve a TITLE in the id slot, which is what makes a room rehydrate after its stored ids are
- *  gone (dissection 9.6). */
+ *  Strict about the two session ids, and strict in the shape a LIVE 0.20.4 dashboard was measured
+ *  to have, because a looser fake is what let the group path ship broken:
+ *  - `session.resume` answers ONLY on the stored id. A runtime id is "session not found". A TITLE in
+ *    the id slot is "session not found" too: the real dashboard does not resolve one, so a fake that
+ *    did was inventing a rehydration path nobody has.
+ *  - `prompt.submit` accepts ONLY the current runtime id. A stored id is "session not found".
+ *  - the runtime id ROTATES on every resume, so pinning the one `session.create` returned fails.
+ *  - a created session is not resumable AT ALL until its first prompt has landed (and, with
+ *    `persistDelayMs`, for a while after), because `session.create` writes no row. */
 function fakeGroupHermes(options: FakeGroupOptions = {}): {
   behavior: FakeHermesBehavior;
   sessions: FakeSession[];
@@ -119,13 +134,9 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
   let seq = 0;
   let held: (() => void) | undefined;
 
+  /** What `session.resume` resolves: a PERSISTED session, by its STORED id, on its own profile. */
   const find = (id: string, profile: string): FakeSession | undefined =>
-    sessions.find(
-      (session) =>
-        session.stored === id ||
-        session.runtime === id ||
-        (session.title === id && session.profile === profile),
-    );
+    sessions.find((session) => session.persisted && session.stored === id && session.profile === profile);
 
   const nextReply = (profile: string): string | undefined => {
     if ((options.silent ?? []).includes(profile)) return undefined;
@@ -151,11 +162,15 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
       "session.list": () => ({ sessions: [] }),
       "session.create": (params, ctx) => {
         seq += 1;
+        const profileName = String(params["profile"] ?? "");
         const session: FakeSession = {
           stored: `stored-${seq}`,
-          runtime: `runtime-${seq}`,
+          runtime: `runtime-${profileName}-${seq}`,
           profile: String(params["profile"] ?? ""),
           title: String(params["title"] ?? ""),
+          // `session.create` writes NO row: the session becomes resumable when its first prompt
+          // lands, never before.
+          persisted: false,
           messages: (options.seedRows ?? []).map((row) => ({ ...row })),
         };
         sessions.push(session);
@@ -170,13 +185,18 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
         const id = String(params["session_id"] ?? "");
         const profile = String(params["profile"] ?? "");
         const session = find(id, profile);
-        if (session === undefined) throw { code: 5003, message: "no such session" };
+        if (session === undefined) throw { code: 5003, message: "session not found" };
+        // A fresh runtime handle per resume, as the live dashboard hands out. The previous one is
+        // dead the moment this reply is written, so nothing may hold on to it.
+        seq += 1;
+        session.runtime = `runtime-${session.profile}-${seq}`;
         return {
           session_id: session.runtime,
           session_key: session.stored,
           message_count: session.messages.length,
           running: false,
-          inflight: false,
+          // Live 0.20.4 sends null here on an idle session, not false.
+          inflight: null,
           ...(params["omit_messages"] === true ? {} : { messages: session.messages }),
         };
       },
@@ -184,12 +204,20 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
         const id = String(params["session_id"] ?? "");
         const session = sessions.find((candidate) => candidate.runtime === id);
         if (session === undefined) {
-          throw { code: 5003, message: `prompt.submit needs the runtime session id, got ${id}` };
+          throw { code: 5003, message: "session not found" };
         }
         if ((options.submitFails ?? []).includes(session.profile)) {
           throw { code: 5010, message: `provider refused the turn for ${session.profile}` };
         }
         session.messages.push({ role: "user", content: String(params["text"] ?? "") });
+        // The prompt is what writes the row. Until that write lands the session stays invisible to
+        // `session.resume`, under EVERY id, which is the window that used to swallow first turns.
+        const persistDelay = options.persistDelayMs ?? 0;
+        if (persistDelay === 0) session.persisted = true;
+        else
+          setTimeout(() => {
+            session.persisted = true;
+          }, persistDelay).unref?.();
         const reply = nextReply(session.profile);
         if (reply !== undefined) {
           const delay = options.delayMs?.[session.profile] ?? 0;
@@ -307,12 +335,10 @@ async function setup(
   // land before any test asks for a room.
   await bridge.refresh("test setup");
 
-  const sessionProfileOf = (runtimeId: string): string => {
-    const created = server.callsOf("session.create");
-    // `session.create` answers in order, so the Nth create is runtime-N.
-    const index = Number(runtimeId.replace("runtime-", "")) - 1;
-    return String(created[index]?.params["profile"] ?? "");
-  };
+  // Runtime ids carry the profile they belong to (`runtime-<profile>-<n>`), because the fake mints
+  // a FRESH one on every resume the way a live dashboard does, so there is no create-ordering left
+  // to decode them by.
+  const sessionProfileOf = (runtimeId: string): string => runtimeId.split("-").slice(1, -1).join("-");
 
   return {
     server,
@@ -529,6 +555,48 @@ describe("a deliberation round", () => {
       await harness.bridge.groupSettled("Release Room");
     }
     expect(harness.server.callsOf("session.create")).toHaveLength(2);
+  });
+
+  /** The live divergence, reproduced. Against a real 0.20.4 dashboard the very first turn of every
+   *  room logged `group turn poll failed for <bot>: session not found` for every member and no reply
+   *  ever landed, while the same bots answered the 1:1 chat in seconds.
+   *
+   *  Two facts, both measured on the wire, are what the fake now enforces and what this pins:
+   *  `session.resume` REFUSES the runtime id `session.create` returned (it takes the stored id and
+   *  nothing else), and the stored id itself is unresumable until the first prompt has persisted.
+   *  The turn poll used to address the runtime id for exactly the sessions it had just created, so
+   *  it asked the one question that could never be answered, three times, and gave up. */
+  it("delivers the first turn of a new room, where the created session resumes only by its stored id and only once the prompt persists", async () => {
+    const { behavior } = fakeGroupHermes({
+      replies: { scout: ["CI is green"], luna: ["shipping notes are up"] },
+      // Longer than the poll cadence, so the turn HAS to sit through unresumable polls rather than
+      // getting lucky on the first one.
+      persistDelayMs: 60,
+    });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "how is the release looking" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    expect(detail.messages.map((message) => [message.from.name, message.text])).toEqual([
+      ["You", "how is the release looking"],
+      ["scout", "CI is green"],
+      ["luna", "shipping notes are up"],
+    ]);
+    // Not one resume was ever addressed to a runtime id, on any path.
+    const resumed = harness.server.callsOf("session.resume").map((call) => String(call.params["session_id"] ?? ""));
+    expect(resumed.length).toBeGreaterThan(0);
+    expect(resumed.filter((id) => id.startsWith("runtime-"))).toEqual([]);
+    // ...and every submit went to one, which is the other half of the split.
+    const submitted = harness.server.callsOf("prompt.submit").map((call) => String(call.params["session_id"] ?? ""));
+    expect(submitted.every((id) => id.startsWith("runtime-"))).toBe(true);
+    // The unresumable window is not a failure: the room was never told the members broke.
+    expect(stateFrames(harness.frames).every((frame) => frame.note === undefined)).toBe(true);
   });
 
   it("scopes the round to the members the user mentioned", async () => {

@@ -23,6 +23,20 @@ import { groupSessionTitle } from "./group-protocol.ts";
 /** Consecutive failing polls tolerated before the turn is abandoned, matching `chat-turns.ts`. */
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 
+/** How many polls a session THIS TURN created may answer "session not found" for before those
+ *  polls start counting against the failure budget.
+ *
+ *  `session.create` persists no database row until the first prompt lands (dissection 14.5), so the
+ *  stored id it handed back is unresumable for as long as that write takes. That is not a failing
+ *  gateway, it is a session that does not exist yet, and counting it as a failure is what killed the
+ *  first turn of every room: three polls, six seconds, and a member that had already replied was
+ *  reported as failed. Observed persistence lag on a live 0.20.4 dashboard is under five seconds;
+ *  fifteen polls is 30 s at the production cadence.
+ *
+ *  Counted in POLLS rather than milliseconds so it scales with `pollMs` exactly as the turn cap
+ *  does: a test that runs the loop at 10 ms gets a 150 ms grace, not a 30 s one. */
+const CREATED_SESSION_PERSIST_GRACE_POLLS = 15;
+
 /** What a member's turn produced.
  *
  *  `pass` is the healthy outcome and covers both the literal `(pass)` and a reply with no text at
@@ -35,10 +49,18 @@ export type GroupTurnResult =
   | { outcome: "timeout"; detail: string }
   | { outcome: "failed"; detail: string };
 
-/** The two ids a member's room session is addressed by. `storedId` is what gets persisted and what
- *  `session.resume` takes; `runtimeId` is the only id `prompt.submit` accepts (dissection 1.2). */
+/** The two ids a member's room session is addressed by. The split is STRICT, and live-proven
+ *  against a 0.20.4 dashboard: `session.resume` answers ONLY on the stored id (it rejects a runtime
+ *  id with "session not found"), and `prompt.submit` accepts ONLY the runtime id (it rejects a
+ *  stored id with the same error). Neither call will take the other's id, ever.
+ *
+ *  The runtime id is also EPHEMERAL: every `session.resume` hands back a fresh one for the same
+ *  stored session, so a runtime id is good for the submit that immediately follows the resolve that
+ *  produced it and for nothing else. It is never a poll target and never persisted. */
 export interface GroupSession {
+  /** The durable handle. Persisted by the room, and the ONLY id `session.resume` accepts. */
   storedId: string;
+  /** The submit-only handle from the resolve that produced this session. Single use. */
   runtimeId: string;
   /** RAW transcript rows Hermes reported when the session was resolved, i.e. `message_count`.
    *
@@ -151,10 +173,14 @@ function detailOf(err: unknown): string {
  *  (dissection 9.6).
  *
  *  Two lookups, in order: the stored id this room remembers, then the session TITLE ITSELF in the
- *  `session_id` slot. The second is not a curiosity, it is what makes a room survive losing its
- *  stored ids (a wiped cache, a room restored from a backup, a session the desktop created first):
- *  Hermes resolves a title in that slot, and a proxy that refuses to pass one through breaks
- *  rehydration and mints a second room session per member instead. */
+ *  `session_id` slot. The title lookup is BEST EFFORT and nothing may depend on it: a live 0.20.4
+ *  dashboard answers "session not found" for a title in that slot, so on that build a room that
+ *  lost its stored ids mints a fresh session per member rather than rehydrating. It is kept because
+ *  it is free (one failed call on a path that was going to create anyway) and because builds that
+ *  do resolve a title there rehydrate for nothing.
+ *
+ *  Whatever lookup lands, the ids are read the same way: `session_id` is the RUNTIME (submit-only,
+ *  single-use) handle and `session_key` is the STORED (resume-only, durable) one. */
 export async function ensureGroupSession(
   rpc: HermesRpc,
   member: string,
@@ -249,15 +275,21 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
   }
 
   const deadline = opts.now() + timeoutMs;
-  // The stored id is the resumable one; a session created moments ago has no row under it until the
-  // prompt lands, and the runtime id is the only handle that works in the meantime.
-  let resumeId = session.created ? session.runtimeId : session.storedId;
+  // The STORED id, always. The runtime id `session.create` handed back is a submit handle and
+  // nothing else: `session.resume` rejects it with "session not found" on every build we have
+  // measured, so polling it (which is what the created path used to do) could only ever fail, and
+  // the old recovery could only ever move TOWARDS it. A session this turn created is simply not
+  // resumable until its prompt persists, which is what the grace below waits out.
+  const resumeId = session.storedId;
+  // False only for a session this turn created that has not answered a resume yet.
+  let persisted = !session.created;
+  let waitedForPersist = 0;
   let failures = 0;
   let lastDetail = "";
 
   while (opts.now() < deadline) {
     await sleep(pollMs);
-    if (!live()) return await harvest({ rpc, member, session, resumeId, log });
+    if (!live()) return await harvest({ rpc, member, session, log });
 
     let raw: unknown;
     try {
@@ -267,11 +299,13 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
         omit_messages: false,
       });
       failures = 0;
+      persisted = true;
     } catch (err) {
       lastDetail = detailOf(err);
-      // A stored id that will not resume yet is not a failure while the runtime id still answers.
-      if (resumeId !== session.runtimeId) {
-        resumeId = session.runtimeId;
+      // The lazily-created session's write has not landed yet. Nothing is wrong, so nothing is
+      // counted; the grace bounds how long "nothing is wrong" stays believable.
+      if (!persisted && waitedForPersist < CREATED_SESSION_PERSIST_GRACE_POLLS) {
+        waitedForPersist += 1;
         continue;
       }
       failures += 1;
@@ -312,13 +346,12 @@ async function harvest(args: {
   rpc: HermesRpc;
   member: string;
   session: GroupSession;
-  resumeId: string;
   log: (message: string) => void;
 }): Promise<GroupTurnResult> {
-  const { rpc, member, session, resumeId, log } = args;
+  const { rpc, member, session, log } = args;
   try {
     const raw = await rpc.request("session.resume", {
-      session_id: resumeId,
+      session_id: session.storedId,
       profile: member,
       omit_messages: false,
     });
