@@ -407,6 +407,25 @@ export class Storage {
     this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
   }
 
+  /** Drops every trace of a bot from the cache: its roster row, its mirrored `ui_meta` blob, and
+   *  its canonical-chat pin. Called when the profile is deleted Hermes-side, so a name that gets
+   *  reused later starts clean rather than inheriting a dead pin, which would send the first open
+   *  of the new bot into a `session.resume` for a session that no longer exists. The next roster
+   *  refresh rewrites `bot_roster` wholesale anyway; the pin and the meta blob are the rows that
+   *  would otherwise outlive the profile. */
+  forgetBot(name: string): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("DELETE FROM bot_roster WHERE name = ?").run(name);
+      this.#db.prepare("DELETE FROM bot_meta WHERE name = ?").run(name);
+      this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   close(): void {
     this.#db.close();
   }

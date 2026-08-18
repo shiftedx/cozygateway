@@ -234,6 +234,19 @@ describe("roster build", () => {
     expect(botActivityAt(profiles[0]!)).toBe(NOW - 1_000);
   });
 
+  it("drops hidden profiles, and only exactly those", () => {
+    const { profiles } = parseProfilesList({
+      profiles: [profileRow({ name: "scout" }), profileRow({ name: "ops-runner" }), profileRow({ name: "ops" })],
+    });
+    // Hiding is by exact profile name: a prefix match would also swallow `ops`.
+    expect(buildRoster(profiles, { ...idle, hidden: new Set(["ops-runner"]) }).map((bot) => bot.name)).toEqual([
+      "scout",
+      "ops",
+    ]);
+    // No hide list at all leaves the roster untouched.
+    expect(buildRoster(profiles, idle)).toHaveLength(3);
+  });
+
   it("handles a roster with no ui_meta anywhere", () => {
     const { profiles } = parseProfilesList({ profiles: [profileRow({ name: "bare" })] });
     const [bot] = buildRoster(profiles, idle);

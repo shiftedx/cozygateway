@@ -192,6 +192,35 @@ export class BotChatTurns {
     await this.#turns.get(name)?.done;
   }
 
+  /** Drops a bot's broadcast watermark. Prefer `cancel` for a deleted bot: dropping the watermark
+   *  alone is a no-op whenever it matters, because a live turn's very next poll writes it straight
+   *  back. */
+  forget(name: string): void {
+    this.#watermarks.delete(name);
+  }
+
+  /** Tears down everything this module holds for a bot whose profile is gone: the live turn poll is
+   *  cancelled, and the watermark, pending sends and last broadcast state are dropped.
+   *
+   *  Cancelling is the load-bearing half. Leaving the poll to "clean up after itself" was wrong on
+   *  both counts: it kept broadcasting `bot_chat` / `bot_chat_state` frames for a bot no longer on
+   *  the roster (three failing polls, then a `failed` state frame), and each of those polls rewrote
+   *  the watermark that `forget` had just deleted, so the drop never took. Cancelling cannot race
+   *  the poll either: the loop checks the flag at every checkpoint and returns without broadcasting.
+   *
+   *  Ordering note: the caller only reaches this after Hermes CONFIRMED the delete, so there is no
+   *  turn left that could legitimately still land. */
+  cancel(name: string): void {
+    const turn = this.#turns.get(name);
+    if (turn !== undefined) {
+      turn.cancelled = true;
+      this.#turns.delete(name);
+    }
+    this.#watermarks.delete(name);
+    this.#pending.delete(name);
+    this.#lastState.delete(name);
+  }
+
   close(): void {
     this.#closed = true;
     for (const turn of this.#turns.values()) turn.cancelled = true;

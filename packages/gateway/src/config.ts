@@ -44,6 +44,18 @@ const HermesBridgeConfigSchema = Type.Object({
   /** Canonical Bot Chats are created hidden so they stay out of the global Sessions list, which
    *  is what the desktop plugin defaults to. */
   hideBotChats: Type.Optional(Type.Boolean()),
+  /** Profile names this gateway keeps off its roster. They remain REAL profiles Hermes-side, and
+   *  every by-name `/bots/:name` route still addresses them; they are only left out of `GET /bots`
+   *  and the `bot_roster` frames. This is for a box whose Hermes also runs automation or service
+   *  profiles that are not bots anybody should chat with. Matched case-insensitively, since Hermes
+   *  stores profile ids lowercase. */
+  hiddenProfiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  /** The Hermes profile this bridge's own link runs on. Setting it makes `DELETE /bots/:name`
+   *  refuse that name: deleting a profile stops its gateway, so an authenticated device could
+   *  otherwise cut the link this gateway talks over. Optional because it cannot be detected (the
+   *  RPC surface reports the profile a SESSION is routed to, never the one the gateway process was
+   *  launched under) and a wrong guess would make a real bot undeletable. */
+  profile: Type.Optional(Type.String({ minLength: 1 })),
 });
 export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
 
@@ -57,7 +69,11 @@ const GatewayConfigSchema = Type.Object({
    *  that disconnects mid-turn cannot leave the agent looping tool calls forever. 0 disables the
    *  bound. Config-file only; not env-driven (see applyEnvOverrides). */
   turnTimeoutSeconds: Type.Integer({ minimum: 0, default: 600 }),
-  agents: Type.Array(AgentConfigSchema, { minItems: 1 }),
+  /** Attach/openclaw/mock agents this gateway serves. May be empty or omitted on a pure-bots
+   *  gateway, whose whole surface is the hermes bridge; see the "at least one surface" check in
+   *  `loadConfig`. It was once required to be non-empty, which forced a placeholder attach agent
+   *  into the config of a box that serves nothing but bots. */
+  agents: Type.Array(AgentConfigSchema, { default: [] }),
   /** Capability id -> integer version, surfaced verbatim as GatewayInfo.capabilities (contract
    *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
    *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
@@ -70,9 +86,20 @@ export function loadConfig(path: string): GatewayConfig {
   const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
   const withDefaults =
     typeof raw === "object" && raw !== null
-      ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 600, ...raw }
+      ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 600, agents: [], ...raw }
       : raw;
   const config = assertValid(GatewayConfigSchema, withDefaults);
+  // A gateway has to serve SOMETHING. Agents and the hermes bridge are the two surfaces, and
+  // either alone is a complete deployment: a pure-bots gateway carries no agents at all, while a
+  // classic attach gateway carries no bridge. Only a config with neither is refused, and it is
+  // refused here rather than by a `minItems` on `agents`, which used to make the pure-bots shape
+  // impossible to express.
+  if (config.agents.length === 0 && config.hermes === undefined) {
+    throw new ContractViolation(
+      'a gateway must serve something: configure at least one entry in "agents", or a "hermes" bridge block for a pure-bots gateway',
+      "/agents",
+    );
+  }
   const seen = new Set<string>();
   for (const agent of config.agents) {
     if (seen.has(agent.id)) {

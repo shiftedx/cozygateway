@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { ContractViolation } from "cozygateway-contract";
 
 import { applyEnvOverrides, loadConfig, type GatewayConfig } from "../src/config.ts";
+import { parseHermesOptions } from "../src/hermes-bridge/config.ts";
 
 function writeConfig(value: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), "cozygateway-config-"));
@@ -26,9 +27,55 @@ describe("loadConfig", () => {
     expect(config.agents[0]?.backend).toBe("mock");
   });
 
-  it("rejects a config with no agents", () => {
-    const path = writeConfig({ name: "g", agents: [] });
-    expect(() => loadConfig(path)).toThrow(ContractViolation);
+  it("rejects a config that serves nothing at all, naming both surfaces", () => {
+    const empty = writeConfig({ name: "g", agents: [] });
+    expect(() => loadConfig(empty)).toThrow(ContractViolation);
+    expect(() => loadConfig(empty)).toThrow(/at least one entry in "agents", or a "hermes" bridge block/);
+    // An omitted `agents` reads the same as an empty one, rather than as a schema error about a
+    // missing key.
+    expect(() => loadConfig(writeConfig({ name: "g" }))).toThrow(/at least one entry in "agents"/);
+  });
+
+  // A pure-bots gateway serves the hermes bridge and nothing else. A non-empty `agents` used to be
+  // required, which forced a placeholder attach agent into the config of a box that serves no
+  // attach agents at all.
+  it("accepts a gateway with no agents when a hermes bridge is configured", () => {
+    const path = writeConfig({
+      name: "bots-only",
+      agents: [],
+      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" },
+    });
+    const config = loadConfig(path);
+    expect(config.agents).toEqual([]);
+    expect(config.hermes?.url).toBe("ws://homelab:8790/api/ws");
+
+    const omitted = loadConfig(
+      writeConfig({ name: "bots-only", hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" } }),
+    );
+    expect(omitted.agents).toEqual([]);
+  });
+
+  it("carries the bridge's optional roster hide list through", () => {
+    const path = writeConfig({
+      name: "bots-only",
+      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN", hiddenProfiles: ["ops-runner"] },
+    });
+    expect(loadConfig(path).hermes?.hiddenProfiles).toEqual(["ops-runner"]);
+  });
+
+  it("normalizes the bridge's own profile name, which DELETE then refuses", () => {
+    const path = writeConfig({
+      name: "bots-only",
+      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN", profile: "  Ops-Host  " },
+    });
+    const parsed = parseHermesOptions(loadConfig(path).hermes!, { HERMES_TOKEN: "t" });
+    expect(parsed.bridgeProfile).toBe("ops-host");
+    // Absent by default: the guard is opt-in because the profile cannot be detected.
+    const bare = writeConfig({
+      name: "bots-only",
+      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" },
+    });
+    expect(parseHermesOptions(loadConfig(bare).hermes!, { HERMES_TOKEN: "t" }).bridgeProfile).toBeUndefined();
   });
 
   it("rejects duplicate agent ids", () => {

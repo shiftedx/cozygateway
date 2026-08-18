@@ -33,6 +33,7 @@ describe("hermes bridge options", () => {
       url: "ws://h/api/ws",
       auth: { mode: "token", token: "s3cret", param: "token" },
       hideBotChats: true,
+      hiddenProfiles: [],
     });
 
     expect(() => parseHermesOptions({ url: "ws://h/api/ws", tokenEnv: "HERMES_TOKEN" }, {})).toThrow(
@@ -61,7 +62,20 @@ describe("hermes bridge options", () => {
         provider: "basic",
       },
       hideBotChats: true,
+      hiddenProfiles: [],
     });
+  });
+
+  it("normalizes the roster hide list: trimmed, lowercased, blanks dropped, duplicates collapsed", () => {
+    const parsed = parseHermesOptions(
+      {
+        url: "ws://h/api/ws",
+        tokenEnv: "HERMES_TOKEN",
+        hiddenProfiles: ["Ops-Runner", "  ops-runner ", "   ", "sweeper"],
+      },
+      { HERMES_TOKEN: "s3cret" },
+    );
+    expect(parsed.hiddenProfiles).toEqual(["ops-runner", "sweeper"]);
   });
 
   it("defaults the dashboard auth provider to basic and passes a configured one through", () => {

@@ -52,6 +52,21 @@ export class HermesUnavailable extends Error {
   }
 }
 
+/** The call went out and nothing came back inside its bound. A SUBCLASS of `HermesUnavailable` on
+ *  purpose, so every existing "the link is not usable" branch keeps working, but distinguishable,
+ *  because the two are not the same news: an unsent call changed nothing, while a timed-out one may
+ *  still be running Hermes-side and completing right now. Anything that tears down local state on
+ *  success must not treat this as a failure that means "nothing happened". */
+export class HermesTimeout extends HermesUnavailable {
+  readonly method: string;
+
+  constructor(method: string, timeoutMs: number) {
+    super(`hermes request "${method}" timed out after ${timeoutMs}ms; it may still be running`);
+    this.name = "HermesTimeout";
+    this.method = method;
+  }
+}
+
 export interface ReconnectPolicy {
   minMs: number;
   maxMs: number;
@@ -169,8 +184,13 @@ export interface HermesClient {
   state(): HermesState;
   /** Resolves with the `result` value. Rejects with `HermesRpcError` (message = the gateway's
    *  error text, verbatim) when the gateway answered with an error, or `HermesUnavailable` when
-   *  the call could not be sent or the socket died first. */
-  request(method: string, params?: unknown): Promise<unknown>;
+   *  the call could not be sent or the socket died first, or `HermesTimeout` (a subclass of it)
+   *  when the call went out and nothing came back inside its bound.
+   *
+   *  `opts.timeoutMs` overrides the client-wide bound for ONE call. It exists for the handful of
+   *  Hermes operations that are legitimately slow (a profile delete stops a service and rmtrees a
+   *  directory), where the default 30 s would reject a call that is going to succeed. */
+  request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
    *  `cron.changed` broadcasts. Handlers cannot be removed. */
   onEvent(handler: (event: HermesEvent) => void): void;
@@ -522,18 +542,19 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   return {
     state: () => state,
 
-    request(method: string, params: unknown = {}): Promise<unknown> {
+    request(method: string, params: unknown = {}, opts: { timeoutMs?: number } = {}): Promise<unknown> {
       return new Promise((resolve, reject) => {
         const socket = ws;
         if (state !== "online" || socket === undefined || socket.readyState !== WebSocket.OPEN) {
           reject(new HermesUnavailable(`cannot send "${method}": hermes bridge is ${state}, not online`));
           return;
         }
+        const bound = opts.timeoutMs ?? requestTimeoutMs;
         const id = String(nextRequestId++);
         const timer = setTimeout(() => {
           pending.delete(id);
-          reject(new HermesUnavailable(`hermes request "${method}" timed out after ${requestTimeoutMs}ms`));
-        }, requestTimeoutMs);
+          reject(new HermesTimeout(method, bound));
+        }, bound);
         timer.unref();
         pending.set(id, { resolve, reject, timer });
         socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));

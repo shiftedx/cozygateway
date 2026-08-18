@@ -120,6 +120,22 @@ export const BotChatSendRequestSchema = Type.Object({
 });
 export type BotChatSendRequest = Static<typeof BotChatSendRequestSchema>;
 
+/** `POST /bots` body: the three-field quick create, plus the two look fields the roster renders.
+ *  `name` is the Hermes profile name and the id of the bot everywhere else in this API; it is
+ *  validated against the Hermes profile-name rule server-side (lowercase slug, reserved names
+ *  refused), so the bounds here are only the cheap ones. `title`, `shape` and `color` are pure
+ *  client convention: they ride the profile's `ui_meta["hermes-bots"]` blob, while `description`
+ *  is the profile's own description and reaches `profiles.create` untouched. */
+export const BotCreateRequestSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 64 }),
+  title: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+  shape: Type.Optional(Type.String({ minLength: 1, maxLength: 32 })),
+  /** Six-digit hex, the form the desktop's palette writes. */
+  color: Type.Optional(Type.String({ pattern: "^#[0-9a-fA-F]{6}$" })),
+});
+export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
+
 /** `POST /bots/focus` body. The app declares what it is looking at so the bridge polls Hermes at
  *  the desktop's cadences only while a screen is open, and idles otherwise. `null` means the app
  *  left the bots surface. */
