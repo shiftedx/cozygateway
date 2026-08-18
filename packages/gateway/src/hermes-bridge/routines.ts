@@ -92,6 +92,33 @@ export class RoutineNotFound extends Error {
   }
 }
 
+/** A routine the backend ACCEPTED but whose stored row could not be read back.
+ *
+ *  It exists so that "I could not confirm what was stored" can never be answered as "here is what
+ *  was stored". The only other thing this gateway could put on the wire is the client's own request,
+ *  and the request is not what the backend holds: the schedule is normalized on the way in (`every
+ *  2h` becomes `every 120m`), the first run time is computed, and a run cap comes back as a display
+ *  string. Echoing the input showed a user a schedule nobody had persisted, on the one path where
+ *  something had actually gone wrong.
+ *
+ *  `createdId` is the id the `add` reported, when it reported one. It is carried because the job may
+ *  well exist: a client that gets this error can list the routines and find out, and the id is what
+ *  makes the leftover deletable. */
+export class RoutineUnconfirmed extends Error {
+  /** The id the `add` reply carried, or undefined when it carried none. */
+  readonly createdId: string | undefined;
+
+  constructor(createdId: string | undefined, detail: string) {
+    super(
+      createdId === undefined
+        ? `the cron add answered without the created job and without its id, so the stored routine could not be read back: ${detail}`
+        : `the routine was created as "${createdId}" but could not be read back: ${detail}`,
+    );
+    this.name = "RoutineUnconfirmed";
+    this.createdId = createdId;
+  }
+}
+
 export interface CronJob {
   job_id?: unknown;
   name?: unknown;
@@ -493,7 +520,14 @@ export interface RoutineWriteResult {
  *  `add` echoes the created job under `job`, so the answer is the backend's own row rather than one
  *  this gateway assembled from the request: the schedule comes back NORMALIZED (`every 2h` is stored
  *  and reported as `every 120m`) and `next_run_at` is computed, and a client that rendered its own
- *  request back would show a schedule the backend does not have. */
+ *  request back would show a schedule the backend does not have.
+ *
+ *  A build that answers without that row is READ BACK once, by the id the reply carried, and the
+ *  stored job is what goes on the wire. It is not assembled from the request, which is what used to
+ *  happen and is the one case where the answer was fiction: a routines pane showed the schedule the
+ *  user typed, in a shape the backend never stores, precisely when the round trip had failed. If the
+ *  read-back does not produce the job, the failure is reported (`RoutineUnconfirmed`) with the id the
+ *  `add` reported, so the caller can go and look rather than being told a story. */
 export async function createBotRoutine(
   rpc: HermesRpc,
   bot: string,
@@ -503,15 +537,19 @@ export async function createBotRoutine(
   const reply = readCronReply("add", await rpc.request("cron.manage", buildRoutineAddParams(bot, input, schedulerProfile)));
   const job = asRecord(reply["job"]) as CronJob | undefined;
   if (job !== undefined) return mapRoutine(job);
-  // An older build that answered without the embedded row still told us the id and the schedule it
-  // stored, so the row is assembled from THAT rather than from the request.
-  return mapRoutine({
-    job_id: reply["job_id"],
-    name: routineJobName(bot, input.title.trim()),
-    schedule: reply["schedule"],
-    next_run_at: reply["next_run_at"],
-    enabled: true,
-  });
+
+  const createdId = asString(reply["job_id"]) ?? "";
+  // Nothing to read back BY. The add reported success, so a routine may exist, and the only honest
+  // answer is that this gateway cannot say which one.
+  if (createdId.length === 0) throw new RoutineUnconfirmed(undefined, "the reply carried no job_id");
+
+  let stored: CronJob;
+  try {
+    stored = await findBotRoutineJob(rpc, bot, createdId);
+  } catch (err) {
+    throw new RoutineUnconfirmed(createdId, err instanceof Error ? err.message : String(err));
+  }
+  return mapRoutine(stored);
 }
 
 /** Deletes a routine. Scoped: an id that is not in this bot's namespace is a 404, never a delete. */
@@ -594,7 +632,11 @@ export async function patchBotRoutine(
   try {
     created = await createBotRoutine(rpc, bot, create, schedulerProfile);
   } catch (err) {
-    if (wasActive) {
+    // A replacement that could not be READ BACK may well be running: the `add` succeeded and only
+    // the confirmation failed. Resuming the old job on top of that is the one outcome this whole
+    // ordering exists to prevent, so an unconfirmed create rolls nothing back. The old job stays
+    // paused, nothing double-fires, and the next list reports whichever jobs are really there.
+    if (wasActive && !(err instanceof RoutineUnconfirmed)) {
       // Best effort, and its failure must not replace the failure the caller needs to see: the
       // routine that could not be edited is now paused, which the next list will report.
       try {

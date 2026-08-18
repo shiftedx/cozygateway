@@ -111,6 +111,12 @@ interface CronFake {
   /** A backend that refuses the `add` softly rather than raising: the schedule shape it dislikes is
    *  still the user's own input. */
   failAdd: boolean;
+  /** An older build whose `add` answers with the id and the stored schedule but NOT the created row,
+   *  which is the shape that used to send the gateway looking for something to echo. */
+  omitAddJob: boolean;
+  /** An `add` that reports success and an id for a job the store does not hold. Implies
+   *  `omitAddJob`: it is the read-back, not the reply, that catches this one. */
+  phantomAdd: boolean;
   methods: Record<string, (params: Record<string, unknown>) => unknown>;
 }
 
@@ -122,6 +128,8 @@ function cronFake(initial: FakeJob[] = []): CronFake {
     failRemove: new Set<string>(),
     failList: false,
     failAdd: false,
+    omitAddJob: false,
+    phantomAdd: false,
   };
   let seq = 0;
 
@@ -177,16 +185,17 @@ function cronFake(initial: FakeJob[] = []): CronFake {
           ...(typeof params["repeat"] === "number" ? { repeat: `${params["repeat"]} times` } : {}),
           ...(params["continuity"] === true ? { continuity: true } : {}),
         };
-        fake.jobs?.push(job);
-        return {
+        if (fake.phantomAdd !== true) fake.jobs?.push(job);
+        const reply: Record<string, unknown> = {
           success: true,
           job_id: job.id,
           name: job.name,
           schedule: job.schedule,
           next_run_at: job.next_run_at,
-          job: format(job),
           message: `Cron job '${job.name}' created.`,
         };
+        if (fake.omitAddJob === true || fake.phantomAdd === true) return reply;
+        return { ...reply, job: format(job) };
       }
       const id = params["name"];
       const job = find(id);
@@ -509,6 +518,78 @@ describe("create, patch and delete", () => {
     const add = h.cron.calls.find((call) => call.action === "add");
     expect(add?.params["repeat"]).toBe(3);
     expect(add?.params["continuity"]).toBe(true);
+  });
+
+  it("reads the stored row back when the add answers without one", async () => {
+    const h = await setup();
+    h.cron.omitAddJob = true;
+    const res = await h.authed(
+      "/bots/scout/routines",
+      body("POST", { title: "Sweep", schedule: "every 2h", prompt: "sweep the inbox" }),
+    );
+    expect(res.status).toBe(201);
+    const created = (await res.json()) as { routine: BotRoutine };
+    // The proof that this came from the STORE and not from the request: the request said `every 2h`.
+    expect(created.routine.schedule).toEqual({ raw: "every 120m", human: "Every 2h" });
+    expect(created.routine.id).toBe(h.cron.jobs[0]?.id);
+    // One re-read, right after the add, and no second attempt at it. The trailing `list` is the
+    // re-read that feeds the `bot_routines` frame.
+    expect(h.cron.calls.map((call) => call.action).slice(0, 2)).toEqual(["add", "list"]);
+  });
+
+  it("refuses rather than echoing the request when the read-back fails", async () => {
+    const h = await setup();
+    h.cron.omitAddJob = true;
+    h.cron.failList = true;
+    const res = await h.authed(
+      "/bots/scout/routines",
+      body("POST", { title: "Sweep", schedule: "every 2h", prompt: "sweep the inbox" }),
+    );
+    expect(res.status).toBe(502);
+    const failure = (await res.json()) as {
+      error: { code: string; message: string };
+      hermesError?: string;
+      createdId?: string;
+      routine?: BotRoutine;
+    };
+    expect(failure.error.code).toBe("backend_unavailable");
+    // No schedule at all beats a schedule nobody stored.
+    expect(failure.routine).toBeUndefined();
+    expect(JSON.stringify(failure)).not.toContain("every 2h");
+    // The job really was created, so the answer says which one it is.
+    expect(failure.createdId).toBe(h.cron.jobs[0]?.id);
+    expect(failure.hermesError).toContain("could not be read back");
+  });
+
+  it("refuses a create whose id the store does not hold", async () => {
+    const h = await setup();
+    h.cron.phantomAdd = true;
+    const res = await h.authed(
+      "/bots/scout/routines",
+      body("POST", { title: "Sweep", schedule: "0 8 * * *", prompt: "sweep the inbox" }),
+    );
+    expect(res.status).toBe(502);
+    const failure = (await res.json()) as { error: { code: string }; createdId?: string };
+    expect(failure.error.code).toBe("backend_unavailable");
+    expect(failure.createdId).toBe("job_1");
+  });
+
+  it("leaves the old routine paused when the replacement cannot be read back", async () => {
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
+    h.cron.phantomAdd = true;
+    const res = await h.authed(
+      "/bots/scout/routines/j1",
+      body("PATCH", { schedule: "0 8 * * *", prompt: "summarize overnight" }),
+    );
+    expect(res.status).toBe(502);
+    const failure = (await res.json()) as { error: { code: string }; routine?: BotRoutine; createdId?: string };
+    expect(failure.error.code).toBe("backend_unavailable");
+    expect(failure.routine).toBeUndefined();
+    expect(failure.createdId).toBe("job_1");
+    // The replacement may be running, so the old job is NOT resumed on top of it: no double fire.
+    expect(h.cron.calls.some((call) => call.action === "resume")).toBe(false);
+    expect(h.cron.jobs).toHaveLength(1);
+    expect(h.cron.jobs[0]).toMatchObject({ id: "j1", schedule: "0 9 * * *", paused: true });
   });
 
   it("pauses and resumes in place, keeping the routine's id", async () => {
@@ -860,6 +941,24 @@ describe("frames", () => {
     h.server.sendEvent("cron.changed");
     await new Promise((resolve) => setTimeout(resolve, 400));
     expect(routineFrames(h.frames)).toHaveLength(0);
+  });
+
+  it("broadcasts the moved state even when the write itself fails (G1)", async () => {
+    // A patch whose replacement cannot be confirmed still PAUSED the old job. The pane watching
+    // `bot_routines` must see that pause, not keep showing the pre-write row as enabled.
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
+    await h.authed("/bots/scout/routines");
+    await until(() => routineFrames(h.frames).length === 1);
+    expect(routineFrames(h.frames)[0]?.routines[0]).toMatchObject({ id: "j1", enabled: true });
+
+    h.cron.phantomAdd = true;
+    const res = await h.authed(
+      "/bots/scout/routines/j1",
+      body("PATCH", { schedule: "0 8 * * *", prompt: "summarize overnight" }),
+    );
+    expect(res.status).toBe(502);
+    await until(() => routineFrames(h.frames).length === 2);
+    expect(routineFrames(h.frames)[1]?.routines[0]).toMatchObject({ id: "j1", enabled: false });
   });
 
   it("marks a delegated legacy routine on the frame too", async () => {

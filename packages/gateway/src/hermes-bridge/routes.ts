@@ -28,7 +28,7 @@ import {
   normalizeProfileName,
 } from "./crud.ts";
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
-import { RoutineNotFound, RoutineRefused, patchNeedsRewrite } from "./routines.ts";
+import { RoutineNotFound, RoutineRefused, RoutineUnconfirmed, patchNeedsRewrite } from "./routines.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
  *  device-token auth as every other route; nothing here speaks a Hermes method name, that all
@@ -125,6 +125,20 @@ function failure(c: Context<Env>, err: unknown) {
   // another bot or to an untagged cron job the operator owns. Not found, not forbidden: this API
   // does not confirm the existence of jobs outside the bot that was asked about.
   if (err instanceof RoutineNotFound) return c.json(errorBody("not_found", err.message), 404);
+  // A create the backend accepted whose stored row could not be read back. A 502 rather than a 201,
+  // because there is no routine to put in a 201 body: the alternative is echoing the request, and
+  // the request is not what the backend stores. `createdId` rides along when the `add` reported one,
+  // so a client can list and find out whether the routine is really there.
+  if (err instanceof RoutineUnconfirmed) {
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", "hermes accepted the routine but its stored schedule could not be read back"),
+        hermesError: err.message,
+        ...(err.createdId === undefined ? {} : { createdId: err.createdId }),
+      },
+      502,
+    );
+  }
   // A cron call the backend ANSWERED with a refusal: it arrives as a successful RPC result carrying
   // `success: false`, so nothing about the transport went wrong and the answer has to say what
   // actually did. That depends on the ACTION, not on the shape:
