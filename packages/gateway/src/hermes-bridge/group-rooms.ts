@@ -361,9 +361,18 @@ export class GroupRooms {
       }
       if (this.#closed || this.#generation(key) !== generation) return;
       await this.#runRounds(key, epoch, generation);
-    })().finally(() => {
-      if (this.#drives.get(key)?.promise === run) this.#drives.delete(key);
-    });
+    })()
+      // Belt and braces on top of the guards inside the loop. NOTHING awaits this promise on a
+      // request path, so any rejection that reached here would be an UNHANDLED rejection, and the
+      // gateway registers no `unhandledRejection` handler: Node's default is to exit. A room
+      // orchestrator must not be able to take the process down, so a drive that fails says so in
+      // the log and dies quietly, whatever the failure turns out to be.
+      .catch((err: unknown) => {
+        this.#log(`group drive for "${key}" failed: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        if (this.#drives.get(key)?.promise === run) this.#drives.delete(key);
+      });
     this.#drives.set(key, { promise: run, generation });
   }
 
@@ -523,9 +532,14 @@ export class GroupRooms {
       this.#log(`group ${groupName}: session for ${member.name} failed: ${detail}`);
       return { outcome: "failed", detail };
     }
-    // A bridge closed while the session was resolving has a closed database behind it: the id is
-    // worth nothing now and writing it is the write that throws.
-    if (this.#closed) return { outcome: "pass" };
+    // The same guard shape the post-turn write uses, and for the same reason. Resolving a session
+    // is a round trip to Hermes, and a `DELETE /bots/groups/:name` landing inside that window takes
+    // the room row with it. The member-session write is a foreign key onto that row, so it fails
+    // with `FOREIGN KEY constraint failed`, and because nothing awaits a drive that rejection
+    // escaped as an UNHANDLED one: a well-timed delete could take the process down. A closed bridge
+    // is the same hazard one level up, where the database itself is gone.
+    if (this.#closed || this.#generation(key) !== startGeneration) return { outcome: "pass" };
+    if (this.#storage.botGroup(key) === undefined) return { outcome: "pass" };
     if (session.storedId !== storedId) this.#storage.setBotGroupSession(key, member.name, session.storedId);
 
     const prompt = buildTurnPrompt(groupName, members, member, delta);

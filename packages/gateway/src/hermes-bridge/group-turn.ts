@@ -53,31 +53,70 @@ export interface GroupSession {
    *  coordinate space as `snapshot.messages`, and the only offset a reply slice is taken at. */
   renderedCount: number;
   /** Id of the last rendered message at resolve time, when there was one. The primary anchor: a
-   *  compaction or a trim can shift `renderedCount` out from under us, and an identity match
-   *  cannot be shifted. Falls back to `renderedCount` when the id is gone. */
+   *  count can be shifted out from under a turn, an identity match cannot. */
   lastRenderedId?: string;
+  /** That same message's text. Carried because `mapChatMessage` SYNTHESIZES an id for a row that
+   *  carries none (`<session>#<index>`), and a compaction renumbers those indices, so an anchor id
+   *  can still "match" after a rewrite while pointing at a completely different row. The text is
+   *  what tells a real anchor from a coincidence. */
+  lastRenderedText?: string;
   /** True when this call created the session, so the caller knows to persist the stored id. */
   created: boolean;
 }
 
+/** The baseline anchor's position in `messages`, or -1 when the anchor does not hold.
+ *
+ *  It does not hold when the id is gone, and it does not hold when the id matches a row whose text
+ *  is not the text the anchor was taken from: that is a renumbered synthetic id, not the message. */
+function anchorIndexOf(
+  messages: readonly BotChatMessage[],
+  session: Pick<GroupSession, "lastRenderedId" | "lastRenderedText">,
+): number {
+  if (session.lastRenderedId === undefined) return -1;
+  const index = messages.findIndex((message) => message.id === session.lastRenderedId);
+  if (index === -1) return -1;
+  if (session.lastRenderedText !== undefined && messages[index]?.text !== session.lastRenderedText) return -1;
+  return index;
+}
+
+/** True when the transcript was REWRITTEN under this turn, i.e. the baseline describes a list that
+ *  no longer exists.
+ *
+ *  Hermes compacts sessions, and a compaction that lands inside a turn window invalidates both
+ *  anchors at once: the count is too high for the list that is there, and the position it names is
+ *  somebody else's. The 1:1 chat path has always handled this hazard explicitly (`chat-turns.ts`
+ *  re-bases when the id it held is gone rather than going permanently silent) and the group path
+ *  now handles it the same way. Without it a compaction reproduces exactly the symptom the mixed
+ *  index spaces produced: an empty window, no reply ever found, and the turn burning the 180 s cap. */
+export function transcriptRewritten(
+  messages: readonly BotChatMessage[],
+  session: Pick<GroupSession, "renderedCount" | "lastRenderedId" | "lastRenderedText">,
+): boolean {
+  if (session.lastRenderedId !== undefined && anchorIndexOf(messages, session) === -1) return true;
+  return messages.length < session.renderedCount;
+}
+
 /** The newest assistant message strictly AFTER the baseline this turn started from.
  *
- *  Anchored on the id of the last rendered message seen before submit, and falling back to the
- *  rendered COUNT when that id is no longer in the transcript. Both anchors are in the filtered
- *  render space, which is the space `messages` is in; the raw `message_count` never enters here.
+ *  Anchored on the id (and text) of the last rendered message seen before submit, falling back to
+ *  the rendered COUNT when there was no anchor to take. Both live in the filtered render space,
+ *  which is the space `messages` is in; the raw `message_count` never enters here.
  *
  *  Walking back from the end (rather than the desktop's walk over the whole transcript) is what
  *  makes a stale reply unrepresentable: the previous turn's answer sits BEFORE the baseline and is
- *  never a candidate. */
+ *  never a candidate. The one case where the walk DOES cover the whole transcript is a rewritten
+ *  one: after a compaction there is no baseline left to respect, and the desktop's answer (the
+ *  newest assistant message) beats silence. */
 export function findFreshReply(
   messages: readonly BotChatMessage[],
-  session: Pick<GroupSession, "renderedCount" | "lastRenderedId">,
+  session: Pick<GroupSession, "renderedCount" | "lastRenderedId" | "lastRenderedText">,
 ): BotChatMessage | undefined {
-  let baseline = Math.min(session.renderedCount, messages.length);
-  if (session.lastRenderedId !== undefined) {
-    const index = messages.findIndex((message) => message.id === session.lastRenderedId);
-    if (index !== -1) baseline = index + 1;
-  }
+  const anchor = anchorIndexOf(messages, session);
+  const baseline = transcriptRewritten(messages, session)
+    ? 0
+    : anchor !== -1
+      ? anchor + 1
+      : Math.min(session.renderedCount, messages.length);
   for (let index = messages.length - 1; index >= baseline; index -= 1) {
     const message = messages[index];
     if (message?.role === "assistant") return message;
@@ -149,7 +188,9 @@ export async function ensureGroupSession(
         runtimeId,
         messageCount: snapshot.messageCount,
         renderedCount: snapshot.messages.length,
-        ...(lastRendered === undefined ? {} : { lastRenderedId: lastRendered.id }),
+        ...(lastRendered === undefined
+          ? {}
+          : { lastRenderedId: lastRendered.id, lastRenderedText: lastRendered.text }),
         created: false,
       };
     } catch {
@@ -243,8 +284,12 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
     if (snapshot.running || snapshot.inflight) continue;
     // RAW against RAW: `messageCount` is Hermes' own row count, and this is the only thing it is
     // ever compared against. The reply itself is picked in the FILTERED space by `findFreshReply`.
+    //
+    // Skipped entirely for a transcript that was rewritten under us: a compaction can leave the
+    // count level or send it BACKWARDS while the reply is sitting right there, and gating on growth
+    // that can never happen is how a turn burns its whole cap for nothing.
     const count = Math.max(snapshot.messages.length, snapshot.messageCount);
-    if (count <= session.messageCount) continue;
+    if (count <= session.messageCount && !transcriptRewritten(snapshot.messages, session)) continue;
     const reply = findFreshReply(snapshot.messages, session);
     if (reply === undefined) continue;
     const text = reply.text.trim();

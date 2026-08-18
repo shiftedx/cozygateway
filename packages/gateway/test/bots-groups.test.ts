@@ -12,7 +12,12 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient, type HermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import { startFakeHermesServer, type FakeHermesBehavior, type FakeHermesServer } from "./support/fake-hermes-server.ts";
+import {
+  NO_REPLY,
+  startFakeHermesServer,
+  type FakeHermesBehavior,
+  type FakeHermesServer,
+} from "./support/fake-hermes-server.ts";
 
 /** Server-side group chats end to end: the room CRUD, a full deliberation round against a fake
  *  Hermes, the caps, epoch supersession, a member whose turn fails, the frames, and durability
@@ -83,6 +88,14 @@ interface FakeGroupOptions {
    *  then a `tool` result row) in front of every reply. Both rows are dropped by the render filter,
    *  so the raw count and the rendered count diverge by two per turn. */
   toolNoise?: boolean;
+  /** Head-trims every session to this many rows once a reply lands: a Hermes-side COMPACTION, which
+   *  rewrites the transcript under a turn that is already in flight. Rows here carry no ids, so the
+   *  synthesized `<session>#<index>` ids are renumbered by the trim as well, which is the case a
+   *  bare id comparison cannot detect. */
+  compactTo?: number;
+  /** Holds the FIRST `session.create` open instead of answering it, so a test can act inside the
+   *  window where a member's session is still resolving. Released through `releaseSession()`. */
+  holdFirstSession?: boolean;
 }
 
 /** A Hermes with several profiles and lazily created, title-addressable sessions.
@@ -96,12 +109,15 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
   sessions: FakeSession[];
   /** Drops a profile from `profiles.list`, i.e. a bot deleted after a room was created. */
   removeProfile: (name: string) => void;
+  /** Answers a `session.create` that `holdFirstSession` is holding open. */
+  releaseSession: () => void;
 } {
   const profiles = [...(options.profiles ?? ["scout", "luna"])];
   const sessions: FakeSession[] = [];
   const queues = new Map<string, string[]>(Object.entries(options.replies ?? {}).map(([k, v]) => [k, [...v]]));
   const spoken = new Map<string, number>();
   let seq = 0;
+  let held: (() => void) | undefined;
 
   const find = (id: string, profile: string): FakeSession | undefined =>
     sessions.find(
@@ -133,7 +149,7 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
         bot_mode_protocol: true,
       }),
       "session.list": () => ({ sessions: [] }),
-      "session.create": (params) => {
+      "session.create": (params, ctx) => {
         seq += 1;
         const session: FakeSession = {
           stored: `stored-${seq}`,
@@ -143,7 +159,12 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
           messages: (options.seedRows ?? []).map((row) => ({ ...row })),
         };
         sessions.push(session);
-        return { stored_session_id: session.stored, session_id: session.runtime };
+        const result = { stored_session_id: session.stored, session_id: session.runtime };
+        if (options.holdFirstSession === true && held === undefined) {
+          held = () => ctx.reply(result);
+          return NO_REPLY;
+        }
+        return result;
       },
       "session.resume": (params) => {
         const id = String(params["session_id"] ?? "");
@@ -181,6 +202,11 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
               session.messages.push({ role: "tool", content: "3 matches" });
             }
             session.messages.push({ role: "assistant", content: reply });
+            // A compaction lands AFTER the reply, so the reply is present and the transcript that
+            // carried the turn's baseline is gone: exactly the window the re-base rule exists for.
+            if (options.compactTo !== undefined && session.messages.length > options.compactTo) {
+              session.messages.splice(0, session.messages.length - options.compactTo);
+            }
           };
           if (delay === 0) push();
           else setTimeout(push, delay).unref?.();
@@ -195,6 +221,10 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
     removeProfile: (name: string) => {
       const index = profiles.indexOf(name);
       if (index !== -1) profiles.splice(index, 1);
+    },
+    releaseSession: () => {
+      held?.();
+      held = undefined;
     },
   };
 }
@@ -213,6 +243,9 @@ interface Harness {
   /** Every out-of-band `@user` escalation the bridge raised. Stands in for the push notifier, which
    *  is what `server.ts` wires this seam to. */
   escalations: Array<{ group: string; member: string; displayName: string; text: string }>;
+  /** Everything the bridge logged. A drive that dies is required to say so here rather than to
+   *  reject into nothing, so this is where a swallowed failure becomes visible. */
+  logs: string[];
 }
 
 async function setup(
@@ -230,6 +263,7 @@ async function setup(
     reconnect: { minMs: 15, maxMs: 60 },
   });
   const frames: ServerFrame[] = [];
+  const logs: string[] = [];
   const escalations: Array<{ group: string; member: string; displayName: string; text: string }> = [];
   const bridge = new HermesBridge({
     client,
@@ -239,7 +273,7 @@ async function setup(
     // Real wall-clock: the turn cap is a duration, and a per-read counter would make a 200 ms cap
     // mean "200 clock reads" instead.
     now: () => Date.now(),
-    logSink: () => {},
+    logSink: (line) => void logs.push(line),
     chatPollMs: 10,
     chatTurnTimeoutMs: overrides.turnTimeoutMs ?? 3_000,
     groupChainDelayMs: 10,
@@ -294,6 +328,7 @@ async function setup(
       }),
     request: async (path, init) => app.request(path, init),
     escalations,
+    logs,
     prompts: () =>
       server
         .callsOf("prompt.submit")
@@ -976,5 +1011,83 @@ describe("room names are addresses", () => {
       body: JSON.stringify({ name: "Two Words", members: ["scout", "luna"] }),
     });
     expect(ok.status).toBe(201);
+  });
+});
+
+describe("a hermes-side compaction inside a turn", () => {
+  it("re-bases instead of going silent when the transcript is rewritten under the turn", async () => {
+    // The residual half of G1. The baseline (a rendered count plus an anchor id) describes the
+    // transcript as it was when the turn started; a compaction that lands before the reply is read
+    // rewrites that transcript, and BOTH anchors fail in the same direction: the list is shorter
+    // than the count says, and the synthesized `<session>#<index>` ids have been renumbered, so the
+    // anchor id can still "match" a completely different row. A baseline of `messages.length` finds
+    // nothing and the turn runs to the cap, which is the original zero-replies symptom returning.
+    const { behavior } = fakeGroupHermes({ alwaysSpeak: true, compactTo: 3 });
+    const harness = await setup(behavior, { turnTimeoutMs: 800 });
+    await createRoom(harness);
+
+    for (const text of ["hello team", "second turn please", "and once more"]) {
+      await harness.authed("/bots/groups/Release%20Room/messages", {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+      await harness.bridge.groupSettled("Release Room");
+    }
+
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    const afterLast = detail.messages.slice(
+      detail.messages.findIndex((message) => message.text === "and once more") + 1,
+    );
+    expect(afterLast.length).toBeGreaterThan(0);
+    const notes = stateFrames(harness.frames).flatMap((frame) => (frame.note === undefined ? [] : [frame.note]));
+    expect(notes.filter((note) => note.reason === "timeout")).toEqual([]);
+    // Each reply is still a distinct one: re-basing must not resurrect an older answer either.
+    const memberTexts = detail.messages.filter((message) => message.from.kind === "member").map((m) => m.text);
+    expect(new Set(memberTexts).size).toBe(memberTexts.length);
+  });
+});
+
+describe("deleting a room while a member session is resolving", () => {
+  it("cannot take the process down with an unhandled rejection", async () => {
+    // A `session.create` is a round trip to Hermes. A DELETE landing inside that window cascades the
+    // room row away, and the member-session write that follows is a foreign key onto it: the write
+    // fails, and because nothing awaits a drive the rejection escaped as an UNHANDLED one. The
+    // gateway registers no `unhandledRejection` handler, so Node's default applies and the process
+    // exits: a device could kill the gateway with a well-timed DELETE.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => void unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const { behavior, releaseSession } = fakeGroupHermes({
+        replies: { scout: ["never posted"], luna: ["(pass)", "(pass)", "(pass)"] },
+        holdFirstSession: true,
+      });
+      const harness = await setup(behavior);
+      await createRoom(harness);
+
+      await harness.authed("/bots/groups/Release%20Room/messages", {
+        method: "POST",
+        body: JSON.stringify({ text: "who is on this" }),
+      });
+      // Scout's session resolve is held open; delete the room from under it.
+      await until(() => harness.server.callsOf("session.create").length === 1);
+      const deleted = await harness.authed("/bots/groups/Release%20Room", { method: "DELETE" });
+      expect(deleted.status).toBe(204);
+      releaseSession();
+      await harness.bridge.groupSettled("Release Room");
+      // Two macrotasks: an unhandled rejection is reported at the end of a turn of the event loop,
+      // so asserting on the same tick would pass whether or not one was raised.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(unhandled).toEqual([]);
+      // And it did not merely get swallowed by the drive's catch: the guarded write never ran.
+      expect(harness.logs.filter((line) => line.includes("FOREIGN KEY"))).toEqual([]);
+      expect(harness.logs.filter((line) => line.includes("group drive for"))).toEqual([]);
+      // The room is gone and stayed gone.
+      expect((await harness.authed("/bots/groups/Release%20Room")).status).toBe(404);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 });
