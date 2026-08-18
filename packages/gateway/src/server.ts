@@ -90,6 +90,7 @@ export async function startGateway(
       now: () => Date.now(),
       hideBotChats: hermesOptions.hideBotChats,
       hiddenProfiles: hermesOptions.hiddenProfiles,
+      ...(hermesOptions.bridgeProfile === undefined ? {} : { bridgeProfile: hermesOptions.bridgeProfile }),
     });
   }
 

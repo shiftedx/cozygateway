@@ -1,6 +1,6 @@
 import type { BotCreateRequest } from "cozygateway-contract";
 
-import { HermesRpcError } from "./client.ts";
+import { HermesRpcError, HermesUnavailable } from "./client.ts";
 import { UI_META_KEY } from "./roster.ts";
 import type { HermesRpc } from "./canonical-chat.ts";
 
@@ -61,6 +61,19 @@ export class BotDeleteRefused extends Error {
   }
 }
 
+/** The profile named is not there. Answered as 404 rather than folded into the generic backend
+ *  failure, because "already gone" and "the delete broke" are different news to a client, and the
+ *  retry of a delete that timed out mid-flight (see `PROFILE_DELETE_TIMEOUT_MS`) lands here. */
+export class BotNotFound extends Error {
+  readonly botName: string;
+
+  constructor(botName: string) {
+    super(`no bot named "${botName}" exists`);
+    this.name = "BotNotFound";
+    this.botName = botName;
+  }
+}
+
 /** The gateway's command allow-list refused the delete. `hint` is the gateway's own explanation,
  *  passed through verbatim so an operator can act on it (dissection 1.2: `cli.exec` answers
  *  `{ blocked: true, hint }` rather than an error). */
@@ -107,6 +120,19 @@ export function validateNewBotName(raw: string): string {
   if (name === DEFAULT_PROFILE) {
     throw new BotNameInvalid('"default" is the built-in Hermes profile and cannot be created');
   }
+  return assertProfileNameRule(name);
+}
+
+/** The shape rule alone, on an already-normalized name. Split out of `validateNewBotName` so the
+ *  DELETE path runs the SAME check: a name that cannot name a profile must never reach
+ *  `profiles.delete` or a `cli.exec` argv, whatever the caller put in the URL.
+ *
+ *  It is the argv that makes this load-bearing rather than cosmetic. `DELETE /bots/%2E%2E%2Fetc`
+ *  decodes to `../etc` and `DELETE /bots/--help` to a leading-dash token, and both were being
+ *  handed to a command line this gateway builds itself, relying entirely on the remote validator to
+ *  say no. It also aligns the two routes' errors: a garbage name is a 400 naming the rule, not a
+ *  502 carrying CLI stderr. */
+export function assertProfileNameRule(name: string): string {
   if (!PROFILE_ID_RE.test(name)) {
     throw new BotNameInvalid(
       `invalid bot name "${name}": it must match [a-z0-9][a-z0-9_-]{0,63} (lowercase letters, digits, - and _)`,
@@ -118,6 +144,17 @@ export function validateNewBotName(raw: string): string {
     );
   }
   return name;
+}
+
+/** Normalizes and validates a name for a DELETE, before anything is put on the wire. `default` is
+ *  refused with its own message (it is the built-in profile, not merely an unusable name), and
+ *  everything else goes through the same rule create applies. */
+export function validateExistingBotName(raw: string): string {
+  const name = normalizeProfileName(raw);
+  if (name === DEFAULT_PROFILE) {
+    throw new BotDeleteRefused('"default" is the built-in Hermes profile and cannot be deleted');
+  }
+  return assertProfileNameRule(name);
 }
 
 /** How a `ui_meta` write landed, the desktop's three-way `saveBotMeta` outcome (dissection 3.1):
@@ -143,6 +180,8 @@ export interface CreatedBot {
   description: string;
   meta: BotMetaBlob;
   metaOutcome: MetaOutcome;
+  /** Hermes' own text for a look write that did not land, verbatim. Absent when it landed. */
+  metaError?: string;
 }
 
 /** True when a `profiles.create` failure means "that name is taken". Upstream turns the
@@ -199,12 +238,30 @@ export async function createBotProfile(
     created: now,
   };
   let metaOutcome: MetaOutcome;
+  let metaError: string | undefined;
   try {
     metaOutcome = metaOutcomeOf(await rpc.request("profiles.configure", { name, ui_meta: { [UI_META_KEY]: meta } }));
-  } catch {
-    metaOutcome = "unsupported";
+  } catch (err) {
+    // The two failures are NOT the same news, and a bare catch reported both as `unsupported`,
+    // which the contract documents as the silent, expected fallback a client should not surface.
+    // A socket that dropped or a call that timed out is a look this gateway LOST, which is exactly
+    // the `failed` outcome the doc says is worth showing and worth retrying.
+    //
+    // Neither one fails the create: `profiles.create` already returned, so the profile exists.
+    // Answering 502 here would tell a caller its bot was not made, and its retry would come back
+    // 409 on a bot it owns. The transport failure is surfaced as `failed` plus the Hermes text on
+    // `metaError` instead, which is the honest report of what happened.
+    if (err instanceof HermesUnavailable) {
+      metaOutcome = "failed";
+      metaError = err.message;
+    } else if (err instanceof HermesRpcError) {
+      metaOutcome = "unsupported";
+      metaError = err.message;
+    } else {
+      throw err;
+    }
   }
-  return { name, description, meta, metaOutcome };
+  return { name, description, meta, metaOutcome, ...(metaError === undefined ? {} : { metaError }) };
 }
 
 /** Which path actually deleted the profile. Reported so an operator can tell a teardown-first
@@ -214,6 +271,30 @@ export type DeletePath = "rpc" | "cli";
 /** The argv the desktop plugin runs for its legacy delete (dissection 1.2). Kept verbatim: the
  *  gateway's allow-list matches on argv, so a reworded flag is a blocked command. */
 export const PROFILE_DELETE_ARGV = (name: string): string[] => ["profile", "delete", name, "--yes"];
+
+/** How long a profile delete is given, in seconds on the wire (`cli.exec` takes `timeout` in
+ *  seconds, defaults to 240 and caps at 600) and in milliseconds for the client-side bound.
+ *
+ *  The default 30 s request bound was wrong for this call by an order of magnitude. Upstream's
+ *  `delete_profile` disables the profile's systemd/launchd unit, stops a running gateway, and
+ *  rmtrees the profile directory with retries. A delete crossing 30 s rejected with "the bridge is
+ *  not connected" while the profile was being deleted for real, and nothing local was cleaned up.
+ *  180 s is the same order as the chat turn cap and comfortably inside `cli.exec`'s own default. */
+export const PROFILE_DELETE_TIMEOUT_S = 180;
+export const PROFILE_DELETE_TIMEOUT_MS = PROFILE_DELETE_TIMEOUT_S * 1_000;
+
+/** Upstream's "there is no such profile" text, from the `FileNotFoundError` `delete_profile` raises
+ *  and the message the CLI prints for it. Matched on the CLI's combined output and on an RPC error
+ *  message, both of which are the only channels either door offers. */
+const MISSING_PROFILE_RE = /(no such profile|does not exist|not found|no profile named)/i;
+
+/** True when a `profiles.delete` rejection means "that profile is not there" rather than
+ *  "that method does not exist" or a real failure. */
+export function isMissingProfileError(err: unknown): boolean {
+  if (!(err instanceof HermesRpcError)) return false;
+  if (isUnknownMethod(err)) return false;
+  return MISSING_PROFILE_RE.test(err.message);
+}
 
 /** True when Hermes rejected a call because it does not know the method. The error text is the
  *  documented feature-probe channel (`/unknown method/i`, dissection 1.1) and is never reworded
@@ -236,28 +317,37 @@ export function isUnknownMethod(err: unknown): boolean {
  *  `{ blocked: true, hint }`, and it means the gateway's command allow-list refused to run the
  *  delete at all. It is raised here so the route can surface the hint, which is the only thing
  *  that tells an operator to widen the allow-list. */
-export async function deleteBotProfile(rpc: HermesRpc, rawName: string): Promise<DeletePath> {
-  const name = normalizeProfileName(rawName);
-  if (name === DEFAULT_PROFILE) {
-    throw new BotDeleteRefused('"default" is the built-in Hermes profile and cannot be deleted');
-  }
+export async function deleteBotProfile(
+  rpc: HermesRpc,
+  rawName: string,
+  timeoutMs: number = PROFILE_DELETE_TIMEOUT_MS,
+): Promise<DeletePath> {
+  const name = validateExistingBotName(rawName);
+  const timeoutS = Math.max(1, Math.round(timeoutMs / 1_000));
 
   try {
-    await rpc.request("profiles.delete", { name });
+    await rpc.request("profiles.delete", { name }, { timeoutMs });
     return "rpc";
   } catch (err) {
+    if (isMissingProfileError(err)) throw new BotNotFound(name);
     if (!isUnknownMethod(err)) throw err;
   }
 
-  const result = await rpc.request("cli.exec", { argv: PROFILE_DELETE_ARGV(name) });
+  const result = await rpc.request(
+    "cli.exec",
+    { argv: PROFILE_DELETE_ARGV(name), timeout: timeoutS },
+    { timeoutMs },
+  );
   const record = typeof result === "object" && result !== null ? (result as Record<string, unknown>) : {};
   if (record["blocked"] === true) {
     const hint = typeof record["hint"] === "string" ? record["hint"] : "no hint given";
     throw new BotDeleteBlocked(hint);
   }
   const exitCode = typeof record["code"] === "number" ? record["code"] : 0;
+  const output = typeof record["output"] === "string" ? record["output"] : "";
   if (exitCode !== 0) {
-    throw new BotDeleteFailed(exitCode, typeof record["output"] === "string" ? record["output"] : "");
+    if (MISSING_PROFILE_RE.test(output)) throw new BotNotFound(name);
+    throw new BotDeleteFailed(exitCode, output);
   }
   return "cli";
 }

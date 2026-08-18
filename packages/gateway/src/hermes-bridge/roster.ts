@@ -131,15 +131,23 @@ export function uiMetaBytes(meta: Record<string, unknown>): number {
  *
  *  The clear is only authoritative about state the snapshot could have seen. A pin THIS gateway
  *  wrote after the snapshot was taken is newer than the server's answer, not contradicted by it,
- *  so it reads as `undefined` and the local record wins. */
+ *  so it reads as `undefined` and the local record wins.
+ *
+ *  `uiMetaSupported: false` disables the clear entirely. On a Hermes that cannot store `ui_meta`
+ *  at all, NO blob will ever carry `chat`, so every refresh read as an authoritative clear and threw
+ *  the local pin away; a chat opened again inside its kickoff window (nothing in `session.list`
+ *  yet, no pin to fall back on) then minted a SECOND canonical chat. A server that cannot record a
+ *  pin cannot be asserting that the pin is gone. */
 export function resolveChatPin(
   meta: Record<string, unknown> | null,
   localPin: { sessionId: string; updatedAt: number } | undefined,
   snapshotAt: number | null,
+  uiMetaSupported = true,
 ): string | null | undefined {
   if (meta === null) return undefined;
   const chat = asString(meta["chat"]);
   if (chat !== undefined && chat.length > 0) return chat;
+  if (!uiMetaSupported) return undefined;
   if (localPin !== undefined && (snapshotAt === null || localPin.updatedAt > snapshotAt)) return undefined;
   return null;
 }
@@ -271,6 +279,10 @@ export interface RosterBuildOptions extends PresenceContext {
    *  that builds a roster, so `GET /bots` and the `bot_roster` frame cannot disagree about what is
    *  on it. Names are compared already-normalized (lowercase), as Hermes stores them. */
   hidden?: ReadonlySet<string>;
+  /** False once this Hermes has shown it cannot store `ui_meta` at all. Passed through to
+   *  `resolveChatPin`, where it disables the authoritative-clear reading: see that function. Default
+   *  true, which is the state of every gateway that has not yet proven otherwise. */
+  uiMetaSupported?: boolean;
 }
 
 /** Builds the merged roster: profiles plus their `ui_meta` blob, preview classification, presence
@@ -283,7 +295,7 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
     // One rule, shared with the chat route (`resolveChatPin`): a server blob is the whole truth
     // about `chat` unless this gateway wrote a newer pin than the snapshot could have seen.
     const local = opts.pins.get(profile.name);
-    const resolved = resolveChatPin(meta, local, opts.now);
+    const resolved = resolveChatPin(meta, local, opts.now, opts.uiMetaSupported ?? true);
     const chatSessionId = resolved === undefined ? (local?.sessionId ?? null) : resolved;
     const group = asString(meta?.["group"])?.trim();
     const summary: BotSummary = {

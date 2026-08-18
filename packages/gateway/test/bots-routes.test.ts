@@ -295,10 +295,15 @@ describe("GET /bots/:name/chat", () => {
     });
   });
 
+  // `scoutRow`'s blob carries a title and NO `chat`, which is an authoritative clear: the local pin
+  // must lose to it, and does, on every surface. These two cases are about the OTHER shape, a server
+  // that carries no bot blob at all, which is the only state a gateway-local pin fills.
+  const scoutNoMeta = { ...scoutRow, ui_meta: {} };
+
   it("returns the existing pin unchanged when it still resolves", async () => {
     const { authed, storage } = await setup({
       methods: {
-        "profiles.list": () => profilesListResult([scoutRow]),
+        "profiles.list": () => profilesListResult([scoutNoMeta]),
         "session.list": () => ({ sessions: [{ id: "newest", title: "x" }, { id: "pinned", title: "Bot Chat" }] }),
       },
     });
@@ -312,7 +317,7 @@ describe("GET /bots/:name/chat", () => {
   it("re-pins the newest session when the pinned id has vanished", async () => {
     const { authed, storage } = await setup({
       methods: {
-        "profiles.list": () => profilesListResult([scoutRow]),
+        "profiles.list": () => profilesListResult([scoutNoMeta]),
         "session.list": () => ({ sessions: [{ id: "newest", title: "x" }] }),
       },
     });

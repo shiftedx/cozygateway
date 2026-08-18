@@ -8,6 +8,8 @@ export interface ParsedHermesOptions {
   /** Profile names kept off this gateway's roster, already normalized to the lowercase form
    *  Hermes stores them in. Empty when the operator hid nothing. */
   hiddenProfiles: string[];
+  /** The profile the bridge's own Hermes link runs on, normalized, or undefined when unset. */
+  bridgeProfile: string | undefined;
 }
 
 /** Normalizes the operator's hide list: trimmed, lowercased (Hermes stores profile ids lowercase,
@@ -84,6 +86,8 @@ export function parseHermesOptions(
 ): ParsedHermesOptions {
   const hideBotChats = config.hideBotChats ?? true;
   const hiddenProfiles = parseHiddenProfiles(config.hiddenProfiles);
+  const trimmedProfile = config.profile?.trim().toLowerCase();
+  const bridgeProfile = trimmedProfile === undefined || trimmedProfile.length === 0 ? undefined : trimmedProfile;
   const mode = config.authMode ?? "token";
 
   if (mode === "password") {
@@ -114,6 +118,7 @@ export function parseHermesOptions(
       },
       hideBotChats,
       hiddenProfiles,
+      bridgeProfile,
     };
   }
 
@@ -135,5 +140,6 @@ export function parseHermesOptions(
     auth: { mode: "token", token, param: config.authParam ?? "token" },
     hideBotChats,
     hiddenProfiles,
+    bridgeProfile,
   };
 }

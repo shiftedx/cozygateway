@@ -8,7 +8,12 @@ import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient, type HermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
 import { validateNewBotName, BotNameInvalid } from "../src/hermes-bridge/crud.ts";
-import { startFakeHermesServer, type FakeHermesBehavior, type FakeHermesServer } from "./support/fake-hermes-server.ts";
+import {
+  NO_REPLY,
+  startFakeHermesServer,
+  type FakeHermesBehavior,
+  type FakeHermesServer,
+} from "./support/fake-hermes-server.ts";
 
 /** Bot create and delete over the bridge (contract/ext-bots-v1.md section 4), plus the operator's
  *  roster hide list. Everything runs against the fake Hermes so the two-RPC create, the CLI delete
@@ -51,7 +56,11 @@ interface Harness {
   authed: (path: string, init?: RequestInit) => Promise<Response>;
 }
 
-async function setup(behavior: FakeHermesBehavior = {}, hiddenProfiles: string[] = []): Promise<Harness> {
+async function setup(
+  behavior: FakeHermesBehavior = {},
+  hiddenProfiles: string[] = [],
+  extra: { bridgeProfile?: string; deleteTimeoutMs?: number } = {},
+): Promise<Harness> {
   const server = await startFakeHermesServer(behavior);
   servers.push(server);
   const storage = openStorage(":memory:");
@@ -69,6 +78,8 @@ async function setup(behavior: FakeHermesBehavior = {}, hiddenProfiles: string[]
     now: () => NOW,
     logSink: () => {},
     hiddenProfiles,
+    ...(extra.bridgeProfile === undefined ? {} : { bridgeProfile: extra.bridgeProfile }),
+    ...(extra.deleteTimeoutMs === undefined ? {} : { deleteTimeoutMs: extra.deleteTimeoutMs }),
   });
   bridges.push(bridge);
 
@@ -417,5 +428,272 @@ describe("hidden profiles", () => {
     const sessions = await authed("/bots/ops-runner/sessions");
     expect(sessions.status).toBe(200);
     expect(server.callsOf("session.list")[0]?.params).toMatchObject({ profile: "ops-runner" });
+  });
+});
+
+/** Everything the adversarial review of this PR turned up. Each case names the finding it closes
+ *  and fails without its fix. */
+describe("review fixes", () => {
+  /** A Hermes with one hidden bot that has a desktop-authored look blob, a session list, and a
+   *  working `profiles.configure`. The blob lives in `meta` so a test can read back exactly what
+   *  the gateway wrote. */
+  function hiddenBotHermes(meta: Record<string, unknown>, sessions: Array<{ id: string; title: string }>) {
+    const state = { meta, sessions, created: 0 };
+    const behavior: FakeHermesBehavior = {
+      methods: {
+        "profiles.list": () => ({
+          profiles: [
+            { name: "default", description: "", has_avatar: false },
+            { name: "ops-runner", description: "", has_avatar: false, ui_meta: { "hermes-bots": state.meta } },
+          ],
+          bot_mode_protocol: true,
+        }),
+        "session.list": () => ({ sessions: state.sessions }),
+        "session.create": () => {
+          state.created += 1;
+          return { stored_session_id: `stored-${state.created}`, session_id: `runtime-${state.created}` };
+        },
+        // The kickoff prompt a fresh canonical chat is opened with.
+        "prompt.submit": () => ({ ok: true }),
+        "profiles.configure": (params) => {
+          const blob = (params["ui_meta"] as Record<string, unknown>)["hermes-bots"];
+          if (typeof blob === "object" && blob !== null) state.meta = blob as Record<string, unknown>;
+          return { applied: { ui_meta: true } };
+        },
+      },
+    };
+    return { behavior, state };
+  }
+
+  it("B1: a hidden bot's chat open preserves its server blob instead of wiping it", async () => {
+    // Hidden bots are absent from the roster cache by design, and the pin write path used to build
+    // its replacement blob from that cache. The first chat open from a phone therefore wrote
+    // `ui_meta["hermes-bots"] = { chat: <id> }` WHOLE, destroying the desktop's title, shape, color
+    // and created stamp for a bot the docs say is still chattable.
+    const { behavior, state } = hiddenBotHermes({ title: "Ops", shape: "squircle", color: "#8b5cf6" }, []);
+    const { authed } = await setup(behavior, ["ops-runner"]);
+
+    const body = (await (await authed("/bots/ops-runner/chat")).json()) as { sessionId: string };
+    expect(body.sessionId).toBe("stored-1");
+    expect(state.meta).toEqual({ title: "Ops", shape: "squircle", color: "#8b5cf6", chat: "stored-1" });
+  });
+
+  it("B1: a hidden bot's SERVER pin is honored, not just its local one", async () => {
+    // `#serverPinOf` read the filtered cache too, so for a hidden bot it always answered "the server
+    // knows nothing" and the authoritative pin was never consulted.
+    const { behavior } = hiddenBotHermes({ title: "Ops", chat: "sess-9" }, [
+      { id: "sess-9", title: "Bot Chat" },
+      { id: "newer", title: "Bot Chat" },
+    ]);
+    const { authed, server } = await setup(behavior, ["ops-runner"]);
+
+    expect(await (await authed("/bots/ops-runner/chat")).json()).toMatchObject({
+      sessionId: "sess-9",
+      adoption: "pin",
+    });
+    expect(server.callsOf("session.create")).toHaveLength(0);
+  });
+
+  it("B2: DELETE applies the same name rule as POST, before anything reaches hermes", async () => {
+    const { authed, server } = await setup({ methods: { "profiles.list": liveProfiles(new Set(["default"])) } });
+
+    // Hono decodes the path param, so these are the real strings the handler saw. All three were
+    // forwarded into `profiles.delete` and into a `cli.exec` argv this gateway builds itself.
+    for (const [path, pattern] of [
+      ["/bots/%2E%2E%2F%2E%2E%2Fetc", /a-z0-9/],
+      ["/bots/--help", /a-z0-9/],
+      ["/bots/a%2Fb", /a-z0-9/],
+      ["/bots/hermes", /reserved/],
+      ["/bots/root", /reserved/],
+    ] as const) {
+      const res = await authed(path, { method: "DELETE" });
+      expect(res.status, path).toBe(400);
+      const body = (await res.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe("invalid_request");
+      expect(body.error.message).toMatch(pattern);
+    }
+    expect(server.callsOf("profiles.delete")).toHaveLength(0);
+    expect(server.callsOf("cli.exec")).toHaveLength(0);
+  });
+
+  it("M1: one canonical name across chat and delete, so no pin outlives the bot", async () => {
+    // `GET /bots/Scout/chat` pinned under "Scout" while `DELETE /bots/scout` forgot "scout": the
+    // orphan pin `forgetBot` exists to prevent, plus two independent identities for one bot.
+    const names = new Set(["default", "scout"]);
+    const { authed, server, storage } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(names),
+        "session.list": () => ({ sessions: [{ id: "sess-1", title: "Bot Chat" }] }),
+        "cli.exec": (params) => {
+          names.delete((params["argv"] as string[])[2]!);
+          return { blocked: false, code: 0, output: "" };
+        },
+      },
+    });
+
+    await authed("/bots/Scout/chat");
+    expect(storage.botChatPin("scout")).toBe("sess-1");
+    expect(storage.botChatPin("Scout")).toBeUndefined();
+
+    expect((await authed("/bots/SCOUT", { method: "DELETE" })).status).toBe(204);
+    expect(server.callsOf("cli.exec")[0]?.params["argv"]).toEqual(["profile", "delete", "scout", "--yes"]);
+    expect(storage.botChatPin("scout")).toBeUndefined();
+  });
+
+  it("M2: a slow delete is given room, and its bound is honest when it runs out", async () => {
+    // The 30 s client default rejected a delete that was succeeding for real (upstream stops a
+    // service and rmtrees a directory), answered 503 "the bridge is not connected", which is
+    // factually wrong, and never cleaned up. The call now carries its own bound, and a bound that
+    // does run out says so rather than blaming the link.
+    const names = new Set(["default", "scout"]);
+    const { authed, server } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(names),
+        "cli.exec": (params) => {
+          names.delete((params["argv"] as string[])[2]!);
+          return { blocked: false, code: 0, output: "" };
+        },
+      },
+    });
+    expect((await authed("/bots/scout", { method: "DELETE" })).status).toBe(204);
+    // `cli.exec`'s own timeout rides the params, in SECONDS, well inside its 600 s cap.
+    expect(server.callsOf("cli.exec")[0]?.params["timeout"]).toBe(180);
+  });
+
+  it("M2: a delete that times out reports it honestly and keeps every local record", async () => {
+    const { authed, storage, bridge } = await setup(
+      {
+        methods: {
+          "profiles.list": liveProfiles(new Set(["default", "scout"])),
+          // Never answers: the client-side bound is what ends this call.
+          "cli.exec": () => NO_REPLY,
+        },
+      },
+      [],
+      // A short bound stands in for the 180 s one so the test does not wait three minutes.
+      { deleteTimeoutMs: 40 },
+    );
+    await until(() => bridge.roster().bots.length === 2, 4_000);
+    storage.setBotChatPin("scout", "sess-1", NOW);
+
+    const res = await authed("/bots/scout", { method: "DELETE" });
+    expect(res.status).toBe(504);
+    const body = (await res.json()) as { error: { code: string; message: string }; timedOut: boolean };
+    expect(body.error.code).toBe("backend_unavailable");
+    expect(body.error.message).toMatch(/may still be running/);
+    expect(body.timedOut).toBe(true);
+
+    // Nothing local was cleared: the delete may be completing right now, and a pin thrown away for
+    // a bot that still exists is a second canonical chat on the next open.
+    expect(storage.botChatPin("scout")).toBe("sess-1");
+    expect(bridge.roster().bots.map((bot) => bot.name)).toContain("scout");
+  });
+
+  it("M3: a look write lost to the transport is `failed`, not the silent `unsupported`", async () => {
+    // `unsupported` is documented as the expected, silent fallback on an old gateway. Reporting a
+    // dropped socket as that told the app nothing was wrong about a write that really was lost.
+    const names = new Set<string>(["default"]);
+    const { authed } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(names),
+        "profiles.create": (params) => {
+          names.add(String(params["name"]));
+          return {};
+        },
+      },
+      dropOnMethod: ["profiles.configure"],
+    });
+
+    const res = await authed("/bots", post({ name: "scout", color: "#ef4444" }));
+    // Still 201: `profiles.create` already returned, so the bot exists. Answering 502 here would
+    // tell the caller its bot was not made and send its retry into a 409 on a bot it owns.
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { metaOutcome: string; metaError?: string };
+    expect(body.metaOutcome).toBe("failed");
+    expect(body.metaError).toBeTypeOf("string");
+  });
+
+  it("minor 1: deleting a bot that is not there answers 404, not a raw 502", async () => {
+    const { authed } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(new Set(["default"])),
+        "cli.exec": () => ({ blocked: false, code: 1, output: "Error: profile 'ghost' does not exist" }),
+      },
+    });
+    const res = await authed("/bots/ghost", { method: "DELETE" });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("not_found");
+  });
+
+  it("minor 2: a delete cancels the bot's live turn poll instead of leaving it broadcasting", async () => {
+    const names = new Set(["default", "scout"]);
+    const { authed, bridge, frames } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(names),
+        "session.list": () => ({ sessions: [{ id: "sess-1", title: "Bot Chat" }] }),
+        "session.resume": () => ({
+          session_id: "runtime-1",
+          session_key: "k",
+          message_count: 0,
+          running: true,
+          inflight: false,
+          messages: [],
+        }),
+        "prompt.submit": () => ({ ok: true }),
+        "cli.exec": (params) => {
+          names.delete((params["argv"] as string[])[2]!);
+          return { blocked: false, code: 0, output: "" };
+        },
+      },
+    });
+    await until(() => bridge.roster().bots.length === 2, 4_000);
+
+    expect((await authed("/bots/scout/chat/messages", post({ text: "hi" }))).status).toBe(202);
+    await until(() => bridge.chatPolling("scout"), 4_000);
+
+    expect((await authed("/bots/scout", { method: "DELETE" })).status).toBe(204);
+    expect(bridge.chatPolling("scout")).toBe(false);
+
+    // No further chat frames for a bot that is off the roster.
+    const before = frames.filter((frame) => frame.type === "bot_chat" || frame.type === "bot_chat_state").length;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const after = frames.filter((frame) => frame.type === "bot_chat" || frame.type === "bot_chat_state").length;
+    expect(after).toBe(before);
+  });
+
+  it("minor 3: two racing creates of one name cost exactly one profiles.create", async () => {
+    const names = new Set<string>(["default"]);
+    const { authed, server } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(names),
+        "profiles.create": (params) => {
+          const name = String(params["name"]);
+          if (names.has(name)) throw { code: 4062, message: `Profile '${name}' already exists at /x` };
+          names.add(name);
+          return {};
+        },
+        "profiles.configure": () => ({ applied: { ui_meta: true } }),
+      },
+    });
+
+    const [a, b] = await Promise.all([
+      authed("/bots", post({ name: "scout" })),
+      authed("/bots", post({ name: "Scout" })),
+    ]);
+    expect([a!.status, b!.status]).toEqual([201, 201]);
+    expect(server.callsOf("profiles.create")).toHaveLength(1);
+  });
+
+  it("minor 4: the profile the bridge itself runs on cannot be deleted from here", async () => {
+    const { authed, server } = await setup(
+      { methods: { "profiles.list": liveProfiles(new Set(["default", "scout"])) } },
+      [],
+      { bridgeProfile: "Scout" },
+    );
+    const res = await authed("/bots/scout", { method: "DELETE" });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toMatch(/own hermes link/i);
+    expect(server.callsOf("cli.exec")).toHaveLength(0);
+    expect(server.callsOf("profiles.delete")).toHaveLength(0);
   });
 });

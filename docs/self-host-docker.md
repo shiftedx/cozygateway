@@ -117,6 +117,27 @@ They stay real profiles Hermes-side, and every `/bots/:name` route still address
 only left out of `GET /bots` and the `bot_roster` and `bot_presence` frames. Names are matched
 case-insensitively, since Hermes stores profile ids lowercase.
 
+#### Protecting the bridge's own profile
+
+`DELETE /bots/:name` deletes a real Hermes profile, and deleting one stops that profile's gateway.
+If the bridge talks to a gateway running under a named profile, tell it so and that name becomes
+undeletable over the API:
+
+```json
+{
+  "hermes": {
+    "url": "ws://homelab:8790/api/ws",
+    "tokenEnv": "COZYGATEWAY_HERMES_TOKEN",
+    "profile": "ops-host"
+  }
+}
+```
+
+It is optional and never guessed. The JSON-RPC surface reports which profile a SESSION is routed to,
+never which profile the gateway process itself was launched under, and a wrong guess would make a
+real bot permanently undeletable. Leave it out and there is no guard, which is where the gateway
+already stood.
+
 Relay:
 
 | Variable | Default | Meaning |

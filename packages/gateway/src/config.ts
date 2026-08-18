@@ -50,6 +50,12 @@ const HermesBridgeConfigSchema = Type.Object({
    *  profiles that are not bots anybody should chat with. Matched case-insensitively, since Hermes
    *  stores profile ids lowercase. */
   hiddenProfiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  /** The Hermes profile this bridge's own link runs on. Setting it makes `DELETE /bots/:name`
+   *  refuse that name: deleting a profile stops its gateway, so an authenticated device could
+   *  otherwise cut the link this gateway talks over. Optional because it cannot be detected (the
+   *  RPC surface reports the profile a SESSION is routed to, never the one the gateway process was
+   *  launched under) and a wrong guess would make a real bot undeletable. */
+  profile: Type.Optional(Type.String({ minLength: 1 })),
 });
 export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
 

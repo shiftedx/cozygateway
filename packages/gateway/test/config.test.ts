@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { ContractViolation } from "cozygateway-contract";
 
 import { applyEnvOverrides, loadConfig, type GatewayConfig } from "../src/config.ts";
+import { parseHermesOptions } from "../src/hermes-bridge/config.ts";
 
 function writeConfig(value: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), "cozygateway-config-"));
@@ -60,6 +61,21 @@ describe("loadConfig", () => {
       hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN", hiddenProfiles: ["ops-runner"] },
     });
     expect(loadConfig(path).hermes?.hiddenProfiles).toEqual(["ops-runner"]);
+  });
+
+  it("normalizes the bridge's own profile name, which DELETE then refuses", () => {
+    const path = writeConfig({
+      name: "bots-only",
+      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN", profile: "  Ops-Host  " },
+    });
+    const parsed = parseHermesOptions(loadConfig(path).hermes!, { HERMES_TOKEN: "t" });
+    expect(parsed.bridgeProfile).toBe("ops-host");
+    // Absent by default: the guard is opt-in because the profile cannot be detected.
+    const bare = writeConfig({
+      name: "bots-only",
+      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" },
+    });
+    expect(parseHermesOptions(loadConfig(bare).hermes!, { HERMES_TOKEN: "t" }).bridgeProfile).toBeUndefined();
   });
 
   it("rejects duplicate agent ids", () => {

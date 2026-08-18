@@ -9,10 +9,18 @@ import {
   assertValid,
 } from "cozygateway-contract";
 
-import { HermesRpcError, HermesUnavailable } from "./client.ts";
+import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { RuntimeSessionUnknown } from "./chat-turns.ts";
 import type { BotsSurface } from "./bridge.ts";
-import { BotDeleteBlocked, BotDeleteFailed, BotDeleteRefused, BotNameInvalid, BotNameTaken } from "./crud.ts";
+import {
+  BotDeleteBlocked,
+  BotDeleteFailed,
+  BotDeleteRefused,
+  BotNameInvalid,
+  BotNameTaken,
+  BotNotFound,
+  normalizeProfileName,
+} from "./crud.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
  *  device-token auth as every other route; nothing here speaks a Hermes method name, that all
@@ -40,6 +48,25 @@ function extensionErrorBody(code: "conflict" | "command_blocked", message: strin
   return { error: { code, message } };
 }
 
+/** The ONE canonicalization every `/bots/:name` route applies to its path parameter, so a bot has
+ *  exactly one identity no matter what casing or padding a client used in the URL.
+ *
+ *  Without it the routes disagreed with each other: `GET /bots/Scout/chat` pinned under the key
+ *  `"Scout"` while `DELETE /bots/scout` forgot `"scout"`, leaving behind the orphan pin and meta row
+ *  that `forgetBot` exists to prevent, and giving the same bot two independent inflight and pin
+ *  identities depending on how it was spelled. Normalizing at the boundary, not in each handler, is
+ *  what makes that unrepresentable.
+ *
+ *  Returns the canonical name, or a 400 response for a name that cannot name a profile at all. */
+function canonicalName(c: Context<Env>): { name: string } | { response: Response } {
+  try {
+    return { name: normalizeProfileName(c.req.param("name") ?? "") };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : "invalid bot name";
+    return { response: c.json(errorBody("invalid_request", detail), 400) };
+  }
+}
+
 function failure(c: Context<Env>, err: unknown) {
   if (err instanceof HermesRpcError) {
     return c.json(
@@ -57,6 +84,20 @@ function failure(c: Context<Env>, err: unknown) {
     return c.json(
       { ...errorBody("backend_unavailable", "the hermes gateway did not report a runtime session"), hermesError: err.message },
       502,
+    );
+  }
+  // Checked BEFORE HermesUnavailable, which it subclasses. A call that went out and did not answer
+  // in time is not "the bridge is not connected": the operation may be running to completion right
+  // now (a profile delete stops a service and rmtrees a directory), and telling a client nothing
+  // reached Hermes is factually wrong and invites a retry against work already in flight.
+  if (err instanceof HermesTimeout) {
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", "the hermes gateway did not answer in time; the operation may still be running"),
+        hermesError: err.message,
+        timedOut: true,
+      },
+      504,
     );
   }
   if (err instanceof HermesUnavailable) {
@@ -100,7 +141,14 @@ export function registerBotRoutes(
     }
     try {
       const created = await bots.createBot(parsed);
-      return c.json({ bot: created.bot, metaOutcome: created.metaOutcome }, 201);
+      return c.json(
+        {
+          bot: created.bot,
+          metaOutcome: created.metaOutcome,
+          ...(created.metaError === undefined ? {} : { metaError: created.metaError }),
+        },
+        201,
+      );
     } catch (err) {
       // The name rule is Hermes', but it is checked before the RPC, so it reads as the 400 it is
       // rather than as a backend failure.
@@ -113,12 +161,17 @@ export function registerBotRoutes(
   // 204: the bot is gone, and there is nothing left to say about it. The roster frame that follows
   // is how every other device finds out.
   app.delete("/bots/:name", requireDevice, async (c) => {
-    const name = c.req.param("name");
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
     try {
-      await bots.deleteBot(name);
+      await bots.deleteBot(resolved.name);
       return c.body(null, 204);
     } catch (err) {
+      if (err instanceof BotNameInvalid) return c.json(errorBody("invalid_request", err.message), 400);
       if (err instanceof BotDeleteRefused) return c.json(errorBody("invalid_request", err.message), 400);
+      // Deliberately 404 rather than 204: this route is NOT idempotent, and a client that cannot
+      // tell "already gone" from "the delete broke" cannot decide whether to retry.
+      if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
       // `blocked` is not a Hermes error, it is a successful `cli.exec` that refused to run the
       // command. The hint is the gateway's own text and is what tells an operator to widen the
       // allow-list, so it rides the body verbatim rather than being folded into the message.
@@ -159,7 +212,9 @@ export function registerBotRoutes(
   });
 
   app.get("/bots/:name/chat", requireDevice, async (c) => {
-    const name = c.req.param("name");
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
     try {
       const result = await bots.canonicalChat(name);
       return c.json({ name, sessionId: result.sessionId, adoption: result.adoption });
@@ -171,7 +226,9 @@ export function registerBotRoutes(
   // Full duplex over the canonical chat. Both routes resolve the chat themselves, so the app never
   // has to hold a session id: `name` is the only identifier in this API.
   app.get("/bots/:name/chat/messages", requireDevice, async (c) => {
-    const name = c.req.param("name");
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
     try {
       const history = await bots.chatHistory(name);
       return c.json({ name, ...history });
@@ -184,7 +241,9 @@ export function registerBotRoutes(
   // `bot_chat` frames. The body carries the user message the bridge committed, so the app can
   // render it at once instead of waiting for it to come back around the poll.
   app.post("/bots/:name/chat/messages", requireDevice, async (c) => {
-    const name = c.req.param("name");
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
     let body: unknown;
     try {
       body = await c.req.json();
@@ -209,7 +268,9 @@ export function registerBotRoutes(
   });
 
   app.get("/bots/:name/sessions", requireDevice, async (c) => {
-    const name = c.req.param("name");
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
     try {
       return c.json({ sessions: await bots.sessions(name, SESSION_LIST_LIMIT) });
     } catch (err) {

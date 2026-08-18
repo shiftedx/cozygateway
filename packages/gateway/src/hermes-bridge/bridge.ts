@@ -22,7 +22,15 @@ import {
   UI_META_KEY,
 } from "./roster.ts";
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
-import { createBotProfile, deleteBotProfile, type CreatedBot, type DeletePath } from "./crud.ts";
+import {
+  BotDeleteRefused,
+  createBotProfile,
+  deleteBotProfile,
+  PROFILE_DELETE_TIMEOUT_MS,
+  validateExistingBotName,
+  type CreatedBot,
+  type DeletePath,
+} from "./crud.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -84,6 +92,8 @@ export interface BotsSurface {
 export interface BotCreated {
   bot: BotSummary;
   metaOutcome: CreatedBot["metaOutcome"];
+  /** Hermes' own text for a look write that did not land. Absent when it landed. */
+  metaError?: string;
 }
 
 /** What `GET /bots/:name/chat/messages` answers with. `adoption` says how the chat was resolved,
@@ -106,12 +116,23 @@ export interface HermesBridgeOptions {
   hideBotChats?: boolean;
   /** Profile names kept off the roster this gateway serves. See `RosterBuildOptions.hidden`. */
   hiddenProfiles?: Iterable<string>;
+  /** The Hermes profile this bridge's own link runs on, when the operator has told us. Deleting it
+   *  stops the gateway the bridge is talking to, so `DELETE /bots/:name` refuses it.
+   *
+   *  It has to be configured rather than detected: the JSON-RPC surface reports which profile a
+   *  SESSION is routed to, never which profile the gateway process itself was launched under, and
+   *  guessing wrong in either direction is worse than not guessing (a wrong guess makes a real bot
+   *  undeletable; no guess leaves the operator where they already were). Unset means no guard. */
+  bridgeProfile?: string;
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
   /** Turn-poll cadence and cap. Defaults are the desktop's own 2 s / 180 s. */
   chatPollMs?: number;
   chatTurnTimeoutMs?: number;
+  /** How long a profile delete is given. Default `PROFILE_DELETE_TIMEOUT_MS` (180 s). Overridable
+   *  so the timeout path is testable in milliseconds instead of minutes. */
+  deleteTimeoutMs?: number;
   logSink?: (line: string) => void;
 }
 
@@ -122,6 +143,8 @@ export class HermesBridge implements BotsSurface {
   readonly #now: () => number;
   readonly #hideBotChats: boolean;
   readonly #hidden: ReadonlySet<string>;
+  readonly #bridgeProfile: string | undefined;
+  readonly #deleteTimeoutMs: number;
   readonly #rosterPollMs: number;
   readonly #routinesPollMs: number;
   readonly #focusTtlMs: number;
@@ -129,6 +152,7 @@ export class HermesBridge implements BotsSurface {
 
   readonly #focus = new Map<string, { screen: BotFocusScreen; at: number }>();
   readonly #chatInflight = new Map<string, Promise<CanonicalChatResult>>();
+  readonly #createInflight = new Map<string, Promise<BotCreated>>();
   readonly #pins: PinStore;
   readonly #chat: BotChatTurns;
 
@@ -170,6 +194,9 @@ export class HermesBridge implements BotsSurface {
     // as Hermes stores them (lowercase), and a caller that hands over `Ops-Runner` means the same
     // bot as one that hands over `ops-runner`.
     this.#hidden = new Set([...(opts.hiddenProfiles ?? [])].map((name) => name.trim().toLowerCase()));
+    const bridgeProfile = opts.bridgeProfile?.trim().toLowerCase();
+    this.#bridgeProfile = bridgeProfile === undefined || bridgeProfile.length === 0 ? undefined : bridgeProfile;
+    this.#deleteTimeoutMs = opts.deleteTimeoutMs ?? PROFILE_DELETE_TIMEOUT_MS;
     this.#rosterPollMs = opts.rosterPollMs ?? ROSTER_POLL_MS;
     this.#routinesPollMs = opts.routinesPollMs ?? ROUTINES_POLL_MS;
     this.#focusTtlMs = opts.focusTtlMs ?? FOCUS_TTL_MS;
@@ -253,6 +280,7 @@ export class HermesBridge implements BotsSurface {
         const bots = buildRoster(profiles, {
           hidden: this.#hidden,
           pins: this.#storage.botChatPinEntries(),
+          uiMetaSupported: this.#uiMetaWriteback,
           routedProfile: this.#routedProfile,
           gatewayState: this.#gatewayState(),
           now: fetchedAt,
@@ -297,11 +325,11 @@ export class HermesBridge implements BotsSurface {
     // De-duplicated by bot name: two taps (or two devices) must not mint two canonical chats.
     if (inflight !== undefined) return inflight;
 
-    const serverPin = this.#serverPinOf(name);
     const run = (async () => {
       this.#routedProfile = name;
       this.#busyDepth += 1;
       try {
+        const serverPin = await this.#serverPinOf(name);
         const result = await resolveCanonicalChat(name, {
           rpc: this.#client,
           pins: this.#pins,
@@ -414,10 +442,31 @@ export class HermesBridge implements BotsSurface {
    *  refresh itself failed) the row is synthesized from what was just written, so the response is
    *  a complete `BotSummary` either way. */
   async createBot(input: BotCreateRequest): Promise<BotCreated> {
-    const created = await createBotProfile(this.#client, input, this.#now());
-    await this.refresh(`bot ${created.name} created`);
-    const row = this.#storage.botRoster().bots.find((bot) => bot.name === created.name);
-    return { bot: row ?? synthesizeSummary(created), metaOutcome: created.metaOutcome };
+    // Single-flight by name, the same rule `canonicalChat` uses. Upstream's `create_profile` races
+    // on the filesystem and answers the loser with `FileExistsError` -> 4062 -> 409, so this is not
+    // what makes concurrent creates safe; it is what keeps the SECOND tap from spending a create,
+    // a configure and a roster refresh to learn that, and what makes two devices creating the same
+    // bot at the same instant answer the same 201 with the same row.
+    const key = input.name.trim().toLowerCase();
+    const inflight = this.#createInflight.get(key);
+    if (inflight !== undefined) return inflight;
+
+    const run = (async () => {
+      try {
+        const created = await createBotProfile(this.#client, input, this.#now());
+        await this.refresh(`bot ${created.name} created`);
+        const row = this.#storage.botRoster().bots.find((bot) => bot.name === created.name);
+        return {
+          bot: row ?? synthesizeSummary(created),
+          metaOutcome: created.metaOutcome,
+          ...(created.metaError === undefined ? {} : { metaError: created.metaError }),
+        };
+      } finally {
+        this.#createInflight.delete(key);
+      }
+    })();
+    this.#createInflight.set(key, run);
+    return run;
   }
 
   /** Deletes a bot's profile and forgets everything this gateway held about it.
@@ -427,10 +476,26 @@ export class HermesBridge implements BotsSurface {
    *  on the roster with its canonical-chat pin thrown away, and the next open would mint a SECOND
    *  chat on a bot that still exists. Failing first means nothing local changed. */
   async deleteBot(name: string): Promise<DeletePath> {
-    const path = await deleteBotProfile(this.#client, name);
-    const canonical = name.trim().toLowerCase();
+    // Validated and canonicalized BEFORE anything goes on the wire, by the same rule create uses:
+    // this name is about to be interpolated into a `cli.exec` argv that this gateway builds itself.
+    const canonical = validateExistingBotName(name);
+    if (this.#bridgeProfile !== undefined && canonical === this.#bridgeProfile) {
+      throw new BotDeleteRefused(
+        `"${canonical}" is the profile this gateway's own Hermes link runs on and cannot be deleted from here`,
+      );
+    }
+
+    const path = await deleteBotProfile(this.#client, canonical, this.#deleteTimeoutMs);
+    // Only reached when Hermes CONFIRMED the delete. A timeout or a dropped socket throws above and
+    // leaves every local record intact, because a delete that may still be running is not a delete
+    // that happened.
     this.#storage.forgetBot(canonical);
-    this.#chat.forget(canonical);
+    // The live turn poll goes with it. Left running it keeps broadcasting `bot_chat` /
+    // `bot_chat_state` frames for a bot that is no longer on the roster, and its next poll rewrites
+    // the very watermark `forget` just dropped.
+    this.#chat.cancel(canonical);
+    this.#chatInflight.delete(canonical);
+    this.#kickoffs.delete(canonical);
     await this.refresh(`bot ${canonical} deleted`);
     return path;
   }
@@ -466,13 +531,49 @@ export class HermesBridge implements BotsSurface {
    *  same bot: `undefined` only when the server carries no bot blob at all (or the bot is not in
    *  the cache yet), the pin when the blob names one, and `null` otherwise, because a blob without
    *  a `chat` key is an authoritative clear (dissection 3.2). */
-  #serverPinOf(name: string): string | null | undefined {
+  async #serverPinOf(name: string): Promise<string | null | undefined> {
     const roster = this.#storage.botRoster();
     const cached = roster.bots.find((bot) => bot.name === name);
-    if (cached === undefined) return undefined;
-    // Exactly the rule `buildRoster` applied to this same snapshot, so `GET /bots` and this route
-    // cannot answer differently for the same bot.
-    return resolveChatPin(cached.meta, this.#storage.botChatPinEntry(name), roster.updatedAt);
+    if (cached !== undefined) {
+      // Exactly the rule `buildRoster` applied to this same snapshot, so `GET /bots` and this route
+      // cannot answer differently for the same bot.
+      return resolveChatPin(cached.meta, this.#storage.botChatPinEntry(name), roster.updatedAt, this.#uiMetaWriteback);
+    }
+
+    // Not in the cache. A HIDDEN bot is the case that matters: the hide list is a roster filter,
+    // not an access rule, so hidden bots are still chattable by name, but they are deliberately
+    // absent from `bot_roster` and therefore from this cache. Reading that absence as "the server
+    // knows nothing" made every hidden bot's server pin invisible: the desktop's authoritative pin
+    // (and its authoritative CLEAR) were never honored, and only the gateway-local pin was
+    // consulted. So fetch this one profile fresh instead of guessing. A cold cache takes the same
+    // path, which is strictly better than the guess it replaces.
+    const at = this.#now();
+    const uiMeta = await this.#freshUiMeta(name);
+    if (uiMeta === undefined) return undefined;
+    return resolveChatPin(readBotMeta(uiMeta).meta, this.#storage.botChatPinEntry(name), at, this.#uiMetaWriteback);
+  }
+
+  /** One profile's raw `ui_meta` value, read fresh off the wire. `undefined` when the profile is not
+   *  in the answer at all; a profile that is there but carries no `ui_meta` yields `null`, which is
+   *  the difference between "we do not know" and "there is no blob".
+   *
+   *  Throws nothing: a read that cannot be made answers `undefined`, which every caller already
+   *  treats as "the server knows nothing" and degrades to the local record for. */
+  async #freshUiMeta(name: string): Promise<unknown | undefined> {
+    try {
+      const raw = await this.#client.request("profiles.list", {});
+      const profiles = (raw as Record<string, unknown> | null)?.["profiles"];
+      if (!Array.isArray(profiles)) return undefined;
+      const row = profiles.find(
+        (entry) => typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["name"] === name,
+      );
+      if (row === undefined) return undefined;
+      return (row as Record<string, unknown>)["ui_meta"] ?? null;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "unknown";
+      this.#log(`fresh ui_meta read failed for ${name}: ${detail}`);
+      return undefined;
+    }
   }
 
   /** Writes the canonical-chat pin into the bot's `ui_meta`, the desktop's `saveBotMeta`
@@ -496,23 +597,25 @@ export class HermesBridge implements BotsSurface {
   ): Promise<void> {
     if (!this.#uiMetaWriteback) return;
     try {
-      const raw = await this.#client.request("profiles.list", {});
-      const row = Array.isArray((raw as Record<string, unknown> | null)?.["profiles"])
-        ? ((raw as Record<string, unknown>)["profiles"] as unknown[]).find(
-            (entry) =>
-              typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["name"] === name,
-          )
-        : undefined;
-      const uiMeta = typeof row === "object" && row !== null ? (row as Record<string, unknown>)["ui_meta"] : undefined;
+      const uiMeta = await this.#freshUiMeta(name);
       const fresh = readBotMeta(uiMeta).meta;
 
       if (fresh !== null && fresh["chat"] === sessionId) return; // The server already agrees.
+      // A fresh blob that carries no `chat` is a clear, and the fresh read is by definition newer
+      // than anything this gateway holds. The ONE case that is not a clear is the resolve having
+      // observed that same pinless blob itself (`previousServerPin === null`) and having decided to
+      // adopt or mint anyway: that is the first pin on a bot whose look blob already exists, which
+      // is the ordinary create-then-open sequence.
+      //
+      // Requiring `previousServerPin` to be a STRING here was one branch too narrow: a cold roster
+      // cache (or the stamp exception) makes it `undefined`, and a blob cleared server-side between
+      // resolve and writeback was then re-pinned anyway.
       const clearedSinceResolve =
-        typeof previousServerPin === "string" && fresh !== null && typeof fresh["chat"] !== "string";
+        previousServerPin !== null && fresh !== null && typeof fresh["chat"] !== "string";
       if (clearedSinceResolve) {
-        // The pin was there when this resolve started and is gone now: the desktop cleared it, and
-        // that clear is authoritative (dissection 3.2). Writing here would resurrect it.
-        this.#log(`ui_meta pin writeback skipped for ${name}: the server cleared the pin`);
+        // The server's blob says the pin is gone, and that clear is authoritative (dissection 3.2).
+        // Writing here would resurrect it.
+        this.#log(`ui_meta pin writeback skipped for ${name}: the server carries no pin`);
         return;
       }
 

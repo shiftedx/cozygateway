@@ -41,7 +41,8 @@ export interface CanonicalChatResult {
 }
 
 export interface HermesRpc {
-  request(method: string, params?: unknown): Promise<unknown>;
+  /** `opts.timeoutMs` bounds this one call, overriding the client-wide default. */
+  request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
 }
 
 /** The local pin store. Backed by SQLite in production; a plain map in tests. */

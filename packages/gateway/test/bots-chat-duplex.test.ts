@@ -557,6 +557,49 @@ describe("ui_meta writeback (review I2/I3)", () => {
     expect(state.meta).toEqual({ title: "Scout", chat: "stored-1" });
   });
 
+  it("does not read an absent pin as a CLEAR on a gateway that cannot store ui_meta (R1)", async () => {
+    // The residual from the #31 verification. On a Hermes with no ui_meta support NO blob will ever
+    // carry `chat`, so every roster refresh read the absent key as an authoritative clear and threw
+    // the gateway-local pin away. Open the chat, refresh once, open again: before the fix that
+    // second open found no pin, an empty session list (the kickoff has not persisted), and minted a
+    // SECOND canonical chat.
+    const { behavior } = fakeBotMode({ sessions: [], supportsConfigure: false });
+    const { authed, server, bridge, storage } = await setup(behavior);
+
+    const first = (await (await authed("/bots/scout/chat")).json()) as { sessionId: string };
+    expect(first.sessionId).toBe("stored-1");
+
+    await bridge.refresh("the refresh that used to erase the pin");
+    expect(storage.botChatPin("scout")).toBe("stored-1");
+    // And the roster reports it too, rather than showing "no conversation" for a chat the app is in.
+    expect(bridge.roster().bots.find((bot) => bot.name === "scout")?.chatSessionId).toBe("stored-1");
+
+    const second = (await (await authed("/bots/scout/chat")).json()) as { sessionId: string; adoption: string };
+    expect(second).toMatchObject({ sessionId: "stored-1", adoption: "pin" });
+    expect(server.callsOf("session.create")).toHaveLength(1);
+  });
+
+  it("honors a fresh-read clear even when the resolve saw no pin at all (R2)", async () => {
+    // The other residual. `clearedSinceResolve` required the resolve to have seen a STRING pin, so
+    // when it saw nothing (the profile carried no blob yet) a blob that appeared meanwhile without a
+    // `chat` key was written over anyway. The fresh read is by definition newer than anything this
+    // gateway holds, so the only blob it may add a pin to is one the resolve observed itself.
+    const { behavior, state } = fakeBotMode({ sessions: [], meta: null });
+    const create = behavior.methods!["session.create"]!;
+    behavior.methods!["session.create"] = (params, ctx) => {
+      const result = create(params, ctx);
+      // The desktop writes the bot's look between our resolve and our writeback, and that blob
+      // carries no pin.
+      state.meta = { title: "Scout", color: "#8b5cf6" };
+      return result;
+    };
+    const { authed, server } = await setup(behavior);
+
+    await authed("/bots/scout/chat");
+    expect(state.meta).toEqual({ title: "Scout", color: "#8b5cf6" });
+    expect(server.callsOf("profiles.configure")).toHaveLength(0);
+  });
+
   it("stops asking a gateway that cannot store ui_meta", async () => {
     const { behavior } = fakeBotMode({ sessions: [], supportsConfigure: false });
     const { authed, server } = await setup(behavior);
