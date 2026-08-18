@@ -49,13 +49,99 @@ function asString(value: unknown): string | undefined {
  *    top level. Recognized by any of the fields the plugin owns being present, and adopted as-is
  *    so an older profile keeps its title, look, group, and canonical-chat pin. */
 export function extractBotMeta(uiMeta: unknown): Record<string, unknown> | null {
+  return readBotMeta(uiMeta).meta;
+}
+
+/** Fields the desktop plugin owns inside its namespace. Used to decide what may be carried over
+ *  from a LEGACY (pre-namespace) `ui_meta`, which is the whole record and may contain another
+ *  plugin's keys. */
+const BOT_META_FIELDS = ["shape", "color", "title", "chat", "pinned", "group", "created", "custom", "pet"];
+
+/** Fields that must never be written back into `ui_meta` (dissection 3.1): `image` and `pet` are
+ *  data URLs and `custom` is a custom-avatar payload. `ui_meta` is capped at 64 KB and rides EVERY
+ *  `profiles.list`, so an avatar parked there costs every roster poll and can push the blob past
+ *  the cap, at which point the write fails and the pin stays gateway-local. */
+export const BOT_META_ASSET_FIELDS = ["image", "pet", "custom"] as const;
+
+/** The gateway-side cap on one profile's `ui_meta` payload, in bytes (dissection 3.1). */
+export const UI_META_MAX_BYTES = 64 * 1024;
+
+/** `extractBotMeta` plus the shape it came from. `legacy` means the fields were found flat at the
+ *  top of `ui_meta`, so the record also carries whatever else lived there. */
+export function readBotMeta(uiMeta: unknown): { meta: Record<string, unknown> | null; legacy: boolean } {
   const record = asRecord(uiMeta);
-  if (record === undefined) return null;
+  if (record === undefined) return { meta: null, legacy: false };
   const namespaced = asRecord(record[UI_META_KEY]);
-  if (namespaced !== undefined) return namespaced;
-  const LEGACY_FIELDS = ["shape", "color", "title", "chat", "pinned", "group", "created", "custom", "pet"];
-  const hasLegacyField = LEGACY_FIELDS.some((field) => field in record);
-  return hasLegacyField ? record : null;
+  if (namespaced !== undefined) return { meta: namespaced, legacy: false };
+  const hasLegacyField = BOT_META_FIELDS.some((field) => field in record);
+  return hasLegacyField ? { meta: record, legacy: true } : { meta: null, legacy: false };
+}
+
+/** The blob to push back under `ui_meta["hermes-bots"]`, given what the profile carries today.
+ *
+ *  Two rules, both load-bearing:
+ *  - a LEGACY blob is the whole `ui_meta` record, so only the fields the plugin owns are carried
+ *    over. Re-nesting the record wholesale would push another plugin's namespace (and possibly a
+ *    data-URL avatar) under `hermes-bots`, on every chat open, forever.
+ *  - `image`, `pet` and `custom` are stripped either way, exactly as the desktop's `saveBotMeta`
+ *    strips them.
+ *
+ *  The result is capped: anything past `UI_META_MAX_BYTES` is reduced to the compact fields, and a
+ *  blob still over the cap after that is refused (null) so the caller keeps the pin gateway-local
+ *  rather than firing a write the gateway will reject. */
+export function botMetaForWriteback(
+  uiMeta: unknown,
+  patch: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const { meta, legacy } = readBotMeta(uiMeta);
+  const source = meta ?? {};
+  const base: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if ((BOT_META_ASSET_FIELDS as readonly string[]).includes(key)) continue;
+    if (legacy && !BOT_META_FIELDS.includes(key)) continue;
+    base[key] = value;
+  }
+  const merged = { ...base, ...patch };
+  if (uiMetaBytes(merged) <= UI_META_MAX_BYTES) return merged;
+
+  // Over the cap: keep only what the plugin actually syncs, then give up rather than write junk.
+  const compact: Record<string, unknown> = {};
+  for (const field of BOT_META_FIELDS) {
+    if ((BOT_META_ASSET_FIELDS as readonly string[]).includes(field)) continue;
+    if (field in merged) compact[field] = merged[field];
+  }
+  Object.assign(compact, patch);
+  return uiMetaBytes(compact) <= UI_META_MAX_BYTES ? compact : null;
+}
+
+/** Bytes the blob costs on the wire, namespace wrapper included. */
+export function uiMetaBytes(meta: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify({ [UI_META_KEY]: meta }), "utf8");
+}
+
+/** The canonical-chat pin a bot's blob implies, three-valued and shared by `GET /bots` and
+ *  `GET /bots/:name/chat` so the two can never disagree about it (they did: the roster mapped an
+ *  absent `chat` key to null while the chat route fell back to a fresh local pin, and the roster
+ *  then showed "no conversation" for a chat the app was sitting in).
+ *
+ *  - a string is the server's pin;
+ *  - `null` is an authoritative CLEAR: a blob that carries no `chat` key means the pin is gone
+ *    (dissection 3.2), and it must not be resurrected from the local record;
+ *  - `undefined` is "the server knows nothing", which is the only case the local record fills.
+ *
+ *  The clear is only authoritative about state the snapshot could have seen. A pin THIS gateway
+ *  wrote after the snapshot was taken is newer than the server's answer, not contradicted by it,
+ *  so it reads as `undefined` and the local record wins. */
+export function resolveChatPin(
+  meta: Record<string, unknown> | null,
+  localPin: { sessionId: string; updatedAt: number } | undefined,
+  snapshotAt: number | null,
+): string | null | undefined {
+  if (meta === null) return undefined;
+  const chat = asString(meta["chat"]);
+  if (chat !== undefined && chat.length > 0) return chat;
+  if (localPin !== undefined && (snapshotAt === null || localPin.updatedAt > snapshotAt)) return undefined;
+  return null;
 }
 
 export function parseProfileRow(row: unknown): ParsedProfile | undefined {
@@ -168,16 +254,16 @@ export function botActivityAt(profile: ParsedProfile): number {
 }
 
 export interface RosterBuildOptions extends PresenceContext {
-  /** Canonical-chat pins the gateway holds locally, by profile name. Consulted ONLY for a profile
-   *  that carries no `ui_meta["hermes-bots"]` blob at all. The merge is a key-wise replace of that
-   *  whole object (dissection 3.2): once the server carries a blob, an absent `chat` key means the
-   *  pin is absent, and an authoritative deletion must not be resurrected from cache.
+  /** Canonical-chat pins the gateway holds locally, by profile name, each with the stamp of the
+   *  write that made it. Consulted through `resolveChatPin`, so `GET /bots` reports exactly the
+   *  pin `GET /bots/:name/chat` would resolve: a profile with no bot blob falls back to the local
+   *  record, a blob without `chat` is an authoritative clear (dissection 3.2), and a local pin
+   *  written AFTER this snapshot was taken outlives that clear because the snapshot cannot have
+   *  seen it.
    *
-   *  Consequence in v1: the gateway does not write pins back to `ui_meta` yet, so a chat first
-   *  opened from the phone against a bot the desktop has already configured is re-adopted (by
-   *  canonical title) on each open rather than read out of this map. That is the correct-by-3.2
-   *  behavior, and it goes away when writeback lands. */
-  pins: ReadonlyMap<string, string>;
+   *  `now` doubles as the snapshot stamp, so the caller must pass the moment it asked Hermes for
+   *  this data and stamp the cached roster with the same value. */
+  pins: ReadonlyMap<string, { sessionId: string; updatedAt: number }>;
 }
 
 /** Builds the merged roster: profiles plus their `ui_meta` blob, preview classification, presence
@@ -186,10 +272,11 @@ export interface RosterBuildOptions extends PresenceContext {
 export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions): BotSummary[] {
   const rows = profiles.map((profile) => {
     const meta = profile.meta;
-    // Key-wise replace, per dissection 3.2: a server blob is the whole truth about `chat`, key
-    // present or not. The local pin only covers a profile the server carries no blob for.
-    const chatSessionId =
-      meta === null ? (opts.pins.get(profile.name) ?? null) : (asString(meta["chat"]) ?? null);
+    // One rule, shared with the chat route (`resolveChatPin`): a server blob is the whole truth
+    // about `chat` unless this gateway wrote a newer pin than the snapshot could have seen.
+    const local = opts.pins.get(profile.name);
+    const resolved = resolveChatPin(meta, local, opts.now);
+    const chatSessionId = resolved === undefined ? (local?.sessionId ?? null) : resolved;
     const group = asString(meta?.["group"])?.trim();
     const summary: BotSummary = {
       name: profile.name,

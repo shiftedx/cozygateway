@@ -81,7 +81,7 @@ async function setup(
     storage,
     config,
     bots: bridge,
-    gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 1 } },
+    gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 2 } },
     presenceOf: () => "online",
     submitUserMessage: (threadId: string, blocks: RichBlock[]): Message =>
       storage.appendMessage(threadId, { role: "user", blocks }, 500),

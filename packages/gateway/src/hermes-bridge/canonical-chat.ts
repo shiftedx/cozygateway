@@ -33,6 +33,11 @@ export type ChatAdoption =
 export interface CanonicalChatResult {
   sessionId: string;
   adoption: ChatAdoption;
+  /** The RUNTIME session id, when this call is the one that created the chat. `prompt.submit` only
+   *  accepts the runtime id (dissection 1.2 row 11) and it is a DIFFERENT value from the stored id
+   *  that gets pinned; a chat whose kickoff has not persisted yet cannot be resumed, so this is the
+   *  only way to learn it. Absent for every adoption path other than `created`. */
+  runtimeId?: string;
 }
 
 export interface HermesRpc {
@@ -94,6 +99,13 @@ export interface CanonicalChatDeps {
    *  knowing nothing at all. Only `undefined` falls back to the local pin; a `null` clear is
    *  authoritative and must not be resurrected from cache. */
   serverPin?: string | null;
+  /** Pushes the resolved pin into the server's `ui_meta`, the desktop's `saveBotMeta(name, {chat})`
+   *  (dissection 3.1). Called only when the resolved pin differs from what the server already
+   *  carries, and NEVER allowed to fail the resolve: a gateway too old to store `ui_meta` still
+   *  gets a working chat, it just keeps the pin gateway-local. Without this writeback the server
+   *  never learns the phone's chat, and every later open has to re-derive it, which is how a
+   *  duplicate chat gets minted while the first one's kickoff is still in flight. */
+  saveServerPin?: (sessionId: string) => Promise<void>;
   /** How many sessions to consider when adopting. The desktop uses 100. */
   listLimit?: number;
 }
@@ -106,7 +118,10 @@ export async function listBotSessions(rpc: HermesRpc, name: string, limit: numbe
  *  prompt against the RUNTIME id (the stored id is what gets pinned; they are different values).
  *  A failed submit rolls the pin back, exactly as the desktop does, so a half-created chat never
  *  becomes the permanent pointer. */
-async function createCanonicalChat(name: string, deps: CanonicalChatDeps): Promise<string> {
+async function createCanonicalChat(
+  name: string,
+  deps: CanonicalChatDeps,
+): Promise<{ storedId: string; runtimeId: string }> {
   const created = asRecord(
     await deps.rpc.request("session.create", {
       profile: name,
@@ -131,7 +146,7 @@ async function createCanonicalChat(name: string, deps: CanonicalChatDeps): Promi
     deps.pins.clear(name);
     throw err;
   }
-  return storedId;
+  return { storedId, runtimeId };
 }
 
 /** Resolve-or-create, per dissection 5.2. Single-flight is the caller's job (see the bridge):
@@ -140,6 +155,14 @@ export async function resolveCanonicalChat(
   name: string,
   deps: CanonicalChatDeps,
 ): Promise<CanonicalChatResult> {
+  const result = await resolvePin(name, deps);
+  // The server is told about a pin it does not already carry, so the next open (from this phone,
+  // another device, or the desktop) reads it back rather than re-deriving it.
+  if (result.sessionId !== deps.serverPin) await deps.saveServerPin?.(result.sessionId);
+  return result;
+}
+
+async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<CanonicalChatResult> {
   const limit = deps.listLimit ?? 100;
   // `??` would be wrong here: it collapses an explicit server clear (null) back onto the local
   // pin, which is exactly the resurrection dissection 3.2 forbids.
@@ -147,10 +170,21 @@ export async function resolveCanonicalChat(
   const rows = await listBotSessions(deps.rpc, name, limit);
 
   if (rows.length === 0) {
-    // No history at all: the pin, if any, points at nothing. Clear it before creating so a failed
-    // creation cannot leave a stale pointer behind.
+    // An empty list does NOT prove the bot has no chat. `session.create` persists no row until the
+    // first prompt lands (dissection 5.1), so a chat created moments ago is invisible to
+    // `session.list` while its kickoff is still in flight. Creating again here is what minted a
+    // second canonical chat on every fast second open: two "created" answers, two session ids, and
+    // a roster preview pointing at a chat the app was not showing. A pin we hold is therefore
+    // believed over an empty list; only a bot with no pin at all gets a new chat.
+    if (typeof pin === "string" && pin.length > 0) {
+      deps.pins.set(name, pin);
+      return { sessionId: pin, adoption: "pin" };
+    }
+    // No pin and no history: the pin, if any, points at nothing. Clear it before creating so a
+    // failed creation cannot leave a stale pointer behind.
     deps.pins.clear(name);
-    return { sessionId: await createCanonicalChat(name, deps), adoption: "created" };
+    const created = await createCanonicalChat(name, deps);
+    return { sessionId: created.storedId, adoption: "created", runtimeId: created.runtimeId };
   }
 
   if (pin === undefined || pin === null) {

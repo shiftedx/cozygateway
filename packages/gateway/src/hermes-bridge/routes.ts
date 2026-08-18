@@ -2,12 +2,14 @@ import type { Context, Hono, MiddlewareHandler } from "hono";
 import {
   type ErrorBody,
   type ErrorCode,
+  BotChatSendRequestSchema,
   BotFocusRequestSchema,
   ContractViolation,
   assertValid,
 } from "cozygateway-contract";
 
 import { HermesRpcError, HermesUnavailable } from "./client.ts";
+import { RuntimeSessionUnknown } from "./chat-turns.ts";
 import type { BotsSurface } from "./bridge.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
@@ -37,6 +39,14 @@ function failure(c: Context<Env>, err: unknown) {
         hermesError: err.message,
         ...(err.code === undefined ? {} : { hermesErrorCode: err.code }),
       },
+      502,
+    );
+  }
+  // A send whose runtime session id could not be established. Reported rather than degraded into a
+  // submit against the stored id, which answers 202 for a message that goes nowhere.
+  if (err instanceof RuntimeSessionUnknown) {
+    return c.json(
+      { ...errorBody("backend_unavailable", "the hermes gateway did not report a runtime session"), hermesError: err.message },
       502,
     );
   }
@@ -85,6 +95,46 @@ export function registerBotRoutes(
     try {
       const result = await bots.canonicalChat(name);
       return c.json({ name, sessionId: result.sessionId, adoption: result.adoption });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // Full duplex over the canonical chat. Both routes resolve the chat themselves, so the app never
+  // has to hold a session id: `name` is the only identifier in this API.
+  app.get("/bots/:name/chat/messages", requireDevice, async (c) => {
+    const name = c.req.param("name");
+    try {
+      const history = await bots.chatHistory(name);
+      return c.json({ name, ...history });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // 202, not 200: Hermes has accepted the prompt, and the reply lands later over `/ws` as
+  // `bot_chat` frames. The body carries the user message the bridge committed, so the app can
+  // render it at once instead of waiting for it to come back around the poll.
+  app.post("/bots/:name/chat/messages", requireDevice, async (c) => {
+    const name = c.req.param("name");
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotChatSendRequestSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      const sent = await bots.sendChatMessage(name, parsed.text, {
+        ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
+      });
+      return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
     } catch (err) {
       return failure(c, err);
     }

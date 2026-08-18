@@ -5,7 +5,12 @@
 import { type Static, Type } from "@sinclair/typebox";
 
 import { RichBlockSchema } from "./rich-blocks.ts";
-import { BotPresenceFrameSchema, BotRosterFrameSchema } from "./ext-bots.ts";
+import {
+  BotChatFrameSchema,
+  BotChatStateFrameSchema,
+  BotPresenceFrameSchema,
+  BotRosterFrameSchema,
+} from "./ext-bots.ts";
 import {
   GatewayInfoSchema,
   MessageSchema,
@@ -90,5 +95,7 @@ export const ServerFrameSchema = Type.Union([
   // that advertises the capability; clients that do not know it ignore unknown frame types.
   BotRosterFrameSchema,
   BotPresenceFrameSchema,
+  BotChatFrameSchema,
+  BotChatStateFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

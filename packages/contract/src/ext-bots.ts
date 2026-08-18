@@ -1,4 +1,4 @@
-/** Vendor extension `com.cozylabs.bots`, version 1. NOT part of the frozen `contract: "v1"`
+/** Vendor extension `com.cozylabs.bots`, version 2. NOT part of the frozen `contract: "v1"`
  *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
  *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
  *  advertise the capability never emits these frames, and a client that does not recognize the
@@ -57,6 +57,69 @@ export const BotPresenceFrameSchema = Type.Object({
 });
 export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
 
+/** One message in a bot's canonical chat, after the bridge has flattened whatever shape Hermes
+ *  returned. `id` is stable for a given session: the gateway's own message id when it carries one,
+ *  otherwise the session id plus the message's position, so a client can key a list on it and
+ *  drop a replayed frame. `at` is MILLISECONDS, or null when the message carries no timestamp at
+ *  all (Hermes stamps in seconds on some builds and not at all on others).
+ *
+ *  `role` is always `user` or `assistant` on this wire: the bridge drops `system` and `tool` rows,
+ *  and any row whose text is empty, so tool chatter never reaches a chat bubble.
+ *
+ *  `clientId` is the echo of what the sender put on `POST /bots/:name/chat/messages` (or the
+ *  gateway's own local id when the sender sent none). It rides the 202 body AND the same message
+ *  when it comes back in a `bot_chat` frame, which is what lets a sender replace its optimistic row
+ *  instead of rendering the message twice. */
+export const BotChatMessageSchema = Type.Object({
+  id: Type.String(),
+  role: Type.String(),
+  text: Type.String(),
+  at: Type.Union([Type.Integer(), Type.Null()]),
+  clientId: Type.Optional(Type.String()),
+});
+export type BotChatMessage = Static<typeof BotChatMessageSchema>;
+
+/** New messages in a bot's canonical chat. A DELTA, not a snapshot: `messages` carries only what
+ *  the bridge has not broadcast before, in order. */
+export const BotChatFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  messages: Type.Array(BotChatMessageSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotChatFrame = Static<typeof BotChatFrameSchema>;
+
+/** How a bot's canonical chat is doing right now. `phase` is the bridge's own view of the turn it
+ *  is polling; `running` and `inflight` are Hermes' own flags, passed through. */
+export const BotChatStateFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_state"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  /** `polling` = a turn is being awaited; `complete` = the reply landed and Hermes went idle;
+   *  `timeout` = the cap expired with no settled reply; `failed` = the poll gave up because
+   *  Hermes kept refusing. */
+  phase: Type.Union([
+    Type.Literal("polling"),
+    Type.Literal("complete"),
+    Type.Literal("timeout"),
+    Type.Literal("failed"),
+  ]),
+  running: Type.Boolean(),
+  inflight: Type.Boolean(),
+  updatedAt: Type.Integer(),
+});
+export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;
+
+/** `POST /bots/:name/chat/messages` body. `clientId` is the sender's own id for this message; the
+ *  gateway never interprets it, it only echoes it back on the committed message and on that same
+ *  message when the turn poll finds it, so the sender can de-duplicate its optimistic row. */
+export const BotChatSendRequestSchema = Type.Object({
+  text: Type.String({ minLength: 1, maxLength: 32_000 }),
+  clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+});
+export type BotChatSendRequest = Static<typeof BotChatSendRequestSchema>;
+
 /** `POST /bots/focus` body. The app declares what it is looking at so the bridge polls Hermes at
  *  the desktop's cadences only while a screen is open, and idles otherwise. `null` means the app
  *  left the bots surface. */
@@ -66,6 +129,12 @@ export const BotFocusRequestSchema = Type.Object({
 export type BotFocusRequest = Static<typeof BotFocusRequestSchema>;
 
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
- *  configured. */
+ *  configured.
+ *
+ *  Version history, additive throughout (a client compares `>=`, never `===`):
+ *  - `1`: roster, presence, canonical-chat resolve, session list, history read.
+ *  - `2`: `POST /bots/:name/chat/messages` plus the `bot_chat` and `bot_chat_state` frames. A
+ *    client that offers a composer MUST require `>= 2`: a v1 gateway 404s that route and never
+ *    sends those frames, which without this bump reads as a silently dead composer. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 1;
+export const BOTS_CAPABILITY_VERSION = 2;
