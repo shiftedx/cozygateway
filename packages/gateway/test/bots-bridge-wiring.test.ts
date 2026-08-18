@@ -205,7 +205,7 @@ describe("startGateway with a hermes bridge", () => {
     gateways.push(gateway);
 
     const info = (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
-    expect(info.capabilities?.["com.cozylabs.bots"]).toBe(4);
+    expect(info.capabilities?.["com.cozylabs.bots"]).toBe(5);
 
     const code = gateway.issueSetupCode();
     const pairRes = await fetch(`${gateway.url}/pair`, {

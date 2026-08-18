@@ -66,6 +66,42 @@ CREATE TABLE IF NOT EXISTS bot_chat_pins (
   session_id TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 ) STRICT;
+-- Group chat rooms. Unlike the three tables above these are NOT a cache: this gateway hosts the
+-- rooms (spec section 4), so the room, its transcript, each member's watermark and the epoch are
+-- the source of truth and must survive a restart. Only the "a round loop is running right now"
+-- flag is runtime state, and it is deliberately absent here: a process that died mid-round left no
+-- loop behind, so a restored room is settled until the user speaks again.
+--
+-- The key column is the lowercased room name (rooms are addressed case-insensitively and cannot
+-- collide on case); the name column is what the user typed and what renders. Both child tables
+-- cascade off the room, so DELETE /bots/groups/:name leaves nothing behind.
+CREATE TABLE IF NOT EXISTS bot_groups (
+  key TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  members_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  epoch INTEGER NOT NULL,
+  needs_you INTEGER NOT NULL,
+  next_seq INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS bot_group_log (
+  group_key TEXT NOT NULL REFERENCES bot_groups(key) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  from_kind TEXT NOT NULL,
+  from_name TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  client_id TEXT,
+  PRIMARY KEY (group_key, seq)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS bot_group_members (
+  group_key TEXT NOT NULL REFERENCES bot_groups(key) ON DELETE CASCADE,
+  member TEXT NOT NULL,
+  watermark INTEGER NOT NULL,
+  session_id TEXT,
+  PRIMARY KEY (group_key, member)
+) STRICT, WITHOUT ROWID;
 `;
 
 export interface DeviceRow {
@@ -93,6 +129,53 @@ export interface PushRegistrationRow {
   pushId: string;
   relayUrl: string;
   pushKey: string;
+}
+
+/** A group room as it sits on disk. `epoch` and `needsYou` are live protocol state, not metadata:
+ *  the epoch supersedes in-flight rounds and `needsYou` is the escalation badge. */
+export interface BotGroupRow {
+  key: string;
+  name: string;
+  members: string[];
+  createdAt: number;
+  epoch: number;
+  needsYou: boolean;
+  nextSeq: number;
+}
+
+/** One transcript entry. `kind` is `user` for the human and `member` for a bot; `name` is the bot's
+ *  profile name (or the human's label) and `displayName` is what renders. */
+export interface BotGroupLogRow {
+  seq: number;
+  kind: "user" | "member";
+  name: string;
+  displayName: string;
+  text: string;
+  at: number;
+  clientId?: string;
+}
+
+interface BotGroupDbRow {
+  key: string;
+  name: string;
+  membersJson: string;
+  createdAt: number;
+  epoch: number;
+  needsYou: number;
+  nextSeq: number;
+}
+
+function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
+  const parsed: unknown = JSON.parse(row.membersJson);
+  return {
+    key: row.key,
+    name: row.name,
+    members: Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [],
+    createdAt: row.createdAt,
+    epoch: row.epoch,
+    needsYou: row.needsYou === 1,
+    nextSeq: row.nextSeq,
+  };
 }
 
 interface MessageDbRow {
@@ -424,6 +507,173 @@ export class Storage {
       this.#db.exec("ROLLBACK");
       throw err;
     }
+  }
+
+  // --- Group chat rooms (contract/ext-bots-v1.md section 4, groups). ------------------------------
+
+  /** Creates a room. Returns false when one already exists under the same case-insensitive key,
+   *  which the route answers as a 409 rather than silently adopting a different membership. */
+  createBotGroup(room: { key: string; name: string; members: string[]; createdAt: number }): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.#db.prepare("SELECT key FROM bot_groups WHERE key = ?").get(room.key);
+      if (existing !== undefined) {
+        this.#db.exec("ROLLBACK");
+        return false;
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO bot_groups (key, name, members_json, created_at, epoch, needs_you, next_seq)
+           VALUES (?, ?, ?, ?, 0, 0, 1)`,
+        )
+        .run(room.key, room.name, JSON.stringify(room.members), room.createdAt);
+      const member = this.#db.prepare(
+        "INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, NULL)",
+      );
+      for (const name of room.members) member.run(room.key, name);
+      this.#db.exec("COMMIT");
+      return true;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  botGroups(): BotGroupRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT key, name, members_json AS membersJson, created_at AS createdAt, epoch,
+                needs_you AS needsYou, next_seq AS nextSeq
+         FROM bot_groups ORDER BY created_at, key`,
+      )
+      .all() as unknown as BotGroupDbRow[];
+    return rows.map(toBotGroupRow);
+  }
+
+  botGroup(key: string): BotGroupRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT key, name, members_json AS membersJson, created_at AS createdAt, epoch,
+                needs_you AS needsYou, next_seq AS nextSeq
+         FROM bot_groups WHERE key = ?`,
+      )
+      .get(key) as BotGroupDbRow | undefined;
+    return row === undefined ? undefined : toBotGroupRow(row);
+  }
+
+  /** Drops a room and, by cascade, its transcript and its per-member state. */
+  deleteBotGroup(key: string): boolean {
+    return this.#db.prepare("DELETE FROM bot_groups WHERE key = ?").run(key).changes === 1;
+  }
+
+  /** Appends one entry and hands back the room-local `seq` it was given. The counter lives on the
+   *  room rather than being derived from `MAX(seq)`, so a trim that drops the head can never hand a
+   *  later entry a seq the room has already used. */
+  appendBotGroupMessage(key: string, entry: Omit<BotGroupLogRow, "seq">): BotGroupLogRow {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db.prepare("SELECT next_seq AS nextSeq FROM bot_groups WHERE key = ?").get(key) as
+        | { nextSeq: number }
+        | undefined;
+      if (row === undefined) throw new Error(`no group room "${key}"`);
+      const seq = row.nextSeq;
+      this.#db
+        .prepare(
+          `INSERT INTO bot_group_log (group_key, seq, from_kind, from_name, display_name, text, at, client_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(key, seq, entry.kind, entry.name, entry.displayName, entry.text, entry.at, entry.clientId ?? null);
+      this.#db.prepare("UPDATE bot_groups SET next_seq = ? WHERE key = ?").run(seq + 1, key);
+      this.#db.exec("COMMIT");
+      return { ...entry, seq };
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  botGroupLog(key: string): BotGroupLogRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT seq, from_kind AS kind, from_name AS name, display_name AS displayName, text, at,
+                client_id AS clientId
+         FROM bot_group_log WHERE group_key = ? ORDER BY seq`,
+      )
+      .all(key) as unknown as Array<BotGroupLogRow & { clientId: string | null }>;
+    return rows.map((row) => {
+      const entry: BotGroupLogRow = {
+        seq: row.seq,
+        kind: row.kind,
+        name: row.name,
+        displayName: row.displayName,
+        text: row.text,
+        at: row.at,
+      };
+      if (row.clientId !== null) entry.clientId = row.clientId;
+      return entry;
+    });
+  }
+
+  /** Keeps the newest `limit` entries, dropping from the head (the desktop's own retention rule).
+   *  Watermarks are seqs, not indices, so nothing else has to move. */
+  trimBotGroupLog(key: string, limit: number): void {
+    this.#db
+      .prepare(
+        `DELETE FROM bot_group_log WHERE group_key = ? AND seq NOT IN
+           (SELECT seq FROM bot_group_log WHERE group_key = ? ORDER BY seq DESC LIMIT ?)`,
+      )
+      .run(key, key, limit);
+  }
+
+  /** Per-member watermark (highest seq the member has been shown) and room session id. Members are
+   *  rowed at create; a member row missing here means the room predates it, which reads as a fresh
+   *  member that has seen nothing. */
+  botGroupMembers(key: string): Map<string, { watermark: number; sessionId: string | null }> {
+    const rows = this.#db
+      .prepare("SELECT member, watermark, session_id AS sessionId FROM bot_group_members WHERE group_key = ?")
+      .all(key) as unknown as Array<{ member: string; watermark: number; sessionId: string | null }>;
+    return new Map(rows.map((row) => [row.member, { watermark: row.watermark, sessionId: row.sessionId }]));
+  }
+
+  setBotGroupWatermark(key: string, member: string, watermark: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, ?, NULL)
+         ON CONFLICT(group_key, member) DO UPDATE SET watermark = excluded.watermark`,
+      )
+      .run(key, member, watermark);
+  }
+
+  setBotGroupSession(key: string, member: string, sessionId: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, ?)
+         ON CONFLICT(group_key, member) DO UPDATE SET session_id = excluded.session_id`,
+      )
+      .run(key, member, sessionId);
+  }
+
+  /** Bumps and returns the room's epoch. The bump is what supersedes a round loop still running from
+   *  the previous user message, so it has to be atomic with respect to concurrent sends. */
+  bumpBotGroupEpoch(key: string): number {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db.prepare("SELECT epoch FROM bot_groups WHERE key = ?").get(key) as
+        | { epoch: number }
+        | undefined;
+      if (row === undefined) throw new Error(`no group room "${key}"`);
+      const epoch = row.epoch + 1;
+      this.#db.prepare("UPDATE bot_groups SET epoch = ? WHERE key = ?").run(epoch, key);
+      this.#db.exec("COMMIT");
+      return epoch;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  setBotGroupNeedsYou(key: string, needsYou: boolean): void {
+    this.#db.prepare("UPDATE bot_groups SET needs_you = ? WHERE key = ?").run(needsYou ? 1 : 0, key);
   }
 
   close(): void {

@@ -2,6 +2,9 @@ import type {
   BotCatalog,
   BotChatMessage,
   BotCreateRequest,
+  BotGroup,
+  BotGroupDetail,
+  BotGroupMessage,
   BotProfile,
   BotProfilePatch,
   BotRoutine,
@@ -32,7 +35,9 @@ import {
   resolveChatPin,
   UI_META_KEY,
 } from "./roster.ts";
+import type { GroupMember } from "./group-protocol.ts";
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
+import { GroupRooms } from "./group-rooms.ts";
 import {
   BotDeleteRefused,
   BotNotFound,
@@ -128,6 +133,13 @@ export interface BotsSurface {
   patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult>;
   deleteRoutine(name: string, id: string): Promise<void>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
+  /** Group chat rooms. Hosted by this gateway rather than by a client, so they are the one part of
+   *  this surface whose state is OURS and not a cache of Hermes' (see `group-rooms.ts`). */
+  groups(): BotGroup[];
+  createGroup(name: string, members: string[]): Promise<BotGroup>;
+  deleteGroup(name: string): void;
+  groupDetail(name: string): BotGroupDetail;
+  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage;
 }
 
 /** What `GET /bots/:name/routines` answers with. */
@@ -182,6 +194,9 @@ export interface HermesBridgeOptions {
   /** Turn-poll cadence and cap. Defaults are the desktop's own 2 s / 180 s. */
   chatPollMs?: number;
   chatTurnTimeoutMs?: number;
+  /** How long a superseding group drive waits before taking over. Default `GROUP_CHAIN_DELAY_MS`
+   *  (250 ms), the desktop's own. */
+  groupChainDelayMs?: number;
   /** How long a profile delete is given. Default `PROFILE_DELETE_TIMEOUT_MS` (180 s). Overridable
    *  so the timeout path is testable in milliseconds instead of minutes. */
   deleteTimeoutMs?: number;
@@ -223,6 +238,7 @@ export class HermesBridge implements BotsSurface {
   readonly #configureChain = new Map<string, Promise<unknown>>();
   readonly #pins: PinStore;
   readonly #chat: BotChatTurns;
+  readonly #groups: GroupRooms;
 
   /** Bots whose routines something has read recently, and when. Drives the `cron.changed` fan-out;
    *  see `ROUTINE_WATCH_TTL_MS`. */
@@ -298,6 +314,64 @@ export class HermesBridge implements BotsSurface {
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
       ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),
     });
+    this.#groups = new GroupRooms({
+      rpc: this.#client,
+      storage: this.#storage,
+      broadcast: this.#broadcast,
+      now: this.#now,
+      log: this.#log,
+      hidden: this.#hideBotChats,
+      memberInfo: (name) => this.#memberInfo(name),
+      assertBotKnown: (name) => this.#assertBotKnown(name),
+      // A member turn is the same shape of wait as a 1:1 turn, so it honors the same overrides and
+      // a test can scale both down together.
+      ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
+      ...(opts.chatTurnTimeoutMs === undefined ? {} : { turnTimeoutMs: opts.chatTurnTimeoutMs }),
+      ...(opts.groupChainDelayMs === undefined ? {} : { chainDelayMs: opts.groupChainDelayMs }),
+    });
+  }
+
+  /** How the protocol addresses one member: its profile name, the handle peers mention it by, and
+   *  the title a transcript renders. Read from the roster cache, and DERIVED when the cache has not
+   *  seen the bot (a cold start, a hidden profile), because a room whose membership silently shrinks
+   *  because a cache was cold would be far worse than one whose member shows up under a plain name. */
+  #memberInfo(name: string): GroupMember {
+    const row = this.#storage.botRoster().bots.find((bot) => bot.name === name);
+    return {
+      name,
+      handle: row?.handle ?? botHandle(name),
+      displayName: row?.displayName ?? botDisplayName(name, null),
+    };
+  }
+
+  groups(): BotGroup[] {
+    return this.#groups.list();
+  }
+
+  async createGroup(name: string, members: string[]): Promise<BotGroup> {
+    return this.#groups.create(name, members);
+  }
+
+  deleteGroup(name: string): void {
+    this.#groups.remove(name);
+  }
+
+  groupDetail(name: string): BotGroupDetail {
+    return this.#groups.detail(name);
+  }
+
+  sendGroupMessage(name: string, text: string, opts: { clientId?: string } = {}): BotGroupMessage {
+    return this.#groups.send(name, text, opts);
+  }
+
+  /** Test seam: resolves when the room's deliberation has finished. */
+  async groupSettled(name: string): Promise<void> {
+    await this.#groups.settled(name);
+  }
+
+  /** Test seam: true while a round loop holds the room. */
+  groupRunning(name: string): boolean {
+    return this.#groups.running(name);
   }
 
   /** Wires the client's events and starts it. The first roster refresh runs as soon as the link
@@ -895,6 +969,7 @@ export class HermesBridge implements BotsSurface {
   async close(): Promise<void> {
     this.#closed = true;
     this.#chat.close();
+    this.#groups.close();
     if (this.#pollTimer !== undefined) clearTimeout(this.#pollTimer);
     this.#pollTimer = undefined;
     if (this.#debounceTimer !== undefined) clearTimeout(this.#debounceTimer);

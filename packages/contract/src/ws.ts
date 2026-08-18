@@ -8,6 +8,8 @@ import { RichBlockSchema } from "./rich-blocks.ts";
 import {
   BotChatFrameSchema,
   BotChatStateFrameSchema,
+  BotGroupFrameSchema,
+  BotGroupStateFrameSchema,
   BotPresenceFrameSchema,
   BotRosterFrameSchema,
   BotRoutinesFrameSchema,
@@ -99,5 +101,7 @@ export const ServerFrameSchema = Type.Union([
   BotChatFrameSchema,
   BotChatStateFrameSchema,
   BotRoutinesFrameSchema,
+  BotGroupFrameSchema,
+  BotGroupStateFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;
