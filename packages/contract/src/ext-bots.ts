@@ -1,4 +1,4 @@
-/** Vendor extension `com.cozylabs.bots`, version 3. NOT part of the frozen `contract: "v1"`
+/** Vendor extension `com.cozylabs.bots`, version 4. NOT part of the frozen `contract: "v1"`
  *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
  *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
  *  advertise the capability never emits these frames, and a client that does not recognize the
@@ -281,6 +281,148 @@ export const BotCatalogSchema = Type.Object({
 });
 export type BotCatalog = Static<typeof BotCatalogSchema>;
 
+/** One routine's schedule. `raw` is the Hermes-native schedule string EXACTLY as the backend stores
+ *  it (`30m`, `every 2h`, `0 9 * * 1-5`), which is also exactly what a client sends back on a write:
+ *  the schedule is never re-encoded on this wire, because the picker's frequency choice is not
+ *  recoverable from the string and a round trip through a structured form would silently rewrite
+ *  schedules a desktop authored.
+ *
+ *  `human` is the gateway's own label for the shapes it can name (`Daily`, `Every 3h`, `Once (30m)`)
+ *  and is ABSENT when the string is not one of them, which is a client's signal to render `raw`
+ *  verbatim rather than a label it invented. */
+export const BotRoutineScheduleSchema = Type.Object({
+  raw: Type.String(),
+  human: Type.Optional(Type.String()),
+});
+export type BotRoutineSchedule = Static<typeof BotRoutineScheduleSchema>;
+
+/** One routine (a Hermes cron job in this bot's `[bot:<name>]` namespace).
+ *
+ *  `id` is the backend's `job_id` and is the ONLY identifier the write routes accept; the display
+ *  title is not unique and is not an id. `title` is the job name with the `[bot:<name>] ` tag
+ *  stripped, and falls back to `Untitled cronjob` for a tagged job with nothing after the tag.
+ *
+ *  `enabled` is the ROW STATE the desktop's switch renders, which folds three backend facts into
+ *  one: a job is enabled only when the backend's `enabled` is not false, its `state` is not
+ *  `paused`, and it is not `legacyUnsafe`. `state` carries the backend's own word when it sent one.
+ *
+ *  `legacyUnsafe` marks a pre-marker delegated routine: a tagged job whose prompt begins with
+ *  `You are running the scheduled routine "`. Those are auto-paused on every list (see
+ *  `GET /bots/:name/routines`) and cannot be resumed through this API; a client renders the row
+ *  disabled with the desktop's own wording and offers delete only. `autoPaused` is true for the one
+ *  response in which this gateway actually performed that pause.
+ *
+ *  `lastRun` and `nextRun` are MILLISECONDS, or null when the backend sent nothing parsable (it
+ *  sends ISO strings, and older builds send neither). */
+export const BotRoutineSchema = Type.Object({
+  id: Type.String(),
+  title: Type.String(),
+  schedule: BotRoutineScheduleSchema,
+  enabled: Type.Boolean(),
+  state: Type.Optional(Type.String()),
+  legacyUnsafe: Type.Boolean(),
+  autoPaused: Type.Optional(Type.Boolean()),
+  /** The job's prompt as the backend reported it, which on a list is often a PREVIEW rather than
+   *  the whole thing. Absent when the backend sent neither. */
+  prompt: Type.Optional(Type.String()),
+  lastRun: Type.Union([Type.Integer(), Type.Null()]),
+  nextRun: Type.Union([Type.Integer(), Type.Null()]),
+  /** How the last run ended, the backend's own word (`success`, `error`, ...), when it sent one. */
+  lastStatus: Type.Optional(Type.String()),
+  /** The backend's run-cap DISPLAY string, not a number: `forever`, `once`, `3 times`, `1/3`. It is
+   *  rendered, never parsed, and it is NOT what a write sends (a create sends an integer `repeat`),
+   *  because the remaining count is not recoverable from it. */
+  repeat: Type.Optional(Type.String()),
+  continuity: Type.Optional(Type.Boolean()),
+});
+export type BotRoutine = Static<typeof BotRoutineSchema>;
+
+/** `GET /bots/:name/routines`: every routine in that bot's namespace, and nothing else. */
+export const BotRoutineListResponseSchema = Type.Object({
+  name: Type.String(),
+  routines: Type.Array(BotRoutineSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotRoutineListResponse = Static<typeof BotRoutineListResponseSchema>;
+
+/** A schedule string and a routine title both reach a shell-quoted command line and a cron store,
+ *  so a NUL is refused at the boundary the way the desktop refuses it, and a name must carry at
+ *  least one non-whitespace character. */
+const RoutineText = (max: number) =>
+  Type.String({ minLength: 1, maxLength: max, pattern: "^(?![\\s\\S]*\\u0000)[\\s\\S]*\\S[\\s\\S]*$" });
+
+/** `POST /bots/:name/routines` body. `schedule` is the RAW Hermes schedule string, composed by the
+ *  client exactly as the desktop's picker composes it (`30m`, `every 1h`, `0 9 * * *`,
+ *  `0 9 * * 1-5`, `0 9 * * 1`, `0 9 1 * *`, `every 2h`, or free text on Advanced). The gateway does
+ *  not validate its grammar: the backend owns that, and a gateway that guessed would refuse
+ *  schedules a newer Hermes accepts.
+ *
+ *  `prompt` is the routine's INSTRUCTION, in the user's own words. The gateway, not the client,
+ *  decides how it is delivered (see `contract/ext-bots-v1.md`, routines): it may be sent bare or
+ *  wrapped in the marker-prefixed delegation the desktop uses, and a client must not build that
+ *  wrapper itself. */
+export const BotRoutineCreateRequestSchema = Type.Object({
+  title: RoutineText(200),
+  schedule: RoutineText(200),
+  prompt: RoutineText(32_000),
+  /** Stop after N runs. Absent means forever, which is the desktop's blank field. */
+  repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  /** Each run sees the previous run's output. */
+  continuity: Type.Optional(Type.Boolean()),
+});
+export type BotRoutineCreateRequest = Static<typeof BotRoutineCreateRequestSchema>;
+
+/** `PATCH /bots/:name/routines/:id` body. Every field is optional and only the fields present are
+ *  written. `enabled` alone is the row switch (true resumes, false pauses) and keeps the routine's
+ *  `id`.
+ *
+ *  `title`, `schedule`, `prompt`, `repeat` and `continuity` are a REWRITE, and the backend has no
+ *  edit action at all: the gateway pauses the old job, creates a replacement, and removes the old
+ *  one, so the routine comes back with a NEW `id`. Three consequences a client must design around,
+ *  all spelled out in `contract/ext-bots-v1.md`:
+ *  - `prompt` is REQUIRED whenever any of those five is present, because the backend only ever
+ *    reports a 100-character preview of a stored prompt and a rewrite that guessed the rest would
+ *    silently truncate the user's instruction;
+ *  - everything the patch does not restate is CARRIED OVER from the routine being replaced, run cap
+ *    included (it is recovered from the backend's display string, and a remaining `1/3` is carried
+ *    as the 2 runs that are left), so an edit to a title cannot turn a bounded routine into a
+ *    forever one;
+ *  - `enabled` COMPOSES with a rewrite instead of being ignored by it: the replacement ends up in
+ *    the state the patch asked for, and otherwise in the state the routine already had. */
+export const BotRoutinePatchSchema = Type.Object({
+  title: Type.Optional(RoutineText(200)),
+  schedule: Type.Optional(RoutineText(200)),
+  prompt: Type.Optional(RoutineText(32_000)),
+  enabled: Type.Optional(Type.Boolean()),
+  repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  continuity: Type.Optional(Type.Boolean()),
+});
+export type BotRoutinePatch = Static<typeof BotRoutinePatchSchema>;
+
+/** `POST` and `PATCH` response: the routine as it now stands.
+ *
+ *  `replacedId` is the id the routine had before a rewrite, so a client can retire its old row.
+ *  `orphanedId` is the darker case: the replacement was created but the old job could not be
+ *  removed. It is reported rather than swallowed because that job still EXISTS. It is left PAUSED,
+ *  so it cannot fire and cannot double-run the routine, and it is deletable by id. */
+export const BotRoutineWriteResponseSchema = Type.Object({
+  name: Type.String(),
+  routine: BotRoutineSchema,
+  replacedId: Type.Optional(Type.String()),
+  orphanedId: Type.Optional(Type.String()),
+});
+export type BotRoutineWriteResponse = Static<typeof BotRoutineWriteResponseSchema>;
+
+/** One bot's routines, as a FULL REPLACE snapshot. Sent when this gateway changed them and when a
+ *  `cron.changed` broadcast made the bridge re-read a bot whose routines some device is watching. */
+export const BotRoutinesFrameSchema = Type.Object({
+  type: Type.Literal("bot_routines"),
+  bot: Type.String(),
+  routines: Type.Array(BotRoutineSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotRoutinesFrame = Static<typeof BotRoutinesFrameSchema>;
+
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
  *  configured.
  *
@@ -291,6 +433,9 @@ export type BotCatalog = Static<typeof BotCatalogSchema>;
  *    sends those frames, which without this bump reads as a silently dead composer.
  *  - `3`: the edit-profile surface: `GET`/`PATCH /bots/:name/profile` and `GET /bots/catalog`. A
  *    client that offers an edit screen MUST require `>= 3`, by the same rule the composer bump
- *    used: a screen whose Save 404s reads as a broken app, not as a missing feature. */
+ *    used: a screen whose Save 404s reads as a broken app, not as a missing feature.
+ *  - `4`: the routines surface: `GET`/`POST /bots/:name/routines`,
+ *    `PATCH`/`DELETE /bots/:name/routines/:id`, plus the `bot_routines` frame. A client that offers
+ *    a routines pane MUST require `>= 4`. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 3;
+export const BOTS_CAPABILITY_VERSION = 4;

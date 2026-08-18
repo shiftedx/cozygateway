@@ -4,6 +4,9 @@ import type {
   BotCreateRequest,
   BotProfile,
   BotProfilePatch,
+  BotRoutine,
+  BotRoutineCreateRequest,
+  BotRoutinePatch,
   BotSummary,
   ServerFrame,
 } from "cozygateway-contract";
@@ -50,6 +53,13 @@ import {
   type CachedCatalog,
   type ProfileConfigureResult,
 } from "./profile.ts";
+import {
+  createBotRoutine,
+  deleteBotRoutine,
+  listBotRoutines,
+  patchBotRoutine,
+  type RoutineWriteResult,
+} from "./routines.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -57,9 +67,8 @@ import {
  *
  *  Cadence follows the desktop's own polling rates, but only while a device says it is looking at
  *  something: roster every 5 s while the roster screen is focused, routines every 20 s while the
- *  routines screen is (routine data itself arrives in a later wave; the cadence hook is here so
- *  the focus contract is complete). With nothing focused the bridge is idle and costs the Hermes
- *  gateway nothing. Where Hermes offers a broadcast instead (`sessions.changed`, `cron.changed`)
+ *  routines screen is. With nothing focused the bridge is idle and costs the Hermes gateway
+ *  nothing. Where Hermes offers a broadcast instead (`sessions.changed`, `cron.changed`)
  *  the bridge refreshes on the event, debounced, which beats any poll. */
 
 /** Desktop-parity poll cadences, in milliseconds (dissection 1.3). */
@@ -73,6 +82,16 @@ export const FOCUS_TTL_MS = 60_000;
 /** Change broadcasts are coalesced: a burst of `sessions.changed` during one turn should cost one
  *  refresh, not one per event. */
 const CHANGE_DEBOUNCE_MS = 250;
+
+/** How long a bot's routines keep being re-read on a `cron.changed` broadcast after the last time
+ *  anything asked for them.
+ *
+ *  A cron change carries no bot name, so "which bots changed" is unanswerable and the bridge
+ *  re-reads the bots something is actually watching. Bounded by time rather than by count because
+ *  the cost is one `cron.manage` per watched bot per change burst, and a routines pane that has been
+ *  closed for five minutes is not worth a round trip. A device that is still looking at the pane
+ *  keeps its bot warm simply by reading it. */
+export const ROUTINE_WATCH_TTL_MS = 5 * 60_000;
 
 export type BotFocusScreen = "roster" | "routines";
 
@@ -104,7 +123,18 @@ export interface BotsSurface {
   botProfile(name: string): Promise<BotProfile>;
   configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult>;
   catalog(query: string): Promise<BotCatalog>;
+  routines(name: string): Promise<BotRoutineList>;
+  createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult>;
+  patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult>;
+  deleteRoutine(name: string, id: string): Promise<void>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
+}
+
+/** What `GET /bots/:name/routines` answers with. */
+export interface BotRoutineList {
+  name: string;
+  routines: BotRoutine[];
+  updatedAt: number;
 }
 
 /** What `POST /bots` answers with: the roster row of the bot that now exists, plus how its look
@@ -194,6 +224,19 @@ export class HermesBridge implements BotsSurface {
   readonly #pins: PinStore;
   readonly #chat: BotChatTurns;
 
+  /** Bots whose routines something has read recently, and when. Drives the `cron.changed` fan-out;
+   *  see `ROUTINE_WATCH_TTL_MS`. */
+  readonly #routineWatch = new Map<string, number>();
+  /** One list per bot at a time. Concurrency here is not merely wasteful: a list PAUSES legacy
+   *  routines as a side effect, and two overlapping lists would both try to pause the same jobs. */
+  readonly #routineInflight = new Map<string, Promise<BotRoutineList>>();
+  /** The tail of the per-bot routine-WRITE chain, by bot name. The same chain `#configureChain` is,
+   *  for the same reason, and just as load-bearing: see `#chainRoutineWrite`. */
+  readonly #routineWriteChain = new Map<string, Promise<unknown>>();
+  /** The last routines payload broadcast per bot, so an unchanged re-read is silent on the wire. */
+  readonly #lastRoutinesJson = new Map<string, string>();
+  #routineDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
   /** Chats THIS bridge created whose kickoff has not been observed to land yet, by bot name. Two
    *  things hang off it: the empty-history tolerance (a session with no persisted row cannot be
    *  resumed, and Hermes answers that with an error, which is not a failure the app should see),
@@ -269,6 +312,9 @@ export class HermesBridge implements BotsSurface {
       if (event.type === "sessions.changed" || event.type === "cron.changed") {
         this.refreshSoon(event.type);
       }
+      // A cron change is the ONE broadcast that says something about routines, and it says only
+      // that something changed: no job id, no profile. So every watched bot is re-read, debounced.
+      if (event.type === "cron.changed") this.#refreshRoutinesSoon();
     });
     this.#client.start();
     this.#schedulePoll();
@@ -567,6 +613,10 @@ export class HermesBridge implements BotsSurface {
     this.#chat.cancel(canonical);
     this.#chatInflight.delete(canonical);
     this.#kickoffs.delete(canonical);
+    // Nothing left to watch: a deleted profile's cron store goes with it, and a `cron.changed` that
+    // kept re-reading it would spend a round trip per burst on a 404.
+    this.#routineWatch.delete(canonical);
+    this.#lastRoutinesJson.delete(canonical);
     await this.refresh(`bot ${canonical} deleted`);
     return path;
   }
@@ -680,6 +730,152 @@ export class HermesBridge implements BotsSurface {
     }
   }
 
+  /** One bot's routines, read fresh.
+   *
+   *  Not cached: a routines pane is opened deliberately and rarely, the answer carries next-run
+   *  times that go stale by the second, and the read has a SIDE EFFECT (the legacy auto-pause) that
+   *  a cache would skip. What is shared is the call itself, so two devices opening the pane together
+   *  cost one round trip and one pause attempt.
+   *
+   *  Reading also arms the `cron.changed` fan-out for this bot, which is what turns a one-shot read
+   *  into a live pane without any client polling. */
+  async routines(name: string): Promise<BotRoutineList> {
+    await this.#assertBotKnown(name);
+    return this.#readRoutines(name);
+  }
+
+  /** Creates a routine and broadcasts the bot's new list.
+   *
+   *  The list is re-read rather than assembled from the create's own answer: the backend normalizes
+   *  a schedule on the way in, and a client watching `bot_routines` must not see a row that
+   *  disagrees with the one the next read produces. */
+  async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> {
+    await this.#assertBotKnown(name);
+    return this.#chainRoutineWrite(name, async () => {
+      const routine = await createBotRoutine(this.#client, name, input, this.#bridgeProfile);
+      await this.#publishRoutines(name);
+      return { routine };
+    });
+  }
+
+  async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> {
+    await this.#assertBotKnown(name);
+    return this.#chainRoutineWrite(name, async () => {
+      const result = await patchBotRoutine(this.#client, name, id, patch, this.#bridgeProfile);
+      await this.#publishRoutines(name);
+      return result;
+    });
+  }
+
+  async deleteRoutine(name: string, id: string): Promise<void> {
+    await this.#assertBotKnown(name);
+    await this.#chainRoutineWrite(name, async () => {
+      await deleteBotRoutine(this.#client, name, id);
+      await this.#publishRoutines(name);
+    });
+  }
+
+  /** Runs one routine write for a bot, SERIALIZED behind that bot's other routine writes.
+   *
+   *  A correctness rule, not an economy, and the same one `configureProfile` follows. `cron.manage`
+   *  has no update action, so an edit is a read-modify-write across four separate RPCs (find, pause,
+   *  add, remove). Two overlapping edits of the same routine both find the job, both pause it, both
+   *  add a replacement, and both remove the same old one, which leaves the user with ONE routine on
+   *  their screen and TWO live cron jobs firing forever. A double-tapped Save on a phone is the
+   *  ordinary path into that, and a scheduler that quietly doubles is the worst kind of bug because
+   *  nothing on the surface shows it.
+   *
+   *  A chain rather than a dedupe: the second write asked for something different and must still
+   *  happen, just after the first. The link is installed before awaiting, so a third caller queues
+   *  behind the second. A failed write does not poison the queue (the wait swallows its predecessor's
+   *  failure), and a chain whose tail is the promise that just settled is dropped, so an idle bot
+   *  leaves nothing behind. It bounds this gateway only: a desktop editing the same cron store still
+   *  races upstream, and serializing what we can see is the half that is ours. */
+  async #chainRoutineWrite<T>(name: string, write: () => Promise<T>): Promise<T> {
+    const previous = this.#routineWriteChain.get(name);
+    const run = (async () => {
+      if (previous !== undefined) await previous.catch(() => {});
+      return write();
+    })();
+    this.#routineWriteChain.set(name, run);
+    try {
+      return await run;
+    } finally {
+      if (this.#routineWriteChain.get(name) === run) this.#routineWriteChain.delete(name);
+    }
+  }
+
+  /** Reads a bot's routines, single-flight, and broadcasts when the list actually changed. */
+  async #readRoutines(name: string, opts: { renew?: boolean; fresh?: boolean } = {}): Promise<BotRoutineList> {
+    if (opts.fresh === true) {
+      // A read that STARTED before this gateway's write cannot describe the store after it. Joining
+      // it would broadcast the pre-write list and cache it in `#lastRoutinesJson`, which then
+      // suppresses the correct frame as "unchanged" and leaves every client a poll behind.
+      for (let guard = 0; guard < 4; guard += 1) {
+        const pending = this.#routineInflight.get(name);
+        if (pending === undefined) break;
+        await pending.catch(() => {});
+      }
+    }
+    const inflight = this.#routineInflight.get(name);
+    if (inflight !== undefined) return inflight;
+    const run = (async () => {
+      try {
+        const { routines } = await listBotRoutines(this.#client, name);
+        const view: BotRoutineList = { name, routines, updatedAt: this.#now() };
+        // A read the fan-out itself performed does NOT renew the watch. Renewing it would make a
+        // gateway with steady cron traffic keep every bot ever opened warm forever, which is the
+        // one thing the TTL exists to prevent.
+        if (opts.renew !== false) this.#routineWatch.set(name, this.#now());
+        this.#publishRoutineFrame(view);
+        return view;
+      } finally {
+        this.#routineInflight.delete(name);
+      }
+    })();
+    this.#routineInflight.set(name, run);
+    return run;
+  }
+
+  /** Re-reads a bot's routines after this gateway changed them. Never fails the write that caused
+   *  it: the change landed, and a broadcast that could not be built is a missing frame, not a failed
+   *  operation. The client's own response already carries the row. */
+  async #publishRoutines(name: string, opts: { renew?: boolean } = {}): Promise<void> {
+    try {
+      await this.#readRoutines(name, { ...opts, fresh: true });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "unknown failure";
+      this.#log(`routines refresh failed for ${name}: ${detail}`);
+    }
+  }
+
+  #publishRoutineFrame(view: BotRoutineList): void {
+    const json = JSON.stringify(view.routines);
+    if (this.#lastRoutinesJson.get(view.name) === json) return;
+    this.#lastRoutinesJson.set(view.name, json);
+    this.#broadcast({ type: "bot_routines", bot: view.name, routines: view.routines, updatedAt: view.updatedAt });
+  }
+
+  /** Debounced fan-out over the watched bots. A burst of `cron.changed` during one edit costs one
+   *  read per watched bot, not one per event. */
+  #refreshRoutinesSoon(): void {
+    if (this.#closed) return;
+    if (this.#routineDebounceTimer !== undefined) return;
+    this.#routineDebounceTimer = setTimeout(() => {
+      this.#routineDebounceTimer = undefined;
+      const cutoff = this.#now() - ROUTINE_WATCH_TTL_MS;
+      for (const [bot, at] of this.#routineWatch) {
+        if (at < cutoff) {
+          this.#routineWatch.delete(bot);
+          this.#lastRoutinesJson.delete(bot);
+          continue;
+        }
+        void this.#publishRoutines(bot, { renew: false });
+      }
+    }, CHANGE_DEBOUNCE_MS);
+    this.#routineDebounceTimer.unref();
+  }
+
   /** Test seam: true while a turn poll is live for this bot. */
   chatPolling(name: string): boolean {
     return this.#chat.polling(name);
@@ -703,6 +899,8 @@ export class HermesBridge implements BotsSurface {
     this.#pollTimer = undefined;
     if (this.#debounceTimer !== undefined) clearTimeout(this.#debounceTimer);
     this.#debounceTimer = undefined;
+    if (this.#routineDebounceTimer !== undefined) clearTimeout(this.#routineDebounceTimer);
+    this.#routineDebounceTimer = undefined;
     await this.#client.close();
   }
 
@@ -836,8 +1034,10 @@ export class HermesBridge implements BotsSurface {
     return state === "connecting" ? "connecting" : "idle";
   }
 
-  /** The poll interval implied by what devices say they are looking at, or undefined for idle. */
-  #pollIntervalMs(): number | undefined {
+  /** The poll implied by what devices say they are looking at, or undefined for idle. `routines` is
+   *  reported alongside the interval rather than folded into it: a routines pane needs the cron
+   *  store re-read, which the roster refresh does not touch. */
+  #pollIntervalMs(): { ms: number; routines: boolean } | undefined {
     const cutoff = this.#now() - this.#focusTtlMs;
     let roster = false;
     let routines = false;
@@ -849,8 +1049,8 @@ export class HermesBridge implements BotsSurface {
       if (entry.screen === "roster") roster = true;
       if (entry.screen === "routines") routines = true;
     }
-    if (roster) return this.#rosterPollMs;
-    if (routines) return this.#routinesPollMs;
+    if (roster) return { ms: this.#rosterPollMs, routines };
+    if (routines) return { ms: this.#routinesPollMs, routines: true };
     return undefined;
   }
 
@@ -860,12 +1060,16 @@ export class HermesBridge implements BotsSurface {
       this.#pollTimer = undefined;
     }
     if (this.#closed) return;
-    const interval = this.#pollIntervalMs();
-    if (interval === undefined) return;
+    const poll = this.#pollIntervalMs();
+    if (poll === undefined) return;
     this.#pollTimer = setTimeout(() => {
       this.#pollTimer = undefined;
+      // The routines poll is the FALLBACK for a gateway that does not broadcast `cron.changed`.
+      // Where the broadcast exists it has already fired, and this re-read finds nothing new and
+      // stays silent, because a frame is only sent when the list actually changed.
+      if (poll.routines) this.#refreshRoutinesSoon();
       void this.refresh("poll").finally(() => this.#schedulePoll());
-    }, interval);
+    }, poll.ms);
     this.#pollTimer.unref();
   }
 }
