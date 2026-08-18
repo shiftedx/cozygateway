@@ -82,6 +82,29 @@ export interface FakeHermesServer {
   /** Every query string the server has seen on an upgrade, in connection order. */
   queries(): string[];
   sendEvent(type: string, payload?: unknown, sessionId?: string): void;
+  /** The token-event sequence a real Hermes 0.20.3 emits for one assistant turn, modeled on the
+   *  probe capture of 2026-08-18: `message.start`, one `message.delta` per token with the text in
+   *  `payload.text`, and `message.complete` carrying the whole reply plus a usage block. Every frame
+   *  is addressed by the RUNTIME session id, which is the id the events actually carry.
+   *
+   *  `thinking` and `reasoning` chunks are interleaved between the deltas when asked for, because
+   *  that is what the real stream does and because a test that never emits them cannot prove they
+   *  are dropped. */
+  streamMessage(
+    runtimeSessionId: string,
+    opts: {
+      deltas: string[];
+      /** Defaults to the deltas joined, which is what Hermes reports. Pass a different value to
+       *  model a turn where the accumulation and the persisted message disagree. */
+      final?: string;
+      thinking?: string[];
+      reasoning?: string[];
+      /** Omit the closing `message.complete`, i.e. a turn still in flight. */
+      complete?: boolean;
+      /** Omit the opening `message.start`, i.e. the bridge attached mid-turn. */
+      start?: boolean;
+    },
+  ): void;
   dropAll(code?: number): void;
   setBehavior(patch: Partial<FakeHermesBehavior>): void;
   close(): Promise<void>;
@@ -290,6 +313,37 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
       for (const ws of sockets) {
         if (ws.readyState === WebSocket.OPEN) ws.send(raw);
       }
+    },
+    streamMessage(runtimeSessionId, opts): void {
+      const emit = (type: string, payload?: unknown): void => {
+        const raw = JSON.stringify({
+          jsonrpc: "2.0",
+          method: "event",
+          params: { type, session_id: runtimeSessionId, ...(payload === undefined ? {} : { payload }) },
+        });
+        for (const ws of sockets) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(raw);
+        }
+      };
+      if (opts.start !== false) emit("message.start");
+      const thinking = [...(opts.thinking ?? [])];
+      const reasoning = [...(opts.reasoning ?? [])];
+      for (const text of opts.deltas) {
+        emit("message.delta", { text });
+        const think = thinking.shift();
+        if (think !== undefined) emit("thinking.delta", { text: think });
+        const reason = reasoning.shift();
+        if (reason !== undefined) emit("reasoning.delta", { text: reason });
+      }
+      for (const text of thinking) emit("thinking.delta", { text });
+      for (const text of reasoning) emit("reasoning.delta", { text });
+      if (opts.complete === false) return;
+      const final = opts.final ?? opts.deltas.join("");
+      emit("reasoning.available", { text: final });
+      emit("message.complete", {
+        text: final,
+        usage: { model: "gpt-5.6-sol", input: 16_961, output: 15, total: 16_976, context_percent: 6 },
+      });
     },
     dropAll(code?: number): void {
       // No code means an abrupt drop (terminate), since ws only accepts 1000 or 3000-4999 on

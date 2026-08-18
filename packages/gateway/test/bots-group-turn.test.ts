@@ -212,6 +212,38 @@ describe("runMemberTurn", () => {
     expect(result).toEqual({ outcome: "spoke", text: "here is my take" });
   });
 
+  it("binds the runtime session to the member AND the room before submitting", async () => {
+    const rows: Array<Record<string, unknown>> = [
+      { role: "user", content: "turn prompt" },
+      { role: "assistant", content: "ship it" },
+    ];
+    const { rpc, calls } = transcriptRpc(rows);
+    const bound: Array<{ id: string; binding: Record<string, unknown>; after: string[] }> = [];
+    await runMemberTurn({
+      rpc,
+      member: "scout",
+      group: "Release Room",
+      prompt: "turn prompt",
+      session: baseSession(),
+      now: () => Date.now(),
+      pollMs: 1,
+      timeoutMs: 300,
+      stream: {
+        bind: (id, binding) => bound.push({ id, binding: { ...binding }, after: [...calls] }),
+        forgetBot: () => {},
+      },
+    });
+
+    // The RUNTIME id, because that is the id Hermes puts on its event frames, mapped to the STORED
+    // id, because that is what a frame is keyed on. And the room, so a client can render the draft
+    // in the room rather than in the member's 1:1 chat.
+    expect(bound).toHaveLength(1);
+    expect(bound[0]!.id).toBe("runtime-1");
+    expect(bound[0]!.binding).toEqual({ bot: "scout", sessionId: "stored-1", room: "Release Room" });
+    // Before the submit: the first token can beat the submit's own reply onto the socket.
+    expect(bound[0]!.after).toEqual([]);
+  });
+
   it("posts a reply that had already completed when the room was superseded", async () => {
     const rows: Array<Record<string, unknown>> = [{ role: "user", content: "turn prompt" }, { role: "assistant", content: "the late answer" }];
     const { rpc, calls } = transcriptRpc(rows);

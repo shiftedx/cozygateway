@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { Message, RichBlock, ServerFrame } from "cozygateway-contract";
 
+import { BOTS_CAPABILITY_VERSION } from "cozygateway-contract";
+
 import { openStorage, type Storage } from "../src/storage.ts";
 import { createApp } from "../src/http.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
@@ -57,7 +59,7 @@ interface Harness {
 
 async function setup(
   behavior: FakeHermesBehavior = {},
-  overrides: { chatPollMs?: number; chatTurnTimeoutMs?: number } = {},
+  overrides: { chatPollMs?: number; chatTurnTimeoutMs?: number; chatDeltaThrottleMs?: number } = {},
 ): Promise<Harness> {
   const server = await startFakeHermesServer(behavior);
   servers.push(server);
@@ -81,6 +83,7 @@ async function setup(
     logSink: () => {},
     chatPollMs: overrides.chatPollMs ?? 10,
     chatTurnTimeoutMs: overrides.chatTurnTimeoutMs ?? 2_000,
+    chatDeltaThrottleMs: overrides.chatDeltaThrottleMs ?? 10,
   });
   bridges.push(bridge);
 
@@ -663,5 +666,126 @@ describe("what reaches the phone (review I6/I9)", () => {
       .flatMap((frame) => (frame as { messages: Array<{ id: string; clientId?: string }> }).messages);
     expect(delivered.find((message) => message.id === "m-real")?.clientId).toBe("phone-7");
     expect(delivered.find((message) => message.id === "m-reply")?.clientId).toBeUndefined();
+  });
+});
+
+describe("bot_chat_delta", () => {
+  /** The live draft, end to end: a real bridge holding a real socket to the fake Hermes, which
+   *  emits the token events a real Hermes 0.20.3 emits (`message.start`, one `message.delta` per
+   *  token, `message.complete` with the whole reply), interleaved with the `thinking.delta` and
+   *  `reasoning.delta` frames that ride the same socket. */
+
+  type DeltaFrame = Extract<ServerFrame, { type: "bot_chat_delta" }>;
+  const deltasOf = (frames: ServerFrame[]): DeltaFrame[] =>
+    frames.filter((frame): frame is DeltaFrame => frame.type === "bot_chat_delta");
+
+  async function sendAndStream(
+    frames: ServerFrame[],
+    authed: Harness["authed"],
+    server: FakeHermesServer,
+    stream: Parameters<FakeHermesServer["streamMessage"]>[1],
+  ): Promise<void> {
+    await authed("/bots/scout/chat/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "how is CI" }),
+    });
+    await until(() => server.callsOf("prompt.submit").length === 1);
+    server.streamMessage("runtime-1", stream);
+    await until(() => deltasOf(frames).some((frame) => frame.done === true), 4_000);
+  }
+
+  it("turns the hermes token stream into a growing draft, and the poll still delivers the reply", async () => {
+    const messages: Array<Record<string, unknown>> = [{ role: "user", content: "how is CI" }];
+    let running = true;
+    const { behavior } = fakeBotMode({
+      sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }],
+      messages,
+      running: () => running,
+    });
+    const { authed, frames, server, bridge } = await setup(behavior);
+
+    await sendAndStream(frames, authed, server, {
+      deltas: ["all", " green", " on", " main"],
+      thinking: ["( \u2022_\u2022)>\u2310\u25a0-\u25a0 cogitating..."],
+      reasoning: ["the user is asking about CI, the last run passed"],
+    });
+
+    const drafts = deltasOf(frames);
+    expect(drafts.length).toBeGreaterThan(0);
+    // Every frame names the bot and the STORED session id, carries the full text so far, and the
+    // text only ever grows.
+    for (const frame of drafts) expect(frame).toMatchObject({ bot: "scout", sessionId: "canonical" });
+    const texts = drafts.map((frame) => frame.text);
+    for (let index = 1; index < texts.length; index += 1) {
+      expect(texts[index]!.startsWith(texts[index - 1]!)).toBe(true);
+    }
+    expect(drafts.map((frame) => frame.seq)).toEqual(drafts.map((_, index) => index + 1));
+    expect(new Set(drafts.map((frame) => frame.turnId)).size).toBe(1);
+    expect(drafts.at(-1)).toMatchObject({ text: "all green on main", done: true });
+
+    // Nothing from the reasoning family reached the wire, on any frame.
+    const rendered = JSON.stringify(frames);
+    expect(rendered).not.toContain("cogitating");
+    expect(rendered).not.toContain("asking about CI");
+
+    // And the draft changed nothing about how the reply is delivered: the poll finds the canonical
+    // message and broadcasts it, which is still the only thing a client stores.
+    messages.push({ id: "m-reply", role: "assistant", content: "all green on main" });
+    running = false;
+    await bridge.chatSettled("scout");
+    const delivered = frames
+      .filter((frame) => frame.type === "bot_chat")
+      .flatMap((frame) => (frame as { messages: Array<{ id: string; text: string }> }).messages);
+    expect(delivered.find((message) => message.id === "m-reply")?.text).toBe("all green on main");
+  });
+
+  it("keeps the draft out of a second turn on the same session", async () => {
+    const messages: Array<Record<string, unknown>> = [];
+    let running = true;
+    const { behavior } = fakeBotMode({
+      sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }],
+      messages,
+      running: () => running,
+    });
+    const { authed, frames, server } = await setup(behavior);
+
+    await sendAndStream(frames, authed, server, { deltas: ["first reply"] });
+    const firstTurn = deltasOf(frames).at(-1)!.turnId;
+    frames.length = 0;
+
+    await authed("/bots/scout/chat/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "and now" }),
+    });
+    await until(() => server.callsOf("prompt.submit").length === 2);
+    server.streamMessage("runtime-1", { deltas: ["second reply"] });
+    await until(() => deltasOf(frames).some((frame) => frame.done === true), 4_000);
+
+    const second = deltasOf(frames).at(-1)!;
+    // A Hermes session id is reused across turns; a turn id is not, which is what invalidates the
+    // previous draft on a client instead of appending to it.
+    expect(second.turnId).not.toBe(firstTurn);
+    expect(second.text).toBe("second reply");
+    // Seq restarts with the turn, which is why a client compares it only within one turnId.
+    expect(deltasOf(frames)[0]!.seq).toBe(1);
+  });
+
+  it("stays silent for a session this gateway never submitted into", async () => {
+    const { behavior } = fakeBotMode({ sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }] });
+    const { frames, server } = await setup(behavior);
+
+    // What a Hermes desktop's own session looks like from here: events for a session id the bridge
+    // has no binding for. They are somebody else's turn and produce nothing.
+    server.streamMessage("runtime-someone-else", { deltas: ["not ours"] });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(deltasOf(frames)).toHaveLength(0);
+  });
+
+  it("advertises the streaming capability version", () => {
+    // A client gates its draft rendering on >= 6; everything else about the bots surface is
+    // unchanged, so an older client simply ignores an unknown frame type.
+    expect(BOTS_CAPABILITY_VERSION).toBe(6);
   });
 });

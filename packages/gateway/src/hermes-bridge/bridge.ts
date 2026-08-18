@@ -36,6 +36,7 @@ import {
   UI_META_KEY,
 } from "./roster.ts";
 import type { GroupMember } from "./group-protocol.ts";
+import { BotChatStream } from "./chat-stream.ts";
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import {
@@ -194,6 +195,9 @@ export interface HermesBridgeOptions {
   /** Turn-poll cadence and cap. Defaults are the desktop's own 2 s / 180 s. */
   chatPollMs?: number;
   chatTurnTimeoutMs?: number;
+  /** How often a live reply draft may go on the wire, per session. Default
+   *  `CHAT_DELTA_THROTTLE_MS` (200 ms). */
+  chatDeltaThrottleMs?: number;
   /** How long a superseding group drive waits before taking over. Default `GROUP_CHAIN_DELAY_MS`
    *  (250 ms), the desktop's own. */
   groupChainDelayMs?: number;
@@ -243,6 +247,10 @@ export class HermesBridge implements BotsSurface {
   readonly #configureChain = new Map<string, Promise<unknown>>();
   readonly #pins: PinStore;
   readonly #chat: BotChatTurns;
+  /** The live-draft producer. It reads Hermes' `message.*` events off the SAME socket everything
+   *  else here speaks over, and it is fed from exactly two places: `start()` hands it every event
+   *  frame, and the two turn paths tell it which runtime session belongs to which bot. */
+  readonly #stream: BotChatStream;
   readonly #groups: GroupRooms;
 
   /** Bots whose routines something has read recently, and when. Drives the `cron.changed` fan-out;
@@ -311,11 +319,17 @@ export class HermesBridge implements BotsSurface {
       set: (name, sessionId) => this.#storage.setBotChatPin(name, sessionId, this.#now()),
       clear: (name) => this.#storage.clearBotChatPin(name),
     };
+    this.#stream = new BotChatStream({
+      broadcast: this.#broadcast,
+      now: this.#now,
+      ...(opts.chatDeltaThrottleMs === undefined ? {} : { throttleMs: opts.chatDeltaThrottleMs }),
+    });
     this.#chat = new BotChatTurns({
       rpc: this.#client,
       broadcast: this.#broadcast,
       now: this.#now,
       log: this.#log,
+      stream: this.#stream,
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
       ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),
     });
@@ -326,6 +340,7 @@ export class HermesBridge implements BotsSurface {
       now: this.#now,
       log: this.#log,
       hidden: this.#hideBotChats,
+      stream: this.#stream,
       memberInfo: (name) => this.#memberInfo(name),
       // Validated against a FRESH profile list rather than the roster cache: a room is written to
       // disk and its members are handed to `session.create` on the first round, and a cache that
@@ -410,8 +425,16 @@ export class HermesBridge implements BotsSurface {
   start(): void {
     this.#client.onStateChange((state) => {
       if (state === "online") this.refreshSoon("hermes online");
+      // A dropped socket takes any half-written draft with it. Dropping the buffers here is what
+      // keeps a reconnect from resuming a reply from its middle; the reply itself still arrives
+      // over the turn poll, which is the only thing that ever delivered it.
+      else this.#stream.reset();
     });
     this.#client.onEvent((event) => {
+      // The token stream (`message.start` / `message.delta` / `message.complete`). Everything else
+      // this gateway does with events is below; the stream reads its three types and ignores the
+      // rest, chain-of-thought events emphatically included.
+      this.#stream.handleEvent(event);
       // Optional broadcasts. A gateway that never sends them is fully supported: the poll path
       // covers the same ground, just slower.
       if (event.type === "sessions.changed" || event.type === "cron.changed") {
@@ -1027,6 +1050,7 @@ export class HermesBridge implements BotsSurface {
   async close(): Promise<void> {
     this.#closed = true;
     this.#chat.close();
+    this.#stream.close();
     // Awaited: a room drive that is mid-turn holds a reference to the storage the caller is about
     // to close, and it must be finished with it before this resolves.
     await this.#groups.close();

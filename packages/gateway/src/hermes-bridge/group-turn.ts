@@ -2,6 +2,7 @@ import type { BotChatMessage } from "cozygateway-contract";
 
 import type { HermesRpc } from "./canonical-chat.ts";
 import { parseChatSnapshot } from "./chat-messages.ts";
+import type { ChatStreamBinder } from "./chat-stream.ts";
 import { CHAT_POLL_MS, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 import { groupSessionTitle } from "./group-protocol.ts";
 
@@ -288,6 +289,11 @@ export interface MemberTurnOptions {
    *  the poll then stops rather than spending the rest of the 180 s cap on an answer nobody wants.
    *  It stops with ONE last read (`harvest`), so an answer that already landed is not discarded. */
   live?: () => boolean;
+  /** Where this member's reply is drafted while it is being written. The room's own transcript is
+   *  still assembled from the poll below and nothing else; the draft is a `bot_chat_delta` frame
+   *  carrying `room` alongside the member name, so a client can show the member typing in the room
+   *  it belongs to. Optional, exactly as on the 1:1 path. */
+  stream?: ChatStreamBinder;
   log?: (message: string) => void;
 }
 
@@ -300,6 +306,10 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
   const timeoutMs = opts.timeoutMs ?? CHAT_TURN_TIMEOUT_MS;
   const live = opts.live ?? (() => true);
   const log = opts.log ?? ((): void => {});
+
+  // Bound before the submit for the same reason the 1:1 path binds before its submit: the first
+  // token event can beat the submit's own reply, and an unbound session's events are dropped.
+  opts.stream?.bind(session.runtimeId, { bot: member, sessionId: session.storedId, room: opts.group });
 
   try {
     await rpc.request("prompt.submit", { session_id: session.runtimeId, text: prompt });

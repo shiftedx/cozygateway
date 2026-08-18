@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 4 }
+"capabilities": { "com.cozylabs.bots": 6 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -63,6 +63,11 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   pane MUST require `>= 4`, for the same reason again.
 - `5`: server-side group chats: the `/bots/groups` routes plus the `bot_group` and
   `bot_group_state` frames. A client that offers a rooms screen MUST require `>= 5`.
+- `6`: the `bot_chat_delta` frame, a live draft of the reply a bot is writing. No route changes ride
+  this bump and nothing about an existing frame changed. It exists because a gateway that CANNOT
+  stream and a bot that simply has not produced a token yet look identical on the wire: a client
+  that wants to show "typing" as a growing bubble gates that on `>= 6` and otherwise keeps its
+  spinner. A client that ignores the frame entirely loses nothing but the animation.
 
 ## 3. Resources
 
@@ -550,6 +555,11 @@ sender's own message. That is the desktop plugin's own turn loop, moved server-s
 phone that is backgrounded (or a second device that was never in the room) still receives the whole
 turn. Each poll that finds new messages emits a `bot_chat` delta; each change of state emits a
 `bot_chat_state`.
+
+While the turn runs, the gateway also streams a LIVE DRAFT of the reply as `bot_chat_delta` frames
+(section 6), built from Hermes' own token events rather than from the poll. It is decoration: the
+message a client stores is still the one that arrives in `bot_chat`, and a turn that streams nothing
+is an ordinary turn.
 
 There is exactly ONE turn poll per bot. A send that arrives while a poll is running rides that
 poll rather than starting another, and extends its deadline. Three consecutive failing polls
@@ -1382,6 +1392,9 @@ are only ever sent by a gateway that advertises the capability.
 { type: "bot_chat_state", bot: string, sessionId: string,
   phase: "polling" | "complete" | "timeout" | "failed",
   running: boolean, inflight: boolean, updatedAt: integer }
+{ type: "bot_chat_delta", bot: string, sessionId: string, turnId: string,
+  text: string, seq: integer, updatedAt: integer,
+  done?: boolean, room?: string }
 { type: "bot_routines", bot: string, routines: BotRoutine[], updatedAt: integer }
 { type: "bot_group", group: string, messages: BotGroupMessage[], updatedAt: integer }
 { type: "bot_group_state", group: string,
@@ -1416,6 +1429,76 @@ gateway's view of the turn it is polling (`polling` while awaiting, `complete` w
 and Hermes went idle, `timeout` at the 180 s cap, `failed` when Hermes kept refusing), while
 `running` and `inflight` are Hermes' own flags passed through.
 
+### bot_chat_delta, the live draft
+
+`bot_chat_delta` is the reply a bot is writing, sent while it writes it. Version 6 and up.
+
+```
+{ type: "bot_chat_delta", bot: "scout", sessionId: "canonical",
+  turnId: "runtime-1#1800000000123-4", text: "all", seq: 1, updatedAt: 1800000000123 }
+{ type: "bot_chat_delta", bot: "scout", sessionId: "canonical",
+  turnId: "runtime-1#1800000000123-4", text: "all green on", seq: 2, updatedAt: 1800000000323 }
+{ type: "bot_chat_delta", bot: "scout", sessionId: "canonical",
+  turnId: "runtime-1#1800000000123-4", text: "all green on main", seq: 3,
+  updatedAt: 1800000000480, done: true }
+```
+
+and, for a member speaking inside a group room:
+
+```
+{ type: "bot_chat_delta", bot: "scout", sessionId: "<the member's room session>",
+  room: "Release Room", turnId: "runtime-7#1800000000900-9", text: "ship it", seq: 1,
+  updatedAt: 1800000000900 }
+```
+
+Read it as a DRAFT and never as a message:
+
+- `text` is the FULL accumulated assistant text so far, not an increment. There is nothing to
+  reassemble, re-ordering is harmless, and any subset of the frames can be dropped: render the
+  newest one you have.
+- `seq` is monotonic within one `turnId` and starts at 1. Drop a frame whose `seq` is not greater
+  than the last one rendered for that turn.
+- `turnId` is minted per turn and is never reused. A Hermes session id IS reused across turns, so
+  the turn id is the only thing that says "this is a different reply": a frame with a new `turnId`
+  REPLACES the draft, it does not extend it.
+- `done: true` marks the last frame of a turn. Nothing further will be sent for that `turnId`.
+- `room` is present only for a member's turn inside a group room, and then `bot` is the member's
+  profile name and `sessionId` is that member's own room session, which is not an id a client
+  addresses anywhere else. Key the draft on `room` + `bot` and render it in the room; the room's
+  actual transcript still arrives as `bot_group` entries.
+- The draft is NOT persisted anywhere. It is never replayed, a device that connects mid-turn will
+  usually pick the draft up part-way through, and `GET /bots/:name/chat/messages` knows nothing
+  about it.
+
+Clear the draft on whichever comes first: `done`, a `bot_chat_state` phase of `complete`, `timeout`
+or `failed`, or the canonical message landing in `bot_chat`. Do not try to reconcile the draft text
+with the final message: they are produced by two different paths and the final message wins outright
+(it may be trimmed, tool chatter may have been dropped from it, and a compaction may have rewritten
+the transcript under both).
+
+Three behaviours worth designing around, stated plainly because a user can observe all three:
+
+- **The draft can freeze and then jump.** Hermes routes these events to whichever connection most
+  recently resumed the session, so a human opening the same session in a Hermes desktop takes the
+  route away from this gateway. The gateway's own 2 s turn poll resumes the session and takes it
+  back, so the draft stalls for up to a poll interval and then jumps forward, or (for a short turn)
+  never appears at all. The reply itself is never at risk: it does not come from this path.
+- **A draft may start part-way in.** Under the same theft, or after a reconnect mid-turn, the
+  gateway starts drafting from the first token it sees. The `done` frame carries the whole reply as
+  Hermes persisted it, so the draft self-corrects at the end.
+- **A turn may produce no draft at all.** A Hermes build that does not emit token events, a stolen
+  transport for the turn's whole length, or a reply short enough to complete inside one throttle
+  window. A client MUST keep whatever "working" affordance it had for the gap before the first
+  token, which is a real gap (1.8 to 3 seconds against a hosted model in the reference probe).
+
+Frequency is throttled server-side to one frame per session per 200 ms, plus the closing `done`
+frame, so a long reply costs tens of frames rather than the hundreds of token events behind it.
+Unchanged text is never re-sent.
+
+Nothing derived from a model's chain of thought EVER rides this frame. Hermes emits
+`thinking.delta`, `reasoning.delta` and `reasoning.available` on the very same socket; the gateway
+reads the `message.*` family and drops everything else, and there is no setting that changes it.
+
 `bot_routines` is a FULL REPLACE for one bot, sent only when that bot's routine list actually
 changed, so an idle cron store is silent. It fires when this gateway changed a routine, and when a
 `cron.changed` broadcast arrived for a bot whose routines something has read in the last five
@@ -1447,7 +1530,9 @@ persisted with a monotonic `seq`, so a device that missed a frame recovers compl
 
 ## 7. Not in this extension yet
 
-Per-device chat-frame scoping and per-device delta watermarks; model and description writes (see
+Draft frames for anything but a bot's own reply (a user's typing, a tool call in progress), replay
+of a draft to a device that joined mid-turn, and any persistence of one; per-device chat-frame
+scoping and per-device delta watermarks; model and description writes (see
 `PATCH /bots/:name/profile`); skill install; MCP server setup and OAuth; bot duplicate; avatars;
 routine run-now and run output (the backend exposes neither over this RPC); push; and
 multi-connection

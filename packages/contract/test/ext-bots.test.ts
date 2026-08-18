@@ -4,6 +4,7 @@ import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/
 import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
+  BotChatDeltaFrameSchema,
   BotFocusRequestSchema,
   BotGroupCreateRequestSchema,
   BotGroupDetailSchema,
@@ -91,6 +92,28 @@ describe("bots server frames", () => {
       },
     ];
     for (const frame of frames) expect(check(ServerFrameSchema, frame)).toBe(true);
+  });
+
+  it("carries the live reply draft, room and all", () => {
+    const draft: ServerFrame = {
+      type: "bot_chat_delta",
+      bot: "scout",
+      sessionId: "canonical",
+      turnId: "canonical#1-1",
+      text: "all green on",
+      seq: 3,
+      updatedAt: 1_800_000_000_000,
+    };
+    expect(check(ServerFrameSchema, draft)).toBe(true);
+    // The last frame of a turn, and the group-room shape: same frame, two optional fields.
+    expect(check(ServerFrameSchema, { ...draft, done: true })).toBe(true);
+    expect(check(ServerFrameSchema, { ...draft, room: "Release Room", done: true })).toBe(true);
+    // An empty draft is legal (a turn that has produced no text yet); a missing one is not.
+    expect(check(BotChatDeltaFrameSchema, { ...draft, text: "" })).toBe(true);
+    expect(check(BotChatDeltaFrameSchema, { ...draft, text: undefined })).toBe(false);
+    // `seq` is an ordinal, not a stamp: a fractional one would break the drop-stale rule.
+    expect(check(BotChatDeltaFrameSchema, { ...draft, seq: 1.5 })).toBe(false);
+    expect(check(BotChatDeltaFrameSchema, { ...draft, turnId: 7 })).toBe(false);
   });
 
   it("still rejects an unknown frame type, since the union stays closed", () => {
@@ -268,7 +291,9 @@ describe("capability advertisement", () => {
     // 2 for the composer (a v1 gateway 404s the send route), 3 for the edit-profile surface
     // (a v2 gateway 404s the profile routes, which reads as a Save that silently does nothing),
     // 4 for the routines surface (a v3 gateway 404s them and never sends `bot_routines`),
-    // 5 for the group-chat rooms (a v4 gateway 404s them and never sends `bot_group`).
-    expect(BOTS_CAPABILITY_VERSION).toBe(5);
+    // 5 for the group-chat rooms (a v4 gateway 404s them and never sends `bot_group`),
+    // 6 for `bot_chat_delta`, the live draft of a reply, which adds no route: a client gates the
+    // drawing of a growing bubble on it rather than on a gateway that just happens to be quiet.
+    expect(BOTS_CAPABILITY_VERSION).toBe(6);
   });
 });
