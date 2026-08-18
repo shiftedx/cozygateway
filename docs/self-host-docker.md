@@ -3,6 +3,10 @@
 Two containers: the gateway (your agent as a chat contact) and the push relay (ciphertext-only
 notification forwarder). Both build from this monorepo and store SQLite on a named volume.
 
+Prefer not to do this by hand? `docs/agent-install.md` is the same install written as a playbook an
+AI agent can execute for you, end to end, including the Hermes dashboard wiring and the pairing
+code. This document stays the reference for every field it sets.
+
 ## Try it in one command (reference echo backend)
 
     docker build -f packages/gateway/Dockerfile -t cozygateway .

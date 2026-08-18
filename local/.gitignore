@@ -1,0 +1,5 @@
+# Everything the agent install generates lands here: the gateway config, the SQLite db, logs,
+# and the recorded dashboard credential. None of it belongs in git, and this file is the only
+# tracked thing in the directory.
+*
+!.gitignore
