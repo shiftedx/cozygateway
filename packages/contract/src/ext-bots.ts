@@ -423,6 +423,107 @@ export const BotRoutinesFrameSchema = Type.Object({
 });
 export type BotRoutinesFrame = Static<typeof BotRoutinesFrameSchema>;
 
+/** One entry in a group room's log. `from.kind` is `user` for the human (whose display name is the
+ *  desktop's own `You`) and `member` for a bot, in which case `from.name` is the bot's profile name
+ *  and `from.displayName` is what a transcript renders. `at` is MILLISECONDS.
+ *
+ *  `seq` is the room-local ordinal and is what a client keys on: the log is TRIMMED from the head
+ *  once it passes its retention cap, so a position in the array is not stable while a `seq` is. */
+export const BotGroupMessageSchema = Type.Object({
+  seq: Type.Integer(),
+  from: Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    name: Type.String(),
+    displayName: Type.String(),
+  }),
+  text: Type.String(),
+  at: Type.Integer(),
+  clientId: Type.Optional(Type.String()),
+});
+export type BotGroupMessage = Static<typeof BotGroupMessageSchema>;
+
+/** A room, without its log. `members` are Hermes profile names in the order the room was created
+ *  with, and that order is what the per-round speaker rotation turns. `state` is the room's live
+ *  orchestration state; `needsYou` is the sticky escalation flag (a member's reply mentioned
+ *  `@user`), cleared when the user sends into the room or opens it. */
+export const BotGroupSchema = Type.Object({
+  name: Type.String(),
+  members: Type.Array(Type.String()),
+  createdAt: Type.Integer(),
+  state: Type.Union([Type.Literal("running"), Type.Literal("settled"), Type.Literal("needs_you")]),
+  needsYou: Type.Boolean(),
+  /** Bumped on every user send. A round loop that finds the epoch changed abandons the rest of its
+   *  rounds, which is how a second user message supersedes the first mid-deliberation. */
+  epoch: Type.Integer(),
+  /** Stamp of the newest log entry, or the room's creation when the log is empty. */
+  updatedAt: Type.Integer(),
+});
+export type BotGroup = Static<typeof BotGroupSchema>;
+
+/** `GET /bots/groups/:name`: the room plus its log. */
+export const BotGroupDetailSchema = Type.Composite([
+  BotGroupSchema,
+  Type.Object({ messages: Type.Array(BotGroupMessageSchema) }),
+]);
+export type BotGroupDetail = Static<typeof BotGroupDetailSchema>;
+
+/** New room messages. A DELTA, like `bot_chat`: only entries the gateway has not broadcast before,
+ *  in `seq` order. */
+export const BotGroupFrameSchema = Type.Object({
+  type: Type.Literal("bot_group"),
+  group: Type.String(),
+  messages: Type.Array(BotGroupMessageSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotGroupFrame = Static<typeof BotGroupFrameSchema>;
+
+/** A member turn that produced no message for a reason worth showing. NEVER a fabricated room
+ *  message: a member whose turn timed out or failed contributes this note and the round carries on
+ *  with the others. `detail` is Hermes' own text verbatim when the failure came from Hermes.
+ *
+ *  A member that simply chose to pass produces no note at all: passing is ordinary, and the desktop
+ *  protocol treats it as the healthy outcome rather than as an incident.
+ *
+ *  `capped` is the third reason and the only one that is not a failure: the room stopped because it
+ *  reached its 10-message limit for this send, and `member` names the member that was next in line
+ *  and never got asked. Without it a capped room is indistinguishable from one where everybody
+ *  passed, and those mean opposite things to a reader deciding whether to send again. */
+export const BotGroupNoteSchema = Type.Object({
+  member: Type.String(),
+  reason: Type.Union([Type.Literal("timeout"), Type.Literal("failed"), Type.Literal("capped")]),
+  detail: Type.String(),
+});
+export type BotGroupNote = Static<typeof BotGroupNoteSchema>;
+
+/** How a room's deliberation is doing. `running` while a round loop holds the room, `settled` when
+ *  every responder passed or a cap was reached, `needs_you` when the loop settled AND some member's
+ *  reply mentioned `@user`. `round` is the zero-based round the loop is on. */
+export const BotGroupStateFrameSchema = Type.Object({
+  type: Type.Literal("bot_group_state"),
+  group: Type.String(),
+  state: Type.Union([Type.Literal("running"), Type.Literal("settled"), Type.Literal("needs_you")]),
+  round: Type.Integer(),
+  epoch: Type.Integer(),
+  note: Type.Optional(BotGroupNoteSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotGroupStateFrame = Static<typeof BotGroupStateFrameSchema>;
+
+/** `POST /bots/groups` body. Membership is 2 to 6 bots, the desktop's own bounds, and every name is
+ *  validated against the roster before the room exists. */
+export const BotGroupCreateRequestSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 64 }),
+  members: Type.Array(Type.String({ minLength: 1, maxLength: 64 }), { minItems: 2, maxItems: 6 }),
+});
+export type BotGroupCreateRequest = Static<typeof BotGroupCreateRequestSchema>;
+
+/** `POST /bots/groups/:name/messages` body. Same `clientId` echo contract as the 1:1 composer. */
+export const BotGroupSendRequestSchema = Type.Object({
+  text: Type.String({ minLength: 1, maxLength: 32_000 }),
+  clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+});
+export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
+
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
  *  configured.
  *
@@ -436,6 +537,8 @@ export type BotRoutinesFrame = Static<typeof BotRoutinesFrameSchema>;
  *    used: a screen whose Save 404s reads as a broken app, not as a missing feature.
  *  - `4`: the routines surface: `GET`/`POST /bots/:name/routines`,
  *    `PATCH`/`DELETE /bots/:name/routines/:id`, plus the `bot_routines` frame. A client that offers
- *    a routines pane MUST require `>= 4`. */
+ *    a routines pane MUST require `>= 4`.
+ *  - `5`: server-side group chats: the `/bots/groups` routes plus the `bot_group` and
+ *    `bot_group_state` frames. A client that offers a rooms screen MUST require `>= 5`. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 4;
+export const BOTS_CAPABILITY_VERSION = 5;

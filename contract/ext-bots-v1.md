@@ -1,7 +1,7 @@
 # cozygateway vendor extension: com.cozylabs.bots, v1
 
 Status: draft, wave 5 (read path, full-duplex bot chat, bot create/delete, the edit-profile
-surface, and routines). Versioned
+surface, routines, and server-side group chats). Versioned
 INDEPENDENTLY of `contract/v1.md`, which stays frozen. This document describes an optional surface
 a gateway may or may not have; a client that does not recognize it ignores the capability and the
 frames, and nothing in v1 changes.
@@ -12,9 +12,14 @@ Machine artifact: `packages/contract/src/ext-bots.ts` (TypeBox schemas). Notatio
 ## 1. What it is
 
 A surface over a Hermes gateway's "Bot Mode": the roster of named bots, each bot's canonical chat
-(read AND write), and each bot's session list. The gateway holds one persistent outbound JSON-RPC WebSocket
+(read AND write), each bot's session list, and multi-bot group rooms. The gateway holds one
+persistent outbound JSON-RPC WebSocket
 to the Hermes gateway (the "hermes bridge") and caches what it learns in SQLite, so the app reads
 are cache-first and the live updates are pushed rather than polled.
+
+Group rooms are the exception to "cache": they are HOSTED here, not mirrored from Hermes, which is
+also why a Hermes desktop on the same gateway cannot see them. See the group-chat notes in section 4
+before building against them.
 
 Bot Mode itself is mostly a set of CONVENTIONS over generic Hermes primitives (profiles, a
 `ui_meta` blob, cron, a session `hidden` flag). The bridge reimplements those conventions
@@ -56,6 +61,8 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
 - `4`: the routines surface: `GET` and `POST /bots/:name/routines`, `PATCH` and
   `DELETE /bots/:name/routines/:id`, plus the `bot_routines` frame. A client that offers a routines
   pane MUST require `>= 4`, for the same reason again.
+- `5`: server-side group chats: the `/bots/groups` routes plus the `bot_group` and
+  `bot_group_state` frames. A client that offers a rooms screen MUST require `>= 5`.
 
 ## 3. Resources
 
@@ -223,6 +230,68 @@ remaining-run count is not recoverable from the string the backend reports.
 and there is no RPC anywhere that returns the whole thing. It is enough to recognize a routine, not
 enough to rebuild one, which is why an edit must resend the instruction (see
 `PATCH /bots/:name/routines/:id`).
+
+### BotGroupMessage
+
+```
+{
+  seq: integer,                       // room-local ordinal, stable and monotonic
+  from: { kind: "user" | "member", name: string, displayName: string },
+  text: string,
+  at: integer,                        // MILLISECONDS
+  clientId?: string                   // echo of the sender's own id, user messages only
+}
+```
+
+One entry in a room transcript. `from.kind: "user"` is the human, whose `name` and `displayName` are
+both the literal `You` (the desktop's own label, kept so a transcript reads the same on both
+clients). For a member, `name` is the Hermes profile name and `displayName` is the bot's title.
+
+Key a list on `seq`, never on array position: the log is TRIMMED from the head at 96 entries, so
+positions shift while a `seq` never does. `seq` starts at 1 per room and is never reused, including
+after a trim.
+
+### BotGroup
+
+```
+{
+  name: string,                       // as typed, 1..64
+  members: string[],                  // 2..6 Hermes profile names, in creation order
+  createdAt: integer,                 // MILLISECONDS
+  state: "running" | "settled" | "needs_you",
+  needsYou: boolean,
+  epoch: integer,
+  updatedAt: integer                  // newest entry's stamp, or createdAt for an empty room
+}
+```
+
+`state` is derived and is what a list renders: `running` while a round loop holds the room,
+`needs_you` when the room is idle and some member's reply mentioned `@user`, `settled` otherwise.
+`needsYou` is the same escalation flag on its own, so a client can show a badge without parsing the
+state union.
+
+`epoch` is bumped on every user send and is the supersession counter: a round loop that finds the
+room's epoch has moved on abandons the rest of its rounds. A client can ignore it; it is on the wire
+because the state frames carry it, and a client that renders per-conversation state wants to know
+which send a frame belongs to.
+
+Room names are addressed CASE-INSENSITIVELY (`/bots/groups/release%20room` reaches `Release Room`)
+and two rooms cannot differ by case alone.
+
+### BotGroupDetail
+
+`BotGroup` plus `messages: BotGroupMessage[]`, oldest first. Returned by `GET /bots/groups/:name`.
+
+### BotGroupNote
+
+```
+{ member: string, reason: "timeout" | "failed", detail: string }
+```
+
+Rides a `bot_group_state` frame when a member's turn produced nothing for a reason worth showing.
+`detail` is the gateway's own text, verbatim from Hermes when that is where the failure came from. A
+member that simply PASSED produces no note: passing is the protocol's healthy outcome, not an
+incident.
 
 ## 4. Routes
 
@@ -1081,6 +1150,181 @@ roster warm must re-POST inside that 60 s window. Where Hermes offers a change b
 refreshes on the event instead, which is cheaper than any poll; a change that arrives while a
 refresh is already running costs exactly one more refresh, after it.
 
+### GET /bots/groups
+
+```
+200 { groups: BotGroup[] }
+```
+
+Every room this gateway hosts, oldest first. No Hermes round trip: rooms are the gateway's own
+state (see "Group chats" below), so this route answers from SQLite and is always current.
+
+### POST /bots/groups
+
+```
+body { name: string, members: string[] }   // name 1..64, members 2..6
+201  { group: BotGroup }
+400  invalid_request                       // bad body, member count out of bounds, reserved name
+404  not_found                             // a member names no Hermes profile
+409  conflict                              // a room with that name (case-insensitively) exists
+```
+
+```
+POST /bots/groups
+{ "name": "Release Room", "members": ["scout", "luna"] }
+
+201
+{ "group": { "name": "Release Room", "members": ["scout", "luna"],
+             "createdAt": 1800000000000, "state": "settled", "needsYou": false,
+             "epoch": 0, "updatedAt": 1800000000000 } }
+```
+
+Member names are canonicalized the same way every `/bots/:name` route canonicalizes its path
+parameter (trimmed, lowercased), and DUPLICATES COLLAPSE: `["scout", "Scout"]` is one member and
+therefore fails the two-member floor with a 400 rather than creating a room that talks to itself.
+
+Every member is validated against the roster BEFORE the room is written, so a create either yields a
+room whose membership is real or yields a 404 and no room at all. Membership is fixed at create;
+there is no edit route yet (see section 7).
+
+Six room names are RESERVED and answer 400: `profile`, `chat`, `sessions`, `messages`, `catalog`,
+`focus`. `/bots/groups/:name` and `/bots/:name/<suffix>` are both three segments, and the per-bot
+routes are matched first so that a bot literally named `groups` keeps working. Refusing those six
+names is the other half of that bargain: no room can exist at an address that would not reach it.
+
+On the same reasoning, a name carrying `/`, `\`, `?`, `#`, `%` or a control character answers 400.
+The name IS the path segment the room lives at, and a room whose address only resolves when the
+client percent-encodes it exactly right is a room some client will fail to reach. Spaces are fine
+(`Release%20Room` above), and every other printable character is fine.
+
+### GET /bots/groups/:name
+
+```
+200 BotGroupDetail
+404 not_found
+```
+
+The room and its whole transcript (at most 96 entries; older ones are trimmed).
+
+This read CLEARS the room's `needs you` badge, which is the desktop's rule: opening the room is the
+acknowledgement. The clear is broadcast as a `bot_group_state` frame, so the badge drops on every
+device rather than only on the one that read it. The response itself always carries
+`needsYou: false` for that reason.
+
+### DELETE /bots/groups/:name
+
+```
+204 (no body)
+404 not_found
+```
+
+Deletes the room, its transcript and its per-member watermarks. NOT idempotent: a second delete is a
+404, by the same rule `DELETE /bots/:name` follows, so a client can tell "already gone" from "the
+delete broke".
+
+What it does NOT delete is each member's `Group: <name>` session inside Hermes. That is the bot's own
+memory of the conversation, removing it is not this route's business, and a room later recreated
+under the same name picks those sessions straight back up.
+
+### POST /bots/groups/:name/messages
+
+```
+body { text: string, clientId?: string }   // text 1..32000
+202  { group: string, message: BotGroupMessage }
+400  invalid_request
+404  not_found
+```
+
+```
+POST /bots/groups/Release%20Room/messages
+{ "text": "@luna how is the plan looking?", "clientId": "c-1" }
+
+202
+{ "group": "Release Room",
+  "message": { "seq": 1, "from": { "kind": "user", "name": "You", "displayName": "You" },
+               "text": "@luna how is the plan looking?", "at": 1800000000000, "clientId": "c-1" } }
+```
+
+202, not 200: the message is durable and the deliberation it starts runs afterwards, in the gateway.
+Every reply arrives over `/ws` as `bot_group` frames, with `bot_group_state` around them. Nothing in
+this request waits on a member turn, which is the entire point of hosting the room server-side: the
+phone can be locked before the first bot answers.
+
+The body carries the entry the gateway committed, so the app can render the user's own message
+immediately. `clientId` is echoed there and on the same entry when it arrives in a `bot_group` frame.
+
+### Group chats: how a room actually behaves
+
+This is the one place where this gateway does something the Hermes desktop does NOT, and it is worth
+stating exactly.
+
+**Rooms are gateway-local.** The desktop plugin has no room object at all: it marks each bot's
+`ui_meta` with a group name and runs the whole deliberation in the renderer, keeping the log in
+browser storage. This gateway hosts the room instead: membership, transcript, watermarks and epoch
+live in its SQLite. So a Hermes DESKTOP connected to the same Hermes gateway WILL NOT SEE these
+rooms, their transcripts, or their membership. What it does see is the other half, which is stored
+Hermes-side exactly as the desktop stores it: each member has a session titled `Group: <name>`
+carrying its own side of the conversation. This is a deliberate trade (rooms that survive
+backgrounding, restarts and second devices, in exchange for desktop visibility), not an oversight.
+
+**The protocol itself is the desktop's, unchanged.** A user message starts a deliberation:
+
+1. Responders are resolved from the log slice since the last user message. `@everyone`, `@all`, or
+   NO mention at all means every member answers; otherwise only the members mentioned. A member
+   named by a TEAMMATE joins from the next round, because responders are recomputed each round.
+   Mentions resolve on a bot's name, its name with separators collapsed, its title, and its title's
+   first word, so `@ops-runner`, `@opsrunner` and `@Ops` all reach the same bot. `@user` is the
+   human and never resolves to a member.
+2. Members take turns SERIALLY, never in parallel, in an order rotated by one per round so a
+   different member leads each time.
+3. A member is skipped in a round where nothing it has not already seen has landed. This is why a
+   three-round deliberation between two bots usually posts four messages rather than six.
+4. Each member is asked with a self-contained turn prompt naming the room, its own handle, its
+   peers, and the transcript delta since its last turn (at most 24 lines). The rules travel in that
+   prompt rather than in the bot's SOUL, so ANY existing bot can join a room with no profile change.
+5. A member with nothing to add answers `(pass)` and nothing is posted. Passing is the healthy
+   outcome; a round in which everybody passes settles the room immediately.
+6. Caps: at most 3 rounds and at most 10 posted messages per user send, 2 to 6 members per room, 24
+   delta lines per turn, 180 s per member turn, 96 entries of transcript retained.
+
+**Failure is reported, never invented.** A member whose turn times out or fails posts NOTHING. The
+room emits a `bot_group_state` frame carrying a `note` naming the member and the reason, and the
+round continues with the other members. The gateway never writes a message on a bot's behalf. Two
+non-failure conditions use the same note channel so they are not silent either: `reason: "capped"`
+when the room stopped because it reached its 10-message limit for this send (`member` names the one
+that was next in line), and `reason: "failed"` with a "no longer a bot" detail when a member's
+profile was deleted after the room was created, which is skipped rather than retried every round.
+
+**A newer user message supersedes an older deliberation.** Sending again bumps the room's `epoch`;
+the loop still running checks the epoch at every member boundary and abandons the rest of its rounds
+there, and the new deliberation takes over. The superseded loop stays silent about state: only the
+current one ever emits `settled` or `needs_you`, so a stale settle cannot land on top of a live
+conversation. A member turn already in flight when the supersession happens is NOT waited on, but it
+is not thrown away either: the turn is read once more, and if the member's reply has ALREADY
+completed it is posted (it was a real answer to a real question). If the member is still thinking,
+the turn is abandoned, its answer stays in that member's own `Group: <name>` session, and the next
+round's delta carries the conversation forward from there. Nothing after that turn runs either way.
+
+**Deleting a room stops its deliberation.** `DELETE` answers immediately rather than waiting on a
+member turn that can be up to 180 s from finishing, so a drive may still be winding down for a beat
+afterwards. It writes nothing: a drive checks at every member boundary that the room it started
+against is still the room living at that name, so a room deleted and recreated under the same name
+never runs two deliberations at once, and the dead one's replies are dropped rather than posted into
+the new room.
+
+**`needs you`** is set when a member's reply mentions `@user`, and cleared when the user sends into
+the room or opens it. `@user` has to START a mention, so an email address such as
+`ops@user.example.com` is not an escalation. Setting it also raises a push notification through the
+relay, for a device that is not holding a socket open, under the thread id `group:<name>`; devices
+that were connected at that moment are excluded, because they already have the frame. Client-side
+handling of the `group:<name>` thread id is a follow-up: a client that does not recognize it should
+treat the push as a plain "a room wants you" and open the app.
+
+**Restart behavior.** Everything except "a loop is running right now" is durable. A gateway that
+restarts mid-deliberation comes back with the room, its transcript, its watermarks and its epoch
+intact, and the room `settled`: the process that was driving it is gone, so nothing is running, and
+the next user message starts a fresh deliberation from where the transcript left off.
+
 ### Errors
 
 The ordinary `ErrorBody` (`contract/v1.md` section 4) plus, when the failure came from Hermes,
@@ -1130,6 +1374,10 @@ are only ever sent by a gateway that advertises the capability.
   phase: "polling" | "complete" | "timeout" | "failed",
   running: boolean, inflight: boolean, updatedAt: integer }
 { type: "bot_routines", bot: string, routines: BotRoutine[], updatedAt: integer }
+{ type: "bot_group", group: string, messages: BotGroupMessage[], updatedAt: integer }
+{ type: "bot_group_state", group: string,
+  state: "running" | "settled" | "needs_you",
+  round: integer, epoch: integer, note?: BotGroupNote, updatedAt: integer }
 ```
 
 `bot_roster` and `bot_presence` are FULL REPLACE snapshots, and both are sent only when the value
@@ -1169,11 +1417,34 @@ whose routines pane has been open longer than that should re-read on foreground 
 the frames kept coming. Where a gateway sends no `cron.changed` at all, `POST /bots/focus` with
 `screen: "routines"` drives the same re-read on the desktop's own 20 s cadence.
 
+`bot_group` is a DELTA on the same terms as `bot_chat`: `messages` carries only the room entries the
+gateway has not broadcast before, in `seq` order, and one frame is sent per entry as the
+deliberation produces it. The user's own message rides a frame too, so a second device sees it
+arrive. Key on `BotGroupMessage.seq` and a replayed entry is harmless.
+
+`bot_group_state` brackets a deliberation. `running` is sent when a loop takes the room and again
+whenever it has a `note` to report; `settled` or `needs_you` is sent once when the loop finishes,
+and only by the loop that still owns the room (a superseded loop stays silent). `round` is the
+zero-based round the loop is on, and `epoch` says which user send the frame belongs to. A `note`
+means a member contributed nothing to the round and why: `timeout` and `failed` are its turn not
+completing, and `capped` is the room hitting its 10-message limit with that member next in line. A
+room may also emit a `settled` or `needs_you`
+frame outside a deliberation, when `GET /bots/groups/:name` clears the escalation badge.
+
+Both group frames are BROADCAST to every paired device, on the same one-user-gateway reasoning the
+chat frames use. Unlike `bot_chat` there is no shared read watermark to miss: room entries are
+persisted with a monotonic `seq`, so a device that missed a frame recovers completely by reading
+`GET /bots/groups/:name`.
+
 ## 7. Not in this extension yet
 
 Per-device chat-frame scoping and per-device delta watermarks; model and description writes (see
 `PATCH /bots/:name/profile`); skill install; MCP server setup and OAuth; bot duplicate; avatars;
-routine run-now and run output (the backend exposes neither over this RPC); group chats; push; and
+routine run-now and run output (the backend exposes neither over this RPC); push; and
 multi-connection
 rosters (the bridge targets exactly one Hermes gateway). Route shapes keep the `connection`
 concept out of the URL so a later version can add it additively.
+
+For group chats specifically: editing a room's membership or renaming a room (delete and recreate
+for now; the members' `Group: <name>` sessions are preserved and picked back up by title), a
+per-room interrupt, cross-machine membership, and any sync of rooms back to a Hermes desktop.

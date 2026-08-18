@@ -5,6 +5,8 @@ import {
   BotChatSendRequestSchema,
   BotCreateRequestSchema,
   BotFocusRequestSchema,
+  BotGroupCreateRequestSchema,
+  BotGroupSendRequestSchema,
   BotProfilePatchSchema,
   BotRoutineCreateRequestSchema,
   BotRoutinePatchSchema,
@@ -25,6 +27,7 @@ import {
   PROFILE_ID_RE,
   normalizeProfileName,
 } from "./crud.ts";
+import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import { RoutineNotFound, RoutineRefused, patchNeedsRewrite } from "./routines.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
@@ -550,4 +553,94 @@ export function registerBotRoutes(
       return failure(c, err);
     }
   });
+
+  // Group chats. Registered AFTER the per-bot routes on purpose: `/bots/groups/:name` and
+  // `/bots/:name/<suffix>` are both three segments, and Hono runs matching handlers in registration
+  // order, so a bot literally named `groups` keeps `/bots/groups/profile` and friends. The other
+  // half of that bargain is `RESERVED_GROUP_NAMES`, which refuses those suffixes as room names, so
+  // no room can be created at an address that would not reach it.
+  //
+  // `/bots/groups` itself is two segments and collides with nothing: the only two-segment per-bot
+  // route is `DELETE /bots/:name`, and rooms are deleted at `/bots/groups/:name`.
+  app.get("/bots/groups", requireDevice, (c) => c.json({ groups: bots.groups() }));
+
+  app.post("/bots/groups", requireDevice, async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotGroupCreateRequestSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      return c.json({ group: await bots.createGroup(parsed.name, parsed.members) }, 201);
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+
+  app.get("/bots/groups/:group", requireDevice, (c) => {
+    try {
+      return c.json(bots.groupDetail(c.req.param("group") ?? ""));
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+
+  // 204: the room is gone, along with its transcript and its per-member watermarks. The members'
+  // own `Group: <name>` sessions in Hermes are left standing (see `GroupRooms.remove`).
+  app.delete("/bots/groups/:group", requireDevice, (c) => {
+    try {
+      bots.deleteGroup(c.req.param("group") ?? "");
+      return c.body(null, 204);
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+
+  // 202, like the 1:1 composer: the message is durable, and the deliberation it starts arrives later
+  // as `bot_group` and `bot_group_state` frames. Nothing here waits on a member turn, which is the
+  // whole point of hosting the room server-side.
+  app.post("/bots/groups/:group/messages", requireDevice, async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotGroupSendRequestSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      const group = c.req.param("group") ?? "";
+      const message = bots.sendGroupMessage(group, parsed.text, {
+        ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
+      });
+      return c.json({ group, message }, 202);
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+}
+
+/** Room errors on top of the shared `failure` mapping. A room is this gateway's own object, so its
+ *  failures are ordinary 4xx answers rather than anything about Hermes; only membership validation
+ *  reaches Hermes at all, and that arrives here as `BotNotFound`, which `failure` already answers
+ *  as the 404 it is. */
+function groupFailure(c: Context<Env>, err: unknown) {
+  if (err instanceof GroupNotFound) return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof GroupExists) return c.json(extensionErrorBody("conflict", err.message), 409);
+  if (err instanceof GroupInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+  if (err instanceof BotNameInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+  return failure(c, err);
 }

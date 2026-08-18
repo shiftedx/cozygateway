@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import type { BotSummary, ServerFrame } from "../src/index.ts";
+import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/index.ts";
 import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotFocusRequestSchema,
+  BotGroupCreateRequestSchema,
+  BotGroupDetailSchema,
+  BotGroupMessageSchema,
+  BotGroupSchema,
+  BotGroupSendRequestSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
   BotRoutineCreateRequestSchema,
@@ -28,6 +33,23 @@ const bot: BotSummary = {
   chatSessionId: "sess-1",
   preview: { kind: "a2a", text: "the build is green", sender: "luna" },
   meta: { title: "Scout", created: 1_799_000_000_000 },
+};
+
+const groupMessage: BotGroupMessage = {
+  seq: 2,
+  from: { kind: "member", name: "scout", displayName: "Scout" },
+  text: "CI is green",
+  at: 1_800_000_000_000,
+};
+
+const group: BotGroup = {
+  name: "Release Room",
+  members: ["scout", "luna"],
+  createdAt: 1_799_000_000_000,
+  state: "settled",
+  needsYou: false,
+  epoch: 2,
+  updatedAt: 1_800_000_000_000,
 };
 
 describe("bot summary", () => {
@@ -56,12 +78,53 @@ describe("bots server frames", () => {
     const frames: ServerFrame[] = [
       { type: "bot_roster", bots: [bot], updatedAt: 1 },
       { type: "bot_presence", active: ["scout"], updatedAt: 1 },
+      { type: "bot_group", group: "Release Room", messages: [groupMessage], updatedAt: 1 },
+      { type: "bot_group_state", group: "Release Room", state: "running", round: 0, epoch: 2, updatedAt: 1 },
+      {
+        type: "bot_group_state",
+        group: "Release Room",
+        state: "needs_you",
+        round: 1,
+        epoch: 2,
+        note: { member: "scout", reason: "timeout", detail: "no reply within 180s" },
+        updatedAt: 1,
+      },
     ];
     for (const frame of frames) expect(check(ServerFrameSchema, frame)).toBe(true);
   });
 
   it("still rejects an unknown frame type, since the union stays closed", () => {
     expect(check(ServerFrameSchema, { type: "bot_routines", jobs: [] })).toBe(false);
+  });
+});
+
+describe("group rooms", () => {
+  it("accepts a room, its log, and a room plus log", () => {
+    expect(check(BotGroupMessageSchema, groupMessage)).toBe(true);
+    expect(check(BotGroupSchema, group)).toBe(true);
+    expect(check(BotGroupDetailSchema, { ...group, messages: [groupMessage] })).toBe(true);
+    // The log is required on the detail shape: a room with no messages sends `[]`, never nothing.
+    expect(check(BotGroupDetailSchema, group)).toBe(false);
+  });
+
+  it("keeps the state and sender unions closed", () => {
+    expect(check(BotGroupSchema, { ...group, state: "thinking" })).toBe(false);
+    expect(
+      check(BotGroupMessageSchema, { ...groupMessage, from: { kind: "bot", name: "scout", displayName: "Scout" } }),
+    ).toBe(false);
+  });
+
+  it("holds the 2 to 6 membership bounds at the wire boundary", () => {
+    const base = { name: "Release Room" };
+    expect(check(BotGroupCreateRequestSchema, { ...base, members: ["scout"] })).toBe(false);
+    expect(check(BotGroupCreateRequestSchema, { ...base, members: ["scout", "luna"] })).toBe(true);
+    expect(check(BotGroupCreateRequestSchema, { ...base, members: ["a", "b", "c", "d", "e", "f"] })).toBe(true);
+    expect(check(BotGroupCreateRequestSchema, { ...base, members: ["a", "b", "c", "d", "e", "f", "g"] })).toBe(false);
+  });
+
+  it("requires text on a send, and bounds the client id", () => {
+    expect(check(BotGroupSendRequestSchema, { text: "" })).toBe(false);
+    expect(check(BotGroupSendRequestSchema, { text: "hi", clientId: "c-1" })).toBe(true);
   });
 });
 
@@ -204,7 +267,8 @@ describe("capability advertisement", () => {
     expect(BOTS_CAPABILITY_ID).toBe("com.cozylabs.bots");
     // 2 for the composer (a v1 gateway 404s the send route), 3 for the edit-profile surface
     // (a v2 gateway 404s the profile routes, which reads as a Save that silently does nothing),
-    // 4 for the routines surface (a v3 gateway 404s them and never sends `bot_routines`).
-    expect(BOTS_CAPABILITY_VERSION).toBe(4);
+    // 4 for the routines surface (a v3 gateway 404s them and never sends `bot_routines`),
+    // 5 for the group-chat rooms (a v4 gateway 404s them and never sends `bot_group`).
+    expect(BOTS_CAPABILITY_VERSION).toBe(5);
   });
 });
