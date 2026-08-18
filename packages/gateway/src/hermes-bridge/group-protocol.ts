@@ -100,10 +100,15 @@ export function parseMentions(text: string, members: GroupMember[]): { everyone:
   return { everyone, members: named };
 }
 
-/** True when a MEMBER's reply escalates to the human (dissection 9.9). Word-bounded so `@userland`
- *  is not an escalation. */
+/** True when a MEMBER's reply escalates to the human (dissection 9.9).
+ *
+ *  Word-bounded on the right so `@userland` is not an escalation, and bounded on the LEFT as well,
+ *  which upstream is not: `@user` has to START a mention, so `mail me at ops@user.example.com` is an
+ *  email address rather than a summons. Upstream got away with the looser rule because a false
+ *  positive there only lit a pill in a window the user was already looking at; here it sets durable
+ *  room state and raises an out-of-band escalation. */
 export function mentionsUser(text: string): boolean {
-  return /@user\b/i.test(text);
+  return /(?:^|[^\w@.-])@user\b/i.test(text);
 }
 
 /** Who answers this round (dissection 9.4). Scan the log back to the last USER entry, take that

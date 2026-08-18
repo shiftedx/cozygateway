@@ -1192,6 +1192,11 @@ Six room names are RESERVED and answer 400: `profile`, `chat`, `sessions`, `mess
 routes are matched first so that a bot literally named `groups` keeps working. Refusing those six
 names is the other half of that bargain: no room can exist at an address that would not reach it.
 
+On the same reasoning, a name carrying `/`, `\`, `?`, `#`, `%` or a control character answers 400.
+The name IS the path segment the room lives at, and a room whose address only resolves when the
+client percent-encodes it exactly right is a room some client will fail to reach. Spaces are fine
+(`Release%20Room` above), and every other printable character is fine.
+
 ### GET /bots/groups/:name
 
 ```
@@ -1284,17 +1289,36 @@ backgrounding, restarts and second devices, in exchange for desktop visibility),
 
 **Failure is reported, never invented.** A member whose turn times out or fails posts NOTHING. The
 room emits a `bot_group_state` frame carrying a `note` naming the member and the reason, and the
-round continues with the other members. The gateway never writes a message on a bot's behalf.
+round continues with the other members. The gateway never writes a message on a bot's behalf. Two
+non-failure conditions use the same note channel so they are not silent either: `reason: "capped"`
+when the room stopped because it reached its 10-message limit for this send (`member` names the one
+that was next in line), and `reason: "failed"` with a "no longer a bot" detail when a member's
+profile was deleted after the room was created, which is skipped rather than retried every round.
 
 **A newer user message supersedes an older deliberation.** Sending again bumps the room's `epoch`;
 the loop still running checks the epoch at every member boundary and abandons the rest of its rounds
 there, and the new deliberation takes over. The superseded loop stays silent about state: only the
 current one ever emits `settled` or `needs_you`, so a stale settle cannot land on top of a live
-conversation. A member turn already in flight when the supersession happens is allowed to finish and
-its message is posted (it was a real answer to a real question), but nothing after it runs.
+conversation. A member turn already in flight when the supersession happens is NOT waited on, but it
+is not thrown away either: the turn is read once more, and if the member's reply has ALREADY
+completed it is posted (it was a real answer to a real question). If the member is still thinking,
+the turn is abandoned, its answer stays in that member's own `Group: <name>` session, and the next
+round's delta carries the conversation forward from there. Nothing after that turn runs either way.
+
+**Deleting a room stops its deliberation.** `DELETE` answers immediately rather than waiting on a
+member turn that can be up to 180 s from finishing, so a drive may still be winding down for a beat
+afterwards. It writes nothing: a drive checks at every member boundary that the room it started
+against is still the room living at that name, so a room deleted and recreated under the same name
+never runs two deliberations at once, and the dead one's replies are dropped rather than posted into
+the new room.
 
 **`needs you`** is set when a member's reply mentions `@user`, and cleared when the user sends into
-the room or opens it.
+the room or opens it. `@user` has to START a mention, so an email address such as
+`ops@user.example.com` is not an escalation. Setting it also raises a push notification through the
+relay, for a device that is not holding a socket open, under the thread id `group:<name>`; devices
+that were connected at that moment are excluded, because they already have the frame. Client-side
+handling of the `group:<name>` thread id is a follow-up: a client that does not recognize it should
+treat the push as a plain "a room wants you" and open the app.
 
 **Restart behavior.** Everything except "a loop is running right now" is durable. A gateway that
 restarts mid-deliberation comes back with the room, its transcript, its watermarks and its epoch
@@ -1402,7 +1426,9 @@ arrive. Key on `BotGroupMessage.seq` and a replayed entry is harmless.
 whenever it has a `note` to report; `settled` or `needs_you` is sent once when the loop finishes,
 and only by the loop that still owns the room (a superseded loop stays silent). `round` is the
 zero-based round the loop is on, and `epoch` says which user send the frame belongs to. A `note`
-means a member's turn produced nothing and why. A room may also emit a `settled` or `needs_you`
+means a member contributed nothing to the round and why: `timeout` and `failed` are its turn not
+completing, and `capped` is the room hitting its 10-message limit with that member next in line. A
+room may also emit a `settled` or `needs_you`
 frame outside a deliberation, when `GET /bots/groups/:name` clears the escalation badge.
 
 Both group frames are BROADCAST to every paired device, on the same one-user-gateway reasoning the

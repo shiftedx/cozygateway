@@ -94,6 +94,19 @@ describe("mentionsUser", () => {
     expect(mentionsUser("the @userland build")).toBe(false);
     expect(mentionsUser("nothing to see")).toBe(false);
   });
+
+  it("is bounded on the LEFT too, so an email address is not a summons", () => {
+    // Upstream's rule fires on both of these. Here the escalation sets durable room state and
+    // raises a push, so a bot quoting a support address must not page the human.
+    expect(mentionsUser("mail me at a@user.io")).toBe(false);
+    expect(mentionsUser("escalate to ops@user.example.com")).toBe(false);
+    expect(mentionsUser("see docs.@user")).toBe(false);
+    // Still an escalation in every shape a model actually writes one.
+    expect(mentionsUser("@user")).toBe(true);
+    expect(mentionsUser("hey @user, thoughts?")).toBe(true);
+    expect(mentionsUser("(@user should decide)")).toBe(true);
+    expect(mentionsUser("line one\n@user look at this")).toBe(true);
+  });
 });
 
 describe("resolveResponders", () => {

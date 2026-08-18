@@ -75,6 +75,14 @@ interface FakeGroupOptions {
   silent?: string[];
   /** Milliseconds a profile's reply takes to appear. */
   delayMs?: Record<string, number>;
+  /** Rows every session is born with. Real bots have these (a `system` prompt is the first row of
+   *  most transcripts) and they are exactly the rows `mapChatMessage` DROPS, so a fake that never
+   *  emits one cannot see a baseline that indexes the wrong list. */
+  seedRows?: Array<Record<string, unknown>>;
+  /** True to write a tool round trip (an assistant turn whose content is a bare `tool_use` part,
+   *  then a `tool` result row) in front of every reply. Both rows are dropped by the render filter,
+   *  so the raw count and the rendered count diverge by two per turn. */
+  toolNoise?: boolean;
 }
 
 /** A Hermes with several profiles and lazily created, title-addressable sessions.
@@ -83,8 +91,13 @@ interface FakeGroupOptions {
  *  accepts the RUNTIME id, `session.resume` answers on the stored id, and `session.resume` must also
  *  resolve a TITLE in the id slot, which is what makes a room rehydrate after its stored ids are
  *  gone (dissection 9.6). */
-function fakeGroupHermes(options: FakeGroupOptions = {}): { behavior: FakeHermesBehavior; sessions: FakeSession[] } {
-  const profiles = options.profiles ?? ["scout", "luna"];
+function fakeGroupHermes(options: FakeGroupOptions = {}): {
+  behavior: FakeHermesBehavior;
+  sessions: FakeSession[];
+  /** Drops a profile from `profiles.list`, i.e. a bot deleted after a room was created. */
+  removeProfile: (name: string) => void;
+} {
+  const profiles = [...(options.profiles ?? ["scout", "luna"])];
   const sessions: FakeSession[] = [];
   const queues = new Map<string, string[]>(Object.entries(options.replies ?? {}).map(([k, v]) => [k, [...v]]));
   const spoken = new Map<string, number>();
@@ -127,7 +140,7 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): { behavior: FakeHermes
           runtime: `runtime-${seq}`,
           profile: String(params["profile"] ?? ""),
           title: String(params["title"] ?? ""),
-          messages: [],
+          messages: (options.seedRows ?? []).map((row) => ({ ...row })),
         };
         sessions.push(session);
         return { stored_session_id: session.stored, session_id: session.runtime };
@@ -159,7 +172,16 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): { behavior: FakeHermes
         const reply = nextReply(session.profile);
         if (reply !== undefined) {
           const delay = options.delayMs?.[session.profile] ?? 0;
-          const push = (): void => void session.messages.push({ role: "assistant", content: reply });
+          const push = (): void => {
+            if (options.toolNoise === true) {
+              session.messages.push({
+                role: "assistant",
+                content: [{ type: "tool_use", name: "grep", input: { pattern: "release" } }],
+              });
+              session.messages.push({ role: "tool", content: "3 matches" });
+            }
+            session.messages.push({ role: "assistant", content: reply });
+          };
           if (delay === 0) push();
           else setTimeout(push, delay).unref?.();
         }
@@ -167,7 +189,14 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): { behavior: FakeHermes
       },
     },
   };
-  return { behavior, sessions };
+  return {
+    behavior,
+    sessions,
+    removeProfile: (name: string) => {
+      const index = profiles.indexOf(name);
+      if (index !== -1) profiles.splice(index, 1);
+    },
+  };
 }
 
 interface Harness {
@@ -181,6 +210,9 @@ interface Harness {
   request: (path: string, init?: RequestInit) => Promise<Response>;
   /** Every prompt this Hermes was asked, with the profile it was asked of. */
   prompts: () => Array<{ profile: string; text: string }>;
+  /** Every out-of-band `@user` escalation the bridge raised. Stands in for the push notifier, which
+   *  is what `server.ts` wires this seam to. */
+  escalations: Array<{ group: string; member: string; displayName: string; text: string }>;
 }
 
 async function setup(
@@ -198,10 +230,12 @@ async function setup(
     reconnect: { minMs: 15, maxMs: 60 },
   });
   const frames: ServerFrame[] = [];
+  const escalations: Array<{ group: string; member: string; displayName: string; text: string }> = [];
   const bridge = new HermesBridge({
     client,
     storage,
     broadcast: (frame) => frames.push(frame),
+    onGroupEscalation: (event) => escalations.push(event),
     // Real wall-clock: the turn cap is a duration, and a per-read counter would make a 200 ms cap
     // mean "200 clock reads" instead.
     now: () => Date.now(),
@@ -259,6 +293,7 @@ async function setup(
         headers: { "content-type": "application/json", ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` },
       }),
     request: async (path, init) => app.request(path, init),
+    escalations,
     prompts: () =>
       server
         .callsOf("prompt.submit")
@@ -704,5 +739,242 @@ describe("durability", () => {
     const prompt = second.prompts()[0]!;
     expect(prompt.text).toContain("  You (user): and now?");
     expect(prompt.text).not.toContain("ready?");
+  });
+});
+
+describe("transcripts a real bot actually has", () => {
+  it("keeps finding replies once the transcript carries rows a chat does not render", async () => {
+    // The regression this pins: the reply baseline used to be Hermes' RAW `message_count` while the
+    // window it indexed was the FILTERED render list. One system row plus one tool round trip is
+    // enough to make the window empty, and from then on EVERY member turn runs to the timeout cap
+    // and the room is dead. Both row kinds are ordinary for any bot that has used a tool once.
+    const { behavior } = fakeGroupHermes({
+      seedRows: [{ role: "system", content: "you are a helpful bot" }],
+      toolNoise: true,
+      alwaysSpeak: true,
+    });
+    const harness = await setup(behavior, { turnTimeoutMs: 800 });
+    await createRoom(harness);
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "hello team" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    // The SECOND send is where the old code died: by then the dropped rows have accumulated.
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "second turn please" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    const afterSecond = detail.messages.slice(
+      detail.messages.findIndex((message) => message.text === "second turn please") + 1,
+    );
+    expect(afterSecond.length).toBeGreaterThan(0);
+    expect(afterSecond.map((message) => message.from.name)).toContain("scout");
+    expect(afterSecond.map((message) => message.from.name)).toContain("luna");
+    // And nothing timed out on the way: a note here would mean the window was empty again.
+    const notes = stateFrames(harness.frames).flatMap((frame) => (frame.note === undefined ? [] : [frame.note]));
+    expect(notes.filter((note) => note.reason === "timeout")).toEqual([]);
+    // Every member message is a distinct reply, so no stale answer was returned twice either.
+    const memberTexts = detail.messages.filter((message) => message.from.kind === "member").map((m) => m.text);
+    expect(new Set(memberTexts).size).toBe(memberTexts.length);
+  });
+});
+
+describe("delete racing a live drive", () => {
+  it("never runs two drives against one room key, so a recreated room cannot duplicate messages", async () => {
+    // The regression this pins: `remove()` used to DROP the drive handle while the drive was still
+    // running. A room recreated under the same key then had nothing to chain behind, and the dead
+    // drive's epoch guard matched the fresh room's epoch after its first send, so two drives ran
+    // against one room and the log came back with duplicated messages.
+    const { behavior } = fakeGroupHermes({ alwaysSpeak: true, delayMs: { scout: 200, luna: 200 } });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "original question" }),
+    });
+    // Delete while scout's turn is genuinely in flight.
+    await until(() => harness.prompts().length === 1);
+    const deleted = await harness.authed("/bots/groups/Release%20Room", { method: "DELETE" });
+    expect(deleted.status).toBe(204);
+    await createRoom(harness);
+    const sent = await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "fresh start" }),
+    });
+    expect(sent.status).toBe(202);
+
+    await harness.bridge.groupSettled("Release Room");
+    // The dying drive can still be finishing its own turn when the fresh one settles; give the key
+    // one more settle so nothing it might write lands after the assertions.
+    await harness.bridge.groupSettled("Release Room");
+
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    // The fresh room starts from nothing: the deleted room's transcript cascaded away, and the dead
+    // drive wrote none of its own replies into the room that replaced it.
+    expect(detail.messages[0]).toMatchObject({ seq: 1, text: "fresh start" });
+    const texts = detail.messages.map((message) => message.text);
+    expect(new Set(texts).size).toBe(texts.length);
+    expect(texts).not.toContain("original question");
+    // Serial to the end: seqs are contiguous and each member message follows the one before it.
+    expect(detail.messages.map((message) => message.seq)).toEqual(
+      detail.messages.map((_message, index) => index + 1),
+    );
+  });
+
+  it("does not report a recreated room as running just because the old drive is winding down", async () => {
+    const { behavior } = fakeGroupHermes({ alwaysSpeak: true, delayMs: { scout: 200, luna: 200 } });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "original question" }),
+    });
+    await until(() => harness.prompts().length === 1);
+    await harness.authed("/bots/groups/Release%20Room", { method: "DELETE" });
+    const fresh = await createRoom(harness);
+    expect(fresh.state).toBe("settled");
+  });
+});
+
+describe("supersession keeps a completed answer", () => {
+  it("posts an in-flight member's reply when it had already landed", async () => {
+    // The contract's own rule: a turn already in flight when a newer user message arrives is not
+    // waited on, but an answer that has ALREADY completed was a real answer to a real question and
+    // is posted rather than discarded.
+    const { behavior } = fakeGroupHermes({
+      replies: { scout: ["the answer that just landed"], luna: ["(pass)", "(pass)", "(pass)"] },
+      // Long enough that the room is superseded before the poll cadence would have picked the
+      // reply up, short enough that it HAS landed by the time the harvest read goes out.
+      delayMs: { scout: 60 },
+    });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "first question" }),
+    });
+    await until(() => harness.prompts().length === 1);
+    // Wait for scout's answer to exist in Hermes, THEN supersede: the harvest read must find it.
+    await until(() => harness.server.callsOf("session.resume").length > 1);
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "second question" }),
+    });
+    await until(() => !harness.bridge.groupRunning("Release Room"));
+
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    expect(detail.messages.map((message) => message.text)).toContain("the answer that just landed");
+  });
+});
+
+describe("the @user escalation", () => {
+  it("raises an out-of-band escalation alongside the durable badge", async () => {
+    const { behavior } = fakeGroupHermes({
+      replies: { scout: ["@user we need a decision on the cutoff"], luna: ["(pass)", "(pass)", "(pass)"] },
+    });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "what is blocking us" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    expect(harness.escalations).toEqual([
+      {
+        group: "Release Room",
+        member: "scout",
+        displayName: "Scout",
+        text: "@user we need a decision on the cutoff",
+      },
+    ]);
+  });
+
+  it("does not raise one for an email address that merely contains @user", async () => {
+    const { behavior } = fakeGroupHermes({
+      replies: { scout: ["file it with ops@user.example.com"], luna: ["(pass)", "(pass)", "(pass)"] },
+    });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "where do bugs go" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    expect(harness.escalations).toEqual([]);
+    const group = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    expect(group.needsYou).toBe(false);
+  });
+});
+
+describe("rooms say why they stopped", () => {
+  it("reports the ten-message cap as a note instead of settling silently", async () => {
+    // Four members would post twelve over three rounds; the cap lands first.
+    const { behavior } = fakeGroupHermes({ profiles: ["a", "b", "c", "d"], alwaysSpeak: true });
+    const harness = await setup(behavior);
+    await createRoom(harness, "Loud Room", ["a", "b", "c", "d"]);
+    await harness.authed("/bots/groups/Loud%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "everybody talk" }),
+    });
+    await harness.bridge.groupSettled("Loud Room");
+
+    const notes = stateFrames(harness.frames).flatMap((frame) => (frame.note === undefined ? [] : [frame.note]));
+    const capped = notes.filter((note) => note.reason === "capped");
+    expect(capped).toHaveLength(1);
+    expect(capped[0]!.detail).toContain("10-message limit");
+  });
+
+  it("skips a member whose profile was deleted after the room was created", async () => {
+    const { behavior, removeProfile } = fakeGroupHermes({ replies: { luna: ["I will cover it"] } });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+    // Scout is gone, and the roster cache has caught up.
+    removeProfile("scout");
+    await harness.bridge.refresh("test");
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "who is on this" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    // Not one prompt was spent on the deleted member, and the room said so.
+    expect(harness.prompts().map((prompt) => prompt.profile)).not.toContain("scout");
+    const notes = stateFrames(harness.frames).flatMap((frame) => (frame.note === undefined ? [] : [frame.note]));
+    expect(notes.some((note) => note.member === "scout" && note.detail.includes("no longer a bot"))).toBe(true);
+    // And the surviving member still answered.
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    expect(detail.messages.map((message) => message.text)).toContain("I will cover it");
+  });
+});
+
+describe("room names are addresses", () => {
+  it("refuses a name that would need percent-encoding to reach", async () => {
+    const { behavior } = fakeGroupHermes();
+    const harness = await setup(behavior);
+    for (const name of ["a/b", "back\\slash", "hash#tag", "pct%20", "q?uery"]) {
+      const res = await harness.authed("/bots/groups", {
+        method: "POST",
+        body: JSON.stringify({ name, members: ["scout", "luna"] }),
+      });
+      expect([name, res.status]).toEqual([name, 400]);
+    }
+    // A space is fine: it is what `Release%20Room` already relies on.
+    const ok = await harness.authed("/bots/groups", {
+      method: "POST",
+      body: JSON.stringify({ name: "Two Words", members: ["scout", "luna"] }),
+    });
+    expect(ok.status).toBe(201);
   });
 });

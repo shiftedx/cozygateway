@@ -197,6 +197,11 @@ export interface HermesBridgeOptions {
   /** How long a superseding group drive waits before taking over. Default `GROUP_CHAIN_DELAY_MS`
    *  (250 ms), the desktop's own. */
   groupChainDelayMs?: number;
+  /** Raised when a group member's reply mentions `@user` (spec section 4's escalation). The room's
+   *  durable `needs you` state and its `bot_group_state` frame have already happened by then; this
+   *  is the out-of-band leg, for a device with no live socket. Wired to the push notifier at server
+   *  assembly; unset (as in every test that does not care) means the escalation stays in-band. */
+  onGroupEscalation?: (event: { group: string; member: string; displayName: string; text: string }) => void;
   /** How long a profile delete is given. Default `PROFILE_DELETE_TIMEOUT_MS` (180 s). Overridable
    *  so the timeout path is testable in milliseconds instead of minutes. */
   deleteTimeoutMs?: number;
@@ -323,6 +328,14 @@ export class HermesBridge implements BotsSurface {
       hidden: this.#hideBotChats,
       memberInfo: (name) => this.#memberInfo(name),
       assertBotKnown: (name) => this.#assertBotKnown(name),
+      // Cache-only and deliberately unsure: an EMPTY roster means the cache has not landed yet, not
+      // that every bot was deleted, and answering `false` there would make a cold start report every
+      // member of every room as gone.
+      memberKnown: (name) => {
+        const bots = this.#storage.botRoster().bots;
+        return bots.length === 0 ? undefined : bots.some((bot) => bot.name === name);
+      },
+      ...(opts.onGroupEscalation === undefined ? {} : { escalate: opts.onGroupEscalation }),
       // A member turn is the same shape of wait as a 1:1 turn, so it honors the same overrides and
       // a test can scale both down together.
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
@@ -969,7 +982,9 @@ export class HermesBridge implements BotsSurface {
   async close(): Promise<void> {
     this.#closed = true;
     this.#chat.close();
-    this.#groups.close();
+    // Awaited: a room drive that is mid-turn holds a reference to the storage the caller is about
+    // to close, and it must be finished with it before this resolves.
+    await this.#groups.close();
     if (this.#pollTimer !== undefined) clearTimeout(this.#pollTimer);
     this.#pollTimer = undefined;
     if (this.#debounceTimer !== undefined) clearTimeout(this.#debounceTimer);

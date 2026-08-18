@@ -1,3 +1,5 @@
+import type { BotChatMessage } from "cozygateway-contract";
+
 import type { HermesRpc } from "./canonical-chat.ts";
 import { parseChatSnapshot } from "./chat-messages.ts";
 import { CHAT_POLL_MS, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
@@ -38,11 +40,49 @@ export type GroupTurnResult =
 export interface GroupSession {
   storedId: string;
   runtimeId: string;
-  /** Messages already in the session when it was resolved, the baseline a turn grows past. Zero for
-   *  a session that was just created, or one too lazy to resume. */
+  /** RAW transcript rows Hermes reported when the session was resolved, i.e. `message_count`.
+   *
+   *  This number lives in HERMES' coordinate space, which counts every row: `system` prompts,
+   *  `tool` results and tool-call-only assistant turns included. It is therefore only ever
+   *  compared against another RAW count (the "did the transcript grow at all" check) and MUST NOT
+   *  be used to index `snapshot.messages`, which is the FILTERED render list `mapChatMessage`
+   *  produces. Mixing the two is what made every member turn time out for any bot whose transcript
+   *  had ever carried a dropped row. */
   messageCount: number;
+  /** RENDERED messages already in the session when it was resolved: the baseline in the SAME
+   *  coordinate space as `snapshot.messages`, and the only offset a reply slice is taken at. */
+  renderedCount: number;
+  /** Id of the last rendered message at resolve time, when there was one. The primary anchor: a
+   *  compaction or a trim can shift `renderedCount` out from under us, and an identity match
+   *  cannot be shifted. Falls back to `renderedCount` when the id is gone. */
+  lastRenderedId?: string;
   /** True when this call created the session, so the caller knows to persist the stored id. */
   created: boolean;
+}
+
+/** The newest assistant message strictly AFTER the baseline this turn started from.
+ *
+ *  Anchored on the id of the last rendered message seen before submit, and falling back to the
+ *  rendered COUNT when that id is no longer in the transcript. Both anchors are in the filtered
+ *  render space, which is the space `messages` is in; the raw `message_count` never enters here.
+ *
+ *  Walking back from the end (rather than the desktop's walk over the whole transcript) is what
+ *  makes a stale reply unrepresentable: the previous turn's answer sits BEFORE the baseline and is
+ *  never a candidate. */
+export function findFreshReply(
+  messages: readonly BotChatMessage[],
+  session: Pick<GroupSession, "renderedCount" | "lastRenderedId">,
+): BotChatMessage | undefined {
+  let baseline = Math.min(session.renderedCount, messages.length);
+  if (session.lastRenderedId !== undefined) {
+    const index = messages.findIndex((message) => message.id === session.lastRenderedId);
+    if (index !== -1) baseline = index + 1;
+  }
+  for (let index = messages.length - 1; index >= baseline; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "assistant") return message;
+  }
+  return undefined;
 }
 
 export interface GroupSessionOptions {
@@ -86,16 +126,32 @@ export async function ensureGroupSession(
   const targets = opts.storedId === undefined ? [title] : [opts.storedId, title];
   for (const target of targets) {
     try {
+      // Messages are ASKED FOR here, unlike the 1:1 path's cheap probe: the turn's baseline has to
+      // be the RENDERED length, and `omit_messages: true` can only ever answer with the raw count.
+      // One extra transcript read per member turn is the price of a baseline that indexes the list
+      // it is actually used against.
       const raw = asRecord(await rpc.request("session.resume", {
         session_id: target,
         profile: member,
-        omit_messages: true,
+        omit_messages: false,
       }));
       const runtimeId = asId(raw?.["session_id"]);
       if (runtimeId === undefined) continue;
       const storedId = asId(raw?.["session_key"]) ?? (target === title ? runtimeId : target);
+      // Parsed under the STORED id, and so is every poll below, so the ids `mapChatMessage`
+      // synthesizes for rows carrying none (`<session>#<index>`) are comparable across the two
+      // reads. Parsing each read under whatever id it was addressed by would make the anchor miss
+      // on the first poll and silently drop back to the count.
       const snapshot = parseChatSnapshot(raw, storedId);
-      return { storedId, runtimeId, messageCount: snapshot.messageCount, created: false };
+      const lastRendered = snapshot.messages.at(-1);
+      return {
+        storedId,
+        runtimeId,
+        messageCount: snapshot.messageCount,
+        renderedCount: snapshot.messages.length,
+        ...(lastRendered === undefined ? {} : { lastRenderedId: lastRendered.id }),
+        created: false,
+      };
     } catch {
       // A session that does not exist under this key is the ordinary case for the first turn of a
       // new room. Fall through to the next key, and then to creation.
@@ -114,7 +170,7 @@ export async function ensureGroupSession(
   if (runtimeId === undefined || storedId === undefined) {
     throw new Error(`hermes session.create returned no session ids for ${member}`);
   }
-  return { storedId, runtimeId, messageCount: 0, created: true };
+  return { storedId, runtimeId, messageCount: 0, renderedCount: 0, created: true };
 }
 
 export interface MemberTurnOptions {
@@ -127,7 +183,8 @@ export interface MemberTurnOptions {
   pollMs?: number;
   timeoutMs?: number;
   /** True while this turn is still the room's business. A superseding user message flips it, and
-   *  the poll then stops rather than spending the rest of the 180 s cap on an answer nobody wants. */
+   *  the poll then stops rather than spending the rest of the 180 s cap on an answer nobody wants.
+   *  It stops with ONE last read (`harvest`), so an answer that already landed is not discarded. */
   live?: () => boolean;
   log?: (message: string) => void;
 }
@@ -159,7 +216,7 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
 
   while (opts.now() < deadline) {
     await sleep(pollMs);
-    if (!live()) return { outcome: "pass" };
+    if (!live()) return await harvest({ rpc, member, session, resumeId, log });
 
     let raw: unknown;
     try {
@@ -182,18 +239,13 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
       continue;
     }
 
-    const snapshot = parseChatSnapshot(raw, resumeId);
+    const snapshot = parseChatSnapshot(raw, session.storedId);
     if (snapshot.running || snapshot.inflight) continue;
+    // RAW against RAW: `messageCount` is Hermes' own row count, and this is the only thing it is
+    // ever compared against. The reply itself is picked in the FILTERED space by `findFreshReply`.
     const count = Math.max(snapshot.messages.length, snapshot.messageCount);
     if (count <= session.messageCount) continue;
-    // The newest assistant message AT OR PAST THE BASELINE. The desktop walks back over the whole
-    // transcript here, which has a race it gets away with because the window is small: the user's own
-    // prompt lands first, so between "the count grew" and "the model started" the walk finds the
-    // PREVIOUS turn's reply and returns it as this turn's. In a room that reads as a member repeating
-    // itself, which is exactly the thing the protocol asks members not to do. Slicing at the baseline
-    // costs nothing and makes a stale reply unrepresentable.
-    const fresh = snapshot.messages.slice(Math.min(session.messageCount, snapshot.messages.length));
-    const reply = [...fresh].reverse().find((message) => message.role === "assistant");
+    const reply = findFreshReply(snapshot.messages, session);
     if (reply === undefined) continue;
     const text = reply.text.trim();
     return text.length === 0 ? { outcome: "pass" } : { outcome: "spoke", text };
@@ -201,6 +253,39 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
 
   const detail = lastDetail.length > 0 ? lastDetail : `no reply within ${Math.round(timeoutMs / 1000)}s`;
   return { outcome: "timeout", detail };
+}
+
+/** What a superseded turn does with its answer.
+ *
+ *  The contract's promise is that a member turn already in flight when a newer user message lands
+ *  is not thrown away just for being late: it was a real answer to a real question. But it must not
+ *  hold the room up either, so this does NOT wait. One read: if the reply has ALREADY completed it
+ *  is returned and the room posts it; if the member is still thinking, the turn is abandoned and
+ *  the answer stays in the member's own `Group: <name>` session, where the next round's delta will
+ *  carry the conversation forward anyway. */
+async function harvest(args: {
+  rpc: HermesRpc;
+  member: string;
+  session: GroupSession;
+  resumeId: string;
+  log: (message: string) => void;
+}): Promise<GroupTurnResult> {
+  const { rpc, member, session, resumeId, log } = args;
+  try {
+    const raw = await rpc.request("session.resume", {
+      session_id: resumeId,
+      profile: member,
+      omit_messages: false,
+    });
+    const snapshot = parseChatSnapshot(raw, session.storedId);
+    if (!snapshot.running && !snapshot.inflight) {
+      const text = findFreshReply(snapshot.messages, session)?.text.trim() ?? "";
+      if (text.length > 0) return { outcome: "spoke", text };
+    }
+  } catch (err) {
+    log(`group turn harvest failed for ${member}: ${detailOf(err)}`);
+  }
+  return { outcome: "pass" };
 }
 
 function sleep(ms: number): Promise<void> {

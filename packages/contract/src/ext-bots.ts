@@ -482,10 +482,15 @@ export type BotGroupFrame = Static<typeof BotGroupFrameSchema>;
  *  with the others. `detail` is Hermes' own text verbatim when the failure came from Hermes.
  *
  *  A member that simply chose to pass produces no note at all: passing is ordinary, and the desktop
- *  protocol treats it as the healthy outcome rather than as an incident. */
+ *  protocol treats it as the healthy outcome rather than as an incident.
+ *
+ *  `capped` is the third reason and the only one that is not a failure: the room stopped because it
+ *  reached its 10-message limit for this send, and `member` names the member that was next in line
+ *  and never got asked. Without it a capped room is indistinguishable from one where everybody
+ *  passed, and those mean opposite things to a reader deciding whether to send again. */
 export const BotGroupNoteSchema = Type.Object({
   member: Type.String(),
-  reason: Type.Union([Type.Literal("timeout"), Type.Literal("failed")]),
+  reason: Type.Union([Type.Literal("timeout"), Type.Literal("failed"), Type.Literal("capped")]),
   detail: Type.String(),
 });
 export type BotGroupNote = Static<typeof BotGroupNoteSchema>;

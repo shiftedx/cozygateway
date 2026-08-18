@@ -77,6 +77,12 @@ export async function startGateway(
   // Dial-out JSON-RPC client to the Hermes gateway plus the cache/refresh/focus machinery on top
   // of it. Credential resolution already happened above, before the port is bound, so a
   // misconfigured bridge fails startup instead of half-starting.
+  // The push notifier is built further down (it needs the hub's presence check, which needs the
+  // hub), but the bridge above it has to be able to raise a group escalation. This indirection is
+  // the whole of the coupling: unset until the notifier exists, which is before the listener is
+  // bound and therefore before any room can run a round.
+  let raisePush: (event: { threadId: string; agentName: string; preview: string }) => void = () => {};
+
   let bridge: HermesBridge | undefined;
   if (hermesOptions !== undefined) {
     const client = createHermesClient({
@@ -91,6 +97,18 @@ export async function startGateway(
       hideBotChats: hermesOptions.hideBotChats,
       hiddenProfiles: hermesOptions.hiddenProfiles,
       ...(hermesOptions.bridgeProfile === undefined ? {} : { bridgeProfile: hermesOptions.bridgeProfile }),
+      // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
+      // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
+      // rather than borrowed from a chat thread, so a client that does not know about rooms yet
+      // cannot mistake it for one of its threads. Client-side handling of that id is the documented
+      // follow-up (contract, "needs you").
+      onGroupEscalation: (event) => {
+        raisePush({
+          threadId: `group:${event.group}`,
+          agentName: event.displayName,
+          preview: event.text,
+        });
+      },
     });
   }
 
@@ -153,15 +171,19 @@ export async function startGateway(
           },
         },
   );
+  const notifier = new RelayNotifier({
+    storage,
+    log: options.notifierLog,
+    isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
+  });
+  // Same targeting rule a 1:1 turn gets: a device holding a live socket saw the room's frame and is
+  // excluded here rather than pushed to twice.
+  raisePush = (event) => notifier.notify(event, hub.connectedDeviceIds());
   const runner = new TurnRunner({
     storage,
     hub,
     adapters,
-    notifier: new RelayNotifier({
-      storage,
-      log: options.notifierLog,
-      isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
-    }),
+    notifier,
     now: () => Date.now(),
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
   });
