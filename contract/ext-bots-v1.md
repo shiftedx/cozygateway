@@ -269,7 +269,21 @@ same bot, and no pin or meta row can outlive the profile it belongs to.
 
 ```
 200 { name: string, sessionId: string, adoption: "pin" | "title" | "latest" | "recovery" | "created" }
+404 not_found                         // no profile named `name` exists
 ```
+
+Every `/bots/:name/*` route below, this one included, answers **404 `not_found`** when `:name`
+does not name a Hermes profile at all, checked against the roster cache and, on a miss, a fresh
+`profiles.list` (never the possibly-stale cache alone, so a bot created moments ago is never
+punished for a snapshot that predates it, and so a HIDDEN bot -- absent from the cache by design,
+per `GET /bots` above -- is still resolved correctly rather than read as unknown). `hermes`
+`session.create` does not itself validate the profile name, so without this check
+`GET /bots/probe-bot/chat` on a name nobody ever created answered 200 `adoption: "created"`, minting
+a live session for a profile that was never there, while `POST /bots/:name/chat/messages` on that
+same name 202'd into the void: accepted by the gateway, delivered nowhere, because there was never a
+Hermes-side profile behind it. "Unknown" here means "not a Hermes profile at all"; a hidden bot is a
+real profile and stays chattable by name on every one of these routes, exactly as section 3's
+`GET /bots` note describes.
 
 Resolve-or-create the canonical Bot Chat. The gateway lists the bot's sessions and:
 
@@ -324,6 +338,7 @@ Three v1 properties worth knowing before writing a client:
   inflight: boolean,
   updatedAt: integer
 }
+404 not_found                         // no profile named `name` exists
 ```
 
 History of the canonical chat. The chat is resolved exactly as `GET /bots/:name/chat` resolves it,
@@ -345,6 +360,7 @@ time.
 body { text: string, clientId?: string }   // text 1..32000 characters, clientId 1..128
 202  { name: string, sessionId: string, message: BotChatMessage }
 400  invalid_request                       // missing or empty text
+404  not_found                             // no profile named `name` exists
 502  backend_unavailable                   // hermes refused, or no runtime session could be addressed
 ```
 
@@ -376,6 +392,7 @@ abandon the turn with `phase: "failed"`; a single transient failure is ridden ou
 
 ```
 200 { sessions: [ { id: string, title: string, preview: string | null, source: string | null } ] }
+404 not_found                         // no profile named `name` exists
 ```
 
 Passthrough of the bot's session list, capped at 200 rows.

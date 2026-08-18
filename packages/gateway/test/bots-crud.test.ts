@@ -697,3 +697,106 @@ describe("review fixes", () => {
     expect(server.callsOf("profiles.delete")).toHaveLength(0);
   });
 });
+
+/** GET /bots/probe-bot/chat for a name Hermes never heard of answered 200 with `adoption: "created"`:
+ *  `session.create` does not itself validate the profile it is handed, so the bridge minted a live
+ *  chat session for a profile that was never there, and the follow-up `POST .../chat/messages` 202'd
+ *  into the void. Every `/bots/:name/*` route must 404 `not_found` on such a name instead, checked
+ *  against a fresh `profiles.list` on a cache miss so neither a just-created bot nor a hidden one is
+ *  wrongly caught by it. */
+describe("unknown bot (contract/ext-bots-v1.md section 4)", () => {
+  it("404s chat, chat history, chat send, sessions and delete, without minting anything hermes-side", async () => {
+    const { authed, server } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(new Set(["default"])),
+        "session.create": () => ({ stored_session_id: "stored-1", session_id: "runtime-1" }),
+        "session.list": () => ({ sessions: [] }),
+        "prompt.submit": () => ({ ok: true }),
+        "cli.exec": () => ({ blocked: false, code: 1, output: "Error: profile 'probe-bot' does not exist" }),
+      },
+    });
+
+    const chat = await authed("/bots/probe-bot/chat");
+    expect(chat.status).toBe(404);
+    expect(((await chat.json()) as { error: { code: string } }).error.code).toBe("not_found");
+
+    const history = await authed("/bots/probe-bot/chat/messages");
+    expect(history.status).toBe(404);
+    expect(((await history.json()) as { error: { code: string } }).error.code).toBe("not_found");
+
+    const send = await authed("/bots/probe-bot/chat/messages", post({ text: "hello?" }));
+    expect(send.status).toBe(404);
+    expect(((await send.json()) as { error: { code: string } }).error.code).toBe("not_found");
+
+    const sessions = await authed("/bots/probe-bot/sessions");
+    expect(sessions.status).toBe(404);
+    expect(((await sessions.json()) as { error: { code: string } }).error.code).toBe("not_found");
+
+    const del = await authed("/bots/probe-bot", { method: "DELETE" });
+    expect(del.status).toBe(404);
+
+    // The exact bug this closes: nothing hermes-side was ever touched for a profile that is not
+    // there, chat's own kickoff (`session.create` + `prompt.submit`) included.
+    expect(server.callsOf("session.create")).toHaveLength(0);
+    expect(server.callsOf("session.list")).toHaveLength(0);
+    expect(server.callsOf("prompt.submit")).toHaveLength(0);
+  });
+
+  it("a bot created moments ago is immediately chattable, not 404'd by a stale cache", async () => {
+    const names = new Set<string>(["default"]);
+    const { authed, server, bridge } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(names),
+        "profiles.create": (params) => {
+          names.add(String(params["name"]));
+          return {};
+        },
+        "profiles.configure": () => ({ applied: { ui_meta: true } }),
+        "session.list": () => ({ sessions: [] }),
+        "session.create": () => ({ stored_session_id: "stored-1", session_id: "runtime-1" }),
+        "prompt.submit": () => ({ ok: true }),
+      },
+    });
+    // Let the connect-time refresh (and its trailing debounce) settle before measuring, so it is
+    // never mistaken for a round trip the chat guard caused.
+    await until(() => bridge.roster().bots.length >= 1, 4_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const created = await authed("/bots", post({ name: "scout" }));
+    expect(created.status).toBe(201);
+
+    // The roster cache already carries `scout` (`createBot` awaits its own refresh before
+    // answering 201), so the unknown-bot guard is satisfied from the cache, no extra round trip.
+    const before = server.calls().length;
+    const chat = await authed("/bots/scout/chat");
+    expect(chat.status).toBe(200);
+    expect(await chat.json()).toMatchObject({ name: "scout", adoption: "created" });
+
+    // The unknown-bot guard is satisfied from the roster cache `createBot` already refreshed, so
+    // the FIRST call this resolve makes is `session.list`, not another `profiles.list` spent just
+    // to confirm a bot the gateway itself just created still exists. (A later `profiles.list` is
+    // expected: it is the unrelated, pre-existing pin-writeback read.)
+    expect(server.calls().slice(before).map((call) => call.method)[0]).toBe("session.list");
+  });
+
+  it("a hidden bot is resolved off a fresh profiles.list rather than read as unknown", async () => {
+    const { authed } = await setup(
+      {
+        methods: {
+          "profiles.list": liveProfiles(new Set(["default", "ops-runner"])),
+          "session.list": () => ({ sessions: [{ id: "s1", title: "Bot Chat", preview: null, source: "cli" }] }),
+        },
+      },
+      ["ops-runner"],
+    );
+
+    // Hidden bots never land in the roster cache by design, so this exercises the fresh-read arm
+    // of the same guard the unknown-bot case takes, and it must resolve, not 404.
+    const chat = await authed("/bots/ops-runner/chat");
+    expect(chat.status).toBe(200);
+    expect(await chat.json()).toMatchObject({ name: "ops-runner", sessionId: "s1", adoption: "title" });
+
+    const sessions = await authed("/bots/ops-runner/sessions");
+    expect(sessions.status).toBe(200);
+  });
+});
