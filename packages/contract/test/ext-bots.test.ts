@@ -5,6 +5,8 @@ import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotFocusRequestSchema,
+  BotProfilePatchSchema,
+  BotProfileSchema,
   BotSummarySchema,
   ServerFrameSchema,
   check,
@@ -70,10 +72,50 @@ describe("focus request", () => {
   });
 });
 
+describe("profile patch", () => {
+  it("accepts any single section, and all of them at once", () => {
+    expect(check(BotProfilePatchSchema, { soul: "# Scout" })).toBe(true);
+    expect(check(BotProfilePatchSchema, { disabledSkills: ["deploy"] })).toBe(true);
+    // Empty is meaningful for toolsets: it POPS the pin rather than disabling everything.
+    expect(check(BotProfilePatchSchema, { enabledToolsets: [] })).toBe(true);
+    expect(
+      check(BotProfilePatchSchema, {
+        soul: "s",
+        disabledSkills: [],
+        enabledToolsets: ["files"],
+        enabledMcpServers: ["github"],
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a list that is not a list of names", () => {
+    expect(check(BotProfilePatchSchema, { disabledSkills: "deploy" })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledMcpServers: [{ name: "github" }] })).toBe(false);
+  });
+});
+
+describe("profile", () => {
+  it("accepts the mapped edit-screen shape, optional fields omitted", () => {
+    expect(
+      check(BotProfileSchema, {
+        name: "scout",
+        description: "watches CI",
+        soul: "# Scout",
+        skills: [{ name: "ci-watch", enabled: true }],
+        toolsets: [{ name: "files", enabled: true, label: "Files", toolCount: 7 }],
+        toolsetsPinned: true,
+        mcpServers: [{ name: "github", installed: true, enabled: true }],
+        model: { provider: "", default: "" },
+      }),
+    ).toBe(true);
+  });
+});
+
 describe("capability advertisement", () => {
   it("is a vendor-scoped id with an integer version", () => {
     expect(BOTS_CAPABILITY_ID).toBe("com.cozylabs.bots");
-    // Bumped for the write route and the chat frames: a v1 gateway 404s the composer.
-    expect(BOTS_CAPABILITY_VERSION).toBe(2);
+    // 2 for the composer (a v1 gateway 404s the send route), 3 for the edit-profile surface
+    // (a v2 gateway 404s the profile routes, which reads as a Save that silently does nothing).
+    expect(BOTS_CAPABILITY_VERSION).toBe(3);
   });
 });

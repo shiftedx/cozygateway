@@ -144,6 +144,122 @@ export const BotFocusRequestSchema = Type.Object({
 });
 export type BotFocusRequest = Static<typeof BotFocusRequestSchema>;
 
+/** One installed skill on a bot's profile. Skills are a DISABLED list server-side: a skill is
+ *  installed-and-enabled unless its name sits in the profile's disabled set, which is why the write
+ *  path sends `disabledSkills` (the OFF names) while the read reports `enabled` per skill.
+ *  `description` rides along only when the gateway carried one. */
+export const BotSkillSchema = Type.Object({
+  name: Type.String(),
+  enabled: Type.Boolean(),
+  description: Type.Optional(Type.String()),
+});
+export type BotSkill = Static<typeof BotSkillSchema>;
+
+/** One toolset. Toolsets are an ENABLED list and it is a PIN: `BotProfile.toolsetsPinned` says
+ *  whether the profile carries one at all, and an EMPTY `enabledToolsets` on the write path pops
+ *  it rather than disabling everything. `toolCount` is how many tools the set resolves to. */
+export const BotToolsetSchema = Type.Object({
+  name: Type.String(),
+  enabled: Type.Boolean(),
+  label: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
+  toolCount: Type.Optional(Type.Integer()),
+});
+export type BotToolset = Static<typeof BotToolsetSchema>;
+
+/** One MCP server as the edit screen sees it: the union of the servers the profile DEFINES and the
+ *  bundled catalog's menu. `installed` is true for a server the profile defines, and the catalog's
+ *  own flag otherwise; `fromCatalog` marks a row the profile does not define yet, which is offered
+ *  so a user can turn it on (the gateway copies its definition from the launch profile on write).
+ *  `auth` is passed through only when the gateway sends it. */
+export const BotMcpServerSchema = Type.Object({
+  name: Type.String(),
+  installed: Type.Boolean(),
+  enabled: Type.Boolean(),
+  auth: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
+  transport: Type.Optional(Type.String()),
+  requires: Type.Optional(Type.Array(Type.String())),
+  fromCatalog: Type.Optional(Type.Boolean()),
+});
+export type BotMcpServer = Static<typeof BotMcpServerSchema>;
+
+/** `GET /bots/:name/profile`: one bot's full edit-screen state. `model.default` is the model id and
+ *  keeps the gateway's own field name; both model fields are empty strings when the profile
+ *  inherits the launch profile's model rather than pinning one. */
+export const BotProfileSchema = Type.Object({
+  name: Type.String(),
+  description: Type.String(),
+  soul: Type.String(),
+  skills: Type.Array(BotSkillSchema),
+  toolsets: Type.Array(BotToolsetSchema),
+  toolsetsPinned: Type.Boolean(),
+  mcpServers: Type.Array(BotMcpServerSchema),
+  model: Type.Object({ provider: Type.String(), default: Type.String() }),
+});
+export type BotProfile = Static<typeof BotProfileSchema>;
+
+/** `PATCH /bots/:name/profile` body. Every field is optional and ONLY the fields present are
+ *  written, which is the desktop's "send only dirty sections" rule. The inversions are the whole
+ *  point of the shape and must not be guessed at:
+ *  - `disabledSkills` is the OFF list (send the names to disable, not the ones to keep);
+ *  - `enabledToolsets` is the ON list, and `[]` CLEARS the pin so every toolset is enabled again;
+ *  - `enabledMcpServers` is the ON list, replace semantics, unknown names skipped by the gateway. */
+export const BotProfilePatchSchema = Type.Object({
+  soul: Type.Optional(Type.String({ maxLength: 200_000 })),
+  disabledSkills: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 500 })),
+  enabledToolsets: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 500 })),
+  enabledMcpServers: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 500 })),
+});
+export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
+
+/** The gateway's per-section `applied` map, echoed VERBATIM: its keys (`soul`, `skills`,
+ *  `toolsets`, `mcp_servers`, and any section a future gateway adds) and its booleans. Deliberately
+ *  open and deliberately NOT renamed to this API's field names, so a client reads exactly what the
+ *  backend said and an unmodeled section still reaches it. */
+export const BotProfileAppliedSchema = Type.Record(Type.String(), Type.Boolean());
+export type BotProfileApplied = Static<typeof BotProfileAppliedSchema>;
+
+/** `PATCH /bots/:name/profile` response. `outcome: "unsupported"` means the gateway answered with
+ *  no `applied` map at all, which is an older backend that does not report per-section results: the
+ *  write may well have landed, but nothing can confirm it, so `ok` is false and `applied` is empty.
+ *  `requested` names the body fields this call carried, so a client can pair a section with the
+ *  `applied` key that answers for it. */
+export const BotProfileConfigureResponseSchema = Type.Object({
+  name: Type.String(),
+  outcome: Type.Union([Type.Literal("applied"), Type.Literal("unsupported")]),
+  ok: Type.Boolean(),
+  applied: BotProfileAppliedSchema,
+  requested: Type.Array(Type.String()),
+});
+export type BotProfileConfigureResponse = Static<typeof BotProfileConfigureResponseSchema>;
+
+/** `GET /bots/catalog`: the menus the edit screen offers, aggregated from three gateway calls.
+ *  `unavailable` names the sections whose call the gateway refused (an older backend missing a
+ *  method); those sections are EMPTY rather than absent, so a client never special-cases a missing
+ *  field. `query` echoes the skill search this catalog was built for. */
+export const BotCatalogSchema = Type.Object({
+  query: Type.String(),
+  skills: Type.Array(Type.Object({ name: Type.String(), description: Type.String() })),
+  mcpServers: Type.Array(
+    Type.Object({
+      name: Type.String(),
+      description: Type.String(),
+      installed: Type.Boolean(),
+      enabled: Type.Boolean(),
+      requires: Type.Array(Type.String()),
+      auth: Type.Optional(Type.String()),
+      transport: Type.Optional(Type.String()),
+    }),
+  ),
+  models: Type.Array(
+    Type.Object({ slug: Type.String(), name: Type.String(), models: Type.Array(Type.String()) }),
+  ),
+  unavailable: Type.Array(Type.String()),
+  updatedAt: Type.Integer(),
+});
+export type BotCatalog = Static<typeof BotCatalogSchema>;
+
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
  *  configured.
  *
@@ -151,6 +267,9 @@ export type BotFocusRequest = Static<typeof BotFocusRequestSchema>;
  *  - `1`: roster, presence, canonical-chat resolve, session list, history read.
  *  - `2`: `POST /bots/:name/chat/messages` plus the `bot_chat` and `bot_chat_state` frames. A
  *    client that offers a composer MUST require `>= 2`: a v1 gateway 404s that route and never
- *    sends those frames, which without this bump reads as a silently dead composer. */
+ *    sends those frames, which without this bump reads as a silently dead composer.
+ *  - `3`: the edit-profile surface: `GET`/`PATCH /bots/:name/profile` and `GET /bots/catalog`. A
+ *    client that offers an edit screen MUST require `>= 3`, by the same rule the composer bump
+ *    used: a screen whose Save 404s reads as a broken app, not as a missing feature. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 2;
+export const BOTS_CAPABILITY_VERSION = 3;

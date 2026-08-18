@@ -1,4 +1,12 @@
-import type { BotChatMessage, BotCreateRequest, BotSummary, ServerFrame } from "cozygateway-contract";
+import type {
+  BotCatalog,
+  BotChatMessage,
+  BotCreateRequest,
+  BotProfile,
+  BotProfilePatch,
+  BotSummary,
+  ServerFrame,
+} from "cozygateway-contract";
 
 import type { Storage } from "../storage.ts";
 import { HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
@@ -32,6 +40,14 @@ import {
   type CreatedBot,
   type DeletePath,
 } from "./crud.ts";
+import {
+  CATALOG_TTL_MS,
+  configureBotProfile,
+  readBotCatalog,
+  readBotProfile,
+  type CachedCatalog,
+  type ProfileConfigureResult,
+} from "./profile.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -83,6 +99,9 @@ export interface BotsSurface {
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
   createBot(input: BotCreateRequest): Promise<BotCreated>;
   deleteBot(name: string): Promise<DeletePath>;
+  botProfile(name: string): Promise<BotProfile>;
+  configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult>;
+  catalog(query: string): Promise<BotCatalog>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
 }
 
@@ -134,6 +153,8 @@ export interface HermesBridgeOptions {
   /** How long a profile delete is given. Default `PROFILE_DELETE_TIMEOUT_MS` (180 s). Overridable
    *  so the timeout path is testable in milliseconds instead of minutes. */
   deleteTimeoutMs?: number;
+  /** How long an edit-screen catalog is served from cache. Default `CATALOG_TTL_MS` (60 s). */
+  catalogTtlMs?: number;
   logSink?: (line: string) => void;
 }
 
@@ -151,7 +172,14 @@ export class HermesBridge implements BotsSurface {
   readonly #focusTtlMs: number;
   readonly #log: (message: string) => void;
 
+  readonly #catalogTtlMs: number;
+
   readonly #focus = new Map<string, { screen: BotFocusScreen; at: number }>();
+  /** The last catalog fetched, per skill query, and the fetch in flight for it. Keyed on the query
+   *  because the skills half is a SEARCH: one cache slot would make every keystroke evict the
+   *  previous answer and re-spend all three calls. */
+  readonly #catalogCache = new Map<string, CachedCatalog>();
+  readonly #catalogInflight = new Map<string, Promise<BotCatalog>>();
   readonly #chatInflight = new Map<string, Promise<CanonicalChatResult>>();
   readonly #createInflight = new Map<string, Promise<BotCreated>>();
   readonly #pins: PinStore;
@@ -198,6 +226,7 @@ export class HermesBridge implements BotsSurface {
     const bridgeProfile = opts.bridgeProfile?.trim().toLowerCase();
     this.#bridgeProfile = bridgeProfile === undefined || bridgeProfile.length === 0 ? undefined : bridgeProfile;
     this.#deleteTimeoutMs = opts.deleteTimeoutMs ?? PROFILE_DELETE_TIMEOUT_MS;
+    this.#catalogTtlMs = opts.catalogTtlMs ?? CATALOG_TTL_MS;
     this.#rosterPollMs = opts.rosterPollMs ?? ROSTER_POLL_MS;
     this.#routinesPollMs = opts.routinesPollMs ?? ROUTINES_POLL_MS;
     this.#focusTtlMs = opts.focusTtlMs ?? FOCUS_TTL_MS;
@@ -530,6 +559,58 @@ export class HermesBridge implements BotsSurface {
     this.#kickoffs.delete(canonical);
     await this.refresh(`bot ${canonical} deleted`);
     return path;
+  }
+
+  /** One bot's edit-screen state.
+   *
+   *  `#assertBotKnown` runs first for the same reason every other `/bots/:name` route runs it: a
+   *  HIDDEN bot must stay editable by name (the hide list is a roster filter, not an access rule,
+   *  and chat already works that way), while a name that names no profile at all must read as the
+   *  404 it is. Upstream's own `profiles.describe` answers 4064 for a missing profile, which would
+   *  surface as a 502 carrying Hermes' text instead of the 404 this API promises. */
+  async botProfile(name: string): Promise<BotProfile> {
+    await this.#assertBotKnown(name);
+    return readBotProfile(this.#client, name);
+  }
+
+  /** Applies an edit. Nothing is cached and nothing is derived: the reply is Hermes' own per-section
+   *  verdict, echoed. A write can change what a bot can do (skills, toolsets, MCP), which is what
+   *  the roster's descriptions and the prompt builder's capability epoch key on, so the roster is
+   *  refreshed behind it. */
+  async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> {
+    await this.#assertBotKnown(name);
+    try {
+      return await configureBotProfile(this.#client, name, patch);
+    } finally {
+      this.refreshSoon(`profile ${name} configured`);
+    }
+  }
+
+  /** The edit screen's menus, briefly cached per skill query.
+   *
+   *  Single-flight AND cached: opening the screen on two devices at once, or a client that reads
+   *  the catalog on every tab switch, must cost one round of three calls rather than one per read.
+   *  A failed fetch is not cached, so a gateway that was down when the screen opened is retried on
+   *  the next read rather than serving an empty catalog for a minute. */
+  async catalog(query: string): Promise<BotCatalog> {
+    const key = query;
+    const cached = this.#catalogCache.get(key);
+    if (cached !== undefined && this.#now() - cached.fetchedAt < this.#catalogTtlMs) return cached.catalog;
+    const inflight = this.#catalogInflight.get(key);
+    if (inflight !== undefined) return inflight;
+
+    const run = (async () => {
+      try {
+        const fetchedAt = this.#now();
+        const catalog = await readBotCatalog(this.#client, query, fetchedAt);
+        this.#catalogCache.set(key, { catalog, fetchedAt });
+        return catalog;
+      } finally {
+        this.#catalogInflight.delete(key);
+      }
+    })();
+    this.#catalogInflight.set(key, run);
+    return run;
   }
 
   /** Test seam: true while a turn poll is live for this bot. */

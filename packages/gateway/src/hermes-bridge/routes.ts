@@ -5,6 +5,7 @@ import {
   BotChatSendRequestSchema,
   BotCreateRequestSchema,
   BotFocusRequestSchema,
+  BotProfilePatchSchema,
   ContractViolation,
   assertValid,
 } from "cozygateway-contract";
@@ -34,6 +35,11 @@ type Env = { Variables: { deviceId: string } };
 
 /** How many sessions `GET /bots/:name/sessions` asks Hermes for. Matches the design's cap. */
 export const SESSION_LIST_LIMIT = 200;
+
+/** Longest skill-search query `GET /bots/catalog` accepts. The query is forwarded to a hub search
+ *  upstream, and the answer is cached per query, so an unbounded one is both a pointless round trip
+ *  and an unbounded cache key. */
+export const CATALOG_QUERY_MAX = 200;
 
 /** Local copy of http.ts's helper, duplicated rather than imported so this module does not close
  *  an import cycle back into the app it is registered on. */
@@ -213,6 +219,80 @@ export function registerBotRoutes(
     }
     bots.setFocus(c.get("deviceId"), parsed.screen);
     return c.json({ ok: true });
+  });
+
+  // Registered ahead of every `/bots/:name/*` route so a literal segment can never be read as a bot
+  // name. Nothing here is per-bot: it is the menu the edit screen offers for ALL bots, which is why
+  // it is one cached aggregate rather than three calls a client makes per screen open.
+  app.get("/bots/catalog", requireDevice, async (c) => {
+    const query = (c.req.query("q") ?? "").trim();
+    if (query.length > CATALOG_QUERY_MAX) {
+      return c.json(errorBody("invalid_request", `q must be at most ${CATALOG_QUERY_MAX} characters`), 400);
+    }
+    try {
+      return c.json(await bots.catalog(query));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.get("/bots/:name/profile", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(await bots.botProfile(resolved.name));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // PATCH, not PUT: every field is optional and only the fields present are written, which is the
+  // desktop's "send only the dirty sections" rule. A body with none of them is refused rather than
+  // answered with an empty `applied` map, because a client that sends nothing has a bug and an
+  // empty success would hide it.
+  app.patch("/bots/:name/profile", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotProfilePatchSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    if (
+      parsed.soul === undefined &&
+      parsed.disabledSkills === undefined &&
+      parsed.enabledToolsets === undefined &&
+      parsed.enabledMcpServers === undefined
+    ) {
+      return c.json(
+        errorBody(
+          "invalid_request",
+          "at least one of soul, disabledSkills, enabledToolsets, enabledMcpServers is required",
+        ),
+        400,
+      );
+    }
+    try {
+      const result = await bots.configureProfile(name, parsed);
+      return c.json({
+        name,
+        outcome: result.outcome,
+        ok: result.ok,
+        applied: result.applied,
+        requested: result.requested,
+      });
+    } catch (err) {
+      return failure(c, err);
+    }
   });
 
   app.get("/bots/:name/chat", requireDevice, async (c) => {
