@@ -61,7 +61,11 @@ async function setup(
   servers.push(server);
   const storage = openStorage(":memory:");
   storages.push(storage);
-  const client = createHermesClient({ url: server.url, token: "T", reconnect: { minMs: 15, maxMs: 60 } });
+  const client = createHermesClient({
+    url: server.url,
+    auth: { mode: "token", token: "T" },
+    reconnect: { minMs: 15, maxMs: 60 },
+  });
   const frames: ServerFrame[] = [];
   const bridge = new HermesBridge({
     client,

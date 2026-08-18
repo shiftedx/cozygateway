@@ -19,10 +19,23 @@ export type AgentConfig = Static<typeof AgentConfigSchema>;
 const HermesBridgeConfigSchema = Type.Object({
   /** The Hermes gateway WebSocket URL, e.g. ws://homelab:8790/api/ws */
   url: Type.String({ minLength: 1 }),
-  /** NAME of the env var holding the session token (loopback) or ws ticket (public bind). */
-  tokenEnv: Type.String({ minLength: 1 }),
-  /** Which upgrade-URL query parameter the credential rides. Default "token". */
+  /** How the WS upgrade is authenticated. "token" (default) is the loopback shape: the credential
+   *  rides the upgrade URL. "password" is the gated shape: the bridge logs in to the dashboard
+   *  over HTTP and mints a fresh single-use ws ticket for every connect. */
+  authMode: Type.Optional(Type.Union([Type.Literal("token"), Type.Literal("password")])),
+  /** Token mode: NAME of the env var holding the session token (loopback) or a pre-minted ticket.
+   *  Required when authMode is "token"; unused in password mode. */
+  tokenEnv: Type.Optional(Type.String({ minLength: 1 })),
+  /** Token mode: which upgrade-URL query parameter the credential rides. Default "token". */
   authParam: Type.Optional(Type.Union([Type.Literal("token"), Type.Literal("ticket")])),
+  /** Password mode: the dashboard username. Not a secret, so it lives in the config file. */
+  username: Type.Optional(Type.String({ minLength: 1 })),
+  /** Password mode: NAME of the env var holding the dashboard password. The value itself NEVER
+   *  appears in the config file. */
+  passwordEnv: Type.Optional(Type.String({ minLength: 1 })),
+  /** Password mode: HTTP origin of the dashboard, e.g. http://homelab:9119. Defaults to the WS
+   *  URL's origin with ws -> http and wss -> https. */
+  baseUrl: Type.Optional(Type.String({ minLength: 1 })),
   /** Canonical Bot Chats are created hidden so they stay out of the global Sessions list, which
    *  is what the desktop plugin defaults to. */
   hideBotChats: Type.Optional(Type.Boolean()),

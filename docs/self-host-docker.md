@@ -48,8 +48,30 @@ Add a `hermes` block to the config file to turn on the bots surface (`/bots`, th
 ```
 
 The config file carries the env var NAME, never the credential. Startup fails closed when that
-variable is unset. Use `"authParam": "ticket"` when the Hermes gateway is on a public bind and
-issues single-use ws tickets instead of session tokens.
+variable is unset. Use `"authParam": "ticket"` when you already hold a minted ws ticket instead of
+a session token.
+
+That default (`"authMode": "token"`) is the LOOPBACK shape: it works because a loopback Hermes
+injects a session token. A Hermes dashboard behind dashboard auth (a gated, non-loopback bind)
+injects no token, so point the bridge at the password shape instead:
+
+```json
+{
+  "hermes": {
+    "url": "ws://homelab:9119/api/ws",
+    "authMode": "password",
+    "username": "cozybridge",
+    "passwordEnv": "COZYGATEWAY_HERMES_PASSWORD"
+  }
+}
+```
+
+The bridge then logs in at `POST {origin}/auth/password-login` (provider `basic`), holds the
+session cookie in memory, and mints a FRESH single-use ticket at `POST {origin}/api/auth/ws-ticket`
+for every connect attempt, because one ticket is good for one upgrade within 30 seconds. The HTTP
+origin is derived from the WebSocket URL (`ws` to `http`, `wss` to `https`); override it with
+`"baseUrl"` when the dashboard is fronted elsewhere. A stale session re-logs in transparently; a
+rejected password fails closed with no retry storm.
 
 Relay:
 

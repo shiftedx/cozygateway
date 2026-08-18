@@ -81,8 +81,7 @@ export async function startGateway(
   if (hermesOptions !== undefined) {
     const client = createHermesClient({
       url: hermesOptions.url,
-      token: hermesOptions.token,
-      authParam: hermesOptions.authParam,
+      auth: hermesOptions.auth,
     });
     bridge = new HermesBridge({
       client,

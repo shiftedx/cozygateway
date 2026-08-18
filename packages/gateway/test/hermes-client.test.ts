@@ -1,8 +1,10 @@
+import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createHermesClient,
   computeReconnectDelay,
+  MAX_TICKET_RETRIES,
   HermesRpcError,
   HermesUnavailable,
   type HermesClient,
@@ -23,7 +25,7 @@ async function fakeServer(behavior?: Parameters<typeof startFakeHermesServer>[0]
 function client(url: string, overrides?: Partial<Parameters<typeof createHermesClient>[0]>): HermesClient {
   const c = createHermesClient({
     url,
-    token: TOKEN,
+    auth: { mode: "token", token: TOKEN },
     reconnect: { minMs: 15, maxMs: 80 },
     ...overrides,
   });
@@ -65,7 +67,7 @@ describe("handshake and auth", () => {
 
   it("uses the ticket parameter when configured for a public bind", async () => {
     const server = await fakeServer();
-    const c = client(server.url, { authParam: "ticket" });
+    const c = client(server.url, { auth: { mode: "token", token: TOKEN, param: "ticket" } });
     c.start();
     await until(() => c.state() === "online");
     expect(server.queries()[0]).toBe(`ticket=${TOKEN}`);
@@ -89,6 +91,132 @@ describe("handshake and auth", () => {
     expect(server.totalConnections()).toBe(1);
     expect(lines.join("")).toContain("close code 4401");
     expect(lines.join("")).not.toContain(TOKEN);
+  });
+});
+
+describe("gated password auth", () => {
+  const USERNAME = "cozybridge";
+  const PASSWORD = "SECRET-DASH-PASSWORD-9f8e7d6c";
+
+  async function gatedServer(
+    overrides?: Parameters<typeof startFakeHermesServer>[0],
+  ): Promise<FakeHermesServer> {
+    return fakeServer({ gated: { username: USERNAME, password: PASSWORD }, ...overrides });
+  }
+
+  function gatedClient(
+    server: FakeHermesServer,
+    overrides?: Partial<Parameters<typeof createHermesClient>[0]>,
+  ): HermesClient {
+    return client(server.url, {
+      auth: { mode: "password", baseUrl: server.baseUrl, username: USERNAME, password: PASSWORD },
+      ...overrides,
+    });
+  }
+
+  it("logs in, mints a ticket, and dials with it", async () => {
+    const server = await gatedServer();
+    const lines: string[] = [];
+    const c = gatedClient(server, { logSink: (line) => lines.push(line) });
+    c.start();
+    await until(() => c.state() === "online");
+
+    expect(server.loginCount()).toBe(1);
+    expect(server.ticketMintCount()).toBe(1);
+    expect(server.queries()[0]).toBe(`ticket=${server.mintedTickets()[0]}`);
+    // Nothing secret reaches the log sink: not the password, not the session, not the ticket.
+    expect(lines.join("")).not.toContain(PASSWORD);
+    expect(lines.join("")).not.toContain(server.mintedTickets()[0]);
+  });
+
+  it("mints a FRESH ticket for every reconnect without logging in again", async () => {
+    const server = await gatedServer();
+    const c = gatedClient(server);
+    c.start();
+    await until(() => c.state() === "online");
+
+    server.dropAll();
+    await until(() => server.totalConnections() >= 2 && c.state() === "online");
+
+    const [first, second] = server.queries();
+    expect(first).not.toBe(second);
+    expect(server.ticketMintCount()).toBe(2);
+    expect(server.mintedTickets()).toHaveLength(2);
+    // The session cookie survives the reconnect; only the ticket is re-minted.
+    expect(server.loginCount()).toBe(1);
+  });
+
+  it("rejects a replayed ticket, because tickets are single-use", async () => {
+    const server = await gatedServer();
+    const c = gatedClient(server);
+    c.start();
+    await until(() => c.state() === "online");
+
+    const consumed = server.mintedTickets()[0];
+    const replay = new WebSocket(`${server.url}?ticket=${consumed}`);
+    const code = await new Promise<number>((resolve) => replay.on("close", (value) => resolve(value)));
+    expect(code).toBe(4401);
+  });
+
+  it("logs in again when the session has expired under a reconnect", async () => {
+    const server = await gatedServer();
+    const c = gatedClient(server);
+    c.start();
+    await until(() => c.state() === "online");
+
+    server.expireSessions();
+    server.dropAll();
+    await until(() => c.state() === "online" && server.totalConnections() >= 2);
+
+    // One 401 on the ws-ticket mint, one re-login, then a second (successful) mint.
+    expect(server.loginCount()).toBe(2);
+    expect(server.ticketMintCount()).toBe(3);
+  });
+
+  it("retries a bounded number of times when the ticket is refused, then fails closed", async () => {
+    // A 0ms TTL means every ticket is born expired, so the upgrade is always closed 4401.
+    const server = await gatedServer({ ticketTtlMs: 0 });
+    const lines: string[] = [];
+    const c = gatedClient(server, { logSink: (line) => lines.push(line) });
+    c.start();
+    await until(() => c.state() === "absent" && server.totalConnections() >= 1, 5_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // The first dial plus MAX_TICKET_RETRIES re-mints, and then it stops.
+    expect(server.totalConnections()).toBe(1 + MAX_TICKET_RETRIES);
+    expect(lines.join("")).toContain("re-minting");
+    expect(lines.join("")).toContain("close code 4401");
+  });
+
+  it("never dials and never retries when the password is wrong", async () => {
+    const server = await gatedServer();
+    const lines: string[] = [];
+    const c = gatedClient(server, {
+      auth: { mode: "password", baseUrl: server.baseUrl, username: USERNAME, password: "not-the-password" },
+      logSink: (line) => lines.push(line),
+    });
+    c.start();
+    await until(() => c.state() === "absent" && server.loginCount() >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expect(server.loginCount()).toBe(1);
+    expect(server.totalConnections()).toBe(0);
+    expect(lines.join("")).toContain("HTTP 401");
+    expect(lines.join("")).not.toContain("not-the-password");
+  });
+
+  it("retries with backoff when the dashboard is unreachable", async () => {
+    const server = await gatedServer();
+    const lines: string[] = [];
+    // Port 1 on loopback refuses instantly, so every login attempt fails at the transport layer.
+    const c = client(server.url, {
+      auth: { mode: "password", baseUrl: "http://127.0.0.1:1", username: USERNAME, password: PASSWORD },
+      logSink: (line) => lines.push(line),
+    });
+    c.start();
+    await until(() => lines.join("").includes("could not obtain a hermes credential"), 4_000);
+    expect(c.state()).not.toBe("online");
+    expect(server.totalConnections()).toBe(0);
   });
 });
 

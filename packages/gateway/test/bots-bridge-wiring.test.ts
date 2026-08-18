@@ -29,11 +29,75 @@ describe("hermes bridge options", () => {
   it("resolves the credential from the environment and never names its value in an error", () => {
     expect(
       parseHermesOptions({ url: "ws://h/api/ws", tokenEnv: "HERMES_TOKEN" }, { HERMES_TOKEN: "s3cret" }),
-    ).toEqual({ url: "ws://h/api/ws", token: "s3cret", authParam: "token", hideBotChats: true });
+    ).toEqual({
+      url: "ws://h/api/ws",
+      auth: { mode: "token", token: "s3cret", param: "token" },
+      hideBotChats: true,
+    });
 
     expect(() => parseHermesOptions({ url: "ws://h/api/ws", tokenEnv: "HERMES_TOKEN" }, {})).toThrow(
       /HERMES_TOKEN/,
     );
+  });
+
+  it("resolves the gated password shape, deriving the dashboard origin from the ws URL", () => {
+    expect(
+      parseHermesOptions(
+        {
+          url: "ws://homelab:9119/api/ws",
+          authMode: "password",
+          username: "cozybridge",
+          passwordEnv: "HERMES_DASH_PASSWORD",
+        },
+        { HERMES_DASH_PASSWORD: "s3cret" },
+      ),
+    ).toEqual({
+      url: "ws://homelab:9119/api/ws",
+      auth: {
+        mode: "password",
+        baseUrl: "http://homelab:9119",
+        username: "cozybridge",
+        password: "s3cret",
+      },
+      hideBotChats: true,
+    });
+  });
+
+  it("fills in the gateway path for an origin-only URL and honours an explicit baseUrl", () => {
+    const parsed = parseHermesOptions(
+      {
+        url: "wss://homelab.example",
+        authMode: "password",
+        username: "cozybridge",
+        passwordEnv: "HERMES_DASH_PASSWORD",
+        baseUrl: "https://dash.example",
+      },
+      { HERMES_DASH_PASSWORD: "s3cret" },
+    );
+    expect(parsed.url).toBe("wss://homelab.example/api/ws");
+    expect(parsed.auth).toEqual({
+      mode: "password",
+      baseUrl: "https://dash.example",
+      username: "cozybridge",
+      password: "s3cret",
+    });
+  });
+
+  it("fails closed on an incomplete password config, naming only the env var", () => {
+    const config = {
+      url: "ws://h/api/ws",
+      authMode: "password" as const,
+      username: "cozybridge",
+      passwordEnv: "HERMES_DASH_PASSWORD",
+    };
+    expect(() => parseHermesOptions(config, {})).toThrow(/HERMES_DASH_PASSWORD/);
+    expect(() => parseHermesOptions({ ...config, username: undefined }, { HERMES_DASH_PASSWORD: "x" })).toThrow(
+      /username/,
+    );
+    expect(() =>
+      parseHermesOptions({ ...config, passwordEnv: undefined }, { HERMES_DASH_PASSWORD: "x" }),
+    ).toThrow(/passwordEnv/);
+    expect(() => parseHermesOptions({ url: "ws://h/api/ws" }, { HERMES_TOKEN: "x" })).toThrow(/tokenEnv/);
   });
 
   it("lets the environment retarget the bridge URL, but only when a bridge is configured", () => {

@@ -13,8 +13,15 @@ import { WebSocket } from "ws";
  *  - responses can arrive OUT OF REQUEST ORDER (long handlers run on a worker pool), so nothing
  *    here may assume FIFO.
  *  - auth rides the upgrade URL: `?token=` on a loopback bind, or a single-use `?ticket=` on a
- *    public bind. Close codes 4401 (auth) and 4403 (origin or IP) are terminal: they are not
- *    retried, because retrying a rejected credential is a hot loop against the gateway.
+ *    gated (dashboard-auth) bind. Close codes 4401 (auth) and 4403 (origin or IP) are terminal:
+ *    they are not retried, because retrying a rejected credential is a hot loop against the
+ *    gateway. The one bounded exception is password mode, where a 4401 can mean nothing worse
+ *    than a single-use ticket that lost its 30s race; see MAX_TICKET_RETRIES.
+ *  - password mode speaks the gated dashboard's HTTP handshake before every dial:
+ *    `POST {base}/auth/password-login` (JSON, provider "basic") mints session cookies, then
+ *    `POST {base}/api/auth/ws-ticket` mints a SINGLE-USE ticket with a 30s TTL. A fresh ticket is
+ *    required for every connect attempt, so the mint sits inside the reconnect loop, not beside
+ *    it. Cookie state lives in this closure and nowhere else.
  *  - global change broadcasts (`sessions.changed`, `cron.changed`, ...) arrive as ordinary event
  *    frames. They are optional: a gateway that never sends them is fully supported, the bridge
  *    just falls back to polling.
@@ -59,6 +66,48 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const AUTH_CLOSE_CODE = 4401;
 export const ORIGIN_CLOSE_CODE = 4403;
 
+/** How many consecutive 4401 closes password mode absorbs before treating auth as terminal. A
+ *  single-use ticket carries a 30s TTL, so ONE 4401 can mean a lost race (slow dial, clock skew)
+ *  rather than a bad credential: the password itself was already accepted over HTTP before the
+ *  ticket was minted. Bounded so a genuinely rejected identity still fails closed instead of
+ *  looping. Reset every time the socket reaches online. */
+export const MAX_TICKET_RETRIES = 2;
+
+/** Bounds each HTTP leg of the gated handshake (login, ws-ticket mint). */
+export const DEFAULT_AUTH_HTTP_TIMEOUT_MS = 10_000;
+
+/** How the client authenticates the WS upgrade.
+ *  - "token": the loopback shape. The value rides the upgrade URL as `?token=` (or `?ticket=`
+ *    for a pre-minted ticket) and is reused on every reconnect.
+ *  - "password": the gated shape. The client logs in over HTTP, holds the session cookie, and
+ *    mints a FRESH single-use ticket for every connect attempt. */
+export type HermesAuth =
+  | { mode: "token"; token: string; param?: "token" | "ticket" }
+  | {
+      mode: "password";
+      /** HTTP origin of the Hermes dashboard, e.g. `http://homelab:9119`. No trailing slash. */
+      baseUrl: string;
+      username: string;
+      password: string;
+    };
+
+/** Raised when the gated dashboard rejected the identity itself (bad password, unknown provider).
+ *  Terminal: retrying is a credential-stuffing loop against a server that already said no. */
+class TerminalAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TerminalAuthError";
+  }
+}
+
+/** Raised when the session cookie is gone or stale. Recoverable by logging in again once. */
+class SessionExpiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionExpiredError";
+  }
+}
+
 /** Same pure backoff shape as the OpenClaw client's, duplicated rather than imported so the two
  *  clients stay independent (this one may tune its curve without touching the chat path).
  *  `attempt` is 1-based; jitter is +/-10% of the doubling base, clamped into the policy band. */
@@ -88,11 +137,11 @@ export interface HermesClientOptions {
   /** The gateway WebSocket URL, e.g. `ws://homelab:8790/api/ws`. Any query string already on it
    *  is preserved; the credential below is appended. */
   url: string;
-  /** The session token (loopback bind) or a single-use ticket (public bind). */
-  token: string;
-  /** Which query parameter the credential rides. Default "token". */
-  authParam?: "token" | "ticket";
+  /** How the upgrade is authenticated: the loopback token shape or the gated password shape. */
+  auth: HermesAuth;
   reconnect?: ReconnectPolicy;
+  /** Bounds each HTTP leg of the gated handshake. Default 10000. */
+  authHttpTimeoutMs?: number;
   /** Bounds socket-open through `gateway.ready`. On expiry the socket is force-closed so the
    *  ordinary reconnect path runs. Default 10000. */
   handshakeTimeoutMs?: number;
@@ -104,7 +153,7 @@ export interface HermesClientOptions {
   requireReadyEvent?: boolean;
   now?: () => number;
   /** Every log line goes through this sink. Lines never contain the URL query string, the token,
-   *  or any frame content beyond a method name. */
+   *  the password, the session cookie, a ticket, or any frame content beyond a method name. */
   logSink?: (line: string) => void;
 }
 
@@ -171,6 +220,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const requireReadyEvent = opts.requireReadyEvent ?? true;
+  const authHttpTimeoutMs = opts.authHttpTimeoutMs ?? DEFAULT_AUTH_HTTP_TIMEOUT_MS;
+  const auth = opts.auth;
   const now = opts.now ?? Date.now;
   const logLine = opts.logSink ?? ((line: string) => void process.stderr.write(line));
   const log = (message: string): void => logLine(`[hermes-bridge] ${message}\n`);
@@ -182,6 +233,10 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   let refused = false;
   let reconnectAttempt = 0;
   let nextRequestId = 1;
+  /** Gated mode only. The dashboard session cookie header value, held here and nowhere else. */
+  let sessionCookie: string | undefined;
+  let ticketRetries = 0;
+  let generation = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -265,6 +320,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     if (event.type === "gateway.ready") {
       clearHandshakeTimer();
       reconnectAttempt = 0;
+      ticketRetries = 0;
       setState("online");
     }
     for (const handler of eventHandlers) handler(event);
@@ -287,6 +343,17 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     ws = undefined;
     failAllPending(new HermesUnavailable("hermes bridge disconnected before a response arrived"));
     if (closed) return;
+    if (code === AUTH_CLOSE_CODE && auth.mode === "password" && ticketRetries < MAX_TICKET_RETRIES) {
+      // Password mode already proved the identity over HTTP, so a 4401 here is most likely a
+      // single-use ticket that expired or lost its race. Re-mint through the ordinary reconnect
+      // path a bounded number of times before falling through to the terminal branch.
+      ticketRetries += 1;
+      log(
+        `gateway refused the single-use ticket (close code ${code}); re-minting (attempt ${ticketRetries} of ${MAX_TICKET_RETRIES})`,
+      );
+      scheduleReconnect();
+      return;
+    }
     if (code === AUTH_CLOSE_CODE || code === ORIGIN_CLOSE_CODE) {
       // Terminal: the credential was rejected (4401) or the origin/IP is not allowed (4403).
       // Retrying either is a hot loop against a gateway that has already said no, so fail closed
@@ -300,15 +367,120 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     scheduleReconnect();
   }
 
+  /** Gated leg 1: exchange username/password for session cookies. The password is written to the
+   *  request body and never anywhere else; no branch of this function logs a credential. */
+  async function login(baseUrl: string, username: string, password: string): Promise<void> {
+    let response: Response;
+    try {
+      response = await fetch(`${baseUrl}/auth/password-login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: "basic", username, password, next: "/" }),
+        redirect: "manual",
+        signal: AbortSignal.timeout(authHttpTimeoutMs),
+      });
+    } catch (err) {
+      throw new Error(`hermes login could not be reached: ${(err as Error).message}`);
+    }
+    // Drain the body so the socket is released back to the agent pool either way.
+    await response.text().catch(() => "");
+    if (response.status === 401 || response.status === 403 || response.status === 404) {
+      // 401 = bad credentials, 404 = unknown provider or one without password support. Both mean
+      // the configured identity will never work; an operator has to fix the config.
+      throw new TerminalAuthError(`hermes rejected the bridge login (HTTP ${response.status})`);
+    }
+    if (!response.ok) throw new Error(`hermes login failed (HTTP ${response.status})`);
+    const cookies = response.headers
+      .getSetCookie()
+      .map((raw) => raw.split(";")[0] ?? "")
+      .filter((pair) => pair.length > 0);
+    if (cookies.length === 0) throw new Error("hermes login returned no session cookie");
+    sessionCookie = cookies.join("; ");
+    log("logged in to the hermes dashboard; session established");
+  }
+
+  /** Gated leg 2: mint a single-use, 30s-TTL ws ticket against the held session. */
+  async function mintTicket(baseUrl: string): Promise<string> {
+    const cookie = sessionCookie;
+    if (cookie === undefined) throw new SessionExpiredError("no hermes session cookie held");
+    let response: Response;
+    try {
+      response = await fetch(`${baseUrl}/api/auth/ws-ticket`, {
+        method: "POST",
+        headers: { cookie },
+        signal: AbortSignal.timeout(authHttpTimeoutMs),
+      });
+    } catch (err) {
+      throw new Error(`hermes ws-ticket could not be reached: ${(err as Error).message}`);
+    }
+    if (response.status === 401 || response.status === 403) {
+      await response.text().catch(() => "");
+      sessionCookie = undefined;
+      throw new SessionExpiredError(`hermes session is no longer valid (HTTP ${response.status})`);
+    }
+    if (!response.ok) {
+      await response.text().catch(() => "");
+      throw new Error(`hermes ws-ticket mint failed (HTTP ${response.status})`);
+    }
+    const body: unknown = await response.json().catch(() => undefined);
+    const ticket =
+      typeof body === "object" && body !== null ? (body as Record<string, unknown>)["ticket"] : undefined;
+    if (typeof ticket !== "string" || ticket.length === 0) {
+      throw new Error("hermes ws-ticket response carried no ticket");
+    }
+    return ticket;
+  }
+
+  /** The credential for ONE connect attempt. Token mode reuses its value; password mode mints a
+   *  fresh ticket every time, logging in first when no session is held and exactly once more when
+   *  the held session turns out to be stale. */
+  async function resolveCredential(): Promise<{ param: string; value: string }> {
+    if (auth.mode === "token") return { param: auth.param ?? "token", value: auth.token };
+    if (sessionCookie === undefined) await login(auth.baseUrl, auth.username, auth.password);
+    try {
+      return { param: "ticket", value: await mintTicket(auth.baseUrl) };
+    } catch (err) {
+      if (!(err instanceof SessionExpiredError)) throw err;
+      log("hermes session expired; logging in again");
+      await login(auth.baseUrl, auth.username, auth.password);
+      return { param: "ticket", value: await mintTicket(auth.baseUrl) };
+    }
+  }
+
   function connect(): void {
     if (closed || refused) return;
-    const socket = new WebSocket(connectUrl(opts.url, opts.authParam ?? "token", opts.token));
+    generation += 1;
+    const attemptGeneration = generation;
+    void (async () => {
+      let credential: { param: string; value: string };
+      try {
+        credential = await resolveCredential();
+      } catch (err) {
+        if (closed || refused || attemptGeneration !== generation) return;
+        if (err instanceof TerminalAuthError) {
+          refused = true;
+          log(`${err.message}; not retrying`);
+          setState("absent");
+          return;
+        }
+        log(`could not obtain a hermes credential: ${(err as Error).message}`);
+        scheduleReconnect();
+        return;
+      }
+      if (closed || refused || attemptGeneration !== generation) return;
+      dial(credential.param, credential.value);
+    })();
+  }
+
+  function dial(param: string, value: string): void {
+    const socket = new WebSocket(connectUrl(opts.url, param, value));
     ws = socket;
     armHandshakeTimer();
     socket.on("open", () => {
       if (requireReadyEvent) return;
       clearHandshakeTimer();
       reconnectAttempt = 0;
+      ticketRetries = 0;
       setState("online");
     });
     socket.on("message", (data) => handleMessage(data));

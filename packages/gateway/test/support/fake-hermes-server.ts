@@ -33,7 +33,18 @@ export interface FakeHermesBehavior {
   refuseNextConnections?: number;
   /** Methods on which the socket is terminated instead of answered. */
   dropOnMethod?: string[];
+  /** When present the server behaves like a GATED Hermes dashboard rather than a loopback bind:
+   *  `POST /auth/password-login` mints a session cookie, `POST /api/auth/ws-ticket` mints a
+   *  single-use ticket against that cookie, and the WS upgrade is accepted only for a live,
+   *  unconsumed ticket (anything else is closed 4401). */
+  gated?: { username: string; password: string };
+  /** Gated mode: ticket lifetime in ms. 0 means every minted ticket is already expired, which is
+   *  how the expiry path is exercised. Default 30000, matching upstream TTL_SECONDS. */
+  ticketTtlMs?: number;
 }
+
+/** Upstream's TTL for a minted ws ticket (ws_tickets.TTL_SECONDS). */
+const TICKET_TTL_MS = 30_000;
 
 /** Returned by a handler that should produce no reply at all. */
 export const NO_REPLY = Symbol("no-reply");
@@ -47,6 +58,17 @@ export interface HermesCall {
 
 export interface FakeHermesServer {
   url: string;
+  /** HTTP origin of the same listener, for the gated login and ws-ticket endpoints. */
+  baseUrl: string;
+  /** Gated mode: how many times `/auth/password-login` has been called. */
+  loginCount(): number;
+  /** Gated mode: how many times `/api/auth/ws-ticket` has been called. */
+  ticketMintCount(): number;
+  /** Gated mode: every ticket the server has minted, in mint order. */
+  mintedTickets(): string[];
+  /** Gated mode: invalidate every session cookie, so the next ws-ticket mint answers 401 and the
+   *  client has to log in again. */
+  expireSessions(): void;
   calls(): HermesCall[];
   callsOf(method: string): HermesCall[];
   totalConnections(): number;
@@ -62,7 +84,79 @@ export interface FakeHermesServer {
 export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): Promise<FakeHermesServer> {
   let cfg: FakeHermesBehavior = { ...initial };
 
-  const http: Server = createServer();
+  const sessions = new Set<string>();
+  const tickets = new Map<string, number>();
+  const mintedTickets: string[] = [];
+  let sessionSeq = 0;
+  let ticketSeq = 0;
+  let loginCount = 0;
+  let ticketMintCount = 0;
+
+  function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+    return new Promise((resolve) => {
+      let raw = "";
+      req.on("data", (chunk) => (raw += String(chunk)));
+      req.on("end", () => resolve(raw));
+    });
+  }
+
+  const http: Server = createServer((req, res) => {
+    const path = (req.url ?? "").split("?")[0];
+    const send = (status: number, body: unknown, headers: Record<string, string | string[]> = {}): void => {
+      res.writeHead(status, { "content-type": "application/json", ...headers });
+      res.end(JSON.stringify(body));
+    };
+    if (cfg.gated === undefined) {
+      send(404, { detail: "Not Found" });
+      return;
+    }
+    if (req.method === "POST" && path === "/auth/password-login") {
+      loginCount += 1;
+      void readBody(req).then((raw) => {
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          send(400, { detail: "bad body" });
+          return;
+        }
+        const gated = cfg.gated;
+        if (gated === undefined) {
+          send(404, { detail: "Not Found" });
+          return;
+        }
+        // Upstream answers 404 for an unknown or non-password provider, deliberately generic.
+        if (body["provider"] !== "basic") {
+          send(404, { detail: "Unknown provider" });
+          return;
+        }
+        if (body["username"] !== gated.username || body["password"] !== gated.password) {
+          send(401, { detail: "Invalid credentials" });
+          return;
+        }
+        const session = `sess-${++sessionSeq}`;
+        sessions.add(session);
+        send(200, { ok: true, next: "/" }, { "set-cookie": [`hermes_session=${session}; Path=/; HttpOnly`] });
+      });
+      return;
+    }
+    if (req.method === "POST" && path === "/api/auth/ws-ticket") {
+      ticketMintCount += 1;
+      const cookie = req.headers.cookie ?? "";
+      const session = /hermes_session=([^;]+)/.exec(cookie)?.[1] ?? "";
+      if (!sessions.has(session)) {
+        send(401, { detail: "Unauthorized" });
+        return;
+      }
+      const ticket = `ticket-${++ticketSeq}-${Math.random().toString(36).slice(2, 10)}`;
+      const ttl = cfg.ticketTtlMs ?? TICKET_TTL_MS;
+      tickets.set(ticket, Date.now() + ttl);
+      mintedTickets.push(ticket);
+      send(200, { ticket, ttl_seconds: Math.round(ttl / 1000) });
+      return;
+    }
+    send(404, { detail: "Not Found" });
+  });
   const wss = new WebSocketServer({ server: http });
   const sockets = new Set<WebSocket>();
   const calls: HermesCall[] = [];
@@ -75,6 +169,18 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
     queries.push(query);
     sockets.add(ws);
     ws.on("close", () => sockets.delete(ws));
+
+    if (cfg.gated !== undefined) {
+      // Single-use: the ticket is consumed on the FIRST upgrade that presents it, so a replay
+      // and an expired ticket both land on the same 4401 the real gateway sends.
+      const ticket = new URLSearchParams(query).get("ticket") ?? "";
+      const expiresAt = tickets.get(ticket);
+      tickets.delete(ticket);
+      if (expiresAt === undefined || expiresAt <= Date.now()) {
+        ws.close(4401, "unauthorized");
+        return;
+      }
+    }
 
     if ((cfg.refuseNextConnections ?? 0) > 0) {
       cfg.refuseNextConnections = (cfg.refuseNextConnections ?? 0) - 1;
@@ -160,6 +266,11 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
 
   return {
     url: `ws://127.0.0.1:${addr.port}/api/ws`,
+    baseUrl: `http://127.0.0.1:${addr.port}`,
+    loginCount: () => loginCount,
+    ticketMintCount: () => ticketMintCount,
+    mintedTickets: () => [...mintedTickets],
+    expireSessions: () => sessions.clear(),
     calls: () => [...calls],
     callsOf: (method: string) => calls.filter((call) => call.method === method),
     totalConnections: () => totalConnections,
