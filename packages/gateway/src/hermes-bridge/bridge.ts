@@ -907,18 +907,26 @@ export class HermesBridge implements BotsSurface {
   async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> {
     await this.#assertBotKnown(name);
     return this.#chainRoutineWrite(name, async () => {
-      const routine = await createBotRoutine(this.#client, name, input, this.#bridgeProfile);
-      await this.#publishRoutines(name);
-      return { routine };
+      // Publish in `finally`: a failed write can still have MOVED state (an add that landed but
+      // could not be read back, a pause taken before a replacement that was never confirmed), and
+      // a client watching `bot_routines` must not keep showing the pre-write rows.
+      try {
+        const routine = await createBotRoutine(this.#client, name, input, this.#bridgeProfile);
+        return { routine };
+      } finally {
+        await this.#publishRoutines(name);
+      }
     });
   }
 
   async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> {
     await this.#assertBotKnown(name);
     return this.#chainRoutineWrite(name, async () => {
-      const result = await patchBotRoutine(this.#client, name, id, patch, this.#bridgeProfile);
-      await this.#publishRoutines(name);
-      return result;
+      try {
+        return await patchBotRoutine(this.#client, name, id, patch, this.#bridgeProfile);
+      } finally {
+        await this.#publishRoutines(name);
+      }
     });
   }
 

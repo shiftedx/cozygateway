@@ -1058,7 +1058,9 @@ carried, and the stored job is what comes back. When the read-back finds nothing
 502, never a 201 built out of the request: a routines pane rendering the string the user typed, in a
 shape the backend does not store, at the exact moment the round trip failed, is the one outcome worth
 refusing. `createdId` is present whenever the `add` reported an id, because the routine may really be
-there; list the routines to find out, and delete the leftover by that id if it is.
+there; list the routines to find out, and delete the leftover by that id if it is. Do NOT blindly
+retry this 502 (or accept a second Save tap for it): the add likely landed, and each retry can add
+another live schedule. List first.
 
 ### PATCH /bots/:name/routines/:id
 
@@ -1096,7 +1098,10 @@ routine firing twice or half-edited:
    replacement the backend accepted and the gateway could not read back: it may already be running,
    and resuming the old one on top of it is exactly the double schedule this ordering exists to
    prevent. The old routine stays paused, the error carries `createdId`, and a list says which jobs
-   are really there.
+   are really there. On this path the old job is also never REMOVED and no `orphanedId` is
+   reported: the old routine keeps its id, paused, and its own switch turns it back on. The retry
+   warning above applies here too, doubled: a blind retry can leave the unconfirmed replacement AND
+   a second replacement both live.
 3. the old job is REMOVED. If THAT fails, the new routine exists and the old one is still paused, so
    nothing double-fires; its id comes back as `orphanedId` and is deletable through
    `DELETE /bots/:name/routines/:id`.

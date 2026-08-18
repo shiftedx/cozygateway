@@ -943,6 +943,24 @@ describe("frames", () => {
     expect(routineFrames(h.frames)).toHaveLength(0);
   });
 
+  it("broadcasts the moved state even when the write itself fails (G1)", async () => {
+    // A patch whose replacement cannot be confirmed still PAUSED the old job. The pane watching
+    // `bot_routines` must see that pause, not keep showing the pre-write row as enabled.
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
+    await h.authed("/bots/scout/routines");
+    await until(() => routineFrames(h.frames).length === 1);
+    expect(routineFrames(h.frames)[0]?.routines[0]).toMatchObject({ id: "j1", enabled: true });
+
+    h.cron.phantomAdd = true;
+    const res = await h.authed(
+      "/bots/scout/routines/j1",
+      body("PATCH", { schedule: "0 8 * * *", prompt: "summarize overnight" }),
+    );
+    expect(res.status).toBe(502);
+    await until(() => routineFrames(h.frames).length === 2);
+    expect(routineFrames(h.frames)[1]?.routines[0]).toMatchObject({ id: "j1", enabled: false });
+  });
+
   it("marks a delegated legacy routine on the frame too", async () => {
     const h = await setup([
       job({
