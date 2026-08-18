@@ -38,8 +38,14 @@ export const SESSION_LIST_LIMIT = 200;
 
 /** Longest skill-search query `GET /bots/catalog` accepts. The query is forwarded to a hub search
  *  upstream, and the answer is cached per query, so an unbounded one is both a pointless round trip
- *  and an unbounded cache key. */
+ *  and an unbounded query string. The NUMBER of cache entries is bounded separately, in the bridge
+ *  (`CATALOG_CACHE_MAX`): a length cap bounds the key, never the key space. */
 export const CATALOG_QUERY_MAX = 200;
+
+/** Hermes' JSON-RPC code for "no profile by that name". Mapped to a 404 rather than the blanket 502
+ *  every other rejection gets, so the TOCTOU window between a roster-cache hit and the call behind
+ *  it answers what the route promises instead of reading as a backend failure. */
+export const HERMES_PROFILE_NOT_FOUND = 4064;
 
 /** Local copy of http.ts's helper, duplicated rather than imported so this module does not close
  *  an import cycle back into the app it is registered on. */
@@ -78,6 +84,12 @@ function failure(c: Context<Env>, err: unknown) {
   // a backend failure of any kind, it is a 404 that says so, on every `/bots/:name/*` route the
   // same way `DELETE /bots/:name` already answers it.
   if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
+  // Same news, said by Hermes instead of by the pre-check: a bot deleted between a roster-cache hit
+  // and the call that followed it is the narrow window `#assertBotKnown` cannot close, and a 502
+  // there contradicts what every one of these routes promises about a name that names no profile.
+  if (err instanceof HermesRpcError && err.code === HERMES_PROFILE_NOT_FOUND) {
+    return c.json(errorBody("not_found", err.message), 404);
+  }
   if (err instanceof HermesRpcError) {
     return c.json(
       {
@@ -221,9 +233,11 @@ export function registerBotRoutes(
     return c.json({ ok: true });
   });
 
-  // Registered ahead of every `/bots/:name/*` route so a literal segment can never be read as a bot
-  // name. Nothing here is per-bot: it is the menu the edit screen offers for ALL bots, which is why
-  // it is one cached aggregate rather than three calls a client makes per screen open.
+  // Nothing here is per-bot: it is the menu the edit screen offers for ALL bots, which is why it is
+  // one cached aggregate rather than three calls a client makes per screen open. There is no
+  // routing ambiguity to resolve either way: `/bots/catalog` is two segments and every per-bot
+  // route is three or more, so a bot literally named `catalog` stays fully addressable at
+  // `/bots/catalog/profile` while this route serves the menu.
   app.get("/bots/catalog", requireDevice, async (c) => {
     const query = (c.req.query("q") ?? "").trim();
     if (query.length > CATALOG_QUERY_MAX) {

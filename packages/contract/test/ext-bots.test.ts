@@ -92,6 +92,17 @@ describe("profile patch", () => {
     expect(check(BotProfilePatchSchema, { disabledSkills: "deploy" })).toBe(false);
     expect(check(BotProfilePatchSchema, { enabledMcpServers: [{ name: "github" }] })).toBe(false);
   });
+
+  // A single space passes `minLength: 1`, and the backend then filters it, leaving an EMPTY
+  // `enabled_toolsets`, which POPS the pin and enables every toolset. A typo must not be the
+  // maximum-permission request, so the item rule requires a non-whitespace character.
+  it("rejects a whitespace-only name in any of the three lists", () => {
+    expect(check(BotProfilePatchSchema, { enabledToolsets: ["  "] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { disabledSkills: ["\t"] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledMcpServers: ["\n"] })).toBe(false);
+    // A name with padding around real characters is still a name; the bridge trims it.
+    expect(check(BotProfilePatchSchema, { enabledToolsets: [" files "] })).toBe(true);
+  });
 });
 
 describe("profile", () => {
@@ -106,8 +117,27 @@ describe("profile", () => {
         toolsetsPinned: true,
         mcpServers: [{ name: "github", installed: true, enabled: true }],
         model: { provider: "", default: "" },
+        runtimeInert: ["toolsets", "mcpServers"],
       }),
     ).toBe(true);
+  });
+
+  // Required, not optional: a client gates its honesty note on this field, and an absent one would
+  // read as "everything works" on exactly the backends where it does not.
+  it("requires runtimeInert, and only knows the two section names", () => {
+    const base = {
+      name: "scout",
+      description: "",
+      soul: "",
+      skills: [],
+      toolsets: [],
+      toolsetsPinned: false,
+      mcpServers: [],
+      model: { provider: "", default: "" },
+    };
+    expect(check(BotProfileSchema, base)).toBe(false);
+    expect(check(BotProfileSchema, { ...base, runtimeInert: [] })).toBe(true);
+    expect(check(BotProfileSchema, { ...base, runtimeInert: ["skills"] })).toBe(false);
   });
 });
 

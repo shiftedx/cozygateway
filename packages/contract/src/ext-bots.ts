@@ -1,4 +1,4 @@
-/** Vendor extension `com.cozylabs.bots`, version 2. NOT part of the frozen `contract: "v1"`
+/** Vendor extension `com.cozylabs.bots`, version 3. NOT part of the frozen `contract: "v1"`
  *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
  *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
  *  advertise the capability never emits these frames, and a client that does not recognize the
@@ -184,6 +184,19 @@ export const BotMcpServerSchema = Type.Object({
 });
 export type BotMcpServer = Static<typeof BotMcpServerSchema>;
 
+/** Which profile sections this gateway accepts, persists and shows back on a read, but which the
+ *  BACKEND does not consult at runtime. A client renders those sections with an honesty note
+ *  ("saved, takes effect when the gateway supports it") and gates it on this list rather than on a
+ *  Hermes version string it has no reliable way to read.
+ *
+ *  Always present, possibly empty. The names are the PATCH body's own sections, minus the
+ *  `enabled`/`disabled` prefix: `toolsets` answers for `enabledToolsets`, `mcpServers` for
+ *  `enabledMcpServers`. A client that does not recognize a name shows the generic note. */
+export const BotProfileRuntimeInertSchema = Type.Array(
+  Type.Union([Type.Literal("toolsets"), Type.Literal("mcpServers")]),
+);
+export type BotProfileRuntimeInert = Static<typeof BotProfileRuntimeInertSchema>;
+
 /** `GET /bots/:name/profile`: one bot's full edit-screen state. `model.default` is the model id and
  *  keeps the gateway's own field name; both model fields are empty strings when the profile
  *  inherits the launch profile's model rather than pinning one. */
@@ -196,6 +209,7 @@ export const BotProfileSchema = Type.Object({
   toolsetsPinned: Type.Boolean(),
   mcpServers: Type.Array(BotMcpServerSchema),
   model: Type.Object({ provider: Type.String(), default: Type.String() }),
+  runtimeInert: BotProfileRuntimeInertSchema,
 });
 export type BotProfile = Static<typeof BotProfileSchema>;
 
@@ -204,12 +218,19 @@ export type BotProfile = Static<typeof BotProfileSchema>;
  *  point of the shape and must not be guessed at:
  *  - `disabledSkills` is the OFF list (send the names to disable, not the ones to keep);
  *  - `enabledToolsets` is the ON list, and `[]` CLEARS the pin so every toolset is enabled again;
- *  - `enabledMcpServers` is the ON list, replace semantics, unknown names skipped by the gateway. */
+ *  - `enabledMcpServers` is the ON list, replace semantics, unknown names skipped by the gateway.
+ *
+ *  Every name must carry at least one non-whitespace character, which is why the item rule is a
+ *  PATTERN and not just `minLength: 1`. A single space passes a length check, and the backend then
+ *  filters it, leaving `enabledToolsets` EMPTY, which pops the pin and enables every toolset: the
+ *  maximum-permission outcome from what looks like a typo. Refused at the boundary instead. */
+const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
+
 export const BotProfilePatchSchema = Type.Object({
   soul: Type.Optional(Type.String({ maxLength: 200_000 })),
-  disabledSkills: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 500 })),
-  enabledToolsets: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 500 })),
-  enabledMcpServers: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 500 })),
+  disabledSkills: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  enabledToolsets: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  enabledMcpServers: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
 });
 export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
 

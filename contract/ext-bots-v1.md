@@ -144,13 +144,21 @@ of `meta.created` and `lastActiveAt`. Client-side search filters this order, it 
   mcpServers: [ { name: string, installed: boolean, enabled: boolean,
                   auth?: string, description?: string, transport?: string,
                   requires?: string[], fromCatalog?: boolean } ],
-  model: { provider: string, default: string }   // both "" when the profile inherits
+  model: { provider: string, default: string },  // both "" when the profile inherits
+  runtimeInert: string[]              // sections saved and shown back, but inert at runtime today
 }
 ```
 
 Read by `GET /bots/:name/profile`, written (in part) by `PATCH /bots/:name/profile`. The three
 lists carry three DIFFERENT enable semantics; the table under that route is the load-bearing part
 of this document for a client author.
+
+`runtimeInert` is always present and possibly empty. It names the PATCH sections this gateway
+accepts, persists and reads back, but which the backend does not consult when the bot actually
+runs. Values are `"toolsets"` (for `enabledToolsets`) and `"mcpServers"` (for `enabledMcpServers`);
+a client that does not recognize a value shows a generic note. See the KNOWN ISSUE under
+`PATCH /bots/:name/profile`, which this field exists to let a client gate on without sniffing a
+backend version string it has no reliable way to read.
 
 ### BotCatalog
 
@@ -484,7 +492,8 @@ Full response example:
       "fromCatalog": true
     }
   ],
-  "model": { "provider": "nous", "default": "hermes-4" }
+  "model": { "provider": "nous", "default": "hermes-4" },
+  "runtimeInert": ["toolsets", "mcpServers"]
 }
 ```
 
@@ -501,6 +510,8 @@ Field notes, in the order a client will hit them:
   is the difference between "the user turned these on" and "nobody has decided yet".
 - `label`, `description`, `toolCount`, `transport`, `requires`, `auth` and `fromCatalog` are all
   OPTIONAL and are omitted when the gateway carried nothing for them.
+- `runtimeInert` is always present. Render the sections it names with the honesty note described
+  under `PATCH /bots/:name/profile`, and gate on this field rather than on a backend version.
 
 THE THREE LIST SEMANTICS. They are not the same, and a client that treats them uniformly writes the
 opposite of what its user chose:
@@ -511,9 +522,51 @@ opposite of what its user chose:
 | toolsets | `toolsets[].enabled` + `toolsetsPinned` | `enabledToolsets` | The names to turn ON. `[]` CLEARS the pin (everything enabled again), it does NOT disable everything. |
 | mcpServers | `mcpServers[].enabled` | `enabledMcpServers` | The names to turn ON. Replace semantics; a name the gateway does not know is skipped, never invented. |
 
+> **KNOWN ISSUE: two of these three sections are saved but do not take effect yet.**
+>
+> On Hermes 0.20.3 and 0.20.4, `enabledToolsets` and `enabledMcpServers` are written, persisted and
+> read back correctly, and every screen shows the state the user chose. Neither changes what the bot
+> can actually do at runtime. This is an upstream defect, not a gap in this gateway: the desktop
+> Edit Profile dialog has the identical hole.
+>
+> - **Toolsets.** `profiles.configure` writes `tools.enabled_toolsets`. Exactly two things in the
+>   whole backend read that key: `profiles.describe` (which is what the edit screen shows back) and
+>   the bot-mode capability fingerprint. Runtime toolset resolution reads `platform_toolsets` for
+>   the platform instead. The pin is describe-visible only.
+> - **MCP servers.** `profiles.configure` writes a per-server `disabled` key, and `profiles.describe`
+>   reads it. Nothing else does. Every runtime consumer, and the MCP catalog's own `is_enabled`,
+>   reads the `enabled` key instead.
+>
+> The fingerprint DOES change, so a save rebuilds the capability epoch and the system prompt: the
+> user sees activity, just not the effect. Without this note the first bug report is "I turned off
+> the shell toolset on my phone and the bot still ran shell commands."
+>
+> **What a client should do.** Keep sending both sections (they are accepted, persisted and
+> forward-compatible, so a backend that starts honouring them needs no client change), and surface
+> those two sections with an honesty note: *saved, takes effect when the gateway supports it*. Gate
+> the note on `BotProfile.runtimeInert` from `GET /bots/:name/profile`, which names exactly the
+> sections this gateway knows to be inert (`"toolsets"`, `"mcpServers"`, and it shrinks when a
+> backend fixes them). Do NOT sniff a backend version: nothing on this wire carries one a client can
+> trust. `disabledSkills` is NOT affected and takes effect normally.
+
 Why skills invert: the backend stores a DISABLED list, so an installed skill is enabled unless its
 name is in that list. Echoing the enabled names back would disable exactly the skills the user kept.
 A skill row that carries no `enabled` field at all is enabled, for the same reason.
+
+Two caveats on the skills round trip, both upstream behaviours the desktop shares, both of which
+matter because this document tells a client exactly how to compute `disabledSkills`:
+
+- `disabledSkills` is REPLACE semantics against a list the read cannot fully see. `skills[]`
+  enumerates only the skills installed under the profile's own skills directory, while the stored
+  disabled list can legitimately hold names that are not there: a skill that was disabled and then
+  uninstalled, and project-local or external-directory skills the runtime scans but the read does
+  not enumerate. Saving the computed set silently RE-ENABLES those. A client that must not do that
+  has no way to avoid it on this version; a client that shows a "reset skills" affordance should at
+  least not present the save as a no-op.
+- A disable can also be a no-op in the other direction: the read keys a skill on its DIRECTORY name
+  while the runtime matches the skill's declared `name`, and the read's comparison is
+  case-insensitive while the runtime's is not. Where the two disagree, a name sent in
+  `disabledSkills` matches nothing at runtime.
 
 Why an empty `enabledToolsets` means "all of them": the backend stores an optional PIN, and popping
 the pin restores every toolset. The desktop exploits this and sends `[]` both when everything is
@@ -526,10 +579,15 @@ How `mcpServers` is assembled: it is a UNION of two sources, and the two carry d
   of them (the profile carries their definition) and `enabled` is the inverse of the backend's
   `disabled` flag. A defined-but-disabled server is `installed: true, enabled: false`.
 - Servers from the bundled catalog that the profile does NOT define follow, marked
-  `fromCatalog: true`. They are always `enabled: false` for this bot, even though the catalog's own
-  `enabled` flag may say otherwise: that flag describes the LAUNCH profile, and rendering it as this
-  bot's state is how a checkbox lies. Turning one on is supported: the backend copies its definition
-  from the launch profile on write.
+  `fromCatalog: true`. They are always `enabled: false` for this bot, even though the catalog row's
+  own `enabled` flag may say otherwise. Not because that flag describes some other profile: this
+  route asks for the catalog SCOPED to the bot, and the backend resolves `installed` and `enabled`
+  under that scope, so the flags already describe this bot. The reason is narrower and stronger. A
+  row absent from the profile's defined servers is by construction absent from the very config the
+  scoped flag resolves through, so a `true` there cannot describe this bot under any reading, and
+  forcing `false` states that invariant rather than trusting it. (The launch-profile caveat is real
+  for `GET /bots/catalog`, which asks UNSCOPED. See that route.) Turning one on is supported: the
+  backend copies its definition from the launch profile on write.
 - `requires` lists the environment keys the server needs before it will work, so a client can mark a
   row as needing setup. `auth` is a hint about how the server authenticates and is present only when
   the gateway sends one (Hermes 0.20.3 does not, so treat its absence as "unknown", not as "none").
@@ -558,6 +616,23 @@ body {
 
 A body carrying none of the four fields is a 400, not an empty success: a client that sends nothing
 has a bug, and answering it with an empty `applied` map hides it.
+
+`soul: ""` CLEARS SOUL.md. It writes a zero-byte file, it is not a no-op and it is not the same as
+omitting the field: omitting leaves the existing SOUL.md untouched, sending `""` empties it. Every
+name in the three lists must carry at least one non-whitespace character; a whitespace-only name is
+a 400 rather than being forwarded, because the backend would filter it and leave `enabledToolsets`
+EMPTY, which pops the pin and enables everything. Names are trimmed and deduped at this boundary.
+
+**Two sections of this body are runtime-inert on Hermes 0.20.3 / 0.20.4.** See the KNOWN ISSUE
+under `GET /bots/:name/profile`, and gate the client-side note on `BotProfile.runtimeInert`.
+
+CONCURRENCY. This gateway serializes patches PER BOT: two overlapping saves of the same bot run one
+after the other, never at once, because the backend's write is a read-modify-write across up to
+three separate save cycles and two overlapping calls silently lose the loser's sections. What is NOT
+offered on this version is optimistic concurrency: there is no ETag or version on
+`GET /bots/:name/profile`, so a read, a user edit and a patch is a lost-update window against any
+writer this gateway does not see (a desktop editing the same profile directly). A client that keeps
+an edit screen open for a long time should re-read before saving.
 
 Request example, all four sections at once:
 
@@ -607,7 +682,9 @@ volunteered is reported but never makes a successful write read as a failure.
 - `"unsupported"`: the gateway answered with NO `applied` map at all. That is an older backend that
   does not report per-section results. The write may well have landed, but nothing can confirm it,
   so `ok` is `false` and `applied` is `{}`. A client should treat this as "we cannot tell" and
-  re-read the profile, NOT as an error to put in front of a user.
+  re-read the profile, NOT as an error to put in front of a user. No shipped Hermes does this: every
+  known version answers with an `applied` map, possibly empty. Handle it as forward compatibility,
+  not as a case to design a screen around.
 
 ```json
 { "name": "scout", "outcome": "unsupported", "ok": false, "applied": {}, "requested": ["soul"] }
@@ -690,19 +767,32 @@ Response example:
 - `models[].models` is a flat list of model IDs. Upstream returns model rows as bare strings on some
   builds and as objects on others; both are reduced to the ID, which is what a model write wants.
 - `unavailable` names the sections whose gateway call was refused, which is how an older backend
-  missing a method shows up. Those sections are EMPTY rather than absent, so a client never
-  special-cases a missing field:
+  missing a method shows up. It is SORTED, so the same degradation reads the same way every time.
+  Those sections are EMPTY rather than absent, so a client never special-cases a missing field:
 
 ```json
-{ "query": "", "skills": [], "mcpServers": [], "models": [], "unavailable": ["skills", "models"] }
+{ "query": "", "skills": [], "mcpServers": [], "models": [],
+  "unavailable": ["models", "skills"], "updatedAt": 1800000000000 }
 ```
 
   A TRANSPORT failure is different and is not degraded: if the bridge is down the route answers 503
   rather than three empty lists.
 
-The answer is cached for 60 s per `q`, and concurrent reads of the same `q` share one fetch, so two
-devices opening the edit screen together cost one round of three calls. A failed fetch is not
-cached, so a gateway that was down when the screen opened is retried on the next read.
+CACHING, and the three cases are not the same:
+
+- A COMPLETE answer (`unavailable` empty) is cached for 60 s per `q`.
+- A DEGRADED answer (`unavailable` non-empty) is cached for a few seconds only. It is a report that
+  a section could not be fetched, not the screen's data, and the most failure-prone of the three
+  calls is the model inventory, which does live discovery against every configured provider. One
+  flaky moment must not pin an empty model picker in front of a user for a full minute under a
+  message that reads "your gateway is too old". It is cached at all, rather than not cached, so a
+  client re-reading per keystroke cannot hammer a struggling backend.
+- A TRANSPORT failure is not cached at all, so a gateway that was down when the screen opened is
+  retried on the very next read.
+
+Concurrent reads of the same `q` share one fetch, so two devices opening the edit screen together
+cost one round of three calls. The cache holds a bounded number of recent queries and evicts the
+oldest, so a client that reads per keystroke cannot grow it without limit.
 
 ### POST /bots/focus
 

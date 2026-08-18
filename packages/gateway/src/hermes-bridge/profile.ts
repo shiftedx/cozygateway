@@ -1,6 +1,12 @@
-import type { BotCatalog, BotProfile, BotProfilePatch, BotProfileApplied } from "cozygateway-contract";
+import type {
+  BotCatalog,
+  BotProfile,
+  BotProfilePatch,
+  BotProfileApplied,
+  BotProfileRuntimeInert,
+} from "cozygateway-contract";
 
-import { HermesRpcError } from "./client.ts";
+import { HermesRpcError, HermesTimeout } from "./client.ts";
 import type { HermesRpc } from "./canonical-chat.ts";
 
 /** The edit-profile surface: everything the desktop's `EditProfileDialog` reads and everything its
@@ -40,6 +46,24 @@ export const APPLIED_KEY_OF = {
  *  that does not speak the per-section contract, which is different news from a gateway that spoke
  *  it and said a section did not apply. */
 export type ConfigureOutcome = "applied" | "unsupported";
+
+/** The profile sections this gateway accepts, persists and reads back, but which the BACKEND does
+ *  not consult when the bot actually runs. Reported on every profile read as `runtimeInert` so a
+ *  client can render the honesty note without sniffing a Hermes version.
+ *
+ *  Both are upstream defects on Hermes 0.20.3 / 0.20.4, not gaps in this bridge, and the desktop
+ *  has the identical hole:
+ *  - TOOLSETS: `profiles.configure` writes `tools.enabled_toolsets`, which only `profiles.describe`
+ *    and the bot-mode capability fingerprint ever read. Runtime toolset resolution reads
+ *    `config["platform_toolsets"][platform]` instead, so the pin is describe-visible only.
+ *  - MCP SERVERS: `profiles.configure` writes the per-server `disabled` key, which only
+ *    `profiles.describe` reads. Every runtime consumer, and `mcp_catalog.is_enabled`, reads the
+ *    `enabled` key instead.
+ *
+ *  Kept as a constant rather than probed: nothing on the wire distinguishes a gateway that fixed
+ *  this from one that did not, and claiming a section works when it might not is the failure that
+ *  costs a user their trust. Narrow it when a backend that honours these lands. */
+export const RUNTIME_INERT_SECTIONS: BotProfileRuntimeInert = ["toolsets", "mcpServers"];
 
 export interface ProfileConfigureResult {
   outcome: ConfigureOutcome;
@@ -144,9 +168,17 @@ export function mapProfileDescribe(describe: unknown, catalog?: unknown): BotPro
       mcpServer({
         name,
         installed: row["installed"] === true,
-        // Not defined by the profile means not enabled for it, whatever the catalog's own global
-        // `enabled` says: that flag describes the LAUNCH profile, and rendering it as this bot's
-        // state is how a checkbox lies.
+        // Not defined by the profile means not enabled for it, whatever the catalog row's own
+        // `enabled` says. Note this is NOT because the catalog flag describes the launch profile:
+        // `readBotProfile` asks `mcp.catalog { profile: name }`, and upstream applies a hermes-home
+        // override for that profile before resolving `installed`/`enabled`, so the flags are
+        // already scoped to THIS bot. The reason is narrower and stronger: a row that is absent
+        // from `describe.mcp_servers` is by construction absent from that profile's `config.yaml`
+        // `mcp_servers` map, which is exactly what the scoped `enabled` resolves through, so the
+        // flag cannot be true here for any server the profile has not defined. Forcing `false`
+        // states that invariant instead of trusting it, and it is also what keeps the UNSCOPED
+        // catalog (`GET /bots/catalog`, which really does describe the launch profile) from ever
+        // rendering as this bot's state if a caller passes one in.
         enabled: false,
         row: undefined,
         catalogRow: row,
@@ -166,6 +198,9 @@ export function mapProfileDescribe(describe: unknown, catalog?: unknown): BotPro
       provider: asString(model["provider"]) ?? "",
       default: asString(model["default"]) ?? "",
     },
+    // Constant, not derived from this reply: see RUNTIME_INERT_SECTIONS. Copied so a caller cannot
+    // mutate the shared constant through a response object.
+    runtimeInert: [...RUNTIME_INERT_SECTIONS],
   };
 }
 
@@ -199,18 +234,45 @@ function mcpServer(input: {
 
 /** Reads one bot's edit-screen state. `mcp.catalog` is best-effort exactly as the desktop treats it
  *  (`.catch(() => null)`): a gateway that does not offer it still answers the profile, it just
- *  cannot offer servers the profile has not defined. A transport failure is NOT swallowed, because
- *  that means the whole read is unreliable, not that one section is missing. */
+ *  cannot offer servers the profile has not defined.
+ *
+ *  A REJECTION and a TIMEOUT are both swallowed, because both mean the same thing about the same
+ *  optional half: this read cannot offer undefined servers, which is a smaller answer, not a wrong
+ *  one. A slow-but-alive catalog turning a perfectly good `profiles.describe` into a 504 was the
+ *  bug; the desktop's `.catch(() => null)` swallows its timeouts too. A `HermesUnavailable` that is
+ *  NOT a timeout still propagates: the bridge is down, so the `profiles.describe` that just
+ *  succeeded is the stale half, and the route should say the bridge is down. */
 export async function readBotProfile(rpc: HermesRpc, name: string): Promise<BotProfile> {
   const describe = await rpc.request("profiles.describe", { name });
   let catalog: unknown;
   try {
     catalog = await rpc.request("mcp.catalog", { profile: name });
   } catch (err) {
-    if (!(err instanceof HermesRpcError)) throw err;
+    if (!(err instanceof HermesRpcError) && !(err instanceof HermesTimeout)) throw err;
     catalog = undefined;
   }
   return { ...mapProfileDescribe(describe, catalog), name };
+}
+
+/** Cleans one list before it goes on the wire: trims each name, drops the blanks, and dedupes,
+ *  preserving first-seen order.
+ *
+ *  The gateway is the layer that owes the backend a clean list, and upstream's own cleaning is
+ *  uneven: it filters blanks for skills and toolsets but not consistently across all three, and a
+ *  single whitespace name in `enabledToolsets` survives `minLength: 1` validation only to be
+ *  filtered upstream into an EMPTY list, which POPS the pin and enables every toolset. A client
+ *  that sent one stray space would get the maximum-permission outcome. Trimming here makes that
+ *  request refuse to be misread: a whitespace-only name is simply not a name. */
+export function normalizeNames(names: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of names) {
+    const name = raw.trim();
+    if (name.length === 0 || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
 }
 
 /** The `profiles.configure` params for a patch, plus which fields asked for them. Only the fields
@@ -227,18 +289,20 @@ export function buildConfigurePayload(
     requested.push("soul");
   }
   if (patch.disabledSkills !== undefined) {
-    params["disabled_skills"] = [...patch.disabledSkills];
+    params["disabled_skills"] = normalizeNames(patch.disabledSkills);
     requested.push("disabledSkills");
   }
   if (patch.enabledToolsets !== undefined) {
-    // Passed through EXACTLY, empty array included: `[]` is not "disable everything", it pops the
-    // pin so every toolset is enabled again (dissection 4.2). Dropping an empty array here would
-    // make "turn everything back on" unrepresentable.
-    params["enabled_toolsets"] = [...patch.enabledToolsets];
+    // The EMPTINESS is passed through exactly, normalization or not: `[]` is not "disable
+    // everything", it pops the pin so every toolset is enabled again (dissection 4.2). Dropping an
+    // empty array here would make "turn everything back on" unrepresentable. The names themselves
+    // are still trimmed and deduped, and the schema has already refused a whitespace-only name, so
+    // a list that arrives non-empty can never normalize down into the pin-popping empty case.
+    params["enabled_toolsets"] = normalizeNames(patch.enabledToolsets);
     requested.push("enabledToolsets");
   }
   if (patch.enabledMcpServers !== undefined) {
-    params["enabled_mcp_servers"] = [...patch.enabledMcpServers];
+    params["enabled_mcp_servers"] = normalizeNames(patch.enabledMcpServers);
     requested.push("enabledMcpServers");
   }
   return { params, requested };
@@ -286,6 +350,30 @@ export async function configureBotProfile(
  *  the next open. */
 export const CATALOG_TTL_MS = 60_000;
 
+/** How long a DEGRADED catalog (one whose `unavailable` is non-empty) is served from cache.
+ *
+ *  Deliberately seconds, not a minute. A degraded answer is not the screen's data, it is a report
+ *  that a section could not be fetched, and the most failure-prone of the three is `model.options`
+ *  with `refresh: true`: it busts upstream's model-id cache and does live discovery against every
+ *  saved provider, offline local endpoints included. One flaky refresh must not pin an empty model
+ *  picker in front of the user for a full minute under a message that reads "your gateway is too
+ *  old" rather than "retry".
+ *
+ *  Cached at all, rather than not cached, because the failing call is the expensive one: a client
+ *  that re-reads on every keystroke would otherwise hammer a struggling gateway with live provider
+ *  discovery. A few seconds is the retry floor, not a data lifetime. */
+export const CATALOG_DEGRADED_TTL_MS = 5_000;
+
+/** How many per-query catalog answers are kept at once.
+ *
+ *  The cache is keyed on the skill-search query so a keystroke does not evict the previous answer,
+ *  which is exactly what makes the key space CLIENT-CHOSEN and unbounded: an edit screen that reads
+ *  per keystroke mints one entry per prefix, each holding a full skills + MCP + models payload, and
+ *  a length cap on the query bounds the key, not the number of keys. Bounded and swept on write, so
+ *  a paired device cannot grow this without limit and a decade-stale entry cannot outlive its own
+ *  usefulness. Small on purpose: the value of the cache is one screen open, not a history. */
+export const CATALOG_CACHE_MAX = 32;
+
 /** Which catalog sections could not be fetched. A section here is EMPTY in the response rather than
  *  absent, so a client renders "nothing to offer" without special-casing a missing field, and can
  *  say why. */
@@ -295,6 +383,9 @@ export interface CachedCatalog {
   catalog: BotCatalog;
   /** When the three calls behind it were made. Cache bookkeeping only, never on the wire. */
   fetchedAt: number;
+  /** How long THIS entry is good for. Per entry rather than global because a degraded answer is
+   *  worth seconds and a complete one is worth a minute. */
+  ttlMs: number;
 }
 
 /** The desktop's own `model.options` params (dissection 1.2 row 13). `refresh: true` is what makes
@@ -385,5 +476,9 @@ export async function readBotCatalog(rpc: HermesRpc, query: string, now: number)
     ),
   ]);
 
+  // Sorted, because the three `section()` calls run concurrently and push in whatever order they
+  // reject: an unsorted list makes the same degradation read as a different answer run to run, and
+  // a client diffing responses (or a test asserting one) would see churn that means nothing.
+  unavailable.sort();
   return { query, skills, mcpServers, models, unavailable, updatedAt: now };
 }
