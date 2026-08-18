@@ -10,8 +10,15 @@ import {
   type PinStore,
   type SessionRow,
 } from "./canonical-chat.ts";
-import { buildRoster, parseProfilesList, UI_META_KEY } from "./roster.ts";
-import { BotChatTurns } from "./chat-turns.ts";
+import {
+  botMetaForWriteback,
+  buildRoster,
+  parseProfilesList,
+  readBotMeta,
+  resolveChatPin,
+  UI_META_KEY,
+} from "./roster.ts";
+import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -56,7 +63,11 @@ export interface BotsSurface {
   canonicalChat(name: string): Promise<CanonicalChatResult>;
   sessions(name: string, limit: number): Promise<SessionRow[]>;
   chatHistory(name: string): Promise<BotChatHistory>;
-  sendChatMessage(name: string, text: string): Promise<{ sessionId: string; message: BotChatMessage }>;
+  sendChatMessage(
+    name: string,
+    text: string,
+    opts?: { clientId?: string },
+  ): Promise<{ sessionId: string; message: BotChatMessage }>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
 }
 
@@ -102,6 +113,19 @@ export class HermesBridge implements BotsSurface {
   readonly #chatInflight = new Map<string, Promise<CanonicalChatResult>>();
   readonly #pins: PinStore;
   readonly #chat: BotChatTurns;
+
+  /** Chats THIS bridge created whose kickoff has not been observed to land yet, by bot name. Two
+   *  things hang off it: the empty-history tolerance (a session with no persisted row cannot be
+   *  resumed, and Hermes answers that with an error, which is not a failure the app should see),
+   *  and the RUNTIME session id, which `prompt.submit` requires and which nothing else can hand
+   *  back while the chat is still lazy. Cleared the moment a resume of that session succeeds. */
+  readonly #kickoffs = new Map<string, { sessionId: string; runtimeId: string; at: number }>();
+
+  /** False once this Hermes has shown it cannot store `ui_meta` (an unknown-method rejection, or a
+   *  reply carrying no `applied` object at all: dissection 3.1's `unsupported` outcome). Retrying
+   *  forever costs one `profiles.configure` per chat open on every old gateway, for a write that
+   *  is never going to apply. */
+  #uiMetaWriteback = true;
 
   /** The profile the Hermes gateway is routed to, and whether it is mid-turn. Both feed the
    *  presence rule (dissection 7.1). The bridge only knows the routed profile when it is the one
@@ -198,20 +222,23 @@ export class HermesBridge implements BotsSurface {
     }
     const run = (async () => {
       try {
+        // Stamped BEFORE the call, and the same value is what the cache is stored under: it is the
+        // moment this snapshot's data was asked for, so "was this local pin written after the
+        // server could have seen it" has one answer, whether it is asked here or by `#serverPinOf`.
+        const fetchedAt = this.#now();
         const result = await this.#client.request("profiles.list", {});
         const { profiles } = parseProfilesList(result);
         const bots = buildRoster(profiles, {
-          pins: this.#storage.botChatPins(),
+          pins: this.#storage.botChatPinEntries(),
           routedProfile: this.#routedProfile,
           gatewayState: this.#gatewayState(),
-          now: this.#now(),
+          now: fetchedAt,
         });
-        const updatedAt = this.#now();
         this.#storage.replaceBotRoster(
           bots.map((summary) => ({ name: summary.name, summary })),
-          updatedAt,
+          fetchedAt,
         );
-        this.#publish(bots, updatedAt);
+        this.#publish(bots, fetchedAt);
       } catch (err) {
         const detail = err instanceof Error ? err.message : "unknown failure";
         this.#log(`roster refresh failed (${reason}): ${detail}`);
@@ -252,13 +279,19 @@ export class HermesBridge implements BotsSurface {
       this.#routedProfile = name;
       this.#busyDepth += 1;
       try {
-        return await resolveCanonicalChat(name, {
+        const result = await resolveCanonicalChat(name, {
           rpc: this.#client,
           pins: this.#pins,
           hideBotChats: this.#hideBotChats,
           serverPin,
-          saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId),
+          saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
         });
+        // A chat this call created is lazy until its kickoff lands: remember the runtime id and
+        // the moment, because for the next few seconds it cannot be resumed at all.
+        if (result.adoption === "created" && result.runtimeId !== undefined) {
+          this.#kickoffs.set(name, { sessionId: result.sessionId, runtimeId: result.runtimeId, at: this.#now() });
+        }
+        return result;
       } finally {
         this.#busyDepth = Math.max(0, this.#busyDepth - 1);
         // Nothing is routed once the last turn drains, so the busy leg of the presence rule stops
@@ -282,11 +315,18 @@ export class HermesBridge implements BotsSurface {
    *  A chat that was just created has no resumable row until its kickoff lands (dissection 5.1),
    *  and Hermes answers that with an error. That case reads as an empty history rather than a
    *  failure, since the messages arrive over `bot_chat` frames moments later. Any other failure
-   *  propagates so the route can pass the Hermes text through verbatim. */
+   *  propagates so the route can pass the Hermes text through verbatim.
+   *
+   *  The tolerance keys on the KICKOFF WINDOW, not on `adoption`. Adoption only says `created` on
+   *  the call that did the creating; the second open inside that same window (open bot, resolve,
+   *  read history: the exact sequence the app performs) correctly answers `pin`, and gating on
+   *  `created` made that second read a 502 for the one scenario this whole path exists for. */
   async chatHistory(name: string): Promise<BotChatHistory> {
     const chat = await this.canonicalChat(name);
     try {
       const snapshot = await this.#chat.history(name, chat.sessionId);
+      // The session resumed, so it is no longer lazy.
+      if (this.#kickoffs.get(name)?.sessionId === chat.sessionId) this.#kickoffs.delete(name);
       return {
         sessionId: chat.sessionId,
         adoption: chat.adoption,
@@ -296,7 +336,7 @@ export class HermesBridge implements BotsSurface {
         updatedAt: this.#now(),
       };
     } catch (err) {
-      if (chat.adoption !== "created") throw err;
+      if (!this.#inKickoffWindow(name, chat.sessionId)) throw err;
       return {
         sessionId: chat.sessionId,
         adoption: chat.adoption,
@@ -309,11 +349,37 @@ export class HermesBridge implements BotsSurface {
   }
 
   /** Submits into the canonical chat and leaves a turn poll running behind it. The reply is
-   *  delivered over `/ws`, never in this response. */
-  async sendChatMessage(name: string, text: string): Promise<{ sessionId: string; message: BotChatMessage }> {
+   *  delivered over `/ws`, never in this response.
+   *
+   *  The runtime id of a chat still inside its kickoff window is handed down: that session cannot
+   *  be resumed yet, and `prompt.submit` accepts nothing else. */
+  async sendChatMessage(
+    name: string,
+    text: string,
+    opts: { clientId?: string } = {},
+  ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const chat = await this.canonicalChat(name);
-    const message = await this.#chat.send(name, chat.sessionId, text);
+    const kickoff = this.#kickoffs.get(name);
+    const runtimeId =
+      chat.runtimeId ?? (kickoff !== undefined && kickoff.sessionId === chat.sessionId ? kickoff.runtimeId : undefined);
+    const message = await this.#chat.send(name, chat.sessionId, text, {
+      ...(runtimeId === undefined ? {} : { runtimeId }),
+      ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
+    });
     return { sessionId: chat.sessionId, message };
+  }
+
+  /** True while a chat this bridge created is still lazy: the kickoff has not been seen to land,
+   *  so `session.resume` on it legitimately fails. The window is the turn cap, after which a
+   *  session that still cannot be resumed is a real failure and is reported as one. */
+  #inKickoffWindow(name: string, sessionId: string): boolean {
+    const kickoff = this.#kickoffs.get(name);
+    if (kickoff === undefined || kickoff.sessionId !== sessionId) return false;
+    if (this.#now() - kickoff.at > CHAT_TURN_TIMEOUT_MS) {
+      this.#kickoffs.delete(name);
+      return false;
+    }
+    return true;
   }
 
   /** Test seam: true while a turn poll is live for this bot. */
@@ -351,32 +417,58 @@ export class HermesBridge implements BotsSurface {
     const roster = this.#storage.botRoster();
     const cached = roster.bots.find((bot) => bot.name === name);
     if (cached === undefined) return undefined;
-    const meta = cached.meta;
-    if (meta === null) return undefined;
-    if (typeof meta["chat"] === "string") return meta["chat"];
-
-    // The blob carries no `chat`, which reads as an authoritative clear. It is only authoritative
-    // about state the snapshot could have seen: a pin this gateway wrote AFTER that snapshot was
-    // taken is newer than the server's answer, not contradicted by it. Without this the phone's
-    // own freshly created chat was thrown away on the very next open (the bridge does not write
-    // pins back to `ui_meta` yet), and, with the new session still unlisted because its kickoff
-    // had not landed, a SECOND canonical chat was minted: the live duplicate-adoption bug.
-    const local = this.#storage.botChatPinEntry(name);
-    if (local !== undefined && (roster.updatedAt === null || local.updatedAt > roster.updatedAt)) {
-      return undefined;
-    }
-    return null;
+    // Exactly the rule `buildRoster` applied to this same snapshot, so `GET /bots` and this route
+    // cannot answer differently for the same bot.
+    return resolveChatPin(cached.meta, this.#storage.botChatPinEntry(name), roster.updatedAt);
   }
 
-  /** Writes the canonical-chat pin into the bot's `ui_meta`, the desktop's `saveBotMeta` (
-   *  dissection 3.1). The blob is REPLACED whole, so the cached blob is merged key-wise here
-   *  first, and the write counts as persisted only when `applied.ui_meta === true`; anything else
-   *  (an old gateway rejecting the method, a 64KB blob, a transient failure) leaves the pin
-   *  gateway-local, which still works, so nothing here is ever allowed to fail the caller. */
-  async #saveServerPin(name: string, sessionId: string): Promise<void> {
-    const cached = this.#storage.botRoster().bots.find((bot) => bot.name === name);
-    const meta = { ...(cached?.meta ?? {}), chat: sessionId };
+  /** Writes the canonical-chat pin into the bot's `ui_meta`, the desktop's `saveBotMeta`
+   *  (dissection 3.1). Nothing here is ever allowed to fail the caller: a gateway that cannot store
+   *  `ui_meta` still gets a working chat, the pin just stays gateway-local.
+   *
+   *  `profiles.configure` REPLACES the whole blob, which makes this a read-modify-write, and the
+   *  read must be FRESH. Building it from the cached roster (up to one poll interval old) silently
+   *  reverted any desktop `saveBotMeta` that landed since the last refresh, and, worse, pushed a
+   *  re-derived pin back into a blob the desktop had authoritatively cleared: the dissection-3.2
+   *  resurrection, re-entering through the write path. So: re-read `profiles.list`, skip the write
+   *  when the server already carries this pin, and honor a clear that is newer than our own pin.
+   *
+   *  What goes on the wire is filtered too (`botMetaForWriteback`): `image`/`pet`/`custom` are
+   *  stripped and a legacy pre-namespace blob contributes only the fields the plugin owns, because
+   *  `ui_meta` is capped at 64 KB and rides every `profiles.list`. */
+  async #saveServerPin(
+    name: string,
+    sessionId: string,
+    previousServerPin: string | null | undefined,
+  ): Promise<void> {
+    if (!this.#uiMetaWriteback) return;
     try {
+      const raw = await this.#client.request("profiles.list", {});
+      const row = Array.isArray((raw as Record<string, unknown> | null)?.["profiles"])
+        ? ((raw as Record<string, unknown>)["profiles"] as unknown[]).find(
+            (entry) =>
+              typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["name"] === name,
+          )
+        : undefined;
+      const uiMeta = typeof row === "object" && row !== null ? (row as Record<string, unknown>)["ui_meta"] : undefined;
+      const fresh = readBotMeta(uiMeta).meta;
+
+      if (fresh !== null && fresh["chat"] === sessionId) return; // The server already agrees.
+      const clearedSinceResolve =
+        typeof previousServerPin === "string" && fresh !== null && typeof fresh["chat"] !== "string";
+      if (clearedSinceResolve) {
+        // The pin was there when this resolve started and is gone now: the desktop cleared it, and
+        // that clear is authoritative (dissection 3.2). Writing here would resurrect it.
+        this.#log(`ui_meta pin writeback skipped for ${name}: the server cleared the pin`);
+        return;
+      }
+
+      const meta = botMetaForWriteback(uiMeta, { chat: sessionId });
+      if (meta === null) {
+        this.#log(`ui_meta pin writeback skipped for ${name}: the blob exceeds the 64KB cap`);
+        return;
+      }
+
       const result = await this.#client.request("profiles.configure", {
         name,
         ui_meta: { [UI_META_KEY]: meta },
@@ -385,11 +477,19 @@ export class HermesBridge implements BotsSurface {
         typeof result === "object" && result !== null
           ? (result as Record<string, unknown>)["applied"]
           : undefined;
-      const persisted =
-        typeof applied === "object" && applied !== null && (applied as Record<string, unknown>)["ui_meta"] === true;
-      if (!persisted) this.#log(`ui_meta pin writeback not applied for ${name}, keeping it gateway-local`);
+      if (typeof applied !== "object" || applied === null) {
+        // No `applied` map at all is dissection 3.1's `unsupported`: an older gateway. Stop asking.
+        this.#uiMetaWriteback = false;
+        this.#log(`ui_meta pin writeback unsupported by this hermes, keeping pins gateway-local`);
+        return;
+      }
+      if ((applied as Record<string, unknown>)["ui_meta"] !== true) {
+        this.#log(`ui_meta pin writeback not applied for ${name}, keeping it gateway-local`);
+      }
     } catch (err) {
-      this.#log(`ui_meta pin writeback failed for ${name}: ${err instanceof Error ? err.message : "unknown"}`);
+      const detail = err instanceof Error ? err.message : "unknown";
+      if (/unknown method/i.test(detail)) this.#uiMetaWriteback = false;
+      this.#log(`ui_meta pin writeback failed for ${name}: ${detail}`);
     }
   }
 

@@ -91,9 +91,18 @@ export function extractMessageText(message: Record<string, unknown>): string {
   return parts.join("").trim();
 }
 
-/** Maps one raw message. Returns undefined for anything with neither a role nor any text, which is
- *  how a control record slipped into `messages` gets dropped instead of rendered as a blank
- *  bubble. `sessionId` and `index` only feed the synthesized id. */
+/** The only two roles that reach a chat bubble. Everything else in a Hermes transcript is turn
+ *  machinery: a `system` prompt, a `tool` result, and an assistant message whose content is a bare
+ *  `tool_use` part all belong to the turn, not to the conversation. The desktop consumer this is
+ *  modelled on walks back to the last `role === "assistant"` message precisely so that chatter
+ *  never surfaces (dissection 9.7), and the phone has no other filter in front of it. */
+const RENDERED_ROLES = new Set(["user", "assistant"]);
+
+/** Maps one raw message, or drops it. A row is dropped when it is not an object, when its role is
+ *  not one a chat renders, or when it has no text at all (a tool-call-only assistant turn), which
+ *  is what keeps tool chatter and blank bubbles out of the app entirely. `sessionId` and `index`
+ *  only feed the synthesized id, and `index` is the raw index so ids stay stable across polls even
+ *  though rows in between are dropped. */
 export function mapChatMessage(
   raw: unknown,
   sessionId: string,
@@ -101,10 +110,12 @@ export function mapChatMessage(
 ): BotChatMessage | undefined {
   const record = asRecord(raw);
   if (record === undefined) return undefined;
-  const role = typeof record["role"] === "string" && record["role"].length > 0 ? record["role"] : "assistant";
+  const rawRole = typeof record["role"] === "string" ? record["role"].trim().toLowerCase() : "";
+  const role = rawRole.length > 0 ? rawRole : "assistant";
+  if (!RENDERED_ROLES.has(role)) return undefined;
   const text = extractMessageText(record);
+  if (text.length === 0) return undefined;
   const id = asId(record["id"]) ?? asId(record["message_id"]) ?? `${sessionId}#${index}`;
-  if (text.length === 0 && record["role"] === undefined) return undefined;
   return { id, role, text, at: messageTimestamp(record) };
 }
 

@@ -88,7 +88,7 @@ async function setup(
     storage,
     config,
     bots: bridge,
-    gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 1 } },
+    gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 2 } },
     presenceOf: () => "online",
     submitUserMessage: (threadId: string, blocks: RichBlock[]): Message =>
       storage.appendMessage(threadId, { role: "user", blocks }, 500),
@@ -119,8 +119,21 @@ async function setup(
   };
 }
 
+interface FakeBotState {
+  meta: Record<string, unknown> | null;
+  sessions: Array<{ id: string; title: string }>;
+  created: number;
+  /** stored session id -> RUNTIME session id, the only id `prompt.submit` accepts. */
+  runtime: Map<string, string>;
+}
+
 /** A Hermes whose bot has one canonical chat with a growing message list, and which stores what
- *  `profiles.configure` writes so the roster reflects it, exactly as the real gateway does. */
+ *  `profiles.configure` writes so the roster reflects it, exactly as the real gateway does.
+ *
+ *  Strict about session ids on purpose. The real gateway distinguishes the STORED id (what gets
+ *  pinned) from the RUNTIME id (what `prompt.submit` is addressed to, dissection 1.2 row 11), and a
+ *  session with no persisted row cannot be resumed at all. A fake that accepts any id in any slot
+ *  is what let a send against the stored id look green for a whole release. */
 function fakeBotMode(options: {
   /** Sessions `session.list` reports. Empty models a chat whose kickoff has not landed yet. */
   sessions?: Array<{ id: string; title: string }>;
@@ -128,11 +141,20 @@ function fakeBotMode(options: {
   running?: () => boolean;
   /** Omit to make `profiles.configure` an unknown method, which is what an old gateway does. */
   supportsConfigure?: boolean;
-} = {}): { behavior: FakeHermesBehavior; state: { meta: Record<string, unknown>; sessions: Array<{ id: string; title: string }>; created: number } } {
-  const state = {
-    meta: { title: "Scout" } as Record<string, unknown>,
-    sessions: options.sessions ?? [],
+  /** Starting `ui_meta["hermes-bots"]` blob; null means the profile carries no ui_meta at all. */
+  meta?: Record<string, unknown> | null;
+} = {}): { behavior: FakeHermesBehavior; state: FakeBotState } {
+  const sessions = options.sessions ?? [];
+  const state: FakeBotState = {
+    meta: options.meta === undefined ? { title: "Scout" } : options.meta,
+    sessions,
     created: 0,
+    runtime: new Map(sessions.map((session, index) => [session.id, `runtime-${index + 1}`])),
+  };
+  const storedOf = (id: string): string | undefined => {
+    if (state.runtime.has(id)) return id;
+    for (const [stored, runtime] of state.runtime) if (runtime === id) return stored;
+    return undefined;
   };
   const behavior: FakeHermesBehavior = {
     methods: {
@@ -143,7 +165,7 @@ function fakeBotMode(options: {
             description: "watches CI",
             has_avatar: false,
             last_session: { last_active: Math.round(NOW / 1000) - 5, preview: "all green" },
-            ui_meta: { "hermes-bots": state.meta },
+            ...(state.meta === null ? {} : { ui_meta: { "hermes-bots": state.meta } }),
           },
         ],
         bot_mode_protocol: true,
@@ -151,19 +173,36 @@ function fakeBotMode(options: {
       "session.list": () => ({ sessions: state.sessions }),
       "session.create": () => {
         state.created += 1;
+        const stored = `stored-${state.created}`;
+        state.runtime.set(stored, `runtime-${state.created}`);
         // Deliberately persists NOTHING: the row only appears once the kickoff prompt lands, which
         // is the real gateway's behavior and the whole reason the duplicate bug existed.
-        return { stored_session_id: `stored-${state.created}`, session_id: `runtime-${state.created}` };
+        return { stored_session_id: stored, session_id: `runtime-${state.created}` };
       },
-      "prompt.submit": () => ({ ok: true }),
-      "session.resume": (params) => ({
-        session_id: "runtime-1",
-        session_key: "k",
-        message_count: (options.messages ?? []).length,
-        running: options.running?.() ?? false,
-        inflight: false,
-        ...(params["omit_messages"] === true ? {} : { messages: options.messages ?? [] }),
-      }),
+      "prompt.submit": (params) => {
+        const id = String(params["session_id"] ?? "");
+        const stored = storedOf(id);
+        if (stored === undefined || state.runtime.get(stored) !== id) {
+          throw { code: 5003, message: `prompt.submit needs the runtime session id, got ${id}` };
+        }
+        return { ok: true };
+      },
+      "session.resume": (params) => {
+        const id = String(params["session_id"] ?? "");
+        const stored = storedOf(id);
+        // A session with no listed row has not persisted yet: hermes has nothing to resume.
+        if (stored === undefined || !state.sessions.some((session) => session.id === stored)) {
+          throw { code: 5003, message: "no such session" };
+        }
+        return {
+          session_id: state.runtime.get(stored),
+          session_key: "k",
+          message_count: (options.messages ?? []).length,
+          running: options.running?.() ?? false,
+          inflight: false,
+          ...(params["omit_messages"] === true ? {} : { messages: options.messages ?? [] }),
+        };
+      },
       ...(options.supportsConfigure === false
         ? {}
         : {
@@ -360,7 +399,7 @@ describe("canonical chat duplicate adoption (wave 1 regression)", () => {
     expect(server.callsOf("session.create")).toHaveLength(1);
     expect(state.created).toBe(1);
     // The pin was pushed into ui_meta, so any other device reads it back instead of re-deriving.
-    expect(state.meta["chat"]).toBe("stored-1");
+    expect(state.meta?.["chat"]).toBe("stored-1");
   });
 
   it("still resolves the first chat when the gateway cannot store ui_meta", async () => {
@@ -407,5 +446,179 @@ describe("canonical chat duplicate adoption (wave 1 regression)", () => {
       "Hey, tell me about yourself!",
       "hello",
     ]);
+  });
+});
+
+describe("the kickoff window (review C1/C2)", () => {
+  it("answers an empty history on EVERY read while the kickoff is in flight, not just the first", async () => {
+    // The app's own sequence: open the bot, resolve, read history. The second read resolves the
+    // pin (adoption "pin", not "created"), and gating the empty-history tolerance on adoption made
+    // exactly that read answer 502 for the scenario the tolerance exists for.
+    const { behavior } = fakeBotMode({ sessions: [] });
+    const { authed } = await setup(behavior);
+
+    const first = await authed("/bots/scout/chat/messages");
+    const second = await authed("/bots/scout/chat/messages");
+    expect([first.status, second.status]).toEqual([200, 200]);
+    const firstBody = (await first.json()) as { adoption: string; sessionId: string; messages: unknown[] };
+    const secondBody = (await second.json()) as { adoption: string; sessionId: string; messages: unknown[] };
+    expect(firstBody).toMatchObject({ adoption: "created", sessionId: "stored-1", messages: [] });
+    expect(secondBody).toMatchObject({ adoption: "pin", sessionId: "stored-1", messages: [] });
+  });
+
+  it("still reports a resume failure outside the kickoff window", async () => {
+    // A chat this gateway did not just create has no excuse: the hermes text goes through verbatim.
+    const { behavior } = fakeBotMode({ sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }] });
+    behavior.methods!["session.resume"] = () => {
+      throw { code: 5003, message: "no such session" };
+    };
+    const { authed } = await setup(behavior);
+    const res = await authed("/bots/scout/chat/messages");
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ hermesError: "no such session", hermesErrorCode: 5003 });
+  });
+
+  it("submits a send during the kickoff window against the RUNTIME id", async () => {
+    // The lazy session cannot be resumed, so the runtime id `session.create` returned is the only
+    // one prompt.submit accepts. Submitting the STORED id answered 202 and lost the message.
+    const { behavior, state } = fakeBotMode({ sessions: [] });
+    const { authed, server } = await setup(behavior);
+
+    await authed("/bots/scout/chat");
+    const res = await authed("/bots/scout/chat/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "hello" }),
+    });
+    expect(res.status).toBe(202);
+    expect(state.created).toBe(1);
+    expect(server.callsOf("prompt.submit").map((call) => call.params["session_id"])).toEqual([
+      "runtime-1",
+      "runtime-1",
+    ]);
+  });
+
+  it("reports a send it cannot address rather than submitting the stored id", async () => {
+    // No runtime id anywhere: the resume fails and this gateway did not create the chat. The send
+    // fails loudly instead of answering 202 for a prompt that went to the wrong slot.
+    const { behavior } = fakeBotMode({ sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }] });
+    behavior.methods!["session.resume"] = () => {
+      throw { code: 5003, message: "no such session" };
+    };
+    const { authed, server } = await setup(behavior);
+    const res = await authed("/bots/scout/chat/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "hello" }),
+    });
+    expect(res.status).toBe(502);
+    expect(server.callsOf("prompt.submit")).toHaveLength(0);
+  });
+});
+
+describe("ui_meta writeback (review I2/I3)", () => {
+  it("merges onto a FRESH read, so a desktop edge since the last poll survives", async () => {
+    const { behavior, state } = fakeBotMode({ sessions: [] });
+    const { authed, bridge } = await setup(behavior);
+    await bridge.refresh("prime the cache");
+    // The desktop renames the bot AFTER the cache snapshot. Building the write from that cache
+    // reverted the rename; the blob is replaced whole by profiles.configure.
+    state.meta = { title: "Renamed", group: "Ops" };
+
+    await authed("/bots/scout/chat");
+    expect(state.meta).toEqual({ title: "Renamed", group: "Ops", chat: "stored-1" });
+  });
+
+  it("does not resurrect a pin the desktop cleared after the snapshot", async () => {
+    const { behavior, state } = fakeBotMode({
+      sessions: [{ id: "sess-9", title: CANONICAL_CHAT_TITLE }],
+      meta: { title: "Scout", chat: "sess-9" },
+    });
+    const { authed, bridge } = await setup(behavior);
+    await bridge.refresh("prime the cache");
+    // Compaction rewrote the lineage AND the desktop cleared the pin. The recovery re-pin must stay
+    // gateway-local: the clear is authoritative (dissection 3.2), and the write path must not be a
+    // second way to resurrect it.
+    state.sessions = [{ id: "sess-2", title: CANONICAL_CHAT_TITLE }];
+    state.meta = { title: "Scout" };
+
+    const body = (await (await authed("/bots/scout/chat")).json()) as { adoption: string; sessionId: string };
+    expect(body).toMatchObject({ adoption: "recovery", sessionId: "sess-2" });
+    expect(state.meta).toEqual({ title: "Scout" });
+  });
+
+  it("strips the asset fields instead of pushing a data URL through every roster poll", async () => {
+    const { behavior, state } = fakeBotMode({
+      sessions: [],
+      meta: { title: "Scout", image: "data:image/png;base64,AAAA", pet: "cat", custom: "<svg/>" },
+    });
+    const { authed } = await setup(behavior);
+    await authed("/bots/scout/chat");
+    expect(state.meta).toEqual({ title: "Scout", chat: "stored-1" });
+  });
+
+  it("stops asking a gateway that cannot store ui_meta", async () => {
+    const { behavior } = fakeBotMode({ sessions: [], supportsConfigure: false });
+    const { authed, server } = await setup(behavior);
+    await authed("/bots/scout/chat");
+    await authed("/bots/scout/chat");
+    await authed("/bots/scout/chat");
+    // One rejected attempt, then the bridge keeps the pin gateway-local instead of firing a
+    // configure on every chat open forever.
+    expect(server.callsOf("profiles.configure")).toHaveLength(1);
+  });
+});
+
+describe("what reaches the phone (review I6/I9)", () => {
+  it("keeps system and tool rows, and blank tool-only turns, out of the history", async () => {
+    const { behavior } = fakeBotMode({
+      sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }],
+      messages: [
+        { role: "system", content: "you are a bot" },
+        { role: "assistant", content: [{ type: "tool_use", name: "read" }] },
+        { role: "tool", content: "file1\nfile2" },
+        { role: "user", content: "what did you find" },
+        { role: "assistant", content: "done" },
+      ],
+    });
+    const { authed } = await setup(behavior);
+    const body = (await (await authed("/bots/scout/chat/messages")).json()) as {
+      messages: Array<{ role: string; text: string }>;
+    };
+    expect(body.messages).toEqual([
+      { id: "canonical#3", role: "user", text: "what did you find", at: null },
+      { id: "canonical#4", role: "assistant", text: "done", at: null },
+    ]);
+  });
+
+  it("echoes the sender's clientId back on the message when the poll finds it", async () => {
+    const messages: Array<Record<string, unknown>> = [];
+    let running = true;
+    const { behavior } = fakeBotMode({
+      sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }],
+      messages,
+      running: () => running,
+    });
+    const { authed, frames, bridge } = await setup(behavior);
+
+    const res = await authed("/bots/scout/chat/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "how is CI", clientId: "phone-7" }),
+    });
+    const body = (await res.json()) as { message: { id: string; clientId?: string } };
+    expect(body.message.clientId).toBe("phone-7");
+
+    // The same message comes back with hermes' own id, which is why the id alone can never dedupe.
+    messages.push({ id: "m-real", role: "user", content: "how is CI" });
+    messages.push({ id: "m-reply", role: "assistant", content: "all green" });
+    running = false;
+    await bridge.chatSettled("scout");
+
+    const delivered = frames
+      .filter((frame) => frame.type === "bot_chat")
+      .flatMap((frame) => (frame as { messages: Array<{ id: string; clientId?: string }> }).messages);
+    expect(delivered.find((message) => message.id === "m-real")?.clientId).toBe("phone-7");
+    expect(delivered.find((message) => message.id === "m-reply")?.clientId).toBeUndefined();
   });
 });

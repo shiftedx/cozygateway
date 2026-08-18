@@ -33,6 +33,11 @@ export type ChatAdoption =
 export interface CanonicalChatResult {
   sessionId: string;
   adoption: ChatAdoption;
+  /** The RUNTIME session id, when this call is the one that created the chat. `prompt.submit` only
+   *  accepts the runtime id (dissection 1.2 row 11) and it is a DIFFERENT value from the stored id
+   *  that gets pinned; a chat whose kickoff has not persisted yet cannot be resumed, so this is the
+   *  only way to learn it. Absent for every adoption path other than `created`. */
+  runtimeId?: string;
 }
 
 export interface HermesRpc {
@@ -113,7 +118,10 @@ export async function listBotSessions(rpc: HermesRpc, name: string, limit: numbe
  *  prompt against the RUNTIME id (the stored id is what gets pinned; they are different values).
  *  A failed submit rolls the pin back, exactly as the desktop does, so a half-created chat never
  *  becomes the permanent pointer. */
-async function createCanonicalChat(name: string, deps: CanonicalChatDeps): Promise<string> {
+async function createCanonicalChat(
+  name: string,
+  deps: CanonicalChatDeps,
+): Promise<{ storedId: string; runtimeId: string }> {
   const created = asRecord(
     await deps.rpc.request("session.create", {
       profile: name,
@@ -138,7 +146,7 @@ async function createCanonicalChat(name: string, deps: CanonicalChatDeps): Promi
     deps.pins.clear(name);
     throw err;
   }
-  return storedId;
+  return { storedId, runtimeId };
 }
 
 /** Resolve-or-create, per dissection 5.2. Single-flight is the caller's job (see the bridge):
@@ -175,7 +183,8 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
     // No pin and no history: the pin, if any, points at nothing. Clear it before creating so a
     // failed creation cannot leave a stale pointer behind.
     deps.pins.clear(name);
-    return { sessionId: await createCanonicalChat(name, deps), adoption: "created" };
+    const created = await createCanonicalChat(name, deps);
+    return { sessionId: created.storedId, adoption: "created", runtimeId: created.runtimeId };
   }
 
   if (pin === undefined || pin === null) {

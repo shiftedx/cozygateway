@@ -149,7 +149,9 @@ describe("BotChatTurns", () => {
       timeoutMs: 400,
       failResume: 2,
     });
-    await turns.send("scout", "stored-1", "hi");
+    // The pre-submit resume is one of the failing ones, so the send is addressed with the runtime
+    // id `session.create` handed back, exactly as the bridge does for a chat it just created.
+    await turns.send("scout", "stored-1", "hi", { runtimeId: "runtime-1" });
     await turns.settled("scout");
     expect(chatFrames(frames).flatMap((frame) => frame.messages).map((message) => message.text)).toEqual([
       "recovered",
@@ -159,7 +161,7 @@ describe("BotChatTurns", () => {
 
   it("stops polling when hermes keeps refusing", async () => {
     const { turns, frames } = harness(() => ({ messages: [] }), { pollMs: 5, timeoutMs: 400, failResume: 99 });
-    await turns.send("scout", "stored-1", "hi");
+    await turns.send("scout", "stored-1", "hi", { runtimeId: "runtime-1" });
     await turns.settled("scout");
     expect(stateFrames(frames).at(-1)).toMatchObject({ phase: "failed" });
   });
@@ -174,5 +176,87 @@ describe("BotChatTurns", () => {
     await turns.settled("scout");
     // The two messages the client already has are not re-broadcast.
     expect(chatFrames(frames)).toHaveLength(0);
+  });
+  it("does not read the user's own committed message as the reply (review I4)", async () => {
+    // prompt.submit PERSISTS the user message, so the count is past the baseline on the very first
+    // poll. With hermes not yet reporting running/inflight (a queued turn, a serial scheduler) that
+    // read as "complete", the loop returned, and the assistant's reply reached nobody.
+    let reply: Reply = { messages: [{ role: "user", content: "hi" }] };
+    const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+    await turns.send("scout", "stored-1", "hi");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stateFrames(frames).some((frame) => frame.phase === "complete")).toBe(false);
+
+    reply = { messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "all green" }] };
+    await turns.settled("scout");
+    expect(stateFrames(frames).at(-1)).toMatchObject({ phase: "complete" });
+  });
+
+  it("opens the turn with hermes' own flags, not invented ones (review M2)", async () => {
+    const { turns, frames } = harness(() => ({ messages: [{ role: "user", content: "hi" }], running: true }), {
+      pollMs: 5,
+      timeoutMs: 40,
+    });
+    await turns.send("scout", "stored-1", "hi");
+    expect(stateFrames(frames).at(0)).toMatchObject({ phase: "polling", running: true, inflight: false });
+    await turns.settled("scout");
+  });
+
+  it("keeps delivering after a compaction shrinks the transcript (review I5)", async () => {
+    // The canonical chat is where /new is rerouted to /compact (dissection 5.5), and compaction
+    // REPLACES the message list. A count-only watermark can only move up, so one compaction left
+    // the phone silent forever.
+    let reply: Reply = {
+      messages: [
+        { id: "a", role: "user", content: "one" },
+        { id: "b", role: "assistant", content: "two" },
+        { id: "c", role: "user", content: "three" },
+      ],
+    };
+    const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+    await turns.history("scout", "stored-1");
+
+    reply = {
+      messages: [
+        { id: "s1", role: "assistant", content: "summary so far" },
+        { id: "d", role: "user", content: "after the compaction" },
+      ],
+    };
+    await turns.send("scout", "stored-1", "after the compaction");
+    reply = {
+      messages: [
+        { id: "s1", role: "assistant", content: "summary so far" },
+        { id: "d", role: "user", content: "after the compaction" },
+        { id: "e", role: "assistant", content: "still here" },
+      ],
+    };
+    await turns.settled("scout");
+
+    const delivered = chatFrames(frames).flatMap((frame) => frame.messages);
+    expect(delivered.map((message) => message.text)).toEqual([
+      "summary so far",
+      "after the compaction",
+      "still here",
+    ]);
+  });
+
+  it("cancels a poll whose session id changed under it (review I8)", async () => {
+    const { turns, frames } = harness(() => ({ messages: [{ role: "assistant", content: "working" }], running: true }), {
+      pollMs: 5,
+      timeoutMs: 400,
+    });
+    await turns.send("scout", "stored-1", "one");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // A recovery re-pin, a desktop clear, or a writeback race moves the bot to another session.
+    await turns.send("scout", "stored-2", "two");
+    const sessionOf = (frame: ServerFrame): string | undefined => (frame as { sessionId?: string }).sessionId;
+    const before = frames.filter((frame) => sessionOf(frame) === "stored-1").length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // The displaced poll is gone: no more frames for a chat the app has left.
+    expect(frames.filter((frame) => sessionOf(frame) === "stored-1").length).toBe(before);
+    expect(frames.some((frame) => sessionOf(frame) === "stored-2")).toBe(true);
+    turns.close();
+    expect(turns.polling("scout")).toBe(false);
   });
 });

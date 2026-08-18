@@ -1,6 +1,7 @@
 # cozygateway vendor extension: com.cozylabs.bots, v1
 
-Status: draft, wave 2 (read path plus full-duplex bot chat). Versioned INDEPENDENTLY of `contract/v1.md`, which stays
+Status: draft. Read path plus full-duplex bot chat (the 4.5 pivot slice; spec section 5's W2 is bot CRUD and
+avatars, which is a later, additive version of this document). Versioned INDEPENDENTLY of `contract/v1.md`, which stays
 frozen. This document describes an optional surface a gateway may or may not have; a client that
 does not recognize it ignores the capability and the frames, and nothing in v1 changes.
 
@@ -30,12 +31,19 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 1 }
+"capabilities": { "com.cozylabs.bots": 2 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
 A gateway with no bridge omits the id entirely and does not register any `/bots` route, so a
 client can rely on the capability rather than probing for 404s.
+
+Versions are ADDITIVE, so a client compares `>=`, never `===`:
+
+- `1`: roster, presence, canonical-chat resolve, session list, chat history.
+- `2`: `POST /bots/:name/chat/messages` plus the `bot_chat` and `bot_chat_state` frames. A client
+  that offers a composer MUST require `>= 2`: a version 1 gateway 404s that route and never sends
+  those frames, which without the bump reads as a composer that silently does nothing.
 
 ## 3. Resources
 
@@ -76,11 +84,18 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
 - `at`: the first usable value among `at`, `ts`, `timestamp`, `time`, `created_at`, `created`.
   A number at or below 10^11 is read as SECONDS and multiplied, anything larger is already
   milliseconds; numeric strings and ISO strings are accepted; anything else yields null.
-- `id`: the message's own `id` or `message_id` when it has one, otherwise `<sessionId>#<index>`.
-  Stable for a given session, which is what makes it safe to key a list on and to de-duplicate a
-  replayed frame with.
-- A row that is not an object, or that carries neither a role nor any text, is DROPPED rather than
-  rendered as a blank bubble.
+- `id`: the message's own `id` or `message_id` when it has one, otherwise `<sessionId>#<index>`,
+  where `index` is the position in the RAW list, so dropped rows do not shift the ids of the ones
+  that survive. Stable for a given session, which is what makes it safe to key a list on and to
+  de-duplicate a replayed frame with.
+- `clientId`: present only on a message the sender submitted with one (see
+  `POST /bots/:name/chat/messages`), both in the 202 body and on that same message when it comes
+  back in a `bot_chat` frame.
+- Rows are DROPPED, never rendered as blank bubbles: anything that is not an object, anything whose
+  role is not `user` or `assistant` (a `system` prompt, a `tool` result), and anything whose text is
+  empty after flattening (an assistant turn whose whole content was a `tool_use` part). Only the two
+  conversational roles reach the app, from BOTH the history route and the frames, so a client never
+  has to filter tool chatter itself.
 
 A reply the bridge cannot parse at all reads as an empty, idle session. It never raises.
 
@@ -144,13 +159,21 @@ Three v1 properties worth knowing before writing a client:
 - **The server's pin wins, key-wise.** `ui_meta["hermes-bots"]` is the cross-machine source of
   truth for `chat`: once a profile carries that blob, an absent `chat` key and an explicit
   `chat: null` both mean "no pin", and the gateway's local record is never used to fill the gap.
-  Only a profile with no bot blob at all falls back to that local record. `GET /bots` and this
-  route read the pin the same way, so they cannot disagree.
+  Only a profile with no bot blob at all falls back to that local record, with ONE exception, and
+  `GET /bots` applies it identically so the two routes cannot disagree: a pin this gateway wrote
+  AFTER the `profiles.list` snapshot in hand is newer than that snapshot, not contradicted by it, so
+  it survives an absent `chat` key until a later snapshot has had a chance to see it.
 - **The pin IS written back.** When the resolved pin differs from what the profile's
-  `ui_meta["hermes-bots"]` carries, the gateway pushes it with `profiles.configure`, merging the
-  cached blob key-wise (the blob is replaced whole by that RPC). The write counts as persisted only
-  when `applied.ui_meta === true`; a gateway that rejects the method, or does not apply it, leaves
-  the pin gateway-local, which still works. A writeback failure never fails the request.
+  `ui_meta["hermes-bots"]` carries, the gateway pushes it with `profiles.configure`. Because that
+  RPC replaces the blob WHOLE, the write is a read-modify-write against a FRESH `profiles.list`,
+  never against the cached roster: another client's edit that landed since the last poll survives,
+  and a pin that was present when the resolve started and is gone from the fresh read is treated as
+  an authoritative clear and NOT written back. `image`, `pet` and `custom` are stripped, a legacy
+  pre-namespace `ui_meta` contributes only the fields this namespace owns, and a blob that would
+  exceed the 64 KB `ui_meta` cap is reduced or refused, because that object rides every
+  `profiles.list`. The write counts as persisted only when `applied.ui_meta === true`; a gateway
+  that rejects the method, or answers without an `applied` map at all, is not asked again and the
+  pin stays gateway-local, which still works. A writeback failure never fails the request.
 - **A pin the gateway just wrote survives an empty session list.** `session.create` persists no row
   until its first prompt lands, so for a few seconds after a chat is created `session.list` still
   answers empty. An empty list therefore does NOT mean "this bot has no chat": a pin the gateway
@@ -178,8 +201,10 @@ History of the canonical chat. The chat is resolved exactly as `GET /bots/:name/
 so the app never has to hold a session id, and the same side effect applies: a bot with no history
 gets a chat created and a kickoff submitted. A chat whose kickoff has not landed yet has no row to
 resume, and Hermes rejects the resume; that specific case answers `messages: []` rather than an
-error, because the messages arrive over `bot_chat` frames moments later. Every other Hermes failure
-is passed through.
+error, because the messages arrive over `bot_chat` frames moments later. The tolerance follows the
+KICKOFF WINDOW (a chat this gateway created whose first prompt has not been seen to land, up to the
+180 s turn cap), NOT the `adoption` value: the second read inside that window correctly reports
+`pin`, and it is exactly the read the app performs. Every other Hermes failure is passed through.
 
 `running` and `inflight` are Hermes' own flags for the session: a client rendering a "thinking"
 state should trust the `bot_chat_state` frames over this snapshot, which is only ever a point in
@@ -188,21 +213,28 @@ time.
 ### POST /bots/:name/chat/messages
 
 ```
-body { text: string }              // 1..32000 characters
+body { text: string, clientId?: string }   // text 1..32000 characters, clientId 1..128
 202  { name: string, sessionId: string, message: BotChatMessage }
-400  invalid_request               // missing or empty text
+400  invalid_request                       // missing or empty text
+502  backend_unavailable                   // hermes refused, or no runtime session could be addressed
 ```
 
 Submits `text` into the canonical chat. **202, not 200**: Hermes has accepted the prompt and the
 reply is NOT in this response. The body carries the user message the gateway committed, so the app
 can render it immediately; its `id` is a gateway-local one (`<sessionId>#local-<ms>`) because Hermes
-does not hand one back, and the same message reappears with its real id in the next `bot_chat`
-frame, which is why frames are keyed on id.
+does not hand one back, and the same message reappears with HERMES' own id in a later `bot_chat`
+frame. The two ids never match, so dedupe rides `clientId` instead: whatever the sender put on the
+request (or the gateway-local id, when it sent none) comes back on the committed message AND on that
+same message in the frame, so the optimistic row is replaced rather than duplicated.
 
 Delivery of the reply: the gateway submits against the session's RUNTIME id (learned from a cheap
-`session.resume`, which is also the message-count baseline), then polls `session.resume` every
-2 seconds until the count has grown AND the session reports neither `running` nor `inflight`,
-giving up after 180 seconds. That is the desktop plugin's own turn loop, moved server-side, so a
+`session.resume`, which is also the message-count baseline, or from `session.create` for a chat
+whose kickoff has not persisted and therefore cannot be resumed at all). The stored pin is NEVER
+used in that slot: a send whose runtime id cannot be established answers 502 rather than submitting
+somewhere the message is lost. The gateway then polls `session.resume` every 2 seconds until the
+transcript ENDS on an assistant message AND the session reports neither `running` nor `inflight`,
+giving up after 180 seconds. Growth alone is not enough, because `prompt.submit` persists the
+sender's own message. That is the desktop plugin's own turn loop, moved server-side, so a
 phone that is backgrounded (or a second device that was never in the room) still receives the whole
 turn. Each poll that finds new messages emits a `bot_chat` delta; each change of state emits a
 `bot_chat_state`.
@@ -278,10 +310,22 @@ actually changed, so an idle gateway is silent. `bot_presence.active` carries pr
 roster order.
 
 `bot_chat` is a DELTA: `messages` carries only what the gateway has not broadcast before for that
-bot, in order. The watermark is per bot and resets when the bot's session id changes; a
+bot, in order. The watermark is per bot and is kept as the last broadcast message ID, not a count,
+so a `/compact` that SHRINKS the transcript re-bases the stream (the compacted transcript is
+delivered once) instead of silencing it. It also resets when the bot's session id changes; a
 `GET /bots/:name/chat/messages` re-bases it on what that response returned, so a client that reads
 history and then listens receives each message exactly once. Keying on `BotChatMessage.id` makes a
 duplicate harmless anyway.
+
+Two scoping properties to design a client around:
+
+- Both chat frames are BROADCAST to every paired device, carrying full message text. That is
+  intended under the one-user gateway model (a phone, a tablet and a laptop belonging to the same
+  person all follow the same turn), and it is the property that would have to change first if a
+  gateway ever served more than one human.
+- The delta watermark is per bot, SHARED by those devices. A `GET /bots/:name/chat/messages` from
+  one device re-bases it for all of them, so a second device mid-turn can miss a delta and recovers
+  on its next history read. A client that must not miss a message reads history on foreground.
 
 `bot_chat_state` is edge-triggered: a poll that finds nothing changed is silent. `phase` is the
 gateway's view of the turn it is polling (`polling` while awaiting, `complete` when the reply landed
@@ -290,6 +334,7 @@ and Hermes went idle, `timeout` at the 180 s cap, `failed` when Hermes kept refu
 
 ## 7. Not in this extension yet
 
-Bot create, edit, duplicate, delete; avatars; routines; group chats; push; and multi-connection
+Per-device chat-frame scoping and per-device delta watermarks; bot create, edit, duplicate, delete;
+avatars; routines; group chats; push; and multi-connection
 rosters (the bridge targets exactly one Hermes gateway). Route shapes keep the `connection`
 concept out of the URL so a later version can add it additively.

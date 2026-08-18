@@ -100,4 +100,31 @@ describe("parseChatSnapshot", () => {
     const snapshot = parseChatSnapshot({ messages: [null, 7, {}, { role: "assistant", content: "kept" }] }, "s");
     expect(snapshot.messages.map((message) => message.text)).toEqual(["kept"]);
   });
+  it("drops system and tool rows and blank tool-only turns (review I9)", () => {
+    // The exact leak the review proved: everything but the two real bubbles reached the phone.
+    const snapshot = parseChatSnapshot(
+      {
+        messages: [
+          { role: "system", content: "you are a bot" },
+          { role: "assistant", content: [{ type: "tool_use", name: "read" }] },
+          { role: "tool", content: "file1\nfile2" },
+          { role: "user", content: "what did you find" },
+          { role: "assistant", content: "done" },
+        ],
+      },
+      "canonical",
+    );
+    expect(snapshot.messages).toEqual([
+      { id: "canonical#3", role: "user", text: "what did you find", at: null },
+      { id: "canonical#4", role: "assistant", text: "done", at: null },
+    ]);
+  });
+
+  it("normalizes the role's case and keeps the raw index in synthesized ids", () => {
+    const snapshot = parseChatSnapshot(
+      { messages: [{ role: "SYSTEM", content: "setup" }, { role: "Assistant", content: "hi" }] },
+      "s",
+    );
+    expect(snapshot.messages).toEqual([{ id: "s#1", role: "assistant", text: "hi", at: null }]);
+  });
 });

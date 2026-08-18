@@ -9,6 +9,7 @@ import {
 } from "cozygateway-contract";
 
 import { HermesRpcError, HermesUnavailable } from "./client.ts";
+import { RuntimeSessionUnknown } from "./chat-turns.ts";
 import type { BotsSurface } from "./bridge.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
@@ -38,6 +39,14 @@ function failure(c: Context<Env>, err: unknown) {
         hermesError: err.message,
         ...(err.code === undefined ? {} : { hermesErrorCode: err.code }),
       },
+      502,
+    );
+  }
+  // A send whose runtime session id could not be established. Reported rather than degraded into a
+  // submit against the stored id, which answers 202 for a message that goes nowhere.
+  if (err instanceof RuntimeSessionUnknown) {
+    return c.json(
+      { ...errorBody("backend_unavailable", "the hermes gateway did not report a runtime session"), hermesError: err.message },
       502,
     );
   }
@@ -122,7 +131,9 @@ export function registerBotRoutes(
       return c.json(errorBody("invalid_request", detail), 400);
     }
     try {
-      const sent = await bots.sendChatMessage(name, parsed.text);
+      const sent = await bots.sendChatMessage(name, parsed.text, {
+        ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
+      });
       return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
     } catch (err) {
       return failure(c, err);

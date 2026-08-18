@@ -73,6 +73,7 @@ describe("focus request", () => {
 describe("capability advertisement", () => {
   it("is a vendor-scoped id with an integer version", () => {
     expect(BOTS_CAPABILITY_ID).toBe("com.cozylabs.bots");
-    expect(BOTS_CAPABILITY_VERSION).toBe(1);
+    // Bumped for the write route and the chat frames: a v1 gateway 404s the composer.
+    expect(BOTS_CAPABILITY_VERSION).toBe(2);
   });
 });

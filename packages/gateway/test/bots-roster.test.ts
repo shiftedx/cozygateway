@@ -10,6 +10,10 @@ import {
   extractBotMeta,
   isBotActive,
   parseProfilesList,
+  botMetaForWriteback,
+  resolveChatPin,
+  uiMetaBytes,
+  UI_META_MAX_BYTES,
 } from "../src/hermes-bridge/roster.ts";
 
 const NOW = 1_800_000_000_000; // milliseconds
@@ -32,7 +36,15 @@ function lastSession(secondsAgo: number, preview?: string): Record<string, unkno
   };
 }
 
-const idle = { routedProfile: null, gatewayState: "open" as const, now: NOW, pins: new Map<string, string>() };
+type PinEntries = Map<string, { sessionId: string; updatedAt: number }>;
+
+/** Local pins as the storage hands them over: a session id plus the stamp of the write. `OLD_PIN`
+ *  is older than the snapshot `idle` describes, so an authoritative clear outranks it. */
+const OLD_PIN = NOW - 10_000;
+const pinEntries = (entries: Record<string, string>, updatedAt = OLD_PIN): PinEntries =>
+  new Map(Object.entries(entries).map(([name, sessionId]) => [name, { sessionId, updatedAt }]));
+
+const idle = { routedProfile: null, gatewayState: "open" as const, now: NOW, pins: new Map() as PinEntries };
 
 describe("profiles.list decoding", () => {
   it("converts last_active seconds to milliseconds and keeps meta.created in milliseconds", () => {
@@ -161,11 +173,7 @@ describe("roster build", () => {
   });
 
   it("uses the local pin only for a profile the server carries no bot blob for", () => {
-    const pins = new Map([
-      ["blobless", "local-1"],
-      ["keyless", "local-2"],
-      ["cleared", "local-3"],
-    ]);
+    const pins = pinEntries({ blobless: "local-1", keyless: "local-2", cleared: "local-3" });
     const { profiles } = parseProfilesList({
       profiles: [
         profileRow({ name: "blobless" }),
@@ -181,6 +189,21 @@ describe("roster build", () => {
     // neither may be resurrected from the cache.
     expect(byName.get("keyless")!.chatSessionId).toBeNull();
     expect(byName.get("cleared")!.chatSessionId).toBeNull();
+  });
+
+  it("keeps a pin written after the snapshot, so the roster agrees with the chat route", () => {
+    // The chat route treats an absent `chat` key as authoritative ONLY about state the snapshot
+    // could have seen; a pin this gateway wrote afterwards is newer, not contradicted. The roster
+    // used to map that same blob to null, so `GET /bots` reported "no conversation" for the very
+    // chat `GET /bots/:name/chat` was handing the app.
+    const fresh = pinEntries({ scout: "stored-1" }, NOW + 1);
+    const { profiles } = parseProfilesList({
+      profiles: [profileRow({ name: "scout", ui_meta: { "hermes-bots": { title: "Scout" } } })],
+    });
+    expect(buildRoster(profiles, { ...idle, pins: fresh })[0]!.chatSessionId).toBe("stored-1");
+    expect(resolveChatPin({ title: "Scout" }, { sessionId: "stored-1", updatedAt: NOW + 1 }, NOW)).toBeUndefined();
+    // Older than the snapshot: the clear wins, and both surfaces say so.
+    expect(resolveChatPin({ title: "Scout" }, { sessionId: "stored-1", updatedAt: OLD_PIN }, NOW)).toBeNull();
   });
 
   it("orders pinned bots first, then by most recent activity", () => {
@@ -215,5 +238,43 @@ describe("roster build", () => {
     const { profiles } = parseProfilesList({ profiles: [profileRow({ name: "bare" })] });
     const [bot] = buildRoster(profiles, idle);
     expect(bot).toMatchObject({ meta: null, group: null, pinned: false, chatSessionId: null });
+  });
+});
+
+describe("botMetaForWriteback", () => {
+  it("strips the asset fields the desktop strips", () => {
+    const meta = botMetaForWriteback(
+      { "hermes-bots": { title: "Scout", group: "Ops", image: "data:image/png;base64,AAAA", pet: "cat", custom: "<svg/>" } },
+      { chat: "stored-1" },
+    );
+    // ui_meta is capped and rides EVERY profiles.list, so data URLs never go there (dissection 3.1).
+    expect(meta).toEqual({ title: "Scout", group: "Ops", chat: "stored-1" });
+  });
+
+  it("keeps namespaced keys it does not model", () => {
+    const meta = botMetaForWriteback({ "hermes-bots": { title: "Scout", somethingNew: 7 } }, { chat: "stored-1" });
+    expect(meta).toEqual({ title: "Scout", somethingNew: 7, chat: "stored-1" });
+  });
+
+  it("does not re-nest a legacy blob's foreign namespaces", () => {
+    // A pre-namespace ui_meta IS the whole record, so a naive merge pushed another plugin's keys
+    // (and possibly a data-URL avatar) under hermes-bots on every single chat open.
+    const meta = botMetaForWriteback(
+      { title: "Legacy", pinned: true, image: "data:image/png;base64,AAAA", "other-plugin": { keep: "out" } },
+      { chat: "stored-1" },
+    );
+    expect(meta).toEqual({ title: "Legacy", pinned: true, chat: "stored-1" });
+  });
+
+  it("reduces to the compact fields rather than blowing the 64KB cap", () => {
+    const huge = "x".repeat(UI_META_MAX_BYTES);
+    const meta = botMetaForWriteback({ "hermes-bots": { title: "Scout", blob: huge } }, { chat: "stored-1" });
+    expect(meta).toEqual({ title: "Scout", chat: "stored-1" });
+    expect(uiMetaBytes(meta!)).toBeLessThanOrEqual(UI_META_MAX_BYTES);
+  });
+
+  it("refuses a blob that is over the cap even compacted", () => {
+    const huge = "x".repeat(UI_META_MAX_BYTES);
+    expect(botMetaForWriteback({ "hermes-bots": { title: huge } }, { chat: "stored-1" })).toBeNull();
   });
 });

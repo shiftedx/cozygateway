@@ -7,9 +7,9 @@ import { parseChatSnapshot, type ChatSnapshot } from "./chat-messages.ts";
  *
  *  Hermes has no push stream for session messages in the dissected surface, so the reply is
  *  consumed exactly the way the desktop consumes a group-chat member turn (dissection 9.7): submit
- *  against the RUNTIME session id, then `session.resume` every 2 s until the message count grows
- *  AND the session reports neither `running` nor `inflight`, giving up after 180 s. Parity risk is
- *  zero because it is the same loop, and a streaming upgrade later changes only this file.
+ *  against the RUNTIME session id, then `session.resume` every 2 s until an assistant reply has
+ *  landed AND the session reports neither `running` nor `inflight`, giving up after 180 s. Parity
+ *  risk is zero because it is the same loop, and a streaming upgrade later changes only this file.
  *
  *  What is new here is that the loop runs server-side, so every device sees the turn: each poll
  *  that finds new messages broadcasts them as a `bot_chat` DELTA frame, and each change of turn
@@ -25,6 +25,17 @@ export const CHAT_TURN_TIMEOUT_MS = 180_000;
  *  the full cap. */
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 
+/** Raised when `prompt.submit` cannot be addressed. `prompt.submit` takes the RUNTIME session id
+ *  (dissection 1.2 row 11) and the stored id is a DIFFERENT value, so a send whose runtime id could
+ *  not be established fails loudly here instead of submitting against the pin and answering 202 for
+ *  a message that went nowhere. */
+export class RuntimeSessionUnknown extends Error {
+  constructor(name: string) {
+    super(`hermes did not report a runtime session id for ${name}`);
+    this.name = "RuntimeSessionUnknown";
+  }
+}
+
 export interface ChatTurnsOptions {
   rpc: HermesRpc;
   broadcast: (frame: ServerFrame) => void;
@@ -34,13 +45,46 @@ export interface ChatTurnsOptions {
   log?: (message: string) => void;
 }
 
+/** What the caller knows about the chat that the turn loop cannot learn on its own. */
+export interface SendOptions {
+  /** The RUNTIME id `session.create` handed back, when this chat was created by this gateway and
+   *  its kickoff has not persisted yet. That session has no row to resume, so the resume throws and
+   *  this is the only id `prompt.submit` will accept. */
+  runtimeId?: string;
+  /** The sender's own id for this message, echoed back on the committed message and on the same
+   *  message when the poll finds it. */
+  clientId?: string;
+}
+
 interface ActiveTurn {
   sessionId: string;
-  /** Message count before the prompt was submitted; the turn is done once the count exceeds it. */
+  /** Message count before the prompt was submitted; the turn is done once an assistant reply has
+   *  landed past it. */
   baseline: number;
   /** Extended, not replaced, when a second send lands mid-turn. */
   deadline: number;
+  /** True once some poll saw Hermes report `running` or `inflight`. */
+  sawActivity: boolean;
+  /** Set when the bot's canonical session id changed under this poll: the loop then stops without
+   *  broadcasting anything else for a chat the app has left. */
+  cancelled: boolean;
   done: Promise<void>;
+}
+
+/** A message this gateway accepted and has not yet seen come back around the poll. */
+interface PendingSend {
+  clientId: string;
+  text: string;
+}
+
+/** How far a bot's chat has been broadcast. Kept as the LAST BROADCAST MESSAGE ID rather than a
+ *  count, because the canonical chat is the surface where `/new` is rerouted to `/compact`
+ *  (dissection 5.5) and compaction SHRINKS the message list. A count-only mark can only move up,
+ *  so one compaction silenced the bot forever. */
+interface Watermark {
+  sessionId: string;
+  lastId: string | undefined;
+  count: number;
 }
 
 export class BotChatTurns {
@@ -55,9 +99,9 @@ export class BotChatTurns {
    *  rather than starting a competing one, which is what keeps `session.resume` traffic bounded
    *  no matter how fast a user taps send. */
   readonly #turns = new Map<string, ActiveTurn>();
-  /** How many messages of each bot's chat have already been broadcast, so a `bot_chat` frame
-   *  carries only what is new. Keyed by bot name, and reset whenever the session id changes. */
-  readonly #watermarks = new Map<string, { sessionId: string; count: number }>();
+  readonly #watermarks = new Map<string, Watermark>();
+  readonly #pending = new Map<string, PendingSend[]>();
+  readonly #lastState = new Map<string, string>();
   #closed = false;
 
   constructor(opts: ChatTurnsOptions) {
@@ -73,7 +117,7 @@ export class BotChatTurns {
    *  that follow a history read are deltas against exactly what the client just received. */
   async history(name: string, sessionId: string): Promise<ChatSnapshot> {
     const snapshot = await this.#resume(sessionId, name, false);
-    this.#watermarks.set(name, { sessionId, count: snapshot.messages.length });
+    this.#setWatermark(name, sessionId, snapshot.messages);
     return snapshot;
   }
 
@@ -82,26 +126,59 @@ export class BotChatTurns {
    *
    *  A failure from `prompt.submit` propagates verbatim, so the route can pass the Hermes error
    *  text through untouched. */
-  async send(name: string, sessionId: string, text: string): Promise<BotChatMessage> {
+  async send(name: string, sessionId: string, text: string, opts: SendOptions = {}): Promise<BotChatMessage> {
     // The stored id pins the chat; `prompt.submit` only accepts the RUNTIME id, and the cheapest
-    // way to learn it is an omit_messages resume, which doubles as the count baseline. A session
-    // whose first prompt has not landed yet has no row to resume, and throws: that is expected,
-    // and the stored id is the right fallback there.
+    // way to learn it is an omit_messages resume, which doubles as the count baseline.
     let baseline = 0;
-    let runtimeId = sessionId;
+    let runtimeId: string | undefined;
+    let running = false;
+    let inflight = false;
+    let resumeError: unknown;
     try {
       const snapshot = await this.#resume(sessionId, name, true);
       baseline = snapshot.messageCount;
-      if (snapshot.runtimeId !== undefined) runtimeId = snapshot.runtimeId;
+      runtimeId = snapshot.runtimeId;
+      running = snapshot.running;
+      inflight = snapshot.inflight;
     } catch (err) {
+      resumeError = err;
       this.#log(`resume before submit failed for ${name}: ${err instanceof Error ? err.message : "unknown"}`);
+    }
+
+    if (runtimeId === undefined) {
+      // A session whose first prompt has not persisted has no row to resume (dissection 9.7), so
+      // the id this gateway got back from `session.create` is the recovery. Falling back to the
+      // STORED id here is the bug this guards: the route answered 202, the app rendered the user
+      // bubble, and the prompt went to whatever the stored id addresses.
+      runtimeId = opts.runtimeId;
+    }
+    if (runtimeId === undefined && resumeError !== undefined) {
+      // One retry: the kickoff may have landed in the meantime, which turns the lazy session into
+      // a resumable one and hands back the runtime id.
+      try {
+        const retry = await this.#resume(sessionId, name, true);
+        baseline = retry.messageCount;
+        runtimeId = retry.runtimeId;
+        running = retry.running;
+        inflight = retry.inflight;
+      } catch {
+        // Fall through to the loud failure below.
+      }
+    }
+    if (runtimeId === undefined) {
+      if (resumeError !== undefined) throw resumeError;
+      throw new RuntimeSessionUnknown(name);
     }
 
     await this.#rpc.request("prompt.submit", { session_id: runtimeId, text });
 
     const at = this.#now();
-    this.#startTurn(name, sessionId, baseline);
-    return { id: `${sessionId}#local-${at}`, role: "user", text, at };
+    const clientId = opts.clientId ?? `${sessionId}#local-${at}`;
+    const queue = this.#pending.get(name) ?? [];
+    queue.push({ clientId, text });
+    this.#pending.set(name, queue);
+    this.#startTurn(name, sessionId, baseline, running, inflight);
+    return { id: `${sessionId}#local-${at}`, role: "user", text, at, clientId };
   }
 
   /** True while a turn poll is live for this bot. */
@@ -117,9 +194,14 @@ export class BotChatTurns {
 
   close(): void {
     this.#closed = true;
+    for (const turn of this.#turns.values()) turn.cancelled = true;
+    this.#turns.clear();
+    this.#watermarks.clear();
+    this.#lastState.clear();
+    this.#pending.clear();
   }
 
-  #startTurn(name: string, sessionId: string, baseline: number): void {
+  #startTurn(name: string, sessionId: string, baseline: number, running: boolean, inflight: boolean): void {
     const existing = this.#turns.get(name);
     if (existing !== undefined && existing.sessionId === sessionId) {
       // Single-flight: the live poll adopts the new turn by extending its own deadline. Its
@@ -128,26 +210,35 @@ export class BotChatTurns {
       existing.deadline = this.#now() + this.#timeoutMs;
       return;
     }
+    // The bot's canonical session id changed under a live poll (a compaction re-pin, a desktop
+    // clear, a pin writeback race). That poll is now broadcasting for a chat nobody is in, so it
+    // is cancelled rather than left to run out its 180 s cap.
+    if (existing !== undefined) existing.cancelled = true;
 
     const turn: ActiveTurn = {
       sessionId,
       baseline,
       deadline: this.#now() + this.#timeoutMs,
+      sawActivity: running || inflight,
+      cancelled: false,
       done: Promise.resolve(),
     };
-    turn.done = this.#poll(name, turn).finally(() => {
+    turn.done = this.#poll(name, turn, running, inflight).finally(() => {
       if (this.#turns.get(name) === turn) this.#turns.delete(name);
     });
     this.#turns.set(name, turn);
   }
 
-  async #poll(name: string, turn: ActiveTurn): Promise<void> {
-    this.#emitState(name, turn.sessionId, "polling", true, true);
+  async #poll(name: string, turn: ActiveTurn, running: boolean, inflight: boolean): Promise<void> {
+    // The opening frame carries the flags the pre-submit resume actually reported: `running` and
+    // `inflight` are Hermes' own, and inventing `true` for both made the first frame of every turn
+    // a lie the contract does not allow.
+    this.#emitState(name, turn.sessionId, "polling", running, inflight);
     let failures = 0;
 
-    while (!this.#closed && this.#now() < turn.deadline) {
+    while (!this.#closed && !turn.cancelled && this.#now() < turn.deadline) {
       await this.#sleep(this.#pollMs);
-      if (this.#closed) return;
+      if (this.#closed || turn.cancelled) return;
 
       let snapshot: ChatSnapshot;
       try {
@@ -162,27 +253,53 @@ export class BotChatTurns {
         }
         continue;
       }
+      if (turn.cancelled) return;
 
       this.#emitMessages(name, turn.sessionId, snapshot.messages);
-      const grew = Math.max(snapshot.messages.length, snapshot.messageCount) > turn.baseline;
-      if (grew && !snapshot.running && !snapshot.inflight) {
+      if (snapshot.running || snapshot.inflight) turn.sawActivity = true;
+      if (this.#settled(turn, snapshot)) {
         this.#emitState(name, turn.sessionId, "complete", false, false);
         return;
       }
       this.#emitState(name, turn.sessionId, "polling", snapshot.running, snapshot.inflight);
     }
 
-    if (!this.#closed) this.#emitState(name, turn.sessionId, "timeout", false, false);
+    if (!this.#closed && !turn.cancelled) this.#emitState(name, turn.sessionId, "timeout", false, false);
   }
 
-  /** Broadcasts whatever is past the watermark. A session id change resets the watermark, so
-   *  switching chats replays the new chat's messages once rather than diffing across sessions. */
+  /** Is the turn over? Growth alone is not enough: `prompt.submit` PERSISTS THE USER'S OWN MESSAGE,
+   *  so the count is already past the baseline on the very first poll, 2 s after acceptance. If
+   *  Hermes has not yet flipped `running`/`inflight` (a queued turn, a serial scheduler, a provider
+   *  handshake) that read as "complete" and the loop returned, and since nothing ever polls again
+   *  the assistant's reply was never delivered to any device.
+   *
+   *  So the turn is over only when the session is idle AND the conversation now ENDS on an
+   *  assistant message. A transcript that still ends on the user's message means the reply is
+   *  outstanding, whatever the flags say. The `sawActivity` leg covers a build that returns counts
+   *  without message bodies: there the flags are the only signal there is. */
+  #settled(turn: ActiveTurn, snapshot: ChatSnapshot): boolean {
+    if (snapshot.running || snapshot.inflight) return false;
+    const grew = Math.max(snapshot.messages.length, snapshot.messageCount) > turn.baseline;
+    if (!grew) return false;
+    const last = snapshot.messages.at(-1);
+    if (last !== undefined) return last.role === "assistant";
+    return turn.sawActivity;
+  }
+
+  /** Broadcasts whatever is past the watermark, keyed on message IDENTITY rather than on a count,
+   *  and re-bases when the id it held is gone (a compaction rewrote the transcript) instead of
+   *  going permanently silent. A session id change also re-bases, so switching chats replays the
+   *  new chat's messages once rather than diffing across sessions. */
   #emitMessages(name: string, sessionId: string, messages: BotChatMessage[]): void {
     const mark = this.#watermarks.get(name);
-    const seen = mark !== undefined && mark.sessionId === sessionId ? mark.count : 0;
-    if (messages.length <= seen) return;
-    const fresh = messages.slice(seen);
-    this.#watermarks.set(name, { sessionId, count: messages.length });
+    let seen = 0;
+    if (mark !== undefined && mark.sessionId === sessionId && mark.lastId !== undefined) {
+      const index = messages.findIndex((message) => message.id === mark.lastId);
+      seen = index === -1 ? 0 : index + 1;
+    }
+    const fresh = messages.slice(seen).map((message) => this.#reconcile(name, message));
+    this.#setWatermark(name, sessionId, messages);
+    if (fresh.length === 0) return;
     this.#broadcast({
       type: "bot_chat",
       bot: name,
@@ -192,7 +309,24 @@ export class BotChatTurns {
     });
   }
 
-  #lastState = new Map<string, string>();
+  /** Re-attaches the sender's `clientId` to the user message it accepted, once that message comes
+   *  back around the poll carrying Hermes' own id. Without it the optimistic row the sender
+   *  rendered from the 202 body and the row in the frame share nothing, and the documented
+   *  key-on-id dedupe could never fire. */
+  #reconcile(name: string, message: BotChatMessage): BotChatMessage {
+    if (message.role !== "user") return message;
+    const queue = this.#pending.get(name);
+    if (queue === undefined || queue.length === 0) return message;
+    const index = queue.findIndex((entry) => entry.text === message.text);
+    if (index === -1) return message;
+    const [entry] = queue.splice(index, 1);
+    if (queue.length === 0) this.#pending.delete(name);
+    return { ...message, clientId: entry!.clientId };
+  }
+
+  #setWatermark(name: string, sessionId: string, messages: BotChatMessage[]): void {
+    this.#watermarks.set(name, { sessionId, lastId: messages.at(-1)?.id, count: messages.length });
+  }
 
   /** State frames are edge-triggered: a poll that finds nothing changed is silent on the wire. */
   #emitState(
