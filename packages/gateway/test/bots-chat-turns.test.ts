@@ -291,4 +291,122 @@ describe("BotChatTurns", () => {
     turns.close();
     expect(turns.polling("scout")).toBe(false);
   });
+  // ext-bots-v1 sections 3 and 4: the `clientId` a sender put on a send comes back on THAT send's
+  // message and on no other. Two sends of the same words are two different lines, and the app keys
+  // its transcript on the id it is handed, so a clientId that crosses turns collapses two rows into
+  // one and a user bubble disappears (cozychat#38).
+  describe("clientId re-attachment", () => {
+    const user = (id: string) => ({ id, role: "user", content: "another espresso" });
+    const bot = (id: string) => ({ id, role: "assistant", content: "coming right up" });
+
+    it("never stamps a newer identical send with an earlier turn's clientId (cozychat#38)", async () => {
+      let reply: Reply = { messages: [user("m1")], running: true };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-1" });
+      // The app refreshes mid-turn. A history read re-bases the delta watermark PAST the user row,
+      // so the poll never emits it and `phone-1` is left sitting in the pending queue.
+      await turns.history("scout", "stored-1");
+      reply = { messages: [user("m1"), bot("m2")] };
+      await turns.settled("scout");
+
+      // The same words again, a whole turn later.
+      reply = { messages: [user("m1"), bot("m2"), user("m3")], running: true };
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-2" });
+      reply = { messages: [user("m1"), bot("m2"), user("m3"), bot("m4")] };
+      await turns.settled("scout");
+
+      const rows = chatFrames(frames).flatMap((frame) => frame.messages);
+      expect(rows.find((message) => message.id === "m3")?.clientId).toBe("phone-2");
+      expect(rows.every((message) => message.clientId !== "phone-1")).toBe(true);
+    });
+
+    it("gives two identical sends their own clientIds, one row each", async () => {
+      let reply: Reply = { messages: [user("m1")], running: true };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-1" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), bot("m2")] };
+      await turns.settled("scout");
+
+      reply = { messages: [user("m1"), bot("m2"), user("m3")], running: true };
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-2" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), bot("m2"), user("m3"), bot("m4")] };
+      await turns.settled("scout");
+
+      const rows = chatFrames(frames).flatMap((frame) => frame.messages);
+      expect(rows.map((message) => message.id)).toEqual(["m1", "m2", "m3", "m4"]);
+      expect(rows.find((message) => message.id === "m1")?.clientId).toBe("phone-1");
+      expect(rows.find((message) => message.id === "m3")?.clientId).toBe("phone-2");
+      const stamped = rows.map((message) => message.clientId).filter((id) => id !== undefined);
+      expect(new Set(stamped).size).toBe(stamped.length);
+    });
+
+    it("never re-uses an orphaned clientId for a repeat INSIDE one turn (review G1)", async () => {
+      let reply: Reply = { messages: [user("m1")], running: true };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-1" });
+      // The app refreshes while the bot is still replying. The history read hands the client the
+      // user row directly AND re-bases the watermark past it, so the poll will never emit it and
+      // `phone-1` has nothing left to be attached to.
+      await turns.history("scout", "stored-1");
+      // The user asks again without waiting: same words, same LIVE turn, so no turn boundary is
+      // crossed and the orphan is still in the queue.
+      reply = { messages: [user("m1"), user("m2")], running: true };
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-2" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), user("m2"), bot("m3")] };
+      await turns.settled("scout");
+
+      const rows = chatFrames(frames).flatMap((frame) => frame.messages);
+      expect(rows.find((message) => message.id === "m2")?.clientId).toBe("phone-2");
+      expect(rows.every((message) => message.clientId !== "phone-1")).toBe(true);
+    });
+
+    it("keeps both clientIds when two identical sends ride ONE turn", async () => {
+      let reply: Reply = { messages: [], running: true };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-1" });
+      // A second tap before the poll has seen the first row: same turn, two live sends, and each
+      // still owes its own row a clientId of its own.
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-2" });
+      reply = { messages: [user("m1"), user("m2")], running: true };
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), user("m2"), bot("m3")] };
+      await turns.settled("scout");
+
+      const rows = chatFrames(frames).flatMap((frame) => frame.messages);
+      expect(rows.find((message) => message.id === "m1")?.clientId).toBe("phone-1");
+      expect(rows.find((message) => message.id === "m2")?.clientId).toBe("phone-2");
+    });
+
+    it("does not re-stamp a replayed row when the watermark re-bases (cozychat#38)", async () => {
+      let reply: Reply = { messages: [user("m1")], running: true };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-1" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), bot("m2")] };
+      await turns.settled("scout");
+
+      // A compaction rewrote the tail: the id the watermark held is gone, so the whole transcript
+      // is replayed. The replayed user row is one the client already has, and it must not be
+      // handed the clientId belonging to the send now in flight.
+      reply = { messages: [user("m1"), user("m3")], running: true };
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-2" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), user("m3"), bot("m4")] };
+      await turns.settled("scout");
+
+      const rows = chatFrames(frames).flatMap((frame) => frame.messages);
+      expect(rows.filter((message) => message.id === "m1").every((message) => message.clientId !== "phone-2")).toBe(
+        true,
+      );
+      expect(rows.find((message) => message.id === "m3")?.clientId).toBe("phone-2");
+    });
+  });
 });

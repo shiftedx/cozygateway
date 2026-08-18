@@ -69,6 +69,10 @@ export interface SendOptions {
 
 interface ActiveTurn {
   sessionId: string;
+  /** Which turn this is, monotonic per process. A pending send belongs to exactly one of these, and
+   *  a send that opens a NEW turn proves every entry left from an older one will never be matched
+   *  (see `PendingSend`). */
+  id: number;
   /** Message count before the prompt was submitted; the turn is done once an assistant reply has
    *  landed past it. */
   baseline: number;
@@ -82,10 +86,23 @@ interface ActiveTurn {
   done: Promise<void>;
 }
 
-/** A message this gateway accepted and has not yet seen come back around the poll. */
+/** A message this gateway accepted and has not yet seen come back around the poll.
+ *
+ *  The queue is FIFO and an entry is usable EXACTLY ONCE: two sends of the same words are two
+ *  different lines of the transcript, and the app keys its rows on what it is handed, so an entry
+ *  that gets reused (or that outlives its own turn and is then claimed by a later identical send)
+ *  collapses two rows into one and a user bubble disappears (cozychat#38). */
 interface PendingSend {
   clientId: string;
   text: string;
+  /** The turn that carried this send. A send that opens a NEW turn is proof that every entry from
+   *  an older one is dead: that turn's poll has already ended, so the row it was waiting for is
+   *  either delivered or never coming. Dropping them there is what keeps a clientId from crossing
+   *  a turn boundary onto a later send of the very same words. */
+  turn: number;
+  /** When the send was accepted. Fixes the queue order, and expires an entry whose message never
+   *  came back around the poll at all, inside a turn long enough that no newer turn has started. */
+  at: number;
 }
 
 /** How far a bot's chat has been broadcast. Kept as the LAST BROADCAST MESSAGE ID rather than a
@@ -96,7 +113,18 @@ interface Watermark {
   sessionId: string;
   lastId: string | undefined;
   count: number;
+  /** Every message id this bot's chat has already handed out for this session. A re-base replays
+   *  rows the client already has, and a replayed row must never be stamped with the clientId of a
+   *  send still in flight: that is the same collapse the FIFO queue exists to prevent, arriving
+   *  from the other direction. Bounded, so a long chat cannot grow this without limit. */
+  seen: Set<string>;
 }
+
+/** How many message ids a watermark remembers. Comfortably more than a compaction replays, and
+ *  small enough that the set is never a memory concern. */
+const MAX_SEEN_IDS = 1_000;
+
+const EMPTY_IDS: ReadonlySet<string> = new Set<string>();
 
 export class BotChatTurns {
   readonly #rpc: HermesRpc;
@@ -114,6 +142,7 @@ export class BotChatTurns {
   readonly #watermarks = new Map<string, Watermark>();
   readonly #pending = new Map<string, PendingSend[]>();
   readonly #lastState = new Map<string, string>();
+  #nextTurnId = 0;
   #closed = false;
 
   constructor(opts: ChatTurnsOptions) {
@@ -130,8 +159,39 @@ export class BotChatTurns {
    *  that follow a history read are deltas against exactly what the client just received. */
   async history(name: string, sessionId: string): Promise<ChatSnapshot> {
     const snapshot = await this.#resume(sessionId, name, false);
+    this.#spendPending(name, snapshot.messages);
     this.#setWatermark(name, sessionId, snapshot.messages);
     return snapshot;
+  }
+
+  /** A history read hands the client every row it returns AND re-bases the delta watermark past
+   *  them, so none of those rows is ever coming back around the poll. A pending entry waiting for
+   *  one of them is dead the moment the read happens, and leaving it in the queue is what let the
+   *  NEXT identical send collect a clientId that belonged to an earlier one. The turn boundary does
+   *  not save that case: a repeat sent while the bot is still replying JOINS the live turn, so no
+   *  boundary is crossed at all (review G1).
+   *
+   *  Right even though the watermark, and therefore this re-base, is SHARED across devices: it is
+   *  precisely because someone else's refresh moved the mark past the row that the sender's own
+   *  frame is never coming. The entry is dead whoever read the history.
+   *
+   *  The returned rows are NOT stamped on the way out. The 202 body already carried the clientId to
+   *  the sender, the history route has never carried one (section 3), and minting one into a
+   *  response that another device asked for would be putting one device's join key in another's
+   *  hands. */
+  #spendPending(name: string, messages: BotChatMessage[]): void {
+    const queue = this.#pending.get(name);
+    if (queue === undefined || queue.length === 0) return;
+    for (const message of messages) {
+      if (message.role !== "user") continue;
+      const index = queue.findIndex((entry) => entry.text === message.text);
+      if (index === -1) continue;
+      // Same consumption rule as `#reconcile`: FIFO, one entry per row, and everything ahead of the
+      // match goes with it.
+      queue.splice(0, index + 1);
+      if (queue.length === 0) break;
+    }
+    if (queue.length === 0) this.#pending.delete(name);
   }
 
   /** Submits `text` into the canonical chat and starts (or extends) the turn poll. Resolves as
@@ -193,10 +253,18 @@ export class BotChatTurns {
 
     const at = this.#now();
     const clientId = opts.clientId ?? `${sessionId}#local-${at}`;
-    const queue = this.#pending.get(name) ?? [];
-    queue.push({ clientId, text });
+    const turnId = this.#startTurn(name, sessionId, baseline, running, inflight);
+    // Entries from a turn that is over, or that have outlived a whole turn cap inside a live one,
+    // belong to a message that is never coming back around the poll (a history read re-based the
+    // watermark past it, hermes dropped it, the turn was abandoned). Leaving them in the queue is
+    // what let a later send of the SAME words claim one and hand the app a duplicate id
+    // (cozychat#38). Entries from THIS turn stay: two quick taps are two live sends, and each still
+    // owes its own row a clientId.
+    const queue = (this.#pending.get(name) ?? []).filter(
+      (entry) => entry.turn === turnId && entry.at > at - this.#timeoutMs,
+    );
+    queue.push({ clientId, text, turn: turnId, at });
     this.#pending.set(name, queue);
-    this.#startTurn(name, sessionId, baseline, running, inflight);
     return { id: `${sessionId}#local-${at}`, role: "user", text, at, clientId };
   }
 
@@ -250,14 +318,15 @@ export class BotChatTurns {
     this.#pending.clear();
   }
 
-  #startTurn(name: string, sessionId: string, baseline: number, running: boolean, inflight: boolean): void {
+  /** Opens (or joins) the poll for a send, and answers which turn the send belongs to. */
+  #startTurn(name: string, sessionId: string, baseline: number, running: boolean, inflight: boolean): number {
     const existing = this.#turns.get(name);
     if (existing !== undefined && existing.sessionId === sessionId) {
       // Single-flight: the live poll adopts the new turn by extending its own deadline. Its
       // completion test still requires an idle session, so it cannot declare the second turn done
       // while Hermes is mid-reply.
       existing.deadline = this.#now() + this.#timeoutMs;
-      return;
+      return existing.id;
     }
     // The bot's canonical session id changed under a live poll (a compaction re-pin, a desktop
     // clear, a pin writeback race). That poll is now broadcasting for a chat nobody is in, so it
@@ -266,6 +335,7 @@ export class BotChatTurns {
 
     const turn: ActiveTurn = {
       sessionId,
+      id: (this.#nextTurnId += 1),
       baseline,
       deadline: this.#now() + this.#timeoutMs,
       sawActivity: running || inflight,
@@ -276,6 +346,7 @@ export class BotChatTurns {
       if (this.#turns.get(name) === turn) this.#turns.delete(name);
     });
     this.#turns.set(name, turn);
+    return turn.id;
   }
 
   async #poll(name: string, turn: ActiveTurn, running: boolean, inflight: boolean): Promise<void> {
@@ -346,7 +417,8 @@ export class BotChatTurns {
       const index = messages.findIndex((message) => message.id === mark.lastId);
       seen = index === -1 ? 0 : index + 1;
     }
-    const fresh = messages.slice(seen).map((message) => this.#reconcile(name, message));
+    const already = mark !== undefined && mark.sessionId === sessionId ? mark.seen : EMPTY_IDS;
+    const fresh = messages.slice(seen).map((message) => this.#reconcile(name, message, already));
     this.#setWatermark(name, sessionId, messages);
     if (fresh.length === 0) return;
     this.#broadcast({
@@ -361,20 +433,46 @@ export class BotChatTurns {
   /** Re-attaches the sender's `clientId` to the user message it accepted, once that message comes
    *  back around the poll carrying Hermes' own id. Without it the optimistic row the sender
    *  rendered from the 202 body and the row in the frame share nothing, and the documented
-   *  key-on-id dedupe could never fire. */
-  #reconcile(name: string, message: BotChatMessage): BotChatMessage {
+   *  key-on-id dedupe could never fire.
+   *
+   *  Text alone cannot say WHICH send a row is: a user who asks the same thing twice produces two
+   *  rows with identical text, and matching the first entry that happens to hold those words let a
+   *  clientId cross a turn boundary. The app then held two transcript rows with one id, and SwiftUI
+   *  dropped one of them without a word (cozychat#38). So the match is ordered and single use:
+   *
+   *   • a row this session has ALREADY broadcast is never stamped. It is a replay off a re-based
+   *     watermark, the client has it, and the send in flight is not it.
+   *   • the queue is FIFO and the first entry holding this text wins, since hermes persists sends
+   *     in the order it accepted them and the poll reads them back in that order.
+   *   • everything AHEAD of the match is dropped with it. A newer entry matching first is proof
+   *     those older ones will never be matched at all, and leaving them is what let the next
+   *     identical send collect a dead clientId.
+   *   • an entry is consumed exactly once, so a second row can never be handed the same id. */
+  #reconcile(name: string, message: BotChatMessage, alreadyBroadcast: ReadonlySet<string>): BotChatMessage {
     if (message.role !== "user") return message;
+    if (alreadyBroadcast.has(message.id)) return message;
     const queue = this.#pending.get(name);
     if (queue === undefined || queue.length === 0) return message;
     const index = queue.findIndex((entry) => entry.text === message.text);
     if (index === -1) return message;
-    const [entry] = queue.splice(index, 1);
+    const consumed = queue.splice(0, index + 1);
     if (queue.length === 0) this.#pending.delete(name);
-    return { ...message, clientId: entry!.clientId };
+    return { ...message, clientId: consumed[consumed.length - 1]!.clientId };
   }
 
   #setWatermark(name: string, sessionId: string, messages: BotChatMessage[]): void {
-    this.#watermarks.set(name, { sessionId, lastId: messages.at(-1)?.id, count: messages.length });
+    const previous = this.#watermarks.get(name);
+    // A different session is a different transcript, so its ids carry nothing over.
+    const seen = previous !== undefined && previous.sessionId === sessionId ? previous.seen : new Set<string>();
+    for (const message of messages) seen.add(message.id);
+    // Insertion ordered, so trimming from the front drops the oldest ids first.
+    if (seen.size > MAX_SEEN_IDS) {
+      for (const id of seen) {
+        if (seen.size <= MAX_SEEN_IDS) break;
+        seen.delete(id);
+      }
+    }
+    this.#watermarks.set(name, { sessionId, lastId: messages.at(-1)?.id, count: messages.length, seen });
   }
 
   /** State frames are edge-triggered: a poll that finds nothing changed is silent on the wire. */
