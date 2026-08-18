@@ -7,7 +7,14 @@
 #   2. COZYGATEWAY_HERMES_PASSWORD, the dashboard password the bridge logs in with. The config file
 #      names the VARIABLE; the value lives only in .env and in the process environment;
 #   3. host.docker.internal, so the container can dial `hermes dashboard` running on the host. On
-#      Docker Desktop it already resolves; the extra_hosts entry is what makes it work on Linux.
+#      Docker Desktop it already resolves; the extra_hosts entry is what makes it work on Linux;
+#   4. COZYGATEWAY_PORT, so --gateway-port actually moves the gateway. The base file pins the
+#      container's port to 8787 in the environment AND publishes 8787:8787, and
+#      applyEnvOverrides (packages/gateway/src/config.ts) lets that env var beat the config file's
+#      `port`. Setting only the config file therefore changed nothing and left the health poll
+#      knocking on a port nobody served. Here the env var and the published mapping both come from
+#      the same variable. `!override` on ports is required: compose APPENDS list entries otherwise,
+#      which would keep publishing 8787 alongside the new port.
 #
 # Usage, from the repo root:
 #   docker compose -f docker-compose.yml -f docker/agent-install.override.yml up -d --build gateway
@@ -20,7 +27,12 @@
 services:
   gateway:
     environment:
-      COZYGATEWAY_HERMES_PASSWORD: "${COZYGATEWAY_HERMES_PASSWORD:?set the dashboard password in .env (escape any $ as $$)}"
+      # The `$$$$` is deliberate: compose collapses `$$` to `$` inside the message body too, so
+      # advice about doubling `$` has to be doubled twice to survive and read as "escape any $ as $$".
+      COZYGATEWAY_HERMES_PASSWORD: "${COZYGATEWAY_HERMES_PASSWORD:?set the dashboard password in .env (escape any $$ as $$$$)}"
+      COZYGATEWAY_PORT: "${COZYGATEWAY_PORT:-8787}"
+    ports: !override
+      - "${COZYGATEWAY_PORT:-8787}:${COZYGATEWAY_PORT:-8787}"
     volumes:
       - ./local/cozygateway.config.json:/app/cozygateway.config.json:ro
     extra_hosts:
