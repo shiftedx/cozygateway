@@ -28,7 +28,7 @@ import {
   normalizeProfileName,
 } from "./crud.ts";
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
-import { RoutineNotFound, RoutineRefused, patchNeedsRewrite } from "./routines.ts";
+import { RoutineNotFound, RoutineRefused, RoutineUnconfirmed, patchNeedsRewrite } from "./routines.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
  *  device-token auth as every other route; nothing here speaks a Hermes method name, that all
@@ -140,6 +140,20 @@ function failure(c: Context<Env>, err: unknown) {
   //
   // The backend's text rides along verbatim in `hermesError` either way, because it is the only
   // description of what was actually wrong.
+  // A create the backend accepted whose stored row could not be read back. A 502 rather than a 201,
+  // because there is no routine to put in a 201 body: the alternative is echoing the request, and
+  // the request is not what the backend stores. `createdId` rides along when the `add` reported one,
+  // so a client can list and find out whether the routine is really there.
+  if (err instanceof RoutineUnconfirmed) {
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", "hermes accepted the routine but its stored schedule could not be read back"),
+        hermesError: err.message,
+        ...(err.createdId === undefined ? {} : { createdId: err.createdId }),
+      },
+      502,
+    );
+  }
   if (err instanceof RoutineRefused) {
     return err.clientInput
       ? c.json(

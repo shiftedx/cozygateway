@@ -1005,6 +1005,8 @@ body { title: string, schedule: string, prompt: string, repeat?: integer, contin
 400  invalid_request + hermesError    // hermes ANSWERED the `add` with a refusal (`success: false`)
 404  not_found                        // no profile named `name` exists
 502  backend_unavailable + hermesError // hermes REJECTED the call: an unparsable schedule is this
+502  backend_unavailable + hermesError + createdId?  // hermes ACCEPTED the add but the stored
+                                      // routine could not be read back; see below
 ```
 
 `schedule` is the RAW Hermes schedule string, composed exactly as the desktop's picker composes it.
@@ -1050,6 +1052,14 @@ gateway decides how the instruction is delivered, and a client-built wrapper is 
 legacy auto-pause exists to kill. The response carries the routine the backend actually STORED, not
 an echo of the request, because the schedule is normalized and the first run time is computed.
 
+That rule holds on the failure path too, which is where it matters most. `add` normally answers with
+the created row embedded; a build that answers without one is READ BACK once, by the id the reply
+carried, and the stored job is what comes back. When the read-back finds nothing, the answer is a
+502, never a 201 built out of the request: a routines pane rendering the string the user typed, in a
+shape the backend does not store, at the exact moment the round trip failed, is the one outcome worth
+refusing. `createdId` is present whenever the `add` reported an id, because the routine may really be
+there; list the routines to find out, and delete the leftover by that id if it is.
+
 ### PATCH /bots/:name/routines/:id
 
 ```
@@ -1062,6 +1072,8 @@ body { title?: string, schedule?: string, prompt?: string, enabled?: boolean,
 404  not_found                        // no profile named `name`, or no routine `id` for this bot
 502  backend_unavailable + hermesError // hermes REJECTED the call, or ANSWERED a pause/resume/remove
                                       // with a refusal
+502  backend_unavailable + hermesError + createdId?  // the replacement was accepted but could not be
+                                      // read back; the old routine is left PAUSED, see step 2 below
 ```
 
 Two very different operations, and the difference is the backend's rather than this API's invention:
@@ -1080,7 +1092,11 @@ routine firing twice or half-edited:
    whole edit, since the alternative is a window with two live schedules.
 2. the replacement is CREATED. If that fails (an unparsable schedule is the common case) the old job
    is resumed back to the state it was in and the failure is reported: the routine is exactly as it
-   was before the edit was attempted.
+   was before the edit was attempted. The one create failure that is NOT rolled back is a
+   replacement the backend accepted and the gateway could not read back: it may already be running,
+   and resuming the old one on top of it is exactly the double schedule this ordering exists to
+   prevent. The old routine stays paused, the error carries `createdId`, and a list says which jobs
+   are really there.
 3. the old job is REMOVED. If THAT fails, the new routine exists and the old one is still paused, so
    nothing double-fires; its id comes back as `orphanedId` and is deletable through
    `DELETE /bots/:name/routines/:id`.
