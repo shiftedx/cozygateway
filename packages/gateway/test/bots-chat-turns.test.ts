@@ -366,6 +366,31 @@ describe("BotChatTurns", () => {
       expect(rows.every((message) => message.clientId !== "phone-1")).toBe(true);
     });
 
+    it("a refresh does not spend the send it is racing against an OLD row (review R2-SELF2)", async () => {
+      let reply: Reply = { messages: [user("m1")], running: true };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-1" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), bot("m2")] };
+      await turns.settled("scout");
+
+      // A whole turn later the user asks the same thing again, and the app refreshes before hermes
+      // has persisted the new line. The snapshot therefore holds only the OLD copy of those words,
+      // which this client was handed a turn ago and which no send is waiting for.
+      reply = { messages: [user("m1"), bot("m2")], running: true };
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-2" });
+      await turns.history("scout", "stored-1");
+
+      reply = { messages: [user("m1"), bot("m2"), user("m3")], running: true };
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), bot("m2"), user("m3"), bot("m4")] };
+      await turns.settled("scout");
+
+      const rows = chatFrames(frames).flatMap((frame) => frame.messages);
+      expect(rows.find((message) => message.id === "m3")?.clientId).toBe("phone-2");
+    });
+
     it("keeps both clientIds when two identical sends ride ONE turn", async () => {
       let reply: Reply = { messages: [], running: true };
       const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });

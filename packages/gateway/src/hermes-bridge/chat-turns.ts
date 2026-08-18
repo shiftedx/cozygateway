@@ -159,7 +159,7 @@ export class BotChatTurns {
    *  that follow a history read are deltas against exactly what the client just received. */
   async history(name: string, sessionId: string): Promise<ChatSnapshot> {
     const snapshot = await this.#resume(sessionId, name, false);
-    this.#spendPending(name, snapshot.messages);
+    this.#spendPending(name, sessionId, snapshot.messages);
     this.#setWatermark(name, sessionId, snapshot.messages);
     return snapshot;
   }
@@ -179,11 +179,20 @@ export class BotChatTurns {
    *  the sender, the history route has never carried one (section 3), and minting one into a
    *  response that another device asked for would be putting one device's join key in another's
    *  hands. */
-  #spendPending(name: string, messages: BotChatMessage[]): void {
+  #spendPending(name: string, sessionId: string, messages: BotChatMessage[]): void {
     const queue = this.#pending.get(name);
     if (queue === undefined || queue.length === 0) return;
+    const mark = this.#watermarks.get(name);
+    const delivered = mark !== undefined && mark.sessionId === sessionId ? mark.seen : EMPTY_IDS;
     for (const message of messages) {
       if (message.role !== "user") continue;
+      // The same guard `#reconcile` has, and for the same reason. A row this client has ALREADY
+      // been given is not the row any pending send is waiting for, so spending an entry against it
+      // eats a send that is still perfectly in flight: the frame that follows carries no clientId,
+      // the sender's optimistic bubble is never joined, and the user looks at their own line twice
+      // until the turn settles. The refresh that does this is most often the SENDER'S own, moments
+      // after tapping send.
+      if (delivered.has(message.id)) continue;
       const index = queue.findIndex((entry) => entry.text === message.text);
       if (index === -1) continue;
       // Same consumption rule as `#reconcile`: FIFO, one entry per row, and everything ahead of the
