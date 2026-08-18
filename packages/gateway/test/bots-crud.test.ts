@@ -779,6 +779,36 @@ describe("unknown bot (contract/ext-bots-v1.md section 4)", () => {
     expect(server.calls().slice(before).map((call) => call.method)[0]).toBe("session.list");
   });
 
+  /** The same auto-create hazard the group rooms were bitten by, on the 1:1 path: the unknown-bot
+   *  guard is satisfied from the roster cache, and a cache is only ever as young as its last
+   *  refresh. Everywhere else a stale yes costs one 404 that Hermes hands back a moment later, but
+   *  `session.create` does not answer 404 for a name it does not know, it CREATES the profile. So the
+   *  one path that mints a chat re-checks, fresh, immediately before it does. */
+  it("does not mint a chat for a bot the cache still lists but hermes no longer has", async () => {
+    const names = new Set<string>(["default", "scout"]);
+    const { authed, server, bridge } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(names),
+        "session.list": () => ({ sessions: [] }),
+        "session.create": () => ({ stored_session_id: "stored-1", session_id: "runtime-1" }),
+        "prompt.submit": () => ({ ok: true }),
+      },
+    });
+    await until(() => bridge.roster().bots.some((bot) => bot.name === "scout"), 4_000);
+
+    // Deleted behind the bridge's back, with no refresh behind it: the cache is as stale as it was
+    // when this happened live.
+    names.delete("scout");
+    expect(bridge.roster().bots.map((bot) => bot.name)).toContain("scout");
+
+    const chat = await authed("/bots/scout/chat");
+    expect(chat.status).toBe(404);
+    expect(((await chat.json()) as { error: { code: string } }).error.code).toBe("not_found");
+    // Nothing was minted, so nothing was resurrected.
+    expect(server.callsOf("session.create")).toHaveLength(0);
+    expect(server.callsOf("prompt.submit")).toHaveLength(0);
+  });
+
   it("a hidden bot is resolved off a fresh profiles.list rather than read as unknown", async () => {
     const { authed } = await setup(
       {

@@ -101,14 +101,20 @@ export interface GroupRoomsOptions {
    *  the roster cache has not seen yet is derived from its profile name rather than dropped, so a
    *  cold cache cannot silently shrink a room. */
   memberInfo: (name: string) => GroupMember;
-  /** Throws `BotNotFound` when the name names no Hermes profile. Used at create only: membership is
-   *  validated once, when the room is made. */
-  assertBotKnown: (name: string) => Promise<void>;
+  /** Which of these names are NOT bots on this gateway, answered from a FRESH read rather than a
+   *  cached snapshot. Used at create: membership is validated once, when the room is made, and the
+   *  room then outlives the answer. */
+  missingMembers: (names: string[]) => Promise<string[]>;
   /** Cache-only, synchronous "is this still a bot?", read at every member boundary so a member
    *  deleted after the room was created is skipped with a note instead of burning a whole failed
    *  turn per round forever. Answers `undefined` when the roster cache cannot tell (a cold cache),
    *  which reads as "assume it is still there": a cold cache must never shrink a room. */
   memberKnown?: (name: string) => boolean | undefined;
+  /** Authoritative "is this still a bot?", asked at the LAST boundary before a member's turn can
+   *  mint a session. Costs a round trip, which the cheap `memberKnown` gate above spares whenever
+   *  the cache is already sure. It must not throw, and must answer `true` when it cannot tell: a
+   *  gateway that cannot reach Hermes has learned nothing about who is still a bot. */
+  memberExists?: (name: string) => Promise<boolean>;
   /** Called when a member's reply mentions `@user`, i.e. the room needs the human. The room has
    *  already set its durable `needs you` state and emitted its frame by then; this is the OUT OF
    *  BAND leg, for a phone that is not holding a socket open (spec section 4). Fire-and-forget by
@@ -128,8 +134,9 @@ export class GroupRooms {
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
   readonly #memberInfo: (name: string) => GroupMember;
-  readonly #assertBotKnown: (name: string) => Promise<void>;
+  readonly #missingMembers: (names: string[]) => Promise<string[]>;
   readonly #memberKnown: (name: string) => boolean | undefined;
+  readonly #memberExists: (name: string) => Promise<boolean>;
   readonly #escalate: (event: { group: string; member: string; displayName: string; text: string }) => void;
   readonly #hidden: boolean;
   readonly #pollMs: number | undefined;
@@ -160,8 +167,9 @@ export class GroupRooms {
     this.#broadcast = opts.broadcast;
     this.#now = opts.now;
     this.#memberInfo = opts.memberInfo;
-    this.#assertBotKnown = opts.assertBotKnown;
+    this.#missingMembers = opts.missingMembers;
     this.#memberKnown = opts.memberKnown ?? ((): boolean | undefined => undefined);
+    this.#memberExists = opts.memberExists ?? ((): Promise<boolean> => Promise.resolve(true));
     this.#escalate = opts.escalate ?? ((): void => {});
     this.#hidden = opts.hidden ?? true;
     this.#pollMs = opts.pollMs;
@@ -174,9 +182,9 @@ export class GroupRooms {
     return this.#storage.botGroups().map((room) => this.#view(room));
   }
 
-  /** Creates a room. Membership is validated against the roster BEFORE anything is written, so a
-   *  room can never exist naming a bot that does not, and the caller gets one clear 404 instead of a
-   *  room that fails on its first round. */
+  /** Creates a room. Membership is validated against a FRESH profile list BEFORE anything is
+   *  written, so a room can never exist naming a bot that does not, and the caller gets one 400
+   *  naming every member that is missing instead of a room that fails on its first round. */
   async create(rawName: string, rawMembers: string[]): Promise<BotGroup> {
     const name = rawName.trim();
     if (name.length === 0) throw new GroupInvalid("a group name is required");
@@ -205,9 +213,20 @@ export class GroupRooms {
         `a group needs between ${GROUP_MIN_MEMBERS} and ${GROUP_MAX_MEMBERS} distinct members, got ${members.length}`,
       );
     }
-    // Serial rather than parallel: the check is cache-first and only a MISS costs a round trip, so
-    // the common case is free and the rare one fails on the first unknown name.
-    for (const member of members) await this.#assertBotKnown(member);
+    // One FRESH read for the whole membership, and every missing name comes back at once.
+    //
+    // Cache-first would be cheaper and was what this did, and it is what let the bug in: the roster
+    // snapshot still listed a bot that had just been deleted, the room was written naming it, and
+    // the first round handed that name to `session.create`, which in Hermes 0.20.x AUTO-CREATES a
+    // profile for a name it does not know. The deleted bot came back as a bare profile. A room is
+    // durable and its membership is fixed at create, so this is the one place where paying for a
+    // fresh answer is obviously right.
+    const missing = await this.#missingMembers(members);
+    if (missing.length > 0) {
+      throw new GroupInvalid(
+        `not a bot on this gateway: ${missing.join(", ")}. A room can only name bots that exist here.`,
+      );
+    }
 
     if (!this.#storage.createBotGroup({ key, name, members, createdAt: this.#now() })) {
       throw new GroupExists(name);
@@ -417,11 +436,7 @@ export class GroupRooms {
           // is gone, the session cannot resolve, and without this the room burns one failed turn on
           // it every round, forever.
           if (this.#memberKnown(member.name) === false) {
-            this.#emitState(current, "running", round, {
-              member: member.name,
-              reason: "failed",
-              detail: `${member.displayName} is no longer a bot on this gateway`,
-            }, startEpoch);
+            this.#emitState(current, "running", round, goneNote(member), startEpoch);
             continue;
           }
 
@@ -450,6 +465,15 @@ export class GroupRooms {
           // to decide whether to write would be the read that throws.
           if (this.#closed || this.#generation(key) !== startGeneration) return;
           if (this.#storage.botGroup(key) === undefined) return;
+          // The member was deleted while this round was running, and the turn stopped at the
+          // boundary before it could have minted anything. Same news, same note and same skip as the
+          // pre-round gate above, and deliberately BEFORE the watermark write: a member that was
+          // never asked has not read the room, so if it ever comes back it starts from where it was.
+          if (result.outcome === "gone") {
+            const live = this.#storage.botGroup(key);
+            if (live !== undefined) this.#emitState(live, "running", round, goneNote(member), startEpoch);
+            continue;
+          }
           // Marked as having seen everything that existed BEFORE its reply, whatever the outcome,
           // so a member that failed or passed is not asked about the same delta forever.
           this.#storage.setBotGroupWatermark(key, member.name, highestSeq(log, watermark));
@@ -521,6 +545,12 @@ export class GroupRooms {
     storedId?: string;
   }): Promise<GroupTurnResult> {
     const { key, groupName, member, members, delta, startEpoch, startGeneration, storedId } = args;
+    // The LAST boundary before this turn can mint anything, and the one the `memberKnown` gate at
+    // the top of the round cannot cover: that gate reads a snapshot, and a member deleted since the
+    // snapshot was taken still reads as present there. `ensureGroupSession` falls through to
+    // `session.create` when neither session lookup lands, and Hermes 0.20.x auto-creates a profile
+    // for a name it does not know, so an unchecked name here does not fail: it RESURRECTS the bot.
+    if (!(await this.#memberExists(member.name))) return { outcome: "gone" };
     let session;
     try {
       session = await ensureGroupSession(this.#rpc, member.name, groupName, {
@@ -597,6 +627,20 @@ export class GroupRooms {
       updatedAt: this.#now(),
     });
   }
+}
+
+/** What a room says about a member that is no longer a bot here. One wording for both places that
+ *  can discover it (the cheap cache gate at the top of a member's slot, and the authoritative check
+ *  at the turn boundary), because to a reader they are the same event.
+ *
+ *  `failed` is the reason because the contract's note has three (`timeout`, `failed`, `capped`) and
+ *  this is not a timeout or a cap. The detail is what carries the meaning. */
+function goneNote(member: GroupMember): BotGroupNote {
+  return {
+    member: member.name,
+    reason: "failed",
+    detail: `${member.displayName} is no longer a bot on this gateway`,
+  };
 }
 
 function toWireMessage(row: BotGroupLogRow): BotGroupMessage {

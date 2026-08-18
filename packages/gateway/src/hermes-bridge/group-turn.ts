@@ -42,10 +42,16 @@ const CREATED_SESSION_PERSIST_GRACE_POLLS = 15;
  *  `pass` is the healthy outcome and covers both the literal `(pass)` and a reply with no text at
  *  all. `timeout` and `failed` are the honest ones: the member said nothing because its turn did not
  *  complete, which the room reports as a note and never as a message it invented on the member's
- *  behalf. */
+ *  behalf.
+ *
+ *  `gone` is the turn that never started: the member is no longer a bot on this gateway, so there
+ *  was nothing to ask and nothing was asked. It is separate from `failed` because nothing failed,
+ *  and separate from `pass` because a vanished member must not have its watermark advanced as though
+ *  it had read the room. */
 export type GroupTurnResult =
   | { outcome: "spoke"; text: string }
   | { outcome: "pass" }
+  | { outcome: "gone" }
   | { outcome: "timeout"; detail: string }
   | { outcome: "failed"; detail: string };
 

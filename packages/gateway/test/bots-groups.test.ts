@@ -161,12 +161,20 @@ function fakeGroupHermes(options: FakeGroupOptions = {}): {
       }),
       "session.list": () => ({ sessions: [] }),
       "session.create": (params, ctx) => {
+        const profile = String(params["profile"] ?? "");
+        // Hermes 0.20.x AUTO-CREATES a profile for a name it does not know, which is how a bot
+        // deleted while a room was being created came back as a bare profile. A fake that copied
+        // that behavior would let the whole class of bug hide behind a green suite, so this one
+        // REFUSES: any `session.create` for a name `profiles.list` does not carry is a test
+        // failure, wherever in the bridge it came from.
+        if (!profiles.includes(profile)) {
+          throw { code: 4064, message: `profile '${profile}' not found: session.create must never mint one` };
+        }
         seq += 1;
-        const profileName = String(params["profile"] ?? "");
         const session: FakeSession = {
           stored: `stored-${seq}`,
-          runtime: `runtime-${profileName}-${seq}`,
-          profile: String(params["profile"] ?? ""),
+          runtime: `runtime-${profile}-${seq}`,
+          profile,
           title: String(params["title"] ?? ""),
           // `session.create` writes NO row: the session becomes resumable when its first prompt
           // lands, never before.
@@ -439,16 +447,45 @@ describe("room CRUD", () => {
     expect(((await send.json()) as { error: { code: string } }).error.code).toBe("not_found");
   });
 
-  it("validates membership against the roster", async () => {
+  it("refuses a room naming bots that do not exist, and names every one of them", async () => {
     const { behavior } = fakeGroupHermes();
     const harness = await setup(behavior);
     const res = await harness.authed("/bots/groups", {
       method: "POST",
-      body: JSON.stringify({ name: "Ghost Room", members: ["scout", "ghost"] }),
+      body: JSON.stringify({ name: "Ghost Room", members: ["scout", "ghost", "phantom"] }),
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(400);
+    // Both missing names, not just the first: a client fixing its membership one 4xx at a time is a
+    // client the user watches spin.
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("invalid_request");
+    expect(body.error.message).toContain("ghost");
+    expect(body.error.message).toContain("phantom");
     // Nothing was written: a room can never name a bot that does not exist.
     expect(((await (await harness.authed("/bots/groups")).json()) as { groups: BotGroup[] }).groups).toEqual([]);
+  });
+
+  /** Proven live: a room created while the roster cache still listed a just-deleted bot accepted it
+   *  as a member, and the member's first turn handed the name to `session.create`, which Hermes
+   *  0.20.x answers by CREATING the profile. The bot was resurrected as a bare profile that no
+   *  roster could tell from a real one. Membership is therefore validated FRESH, never off the
+   *  snapshot. */
+  it("refuses a member the roster cache still lists but hermes no longer has", async () => {
+    const { behavior, removeProfile } = fakeGroupHermes();
+    const harness = await setup(behavior);
+    // Deleted with no refresh behind it, so the cache is exactly as stale as it was live.
+    removeProfile("luna");
+    expect(harness.bridge.roster().bots.map((bot) => bot.name)).toContain("luna");
+
+    const res = await harness.authed("/bots/groups", {
+      method: "POST",
+      body: JSON.stringify({ name: "Ghost Room", members: ["scout", "luna"] }),
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toContain("luna");
+    expect(((await (await harness.authed("/bots/groups")).json()) as { groups: BotGroup[] }).groups).toEqual([]);
+    // The resurrection itself: not one session was minted, so no profile could be auto-created.
+    expect(harness.server.callsOf("session.create")).toHaveLength(0);
   });
 
   it("holds the 2 to 6 member bounds", async () => {
@@ -1059,6 +1096,46 @@ describe("rooms say why they stopped", () => {
     // And the surviving member still answered.
     const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
     expect(detail.messages.map((message) => message.text)).toContain("I will cover it");
+  });
+
+  /** The other half of the same hazard, at the boundary the cache gate cannot see: the member is
+   *  deleted DURING the round, so the roster snapshot the gate reads still lists it, and the next
+   *  thing that would touch the name is `ensureGroupSession` falling through to `session.create`. */
+  it("skips a member deleted mid-round instead of minting a session that resurrects it", async () => {
+    const { behavior, removeProfile } = fakeGroupHermes({ replies: { scout: ["I will cover it"] } });
+    const harness = await setup(behavior);
+    await createRoom(harness);
+
+    // Luna goes the moment scout's turn is submitted: her turn is next, and no refresh runs in
+    // between, so the cache still says she is a bot.
+    const submit = behavior.methods!["prompt.submit"]!;
+    behavior.methods!["prompt.submit"] = (params, ctx) => {
+      const result = submit(params, ctx);
+      removeProfile("luna");
+      return result;
+    };
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "who is on this" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    // The whole point: nothing was minted for the vanished member, so nothing could be created back
+    // into existence hermes-side.
+    const createdFor = harness.server.callsOf("session.create").map((call) => String(call.params["profile"] ?? ""));
+    expect(createdFor).not.toContain("luna");
+    expect(harness.prompts().map((prompt) => prompt.profile)).not.toContain("luna");
+
+    // The room says so calmly, and the member that was there still spoke.
+    const notes = stateFrames(harness.frames).flatMap((frame) => (frame.note === undefined ? [] : [frame.note]));
+    expect(notes.some((note) => note.member === "luna" && note.detail.includes("no longer a bot"))).toBe(true);
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    expect(detail.messages.map((message) => message.text)).toContain("I will cover it");
+
+    // A skipped member keeps its watermark: it never read the room, so a bot restored under the same
+    // name picks up from where it was rather than from a conversation it was absent for.
+    expect(harness.storage.botGroupMembers("release room").get("luna")?.watermark ?? 0).toBe(0);
   });
 });
 
