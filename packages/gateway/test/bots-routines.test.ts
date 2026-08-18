@@ -105,6 +105,12 @@ interface CronFake {
   /** Job ids whose pause must fail (as a SOFT refusal, the way the backend refuses). */
   failPause: Set<string>;
   failRemove: Set<string>;
+  /** A backend that refuses the scoped LIST, which is what an older or scoping-hostile gateway
+   *  does. There is no client input in a list, so its refusal is a server-side failure. */
+  failList: boolean;
+  /** A backend that refuses the `add` softly rather than raising: the schedule shape it dislikes is
+   *  still the user's own input. */
+  failAdd: boolean;
   methods: Record<string, (params: Record<string, unknown>) => unknown>;
 }
 
@@ -114,6 +120,8 @@ function cronFake(initial: FakeJob[] = []): CronFake {
     calls: [],
     failPause: new Set<string>(),
     failRemove: new Set<string>(),
+    failList: false,
+    failAdd: false,
   };
   let seq = 0;
 
@@ -146,9 +154,11 @@ function cronFake(initial: FakeJob[] = []): CronFake {
       const action = String(params["action"] ?? "list");
       fake.calls?.push({ action, params });
       if (action === "list") {
+        if (fake.failList === true) return { success: false, error: "unknown profile scope" };
         return { success: true, count: fake.jobs?.length ?? 0, jobs: (fake.jobs ?? []).map(format) };
       }
       if (action === "add") {
+        if (fake.failAdd === true) return { success: false, error: "refused the add" };
         let schedule: string;
         try {
           schedule = normalizeSchedule(String(params["schedule"] ?? ""));
@@ -213,10 +223,19 @@ interface Harness {
   request: (path: string, init?: RequestInit) => Promise<Response>;
 }
 
-async function setup(jobs: FakeJob[] = [], opts: { bridgeProfile?: string } = {}): Promise<Harness> {
+async function setup(
+  jobs: FakeJob[] = [],
+  opts: { bridgeProfile?: string; profiles?: string[] } = {},
+): Promise<Harness> {
   const cron = cronFake(jobs);
+  // A roster that can hold names this gateway would never CREATE, because a profile made outside it
+  // can, and the routines surface has to survive one.
+  const profiles =
+    opts.profiles === undefined
+      ? profilesListResult
+      : { profiles: opts.profiles.map((name) => ({ name, description: "", has_avatar: false })), bot_mode_protocol: true };
   const server = await startFakeHermesServer({
-    methods: { "profiles.list": () => profilesListResult, ...cron.methods },
+    methods: { "profiles.list": () => profiles, ...cron.methods },
   });
   servers.push(server);
   const storage = openStorage(":memory:");
@@ -296,6 +315,10 @@ describe("namespacing", () => {
     expect(routineTitle({ name: "[bot:scout] " })).toBe("Untitled cronjob");
     expect(routineBot({ name: "nightly backup" })).toBeNull();
     expect(routineJobName("scout", "Morning digest")).toBe("[bot:scout] Morning digest");
+    // A bracket inside the tag makes the name ambiguous, and the safe reading is that it belongs to
+    // NOBODY: read as bot `a`, it would hand one bot another's routines to list and to delete.
+    expect(routineBot({ name: "[bot:a]b] Theirs" })).toBeNull();
+    expect(routineBot({ name: "[bot:scout]" })).toBe("scout");
   });
 
   it("round-trips a created routine through the namespace", async () => {
@@ -443,6 +466,30 @@ describe("the legacy auto-pause", () => {
     // A quote in free text closes, escapes and reopens rather than breaking out of the command.
     expect(shellQuote("it's")).toBe(`'it'"'"'s'`);
   });
+
+  it("marks a bare instruction that happens to read like the legacy sentence", () => {
+    // Otherwise a user whose own words start that way gets their routine flagged legacyUnsafe and
+    // auto-paused on every single list, forever, for text they wrote themselves.
+    const prompt = routinePrompt({
+      bot: "scout",
+      title: "Digest",
+      instruction: `${LEGACY_DELEGATED_ROUTINE_PREFIX}Digest" the way I asked`,
+      schedulerProfile: "scout",
+    });
+    expect(prompt.startsWith(SAFE_ROUTINE_MARKER)).toBe(true);
+    expect(prompt).toContain(`${LEGACY_DELEGATED_ROUTINE_PREFIX}Digest" the way I asked`);
+  });
+
+  it("does not try to pause a legacy job the backend gave no id for", async () => {
+    const h = await setup([
+      job({ id: "", name: "[bot:scout] Legacy", prompt: `${LEGACY_DELEGATED_ROUTINE_PREFIX}Legacy" for agent 'scout'.` }),
+    ]);
+    const { routines } = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
+    // Reported as the legacy row it is; `cron.manage` resolves the row by `name`, and an empty one
+    // names nothing, so the pause would be a guaranteed refusal against an unidentified job.
+    expect(routines[0]).toMatchObject({ legacyUnsafe: true, enabled: false });
+    expect(h.cron.calls.some((call) => call.action === "pause")).toBe(false);
+  });
 });
 
 describe("create, patch and delete", () => {
@@ -569,16 +616,163 @@ describe("create, patch and delete", () => {
     expect(h.cron.calls.some((call) => call.action === "add")).toBe(false);
   });
 
-  it("turns the backend's soft refusal into a 400 carrying its text", async () => {
+  it("reports a refused ROW ACTION as the backend failure it is, carrying its text", async () => {
     const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
     h.cron.failPause.add("j1");
     const res = await h.authed("/bots/scout/routines/j1", body("PATCH", { enabled: false }));
     // `success: false` arrives inside a SUCCESSFUL rpc result; a bridge that ignored it would have
-    // answered 200 for a pause that never happened.
+    // answered 200 for a pause that never happened. But a pause carries only a job id this gateway
+    // resolved itself, so there is no client input for a 400 to be about.
+    expect(res.status).toBe(502);
+    const failure = (await res.json()) as { error: { code: string }; hermesError: string };
+    expect(failure.error.code).toBe("backend_unavailable");
+    expect(failure.hermesError).toContain("Failed to pause 'j1'");
+  });
+
+  it("reports a refused LIST as a backend failure, not as the client's typing", async () => {
+    // The reviewer's probe: a Hermes that refuses the scoped list (an older or scoping-hostile
+    // build) used to turn a GET with no body into "invalid_request", which puts "check what you
+    // typed" over the whole routines pane.
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
+    h.cron.failList = true;
+    const res = await h.authed("/bots/scout/routines");
+    expect(res.status).toBe(502);
+    const failure = (await res.json()) as { error: { code: string }; hermesError: string };
+    expect(failure.error.code).toBe("backend_unavailable");
+    expect(failure.hermesError).toContain("unknown profile scope");
+  });
+
+  it("reports a refused ADD as the client's input", async () => {
+    const h = await setup();
+    h.cron.failAdd = true;
+    const res = await h.authed(
+      "/bots/scout/routines",
+      body("POST", { title: "Sweep", schedule: "0 9 * * *", prompt: "sweep" }),
+    );
+    // `add` is the one cron call that carries what the user typed, so its refusal really is a 400.
     expect(res.status).toBe(400);
     const failure = (await res.json()) as { error: { code: string }; hermesError: string };
     expect(failure.error.code).toBe("invalid_request");
-    expect(failure.hermesError).toContain("Failed to pause 'j1'");
+    expect(failure.hermesError).toContain("refused the add");
+  });
+
+  it("honors `enabled` sent alongside a rewrite instead of dropping it", async () => {
+    // The reviewer's probe: PATCH {title, prompt, enabled: true} on a PAUSED routine used to answer
+    // with `enabled: false`, because the rewrite read the old row's state and never looked at the
+    // patch.
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest", enabled: false, paused: true })]);
+    const patched = (await (
+      await h.authed("/bots/scout/routines/j1", body("PATCH", { title: "Digest v2", prompt: "summarize", enabled: true }))
+    ).json()) as { routine: BotRoutine };
+    expect(patched.routine.enabled).toBe(true);
+    expect(h.cron.jobs).toHaveLength(1);
+    expect(h.cron.jobs[0]).toMatchObject({ name: "[bot:scout] Digest v2", paused: false });
+
+    // And the other direction: a rewrite that switches a running routine off.
+    const off = (await (
+      await h.authed(`/bots/scout/routines/${h.cron.jobs[0]?.id ?? ""}`, body("PATCH", { prompt: "again", enabled: false }))
+    ).json()) as { routine: BotRoutine };
+    expect(off.routine.enabled).toBe(false);
+    expect(h.cron.jobs[0]?.paused).toBe(true);
+  });
+
+  it("refuses `enabled` plus `repeat` rather than answering 200 and dropping the run cap", async () => {
+    // The reviewer's probe: `{enabled, repeat}` took the row-action branch, answered 200 and made
+    // ZERO add calls, so the cap was accepted and thrown away. `repeat` reaches the backend only on
+    // an `add`, so it is a rewrite, and a rewrite without the instruction is refused.
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
+    const res = await h.authed("/bots/scout/routines/j1", body("PATCH", { enabled: false, repeat: 3 }));
+    expect(res.status).toBe(400);
+    const failure = (await res.json()) as { error: { message: string } };
+    expect(failure.error.message).toContain("prompt is required");
+    expect(h.cron.calls.some((call) => call.action === "add")).toBe(false);
+    // Nothing was switched either: the patch was refused whole.
+    expect(h.cron.jobs[0]?.paused).toBe(false);
+  });
+
+  it("carries the run cap and continuity across a rewrite that does not restate them", async () => {
+    // The reviewer's probe: a title-only rewrite of a `3 times` / continuity job came back
+    // `repeat: forever`, `continuity: undefined`. A typo fix must not un-bound a routine.
+    const h = await setup([
+      job({ id: "j1", name: "[bot:scout] Digest", repeat: "1/3", continuity: true }),
+    ]);
+    const patched = (await (
+      await h.authed("/bots/scout/routines/j1", body("PATCH", { title: "Digest v2", prompt: "summarize" }))
+    ).json()) as { routine: BotRoutine };
+    // `1/3` is run 1 of 3, so what the replacement is capped at is what REMAINS.
+    const add = h.cron.calls.find((call) => call.action === "add");
+    expect(add?.params["repeat"]).toBe(2);
+    expect(add?.params["continuity"]).toBe(true);
+    expect(patched.routine.repeat).toBe("2 times");
+    expect(patched.routine.continuity).toBe(true);
+  });
+
+  it("serializes concurrent rewrites, so a double-tapped Save cannot leave two live jobs", async () => {
+    // The reviewer's probe, verbatim: two concurrent PATCHes of the same id. Unserialized, both
+    // found the job, both paused it, both added a replacement and both removed the same old one,
+    // leaving TWO enabled cron jobs where the user has one routine, firing forever.
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
+    const [a, b] = await Promise.all([
+      h.authed("/bots/scout/routines/j1", body("PATCH", { title: "A", prompt: "summarize" })),
+      h.authed("/bots/scout/routines/j1", body("PATCH", { title: "B", prompt: "summarize" })),
+    ]);
+    // One rewrite lands; the other arrives after its job id is gone and is the 404 it is.
+    expect([a.status, b.status].sort()).toEqual([200, 404]);
+    expect(h.cron.jobs).toHaveLength(1);
+    const list = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
+    expect(list.routines).toHaveLength(1);
+    expect(list.routines[0]?.enabled).toBe(true);
+  });
+
+  it("serializes a create racing a delete of the same bot", async () => {
+    const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
+    const [created, deleted] = await Promise.all([
+      h.authed("/bots/scout/routines", body("POST", { title: "Sweep", schedule: "0 8 * * *", prompt: "sweep" })),
+      h.authed("/bots/scout/routines/j1", { method: "DELETE" }),
+    ]);
+    expect(created.status).toBe(201);
+    expect(deleted.status).toBe(204);
+    expect(h.cron.jobs.map((entry) => entry.name)).toEqual(["[bot:scout] Sweep"]);
+  });
+});
+
+describe("the bot name is held to the profile-id rule", () => {
+  // A profile whose name escapes the tag charset breaks the ONE relation this whole surface rests
+  // on: `[bot:a]b] Theirs` parses as bot `a`. Gateway-created bots cannot hold such a name, but a
+  // profile made outside this gateway can, and the routes are one line from being safe either way.
+  const store = (): FakeJob[] => [
+    job({ id: "j1", name: "[bot:a]b] Theirs" }),
+    job({ id: "j2", name: "[bot:a] Mine" }),
+  ];
+
+  it("keeps a bracketed profile's routines out of another bot's list", async () => {
+    const h = await setup(store(), { profiles: ["a", "a]b"] });
+    const mine = (await (await h.authed("/bots/a/routines")).json()) as { routines: BotRoutine[] };
+    // Without the rule, bot `a` saw `j1` as its own routine titled `b] Theirs`.
+    expect(mine.routines.map((routine) => routine.id)).toEqual(["j2"]);
+  });
+
+  it("refuses a delete of another bot's routine through the bracket", async () => {
+    const h = await setup(store(), { profiles: ["a", "a]b"] });
+    expect((await h.authed("/bots/a/routines/j1", { method: "DELETE" })).status).toBe(404);
+    expect(h.cron.jobs).toHaveLength(2);
+  });
+
+  it("refuses every routine route for a name outside the rule, before any hermes call", async () => {
+    const h = await setup(store(), { profiles: ["a", "a]b"] });
+    const paths = "/bots/a%5Db/routines";
+    for (const res of [
+      await h.authed(paths),
+      await h.authed(paths, body("POST", { title: "T", schedule: "0 9 * * *", prompt: "p" })),
+      await h.authed(`${paths}/j1`, body("PATCH", { enabled: false })),
+      await h.authed(`${paths}/j1`, { method: "DELETE" }),
+    ]) {
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_request");
+    }
+    // Nothing went out: a create used to answer 201 and orphan the job it made.
+    expect(h.cron.calls).toHaveLength(0);
+    expect(h.cron.jobs).toHaveLength(2);
   });
 });
 

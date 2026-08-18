@@ -376,15 +376,19 @@ export type BotRoutineCreateRequest = Static<typeof BotRoutineCreateRequestSchem
  *  written. `enabled` alone is the row switch (true resumes, false pauses) and keeps the routine's
  *  `id`.
  *
- *  `title`, `schedule` and `prompt` are a REWRITE, and the backend has no edit action at all: the
- *  gateway pauses the old job, creates a replacement, and removes the old one, so the routine comes
- *  back with a NEW `id`. Two consequences a client must design around, both spelled out in
- *  `contract/ext-bots-v1.md`:
- *  - `prompt` is REQUIRED whenever any of the three is present, because the backend only ever
+ *  `title`, `schedule`, `prompt`, `repeat` and `continuity` are a REWRITE, and the backend has no
+ *  edit action at all: the gateway pauses the old job, creates a replacement, and removes the old
+ *  one, so the routine comes back with a NEW `id`. Three consequences a client must design around,
+ *  all spelled out in `contract/ext-bots-v1.md`:
+ *  - `prompt` is REQUIRED whenever any of those five is present, because the backend only ever
  *    reports a 100-character preview of a stored prompt and a rewrite that guessed the rest would
  *    silently truncate the user's instruction;
- *  - `repeat` and `continuity` are not carried over unless they are restated here, for the same
- *    reason: the backend reports the run cap as a display string, not a number. */
+ *  - everything the patch does not restate is CARRIED OVER from the routine being replaced, run cap
+ *    included (it is recovered from the backend's display string, and a remaining `1/3` is carried
+ *    as the 2 runs that are left), so an edit to a title cannot turn a bounded routine into a
+ *    forever one;
+ *  - `enabled` COMPOSES with a rewrite instead of being ignored by it: the replacement ends up in
+ *    the state the patch asked for, and otherwise in the state the routine already had. */
 export const BotRoutinePatchSchema = Type.Object({
   title: Type.Optional(RoutineText(200)),
   schedule: Type.Optional(RoutineText(200)),

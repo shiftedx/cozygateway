@@ -23,8 +23,20 @@ import type { HermesRpc } from "./canonical-chat.ts";
  *  the tag filter is what keeps the answer correct. Neither behavior is probed for, because the tag
  *  filter is required under both. */
 
-/** The desktop's own three constants, verbatim (plugin.js:5230-5232). */
-export const BOT_TAG_RE = /^\[bot:([a-z0-9][a-z0-9_-]*)\]\s*/i;
+/** The desktop's own three constants (plugin.js:5230-5232), with ONE deliberate tightening.
+ *
+ *  The desktop's tag regex ends at `\]\s*`, which means it matches a PREFIX of the name and stops
+ *  wherever the first `]` falls. A profile named `a]b` writes the job name `[bot:a]b] Title`, and
+ *  that regex reads it as bot `a`: bot `a` then lists, edits and DELETES a routine belonging to
+ *  another bot, and `a]b`'s own routines are orphaned the moment they are created. The lookahead
+ *  requires the tag to be followed by whitespace or by nothing at all, which is exactly how both
+ *  clients WRITE it (`routineJobName`), so a name carrying a bracket inside the tag now belongs to
+ *  nobody instead of belonging to the wrong bot. Invisible is the safe side of that trade; owned by
+ *  a bot that did not create it is not.
+ *
+ *  The routes apply the profile-id charset rule as well, which keeps this gateway from ever writing
+ *  such a name. This is the half that also holds for a job some other client wrote. */
+export const BOT_TAG_RE = /^\[bot:([a-z0-9][a-z0-9_-]*)\](?=\s|$)\s*/i;
 export const SAFE_ROUTINE_MARKER = "[bot-mode:routine:v2] ";
 export const LEGACY_DELEGATED_ROUTINE_PREFIX = 'You are running the scheduled routine "';
 
@@ -45,13 +57,28 @@ export const LEGACY_PAUSED_NOTE =
  *  own text rides along untouched. */
 export class RoutineRefused extends Error {
   readonly action: string;
+  /** True when the refused call carried something the CLIENT chose, which is what makes the refusal
+   *  a 400 rather than a 502. See `ROUTINE_CLIENT_INPUT_ACTIONS`. */
+  readonly clientInput: boolean;
 
   constructor(action: string, message: string) {
     super(message);
     this.name = "RoutineRefused";
     this.action = action;
+    this.clientInput = ROUTINE_CLIENT_INPUT_ACTIONS.has(action);
   }
 }
+
+/** The cron actions whose params carry client input, and therefore the only ones whose refusal can
+ *  honestly be reported as "check what you typed".
+ *
+ *  `add` carries a schedule, a title and an instruction the user wrote, so a refusal there really is
+ *  a 400. `list` carries no user input at all, and `pause` / `resume` / `remove` carry only a job id
+ *  this gateway already resolved inside the bot's own namespace (an id that resolved to nothing is a
+ *  404 long before the call goes out). A refusal on one of those is the backend failing to do
+ *  something it was asked to do, and reporting it as invalid input puts "check what you typed" over
+ *  a GET with no body. */
+export const ROUTINE_CLIENT_INPUT_ACTIONS: ReadonlySet<string> = new Set(["add"]);
 
 /** A routine that does not exist in this bot's namespace. Its own type so the route can answer the
  *  404 it is rather than a backend failure, the same way an unknown bot name does. */
@@ -284,7 +311,16 @@ export async function listBotRoutines(rpc: HermesRpc, bot: string): Promise<Rout
   const jobs = await listCronJobs(rpc, bot);
   const mine = selectRoutineJobs(jobs, bot);
 
-  const legacyActive = mine.filter((job) => isLegacyDelegatedRoutine(job) && job.enabled !== false && job.state !== "paused");
+  // A job with no id cannot be paused: `cron.manage` resolves the row by the `name` param, and an
+  // empty one names nothing, so the call is a guaranteed refusal against a store this gateway would
+  // rather not be poking blind. It stays in the list, reported as the legacy row it is.
+  const legacyActive = mine.filter(
+    (job) =>
+      isLegacyDelegatedRoutine(job) &&
+      (asString(job.job_id) ?? "").length > 0 &&
+      job.enabled !== false &&
+      job.state !== "paused",
+  );
   const paused = await Promise.all(
     legacyActive.map(async (job) => {
       try {
@@ -346,7 +382,15 @@ export function routinePrompt(input: {
 }): string {
   const scheduler = (input.schedulerProfile ?? "").trim().toLowerCase();
   const bot = input.bot.trim().toLowerCase();
-  if (bot.length > 0 && bot === scheduler) return input.instruction;
+  if (bot.length > 0 && bot === scheduler) {
+    // The bare instruction, except when the user's own words happen to begin with the legacy
+    // sentence: the legacy check is a `startsWith`, so an instruction that starts that way would be
+    // read as a pre-marker delegated job and auto-paused on every list, forever, for text the user
+    // wrote themselves. The marker in front costs nothing and is what the check looks past.
+    return input.instruction.startsWith(LEGACY_DELEGATED_ROUTINE_PREFIX)
+      ? `${SAFE_ROUTINE_MARKER}${input.instruction}`
+      : input.instruction;
+  }
   return (
     `${SAFE_ROUTINE_MARKER}You are running the scheduled routine "${input.title}" for agent '${input.bot}'. ` +
     `Execute it AS that agent so the run lands in its own history: run this in the terminal and relay the output:\n\n` +
@@ -392,9 +436,48 @@ export function buildRoutineActionParams(
   return { action, name: jobId, profile: bot };
 }
 
-/** Which of a patch's fields need the job to be rewritten rather than merely paused or resumed. */
+/** Which of a patch's fields need the job to be rewritten rather than merely paused or resumed.
+ *
+ *  `repeat` and `continuity` count, and leaving them out was not a shortcut but a silent data loss:
+ *  `cron.manage` has no update action, so the ONLY way either reaches the backend is on an `add`. A
+ *  patch carrying `enabled` plus `repeat` took the row-action branch, answered 200, and threw the run
+ *  cap away. There is no branch here that can write them without a rewrite, so a patch that names
+ *  them is a rewrite. */
 export function patchNeedsRewrite(patch: BotRoutinePatch): boolean {
-  return patch.title !== undefined || patch.schedule !== undefined || patch.prompt !== undefined;
+  return (
+    patch.title !== undefined ||
+    patch.schedule !== undefined ||
+    patch.prompt !== undefined ||
+    patch.repeat !== undefined ||
+    patch.continuity !== undefined
+  );
+}
+
+/** The run cap still owed on an existing job, read back out of the DISPLAY string the backend
+ *  reports (`forever`, `once`, `3 times`, `1/3`).
+ *
+ *  A rewrite is a delete and a create, so anything the patch does not restate is gone unless it is
+ *  recovered here, and a bounded routine silently becoming a forever one because the user fixed a
+ *  typo in its title is the worst version of that. `1/3` is "run 1 of 3", so what the replacement
+ *  should be capped at is what REMAINS. A shape this cannot read returns undefined, which is the
+ *  old behavior (uncapped) for a string nothing can honestly interpret. */
+export function routineRepeatCount(job: CronJob): number | undefined {
+  const text = (asString(job.repeat) ?? "").trim().toLowerCase();
+  if (text.length === 0 || text === "forever") return undefined;
+  if (text === "once") return 1;
+  const times = /^(\d+)\s+times?$/.exec(text);
+  if (times !== null) {
+    const count = Number(times[1]);
+    return Number.isFinite(count) && count > 0 ? count : undefined;
+  }
+  const progress = /^(\d+)\s*\/\s*(\d+)$/.exec(text);
+  if (progress !== null) {
+    const done = Number(progress[1]);
+    const total = Number(progress[2]);
+    if (!Number.isFinite(done) || !Number.isFinite(total)) return undefined;
+    return Math.max(1, total - done);
+  }
+  return undefined;
 }
 
 export interface RoutineWriteResult {
@@ -445,7 +528,9 @@ export async function deleteBotRoutine(rpc: HermesRpc, bot: string, jobId: strin
  *  - `enabled` alone is a ROW ACTION (`pause` / `resume`) and keeps the routine's id.
  *  - anything else is a REWRITE, because `cron.manage` exposes no update action at all: the tool
  *    behind it has one, and the gateway does not route to it. So the routine is recreated, and its
- *    id changes.
+ *    id changes. `enabled` COMPOSES with a rewrite rather than being ignored by it: the replacement
+ *    ends in the state the patch asked for, and in the state the routine already had when it did
+ *    not ask.
  *
  *  The rewrite order is chosen so that no failure can leave a routine firing twice or firing with
  *  half an edit applied:
@@ -479,6 +564,10 @@ export async function patchBotRoutine(
   }
 
   const wasActive = routineActive(existing);
+  // What the routine should end up as, which is NOT simply what it was: a patch may carry `enabled`
+  // alongside the fields that force the rewrite, and answering 200 while ignoring it told the user
+  // their switch had been honored when it had not.
+  const desiredActive = patch.enabled ?? wasActive;
   if (wasActive) {
     readCronReply("pause", await rpc.request("cron.manage", buildRoutineActionParams("pause", bot, jobId)));
   }
@@ -487,12 +576,18 @@ export async function patchBotRoutine(
   // Guarded by the route, which refuses a rewrite with no prompt: the backend reports a 100-char
   // PREVIEW of a stored prompt and never the whole thing, so there is nothing here to fall back on.
   const prompt = patch.prompt ?? "";
+  // Every field the patch did not restate is carried over from the job being replaced, because a
+  // rewrite is a delete and a create and anything not carried is DELETED. The run cap comes back out
+  // of the display string (`routineRepeatCount`), so a title edit no longer turns a bounded routine
+  // into a forever one.
+  const repeat = patch.repeat ?? routineRepeatCount(existing);
+  const continuity = patch.continuity ?? (existing.continuity === true ? true : undefined);
   const create: BotRoutineCreateRequest = {
     title,
     schedule: patch.schedule ?? (asString(existing.schedule) ?? ""),
     prompt,
-    ...(patch.repeat === undefined ? {} : { repeat: patch.repeat }),
-    ...(patch.continuity === undefined ? {} : { continuity: patch.continuity }),
+    ...(repeat === undefined ? {} : { repeat }),
+    ...(continuity === undefined ? {} : { continuity }),
   };
 
   let created: BotRoutine;
@@ -518,10 +613,12 @@ export async function patchBotRoutine(
     orphanedId = jobId;
   }
 
-  // The replacement inherits the row state the routine had: an edit is not a resume, and a routine
-  // the user had switched off must not come back on because they fixed a typo in its title.
+  // The replacement is put into the state the patch asked for, which defaults to the state the
+  // routine already had: an edit is not a resume, and a routine the user had switched off must not
+  // come back on because they fixed a typo in its title. `add` always creates a RUNNING job, so only
+  // the off case has anything to do here.
   let routine = created;
-  if (!wasActive && routineActive(created)) {
+  if (!desiredActive && routineActive(created)) {
     try {
       const reply = readCronReply(
         "pause",

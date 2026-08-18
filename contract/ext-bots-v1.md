@@ -845,9 +845,17 @@ oldest, so a client that reads per keystroke cannot grow it without limit.
 
 ```
 200 { name: string, routines: BotRoutine[], updatedAt: integer }
+400 invalid_request                   // `name` is not a legal profile id (see below)
 404 not_found                         // no profile named `name` exists
 502 backend_unavailable + hermesError // hermes answered and refused
 ```
+
+**The name rule, on all four routine routes.** `name` must match `[a-z0-9][a-z0-9_-]{0,63}`, the
+Hermes profile id rule, and a name that does not is a 400 before anything reaches Hermes. The tag is
+the entire ownership relation and it is parsed back out of a job name with that same charset, so a
+profile called `a]b` would write `[bot:a]b] Title`, which reads as bot `a`: it would let one bot list
+and DELETE another's routines, and orphan its own on creation. Profiles this gateway creates cannot
+hold such a name; profiles created elsewhere can, so the routes check.
 
 Every routine in this bot's `[bot:<name>]` namespace, and nothing else. Read fresh on every call:
 the answer carries next-run times that go stale by the second, and the read has a side effect (see
@@ -913,8 +921,9 @@ Three properties of that behavior are load-bearing and a client should not work 
 ```
 body { title: string, schedule: string, prompt: string, repeat?: integer, continuity?: boolean }
 201  { name: string, routine: BotRoutine }
-400  invalid_request                  // malformed body, or a NUL in title/schedule/prompt
-400  invalid_request + hermesError    // hermes ANSWERED with a refusal (`success: false`)
+400  invalid_request                  // malformed body, a NUL in title/schedule/prompt, or a `name`
+                                      // that is not a legal profile id (see below)
+400  invalid_request + hermesError    // hermes ANSWERED the `add` with a refusal (`success: false`)
 404  not_found                        // no profile named `name` exists
 502  backend_unavailable + hermesError // hermes REJECTED the call: an unparsable schedule is this
 ```
@@ -942,9 +951,16 @@ backend's own four-line usage message comes back in `hermesError`.
 
 Two failure shapes, and they mean different things. A schedule the backend cannot PARSE raises
 inside Hermes and comes back as a rejection: **502** with the usage message in `hermesError`. A cron
-call Hermes ANSWERS with `success: false` (a job id that resolves to nothing, a validation refusal)
-is not a backend failure at all, and comes back as **400** with the backend's text in `hermesError`,
-because the input was the client's.
+call Hermes ANSWERS with `success: false` is not a transport failure at all, and which status it
+gets depends on WHOSE input the refused call carried:
+
+- a refused **`add`** is **400** with the backend's text in `hermesError`. That call carries a
+  schedule, a title and an instruction the client composed, so the input really was the client's.
+- a refused **`list`**, **`pause`**, **`resume`** or **`remove`** is **502**, same `hermesError`.
+  A list carries no client input at all, and the row actions carry only a job id the gateway already
+  resolved inside the bot's own namespace (an id that resolves to nothing is a 404, before the call
+  goes out). Reporting those as `invalid_request` would put "check what you typed" over a GET with no
+  body, which is what an older or scoping-hostile Hermes turned the whole routines pane into.
 
 `repeat` is "stop after N runs", blank meaning forever; the desktop offers it for every frequency
 except Once and Advanced. `continuity: true` injects the previous run's output into the next run's
@@ -961,10 +977,12 @@ an echo of the request, because the schedule is normalized and the first run tim
 body { title?: string, schedule?: string, prompt?: string, enabled?: boolean,
        repeat?: integer, continuity?: boolean }
 200  { name: string, routine: BotRoutine, replacedId?: string, orphanedId?: string }
-400  invalid_request                  // no fields, or title/schedule without prompt
-400  invalid_request + hermesError    // hermes ANSWERED with a refusal (`success: false`)
+400  invalid_request                  // no fields, a rewrite field without prompt, or a `name` that
+                                      // is not a legal profile id
+400  invalid_request + hermesError    // hermes ANSWERED the `add` with a refusal (`success: false`)
 404  not_found                        // no profile named `name`, or no routine `id` for this bot
-502  backend_unavailable + hermesError // hermes REJECTED the call
+502  backend_unavailable + hermesError // hermes REJECTED the call, or ANSWERED a pause/resume/remove
+                                      // with a refusal
 ```
 
 Two very different operations, and the difference is the backend's rather than this API's invention:
@@ -972,7 +990,9 @@ Two very different operations, and the difference is the backend's rather than t
 **`enabled` alone is the row switch.** `true` resumes, `false` pauses, and the routine keeps its
 `id`. This is the desktop's switch, and the pause/resume it performs is the same one.
 
-**Anything else is a REWRITE, and the routine's `id` CHANGES.** `cron.manage` exposes no update
+**Anything else is a REWRITE, and the routine's `id` CHANGES.** `repeat` and `continuity` are on
+that side of the line too: neither reaches the backend except on an `add`, so a patch naming one
+cannot be honored without the rewrite. `cron.manage` exposes no update
 action at all on Hermes 0.20.3 and 0.20.4 (the tool behind it has one; the gateway does not route to
 it), so an edit is a recreate. The gateway performs it in an order chosen so no failure can leave a
 routine firing twice or half-edited:
@@ -987,23 +1007,29 @@ routine firing twice or half-edited:
    `DELETE /bots/:name/routines/:id`.
 
 `replacedId` is always present on a rewrite. A routine that was switched OFF stays off across a
-rewrite: an edit is not a resume.
+rewrite: an edit is not a resume. `enabled` sent ALONGSIDE the rewrite fields is honored rather than
+ignored, so `{ title, prompt, enabled: true }` on a paused routine comes back running.
 
 Two rules follow from the backend and cannot be papered over:
 
-- **`prompt` is REQUIRED whenever `title`, `schedule` or `prompt` is present.** The backend reports
-  only a 100-character preview of a stored prompt, so a rewrite that reused it would silently
-  truncate the user's instruction. A client's edit form must carry the instruction it wants the
-  routine to end with, not the preview it read back.
-- **`repeat` and `continuity` are not carried over unless restated.** The backend reports the run cap
-  as a display string (`1/3`), not a number, so the remaining count cannot be reconstructed.
+- **`prompt` is REQUIRED whenever `title`, `schedule`, `prompt`, `repeat` or `continuity` is
+  present.** The backend reports only a 100-character preview of a stored prompt, so a rewrite that
+  reused it would silently truncate the user's instruction. A client's edit form must carry the
+  instruction it wants the routine to end with, not the preview it read back.
+- **Everything else IS carried over.** A rewrite is a delete and a create, so any field the patch
+  does not restate would otherwise be lost; the gateway restates them from the routine it is
+  replacing. The run cap is recovered from the display string (`3 times` is carried as 3, and a
+  part-run `1/3` as the 2 runs that remain), so fixing a typo in a title cannot turn a bounded
+  routine into a forever one. A shape the display string cannot express (an unknown word) is the one
+  case that cannot be recovered, and the replacement is uncapped.
 
 ### DELETE /bots/:name/routines/:id
 
 ```
 204                                   // gone
+400 invalid_request                   // `name` is not a legal profile id
 404 not_found                         // no profile named `name`, or no routine `id` for this bot
-400 invalid_request + hermesError     // hermes answered the removal with a refusal
+502 backend_unavailable + hermesError // hermes answered the removal with a refusal
 ```
 
 Not idempotent: a second delete answers 404, by the same rule `DELETE /bots/:name` follows. An id

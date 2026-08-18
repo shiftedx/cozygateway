@@ -230,6 +230,9 @@ export class HermesBridge implements BotsSurface {
   /** One list per bot at a time. Concurrency here is not merely wasteful: a list PAUSES legacy
    *  routines as a side effect, and two overlapping lists would both try to pause the same jobs. */
   readonly #routineInflight = new Map<string, Promise<BotRoutineList>>();
+  /** The tail of the per-bot routine-WRITE chain, by bot name. The same chain `#configureChain` is,
+   *  for the same reason, and just as load-bearing: see `#chainRoutineWrite`. */
+  readonly #routineWriteChain = new Map<string, Promise<unknown>>();
   /** The last routines payload broadcast per bot, so an unchanged re-read is silent on the wire. */
   readonly #lastRoutinesJson = new Map<string, string>();
   #routineDebounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -748,26 +751,72 @@ export class HermesBridge implements BotsSurface {
    *  disagrees with the one the next read produces. */
   async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> {
     await this.#assertBotKnown(name);
-    const routine = await createBotRoutine(this.#client, name, input, this.#bridgeProfile);
-    await this.#publishRoutines(name);
-    return { routine };
+    return this.#chainRoutineWrite(name, async () => {
+      const routine = await createBotRoutine(this.#client, name, input, this.#bridgeProfile);
+      await this.#publishRoutines(name);
+      return { routine };
+    });
   }
 
   async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> {
     await this.#assertBotKnown(name);
-    const result = await patchBotRoutine(this.#client, name, id, patch, this.#bridgeProfile);
-    await this.#publishRoutines(name);
-    return result;
+    return this.#chainRoutineWrite(name, async () => {
+      const result = await patchBotRoutine(this.#client, name, id, patch, this.#bridgeProfile);
+      await this.#publishRoutines(name);
+      return result;
+    });
   }
 
   async deleteRoutine(name: string, id: string): Promise<void> {
     await this.#assertBotKnown(name);
-    await deleteBotRoutine(this.#client, name, id);
-    await this.#publishRoutines(name);
+    await this.#chainRoutineWrite(name, async () => {
+      await deleteBotRoutine(this.#client, name, id);
+      await this.#publishRoutines(name);
+    });
+  }
+
+  /** Runs one routine write for a bot, SERIALIZED behind that bot's other routine writes.
+   *
+   *  A correctness rule, not an economy, and the same one `configureProfile` follows. `cron.manage`
+   *  has no update action, so an edit is a read-modify-write across four separate RPCs (find, pause,
+   *  add, remove). Two overlapping edits of the same routine both find the job, both pause it, both
+   *  add a replacement, and both remove the same old one, which leaves the user with ONE routine on
+   *  their screen and TWO live cron jobs firing forever. A double-tapped Save on a phone is the
+   *  ordinary path into that, and a scheduler that quietly doubles is the worst kind of bug because
+   *  nothing on the surface shows it.
+   *
+   *  A chain rather than a dedupe: the second write asked for something different and must still
+   *  happen, just after the first. The link is installed before awaiting, so a third caller queues
+   *  behind the second. A failed write does not poison the queue (the wait swallows its predecessor's
+   *  failure), and a chain whose tail is the promise that just settled is dropped, so an idle bot
+   *  leaves nothing behind. It bounds this gateway only: a desktop editing the same cron store still
+   *  races upstream, and serializing what we can see is the half that is ours. */
+  async #chainRoutineWrite<T>(name: string, write: () => Promise<T>): Promise<T> {
+    const previous = this.#routineWriteChain.get(name);
+    const run = (async () => {
+      if (previous !== undefined) await previous.catch(() => {});
+      return write();
+    })();
+    this.#routineWriteChain.set(name, run);
+    try {
+      return await run;
+    } finally {
+      if (this.#routineWriteChain.get(name) === run) this.#routineWriteChain.delete(name);
+    }
   }
 
   /** Reads a bot's routines, single-flight, and broadcasts when the list actually changed. */
-  async #readRoutines(name: string, opts: { renew?: boolean } = {}): Promise<BotRoutineList> {
+  async #readRoutines(name: string, opts: { renew?: boolean; fresh?: boolean } = {}): Promise<BotRoutineList> {
+    if (opts.fresh === true) {
+      // A read that STARTED before this gateway's write cannot describe the store after it. Joining
+      // it would broadcast the pre-write list and cache it in `#lastRoutinesJson`, which then
+      // suppresses the correct frame as "unchanged" and leaves every client a poll behind.
+      for (let guard = 0; guard < 4; guard += 1) {
+        const pending = this.#routineInflight.get(name);
+        if (pending === undefined) break;
+        await pending.catch(() => {});
+      }
+    }
     const inflight = this.#routineInflight.get(name);
     if (inflight !== undefined) return inflight;
     const run = (async () => {
@@ -793,7 +842,7 @@ export class HermesBridge implements BotsSurface {
    *  operation. The client's own response already carries the row. */
   async #publishRoutines(name: string, opts: { renew?: boolean } = {}): Promise<void> {
     try {
-      await this.#readRoutines(name, opts);
+      await this.#readRoutines(name, { ...opts, fresh: true });
     } catch (err) {
       const detail = err instanceof Error ? err.message : "unknown failure";
       this.#log(`routines refresh failed for ${name}: ${detail}`);
