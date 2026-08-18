@@ -34,6 +34,54 @@ Gateway:
 | `COZYGATEWAY_PORT` | `8787` | listen port |
 | `COZYGATEWAY_DB_PATH` | `cozygateway.db` (image sets `/data/cozygateway.db`) | SQLite path |
 | `COZYGATEWAY_ATTACH_TOKEN` | (required for the attach config) | bearer token the plugin presents on `/attach` |
+| `COZYGATEWAY_HERMES_URL` | (config value) | retargets the optional hermes bots bridge; ignored when no bridge is configured |
+
+### Optional: the hermes bots bridge
+
+Add a `hermes` block to the config file to turn on the bots surface (`/bots`, the `bot_roster` and
+`bot_presence` frames, and the `com.cozylabs.bots` capability; see `contract/ext-bots-v1.md`):
+
+```json
+{
+  "hermes": { "url": "ws://homelab:8790/api/ws", "tokenEnv": "COZYGATEWAY_HERMES_TOKEN" }
+}
+```
+
+The config file carries the env var NAME, never the credential. Startup fails closed when that
+variable is unset. Use `"authParam": "ticket"` when you already hold a minted ws ticket instead of
+a session token.
+
+That default (`"authMode": "token"`) is the LOOPBACK shape: it works because a loopback Hermes
+injects a session token. A Hermes dashboard behind dashboard auth (a gated, non-loopback bind)
+injects no token, so point the bridge at the password shape instead:
+
+```json
+{
+  "hermes": {
+    "url": "ws://homelab:9119/api/ws",
+    "authMode": "password",
+    "username": "cozybridge",
+    "passwordEnv": "COZYGATEWAY_HERMES_PASSWORD"
+  }
+}
+```
+
+The bridge then logs in at `POST {origin}/auth/password-login`, holds the
+session cookie in memory, and mints a FRESH single-use ticket at `POST {origin}/api/auth/ws-ticket`
+for every connect attempt, because one ticket is good for one upgrade within 30 seconds. The HTTP
+origin is derived from the WebSocket URL (`ws` to `http`, `wss` to `https`); override it with
+`"baseUrl"` when the dashboard is fronted elsewhere. A stale session re-logs in transparently; a
+rejected password fails closed with no retry storm.
+
+The login names an auth provider, `basic` by default. That is the implementation Hermes bundles,
+not the protocol: a dashboard that registers a different password provider (an LDAP bind, say)
+needs `"provider": "its-name"` in the same block. A provider the dashboard does not know answers a
+generic HTTP 404, and the bridge log says which provider it tried, so the mismatch is not mistaken
+for a bad password.
+
+The `url` must be `ws://` or `wss://`. A missing scheme is rejected at startup rather than at dial
+time, so a typo can never leave the bots capability advertised over a bridge that is dead for the
+life of the process.
 
 Relay:
 
