@@ -1,4 +1,4 @@
-/** Vendor extension `com.cozylabs.bots`, version 4. NOT part of the frozen `contract: "v1"`
+/** Vendor extension `com.cozylabs.bots`, version 6. NOT part of the frozen `contract: "v1"`
  *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
  *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
  *  advertise the capability never emits these frames, and a client that does not recognize the
@@ -110,6 +110,47 @@ export const BotChatStateFrameSchema = Type.Object({
   updatedAt: Type.Integer(),
 });
 export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;
+
+/** A LIVE DRAFT of the assistant reply a bot is composing right now, streamed off the Hermes
+ *  `message.delta` events while the turn runs. Decoration, never the record: the canonical message
+ *  still arrives in a `bot_chat` frame when the turn's poll finds it, and that message is the one a
+ *  client stores.
+ *
+ *  Three properties make it safe to drop any subset of these frames:
+ *  - `text` is the FULL accumulated assistant text so far, not an increment, so a client never
+ *    reassembles anything and a missed frame costs nothing but a moment of staleness;
+ *  - `seq` is monotonic within one `turnId`, so a frame that arrives out of order is dropped by
+ *    comparing it against the last one rendered;
+ *  - `turnId` is minted per turn and is never reused, so a new turn on the same session invalidates
+ *    the previous draft outright (a Hermes session id IS reused across turns; the turn id is not).
+ *
+ *  `done` marks the last frame of a turn: no further delta for that `turnId` will be sent, and the
+ *  reply itself is on its way over `bot_chat`. A client clears the draft on `done`, on a
+ *  `bot_chat_state` phase of `complete`/`timeout`/`failed`, or when the canonical message lands,
+ *  whichever comes first.
+ *
+ *  `room` is present only for a member's turn inside a group room, in which case `bot` is the member
+ *  profile name and `sessionId` is that member's room session, which is not a session a client
+ *  addresses anywhere else: render the draft in the room keyed on `room` + `bot`.
+ *
+ *  NOTHING derived from a model's chain of thought ever rides this frame. The gateway forwards the
+ *  `message.*` event family and nothing else; `thinking.delta`, `reasoning.delta` and
+ *  `reasoning.available` are dropped at the bridge. */
+export const BotChatDeltaFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_delta"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  /** FULL accumulated assistant text so far. Idempotent and drop-tolerant. */
+  text: Type.String(),
+  /** Monotonic within one `turnId`, starting at 1. */
+  seq: Type.Integer(),
+  updatedAt: Type.Integer(),
+  done: Type.Optional(Type.Boolean()),
+  /** The group room this draft belongs to, for a member turn. Absent for a 1:1 chat. */
+  room: Type.Optional(Type.String()),
+});
+export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
 
 /** `POST /bots/:name/chat/messages` body. `clientId` is the sender's own id for this message; the
  *  gateway never interprets it, it only echoes it back on the committed message and on that same
@@ -539,6 +580,11 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    `PATCH`/`DELETE /bots/:name/routines/:id`, plus the `bot_routines` frame. A client that offers
  *    a routines pane MUST require `>= 4`.
  *  - `5`: server-side group chats: the `/bots/groups` routes plus the `bot_group` and
- *    `bot_group_state` frames. A client that offers a rooms screen MUST require `>= 5`. */
+ *    `bot_group_state` frames. A client that offers a rooms screen MUST require `>= 5`.
+ *  - `6`: the `bot_chat_delta` frame, the live draft of a reply as it is written. No route changes
+ *    ride this bump: it exists so a client can tell "this gateway will stream" from "this gateway
+ *    is quiet right now", since a bot that never streams and a gateway that cannot stream look
+ *    identical otherwise. Everything works unchanged without it; the draft is decoration and the
+ *    `bot_chat` frame remains the record. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 5;
+export const BOTS_CAPABILITY_VERSION = 6;

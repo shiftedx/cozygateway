@@ -21,6 +21,7 @@ import {
   type GroupLogEntry,
   type GroupMember,
 } from "./group-protocol.ts";
+import type { ChatStreamBinder } from "./chat-stream.ts";
 import { MemberGone, ensureGroupSession, runMemberTurn, type GroupTurnResult } from "./group-turn.ts";
 
 /** Server-side group chats: durable rooms whose deliberation rounds run HERE rather than in a
@@ -135,6 +136,9 @@ export interface GroupRoomsOptions {
   escalate?: (event: { group: string; member: string; displayName: string; text: string }) => void;
   /** Room sessions are born hidden by the same rule canonical chats are. */
   hidden?: boolean;
+  /** Where a member's reply is drafted while it is being written, so a room shows a member typing
+   *  the way a 1:1 chat does. Optional; the room's transcript never depends on it. */
+  stream?: ChatStreamBinder;
   pollMs?: number;
   turnTimeoutMs?: number;
   chainDelayMs?: number;
@@ -152,6 +156,7 @@ export class GroupRooms {
   readonly #memberExists: (name: string) => Promise<boolean>;
   readonly #escalate: (event: { group: string; member: string; displayName: string; text: string }) => void;
   readonly #hidden: boolean;
+  readonly #stream: ChatStreamBinder | undefined;
   readonly #pollMs: number | undefined;
   readonly #turnTimeoutMs: number | undefined;
   readonly #chainDelayMs: number;
@@ -185,6 +190,7 @@ export class GroupRooms {
     this.#memberExists = opts.memberExists ?? ((): Promise<boolean> => Promise.resolve(true));
     this.#escalate = opts.escalate ?? ((): void => {});
     this.#hidden = opts.hidden ?? true;
+    this.#stream = opts.stream;
     this.#pollMs = opts.pollMs;
     this.#turnTimeoutMs = opts.turnTimeoutMs;
     this.#chainDelayMs = opts.chainDelayMs ?? GROUP_CHAIN_DELAY_MS;
@@ -608,6 +614,7 @@ export class GroupRooms {
       prompt,
       session,
       now: this.#now,
+      ...(this.#stream === undefined ? {} : { stream: this.#stream }),
       ...(this.#pollMs === undefined ? {} : { pollMs: this.#pollMs }),
       ...(this.#turnTimeoutMs === undefined ? {} : { timeoutMs: this.#turnTimeoutMs }),
       // A turn whose room was superseded or deleted stops early instead of burning the rest of the

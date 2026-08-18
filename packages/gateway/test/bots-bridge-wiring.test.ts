@@ -2,7 +2,7 @@ import { once } from "node:events";
 
 import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
-import type { GatewayInfo, ServerFrame } from "cozygateway-contract";
+import { BOTS_CAPABILITY_VERSION, type GatewayInfo, type ServerFrame } from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { applyEnvOverrides } from "../src/config.ts";
@@ -205,7 +205,7 @@ describe("startGateway with a hermes bridge", () => {
     gateways.push(gateway);
 
     const info = (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
-    expect(info.capabilities?.["com.cozylabs.bots"]).toBe(5);
+    expect(info.capabilities?.["com.cozylabs.bots"]).toBe(BOTS_CAPABILITY_VERSION);
 
     const code = gateway.issueSetupCode();
     const pairRes = await fetch(`${gateway.url}/pair`, {

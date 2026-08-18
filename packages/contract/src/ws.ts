@@ -6,6 +6,7 @@ import { type Static, Type } from "@sinclair/typebox";
 
 import { RichBlockSchema } from "./rich-blocks.ts";
 import {
+  BotChatDeltaFrameSchema,
   BotChatFrameSchema,
   BotChatStateFrameSchema,
   BotGroupFrameSchema,
@@ -100,6 +101,7 @@ export const ServerFrameSchema = Type.Union([
   BotPresenceFrameSchema,
   BotChatFrameSchema,
   BotChatStateFrameSchema,
+  BotChatDeltaFrameSchema,
   BotRoutinesFrameSchema,
   BotGroupFrameSchema,
   BotGroupStateFrameSchema,

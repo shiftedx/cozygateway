@@ -240,6 +240,38 @@ describe("BotChatTurns", () => {
     ]);
   });
 
+  it("binds the runtime session to the bot before submitting, and drops it when the bot is cancelled", async () => {
+    const bound: Array<{ id: string; binding: Record<string, unknown>; after: string[] }> = [];
+    const forgotten: string[] = [];
+    const frames: ServerFrame[] = [];
+    const rpc = stub(() => ({ messages: [{ role: "user", content: "hi" }], running: true }));
+    const turns = new BotChatTurns({
+      rpc,
+      broadcast: (frame) => frames.push(frame),
+      now: () => 1_800_000_000_000,
+      pollMs: 5,
+      timeoutMs: 200,
+      stream: {
+        bind: (id, binding) =>
+          bound.push({ id, binding: { ...binding }, after: rpc.calls.map((call) => call.method) }),
+        forgetBot: (name) => forgotten.push(name),
+      },
+    });
+
+    await turns.send("scout", "stored-1", "how is CI");
+    // The RUNTIME id (what Hermes stamps its events with) mapped to the STORED id (what every bots
+    // frame is keyed on), declared BEFORE `prompt.submit`, because the first token can arrive
+    // before the submit's own reply does.
+    expect(bound).toHaveLength(1);
+    expect(bound[0]!.id).toBe("runtime-1");
+    expect(bound[0]!.binding).toEqual({ bot: "scout", sessionId: "stored-1" });
+    expect(bound[0]!.after).toEqual(["session.resume"]);
+
+    turns.cancel("scout");
+    expect(forgotten).toEqual(["scout"]);
+    turns.close();
+  });
+
   it("cancels a poll whose session id changed under it (review I8)", async () => {
     const { turns, frames } = harness(() => ({ messages: [{ role: "assistant", content: "working" }], running: true }), {
       pollMs: 5,

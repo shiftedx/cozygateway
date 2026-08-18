@@ -2,14 +2,21 @@ import type { BotChatMessage, ServerFrame } from "cozygateway-contract";
 
 import type { HermesRpc } from "./canonical-chat.ts";
 import { parseChatSnapshot, type ChatSnapshot } from "./chat-messages.ts";
+import type { ChatStreamBinder } from "./chat-stream.ts";
 
 /** Duplex over the canonical Bot Chat: read the history, submit a prompt, and deliver the reply.
  *
- *  Hermes has no push stream for session messages in the dissected surface, so the reply is
- *  consumed exactly the way the desktop consumes a group-chat member turn (dissection 9.7): submit
- *  against the RUNTIME session id, then `session.resume` every 2 s until an assistant reply has
- *  landed AND the session reports neither `running` nor `inflight`, giving up after 180 s. Parity
- *  risk is zero because it is the same loop, and a streaming upgrade later changes only this file.
+ *  The reply is consumed exactly the way the desktop consumes a group-chat member turn (dissection
+ *  9.7): submit against the RUNTIME session id, then `session.resume` every 2 s until an assistant
+ *  reply has landed AND the session reports neither `running` nor `inflight`, giving up after 180 s.
+ *  Parity risk is zero because it is the same loop.
+ *
+ *  Hermes DOES push token events for the turn (`message.start` / `message.delta` /
+ *  `message.complete`), and `chat-stream.ts` turns them into the live draft a client renders while
+ *  it waits. That is decoration on top of this loop and never a replacement for it: the poll is what
+ *  delivers the message, what reports the turn phase, and what re-claims the event transport when a
+ *  Hermes desktop steals it (see `chat-stream.ts`). All this file owes the stream is the runtime
+ *  session id, which it has to resolve to submit at all.
  *
  *  What is new here is that the loop runs server-side, so every device sees the turn: each poll
  *  that finds new messages broadcasts them as a `bot_chat` DELTA frame, and each change of turn
@@ -40,6 +47,10 @@ export interface ChatTurnsOptions {
   rpc: HermesRpc;
   broadcast: (frame: ServerFrame) => void;
   now: () => number;
+  /** Where the live draft of a reply is assembled. Optional: with no stream the turn behaves exactly
+   *  as it always has, which is also what happens on a Hermes build that sends no `message.*`
+   *  events. The poll below is unaffected either way and remains the source of the reply. */
+  stream?: ChatStreamBinder;
   pollMs?: number;
   timeoutMs?: number;
   log?: (message: string) => void;
@@ -94,6 +105,7 @@ export class BotChatTurns {
   readonly #pollMs: number;
   readonly #timeoutMs: number;
   readonly #log: (message: string) => void;
+  readonly #stream: ChatStreamBinder | undefined;
 
   /** One turn poll per bot at a time. A second send while a poll is running rides that poll
    *  rather than starting a competing one, which is what keeps `session.resume` traffic bounded
@@ -111,6 +123,7 @@ export class BotChatTurns {
     this.#pollMs = opts.pollMs ?? CHAT_POLL_MS;
     this.#timeoutMs = opts.timeoutMs ?? CHAT_TURN_TIMEOUT_MS;
     this.#log = opts.log ?? (() => {});
+    this.#stream = opts.stream;
   }
 
   /** Full history of a bot's canonical chat. Also re-bases the broadcast watermark, so the frames
@@ -170,6 +183,12 @@ export class BotChatTurns {
       throw new RuntimeSessionUnknown(name);
     }
 
+    // Told BEFORE the submit, because the first `message.delta` can land before `prompt.submit`
+    // answers, and an event whose session is not bound yet is dropped. This is also the only place
+    // the runtime id (the id Hermes puts on its event frames) and the stored id (the id every bots
+    // frame is keyed on) are both in hand.
+    this.#stream?.bind(runtimeId, { bot: name, sessionId });
+
     await this.#rpc.request("prompt.submit", { session_id: runtimeId, text });
 
     const at = this.#now();
@@ -219,6 +238,7 @@ export class BotChatTurns {
     this.#watermarks.delete(name);
     this.#pending.delete(name);
     this.#lastState.delete(name);
+    this.#stream?.forgetBot(name);
   }
 
   close(): void {
