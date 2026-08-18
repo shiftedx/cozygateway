@@ -265,7 +265,8 @@ describe("draft ceiling (review PR40 M1)", () => {
     event("message.delta", "runtime-cap", { text: "abcdefghij" });
     await new Promise((resolve) => setTimeout(resolve, 5));
     const atCap = deltas().length;
-    const capped = deltas()[atCap - 1];
+    const capped = deltas().at(-1);
+    if (capped === undefined) throw new Error("no delta reached the wire");
     expect(capped.text.length).toBeLessThanOrEqual(CHAT_DELTA_MAX_CHARS);
     event("message.delta", "runtime-cap", { text: "MORE" });
     await new Promise((resolve) => setTimeout(resolve, 5));
