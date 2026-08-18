@@ -1,7 +1,7 @@
 # cozygateway vendor extension: com.cozylabs.bots, v1
 
-Status: draft, wave 4 (read path, full-duplex bot chat, bot create/delete, and the edit-profile
-surface). Versioned
+Status: draft, wave 5 (read path, full-duplex bot chat, bot create/delete, the edit-profile
+surface, and routines). Versioned
 INDEPENDENTLY of `contract/v1.md`, which stays frozen. This document describes an optional surface
 a gateway may or may not have; a client that does not recognize it ignores the capability and the
 frames, and nothing in v1 changes.
@@ -32,7 +32,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 3 }
+"capabilities": { "com.cozylabs.bots": 4 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -53,6 +53,9 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
 - `3`: the edit-profile surface: `GET` and `PATCH /bots/:name/profile`, plus `GET /bots/catalog`. A
   client that offers an edit screen MUST require `>= 3`, by the same rule the composer bump used: a
   screen whose Save 404s reads as a broken app rather than as a missing feature.
+- `4`: the routines surface: `GET` and `POST /bots/:name/routines`, `PATCH` and
+  `DELETE /bots/:name/routines/:id`, plus the `bot_routines` frame. A client that offers a routines
+  pane MUST require `>= 4`, for the same reason again.
 
 ## 3. Resources
 
@@ -176,6 +179,50 @@ backend version string it has no reliable way to read.
 
 Read by `GET /bots/catalog`. It is the MENU, shared by every bot; a bot's own state is in
 `BotProfile`.
+
+### BotRoutine
+
+```
+{
+  id: string,                         // the backend's cron `job_id`, the ONLY write identifier
+  title: string,                      // the job name with its `[bot:<name>] ` tag stripped
+  schedule: { raw: string, human?: string },
+  enabled: boolean,                   // the row switch: on unless paused, disabled, or legacyUnsafe
+  state?: string,                     // the backend's own word, e.g. "paused"
+  legacyUnsafe: boolean,              // a pre-marker delegated routine; see the auto-pause below
+  autoPaused?: boolean,               // this response is the one that paused it
+  prompt?: string,                    // the backend's PREVIEW, truncated at 100 characters
+  lastRun: integer | null,            // MILLISECONDS
+  nextRun: integer | null,            // MILLISECONDS
+  lastStatus?: string,                // how the last run ended, the backend's own word
+  repeat?: string,                    // a DISPLAY string: "forever", "once", "3 times", "1/3"
+  continuity?: boolean                // each run sees the previous run's output
+}
+```
+
+A routine is an ordinary Hermes cron job whose NAME is `[bot:<name>] <title>`. That tag is the
+ENTIRE relationship between a bot and a routine: there is no bot field on a cron job and no per-bot
+cron API. Consequences a client should hold onto:
+
+- the gateway filters every list and every write through that tag, so another bot's jobs and the
+  operator's own unrelated cron jobs are invisible on these routes, whatever id is sent;
+- the tag is written exactly as the Hermes desktop writes it, so routines created on a phone appear
+  in the desktop's Routines pane and vice versa.
+
+`schedule.raw` is the backend's stored schedule string, which is a NORMALIZED echo rather than what
+was sent: an interval comes back in minutes (`every 2h` is stored and reported as `every 120m`), a
+one-shot duration comes back as `once in 30m`, an ISO timestamp as `once at 2026-02-03 14:00`, and a
+cron expression verbatim. `human` is present only for the shapes the gateway can name (`Daily`,
+`Hourly`, `Every 3h`, `Every 45m`, `Every 2 days`, `Once (30m)`); when it is absent, render `raw`.
+Cron expressions never get an English rendering from either side.
+
+`repeat` is a display string and NOT what a write sends: a create sends an integer `repeat`, and the
+remaining-run count is not recoverable from the string the backend reports.
+
+`prompt` is a PREVIEW. The backend truncates a stored prompt to 100 characters and appends `...`,
+and there is no RPC anywhere that returns the whole thing. It is enough to recognize a routine, not
+enough to rebuild one, which is why an edit must resend the instruction (see
+`PATCH /bots/:name/routines/:id`).
 
 ## 4. Routes
 
@@ -794,6 +841,197 @@ Concurrent reads of the same `q` share one fetch, so two devices opening the edi
 cost one round of three calls. The cache holds a bounded number of recent queries and evicts the
 oldest, so a client that reads per keystroke cannot grow it without limit.
 
+### GET /bots/:name/routines
+
+```
+200 { name: string, routines: BotRoutine[], updatedAt: integer }
+404 not_found                         // no profile named `name` exists
+502 backend_unavailable + hermesError // hermes answered and refused
+```
+
+Every routine in this bot's `[bot:<name>]` namespace, and nothing else. Read fresh on every call:
+the answer carries next-run times that go stale by the second, and the read has a side effect (see
+below) that a cache would skip. Two devices reading at once share one round trip.
+
+Full response example:
+
+```json
+{
+  "name": "scout",
+  "routines": [
+    {
+      "id": "job_7f2c19",
+      "title": "Morning digest",
+      "schedule": { "raw": "0 9 * * 1-5" },
+      "enabled": true,
+      "state": "active",
+      "legacyUnsafe": false,
+      "prompt": "[bot-mode:routine:v2] You are running the scheduled routine \"Morning digest\" for agent 's...",
+      "lastRun": 1755424800000,
+      "nextRun": 1755507600000,
+      "lastStatus": "success",
+      "repeat": "forever"
+    },
+    {
+      "id": "job_04ba55",
+      "title": "Inbox sweep",
+      "schedule": { "raw": "every 120m", "human": "Every 2h" },
+      "enabled": false,
+      "state": "paused",
+      "legacyUnsafe": false,
+      "lastRun": null,
+      "nextRun": null,
+      "repeat": "3 times",
+      "continuity": true
+    }
+  ],
+  "updatedAt": 1755428400000
+}
+```
+
+**The legacy auto-pause.** A routine is `legacyUnsafe` when it carries the `[bot:]` tag AND its
+prompt begins with `You are running the scheduled routine "`. That is the pre-marker delegation
+shape, which builds a shell command by interpolating a title that syncs from `ui_meta`: anything
+that can write a bot's look can write a command line, and those jobs keep FIRING until something
+pauses them. So this route pauses every active one it finds, exactly as the Hermes desktop does, and
+reports the row as paused in the same response (`autoPaused: true`).
+
+Three properties of that behavior are load-bearing and a client should not work around them:
+
+- a pause that FAILS never fails the list. The routines still come back; only the jobs the backend
+  actually paused are reported paused, and the next read retries the rest. A list that failed
+  because a pause failed would put "could not load routines" over data that loaded perfectly, and a
+  20 s poll would retry the failing pause inside the failing read forever.
+- `legacyUnsafe` rows cannot be resumed through this API. Render them disabled with the desktop's
+  own wording, *"Paused for security: delete and recreate this legacy cronjob before running it
+  again."*, and offer delete only.
+- a routine this gateway creates is never legacy: its delegation prompt is prefixed with the marker
+  `[bot-mode:routine:v2] `, which is what keeps it out of the `startsWith` check.
+
+### POST /bots/:name/routines
+
+```
+body { title: string, schedule: string, prompt: string, repeat?: integer, continuity?: boolean }
+201  { name: string, routine: BotRoutine }
+400  invalid_request                  // malformed body, or a NUL in title/schedule/prompt
+400  invalid_request + hermesError    // hermes refused: an unparsable schedule is the usual one
+404  not_found                        // no profile named `name` exists
+```
+
+`schedule` is the RAW Hermes schedule string, composed exactly as the desktop's picker composes it.
+The gateway does not validate its grammar; the backend owns that, and a gateway that guessed would
+refuse schedules a newer Hermes accepts. What the backend accepts today:
+
+| picker frequency | send | example |
+|---|---|---|
+| Once, in… | `<n><m\|h\|d>` | `30m` |
+| Every hour | `every 1h` | `every 1h` |
+| Every day | `<m> <h> * * *` | `0 9 * * *` |
+| Weekdays | `<m> <h> * * 1-5` | `0 9 * * 1-5` |
+| Every week | `<m> <h> * * <0-6>` | `0 9 * * 1` |
+| Every month | `<m> <h> <day> * *` | `0 9 1 * *` |
+| Interval | `every <n><m\|h\|d>` | `every 2h` |
+| Advanced | raw user text | `every 1d`, `0 9 * * *` |
+
+Durations accept `m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days`, one unit only: there is
+no `1h30m`, no weeks, and no natural language. A cron expression must be 5 or 6 fields of digits and
+`* - , /` (names like `MON` are refused). An ISO timestamp (`2026-02-03T14:00`) is accepted as a
+one-shot and is anchored to the backend's configured timezone. Anything else is refused, and the
+backend's own four-line usage message comes back in `hermesError`.
+
+`repeat` is "stop after N runs", blank meaning forever; the desktop offers it for every frequency
+except Once and Advanced. `continuity: true` injects the previous run's output into the next run's
+prompt (it does NOT reuse a session; see below).
+
+`prompt` is the routine's INSTRUCTION in the user's own words. Do not build a delegation wrapper: the
+gateway decides how the instruction is delivered, and a client-built wrapper is exactly the shape the
+legacy auto-pause exists to kill. The response carries the routine the backend actually STORED, not
+an echo of the request, because the schedule is normalized and the first run time is computed.
+
+### PATCH /bots/:name/routines/:id
+
+```
+body { title?: string, schedule?: string, prompt?: string, enabled?: boolean,
+       repeat?: integer, continuity?: boolean }
+200  { name: string, routine: BotRoutine, replacedId?: string, orphanedId?: string }
+400  invalid_request                  // no fields, or title/schedule without prompt
+400  invalid_request + hermesError    // hermes refused
+404  not_found                        // no profile named `name`, or no routine `id` for this bot
+```
+
+Two very different operations, and the difference is the backend's rather than this API's invention:
+
+**`enabled` alone is the row switch.** `true` resumes, `false` pauses, and the routine keeps its
+`id`. This is the desktop's switch, and the pause/resume it performs is the same one.
+
+**Anything else is a REWRITE, and the routine's `id` CHANGES.** `cron.manage` exposes no update
+action at all on Hermes 0.20.3 and 0.20.4 (the tool behind it has one; the gateway does not route to
+it), so an edit is a recreate. The gateway performs it in an order chosen so no failure can leave a
+routine firing twice or half-edited:
+
+1. the existing job is PAUSED, so from that moment it cannot fire. A pause that fails aborts the
+   whole edit, since the alternative is a window with two live schedules.
+2. the replacement is CREATED. If that fails (an unparsable schedule is the common case) the old job
+   is resumed back to the state it was in and the failure is reported: the routine is exactly as it
+   was before the edit was attempted.
+3. the old job is REMOVED. If THAT fails, the new routine exists and the old one is still paused, so
+   nothing double-fires; its id comes back as `orphanedId` and is deletable through
+   `DELETE /bots/:name/routines/:id`.
+
+`replacedId` is always present on a rewrite. A routine that was switched OFF stays off across a
+rewrite: an edit is not a resume.
+
+Two rules follow from the backend and cannot be papered over:
+
+- **`prompt` is REQUIRED whenever `title`, `schedule` or `prompt` is present.** The backend reports
+  only a 100-character preview of a stored prompt, so a rewrite that reused it would silently
+  truncate the user's instruction. A client's edit form must carry the instruction it wants the
+  routine to end with, not the preview it read back.
+- **`repeat` and `continuity` are not carried over unless restated.** The backend reports the run cap
+  as a display string (`1/3`), not a number, so the remaining count cannot be reconstructed.
+
+### DELETE /bots/:name/routines/:id
+
+```
+204                                   // gone
+404 not_found                         // no profile named `name`, or no routine `id` for this bot
+400 invalid_request + hermesError     // hermes refused the removal
+```
+
+Not idempotent: a second delete answers 404, by the same rule `DELETE /bots/:name` follows. An id
+that names a job outside this bot's `[bot:]` namespace is a 404, never a delete.
+
+### Where a routine's runs land
+
+Stated plainly, because it is the one place a client's mental model is likely to be wrong, and the
+answer is not what "runs land in its own chat history" suggests.
+
+**A routine's output does NOT appear in the bot's canonical `Bot Chat`.** Every cron fire mints a
+brand new session, `cron_<job_id>_<timestamp>`, titled `<job name> · <Mon DD HH:MM>` with source
+`cron`, and ends it when the run finishes. Nothing in the cron path resumes `Bot Chat`, and
+`continuity: true` does not change this: it injects the previous run's OUTPUT FILE into the next
+run's prompt, and still mints a fresh session. So `GET /bots/:name/chat/messages` will not show
+routine output, and a client must not present the routines pane as if it would.
+
+Those cron sessions are not hidden, and `session.list` does not filter source `cron`, so they DO
+appear in `GET /bots/:name/sessions` as one row per run. That list is where a client can surface
+"what did this routine do", by title and time.
+
+Where the run happens depends on the delivery the gateway chose, which follows the desktop's rule:
+
+- when the routine's bot is the profile the gateway's own Hermes runs as (`hermes.bridgeProfile`),
+  the stored prompt is the bare instruction;
+- otherwise the instruction is wrapped in a marker-prefixed delegation that runs
+  `hermes -p <bot> chat -c "Routine: <title>" -q "[Scheduled routine] <instruction>"`, so the run
+  reaches that bot's own history rather than the scheduler's. That delegated run lands in a session
+  titled `Routine: <title>`, which again is not `Bot Chat`.
+
+One operator-level caveat, stated because a client cannot detect it and will otherwise be blamed for
+it: cron storage is per Hermes home, and a job created with `profile: <bot>` is written to that
+bot's own cron store. It fires only if a Hermes scheduler is actually running for that profile. A
+routine created against a profile nothing is running will sit there, correctly stored, and never
+fire. The gateway does not claim otherwise, and there is no field on the wire that can promise it.
+
 ### POST /bots/focus
 
 ```
@@ -847,7 +1085,7 @@ recomputes presence locally must divide before comparing.
 
 ## 6. Server frames
 
-Both are additive members of the `ServerFrame` union on the existing per-device `/ws` socket, and
+All of them are additive members of the `ServerFrame` union on the existing per-device `/ws` socket, and
 are only ever sent by a gateway that advertises the capability.
 
 ```
@@ -857,6 +1095,7 @@ are only ever sent by a gateway that advertises the capability.
 { type: "bot_chat_state", bot: string, sessionId: string,
   phase: "polling" | "complete" | "timeout" | "failed",
   running: boolean, inflight: boolean, updatedAt: integer }
+{ type: "bot_routines", bot: string, routines: BotRoutine[], updatedAt: integer }
 ```
 
 `bot_roster` and `bot_presence` are FULL REPLACE snapshots, and both are sent only when the value
@@ -886,10 +1125,21 @@ gateway's view of the turn it is polling (`polling` while awaiting, `complete` w
 and Hermes went idle, `timeout` at the 180 s cap, `failed` when Hermes kept refusing), while
 `running` and `inflight` are Hermes' own flags passed through.
 
+`bot_routines` is a FULL REPLACE for one bot, sent only when that bot's routine list actually
+changed, so an idle cron store is silent. It fires when this gateway changed a routine, and when a
+`cron.changed` broadcast arrived for a bot whose routines something has read in the last five
+minutes. A cron change carries no bot name and no job id, so "which bots changed" is unanswerable
+and the gateway re-reads the bots it has reason to believe someone is watching: reading
+`GET /bots/:name/routines` is what arms that, and reading it again is what keeps it armed. A client
+whose routines pane has been open longer than that should re-read on foreground rather than assume
+the frames kept coming. Where a gateway sends no `cron.changed` at all, `POST /bots/focus` with
+`screen: "routines"` drives the same re-read on the desktop's own 20 s cadence.
+
 ## 7. Not in this extension yet
 
 Per-device chat-frame scoping and per-device delta watermarks; model and description writes (see
 `PATCH /bots/:name/profile`); skill install; MCP server setup and OAuth; bot duplicate; avatars;
-routines; group chats; push; and multi-connection
+routine run-now and run output (the backend exposes neither over this RPC); group chats; push; and
+multi-connection
 rosters (the bridge targets exactly one Hermes gateway). Route shapes keep the `connection`
 concept out of the URL so a later version can add it additively.

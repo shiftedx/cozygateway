@@ -145,7 +145,8 @@ describe("capability advertisement", () => {
   it("is a vendor-scoped id with an integer version", () => {
     expect(BOTS_CAPABILITY_ID).toBe("com.cozylabs.bots");
     // 2 for the composer (a v1 gateway 404s the send route), 3 for the edit-profile surface
-    // (a v2 gateway 404s the profile routes, which reads as a Save that silently does nothing).
-    expect(BOTS_CAPABILITY_VERSION).toBe(3);
+    // (a v2 gateway 404s the profile routes, which reads as a Save that silently does nothing),
+    // 4 for the routines surface (a v3 gateway 404s them and never sends `bot_routines`).
+    expect(BOTS_CAPABILITY_VERSION).toBe(4);
   });
 });

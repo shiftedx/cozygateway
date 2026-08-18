@@ -10,6 +10,7 @@ import {
   BotChatStateFrameSchema,
   BotPresenceFrameSchema,
   BotRosterFrameSchema,
+  BotRoutinesFrameSchema,
 } from "./ext-bots.ts";
 import {
   GatewayInfoSchema,
@@ -97,5 +98,6 @@ export const ServerFrameSchema = Type.Union([
   BotPresenceFrameSchema,
   BotChatFrameSchema,
   BotChatStateFrameSchema,
+  BotRoutinesFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

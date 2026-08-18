@@ -6,6 +6,8 @@ import {
   BotCreateRequestSchema,
   BotFocusRequestSchema,
   BotProfilePatchSchema,
+  BotRoutineCreateRequestSchema,
+  BotRoutinePatchSchema,
   ContractViolation,
   assertValid,
 } from "cozygateway-contract";
@@ -22,6 +24,7 @@ import {
   BotNotFound,
   normalizeProfileName,
 } from "./crud.ts";
+import { RoutineNotFound, RoutineRefused, patchNeedsRewrite } from "./routines.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
  *  device-token auth as every other route; nothing here speaks a Hermes method name, that all
@@ -84,6 +87,18 @@ function failure(c: Context<Env>, err: unknown) {
   // a backend failure of any kind, it is a 404 that says so, on every `/bots/:name/*` route the
   // same way `DELETE /bots/:name` already answers it.
   if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
+  // A routine id that names nothing in this bot's namespace, which includes an id that belongs to
+  // another bot or to an untagged cron job the operator owns. Not found, not forbidden: this API
+  // does not confirm the existence of jobs outside the bot that was asked about.
+  if (err instanceof RoutineNotFound) return c.json(errorBody("not_found", err.message), 404);
+  // A cron call the backend ANSWERED with a refusal. It arrives as a successful RPC result carrying
+  // `success: false`, so it is not a backend failure and must not read as one: an unparsable
+  // schedule is the client's input, and a 502 would tell a user to check their gateway when they
+  // should be checking what they typed. The backend's text rides along verbatim in `hermesError`,
+  // because it is the only description of what was actually wrong.
+  if (err instanceof RoutineRefused) {
+    return c.json({ ...errorBody("invalid_request", `hermes refused the cron ${err.action}`), hermesError: err.message }, 400);
+  }
   // Same news, said by Hermes instead of by the pre-check: a bot deleted between a roster-cache hit
   // and the call that followed it is the narrow window `#assertBotKnown` cannot close, and a 502
   // there contradicts what every one of these routes promises about a name that names no profile.
@@ -360,6 +375,118 @@ export function registerBotRoutes(
         ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
       });
       return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // Routines. Every one of these is scoped to the bot's `[bot:<name>]` cron namespace, which is the
+  // only thing that makes a cron job a bot's routine: the operator's own unrelated cron jobs are
+  // invisible here, and so are another bot's, whatever id a client sends.
+  app.get("/bots/:name/routines", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(await bots.routines(resolved.name));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // 201 with the routine the backend actually stored, not an echo of the request: the schedule is
+  // normalized on the way in (`every 2h` is stored as `every 120m`) and the first run time is
+  // computed, so a client that rendered its own request back would show a routine that does not
+  // exist in those two fields.
+  app.post("/bots/:name/routines", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotRoutineCreateRequestSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      const result = await bots.createRoutine(name, parsed);
+      return c.json({ name, routine: result.routine }, 201);
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.patch("/bots/:name/routines/:id", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
+    const id = c.req.param("id") ?? "";
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotRoutinePatchSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    if (
+      parsed.title === undefined &&
+      parsed.schedule === undefined &&
+      parsed.prompt === undefined &&
+      parsed.enabled === undefined
+    ) {
+      return c.json(
+        errorBody("invalid_request", "at least one of title, schedule, prompt, enabled is required"),
+        400,
+      );
+    }
+    // The one rule a client cannot discover from the shape: an edit to a routine's title or
+    // schedule must carry its instruction too. There is no update action on the backend, so an edit
+    // is a recreate, and the backend only ever reports a 100-character PREVIEW of a stored prompt.
+    // Rebuilding a routine from that preview would silently truncate the user's own instruction, so
+    // the request is refused instead of quietly damaging the routine.
+    if (patchNeedsRewrite(parsed) && parsed.prompt === undefined) {
+      return c.json(
+        errorBody(
+          "invalid_request",
+          "prompt is required when title or schedule changes: hermes has no cron update action and reports only a truncated prompt preview, so the routine is recreated",
+        ),
+        400,
+      );
+    }
+    try {
+      const result = await bots.patchRoutine(name, id, parsed);
+      return c.json({
+        name,
+        routine: result.routine,
+        ...(result.replacedId === undefined ? {} : { replacedId: result.replacedId }),
+        ...(result.orphanedId === undefined ? {} : { orphanedId: result.orphanedId }),
+      });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // 204, and NOT idempotent: a second delete of the same routine is a 404, by the same rule
+  // `DELETE /bots/:name` follows. A client that cannot tell "already gone" from "the delete broke"
+  // cannot decide whether to retry.
+  app.delete("/bots/:name/routines/:id", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      await bots.deleteRoutine(resolved.name, c.req.param("id") ?? "");
+      return c.body(null, 204);
     } catch (err) {
       return failure(c, err);
     }
