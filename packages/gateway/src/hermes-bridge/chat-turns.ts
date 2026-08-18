@@ -159,8 +159,39 @@ export class BotChatTurns {
    *  that follow a history read are deltas against exactly what the client just received. */
   async history(name: string, sessionId: string): Promise<ChatSnapshot> {
     const snapshot = await this.#resume(sessionId, name, false);
+    this.#spendPending(name, snapshot.messages);
     this.#setWatermark(name, sessionId, snapshot.messages);
     return snapshot;
+  }
+
+  /** A history read hands the client every row it returns AND re-bases the delta watermark past
+   *  them, so none of those rows is ever coming back around the poll. A pending entry waiting for
+   *  one of them is dead the moment the read happens, and leaving it in the queue is what let the
+   *  NEXT identical send collect a clientId that belonged to an earlier one. The turn boundary does
+   *  not save that case: a repeat sent while the bot is still replying JOINS the live turn, so no
+   *  boundary is crossed at all (review G1).
+   *
+   *  Right even though the watermark, and therefore this re-base, is SHARED across devices: it is
+   *  precisely because someone else's refresh moved the mark past the row that the sender's own
+   *  frame is never coming. The entry is dead whoever read the history.
+   *
+   *  The returned rows are NOT stamped on the way out. The 202 body already carried the clientId to
+   *  the sender, the history route has never carried one (section 3), and minting one into a
+   *  response that another device asked for would be putting one device's join key in another's
+   *  hands. */
+  #spendPending(name: string, messages: BotChatMessage[]): void {
+    const queue = this.#pending.get(name);
+    if (queue === undefined || queue.length === 0) return;
+    for (const message of messages) {
+      if (message.role !== "user") continue;
+      const index = queue.findIndex((entry) => entry.text === message.text);
+      if (index === -1) continue;
+      // Same consumption rule as `#reconcile`: FIFO, one entry per row, and everything ahead of the
+      // match goes with it.
+      queue.splice(0, index + 1);
+      if (queue.length === 0) break;
+    }
+    if (queue.length === 0) this.#pending.delete(name);
   }
 
   /** Submits `text` into the canonical chat and starts (or extends) the turn poll. Resolves as

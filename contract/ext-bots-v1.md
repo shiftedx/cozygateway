@@ -114,12 +114,17 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
   de-duplicate a replayed frame with.
 - `clientId`: present only on a message the sender submitted with one (see
   `POST /bots/:name/chat/messages`), both in the 202 body and on that same message when it comes
-  back in a `bot_chat` frame. It appears on EXACTLY ONE message, and only on the one that send
-  produced: a clientId is never re-used for a second row, never attached to a row the gateway has
-  already broadcast (a re-based watermark replays rows a client already holds), and never carried
-  across a turn boundary, however many times the same words are sent. `id` is therefore the
-  identity of a rendered row and `clientId` is only the join back to the sender's optimistic copy;
-  a client that keys its list on the clientId instead collapses two identical sends into one row.
+  back in a `bot_chat` frame. It appears on AT MOST ONE message: a clientId is never re-used for a
+  second row, never attached to a row the gateway has already delivered (in an earlier frame or in a
+  history read, either of which can replay rows a client already holds), and never carried across a
+  turn boundary or past a history read that re-based the watermark over the row it was waiting for,
+  however many times the same words are sent.
+  It is not a guarantee that the row wearing it is the row that send produced. A frame's user row is
+  joined back to a send by its TEXT, which is the only thing the two have in common, so if hermes
+  never records a send at all the next row with those same words can inherit its key. `id` is
+  therefore the identity of a rendered row and `clientId` is only the join back to the sender's
+  optimistic copy; a client that keys its list on the clientId instead collapses two identical sends
+  into one row.
 - Rows are DROPPED, never rendered as blank bubbles: anything that is not an object, anything whose
   role is not `user` or `assistant` (a `system` prompt, a `tool` result), and anything whose text is
   empty after flattening (an assistant turn whose whole content was a `tool_use` part). Only the two
@@ -550,13 +555,23 @@ request (or the gateway-local id, when it sent none) comes back on the committed
 same message in the frame, so the optimistic row is replaced rather than duplicated.
 
 The gateway matches a frame's user row back to the send it came from by TEXT, which is the only
-thing the two have in common, so the match is ordered and single use: the queue of accepted sends is
-FIFO, the first entry holding those words wins, that entry is then spent, everything ahead of it is
-dropped (a newer entry matching first proves the older ones are never coming back), and the entries
-of a turn are dropped when the next turn opens. A row the gateway has already broadcast is never
-stamped at all. Without those rules, sending the same words twice handed the second row the FIRST
-send's clientId, and a client keyed on it silently rendered one bubble where the user had typed two
-(cozychat#38). The wire shape is unchanged, which is why this rides capability 6.
+thing the two have in common, so the match is ordered and single use. The queue of accepted sends is
+FIFO, the first entry holding those words wins, that entry is then spent, and everything ahead of it
+is dropped (a newer entry matching first proves the older ones are never coming back). An entry is
+also dropped, unmatched, in the two places where the row it was waiting for can no longer arrive:
+
+- when the next turn opens, since the previous turn's poll has ended;
+- when a history read re-bases the delta watermark past that row, since the row is handed to the
+  reader directly and the poll will never emit it. This is the case a turn boundary cannot cover,
+  because a repeat sent while the bot is still replying JOINS the live turn rather than opening a
+  new one.
+
+A row the gateway has already delivered is never stamped at all. Without those rules, sending the
+same words twice handed the second row the FIRST send's clientId, and a client keyed on it silently
+rendered one bubble where the user had typed two (cozychat#38). What survives is the residual case
+in the section 3 note: a send hermes never records leaves its key free for the next row with the
+same words, which is why `id`, not `clientId`, is a row's identity. The wire shape is unchanged,
+which is why this rides capability 6.
 
 Delivery of the reply: the gateway submits against the session's RUNTIME id (learned from a cheap
 `session.resume`, which is also the message-count baseline, or from `session.create` for a chat

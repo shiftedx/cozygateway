@@ -344,6 +344,28 @@ describe("BotChatTurns", () => {
       expect(new Set(stamped).size).toBe(stamped.length);
     });
 
+    it("never re-uses an orphaned clientId for a repeat INSIDE one turn (review G1)", async () => {
+      let reply: Reply = { messages: [user("m1")], running: true };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-1" });
+      // The app refreshes while the bot is still replying. The history read hands the client the
+      // user row directly AND re-bases the watermark past it, so the poll will never emit it and
+      // `phone-1` has nothing left to be attached to.
+      await turns.history("scout", "stored-1");
+      // The user asks again without waiting: same words, same LIVE turn, so no turn boundary is
+      // crossed and the orphan is still in the queue.
+      reply = { messages: [user("m1"), user("m2")], running: true };
+      await turns.send("scout", "stored-1", "another espresso", { clientId: "phone-2" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reply = { messages: [user("m1"), user("m2"), bot("m3")] };
+      await turns.settled("scout");
+
+      const rows = chatFrames(frames).flatMap((frame) => frame.messages);
+      expect(rows.find((message) => message.id === "m2")?.clientId).toBe("phone-2");
+      expect(rows.every((message) => message.clientId !== "phone-1")).toBe(true);
+    });
+
     it("keeps both clientIds when two identical sends ride ONE turn", async () => {
       let reply: Reply = { messages: [], running: true };
       const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
