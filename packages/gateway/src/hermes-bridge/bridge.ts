@@ -1,4 +1,12 @@
-import type { BotChatMessage, BotCreateRequest, BotSummary, ServerFrame } from "cozygateway-contract";
+import type {
+  BotCatalog,
+  BotChatMessage,
+  BotCreateRequest,
+  BotProfile,
+  BotProfilePatch,
+  BotSummary,
+  ServerFrame,
+} from "cozygateway-contract";
 
 import type { Storage } from "../storage.ts";
 import { HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
@@ -32,6 +40,16 @@ import {
   type CreatedBot,
   type DeletePath,
 } from "./crud.ts";
+import {
+  CATALOG_CACHE_MAX,
+  CATALOG_DEGRADED_TTL_MS,
+  CATALOG_TTL_MS,
+  configureBotProfile,
+  readBotCatalog,
+  readBotProfile,
+  type CachedCatalog,
+  type ProfileConfigureResult,
+} from "./profile.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -83,6 +101,9 @@ export interface BotsSurface {
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
   createBot(input: BotCreateRequest): Promise<BotCreated>;
   deleteBot(name: string): Promise<DeletePath>;
+  botProfile(name: string): Promise<BotProfile>;
+  configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult>;
+  catalog(query: string): Promise<BotCatalog>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
 }
 
@@ -134,6 +155,11 @@ export interface HermesBridgeOptions {
   /** How long a profile delete is given. Default `PROFILE_DELETE_TIMEOUT_MS` (180 s). Overridable
    *  so the timeout path is testable in milliseconds instead of minutes. */
   deleteTimeoutMs?: number;
+  /** How long an edit-screen catalog is served from cache. Default `CATALOG_TTL_MS` (60 s). */
+  catalogTtlMs?: number;
+  /** How long a DEGRADED catalog (non-empty `unavailable`) is served from cache. Default
+   *  `CATALOG_DEGRADED_TTL_MS` (5 s). */
+  catalogDegradedTtlMs?: number;
   logSink?: (line: string) => void;
 }
 
@@ -151,9 +177,20 @@ export class HermesBridge implements BotsSurface {
   readonly #focusTtlMs: number;
   readonly #log: (message: string) => void;
 
+  readonly #catalogTtlMs: number;
+  readonly #catalogDegradedTtlMs: number;
+
   readonly #focus = new Map<string, { screen: BotFocusScreen; at: number }>();
+  /** The last catalog fetched, per skill query, and the fetch in flight for it. Keyed on the query
+   *  because the skills half is a SEARCH: one cache slot would make every keystroke evict the
+   *  previous answer and re-spend all three calls. */
+  readonly #catalogCache = new Map<string, CachedCatalog>();
+  readonly #catalogInflight = new Map<string, Promise<BotCatalog>>();
   readonly #chatInflight = new Map<string, Promise<CanonicalChatResult>>();
   readonly #createInflight = new Map<string, Promise<BotCreated>>();
+  /** The tail of the per-bot profile-write CHAIN, by bot name. Not a dedupe like the two above:
+   *  the second write must still run, it just runs AFTER the first. See `configureProfile`. */
+  readonly #configureChain = new Map<string, Promise<unknown>>();
   readonly #pins: PinStore;
   readonly #chat: BotChatTurns;
 
@@ -198,6 +235,8 @@ export class HermesBridge implements BotsSurface {
     const bridgeProfile = opts.bridgeProfile?.trim().toLowerCase();
     this.#bridgeProfile = bridgeProfile === undefined || bridgeProfile.length === 0 ? undefined : bridgeProfile;
     this.#deleteTimeoutMs = opts.deleteTimeoutMs ?? PROFILE_DELETE_TIMEOUT_MS;
+    this.#catalogTtlMs = opts.catalogTtlMs ?? CATALOG_TTL_MS;
+    this.#catalogDegradedTtlMs = opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
     this.#rosterPollMs = opts.rosterPollMs ?? ROSTER_POLL_MS;
     this.#routinesPollMs = opts.routinesPollMs ?? ROUTINES_POLL_MS;
     this.#focusTtlMs = opts.focusTtlMs ?? FOCUS_TTL_MS;
@@ -530,6 +569,115 @@ export class HermesBridge implements BotsSurface {
     this.#kickoffs.delete(canonical);
     await this.refresh(`bot ${canonical} deleted`);
     return path;
+  }
+
+  /** One bot's edit-screen state.
+   *
+   *  `#assertBotKnown` runs first for the same reason every other `/bots/:name` route runs it: a
+   *  HIDDEN bot must stay editable by name (the hide list is a roster filter, not an access rule,
+   *  and chat already works that way), while a name that names no profile at all must read as the
+   *  404 it is. Upstream's own `profiles.describe` answers 4064 for a missing profile, which would
+   *  surface as a 502 carrying Hermes' text instead of the 404 this API promises. */
+  async botProfile(name: string): Promise<BotProfile> {
+    await this.#assertBotKnown(name);
+    return readBotProfile(this.#client, name);
+  }
+
+  /** Applies an edit. Nothing is cached and nothing is derived: the reply is Hermes' own per-section
+   *  verdict, echoed. A write can change what a bot can do (skills, toolsets, MCP), which is what
+   *  the roster's descriptions and the prompt builder's capability epoch key on, so the roster is
+   *  refreshed behind it.
+   *
+   *  SERIALIZED PER BOT, and this is a correctness rule rather than an economy. Upstream's
+   *  `profiles.configure` runs on a worker pool and performs up to THREE separate load/save cycles
+   *  in one call (skills, then toolsets, then MCP). Its config lock is held inside each save, so it
+   *  makes one WRITE atomic, not the read-modify-write around it, and each save rewrites the whole
+   *  document. Two overlapping configures therefore silently lose the loser's sections. The desktop
+   *  never hit this because it is one client; a gateway is the surface where two phones, or a phone
+   *  and a desktop, save the same bot.
+   *
+   *  A CHAIN, not the dedupe `canonicalChat` and `createBot` use: the second write asked for
+   *  something different from the first and must still happen, just after it. The chain link is
+   *  installed before awaiting, so a third caller queues behind the second rather than behind the
+   *  first. A failed write does not poison the queue (the tail is caught), and a chain whose tail
+   *  is still the promise that just settled is deleted, so an idle bot leaves nothing behind.
+   *
+   *  It bounds nothing across gateways: a desktop writing the same profile directly still races
+   *  upstream. Serializing what this gateway can see is the half that is ours to fix. */
+  async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> {
+    await this.#assertBotKnown(name);
+    const previous = this.#configureChain.get(name);
+    const run = (async () => {
+      // A predecessor's failure is not this write's failure, so the wait swallows it.
+      if (previous !== undefined) await previous.catch(() => {});
+      try {
+        return await configureBotProfile(this.#client, name, patch);
+      } finally {
+        this.refreshSoon(`profile ${name} configured`);
+      }
+    })();
+    this.#configureChain.set(name, run);
+    try {
+      return await run;
+    } finally {
+      if (this.#configureChain.get(name) === run) this.#configureChain.delete(name);
+    }
+  }
+
+  /** The edit screen's menus, briefly cached per skill query.
+   *
+   *  Single-flight AND cached: opening the screen on two devices at once, or a client that reads
+   *  the catalog on every tab switch, must cost one round of three calls rather than one per read.
+   *
+   *  A TRANSPORT failure is not cached at all: it throws out of `readBotCatalog` before anything is
+   *  stored, so a gateway that was down when the screen opened is retried on the next read rather
+   *  than serving an empty catalog for a minute.
+   *
+   *  A DEGRADED answer (one section's RPC rejected, the rest fine) is cached, but only for
+   *  `CATALOG_DEGRADED_TTL_MS`. It used to take the full minute, which is how a single flaky
+   *  `model.options` refresh pinned an empty model picker in front of a user for 60 s under a
+   *  message that reads "your gateway is too old". A few seconds keeps a struggling gateway from
+   *  being hammered per keystroke without turning one bad moment into a stuck screen. */
+  async catalog(query: string): Promise<BotCatalog> {
+    const key = query;
+    const cached = this.#catalogCache.get(key);
+    if (cached !== undefined && this.#now() - cached.fetchedAt < cached.ttlMs) return cached.catalog;
+    const inflight = this.#catalogInflight.get(key);
+    if (inflight !== undefined) return inflight;
+
+    const run = (async () => {
+      try {
+        const fetchedAt = this.#now();
+        const catalog = await readBotCatalog(this.#client, query, fetchedAt);
+        const ttlMs = catalog.unavailable.length === 0 ? this.#catalogTtlMs : this.#catalogDegradedTtlMs;
+        this.#rememberCatalog(key, { catalog, fetchedAt, ttlMs });
+        return catalog;
+      } finally {
+        this.#catalogInflight.delete(key);
+      }
+    })();
+    this.#catalogInflight.set(key, run);
+    return run;
+  }
+
+  /** Stores one catalog answer, sweeping the cache on the way in.
+   *
+   *  The key is the client's own search string, so the key SPACE is client-chosen: an edit screen
+   *  reading per keystroke mints one entry per prefix, each holding a full skills + MCP + models
+   *  payload, and the query-length cap on the route bounds the key, not the number of keys. Expired
+   *  entries go first (they are dead weight by definition), and if that is not enough the oldest
+   *  insertion is evicted, which `Map` iteration order hands over for free. */
+  #rememberCatalog(key: string, entry: CachedCatalog): void {
+    const now = this.#now();
+    for (const [cachedKey, cached] of this.#catalogCache) {
+      if (now - cached.fetchedAt >= cached.ttlMs) this.#catalogCache.delete(cachedKey);
+    }
+    this.#catalogCache.set(key, entry);
+    while (this.#catalogCache.size > CATALOG_CACHE_MAX) {
+      const oldest = this.#catalogCache.keys().next();
+      if (oldest.done === true) break;
+      this.#catalogCache.delete(oldest.value);
+    }
   }
 
   /** Test seam: true while a turn poll is live for this bot. */

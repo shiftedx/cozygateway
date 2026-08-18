@@ -5,6 +5,8 @@ import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotFocusRequestSchema,
+  BotProfilePatchSchema,
+  BotProfileSchema,
   BotSummarySchema,
   ServerFrameSchema,
   check,
@@ -70,10 +72,80 @@ describe("focus request", () => {
   });
 });
 
+describe("profile patch", () => {
+  it("accepts any single section, and all of them at once", () => {
+    expect(check(BotProfilePatchSchema, { soul: "# Scout" })).toBe(true);
+    expect(check(BotProfilePatchSchema, { disabledSkills: ["deploy"] })).toBe(true);
+    // Empty is meaningful for toolsets: it POPS the pin rather than disabling everything.
+    expect(check(BotProfilePatchSchema, { enabledToolsets: [] })).toBe(true);
+    expect(
+      check(BotProfilePatchSchema, {
+        soul: "s",
+        disabledSkills: [],
+        enabledToolsets: ["files"],
+        enabledMcpServers: ["github"],
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a list that is not a list of names", () => {
+    expect(check(BotProfilePatchSchema, { disabledSkills: "deploy" })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledMcpServers: [{ name: "github" }] })).toBe(false);
+  });
+
+  // A single space passes `minLength: 1`, and the backend then filters it, leaving an EMPTY
+  // `enabled_toolsets`, which POPS the pin and enables every toolset. A typo must not be the
+  // maximum-permission request, so the item rule requires a non-whitespace character.
+  it("rejects a whitespace-only name in any of the three lists", () => {
+    expect(check(BotProfilePatchSchema, { enabledToolsets: ["  "] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { disabledSkills: ["\t"] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledMcpServers: ["\n"] })).toBe(false);
+    // A name with padding around real characters is still a name; the bridge trims it.
+    expect(check(BotProfilePatchSchema, { enabledToolsets: [" files "] })).toBe(true);
+  });
+});
+
+describe("profile", () => {
+  it("accepts the mapped edit-screen shape, optional fields omitted", () => {
+    expect(
+      check(BotProfileSchema, {
+        name: "scout",
+        description: "watches CI",
+        soul: "# Scout",
+        skills: [{ name: "ci-watch", enabled: true }],
+        toolsets: [{ name: "files", enabled: true, label: "Files", toolCount: 7 }],
+        toolsetsPinned: true,
+        mcpServers: [{ name: "github", installed: true, enabled: true }],
+        model: { provider: "", default: "" },
+        runtimeInert: ["toolsets", "mcpServers"],
+      }),
+    ).toBe(true);
+  });
+
+  // Required, not optional: a client gates its honesty note on this field, and an absent one would
+  // read as "everything works" on exactly the backends where it does not.
+  it("requires runtimeInert, and only knows the two section names", () => {
+    const base = {
+      name: "scout",
+      description: "",
+      soul: "",
+      skills: [],
+      toolsets: [],
+      toolsetsPinned: false,
+      mcpServers: [],
+      model: { provider: "", default: "" },
+    };
+    expect(check(BotProfileSchema, base)).toBe(false);
+    expect(check(BotProfileSchema, { ...base, runtimeInert: [] })).toBe(true);
+    expect(check(BotProfileSchema, { ...base, runtimeInert: ["skills"] })).toBe(false);
+  });
+});
+
 describe("capability advertisement", () => {
   it("is a vendor-scoped id with an integer version", () => {
     expect(BOTS_CAPABILITY_ID).toBe("com.cozylabs.bots");
-    // Bumped for the write route and the chat frames: a v1 gateway 404s the composer.
-    expect(BOTS_CAPABILITY_VERSION).toBe(2);
+    // 2 for the composer (a v1 gateway 404s the send route), 3 for the edit-profile surface
+    // (a v2 gateway 404s the profile routes, which reads as a Save that silently does nothing).
+    expect(BOTS_CAPABILITY_VERSION).toBe(3);
   });
 });
