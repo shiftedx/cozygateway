@@ -107,6 +107,14 @@ export interface CanonicalChatDeps {
    *  never learns the phone's chat, and every later open has to re-derive it, which is how a
    *  duplicate chat gets minted while the first one's kickoff is still in flight. */
   saveServerPin?: (sessionId: string) => Promise<void>;
+  /** Throws when `name` is no longer a profile on this gateway, checked FRESH. Called on one path
+   *  only: immediately before a chat is MINTED, because `session.create` is where an unknown name
+   *  stops being a 404 and starts being a new profile (Hermes 0.20.x auto-creates one). The caller's
+   *  own unknown-bot guard is cache-first by design, which is right for a read but is a snapshot,
+   *  and a snapshot is exactly what a bot deleted seconds ago is still in.
+   *
+   *  Nothing to check on the adopt paths: those resolve a session that already exists. */
+  assertStillExists?: () => Promise<void>;
   /** How many sessions to consider when adopting. The desktop uses 100. */
   listLimit?: number;
 }
@@ -115,7 +123,8 @@ export async function listBotSessions(rpc: HermesRpc, name: string, limit: numbe
   return parseSessionList(await rpc.request("session.list", { profile: name, limit }));
 }
 
-/** Creates the canonical chat: `session.create` for the ids, pin it, then submit the kickoff
+/** Creates the canonical chat: check the bot is still there, `session.create` for the ids, pin it,
+ *  then submit the kickoff
  *  prompt against the RUNTIME id (the stored id is what gets pinned; they are different values).
  *  A failed submit rolls the pin back, exactly as the desktop does, so a half-created chat never
  *  becomes the permanent pointer. */
@@ -123,6 +132,7 @@ async function createCanonicalChat(
   name: string,
   deps: CanonicalChatDeps,
 ): Promise<{ storedId: string; runtimeId: string }> {
+  await deps.assertStillExists?.();
   const created = asRecord(
     await deps.rpc.request("session.create", {
       profile: name,

@@ -327,13 +327,31 @@ export class HermesBridge implements BotsSurface {
       log: this.#log,
       hidden: this.#hideBotChats,
       memberInfo: (name) => this.#memberInfo(name),
-      assertBotKnown: (name) => this.#assertBotKnown(name),
+      // Validated against a FRESH profile list rather than the roster cache: a room is written to
+      // disk and its members are handed to `session.create` on the first round, and a cache that
+      // still lists a bot deleted seconds ago is exactly how a room came to name a bot that Hermes
+      // then auto-created back into existence. One round trip per create, whatever the member count.
+      missingMembers: async (names) => {
+        const known = await this.#freshProfileNames();
+        return names.filter((name) => !known.has(name));
+      },
       // Cache-only and deliberately unsure: an EMPTY roster means the cache has not landed yet, not
       // that every bot was deleted, and answering `false` there would make a cold start report every
       // member of every room as gone.
       memberKnown: (name) => {
         const bots = this.#storage.botRoster().bots;
         return bots.length === 0 ? undefined : bots.some((bot) => bot.name === name);
+      },
+      // The turn boundary's own check, and the one the cheap `memberKnown` gate cannot make: a
+      // positive cache hit is a snapshot, and the whole hazard here is a member deleted since it was
+      // taken. A transport failure reads as "still there" so a flaky link can never shrink a room;
+      // the turn that follows fails honestly on its own.
+      memberExists: async (name) => {
+        try {
+          return (await this.#freshProfileNames()).has(name);
+        } catch {
+          return true;
+        }
       },
       ...(opts.onGroupEscalation === undefined ? {} : { escalate: opts.onGroupEscalation }),
       // A member turn is the same shape of wait as a 1:1 turn, so it honors the same overrides and
@@ -515,6 +533,13 @@ export class HermesBridge implements BotsSurface {
             hideBotChats: this.#hideBotChats,
             serverPin,
             saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
+            // The guard above is cache-first, so it can be satisfied by a snapshot taken before the
+            // bot was deleted. That is harmless on every path but this one: minting the chat means
+            // `session.create`, and Hermes 0.20.x answers that for an unknown name by CREATING the
+            // profile. The cost is one round trip on the one open per bot that mints a chat.
+            assertStillExists: async () => {
+              if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
+            },
           });
           // A chat this call created is lazy until its kickoff lands: remember the runtime id and
           // the moment, because for the next few seconds it cannot be resumed at all.
@@ -559,9 +584,29 @@ export class HermesBridge implements BotsSurface {
   async #assertBotKnown(name: string): Promise<void> {
     const cached = this.#storage.botRoster().bots.some((bot) => bot.name === name);
     if (cached) return;
-    const result = await this.#client.request("profiles.list", {});
-    const { profiles } = parseProfilesList(result);
-    if (!profiles.some((profile) => profile.name === name)) throw new BotNotFound(name);
+    if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
+  }
+
+  /** Every profile name Hermes reports RIGHT NOW, cache untouched.
+   *
+   *  The cache-first arm of `#assertBotKnown` answers a positive from a SNAPSHOT, and a snapshot can
+   *  only ever be as young as the last refresh. That is the right trade for a read route, where a
+   *  stale yes costs one 404 that Hermes itself hands back a moment later. It is the wrong trade
+   *  anywhere a stale yes reaches `session.create`, because Hermes 0.20.x AUTO-CREATES a profile for
+   *  a name it does not know: a deleted bot comes back as a bare profile, and no later refresh can
+   *  tell it apart from a real one. Those callers ask this instead.
+   *
+   *  There are exactly three, and the survey behind that number is worth keeping: room CREATE (the
+   *  membership is durable and its first round mints sessions), the member TURN boundary (see
+   *  `GroupRooms`), and the canonical chat's CREATE arm. Everything else that reaches a session was
+   *  checked and does not need it. The chat turn poll and the group poll only ever `session.resume`
+   *  or `prompt.submit` an id that already exists, which a Hermes with no such session refuses
+   *  rather than invents; the adopt arms of `resolveCanonicalChat` resolve a session that is already
+   *  there; and the routines routes speak only `cron.manage`, behind `#assertBotKnown`, and mint no
+   *  profile of their own. */
+  async #freshProfileNames(): Promise<Set<string>> {
+    const { profiles } = parseProfilesList(await this.#client.request("profiles.list", {}));
+    return new Set(profiles.map((profile) => profile.name));
   }
 
   /** History of a bot's canonical chat. Resolving the chat first is what makes this route usable

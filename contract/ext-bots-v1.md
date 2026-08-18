@@ -1164,8 +1164,8 @@ state (see "Group chats" below), so this route answers from SQLite and is always
 ```
 body { name: string, members: string[] }   // name 1..64, members 2..6
 201  { group: BotGroup }
-400  invalid_request                       // bad body, member count out of bounds, reserved name
-404  not_found                             // a member names no Hermes profile
+400  invalid_request                       // bad body, member count out of bounds, reserved name,
+                                          // or members that are not bots here (all of them named)
 409  conflict                              // a room with that name (case-insensitively) exists
 ```
 
@@ -1183,9 +1183,18 @@ Member names are canonicalized the same way every `/bots/:name` route canonicali
 parameter (trimmed, lowercased), and DUPLICATES COLLAPSE: `["scout", "Scout"]` is one member and
 therefore fails the two-member floor with a 400 rather than creating a room that talks to itself.
 
-Every member is validated against the roster BEFORE the room is written, so a create either yields a
-room whose membership is real or yields a 404 and no room at all. Membership is fixed at create;
-there is no edit route yet (see section 7).
+Every member is validated BEFORE the room is written, so a create either yields a room whose
+membership is real or yields a 400 and no room at all, and the error names EVERY member that is
+missing rather than only the first. Membership is fixed at create; there is no edit route yet (see
+section 7).
+
+The check reads a FRESH profile list rather than the gateway's roster cache. A cache is only ever as
+young as its last refresh, and a stale yes here is not a cosmetic problem: the room is durable, its
+first round hands each member name to `session.create`, and a Hermes that does not know the name
+CREATES a profile for it. A bot deleted moments before the room was made would come back as a bare
+profile that no later roster could tell from a real one. For the same reason a member that vanishes
+while a room is deliberating is dropped from the round with a `bot_group_state` note ("<bot> is no
+longer a bot on this gateway") instead of having a session minted for it.
 
 Six room names are RESERVED and answer 400: `profile`, `chat`, `sessions`, `messages`, `catalog`,
 `focus`. `/bots/groups/:name` and `/bots/:name/<suffix>` are both three segments, and the per-bot

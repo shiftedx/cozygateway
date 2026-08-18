@@ -42,10 +42,16 @@ const CREATED_SESSION_PERSIST_GRACE_POLLS = 15;
  *  `pass` is the healthy outcome and covers both the literal `(pass)` and a reply with no text at
  *  all. `timeout` and `failed` are the honest ones: the member said nothing because its turn did not
  *  complete, which the room reports as a note and never as a message it invented on the member's
- *  behalf. */
+ *  behalf.
+ *
+ *  `gone` is the turn that never started: the member is no longer a bot on this gateway, so there
+ *  was nothing to ask and nothing was asked. It is separate from `failed` because nothing failed,
+ *  and separate from `pass` because a vanished member must not have its watermark advanced as though
+ *  it had read the room. */
 export type GroupTurnResult =
   | { outcome: "spoke"; text: string }
   | { outcome: "pass" }
+  | { outcome: "gone" }
   | { outcome: "timeout"; detail: string }
   | { outcome: "failed"; detail: string };
 
@@ -146,11 +152,36 @@ export function findFreshReply(
   return undefined;
 }
 
+/** Thrown by `ensureGroupSession` when the member is no longer a bot on this gateway, discovered at
+ *  the only boundary where it matters: the instant before `session.create`. Its own type rather than
+ *  a plain `Error` because the room reads it as news (`gone`) rather than as a failed turn, and the
+ *  two get different wording, different watermark handling and different notes. */
+export class MemberGone extends Error {
+  readonly member: string;
+  constructor(member: string) {
+    super(`${member} is no longer a bot on this gateway`);
+    this.name = "MemberGone";
+    this.member = member;
+  }
+}
+
 export interface GroupSessionOptions {
   /** The stored id this room remembers for the member, when it has one. */
   storedId?: string;
   /** Room sessions are born hidden by the same rule canonical chats are. */
   hidden: boolean;
+  /** Throws `MemberGone` when the member is no longer a profile on this gateway, checked FRESH.
+   *  Called on the CREATE arm only, immediately before `session.create`, which is the same place
+   *  and for the same reason as `CanonicalChatDeps.assertStillExists`: an unknown name is a 404
+   *  everywhere else, but `session.create` in Hermes 0.20.x AUTO-CREATES a profile for it, so a
+   *  deleted bot comes back as a bare profile that no later refresh can tell from a real one.
+   *
+   *  Here rather than at the top of the turn so a room pays the round trip once per NEW session
+   *  instead of once per member per round, and so the window between the answer and the create is
+   *  the two statements between them rather than the whole of the resume path. The resume arms need
+   *  nothing: they address a session that already exists, which a Hermes that has neither refuses
+   *  rather than invents. */
+  assertStillExists?: () => Promise<void>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -180,7 +211,10 @@ function detailOf(err: unknown): string {
  *  do resolve a title there rehydrate for nothing.
  *
  *  Whatever lookup lands, the ids are read the same way: `session_id` is the RUNTIME (submit-only,
- *  single-use) handle and `session_key` is the STORED (resume-only, durable) one. */
+ *  single-use) handle and `session_key` is the STORED (resume-only, durable) one.
+ *
+ *  The create arm, and only the create arm, first asks `opts.assertStillExists` whether the member
+ *  is still a bot here, and throws `MemberGone` when it is not. */
 export async function ensureGroupSession(
   rpc: HermesRpc,
   member: string,
@@ -225,6 +259,7 @@ export async function ensureGroupSession(
     }
   }
 
+  await opts.assertStillExists?.();
   const created = asRecord(
     await rpc.request("session.create", {
       profile: member,
