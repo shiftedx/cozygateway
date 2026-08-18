@@ -41,6 +41,12 @@ import type { HermesEvent } from "./client.ts";
  *  slow enough that a long reply costs tens of frames rather than hundreds on a phone radio. */
 export const CHAT_DELTA_THROTTLE_MS = 200;
 
+/** Draft ceiling (review PR40 M1): the streamed draft is decoration, and re-sending the full
+ *  accumulated text every throttle tick amplifies long replies without bound (a 20 KB reply
+ *  already fans out megabytes per device). Past this many characters the draft stops growing
+ *  and stops emitting; the authoritative complete message still arrives whole via the poll. */
+export const CHAT_DELTA_MAX_CHARS = 65536;
+
 /** How many sessions may hold a binding. A binding is ~100 bytes and one is written per send, so
  *  this is a leak stop rather than a tuning knob: the oldest entry is evicted past the cap. */
 const MAX_BINDINGS = 512;
@@ -172,7 +178,9 @@ export class BotChatStream implements ChatStreamBinder {
         // over. Hermes has not been observed to send one, but the ordering is not ours to
         // guarantee, and reviving a retired draft is a visible bug where dropping the frame is not.
         if (turn.finished) return;
-        turn.text += chunk;
+        // Past the ceiling the draft freezes: no growth, no further frames (M1 amplification cap).
+        if (turn.text.length >= CHAT_DELTA_MAX_CHARS) return;
+        turn.text = (turn.text + chunk).slice(0, CHAT_DELTA_MAX_CHARS);
         this.#schedule(runtimeId, binding, turn);
         return;
       }

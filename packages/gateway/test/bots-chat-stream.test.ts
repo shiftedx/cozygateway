@@ -252,3 +252,23 @@ describe("BotChatStream", () => {
     expect(frames).toHaveLength(0);
   });
 });
+
+import { CHAT_DELTA_MAX_CHARS } from "../src/hermes-bridge/chat-stream.ts";
+
+describe("draft ceiling (review PR40 M1)", () => {
+  it("freezes the draft at the ceiling and emits nothing further", async () => {
+    const { deltas, event, stream } = harness(0);
+    stream.bind("runtime-cap", { bot: "sage", sessionId: "stored-cap" });
+    event("message.start", "runtime-cap");
+    event("message.delta", "runtime-cap", { text: "x".repeat(CHAT_DELTA_MAX_CHARS - 5) });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    event("message.delta", "runtime-cap", { text: "abcdefghij" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const atCap = deltas().length;
+    const capped = deltas()[atCap - 1];
+    expect(capped.text.length).toBeLessThanOrEqual(CHAT_DELTA_MAX_CHARS);
+    event("message.delta", "runtime-cap", { text: "MORE" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(deltas().length).toBe(atCap);
+  });
+});
