@@ -1,4 +1,4 @@
-import type { BotChatMessage, BotSummary, ServerFrame } from "cozygateway-contract";
+import type { BotChatMessage, BotCreateRequest, BotSummary, ServerFrame } from "cozygateway-contract";
 
 import type { Storage } from "../storage.ts";
 import { HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
@@ -11,14 +11,18 @@ import {
   type SessionRow,
 } from "./canonical-chat.ts";
 import {
+  botDisplayName,
+  botHandle,
   botMetaForWriteback,
   buildRoster,
+  classifyPreview,
   parseProfilesList,
   readBotMeta,
   resolveChatPin,
   UI_META_KEY,
 } from "./roster.ts";
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
+import { createBotProfile, deleteBotProfile, type CreatedBot, type DeletePath } from "./crud.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -68,7 +72,18 @@ export interface BotsSurface {
     text: string,
     opts?: { clientId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
+  createBot(input: BotCreateRequest): Promise<BotCreated>;
+  deleteBot(name: string): Promise<DeletePath>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
+}
+
+/** What `POST /bots` answers with: the roster row of the bot that now exists, plus how its look
+ *  write landed. `metaOutcome` is the desktop's three-way `saveBotMeta` contract, surfaced rather
+ *  than swallowed so a client can tell "your color is on every device" from "your color is only on
+ *  this gateway". */
+export interface BotCreated {
+  bot: BotSummary;
+  metaOutcome: CreatedBot["metaOutcome"];
 }
 
 /** What `GET /bots/:name/chat/messages` answers with. `adoption` says how the chat was resolved,
@@ -89,6 +104,8 @@ export interface HermesBridgeOptions {
   now: () => number;
   /** New canonical chats are born hidden (desktop default). */
   hideBotChats?: boolean;
+  /** Profile names kept off the roster this gateway serves. See `RosterBuildOptions.hidden`. */
+  hiddenProfiles?: Iterable<string>;
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
@@ -104,6 +121,7 @@ export class HermesBridge implements BotsSurface {
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
   readonly #hideBotChats: boolean;
+  readonly #hidden: ReadonlySet<string>;
   readonly #rosterPollMs: number;
   readonly #routinesPollMs: number;
   readonly #focusTtlMs: number;
@@ -148,6 +166,10 @@ export class HermesBridge implements BotsSurface {
     this.#broadcast = opts.broadcast;
     this.#now = opts.now;
     this.#hideBotChats = opts.hideBotChats ?? true;
+    // Normalized here as well as in the config parser: the set is compared against profile names
+    // as Hermes stores them (lowercase), and a caller that hands over `Ops-Runner` means the same
+    // bot as one that hands over `ops-runner`.
+    this.#hidden = new Set([...(opts.hiddenProfiles ?? [])].map((name) => name.trim().toLowerCase()));
     this.#rosterPollMs = opts.rosterPollMs ?? ROSTER_POLL_MS;
     this.#routinesPollMs = opts.routinesPollMs ?? ROUTINES_POLL_MS;
     this.#focusTtlMs = opts.focusTtlMs ?? FOCUS_TTL_MS;
@@ -229,6 +251,7 @@ export class HermesBridge implements BotsSurface {
         const result = await this.#client.request("profiles.list", {});
         const { profiles } = parseProfilesList(result);
         const bots = buildRoster(profiles, {
+          hidden: this.#hidden,
           pins: this.#storage.botChatPinEntries(),
           routedProfile: this.#routedProfile,
           gatewayState: this.#gatewayState(),
@@ -382,6 +405,36 @@ export class HermesBridge implements BotsSurface {
     return true;
   }
 
+  /** Creates a bot, then refreshes the roster so the caller receives the same row every device is
+   *  about to get on its `bot_roster` frame rather than one this method invented.
+   *
+   *  The refresh is awaited on purpose: `POST /bots` answering 201 with a row the very next
+   *  `GET /bots` does not carry is an inconsistency an app cannot resolve without a manual
+   *  refresh. When the bot is not in the refreshed roster (the operator hid its name, or the
+   *  refresh itself failed) the row is synthesized from what was just written, so the response is
+   *  a complete `BotSummary` either way. */
+  async createBot(input: BotCreateRequest): Promise<BotCreated> {
+    const created = await createBotProfile(this.#client, input, this.#now());
+    await this.refresh(`bot ${created.name} created`);
+    const row = this.#storage.botRoster().bots.find((bot) => bot.name === created.name);
+    return { bot: row ?? synthesizeSummary(created), metaOutcome: created.metaOutcome };
+  }
+
+  /** Deletes a bot's profile and forgets everything this gateway held about it.
+   *
+   *  Order matters: Hermes first, cache second. A cache cleared ahead of a delete that then fails
+   *  (a blocked command, a backend still holding the profile directory open) would leave the bot
+   *  on the roster with its canonical-chat pin thrown away, and the next open would mint a SECOND
+   *  chat on a bot that still exists. Failing first means nothing local changed. */
+  async deleteBot(name: string): Promise<DeletePath> {
+    const path = await deleteBotProfile(this.#client, name);
+    const canonical = name.trim().toLowerCase();
+    this.#storage.forgetBot(canonical);
+    this.#chat.forget(canonical);
+    await this.refresh(`bot ${canonical} deleted`);
+    return path;
+  }
+
   /** Test seam: true while a turn poll is live for this bot. */
   chatPolling(name: string): boolean {
     return this.#chat.polling(name);
@@ -532,6 +585,28 @@ export class HermesBridge implements BotsSurface {
     }, interval);
     this.#pollTimer.unref();
   }
+}
+
+/** The roster row for a bot that exists but is not in the cached roster: hidden by config, or
+ *  created while the refresh behind it failed. Built from the blob just written, so it matches
+ *  what a later refresh will produce for the same profile. A brand new profile has no sessions and
+ *  no activity, which is why every live field here is empty rather than guessed. */
+function synthesizeSummary(created: CreatedBot): BotSummary {
+  const meta: Record<string, unknown> = { ...created.meta };
+  return {
+    name: created.name,
+    displayName: botDisplayName(created.name, meta),
+    handle: botHandle(created.name),
+    description: created.description.length === 0 ? null : created.description,
+    hasAvatar: false,
+    group: null,
+    pinned: false,
+    active: false,
+    lastActiveAt: null,
+    chatSessionId: null,
+    preview: classifyPreview(null, created.description.length === 0 ? null : created.description),
+    meta,
+  };
 }
 
 /** True when a failure means "Hermes is not reachable right now" rather than "Hermes said no". */

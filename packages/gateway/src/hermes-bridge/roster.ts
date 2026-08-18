@@ -264,13 +264,21 @@ export interface RosterBuildOptions extends PresenceContext {
    *  `now` doubles as the snapshot stamp, so the caller must pass the moment it asked Hermes for
    *  this data and stamp the cached roster with the same value. */
   pins: ReadonlyMap<string, { sessionId: string; updatedAt: number }>;
+  /** Profile names the operator has hidden (`hiddenProfiles` in the bridge config). They stay REAL
+   *  profiles Hermes-side and every by-name route still addresses them; they are simply left off
+   *  the roster this gateway serves, which is how a box whose Hermes also runs automation profiles
+   *  shows a phone only the bots that belong on it. The filter lives here, in the single function
+   *  that builds a roster, so `GET /bots` and the `bot_roster` frame cannot disagree about what is
+   *  on it. Names are compared already-normalized (lowercase), as Hermes stores them. */
+  hidden?: ReadonlySet<string>;
 }
 
 /** Builds the merged roster: profiles plus their `ui_meta` blob, preview classification, presence
  *  flag, and the canonical-chat pointer, sorted pinned-first then most-recently-active. Search
  *  never re-ranks, so this is the one ordering the app renders. */
 export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions): BotSummary[] {
-  const rows = profiles.map((profile) => {
+  const visible = opts.hidden === undefined ? profiles : profiles.filter((p) => !opts.hidden?.has(p.name));
+  const rows = visible.map((profile) => {
     const meta = profile.meta;
     // One rule, shared with the chat route (`resolveChatPin`): a server blob is the whole truth
     // about `chat` unless this gateway wrote a newer pin than the snapshot could have seen.

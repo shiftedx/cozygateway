@@ -3,6 +3,7 @@ import {
   type ErrorBody,
   type ErrorCode,
   BotChatSendRequestSchema,
+  BotCreateRequestSchema,
   BotFocusRequestSchema,
   ContractViolation,
   assertValid,
@@ -11,6 +12,7 @@ import {
 import { HermesRpcError, HermesUnavailable } from "./client.ts";
 import { RuntimeSessionUnknown } from "./chat-turns.ts";
 import type { BotsSurface } from "./bridge.ts";
+import { BotDeleteBlocked, BotDeleteFailed, BotDeleteRefused, BotNameInvalid, BotNameTaken } from "./crud.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
  *  device-token auth as every other route; nothing here speaks a Hermes method name, that all
@@ -28,6 +30,13 @@ export const SESSION_LIST_LIMIT = 200;
 /** Local copy of http.ts's helper, duplicated rather than imported so this module does not close
  *  an import cycle back into the app it is registered on. */
 function errorBody(code: ErrorCode, message: string): ErrorBody {
+  return { error: { code, message } };
+}
+
+/** Error codes this extension adds to the frozen core list (`contract/v1.md` section 4 keeps
+ *  `error.code` a plain string precisely so an extension can). A client that does not know them
+ *  treats them as a generic failure, which the HTTP status already conveys. */
+function extensionErrorBody(code: "conflict" | "command_blocked", message: string): ErrorBody {
   return { error: { code, message } };
 }
 
@@ -70,6 +79,65 @@ export function registerBotRoutes(
     const view = bots.roster();
     bots.refreshSoon("GET /bots");
     return c.json({ bots: view.bots, updatedAt: view.updatedAt, stale: view.stale });
+  });
+
+  // 201 with the bot's roster row, which is the same row the `bot_roster` frame that fires
+  // alongside it carries: the bridge refreshes the roster before answering, so the app never sees
+  // a bot it just made missing from its own list.
+  app.post("/bots", requireDevice, async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotCreateRequestSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      const created = await bots.createBot(parsed);
+      return c.json({ bot: created.bot, metaOutcome: created.metaOutcome }, 201);
+    } catch (err) {
+      // The name rule is Hermes', but it is checked before the RPC, so it reads as the 400 it is
+      // rather than as a backend failure.
+      if (err instanceof BotNameInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+      if (err instanceof BotNameTaken) return c.json(extensionErrorBody("conflict", err.message), 409);
+      return failure(c, err);
+    }
+  });
+
+  // 204: the bot is gone, and there is nothing left to say about it. The roster frame that follows
+  // is how every other device finds out.
+  app.delete("/bots/:name", requireDevice, async (c) => {
+    const name = c.req.param("name");
+    try {
+      await bots.deleteBot(name);
+      return c.body(null, 204);
+    } catch (err) {
+      if (err instanceof BotDeleteRefused) return c.json(errorBody("invalid_request", err.message), 400);
+      // `blocked` is not a Hermes error, it is a successful `cli.exec` that refused to run the
+      // command. The hint is the gateway's own text and is what tells an operator to widen the
+      // allow-list, so it rides the body verbatim rather than being folded into the message.
+      if (err instanceof BotDeleteBlocked) {
+        return c.json({ ...extensionErrorBody("command_blocked", err.message), blocked: true, hint: err.hint }, 502);
+      }
+      if (err instanceof BotDeleteFailed) {
+        return c.json(
+          {
+            ...errorBody("backend_unavailable", err.message),
+            blocked: false,
+            exitCode: err.exitCode,
+            hermesError: err.output,
+          },
+          502,
+        );
+      }
+      return failure(c, err);
+    }
   });
 
   app.post("/bots/focus", requireDevice, async (c) => {

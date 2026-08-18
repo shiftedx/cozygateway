@@ -5,6 +5,22 @@ export interface ParsedHermesOptions {
   url: string;
   auth: HermesAuth;
   hideBotChats: boolean;
+  /** Profile names kept off this gateway's roster, already normalized to the lowercase form
+   *  Hermes stores them in. Empty when the operator hid nothing. */
+  hiddenProfiles: string[];
+}
+
+/** Normalizes the operator's hide list: trimmed, lowercased (Hermes stores profile ids lowercase,
+ *  so a `Scout` written in the config file must still hide `scout`), blanks dropped, duplicates
+ *  collapsed. Order carries no meaning. */
+function parseHiddenProfiles(names: string[] | undefined): string[] {
+  if (names === undefined) return [];
+  const seen = new Set<string>();
+  for (const raw of names) {
+    const name = raw.trim().toLowerCase();
+    if (name.length > 0) seen.add(name);
+  }
+  return [...seen];
 }
 
 /** The gated dashboard mounts the JSON-RPC gateway here. Used when the configured URL names only
@@ -67,6 +83,7 @@ export function parseHermesOptions(
   env: Record<string, string | undefined>,
 ): ParsedHermesOptions {
   const hideBotChats = config.hideBotChats ?? true;
+  const hiddenProfiles = parseHiddenProfiles(config.hiddenProfiles);
   const mode = config.authMode ?? "token";
 
   if (mode === "password") {
@@ -96,6 +113,7 @@ export function parseHermesOptions(
         provider: config.provider ?? DEFAULT_AUTH_PROVIDER,
       },
       hideBotChats,
+      hiddenProfiles,
     };
   }
 
@@ -116,5 +134,6 @@ export function parseHermesOptions(
     url: config.url,
     auth: { mode: "token", token, param: config.authParam ?? "token" },
     hideBotChats,
+    hiddenProfiles,
   };
 }

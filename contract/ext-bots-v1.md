@@ -1,9 +1,9 @@
 # cozygateway vendor extension: com.cozylabs.bots, v1
 
-Status: draft. Read path plus full-duplex bot chat (the 4.5 pivot slice; spec section 5's W2 is bot CRUD and
-avatars, which is a later, additive version of this document). Versioned INDEPENDENTLY of `contract/v1.md`, which stays
-frozen. This document describes an optional surface a gateway may or may not have; a client that
-does not recognize it ignores the capability and the frames, and nothing in v1 changes.
+Status: draft, wave 3 (read path, full-duplex bot chat, and bot create/delete). Versioned
+INDEPENDENTLY of `contract/v1.md`, which stays frozen. This document describes an optional surface
+a gateway may or may not have; a client that does not recognize it ignores the capability and the
+frames, and nothing in v1 changes.
 
 Machine artifact: `packages/contract/src/ext-bots.ts` (TypeBox schemas). Notation follows
 `contract/v1.md`: objects are OPEN, unions are CLOSED, `field?:` means optional.
@@ -135,6 +135,79 @@ Answers from the cache immediately, including on a cold link (`bots: []`, `updat
 kicks off a background refresh whose result arrives as a `bot_roster` frame. `stale` is true when
 the bridge is not currently connected to Hermes, so the app can show a soft "showing the last good
 list" state instead of an error.
+
+Profiles the gateway operator has hidden (`hermes.hiddenProfiles` in its config) are NOT on this
+list, and never appear in a `bot_roster` or `bot_presence` frame. They remain real Hermes profiles,
+and every `/bots/:name` route still addresses them: hiding is a roster filter, not an access rule.
+
+### POST /bots
+
+```
+body {
+  name: string,                       // 1..64, the Hermes profile name
+  title?: string,                     // 1..120
+  description?: string,               // 0..2000
+  shape?: string,                     // 1..32
+  color?: string                      // "#rrggbb"
+}
+201  { bot: BotSummary, metaOutcome: "persisted" | "unsupported" | "failed" }
+400  invalid_request                  // malformed body, or a name the Hermes rule refuses
+409  conflict                         // a profile of that name already exists
+```
+
+Creates a bot, which upstream calls a profile. Two Hermes calls, in this order:
+
+1. `profiles.create` with the canonical name, the `description` verbatim, and **`share_auth: true`
+   sent explicitly**. That flag is load-bearing: the backend defaults it to false, which COPIES the
+   launch profile's `auth.json` rather than sharing it, and a forked OAuth pool means the first
+   token refresh on either side invalidates the other. The description is the profile's own;
+   `title` is a client-side label and stays out of it.
+2. `profiles.configure` writing `ui_meta["hermes-bots"] = { title?, shape?, color?, created }`,
+   where `created` is MILLISECONDS. The namespace key and the field names are the desktop plugin's,
+   so a bot made from a phone renders identically on a desktop.
+
+`metaOutcome` is the desktop's three-way `saveBotMeta` contract, reported rather than swallowed:
+`persisted` when the gateway answered `applied.ui_meta === true`; `unsupported` when it does not
+speak that contract at all (it rejected `profiles.configure`, or answered without an `applied`
+object), which is the expected, silent fallback on an older Hermes; `failed` when it speaks the
+contract and said the blob did not apply. **A look that did not persist never fails the create**:
+the bot exists either way, and only `failed` is worth showing a user.
+
+`name` is validated against the Hermes profile rule before anything is put on the wire, so a bad
+name is a 400 naming the rule rather than a 502. The rule, from upstream `hermes_cli/profiles.py` at
+v2026.8.16.2: the name is trimmed and lowercased first (so `Scout` is accepted and becomes `scout`),
+then it must match `[a-z0-9][a-z0-9_-]{0,63}`, and it must not be one of the reserved names
+`hermes`, `default`, `test`, `tmp`, `root`, `sudo`. `default` additionally names the built-in
+profile and can never be created.
+
+The response carries the bot's roster row, and the gateway refreshes the roster BEFORE answering, so
+that row is the same one the `bot_roster` frame firing alongside it carries. A bot created under a
+hidden name is returned here but is absent from that frame, by definition.
+
+### DELETE /bots/:name
+
+```
+204  (no body)
+400  invalid_request                  // the built-in "default" profile is refused
+502  command_blocked                  // + { blocked: true, hint: string }
+502  backend_unavailable              // + { blocked: false, exitCode: integer, hermesError: string }
+```
+
+Deletes the bot's profile. The gateway prefers a teardown-first `profiles.delete` RPC and falls back
+to `cli.exec ["profile","delete",<name>,"--yes"]` when the gateway answers `/unknown method/i`.
+Hermes 0.20.3 registers no such RPC, so the CLI path is the live one today; the probe means a
+gateway that later gains the RPC is used correctly with no change on either side. The teardown-first
+preference matters because `cli.exec` bypasses backend teardown, and a pool backend still holding
+the profile directory open races the CLI's rmtree, which is upstream's "can't delete a bot" bug.
+
+`blocked` is not a Hermes error: it is a SUCCESSFUL `cli.exec` whose result says the gateway's
+command allow-list refused to run the delete at all. The gateway's own `hint` rides the body
+verbatim, because it is the only thing that tells an operator what to widen.
+
+Nothing local is discarded until Hermes confirms the delete, so a blocked or failing delete leaves
+the bot exactly as it was, canonical-chat pin included. On success the gateway forgets the bot's
+cached roster row, its `ui_meta` mirror, its canonical-chat pin, and its chat broadcast watermark,
+then refreshes the roster, so a name reused later starts clean.
 
 ### GET /bots/:name/chat
 
@@ -281,6 +354,14 @@ the gateway's own text VERBATIM:
   `/unknown method/i` against `hermesError`, so it is never reworded.
 - `503` with `hermesError`: the bridge is not connected, nothing reached Hermes.
 
+Two error CODES are added by this extension, on top of the core list in `contract/v1.md` section 4
+(where `error.code` is a plain string precisely so an extension can add to it). A client that does
+not know them treats them as a generic failure, which the HTTP status already conveys:
+
+- `conflict` (409, `POST /bots`): the profile name is taken.
+- `command_blocked` (502, `DELETE /bots/:name`): the gateway's command allow-list refused to run
+  the profile delete; the body carries `blocked: true` and the gateway's own `hint`.
+
 ## 5. Presence
 
 A bot is `active` when EITHER holds:
@@ -334,7 +415,7 @@ and Hermes went idle, `timeout` at the 180 s cap, `failed` when Hermes kept refu
 
 ## 7. Not in this extension yet
 
-Per-device chat-frame scoping and per-device delta watermarks; bot create, edit, duplicate, delete;
-avatars; routines; group chats; push; and multi-connection
+Per-device chat-frame scoping and per-device delta watermarks; bot edit and duplicate; avatars;
+routines; group chats; push; and multi-connection
 rosters (the bridge targets exactly one Hermes gateway). Route shapes keep the `connection`
 concept out of the URL so a later version can add it additively.

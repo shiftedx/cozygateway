@@ -192,6 +192,15 @@ export class BotChatTurns {
     await this.#turns.get(name)?.done;
   }
 
+  /** Drops a bot's broadcast watermark, for a bot whose profile has been deleted. A live turn (if
+   *  any) is left to finish and clean up after itself: it polls a session that is gone, which ends
+   *  the turn on its own, and tearing it down here would race that. A stale watermark, by
+   *  contrast, would silently swallow the opening messages of a bot created later under the same
+   *  name. */
+  forget(name: string): void {
+    this.#watermarks.delete(name);
+  }
+
   close(): void {
     this.#closed = true;
     for (const turn of this.#turns.values()) turn.cancelled = true;

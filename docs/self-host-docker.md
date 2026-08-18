@@ -83,6 +83,40 @@ The `url` must be `ws://` or `wss://`. A missing scheme is rejected at startup r
 time, so a typo can never leave the bots capability advertised over a bridge that is dead for the
 life of the process.
 
+#### A pure-bots gateway needs no agents
+
+A gateway whose whole surface is the bots bridge takes an empty `agents` list, or none at all:
+
+```json
+{
+  "name": "cozy-bots",
+  "hermes": { "url": "ws://homelab:8790/api/ws", "tokenEnv": "COZYGATEWAY_HERMES_TOKEN" }
+}
+```
+
+A gateway must still serve SOMETHING: a config with neither an agent nor a `hermes` block fails at
+startup saying so. There is no longer any reason to keep a placeholder attach agent in the config of
+a box that only serves bots.
+
+#### Hiding profiles from the roster
+
+Hermes profiles that are not bots anybody should chat with (automation or service profiles) can be
+kept off this gateway's roster:
+
+```json
+{
+  "hermes": {
+    "url": "ws://homelab:8790/api/ws",
+    "tokenEnv": "COZYGATEWAY_HERMES_TOKEN",
+    "hiddenProfiles": ["ops-runner", "sweeper"]
+  }
+}
+```
+
+They stay real profiles Hermes-side, and every `/bots/:name` route still addresses them; they are
+only left out of `GET /bots` and the `bot_roster` and `bot_presence` frames. Names are matched
+case-insensitively, since Hermes stores profile ids lowercase.
+
 Relay:
 
 | Variable | Default | Meaning |

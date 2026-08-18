@@ -89,6 +89,7 @@ export async function startGateway(
       broadcast: (frame) => hub.broadcast(frame),
       now: () => Date.now(),
       hideBotChats: hermesOptions.hideBotChats,
+      hiddenProfiles: hermesOptions.hiddenProfiles,
     });
   }
 
