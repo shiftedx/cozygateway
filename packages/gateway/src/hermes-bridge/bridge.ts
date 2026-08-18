@@ -24,6 +24,7 @@ import {
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 import {
   BotDeleteRefused,
+  BotNotFound,
   createBotProfile,
   deleteBotProfile,
   PROFILE_DELETE_TIMEOUT_MS,
@@ -326,30 +327,38 @@ export class HermesBridge implements BotsSurface {
     if (inflight !== undefined) return inflight;
 
     const run = (async () => {
-      this.#routedProfile = name;
-      this.#busyDepth += 1;
       try {
-        const serverPin = await this.#serverPinOf(name);
-        const result = await resolveCanonicalChat(name, {
-          rpc: this.#client,
-          pins: this.#pins,
-          hideBotChats: this.#hideBotChats,
-          serverPin,
-          saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
-        });
-        // A chat this call created is lazy until its kickoff lands: remember the runtime id and
-        // the moment, because for the next few seconds it cannot be resumed at all.
-        if (result.adoption === "created" && result.runtimeId !== undefined) {
-          this.#kickoffs.set(name, { sessionId: result.sessionId, runtimeId: result.runtimeId, at: this.#now() });
+        // Checked BEFORE anything routes or mints state: a name that names no profile at all must
+        // never reach `resolveCanonicalChat`, which happily calls `session.create` for it (Hermes'
+        // `session.create` does not itself validate the profile), minting a chat that hangs off
+        // nothing a roster will ever show again.
+        await this.#assertBotKnown(name);
+        this.#routedProfile = name;
+        this.#busyDepth += 1;
+        try {
+          const serverPin = await this.#serverPinOf(name);
+          const result = await resolveCanonicalChat(name, {
+            rpc: this.#client,
+            pins: this.#pins,
+            hideBotChats: this.#hideBotChats,
+            serverPin,
+            saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
+          });
+          // A chat this call created is lazy until its kickoff lands: remember the runtime id and
+          // the moment, because for the next few seconds it cannot be resumed at all.
+          if (result.adoption === "created" && result.runtimeId !== undefined) {
+            this.#kickoffs.set(name, { sessionId: result.sessionId, runtimeId: result.runtimeId, at: this.#now() });
+          }
+          return result;
+        } finally {
+          this.#busyDepth = Math.max(0, this.#busyDepth - 1);
+          // Nothing is routed once the last turn drains, so the busy leg of the presence rule stops
+          // being attributed to whichever bot happened to resolve last.
+          if (this.#busyDepth === 0) this.#routedProfile = null;
+          this.refreshSoon("canonical chat resolved");
         }
-        return result;
       } finally {
-        this.#busyDepth = Math.max(0, this.#busyDepth - 1);
-        // Nothing is routed once the last turn drains, so the busy leg of the presence rule stops
-        // being attributed to whichever bot happened to resolve last.
-        if (this.#busyDepth === 0) this.#routedProfile = null;
         this.#chatInflight.delete(name);
-        this.refreshSoon("canonical chat resolved");
       }
     })();
     this.#chatInflight.set(name, run);
@@ -357,7 +366,30 @@ export class HermesBridge implements BotsSurface {
   }
 
   async sessions(name: string, limit: number): Promise<SessionRow[]> {
+    // Same guard as `canonicalChat`: `session.list` on an unknown profile answers empty rather than
+    // an error, which without this check reads as "this bot has no sessions" instead of "this bot
+    // does not exist".
+    await this.#assertBotKnown(name);
     return listBotSessions(this.#client, name, limit);
+  }
+
+  /** True when `name` names no Hermes profile at all, so a bug like Hermes' own `session.create`
+   *  tolerating a nonexistent profile (proven live: it happily minted a session for one) cannot
+   *  leak into this API as a successful chat open.
+   *
+   *  Cache-first, fresh on a miss, the same shape `#serverPinOf` already uses: the roster cache
+   *  answers a KNOWN bot without a round trip (a bot this bridge just created is already in it,
+   *  because `createBot` awaits its own refresh before answering), and a miss is checked against a
+   *  FRESH `profiles.list` rather than trusted, because the cache is also where a HIDDEN bot is
+   *  never going to be (`RosterBuildOptions.hidden` filters it out on purpose) even though it stays
+   *  chattable by name per the contract. A transport failure propagates rather than reading as
+   *  "unknown": the route's `failure()` handler already turns that into the right 502/503/504. */
+  async #assertBotKnown(name: string): Promise<void> {
+    const cached = this.#storage.botRoster().bots.some((bot) => bot.name === name);
+    if (cached) return;
+    const result = await this.#client.request("profiles.list", {});
+    const { profiles } = parseProfilesList(result);
+    if (!profiles.some((profile) => profile.name === name)) throw new BotNotFound(name);
   }
 
   /** History of a bot's canonical chat. Resolving the chat first is what makes this route usable

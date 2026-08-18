@@ -68,6 +68,10 @@ function canonicalName(c: Context<Env>): { name: string } | { response: Response
 }
 
 function failure(c: Context<Env>, err: unknown) {
+  // Checked first, ahead of every other mapping: a name that names no Hermes profile at all is not
+  // a backend failure of any kind, it is a 404 that says so, on every `/bots/:name/*` route the
+  // same way `DELETE /bots/:name` already answers it.
+  if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
   if (err instanceof HermesRpcError) {
     return c.json(
       {
