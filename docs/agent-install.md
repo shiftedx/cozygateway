@@ -374,7 +374,7 @@ curl -s -o /dev/null -w 'revoked:%{http_code}\n' -X DELETE \
 That is one command on purpose: the setup code, the token and the device id never leave the shell
 that made them.
 
-**Expect:** a JSON array, then `bots:200`, then `revoked:200`.
+**Expect:** a JSON object with a `bots` array (a fresh gateway answers `{"bots":[],...,"stale":true}` on the first read, which is fine), then `bots:200`, then `revoked:200`.
 
 - `bots:401` means the token was not sent or not accepted; re-run the whole block.
 - `bots:200` with `[]` is a **real pass**: the human has no visible bot profiles yet, or they are

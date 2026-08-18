@@ -1043,7 +1043,7 @@ if [ "$NO_START" = "0" ] && ! dry; then
     ok "GET /bots as a paired device -> 200; the throwaway install-check device was revoked"
     info "roster: $BOTS_JSON"
     case "$BOTS_JSON" in
-      "[]") info "the roster is EMPTY. That is a real 200, not a failure: the human has no visible bot profiles yet, or they are all in hiddenProfiles ($HIDDEN_PROFILES)." ;;
+      '{"bots":[]'*) info "the roster is EMPTY. That is a real 200, not a failure: the human has no visible bot profiles yet, or they are all in hiddenProfiles ($HIDDEN_PROFILES)." ;;
     esac
   fi
 fi
