@@ -368,6 +368,15 @@ export class Storage {
     return row?.sessionId;
   }
 
+  /** The pin plus the stamp of the write that made it. The stamp is what lets the bridge tell a
+   *  pin it wrote itself moments ago from one the cached roster has already had a chance to see,
+   *  which is the difference between adopting the existing chat and minting a duplicate. */
+  botChatPinEntry(name: string): { sessionId: string; updatedAt: number } | undefined {
+    return this.#db
+      .prepare("SELECT session_id AS sessionId, updated_at AS updatedAt FROM bot_chat_pins WHERE name = ?")
+      .get(name) as { sessionId: string; updatedAt: number } | undefined;
+  }
+
   botChatPins(): Map<string, string> {
     const rows = this.#db
       .prepare("SELECT name, session_id AS sessionId FROM bot_chat_pins")

@@ -1,4 +1,4 @@
-import type { BotSummary, ServerFrame } from "cozygateway-contract";
+import type { BotChatMessage, BotSummary, ServerFrame } from "cozygateway-contract";
 
 import type { Storage } from "../storage.ts";
 import { HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
@@ -6,10 +6,12 @@ import {
   resolveCanonicalChat,
   listBotSessions,
   type CanonicalChatResult,
+  type ChatAdoption,
   type PinStore,
   type SessionRow,
 } from "./canonical-chat.ts";
-import { buildRoster, parseProfilesList } from "./roster.ts";
+import { buildRoster, parseProfilesList, UI_META_KEY } from "./roster.ts";
+import { BotChatTurns } from "./chat-turns.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -53,7 +55,20 @@ export interface BotsSurface {
   refreshSoon(reason: string): void;
   canonicalChat(name: string): Promise<CanonicalChatResult>;
   sessions(name: string, limit: number): Promise<SessionRow[]>;
+  chatHistory(name: string): Promise<BotChatHistory>;
+  sendChatMessage(name: string, text: string): Promise<{ sessionId: string; message: BotChatMessage }>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
+}
+
+/** What `GET /bots/:name/chat/messages` answers with. `adoption` says how the chat was resolved,
+ *  which is the same value `GET /bots/:name/chat` reports. */
+export interface BotChatHistory {
+  sessionId: string;
+  adoption: ChatAdoption;
+  messages: BotChatMessage[];
+  running: boolean;
+  inflight: boolean;
+  updatedAt: number;
 }
 
 export interface HermesBridgeOptions {
@@ -66,6 +81,9 @@ export interface HermesBridgeOptions {
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
+  /** Turn-poll cadence and cap. Defaults are the desktop's own 2 s / 180 s. */
+  chatPollMs?: number;
+  chatTurnTimeoutMs?: number;
   logSink?: (line: string) => void;
 }
 
@@ -83,6 +101,7 @@ export class HermesBridge implements BotsSurface {
   readonly #focus = new Map<string, { screen: BotFocusScreen; at: number }>();
   readonly #chatInflight = new Map<string, Promise<CanonicalChatResult>>();
   readonly #pins: PinStore;
+  readonly #chat: BotChatTurns;
 
   /** The profile the Hermes gateway is routed to, and whether it is mid-turn. Both feed the
    *  presence rule (dissection 7.1). The bridge only knows the routed profile when it is the one
@@ -115,6 +134,14 @@ export class HermesBridge implements BotsSurface {
       set: (name, sessionId) => this.#storage.setBotChatPin(name, sessionId, this.#now()),
       clear: (name) => this.#storage.clearBotChatPin(name),
     };
+    this.#chat = new BotChatTurns({
+      rpc: this.#client,
+      broadcast: this.#broadcast,
+      now: this.#now,
+      log: this.#log,
+      ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
+      ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),
+    });
   }
 
   /** Wires the client's events and starts it. The first roster refresh runs as soon as the link
@@ -230,6 +257,7 @@ export class HermesBridge implements BotsSurface {
           pins: this.#pins,
           hideBotChats: this.#hideBotChats,
           serverPin,
+          saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId),
         });
       } finally {
         this.#busyDepth = Math.max(0, this.#busyDepth - 1);
@@ -248,6 +276,56 @@ export class HermesBridge implements BotsSurface {
     return listBotSessions(this.#client, name, limit);
   }
 
+  /** History of a bot's canonical chat. Resolving the chat first is what makes this route usable
+   *  as the app's only entry point: the app never has to know a session id.
+   *
+   *  A chat that was just created has no resumable row until its kickoff lands (dissection 5.1),
+   *  and Hermes answers that with an error. That case reads as an empty history rather than a
+   *  failure, since the messages arrive over `bot_chat` frames moments later. Any other failure
+   *  propagates so the route can pass the Hermes text through verbatim. */
+  async chatHistory(name: string): Promise<BotChatHistory> {
+    const chat = await this.canonicalChat(name);
+    try {
+      const snapshot = await this.#chat.history(name, chat.sessionId);
+      return {
+        sessionId: chat.sessionId,
+        adoption: chat.adoption,
+        messages: snapshot.messages,
+        running: snapshot.running,
+        inflight: snapshot.inflight,
+        updatedAt: this.#now(),
+      };
+    } catch (err) {
+      if (chat.adoption !== "created") throw err;
+      return {
+        sessionId: chat.sessionId,
+        adoption: chat.adoption,
+        messages: [],
+        running: false,
+        inflight: false,
+        updatedAt: this.#now(),
+      };
+    }
+  }
+
+  /** Submits into the canonical chat and leaves a turn poll running behind it. The reply is
+   *  delivered over `/ws`, never in this response. */
+  async sendChatMessage(name: string, text: string): Promise<{ sessionId: string; message: BotChatMessage }> {
+    const chat = await this.canonicalChat(name);
+    const message = await this.#chat.send(name, chat.sessionId, text);
+    return { sessionId: chat.sessionId, message };
+  }
+
+  /** Test seam: true while a turn poll is live for this bot. */
+  chatPolling(name: string): boolean {
+    return this.#chat.polling(name);
+  }
+
+  /** Test seam: resolves when the bot's live turn poll finishes. */
+  async chatSettled(name: string): Promise<void> {
+    await this.#chat.settled(name);
+  }
+
   setFocus(deviceId: string, screen: BotFocusScreen | null): void {
     if (screen === null) this.#focus.delete(deviceId);
     else this.#focus.set(deviceId, { screen, at: this.#now() });
@@ -256,6 +334,7 @@ export class HermesBridge implements BotsSurface {
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#chat.close();
     if (this.#pollTimer !== undefined) clearTimeout(this.#pollTimer);
     this.#pollTimer = undefined;
     if (this.#debounceTimer !== undefined) clearTimeout(this.#debounceTimer);
@@ -269,11 +348,49 @@ export class HermesBridge implements BotsSurface {
    *  the cache yet), the pin when the blob names one, and `null` otherwise, because a blob without
    *  a `chat` key is an authoritative clear (dissection 3.2). */
   #serverPinOf(name: string): string | null | undefined {
-    const cached = this.#storage.botRoster().bots.find((bot) => bot.name === name);
+    const roster = this.#storage.botRoster();
+    const cached = roster.bots.find((bot) => bot.name === name);
     if (cached === undefined) return undefined;
     const meta = cached.meta;
     if (meta === null) return undefined;
-    return typeof meta["chat"] === "string" ? meta["chat"] : null;
+    if (typeof meta["chat"] === "string") return meta["chat"];
+
+    // The blob carries no `chat`, which reads as an authoritative clear. It is only authoritative
+    // about state the snapshot could have seen: a pin this gateway wrote AFTER that snapshot was
+    // taken is newer than the server's answer, not contradicted by it. Without this the phone's
+    // own freshly created chat was thrown away on the very next open (the bridge does not write
+    // pins back to `ui_meta` yet), and, with the new session still unlisted because its kickoff
+    // had not landed, a SECOND canonical chat was minted: the live duplicate-adoption bug.
+    const local = this.#storage.botChatPinEntry(name);
+    if (local !== undefined && (roster.updatedAt === null || local.updatedAt > roster.updatedAt)) {
+      return undefined;
+    }
+    return null;
+  }
+
+  /** Writes the canonical-chat pin into the bot's `ui_meta`, the desktop's `saveBotMeta` (
+   *  dissection 3.1). The blob is REPLACED whole, so the cached blob is merged key-wise here
+   *  first, and the write counts as persisted only when `applied.ui_meta === true`; anything else
+   *  (an old gateway rejecting the method, a 64KB blob, a transient failure) leaves the pin
+   *  gateway-local, which still works, so nothing here is ever allowed to fail the caller. */
+  async #saveServerPin(name: string, sessionId: string): Promise<void> {
+    const cached = this.#storage.botRoster().bots.find((bot) => bot.name === name);
+    const meta = { ...(cached?.meta ?? {}), chat: sessionId };
+    try {
+      const result = await this.#client.request("profiles.configure", {
+        name,
+        ui_meta: { [UI_META_KEY]: meta },
+      });
+      const applied =
+        typeof result === "object" && result !== null
+          ? (result as Record<string, unknown>)["applied"]
+          : undefined;
+      const persisted =
+        typeof applied === "object" && applied !== null && (applied as Record<string, unknown>)["ui_meta"] === true;
+      if (!persisted) this.#log(`ui_meta pin writeback not applied for ${name}, keeping it gateway-local`);
+    } catch (err) {
+      this.#log(`ui_meta pin writeback failed for ${name}: ${err instanceof Error ? err.message : "unknown"}`);
+    }
   }
 
   #gatewayState(): "idle" | "connecting" | "open" | "busy" {
