@@ -1,5 +1,5 @@
 import type { HermesBridgeConfig } from "../config.ts";
-import type { HermesAuth } from "./client.ts";
+import { DEFAULT_AUTH_PROVIDER, type HermesAuth } from "./client.ts";
 
 export interface ParsedHermesOptions {
   url: string;
@@ -11,28 +11,40 @@ export interface ParsedHermesOptions {
  *  an origin, so `url: "ws://homelab:9119"` and `url: "ws://homelab:9119/api/ws"` behave alike. */
 const GATEWAY_WS_PATH = "/api/ws";
 
-/** Derives the dashboard's HTTP origin from the gateway WebSocket URL: ws -> http, wss -> https,
- *  path dropped. The login and ws-ticket endpoints are absolute paths off that origin. */
-function httpOriginOf(url: string): string {
+/** Parses the configured URL, or throws a message an operator can act on. Both auth modes go
+ *  through this: an unparseable or non-WebSocket URL must fail HERE, at startup, rather than
+ *  inside the client's connect path, where `new WebSocket()` throws synchronously with no
+ *  reconnect behind it and leaves the bots capability advertised over a dead bridge.
+ *
+ *  The scheme check is the load-bearing half: `new URL("homelab:8790/api/ws")` parses happily
+ *  (protocol "homelab:"), so a dropped `ws://` is caught only by demanding ws or wss. */
+function parseWsUrl(url: string): URL {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
     throw new Error(`hermes bridge: "${url}" is not a valid URL`);
   }
-  const protocol = parsed.protocol === "wss:" ? "https:" : parsed.protocol === "ws:" ? "http:" : parsed.protocol;
+  if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+    throw new Error(
+      `hermes bridge: "${url}" must be a ws:// or wss:// URL, not "${parsed.protocol}" (the gateway is a WebSocket)`,
+    );
+  }
+  return parsed;
+}
+
+/** Derives the dashboard's HTTP origin from the gateway WebSocket URL: ws -> http, wss -> https,
+ *  path dropped. The login and ws-ticket endpoints are absolute paths off that origin. */
+function httpOriginOf(url: string): string {
+  const parsed = parseWsUrl(url);
+  const protocol = parsed.protocol === "wss:" ? "https:" : "http:";
   return `${protocol}//${parsed.host}`;
 }
 
 /** Normalizes the WS URL so gated mode always lands on the JSON-RPC gateway path. A URL that
  *  already carries a path is left exactly as configured. */
 function gatewayWsUrl(url: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`hermes bridge: "${url}" is not a valid URL`);
-  }
+  const parsed = parseWsUrl(url);
   if (parsed.pathname === "" || parsed.pathname === "/") {
     parsed.pathname = GATEWAY_WS_PATH;
     return parsed.toString().replace(/\/$/, "");
@@ -81,6 +93,7 @@ export function parseHermesOptions(
         baseUrl: config.baseUrl ?? httpOriginOf(config.url),
         username,
         password,
+        provider: config.provider ?? DEFAULT_AUTH_PROVIDER,
       },
       hideBotChats,
     };
@@ -96,6 +109,9 @@ export function parseHermesOptions(
       `hermes bridge: environment variable "${tokenEnv}" is not set; the gateway credential rides the environment, never the config file`,
     );
   }
+  // Validated even though the value is used verbatim: token mode is the one path that never
+  // reparses the URL later, so this is the only place a typo can be caught before the dial.
+  parseWsUrl(config.url);
   return {
     url: config.url,
     auth: { mode: "token", token, param: config.authParam ?? "token" },

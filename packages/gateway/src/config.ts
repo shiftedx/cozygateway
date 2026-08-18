@@ -33,6 +33,11 @@ const HermesBridgeConfigSchema = Type.Object({
   /** Password mode: NAME of the env var holding the dashboard password. The value itself NEVER
    *  appears in the config file. */
   passwordEnv: Type.Optional(Type.String({ minLength: 1 })),
+  /** Password mode: which registered dashboard auth provider the login names. "basic" is the
+   *  bundled implementation and the default, not the protocol: a dashboard that registers another
+   *  password provider (an LDAP bind, say) names it here. A provider the dashboard does not know
+   *  answers 404, and the bridge says so by name. */
+  provider: Type.Optional(Type.String({ minLength: 1 })),
   /** Password mode: HTTP origin of the dashboard, e.g. http://homelab:9119. Defaults to the WS
    *  URL's origin with ws -> http and wss -> https. */
   baseUrl: Type.Optional(Type.String({ minLength: 1 })),

@@ -66,12 +66,22 @@ injects no token, so point the bridge at the password shape instead:
 }
 ```
 
-The bridge then logs in at `POST {origin}/auth/password-login` (provider `basic`), holds the
+The bridge then logs in at `POST {origin}/auth/password-login`, holds the
 session cookie in memory, and mints a FRESH single-use ticket at `POST {origin}/api/auth/ws-ticket`
 for every connect attempt, because one ticket is good for one upgrade within 30 seconds. The HTTP
 origin is derived from the WebSocket URL (`ws` to `http`, `wss` to `https`); override it with
 `"baseUrl"` when the dashboard is fronted elsewhere. A stale session re-logs in transparently; a
 rejected password fails closed with no retry storm.
+
+The login names an auth provider, `basic` by default. That is the implementation Hermes bundles,
+not the protocol: a dashboard that registers a different password provider (an LDAP bind, say)
+needs `"provider": "its-name"` in the same block. A provider the dashboard does not know answers a
+generic HTTP 404, and the bridge log says which provider it tried, so the mismatch is not mistaken
+for a bad password.
+
+The `url` must be `ws://` or `wss://`. A missing scheme is rejected at startup rather than at dial
+time, so a typo can never leave the bots capability advertised over a bridge that is dead for the
+life of the process.
 
 Relay:
 

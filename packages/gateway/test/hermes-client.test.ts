@@ -205,6 +205,39 @@ describe("gated password auth", () => {
     expect(lines.join("")).not.toContain("not-the-password");
   });
 
+  it("logs in against a configured non-basic provider", async () => {
+    const server = await gatedServer({ gated: { username: USERNAME, password: PASSWORD, provider: "ldap" } });
+    const c = gatedClient(server, {
+      auth: {
+        mode: "password",
+        baseUrl: server.baseUrl,
+        username: USERNAME,
+        password: PASSWORD,
+        provider: "ldap",
+      },
+    });
+    c.start();
+    await until(() => c.state() === "online");
+    expect(server.loginCount()).toBe(1);
+  });
+
+  it("names the provider when the dashboard does not register it (HTTP 404)", async () => {
+    const server = await gatedServer({ gated: { username: USERNAME, password: PASSWORD, provider: "ldap" } });
+    const lines: string[] = [];
+    // Default provider "basic" against a dashboard that only registers "ldap": upstream answers a
+    // generic 404, so the message has to say which provider was tried.
+    const c = gatedClient(server, { logSink: (line) => lines.push(line) });
+    c.start();
+    await until(() => c.state() === "absent" && server.loginCount() >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expect(server.loginCount()).toBe(1);
+    expect(server.totalConnections()).toBe(0);
+    expect(lines.join("")).toContain('no password auth provider named "basic"');
+    expect(lines.join("")).toContain("HTTP 404");
+    expect(lines.join("")).not.toContain(PASSWORD);
+  });
+
   it("retries with backoff when the dashboard is unreachable", async () => {
     const server = await gatedServer();
     const lines: string[] = [];

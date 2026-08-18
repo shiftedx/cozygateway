@@ -37,7 +37,13 @@ export interface FakeHermesBehavior {
    *  `POST /auth/password-login` mints a session cookie, `POST /api/auth/ws-ticket` mints a
    *  single-use ticket against that cookie, and the WS upgrade is accepted only for a live,
    *  unconsumed ticket (anything else is closed 4401). */
-  gated?: { username: string; password: string };
+  gated?: {
+    username: string;
+    password: string;
+    /** The one password provider this dashboard registers. Any other name answers 404, the way
+     *  upstream does for an unknown or non-password provider. Default "basic". */
+    provider?: string;
+  };
   /** Gated mode: ticket lifetime in ms. 0 means every minted ticket is already expired, which is
    *  how the expiry path is exercised. Default 30000, matching upstream TTL_SECONDS. */
   ticketTtlMs?: number;
@@ -126,7 +132,7 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
           return;
         }
         // Upstream answers 404 for an unknown or non-password provider, deliberately generic.
-        if (body["provider"] !== "basic") {
+        if (body["provider"] !== (gated.provider ?? "basic")) {
           send(404, { detail: "Unknown provider" });
           return;
         }

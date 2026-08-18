@@ -58,9 +58,50 @@ describe("hermes bridge options", () => {
         baseUrl: "http://homelab:9119",
         username: "cozybridge",
         password: "s3cret",
+        provider: "basic",
       },
       hideBotChats: true,
     });
+  });
+
+  it("defaults the dashboard auth provider to basic and passes a configured one through", () => {
+    const parsed = parseHermesOptions(
+      {
+        url: "ws://homelab:9119/api/ws",
+        authMode: "password",
+        username: "cozybridge",
+        passwordEnv: "HERMES_DASH_PASSWORD",
+        provider: "ldap",
+      },
+      { HERMES_DASH_PASSWORD: "s3cret" },
+    );
+    expect(parsed.auth).toMatchObject({ provider: "ldap" });
+  });
+
+  it("rejects a URL that is unparseable or not a WebSocket scheme, in both auth modes", () => {
+    // The killer typo: `new URL("homelab:8790/api/ws")` PARSES, so only a scheme check catches it,
+    // and unvalidated it reaches `new WebSocket()` inside the connect path where it throws with
+    // no reconnect behind it.
+    expect(() =>
+      parseHermesOptions({ url: "homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" }, { HERMES_TOKEN: "s3cret" }),
+    ).toThrow(/ws:\/\/ or wss:\/\//);
+    expect(() =>
+      parseHermesOptions({ url: "http://homelab:8790", tokenEnv: "HERMES_TOKEN" }, { HERMES_TOKEN: "s3cret" }),
+    ).toThrow(/ws:\/\/ or wss:\/\//);
+    expect(() =>
+      parseHermesOptions({ url: "not a url", tokenEnv: "HERMES_TOKEN" }, { HERMES_TOKEN: "s3cret" }),
+    ).toThrow(/is not a valid URL/);
+    expect(() =>
+      parseHermesOptions(
+        {
+          url: "homelab:9119",
+          authMode: "password",
+          username: "cozybridge",
+          passwordEnv: "HERMES_DASH_PASSWORD",
+        },
+        { HERMES_DASH_PASSWORD: "s3cret" },
+      ),
+    ).toThrow(/ws:\/\/ or wss:\/\//);
   });
 
   it("fills in the gateway path for an origin-only URL and honours an explicit baseUrl", () => {
@@ -80,6 +121,7 @@ describe("hermes bridge options", () => {
       baseUrl: "https://dash.example",
       username: "cozybridge",
       password: "s3cret",
+      provider: "basic",
     });
   });
 
@@ -207,5 +249,20 @@ describe("startGateway with a hermes bridge", () => {
         hermes: { url: "ws://127.0.0.1:1/api/ws", tokenEnv: "MISSING_HERMES_TOKEN" },
       }),
     ).rejects.toThrow(/MISSING_HERMES_TOKEN/);
+  });
+
+  it("fails startup on a malformed bridge URL instead of advertising a dead bridge", async () => {
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    await expect(
+      startGateway({
+        name: "e2e",
+        port: 0,
+        dbPath: ":memory:",
+        turnTimeoutSeconds: 0,
+        agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+        hermes: { url: "homelab:8790/api/ws", tokenEnv: "TEST_HERMES_TOKEN" },
+      }),
+    ).rejects.toThrow(/ws:\/\/ or wss:\/\//);
+    delete process.env["TEST_HERMES_TOKEN"];
   });
 });

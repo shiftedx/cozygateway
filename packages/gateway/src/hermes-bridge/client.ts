@@ -18,7 +18,7 @@ import { WebSocket } from "ws";
  *    gateway. The one bounded exception is password mode, where a 4401 can mean nothing worse
  *    than a single-use ticket that lost its 30s race; see MAX_TICKET_RETRIES.
  *  - password mode speaks the gated dashboard's HTTP handshake before every dial:
- *    `POST {base}/auth/password-login` (JSON, provider "basic") mints session cookies, then
+ *    `POST {base}/auth/password-login` (JSON, provider "basic" unless configured) mints cookies,
  *    `POST {base}/api/auth/ws-ticket` mints a SINGLE-USE ticket with a 30s TTL. A fresh ticket is
  *    required for every connect attempt, so the mint sits inside the reconnect loop, not beside
  *    it. Cookie state lives in this closure and nowhere else.
@@ -76,6 +76,10 @@ export const MAX_TICKET_RETRIES = 2;
 /** Bounds each HTTP leg of the gated handshake (login, ws-ticket mint). */
 export const DEFAULT_AUTH_HTTP_TIMEOUT_MS = 10_000;
 
+/** The password provider a stock Hermes dashboard bundles. It is one implementation of an
+ *  extension point, not the protocol, so it is a default and not a constant of the wire. */
+export const DEFAULT_AUTH_PROVIDER = "basic";
+
 /** How the client authenticates the WS upgrade.
  *  - "token": the loopback shape. The value rides the upgrade URL as `?token=` (or `?ticket=`
  *    for a pre-minted ticket) and is reused on every reconnect.
@@ -89,6 +93,10 @@ export type HermesAuth =
       baseUrl: string;
       username: string;
       password: string;
+      /** Which registered password provider the login names. `basic` is the bundled one, not the
+       *  protocol: a dashboard can register others (LDAP bind and so on), and upstream answers a
+       *  deliberately generic 404 for a provider it does not know. Default `basic`. */
+      provider?: string;
     };
 
 /** Raised when the gated dashboard rejected the identity itself (bad password, unknown provider).
@@ -369,13 +377,18 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
   /** Gated leg 1: exchange username/password for session cookies. The password is written to the
    *  request body and never anywhere else; no branch of this function logs a credential. */
-  async function login(baseUrl: string, username: string, password: string): Promise<void> {
+  async function login(
+    baseUrl: string,
+    username: string,
+    password: string,
+    provider: string,
+  ): Promise<void> {
     let response: Response;
     try {
       response = await fetch(`${baseUrl}/auth/password-login`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ provider: "basic", username, password, next: "/" }),
+        body: JSON.stringify({ provider, username, password, next: "/" }),
         redirect: "manual",
         signal: AbortSignal.timeout(authHttpTimeoutMs),
       });
@@ -384,9 +397,17 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     }
     // Drain the body so the socket is released back to the agent pool either way.
     await response.text().catch(() => "");
-    if (response.status === 401 || response.status === 403 || response.status === 404) {
-      // 401 = bad credentials, 404 = unknown provider or one without password support. Both mean
-      // the configured identity will never work; an operator has to fix the config.
+    if (response.status === 404) {
+      // Upstream answers a deliberately generic 404 for both "no such provider" and "this provider
+      // has no password support". Naming the provider is the only way an operator can tell that
+      // apart from a bad password, which is what the 401 branch below means.
+      throw new TerminalAuthError(
+        `hermes has no password auth provider named "${provider}" (HTTP 404); set "provider" in the hermes bridge config to one the dashboard registers`,
+      );
+    }
+    if (response.status === 401 || response.status === 403) {
+      // The identity itself was refused. It will not become valid by retrying; an operator has to
+      // fix the config.
       throw new TerminalAuthError(`hermes rejected the bridge login (HTTP ${response.status})`);
     }
     if (!response.ok) throw new Error(`hermes login failed (HTTP ${response.status})`);
@@ -436,13 +457,14 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
    *  the held session turns out to be stale. */
   async function resolveCredential(): Promise<{ param: string; value: string }> {
     if (auth.mode === "token") return { param: auth.param ?? "token", value: auth.token };
-    if (sessionCookie === undefined) await login(auth.baseUrl, auth.username, auth.password);
+    const provider = auth.provider ?? DEFAULT_AUTH_PROVIDER;
+    if (sessionCookie === undefined) await login(auth.baseUrl, auth.username, auth.password, provider);
     try {
       return { param: "ticket", value: await mintTicket(auth.baseUrl) };
     } catch (err) {
       if (!(err instanceof SessionExpiredError)) throw err;
       log("hermes session expired; logging in again");
-      await login(auth.baseUrl, auth.username, auth.password);
+      await login(auth.baseUrl, auth.username, auth.password, provider);
       return { param: "ticket", value: await mintTicket(auth.baseUrl) };
     }
   }
@@ -468,7 +490,16 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
         return;
       }
       if (closed || refused || attemptGeneration !== generation) return;
-      dial(credential.param, credential.value);
+      try {
+        dial(credential.param, credential.value);
+      } catch (err) {
+        // `new WebSocket()` throws SYNCHRONOUSLY on a malformed URL. Inside this IIFE that would
+        // otherwise surface as an unhandled rejection with no reconnect behind it, leaving the
+        // bridge dead for the process lifetime. Config validation catches the common typo at
+        // startup; this is the belt.
+        log(`could not dial hermes: ${(err as Error).message}`);
+        scheduleReconnect();
+      }
     })();
   }
 
