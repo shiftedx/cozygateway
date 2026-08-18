@@ -286,7 +286,7 @@ interface Harness {
 
 async function setup(
   behavior: FakeHermesBehavior,
-  overrides: { turnTimeoutMs?: number; dbPath?: string } = {},
+  overrides: { turnTimeoutMs?: number; dbPath?: string; hiddenProfiles?: string[]; rosterPollMs?: number } = {},
 ): Promise<Harness> {
   const server = await startFakeHermesServer(behavior);
   servers.push(server);
@@ -313,6 +313,8 @@ async function setup(
     chatPollMs: 10,
     chatTurnTimeoutMs: overrides.turnTimeoutMs ?? 3_000,
     groupChainDelayMs: 10,
+    ...(overrides.hiddenProfiles === undefined ? {} : { hiddenProfiles: overrides.hiddenProfiles }),
+    ...(overrides.rosterPollMs === undefined ? {} : { rosterPollMs: overrides.rosterPollMs }),
   });
   bridges.push(bridge);
 
@@ -1136,6 +1138,58 @@ describe("rooms say why they stopped", () => {
     // A skipped member keeps its watermark: it never read the room, so a bot restored under the same
     // name picks up from where it was rather than from a conversation it was absent for.
     expect(harness.storage.botGroupMembers("release room").get("luna")?.watermark ?? 0).toBe(0);
+  });
+
+  /** A HIDDEN bot is a real bot the gateway keeps out of its roster views. The cheap cache gate
+   *  reads that filtered roster, so it answers "not a bot" for a hidden member of a room, every
+   *  round, forever: the room reported her gone and never asked her anything, while she sat there
+   *  in `profiles.list` the whole time. The fresh check is what the skip has to clear, which is why
+   *  a negative from the cache only buys a round trip and never the verdict. */
+  it("still asks a hidden bot that the roster cache cannot see", async () => {
+    const { behavior } = fakeGroupHermes({ replies: { scout: ["I will cover it"], luna: ["so will I"] } });
+    const harness = await setup(behavior, { hiddenProfiles: ["luna"] });
+    // The premise: hidden means absent from the roster, present in hermes.
+    expect(harness.bridge.roster().bots.map((bot) => bot.name)).not.toContain("luna");
+    await createRoom(harness);
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "who is on this" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    expect(harness.prompts().map((prompt) => prompt.profile)).toContain("luna");
+    const detail = (await (await harness.authed("/bots/groups/Release%20Room")).json()) as BotGroupDetail;
+    expect(detail.messages.map((message) => message.text)).toContain("so will I");
+    const notes = stateFrames(harness.frames).flatMap((frame) => (frame.note === undefined ? [] : [frame.note]));
+    expect(notes.some((note) => note.detail.includes("no longer a bot"))).toBe(false);
+  });
+
+  /** The guard's PRICE, pinned. It used to be asked once per member per round, which on a live room
+   *  meant a `profiles.list` (every profile's `ui_meta`, up to 64 KB each) on every healthy turn.
+   *  Asking inside `ensureGroupSession`'s create arm instead makes a room that already has its
+   *  sessions cost nothing at all, which is what this measures: a second send, no new reads. */
+  it("costs no profile reads on a send whose sessions already exist", async () => {
+    const { behavior } = fakeGroupHermes({ alwaysSpeak: true });
+    // The roster poll reads the same method on its own timer; parked well past this test so the
+    // count below is the room's alone.
+    const harness = await setup(behavior, { rosterPollMs: 600_000 });
+    await createRoom(harness);
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "first pass" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+    const afterFirst = harness.server.callsOf("profiles.list").length;
+
+    await harness.authed("/bots/groups/Release%20Room/messages", {
+      method: "POST",
+      body: JSON.stringify({ text: "second pass" }),
+    });
+    await harness.bridge.groupSettled("Release Room");
+
+    expect(harness.server.callsOf("profiles.list").length).toBe(afterFirst);
   });
 });
 

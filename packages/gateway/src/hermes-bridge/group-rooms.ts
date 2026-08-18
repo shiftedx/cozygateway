@@ -21,7 +21,7 @@ import {
   type GroupLogEntry,
   type GroupMember,
 } from "./group-protocol.ts";
-import { ensureGroupSession, runMemberTurn, type GroupTurnResult } from "./group-turn.ts";
+import { MemberGone, ensureGroupSession, runMemberTurn, type GroupTurnResult } from "./group-turn.ts";
 
 /** Server-side group chats: durable rooms whose deliberation rounds run HERE rather than in a
  *  client (spec section 4, the one deliberate deviation from the Hermes desktop).
@@ -108,12 +108,25 @@ export interface GroupRoomsOptions {
   /** Cache-only, synchronous "is this still a bot?", read at every member boundary so a member
    *  deleted after the room was created is skipped with a note instead of burning a whole failed
    *  turn per round forever. Answers `undefined` when the roster cache cannot tell (a cold cache),
-   *  which reads as "assume it is still there": a cold cache must never shrink a room. */
+   *  which reads as "assume it is still there": a cold cache must never shrink a room.
+   *
+   *  It is a HINT and never the last word. A `false` here only nominates a member for the
+   *  authoritative `memberExists` check below, because the cache this reads is filtered (hidden
+   *  bots are not in it at all) and a member it cannot see is not the same thing as a member that
+   *  is not there. */
   memberKnown?: (name: string) => boolean | undefined;
-  /** Authoritative "is this still a bot?", asked at the LAST boundary before a member's turn can
-   *  mint a session. Costs a round trip, which the cheap `memberKnown` gate above spares whenever
-   *  the cache is already sure. It must not throw, and must answer `true` when it cannot tell: a
-   *  gateway that cannot reach Hermes has learned nothing about who is still a bot. */
+  /** Authoritative "is this still a bot?", answered from a FRESH read. Asked in exactly two places,
+   *  both of which cost a round trip only when something is actually at stake:
+   *
+   *  - when the cheap `memberKnown` gate says `false`, to confirm the news before a member is
+   *    skipped for the rest of the room's life; and
+   *  - inside `ensureGroupSession`'s CREATE arm, the instant before `session.create`, which is the
+   *    one call that turns an unknown name into a NEW profile.
+   *
+   *  A member whose session already resolves therefore costs nothing, which is the whole point: the
+   *  earlier shape of this guard asked once per member per round and burned a `profiles.list` on
+   *  every healthy turn. It must not throw, and must answer `true` when it cannot tell: a gateway
+   *  that cannot reach Hermes has learned nothing about who is still a bot. */
   memberExists?: (name: string) => Promise<boolean>;
   /** Called when a member's reply mentions `@user`, i.e. the room needs the human. The room has
    *  already set its durable `needs you` state and emitted its frame by then; this is the OUT OF
@@ -435,8 +448,20 @@ export class GroupRooms {
           // A member deleted after the room was created is not a turn worth spending: the profile
           // is gone, the session cannot resolve, and without this the room burns one failed turn on
           // it every round, forever.
-          if (this.#memberKnown(member.name) === false) {
-            this.#emitState(current, "running", round, goneNote(member), startEpoch);
+          //
+          // The cache alone must NOT be allowed to end a member's participation, though, and this
+          // is the ordering that bug taught: the roster cache is built FILTERED, so a bot the
+          // gateway hides is absent from it while being perfectly real in Hermes. Left to itself
+          // this gate answered `false` for such a member every round and reported it gone forever,
+          // which is precisely the silent shrinking the gate exists to prevent. So a negative cache
+          // answer only buys the round trip: the fresh read is what decides.
+          if (this.#memberKnown(member.name) === false && !(await this.#memberExists(member.name))) {
+            // The gate now awaits, so the room it emits against has to be re-read: the same
+            // boundary conditions the top of this loop checks can all have happened meanwhile.
+            if (this.#closed || this.#generation(key) !== startGeneration) return;
+            const live = this.#storage.botGroup(key);
+            if (live === undefined || live.epoch !== startEpoch) return;
+            this.#emitState(live, "running", round, goneNote(member), startEpoch);
             continue;
           }
 
@@ -545,19 +570,22 @@ export class GroupRooms {
     storedId?: string;
   }): Promise<GroupTurnResult> {
     const { key, groupName, member, members, delta, startEpoch, startGeneration, storedId } = args;
-    // The LAST boundary before this turn can mint anything, and the one the `memberKnown` gate at
-    // the top of the round cannot cover: that gate reads a snapshot, and a member deleted since the
-    // snapshot was taken still reads as present there. `ensureGroupSession` falls through to
-    // `session.create` when neither session lookup lands, and Hermes 0.20.x auto-creates a profile
-    // for a name it does not know, so an unchecked name here does not fail: it RESURRECTS the bot.
-    if (!(await this.#memberExists(member.name))) return { outcome: "gone" };
     let session;
     try {
       session = await ensureGroupSession(this.#rpc, member.name, groupName, {
         ...(storedId === undefined ? {} : { storedId }),
         hidden: this.#hidden,
+        // Handed DOWN rather than run here, so it fires on the one arm that can mint a profile and
+        // fires there immediately before `session.create`. Checking at the top of this method
+        // instead would pay a round trip on every healthy turn and still leave the whole of
+        // `ensureGroupSession` (up to two full transcript reads) inside the window.
+        assertStillExists: async () => {
+          if (!(await this.#memberExists(member.name))) throw new MemberGone(member.name);
+        },
       });
     } catch (err) {
+      // Not a failed turn: nothing was asked, because there is nobody left to ask.
+      if (err instanceof MemberGone) return { outcome: "gone" };
       const detail = err instanceof Error ? err.message : "unknown failure";
       this.#log(`group ${groupName}: session for ${member.name} failed: ${detail}`);
       return { outcome: "failed", detail };
@@ -630,8 +658,8 @@ export class GroupRooms {
 }
 
 /** What a room says about a member that is no longer a bot here. One wording for both places that
- *  can discover it (the cheap cache gate at the top of a member's slot, and the authoritative check
- *  at the turn boundary), because to a reader they are the same event.
+ *  can discover it (the cache gate at the top of a member's slot, once its fresh read confirms the
+ *  news, and `ensureGroupSession`'s create arm), because to a reader they are the same event.
  *
  *  `failed` is the reason because the contract's note has three (`timeout`, `failed`, `capped`) and
  *  this is not a timeout or a cap. The detail is what carries the meaning. */
