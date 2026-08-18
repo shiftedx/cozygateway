@@ -7,6 +7,9 @@ import {
   BotFocusRequestSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
+  BotRoutineCreateRequestSchema,
+  BotRoutinePatchSchema,
+  BotRoutineSchema,
   BotSummarySchema,
   ServerFrameSchema,
   check,
@@ -138,6 +141,61 @@ describe("profile", () => {
     expect(check(BotProfileSchema, base)).toBe(false);
     expect(check(BotProfileSchema, { ...base, runtimeInert: [] })).toBe(true);
     expect(check(BotProfileSchema, { ...base, runtimeInert: ["skills"] })).toBe(false);
+  });
+});
+
+describe("routines", () => {
+  const routine = {
+    id: "job_7f2c19",
+    title: "Morning digest",
+    schedule: { raw: "every 120m", human: "Every 2h" },
+    enabled: true,
+    legacyUnsafe: false,
+    lastRun: null,
+    nextRun: 1_800_000_600_000,
+  };
+
+  it("accepts a minimal routine and one carrying every optional field", () => {
+    expect(check(BotRoutineSchema, routine)).toBe(true);
+    expect(
+      check(BotRoutineSchema, {
+        ...routine,
+        state: "paused",
+        autoPaused: true,
+        prompt: "check the build...",
+        lastStatus: "success",
+        // A DISPLAY string, never a number: the remaining run count is not recoverable from it.
+        repeat: "1/3",
+        continuity: true,
+      }),
+    ).toBe(true);
+    expect(check(BotRoutineSchema, { ...routine, repeat: 3 })).toBe(false);
+    // Timestamps are nullable but never absent, so a client has one shape to read.
+    expect(check(BotRoutineSchema, { ...routine, nextRun: "2026-08-18T09:00:00Z" })).toBe(false);
+  });
+
+  it("refuses a NUL and a whitespace-only field on a create", () => {
+    const create = { title: "Digest", schedule: "0 9 * * *", prompt: "summarize the overnight builds" };
+    expect(check(BotRoutineCreateRequestSchema, create)).toBe(true);
+    // A prompt spans lines, so the NUL rule cannot be a `.`-based pattern.
+    expect(check(BotRoutineCreateRequestSchema, { ...create, prompt: "summarize\nthe builds" })).toBe(true);
+    expect(check(BotRoutineCreateRequestSchema, { ...create, title: "Dig\u0000est" })).toBe(false);
+    expect(check(BotRoutineCreateRequestSchema, { ...create, prompt: "sum\u0000marize" })).toBe(false);
+    expect(check(BotRoutineCreateRequestSchema, { ...create, title: "   " })).toBe(false);
+    expect(check(BotRoutineCreateRequestSchema, { ...create, repeat: 0 })).toBe(false);
+  });
+
+  it("takes any single field on a patch, including the row switch alone", () => {
+    expect(check(BotRoutinePatchSchema, { enabled: false })).toBe(true);
+    expect(check(BotRoutinePatchSchema, { title: "Digest v2", prompt: "summarize" })).toBe(true);
+    // Emptiness is refused at the schema level for each field; "no fields at all" is the route's
+    // rule, since an empty object is a legal patch shape.
+    expect(check(BotRoutinePatchSchema, { title: "" })).toBe(false);
+  });
+
+  it("carries bot_routines in the ServerFrame union", () => {
+    const frame: ServerFrame = { type: "bot_routines", bot: "scout", routines: [routine], updatedAt: 1_800_000_000_000 };
+    expect(check(ServerFrameSchema, frame)).toBe(true);
   });
 });
 

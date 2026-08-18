@@ -1,4 +1,4 @@
-/** Vendor extension `com.cozylabs.bots`, version 3. NOT part of the frozen `contract: "v1"`
+/** Vendor extension `com.cozylabs.bots`, version 4. NOT part of the frozen `contract: "v1"`
  *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
  *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
  *  advertise the capability never emits these frames, and a client that does not recognize the
@@ -348,7 +348,8 @@ export type BotRoutineListResponse = Static<typeof BotRoutineListResponseSchema>
 /** A schedule string and a routine title both reach a shell-quoted command line and a cron store,
  *  so a NUL is refused at the boundary the way the desktop refuses it, and a name must carry at
  *  least one non-whitespace character. */
-const RoutineText = (max: number) => Type.String({ minLength: 1, maxLength: max, pattern: "^[^\\u0000]*\\S[^\\u0000]*$" });
+const RoutineText = (max: number) =>
+  Type.String({ minLength: 1, maxLength: max, pattern: "^(?![\\s\\S]*\\u0000)[\\s\\S]*\\S[\\s\\S]*$" });
 
 /** `POST /bots/:name/routines` body. `schedule` is the RAW Hermes schedule string, composed by the
  *  client exactly as the desktop's picker composes it (`30m`, `every 1h`, `0 9 * * *`,

@@ -288,7 +288,13 @@ export async function listBotRoutines(rpc: HermesRpc, bot: string): Promise<Rout
   const paused = await Promise.all(
     legacyActive.map(async (job) => {
       try {
-        await rpc.request("cron.manage", { action: "pause", name: asString(job.job_id) ?? "", profile: bot });
+        // Inspected, not merely awaited: a refusal arrives as a SUCCESSFUL result carrying
+        // `success: false`, and claiming a pause that did not happen is the one thing this overlay
+        // must never do.
+        readCronReply(
+          "pause",
+          await rpc.request("cron.manage", { action: "pause", name: asString(job.job_id) ?? "", profile: bot }),
+        );
         return asString(job.job_id) ?? "";
       } catch {
         return undefined;

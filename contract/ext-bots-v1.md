@@ -914,8 +914,9 @@ Three properties of that behavior are load-bearing and a client should not work 
 body { title: string, schedule: string, prompt: string, repeat?: integer, continuity?: boolean }
 201  { name: string, routine: BotRoutine }
 400  invalid_request                  // malformed body, or a NUL in title/schedule/prompt
-400  invalid_request + hermesError    // hermes refused: an unparsable schedule is the usual one
+400  invalid_request + hermesError    // hermes ANSWERED with a refusal (`success: false`)
 404  not_found                        // no profile named `name` exists
+502  backend_unavailable + hermesError // hermes REJECTED the call: an unparsable schedule is this
 ```
 
 `schedule` is the RAW Hermes schedule string, composed exactly as the desktop's picker composes it.
@@ -939,6 +940,12 @@ no `1h30m`, no weeks, and no natural language. A cron expression must be 5 or 6 
 one-shot and is anchored to the backend's configured timezone. Anything else is refused, and the
 backend's own four-line usage message comes back in `hermesError`.
 
+Two failure shapes, and they mean different things. A schedule the backend cannot PARSE raises
+inside Hermes and comes back as a rejection: **502** with the usage message in `hermesError`. A cron
+call Hermes ANSWERS with `success: false` (a job id that resolves to nothing, a validation refusal)
+is not a backend failure at all, and comes back as **400** with the backend's text in `hermesError`,
+because the input was the client's.
+
 `repeat` is "stop after N runs", blank meaning forever; the desktop offers it for every frequency
 except Once and Advanced. `continuity: true` injects the previous run's output into the next run's
 prompt (it does NOT reuse a session; see below).
@@ -955,8 +962,9 @@ body { title?: string, schedule?: string, prompt?: string, enabled?: boolean,
        repeat?: integer, continuity?: boolean }
 200  { name: string, routine: BotRoutine, replacedId?: string, orphanedId?: string }
 400  invalid_request                  // no fields, or title/schedule without prompt
-400  invalid_request + hermesError    // hermes refused
+400  invalid_request + hermesError    // hermes ANSWERED with a refusal (`success: false`)
 404  not_found                        // no profile named `name`, or no routine `id` for this bot
+502  backend_unavailable + hermesError // hermes REJECTED the call
 ```
 
 Two very different operations, and the difference is the backend's rather than this API's invention:
@@ -995,7 +1003,7 @@ Two rules follow from the backend and cannot be papered over:
 ```
 204                                   // gone
 404 not_found                         // no profile named `name`, or no routine `id` for this bot
-400 invalid_request + hermesError     // hermes refused the removal
+400 invalid_request + hermesError     // hermes answered the removal with a refusal
 ```
 
 Not idempotent: a second delete answers 404, by the same rule `DELETE /bots/:name` follows. An id
