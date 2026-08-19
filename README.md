@@ -32,8 +32,8 @@ The playbook is written for the agent, not for you: every step carries a check c
 
 ## Status
 
-- Shipped: contract v1 (frozen), reference gateway, conformance suite, attach backend adapter, push relay + encrypted push origination (`contract/push-v0.md`).
-- Planned: the phone app, platform push transports (APNs), TLS for the phone link, additional backend adapters.
+- Shipped: contract v1 (frozen), reference gateway, conformance suite, attach backend adapter, push relay + encrypted push origination (`contract/push-v0.md`), TLS for the phone link (gateway-native, or a shipped Caddy sidecar example; `docs/tls.md`).
+- Planned: the phone app, platform push transports (APNs), additional backend adapters.
 
 ## Repo layout
 
@@ -46,7 +46,7 @@ The playbook is written for the agent, not for you: every step carries a check c
 
 ## Privacy model
 
-Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS with trust-on-first-use certificate pinning for the phone link is planned; see `packages/gateway/README.md` for the current, loopback-only reachability model. The push relay carries ciphertext only and is open source so you can host your own.
+Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS for the phone link ships two ways, gateway-native or a Caddy sidecar example, and the app pins the certificate on first use; see `docs/tls.md`. Plain HTTP remains the default, for boxes that already terminate TLS in front. The push relay carries ciphertext only and is open source so you can host your own.
 
 ## Development
 

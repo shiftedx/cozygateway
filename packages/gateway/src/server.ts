@@ -1,4 +1,5 @@
 import type { Server } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 
 import { serve } from "@hono/node-server";
 import { BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type GatewayInfo } from "cozygateway-contract";
@@ -19,6 +20,7 @@ import { createUpgradeDispatcher, type UpgradeHandler } from "./upgrade-dispatch
 import { createHermesClient } from "./hermes-bridge/client.ts";
 import { parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge } from "./hermes-bridge/bridge.ts";
+import { resolveTlsMaterial } from "./tls.ts";
 
 export const GATEWAY_VERSION = "0.1.0";
 
@@ -50,6 +52,12 @@ export async function startGateway(
   config: GatewayConfig,
   options: StartGatewayOptions = {},
 ): Promise<RunningGateway> {
+  // First thing, before the database is opened or a single socket is dialed: if the operator asked
+  // for TLS, prove the pair is usable. Absent config resolves to undefined and every line below
+  // behaves exactly as it did before TLS existed. Present-but-broken throws here, so the failure is
+  // a refusal to start rather than a plaintext listener on a port believed to be encrypted.
+  const tls = resolveTlsMaterial(config.tls);
+  const scheme = tls === undefined ? "http" : "https";
   const storage = openStorage(config.dbPath);
   for (const agent of config.agents) {
     storage.upsertAgent({ id: agent.id, name: agent.name, avatar: agent.avatar ?? null, backend: agent.backend });
@@ -204,9 +212,23 @@ export async function startGateway(
   });
 
   const server = await new Promise<Server>((resolve) => {
-    const s = serve({ fetch: app.fetch, port: config.port, hostname: config.host ?? "127.0.0.1" }, () => {
-      resolve(s as Server);
-    });
+    // The TLS branch swaps only the factory and its options; the fetch handler, the port, the
+    // hostname, and the upgrade dispatcher below are identical either way. https.Server extends
+    // http.Server, so everything downstream (including the 'upgrade' listener that carries /ws and
+    // /attach, which therefore become wss automatically) is unchanged.
+    const s = serve(
+      {
+        fetch: app.fetch,
+        port: config.port,
+        hostname: config.host ?? "127.0.0.1",
+        ...(tls === undefined
+          ? {}
+          : { createServer: createHttpsServer, serverOptions: { cert: tls.cert, key: tls.key } }),
+      },
+      () => {
+        resolve(s as Server);
+      },
+    );
   });
   // Two ws WebSocketServer instances constructed with {server, path} on the SAME http.Server
   // would each attach their own 'upgrade' listener, and Node invokes both for every request; the
@@ -228,7 +250,7 @@ export async function startGateway(
   const port = address !== null && typeof address === "object" ? address.port : config.port;
 
   return {
-    url: `http://${config.host ?? "127.0.0.1"}:${port}`,
+    url: `${scheme}://${config.host ?? "127.0.0.1"}:${port}`,
     port,
     storage,
     issueSetupCode: () => {

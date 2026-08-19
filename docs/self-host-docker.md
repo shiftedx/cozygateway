@@ -39,6 +39,8 @@ Gateway:
 | `COZYGATEWAY_DB_PATH` | `cozygateway.db` (image sets `/data/cozygateway.db`) | SQLite path |
 | `COZYGATEWAY_ATTACH_TOKEN` | (required for the attach config) | bearer token the plugin presents on `/attach` |
 | `COZYGATEWAY_HERMES_URL` | (config value) | retargets the optional hermes bots bridge; ignored when no bridge is configured |
+| `COZY_TLS_CERT_FILE` | (unset: plain HTTP) | PEM certificate chain; set with the key to serve HTTPS (`docs/tls.md`) |
+| `COZY_TLS_KEY_FILE` | (unset: plain HTTP) | matching unencrypted PEM private key |
 
 ### Optional: the hermes bots bridge
 
@@ -148,11 +150,24 @@ Relay:
 | --- | --- | --- |
 | `COZY_RELAY_PORT` | `8788` | listen port (compose maps and passes it to the relay CLI) |
 
-## Security note
+## TLS
 
-The gateway serves plaintext over `0.0.0.0` inside the container. Keep it on a trusted network
-(the homelab LAN) or behind your own TLS-terminating reverse proxy; TLS with certificate pinning
-for the phone link is planned upstream.
+By default the gateway serves plaintext over `0.0.0.0` inside the container, which is correct
+behind a reverse proxy and fine on a trusted LAN. Two shipped options terminate TLS without any
+box-specific proxy surgery:
+
+- `docker compose -f docker-compose.yml -f docker-compose.tls-caddy.yml up -d`: a Caddy sidecar on
+  443, certificate issued and renewed for you.
+- `docker compose -f docker-compose.yml -f docker-compose.tls-native.yml up -d`: the gateway
+  terminates TLS itself from a cert/key pair you mount (`COZY_TLS_CERT_FILE` /
+  `COZY_TLS_KEY_FILE`).
+
+Both are overlays; naming neither leaves the deployment exactly as it was. With the TLS variables
+unset the gateway serves plain HTTP; set one without the other, or set them to something unusable,
+and it refuses to start rather than falling back to plaintext. See `docs/tls.md` for which to pick
+and for what the app's trust-on-first-use certificate pinning expects.
+
+Whatever you choose, do not put a plaintext gateway on the open internet.
 
 ## Push over APNs (optional)
 

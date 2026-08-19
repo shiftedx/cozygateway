@@ -1,0 +1,23 @@
+# Reference Caddyfile for the TLS sidecar (docker-compose.tls-caddy.yml).
+#
+# Two lines of TLS policy, pick one:
+#
+#   tls internal
+#       Caddy runs its own CA and issues a certificate for whatever name you gave. No ACME, no
+#       reachability from the internet, works for a LAN name or a bare IP. The CozyChat app pins
+#       the certificate it first sees (TOFU), so an untrusted-by-the-OS certificate is a supported
+#       posture: you confirm the fingerprint once at pairing time. Keep the caddy-data volume, or
+#       a restart mints a new CA and the app will refuse the changed certificate.
+#
+#   (delete the tls line entirely)
+#       Caddy provisions a real Let's Encrypt certificate for the hostname, automatically, and
+#       renews it. Requires the name to resolve to this machine and ports 80/443 to be reachable.
+#       Use this when the gateway is behind a public hostname.
+
+{$COZY_TLS_HOSTNAME} {
+	tls internal
+
+	# The gateway's WebSocket endpoints (/ws for devices, /attach for the agent plugin) need no
+	# special handling: reverse_proxy passes an Upgrade through as a matter of course.
+	reverse_proxy {$COZY_GATEWAY_UPSTREAM}
+}

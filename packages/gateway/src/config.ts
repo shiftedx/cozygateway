@@ -59,6 +59,19 @@ const HermesBridgeConfigSchema = Type.Object({
 });
 export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
 
+/** Optional gateway-native TLS. Both halves are required together: a cert without a key (or the
+ *  reverse) is a half-configured deployment, not a default, and is refused rather than quietly
+ *  falling back to plaintext. Paths only -- key material never enters the config file. Omitting the
+ *  whole block leaves the gateway on plain HTTP exactly as before, which stays the right default
+ *  for a box that already terminates TLS in a reverse proxy in front of it. */
+const TlsConfigSchema = Type.Object({
+  /** Path to the PEM certificate chain, leaf first. */
+  certFile: Type.String({ minLength: 1 }),
+  /** Path to the matching unencrypted PEM private key. */
+  keyFile: Type.String({ minLength: 1 }),
+});
+export type TlsConfig = Static<typeof TlsConfigSchema>;
+
 const GatewayConfigSchema = Type.Object({
   name: Type.String({ minLength: 1 }),
   port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
@@ -79,6 +92,7 @@ const GatewayConfigSchema = Type.Object({
    *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
   hermes: Type.Optional(HermesBridgeConfigSchema),
+  tls: Type.Optional(TlsConfigSchema),
 });
 export type GatewayConfig = Static<typeof GatewayConfigSchema>;
 
@@ -114,6 +128,9 @@ export function loadConfig(path: string): GatewayConfig {
  *  dbPath are env-driven; everything else (name, agents, capabilities, and the attach token, whose
  *  env var NAME lives in options.tokenEnv) comes from the config file. Returns a new object; the
  *  input is not mutated. */
+const nonEmpty = (value: string | undefined): string | undefined =>
+  value !== undefined && value.length > 0 ? value : undefined;
+
 export function applyEnvOverrides(
   config: GatewayConfig,
   env: Record<string, string | undefined>,
@@ -137,6 +154,27 @@ export function applyEnvOverrides(
   const hermesUrl = env["COZYGATEWAY_HERMES_URL"];
   if (hermesUrl !== undefined && hermesUrl.length > 0 && next.hermes !== undefined) {
     next.hermes = { ...next.hermes, url: hermesUrl };
+  }
+  // Gateway-native TLS, container-friendly: the paths ride the environment so a compose file can
+  // mount certs and switch the listener without a config-file edit. Only PATHS -- the key material
+  // stays on the mounted volume. Empty strings are treated as unset, matching the other overrides,
+  // so a compose file that always exports `COZY_TLS_CERT_FILE: "${COZY_TLS_CERT_FILE:-}"` does not
+  // accidentally half-configure TLS.
+  const certFile = nonEmpty(env["COZY_TLS_CERT_FILE"]);
+  const keyFile = nonEmpty(env["COZY_TLS_KEY_FILE"]);
+  if (certFile !== undefined || keyFile !== undefined) {
+    const resolvedCert = certFile ?? next.tls?.certFile;
+    const resolvedKey = keyFile ?? next.tls?.keyFile;
+    // Half-configured is refused rather than dropped back to plaintext: an operator who set one
+    // half meant to serve TLS, and a silent fallback would put an unencrypted listener on the port
+    // they believed was encrypted.
+    if (resolvedCert === undefined || resolvedKey === undefined) {
+      throw new Error(
+        "TLS is half-configured: set BOTH COZY_TLS_CERT_FILE and COZY_TLS_KEY_FILE (or neither, " +
+          "to serve plain HTTP behind a reverse proxy)",
+      );
+    }
+    next.tls = { certFile: resolvedCert, keyFile: resolvedKey };
   }
   return next;
 }
