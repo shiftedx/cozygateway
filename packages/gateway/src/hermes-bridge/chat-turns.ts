@@ -217,17 +217,41 @@ export class BotChatTurns {
     this.#attachments = opts.attachments;
   }
 
-  /** Asks hermes to drop whatever this session has queued, swallowing every failure.
+  /** Asks hermes to drop ONE queued image, by the path it told us it wrote, swallowing every failure.
    *
    *  Called on exactly one path: an attach that landed followed by a submit that did not. It is a
    *  cleanup, so it must not be able to fail the operation it is cleaning up after, and it must not
    *  be able to hang the send behind it either. Still inside the send lock, deliberately: an unwind
-   *  that raced the next send would be racing for the very queue it is trying to empty. */
-  async #detachQuietly(runtimeId: string): Promise<void> {
+   *  that raced the next send would be racing for the very queue it is trying to empty.
+   *
+   *  `path` is REQUIRED by hermes and is not a nicety we can skip: `image.detach` reads
+   *  `params["path"]`, rejects an empty one with `4015 path required`, and removes exactly that entry
+   *  from the session's `attached_images` list. A detach sent without it fails, and because this
+   *  method swallows failures by design that failure is invisible: the unwind looks like it happened
+   *  and the stranded image rides the user's next turn anyway. A best-effort cleanup that cannot
+   *  succeed is worse than none, because it reads as protection.
+   *
+   *  Removing by path rather than clearing the queue is also the correct scope. The queue is
+   *  process-global per session, so a blanket clear would throw away an image somebody else attached
+   *  in the same window; this removes the one entry this send put there and nothing else.
+   *
+   *  The path is an absolute location on the hermes host. It stays in memory: it is never logged,
+   *  never stored, and never reaches a device. That is the same rule the transcript strip and the
+   *  error redaction enforce, applied to the one place the gateway legitimately holds one. */
+  async #detachQuietly(runtimeId: string, path: string): Promise<void> {
     try {
-      await this.#rpc.request("image.detach", { session_id: runtimeId });
+      const result = await this.#rpc.request("image.detach", { session_id: runtimeId, path });
+      // Hermes answers `detached: false` when the path was not on the queue, which is a successful
+      // call that did nothing. Worth a line, because the interesting case is a turn having already
+      // spent the image (the submit failed on our side but landed on theirs).
+      const record = typeof result === "object" && result !== null ? (result as Record<string, unknown>) : {};
+      if (record["detached"] !== true) {
+        this.#log("the photo unwind removed nothing; hermes no longer had it queued");
+      }
     } catch (err) {
-      this.#log(`could not unwind the attached photo after a failed submit: ${err instanceof Error ? err.message : "unknown"}`);
+      this.#log(
+        `could not unwind the attached photo after a failed submit: ${err instanceof Error ? err.message : "unknown"}`,
+      );
     }
   }
 
@@ -385,6 +409,7 @@ export class BotChatTurns {
       // whatever the user says next. Failing loudly instead means a photo send either delivers both
       // halves or neither, and the route can answer 502 for something that genuinely did not happen.
       let attached = false;
+      let attachedPath: string | undefined;
       if (opts.photo !== undefined) {
         const result = await this.#rpc.request("image.attach_bytes", {
           session_id: submitId,
@@ -401,6 +426,11 @@ export class BotChatTurns {
           );
         }
         attached = true;
+        // The absolute host path hermes wrote the bytes to, which is the ONLY handle `image.detach`
+        // accepts. Captured here because here is the only place it is ever offered; it is held for
+        // the length of this send and never leaves the process.
+        const reported = record["path"];
+        attachedPath = typeof reported === "string" && reported.length > 0 ? reported : undefined;
       }
 
       try {
@@ -417,7 +447,14 @@ export class BotChatTurns {
         // detach itself fails there is nothing further to do from here, and reporting a detach
         // failure instead of the submit failure would replace the true cause with a consequence. The
         // contract says exactly this rather than promising more than this can deliver.
-        if (attached) await this.#detachQuietly(submitId);
+        if (attachedPath !== undefined) await this.#detachQuietly(submitId, attachedPath);
+        else if (attached) {
+          // Hermes reported an attach with no path, so there is no handle to unwind with: the only
+          // thing `image.detach` accepts is the exact path. Said out loud rather than silently
+          // skipped, because the consequence is real (the next turn spends the image) and an operator
+          // reading this line knows why.
+          this.#log("hermes attached the photo but reported no path, so the failed send could not be unwound");
+        }
         throw err;
       }
     });
