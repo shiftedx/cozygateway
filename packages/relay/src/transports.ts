@@ -4,6 +4,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { LookupFunction } from "node:net";
 
+import type { PushCategoryId } from "./categories.ts";
 import { isBlockedAddress, isBlockedLiteralHost, stripIpv6Brackets } from "./egress.ts";
 
 /** Vets a single resolved address. Defaults to the real `isBlockedAddress` restricted-
@@ -15,10 +16,24 @@ export type VetAddress = (address: string, family: 4 | 6) => boolean;
 
 export const DELIVERY_TIMEOUT_MS = 10_000;
 
+/** Per-push routing metadata (issue #19, section 2). Everything here is CLEARTEXT and is
+ *  therefore limited to what a transport needs in order to shape its envelope: which
+ *  actionable notification category the app should render, and the key this push coalesces
+ *  on. No field describing the tool call itself appears here; that all rides inside the
+ *  `ciphertext` the relay cannot read. */
+export interface PushDeliveryOptions {
+  /** Actionable category id; becomes `aps.category` on APNs. */
+  category?: PushCategoryId;
+  /** Coalescing key; becomes `apns-collapse-id` on APNs. The approval categories pass the
+   *  `toolCallId`, so a resolve replaces the pending notification it belongs to. */
+  collapseId?: string;
+}
+
 /** A delivery transport. The APNs transport plugs in here in the phone-app phase without
- *  touching routes or storage (design spec, section 3). */
+ *  touching routes or storage (design spec, section 3). `options` is absent for a plain
+ *  message push (today's behavior, unchanged). */
 export interface Transport {
-  deliver(token: string, ciphertext: string): Promise<void>;
+  deliver(token: string, ciphertext: string, options?: PushDeliveryOptions): Promise<void>;
 }
 
 /** Thrown (and surfaced as a rejected `deliver()`) when restricted-egress mode refuses
@@ -110,6 +125,14 @@ export function createVettingLookup(
   };
 }
 
+/** The webhook wire body. `category`/`collapseId` appear only when the caller supplied them,
+ *  so an uncategorized message push is byte-identical to what shipped before issue #19 and a
+ *  UnifiedPush-style consumer that only knows `{ciphertext}` keeps working. */
+function webhookBody(ciphertext: string, options: PushDeliveryOptions | undefined): string {
+  if (options?.category === undefined) return JSON.stringify({ ciphertext });
+  return JSON.stringify({ ciphertext, category: options.category, collapseId: options.collapseId });
+}
+
 /** Restricted-mode delivery: `node:http`/`node:https` `request` with a vetting `lookup`,
  *  keeping the URL's own hostname for the Host header and TLS servername (design
  *  decision, issue #8; the relay is dependency-free, so this is stdlib-only). */
@@ -118,6 +141,7 @@ function deliverRestricted(
   ciphertext: string,
   lookup: LookupFunction,
   vetAddress: VetAddress,
+  options: PushDeliveryOptions | undefined,
 ): Promise<void> {
   const url = new URL(token);
   const hostname = stripIpv6Brackets(url.hostname);
@@ -130,7 +154,7 @@ function deliverRestricted(
       new EgressBlockedError(`webhook delivery refused: "${hostname}" is a blocked literal address`),
     );
   }
-  const body = JSON.stringify({ ciphertext });
+  const body = webhookBody(ciphertext, options);
   const requestFn = url.protocol === "https:" ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
     const req = requestFn(
@@ -168,16 +192,16 @@ export function webhookTransport(options: WebhookTransportOptions = {}): Transpo
     const lookup = options.lookup ?? dnsLookup;
     const vetAddress = options.vetAddress ?? isBlockedAddress;
     return {
-      deliver: (token, ciphertext) => deliverRestricted(token, ciphertext, lookup, vetAddress),
+      deliver: (token, ciphertext, push) => deliverRestricted(token, ciphertext, lookup, vetAddress, push),
     };
   }
   const fetchImpl = options.fetchImpl ?? fetch;
   return {
-    async deliver(token: string, ciphertext: string): Promise<void> {
+    async deliver(token: string, ciphertext: string, push?: PushDeliveryOptions): Promise<void> {
       const res = await fetchImpl(token, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ciphertext }),
+        body: webhookBody(ciphertext, push),
         signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
       });
       if (!res.ok) throw new Error(`webhook delivery failed: HTTP ${res.status}`);

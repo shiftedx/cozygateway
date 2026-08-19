@@ -1,7 +1,11 @@
 import { connect as http2Connect, type ClientHttp2Session } from "node:http2";
 import { createPrivateKey, sign } from "node:crypto";
 
-import type { Transport } from "./transports.ts";
+import { PUSH_CATEGORIES } from "./categories.ts";
+import type { PushDeliveryOptions, Transport } from "./transports.ts";
+
+/** The content-free alert used when no category applies (today's message push, unchanged). */
+const DEFAULT_ALERT = { title: "CozyChat", body: "New message" } as const;
 
 /** APNs provider config. The .p8 key is PEM (PKCS8) contents; env plumbing reads it from a file. */
 export interface ApnsConfig {
@@ -86,9 +90,19 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
   };
 
   return {
-    deliver(token: string, ciphertext: string): Promise<void> {
+    deliver(token: string, ciphertext: string, push?: PushDeliveryOptions): Promise<void> {
+      // The category shapes the ENVELOPE only: which actionable category the app renders its
+      // Approve/Deny buttons for, and the fallback alert shown if the Notification Service
+      // Extension cannot run. The relay never reads the ciphertext, so the alert it builds is
+      // a fixed, content-free string per category; the NSE decrypts and rewrites it on device.
+      const spec = push?.category === undefined ? undefined : PUSH_CATEGORIES[push.category];
+      const alert = spec?.alert ?? DEFAULT_ALERT;
       const body = JSON.stringify({
-        aps: { alert: { title: "CozyChat", body: "New message" }, "mutable-content": 1 },
+        aps: {
+          alert: { title: alert.title, body: alert.body },
+          "mutable-content": 1,
+          ...(spec === undefined ? {} : { category: spec.id }),
+        },
         c: ciphertext,
       });
       return new Promise<void>((resolve, reject) => {
@@ -119,8 +133,12 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
           ":path": `/3/device/${token}`,
           authorization: `bearer ${providerJwt()}`,
           "apns-topic": config.topic,
-          "apns-push-type": "alert",
+          "apns-push-type": spec?.pushType ?? "alert",
           "content-type": "application/json",
+          // Coalescing: a later push with the same collapse id REPLACES the delivered one on
+          // device. The approval categories pass the toolCallId, so a resolve overwrites the
+          // pending banner for exactly that tool call and nothing else.
+          ...(push?.collapseId === undefined ? {} : { "apns-collapse-id": push.collapseId }),
         });
         let status = 0;
         let responseBody = "";

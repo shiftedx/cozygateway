@@ -14,7 +14,22 @@ export {
   RelayStorage,
   type RegistrationRow,
 } from "./storage.ts";
-export { webhookTransport, DELIVERY_TIMEOUT_MS, type Transport } from "./transports.ts";
+export {
+  webhookTransport,
+  DELIVERY_TIMEOUT_MS,
+  type PushDeliveryOptions,
+  type Transport,
+} from "./transports.ts";
+export {
+  COLLAPSE_ID_MAX_LENGTH,
+  COLLAPSE_ID_PATTERN,
+  PUSH_CATEGORIES,
+  PUSH_CATEGORY_IDS,
+  isPushCategoryId,
+  isValidCollapseId,
+  type PushCategoryId,
+  type PushCategorySpec,
+} from "./categories.ts";
 export {
   CIPHERTEXT_MAX_LENGTH,
   RELAY_ERROR_CODES,

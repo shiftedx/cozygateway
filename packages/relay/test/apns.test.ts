@@ -178,6 +178,67 @@ describe("apnsTransport.deliver", () => {
   });
 });
 
+describe("apnsTransport approval category (issue #19 push lane)", () => {
+  async function deliverWithCategory(
+    category: "approval.pending" | "approval.resolved",
+    collapseId: string,
+  ): Promise<{ headers: Record<string, unknown>; body: Record<string, unknown> }> {
+    const { config } = testConfig();
+    let seen: { headers: Record<string, unknown>; body: string } | undefined;
+    const baseUrl = await fakeApns((headers, body, stream) => {
+      seen = { headers, body };
+      stream.respond({ ":status": 200 });
+      stream.end();
+    });
+    await apnsTransport(config, { baseUrl }).deliver("DEVTOK", "CIPHERBLOB", { category, collapseId });
+    return { headers: seen?.headers ?? {}, body: JSON.parse(seen?.body ?? "{}") as Record<string, unknown> };
+  }
+
+  it("sets aps.category so the app can attach its Approve/Deny actions client-side", async () => {
+    const { body } = await deliverWithCategory("approval.pending", "toolu_01");
+    expect(body["aps"]).toMatchObject({ category: "approval.pending", "mutable-content": 1 });
+    expect(body["c"]).toBe("CIPHERBLOB");
+  });
+
+  it("coalesces on the caller's collapse id (apns-collapse-id = toolCallId)", async () => {
+    const { headers } = await deliverWithCategory("approval.pending", "toolu_01");
+    expect(headers["apns-collapse-id"]).toBe("toolu_01");
+    expect(headers["apns-push-type"]).toBe("alert");
+  });
+
+  it("sends the resolve on the same collapse id, so it replaces the pending notification in place", async () => {
+    const { headers, body } = await deliverWithCategory("approval.resolved", "toolu_01");
+    expect(headers["apns-collapse-id"]).toBe("toolu_01");
+    expect(body["aps"]).toMatchObject({ category: "approval.resolved" });
+  });
+
+  it("carries only a value-free fallback alert; every approval detail stays inside the ciphertext", async () => {
+    const { body } = await deliverWithCategory("approval.pending", "toolu_01");
+    const aps = body["aps"] as { alert: { title: string; body: string } };
+    expect(aps.alert).toEqual({ title: "CozyChat", body: "Approval requested" });
+    // The APNs JSON, minus the opaque ciphertext, names nothing about the tool call itself.
+    const rendered = JSON.stringify({ ...body, c: undefined });
+    expect(rendered).not.toContain("CIPHERBLOB");
+    expect(rendered).not.toContain("toolu_01");
+  });
+
+  it("omits apns-collapse-id and aps.category for an uncategorized message push (unchanged)", async () => {
+    const { config } = testConfig();
+    let seen: { headers: Record<string, unknown>; body: string } | undefined;
+    const baseUrl = await fakeApns((headers, body, stream) => {
+      seen = { headers, body };
+      stream.respond({ ":status": 200 });
+      stream.end();
+    });
+    await apnsTransport(config, { baseUrl }).deliver("DEVTOK", "CIPHERBLOB");
+    expect(seen?.headers["apns-collapse-id"]).toBeUndefined();
+    expect(JSON.parse(seen?.body ?? "")).toEqual({
+      aps: { alert: { title: "CozyChat", body: "New message" }, "mutable-content": 1 },
+      c: "CIPHERBLOB",
+    });
+  });
+});
+
 describe("apnsTransport delivery timeout", () => {
   it("exports an operator-sane default timeout", () => {
     expect(APNS_DELIVERY_TIMEOUT_MS).toBe(10_000);

@@ -108,6 +108,13 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   app.post("/notify", async (c) => {
     const parsed = parseBody(NotifyRequestSchema, await readBody(c));
     if (parsed === undefined) return c.json(relayError("invalid_request", "malformed notify body"), 400);
+    // Category and collapse id are one unit (issue #19, section 2): a categorized push that
+    // cannot coalesce could never be retracted or updated when its approval resolves, and a
+    // collapse id with no category is a coalescing key the app has nothing to render against.
+    // Refusing the half-specified forms keeps the app-side contract total.
+    if ((parsed.category === undefined) !== (parsed.collapseId === undefined)) {
+      return c.json(relayError("invalid_request", "category and collapseId must be sent together"), 400);
+    }
     const now = deps.now();
     // TTL sweep BEFORE the lookup: an expired registration 404s on this very request (issue #28).
     deps.storage.pruneRegistrations(now, registrationTtlDays);
@@ -129,7 +136,11 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
     }
     // Delivery is best-effort and never blocks or fails the response (design spec, section 3):
     // the notify counts against the cap whether or not delivery succeeds.
-    void transport.deliver(registration.token, parsed.ciphertext).catch((err: unknown) => {
+    const push =
+      parsed.category === undefined
+        ? undefined
+        : { category: parsed.category, collapseId: parsed.collapseId };
+    void transport.deliver(registration.token, parsed.ciphertext, push).catch((err: unknown) => {
       log(`push id ${registration.pushId}: delivery failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     return c.json({}, 202);

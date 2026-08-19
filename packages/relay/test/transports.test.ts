@@ -39,6 +39,23 @@ describe("webhook transport (unrestricted, default)", () => {
     );
   });
 
+  it("adds the push category and collapse id when the caller supplies them (issue #19 push lane)", async () => {
+    const calls: Array<{ body: string }> = [];
+    const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ body: String(init?.body) });
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    await webhookTransport({ fetchImpl }).deliver("https://x.example/hook", "CIPHER", {
+      category: "approval.pending",
+      collapseId: "toolu_01",
+    });
+    expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+      ciphertext: "CIPHER",
+      category: "approval.pending",
+      collapseId: "toolu_01",
+    });
+  });
+
   it("defaults to unrestricted when no options are given", async () => {
     // Regression guard: webhookTransport() with zero args must not throw and must not
     // silently switch into restricted mode.
