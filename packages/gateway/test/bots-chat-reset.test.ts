@@ -363,6 +363,25 @@ describe("chat reset: a retired chat is never adopted again", () => {
     expect(chat.sessionId).not.toBe("sess-1");
   });
 
+  it("does not resurrect the retired chat when the PIN ITSELF names it (review G5: stale server pin)", async () => {
+    const state = { sessions: [{ id: "sess-1", title: CANONICAL_CHAT_TITLE }], insert: "back" as const };
+    const { authed, bridge, storage } = await setup(withGrowingChats(state));
+    await until(() => bridge.roster().bots.length === 1, 4_000);
+
+    const reset = (await (await authed("/bots/scout/chat/reset", { method: "POST" })).json()) as {
+      sessionId: string;
+    };
+    expect(reset.sessionId).toBe("stored-2");
+
+    // The stale-pin shape: `saveServerPin` failed silently after the reset, so the pin still names
+    // the RETIRED session, which is listed. Honoring it would be the cleared conversation back.
+    storage.setBotChatPin("scout", "sess-1", Date.now());
+
+    const chat = (await (await authed("/bots/scout/chat")).json()) as { sessionId: string };
+    expect(chat.sessionId).toBe("stored-2");
+    expect(chat.sessionId).not.toBe("sess-1");
+  });
+
   it("does not resurrect it across TWO resets either, with every retired chat ahead of the live one", async () => {
     const state = { sessions: [{ id: "sess-1", title: CANONICAL_CHAT_TITLE }], insert: "back" as const };
     const { authed, bridge, storage } = await setup(withGrowingChats(state));

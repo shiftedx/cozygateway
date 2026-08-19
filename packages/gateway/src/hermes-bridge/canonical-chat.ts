@@ -275,6 +275,21 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
     return { sessionId: pin, adoption: "pin" };
   }
 
+  // The pin itself gets the same retired check the heuristics got. Reachable with no exotic
+  // failure: `saveServerPin` may fail silently after a reset, the server pin then still names the
+  // retired session, and the server pin is preferred over the local one - honoring it here is the
+  // cleared conversation coming back. The listed-but-retired pin re-resolves among the candidates.
+  if (isRetired(pin)) {
+    const titled = candidates.find((row) => row.title === CANONICAL_CHAT_TITLE);
+    const adopted = titled ?? candidates[0];
+    if (adopted !== undefined) {
+      deps.pins.set(name, adopted.id);
+      return { sessionId: adopted.id, adoption: "recovery" };
+    }
+    deps.pins.clear(name);
+    const created = await mintCanonicalChat(name, deps);
+    return { sessionId: created.storedId, adoption: "created", runtimeId: created.runtimeId };
+  }
   deps.pins.set(name, pin);
   return { sessionId: pin, adoption: "pin" };
 }
