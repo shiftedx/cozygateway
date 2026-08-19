@@ -63,6 +63,16 @@ export const PHOTO_RATE_REFILL_MS = 5_000;
  *  not. */
 export const PHOTO_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
+/** How often the bridge reclaims the disk behind expired photos.
+ *
+ *  Note what this is NOT: it is not what makes the TTL true. Both reads filter on `created_at`, so a
+ *  photo past its expiry is unreachable the moment it expires whether or not anything has swept. That
+ *  ordering matters because the gateway this feature is aimed at is a quiet household box: a house
+ *  that sends photos for a week and then stops would never fire a write-time sweep again, and an
+ *  expiry that depended on one would simply never happen. The timer only decides how long the bytes
+ *  linger on disk after they have stopped being served. */
+export const PHOTO_SWEEP_MS = 60 * 60 * 1000;
+
 /** What the app may cache a served attachment for. Same posture as the capability-7 proxy: the bytes
  *  are immutable (the id names one upload and nothing ever rewrites it) so a day of caching removes
  *  the re-fetch on every scroll-back, and `private` because the answer went through a device-token
@@ -143,6 +153,9 @@ export class PhotoAttachFailed extends Error {
  *  This is the fact-checking half of the content-type rule. A declared type is a claim by the sender;
  *  these bytes are what a decoder will actually see. A file declared `image/png` whose bytes are a
  *  HEIC is refused here rather than travelling to hermes to be refused there. */
+/** Every DIB header size a BMP has ever carried: BITMAPCOREHEADER through BITMAPV5HEADER. */
+const BMP_DIB_HEADER_SIZES = new Set([12, 16, 40, 52, 56, 64, 108, 124]);
+
 function sniff(bytes: Uint8Array): string | undefined {
   const at = (offset: number, ...expected: number[]): boolean =>
     expected.every((byte, index) => bytes[offset + index] === byte);
@@ -154,8 +167,26 @@ function sniff(bytes: Uint8Array): string | undefined {
   }
   // "RIFF" .... "WEBP"
   if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return "image/webp";
-  if (at(0, 0x42, 0x4d)) return "image/bmp";
+  if (at(0, 0x42, 0x4d) && isBmpHeader(bytes)) return "image/bmp";
   return undefined;
+}
+
+/** BMP's signature is two ASCII letters, which is the weakest magic in the table by a wide margin:
+ *  anything beginning "BM" would pass, be stored, be served back, and be forwarded into a model's
+ *  context. Hermes' own `_IMAGE_MAGIC` shares that weakness, but inbound from a device this gateway
+ *  can afford to look one field further, so it does.
+ *
+ *  Three cheap structural facts, all fixed by the format rather than by convention: the file is at
+ *  least a header and an info block, the two reserved 16-bit fields at offset 6 are zero (the spec
+ *  requires it and every real encoder writes zeros), and the DIB header size at offset 14 is one of
+ *  the handful of values that has ever existed. Text and other formats that happen to start "BM" do
+ *  not satisfy all three. */
+function isBmpHeader(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 26) return false;
+  if (bytes[6] !== 0 || bytes[7] !== 0 || bytes[8] !== 0 || bytes[9] !== 0) return false;
+  const dibSize =
+    (bytes[14] ?? 0) | ((bytes[15] ?? 0) << 8) | ((bytes[16] ?? 0) << 16) | ((bytes[17] ?? 0) << 24);
+  return BMP_DIB_HEADER_SIZES.has(dibSize);
 }
 
 /** Exported so the sniff table can be exercised directly. Returns the type the BYTES are, which is
@@ -289,6 +320,27 @@ export function photoDisplayName(ext: string): string {
   return `photo.${ext}`;
 }
 
+/** Replaces anything path-shaped in a hermes error string with a placeholder.
+ *
+ *  Applied ONLY to the photo routes' 502, and the narrowness is the point. Passing hermes' text
+ *  through verbatim is a deliberate convention everywhere else on this surface (client feature probes
+ *  match `/unknown method/i` against it), and this does not touch that. But the photo path is the one
+ *  place where a routine hermes failure NAMES the images directory: a `5027 write failure` carries
+ *  `/Users/<operator>/.hermes/profiles/<bot>/images/...`, and this whole capability exists partly to
+ *  guarantee that no such path reaches a device. Stripping the directives out of the transcript and
+ *  then handing the same path back in an error body would be closing the front door and leaving the
+ *  window open.
+ *
+ *  What survives is everything a person debugging actually needs: the code, the verb, the reason. The
+ *  filename is dropped with the rest of the path rather than kept, because the basename is hermes'
+ *  own generated `upload_<stamp>_<n>.png` and says nothing a reader wants. */
+export function redactHostPaths(message: string): string {
+  // One pass, so a home-relative path cannot be half-eaten by a rule that ran first. A "path" here is
+  // an optional `~` or drive letter, then at least two separator-joined segments: one separator is an
+  // ordinary sentence, two is a location on somebody's disk.
+  return message.replace(/~?(?:[A-Za-z]:)?[\\/](?:[\w.@ -]+[\\/])+[\w.@ -]*/g, "<path>");
+}
+
 export interface PhotoRateLimiter {
   /** Answers whether this device may send a photo right now, spending a token when it may. */
   take(deviceId: string, now: number): { ok: true } | { ok: false; retryAfterMs: number };
@@ -320,7 +372,15 @@ export function createPhotoRateLimiter(
       if (buckets.size > RATE_MEMORY_MAX) {
         for (const [key, entry] of buckets) {
           if (buckets.size <= RATE_MEMORY_MAX) break;
-          if (key !== deviceId && entry.tokens >= capacity) buckets.delete(key);
+          if (key === deviceId) continue;
+          // Refill is recomputed here, not read off the stored value. A bucket is only ever WRITTEN
+          // when it is spent, so its stored `tokens` is by construction below capacity and stays
+          // there however long ago that was: an eviction that trusted the stored number would find
+          // nothing to evict and the map would grow past the bound it claims. What matters is whether
+          // the bucket would be full NOW, which is the same state a device that has never sent a
+          // photo is in, so dropping it gives that device nothing it did not already have.
+          const refilled = entry.tokens + Math.max(0, now - entry.at) / refillMs;
+          if (refilled >= capacity) buckets.delete(key);
         }
       }
       return { ok: true };

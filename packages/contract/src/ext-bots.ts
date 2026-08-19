@@ -1,9 +1,13 @@
-/** Vendor extension `com.cozylabs.bots`, version 6. NOT part of the frozen `contract: "v1"`
+/** Vendor extension `com.cozylabs.bots`. NOT part of the frozen `contract: "v1"`
  *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
  *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
  *  advertise the capability never emits these frames, and a client that does not recognize the
  *  capability ignores them, exactly as the forward-compatibility rule for unknown server frames
  *  requires.
+ *
+ *  The current version and its whole history live on `BOTS_CAPABILITY_VERSION` at the foot of this
+ *  file, and nowhere else. Naming a number up here is how this comment came to claim "version 6"
+ *  through three bumps.
  *
  *  Everything here mirrors what a Hermes gateway's Bot Mode conventions carry. The units are the
  *  ones the wire uses after the bridge has normalized them: `lastActiveAt` is MILLISECONDS (the

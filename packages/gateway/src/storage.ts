@@ -625,32 +625,47 @@ export class Storage {
     }
   }
 
-  /** The bytes behind one `fileId`, scoped to the bot whose route asked for them. The bot scoping is
-   *  not decoration: `/bots/:name/chat/attachments/:fileId` promises an answer about THAT bot, and a
-   *  lookup by id alone would let any bot's URL serve any other bot's photo to a device that guessed
-   *  or kept an id. */
+  /** The bytes behind one `fileId`, scoped to the bot whose route asked for them, and to the TTL.
+   *
+   *  The bot scoping is not decoration: `/bots/:name/chat/attachments/:fileId` promises an answer
+   *  about THAT bot, and a lookup by id alone would let any bot's URL serve any other bot's photo to
+   *  a device that guessed or kept an id.
+   *
+   *  `notBefore` is what makes the contract's expiry TRUE rather than aspirational. A sweep is a
+   *  reclamation of disk and it only runs when something runs it; a household that sends photos for
+   *  a week and then stops has nothing left to trigger one, and every one of those photos would go
+   *  on being served for years. Expiry has to be a property of the READ, and the sweep is then just
+   *  housekeeping behind an answer that is already correct. */
   botChatAttachment(
     bot: string,
     fileId: string,
+    notBefore: number,
   ): { mime: string; name: string; size: number; bytes: Uint8Array } | undefined {
     const row = this.#db
-      .prepare("SELECT mime, name, size, bytes FROM bot_chat_attachments WHERE bot = ? AND file_id = ?")
-      .get(bot, fileId) as { mime: string; name: string; size: number; bytes: Uint8Array } | undefined;
+      .prepare(
+        "SELECT mime, name, size, bytes FROM bot_chat_attachments WHERE bot = ? AND file_id = ? AND created_at >= ?",
+      )
+      .get(bot, fileId, notBefore) as { mime: string; name: string; size: number; bytes: Uint8Array } | undefined;
     return row;
   }
 
   /** The attachment blocks belonging to one transcript row, in insert order. Answers `[]` for the
-   *  overwhelming majority of rows, which is why the index is on `(session_id, message_id)`. */
+   *  overwhelming majority of rows, which is why the index is on `(session_id, message_id)`.
+   *
+   *  Same `notBefore` cut as the read above, and for the same reason plus one more: a block naming a
+   *  file the download route would 404 is worse than no block at all, because a client renders it as
+   *  a picture that is coming and then never resolves. The two reads have to expire together. */
   botChatAttachmentsFor(
     sessionId: string,
     messageId: string,
+    notBefore: number,
   ): Array<{ fileId: string; name: string; mime: string; size: number }> {
     return this.#db
       .prepare(
         `SELECT file_id AS fileId, name, mime, size FROM bot_chat_attachments
-         WHERE session_id = ? AND message_id = ? ORDER BY created_at, file_id`,
+         WHERE session_id = ? AND message_id = ? AND created_at >= ? ORDER BY created_at, file_id`,
       )
-      .all(sessionId, messageId) as unknown as Array<{
+      .all(sessionId, messageId, notBefore) as unknown as Array<{
       fileId: string;
       name: string;
       mime: string;

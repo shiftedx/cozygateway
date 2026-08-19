@@ -1,7 +1,7 @@
 import type { AttachmentBlock, BotChatMessage, ServerFrame } from "cozygateway-contract";
 
 import type { HermesRpc } from "./canonical-chat.ts";
-import { parseChatSnapshot, type ChatSnapshot } from "./chat-messages.ts";
+import { parseChatSnapshot, stripImageDirectives, type ChatSnapshot } from "./chat-messages.ts";
 import type { ChatStreamBinder } from "./chat-stream.ts";
 import { PhotoAttachFailed } from "./photos.ts";
 
@@ -125,6 +125,18 @@ interface ActiveTurn {
  *  collapses two rows into one and a user bubble disappears (cozychat#38). */
 interface PendingSend {
   clientId: string;
+  /** The text as the PERSISTED ROW WILL DECODE, which is not always the text that was submitted.
+   *
+   *  The row a send comes back as is matched by its text, and every user row now has its image
+   *  directive lines stripped on the way out (`stripImageDirectives`). So a send whose own text
+   *  contains a directive-shaped line (a caption reading `look at this\n[screenshot]`, or a plain
+   *  text send that pastes a hermes transcript) is persisted, stripped, and then no longer equals
+   *  what was typed. Holding the raw text here made that send unmatchable: its clientId never joined,
+   *  so the sender saw its own words twice (the cozychat#38 shape, from the other direction), and a
+   *  photo on that send never bound to its row and vanished from every read after the 202.
+   *
+   *  Normalizing HERE rather than normalizing what is submitted is the deliberate half: the model
+   *  still receives exactly what the user wrote, and only the join key is canonicalized. */
   text: string;
   /** The turn that carried this send. A send that opens a NEW turn is proof that every entry from
    *  an older one is dead: that turn's poll has already ended, so the row it was waiting for is
@@ -203,6 +215,20 @@ export class BotChatTurns {
     this.#log = opts.log ?? (() => {});
     this.#stream = opts.stream;
     this.#attachments = opts.attachments;
+  }
+
+  /** Asks hermes to drop whatever this session has queued, swallowing every failure.
+   *
+   *  Called on exactly one path: an attach that landed followed by a submit that did not. It is a
+   *  cleanup, so it must not be able to fail the operation it is cleaning up after, and it must not
+   *  be able to hang the send behind it either. Still inside the send lock, deliberately: an unwind
+   *  that raced the next send would be racing for the very queue it is trying to empty. */
+  async #detachQuietly(runtimeId: string): Promise<void> {
+    try {
+      await this.#rpc.request("image.detach", { session_id: runtimeId });
+    } catch (err) {
+      this.#log(`could not unwind the attached photo after a failed submit: ${err instanceof Error ? err.message : "unknown"}`);
+    }
   }
 
   /** Runs `fn` with this bot's send lock held. FIFO, because the waiters chain off each other rather
@@ -358,6 +384,7 @@ export class BotChatTurns {
       // submitting first would send a caption with no picture and then leave the picture queued for
       // whatever the user says next. Failing loudly instead means a photo send either delivers both
       // halves or neither, and the route can answer 502 for something that genuinely did not happen.
+      let attached = false;
       if (opts.photo !== undefined) {
         const result = await this.#rpc.request("image.attach_bytes", {
           session_id: submitId,
@@ -373,9 +400,26 @@ export class BotChatTurns {
             `hermes did not attach the photo: ${JSON.stringify(result).slice(0, 200)}`,
           );
         }
+        attached = true;
       }
 
-      await this.#rpc.request("prompt.submit", { session_id: submitId, text });
+      try {
+        await this.#rpc.request("prompt.submit", { session_id: submitId, text });
+      } catch (err) {
+        // The attach LANDED and the submit did not. Hermes now holds an image on the session's queue
+        // that no turn of ours will ever spend, and that queue is consumed by the NEXT
+        // `prompt.submit` whatever it is: the user shrugs at the 502, types something unrelated, and
+        // that turn silently carries the orphaned photo into the model's context, about a picture the
+        // transcript does not show (this gateway has already deleted its own copy). A retry of the
+        // photo would put it in twice.
+        //
+        // So the queue is unwound before the failure is reported. Best effort by construction: if the
+        // detach itself fails there is nothing further to do from here, and reporting a detach
+        // failure instead of the submit failure would replace the true cause with a consequence. The
+        // contract says exactly this rather than promising more than this can deliver.
+        if (attached) await this.#detachQuietly(submitId);
+        throw err;
+      }
     });
 
     const at = this.#now();
@@ -390,7 +434,14 @@ export class BotChatTurns {
     const queue = (this.#pending.get(name) ?? []).filter(
       (entry) => entry.turn === turnId && entry.at > at - this.#timeoutMs,
     );
-    queue.push({ clientId, text, turn: turnId, at, ...(opts.photo === undefined ? {} : { photo: opts.photo }) });
+    queue.push({
+      clientId,
+      // The join key, canonicalized to what the transcript will hand back. See `PendingSend.text`.
+      text: stripImageDirectives(text),
+      turn: turnId,
+      at,
+      ...(opts.photo === undefined ? {} : { photo: opts.photo }),
+    });
     this.#pending.set(name, queue);
     return {
       id: `${sessionId}#local-${at}`,

@@ -714,7 +714,8 @@ parts:
 413  media_refused  reason: "too_large"    // over the size cap, declared or delivered
 415  media_refused  reason: "content_type" // not a type this gateway accepts, or the bytes disagree
 429  rate_limited + retryAfterMs           // this DEVICE has sent photos too quickly; retry-after
-502  backend_unavailable + hermesError     // hermes refused; NOTHING was submitted
+502  backend_unavailable + hermesError     // hermes refused; NOTHING was submitted.
+                                           // hermesError has host paths redacted on THIS route
 503  backend_unavailable  busy: true       // the gateway is already sending as many photos as it will
 ```
 
@@ -762,6 +763,12 @@ What the gateway will accept:
 - **The filename is never used.** Not for the stored id, not for the served name, not for the
   extension. The id is generated, the name is `photo.<ext>`, and the extension comes from the sniffed
   bytes.
+- **And no host path leaves this route, including in an error.** Every other route on this surface
+  passes Hermes' own text through verbatim in `hermesError`, and still does, because client feature
+  probes match against it. This route is the exception: its ordinary failures name the Hermes images
+  directory (a write failure carries the full path), and stripping paths out of the transcript while
+  handing the same path back in an error body would close nothing. On this route only, anything
+  path-shaped in `hermesError` is replaced with `<path>`. The code, the verb and the reason survive.
 
 **At most 3 of these run at once, per GATEWAY**, with the same bounded wait and the same `503 busy`
 answer the media proxy uses (`retry-after: 1`, `waitedMs` in the body). The number is smaller than
@@ -769,13 +776,25 @@ the proxy's five because a photo is buffered whole and then base64-encoded into 
 frame, so the cost is memory rather than a socket. On top of that, and unlike the proxy, there is a
 per-DEVICE rate limit: a burst of 8 with one refilling every 5 seconds. The cost of a photo is
 attributable to the phone that caused it, and what is being bounded is one device spending the
-household's token budget in a loop.
+household's token budget in a loop. The token is spent when the request ARRIVES, before anything is
+read or validated, so a run of refused requests costs a device the same budget a run of accepted ones
+does. A limiter that only charged for successes would be one a caller could dodge by failing cheaply.
+A client should treat `429` as "wait", never as a verdict on the photo.
 
 **Attach then submit, in that order, and never one without the other.** The gateway resolves the
 runtime session id exactly as a text send does, attaches the bytes, and only then submits the prompt.
 An attach that fails, or that succeeds without reporting the image as attached, fails the whole send
 with `502` BEFORE any submit, so a caption never lands without its photo. A `502` from this route
-therefore means nothing was sent, and a retry is a retry rather than a duplicate.
+means NOTHING WAS SUBMITTED, and a retry is a retry rather than a duplicate.
+
+The narrow case that phrasing is careful about: the attach can land and the submit can then fail (a
+transient RPC error, a dropped socket with Hermes still up). Hermes would be left holding a queued
+image that the NEXT prompt spends, whatever that prompt is, so the user's next unrelated question
+would silently carry a picture the transcript does not show. The gateway therefore asks Hermes to
+drop the queued image (`image.detach`) before it reports the failure. That unwind is BEST EFFORT: if
+it fails too, the gateway has nothing further to try, and the honest statement of the guarantee is
+"nothing was submitted" rather than "nothing reached Hermes". This is also why the gateway deletes its
+own copy on that path: a photo no message points at is not kept.
 
 Sends are serialized per bot across that pair. Hermes' attached-image queue is per session and is
 consumed and cleared by the next prompt, so an interleaved send would take somebody else's picture:
@@ -823,11 +842,22 @@ went through a device-token route, so they belong to that device rather than to 
 Range requests are not supported and `Accept-Ranges` is not sent: the cap is 8 MB, so the answer is
 always one whole image.
 
-**Photos expire, conversations do not.** A stored photo is kept for 14 days and then swept. After
-that the message keeps its text and simply stops carrying the attachment block, and this route
-answers `404` for the id. A client should render that as a picture that is no longer available rather
-than as a broken chat. Deleting a bot deletes its photos immediately, by the same rule that drops its
-pin and its cached rows.
+**Photos expire, conversations do not.** A stored photo is kept for 14 days. After that the message
+keeps its text and simply stops carrying the attachment block, and this route answers `404` for the
+id. A client should render that as a picture that is no longer available rather than as a broken chat.
+
+The expiry is a property of the READ, not of a sweep having run: a photo past 14 days is unreachable
+from the moment it expires, whether or not the gateway has got around to reclaiming the disk. That
+distinction is load bearing on exactly the gateway this feature is for. A household that sends photos
+for a week and then stops gives a sweep nothing to trigger it, so an expiry that depended on one would
+never happen at all, and the promise above would be false on the quietest boxes rather than the
+busiest.
+
+Deleting a bot deletes its photos immediately, by the same rule that drops its pin and its cached
+rows. Clearing a chat (`POST /bots/:name/chat/reset`) does NOT: the retired session's photos stay
+fetchable by `fileId` until they expire, which is consistent with what a reset actually does, since
+the retired transcript itself also stays on the Hermes host. A client that wants the photos gone as
+well as the chat cleared is asking for a deletion this surface does not offer.
 
 ### GET /bots/:name/media
 

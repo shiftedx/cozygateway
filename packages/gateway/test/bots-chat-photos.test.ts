@@ -22,6 +22,7 @@ import {
   newPhotoFileId,
   photoDisplayName,
   readCappedBody,
+  redactHostPaths,
   sniffImageType,
 } from "../src/hermes-bridge/photos.ts";
 import { startFakeHermesServer, type FakeHermesBehavior, type FakeHermesServer } from "./support/fake-hermes-server.ts";
@@ -74,7 +75,11 @@ const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0
 const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46]);
 const GIF = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 1, 0, 1, 0]);
 const WEBP = new Uint8Array([0x52, 0x49, 0x46, 0x46, 20, 0, 0, 0, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20]);
-const BMP = new Uint8Array([0x42, 0x4d, 30, 0, 0, 0, 0, 0]);
+/** A real BMP header: "BM", the file size, four zero reserved bytes, the pixel offset, and a
+ *  40-byte BITMAPINFOHEADER. The structure matters now: a two-letter prefix is no longer enough. */
+const BMP = new Uint8Array([
+  0x42, 0x4d, 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+]);
 /** The HEIC box header an iPhone actually writes. Not on any list here, by design. */
 const HEIC = new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]);
 
@@ -178,6 +183,56 @@ describe("inbound photo rules", () => {
       acceptPhoto({ declaredType: "image/png", declaredLength: 0, bytes: new Uint8Array(0) }),
     );
     expect((err as PhotoRefused).reason).toBe("empty");
+  });
+
+  it("does not take two letters as proof of a bmp (review Minor 3)", () => {
+    // "BM" is the weakest magic in the table, so the sniff looks one field further: the reserved
+    // bytes at offset 6 and the DIB header size at offset 14. Without that, any text beginning "BM"
+    // is stored, served back, and forwarded into a model context.
+    expect(sniffImageType(new TextEncoder().encode("BM this is just some text, honestly"))).toBeUndefined();
+    // Truncated below a whole header.
+    expect(sniffImageType(new Uint8Array([0x42, 0x4d, 1, 0, 0, 0]))).toBeUndefined();
+    // Right shape, impossible DIB header size.
+    const badDib = BMP.slice();
+    badDib[14] = 41;
+    expect(sniffImageType(badDib)).toBeUndefined();
+    // Right shape, non-zero reserved field.
+    const badReserved = BMP.slice();
+    badReserved[7] = 9;
+    expect(sniffImageType(badReserved)).toBeUndefined();
+    // And a real one still passes.
+    expect(sniffImageType(BMP)).toBe("image/bmp");
+  });
+
+  it("redacts host paths out of a hermes error, and keeps the rest (review Minor 4)", () => {
+    // The one routine hermes failure on this path names the images directory.
+    expect(redactHostPaths("5027 write failure: /Users/kyle/.hermes/profiles/scout/images/upload_1.png")).toBe(
+      "5027 write failure: <path>",
+    );
+    expect(redactHostPaths("could not write C:\\Users\\kyle\\.hermes\\images\\a.png")).toBe(
+      "could not write <path>",
+    );
+    expect(redactHostPaths("could not write ~/.hermes/images/a.png")).toBe("could not write <path>");
+    // What a person debugging actually needs survives untouched.
+    expect(redactHostPaths("unknown method: image.attach_bytes")).toBe("unknown method: image.attach_bytes");
+    expect(redactHostPaths("4018 image too large")).toBe("4018 image too large");
+  });
+
+  it("evicts a bucket that would be full now, not one that was full when it was written", () => {
+    // Review Minor 2. A bucket is only ever WRITTEN when it is spent, so its stored token count is
+    // always below capacity; an eviction that read the stored number would find nothing to evict and
+    // the map would grow past the bound the comment claims.
+    const limiter = createPhotoRateLimiter({ capacity: 2, refillMs: 1 });
+    // A device spends a token long ago, so its stored count is 1 (below capacity) forever after.
+    limiter.take("old", 0);
+    // Far later, another device sends. `old` has refilled by now and is evictable.
+    expect(limiter.take("new", 10_000_000)).toEqual({ ok: true });
+    // The observable consequence of eviction is indistinguishable from a full bucket, which is the
+    // point, so this asserts the arithmetic the eviction relies on rather than the map's size: a
+    // bucket that has had 10 million refill periods is full.
+    expect(limiter.take("old", 10_000_000)).toEqual({ ok: true });
+    expect(limiter.take("old", 10_000_000)).toEqual({ ok: true });
+    expect(limiter.take("old", 10_000_000).ok).toBe(false);
   });
 
   it("mints opaque ids and refuses anything path-shaped in their place", () => {
@@ -371,6 +426,151 @@ describe("BotChatTurns, the attach-then-submit pair", () => {
     const ordered = rpc.methods().filter((method) => method !== "session.resume");
     expect(ordered).toEqual(["image.attach_bytes", "prompt.submit", "prompt.submit"]);
     await turns.settled("scout");
+  });
+
+  it("unwinds the queued image when the attach landed and the submit did not (review I2)", async () => {
+    // Hermes' attached-image queue is spent by the NEXT prompt, whatever it is. Leaving one behind
+    // means the user's next unrelated question silently carries a picture the transcript does not
+    // show, or a retry of the photo puts it in twice.
+    const calls: string[] = [];
+    const detached: Array<Record<string, unknown>> = [];
+    const rpc = {
+      request: async (method: string, params?: unknown): Promise<unknown> => {
+        calls.push(method);
+        if (method === "image.attach_bytes") return { attached: true };
+        if (method === "prompt.submit") throw new Error("5003 session went away");
+        if (method === "image.detach") {
+          detached.push((params ?? {}) as Record<string, unknown>);
+          return { detached: true };
+        }
+        return { session_id: "runtime-1", message_count: 0, running: false, inflight: false, messages: [] };
+      },
+    };
+    const turns = new BotChatTurns({ rpc, broadcast: () => {}, now: tickingClock(), pollMs: 5, timeoutMs: 50 });
+    await expect(turns.send("scout", "stored-1", "look", { photo: photo() })).rejects.toThrow(/5003/);
+
+    expect(calls).toEqual(["session.resume", "image.attach_bytes", "prompt.submit", "image.detach"]);
+    expect(detached).toEqual([{ session_id: "runtime-1" }]);
+  });
+
+  it("does not detach when nothing was ever attached", async () => {
+    // A plain text send that fails to submit has no queue of ours to unwind, and detaching there
+    // would throw away an image somebody else legitimately queued.
+    const calls: string[] = [];
+    const rpc = {
+      request: async (method: string): Promise<unknown> => {
+        calls.push(method);
+        if (method === "prompt.submit") throw new Error("5003 session went away");
+        return { session_id: "runtime-1", message_count: 0, running: false, inflight: false, messages: [] };
+      },
+    };
+    const turns = new BotChatTurns({ rpc, broadcast: () => {}, now: tickingClock(), pollMs: 5, timeoutMs: 50 });
+    await expect(turns.send("scout", "stored-1", "hello")).rejects.toThrow(/5003/);
+    expect(calls).not.toContain("image.detach");
+  });
+
+  it("reports the submit failure even when the unwind fails too", async () => {
+    // The detach is a cleanup: it must not be able to replace the true cause with a consequence.
+    const rpc = {
+      request: async (method: string): Promise<unknown> => {
+        if (method === "image.attach_bytes") return { attached: true };
+        if (method === "prompt.submit") throw new Error("5003 the real problem");
+        if (method === "image.detach") throw new Error("4001 unknown method: image.detach");
+        return { session_id: "runtime-1", message_count: 0, running: false, inflight: false, messages: [] };
+      },
+    };
+    const turns = new BotChatTurns({ rpc, broadcast: () => {}, now: tickingClock(), pollMs: 5, timeoutMs: 50 });
+    await expect(turns.send("scout", "stored-1", "look", { photo: photo() })).rejects.toThrow(/the real problem/);
+  });
+
+  it("matches a send whose own text contains a directive-shaped line (review I3)", async () => {
+    // A caption may legally contain `[screenshot]` or a line starting `@image:` (pasting a hermes
+    // transcript is enough). The persisted row has those lines stripped on the way out, so a pending
+    // entry holding the RAW text can never equal it: the clientId never joins and, worse, the photo
+    // never binds and is gone from every read after the 202.
+    const attachments = memoryAttachments();
+    let messages: Array<Record<string, unknown>> = [];
+    const rpc = {
+      request: async (method: string, params?: unknown): Promise<unknown> => {
+        if (method === "image.attach_bytes") return { attached: true };
+        if (method === "prompt.submit") return { ok: true };
+        const omit = (params as Record<string, unknown>)["omit_messages"] === true;
+        return {
+          session_id: "runtime-1",
+          message_count: messages.length,
+          running: false,
+          inflight: false,
+          ...(omit ? {} : { messages }),
+        };
+      },
+    };
+    const frames: ServerFrame[] = [];
+    const turns = new BotChatTurns({
+      rpc,
+      broadcast: (frame) => frames.push(frame),
+      now: tickingClock(),
+      pollMs: 5,
+      timeoutMs: 400,
+      attachments,
+    });
+
+    const caption = "look at this\n[screenshot]";
+    const sent = await turns.send("scout", "stored-1", caption, { photo: photo("f7"), clientId: "c7" });
+    // The model still receives what the user actually wrote; only the join key is canonicalized.
+    expect(sent.text).toBe(caption);
+
+    // What hermes persists: the caption, plus its own directives appended.
+    messages = [
+      { row_id: 51, role: "user", content: `${caption}\n@image:/Users/operator/.hermes/x.png\n[screenshot]` },
+      { row_id: 52, role: "assistant", content: "a cat" },
+    ];
+    await turns.settled("scout");
+
+    const chat = frames.filter((frame): frame is Extract<ServerFrame, { type: "bot_chat" }> => frame.type === "bot_chat");
+    const userRow = chat.flatMap((frame) => frame.messages).find((message) => message.role === "user");
+    expect(userRow?.clientId).toBe("c7");
+    expect(userRow?.attachments).toHaveLength(1);
+    expect(attachments.bound.get("f7")).toBe("51");
+  });
+
+  it("keeps clientId dedupe on a plain text send containing a directive line (review I3, capability 2)", async () => {
+    // The regression half: the strip is new, the text route is not. A send whose body pastes an
+    // `@image:` line must still have its optimistic row joined, which is the cozychat#38 invariant.
+    let messages: Array<Record<string, unknown>> = [];
+    const rpc = {
+      request: async (method: string, params?: unknown): Promise<unknown> => {
+        if (method === "prompt.submit") return { ok: true };
+        const omit = (params as Record<string, unknown>)["omit_messages"] === true;
+        return {
+          session_id: "runtime-1",
+          message_count: messages.length,
+          running: false,
+          inflight: false,
+          ...(omit ? {} : { messages }),
+        };
+      },
+    };
+    const frames: ServerFrame[] = [];
+    const turns = new BotChatTurns({
+      rpc,
+      broadcast: (frame) => frames.push(frame),
+      now: tickingClock(),
+      pollMs: 5,
+      timeoutMs: 400,
+    });
+
+    const text = "why does this log say\n@image:/Users/operator/out.png\nis that normal";
+    await turns.send("scout", "stored-1", text, { clientId: "c8" });
+    messages = [
+      { row_id: 61, role: "user", content: text },
+      { row_id: 62, role: "assistant", content: "it is" },
+    ];
+    await turns.settled("scout");
+
+    const chat = frames.filter((frame): frame is Extract<ServerFrame, { type: "bot_chat" }> => frame.type === "bot_chat");
+    const userRow = chat.flatMap((frame) => frame.messages).find((message) => message.role === "user");
+    expect(userRow?.clientId).toBe("c8");
+    expect(userRow?.text).toBe("why does this log say\nis that normal");
   });
 
   it("binds the photo to the transcript row, so a later read still carries it", async () => {
@@ -683,6 +883,54 @@ describe("POST /bots/:name/chat/photos", () => {
     expect(server.callsOf("prompt.submit")).toHaveLength(0);
   });
 
+  it("redacts the hermes images path out of the 502 it passes back (review Minor 4)", async () => {
+    const { behavior } = fakeBotMode();
+    behavior.methods!["image.attach_bytes"] = () => {
+      // The real shape of a hermes 5027, which names the operator's own directory.
+      throw { code: 5027, message: "write failure: /Users/operator/.hermes/profiles/scout/images/upload_3.png" };
+    };
+    const { authed } = await setup(behavior);
+    const res = await authed("/bots/scout/chat/photos", upload(PNG, "image/png"));
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { hermesError: string; hermesErrorCode: number };
+    // Stripping paths out of the transcript and handing the same path back in an error body would
+    // close nothing.
+    expect(body.hermesError).not.toContain("/Users/");
+    expect(body.hermesError).toContain("<path>");
+    // What a person debugging needs is still there.
+    expect(body.hermesError).toContain("write failure");
+    expect(body.hermesErrorCode).toBe(5027);
+  });
+
+  it("caps a chunked upload that declares no length at all (review Minor 7)", async () => {
+    // The route tests all send FormData, which carries a computed Content-Length. This one goes down
+    // the other path: a streamed body with no length, read through readCappedBody as wired.
+    const { behavior } = fakeBotMode();
+    const { authed } = await setup(behavior);
+    const boundary = "----cozytest";
+    const head = new TextEncoder().encode(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.png"\r\nContent-Type: image/png\r\n\r\n`,
+    );
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(head);
+      },
+      pull(controller) {
+        // Never ends: the cap is the only thing that can stop this.
+        controller.enqueue(new Uint8Array(256 * 1024));
+      },
+    });
+    const res = await authed("/bots/scout/chat/photos", {
+      method: "POST",
+      headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+      body,
+      // Required by fetch for a streaming request body.
+      duplex: "half",
+    } as RequestInit);
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { reason: string }).reason).toBe("too_large");
+  });
+
   it("leaves no stored bytes behind when the send failed", async () => {
     const { behavior } = fakeBotMode();
     behavior.methods!["image.attach_bytes"] = () => ({ attached: false });
@@ -760,6 +1008,79 @@ describe("GET /bots/:name/chat/attachments/:fileId", () => {
     expect(res.status).toBe(401);
   });
 
+  it("404s an expired photo that no sweep has reached, and drops its block (review I1)", async () => {
+    // The failure this closes: a household sends photos for a week and then stops. Nothing triggers
+    // a write-time sweep ever again, so an expiry that lived only in the sweep would never happen,
+    // and months-old photos would go on being served with 200 and decorating history. Expiry has to
+    // be a property of the read.
+    const { behavior } = fakeBotMode();
+    const server = await startFakeHermesServer(behavior);
+    servers.push(server);
+    const storage = openStorage(":memory:");
+    storages.push(storage);
+    const client = createHermesClient({
+      url: server.url,
+      auth: { mode: "token", token: "T" },
+      reconnect: { minMs: 15, maxMs: 60 },
+    });
+    // A clock the test moves by hand, so "14 days later" costs no wall time and no sweep runs.
+    let clock = NOW;
+    const bridge = new HermesBridge({
+      client,
+      storage,
+      broadcast: () => {},
+      now: () => (clock += 1),
+      logSink: () => {},
+      chatPollMs: 10,
+      chatTurnTimeoutMs: 2_000,
+      // Long enough that it cannot fire during the test: the read filter is what is under test.
+      attachmentSweepMs: 60 * 60 * 1000,
+    });
+    bridges.push(bridge);
+    const app = createApp({
+      storage,
+      config,
+      bots: bridge,
+      gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 9 } },
+      presenceOf: () => "online",
+      submitUserMessage: (threadId: string, blocks: RichBlock[]): Message =>
+        storage.appendMessage(threadId, { role: "user", blocks }, 500),
+      interruptThread: () => "idle",
+      onDeviceRevoked: () => {},
+      now: () => 1_000,
+    });
+    const code = newSetupCode();
+    storage.createSetupCode(code, 1_000 + SETUP_CODE_TTL_MS);
+    const pairRes = await app.request("/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setupCode: code, deviceName: "phone" }),
+    });
+    const { deviceToken } = (await pairRes.json()) as { deviceToken: string };
+    const authed = async (path: string, init?: RequestInit): Promise<Response> =>
+      app.request(path, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` } });
+    bridge.start();
+    await until(() => client.state() === "online", 4_000);
+
+    const sent = await authed("/bots/scout/chat/photos", upload(PNG, "image/png", { text: "keep me" }));
+    const fileId = ((await sent.json()) as { message: { attachments: Array<{ fileId: string }> } }).message
+      .attachments[0]!.fileId;
+    expect((await authed(`/bots/scout/chat/attachments/${fileId}`)).status).toBe(200);
+
+    // Bind it to a row so the block path is exercised too, then walk the clock past the TTL WITHOUT
+    // sweeping anything.
+    storage.bindBotChatAttachment(fileId, "77");
+    expect(storage.botChatAttachmentsFor("canonical", "77", clock - PHOTO_TTL_MS)).toHaveLength(1);
+    clock += PHOTO_TTL_MS + 1;
+
+    expect((await authed(`/bots/scout/chat/attachments/${fileId}`)).status).toBe(404);
+    // And the block goes with it: a block naming a file the download route 404s renders as a picture
+    // that never resolves, which is worse than no block at all.
+    expect(storage.botChatAttachmentsFor("canonical", "77", clock - PHOTO_TTL_MS)).toHaveLength(0);
+    // The row is still on disk, unswept: expiry did not depend on the sweep having run.
+    expect(storage.sweepBotChatAttachments(clock, PHOTO_TTL_MS)).toBe(1);
+  });
+
   it("keeps carrying the photo on the transcript row after the turn has landed", async () => {
     const messages: Array<Record<string, unknown>> = [];
     const { behavior } = fakeBotMode(messages);
@@ -804,8 +1125,8 @@ describe("attachment storage", () => {
     put(storage, "a".repeat(32), NOW - PHOTO_TTL_MS / 2);
     put(storage, "b".repeat(32), NOW);
     expect(storage.sweepBotChatAttachments(NOW + PHOTO_TTL_MS / 2 + 1, PHOTO_TTL_MS)).toBe(1);
-    expect(storage.botChatAttachment("scout", "a".repeat(32))).toBeUndefined();
-    expect(storage.botChatAttachment("scout", "b".repeat(32))).toMatchObject({ mime: "image/png", size: 3 });
+    expect(storage.botChatAttachment("scout", "a".repeat(32), 0)).toBeUndefined();
+    expect(storage.botChatAttachment("scout", "b".repeat(32), 0)).toMatchObject({ mime: "image/png", size: 3 });
   });
 
   it("sweeps on write, so the table is trimmed exactly when it grows", () => {
@@ -813,7 +1134,7 @@ describe("attachment storage", () => {
     storages.push(storage);
     put(storage, "a".repeat(32), NOW - PHOTO_TTL_MS - 1);
     put(storage, "b".repeat(32), NOW);
-    expect(storage.botChatAttachment("scout", "a".repeat(32))).toBeUndefined();
+    expect(storage.botChatAttachment("scout", "a".repeat(32), 0)).toBeUndefined();
   });
 
   it("binds a photo to a row exactly once", () => {
@@ -823,8 +1144,8 @@ describe("attachment storage", () => {
     storage.bindBotChatAttachment("c".repeat(32), "41");
     // A replayed row must not be able to move a photo onto a later message with the same words.
     storage.bindBotChatAttachment("c".repeat(32), "99");
-    expect(storage.botChatAttachmentsFor("canonical", "41")).toHaveLength(1);
-    expect(storage.botChatAttachmentsFor("canonical", "99")).toHaveLength(0);
+    expect(storage.botChatAttachmentsFor("canonical", "41", 0)).toHaveLength(1);
+    expect(storage.botChatAttachmentsFor("canonical", "99", 0)).toHaveLength(0);
   });
 
   it("drops a bot's photos when the bot is forgotten", () => {
@@ -833,8 +1154,8 @@ describe("attachment storage", () => {
     put(storage, "d".repeat(32), NOW, "scout");
     put(storage, "e".repeat(32), NOW, "byte");
     storage.forgetBot("scout");
-    expect(storage.botChatAttachment("scout", "d".repeat(32))).toBeUndefined();
-    expect(storage.botChatAttachment("byte", "e".repeat(32))).toBeDefined();
+    expect(storage.botChatAttachment("scout", "d".repeat(32), 0)).toBeUndefined();
+    expect(storage.botChatAttachment("byte", "e".repeat(32), 0)).toBeDefined();
   });
 });
 

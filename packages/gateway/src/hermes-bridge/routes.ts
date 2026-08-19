@@ -55,6 +55,7 @@ import {
   createPhotoRateLimiter,
   isPhotoFileId,
   readCappedBody,
+  redactHostPaths,
   type PhotoRateLimiter,
 } from "./photos.ts";
 import { RoutineNotFound, RoutineRefused, RoutineUnconfirmed, patchNeedsRewrite } from "./routines.ts";
@@ -569,6 +570,13 @@ export function registerBotRoutes(
       );
     }
 
+    // Spent BEFORE the body is read, the slot is taken, and anything is validated, so a device that
+    // is probing pays for its probes. The cost of that choice, stated rather than discovered: a run
+    // of 415s (a phone retrying an unconverted HEIC) burns the same budget a run of real sends does,
+    // and a 503 busy burns it for something that was the gateway's fault rather than the device's.
+    // That is the right way round for a bound whose purpose is to make a loop expensive, since a
+    // limiter a caller can dodge by sending requests that fail cheaply is not a limiter. The budget
+    // is generous enough (8, refilling) that an honest client hitting it has a bug worth noticing.
     const ticket = photoRate.take(c.get("deviceId"), photoNow());
     if (!ticket.ok) {
       const seconds = Math.max(1, Math.ceil(ticket.retryAfterMs / 1000));
@@ -1024,11 +1032,29 @@ function photoFailure(c: Context<Env>, err: unknown) {
     const status = err.reason === "content_type" ? 415 : err.reason === "too_large" ? 413 : 400;
     return c.json({ ...extensionErrorBody("media_refused", err.message), reason: err.reason }, status);
   }
+  // Hermes' own text, with anything path-shaped redacted. Every other route on this surface passes
+  // that text through verbatim on purpose and still does; this route is the exception because it is
+  // the one whose ordinary failures NAME the images directory on the operator's box (a `5027 write
+  // failure` carries the full path), and this capability's whole transcript-hygiene argument is that
+  // no such path reaches a device. Redacting the transcript and then handing the same path back in an
+  // error body would be pointless.
   if (err instanceof PhotoAttachFailed) {
     return c.json(
       {
-        ...errorBody("backend_unavailable", "the hermes gateway did not accept the photo; nothing was sent"),
-        hermesError: err.message,
+        ...errorBody("backend_unavailable", "the hermes gateway did not accept the photo; nothing was submitted"),
+        hermesError: redactHostPaths(err.message),
+      },
+      502,
+    );
+  }
+  // Everything except the "no such profile" code, which `failure` answers as the 404 it is and which
+  // carries a bot name rather than a path.
+  if (err instanceof HermesRpcError && err.code !== HERMES_PROFILE_NOT_FOUND) {
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", "the hermes gateway rejected the photo"),
+        hermesError: redactHostPaths(err.message),
+        ...(err.code === undefined ? {} : { hermesErrorCode: err.code }),
       },
       502,
     );

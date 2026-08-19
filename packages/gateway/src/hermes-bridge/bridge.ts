@@ -40,7 +40,7 @@ import type { GroupMember } from "./group-protocol.ts";
 import { BotChatStream } from "./chat-stream.ts";
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 import { GroupRooms } from "./group-rooms.ts";
-import { PHOTO_TTL_MS, newPhotoFileId, photoDisplayName } from "./photos.ts";
+import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName } from "./photos.ts";
 import {
   BotDeleteRefused,
   BotNotFound,
@@ -233,6 +233,9 @@ export interface HermesBridgeOptions {
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
+  /** How often expired chat photos are swept off disk. Scaled down in tests; the read filter is what
+   *  enforces the TTL, so this only decides how long unreachable bytes linger. */
+  attachmentSweepMs?: number;
   /** Turn-poll cadence and cap. Defaults are the desktop's own 2 s / 180 s. */
   chatPollMs?: number;
   chatTurnTimeoutMs?: number;
@@ -270,6 +273,7 @@ export class HermesBridge implements BotsSurface {
   readonly #rosterPollMs: number;
   readonly #routinesPollMs: number;
   readonly #focusTtlMs: number;
+  readonly #sweepMs: number;
   readonly #log: (message: string) => void;
 
   readonly #catalogTtlMs: number;
@@ -327,6 +331,7 @@ export class HermesBridge implements BotsSurface {
   #busyDepth = 0;
 
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
+  #sweepTimer: ReturnType<typeof setTimeout> | undefined;
   #debounceTimer: ReturnType<typeof setTimeout> | undefined;
   #refreshing: Promise<void> | undefined;
   /** Set when a refresh was asked for while one was already running; drives the trailing run. */
@@ -353,6 +358,7 @@ export class HermesBridge implements BotsSurface {
     this.#rosterPollMs = opts.rosterPollMs ?? ROSTER_POLL_MS;
     this.#routinesPollMs = opts.routinesPollMs ?? ROUTINES_POLL_MS;
     this.#focusTtlMs = opts.focusTtlMs ?? FOCUS_TTL_MS;
+    this.#sweepMs = opts.attachmentSweepMs ?? PHOTO_SWEEP_MS;
     const sink = opts.logSink ?? ((line: string) => void process.stderr.write(line));
     this.#log = (message: string) => sink(`[hermes-bridge] ${message}\n`);
     this.#pins = {
@@ -377,7 +383,7 @@ export class HermesBridge implements BotsSurface {
       attachments: {
         bind: (fileId, messageId) => this.#storage.bindBotChatAttachment(fileId, messageId),
         forMessage: (sessionId, messageId) =>
-          this.#storage.botChatAttachmentsFor(sessionId, messageId).map((row) => ({
+          this.#storage.botChatAttachmentsFor(sessionId, messageId, this.#now() - PHOTO_TTL_MS).map((row) => ({
             type: "attachment" as const,
             fileId: row.fileId,
             name: row.name,
@@ -501,6 +507,10 @@ export class HermesBridge implements BotsSurface {
     });
     this.#client.start();
     this.#schedulePoll();
+    // Once now, then hourly. The read filter is what makes expiry true; this is what makes the disk
+    // go back.
+    this.#sweepAttachments();
+    this.#scheduleAttachmentSweep();
   }
 
   roster(): BotRosterView {
@@ -998,11 +1008,40 @@ export class HermesBridge implements BotsSurface {
     }
   }
 
-  /** The gateway's own copy of a photo, by opaque id, scoped to the bot the route named. */
+  /** The gateway's own copy of a photo, by opaque id, scoped to the bot the route named AND to the
+   *  TTL. A photo past its expiry is not found, whether or not a sweep has got to it yet: the
+   *  contract promises a 404 after 14 days, and a promise that depends on a timer having fired is not
+   *  a promise. */
   chatAttachment(name: string, fileId: string): BotChatAttachmentBytes | undefined {
-    const row = this.#storage.botChatAttachment(name, fileId);
+    const row = this.#storage.botChatAttachment(name, fileId, this.#now() - PHOTO_TTL_MS);
     if (row === undefined) return undefined;
     return { bytes: row.bytes, mime: row.mime, name: row.name, size: row.size };
+  }
+
+  /** Reclaims the disk behind photos the reads above have already stopped serving.
+   *
+   *  Purely housekeeping, which is exactly why it is allowed to be a lazy timer: correctness lives in
+   *  the read filter, and this only decides how long the bytes linger on disk after they have become
+   *  unreachable. It runs once at `start()` (so a gateway that is restarted occasionally sweeps even
+   *  if it never stays up an hour) and then hourly, unref'd so it can never hold the process open. */
+  #sweepAttachments(): void {
+    try {
+      const dropped = this.#storage.sweepBotChatAttachments(this.#now(), PHOTO_TTL_MS);
+      if (dropped > 0) this.#log(`swept ${dropped} expired chat photo(s)`);
+    } catch (err) {
+      // Never fatal: a sweep that cannot run costs disk, and the reads have already stopped serving
+      // whatever it would have dropped.
+      this.#log(`chat photo sweep failed: ${err instanceof Error ? err.message : "unknown"}`);
+    }
+  }
+
+  #scheduleAttachmentSweep(): void {
+    if (this.#closed) return;
+    this.#sweepTimer = setTimeout(() => {
+      this.#sweepAttachments();
+      this.#scheduleAttachmentSweep();
+    }, this.#sweepMs);
+    this.#sweepTimer.unref();
   }
 
   /** True while a chat this bridge created is still lazy: the kickoff has not been seen to land,
@@ -1377,6 +1416,8 @@ export class HermesBridge implements BotsSurface {
     await this.#groups.close();
     if (this.#pollTimer !== undefined) clearTimeout(this.#pollTimer);
     this.#pollTimer = undefined;
+    if (this.#sweepTimer !== undefined) clearTimeout(this.#sweepTimer);
+    this.#sweepTimer = undefined;
     if (this.#debounceTimer !== undefined) clearTimeout(this.#debounceTimer);
     this.#debounceTimer = undefined;
     if (this.#routineDebounceTimer !== undefined) clearTimeout(this.#routineDebounceTimer);
