@@ -17,6 +17,9 @@ beforeEach(async () => {
     agents: [
       { id: "echo", name: "Echo", backend: "mock" },
       { id: "steer", name: "Steer", backend: "mock-steer" },
+      // Queue-only backend whose turn stays in flight long enough for a REST interrupt to land on
+      // it: the only way to exercise the runner's "unsupported" outcome through the real stack.
+      { id: "hold", name: "Hold", backend: "mock", options: { holdOn: "[[hold]]", holdMs: 1_500 } },
     ],
   });
 });
@@ -108,6 +111,48 @@ describe("POST /threads/:id/interrupt", () => {
     const sys: Message | undefined = committed.map((f) => f.message).find((m) => m.role === "system");
     expect(sys?.marker).toBe("turn.interrupted");
     expect(frames.some((f) => f.type === "error")).toBe(false);
+    ws.close();
+  });
+
+  it("202 {status:interrupting} for a queue-only in-flight turn, with an interrupt_unsupported frame", async () => {
+    // The runner answers "unsupported" for a backend that cannot interrupt; server.ts collapses
+    // that to the same 202 a steer-capable backend gets (a turn WAS in flight), and the honest
+    // detail rides the WebSocket as an interrupt_unsupported error frame. Only the REST layer can
+    // prove the collapse, so this asserts both halves at once.
+    const token = await pair();
+    const id = await thread(token, "hold");
+    const frames: ServerFrame[] = [];
+    const ws = new WebSocket(`${gateway.url.replace("http", "ws")}/ws`);
+    ws.on("message", (d) => frames.push(JSON.parse(String(d)) as ServerFrame));
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => frames.some((f) => f.type === "ready"));
+
+    await fetch(`${gateway.url}/threads/${id}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "[[hold]] long task" }] }),
+    });
+    await until(() => frames.some((f) => f.type === "draft"));
+
+    const res = await fetch(`${gateway.url}/threads/${id}/interrupt`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ status: "interrupting" });
+
+    await until(() => frames.some((f) => f.type === "error"));
+    const error = frames.find((f): f is Extract<ServerFrame, { type: "error" }> => f.type === "error");
+    expect(error?.code).toBe("interrupt_unsupported");
+    expect(error?.threadId).toBe(id);
+    // The turn itself is untouched by the refused interrupt: it still commits its echo normally.
+    await until(() => frames.some((f) => f.type === "done"));
+    const committed = frames.filter(
+      (f): f is Extract<ServerFrame, { type: "committed" }> => f.type === "committed",
+    );
+    expect(committed.some((f) => f.message.role === "agent")).toBe(true);
+    expect(committed.some((f) => f.message.marker !== undefined)).toBe(false);
     ws.close();
   });
 });

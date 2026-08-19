@@ -3,6 +3,7 @@ import type { RichBlock, ToolCall } from "cozygateway-contract";
 
 import { createMockAdapter, createSteerMockAdapter } from "../src/adapters/mock.ts";
 import { buildAdapters } from "../src/adapters/registry.ts";
+import { requireInterrupt, requireSteer } from "./support/session-capabilities.ts";
 
 function record() {
   const events: string[] = [];
@@ -87,7 +88,7 @@ describe("createSteerMockAdapter", () => {
     expect(rec.events).toEqual(["draft"]);
     expect(rec.drafts[0]).toEqual([{ type: "paragraph", text: "Working: one" }]);
 
-    await session.steer?.([{ type: "paragraph", text: "two" }]);
+    expect(await requireSteer(session)([{ type: "paragraph", text: "two" }])).toBe(true);
     await turn;
     expect(rec.events).toEqual([
       "draft",
@@ -97,13 +98,34 @@ describe("createSteerMockAdapter", () => {
     ]);
   });
 
+  it("reports non-acceptance from a steer that loses the race against its own settled turn", async () => {
+    const adapter = createSteerMockAdapter();
+    const session = await adapter.startSession("t1");
+    const rec = record();
+    const turn = session.send([{ type: "paragraph", text: "one" }], rec.handlers);
+    await new Promise((r) => setTimeout(r, 5));
+    const steer = requireSteer(session);
+    expect(await steer([{ type: "paragraph", text: "two" }])).toBe(true); // settles the turn
+    await turn;
+    // The turn is over: these blocks were NOT taken, and the adapter says so rather than no-opping
+    // silently. TurnRunner turns that false into a queued fallback turn.
+    expect(await steer([{ type: "paragraph", text: "three" }])).toBe(false);
+    expect(rec.events.filter((e) => e === "done")).toHaveLength(1);
+  });
+
+  it("steer with no session turn ever started reports non-acceptance", async () => {
+    const adapter = createSteerMockAdapter();
+    const session = await adapter.startSession("t1");
+    expect(await requireSteer(session)([{ type: "paragraph", text: "hello?" }])).toBe(false);
+  });
+
   it("rejects the in-flight send when interrupt is called, with no commit or done", async () => {
     const adapter = createSteerMockAdapter();
     const session = await adapter.startSession("t1");
     const rec = record();
     const turn = session.send([{ type: "paragraph", text: "one" }], rec.handlers);
     await new Promise((r) => setTimeout(r, 5));
-    await session.interrupt?.();
+    await requireInterrupt(session)();
     await expect(turn).rejects.toThrow(/interrupted/);
     expect(rec.events).toEqual(["draft"]);
   });

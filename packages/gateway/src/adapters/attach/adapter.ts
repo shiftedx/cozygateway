@@ -161,13 +161,18 @@ export function createAttachAdapter(deps: {
             if (!sent) failTurn(turnId, `agent "${deps.agentId}" is not attached`);
           });
         },
-        async steer(steerBlocks: RichBlock[]): Promise<void> {
+        async steer(steerBlocks: RichBlock[]): Promise<boolean> {
           const turnId = inflightByThread.get(threadId);
-          if (turnId === undefined) return; // race: no in-flight turn for this thread
+          // Race: no in-flight turn for this thread, so nothing took these blocks. Reporting
+          // non-acceptance is what lets the runner fall back to a queued turn carrying them
+          // (see BackendSession.steer).
+          if (turnId === undefined) return false;
           // The plugin injects this as another inbound message; with the agent-side Hermes config
           // busy_input_mode=steer, injection steers the running turn natively. The reply continues
           // under the EXISTING turnId (no new turn), so no local turn bookkeeping changes here.
-          deps.endpoint.sendSteer(deps.agentId, {
+          // sendSteer answers false when the agent holds no live socket: the frame went nowhere,
+          // which is a non-acceptance too, not a silent drop.
+          return deps.endpoint.sendSteer(deps.agentId, {
             kind: "steer",
             threadId,
             turnId,

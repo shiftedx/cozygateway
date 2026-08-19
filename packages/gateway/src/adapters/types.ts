@@ -13,9 +13,18 @@ export interface BackendSession {
   send(blocks: RichBlock[], handlers: TurnHandlers): Promise<void>;
   close(): Promise<void>;
   /** Deliver blocks mid-turn into the CURRENTLY in-flight turn of this session (no new turnId).
-   *  Present only on steer-capable sessions (adapter.midTurnDelivery === "steer"). Best-effort:
-   *  the runner only calls this while the session's send() promise is unsettled. */
-  steer?(blocks: RichBlock[]): Promise<void>;
+   *  Present only on steer-capable sessions (adapter.midTurnDelivery === "steer"). The runner only
+   *  calls this while the session's send() promise is unsettled.
+   *
+   *  ACCEPTANCE: resolve `false` when the blocks were NOT taken into a live turn (the adapter's own
+   *  turn had already settled, there is no live connection, ...). The runner then falls back to a
+   *  queued turn carrying the same blocks, so a lost race cannot swallow a user message. Resolve
+   *  `true` when they were taken. A REJECTION is read as "not accepted" and takes the same
+   *  fallback. `void`/`undefined` is the backward-compatible legacy return and is read as ACCEPTED,
+   *  so an out-of-tree adapter written against the older `Promise<void>` shape keeps its
+   *  best-effort behavior instead of silently gaining duplicate queued turns; every in-tree
+   *  adapter reports a real boolean. */
+  steer?(blocks: RichBlock[]): Promise<boolean | void>;
   /** Hard-interrupt the in-flight turn: the pending send() promise rejects, and the runner (which
    *  set its interrupting flag first) records a turn.interrupted system message. Present only on
    *  steer-capable sessions. */

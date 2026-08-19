@@ -41,7 +41,12 @@ export function buildAdapters(
   const adapters = new Map<string, BackendAdapter>();
   for (const agent of agents) {
     if (agent.backend === "mock") {
-      adapters.set(agent.id, createMockAdapter(agent.options as { failOn?: string } | undefined));
+      adapters.set(
+        agent.id,
+        createMockAdapter(
+          agent.options as { failOn?: string; holdOn?: string; holdMs?: number } | undefined,
+        ),
+      );
     } else if (agent.backend === "mock-steer") {
       adapters.set(agent.id, createSteerMockAdapter());
     } else if (agent.backend === "attach") {

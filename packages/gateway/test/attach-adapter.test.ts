@@ -16,6 +16,7 @@ import type {
   AttachTurnFrame,
 } from "../src/adapters/attach/protocol.ts";
 import type { TurnHandlers } from "../src/adapters/types.ts";
+import { requireInterrupt, requireSteer } from "./support/session-capabilities.ts";
 
 const agent = (id: string, options?: Record<string, unknown>) => ({
   id,
@@ -327,7 +328,7 @@ describe("createAttachAdapter", () => {
     const endpoint = fakeEndpoint();
     const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
     const { session, turn, observed, frame } = await startTurn(adapter, endpoint, "t1");
-    await session.steer?.([{ type: "paragraph", text: "also do X" }]);
+    expect(await requireSteer(session)([{ type: "paragraph", text: "also do X" }])).toBe(true);
 
     expect(endpoint.steerFrames).toEqual([
       { kind: "steer", threadId: "t1", turnId: frame.turnId, text: "also do X" },
@@ -347,19 +348,34 @@ describe("createAttachAdapter", () => {
     const endpoint = fakeEndpoint();
     const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
     const { session, turn, frame } = await startTurn(adapter, endpoint, "t1");
-    await session.interrupt?.();
+    await requireInterrupt(session)();
     expect(endpoint.interruptFrames).toEqual([{ kind: "interrupt", threadId: "t1", turnId: frame.turnId }]);
     await expect(turn).rejects.toThrow(/interrupted/);
   });
 
-  it("steer and interrupt are no-ops when no turn is in flight for the thread", async () => {
+  it("steer and interrupt are no-ops when no turn is in flight for the thread, and steer says so", async () => {
     const endpoint = fakeEndpoint();
     const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
     const session = await adapter.startSession("t1");
-    await session.steer?.([{ type: "paragraph", text: "x" }]);
-    await session.interrupt?.();
+    expect(await requireSteer(session)([{ type: "paragraph", text: "x" }])).toBe(false);
+    await requireInterrupt(session)();
     expect(endpoint.steerFrames).toHaveLength(0);
     expect(endpoint.interruptFrames).toHaveLength(0);
+  });
+
+  it("steer reports non-acceptance when the agent's socket is gone mid-turn", async () => {
+    // The turn is still in flight adapter-side, but the frame has nowhere to go: sendSteer answers
+    // false and the session passes that through, so the runner queues a fallback turn instead of
+    // treating a write into a dead socket as delivered.
+    const endpoint = fakeEndpoint();
+    const adapter = createAttachAdapter({ agentId: "a1", endpoint, turnTimeoutMs: 1_000 });
+    const { session, turn } = await startTurn(adapter, endpoint, "t1");
+    endpoint.attached = false;
+    expect(await requireSteer(session)([{ type: "paragraph", text: "x" }])).toBe(false);
+    expect(endpoint.steerFrames).toHaveLength(0);
+    // The in-flight turn is untouched by the refused steer; drain it so nothing dangles.
+    await requireInterrupt(session)();
+    await expect(turn).rejects.toThrow(/interrupted/);
   });
 });
 
