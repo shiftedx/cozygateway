@@ -15,6 +15,7 @@ from cozygateway.attach_client import (
     AttachClientConfig,
     InterruptFrame,
     SteerFrame,
+    TurnFrame,
     parse_interrupt_frame,
     parse_steer_frame,
 )
@@ -175,6 +176,39 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
         adapter.handle_message = _boom  # type: ignore[attr-defined]
         # A failed inject must degrade to a best-effort no-op, not crash the drain loop.
         await adapter._handle_interrupt(InterruptFrame(thread_id="chat-1", turn_id="turn-1"))
+
+    async def test_turn_steer_interrupt_share_the_same_source_shape(self):
+        """Pin the invariant _inbound_source exists to keep in lockstep.
+
+        Turn, steer, and interrupt each inject a message on the same thread and must
+        resolve to the same harness session, so all three must build an identical
+        source (same chat_id/chat_type/user identity/authorization) for the same
+        thread_id. A future edit to one call site drifting from the others would
+        break this test.
+        """
+        adapter = self._make_adapter()
+        thread_id = "chat-1"
+
+        await adapter._handle_turn(TurnFrame(thread_id=thread_id, turn_id="turn-1", text="hi"))
+        await adapter._handle_steer(
+            SteerFrame(thread_id=thread_id, turn_id="turn-1", text="more")
+        )
+        await adapter._handle_interrupt(InterruptFrame(thread_id=thread_id, turn_id="turn-1"))
+
+        self.assertEqual(len(adapter.injected), 3)
+        sources = [vars(event.source) for event in adapter.injected]
+        self.assertEqual(sources[0], sources[1])
+        self.assertEqual(sources[1], sources[2])
+        self.assertEqual(
+            sources[0],
+            {
+                "chat_id": thread_id,
+                "chat_type": "dm",
+                "user_name": INBOUND_USER,
+                "user_id": INBOUND_USER,
+                "role_authorized": True,
+            },
+        )
 
 
 if __name__ == "__main__":

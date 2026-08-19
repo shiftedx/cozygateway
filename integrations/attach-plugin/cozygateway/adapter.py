@@ -306,6 +306,30 @@ class AttachAdapter:
             await self._client.close()
             self._client = None
 
+    def _inbound_source(self, thread_id: str) -> Any:
+        """Build the synthetic-inbound ``source`` shared by turn, steer, and interrupt.
+
+        ``_handle_turn``, ``_handle_steer``, and ``_handle_interrupt`` each inject a message on
+        the SAME thread and must resolve to the SAME harness session -- a steer or interrupt that
+        landed on a different chat id, user id, or authorization than the turn it targets would
+        either miss the running session or (worse) silently open a new one. Routing all three
+        through one helper keeps that same-session-identity invariant in lockstep: a future field
+        added to the source only has to change here, and cannot drift between call sites.
+
+        ``chat_id`` is the thread key, so all three frame types resume the one harness session.
+        A non-empty user id plus ``role_authorized`` carries the upstream (gateway-issued token)
+        authorization through the harness's per-message auth gate; the turn was already
+        authorized by the gateway that issued the token, so the identity here is deliberately
+        neutral (see ``INBOUND_USER``).
+        """
+        return self.build_source(  # type: ignore[attr-defined]
+            chat_id=thread_id,
+            chat_type="dm",
+            user_name=INBOUND_USER,
+            user_id=INBOUND_USER,
+            role_authorized=True,
+        )
+
     # -- inbound turn ---------------------------------------------------------
     def _on_turn(self, turn: TurnFrame) -> None:
         """Bound to the client's ``on_turn``: schedule the inject as a task.
@@ -337,17 +361,9 @@ class AttachAdapter:
         from gateway.platforms.base import MessageEvent  # harness-defined identifier
 
         self._active_turn[turn.thread_id] = turn.turn_id
-        # build_source stamps this adapter's platform onto the source; chat_id is
-        # the thread key, message_id is the per-turn reply anchor. A non-empty
-        # user id plus role_authorized carries the upstream authorization through
-        # the harness auth gate.
-        source = self.build_source(  # type: ignore[attr-defined]
-            chat_id=turn.thread_id,
-            chat_type="dm",
-            user_name=INBOUND_USER,
-            user_id=INBOUND_USER,
-            role_authorized=True,
-        )
+        # See _inbound_source for why turn/steer/interrupt share one source builder.
+        # message_id is the per-turn reply anchor.
+        source = self._inbound_source(turn.thread_id)
         event = MessageEvent(
             text=turn.text,
             source=source,
@@ -379,13 +395,8 @@ class AttachAdapter:
         """
         from gateway.platforms.base import MessageEvent  # harness-defined identifier
 
-        source = self.build_source(  # type: ignore[attr-defined]
-            chat_id=frame.thread_id,
-            chat_type="dm",
-            user_name=INBOUND_USER,
-            user_id=INBOUND_USER,
-            role_authorized=True,
-        )
+        # See _inbound_source for why turn/steer/interrupt share one source builder.
+        source = self._inbound_source(frame.thread_id)
         # A distinct message_id for the injected message; the running turn's reply anchor is left
         # untouched so continued drafts still anchor to the original turn.
         event = MessageEvent(text=frame.text, source=source, message_id=f"{frame.turn_id}:steer")
@@ -421,13 +432,8 @@ class AttachAdapter:
         """
         from gateway.platforms.base import MessageEvent  # harness-defined identifier
 
-        source = self.build_source(  # type: ignore[attr-defined]
-            chat_id=frame.thread_id,
-            chat_type="dm",
-            user_name=INBOUND_USER,
-            user_id=INBOUND_USER,
-            role_authorized=True,
-        )
+        # See _inbound_source for why turn/steer/interrupt share one source builder.
+        source = self._inbound_source(frame.thread_id)
         # A slash command, not a turn: the injected text must be exactly "/stop" (the harness
         # recognizes the command from the message text via MessageEvent.get_command), and no
         # reply anchor is attached -- a command carries no turn-derived message_id, and the
