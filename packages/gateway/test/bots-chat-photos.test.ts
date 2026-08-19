@@ -872,6 +872,7 @@ async function setup(
     submitUserMessage: (threadId: string, blocks: RichBlock[]): Message =>
       storage.appendMessage(threadId, { role: "user", blocks }, 500),
     interruptThread: () => "idle",
+    resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: () => {},
     now: () => 1_000,
   });
@@ -1216,6 +1217,7 @@ describe("GET /bots/:name/chat/attachments/:fileId", () => {
       submitUserMessage: (threadId: string, blocks: RichBlock[]): Message =>
         storage.appendMessage(threadId, { role: "user", blocks }, 500),
       interruptThread: () => "idle",
+      resolveApproval: () => Promise.resolve("unknown" as const),
       onDeviceRevoked: () => {},
       now: () => 1_000,
     });

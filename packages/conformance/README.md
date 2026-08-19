@@ -12,12 +12,12 @@ and the `cozygateway-contract` schemas, never from any gateway's source code. Th
 and writes only the public REST and WebSocket surface, so a green run is evidence the
 implementation matches the contract, not that it shares the reference code.
 
-The suite covers fourteen groups: health, capabilities, pairing, the auth wall, device lifecycle,
+The suite covers fifteen groups: health, capabilities, pairing, the auth wall, device lifecycle,
 agents, thread lifecycle, message round trip and seq discipline, WebSocket lifecycle, streaming
-order, reconnect dedup, turn failure, mid-turn interrupt, and the live in-flight interrupt. Every
-group but the last runs against any gateway; the last one activates only when the gateway
-declares the optional stall hook (see "The optional stall hook" below) and is otherwise reported
-as skipped.
+order, reconnect dedup, turn failure, mid-turn interrupt, the live in-flight interrupt, and the
+approval lifecycle. Every group but the last two runs against any gateway; those two activate
+only when the gateway declares the matching optional hook (see "The optional stall hook" and
+"The optional approval hook" below) and are otherwise reported as skipped.
 
 The capabilities group checks the additive `GatewayInfo.capabilities` block (contract v1.md
 section 5, issue #16) generically: that it agrees across `GET /health`, the pair response, and
@@ -65,6 +65,8 @@ export interface ConformanceEnv {
   echoAgentId: string;
   /** Optional: agent id of a stall-capable, interruptible backend. See "The optional stall hook". */
   stallAgentId?: string;
+  /** Optional: agent id of an approval-capable backend. See "The optional approval hook". */
+  approvalAgentId?: string;
 }
 ```
 
@@ -130,6 +132,44 @@ what it passed before the hook existed. This repo keeps a second runner
 (`test/reference-gateway-hookless.test.ts`) that declares no hook, as standing proof that the
 suite stays portable.
 
+## The optional approval hook
+
+The approval surface (contract v1.md section 5a, capability `approvals`) is optional, and the
+echo backend never pauses on a tool call, so a black-box run has no pending approval to decide.
+The approval hook closes that gap the same way the stall hook does.
+
+Declare `approvalAgentId` and the suite adds one group that drives the real sequence: it sends
+into a thread on that agent, waits for the `approval_pending` frame, resolves it over
+`POST /threads/:id/approvals/:toolCallId/{approve,deny}`, and holds your gateway to the
+contract's semantics for both verbs plus the error paths.
+
+**What the hook promises.** `approvalAgentId` names an agent on the gateway under test whose
+backend:
+
+1. on a send, emits at least one `approval_pending` frame for the turn -- carrying that turn's
+   `turnId`, a non-empty `toolCallId`, and a non-empty tool `name` -- and then **stays in
+   flight**: it does not commit and does not emit `done` before the approval is resolved.
+2. honors both verbs, so `POST /threads/:id/approvals/:toolCallId/approve` answers `202` with
+   body `{"status":"approved"}` (and `deny` answers `202 {"status":"denied"}`), followed by
+   exactly one `approval_resolved` frame carrying the same `threadId`, `turnId`, `toolCallId`
+   and the matching `outcome`.
+3. leaves the decision final: resolving the same `toolCallId` again is `409`
+   `approval_not_pending` and produces no second frame.
+
+The suite additionally asserts what any gateway implementing the surface owes: an unknown
+`toolCallId` is `404 not_found`, an unauthenticated resolve is `401 unauthorized`, and
+`GET /health` advertises the `approvals` capability at version 1.
+
+The group does not require the third terminal state (`expired`) to be drivable: a lapse depends
+on a timeout the suite cannot force from outside, so it stays in the implementation's own tests.
+
+**It is optional on purpose**, exactly like the stall hook: omit `approvalAgentId` and the group
+is reported as skipped while every other assertion runs unchanged. The same hookless runner
+(`test/reference-gateway-hookless.test.ts`) is the standing proof, since it declares neither hook.
+
+The reference gateway implements it with its `mock-approval` backend (one draft, one pending
+approval, then it parks until the approval is resolved or its own bounded window lapses).
+
 ## Running the reference gateway's own conformance
 
 This repo ships two runners, both exercised by one command:
@@ -138,8 +178,8 @@ This repo ships two runners, both exercised by one command:
 pnpm --filter cozygateway-conformance test
 ```
 
-- `test/reference-gateway.test.ts` starts the reference gateway with the mock echo adapter **and**
-  the `mock-steer` stall backend, declares the stall hook, and runs the whole suite including the
-  live in-flight interrupt group.
+- `test/reference-gateway.test.ts` starts the reference gateway with the mock echo adapter, the
+  `mock-steer` stall backend **and** the `mock-approval` backend, declares both hooks, and runs
+  the whole suite including the live in-flight interrupt and approval groups.
 - `test/reference-gateway-hookless.test.ts` starts it with the echo adapter alone and declares no
-  hook, so the live-202 cases are skipped and the rest must still be green.
+  hooks, so the live-202 and approval cases are skipped and the rest must still be green.

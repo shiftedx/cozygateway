@@ -89,6 +89,26 @@ or reverse proxy you set up and control remains a perfectly good alternative.
 | `capabilities` | object | `{}` | Map of capability id to integer version, surfaced verbatim as `GatewayInfo.capabilities` (the `GET /health` response, the pair response, and the `ready` frame all carry it). Ids under `com.cozylabs.*` are vendor extensions, versioned independently of the contract; see contract/v1.md section 5. |
 | `tls` | object | absent (plain HTTP) | `{ "certFile", "keyFile" }`, paths to a PEM certificate chain and its matching unencrypted key. Present means the listener serves HTTPS and `/ws` and `/attach` become `wss`; absent means plain HTTP, unchanged. Overridable with `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`. Present-but-unusable (missing file, garbage PEM, encrypted key, key that does not match the certificate, only one of the two set) fails startup before the port binds rather than falling back to plaintext. See [`docs/tls.md`](../../docs/tls.md). |
 
+## Approvals
+
+A backend can pause a turn on a tool call that needs a human decision. The gateway announces it
+as an `approval_pending` frame on the live channel, a client resolves it with
+`POST /threads/:id/approvals/:toolCallId/approve` or `.../deny`, and the outcome comes back as an
+`approval_resolved` frame (`approved` / `denied` / `expired`). The surface is advertised as the
+core `approvals` capability and specified in contract/v1.md section 5a.
+
+An adapter opts in by calling `handlers.onApprovalPending(...)` during a turn and implementing
+`session.resolveApproval(toolCallId, decision)`; both are optional members of the adapter
+interface, so a backend that never pauses needs no changes. `argSummary` carries argument key
+NAMES mapped to JSON type TAGS only, never argument values, and the gateway re-validates it
+against the wire schema before broadcasting: an adapter that puts a raw value there gets its
+approval refused with an `invalid_request` error frame instead of leaking it to every device.
+Every resolution is audit-logged (thread, turn, `toolCallId`, outcome, deciding device).
+
+The built-in `mock-approval` backend implements the whole loop with no real backend behind it
+(one draft, one pending approval, parked until it is resolved or its bounded window lapses); it
+is what the conformance suite's optional approval hook points at.
+
 ## Backends
 
 Each agent names a `backend`. Alongside the built-in backends, cozygateway works with OpenClaw:

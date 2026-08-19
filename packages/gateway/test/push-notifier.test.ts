@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { openStorage } from "../src/storage.ts";
 import { PREVIEW_MAX_CHARS, RelayNotifier } from "../src/push-notifier.ts";
 
-function decrypt(pushKey: string, wire: string): { threadId: string; agentName: string; preview: string } {
+function decrypt(pushKey: string, wire: string): { kind?: string; threadId: string; agentName: string; preview: string } {
   const key = Buffer.from(
     hkdfSync("sha256", Buffer.from(pushKey, "utf8"), Buffer.alloc(0), Buffer.from("cozygateway-push-v0", "utf8"), 32),
   );
@@ -13,7 +13,7 @@ function decrypt(pushKey: string, wire: string): { threadId: string; agentName: 
   const decipher = createDecipheriv("aes-256-gcm", key, raw.subarray(0, 12));
   decipher.setAuthTag(raw.subarray(raw.length - 16));
   const plain = Buffer.concat([decipher.update(raw.subarray(12, raw.length - 16)), decipher.final()]);
-  return JSON.parse(plain.toString("utf8")) as { threadId: string; agentName: string; preview: string };
+  return JSON.parse(plain.toString("utf8")) as { kind?: string; threadId: string; agentName: string; preview: string };
 }
 
 interface Sent {
@@ -83,6 +83,8 @@ describe("RelayNotifier", () => {
     const forP1 = sent.find((s) => s.body.pushId === "p1");
     expect(forP1).toBeDefined();
     expect(decrypt("key-1", forP1?.body.ciphertext ?? "")).toEqual({
+      // The payload names its own kind (issue #19); an absent kind still means "message".
+      kind: "message",
       threadId: "t1",
       agentName: "Agent",
       preview: "hello",
@@ -186,7 +188,7 @@ describe("RelayNotifier", () => {
     expect(sent.some((s) => s.body.pushId === "p1")).toBe(false);
     const forP2 = sent.find((s) => s.body.pushId === "p2");
     expect(forP2).toBeDefined();
-    expect(decrypt("key-2", forP2?.body.ciphertext ?? "")).toEqual({ threadId: "t", agentName: "A", preview: "p" });
+    expect(decrypt("key-2", forP2?.body.ciphertext ?? "")).toEqual({ kind: "message", threadId: "t", agentName: "A", preview: "p" });
     storage.close();
   });
 

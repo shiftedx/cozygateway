@@ -17,7 +17,12 @@ import {
   type Message,
   type ServerFrame,
   type Thread,
+  APPROVALS_CAPABILITY_ID,
+  APPROVALS_CAPABILITY_VERSION,
   AgentSchema,
+  ApprovalPendingFrameSchema,
+  ApprovalResolveResponseSchema,
+  ApprovalResolvedFrameSchema,
   CommittedFrameSchema,
   DeviceSchema,
   DoneFrameSchema,
@@ -61,6 +66,22 @@ export interface ConformanceEnv {
    *  Omit it and the suite skips that group; every other assertion is unaffected, so a gateway
    *  with no stall-capable backend still passes exactly what it passes today. */
   stallAgentId?: string;
+  /** OPTIONAL approval hook (issue #19). Agent id of an approval-capable backend on the gateway
+   *  under test. Declaring it activates the approval group, which is the only way a black-box run
+   *  can prove the approve/deny verbs and the approval frames end to end.
+   *
+   *  A gateway that declares this id promises the backend behind it:
+   *  - on a send, emits at least one `approval_pending` frame for the turn (carrying that turn's
+   *    `turnId`, a `toolCallId`, and a tool `name`) and then STAYS IN FLIGHT until the approval
+   *    is resolved: it never commits and never emits `done` on its own;
+   *  - honors `POST /threads/:id/approvals/:toolCallId/{approve,deny}`, so the call answers
+   *    `202 { "status": "approved" | "denied" }` and an `approval_resolved` frame carrying the
+   *    matching outcome follows on the socket (contract v1.md section 5a);
+   *  - and the gateway advertises the `approvals` capability, since it implements the surface.
+   *
+   *  Omit it and the suite skips that group; every other assertion is unaffected, so a gateway
+   *  with no approval-capable backend still passes exactly what it passes today. */
+  approvalAgentId?: string;
 }
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -993,6 +1014,211 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
           } finally {
             socket.ws.close();
           }
+        },
+        TEST_TIMEOUT_MS,
+      );
+    });
+
+    // Spec section 5a: the approval lifecycle (approval_pending / approval_resolved frames plus
+    // the approve/deny verbs). Like the live-202 group above, it can only be driven against a
+    // backend that actually parks on an approval, so it rides the OPTIONAL approval hook
+    // (`ConformanceEnv.approvalAgentId`, issue #19). A gateway that declares no such agent skips
+    // this group and is held to exactly what it was held to before the hook existed.
+    describe("approval lifecycle (requires the approval hook)", () => {
+      const approvalAgentId = env.approvalAgentId;
+      // it.skip rather than an empty describe, for the same reason as the stall hook: a named,
+      // skipped case is the honest report that this gateway declared no approval backend.
+      const approvalIt = approvalAgentId === undefined ? it.skip : it;
+
+      /** Send into an approval thread and return the pending frame the backend raises. */
+      async function raiseApproval(
+        token: string,
+        threadId: string,
+        socket: Socket,
+      ): Promise<{ toolCallId: string; turnId: string }> {
+        await sendMessage(token, threadId, "do something dangerous");
+        await waitFor(
+          socket,
+          () =>
+            socket.frames.some((f) => f.type === "approval_pending" && f.threadId === threadId),
+          "approval_pending",
+        );
+        const frame = socket.frames.find(
+          (f) => f.type === "approval_pending" && f.threadId === threadId,
+        );
+        const valid = assertValid(ApprovalPendingFrameSchema, frame);
+        expect(valid.toolCallId.length).toBeGreaterThan(0);
+        expect(valid.name.length).toBeGreaterThan(0);
+        // The turn is genuinely parked on the decision: nothing has ended it.
+        expect(socket.frames.some((f) => f.type === "done" && f.turnId === valid.turnId)).toBe(false);
+        return { toolCallId: valid.toolCallId, turnId: valid.turnId };
+      }
+
+      approvalIt(
+        "a pending approval is announced on the live channel, with a turnId, a toolCallId and a tool name",
+        async () => {
+          if (approvalAgentId === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-pending");
+          const thread = await createThreadWith(token, approvalAgentId, "pending approval");
+          const socket = await authedSocket(token);
+          try {
+            const { turnId } = await raiseApproval(token, thread.id, socket);
+            const draft = framesOfType(socket.frames, "draft").find((d) => d.threadId === thread.id);
+            // The approval belongs to the turn that raised it, not to some other identifier.
+            if (draft !== undefined) expect(draft.turnId).toBe(turnId);
+
+            // An approval is live-channel only: it never lands in durable history.
+            const history = await listMessages(token, thread.id);
+            expect(history.every((m) => m.role !== "agent")).toBe(true);
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      approvalIt(
+        "approve is 202 {status:approved} and produces one approval_resolved(approved)",
+        async () => {
+          if (approvalAgentId === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-approve");
+          const thread = await createThreadWith(token, approvalAgentId, "approve");
+          const socket = await authedSocket(token);
+          try {
+            const { toolCallId, turnId } = await raiseApproval(token, thread.id, socket);
+            const res = await authFetch(
+              token,
+              `/threads/${thread.id}/approvals/${toolCallId}/approve`,
+              { method: "POST" },
+            );
+            expect(res.status).toBe(202);
+            expect(assertValid(ApprovalResolveResponseSchema, await res.json()).status).toBe(
+              "approved",
+            );
+
+            await waitFor(
+              socket,
+              () => socket.frames.some((f) => f.type === "approval_resolved"),
+              "approval_resolved",
+            );
+            const resolved = socket.frames.filter((f) => f.type === "approval_resolved");
+            expect(resolved).toHaveLength(1);
+            const valid = assertValid(ApprovalResolvedFrameSchema, resolved[0]);
+            expect(valid).toMatchObject({
+              threadId: thread.id,
+              turnId,
+              toolCallId,
+              outcome: "approved",
+            });
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      approvalIt(
+        "deny is 202 {status:denied} and produces one approval_resolved(denied)",
+        async () => {
+          if (approvalAgentId === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-deny");
+          const thread = await createThreadWith(token, approvalAgentId, "deny");
+          const socket = await authedSocket(token);
+          try {
+            const { toolCallId } = await raiseApproval(token, thread.id, socket);
+            const res = await authFetch(token, `/threads/${thread.id}/approvals/${toolCallId}/deny`, {
+              method: "POST",
+            });
+            expect(res.status).toBe(202);
+            expect(assertValid(ApprovalResolveResponseSchema, await res.json()).status).toBe("denied");
+
+            await waitFor(
+              socket,
+              () => socket.frames.some((f) => f.type === "approval_resolved"),
+              "approval_resolved",
+            );
+            const resolved = socket.frames.filter((f) => f.type === "approval_resolved");
+            expect(resolved).toHaveLength(1);
+            expect(assertValid(ApprovalResolvedFrameSchema, resolved[0]).outcome).toBe("denied");
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      approvalIt(
+        "resolving the same approval twice is 409 approval_not_pending, with no second frame",
+        async () => {
+          if (approvalAgentId === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-twice");
+          const thread = await createThreadWith(token, approvalAgentId, "twice");
+          const socket = await authedSocket(token);
+          try {
+            const { toolCallId } = await raiseApproval(token, thread.id, socket);
+            const first = await authFetch(
+              token,
+              `/threads/${thread.id}/approvals/${toolCallId}/approve`,
+              { method: "POST" },
+            );
+            expect(first.status).toBe(202);
+            await waitFor(
+              socket,
+              () => socket.frames.some((f) => f.type === "approval_resolved"),
+              "approval_resolved",
+            );
+
+            const second = await authFetch(
+              token,
+              `/threads/${thread.id}/approvals/${toolCallId}/deny`,
+              { method: "POST" },
+            );
+            expect(second.status).toBe(409);
+            expect(assertValid(ErrorBodySchema, await second.json()).error.code).toBe(
+              "approval_not_pending",
+            );
+            expect(socket.frames.filter((f) => f.type === "approval_resolved")).toHaveLength(1);
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      approvalIt(
+        "an unknown toolCallId is 404 not_found, and an unauthenticated resolve is 401",
+        async () => {
+          if (approvalAgentId === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-unknown");
+          const thread = await createThreadWith(token, approvalAgentId, "unknown call");
+
+          const unknown = await authFetch(
+            token,
+            `/threads/${thread.id}/approvals/no-such-call/approve`,
+            { method: "POST" },
+          );
+          expect(unknown.status).toBe(404);
+          expect(assertValid(ErrorBodySchema, await unknown.json()).error.code).toBe("not_found");
+
+          const unauthed = await fetch(
+            `${env.baseUrl()}/threads/${thread.id}/approvals/no-such-call/deny`,
+            { method: "POST" },
+          );
+          expect(unauthed.status).toBe(401);
+          expect(assertValid(ErrorBodySchema, await unauthed.json()).error.code).toBe("unauthorized");
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      approvalIt(
+        "the gateway advertises the approvals capability it implements",
+        async () => {
+          if (approvalAgentId === undefined) throw new Error("unreachable: skipped without hook");
+          const info = assertValid(
+            GatewayInfoSchema,
+            await (await fetch(`${env.baseUrl()}/health`)).json(),
+          );
+          expect(info.capabilities?.[APPROVALS_CAPABILITY_ID]).toBe(APPROVALS_CAPABILITY_VERSION);
         },
         TEST_TIMEOUT_MS,
       );

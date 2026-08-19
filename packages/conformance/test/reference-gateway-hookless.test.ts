@@ -1,12 +1,14 @@
-/** Portability guard for the OPTIONAL stall hook (issue #21).
+/** Portability guard for the OPTIONAL hooks: the stall hook (issue #21) and the approval hook
+ *  (issue #19).
  *
- *  The live in-flight interrupt group needs a stall-capable backend, which not every gateway
- *  has. This runner is the standing proof that the hook stayed optional: it boots the reference
- *  gateway with the echo backend ONLY, declares no `stallAgentId`, and runs the whole portable
- *  suite. A green run here means a third-party gateway with no stall backend still passes exactly
- *  what it passed before the hook existed, with the live-202 cases reported as skipped rather
- *  than failing. Should someone ever make the hook mandatory (assert it in the env, or reach for
- *  it outside the gated group), this file goes red first. */
+ *  The live in-flight interrupt group needs a stall-capable backend, and the approval group needs
+ *  an approval-capable one; not every gateway has either. This runner is the standing proof that
+ *  both hooks stayed optional: it boots the reference gateway with the echo backend ONLY, declares
+ *  neither hook, and runs the whole portable suite. A green run here means a third-party gateway
+ *  with no such backends still passes exactly what it passed before the hooks existed, with the
+ *  live-202 and approval cases reported as skipped rather than failing. Should someone ever make
+ *  either hook mandatory (assert it in the env, or reach for it outside its gated group), this
+ *  file goes red first. */
 import { afterAll, beforeAll } from "vitest";
 import { startGateway, type RunningGateway } from "cozygateway";
 
@@ -39,5 +41,6 @@ registerConformanceSuite({
   baseUrl: () => gateway.url,
   issueSetupCode: () => Promise.resolve(gateway.issueSetupCode()),
   echoAgentId: "conformance-echo",
-  // Deliberately no stallAgentId: this is the hookless gateway a third party may be.
+  // Deliberately no stallAgentId and no approvalAgentId: this is the hookless gateway a third
+  // party may be.
 });

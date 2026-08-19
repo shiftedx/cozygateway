@@ -275,6 +275,7 @@ async function setup(
       throw new Error("unused");
     },
     interruptThread: () => "idle",
+    resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: () => {},
     now: () => 1_000,
   });

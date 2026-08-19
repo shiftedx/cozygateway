@@ -99,6 +99,7 @@ async function setup(behavior: FakeHermesBehavior = {}): Promise<Harness> {
       throw new Error("not used");
     },
     interruptThread: () => "idle",
+    resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: () => {},
     now: () => 1_000,
   });

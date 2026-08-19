@@ -59,3 +59,12 @@ export const InterruptResponseSchema = Type.Object({
   status: Type.Literal("interrupting"),
 });
 export type InterruptResponse = Static<typeof InterruptResponseSchema>;
+
+/** Response body of POST /threads/:id/approvals/:toolCallId/{approve,deny} when the decision was
+ *  dispatched to the backend (HTTP 202). The terminal proof is the `approval_resolved` frame on
+ *  the live channel; this body only reports which decision the gateway took. `expired` is not a
+ *  legal status here: resolving an approval that already expired is an error, not a success. */
+export const ApprovalResolveResponseSchema = Type.Object({
+  status: Type.Union([Type.Literal("approved"), Type.Literal("denied")]),
+});
+export type ApprovalResolveResponse = Static<typeof ApprovalResolveResponseSchema>;
