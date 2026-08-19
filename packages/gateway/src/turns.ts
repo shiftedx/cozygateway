@@ -100,9 +100,23 @@ export class TurnRunner {
         this.#now(),
       );
       this.#hub.broadcast({ type: "committed", threadId, seq: userMessage.seq, message: userMessage });
-      void inflight.session.steer(blocks).catch(() => {
-        // Best-effort mid-turn delivery: drafts continue under the existing turnId.
-      });
+      // Defense in depth, NOT a fix for a live bug: this record is cleared in the microtask before
+      // the next request's macrotask, so no HTTP/WS-driven send reaches here against a turn the
+      // ADAPTER has already settled. Should that invariant ever stop holding (an in-process
+      // caller, a backend that settles its own turn without the runner noticing), the adapter is
+      // the only party that knows -- and now it says so. A steer that reports non-acceptance (or
+      // rejects) falls back to a normal queued turn carrying these same blocks, so the message is
+      // answered instead of dropped on the floor by a best-effort no-op. The already-broadcast
+      // delivery marker stays "steer": that frame records the route chosen at submit time and is
+      // never rewritten.
+      void inflight.session.steer(blocks).then(
+        (accepted) => {
+          if (accepted === false) this.#enqueueTurn(threadId, agentName, adapter, blocks);
+        },
+        () => {
+          this.#enqueueTurn(threadId, agentName, adapter, blocks);
+        },
+      );
       return userMessage;
     }
 
@@ -143,6 +157,19 @@ export class TurnRunner {
   ): Message {
     const userMessage = this.#storage.appendMessage(threadId, { role: "user", blocks }, this.#now());
     this.#hub.broadcast({ type: "committed", threadId, seq: userMessage.seq, message: userMessage });
+    this.#enqueueTurn(threadId, agentName, adapter, blocks);
+    return userMessage;
+  }
+
+  /** The queue half of #commitAndQueue, without the commit: chain one turn behind whatever this
+   *  thread is already running. The steer fallback uses it directly, since its user message was
+   *  committed (and broadcast) on the steer path already and must not be committed twice. */
+  #enqueueTurn(
+    threadId: string,
+    agentName: string,
+    adapter: BackendAdapter,
+    blocks: RichBlock[],
+  ): void {
     // Invariant: #runTurn never rejects, so the chain promise never rejects.
     const previous = this.#queues.get(threadId) ?? Promise.resolve();
     const next = previous.then(() => this.#runTurn(threadId, agentName, adapter, blocks));
@@ -150,7 +177,6 @@ export class TurnRunner {
     void next.then(() => {
       if (this.#queues.get(threadId) === next) this.#queues.delete(threadId);
     });
-    return userMessage;
   }
 
   /** Runs one agent turn. NEVER rejects: a backend failure becomes a turn.failed marker plus an

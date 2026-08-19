@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ServerFrame } from "cozygateway-contract";
+import type { RichBlock, ServerFrame } from "cozygateway-contract";
 
 import { openStorage } from "../src/storage.ts";
 import { TurnRunner, nullNotifier, type Notifier } from "../src/turns.ts";
@@ -387,6 +387,130 @@ describe("TurnRunner stop-phrase send path", () => {
       { type: "paragraph", text: "stop adding comments to every file" },
     ]);
     expect(sent.delivery).toBe("steer");
+  });
+
+  it("a mid-turn send that loses the race on a STEER-CAPABLE backend queues normally under a new turnId", async () => {
+    // The queue-only echo covers this at the wrong altitude: it has no steer path at all, so it
+    // proves nothing about a steer-capable backend whose turn has already ended. Here the
+    // mock-steer turn is driven to completion first, so the second send finds no in-flight record
+    // and takes the queue branch (delivery absent, fresh turnId).
+    const { storage, frames, runner } = steerSetup();
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]); // steers the turn to done
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "done"));
+    expect(new Set(draftTurnIds(frames)).size).toBe(1);
+
+    const late = runner.submitUserMessage("t1", [{ type: "paragraph", text: "three" }]);
+    expect(late.delivery).toBeUndefined();
+    await untilFrames(frames, (fs) => new Set(draftTurnIds(fs)).size === 2);
+    const users = storage.messagesSince("t1", 0).filter((m) => m.role === "user");
+    expect(users.map((m) => m.delivery)).toEqual([undefined, "steer", undefined]);
+  });
+});
+
+/** A steer-capable session whose sends never settle on their own and whose steer() reports
+ *  acceptance with `result`. Records every blocks array send() received, so a test can prove a
+ *  refused steer came back as a QUEUED turn carrying the same blocks rather than vanishing. */
+function acceptanceSteerAdapter(result: () => Promise<boolean | void>) {
+  const sent: RichBlock[][] = [];
+  const pending: Array<{ handlers: TurnHandlers; resolve: () => void }> = [];
+  const session: BackendSession = {
+    send(blocks, handlers) {
+      sent.push(blocks);
+      handlers.onDraft({ blocks, toolCalls: [] });
+      return new Promise<void>((resolve) => {
+        pending.push({ handlers, resolve });
+      });
+    },
+    steer: () => result(),
+    async interrupt() {},
+    async close() {},
+  };
+  const adapter: BackendAdapter = {
+    backend: "acceptance-steer",
+    midTurnDelivery: "steer",
+    async startSession() {
+      return session;
+    },
+    presence: () => "online",
+  };
+  return {
+    adapter,
+    sent,
+    finishOldest: () => {
+      const turn = pending.shift();
+      turn?.handlers.onCommit({ blocks: [{ type: "paragraph", text: "done" }] });
+      turn?.handlers.onDone();
+      turn?.resolve();
+    },
+  };
+}
+
+function acceptanceSetup(adapter: BackendAdapter) {
+  const storage = openStorage(":memory:");
+  storage.upsertAgent({ id: "a1", name: "A", avatar: null, backend: adapter.backend });
+  storage.createThread({ id: "t1", agentId: "a1", title: "T", createdAt: 1 });
+  const frames: ServerFrame[] = [];
+  const runner = new TurnRunner({
+    storage,
+    hub: { broadcast: (f) => frames.push(f), connectedDeviceIds: () => new Set() },
+    adapters: new Map<string, BackendAdapter>([["a1", adapter]]),
+    notifier: nullNotifier,
+    now: () => 42,
+  });
+  return { storage, frames, runner };
+}
+
+describe("TurnRunner steer acceptance", () => {
+  it("queues a fallback turn with the same blocks when steer reports it was NOT accepted", async () => {
+    const fake = acceptanceSteerAdapter(async () => false);
+    const { frames, runner } = acceptanceSetup(fake.adapter);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]);
+    // The fallback chains behind the still-in-flight first turn; settling it lets the queue run.
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "committed" && f.message.delivery === "steer"));
+    fake.finishOldest();
+
+    await untilFrames(frames, (fs) => new Set(draftTurnIds(fs)).size === 2);
+    expect(fake.sent).toEqual([
+      [{ type: "paragraph", text: "one" }],
+      [{ type: "paragraph", text: "two" }],
+    ]);
+  });
+
+  it("queues a fallback turn when the steer call rejects outright", async () => {
+    const fake = acceptanceSteerAdapter(async () => {
+      throw new Error("socket gone");
+    });
+    const { frames, runner } = acceptanceSetup(fake.adapter);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "committed" && f.message.delivery === "steer"));
+    fake.finishOldest();
+
+    await untilFrames(frames, (fs) => new Set(draftTurnIds(fs)).size === 2);
+    expect(fake.sent).toHaveLength(2);
+  });
+
+  it("queues NO fallback turn when steer reports acceptance, including the legacy void return", async () => {
+    for (const result of [async () => true, async () => undefined]) {
+      const fake = acceptanceSteerAdapter(result);
+      const { frames, runner } = acceptanceSetup(fake.adapter);
+      runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+      await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+      runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]);
+      await untilFrames(frames, (fs) => fs.some((f) => f.type === "committed" && f.message.delivery === "steer"));
+      fake.finishOldest();
+      // Give any (wrongly) queued fallback turn every chance to start before asserting it did not.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(fake.sent).toEqual([[{ type: "paragraph", text: "one" }]]);
+      expect(new Set(draftTurnIds(frames)).size).toBe(1);
+    }
   });
 });
 

@@ -10,8 +10,20 @@ function firstText(blocks: RichBlock[]): string {
 /** Reference echo backend. contract/v1.md section 7 freezes these semantics; the conformance
  *  suite asserts them frame by frame. Change nothing here without a contract version bump. It
  *  declares "queue" mid-turn delivery: a send while a turn is in flight serializes behind it. */
-export function createMockAdapter(options?: { failOn?: string }): BackendAdapter {
+export function createMockAdapter(options?: {
+  failOn?: string;
+  /** Test-only, opt-in and ABSENT by default (so the frozen echo semantics above are untouched):
+   *  a message containing this token drafts as usual and then holds the turn in flight for
+   *  `holdMs` before committing normally. It exists so a test can catch this queue-only backend
+   *  mid-turn -- the only way to drive the runner's "unsupported" interrupt outcome through the
+   *  real HTTP stack. The hold is bounded rather than open-ended because TurnRunner.closeAll()
+   *  awaits the thread's queue, so a turn that never settled would wedge gateway shutdown. */
+  holdOn?: string;
+  holdMs?: number;
+}): BackendAdapter {
   const failToken = options?.failOn ?? "[[fail]]";
+  const holdToken = options?.holdOn;
+  const holdMs = options?.holdMs ?? 1_000;
 
   const session: BackendSession = {
     async send(blocks: RichBlock[], handlers: TurnHandlers): Promise<void> {
@@ -21,6 +33,12 @@ export function createMockAdapter(options?: { failOn?: string }): BackendAdapter
       if (text.includes(failToken)) {
         await Promise.resolve();
         throw new Error("scripted failure");
+      }
+      if (holdToken !== undefined && text.includes(holdToken)) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, holdMs);
+          timer.unref();
+        });
       }
       await Promise.resolve();
       const final: RichBlock[] = [{ type: "paragraph", text: `Echo: ${text}` }];
@@ -73,9 +91,11 @@ export function createSteerMockAdapter(): BackendAdapter {
             // Deliberately does not resolve: the turn stays in flight until steer/interrupt.
           });
         },
-        async steer(steerBlocks: RichBlock[]): Promise<void> {
+        async steer(steerBlocks: RichBlock[]): Promise<boolean> {
           const cur = inflight;
-          if (cur === undefined || cur.settled) return; // race: the turn already ended
+          // Race: the turn already ended, so these blocks were NOT taken. Reporting non-acceptance
+          // is what lets the runner answer them with a queued turn instead of dropping them.
+          if (cur === undefined || cur.settled) return false;
           cur.text = `${cur.text} + ${firstText(steerBlocks)}`;
           const final: RichBlock[] = [{ type: "paragraph", text: cur.text }];
           cur.handlers.onDraft({ blocks: final, toolCalls: [] });
@@ -84,6 +104,7 @@ export function createSteerMockAdapter(): BackendAdapter {
           cur.handlers.onDone();
           cur.resolve();
           inflight = undefined;
+          return true;
         },
         async interrupt(): Promise<void> {
           const cur = inflight;
