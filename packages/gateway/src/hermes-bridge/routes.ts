@@ -30,10 +30,14 @@ import {
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import {
   MEDIA_CACHE_CONTROL,
+  MEDIA_MAX_CONCURRENT,
+  MediaBusy,
   MediaRefused,
   MediaTimedOut,
   MediaUpstreamFailed,
   type MediaFetch,
+  type MediaLimiter,
+  type MediaLookup,
   fetchMedia,
   resolveMediaSource,
 } from "./media.ts";
@@ -230,7 +234,13 @@ export function registerBotRoutes(
   app: Hono<Env>,
   requireDevice: MiddlewareHandler<Env>,
   bots: BotsSurface,
-  mediaOptions: { fetchImpl?: MediaFetch; timeoutMs?: number } = {},
+  mediaOptions: {
+    fetchImpl?: MediaFetch;
+    timeoutMs?: number;
+    lookup?: MediaLookup;
+    limiter?: MediaLimiter;
+    queueWaitMs?: number;
+  } = {},
 ): void {
   // Cache-first: the snapshot answers immediately, even on a cold link, and a refresh runs in the
   // background so the next read (or the /ws bot_roster frame) carries fresh state.
@@ -597,6 +607,11 @@ export function registerBotRoutes(
         headers: {
           "content-type": media.contentType,
           "cache-control": MEDIA_CACHE_CONTROL,
+          // The bytes came from a host a bot's text named, and this is an authenticated same-origin
+          // route, so the browser or web view is told to take the declared type and not go looking
+          // for a better one. The type is already off an allow-list of raster formats; this stops a
+          // sniffer from promoting something that slipped past it into markup.
+          "x-content-type-options": "nosniff",
           // The app keys its cache on the source, not on this URL, so the source rides back on the
           // answer: a client that followed a redirect chain server-side otherwise has no way to know
           // what it actually got.
@@ -707,7 +722,11 @@ export function registerBotRoutes(
  *    fallback chip and never retries: retrying cannot change the answer.
  *  - `415 media_refused`: something was fetched and it is not a proxied image type. Same finality.
  *  - `413 media_refused`: over the size cap, either declared or delivered.
- *  - `502 backend_unavailable`: the source host failed or answered non-2xx. A retry is reasonable.
+ *  - `503 backend_unavailable` with `busy: true`: nothing was dialed, because this gateway was
+ *    already fetching as many images as it will fetch at once and no slot came free. A retry is not
+ *    just reasonable, it is expected: the client backs off and asks again.
+ *  - `502 backend_unavailable`: the source host failed, did not resolve, or answered non-2xx. A retry
+ *    is reasonable.
  *  - `504 backend_unavailable` with `timedOut: true`: it did not answer in time.
  *
  *  `reason` rides every refusal so a client can render a specific fallback ("this bot pointed at a
@@ -716,6 +735,20 @@ function mediaFailure(c: Context<Env>, err: unknown) {
   if (err instanceof MediaRefused) {
     const status = err.reason === "content_type" ? 415 : err.reason === "too_large" ? 413 : 400;
     return c.json({ ...extensionErrorBody("media_refused", err.message), reason: err.reason }, status);
+  }
+  if (err instanceof MediaBusy) {
+    // `retry-after` in whole seconds, which is all the header allows, and 1 rather than 0 so a client
+    // that obeys it literally does not spin. The wait already spent is in the body for a client that
+    // wants to be smarter about it.
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", `the gateway is already fetching ${MEDIA_MAX_CONCURRENT} images`),
+        busy: true,
+        waitedMs: err.waitedMs,
+      },
+      503,
+      { "retry-after": "1" },
+    );
   }
   if (err instanceof MediaTimedOut) {
     return c.json(

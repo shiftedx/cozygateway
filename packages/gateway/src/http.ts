@@ -25,7 +25,7 @@ import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
 import type { BotsSurface } from "./hermes-bridge/bridge.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
-import type { MediaFetch } from "./hermes-bridge/media.ts";
+import type { MediaFetch, MediaLimiter, MediaLookup } from "./hermes-bridge/media.ts";
 
 export interface AppDeps {
   storage: Storage;
@@ -36,6 +36,13 @@ export interface AppDeps {
   /** Test seam for `GET /bots/:name/media`. Left undefined in production, where the proxy uses the
    *  global `fetch`; a test supplies its own so the media rules can be exercised without a socket. */
   mediaFetch?: MediaFetch;
+  /** Test seams alongside `mediaFetch`, for the same reason: the resolved-address rule and the
+   *  concurrency cap are as much a part of what the proxy will dial as the literal rules are, and a
+   *  rule that can only be exercised against real DNS is a rule that does not get tested. Left
+   *  undefined in production, where the proxy uses `dns.lookup` and the one process-wide limiter. */
+  mediaLookup?: MediaLookup;
+  mediaLimiter?: MediaLimiter;
+  mediaQueueWaitMs?: number;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
   presenceOf: (agentId: string) => PresenceState;
@@ -235,6 +242,9 @@ export function createApp(deps: AppDeps): Hono<Env> {
   if (deps.bots !== undefined) {
     registerBotRoutes(app, requireDevice, deps.bots, {
       ...(deps.mediaFetch === undefined ? {} : { fetchImpl: deps.mediaFetch }),
+      ...(deps.mediaLookup === undefined ? {} : { lookup: deps.mediaLookup }),
+      ...(deps.mediaLimiter === undefined ? {} : { limiter: deps.mediaLimiter }),
+      ...(deps.mediaQueueWaitMs === undefined ? {} : { queueWaitMs: deps.mediaQueueWaitMs }),
     });
   }
 

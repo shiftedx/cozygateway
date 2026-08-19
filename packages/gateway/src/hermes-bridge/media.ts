@@ -15,6 +15,8 @@
  *
  *  Nothing here touches Hermes, so none of it can fail the way the rest of the bridge fails. */
 
+import { lookup as dnsLookup } from "node:dns/promises";
+
 /** Bytes. A phone showing an inline image in a chat bubble does not need more, and the cap is what
  *  keeps a bot's text from pointing the gateway at a multi-gigabyte download. Enforced against the
  *  declared `Content-Length` AND against the bytes actually delivered, because the header is a claim
@@ -30,6 +32,35 @@ export const MEDIA_TIMEOUT_MS = 15_000;
  *  the first: an upstream that answers `302 http://169.254.169.254/...` would otherwise walk the
  *  proxy straight past the guard that refused that address in the query string. */
 export const MEDIA_MAX_REDIRECTS = 3;
+
+/** How many media fetches this gateway will run at once, counted for the whole life of a fetch
+ *  (headers AND the body stream), because a socket held open dribbling bytes costs the same as one
+ *  being negotiated.
+ *
+ *  Per GATEWAY, not per device, and the choice is deliberate: the resource being protected is this
+ *  process's socket table and the household's uplink, both of which are shared by every paired
+ *  device. A per-device cap would multiply the fan-out by the number of phones in the house, which is
+ *  the opposite of a bound. The cost of the choice is that one device loading a gallery can make
+ *  another device's image wait, and that is the right trade for a household gateway with a handful of
+ *  devices: the wait is bounded below, and nothing is dropped that a retry cannot get.
+ *
+ *  The number that matters is not this one but the fan-out it stops: a single reply may carry fifty
+ *  image references, and the app asks for all of them at once. Five in flight turns a crafted reply
+ *  from a resource event into a gallery that fills in a few at a time. */
+export const MEDIA_MAX_CONCURRENT = 5;
+
+/** How long a request will wait for one of those slots before it is refused.
+ *
+ *  A BOUNDED wait rather than an unbounded queue, and rather than an instant refusal. Unbounded is
+ *  wrong because the per-fetch timeout only starts once a slot is held: park four requests behind
+ *  four 15 s fetches and the fourth one's spinner runs for a minute with no way for the client to
+ *  tell a queued request from a slow host, which is exactly the "silently blow its own budget"
+ *  failure. Refusing instantly is wrong the other way: the common deep queue is a burst of thumbnails
+ *  that each finish in well under a second, and refusing those would make a normal gallery flicker
+ *  with errors. Five seconds covers the burst and gives up before a stalled upstream can hide behind
+ *  the queue; past it the client gets a retryable 503 and can ask again when the user scrolls the
+ *  image back into view. */
+export const MEDIA_QUEUE_WAIT_MS = 5_000;
 
 /** Content types the proxy will pass through. An allow-list, not a `image/*` prefix test, and
  *  `image/svg+xml` is deliberately NOT on it: SVG is a document format that carries script and
@@ -89,6 +120,76 @@ export class MediaTimedOut extends Error {
   }
 }
 
+/** Nothing was dialed because this gateway is already fetching as many images as it will fetch at
+ *  once, and a slot did not come free in time. Separate from every other error here because it says
+ *  nothing about the source: the same URL a moment later is likely to work, which is why the route
+ *  turns it into a retryable status rather than a refusal. */
+export class MediaBusy extends Error {
+  readonly waitedMs: number;
+  constructor(waitedMs: number) {
+    super(`the gateway is already fetching ${MEDIA_MAX_CONCURRENT} images and no slot came free in ${waitedMs} ms`);
+    this.name = "MediaBusy";
+    this.waitedMs = waitedMs;
+  }
+}
+
+/** Released when the fetch is finished with its slot, which is when the BODY is done, not when the
+ *  headers arrive. Calling it twice is harmless: the stream teardown paths overlap. */
+export type MediaSlot = () => void;
+
+export type MediaLimiter = {
+  acquire(waitMs?: number): Promise<MediaSlot>;
+  /** For tests and for anything that wants to report saturation. */
+  readonly inFlight: number;
+};
+
+/** A counting semaphore with a FIFO waiting line. FIFO rather than LIFO so a request that has
+ *  already waited is not starved by one that just arrived, which matters when the queue is a burst of
+ *  thumbnails from one reply. Exported so a test can cap at two and watch the cap hold, and so a
+ *  future per-collab policy has somewhere to go. */
+export function createMediaLimiter(limit: number = MEDIA_MAX_CONCURRENT): MediaLimiter {
+  type Waiter = { grant: () => void; timer: ReturnType<typeof setTimeout> };
+  let inFlight = 0;
+  const waiting: Waiter[] = [];
+  const take = (): MediaSlot => {
+    inFlight += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      inFlight -= 1;
+      const next = waiting.shift();
+      if (next !== undefined) {
+        clearTimeout(next.timer);
+        next.grant();
+      }
+    };
+  };
+  return {
+    get inFlight() {
+      return inFlight;
+    },
+    acquire(waitMs: number = MEDIA_QUEUE_WAIT_MS): Promise<MediaSlot> {
+      if (inFlight < limit) return Promise.resolve(take());
+      return new Promise<MediaSlot>((resolve, reject) => {
+        let entry: Waiter;
+        const timer = setTimeout(() => {
+          const at = waiting.indexOf(entry);
+          if (at >= 0) waiting.splice(at, 1);
+          reject(new MediaBusy(waitMs));
+        }, waitMs);
+        // `unref` where it exists, so a queued waiter cannot hold a process open on shutdown.
+        (timer as unknown as { unref?: () => void }).unref?.();
+        entry = { grant: () => resolve(take()), timer };
+        waiting.push(entry);
+      });
+    },
+  };
+}
+
+/** The one every request shares, because the bound is a property of the process. */
+const gatewayMediaLimiter = createMediaLimiter();
+
 /** Reads as a filesystem path rather than as a URL. Checked BEFORE parsing so the refusal names the
  *  real reason: `/Users/x/out.png` and `C:\out.png` do not parse as URLs at all, and reporting them
  *  as "malformed" would tell a user to fix a URL that is not one. */
@@ -105,24 +206,40 @@ function looksLikeLocalPath(src: string): boolean {
  *  a probe of the operator's LAN and of every cloud metadata endpoint that lives on a link-local
  *  address.
  *
- *  This checks LITERALS only. A hostname that RESOLVES into private space still gets dialed, and a
- *  DNS answer that changes between this check and the connection could not be caught here anyway;
- *  closing that properly means resolving first and pinning the socket to the address that was
- *  checked, which is a bigger change than tonight's. The contract says so plainly rather than
- *  implying a guarantee this does not make. */
+ *  This function checks one ADDRESS OR NAME as written. It is applied twice: to the literal in the
+ *  URL, and (by `assertResolvesPublic`) to whatever that URL's hostname resolves to, so a public DNS
+ *  name pointed at private space is caught as well. What survives is the gap between the check and
+ *  the connection: the socket can still be handed a different answer than the one that was checked.
+ *  Closing that means pinning the socket to the address that was checked, which is a bigger change.
+ *  The contract says exactly this rather than implying a guarantee. */
 function isBlockedHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  // The trailing FQDN root dot is stripped FIRST, before any rule, because it changes nothing about
+  // where a name resolves and everything about how a suffix test reads: `localhost.` resolves to
+  // 127.0.0.1 and `nas.local.` is the ordinary mDNS spelling, and both walked past the three name
+  // rules below while the same names without the dot were refused.
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
   // IPv6 loopback, unspecified, unique-local (fc00::/7) and link-local (fe80::/10).
   if (host === "::1" || host === "::") return true;
   if (/^f[cd][0-9a-f]{2}:/.test(host)) return true;
   if (/^fe[89ab][0-9a-f]:/.test(host)) return true;
-  // IPv4-mapped IPv6, checked by unwrapping to the v4 literal. BOTH spellings are handled, because
-  // `new URL()` rewrites the readable one: `[::ffff:10.0.0.1]` comes back out of `url.hostname` as
-  // `[::ffff:a00:1]`, so a check that only knew the dotted form let every private address through
-  // behind four characters of prefix.
-  const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(host);
-  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+  // A v4 address written inside a v6 one, checked by unwrapping to the v4 literal. BOTH spellings of
+  // each prefix are handled, because `new URL()` rewrites the readable one: `[::ffff:10.0.0.1]` comes
+  // back out of `url.hostname` as `[::ffff:a00:1]`, so a check that only knew the dotted form let
+  // every private address through behind four characters of prefix.
+  //
+  // Three prefixes carry a v4 address inside a v6 one and all three are unwrapped the same way, so
+  // the v4 rules below decide every spelling of the same address:
+  //   `::ffff:a.b.c.d`  IPv4-mapped, the common one
+  //   `::a.b.c.d`       IPv4-compatible, deprecated but still routed, and `[::127.0.0.1]` is a
+  //                     perfectly ordinary way to write loopback that Node hands back as `::7f00:1`
+  //   `64:ff9b::a.b.c.d` the well-known NAT64 prefix, which on a network running NAT64 is a live
+  //                     route to the embedded v4 address
+  // Unwrapping rather than blanket-blocking the prefixes keeps the answer consistent across
+  // spellings: `[::ffff:8.8.8.8]` and `[64:ff9b::8.8.8.8]` are public and stay allowed, exactly as
+  // the dotted form does.
+  const dotted = /^(?:::ffff:|::|64:ff9b::)(\d+\.\d+\.\d+\.\d+)$/.exec(host);
+  const hex = /^(?:::ffff:|::|64:ff9b::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
   const v4 = dotted
     ? dotted[1]
     : hex
@@ -180,6 +297,52 @@ export function resolveMediaSource(raw: string): URL {
   return url;
 }
 
+/** Injected in tests, exactly like `fetchImpl`, so the resolved-address rule can be exercised with no
+ *  network and no DNS. Returns every address the name resolves to. */
+export type MediaLookup = (hostname: string) => Promise<string[]>;
+
+const defaultLookup: MediaLookup = async (hostname) =>
+  (await dnsLookup(hostname, { all: true })).map((entry) => entry.address);
+
+/** Reads as an address rather than a name, in which case `isBlockedHost` has already had the final
+ *  word and there is nothing to resolve. `url.hostname` hands back IPv6 in brackets. */
+function isAddressLiteral(hostname: string): boolean {
+  return hostname.startsWith("[") || /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname);
+}
+
+/** The second half of the host rule: resolve the name and apply the SAME address rules to what came
+ *  back.
+ *
+ *  Without this the literal check is bypassed with no infrastructure at all, because public DNS names
+ *  that answer with private addresses are a service anyone can use: `localtest.me` is 127.0.0.1, and
+ *  the `nip.io` and `sslip.io` families answer with whatever address is spelled into the name. A
+ *  literals-only guard refuses `https://127.0.0.1/` and allows `https://127.0.0.1.nip.io/`, which is
+ *  not a guard.
+ *
+ *  What this does NOT close, and the contract says so too: the resolver is asked here and the socket
+ *  asks again, so a name that answers publicly now and privately in a moment (DNS rebinding, or a
+ *  short-TTL record that changes between the two lookups) still reaches a private address. Only
+ *  pinning the connection to the address that was checked closes that, and it needs a custom agent
+ *  per request. This closes "point a hostname at 10.0.0.5", which is the part that costs an attacker
+ *  nothing. */
+async function assertResolvesPublic(url: URL, lookup: MediaLookup): Promise<void> {
+  if (isAddressLiteral(url.hostname)) return;
+  let addresses: string[];
+  try {
+    addresses = await lookup(url.hostname);
+  } catch (err) {
+    throw new MediaUpstreamFailed(
+      `the image source's hostname did not resolve: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  // EVERY answer, not the first: a name that answers with one public and one private address must be
+  // refused, because which one the socket picks is not this function's to decide.
+  const blocked = addresses.find((address) => isBlockedHost(address));
+  if (blocked !== undefined) {
+    throw new MediaRefused("host", `refusing to fetch from ${url.hostname}, which resolves to ${blocked}`);
+  }
+}
+
 export type MediaFetchResult = {
   body: ReadableStream<Uint8Array>;
   contentType: string;
@@ -196,15 +359,42 @@ export type MediaFetch = (url: string, init: { redirect: "manual"; signal: Abort
  *  request, and the phone starts decoding sooner. */
 export async function fetchMedia(
   source: URL,
-  options: { fetchImpl?: MediaFetch; timeoutMs?: number } = {},
+  options: {
+    fetchImpl?: MediaFetch;
+    timeoutMs?: number;
+    lookup?: MediaLookup;
+    limiter?: MediaLimiter;
+    queueWaitMs?: number;
+  } = {},
 ): Promise<MediaFetchResult> {
   const doFetch = options.fetchImpl ?? ((url, init) => fetch(url, init));
+  const lookup = options.lookup ?? defaultLookup;
   const timeoutMs = options.timeoutMs ?? MEDIA_TIMEOUT_MS;
+  const limiter = options.limiter ?? gatewayMediaLimiter;
+
+  // The slot is taken BEFORE the timer starts, and that ordering is the point: a request that waited
+  // in the queue must get its full 15 s once it is dialing, or a deep queue would silently spend a
+  // request's whole budget on waiting and report it as an upstream timeout. Time in the queue is
+  // bounded separately, and running out of it is a different answer (`MediaBusy`) that says the
+  // gateway was busy rather than blaming the source.
+  const slot = await limiter.acquire(options.queueWaitMs);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    slot();
+  };
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let timedOut = false;
   const onAbort = () => {
     timedOut = true;
+    // The slot goes back at the timeout too, not only on a clean end of stream: a caller that takes
+    // the body and then walks away without reading or cancelling it would otherwise hold a slot for
+    // as long as the process lives. The timeout covers the body as well as the headers, so once it
+    // has fired this fetch is finished with the socket either way.
+    release();
   };
   controller.signal.addEventListener("abort", onAbort);
 
@@ -212,6 +402,9 @@ export async function fetchMedia(
     let url = source;
     let response: Response | undefined;
     for (let hop = 0; hop <= MEDIA_MAX_REDIRECTS; hop += 1) {
+      // Per hop, not once: a redirect's host gets the resolved-address check for the same reason it
+      // gets the literal one, since a `302` is just another URL chosen by someone other than us.
+      await assertResolvesPublic(url, lookup);
       let attempt: Response;
       try {
         attempt = await doFetch(url.toString(), { redirect: "manual", signal: controller.signal });
@@ -270,6 +463,7 @@ export async function fetchMedia(
         const { done, value } = await reader.read();
         if (done) {
           clearTimeout(timer);
+          release();
           controllerOut.close();
           return;
         }
@@ -277,6 +471,7 @@ export async function fetchMedia(
         if (seen > MEDIA_MAX_BYTES) {
           await reader.cancel().catch(() => {});
           clearTimeout(timer);
+          release();
           controllerOut.error(new MediaRefused("too_large", `the image ran past the ${MEDIA_MAX_BYTES} byte cap`));
           return;
         }
@@ -284,6 +479,7 @@ export async function fetchMedia(
       },
       async cancel(reason) {
         clearTimeout(timer);
+        release();
         await reader.cancel(reason).catch(() => {});
       },
     });
@@ -295,6 +491,8 @@ export async function fetchMedia(
     };
   } catch (err) {
     clearTimeout(timer);
+    // Every failure path gives the slot back here; the success path holds it until the body ends.
+    release();
     throw err;
   } finally {
     controller.signal.removeEventListener("abort", onAbort);

@@ -609,14 +609,17 @@ GET /bots/:name/media?src=<url-encoded absolute https URL>
 200  <the image bytes>
      content-type: one of the allowed image types below
      cache-control: private, max-age=86400
+     x-content-type-options: nosniff
      x-cozy-media-source: the URL that was actually fetched, after redirects
 
 400  invalid_request                  // src missing, empty, or over 2048 characters
 400  media_refused  reason: "local_path" | "scheme" | "host" | "credentials"
 413  media_refused  reason: "too_large"
 415  media_refused  reason: "content_type"
-502  backend_unavailable              // the source host failed or answered non-2xx
+502  backend_unavailable              // the source host failed, did not resolve, or answered non-2xx
                                       // + sourceError, and sourceStatus when there was one
+503  backend_unavailable  busy: true  // nothing was dialed: the gateway is already fetching as many
+                                      // images as it will at once. + waitedMs, retry-after: 1
 504  backend_unavailable  timedOut: true
 ```
 
@@ -643,13 +646,24 @@ What the proxy will fetch:
 
 - `https` ONLY. `http`, `file`, `data` and everything else is `reason: "scheme"`.
 - No credentials in the URL (`reason: "credentials"`).
-- Not a loopback, private, link-local, carrier-grade-NAT or multicast address LITERAL
-  (`reason: "host"`). The gateway sits inside the operator's network and the `src` it is handed comes
-  out of model output, so without this an authenticated app route becomes a probe of the operator's
-  LAN and of every cloud metadata endpoint on `169.254.169.254`. This checks literals only: a
-  HOSTNAME that resolves into private space is still dialed. Closing that means resolving first and
-  pinning the socket to the address that was checked, which this version does not do, and this
-  paragraph exists so no one reads the guard as more than it is.
+- Not a loopback, private, link-local, carrier-grade-NAT or multicast address (`reason: "host"`).
+  The gateway sits inside the operator's network and the `src` it is handed comes out of model
+  output, so without this an authenticated app route becomes a probe of the operator's LAN and of
+  every cloud metadata endpoint on `169.254.169.254`. The rule is applied TWICE: to the address
+  literal in the URL, and to every address the URL's hostname resolves to, on the initial URL and on
+  each redirect hop. A name is resolved before anything is dialed, so `https://10.0.0.5.nip.io/` is
+  refused for the same reason `https://10.0.0.5/` is. A v4 address written inside a v6 one
+  (`::ffff:`, the deprecated `::` form, the `64:ff9b::` NAT64 prefix) is unwrapped and judged as the
+  v4 address it carries, so no spelling of a private address gets a different answer than another,
+  and a public address inside those prefixes stays allowed. A trailing FQDN root dot is stripped
+  before any of it, so `localhost.` and `nas.local.` are the same names as `localhost` and
+  `nas.local`.
+
+  What this does NOT close, stated plainly rather than implied away: the resolver is asked here and
+  the socket asks again, so a name that answers publicly at the check and privately a moment later
+  (DNS rebinding, a short-TTL record) still reaches a private address. Only pinning the connection to
+  the address that was checked closes that, and this version does not do it. What is closed is the
+  part that costs an attacker nothing: pointing a public hostname at a private address.
 - At most 3 redirects, each hop re-checked against every rule above rather than followed blind.
 - 15 s for the whole exchange, headers and body, so an upstream that dribbles cannot hold a
   connection open.
@@ -662,6 +676,31 @@ What the proxy will fetch:
   SVG is a document format carrying script and external references, and passing one through an
   authenticated route hands a bot's text a way to run markup inside whatever renders it. The
   allow-list is a list, not an `image/*` prefix test, for exactly that reason.
+
+**At most 5 of these run at once, per GATEWAY.** Not per device: what is being protected is the
+gateway process's sockets and the household's uplink, and both are shared by every paired device, so
+a per-device cap would multiply the fan-out by the number of phones instead of bounding it. The slot
+is held for the whole fetch including the body, because a socket dribbling bytes costs what a socket
+being negotiated costs. The bound matters because one reply can carry fifty image references and a
+client asks for all of them: without it that reply is fifty simultaneous outbound fetches, each
+allowed 10 MB and 15 s.
+
+A request that arrives with all five slots busy WAITS, for at most 5 seconds, and is then refused
+with `503` and `busy: true`. The bounded wait is the middle of two worse answers. An unbounded queue
+is wrong because the 15 s fetch timeout only starts once a slot is held: a queued request's total
+latency would be unbounded no matter what the per-fetch timeout says, and a client would have no way
+to tell a request stuck in a queue from a host that is simply slow. Refusing instantly is wrong the other way: the ordinary deep
+queue is a burst of thumbnails that each finish in well under a second, and refusing those would make
+a normal gallery flicker with errors. So: wait through the burst, give up before a stalled upstream
+can hide behind the queue.
+
+`503 busy` says nothing about the source. It carries `waitedMs` and a `retry-after: 1` header, and a
+client should treat it as "ask again", ideally when the image is scrolled back into view, rather than
+as a failure to show in a fallback chip. It is the one error here that a retry of the same URL is
+expected to clear.
+
+`x-content-type-options: nosniff` rides every 200. The content type is already taken from the
+allow-list below, and this stops anything downstream from improving on it.
 
 Range requests are not supported and `Accept-Ranges` is not sent: the cap is 10 MB, so the answer is
 always one whole image.
