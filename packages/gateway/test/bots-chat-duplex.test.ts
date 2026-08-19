@@ -785,7 +785,8 @@ describe("bot_chat_delta", () => {
 
   it("advertises the streaming capability version", () => {
     // A client gates its draft rendering on >= 6; everything else about the bots surface is
-    // unchanged, so an older client simply ignores an unknown frame type.
-    expect(BOTS_CAPABILITY_VERSION).toBe(6);
+    // unchanged, so an older client simply ignores an unknown frame type. The advertised number has
+    // moved past it (7 added the media proxy), which is exactly why a client compares `>=`.
+    expect(BOTS_CAPABILITY_VERSION).toBe(7);
   });
 });

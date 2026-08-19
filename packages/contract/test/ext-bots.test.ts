@@ -293,7 +293,9 @@ describe("capability advertisement", () => {
     // 4 for the routines surface (a v3 gateway 404s them and never sends `bot_routines`),
     // 5 for the group-chat rooms (a v4 gateway 404s them and never sends `bot_group`),
     // 6 for `bot_chat_delta`, the live draft of a reply, which adds no route: a client gates the
-    // drawing of a growing bubble on it rather than on a gateway that just happens to be quiet.
-    expect(BOTS_CAPABILITY_VERSION).toBe(6);
+    // drawing of a growing bubble on it rather than on a gateway that just happens to be quiet,
+    // 7 for `GET /bots/:name/media`, the image proxy (a v6 gateway 404s it, so a client that
+    // rendered inline images anyway would turn working links into broken-image chips).
+    expect(BOTS_CAPABILITY_VERSION).toBe(7);
   });
 });

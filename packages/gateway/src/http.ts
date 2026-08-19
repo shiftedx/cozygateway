@@ -25,6 +25,7 @@ import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
 import type { BotsSurface } from "./hermes-bridge/bridge.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
+import type { MediaFetch } from "./hermes-bridge/media.ts";
 
 export interface AppDeps {
   storage: Storage;
@@ -32,6 +33,9 @@ export interface AppDeps {
    *  routes are not registered at all and the capability is not advertised, so an app probing
    *  `GatewayInfo.capabilities` sees the truth. */
   bots?: BotsSurface;
+  /** Test seam for `GET /bots/:name/media`. Left undefined in production, where the proxy uses the
+   *  global `fetch`; a test supplies its own so the media rules can be exercised without a socket. */
+  mediaFetch?: MediaFetch;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
   presenceOf: (agentId: string) => PresenceState;
@@ -228,7 +232,11 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
-  if (deps.bots !== undefined) registerBotRoutes(app, requireDevice, deps.bots);
+  if (deps.bots !== undefined) {
+    registerBotRoutes(app, requireDevice, deps.bots, {
+      ...(deps.mediaFetch === undefined ? {} : { fetchImpl: deps.mediaFetch }),
+    });
+  }
 
   app.notFound((c) => c.json(errorBody("not_found", "no such route"), 404));
   app.onError((err, c) => c.json(errorBody("internal", "unexpected gateway fault"), 500));
