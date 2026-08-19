@@ -10,6 +10,10 @@ export interface ParsedHermesOptions {
   hiddenProfiles: string[];
   /** The profile the bridge's own Hermes link runs on, normalized, or undefined when unset. */
   bridgeProfile: string | undefined;
+  /** How long a pending approval waits before the gateway synthesizes `expired`, in milliseconds,
+   *  or undefined to take `approvals.ts`'s default (the hermes `approvals.timeout` default of
+   *  300 s). */
+  approvalTimeoutMs: number | undefined;
 }
 
 /** Normalizes the operator's hide list: trimmed, lowercased (Hermes stores profile ids lowercase,
@@ -89,6 +93,8 @@ export function parseHermesOptions(
   const trimmedProfile = config.profile?.trim().toLowerCase();
   const bridgeProfile = trimmedProfile === undefined || trimmedProfile.length === 0 ? undefined : trimmedProfile;
   const mode = config.authMode ?? "token";
+  const approvalTimeoutMs =
+    config.approvalTimeoutSeconds === undefined ? undefined : config.approvalTimeoutSeconds * 1000;
 
   if (mode === "password") {
     const username = config.username;
@@ -119,6 +125,7 @@ export function parseHermesOptions(
       hideBotChats,
       hiddenProfiles,
       bridgeProfile,
+      approvalTimeoutMs,
     };
   }
 
@@ -141,5 +148,6 @@ export function parseHermesOptions(
     hideBotChats,
     hiddenProfiles,
     bridgeProfile,
+    approvalTimeoutMs,
   };
 }

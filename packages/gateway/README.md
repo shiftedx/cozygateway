@@ -109,6 +109,31 @@ The built-in `mock-approval` backend implements the whole loop with no real back
 (one draft, one pending approval, parked until it is resolved or its bounded window lapses); it
 is what the conformance suite's optional approval hook points at.
 
+A pending approval is also pushed out of band, so a phone with no live socket still learns about
+it: category `approval.pending` collapsed on the `toolCallId`, and `approval.resolved` on the same
+collapse id so a resolved or expired approval replaces its own banner in place rather than leaving
+a lock-screen "approve this?" for a decision already made. The category and the collapse id are the
+only cleartext the relay sees; everything describing the tool call rides inside the ciphertext it
+has no key for. See contract/push-v0.md.
+
+### Approvals on the bots bridge
+
+Bot chats (the `com.cozylabs.bots` extension) do NOT go through the adapter surface above: they are
+a parallel path with no threads and no `TurnRunner`, so they carry their own mirror of this
+lifecycle at capability 10 -- the `bot_approval_pending` / `bot_approval_resolved` frames and
+`POST /bots/:name/approvals/:toolCallId/approve` and `.../deny`. See contract/ext-bots-v1.md.
+
+Two things about the bridged leg are deployment facts rather than wire facts, and both are
+documented in [`docs/agent-install.md`](../../docs/agent-install.md): a bridged Hermes profile MUST
+pin `approvals.mode: manual` (the default `smart` lets an aux LLM approve a call with no event at
+all) and MUST NOT set `security.approval.transport` (which routes approvals off the WebSocket
+before this bridge can see them). The installer writes and verifies the first and refuses to
+proceed on the second.
+
+| Hermes bridge option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `hermes.approvalTimeoutSeconds` | integer | `300` | How long a pending approval waits before the gateway synthesizes `expired`. MIRRORS the Hermes `approvals.timeout`, which Hermes does not expose over its RPC surface and for which it emits no expiry event: it drops the entry silently, so the gateway runs its own timer. Out of step with Hermes, the only consequence is that the buttons stop being offered earlier or later than Hermes stops accepting a decision; the gateway never resolves anything by itself. |
+
 ## Backends
 
 Each agent names a `backend`. Alongside the built-in backends, cozygateway works with OpenClaw:

@@ -158,8 +158,8 @@ by accident.
 ## Step 3. Run the installer (the stateful half)
 
 One command does the whole stateful half: generate the dashboard password, hash it with the hasher
-Hermes bundles, merge `basic_auth` into the human's `config.yaml` (after a timestamped backup),
-start the dashboard, write the gateway config and `.env`, start the gateway, and mint a pairing
+Hermes bundles, merge `basic_auth` and the approval pin into the human's `config.yaml` (after a
+timestamped backup), start the dashboard, write the gateway config and `.env`, start the gateway, and mint a pairing
 code. Read the plan first if you like:
 
     cd ~/cozygateway && bash scripts/agent-install.sh --dry-run
@@ -194,14 +194,35 @@ recorded hash and re-hashes nothing.
   (`COZYGATEWAY_ATTACH_TOKEN`, `COZYGATEWAY_HERMES_PASSWORD`, `COZYGATEWAY_PORT`) and preserves
   every other line byte for byte, including the `APNS_*` and `COZY_RELAY_PORT` keys the push relay
   reads from the same file.
-- `<hermes home>/config.yaml`, **merged** into the existing `dashboard:` block after a timestamped
-  backup. It refuses outright, writing nothing and leaving no backup, if that file already has two
-  top-level `dashboard:` keys or is a symlink.
+- `<hermes home>/config.yaml`, **merged** into the existing `dashboard:` and `approvals:` blocks
+  after a timestamped backup. Two keys, and nothing else: `dashboard.basic_auth` (the bridge
+  credential) and `approvals.mode: manual` (see below). `approvals.timeout` is the human's number
+  and is left exactly as it is. It refuses outright, writing nothing and leaving no backup, if that
+  file already has two top-level `dashboard:` keys, is a symlink, or sets
+  `security.approval.transport` (see below).
 
 **Tell the human this**, because it is theirs and they cannot see it from the log: the merge is
 done by the YAML parser, which reserializes the whole file. **Comments and anchors do not survive**,
 and unrelated top-level sections come back reformatted. The values are all preserved and the
 original is in the `config.yaml.bak-agent-install-*` file beside it.
+
+**Why `approvals.mode: manual` is pinned, and why the installer will not merge over an approval
+transport.** Both are about the phone's approve/deny surface (cozygateway#19), and both are
+invisible from the outside: the gateway advertises the capability either way and simply never sends
+a frame, so a misconfigured box looks like a broken app rather than a missing setting.
+
+- `approvals.mode` defaults to `smart` on Hermes 0.20.x: an aux-LLM guardian that decides for
+  itself, and on an APPROVE decision the tool just runs with **no event emitted at all**. The phone
+  is asked sometimes and not others. `manual` is the only mode under which every approval reaches a
+  human, so the installer pins it, merging into whatever `approvals:` block is already there.
+- `security.approval.transport`, if it is set to anything but `builtin`, routes the whole approval
+  prompt to a registered plugin **before** the dashboard-WebSocket branch is reached. The bridge
+  then never sees an approval at all. Removing somebody's security setting behind their back is not
+  the installer's call, so it stops, names the key, and leaves the file untouched. Fix it by hand
+  (or pass `--skip-dashboard` and own `config.yaml` yourself) and re-run.
+
+If you deliberately run with `--skip-dashboard`, `config.yaml` is not touched at all and **both of
+these are yours to get right**, or mobile approve/deny will be silently dead.
 
 **Check:**
 
@@ -263,6 +284,17 @@ before authentication is configured and 401 after, so it proves a process is lis
 about which credential it loaded.
 
 ---
+
+**4c. The approval pin landed, and nothing diverts approvals off the WebSocket.**
+
+    . ~/cozygateway/local/install-env.sh && \
+      "$COZY_HERMES_PY" -c "import yaml,sys; c=yaml.safe_load(open(sys.argv[1])); print((c.get('approvals') or {}).get('mode'), ((c.get('security') or {}).get('approval') or {}).get('transport'))" \
+        "$COZY_HERMES_HOME/config.yaml"
+
+**Expect:** `manual None`. Anything else and the phone's approve/deny surface is silently dead:
+`smart` lets an aux LLM approve a call with no event emitted, and a non-`builtin` transport routes
+the prompt to a plugin before the WebSocket branch. See Step 3 for why, and fix it there rather
+than here.
 
 ## Step 5. Verify the gateway config and `.env`
 
@@ -581,7 +613,8 @@ PY
 **Expect:** `scrypt$`. A `ModuleNotFoundError: No module named 'plugins'` means `COZY_HERMES_PY` is
 wrong; go back to Step 1d. Do not fall back to hashing it some other way.
 
-**A4. Merge it into the existing `dashboard:` block.** Read this warning before you edit anything.
+**A4. Merge it into the existing `dashboard:` block, and pin the approval mode.** Read this
+warning before you edit anything.
 
 > **WARNING.** `config.yaml` almost always already has a top-level `dashboard:` key. You must MERGE
 > `basic_auth` into that existing block. Appending a second top-level `dashboard:` key produces a
@@ -630,6 +663,20 @@ basic["password_hash"] = creds["password_hash"]
 basic.pop("password", None)
 dashboard["basic_auth"] = basic
 cfg["dashboard"] = dashboard
+# The approve/deny pin. `smart` (the 0.20.x default) lets an aux LLM approve a call with no event
+# emitted, so the phone is never asked; `manual` is the only mode that always asks a human. Merged
+# into whatever `approvals:` block exists, and `timeout` is left alone: it is the human's number,
+# and the gateway mirrors it through `hermes.approvalTimeoutSeconds` instead of overriding it.
+transport = ((cfg.get("security") or {}).get("approval") or {}).get("transport")
+if transport is not None and str(transport) != "builtin":
+    raise SystemExit(
+        f"{path} sets security.approval.transport: {transport!r}, which routes approvals away "
+        "from the dashboard WebSocket. Remove it (or set it to builtin) first; the bridge cannot "
+        "see an approval otherwise."
+    )
+approvals = cfg.get("approvals") if isinstance(cfg.get("approvals"), dict) else {}
+approvals["mode"] = "manual"
+cfg["approvals"] = approvals
 tmp = path + ".tmp"
 with open(tmp, "w") as fh:
     yaml.safe_dump(cfg, fh, sort_keys=False, default_flow_style=False)

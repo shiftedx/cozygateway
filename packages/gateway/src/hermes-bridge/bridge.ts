@@ -38,6 +38,12 @@ import {
 } from "./roster.ts";
 import type { GroupMember } from "./group-protocol.ts";
 import { BotChatStream } from "./chat-stream.ts";
+import {
+  BotApprovals,
+  type BotApprovalDecision,
+  type BotApprovalPush,
+  type BotApprovalResolveOutcome,
+} from "./approvals.ts";
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName } from "./photos.ts";
@@ -154,6 +160,15 @@ export interface BotsSurface {
   deleteGroup(name: string): void;
   groupDetail(name: string): BotGroupDetail;
   sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage;
+  /** Capability 10: resolve one pending approval for a bot, per call only. Server-authoritative:
+   *  the hermes session, the turn and the pending state all come from the gateway's own record, so
+   *  the only things the caller contributes are which bot and which correlation id. */
+  resolveApproval(
+    name: string,
+    toolCallId: string,
+    decision: BotApprovalDecision,
+    deviceId: string,
+  ): Promise<BotApprovalResolveOutcome>;
 }
 
 /** One accepted photo on its way to a bot. Everything here has already been decided: the bytes were
@@ -250,6 +265,19 @@ export interface HermesBridgeOptions {
    *  is the out-of-band leg, for a device with no live socket. Wired to the push notifier at server
    *  assembly; unset (as in every test that does not care) means the escalation stays in-band. */
   onGroupEscalation?: (event: { group: string; member: string; displayName: string; text: string }) => void;
+  /** Raised on every pending approval and every resolution (capability 10). The frame has already
+   *  gone out by then; this is the out-of-band leg, for a device with no live socket. Wired to the
+   *  push notifier at server assembly; unset (as in every test that does not care) means the
+   *  approval lifecycle stays in-band. */
+  onApproval?: (event: BotApprovalPush) => void;
+  /** Audit sink for approval resolutions, one line per terminal transition. Defaults to the
+   *  bridge's own log. The line names the bot, the chat, the turn, the toolCallId, the outcome and
+   *  the deciding device, and never anything describing the action. */
+  approvalLog?: (line: string) => void;
+  /** How long a pending approval waits before the gateway calls it `expired`. Mirrors the hermes
+   *  `approvals.timeout`, whose default is 300 s and which is not readable over the JSON-RPC
+   *  surface, so an operator who changes it there sets this too. */
+  approvalTimeoutMs?: number;
   /** How long a profile delete is given. Default `PROFILE_DELETE_TIMEOUT_MS` (180 s). Overridable
    *  so the timeout path is testable in milliseconds instead of minutes. */
   deleteTimeoutMs?: number;
@@ -296,6 +324,10 @@ export class HermesBridge implements BotsSurface {
    *  else here speaks over, and it is fed from exactly two places: `start()` hands it every event
    *  frame, and the two turn paths tell it which runtime session belongs to which bot. */
   readonly #stream: BotChatStream;
+  /** The hermes approval leg (capability 10). It reads `approval.request` off the SAME socket, and
+   *  resolves through `approval.respond`. See `approvals.ts` for why bot approvals cannot ride the
+   *  core `TurnRunner` surface. */
+  readonly #approvals: BotApprovals;
   readonly #groups: GroupRooms;
 
   /** Bots whose routines something has read recently, and when. Drives the `cron.changed` fan-out;
@@ -394,6 +426,22 @@ export class HermesBridge implements BotsSurface {
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
       ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),
     });
+    this.#approvals = new BotApprovals({
+      rpc: this.#client,
+      // The approval leg asks the stream the same question every delta asks it -- which bot, which
+      // stored session, which turn -- because an approval belongs to the turn whose bubble the user
+      // is looking at, and the bindings are written in exactly one place.
+      chat: {
+        binding: (runtimeId) => this.#stream.binding(runtimeId),
+        turnId: (runtimeId) => this.#stream.turnId(runtimeId),
+      },
+      broadcast: this.#broadcast,
+      now: this.#now,
+      log: this.#log,
+      ...(opts.approvalLog === undefined ? {} : { approvalLog: opts.approvalLog }),
+      ...(opts.onApproval === undefined ? {} : { raisePush: opts.onApproval }),
+      ...(opts.approvalTimeoutMs === undefined ? {} : { timeoutMs: opts.approvalTimeoutMs }),
+    });
     this.#groups = new GroupRooms({
       rpc: this.#client,
       storage: this.#storage,
@@ -471,6 +519,21 @@ export class HermesBridge implements BotsSurface {
     return this.#groups.send(name, text, opts);
   }
 
+  /** Capability 10. See `BotsSurface.resolveApproval` and `approvals.ts`. */
+  async resolveApproval(
+    name: string,
+    toolCallId: string,
+    decision: BotApprovalDecision,
+    deviceId: string,
+  ): Promise<BotApprovalResolveOutcome> {
+    return this.#approvals.resolve(name, toolCallId, decision, deviceId);
+  }
+
+  /** Test seam: is this approval still awaiting a decision? */
+  approvalPending(name: string, toolCallId: string): boolean {
+    return this.#approvals.pending(name, toolCallId);
+  }
+
   /** Test seam: resolves when the room's deliberation has finished. */
   async groupSettled(name: string): Promise<void> {
     await this.#groups.settled(name);
@@ -496,6 +559,10 @@ export class HermesBridge implements BotsSurface {
       // this gateway does with events is below; the stream reads its three types and ignores the
       // rest, chain-of-thought events emphatically included.
       this.#stream.handleEvent(event);
+      // The approval leg. Registered here, at the fan-out, and NOT as a case inside
+      // `chat-stream.ts`'s switch, whose `default:` is a deliberate reasoning-leak allow-list that
+      // must keep dropping everything it does not name.
+      this.#approvals.handleEvent(event);
       // Optional broadcasts. A gateway that never sends them is fully supported: the poll path
       // covers the same ground, just slower.
       if (event.type === "sessions.changed" || event.type === "cron.changed") {
@@ -742,6 +809,7 @@ export class HermesBridge implements BotsSurface {
 
           // Teardown BEFORE the mint. See the doc comment: order is the whole correctness argument.
           this.#chat.cancel(name);
+          this.#approvals.forgetBot(name);
           this.#kickoffs.delete(name);
           this.#pins.clear(name);
           // Mark the outgoing session retired, on disk, and do it BEFORE the pin is replaced so a
@@ -1118,6 +1186,7 @@ export class HermesBridge implements BotsSurface {
     // `bot_chat_state` frames for a bot that is no longer on the roster, and its next poll rewrites
     // the very watermark `forget` just dropped.
     this.#chat.cancel(canonical);
+    this.#approvals.forgetBot(canonical);
     this.#chatInflight.delete(canonical);
     this.#kickoffs.delete(canonical);
     // Nothing left to watch: a deleted profile's cron store goes with it, and a `cron.changed` that
@@ -1411,6 +1480,7 @@ export class HermesBridge implements BotsSurface {
     this.#closed = true;
     this.#chat.close();
     this.#stream.close();
+    this.#approvals.close();
     // Awaited: a room drive that is mid-turn holds a reference to the storage the caller is about
     // to close, and it must be finished with it before this resolves.
     await this.#groups.close();

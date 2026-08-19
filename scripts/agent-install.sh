@@ -554,7 +554,7 @@ fi
 
 # ---------------------------------------------------------------------------- 4. config.yaml
 
-step "4/8 merge dashboard.basic_auth into the Hermes config"
+step "4/8 merge dashboard.basic_auth and the approval pin into the Hermes config"
 
 if [ "$SKIP_DASHBOARD" = "1" ]; then
   info "skipped"
@@ -562,7 +562,7 @@ else
   CONFIG_YAML="$HERMES_HOME_DIR/config.yaml"
   info "target: $CONFIG_YAML"
   if dry; then
-    printf 'DRY   merge dashboard.basic_auth {username, password_hash} into %s\n' "$CONFIG_YAML"
+    printf 'DRY   merge dashboard.basic_auth {username, password_hash} and approvals.mode=manual into %s\n' "$CONFIG_YAML"
   else
     mkdir -p "$HERMES_HOME_DIR"
     # Refuse BEFORE the backup, not after: a file we will not touch should not leave a backup
@@ -618,10 +618,50 @@ except yaml.YAMLError as exc:
     )
 if not isinstance(cfg, dict):
     raise SystemExit(f"agent-install: {path} is not a YAML mapping; refusing to overwrite it")
+
+# The one approval setting this script will not decide for the human. `security.approval.transport`
+# routes every approval prompt to a registered plugin BEFORE the gateway branch is reached, so
+# approvals never reach the dashboard WebSocket and the phone's approve/deny surface is
+# permanently blind (cozygateway#19). Deleting somebody's security setting behind their back is not
+# this script's call, so it refuses and names the choice.
+security = cfg.get("security")
+approval = security.get("approval") if isinstance(security, dict) else None
+transport = approval.get("transport") if isinstance(approval, dict) else None
+if transport is not None and str(transport) != "builtin":
+    raise SystemExit(
+        f"agent-install: {path} sets security.approval.transport: {transport!r}.\n"
+        "        That routes tool-call approvals to a plugin instead of the dashboard WebSocket,\n"
+        "        so the cozygateway bridge never sees one and mobile approve/deny is silently\n"
+        "        dead. Remove the key (or set it to builtin) and re-run, or pass\n"
+        "        --skip-dashboard and own this file yourself."
+    )
 PY
     # Back up only when the merge can actually change something. A re-run on a finished box would
     # otherwise litter the human's Hermes home with a new backup every time.
-    if [ -f "$CONFIG_YAML" ] && ! grep -qF "$PASSWORD_HASH" "$CONFIG_YAML"; then
+    # Two things can need writing now, so "does the file already carry the hash" is no longer the
+    # whole question: a re-run on a box installed before the approval pin existed carries the hash
+    # and still needs a write. Ask the file what the merge below would actually change.
+    NEEDS_WRITE=0
+    if [ ! -f "$CONFIG_YAML" ]; then
+      NEEDS_WRITE=1
+    elif ! grep -qF "$PASSWORD_HASH" "$CONFIG_YAML"; then
+      NEEDS_WRITE=1
+    elif ! "$HERMES_PY" - "$CONFIG_YAML" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    cfg = yaml.safe_load(fh) or {}
+approvals = cfg.get("approvals")
+mode = approvals.get("mode") if isinstance(approvals, dict) else None
+# Exit 0 means "already pinned", i.e. no write needed.
+raise SystemExit(0 if mode == "manual" else 1)
+PY
+    then
+      NEEDS_WRITE=1
+    fi
+    if [ -f "$CONFIG_YAML" ] && [ "$NEEDS_WRITE" = "1" ]; then
       BACKUP="$CONFIG_YAML.bak-agent-install-$(date +%Y%m%d%H%M%S)"
       cp "$CONFIG_YAML" "$BACKUP"
       ok "backed up the existing config to $BACKUP"
@@ -705,6 +745,22 @@ basic.pop("password", None)
 dashboard["basic_auth"] = basic
 cfg["dashboard"] = dashboard
 
+# PIN approvals.mode = manual, for exactly the reason the dashboard credential is merged: the
+# bridge cannot work without it and the default is against us. Hermes 0.20.x defaults
+# `approvals.mode` to "smart", an aux-LLM guardian that can APPROVE a dangerous tool call with NO
+# event emitted at all, so the phone is never asked and the mobile approve/deny surface reads as
+# intermittently broken rather than absent (cozygateway#19). `manual` is the only mode under which
+# every approval reaches a human.
+#
+# MERGED into whatever `approvals:` block is already there, and `timeout` is deliberately left
+# alone: it is the human's number, and the gateway MIRRORS it through the config file's
+# `hermes.approvalTimeoutSeconds` rather than overriding it here.
+approvals = cfg.get("approvals")
+if not isinstance(approvals, dict):
+    approvals = {}
+approvals["mode"] = "manual"
+cfg["approvals"] = approvals
+
 after = yaml.safe_dump(cfg, sort_keys=True)
 if after != before:
     tmp = path + ".tmp"
@@ -737,6 +793,13 @@ if basic.get("password_hash") != os.environ["DASHBOARD_BASIC_PASSWORD_HASH"]:
     problems.append("password_hash does not match the hash this run computed")
 if "password" in basic:
     problems.append("a plaintext `password` key is present next to the hash; remove it")
+approvals = cfg.get("approvals") or {}
+if approvals.get("mode") != "manual":
+    problems.append(f"approvals.mode is {approvals.get('mode')!r}, expected 'manual'")
+security = cfg.get("security") or {}
+transport = (security.get("approval") or {}).get("transport")
+if transport is not None and str(transport) != "builtin":
+    problems.append(f"security.approval.transport is {transport!r}; it must be unset or builtin")
 top = 0
 with open(path, "r", encoding="utf-8") as fh:
     for line in fh:
@@ -750,7 +813,7 @@ if problems:
     raise SystemExit(1)
 print("      verified: exactly one dashboard.basic_auth, username and password_hash match, no plaintext password")
 PY
-    ok "config.yaml carries exactly one dashboard.basic_auth block, mode 600"
+    ok "config.yaml carries exactly one dashboard.basic_auth block, approvals.mode: manual, no diverted approval transport, mode 600"
     info "note for the human: the merge reserializes the whole file, so YAML comments and anchors do not survive. Their original file is in the .bak-agent-install-* backup beside it."
   fi
 fi

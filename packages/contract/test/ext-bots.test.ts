@@ -331,7 +331,10 @@ describe("capability advertisement", () => {
     // route, and a client that does not know the frame keeps writing into a retired chat),
     // 9 for photos to bots: `POST /bots/:name/chat/photos`,
     // `GET /bots/:name/chat/attachments/:fileId`, and `BotChatMessage.attachments` (a v8 gateway
-    // 404s both routes, so a picker offered against one silently fails on send).
-    expect(BOTS_CAPABILITY_VERSION).toBe(9);
+    // 404s both routes, so a picker offered against one silently fails on send),
+    // 10 for mobile approve/deny on bot chats: the `bot_approval_pending` / `bot_approval_resolved`
+    // frames and `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny` (a v9 gateway 404s
+    // both routes and never sends either frame, so the buttons would do nothing).
+    expect(BOTS_CAPABILITY_VERSION).toBe(10);
   });
 });
