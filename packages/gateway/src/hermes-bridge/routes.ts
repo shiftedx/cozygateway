@@ -471,6 +471,43 @@ export function registerBotRoutes(
     }
   });
 
+  // Retire the canonical chat and pin a fresh one. Capability 8.
+  //
+  // NOTHING IS DELETED, and this is the first place a reader lands, so it is said here too. Hermes
+  // exposes no session delete on this surface: the retired session and its whole transcript stay on
+  // the Hermes host and keep appearing in `GET /bots/:name/sessions`. The only thing that changes is
+  // which session the bot's canonical pin points at. The action a client hangs off this will be
+  // labelled "clear chat", and that label is generous: what the user really gets is a fresh context
+  // window for the bot and a clean screen, not a deletion.
+  //
+  // No ambiguity with `/bots/:name/chat/messages` above, though both patterns are four segments and
+  // share the first three: the last segment is a LITERAL on both, so `reset` and `messages` can only
+  // ever match their own route and the registration order does not matter. Registered here, after
+  // the duplex pair, purely so the chat routes read in the order a client uses them.
+  //
+  // 200, not the 202 the send route answers with: the work this route describes is FINISHED when it
+  // answers. The new chat exists, it is pinned, the old poll is cancelled, and every device has been
+  // told. Only the kickoff reply is still in flight, and that reply is not what was asked for.
+  //
+  // No request body at all. There is nothing to parameterize: a reset is a reset.
+  app.post("/bots/:name/chat/reset", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
+    try {
+      const result = await bots.resetChat(name);
+      return c.json({
+        name,
+        sessionId: result.sessionId,
+        ...(result.previousSessionId === undefined
+          ? {}
+          : { previousSessionId: result.previousSessionId }),
+      });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
   // Routines. Every one of these is scoped to the bot's `[bot:<name>]` cron namespace, which is the
   // only thing that makes a cron job a bot's routine: the operator's own unrelated cron jobs are
   // invisible here, and so are another bot's, whatever id a client sends.

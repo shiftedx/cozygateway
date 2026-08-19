@@ -2,6 +2,12 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { BotSummary, Message, MessageRole, RichBlock } from "cozygateway-contract";
 
+/** How many retired chat sessions are remembered per bot. Sized against what it has to defend: the
+ *  adoption paths only ever see the sessions `session.list` returns (100 rows), and a bot with more
+ *  than a handful of resets in that window is already unusual, so 32 is generous while still being a
+ *  hard bound on a table nothing else prunes. */
+export const BOT_CHAT_RETIRED_LIMIT = 32;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
@@ -66,6 +72,21 @@ CREATE TABLE IF NOT EXISTS bot_chat_pins (
   session_id TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 ) STRICT;
+-- Sessions a chat RESET retired, per bot. Not a cache and not optional bookkeeping: it is the only
+-- thing that tells a retired "Bot Chat" apart from the live one. A reset mints the replacement with
+-- the exact same title as the chat it retires (that byte-compatibility is deliberate), so after N
+-- resets the host holds N+1 sessions all titled "Bot Chat" and nothing but the pin says which one is
+-- current. Lose the pin (a gateway restart against a Hermes too old to store ui_meta is enough,
+-- because the pin writeback is allowed to fail silently) and the title/position heuristics in
+-- canonical-chat.ts would happily adopt a session the user asked to leave behind, handing back the
+-- conversation they just cleared. Hence: on disk, so it survives the restart that is the whole
+-- hazard, and consulted by every adoption path.
+CREATE TABLE IF NOT EXISTS bot_chat_retired (
+  name TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  retired_at INTEGER NOT NULL,
+  PRIMARY KEY (name, session_id)
+) STRICT, WITHOUT ROWID;
 -- Group chat rooms. Unlike the three tables above these are NOT a cache: this gateway hosts the
 -- rooms (spec section 4), so the room, its transcript, each member's watermark and the epoch are
 -- the source of truth and must survive a restart. Only the "a round loop is running right now"
@@ -490,18 +511,65 @@ export class Storage {
     this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
   }
 
-  /** Drops every trace of a bot from the cache: its roster row, its mirrored `ui_meta` blob, and
-   *  its canonical-chat pin. Called when the profile is deleted Hermes-side, so a name that gets
-   *  reused later starts clean rather than inheriting a dead pin, which would send the first open
-   *  of the new bot into a `session.resume` for a session that no longer exists. The next roster
-   *  refresh rewrites `bot_roster` wholesale anyway; the pin and the meta blob are the rows that
-   *  would otherwise outlive the profile. */
+  /** Every session this gateway has retired for `name`, as a set the adoption paths can test in a
+   *  loop. Read once per resolve rather than queried per row: a bot keeps at most
+   *  `BOT_CHAT_RETIRED_LIMIT` of these, so the whole set is smaller than the session list it filters. */
+  botChatRetired(name: string): Set<string> {
+    const rows = this.#db
+      .prepare("SELECT session_id AS sessionId FROM bot_chat_retired WHERE name = ?")
+      .all(name) as unknown as Array<{ sessionId: string }>;
+    return new Set(rows.map((row) => row.sessionId));
+  }
+
+  /** Records that `sessionId` was retired for `name`, then trims the bot back to the newest
+   *  `BOT_CHAT_RETIRED_LIMIT` entries.
+   *
+   *  The bound is what keeps this table from being an unbounded log: a bot reset a thousand times
+   *  would otherwise carry a thousand rows forever, for a guard that only ever matters against the
+   *  sessions `session.list` still returns (100 rows on the adoption path, 200 on the passthrough).
+   *  Dropping the OLDEST entries is the right end to lose: an id old enough to have fallen off both
+   *  the bound and the list cannot be adopted anyway, and the ids a fresh restart is most likely to
+   *  meet are the recent ones. Writing an id that is already there refreshes its stamp rather than
+   *  duplicating it, so a repeated retire cannot push the newest entries out. */
+  retireBotChat(name: string, sessionId: string, retiredAt: number): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          `INSERT INTO bot_chat_retired (name, session_id, retired_at) VALUES (?, ?, ?)
+           ON CONFLICT(name, session_id) DO UPDATE SET retired_at = excluded.retired_at`,
+        )
+        .run(name, sessionId, retiredAt);
+      this.#db
+        .prepare(
+          `DELETE FROM bot_chat_retired WHERE name = ? AND session_id NOT IN (
+             SELECT session_id FROM bot_chat_retired WHERE name = ?
+             ORDER BY retired_at DESC, session_id DESC LIMIT ?
+           )`,
+        )
+        .run(name, name, BOT_CHAT_RETIRED_LIMIT);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** Drops every trace of a bot from the cache: its roster row, its mirrored `ui_meta` blob, its
+   *  canonical-chat pin, and the sessions its resets retired. Called when the profile is deleted
+   *  Hermes-side, so a name that gets reused later starts clean rather than inheriting a dead pin,
+   *  which would send the first open of the new bot into a `session.resume` for a session that no
+   *  longer exists. The next roster refresh rewrites `bot_roster` wholesale anyway; the pin, the meta
+   *  blob and the retired set are the rows that would otherwise outlive the profile. (The retired set
+   *  goes for the same reason as the pin: it is keyed on a name, not on an identity, so a rebuilt bot
+   *  reusing the name would inherit refusals aimed at sessions belonging to its predecessor.) */
   forgetBot(name: string): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       this.#db.prepare("DELETE FROM bot_roster WHERE name = ?").run(name);
       this.#db.prepare("DELETE FROM bot_meta WHERE name = ?").run(name);
       this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
+      this.#db.prepare("DELETE FROM bot_chat_retired WHERE name = ?").run(name);
       this.#db.exec("COMMIT");
     } catch (err) {
       this.#db.exec("ROLLBACK");

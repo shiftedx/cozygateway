@@ -5,6 +5,8 @@ import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotChatDeltaFrameSchema,
+  BotChatResetFrameSchema,
+  BotChatResetResponseSchema,
   BotFocusRequestSchema,
   BotGroupCreateRequestSchema,
   BotGroupDetailSchema,
@@ -285,6 +287,35 @@ describe("routines", () => {
   });
 });
 
+describe("chat reset", () => {
+  it("carries bot_chat_reset in the ServerFrame union, with and without a retired id", () => {
+    const withPrevious: ServerFrame = {
+      type: "bot_chat_reset",
+      bot: "scout",
+      sessionId: "stored-2",
+      previousSessionId: "stored-1",
+      updatedAt: 1_800_000_000_000,
+    };
+    // A bot that had nothing to retire sends the same frame with the optional id absent, rather
+    // than a null a client would have to special-case.
+    const withoutPrevious: ServerFrame = {
+      type: "bot_chat_reset",
+      bot: "scout",
+      sessionId: "stored-2",
+      updatedAt: 1_800_000_000_000,
+    };
+    expect(check(ServerFrameSchema, withPrevious)).toBe(true);
+    expect(check(ServerFrameSchema, withoutPrevious)).toBe(true);
+    expect(check(BotChatResetFrameSchema, withPrevious)).toBe(true);
+  });
+
+  it("answers the route with the new id, and the retired one only when there was one", () => {
+    expect(check(BotChatResetResponseSchema, { name: "scout", sessionId: "s2", previousSessionId: "s1" })).toBe(true);
+    expect(check(BotChatResetResponseSchema, { name: "scout", sessionId: "s2" })).toBe(true);
+    expect(check(BotChatResetResponseSchema, { name: "scout" })).toBe(false);
+  });
+});
+
 describe("capability advertisement", () => {
   it("is a vendor-scoped id with an integer version", () => {
     expect(BOTS_CAPABILITY_ID).toBe("com.cozylabs.bots");
@@ -295,7 +326,9 @@ describe("capability advertisement", () => {
     // 6 for `bot_chat_delta`, the live draft of a reply, which adds no route: a client gates the
     // drawing of a growing bubble on it rather than on a gateway that just happens to be quiet,
     // 7 for `GET /bots/:name/media`, the image proxy (a v6 gateway 404s it, so a client that
-    // rendered inline images anyway would turn working links into broken-image chips).
-    expect(BOTS_CAPABILITY_VERSION).toBe(7);
+    // rendered inline images anyway would turn working links into broken-image chips),
+    // 8 for `POST /bots/:name/chat/reset` and the `bot_chat_reset` frame (a v7 gateway 404s the
+    // route, and a client that does not know the frame keeps writing into a retired chat).
+    expect(BOTS_CAPABILITY_VERSION).toBe(8);
   });
 });

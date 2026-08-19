@@ -152,6 +152,51 @@ export const BotChatDeltaFrameSchema = Type.Object({
 });
 export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
 
+/** A bot's canonical chat was RETIRED and a fresh one pinned in its place, by
+ *  `POST /bots/:name/chat/reset`. Broadcast to every paired device, which is the whole point of the
+ *  frame: another device sitting on the old chat has no other way to learn that the session it is
+ *  appending to is no longer the bot's canonical one. On receipt a client rebinds to `sessionId`,
+ *  drops whatever draft it was rendering, and reloads history for the new chat.
+ *
+ *  What this frame does NOT say is that anything was deleted. Hermes exposes no session delete on
+ *  this surface: the retired session and its whole transcript stay on the Hermes host and keep
+ *  appearing in `GET /bots/:name/sessions`. The only thing that changed is which session the bot's
+ *  canonical pin points at.
+ *
+ *  A client that does not know this frame ignores it, per the forward-compatibility rule for unknown
+ *  server frames, and then keeps writing into a session that is no longer canonical: it looks
+ *  correct locally and diverges from every other device. That is exactly why the reset route rides a
+ *  capability bump rather than arriving silently. */
+export const BotChatResetFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_reset"),
+  bot: Type.String(),
+  /** The freshly minted canonical chat. Every device rebinds to this id. */
+  sessionId: Type.String(),
+  /** The chat that was retired. Absent when there was nothing to retire. Retired, not deleted: this
+   *  session is still on the Hermes host and still listed by `GET /bots/:name/sessions`. */
+  previousSessionId: Type.Optional(Type.String()),
+  updatedAt: Type.Integer(),
+});
+export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
+
+/** `POST /bots/:name/chat/reset` response. `sessionId` is the STORED id of the new canonical chat,
+ *  the same value a subsequent `GET /bots/:name/chat` reports, and `previousSessionId` is what the
+ *  pin used to point at, absent only when the bot had no chat to retire.
+ *
+ *  NOTHING WAS DELETED, and a client author reading only this schema needs to know it before writing
+ *  a label. Hermes exposes no session delete on this surface, so the reset is a retire-and-re-pin:
+ *  the session named by `previousSessionId` and its entire transcript stay on the Hermes host and
+ *  keep appearing in `GET /bots/:name/sessions` (and in the Hermes desktop's own session list). What
+ *  changed is which session the bot's canonical pin points at, which buys the bot a fresh context
+ *  window and the user a clean screen. A UI that promises the history is gone is promising something
+ *  this gateway did not do. */
+export const BotChatResetResponseSchema = Type.Object({
+  name: Type.String(),
+  sessionId: Type.String(),
+  previousSessionId: Type.Optional(Type.String()),
+});
+export type BotChatResetResponse = Static<typeof BotChatResetResponseSchema>;
+
 /** `POST /bots/:name/chat/messages` body. `clientId` is the sender's own id for this message; the
  *  gateway never interprets it, it only echoes it back on the committed message and on that same
  *  message when the turn poll finds it, so the sender can de-duplicate its optimistic row. */
@@ -591,6 +636,11 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    reached for it anyway would replace working links with broken-image chips. Below 7 a client
  *    keeps whatever it did before, which is to show the link. The route serves `https` sources only;
  *    a LOCAL path on the Hermes box is refused, and the refusal is part of the contract so the app
- *    can say so rather than spin. */
+ *    can say so rather than spin.
+ *  - `8`: `POST /bots/:name/chat/reset` plus the `bot_chat_reset` frame. A client that offers a
+ *    "clear chat" action MUST require `>= 8`: a version 7 gateway 404s the route. Note what it is
+ *    NOT: hermes exposes no session delete here, so the retired chat is still on the hermes host and
+ *    still appears in `GET /bots/:name/sessions`; what is cleared is which session the bot's
+ *    canonical chat points at. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 7;
+export const BOTS_CAPABILITY_VERSION = 8;
