@@ -11,12 +11,7 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient, type HermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import {
-  CANONICAL_CHAT_TITLE,
-  KICKOFF_PROMPT,
-  resolveCanonicalChat,
-  type PinStore,
-} from "../src/hermes-bridge/canonical-chat.ts";
+import { CANONICAL_CHAT_TITLE, resolveCanonicalChat, type PinStore } from "../src/hermes-bridge/canonical-chat.ts";
 import {
   startFakeHermesServer,
   type FakeHermesBehavior,
@@ -188,8 +183,8 @@ describe("POST /bots/:name/chat/reset", () => {
     expect(sessions.sessions.map((row) => row.id)).toContain("sess-1");
   });
 
-  it("mints the new chat with the canonical title and kicks it off against the RUNTIME id", async () => {
-    const { authed, bridge, server } = await setup(withOneChat());
+  it("mints the new chat with the canonical title and says nothing in it", async () => {
+    const { authed, bridge, server, storage } = await setup(withOneChat());
     await until(() => bridge.roster().bots.length === 1, 4_000);
 
     expect((await authed("/bots/scout/chat/reset", { method: "POST" })).status).toBe(200);
@@ -197,12 +192,14 @@ describe("POST /bots/:name/chat/reset", () => {
     const create = server.callsOf("session.create");
     expect(create).toHaveLength(1);
     expect(create[0]!.params).toEqual({ profile: "scout", title: CANONICAL_CHAT_TITLE, hidden: true });
-    // `prompt.submit` accepts only the runtime id, and without the kickoff the session persists no
-    // row at all, so a reset that skipped it would pin a chat nothing can resume.
-    expect(server.callsOf("prompt.submit")[0]!.params).toEqual({
-      session_id: "runtime-2",
-      text: KICKOFF_PROMPT,
-    });
+    // Capability 11: the replacement chat is EMPTY. Up to 10 the reset submitted a canned opener
+    // here, so "clear chat" handed the user back a chat that already had an exchange in it -- one
+    // half of which was attributed to them.
+    expect(server.callsOf("prompt.submit")).toHaveLength(0);
+    // Which makes the replacement unresumable until the user writes in it, so the reset writes down
+    // the RUNTIME id the same way the resolve path does. `prompt.submit` accepts nothing else, and
+    // it has to outlive this process: the chat can sit untouched indefinitely now.
+    expect(storage.botChatRuntimeId("scout", "stored-2")).toBe("runtime-2");
   });
 
   it("cancels the live turn poll belonging to the retired chat", async () => {
@@ -283,7 +280,7 @@ describe("POST /bots/:name/chat/reset", () => {
 });
 
 /** A Hermes whose session list GROWS: every `session.create` adds the new chat to the list, exactly
- *  as a real host does once the kickoff persists. That is what lets these tests reach the state the
+ *  as a real host does once something is written in the chat. That is what lets these tests reach the state the
  *  reset actually produces, a bot holding SEVERAL sessions all titled `Bot Chat`, which is the state
  *  the adoption heuristics cannot read.
  *
@@ -449,10 +446,10 @@ describe("chat reset: a retired chat is never adopted again", () => {
     expect(first).toEqual({ sessionId: "stored-2", adoption: "created", runtimeId: "runtime-2" });
     expect(creates).toHaveLength(1);
 
-    // The second open happens while the minted chat is still lazy: its kickoff has not persisted, so
+    // The second open happens while the minted chat still has no row: nobody has written in it, so
     // `session.list` still returns only the retired row and the pin names something not in it. That
     // is the recovery path with no acceptable candidate, and minting there would spawn a chat on
-    // EVERY open until the kickoff lands. The pin is honored instead.
+    // EVERY open until the user finally typed. The pin is honored instead.
     const second = await resolveCanonicalChat("scout", { ...deps, serverPin: undefined });
     expect(second).toEqual({ sessionId: "stored-2", adoption: "pin" });
     expect(creates).toHaveLength(1);

@@ -740,6 +740,23 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    before. What the version does NOT promise is that any approval will ever be raised: that
  *    depends on the hermes profile running with `approvals.mode: manual` and without
  *    `security.approval.transport`, both of which are deployment facts the wire cannot assert
- *    (see contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin"). */
+ *    (see contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin").
+ *  - `11`: fresh bot chats are BORN EMPTY, and the canned opener becomes a client-side SUGGESTION
+ *    (issue #59). The one entry in this list that changes existing BEHAVIOUR rather than only adding
+ *    surface, so it is a behaviour note before it is a field:
+ *    - up to 10, opening a bot with no chat (and, from 8, resetting one) created the session and
+ *      SUBMITTED a canned opener into it, which the app then rendered as a message the USER had sent
+ *      and which the bot answered before the user had typed anything. Neither path does that any
+ *      more. The gateway submits what the user submits, and nothing else.
+ *    - `GET /bots/:name/chat/messages` gains an optional `suggestion` string, present ONLY when
+ *      `messages` is empty and the deployment configured an opener, and absent otherwise. It is
+ *      presentation-only: a client MAY show it, and MAY let the user send it AS THEIR OWN message
+ *      through the ordinary composer, and until they do it is in no transcript anywhere.
+ *    A client below 11 keeps working and keeps ignoring an optional field it never heard of, but it
+ *    will see something new from an 11 gateway: a freshly opened bot chat is genuinely empty where it
+ *    used to hold an exchange. That is the same empty payload a version 10 gateway already answered
+ *    with while a chat was being created, so nothing breaks; the chat simply no longer fills itself
+ *    in. A client that offers a suggestion chip MUST require `>= 11`, because a version 10 gateway
+ *    never sends the field. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 10;
+export const BOTS_CAPABILITY_VERSION = 11;

@@ -565,8 +565,9 @@ export function registerBotRoutes(
   // the duplex pair, purely so the chat routes read in the order a client uses them.
   //
   // 200, not the 202 the send route answers with: the work this route describes is FINISHED when it
-  // answers. The new chat exists, it is pinned, the old poll is cancelled, and every device has been
-  // told. Only the kickoff reply is still in flight, and that reply is not what was asked for.
+  // answers. The new chat exists, it is pinned, the old poll is cancelled, every device has been
+  // told, and nothing at all is in flight -- the replacement chat is empty and stays empty until the
+  // user writes in it (capability 11).
   //
   // No request body at all. There is nothing to parameterize: a reset is a reset.
   app.post("/bots/:name/chat/reset", requireDevice, async (c) => {

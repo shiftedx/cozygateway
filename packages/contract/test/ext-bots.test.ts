@@ -334,7 +334,10 @@ describe("capability advertisement", () => {
     // 404s both routes, so a picker offered against one silently fails on send),
     // 10 for mobile approve/deny on bot chats: the `bot_approval_pending` / `bot_approval_resolved`
     // frames and `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny` (a v9 gateway 404s
-    // both routes and never sends either frame, so the buttons would do nothing).
-    expect(BOTS_CAPABILITY_VERSION).toBe(10);
+    // both routes and never sends either frame, so the buttons would do nothing),
+    // 11 for fresh bot chats being born EMPTY plus the optional `suggestion` field on
+    // `GET /bots/:name/chat/messages` (a v10 gateway submits a canned opener by itself and never
+    // sends the field, so a client cannot offer a chip and cannot assume an untouched chat is bare).
+    expect(BOTS_CAPABILITY_VERSION).toBe(11);
   });
 });

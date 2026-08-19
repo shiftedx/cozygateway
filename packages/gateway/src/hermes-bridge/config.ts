@@ -1,4 +1,5 @@
 import type { HermesBridgeConfig } from "../config.ts";
+import { DEFAULT_CHAT_SUGGESTION } from "./canonical-chat.ts";
 import { DEFAULT_AUTH_PROVIDER, type HermesAuth } from "./client.ts";
 
 export interface ParsedHermesOptions {
@@ -14,6 +15,9 @@ export interface ParsedHermesOptions {
    *  or undefined to take `approvals.ts`'s default (the hermes `approvals.timeout` default of
    *  300 s). */
   approvalTimeoutMs: number | undefined;
+  /** The opener an empty bot chat offers (capability 11). Always a string, already defaulted: the
+   *  empty string is the operator's "offer nothing", and the bridge reads it as such. */
+  chatSuggestion: string;
 }
 
 /** Normalizes the operator's hide list: trimmed, lowercased (Hermes stores profile ids lowercase,
@@ -95,6 +99,9 @@ export function parseHermesOptions(
   const mode = config.authMode ?? "token";
   const approvalTimeoutMs =
     config.approvalTimeoutSeconds === undefined ? undefined : config.approvalTimeoutSeconds * 1000;
+  // `??`, not `||`: an operator who wrote "" meant it, and collapsing that onto the default would
+  // make the one setting that turns the suggestion off silently do nothing.
+  const chatSuggestion = config.chatSuggestion ?? DEFAULT_CHAT_SUGGESTION;
 
   if (mode === "password") {
     const username = config.username;
@@ -126,6 +133,7 @@ export function parseHermesOptions(
       hiddenProfiles,
       bridgeProfile,
       approvalTimeoutMs,
+      chatSuggestion,
     };
   }
 
@@ -149,5 +157,6 @@ export function parseHermesOptions(
     hiddenProfiles,
     bridgeProfile,
     approvalTimeoutMs,
+    chatSuggestion,
   };
 }

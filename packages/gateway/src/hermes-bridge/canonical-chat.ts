@@ -3,18 +3,34 @@
  *  plugin's resolve-or-create and its three pin-adoption paths server-side, so every device sees
  *  the same chat and a phone that never ran the desktop still lands in the right session.
  *
- *  Byte-compatible conventions that must not drift: the title is exactly `Bot Chat`, and a new
- *  chat is born with a kickoff prompt because `session.create` persists NO database row until the
- *  first prompt (dissection 14.5), so a pre-created empty chat cannot be listed, hidden, or
- *  resumed. */
+ *  One byte-compatible convention that must not drift: the title is exactly `Bot Chat`.
+ *
+ *  A new chat is born EMPTY, and nothing is ever submitted into it on the user's behalf (ext-bots
+ *  capability 11, issue #59). Up to capability 10 the mint submitted a canned opener -- the desktop's
+ *  "kickoff prompt" -- which the app then rendered as a message the USER had sent, and which the bot
+ *  answered before the user had typed anything. The user's own input is the only thing this gateway
+ *  ever submits in a conversation; the opener survives as `DEFAULT_CHAT_SUGGESTION`, offered to the
+ *  client as text it MAY show and the user MAY choose to send.
+ *
+ *  The cost of that, paid deliberately: `session.create` persists NO database row until the first
+ *  prompt (dissection 14.5), so a chat nobody has written to is invisible to `session.list` and
+ *  cannot be resumed -- indefinitely, not for the couple of seconds a kickoff used to take. Two
+ *  things carry the gateway across that gap and both are durable rather than in-memory: the pin
+ *  (`bot_chat_pins.session_id`), which is why an empty session list never means "this bot has no
+ *  chat", and the RUNTIME id (`bot_chat_pins.runtime_id`), which is the only id `prompt.submit`
+ *  accepts for a session that has no row yet. See `Storage.setBotChatRuntimeId`. */
 
 /** The session title the Hermes prompt builder gates its bot-mode protocol injection on. Exact
  *  match, including case. */
 export const CANONICAL_CHAT_TITLE = "Bot Chat";
 
-/** The desktop's kickoff message, kept identical so a chat created from the phone reads the same
- *  as one created from the desktop. */
-export const KICKOFF_PROMPT = "Hey, tell me about yourself!";
+/** The opener an empty bot chat OFFERS. Word for word the message the desktop plugin (and this
+ *  gateway, up to capability 10) used to submit by itself, kept identical so a returning user is
+ *  offered the line they recognize.
+ *
+ *  Presentation only. Nothing in this package submits it: a client may show it, the user may send it
+ *  as their own message, and until they do it is not part of the conversation. */
+export const DEFAULT_CHAT_SUGGESTION = "Hey, tell me about yourself!";
 
 /** How the returned session id was arrived at. Surfaced for observability and tests, and cheap
  *  for the app to ignore. */
@@ -27,7 +43,7 @@ export type ChatAdoption =
   | "latest"
   /** The pinned id vanished (compaction rewrote the lineage): re-pinned the newest session. */
   | "recovery"
-  /** No sessions existed: created one and sent the kickoff prompt. */
+  /** No sessions existed: created one. It is EMPTY, and stays empty until the user writes to it. */
   | "created";
 
 export interface CanonicalChatResult {
@@ -35,8 +51,8 @@ export interface CanonicalChatResult {
   adoption: ChatAdoption;
   /** The RUNTIME session id, when this call is the one that created the chat. `prompt.submit` only
    *  accepts the runtime id (dissection 1.2 row 11) and it is a DIFFERENT value from the stored id
-   *  that gets pinned; a chat whose kickoff has not persisted yet cannot be resumed, so this is the
-   *  only way to learn it. Absent for every adoption path other than `created`. */
+   *  that gets pinned; a chat with no persisted row cannot be resumed, so this is the only way to
+   *  learn it. Absent for every adoption path other than `created`. */
   runtimeId?: string;
 }
 
@@ -114,7 +130,7 @@ export interface CanonicalChatDeps {
    *  carries, and NEVER allowed to fail the resolve: a gateway too old to store `ui_meta` still
    *  gets a working chat, it just keeps the pin gateway-local. Without this writeback the server
    *  never learns the phone's chat, and every later open has to re-derive it, which is how a
-   *  duplicate chat gets minted while the first one's kickoff is still in flight. */
+   *  duplicate chat gets minted for a chat that has no listable row yet. */
   saveServerPin?: (sessionId: string) => Promise<void>;
   /** Throws when `name` is no longer a profile on this gateway, checked FRESH. Called on one path
    *  only: immediately before a chat is MINTED, because `session.create` is where an unknown name
@@ -150,18 +166,21 @@ export async function listBotSessions(rpc: HermesRpc, name: string, limit: numbe
   return parseSessionList(await rpc.request("session.list", { profile: name, limit }));
 }
 
-/** Creates the canonical chat: check the bot is still there, `session.create` for the ids, pin it,
- *  then submit the kickoff
- *  prompt against the RUNTIME id (the stored id is what gets pinned; they are different values).
- *  A failed submit rolls the pin back, exactly as the desktop does, so a half-created chat never
- *  becomes the permanent pointer.
+/** Creates the canonical chat: check the bot is still there, `session.create` for the ids, pin the
+ *  STORED one, and stop. Nothing is submitted (capability 11), so the caller receives an empty chat
+ *  and the RUNTIME id it will need to address the user's first message, because a session with no
+ *  persisted row cannot be resumed and `prompt.submit` accepts nothing else.
  *
- *  Exported because there are now TWO ways a chat gets minted, and they must mint it identically or
- *  a reset chat would not be byte-compatible with a resolved one: `resolveCanonicalChat` below,
- *  which mints only when a bot has no chat at all, and the RESET path in the bridge
+ *  The caller MUST record that runtime id durably (`HermesBridge.#rememberUnwritten`). This function
+ *  cannot do it: it speaks to `rpc` and `pins` and nothing else, which is what keeps it testable with
+ *  two plain objects.
+ *
+ *  Exported because there are TWO ways a chat gets minted, and they must mint it identically or a
+ *  reset chat would not be byte-compatible with a resolved one: `resolveCanonicalChat` below, which
+ *  mints only when a bot has no chat at all, and the RESET path in the bridge
  *  (`HermesBridge.resetChat`), which retires the current pin and mints a replacement on purpose.
  *  Keeping one implementation is what guarantees both are born with the exact title, the hidden
- *  flag, and the kickoff prompt that makes the session persist at all. */
+ *  flag, and -- since capability 11 -- an empty transcript on both. */
 export async function mintCanonicalChat(
   name: string,
   deps: CanonicalChatDeps,
@@ -185,12 +204,6 @@ export async function mintCanonicalChat(
   }
 
   deps.pins.set(name, storedId);
-  try {
-    await deps.rpc.request("prompt.submit", { session_id: runtimeId, text: KICKOFF_PROMPT });
-  } catch (err) {
-    deps.pins.clear(name);
-    throw err;
-  }
   return { storedId, runtimeId };
 }
 
@@ -216,11 +229,16 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
 
   if (rows.length === 0) {
     // An empty list does NOT prove the bot has no chat. `session.create` persists no row until the
-    // first prompt lands (dissection 5.1), so a chat created moments ago is invisible to
-    // `session.list` while its kickoff is still in flight. Creating again here is what minted a
-    // second canonical chat on every fast second open: two "created" answers, two session ids, and
-    // a roster preview pointing at a chat the app was not showing. A pin we hold is therefore
-    // believed over an empty list; only a bot with no pin at all gets a new chat.
+    // first prompt lands (dissection 5.1), so a chat the user has not written in yet is invisible to
+    // `session.list`. Creating again here is what minted a second canonical chat on every fast
+    // second open: two "created" answers, two session ids, and a roster preview pointing at a chat
+    // the app was not showing. A pin we hold is therefore believed over an empty list; only a bot
+    // with no pin at all gets a new chat.
+    //
+    // Since capability 11 this is not a few-second race but the ordinary resting state of a chat
+    // nobody has typed into: the gateway submits nothing on the user's behalf, so an untouched chat
+    // stays unlisted for as long as it stays untouched. The rule was already right; what changed is
+    // how long it has to hold.
     if (typeof pin === "string" && pin.length > 0) {
       deps.pins.set(name, pin);
       return { sessionId: pin, adoption: "pin" };
@@ -267,10 +285,10 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
       return { sessionId: newest.id, adoption: "recovery" };
     }
     // A pin that names nothing listed, and nothing listed worth adopting. Keeping the pin is right
-    // and minting here would be wrong: the commonest way to reach this is a chat minted seconds ago
-    // whose kickoff has not persisted yet (the same lazy window the empty-list branch above reasons
-    // about), where the pin is the only pointer to the new chat and every listed session is one a
-    // reset just retired. Minting would spawn a fresh chat on EVERY open until the kickoff lands.
+    // and minting here would be wrong: the commonest way to reach this is a chat minted after a
+    // reset and not yet written in (the same unlisted state the empty-list branch above reasons
+    // about), where the pin is the only pointer to the new chat and every listed session is one that
+    // reset retired. Minting would spawn a fresh chat on EVERY open until the user finally typed.
     deps.pins.set(name, pin);
     return { sessionId: pin, adoption: "pin" };
   }

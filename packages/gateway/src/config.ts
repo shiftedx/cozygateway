@@ -65,6 +65,13 @@ const HermesBridgeConfigSchema = Type.Object({
    *  to match; leaving them out of step only shifts when the gateway stops offering the buttons,
    *  and never resolves anything on its own. */
   approvalTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** The opener an EMPTY bot chat offers a client (capability 11, issue #59). Defaults to the line
+   *  this gateway used to submit by itself, "Hey, tell me about yourself!".
+   *
+   *  It is a SUGGESTION and nothing else: the gateway never submits it, and it enters the
+   *  conversation only if the user chooses to send it as their own message. Set it to the empty
+   *  string to offer nothing at all, which leaves a fresh chat completely bare. */
+  chatSuggestion: Type.Optional(Type.String()),
 });
 export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
 

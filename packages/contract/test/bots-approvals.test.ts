@@ -76,7 +76,9 @@ describe("bots approval frames", () => {
     }
   });
 
-  it("rides capability 10", () => {
-    expect(BOTS_CAPABILITY_VERSION).toBe(10);
+  it("rides capability 10, and the advertised version has moved past it", () => {
+    // The approval surface landed AT 10 and the number only ever goes up, so this pins the floor a
+    // client must require for approve/deny while letting later, additive bumps through.
+    expect(BOTS_CAPABILITY_VERSION).toBeGreaterThanOrEqual(10);
   });
 });
