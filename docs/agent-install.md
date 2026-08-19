@@ -328,6 +328,16 @@ If it is absent, the config file did not load; check the mount path and re-read 
 `/health` is the only unauthenticated endpoint on the gateway. Everything else, `/bots` included,
 requires a device token.
 
+**Photos to bots (capability 9) need nothing installed, but they do need a bot that can see.** The
+route works on any Hermes at the 0.20.2 floor and adds no install step, no credential and no config
+change. Whether the bot receives PIXELS rather than a text description is decided by its own profile:
+leave `agent.image_input_mode` at its default `auto` and point the bot at a vision-capable model. Two
+caveats worth knowing before someone reports a bug: a profile running
+`model.openai_runtime: codex_app_server` is forced to the text path whatever its model, and a
+non-vision main model routes to text and needs `auxiliary.vision` configured to be useful at all. The
+gateway cannot observe either decision, so neither shows up as an error; the bot simply describes
+instead of looking.
+
 **6b. The bridge actually logged in.**
 
     . ~/cozygateway/local/install-env.sh && cd "$COZY_GATEWAY_DIR" && \

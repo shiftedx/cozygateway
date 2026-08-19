@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 8 }
+"capabilities": { "com.cozylabs.bots": 9 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -80,6 +80,14 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   The frame matters as much as the route, which is why they ride one number: a client below 8 ignores
   `bot_chat_reset` and goes on appending to a session that is no longer canonical, which looks
   perfectly correct on that device and diverges from every other one.
+- `9`: photos to bots. `POST /bots/:name/chat/photos` sends one image with an optional caption,
+  `GET /bots/:name/chat/attachments/:fileId` serves the gateway's own copy back, and
+  `BotChatMessage.attachments` carries the `attachment` block that joins the two. A client that
+  offers a photo picker MUST require `>= 9`: a version 8 gateway 404s both routes. Below 9 nothing
+  changes for a client, because `attachments` is an optional field and no existing route or frame
+  changed shape. What the version does NOT promise is that the bot will SEE the picture: whether a
+  photo arrives as pixels or as a description is decided per turn inside Hermes, from the bot's own
+  model, and this gateway cannot observe that decision. See "What a photo actually reaches" below.
 
 ## 3. Resources
 
@@ -104,7 +112,9 @@ description). `empty` means the bot has no conversation yet.
   id: string,                         // stable per session, see below
   role: string,                       // "user" | "assistant" | whatever hermes said
   text: string,
-  at: integer | null                  // MILLISECONDS, null when the message carries no stamp
+  at: integer | null,                 // MILLISECONDS, null when the message carries no stamp
+  clientId?: string,                  // the sender's own id, echoed; see below
+  attachments?: Attachment[]          // capability >= 9; ABSENT, never [], when there are none
 }
 ```
 
@@ -137,6 +147,24 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
   therefore the identity of a rendered row and `clientId` is only the join back to the sender's
   optimistic copy; a client that keys its list on the clientId instead collapses two identical sends
   into one row.
+- `attachments` (capability `>= 9`): the photos sent WITH this message, each one the frozen
+  `attachment` block from `contract/v1.md` section 2:
+  `{ "type": "attachment", "fileId": string, "name": string, "mimeType": string, "size": integer }`.
+  `fileId` is gateway-scoped and opaque; it is never a URL and never a path, and it is fetched from
+  `GET /bots/:name/chat/attachments/:fileId`. `name` is GENERATED (`photo.jpg`, `photo.png`), never
+  the filename the sender uploaded, and `mimeType` is what the BYTES are rather than what the upload
+  claimed. The field is absent, not an empty array, on a message with no attachments, and it appears
+  on user rows only. It rides the 202 body of the photo send, the `bot_chat` frame that later carries
+  the same row, and every history read of that row from then on, so a photo survives a restart and a
+  scroll-back rather than existing only in the frame it arrived on.
+- Hermes writes its own bookkeeping into the user row it persists for an image turn: an
+  `@image:/absolute/path/on/the/hermes/host.png` directive line and a `[screenshot]` marker (and, on
+  other paths, `[Image attached at: ...]` or `[User attached image: ...]`). Those lines are STRIPPED
+  from `text` before it reaches this wire, on user rows only. No path on the Hermes host ever reaches
+  a device: the block above is what replaces them, and it names bytes this gateway holds rather than
+  a file on somebody's machine. An assistant's own words are never edited this way, because a bot
+  writing about a file it made is conversation, not machinery (and `GET /bots/:name/media` already
+  answers that case with `reason: "local_path"`).
 - Rows are DROPPED, never rendered as blank bubbles: anything that is not an object, anything whose
   role is not `user` or `assistant` (a `system` prompt, a `tool` result), and anything whose text is
   empty after flattening (an assistant turn whose whole content was a `tool_use` part). Only the two
@@ -667,6 +695,169 @@ any of them.
 A reset is mutually exclusive with the canonical-chat resolve for that bot. A resolve already in
 flight is awaited first, and a resolve that arrives while the reset runs joins it and receives the
 NEW chat, so no device is ever handed a session id that is a moment from being retired.
+
+### POST /bots/:name/chat/photos
+
+Capability `>= 9`.
+
+```
+content-type: multipart/form-data
+parts:
+  file      (required, exactly one image)
+  text      (optional, the caption, 0..4000 characters)
+  clientId  (optional, 1..128)
+
+202  { name: string, sessionId: string, message: BotChatMessage }
+400  invalid_request                       // no file part, more than one, or a malformed body
+400  media_refused  reason: "empty"        // a file part with no bytes in it
+404  not_found                             // no profile named `name` exists
+413  media_refused  reason: "too_large"    // over the size cap, declared or delivered
+415  media_refused  reason: "content_type" // not a type this gateway accepts, or the bytes disagree
+429  rate_limited + retryAfterMs           // this DEVICE has sent photos too quickly; retry-after
+502  backend_unavailable + hermesError     // hermes refused; NOTHING was submitted.
+                                           // hermesError has host paths redacted on THIS route
+503  backend_unavailable  busy: true       // the gateway is already sending as many photos as it will
+```
+
+Sends ONE photo, with an optional caption, into the canonical chat. The answer is the same 202 and
+the same body as `POST /bots/:name/chat/messages`, and for the same reason: Hermes has accepted the
+prompt and the reply is not in this response, it arrives over `bot_chat` like any other turn. The
+`clientId` echo, the FIFO match of a send back to its persisted row, and the turn poll all behave
+exactly as they do for a text send. No new frame type exists, and none was needed.
+
+The one thing the body carries that a text send's does not is `message.attachments`, and it carries
+it immediately, so a sender can render its own photo the instant the request returns instead of
+waiting a poll for it.
+
+**A photo is always sent with words.** Hermes holds an attached image on the session and spends it on
+the NEXT prompt and nothing else, so a caption is not decoration here: without one the picture would
+sit queued and land on whatever the user typed afterwards. An absent or blank `text` is therefore
+replaced with a neutral default prompt, and the transcript honestly shows that prompt as the user's
+line rather than an empty bubble.
+
+**One image per send.** Not a limit that could be raised by sending more parts: a second `file` part
+is a `400`. Hermes' image queue is per session and is spent whole on one turn, so several files in
+one request would mean several pictures on one turn described by one attachment block.
+
+What the gateway will accept:
+
+- Content type on an allow-list, not an `image/*` prefix test: `image/png`, `image/jpeg`,
+  `image/gif`, `image/webp`, `image/bmp`. `image/svg+xml` is NOT on it, for the reason
+  `GET /bots/:name/media` gives and more so inbound: SVG is a document format carrying script, and
+  these bytes are stored by this gateway and served back from an authenticated route.
+- `image/heic`, `image/heif`, `image/avif` and `image/tiff` are refused with `415` and a message
+  saying to convert the photo. They ARE on the capability-7 OUTBOUND allow-list, and the asymmetry is
+  deliberate: what a CDN may serve to a phone and what this gateway may feed to a model are different
+  questions, and Hermes' own inbound extension list does not include them. iOS shoots HEIC by
+  default, so converting on device is the app's job; a distinct `415` is what lets it say something
+  true instead of surfacing a Hermes `4016` as a `502`.
+- **The declared type never decides anything.** The leading bytes are sniffed (PNG, JPEG, GIF87a/89a,
+  WEBP, BMP) and they decide. A declared type that is not on the allow-list is refused so the message
+  can be specific; a declared type that disagrees with the bytes is refused rather than resolved in
+  the sender's favour. `mimeType` on the resulting block is always the sniffed type.
+- At most 8 MB per photo, enforced against the declared length AND against the bytes that actually
+  arrive. The number sits between three ceilings: Hermes takes 25 MB per attach, the
+  Anthropic-family providers reject a single image over 5 MB, and a 2048 px JPEG at q0.8 (what an app
+  should send) is under 2 MB. Refusing here rather than at Hermes is what turns "the gateway is
+  broken" into a `413` that says what happened.
+- **The filename is never used.** Not for the stored id, not for the served name, not for the
+  extension. The id is generated, the name is `photo.<ext>`, and the extension comes from the sniffed
+  bytes.
+- **And no host path leaves this route, including in an error.** Every other route on this surface
+  passes Hermes' own text through verbatim in `hermesError`, and still does, because client feature
+  probes match against it. This route is the exception: its ordinary failures name the Hermes images
+  directory (a write failure carries the full path), and stripping paths out of the transcript while
+  handing the same path back in an error body would close nothing. On this route only, anything
+  path-shaped in `hermesError` is replaced with `<path>`. The code, the verb and the reason survive.
+
+**At most 3 of these run at once, per GATEWAY**, with the same bounded wait and the same `503 busy`
+answer the media proxy uses (`retry-after: 1`, `waitedMs` in the body). The number is smaller than
+the proxy's five because a photo is buffered whole and then base64-encoded into a single JSON-RPC
+frame, so the cost is memory rather than a socket. On top of that, and unlike the proxy, there is a
+per-DEVICE rate limit: a burst of 8 with one refilling every 5 seconds. The cost of a photo is
+attributable to the phone that caused it, and what is being bounded is one device spending the
+household's token budget in a loop. The token is spent when the request ARRIVES, before anything is
+read or validated, so a run of refused requests costs a device the same budget a run of accepted ones
+does. A limiter that only charged for successes would be one a caller could dodge by failing cheaply.
+A client should treat `429` as "wait", never as a verdict on the photo.
+
+**Attach then submit, in that order, and never one without the other.** The gateway resolves the
+runtime session id exactly as a text send does, attaches the bytes, and only then submits the prompt.
+An attach that fails, or that succeeds without reporting the image as attached, fails the whole send
+with `502` BEFORE any submit, so a caption never lands without its photo. A `502` from this route
+means NOTHING WAS SUBMITTED, and a retry is a retry rather than a duplicate.
+
+The narrow case that phrasing is careful about: the attach can land and the submit can then fail (a
+transient RPC error, a dropped socket with Hermes still up). Hermes would be left holding a queued
+image that the NEXT prompt spends, whatever that prompt is, so the user's next unrelated question
+would silently carry a picture the transcript does not show. The gateway therefore asks Hermes to
+drop the queued image (`image.detach`) before it reports the failure. That unwind is BEST EFFORT: if
+it fails too, the gateway has nothing further to try, and the honest statement of the guarantee is
+"nothing was submitted" rather than "nothing reached Hermes". This is also why the gateway deletes its
+own copy on that path: a photo no message points at is not kept.
+
+Sends are serialized per bot across that pair. Hermes' attached-image queue is per session and is
+consumed and cleared by the next prompt, so an interleaved send would take somebody else's picture:
+two photos racing would put both on one turn and none on the other, and an ordinary TEXT send racing
+a photo upload would steal the picture outright and attach it to words that were not about it. The
+serialization covers text sends too, for exactly that second case.
+
+**What a photo actually reaches.** Hermes decides per turn whether the bot gets pixels or a text
+description, from the bot's own model: a vision-capable model gets native multimodal input, and a
+text-only one gets a reference and is told to look at the image itself. A profile configured with
+`model.openai_runtime: codex_app_server` is forced to the text path whatever its model. The gateway
+cannot see that decision and does not report it, so a client cannot warn about it from the wire; it
+is a property of the bot, best said on a bot's own screen rather than surfaced as a runtime error.
+
+### GET /bots/:name/chat/attachments/:fileId
+
+Capability `>= 9`.
+
+```
+200  <the image bytes>
+     content-type: the sniffed type of the stored photo
+     content-length: its size in bytes
+     cache-control: private, max-age=86400
+     x-content-type-options: nosniff
+
+400  invalid_request   // `name` is not a legal profile id, or fileId is not an attachment id
+404  not_found         // no attachment with that id belongs to this bot
+```
+
+Serves the gateway's OWN copy of a photo a device sent. Not Hermes' copy: the same upload also
+produced a file at an absolute path on the Hermes host, and that file stays unreachable, because
+`GET /bots/:name/media` already refuses local paths on the grounds that serving one from an
+authenticated route is a file-read primitive over the whole box, and that judgement is not walked
+back here. What is served is the bytes the device itself uploaded, under an id this gateway minted,
+which never came out of model output.
+
+`fileId` is opaque, fixed-shape (32 hex characters) and gateway-scoped, and is checked against that
+shape before any lookup: a path parameter that could be anything is how an id becomes a path. The
+lookup is scoped to the bot in the URL as well, so one bot's route never serves another bot's photo.
+
+The header set is the capability-7 posture, for the same reasons: `nosniff` because the type was
+taken from an allow-list and confirmed against the bytes and nothing downstream should improve on it,
+and `private, max-age=86400` because the bytes are immutable (an id names one upload forever) and
+went through a device-token route, so they belong to that device rather than to any shared cache.
+Range requests are not supported and `Accept-Ranges` is not sent: the cap is 8 MB, so the answer is
+always one whole image.
+
+**Photos expire, conversations do not.** A stored photo is kept for 14 days. After that the message
+keeps its text and simply stops carrying the attachment block, and this route answers `404` for the
+id. A client should render that as a picture that is no longer available rather than as a broken chat.
+
+The expiry is a property of the READ, not of a sweep having run: a photo past 14 days is unreachable
+from the moment it expires, whether or not the gateway has got around to reclaiming the disk. That
+distinction is load bearing on exactly the gateway this feature is for. A household that sends photos
+for a week and then stops gives a sweep nothing to trigger it, so an expiry that depended on one would
+never happen at all, and the promise above would be false on the quietest boxes rather than the
+busiest.
+
+Deleting a bot deletes its photos immediately, by the same rule that drops its pin and its cached
+rows. Clearing a chat (`POST /bots/:name/chat/reset`) does NOT: the retired session's photos stay
+fetchable by `fileId` until they expire, which is consistent with what a reset actually does, since
+the retired transcript itself also stays on the Hermes host. A client that wants the photos gone as
+well as the chat cleared is asking for a deletion this surface does not offer.
 
 ### GET /bots/:name/media
 
@@ -1597,13 +1788,19 @@ the gateway's own text VERBATIM:
   bound. Distinct from 503 on purpose, because the operation may still be running: for a delete, a
   retry can legitimately come back 404 once it finishes.
 
-Two error CODES are added by this extension, on top of the core list in `contract/v1.md` section 4
+Four error CODES are added by this extension, on top of the core list in `contract/v1.md` section 4
 (where `error.code` is a plain string precisely so an extension can add to it). A client that does
 not know them treats them as a generic failure, which the HTTP status already conveys:
 
 - `conflict` (409, `POST /bots`): the profile name is taken.
 - `command_blocked` (502, `DELETE /bots/:name`): the gateway's command allow-list refused to run
   the profile delete; the body carries `blocked: true` and the gateway's own `hint`.
+- `media_refused` (400/413/415, `GET /bots/:name/media` and `POST /bots/:name/chat/photos`): this
+  gateway will not carry that image, in either direction. The body carries `reason` so a client can
+  render a specific fallback without parsing prose.
+- `rate_limited` (429, `POST /bots/:name/chat/photos`): this device has sent photos too quickly. The
+  body carries `retryAfterMs` and the answer carries a `retry-after` header in whole seconds. It is a
+  retryable answer and says nothing about the photo.
 
 ## 5. Presence
 
@@ -1784,7 +1981,10 @@ Draft frames for anything but a bot's own reply (a user's typing, a tool call in
 of a draft to a device that joined mid-turn, and any persistence of one; per-device chat-frame
 scoping and per-device delta watermarks; model and description writes (see
 `PATCH /bots/:name/profile`); skill install; MCP server setup and OAuth; bot duplicate; avatars;
-routine run-now and run output (the backend exposes neither over this RPC); push; and
+routine run-now and run output (the backend exposes neither over this RPC); push; attachments that
+are not images (PDFs and arbitrary files, which Hermes does expose as `pdf.attach` and `file.attach`
+on the same surface), more than one image per send, photos into a GROUP room, and any way for a
+client to learn ahead of time whether a given bot will see pixels or a description; and
 multi-connection
 rosters (the bridge targets exactly one Hermes gateway). Route shapes keep the `connection`
 concept out of the URL so a later version can add it additively.

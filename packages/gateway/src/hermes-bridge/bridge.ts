@@ -40,6 +40,7 @@ import type { GroupMember } from "./group-protocol.ts";
 import { BotChatStream } from "./chat-stream.ts";
 import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 import { GroupRooms } from "./group-rooms.ts";
+import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName } from "./photos.ts";
 import {
   BotDeleteRefused,
   BotNotFound,
@@ -126,6 +127,16 @@ export interface BotsSurface {
     text: string,
     opts?: { clientId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
+  /** Capability 9: one photo, with an optional caption, into the canonical chat. The bytes have
+   *  already passed the inbound rules (`photos.ts`) by the time this is called; what this owns is
+   *  storing the gateway's own copy and getting the RPC pair right. */
+  sendChatPhoto(
+    name: string,
+    photo: BotChatPhotoUpload,
+  ): Promise<{ sessionId: string; message: BotChatMessage }>;
+  /** The gateway's own copy of a photo, for `GET /bots/:name/chat/attachments/:fileId`. Scoped to
+   *  the bot, so one bot's URL never serves another's picture. */
+  chatAttachment(name: string, fileId: string): BotChatAttachmentBytes | undefined;
   createBot(input: BotCreateRequest): Promise<BotCreated>;
   deleteBot(name: string): Promise<DeletePath>;
   botProfile(name: string): Promise<BotProfile>;
@@ -143,6 +154,26 @@ export interface BotsSurface {
   deleteGroup(name: string): void;
   groupDetail(name: string): BotGroupDetail;
   sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage;
+}
+
+/** One accepted photo on its way to a bot. Everything here has already been decided: the bytes were
+ *  sniffed, the type is one this gateway serves back, and the caption is whatever the sender wrote or
+ *  the neutral default. */
+export interface BotChatPhotoUpload {
+  bytes: Uint8Array;
+  mime: string;
+  /** Extension derived from the SNIFFED bytes, never from a client filename. */
+  ext: string;
+  text: string;
+  clientId?: string;
+}
+
+/** The gateway's own copy of a photo, on the way back out. */
+export interface BotChatAttachmentBytes {
+  bytes: Uint8Array;
+  mime: string;
+  name: string;
+  size: number;
 }
 
 /** What `POST /bots/:name/chat/reset` answers with. */
@@ -202,6 +233,9 @@ export interface HermesBridgeOptions {
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
+  /** How often expired chat photos are swept off disk. Scaled down in tests; the read filter is what
+   *  enforces the TTL, so this only decides how long unreachable bytes linger. */
+  attachmentSweepMs?: number;
   /** Turn-poll cadence and cap. Defaults are the desktop's own 2 s / 180 s. */
   chatPollMs?: number;
   chatTurnTimeoutMs?: number;
@@ -239,6 +273,7 @@ export class HermesBridge implements BotsSurface {
   readonly #rosterPollMs: number;
   readonly #routinesPollMs: number;
   readonly #focusTtlMs: number;
+  readonly #sweepMs: number;
   readonly #log: (message: string) => void;
 
   readonly #catalogTtlMs: number;
@@ -296,6 +331,7 @@ export class HermesBridge implements BotsSurface {
   #busyDepth = 0;
 
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
+  #sweepTimer: ReturnType<typeof setTimeout> | undefined;
   #debounceTimer: ReturnType<typeof setTimeout> | undefined;
   #refreshing: Promise<void> | undefined;
   /** Set when a refresh was asked for while one was already running; drives the trailing run. */
@@ -322,6 +358,7 @@ export class HermesBridge implements BotsSurface {
     this.#rosterPollMs = opts.rosterPollMs ?? ROSTER_POLL_MS;
     this.#routinesPollMs = opts.routinesPollMs ?? ROUTINES_POLL_MS;
     this.#focusTtlMs = opts.focusTtlMs ?? FOCUS_TTL_MS;
+    this.#sweepMs = opts.attachmentSweepMs ?? PHOTO_SWEEP_MS;
     const sink = opts.logSink ?? ((line: string) => void process.stderr.write(line));
     this.#log = (message: string) => sink(`[hermes-bridge] ${message}\n`);
     this.#pins = {
@@ -340,6 +377,20 @@ export class HermesBridge implements BotsSurface {
       now: this.#now,
       log: this.#log,
       stream: this.#stream,
+      // Capability 9. The turn loop learns which transcript row a send became; the database is where
+      // that has to be written down, or a photo would decorate one live frame and then be gone from
+      // every later read of the same conversation.
+      attachments: {
+        bind: (fileId, messageId) => this.#storage.bindBotChatAttachment(fileId, messageId),
+        forMessage: (sessionId, messageId) =>
+          this.#storage.botChatAttachmentsFor(sessionId, messageId, this.#now() - PHOTO_TTL_MS).map((row) => ({
+            type: "attachment" as const,
+            fileId: row.fileId,
+            name: row.name,
+            mimeType: row.mime,
+            size: row.size,
+          })),
+      },
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
       ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),
     });
@@ -456,6 +507,10 @@ export class HermesBridge implements BotsSurface {
     });
     this.#client.start();
     this.#schedulePoll();
+    // Once now, then hourly. The read filter is what makes expiry true; this is what makes the disk
+    // go back.
+    this.#sweepAttachments();
+    this.#scheduleAttachmentSweep();
   }
 
   roster(): BotRosterView {
@@ -881,6 +936,114 @@ export class HermesBridge implements BotsSurface {
     return { sessionId: chat.sessionId, message };
   }
 
+  /** One photo, with its caption, into the canonical chat (capability 9).
+   *
+   *  The gateway's own copy is written FIRST, before hermes hears about the picture at all, and that
+   *  ordering is deliberate. The id in the `attachment` block has to exist as a servable file the
+   *  instant the 202 body carries it, or the sender's optimistic bubble points at a 404 for as long
+   *  as the write takes. The cost of that ordering is an orphaned row when the send then fails, which
+   *  is paid for below: a failed send deletes its own bytes, so a refused upload leaves nothing
+   *  behind. Losing the delete (a crash between the two) leaves an unbound row, and an unbound row is
+   *  swept by the TTL like any other.
+   *
+   *  What this deliberately does NOT do is reach for the file hermes wrote from the same bytes. That
+   *  file lives at an absolute path on the hermes host, and `GET /bots/:name/media` already refuses
+   *  to serve local paths because doing so from an authenticated route is a file-read primitive over
+   *  the whole box. The copy served back to devices is the one the device itself uploaded: this
+   *  gateway owns it, and it never came out of model output. */
+  async sendChatPhoto(
+    name: string,
+    photo: BotChatPhotoUpload,
+  ): Promise<{ sessionId: string; message: BotChatMessage }> {
+    const chat = await this.canonicalChat(name);
+    const kickoff = this.#kickoffs.get(name);
+    const runtimeId =
+      chat.runtimeId ?? (kickoff !== undefined && kickoff.sessionId === chat.sessionId ? kickoff.runtimeId : undefined);
+
+    const fileId = newPhotoFileId();
+    const displayName = photoDisplayName(photo.ext);
+    this.#storage.putBotChatAttachment(
+      {
+        fileId,
+        bot: name,
+        sessionId: chat.sessionId,
+        mime: photo.mime,
+        name: displayName,
+        size: photo.bytes.byteLength,
+        bytes: photo.bytes,
+      },
+      this.#now(),
+      PHOTO_TTL_MS,
+    );
+
+    try {
+      const message = await this.#chat.send(name, chat.sessionId, photo.text, {
+        ...(runtimeId === undefined ? {} : { runtimeId }),
+        ...(photo.clientId === undefined ? {} : { clientId: photo.clientId }),
+        photo: {
+          fileId,
+          // Raw base64, no `data:` prefix. Hermes tolerates the prefix and tolerates embedded
+          // whitespace, but tolerance is not a contract and the plain form is what its own docstring
+          // documents.
+          contentBase64: Buffer.from(photo.bytes).toString("base64"),
+          // The only thing hermes uses a filename for is the extension, and this one is generated
+          // from the sniffed bytes. The client's own filename never leaves the request.
+          filename: displayName,
+          block: {
+            type: "attachment",
+            fileId,
+            name: displayName,
+            mimeType: photo.mime,
+            size: photo.bytes.byteLength,
+          },
+        },
+      });
+      return { sessionId: chat.sessionId, message };
+    } catch (err) {
+      // Nothing was submitted (the attach runs before the submit and fails the send), so there is no
+      // transcript row for these bytes and never will be. Keeping them would be keeping a picture no
+      // message points at, for two weeks, in the household's database.
+      this.#storage.deleteBotChatAttachment(fileId);
+      throw err;
+    }
+  }
+
+  /** The gateway's own copy of a photo, by opaque id, scoped to the bot the route named AND to the
+   *  TTL. A photo past its expiry is not found, whether or not a sweep has got to it yet: the
+   *  contract promises a 404 after 14 days, and a promise that depends on a timer having fired is not
+   *  a promise. */
+  chatAttachment(name: string, fileId: string): BotChatAttachmentBytes | undefined {
+    const row = this.#storage.botChatAttachment(name, fileId, this.#now() - PHOTO_TTL_MS);
+    if (row === undefined) return undefined;
+    return { bytes: row.bytes, mime: row.mime, name: row.name, size: row.size };
+  }
+
+  /** Reclaims the disk behind photos the reads above have already stopped serving.
+   *
+   *  Purely housekeeping, which is exactly why it is allowed to be a lazy timer: correctness lives in
+   *  the read filter, and this only decides how long the bytes linger on disk after they have become
+   *  unreachable. It runs once at `start()` (so a gateway that is restarted occasionally sweeps even
+   *  if it never stays up an hour) and then hourly, unref'd so it can never hold the process open. */
+  #sweepAttachments(): void {
+    try {
+      const dropped = this.#storage.sweepBotChatAttachments(this.#now(), PHOTO_TTL_MS);
+      if (dropped > 0) this.#log(`swept ${dropped} expired chat photo(s)`);
+    } catch (err) {
+      // Never fatal: a sweep that cannot run costs disk, and the reads have already stopped serving
+      // whatever it would have dropped.
+      this.#log(`chat photo sweep failed: ${err instanceof Error ? err.message : "unknown"}`);
+    }
+  }
+
+  #scheduleAttachmentSweep(): void {
+    if (this.#closed) return;
+    this.#sweepTimer = setTimeout(() => {
+      this.#sweepAttachments();
+      this.#scheduleAttachmentSweep();
+    }, this.#sweepMs);
+    this.#sweepTimer.unref();
+  }
+
   /** True while a chat this bridge created is still lazy: the kickoff has not been seen to land,
    *  so `session.resume` on it legitimately fails. The window is the turn cap, after which a
    *  session that still cannot be resumed is a real failure and is reported as one. */
@@ -1253,6 +1416,8 @@ export class HermesBridge implements BotsSurface {
     await this.#groups.close();
     if (this.#pollTimer !== undefined) clearTimeout(this.#pollTimer);
     this.#pollTimer = undefined;
+    if (this.#sweepTimer !== undefined) clearTimeout(this.#sweepTimer);
+    this.#sweepTimer = undefined;
     if (this.#debounceTimer !== undefined) clearTimeout(this.#debounceTimer);
     this.#debounceTimer = undefined;
     if (this.#routineDebounceTimer !== undefined) clearTimeout(this.#routineDebounceTimer);

@@ -1,15 +1,21 @@
-/** Vendor extension `com.cozylabs.bots`, version 6. NOT part of the frozen `contract: "v1"`
+/** Vendor extension `com.cozylabs.bots`. NOT part of the frozen `contract: "v1"`
  *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
  *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
  *  advertise the capability never emits these frames, and a client that does not recognize the
  *  capability ignores them, exactly as the forward-compatibility rule for unknown server frames
  *  requires.
  *
+ *  The current version and its whole history live on `BOTS_CAPABILITY_VERSION` at the foot of this
+ *  file, and nowhere else. Naming a number up here is how this comment came to claim "version 6"
+ *  through three bumps.
+ *
  *  Everything here mirrors what a Hermes gateway's Bot Mode conventions carry. The units are the
  *  ones the wire uses after the bridge has normalized them: `lastActiveAt` is MILLISECONDS (the
  *  Hermes `last_session.last_active` is seconds and is converted inside the bridge), and
  *  `meta.created` stays milliseconds as the desktop plugin writes it. */
 import { type Static, Type } from "@sinclair/typebox";
+
+import { AttachmentBlockSchema } from "./rich-blocks.ts";
 
 /** The roster preview line, already classified. `a2a` is a bot-to-bot delivery whose
  *  `Message from ... :` prefix has been stripped, with the sender handle carried separately;
@@ -69,13 +75,21 @@ export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
  *  `clientId` is the echo of what the sender put on `POST /bots/:name/chat/messages` (or the
  *  gateway's own local id when the sender sent none). It rides the 202 body AND the same message
  *  when it comes back in a `bot_chat` frame, which is what lets a sender replace its optimistic row
- *  instead of rendering the message twice. */
+ *  instead of rendering the message twice.
+ *
+ *  `attachments` (capability 9) carries the photos that were sent WITH this message, as the frozen
+ *  `attachment` block from `contract/v1.md`. Every entry's `fileId` is gateway-scoped and opaque, is
+ *  never a URL and is never a path, and is fetched from `GET /bots/:name/chat/attachments/:fileId`.
+ *  A host path never reaches this wire: the bridge strips the `@image:<path>` directive lines hermes
+ *  writes into its own transcript before the text is decoded, and puts this block there instead. The
+ *  field is ABSENT, not empty, on a message with no attachments, so a client below 9 is unaffected. */
 export const BotChatMessageSchema = Type.Object({
   id: Type.String(),
   role: Type.String(),
   text: Type.String(),
   at: Type.Union([Type.Integer(), Type.Null()]),
   clientId: Type.Optional(Type.String()),
+  attachments: Type.Optional(Type.Array(AttachmentBlockSchema)),
 });
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;
 
@@ -205,6 +219,21 @@ export const BotChatSendRequestSchema = Type.Object({
   clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
 export type BotChatSendRequest = Static<typeof BotChatSendRequestSchema>;
+
+/** The non-file parts of the `POST /bots/:name/chat/photos` multipart body (capability 9). The
+ *  `file` part is not modelled here on purpose: it is bytes, and what makes it acceptable is the
+ *  size cap and the magic-byte sniff the gateway runs, neither of which a JSON schema can express.
+ *
+ *  `text` is the CAPTION, and it is what the bot is actually prompted with. It is optional and
+ *  shorter-capped than a text send: a caption rides beside an image, and the 32000-character
+ *  contract on `POST /bots/:name/chat/messages` is untouched by this route. An absent or blank
+ *  caption is replaced by a neutral default prompt, because hermes needs SOME prompt to spend the
+ *  attached image on, and the transcript then honestly shows the words that were submitted. */
+export const BotChatPhotoFieldsSchema = Type.Object({
+  text: Type.Optional(Type.String({ maxLength: 4_000 })),
+  clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+});
+export type BotChatPhotoFields = Static<typeof BotChatPhotoFieldsSchema>;
 
 /** `POST /bots` body: the three-field quick create, plus the two look fields the roster renders.
  *  `name` is the Hermes profile name and the id of the bot everywhere else in this API; it is
@@ -641,6 +670,14 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    "clear chat" action MUST require `>= 8`: a version 7 gateway 404s the route. Note what it is
  *    NOT: hermes exposes no session delete here, so the retired chat is still on the hermes host and
  *    still appears in `GET /bots/:name/sessions`; what is cleared is which session the bot's
- *    canonical chat points at. */
+ *    canonical chat points at.
+ *  - `9`: photos to bots. `POST /bots/:name/chat/photos` sends one image with an optional caption,
+ *    `GET /bots/:name/chat/attachments/:fileId` serves the gateway's own copy of it back, and
+ *    `BotChatMessage.attachments` carries the `attachment` block that ties the two together. A
+ *    client that offers a photo picker MUST require `>= 9`: a version 8 gateway 404s both routes.
+ *    A client below 9 keeps working unchanged, because `attachments` is an optional field it can
+ *    ignore and no existing route or frame changed shape. What a client CANNOT infer from the
+ *    version is whether the bot on the other end can see pixels: that is decided per turn inside
+ *    hermes by the bot's own model, and a text-only model quietly gets a description instead. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 8;
+export const BOTS_CAPABILITY_VERSION = 9;

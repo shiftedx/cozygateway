@@ -12,6 +12,24 @@ export const ListItemSchema = Type.Object({
 });
 export type ListItem = Static<typeof ListItemSchema>;
 
+/** The `attachment` block, named on its own so a vendor extension can reference the EXACT shape
+ *  `contract/v1.md` froze rather than restating it and drifting from it. Pulling it out of the union
+ *  literal changes nothing on the wire: `RichBlockSchema` below still carries this object, byte for
+ *  byte, as its `attachment` member.
+ *
+ *  `fileId` is gateway-scoped and is NEVER a URL, which is what keeps a block from becoming a
+ *  navigable anchor. Whatever surface activates this block owes the reader a route that turns the
+ *  id back into bytes; v1 reserved that route rather than defining it, and
+ *  `contract/ext-bots-v1.md` capability 9 is the first thing to fill it in. */
+export const AttachmentBlockSchema = Type.Object({
+  type: Type.Literal("attachment"),
+  fileId: Type.String(),
+  name: Type.String(),
+  mimeType: Type.String(),
+  size: Type.Integer({ minimum: 0 }),
+});
+export type AttachmentBlock = Static<typeof AttachmentBlockSchema>;
+
 export const RichBlockSchema = Type.Union([
   Type.Object({ type: Type.Literal("paragraph"), text: Type.String() }),
   Type.Object({
@@ -35,12 +53,6 @@ export const RichBlockSchema = Type.Union([
     rows: Type.Array(Type.Array(Type.String())),
   }),
   Type.Object({ type: Type.Literal("math"), latex: Type.String() }),
-  Type.Object({
-    type: Type.Literal("attachment"),
-    fileId: Type.String(),
-    name: Type.String(),
-    mimeType: Type.String(),
-    size: Type.Integer({ minimum: 0 }),
-  }),
+  AttachmentBlockSchema,
 ]);
 export type RichBlock = Static<typeof RichBlockSchema>;

@@ -328,7 +328,10 @@ describe("capability advertisement", () => {
     // 7 for `GET /bots/:name/media`, the image proxy (a v6 gateway 404s it, so a client that
     // rendered inline images anyway would turn working links into broken-image chips),
     // 8 for `POST /bots/:name/chat/reset` and the `bot_chat_reset` frame (a v7 gateway 404s the
-    // route, and a client that does not know the frame keeps writing into a retired chat).
-    expect(BOTS_CAPABILITY_VERSION).toBe(8);
+    // route, and a client that does not know the frame keeps writing into a retired chat),
+    // 9 for photos to bots: `POST /bots/:name/chat/photos`,
+    // `GET /bots/:name/chat/attachments/:fileId`, and `BotChatMessage.attachments` (a v8 gateway
+    // 404s both routes, so a picker offered against one silently fails on send).
+    expect(BOTS_CAPABILITY_VERSION).toBe(9);
   });
 });

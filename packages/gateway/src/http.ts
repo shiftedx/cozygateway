@@ -26,6 +26,7 @@ import { BackendUnavailable } from "./errors.ts";
 import type { BotsSurface } from "./hermes-bridge/bridge.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import type { MediaFetch, MediaLimiter, MediaLookup } from "./hermes-bridge/media.ts";
+import type { PhotoRateLimiter } from "./hermes-bridge/photos.ts";
 
 export interface AppDeps {
   storage: Storage;
@@ -43,6 +44,13 @@ export interface AppDeps {
   mediaLookup?: MediaLookup;
   mediaLimiter?: MediaLimiter;
   mediaQueueWaitMs?: number;
+  /** Test seams for `POST /bots/:name/chat/photos` (capability 9), for the same reason the media
+   *  ones exist: the in-flight bound and the per-device rate limit are as much a part of what the
+   *  route will do as the sniffing rules are, and neither can be exercised at production values
+   *  inside a test. Left undefined in production, where the route builds its own. */
+  photoLimiter?: MediaLimiter;
+  photoQueueWaitMs?: number;
+  photoRateLimiter?: PhotoRateLimiter;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
   presenceOf: (agentId: string) => PresenceState;
@@ -240,12 +248,23 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
   if (deps.bots !== undefined) {
-    registerBotRoutes(app, requireDevice, deps.bots, {
-      ...(deps.mediaFetch === undefined ? {} : { fetchImpl: deps.mediaFetch }),
-      ...(deps.mediaLookup === undefined ? {} : { lookup: deps.mediaLookup }),
-      ...(deps.mediaLimiter === undefined ? {} : { limiter: deps.mediaLimiter }),
-      ...(deps.mediaQueueWaitMs === undefined ? {} : { queueWaitMs: deps.mediaQueueWaitMs }),
-    });
+    registerBotRoutes(
+      app,
+      requireDevice,
+      deps.bots,
+      {
+        ...(deps.mediaFetch === undefined ? {} : { fetchImpl: deps.mediaFetch }),
+        ...(deps.mediaLookup === undefined ? {} : { lookup: deps.mediaLookup }),
+        ...(deps.mediaLimiter === undefined ? {} : { limiter: deps.mediaLimiter }),
+        ...(deps.mediaQueueWaitMs === undefined ? {} : { queueWaitMs: deps.mediaQueueWaitMs }),
+      },
+      {
+        ...(deps.photoLimiter === undefined ? {} : { limiter: deps.photoLimiter }),
+        ...(deps.photoQueueWaitMs === undefined ? {} : { queueWaitMs: deps.photoQueueWaitMs }),
+        ...(deps.photoRateLimiter === undefined ? {} : { rateLimiter: deps.photoRateLimiter }),
+        now: deps.now,
+      },
+    );
   }
 
   app.notFound((c) => c.json(errorBody("not_found", "no such route"), 404));

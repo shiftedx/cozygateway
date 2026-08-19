@@ -87,6 +87,30 @@ CREATE TABLE IF NOT EXISTS bot_chat_retired (
   retired_at INTEGER NOT NULL,
   PRIMARY KEY (name, session_id)
 ) STRICT, WITHOUT ROWID;
+-- Photos a device sent to a bot (contract/ext-bots-v1.md, capability 9). NOT a cache: these bytes
+-- are the gateway's OWN copy of what the device uploaded, and they are the only copy any device can
+-- ever be served. The hermes-side file the same upload produced is deliberately unreachable, for the
+-- reason GET /bots/:name/media already refuses local paths: serving an arbitrary path on the hermes
+-- host from an authenticated route is a file-read primitive over the whole box.
+--
+-- file_id is opaque, random and gateway-scoped; it is the only handle that ever leaves this process.
+-- message_id is NULL until the turn poll (or a history read) sees the user row this photo was sent
+-- with and binds the two. That binding is what makes the attachment durable: without it the photo
+-- would ride exactly one live frame and vanish from the transcript on the next read, since the match
+-- from a send to its persisted row is single-use by design.
+CREATE TABLE IF NOT EXISTS bot_chat_attachments (
+  file_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  message_id TEXT,
+  mime TEXT NOT NULL,
+  name TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS bot_chat_attachments_row
+  ON bot_chat_attachments (session_id, message_id);
 -- Group chat rooms. Unlike the three tables above these are NOT a cache: this gateway hosts the
 -- rooms (spec section 4), so the room, its transcript, each member's watermark and the epoch are
 -- the source of truth and must survive a restart. Only the "a round loop is running right now"
@@ -555,6 +579,121 @@ export class Storage {
     }
   }
 
+  // --- Photos sent to a bot (contract/ext-bots-v1.md, capability 9). -----------------------------
+
+  /** Stores the gateway's own copy of an uploaded photo and sweeps anything past the TTL in the same
+   *  transaction.
+   *
+   *  The sweep rides the insert rather than a timer on purpose: this table only ever grows on an
+   *  insert, so that is exactly when it is worth trimming, and a gateway nobody sends photos to costs
+   *  nothing to keep tidy. */
+  putBotChatAttachment(
+    entry: {
+      fileId: string;
+      bot: string;
+      sessionId: string;
+      mime: string;
+      name: string;
+      size: number;
+      bytes: Uint8Array;
+    },
+    createdAt: number,
+    ttlMs: number,
+  ): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          `INSERT INTO bot_chat_attachments (file_id, bot, session_id, message_id, mime, name, size, bytes, created_at)
+           VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          entry.fileId,
+          entry.bot,
+          entry.sessionId,
+          entry.mime,
+          entry.name,
+          entry.size,
+          entry.bytes,
+          createdAt,
+        );
+      this.#db.prepare("DELETE FROM bot_chat_attachments WHERE created_at < ?").run(createdAt - ttlMs);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** The bytes behind one `fileId`, scoped to the bot whose route asked for them, and to the TTL.
+   *
+   *  The bot scoping is not decoration: `/bots/:name/chat/attachments/:fileId` promises an answer
+   *  about THAT bot, and a lookup by id alone would let any bot's URL serve any other bot's photo to
+   *  a device that guessed or kept an id.
+   *
+   *  `notBefore` is what makes the contract's expiry TRUE rather than aspirational. A sweep is a
+   *  reclamation of disk and it only runs when something runs it; a household that sends photos for
+   *  a week and then stops has nothing left to trigger one, and every one of those photos would go
+   *  on being served for years. Expiry has to be a property of the READ, and the sweep is then just
+   *  housekeeping behind an answer that is already correct. */
+  botChatAttachment(
+    bot: string,
+    fileId: string,
+    notBefore: number,
+  ): { mime: string; name: string; size: number; bytes: Uint8Array } | undefined {
+    const row = this.#db
+      .prepare(
+        "SELECT mime, name, size, bytes FROM bot_chat_attachments WHERE bot = ? AND file_id = ? AND created_at >= ?",
+      )
+      .get(bot, fileId, notBefore) as { mime: string; name: string; size: number; bytes: Uint8Array } | undefined;
+    return row;
+  }
+
+  /** The attachment blocks belonging to one transcript row, in insert order. Answers `[]` for the
+   *  overwhelming majority of rows, which is why the index is on `(session_id, message_id)`.
+   *
+   *  Same `notBefore` cut as the read above, and for the same reason plus one more: a block naming a
+   *  file the download route would 404 is worse than no block at all, because a client renders it as
+   *  a picture that is coming and then never resolves. The two reads have to expire together. */
+  botChatAttachmentsFor(
+    sessionId: string,
+    messageId: string,
+    notBefore: number,
+  ): Array<{ fileId: string; name: string; mime: string; size: number }> {
+    return this.#db
+      .prepare(
+        `SELECT file_id AS fileId, name, mime, size FROM bot_chat_attachments
+         WHERE session_id = ? AND message_id = ? AND created_at >= ? ORDER BY created_at, file_id`,
+      )
+      .all(sessionId, messageId, notBefore) as unknown as Array<{
+      fileId: string;
+      name: string;
+      mime: string;
+      size: number;
+    }>;
+  }
+
+  /** Binds a stored photo to the transcript row it was sent with, ONCE. The `message_id IS NULL`
+   *  guard is what makes it once: the send-to-row match is single-use by design, but a re-bind from a
+   *  replayed row would move a photo off the message it belongs to and onto a later one with the same
+   *  words, which is the exact collapse the pending-send queue exists to prevent. */
+  bindBotChatAttachment(fileId: string, messageId: string): void {
+    this.#db
+      .prepare("UPDATE bot_chat_attachments SET message_id = ? WHERE file_id = ? AND message_id IS NULL")
+      .run(messageId, fileId);
+  }
+
+  /** Drops one stored photo. Used when the send it belonged to failed, so a refused or unsubmitted
+   *  upload leaves no bytes behind. */
+  deleteBotChatAttachment(fileId: string): void {
+    this.#db.prepare("DELETE FROM bot_chat_attachments WHERE file_id = ?").run(fileId);
+  }
+
+  /** Drops every stored photo older than the TTL. Returns how many went, so a caller can log it. */
+  sweepBotChatAttachments(now: number, ttlMs: number): number {
+    return this.#db.prepare("DELETE FROM bot_chat_attachments WHERE created_at < ?").run(now - ttlMs).changes as number;
+  }
+
   /** Drops every trace of a bot from the cache: its roster row, its mirrored `ui_meta` blob, its
    *  canonical-chat pin, and the sessions its resets retired. Called when the profile is deleted
    *  Hermes-side, so a name that gets reused later starts clean rather than inheriting a dead pin,
@@ -570,6 +709,11 @@ export class Storage {
       this.#db.prepare("DELETE FROM bot_meta WHERE name = ?").run(name);
       this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
       this.#db.prepare("DELETE FROM bot_chat_retired WHERE name = ?").run(name);
+      // The photos too, and for a stronger reason than the rows above: they are BYTES a person
+      // uploaded, and a deleted bot is the clearest signal there is that nobody is coming back for
+      // them. Keying on a name rather than an identity cuts the same way it does for the retired set:
+      // a rebuilt bot reusing the name must not inherit its predecessor's pictures.
+      this.#db.prepare("DELETE FROM bot_chat_attachments WHERE bot = ?").run(name);
       this.#db.exec("COMMIT");
     } catch (err) {
       this.#db.exec("ROLLBACK");

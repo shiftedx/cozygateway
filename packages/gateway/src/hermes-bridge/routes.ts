@@ -2,6 +2,7 @@ import type { Context, Hono, MiddlewareHandler } from "hono";
 import {
   type ErrorBody,
   type ErrorCode,
+  BotChatPhotoFieldsSchema,
   BotChatSendRequestSchema,
   BotCreateRequestSchema,
   BotFocusRequestSchema,
@@ -38,9 +39,25 @@ import {
   type MediaFetch,
   type MediaLimiter,
   type MediaLookup,
+  createMediaLimiter,
   fetchMedia,
   resolveMediaSource,
 } from "./media.ts";
+import {
+  PHOTO_CACHE_CONTROL,
+  PHOTO_DEFAULT_PROMPT,
+  PHOTO_MAX_CONCURRENT,
+  PHOTO_MAX_REQUEST_BYTES,
+  PHOTO_QUEUE_WAIT_MS,
+  PhotoAttachFailed,
+  PhotoRefused,
+  acceptPhoto,
+  createPhotoRateLimiter,
+  isPhotoFileId,
+  readCappedBody,
+  redactHostPaths,
+  type PhotoRateLimiter,
+} from "./photos.ts";
 import { RoutineNotFound, RoutineRefused, RoutineUnconfirmed, patchNeedsRewrite } from "./routines.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
@@ -76,7 +93,10 @@ function errorBody(code: ErrorCode, message: string): ErrorBody {
 /** Error codes this extension adds to the frozen core list (`contract/v1.md` section 4 keeps
  *  `error.code` a plain string precisely so an extension can). A client that does not know them
  *  treats them as a generic failure, which the HTTP status already conveys. */
-function extensionErrorBody(code: "conflict" | "command_blocked" | "media_refused", message: string): ErrorBody {
+function extensionErrorBody(
+  code: "conflict" | "command_blocked" | "media_refused" | "rate_limited",
+  message: string,
+): ErrorBody {
   return { error: { code, message } };
 }
 
@@ -241,7 +261,21 @@ export function registerBotRoutes(
     limiter?: MediaLimiter;
     queueWaitMs?: number;
   } = {},
+  photoOptions: {
+    /** Bounded in-flight photo sends, per gateway. Defaults to a fresh limiter at
+     *  `PHOTO_MAX_CONCURRENT`; injected so a test can cap at one and watch the cap hold. */
+    limiter?: MediaLimiter;
+    queueWaitMs?: number;
+    /** Per-device token bucket. Injected for the same reason. */
+    rateLimiter?: PhotoRateLimiter;
+    now?: () => number;
+  } = {},
 ): void {
+  // One limiter per registered app, created here rather than at module scope so two gateways in one
+  // process (which is what the test suite is) do not share a bound.
+  const photoLimiter = photoOptions.limiter ?? createMediaLimiter(PHOTO_MAX_CONCURRENT);
+  const photoRate = photoOptions.rateLimiter ?? createPhotoRateLimiter();
+  const photoNow = photoOptions.now ?? (() => Date.now());
   // Cache-first: the snapshot answers immediately, even on a cold link, and a refresh runs in the
   // background so the next read (or the /ws bot_roster frame) carries fresh state.
   app.get("/bots", requireDevice, (c) => {
@@ -506,6 +540,179 @@ export function registerBotRoutes(
     } catch (err) {
       return failure(c, err);
     }
+  });
+
+  // One photo into the canonical chat. Capability 9.
+  //
+  // 202 and the same body as the text composer, on purpose: a photo send IS a send, and the reply
+  // arrives over `bot_chat` exactly as it does for words. The only thing the body carries that a text
+  // send's does not is the `attachment` block, and it carries it immediately so the sender's
+  // optimistic bubble shows the picture rather than waiting a poll for it.
+  //
+  // Order of the checks below is the order the answers get expensive, and it is load bearing: the
+  // declared length is read before the body is buffered, the rate limit is spent before a slot is
+  // taken, and the slot is held across the hermes round trip because that is the part being bounded.
+  app.post("/bots/:name/chat/photos", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
+
+    // Cheapest possible refusal, before a single byte of the body is read. `Content-Length` is a
+    // claim, so it never decides acceptance; it only decides early rejection.
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > PHOTO_MAX_REQUEST_BYTES) {
+      return c.json(
+        {
+          ...extensionErrorBody("media_refused", `the upload declares ${declared} bytes, over the cap`),
+          reason: "too_large",
+        },
+        413,
+      );
+    }
+
+    // Spent BEFORE the body is read, the slot is taken, and anything is validated, so a device that
+    // is probing pays for its probes. The cost of that choice, stated rather than discovered: a run
+    // of 415s (a phone retrying an unconverted HEIC) burns the same budget a run of real sends does,
+    // and a 503 busy burns it for something that was the gateway's fault rather than the device's.
+    // That is the right way round for a bound whose purpose is to make a loop expensive, since a
+    // limiter a caller can dodge by sending requests that fail cheaply is not a limiter. The budget
+    // is generous enough (8, refilling) that an honest client hitting it has a bug worth noticing.
+    const ticket = photoRate.take(c.get("deviceId"), photoNow());
+    if (!ticket.ok) {
+      const seconds = Math.max(1, Math.ceil(ticket.retryAfterMs / 1000));
+      return c.json(
+        {
+          ...extensionErrorBody("rate_limited", "this device has sent photos too quickly; wait and try again"),
+          retryAfterMs: ticket.retryAfterMs,
+        },
+        429,
+        { "retry-after": String(seconds) },
+      );
+    }
+
+    let slot;
+    try {
+      slot = await photoLimiter.acquire(photoOptions.queueWaitMs ?? PHOTO_QUEUE_WAIT_MS);
+    } catch (err) {
+      if (err instanceof MediaBusy) {
+        return c.json(
+          {
+            ...errorBody("backend_unavailable", `the gateway is already sending ${PHOTO_MAX_CONCURRENT} photos`),
+            busy: true,
+            waitedMs: err.waitedMs,
+          },
+          503,
+          { "retry-after": "1" },
+        );
+      }
+      throw err;
+    }
+    try {
+      // The body is read HERE, with a hard cap, rather than handed to a parse helper. A
+      // `Content-Length` is optional, so a chunked upload declares nothing and a helper that simply
+      // parses the body would buffer whatever arrives; the check above can only catch a sender that
+      // volunteered its own size. Once the bytes are in hand and bounded, the platform's own
+      // multipart parser does the parsing.
+      let form: FormData;
+      try {
+        const raw = await readCappedBody(c.req.raw.body, PHOTO_MAX_REQUEST_BYTES);
+        form = await new Response(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer, {
+          headers: { "content-type": c.req.header("content-type") ?? "" },
+        }).formData();
+      } catch (err) {
+        if (err instanceof PhotoRefused) return photoFailure(c, err);
+        return c.json(errorBody("invalid_request", "the body is not a multipart/form-data upload"), 400);
+      }
+
+      // ONE image per send, stated as a refusal rather than by taking the first. Hermes queues
+      // attached images on the session and spends the whole queue on the next prompt, so a multi-file
+      // upload would put several pictures on one turn with one attachment block to describe them.
+      const parts = form.getAll("file");
+      if (parts.length > 1) {
+        return c.json(errorBody("invalid_request", "exactly one photo per send"), 400);
+      }
+      const file = parts[0];
+      if (!(file instanceof File)) {
+        return c.json(errorBody("invalid_request", 'a single file part named "file" is required'), 400);
+      }
+
+      const textPart = form.get("text");
+      const clientIdPart = form.get("clientId");
+      let fields;
+      try {
+        fields = assertValid(BotChatPhotoFieldsSchema, {
+          ...(typeof textPart === "string" ? { text: textPart } : {}),
+          ...(typeof clientIdPart === "string" ? { clientId: clientIdPart } : {}),
+        });
+      } catch (err) {
+        const detail = err instanceof ContractViolation ? err.message : "malformed fields";
+        return c.json(errorBody("invalid_request", detail), 400);
+      }
+
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let accepted;
+      try {
+        accepted = acceptPhoto({
+          declaredType: file.type === "" ? undefined : file.type,
+          declaredLength: file.size,
+          bytes,
+        });
+      } catch (err) {
+        return photoFailure(c, err);
+      }
+
+      const caption = (fields.text ?? "").trim();
+      try {
+        const sent = await bots.sendChatPhoto(name, {
+          bytes,
+          mime: accepted.mime,
+          ext: accepted.ext,
+          // A photo still needs words: hermes spends an attached image on the next prompt and
+          // nothing else, so an empty caption would leave the picture queued for whatever the user
+          // typed afterwards. The default is neutral and the transcript shows it honestly.
+          text: caption === "" ? PHOTO_DEFAULT_PROMPT : caption,
+          ...(fields.clientId === undefined ? {} : { clientId: fields.clientId }),
+        });
+        return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
+      } catch (err) {
+        return photoFailure(c, err);
+      }
+    } finally {
+      slot();
+    }
+  });
+
+  // The gateway's own copy of a photo a device sent. Not hermes' copy: `GET /bots/:name/media`
+  // refuses local paths precisely because serving one from an authenticated route is a file-read
+  // primitive over the operator's box, and that judgement is not walked back here. These bytes are
+  // the ones the device uploaded, stored under an id this gateway minted, and never sourced from
+  // model output.
+  //
+  // Scoped to the bot AND to a strict id shape, both before the lookup: a path parameter that could
+  // be anything is how an id becomes a path.
+  app.get("/bots/:name/chat/attachments/:fileId", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const fileId = c.req.param("fileId") ?? "";
+    if (!isPhotoFileId(fileId)) {
+      return c.json(errorBody("invalid_request", "fileId is not a gateway attachment id"), 400);
+    }
+    const found = bots.chatAttachment(resolved.name, fileId);
+    if (found === undefined) {
+      return c.json(errorBody("not_found", "no such attachment for this bot"), 404);
+    }
+    return new Response(found.bytes.slice().buffer as ArrayBuffer, {
+      status: 200,
+      headers: {
+        "content-type": found.mime,
+        "content-length": String(found.size),
+        "cache-control": PHOTO_CACHE_CONTROL,
+        // Same posture as the capability-7 proxy. The type came off an allow-list of raster formats
+        // and was confirmed against the bytes, and this stops anything downstream from improving on
+        // it.
+        "x-content-type-options": "nosniff",
+      },
+    });
   });
 
   // Routines. Every one of these is scoped to the bot's `[bot:<name>]` cron namespace, which is the
@@ -804,6 +1011,55 @@ function mediaFailure(c: Context<Env>, err: unknown) {
     );
   }
   throw err;
+}
+
+/** Inbound-photo errors (capability 9). The refusals mirror the media proxy's statuses so a client
+ *  has one mental model for "this gateway will not carry that image", pointed in either direction:
+ *
+ *  - `413 media_refused reason: "too_large"`: over the size cap, declared or delivered.
+ *  - `415 media_refused reason: "content_type"`: the declared type is not one this gateway accepts,
+ *    the BYTES are not an image it accepts, or the two disagree. The `message` names which, because
+ *    "convert this HEIC" and "this is not an image" are different things for a user to do.
+ *  - `400 media_refused reason: "empty"`: a file part with no bytes in it.
+ *  - `502 backend_unavailable`: hermes would not take the photo. The distinction worth keeping is
+ *    that this one is reported only when NOTHING was submitted, so a 502 here never means "your
+ *    caption went without the picture".
+ *
+ *  Anything else falls through to the shared `failure` mapping, which already answers a bot that does
+ *  not exist, a runtime session that could not be addressed, and every transport state. */
+function photoFailure(c: Context<Env>, err: unknown) {
+  if (err instanceof PhotoRefused) {
+    const status = err.reason === "content_type" ? 415 : err.reason === "too_large" ? 413 : 400;
+    return c.json({ ...extensionErrorBody("media_refused", err.message), reason: err.reason }, status);
+  }
+  // Hermes' own text, with anything path-shaped redacted. Every other route on this surface passes
+  // that text through verbatim on purpose and still does; this route is the exception because it is
+  // the one whose ordinary failures NAME the images directory on the operator's box (a `5027 write
+  // failure` carries the full path), and this capability's whole transcript-hygiene argument is that
+  // no such path reaches a device. Redacting the transcript and then handing the same path back in an
+  // error body would be pointless.
+  if (err instanceof PhotoAttachFailed) {
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", "the hermes gateway did not accept the photo; nothing was submitted"),
+        hermesError: redactHostPaths(err.message),
+      },
+      502,
+    );
+  }
+  // Everything except the "no such profile" code, which `failure` answers as the 404 it is and which
+  // carries a bot name rather than a path.
+  if (err instanceof HermesRpcError && err.code !== HERMES_PROFILE_NOT_FOUND) {
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", "the hermes gateway rejected the photo"),
+        hermesError: redactHostPaths(err.message),
+        ...(err.code === undefined ? {} : { hermesErrorCode: err.code }),
+      },
+      502,
+    );
+  }
+  return failure(c, err);
 }
 
 /** Room errors on top of the shared `failure` mapping. A room is this gateway's own object, so its

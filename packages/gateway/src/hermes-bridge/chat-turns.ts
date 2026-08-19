@@ -1,8 +1,9 @@
-import type { BotChatMessage, ServerFrame } from "cozygateway-contract";
+import type { AttachmentBlock, BotChatMessage, ServerFrame } from "cozygateway-contract";
 
 import type { HermesRpc } from "./canonical-chat.ts";
-import { parseChatSnapshot, type ChatSnapshot } from "./chat-messages.ts";
+import { parseChatSnapshot, stripImageDirectives, type ChatSnapshot } from "./chat-messages.ts";
 import type { ChatStreamBinder } from "./chat-stream.ts";
+import { PhotoAttachFailed } from "./photos.ts";
 
 /** Duplex over the canonical Bot Chat: read the history, submit a prompt, and deliver the reply.
  *
@@ -43,10 +44,27 @@ export class RuntimeSessionUnknown extends Error {
   }
 }
 
+/** Where photos this gateway stored are bound to the transcript rows they were sent with, and read
+ *  back again (capability 9). An interface rather than the `Storage` class so the turn loop keeps
+ *  knowing nothing about SQL, and so a test can pin the ordering with a map.
+ *
+ *  The binding is the durable half of the feature. Matching a send to its persisted row is single
+ *  use and lives only in this process's pending queue; without writing the result down, a photo would
+ *  decorate exactly one live frame and then be absent from every later history read. */
+export interface ChatAttachmentStore {
+  /** Called once, when the row a photo was sent with is first seen. */
+  bind(fileId: string, messageId: string): void;
+  /** The blocks belonging to a row, or an empty array, which is the answer for almost every row. */
+  forMessage(sessionId: string, messageId: string): AttachmentBlock[];
+}
+
 export interface ChatTurnsOptions {
   rpc: HermesRpc;
   broadcast: (frame: ServerFrame) => void;
   now: () => number;
+  /** Optional: with no store, photo sends are unavailable and every message goes out undecorated,
+   *  which is exactly how this module behaved before capability 9. */
+  attachments?: ChatAttachmentStore;
   /** Where the live draft of a reply is assembled. Optional: with no stream the turn behaves exactly
    *  as it always has, which is also what happens on a Hermes build that sends no `message.*`
    *  events. The poll below is unaffected either way and remains the source of the reply. */
@@ -65,6 +83,19 @@ export interface SendOptions {
   /** The sender's own id for this message, echoed back on the committed message and on the same
    *  message when the poll finds it. */
   clientId?: string;
+  /** One photo to attach to this turn (capability 9). The gateway has already stored its own copy
+   *  under `fileId` and has already decided the bytes are an image it will accept; what is left is
+   *  the RPC pair, and the order of that pair is the whole contract of this option. */
+  photo?: SendPhoto;
+}
+
+/** A photo riding one send. `block` is the wire shape the message will carry, built by the caller so
+ *  the turn loop never invents contract objects. */
+export interface SendPhoto {
+  fileId: string;
+  contentBase64: string;
+  filename: string;
+  block: AttachmentBlock;
 }
 
 interface ActiveTurn {
@@ -94,6 +125,18 @@ interface ActiveTurn {
  *  collapses two rows into one and a user bubble disappears (cozychat#38). */
 interface PendingSend {
   clientId: string;
+  /** The text as the PERSISTED ROW WILL DECODE, which is not always the text that was submitted.
+   *
+   *  The row a send comes back as is matched by its text, and every user row now has its image
+   *  directive lines stripped on the way out (`stripImageDirectives`). So a send whose own text
+   *  contains a directive-shaped line (a caption reading `look at this\n[screenshot]`, or a plain
+   *  text send that pastes a hermes transcript) is persisted, stripped, and then no longer equals
+   *  what was typed. Holding the raw text here made that send unmatchable: its clientId never joined,
+   *  so the sender saw its own words twice (the cozychat#38 shape, from the other direction), and a
+   *  photo on that send never bound to its row and vanished from every read after the 202.
+   *
+   *  Normalizing HERE rather than normalizing what is submitted is the deliberate half: the model
+   *  still receives exactly what the user wrote, and only the join key is canonicalized. */
   text: string;
   /** The turn that carried this send. A send that opens a NEW turn is proof that every entry from
    *  an older one is dead: that turn's poll has already ended, so the row it was waiting for is
@@ -103,6 +146,11 @@ interface PendingSend {
   /** When the send was accepted. Fixes the queue order, and expires an entry whose message never
    *  came back around the poll at all, inside a turn long enough that no newer turn has started. */
   at: number;
+  /** The photo this send carried, when it carried one. Rides the SAME entry as the clientId, and
+   *  deliberately so: a photo belongs to exactly one line of the transcript, which is the identical
+   *  claim the clientId makes, and duplicating the matching logic would be two chances to disagree
+   *  about which row a send became. */
+  photo?: SendPhoto;
 }
 
 /** How far a bot's chat has been broadcast. Kept as the LAST BROADCAST MESSAGE ID rather than a
@@ -134,6 +182,19 @@ export class BotChatTurns {
   readonly #timeoutMs: number;
   readonly #log: (message: string) => void;
   readonly #stream: ChatStreamBinder | undefined;
+  readonly #attachments: ChatAttachmentStore | undefined;
+
+  /** One send at a time per bot, held across the attach-and-submit pair.
+   *
+   *  Hermes queues an attached image on the SESSION and the next `prompt.submit` consumes and clears
+   *  the whole queue (`tui_gateway/server.py:10495`). So attach-then-submit is two RPCs over a
+   *  process-global per-session queue, and anything that submits in between takes the photo with it:
+   *  two photo sends racing hand one turn both pictures and the other none, and an ordinary TEXT send
+   *  racing a photo send steals the picture outright and attaches it to words that were not about it.
+   *  Serializing the pair closes both, and every send takes the lock rather than only the photo ones,
+   *  because the text-steals-the-photo case is the one a user hits by tapping send while a photo is
+   *  uploading. */
+  readonly #submitLocks = new Map<string, Promise<void>>();
 
   /** One turn poll per bot at a time. A second send while a poll is running rides that poll
    *  rather than starting a competing one, which is what keeps `session.resume` traffic bounded
@@ -153,6 +214,45 @@ export class BotChatTurns {
     this.#timeoutMs = opts.timeoutMs ?? CHAT_TURN_TIMEOUT_MS;
     this.#log = opts.log ?? (() => {});
     this.#stream = opts.stream;
+    this.#attachments = opts.attachments;
+  }
+
+  /** Asks hermes to drop whatever this session has queued, swallowing every failure.
+   *
+   *  Called on exactly one path: an attach that landed followed by a submit that did not. It is a
+   *  cleanup, so it must not be able to fail the operation it is cleaning up after, and it must not
+   *  be able to hang the send behind it either. Still inside the send lock, deliberately: an unwind
+   *  that raced the next send would be racing for the very queue it is trying to empty. */
+  async #detachQuietly(runtimeId: string): Promise<void> {
+    try {
+      await this.#rpc.request("image.detach", { session_id: runtimeId });
+    } catch (err) {
+      this.#log(`could not unwind the attached photo after a failed submit: ${err instanceof Error ? err.message : "unknown"}`);
+    }
+  }
+
+  /** Runs `fn` with this bot's send lock held. FIFO, because the waiters chain off each other rather
+   *  than racing a flag, and a failure inside `fn` releases the lock exactly as a success does. */
+  async #withSubmitLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.#submitLocks.get(name) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = previous.then(
+      () => held,
+      () => held,
+    );
+    this.#submitLocks.set(name, chained);
+    await previous.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      // Only when this call is still the tail of the chain: a send that queued behind this one owns
+      // the entry now, and deleting it would let a third send skip the line.
+      if (this.#submitLocks.get(name) === chained) this.#submitLocks.delete(name);
+    }
   }
 
   /** Full history of a bot's canonical chat. Also re-bases the broadcast watermark, so the frames
@@ -161,7 +261,19 @@ export class BotChatTurns {
     const snapshot = await this.#resume(sessionId, name, false);
     this.#spendPending(name, sessionId, snapshot.messages);
     this.#setWatermark(name, sessionId, snapshot.messages);
-    return snapshot;
+    // Decorated AFTER the spend, because the spend is what binds a just-sent photo to the row it
+    // became: a history read can be the first thing that sees the row, and a photo that was bound a
+    // line later would be missing from the very response that told the client the row exists.
+    return { ...snapshot, messages: snapshot.messages.map((message) => this.#decorate(sessionId, message)) };
+  }
+
+  /** Hangs a row's stored attachments off it. Answers the message untouched for every row that has
+   *  none, which is almost all of them, and for every non-user row, since only a user sends photos on
+   *  this surface. */
+  #decorate(sessionId: string, message: BotChatMessage): BotChatMessage {
+    if (message.role !== "user" || this.#attachments === undefined) return message;
+    const blocks = this.#attachments.forMessage(sessionId, message.id);
+    return blocks.length === 0 ? message : { ...message, attachments: blocks };
   }
 
   /** A history read hands the client every row it returns AND re-bases the delta watermark past
@@ -197,7 +309,14 @@ export class BotChatTurns {
       if (index === -1) continue;
       // Same consumption rule as `#reconcile`: FIFO, one entry per row, and everything ahead of the
       // match goes with it.
-      queue.splice(0, index + 1);
+      const consumed = queue.splice(0, index + 1);
+      // The clientId is deliberately NOT stamped here (see the doc comment), but the PHOTO is bound,
+      // and the difference is not an inconsistency. A clientId is a join key for the device that sent
+      // the message and belongs to that device's response; a photo is a fact about the row itself,
+      // true for every device, and binding it here is the only chance this read has to record it.
+      // Skipping the bind would leave the bytes orphaned in the database forever.
+      const photo = consumed[consumed.length - 1]?.photo;
+      if (photo !== undefined) this.#attachments?.bind(photo.fileId, message.id);
       if (queue.length === 0) break;
     }
     if (queue.length === 0) this.#pending.delete(name);
@@ -252,13 +371,56 @@ export class BotChatTurns {
       throw new RuntimeSessionUnknown(name);
     }
 
-    // Told BEFORE the submit, because the first `message.delta` can land before `prompt.submit`
-    // answers, and an event whose session is not bound yet is dropped. This is also the only place
-    // the runtime id (the id Hermes puts on its event frames) and the stored id (the id every bots
-    // frame is keyed on) are both in hand.
-    this.#stream?.bind(runtimeId, { bot: name, sessionId });
+    const submitId = runtimeId;
+    await this.#withSubmitLock(name, async () => {
+      // Told BEFORE the submit, because the first `message.delta` can land before `prompt.submit`
+      // answers, and an event whose session is not bound yet is dropped. This is also the only place
+      // the runtime id (the id Hermes puts on its event frames) and the stored id (the id every bots
+      // frame is keyed on) are both in hand.
+      this.#stream?.bind(submitId, { bot: name, sessionId });
 
-    await this.#rpc.request("prompt.submit", { session_id: runtimeId, text });
+      // The photo goes in BEFORE the prompt, and a failure here fails the whole send. That order is
+      // the feature: hermes holds attached images on the session and the next submit spends them, so
+      // submitting first would send a caption with no picture and then leave the picture queued for
+      // whatever the user says next. Failing loudly instead means a photo send either delivers both
+      // halves or neither, and the route can answer 502 for something that genuinely did not happen.
+      let attached = false;
+      if (opts.photo !== undefined) {
+        const result = await this.#rpc.request("image.attach_bytes", {
+          session_id: submitId,
+          content_base64: opts.photo.contentBase64,
+          filename: opts.photo.filename,
+        });
+        // A refusal arrives two ways: as an RPC error (which propagated above) or as a perfectly
+        // successful call whose result simply does not say `attached`. Both mean there are no pixels
+        // on the session, so both must stop the submit.
+        const record = typeof result === "object" && result !== null ? (result as Record<string, unknown>) : {};
+        if (record["attached"] !== true) {
+          throw new PhotoAttachFailed(
+            `hermes did not attach the photo: ${JSON.stringify(result).slice(0, 200)}`,
+          );
+        }
+        attached = true;
+      }
+
+      try {
+        await this.#rpc.request("prompt.submit", { session_id: submitId, text });
+      } catch (err) {
+        // The attach LANDED and the submit did not. Hermes now holds an image on the session's queue
+        // that no turn of ours will ever spend, and that queue is consumed by the NEXT
+        // `prompt.submit` whatever it is: the user shrugs at the 502, types something unrelated, and
+        // that turn silently carries the orphaned photo into the model's context, about a picture the
+        // transcript does not show (this gateway has already deleted its own copy). A retry of the
+        // photo would put it in twice.
+        //
+        // So the queue is unwound before the failure is reported. Best effort by construction: if the
+        // detach itself fails there is nothing further to do from here, and reporting a detach
+        // failure instead of the submit failure would replace the true cause with a consequence. The
+        // contract says exactly this rather than promising more than this can deliver.
+        if (attached) await this.#detachQuietly(submitId);
+        throw err;
+      }
+    });
 
     const at = this.#now();
     const clientId = opts.clientId ?? `${sessionId}#local-${at}`;
@@ -272,9 +434,25 @@ export class BotChatTurns {
     const queue = (this.#pending.get(name) ?? []).filter(
       (entry) => entry.turn === turnId && entry.at > at - this.#timeoutMs,
     );
-    queue.push({ clientId, text, turn: turnId, at });
+    queue.push({
+      clientId,
+      // The join key, canonicalized to what the transcript will hand back. See `PendingSend.text`.
+      text: stripImageDirectives(text),
+      turn: turnId,
+      at,
+      ...(opts.photo === undefined ? {} : { photo: opts.photo }),
+    });
     this.#pending.set(name, queue);
-    return { id: `${sessionId}#local-${at}`, role: "user", text, at, clientId };
+    return {
+      id: `${sessionId}#local-${at}`,
+      role: "user",
+      text,
+      at,
+      clientId,
+      // The committed message carries the photo straight away, so the 202 body a sender renders its
+      // optimistic bubble from already has the picture in it and does not have to wait for the poll.
+      ...(opts.photo === undefined ? {} : { attachments: [opts.photo.block] }),
+    };
   }
 
   /** True while a turn poll is live for this bot. */
@@ -325,6 +503,9 @@ export class BotChatTurns {
     this.#watermarks.clear();
     this.#lastState.clear();
     this.#pending.clear();
+    // Safe only because the process is going away: a lock dropped while a send holds it would let the
+    // next send skip the line, and skipping the line is what loses a photo.
+    this.#submitLocks.clear();
   }
 
   /** Opens (or joins) the poll for a send, and answers which turn the send belongs to. */
@@ -427,7 +608,9 @@ export class BotChatTurns {
       seen = index === -1 ? 0 : index + 1;
     }
     const already = mark !== undefined && mark.sessionId === sessionId ? mark.seen : EMPTY_IDS;
-    const fresh = messages.slice(seen).map((message) => this.#reconcile(name, message, already));
+    const fresh = messages
+      .slice(seen)
+      .map((message) => this.#decorate(sessionId, this.#reconcile(name, message, already)));
     this.#setWatermark(name, sessionId, messages);
     if (fresh.length === 0) return;
     this.#broadcast({
@@ -466,7 +649,12 @@ export class BotChatTurns {
     if (index === -1) return message;
     const consumed = queue.splice(0, index + 1);
     if (queue.length === 0) this.#pending.delete(name);
-    return { ...message, clientId: consumed[consumed.length - 1]!.clientId };
+    const entry = consumed[consumed.length - 1]!;
+    // The row this send became is now known, so the photo it carried is written down against it. The
+    // `#decorate` pass that follows reads it straight back, which is what makes the frame and every
+    // later history read agree without either of them holding the pending queue's single-use state.
+    if (entry.photo !== undefined) this.#attachments?.bind(entry.photo.fileId, message.id);
+    return { ...message, clientId: entry.clientId };
   }
 
   #setWatermark(name: string, sessionId: string, messages: BotChatMessage[]): void {
