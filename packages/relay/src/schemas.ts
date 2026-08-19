@@ -1,5 +1,7 @@
 import { type Static, Type } from "@sinclair/typebox";
 
+import { COLLAPSE_ID_MAX_LENGTH, COLLAPSE_ID_PATTERN, PUSH_CATEGORY_IDS } from "./categories.ts";
+
 export const RELAY_ERROR_CODES = [
   "invalid_request",
   "not_found",
@@ -26,8 +28,33 @@ export type RegisterRequest = Static<typeof RegisterRequestSchema>;
 /** Far above any real payload; bounds abuse (design spec, section 3). */
 export const CIPHERTEXT_MAX_LENGTH = 8192;
 
-export const NotifyRequestSchema = Type.Object({
-  pushId: Type.String({ minLength: 1 }),
-  ciphertext: Type.String({ minLength: 1, maxLength: CIPHERTEXT_MAX_LENGTH }),
-});
+/**
+ * `/notify` is a CLOSED body: `additionalProperties: false`.
+ *
+ * This is the relay's redaction boundary (issue #19). The approval payload -- `toolCallId`,
+ * `name`, the key-names-and-type-tags-only `argSummary`, the addressing ids -- is required to
+ * be redacted by its producer and to travel INSIDE `ciphertext`, which the relay cannot read
+ * and therefore cannot vet. What the relay CAN do is guarantee that no cleartext field
+ * describing a tool call exists at this boundary at all: a caller that (buggily) tried to send
+ * `argSummary`, `name`, or a `preview` in the clear is rejected with `invalid_request` and
+ * nothing is delivered.
+ *
+ * Reject, not strip: silently dropping an unknown field would let a broken producer ship a
+ * push that looks fine while quietly losing data, and would leave the leak live the day a
+ * later relay version starts reading that field. A 400 reaches the gateway's error log on the
+ * first call rather than the hundredth.
+ */
+export const NotifyRequestSchema = Type.Object(
+  {
+    pushId: Type.String({ minLength: 1 }),
+    ciphertext: Type.String({ minLength: 1, maxLength: CIPHERTEXT_MAX_LENGTH }),
+    /** Optional routing metadata (issue #19, section 2). Omitted = today's message push. */
+    category: Type.Optional(Type.Union(PUSH_CATEGORY_IDS.map((id) => Type.Literal(id)))),
+    /** Coalescing key; the approval categories use the `toolCallId`. */
+    collapseId: Type.Optional(
+      Type.String({ minLength: 1, maxLength: COLLAPSE_ID_MAX_LENGTH, pattern: COLLAPSE_ID_PATTERN }),
+    ),
+  },
+  { additionalProperties: false },
+);
 export type NotifyRequest = Static<typeof NotifyRequestSchema>;

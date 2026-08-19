@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createRelayApp } from "../src/http.ts";
 import { openRelayStorage, type RelayStorage } from "../src/storage.ts";
-import type { Transport } from "../src/transports.ts";
+import type { PushDeliveryOptions, Transport } from "../src/transports.ts";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -12,6 +12,7 @@ afterEach(() => {
 interface Delivery {
   token: string;
   ciphertext: string;
+  options?: PushDeliveryOptions;
 }
 
 function harness(overrides?: {
@@ -26,9 +27,9 @@ function harness(overrides?: {
   cleanups.push(() => storage.close());
   const deliveries: Delivery[] = [];
   const transport: Transport = {
-    deliver: async (token, ciphertext) => {
+    deliver: async (token, ciphertext, options) => {
       if (overrides?.failDelivery === true) throw new Error("delivery boom");
-      deliveries.push({ token, ciphertext });
+      deliveries.push(options === undefined ? { token, ciphertext } : { token, ciphertext, options });
     },
   };
   const nowRef = overrides?.nowRef ?? { value: Date.UTC(2026, 6, 7, 12, 0, 0) };
@@ -312,6 +313,132 @@ describe("registration TTL (issue #28)", () => {
     expect(
       (await register(app, { platform: "webhook", token: "https://push.example/hook" })).status,
     ).toBe(201);
+  });
+});
+
+describe("POST /notify, approval push category (issue #19 push lane)", () => {
+  async function errorCode(res: Response): Promise<string> {
+    const body = (await res.json()) as { error: { code: string } };
+    return body.error.code;
+  }
+
+  it("passes an approval.pending category and its collapse id through to the transport", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const res = await notify(app, {
+      pushId,
+      ciphertext: "CIPHER",
+      category: "approval.pending",
+      collapseId: "toolu_01",
+    });
+    expect(res.status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries).toEqual([
+      {
+        token: "https://x.example/hook",
+        ciphertext: "CIPHER",
+        options: { category: "approval.pending", collapseId: "toolu_01" },
+      },
+    ]);
+  });
+
+  it("carries approval.resolved on the same collapse id, so a resolve replaces its own pending push", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    await notify(app, { pushId, ciphertext: "P", category: "approval.pending", collapseId: "tc_9" });
+    await notify(app, { pushId, ciphertext: "R", category: "approval.resolved", collapseId: "tc_9" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries.map((d) => d.options?.collapseId)).toEqual(["tc_9", "tc_9"]);
+    expect(deliveries.map((d) => d.options?.category)).toEqual(["approval.pending", "approval.resolved"]);
+  });
+
+  it("still accepts a plain notify with no category (the message push, unchanged)", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    expect((await notify(app, { pushId, ciphertext: "CIPHER" })).status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries[0]?.options).toBeUndefined();
+  });
+
+  it("rejects an unregistered category rather than forwarding it", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const res = await notify(app, { pushId, ciphertext: "C", category: "approval.granted", collapseId: "t1" });
+    expect(res.status).toBe(400);
+    expect(await errorCode(res)).toBe("invalid_request");
+    expect(deliveries).toEqual([]);
+  });
+
+  it("rejects a category without a collapse id (an uncoalescable approval can never be retracted)", async () => {
+    const { app } = harness();
+    const pushId = await registeredPushId(app);
+    const res = await notify(app, { pushId, ciphertext: "C", category: "approval.pending" });
+    expect(res.status).toBe(400);
+    expect(await errorCode(res)).toBe("invalid_request");
+  });
+
+  it("rejects a collapse id without a category (nothing for the app to coalesce it against)", async () => {
+    const { app } = harness();
+    const pushId = await registeredPushId(app);
+    const res = await notify(app, { pushId, ciphertext: "C", collapseId: "t1" });
+    expect(res.status).toBe(400);
+    expect(await errorCode(res)).toBe("invalid_request");
+  });
+
+  it("rejects a collapse id that is not an opaque id, so it cannot smuggle an argument value", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    for (const collapseId of ["rm -rf /var", "a".repeat(65), 'x"y']) {
+      const res = await notify(app, { pushId, ciphertext: "C", category: "approval.pending", collapseId });
+      expect(res.status).toBe(400);
+      expect(await errorCode(res)).toBe("invalid_request");
+    }
+    expect(deliveries).toEqual([]);
+  });
+
+  it("REJECTS a notify carrying cleartext approval fields, so a buggy caller cannot leak a raw value", async () => {
+    // The redaction rule (issue #19: argSummary is key names and type tags only) is enforced
+    // at this boundary by refusing every cleartext payload field outright. Approval metadata
+    // rides inside the ciphertext like every other payload field; nothing describing the tool
+    // call is accepted in the clear, so there is no field a raw value could arrive in.
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const leaky = [
+      { argSummary: { command: "rm -rf /" } },
+      { name: "shell" },
+      { turnId: "t1" },
+      { toolCallId: "tc_1" },
+      { agentId: "ag_1" },
+      { preview: "the raw command" },
+    ];
+    for (const extra of leaky) {
+      const res = await notify(app, {
+        pushId,
+        ciphertext: "C",
+        category: "approval.pending",
+        collapseId: "tc_1",
+        ...extra,
+      });
+      expect(res.status).toBe(400);
+      expect(await errorCode(res)).toBe("invalid_request");
+    }
+    expect(deliveries).toEqual([]);
+  });
+
+  it("counts an approval push against the same per-pushId daily cap", async () => {
+    const { app } = harness({ dailyCap: 1 });
+    const pushId = await registeredPushId(app);
+    expect(
+      (await notify(app, { pushId, ciphertext: "C", category: "approval.pending", collapseId: "t1" })).status,
+    ).toBe(202);
+    const second = await notify(app, {
+      pushId,
+      ciphertext: "C",
+      category: "approval.pending",
+      collapseId: "t1",
+    });
+    expect(second.status).toBe(429);
+    expect(await errorCode(second)).toBe("over_cap");
   });
 });
 

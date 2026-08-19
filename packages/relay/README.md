@@ -71,8 +71,91 @@ boolean directly; only the CLI computes a host-based default.
 `webhook` ships today: delivery is a `POST` of `{"ciphertext": ...}` to the registered
 URL. Unrestricted mode uses `fetch`, unchanged. Restricted mode uses `node:http`/
 `node:https` `request` with a vetting `lookup` so the resolved address can be checked
-before the relay connects to it. Platform push transports (APNs) are planned; registering
-`platform: "apns"` returns 501 until then.
+before the relay connects to it.
+
+`apns` ships when the relay is configured with an APNs key (`APNS_KEY_P8_PATH`,
+`APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`, `APNS_ENVIRONMENT`, all five together or
+none). Delivery is an alert with `mutable-content: 1` carrying the opaque ciphertext
+under the top-level custom key `c`. Registering `platform: "apns"` on a relay with no
+APNs key returns 501 `unsupported_platform`.
+
+## Push categories
+
+A **push category** is the one piece of routing metadata the relay is allowed to see in
+the clear. `POST /notify` takes an optional pair:
+
+    { "pushId": "...", "ciphertext": "...", "category": "approval.pending", "collapseId": "<toolCallId>" }
+
+`category` and `collapseId` are sent together or not at all (400 `invalid_request`
+otherwise); omitting both is the ordinary message push, byte-identical to what shipped
+before. Registered categories (cozygateway issue #19, mobile approve/deny):
+
+| category | APNs push type | `aps.category` | fallback alert | collapse id |
+| --- | --- | --- | --- | --- |
+| `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
+| `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
+
+On APNs the category becomes `aps.category` and the collapse id becomes the
+`apns-collapse-id` header. On a webhook the same two fields are added to the delivered
+JSON body next to `ciphertext`.
+
+### App-side contract (what the phone implements)
+
+- **Register the actionable category** `approval.pending` with two actions, `approve`
+  and `deny` (titles "Approve" and "Deny"; `deny` is the destructive one). Category and
+  action registration is the app's job; the relay only names the category.
+- **Coalescing**: every push about one tool call carries `apns-collapse-id =
+  toolCallId`. The `approval.resolved` push therefore REPLACES the pending banner for
+  that tool call in place. The app should also drop the delivered notification for that
+  `toolCallId` when it sees the resolve while running.
+- **`approval.resolved` is an alert, not a silent background push.** A background
+  (`content-available`) push is best-effort: iOS may throttle or drop it, and a dropped
+  one leaves a stale "approve this?" banner on the lock screen for an approval that is
+  already decided. An alert on the same collapse id is guaranteed to replace it, so the
+  worst case is an unnoticed but correct "resolved" banner rather than a lying "pending"
+  one.
+- **The alert text the relay sends carries nothing.** The relay cannot read the
+  ciphertext, so it emits a fixed, content-free alert per category; the Notification
+  Service Extension decrypts the payload and rewrites the alert on device.
+
+### Notification payload (inside the ciphertext)
+
+Encrypted exactly like the message payload (same per-device `pushKey`, same HKDF /
+AES-256-GCM construction, see `contract/push-v0.md`), because it is the same envelope:
+
+    { "kind": "approval_pending",  "threadId": "...", "agentId": "...", "turnId": "...",
+      "toolCallId": "...", "name": "...", "argSummary": { "command": "string" } }
+
+    { "kind": "approval_resolved", "threadId": "...", "agentId": "...", "turnId": "...",
+      "toolCallId": "...", "outcome": "approved" | "denied" | "expired" }
+
+`argSummary` is **key names and type tags only** (`{ "command": "string" }`), never a raw
+argument value. The proposal's `collabId` maps to cozygateway's `threadId` (contract v1
+`Thread.id`): a cozygateway instance is one user's self-hosted gateway, so it has no
+collab dimension, and the thread is the addressing unit a client resolves an approval
+against.
+
+### Redaction enforcement at the relay boundary
+
+The relay cannot inspect `argSummary`: it is inside a ciphertext the relay has no key
+for, by design. What the relay guarantees instead is that **no cleartext field describing
+a tool call exists at its boundary at all**:
+
+- `POST /notify` is a closed body (`additionalProperties: false`). A caller that sends
+  `argSummary`, `name`, `toolCallId`, or a `preview` in the clear gets 400
+  `invalid_request` and **nothing is delivered**. Reject rather than strip: a silently
+  dropped field lets a broken producer ship a push that looks fine, and leaves the leak
+  live the day a later relay version starts reading that field.
+- `collapseId` is the only caller-controlled cleartext string besides the ciphertext, so
+  it is bounded to an opaque-id charset (`[A-Za-z0-9_.:-]`, 1 to 64 characters). A raw
+  shell command, path, quoted string, or JSON blob cannot pass it. 64 is the APNs
+  `apns-collapse-id` limit; an over-long id is refused rather than truncated, since two
+  ids sharing a 64-byte prefix would silently collapse into one notification, and a
+  wrongly-collapsed approval is a wrongly-answered approval.
+- `category` is an allowlist of the ids in the table above; anything else is 400.
+
+Redaction of `argSummary` itself is therefore the producer's obligation (the gateway,
+before it encrypts), and the relay's job is to leave it no cleartext path to fail into.
 
 ## State
 
