@@ -2,7 +2,13 @@ import type { Server } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 
 import { serve } from "@hono/node-server";
-import { BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type GatewayInfo } from "cozygateway-contract";
+import {
+  APPROVALS_CAPABILITY_ID,
+  APPROVALS_CAPABILITY_VERSION,
+  BOTS_CAPABILITY_ID,
+  BOTS_CAPABILITY_VERSION,
+  type GatewayInfo,
+} from "cozygateway-contract";
 
 import type { GatewayConfig } from "./config.ts";
 import { openStorage, type Storage } from "./storage.ts";
@@ -46,6 +52,11 @@ export interface StartGatewayOptions {
    *  only the env var NAME it rides. Exists so tests can assert the caveat text (and the token's
    *  absence from it) without scraping real stderr. */
   openclawLog?: (message: string) => void;
+  /** Overrides the sink for the approval audit line the runner writes on every resolved approval
+   *  (issue #19). Defaults to stderr, like the other two. The line names the thread, turn,
+   *  toolCallId, outcome, and deciding device, and never the approval's argument summary. Exists
+   *  so a test can read the audit trail without scraping real stderr. */
+  approvalLog?: (message: string) => void;
 }
 
 export async function startGateway(
@@ -77,6 +88,12 @@ export async function startGateway(
     contract: "v1",
     capabilities: {
       ...(config.capabilities ?? {}),
+      // The approval surface (contract v1.md section 5a) is a CORE capability, not a vendor one,
+      // and this gateway always registers the approve/deny routes and can always fan out the
+      // frames, so it is advertised unconditionally. It says "this gateway speaks approvals", not
+      // "some backend here will raise one"; whether a given agent ever raises an approval is a
+      // property of that backend, which the wire has no way to promise in advance.
+      [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
       ...(hermesOptions === undefined ? {} : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION }),
     },
   };
@@ -194,6 +211,7 @@ export async function startGateway(
     notifier,
     now: () => Date.now(),
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
+    ...(options.approvalLog === undefined ? {} : { approvalLog: options.approvalLog }),
   });
 
   const app = createApp({
@@ -207,6 +225,8 @@ export async function startGateway(
     // flight, so REST answers 202, and the runner has already emitted the interrupt_unsupported
     // error frame over the WebSocket.
     interruptThread: (threadId) => (runner.interrupt(threadId) === "idle" ? "idle" : "interrupting"),
+    resolveApproval: (input) =>
+      runner.resolveApproval(input.threadId, input.toolCallId, input.decision, input.deviceId),
     onDeviceRevoked: (deviceId) => hub.closeDevice(deviceId),
     now: () => Date.now(),
   });

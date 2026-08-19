@@ -3,7 +3,13 @@ import { createCipheriv, hkdfSync, randomBytes } from "node:crypto";
 /** HKDF info string, fixed by contract/push-v0.md. */
 export const PUSH_HKDF_INFO = "cozygateway-push-v0";
 
+/** The in-ciphertext notification payload. `kind` is the discriminator (issue #19): the
+ *  approval categories carry `approval_pending` / `approval_resolved`, so the ordinary message
+ *  push says so explicitly rather than being "the one without a kind". A receiver must still
+ *  treat an ABSENT `kind` as `"message"`, because every gateway shipped before this field is
+ *  emitting exactly that payload; contract/push-v0.md says so normatively. */
 export interface PushPayload {
+  kind?: "message";
   threadId: string;
   agentName: string;
   preview: string;

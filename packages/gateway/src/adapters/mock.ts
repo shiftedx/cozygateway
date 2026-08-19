@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
+
 import type { RichBlock } from "cozygateway-contract";
 
-import type { BackendAdapter, BackendSession, TurnHandlers } from "./types.ts";
+import type { ApprovalDecision, BackendAdapter, BackendSession, TurnHandlers } from "./types.ts";
 
 function firstText(blocks: RichBlock[]): string {
   const first = blocks[0];
@@ -112,6 +114,90 @@ export function createSteerMockAdapter(): BackendAdapter {
           cur.settled = true;
           cur.reject(new Error("interrupted by user"));
           inflight = undefined;
+        },
+        async close(): Promise<void> {},
+      };
+    },
+  };
+}
+
+/** LLM-free approval-capable backend: the reference implementation of the conformance suite's
+ *  OPTIONAL approval hook, and the way an approval round trip is drivable in tests with no real
+ *  backend behind it. The frozen echo semantics of `createMockAdapter` above are untouched;
+ *  approvals live in their own backend for the same reason the stall backend does (issue #21):
+ *  the hook needs its own agent id anyway, and the echo backend must keep answering instantly.
+ *
+ *  A send emits one draft ("Working: <text>"), raises ONE pending approval, and stays in flight.
+ *  The turn ends only when the approval reaches a terminal state:
+ *  - `resolveApproval` accepts a decision -> the turn commits "Approval <outcome>: <text>";
+ *  - nobody decides within `expiryMs` -> the backend lapses the approval itself, reports
+ *    `expired`, and commits the same way. That self-lapse is how the third terminal state is
+ *    drivable at all without waiting on a real approval timeout, and it is also why the park is
+ *    BOUNDED rather than open-ended: TurnRunner.closeAll() awaits each thread's queue, so a turn
+ *    nobody ever decided would otherwise wedge gateway shutdown (the same reason
+ *    createMockAdapter's hold is bounded). Shorten it to drive expiry deliberately; the default
+ *    is long enough that a test which does decide always wins the race. */
+export function createApprovalMockAdapter(options?: {
+  /** How long a parked approval waits before lapsing itself as `expired`. */
+  expiryMs?: number;
+}): BackendAdapter {
+  const expiryMs = options?.expiryMs ?? 2_000;
+
+  return {
+    backend: "mock-approval",
+    midTurnDelivery: "queue",
+    presence: () => "online",
+    async startSession(): Promise<BackendSession> {
+      let inflight:
+        | { handlers: TurnHandlers; text: string; toolCallId: string; done: boolean; finish: (outcome: string) => void }
+        | undefined;
+
+      return {
+        send(blocks: RichBlock[], handlers: TurnHandlers): Promise<void> {
+          const text = firstText(blocks);
+          const toolCallId = `call_${randomUUID()}`;
+          return new Promise<void>((resolve) => {
+            const finish = (outcome: string): void => {
+              const cur = inflight;
+              if (cur === undefined || cur.done) return;
+              cur.done = true;
+              inflight = undefined;
+              const final: RichBlock[] = [{ type: "paragraph", text: `Approval ${outcome}: ${text}` }];
+              cur.handlers.onDraft({ blocks: final, toolCalls: [] });
+              cur.handlers.onCommit({ blocks: final });
+              cur.handlers.onDone();
+              resolve();
+            };
+            inflight = { handlers, text, toolCallId, done: false, finish };
+            handlers.onDraft({ blocks: [{ type: "paragraph", text: `Working: ${text}` }], toolCalls: [] });
+            // argSummary is names + type TAGS only, the same discipline a real backend owes.
+            handlers.onApprovalPending?.({
+              toolCallId,
+              name: "run_shell",
+              argSummary: { command: "string" },
+            });
+            const timer = setTimeout(() => {
+              const cur = inflight;
+              if (cur === undefined || cur.done) return;
+              cur.handlers.onApprovalResolved?.({ toolCallId, outcome: "expired" });
+              // Deferred like the decision path below, so the gateway's approval_resolved frame
+              // is out before the turn's own closing frames.
+              setTimeout(() => cur.finish("expired"), 0).unref();
+            }, expiryMs);
+            timer.unref();
+          });
+        },
+        async resolveApproval(toolCallId: string, decision: ApprovalDecision): Promise<boolean> {
+          const cur = inflight;
+          // Not accepted: no pending approval, or not the one this backend is waiting on. The
+          // runner turns that into "not pending" rather than announcing an outcome.
+          if (cur === undefined || cur.done || cur.toolCallId !== toolCallId) return false;
+          // The turn finishes on the next macrotask, AFTER the runner has broadcast the
+          // approval_resolved frame this acceptance produces, so the frame order a client sees is
+          // deterministic: resolved, then the rest of the turn.
+          const outcome = decision === "approve" ? "approved" : "denied";
+          setTimeout(() => cur.finish(outcome), 0).unref();
+          return true;
         },
         async close(): Promise<void> {},
       };

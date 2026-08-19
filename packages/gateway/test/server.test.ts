@@ -70,7 +70,11 @@ describe("startGateway end to end", () => {
 // Issue #16: GatewayInfo.capabilities travels through GET /health, the pair response, and the
 // ready frame -- one shared object, so wiring it once in startGateway covers all three.
 describe("GatewayInfo.capabilities wiring", () => {
-  it("defaults to an empty map when the config sets no capabilities", async () => {
+  // Issue #19 moved the floor: the approval surface is a CORE capability this gateway always
+  // implements, so the baseline map is no longer empty. Everything else about the wiring (one
+  // shared object across all three positions, config-supplied ids passed through untouched) is
+  // unchanged, which is what these two cases actually pin.
+  it("carries the always-on core capabilities when the config sets none of its own", async () => {
     const gw = await startGateway({
       name: "no-caps",
       port: 0,
@@ -80,7 +84,7 @@ describe("GatewayInfo.capabilities wiring", () => {
     });
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
-      expect(health.capabilities).toEqual({});
+      expect(health.capabilities).toEqual({ approvals: 1 });
     } finally {
       await gw.close();
     }
@@ -97,7 +101,11 @@ describe("GatewayInfo.capabilities wiring", () => {
     });
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
-      expect(health.capabilities).toEqual({ "com.cozylabs.test": 1, "com.cozylabs.some-unrecognized-thing": 7 });
+      expect(health.capabilities).toEqual({
+        "com.cozylabs.test": 1,
+        "com.cozylabs.some-unrecognized-thing": 7,
+        approvals: 1,
+      });
 
       const code = gw.issueSetupCode();
       const pairRes = await fetch(`${gw.url}/pair`, {

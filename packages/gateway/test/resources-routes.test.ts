@@ -28,6 +28,7 @@ async function setup(opts?: { backendDown?: boolean }) {
       return storage.appendMessage(threadId, { role: "user", blocks }, 500);
     },
     interruptThread: () => "idle",
+    resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: () => {},
     now: () => 1_000,
   });
@@ -205,6 +206,7 @@ describe("unexpected faults", () => {
         throw new Error("boom");
       },
       interruptThread: () => "idle",
+      resolveApproval: () => Promise.resolve("unknown" as const),
       onDeviceRevoked: () => {},
       now: () => 1_000,
     });

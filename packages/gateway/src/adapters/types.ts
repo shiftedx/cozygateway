@@ -1,4 +1,27 @@
-import type { PresenceState, RichBlock, ToolCall } from "cozygateway-contract";
+import type {
+  ApprovalArgSummary,
+  ApprovalOutcome,
+  PresenceState,
+  RichBlock,
+  ToolCall,
+} from "cozygateway-contract";
+
+/** One tool call inside the turn that is waiting on a human decision. `toolCallId` is the
+ *  correlation id everything downstream keys on: the fanned-out frame, the resolve route, the
+ *  audit line, and the resolution handed back to this session.
+ *
+ *  `argSummary` is argument key NAMES mapped to JSON type TAGS, never argument values, and the
+ *  type says so (contract/v1.md section 5a). The runner re-validates it against the wire schema
+ *  before broadcasting, so an out-of-tree adapter that ignores this cannot leak a raw value onto
+ *  every paired device: its approval is refused with an `invalid_request` error frame instead. */
+export interface ApprovalRequest {
+  toolCallId: string;
+  name: string;
+  argSummary?: ApprovalArgSummary;
+}
+
+/** The only scope a client can express is per-call (native `once`), so the decision is binary. */
+export type ApprovalDecision = "approve" | "deny";
 
 /** Callbacks for one agent turn. The adapter calls onDraft zero or more times (full-replace
  *  semantics), then exactly one onCommit, then onDone. A failed turn REJECTS the send()
@@ -7,6 +30,19 @@ export interface TurnHandlers {
   onDraft(update: { blocks: RichBlock[]; toolCalls: ToolCall[] }): void;
   onCommit(final: { blocks: RichBlock[] }): void;
   onDone(): void;
+  /** OPTIONAL, and optional on purpose: `TurnHandlers` is public surface (it is exported from the
+   *  package root), so an out-of-tree host that builds its own handlers object keeps compiling.
+   *  An adapter therefore calls it as `handlers.onApprovalPending?.(...)`.
+   *
+   *  Raise one pending approval for the in-flight turn. The runner records it under the turn's
+   *  own turnId and fans it out; a second call for the same toolCallId is ignored. */
+  onApprovalPending?(request: ApprovalRequest): void;
+  /** Report that a pending approval reached a terminal state the BACKEND decided: in practice
+   *  `expired` (the backend's own approval timeout lapsed). A resolution the gateway itself
+   *  dispatched is already recorded when `resolveApproval` accepts it, so repeating it here is
+   *  harmless and ignored: the first terminal state per toolCallId wins, and exactly one
+   *  `approval_resolved` frame is ever emitted for it. */
+  onApprovalResolved?(resolution: { toolCallId: string; outcome: ApprovalOutcome }): void;
 }
 
 export interface BackendSession {
@@ -29,6 +65,17 @@ export interface BackendSession {
    *  set its interrupting flag first) records a turn.interrupted system message. Present only on
    *  steer-capable sessions. */
   interrupt?(): Promise<void>;
+  /** Resolve one approval this session raised through `onApprovalPending`. Present only on
+   *  approval-capable sessions; a session that raises approvals without implementing this leaves
+   *  them unresolvable, and the gateway answers such a resolve with `backend_unavailable`.
+   *
+   *  ACCEPTANCE follows the same discipline as `steer` (PR #53): resolve `true` when the decision
+   *  was taken into the live turn, `false` when it was not (the backend had already expired or
+   *  resolved it, the connection is gone, the id is not the one it is waiting on). A rejection is
+   *  read as not accepted. Only an accepted decision becomes an `approval_resolved` frame, so a
+   *  lost race reports "not pending" to the caller instead of announcing an outcome that never
+   *  happened. */
+  resolveApproval?(toolCallId: string, decision: ApprovalDecision): Promise<boolean>;
 }
 
 export interface BackendAdapter {

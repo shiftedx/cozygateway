@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
 
-import type { Message, RichBlock, ServerFrame } from "cozygateway-contract";
+import type { ApprovalOutcome, Message, RichBlock, ServerFrame } from "cozygateway-contract";
+import { ApprovalPendingFrameSchema, ContractViolation, assertValid } from "cozygateway-contract";
 
 import type { Storage } from "./storage.ts";
-import type { BackendAdapter, BackendSession } from "./adapters/types.ts";
+import type {
+  ApprovalDecision,
+  ApprovalRequest,
+  BackendAdapter,
+  BackendSession,
+} from "./adapters/types.ts";
 import { BackendUnavailable } from "./errors.ts";
 import { isStopPhrase, stopCandidateFromBlocks } from "./stop-phrase.ts";
 
@@ -25,6 +31,31 @@ interface Hub {
  *  for a steer-capable backend, "unsupported" for a queue-only one) to HTTP 202, and "idle" to
  *  HTTP 204. */
 export type InterruptOutcome = "interrupting" | "unsupported" | "idle";
+
+/** Outcome of a resolve dispatch (contract v1.md section 5a). The REST layer maps
+ *  approved/denied to 202, `unknown` to 404, `not_pending` to 409 `approval_not_pending`,
+ *  `expired` to 409 `approval_expired`, and `unsupported` to 503 `backend_unavailable`. */
+export type ApprovalResolveOutcome =
+  | "approved"
+  | "denied"
+  | "unknown"
+  | "not_pending"
+  | "expired"
+  | "unsupported";
+
+/** One approval the runner is tracking. Terminal records are KEPT (bounded, see APPROVAL_MEMORY)
+ *  so a late second decision can be answered honestly ("already resolved", "expired") instead of
+ *  collapsing into "never heard of it". */
+interface ApprovalRecord {
+  turnId: string;
+  session: BackendSession;
+  state: "pending" | ApprovalOutcome;
+}
+
+/** Per-thread cap on remembered approvals. Oldest-first eviction: a thread that ran thousands of
+ *  approvals forgets its ancient ones (a resolve for one of those reads as unknown), which is the
+ *  right trade against unbounded growth in a long-lived gateway. */
+const APPROVAL_MEMORY = 200;
 
 interface Inflight {
   turnId: string;
@@ -51,6 +82,11 @@ export class TurnRunner {
   readonly #sessions = new Map<string, Promise<BackendSession>>();
   readonly #queues = new Map<string, Promise<void>>();
   readonly #inflight = new Map<string, Inflight>();
+  /** threadId -> toolCallId -> record. Thread-scoped because every route that reaches an approval
+   *  reaches it through a thread, so a correlation id from one thread can never address another
+   *  thread's approval even if the ids ever collided. */
+  readonly #approvals = new Map<string, Map<string, ApprovalRecord>>();
+  readonly #approvalLog: (line: string) => void;
 
   constructor(deps: {
     storage: Storage;
@@ -61,7 +97,15 @@ export class TurnRunner {
     /** Per-turn wall-clock bound in milliseconds. 0 (the default when omitted) disables the bound.
      *  server.ts passes config.turnTimeoutSeconds * 1000. */
     turnTimeoutMs?: number;
+    /** Audit sink for approval resolutions, one line per terminal transition. Defaults to
+     *  stderr, matching how this gateway logs its other security-relevant events (the openclaw
+     *  root-token caveat, the push notifier's failures); an injected sink is how a test reads it.
+     *  A line names the thread, the turn, the toolCallId, the outcome, and the resolving device.
+     *  It NEVER carries the argument summary, let alone an argument value. */
+    approvalLog?: (line: string) => void;
   }) {
+    this.#approvalLog =
+      deps.approvalLog ?? ((line: string) => void process.stderr.write(`${line}\n`));
     this.#storage = deps.storage;
     this.#hub = deps.hub;
     this.#adapters = deps.adapters;
@@ -129,6 +173,130 @@ export class TurnRunner {
     const inflight = this.#inflight.get(threadId);
     if (inflight === undefined) return "idle";
     return this.#dispatchInterrupt(threadId, inflight);
+  }
+
+  /** Resolve one pending approval on behalf of an authenticated device.
+   *
+   *  Server-authoritative by construction: the caller supplies a thread and a correlation id, and
+   *  everything that decides what actually gets approved -- which turn, which session, whether it
+   *  is still pending -- comes from the runner's own record, never from the request. */
+  async resolveApproval(
+    threadId: string,
+    toolCallId: string,
+    decision: ApprovalDecision,
+    deviceId: string,
+  ): Promise<ApprovalResolveOutcome> {
+    const record = this.#approvals.get(threadId)?.get(toolCallId);
+    if (record === undefined) return "unknown";
+    const settled = this.#settledOutcome(record);
+    if (settled !== undefined) return settled;
+    if (record.session.resolveApproval === undefined) return "unsupported";
+
+    let accepted = false;
+    try {
+      accepted = await record.session.resolveApproval(toolCallId, decision);
+    } catch {
+      // A rejection is read as "not accepted", exactly like steer's acceptance contract.
+      accepted = false;
+    }
+    // The await is a real window: the backend may have expired the approval, or another device
+    // may have resolved it, while this call was in flight. The record is re-read rather than
+    // trusted from before the await, so the second decision is answered instead of duplicated.
+    const settledDuring = this.#settledOutcome(record);
+    if (settledDuring !== undefined) return settledDuring;
+    if (!accepted) return "not_pending";
+
+    const outcome: ApprovalOutcome = decision === "approve" ? "approved" : "denied";
+    this.#settleApproval(threadId, toolCallId, record, outcome, deviceId);
+    return outcome;
+  }
+
+  #settledOutcome(record: ApprovalRecord): ApprovalResolveOutcome | undefined {
+    if (record.state === "pending") return undefined;
+    return record.state === "expired" ? "expired" : "not_pending";
+  }
+
+  /** Record one pending approval raised by the backend and fan it out. Rejects anything that is
+   *  not a valid `approval_pending` frame (in particular an argSummary carrying a raw argument
+   *  value): the frame is dropped, an `invalid_request` error frame goes out in its place, and
+   *  nothing is recorded, so a resolve for it reads as unknown. */
+  #raiseApproval(threadId: string, turnId: string, session: BackendSession, request: ApprovalRequest): void {
+    const frame = {
+      type: "approval_pending" as const,
+      threadId,
+      turnId,
+      toolCallId: request.toolCallId,
+      name: request.name,
+      ...(request.argSummary === undefined ? {} : { argSummary: request.argSummary }),
+    };
+    try {
+      assertValid(ApprovalPendingFrameSchema, frame);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed approval";
+      this.#hub.broadcast({
+        type: "error",
+        code: "invalid_request",
+        // Deliberately does not echo the offending value back onto the wire.
+        message: `approval refused: ${detail}`,
+        threadId,
+      });
+      return;
+    }
+    let byId = this.#approvals.get(threadId);
+    if (byId === undefined) {
+      byId = new Map();
+      this.#approvals.set(threadId, byId);
+    }
+    // Idempotent: a backend that re-announces the same pending approval does not get a second
+    // frame, and never resets a record that has already reached a terminal state.
+    if (byId.has(request.toolCallId)) return;
+    byId.set(request.toolCallId, { turnId, session, state: "pending" });
+    while (byId.size > APPROVAL_MEMORY) {
+      const oldest = byId.keys().next();
+      if (oldest.done === true) break;
+      byId.delete(oldest.value);
+    }
+    this.#hub.broadcast(frame);
+  }
+
+  /** A terminal state the BACKEND decided (in practice: its approval timeout lapsed). */
+  #backendResolvedApproval(threadId: string, toolCallId: string, outcome: ApprovalOutcome): void {
+    const record = this.#approvals.get(threadId)?.get(toolCallId);
+    if (record === undefined || record.state !== "pending") return;
+    this.#settleApproval(threadId, toolCallId, record, outcome, undefined);
+  }
+
+  #settleApproval(
+    threadId: string,
+    toolCallId: string,
+    record: ApprovalRecord,
+    outcome: ApprovalOutcome,
+    deviceId: string | undefined,
+  ): void {
+    record.state = outcome;
+    this.#approvalLog(
+      `approval ${outcome} thread=${threadId} turn=${record.turnId} toolCall=${toolCallId} device=${deviceId ?? "-"}`,
+    );
+    this.#hub.broadcast({
+      type: "approval_resolved",
+      threadId,
+      turnId: record.turnId,
+      toolCallId,
+      outcome,
+    });
+  }
+
+  /** No approval outlives its turn. Whatever is still pending when a turn ends (committed,
+   *  failed, or interrupted) can never be answered by that turn's backend, so it lapses as
+   *  `expired` -- the outcome that already means "nobody's decision took effect". */
+  #expirePendingApprovals(threadId: string, turnId: string): void {
+    const byId = this.#approvals.get(threadId);
+    if (byId === undefined) return;
+    for (const [toolCallId, record] of byId) {
+      if (record.turnId === turnId && record.state === "pending") {
+        this.#settleApproval(threadId, toolCallId, record, "expired", undefined);
+      }
+    }
   }
 
   #dispatchInterrupt(threadId: string, inflight: Inflight): InterruptOutcome {
@@ -240,6 +408,12 @@ export class TurnRunner {
         onDone: () => {
           this.#hub.broadcast({ type: "done", threadId, turnId });
         },
+        onApprovalPending: (request) => {
+          this.#raiseApproval(threadId, turnId, session, request);
+        },
+        onApprovalResolved: (resolution) => {
+          this.#backendResolvedApproval(threadId, resolution.toolCallId, resolution.outcome);
+        },
       });
     } catch (err) {
       const interrupted = record?.interrupting === true;
@@ -278,6 +452,9 @@ export class TurnRunner {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       if (this.#inflight.get(threadId) === record) this.#inflight.delete(threadId);
+      // Runs on every exit path (normal, failed, interrupted): nothing this turn raised is left
+      // hanging as pending against a turn that is over.
+      this.#expirePendingApprovals(threadId, turnId);
     }
   }
 
@@ -285,6 +462,7 @@ export class TurnRunner {
     await Promise.allSettled([...this.#queues.values()]);
     this.#queues.clear();
     this.#inflight.clear();
+    this.#approvals.clear();
     for (const sessionPromise of this.#sessions.values()) {
       try {
         const session = await sessionPromise;

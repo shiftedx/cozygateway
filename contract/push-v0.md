@@ -43,7 +43,34 @@ Registering again mints a new pushId; old ids keep working until deleted.
 
 ### POST /notify
 
-Request: `{"pushId": string, "ciphertext": string}` (`ciphertext` max 8192 chars).
+Request: `{"pushId": string, "ciphertext": string, "category"?: string, "collapseId"?: string}`
+(`ciphertext` max 8192 chars). The body is CLOSED (`additionalProperties: false`): an unknown
+field is 400 `invalid_request` and nothing is delivered, so no cleartext description of a tool
+call can exist at the relay boundary even by accident.
+
+`category` and `collapseId` travel together or not at all (400 `invalid_request` otherwise).
+Omitting both is the ordinary message push, byte-identical to what shipped before. Registered
+categories (cozygateway issue #19, mobile approve/deny):
+
+| category | APNs push type | `aps.category` | fallback alert | collapse id |
+| --- | --- | --- | --- | --- |
+| `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
+| `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
+
+On APNs the category becomes `aps.category` and the collapse id becomes the `apns-collapse-id`
+header; on a webhook both fields are added to the delivered JSON body next to `ciphertext`. A
+category outside the allowlist is 400. `collapseId` is bounded to an opaque-id charset
+(`[A-Za-z0-9_.:-]`, 1 to 64 characters), the only caller-controlled cleartext string besides the
+ciphertext: a raw command, path, or JSON blob cannot pass it, and an over-long id is refused
+rather than truncated, since two ids sharing a 64-byte prefix would collapse into one
+notification and a wrongly-collapsed approval is a wrongly-answered approval.
+
+`approval.resolved` is an ALERT, not a silent background push: a `content-available` push is
+best-effort, and a dropped one leaves a stale "approve this?" banner for an approval that is
+already decided. An alert on the same collapse id replaces it in place, so the worst case is an
+unnoticed but correct "resolved" banner rather than a lying "pending" one. The alert text the
+relay sends carries nothing: it cannot read the ciphertext, so it emits a fixed, content-free
+alert per category and the device's notification service extension rewrites it after decrypting.
 
 Response: 202 `{}` once the notify is accepted and handed to the transport. Delivery is
 best-effort; the relay does not queue or retry in v0, and a delivery failure still
@@ -68,15 +95,59 @@ Response: 200 `{"name": "cozygateway-relay", "version": string}`.
 
 ## Notification ciphertext
 
-- Plaintext: UTF-8 JSON `{"threadId": string, "agentName": string, "preview": string}`.
-  The gateway truncates `preview` to at most 200 characters.
+- Plaintext: UTF-8 JSON, one of the payloads below, discriminated by `kind`.
 - Key: HKDF-SHA256 with ikm = the UTF-8 bytes of the registered `pushKey` string exactly
   as received, salt = empty (zero-length), info = the ASCII string
   `cozygateway-push-v0`, output length = 32 bytes.
 - Encryption: AES-256-GCM, 12-byte random nonce per notification, 16-byte tag.
 - Wire form: `base64url(nonce || ciphertext || tag)`, no padding.
 
+The same envelope carries every payload; only the plaintext differs.
+
+**`kind: "message"`** (an agent reply committed while the device had no live socket):
+
+```json
+{ "kind": "message", "threadId": "string", "agentName": "string", "preview": "string" }
+```
+
+The gateway truncates `preview` to at most 200 characters.
+
+`kind` is ADDITIVE and was introduced with the approval payloads below (cozygateway issue #19).
+A receiver MUST treat an ABSENT `kind` as `"message"`: every gateway that shipped before this
+field emits exactly that payload without it. A gateway at this revision or later always sends
+`"kind": "message"` explicitly, so the discriminator is present in practice and "no kind" only
+ever means "older gateway".
+
+**`kind: "approval_pending"`** (a tool call is waiting on a decision; category
+`approval.pending`, collapse id = `toolCallId`):
+
+```json
+{ "kind": "approval_pending", "threadId": "string", "agentId": "string", "turnId": "string",
+  "toolCallId": "string", "name": "string", "argSummary": { "command": "string" } }
+```
+
+**`kind: "approval_resolved"`** (that approval reached a terminal state; category
+`approval.resolved`, same collapse id, so it replaces the pending banner in place):
+
+```json
+{ "kind": "approval_resolved", "threadId": "string", "agentId": "string", "turnId": "string",
+  "toolCallId": "string", "outcome": "approved" | "denied" | "expired" }
+```
+
+The fields mirror the `approval_pending` / `approval_resolved` session frames of contract v1.md
+section 5a one for one, plus `agentId` (the frames do not carry it because a client already knows
+the thread's agent; a notification arrives with no such context). `argSummary` is argument key
+NAMES mapped to JSON type TAGS only, never a raw argument value, and redacting it is the
+GATEWAY's obligation, before it encrypts: the relay cannot inspect a ciphertext it has no key
+for. The proposal's `collabId` maps to `threadId` here for the reason given in section 5a of
+contract v1.md: a cozygateway instance is one user's self-hosted gateway, so it has no collab
+dimension, and the thread is the addressing unit a resolve is issued against.
+
 ### Test vector
+
+The vector pins the ENVELOPE (key derivation, nonce handling, framing), so its plaintext is
+frozen as-is: the pre-`kind` message payload, which stays a legal payload under the
+absent-kind rule above.
 
 - pushKey: `test-push-key`
 - derived key (hex): `ace1356ac7fe54a993c093cfb02c7c6d6a9c794e8c9076bb6b0281554d263b62`

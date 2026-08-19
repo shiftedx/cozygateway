@@ -63,6 +63,7 @@ export class RelayNotifier implements Notifier {
     const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
     if (targets.length === 0) return;
     const payload: PushPayload = {
+      kind: "message",
       threadId: event.threadId,
       agentName: event.agentName,
       preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),

@@ -13,6 +13,8 @@ export const ERROR_CODES = [
   "backend_unavailable",
   "turn_failed",
   "interrupt_unsupported",
+  "approval_not_pending",
+  "approval_expired",
   "internal",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -36,6 +38,47 @@ export const ToolCallSchema = Type.Object({
   detail: Type.Optional(Type.String()),
 });
 export type ToolCall = Static<typeof ToolCallSchema>;
+
+/** The closed vocabulary an `argSummary` value may carry: a JSON TYPE TAG, never a value.
+ *  Constraining it here (rather than to a free string, as `Record<string, string>` would allow)
+ *  is what makes the scope guard mechanical instead of aspirational: a producer that tries to
+ *  put `"rm -rf /"` where `"string"` belongs fails validation at the wire boundary, on both
+ *  ends. The vocabulary is the six JSON types, so any argument shape has an honest tag. */
+export const ApprovalArgTypeTagSchema = Type.Union([
+  Type.Literal("string"),
+  Type.Literal("number"),
+  Type.Literal("boolean"),
+  Type.Literal("object"),
+  Type.Literal("array"),
+  Type.Literal("null"),
+]);
+export type ApprovalArgTypeTag = Static<typeof ApprovalArgTypeTagSchema>;
+
+/** Argument key NAMES mapped to their type tags, e.g. `{ "command": "string" }`. The argument
+ *  VALUES never cross the wire. */
+export const ApprovalArgSummarySchema = Type.Record(
+  Type.String({ minLength: 1, maxLength: 128 }),
+  ApprovalArgTypeTagSchema,
+);
+export type ApprovalArgSummary = Static<typeof ApprovalArgSummarySchema>;
+
+/** The three terminal states of one approval. `approved` is the native per-call `once` scope
+ *  (the only scope a client can express); `denied` is an explicit refusal; `expired` is the
+ *  backend's own approval timeout lapsing, which is deliberately distinct from `denied` so a
+ *  client can tell "nobody answered" from "somebody said no". */
+export const ApprovalOutcomeSchema = Type.Union([
+  Type.Literal("approved"),
+  Type.Literal("denied"),
+  Type.Literal("expired"),
+]);
+export type ApprovalOutcome = Static<typeof ApprovalOutcomeSchema>;
+
+/** Core (non-vendor) capability id for the approval surface of section 5a: a gateway that
+ *  advertises it registers the approve/deny routes and can emit the approval frames. Unlike a
+ *  `com.cozylabs.*` id, this one has no reverse-DNS prefix, because the surface it names is
+ *  documented in contract/v1.md itself rather than in a vendor's own docs. */
+export const APPROVALS_CAPABILITY_ID = "approvals";
+export const APPROVALS_CAPABILITY_VERSION = 1;
 
 export const DeviceSchema = Type.Object({
   id: Type.String(),

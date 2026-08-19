@@ -25,6 +25,7 @@ function makeApp(now = () => 1_000) {
       throw new Error("not under test");
     },
     interruptThread: () => "idle",
+    resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: (id) => revoked.push(id),
     now,
   });
@@ -76,6 +77,7 @@ describe("GET /health", () => {
         throw new Error("not under test");
       },
       interruptThread: () => "idle",
+      resolveApproval: () => Promise.resolve("unknown" as const),
       onDeviceRevoked: () => {},
       now: () => 1_000,
     });

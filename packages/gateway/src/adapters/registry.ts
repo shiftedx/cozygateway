@@ -1,6 +1,6 @@
 import type { AgentConfig } from "../config.ts";
 import type { BackendAdapter } from "./types.ts";
-import { createMockAdapter, createSteerMockAdapter } from "./mock.ts";
+import { createApprovalMockAdapter, createMockAdapter, createSteerMockAdapter } from "./mock.ts";
 import {
   createAttachAdapter,
   parseAttachOptions,
@@ -49,6 +49,11 @@ export function buildAdapters(
       );
     } else if (agent.backend === "mock-steer") {
       adapters.set(agent.id, createSteerMockAdapter());
+    } else if (agent.backend === "mock-approval") {
+      adapters.set(
+        agent.id,
+        createApprovalMockAdapter(agent.options as { expiryMs?: number } | undefined),
+      );
     } else if (agent.backend === "attach") {
       if (attach === undefined) {
         throw new Error(

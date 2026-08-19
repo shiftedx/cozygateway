@@ -56,6 +56,17 @@ export interface AppDeps {
   presenceOf: (agentId: string) => PresenceState;
   submitUserMessage: (threadId: string, blocks: RichBlock[]) => Message;
   interruptThread: (threadId: string) => "interrupting" | "idle";
+  /** Resolve one pending approval (contract v1.md section 5a). The gateway derives everything
+   *  that matters -- the turn, the backend session, whether the approval is still pending --
+   *  from its own record of the correlation id inside this thread; the request supplies no
+   *  profile, agent, or turn reference of its own. `deviceId` is the authenticated principal,
+   *  carried through only so the audit line can name who decided. */
+  resolveApproval: (input: {
+    threadId: string;
+    toolCallId: string;
+    decision: "approve" | "deny";
+    deviceId: string;
+  }) => Promise<"approved" | "denied" | "unknown" | "not_pending" | "expired" | "unsupported">;
   onDeviceRevoked: (deviceId: string) => void;
   now: () => number;
 }
@@ -238,6 +249,43 @@ export function createApp(deps: AppDeps): Hono<Env> {
     if (outcome === "idle") return c.body(null, 204);
     return c.json({ status: "interrupting" }, 202);
   });
+
+  // Approval verbs (contract v1.md section 5a). Two sibling routes rather than one route with a
+  // decision in the body: the verb is the whole request, exactly as POST /threads/:id/interrupt
+  // takes no body at all, and a notification action button maps to a URL with nothing to encode.
+  // Only per-call scope exists on the wire, so there is nothing else for a client to say.
+  const approvalRoute = (decision: "approve" | "deny") =>
+    async (c: Context<Env>) => {
+      // Read through a generic Context (this handler is shared by two routes), so the params are
+      // typed as possibly absent; the router only reaches here with both present.
+      const thread = deps.storage.threadById(c.req.param("id") ?? "");
+      if (thread === undefined) return c.json(errorBody("not_found", "no such thread"), 404);
+      const outcome = await deps.resolveApproval({
+        threadId: thread.id,
+        toolCallId: c.req.param("toolCallId") ?? "",
+        decision,
+        deviceId: c.get("deviceId"),
+      });
+      switch (outcome) {
+        case "approved":
+        case "denied":
+          return c.json({ status: outcome }, 202);
+        case "unknown":
+          return c.json(errorBody("not_found", "no such pending approval"), 404);
+        case "expired":
+          return c.json(errorBody("approval_expired", "the approval expired before it was resolved"), 409);
+        case "not_pending":
+          return c.json(errorBody("approval_not_pending", "the approval is no longer pending"), 409);
+        case "unsupported":
+          return c.json(
+            errorBody("backend_unavailable", "the agent backend cannot resolve approvals"),
+            503,
+          );
+      }
+    };
+
+  app.post("/threads/:id/approvals/:toolCallId/approve", requireDevice, approvalRoute("approve"));
+  app.post("/threads/:id/approvals/:toolCallId/deny", requireDevice, approvalRoute("deny"));
 
   app.post("/push/register", requireDevice, async (c) => {
     const parsed = parseOr400(c, PushRegisterRequestSchema, await readBody(c));
