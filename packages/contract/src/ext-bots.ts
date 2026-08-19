@@ -187,6 +187,126 @@ export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
  *  There is deliberately NO `argSummary` member: the hermes surface carries no structured
  *  arguments to summarize, and its free-text `command` / `description` are never forwarded into
  *  any frame, push payload, or log line. A member that does not exist cannot leak. */
+/** One tool step inside a bot's turn: capability 12, the live activity a client renders as chips
+ *  while the turn runs.
+ *
+ *  Field for field this is the core `ToolCall` of `contract/v1.md` ("ToolCall") with the two members
+ *  this channel's frames always carry added, and its one free-text member removed:
+ *  - `id` -> `stepId`, `name` and `status` are the core three, and `status` uses the CORE
+ *    vocabulary `running`/`ok`/`error` rather than any new one, so a client that already renders
+ *    threads chips renders these with the same switch.
+ *  - `seq` and the timestamps are added because a bots frame is a snapshot with an ordering, not an
+ *    implicitly ordered array on a draft (see `BotToolActivityFrame`).
+ *  - the core `detail` member is deliberately ABSENT. On the threads surface the OpenClaw adapter
+ *    already refuses to populate it, because the wire's `title`/`meta`/`error` strings carry
+ *    argument-derived content (file names, host paths). The hermes surface is the same hazard and
+ *    worse: its `tool.start` carries `args`, `context` and `args_text`, and its `tool.complete`
+ *    carries `args`, `result`, `result_text`, `summary` and `inline_diff`. NONE of them is
+ *    forwarded, into a frame, a stored row, a push payload or a log line. A member that does not
+ *    exist cannot leak.
+ *
+ *  `name` is the hermes tool identifier, passed through and length-capped. It is the ONE piece of
+ *  hermes-side text on this frame, and it is a tool's name rather than anything a tool was asked to
+ *  do. See `toolStepName` in the gateway's `tool-activity.ts` for the exact rule and its bound. */
+export const BotToolStepSchema = Type.Object({
+  /** Stable for the life of the step and unique within its `turnId`: the hermes `tool_id`, which is
+   *  the correlation key its own start and complete events share. */
+  stepId: Type.String(),
+  /** Position within the turn, from 1, assigned when the gateway FIRST sees the step. It is the
+   *  order the steps started in, and it never moves once assigned. */
+  seq: Type.Integer(),
+  name: Type.String(),
+  /** `running` until the step ends. `ok` and `error` are TERMINAL: a step never leaves them.
+   *
+   *  `error` means THE STEP DID NOT REPORT SUCCESS, which is broader than "the tool threw". Hermes
+   *  puts no status flag on `tool.complete` at all -- the executor computes one and then drops it
+   *  before the event is built -- so the gateway classifies the completion itself, and it does that
+   *  by reading structure it can trust and nothing else (see `toolStepStatus` in the gateway's
+   *  `tool-activity.ts`). Two things therefore land in `error` that a stricter word would not
+   *  cover: a call hermes cancelled or timed out, and a step whose completion this gateway never
+   *  saw because the turn ended first. Both mean the same thing to a reader: this step did not
+   *  finish cleanly. Nothing about WHY is ever reported, on this or any other member. */
+  status: Type.Union([Type.Literal("running"), Type.Literal("ok"), Type.Literal("error")]),
+  /** MILLISECONDS, gateway clock. When the gateway first saw the step. */
+  startedAt: Type.Integer(),
+  /** MILLISECONDS. Absent while `running`, present on every terminal step. */
+  endedAt: Type.Optional(Type.Integer()),
+});
+export type BotToolStep = Static<typeof BotToolStepSchema>;
+
+/** What a bot's turn is DOING right now, as a full-replace snapshot of that turn's tool steps.
+ *  Capability 12 (issue #60).
+ *
+ *  Snapshot, not a delta, for the same reason `bot_chat_delta` carries the full accumulated text:
+ *  it makes every frame independently sufficient and any subset of them droppable. A client renders
+ *  the newest frame it has for a `turnId` and needs no reassembly, and "what happened this turn" is
+ *  read off one frame rather than folded from a stream.
+ *
+ *  - `steps` is EVERY step of the turn so far, in `seq` order, each carrying its own current status.
+ *    A step that has ended stays in the array with a terminal status; it is not removed.
+ *  - `seq` on the FRAME is monotonic within one `turnId`, from 1, so a frame that arrives out of
+ *    order is dropped by comparing it against the last one rendered. (The `seq` on a STEP is a
+ *    different number: the step's position in the turn.)
+ *  - `turnId` is the gateway's own turn id, the same value `bot_chat_delta` and
+ *    `bot_approval_pending` carry for that chat, so all three frames agree about which turn a client
+ *    is looking at.
+ *  - `done` marks the last frame of a turn: every step in it is terminal and no further frame will
+ *    be sent for that `turnId`.
+ *
+ *  `room` is present only for a member's turn inside a group room, exactly as on `bot_chat_delta`.
+ *
+ *  NOT PUSHED. Ever. Tool activity is a foreground surface: it is worth showing to someone watching
+ *  a turn run and is worth nothing to a phone in a pocket, where it would be a stream of
+ *  notifications for something nobody was asked to decide. `contract/push-v0.md` keeps its three
+ *  payload kinds -- `message`, `approval_pending`, `approval_resolved` -- and this capability adds
+ *  none. */
+export const BotToolActivityFrameSchema = Type.Object({
+  type: Type.Literal("bot_tool_activity"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  steps: Type.Array(BotToolStepSchema),
+  /** Monotonic within one `turnId`, starting at 1. */
+  seq: Type.Integer(),
+  updatedAt: Type.Integer(),
+  done: Type.Optional(Type.Boolean()),
+  /** The group room this turn belongs to, for a member turn. Absent for a 1:1 chat. */
+  room: Type.Optional(Type.String()),
+});
+export type BotToolActivityFrame = Static<typeof BotToolActivityFrameSchema>;
+
+/** One past turn's tool steps, as `GET /bots/:name/chat/messages` hands them back. Capability 12.
+ *
+ *  This is what makes the collapsed "what did it do" strip under a reply EXPANDABLE AFTER THE FACT
+ *  rather than only while a socket happened to be open. Hermes replays no tool activity of any kind
+ *  on reconnect and persists none of it on a surface this gateway can read back, so if the gateway
+ *  did not write these down they would exist for exactly as long as one live connection.
+ *
+ *  ## What this deliberately does NOT say
+ *
+ *  It does not name a message. A step belongs to a TURN, and the gateway cannot say which transcript
+ *  row a turn produced without guessing: hermes' transcript carries no turn id, a turn may commit
+ *  more than one assistant row, and the position-matching that would be needed is exactly the kind
+ *  of heuristic that silently attaches one turn's activity to another turn's reply. `attachments`
+ *  can name a message because a photo is bound to the row through the single-use send queue that
+ *  accepted it; there is no equivalent join here, so none is invented.
+ *
+ *  What the gateway can say honestly is WHEN, and it does: `startedAt` and `endedAt` are the same
+ *  millisecond clock as `BotChatMessage.at`. A client places a turn's strip chronologically against
+ *  the messages it already has -- the strip belongs after the last message that precedes
+ *  `startedAt` -- which is a fact rather than a guess. A client that was connected during the turn
+ *  additionally already knows the `turnId` from the live frames and can key on it exactly. */
+export const BotTurnToolStepsSchema = Type.Object({
+  turnId: Type.String(),
+  /** MILLISECONDS: when the turn's FIRST step started. The chronological join to the transcript. */
+  startedAt: Type.Integer(),
+  /** MILLISECONDS: when the turn's LAST step ended. Absent while any step is still `running`, which
+   *  after a restart means a turn whose end this gateway never saw. */
+  endedAt: Type.Optional(Type.Integer()),
+  steps: Type.Array(BotToolStepSchema),
+});
+export type BotTurnToolSteps = Static<typeof BotTurnToolStepsSchema>;
+
 export const BotApprovalPendingFrameSchema = Type.Object({
   type: Type.Literal("bot_approval_pending"),
   bot: Type.String(),
@@ -757,6 +877,25 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    used to hold an exchange. That is the same empty payload a version 10 gateway already answered
  *    with while a chat was being created, so nothing breaks; the chat simply no longer fills itself
  *    in. A client that offers a suggestion chip MUST require `>= 11`, because a version 10 gateway
- *    never sends the field. */
+ *    never sends the field.
+ *  - `12`: LIVE TOOL ACTIVITY for bot chats (issue #60). The `bot_tool_activity` frame, a
+ *    full-replace snapshot of a turn's tool steps as they run, plus a `toolSteps` array on
+ *    `GET /bots/:name/chat/messages` carrying the same steps for turns that have already finished.
+ *    A client that offers step-by-step chips MUST require `>= 12`: a version 11 gateway never sends
+ *    the frame and never sends the field, so a chip strip would sit permanently empty. A client
+ *    below 12 keeps working unchanged -- it ignores a frame type it does not know and an optional
+ *    response field it never heard of, which is exactly where it was before.
+ *
+ *    Additive throughout, and deliberately narrow. Three things it does NOT do:
+ *    - it adds NO push. Tool steps stay off `contract/push-v0.md` entirely; its payload kinds are
+ *      still `message`, `approval_pending` and `approval_resolved`. Chips are a foreground surface.
+ *    - it does not change `BotChatMessage`. The steps are NOT attached to a transcript row, because
+ *      the gateway cannot honestly say which row a turn produced (see `BotTurnToolSteps`).
+ *    - it carries no tool arguments, output, or preview text of any kind. See `BotToolStep`.
+ *
+ *    What the version does NOT promise, exactly as with 10, is that any step will ever be reported:
+ *    hermes gates its whole tool lifecycle on `display.tool_progress`, which defaults to `all` but
+ *    which an operator can set to `off`, and a profile running that way is silent here (see
+ *    contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin"). */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 11;
+export const BOTS_CAPABILITY_VERSION = 12;

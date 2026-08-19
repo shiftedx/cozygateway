@@ -11,6 +11,7 @@ import type {
   BotRoutineCreateRequest,
   BotRoutinePatch,
   BotSummary,
+  BotTurnToolSteps,
   ServerFrame,
 } from "cozygateway-contract";
 
@@ -39,6 +40,7 @@ import {
 } from "./roster.ts";
 import type { GroupMember } from "./group-protocol.ts";
 import { BotChatStream } from "./chat-stream.ts";
+import { BotToolActivity, TOOL_STEP_TTL_MS, groupToolSteps } from "./tool-activity.ts";
 import {
   BotApprovals,
   type BotApprovalDecision,
@@ -226,6 +228,11 @@ export interface BotChatHistory {
   messages: BotChatMessage[];
   running: boolean;
   inflight: boolean;
+  /** Tool steps for the turns this chat has already run (ext-bots capability 12). ABSENT rather
+   *  than empty when there are none. Deliberately NOT attached to a message: see
+   *  `BotTurnToolSteps` in the contract for why the gateway will not guess which transcript row a
+   *  turn produced, and what a client joins on instead. */
+  toolSteps?: BotTurnToolSteps[];
   updatedAt: number;
   /** An opener the client MAY offer while this chat is empty (ext-bots capability 11).
    *
@@ -272,6 +279,9 @@ export interface HermesBridgeOptions {
   /** How often a live reply draft may go on the wire, per session. Default
    *  `CHAT_DELTA_THROTTLE_MS` (200 ms). */
   chatDeltaThrottleMs?: number;
+  /** How often a turn's tool-step snapshot may go on the wire, per session (capability 12). Default
+   *  `TOOL_ACTIVITY_THROTTLE_MS` (200 ms). */
+  toolActivityThrottleMs?: number;
   /** How long a superseding group drive waits before taking over. Default `GROUP_CHAIN_DELAY_MS`
    *  (250 ms), the desktop's own. */
   groupChainDelayMs?: number;
@@ -343,6 +353,9 @@ export class HermesBridge implements BotsSurface {
    *  resolves through `approval.respond`. See `approvals.ts` for why bot approvals cannot ride the
    *  core `TurnRunner` surface. */
   readonly #approvals: BotApprovals;
+  /** Capability 12. Live tool steps for a bot's turn; see `tool-activity.ts` for what hermes offers
+   *  on this surface and for the redaction posture that keeps its free text off the wire. */
+  readonly #toolActivity: BotToolActivity;
   readonly #groups: GroupRooms;
 
   /** Bots whose routines something has read recently, and when. Drives the `cron.changed` fan-out;
@@ -456,6 +469,24 @@ export class HermesBridge implements BotsSurface {
       ...(opts.onApproval === undefined ? {} : { raisePush: opts.onApproval }),
       ...(opts.approvalTimeoutMs === undefined ? {} : { timeoutMs: opts.approvalTimeoutMs }),
     });
+    this.#toolActivity = new BotToolActivity({
+      // The same pair the approval leg asks the stream for, and for the same reason: a tool step
+      // belongs to the turn whose bubble the user is looking at, so `bot_tool_activity`,
+      // `bot_chat_delta` and `bot_approval_pending` all name one turn for one chat.
+      chat: {
+        binding: (runtimeId) => this.#stream.binding(runtimeId),
+        turnId: (runtimeId) => this.#stream.turnId(runtimeId),
+      },
+      broadcast: this.#broadcast,
+      now: this.#now,
+      log: this.#log,
+      // Hermes replays no tool lifecycle on reconnect and persists none this gateway can read back,
+      // so the steps are written here or they exist only for as long as one socket stayed open.
+      store: {
+        record: (step) => this.#storage.upsertBotChatToolStep(step),
+      },
+      ...(opts.toolActivityThrottleMs === undefined ? {} : { throttleMs: opts.toolActivityThrottleMs }),
+    });
     this.#groups = new GroupRooms({
       rpc: this.#client,
       storage: this.#storage,
@@ -566,7 +597,12 @@ export class HermesBridge implements BotsSurface {
       // A dropped socket takes any half-written draft with it. Dropping the buffers here is what
       // keeps a reconnect from resuming a reply from its middle; the reply itself still arrives
       // over the turn poll, which is the only thing that ever delivered it.
-      else this.#stream.reset();
+      else {
+        this.#stream.reset();
+        // Same argument: the completions for those steps went with the socket, and claiming an
+        // outcome nobody observed would be inventing one.
+        this.#toolActivity.reset();
+      }
     });
     this.#client.onEvent((event) => {
       // The token stream (`message.start` / `message.delta` / `message.complete`). Everything else
@@ -577,6 +613,9 @@ export class HermesBridge implements BotsSurface {
       // `chat-stream.ts`'s switch, whose `default:` is a deliberate reasoning-leak allow-list that
       // must keep dropping everything it does not name.
       this.#approvals.handleEvent(event);
+      // The tool-activity leg. Registered here at the fan-out for the same reason the approval leg
+      // is, and it reads `tool.start` / `tool.complete` / `message.complete` and nothing else.
+      this.#toolActivity.handleEvent(event);
       // Optional broadcasts. A gateway that never sends them is fully supported: the poll path
       // covers the same ground, just slower.
       if (event.type === "sessions.changed" || event.type === "cron.changed") {
@@ -825,6 +864,10 @@ export class HermesBridge implements BotsSurface {
           // Teardown BEFORE the mint. See the doc comment: order is the whole correctness argument.
           this.#chat.cancel(name);
           this.#approvals.forgetBot(name);
+          this.#toolActivity.forgetBot(name);
+          // The retired chat's steps go too: they described turns in a conversation the user asked
+          // to leave behind, and the new chat must not open holding the old one's activity.
+          this.#storage.deleteBotChatToolSteps(name);
           // The pin row goes, and the outgoing chat's runtime id goes with it. Nothing may be left
           // that could address a send at the session this reset is leaving behind.
           this.#pins.clear(name);
@@ -982,12 +1025,18 @@ export class HermesBridge implements BotsSurface {
       const snapshot = await this.#chat.history(name, chat.sessionId);
       // The session resumed, so it has a row: the runtime id is stale from here on.
       this.#storage.clearBotChatRuntimeId(name, chat.sessionId);
+      const steps = groupToolSteps(
+        this.#storage.botChatToolSteps(chat.sessionId, this.#now() - TOOL_STEP_TTL_MS),
+      );
       return {
         sessionId: chat.sessionId,
         adoption: chat.adoption,
         messages: snapshot.messages,
         running: snapshot.running,
         inflight: snapshot.inflight,
+        // Capability 12. Absent, not empty, on a chat that has run no tools, so a client below 12 is
+        // unaffected and one at 12 can tell "nothing happened" from "nothing was recorded".
+        ...(steps.length === 0 ? {} : { toolSteps: steps }),
         updatedAt: this.#now(),
         ...this.#suggestionFor(snapshot.messages),
       };
@@ -1130,6 +1179,11 @@ export class HermesBridge implements BotsSurface {
     try {
       const dropped = this.#storage.sweepBotChatAttachments(this.#now(), PHOTO_TTL_MS);
       if (dropped > 0) this.#log(`swept ${dropped} expired chat photo(s)`);
+      // Tool steps ride the same hourly pass. They are rows rather than bytes, so the TTL is much
+      // longer: the point of persisting them at all is that a chip strip can be expanded long after
+      // the turn, and a strip that vanished after a week would defeat that.
+      const steps = this.#storage.sweepBotChatToolSteps(this.#now(), TOOL_STEP_TTL_MS);
+      if (steps > 0) this.#log(`swept ${steps} expired tool step(s)`);
     } catch (err) {
       // Never fatal: a sweep that cannot run costs disk, and the reads have already stopped serving
       // whatever it would have dropped.
@@ -1208,6 +1262,7 @@ export class HermesBridge implements BotsSurface {
     // the very watermark `forget` just dropped.
     this.#chat.cancel(canonical);
     this.#approvals.forgetBot(canonical);
+    this.#toolActivity.forgetBot(canonical);
     this.#chatInflight.delete(canonical);
     // The unwritten-chat runtime id needs no line of its own: `forgetBot` drops the whole pin row it
     // lives on.
@@ -1503,6 +1558,7 @@ export class HermesBridge implements BotsSurface {
     this.#chat.close();
     this.#stream.close();
     this.#approvals.close();
+    this.#toolActivity.close();
     // Awaited: a room drive that is mid-turn holds a reference to the storage the caller is about
     // to close, and it must be finished with it before this resolves.
     await this.#groups.close();

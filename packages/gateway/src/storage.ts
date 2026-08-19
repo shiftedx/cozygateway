@@ -122,6 +122,34 @@ CREATE TABLE IF NOT EXISTS bot_chat_attachments (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS bot_chat_attachments_row
   ON bot_chat_attachments (session_id, message_id);
+-- Tool steps a bot's turn ran (contract/ext-bots-v1.md, capability 12). A CACHE of nothing: hermes
+-- keeps its tool lifecycle on a live event stream and replays none of it, so if these rows are not
+-- written here the activity exists for exactly as long as a socket stayed open, and the collapsed
+-- "what did it do" strip under a reply in history has nothing to expand.
+--
+-- Deliberately NOT keyed to a transcript row. A step belongs to a TURN, and the gateway cannot say
+-- which assistant row a turn produced without guessing (see the note on BotTurnToolSteps in
+-- ext-bots.ts). What it can say honestly is WHEN, so started_at is the join a client uses to
+-- place a turn's strip against the message timestamps it already has.
+--
+-- The name column is the only text here, and it is a tool identifier: never an argument, a command
+-- or a path. Nothing else from the hermes tool events is stored, for the same reason nothing else is
+-- broadcast: this table would otherwise become the durable copy of exactly the free text the wire
+-- refuses to carry.
+CREATE TABLE IF NOT EXISTS bot_chat_tool_steps (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  PRIMARY KEY (bot, turn_id, step_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_session
+  ON bot_chat_tool_steps (session_id, started_at);
 -- Group chat rooms. Unlike the three tables above these are NOT a cache: this gateway hosts the
 -- rooms (spec section 4), so the room, its transcript, each member's watermark and the epoch are
 -- the source of truth and must survive a restart. Only the "a round loop is running right now"
@@ -744,6 +772,94 @@ export class Storage {
     return this.#db.prepare("DELETE FROM bot_chat_attachments WHERE created_at < ?").run(now - ttlMs).changes as number;
   }
 
+  /** Writes one tool step, or updates the one already there (capability 12). Upsert rather than
+   *  insert-then-update because a step is written twice by design -- once when it starts and once
+   *  when it ends -- and the end write must not depend on the start write having happened: an event
+   *  stream this gateway attached to mid-turn delivers an end with no start, and a step recorded
+   *  only at its end is still a true thing that happened.
+   *
+   *  `seq` and `started_at` are pinned by the FIRST write and never moved, so a step keeps the
+   *  position it was first seen in. Status and `ended_at` are the only columns a later write owns. */
+  upsertBotChatToolStep(step: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    stepId: string;
+    seq: number;
+    name: string;
+    status: string;
+    startedAt: number;
+    endedAt: number | undefined;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_chat_tool_steps
+           (bot, session_id, turn_id, step_id, seq, name, status, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot, turn_id, step_id) DO UPDATE SET
+           status = excluded.status,
+           ended_at = COALESCE(excluded.ended_at, bot_chat_tool_steps.ended_at),
+           name = CASE WHEN bot_chat_tool_steps.name = '' THEN excluded.name ELSE bot_chat_tool_steps.name END`,
+      )
+      .run(
+        step.bot,
+        step.sessionId,
+        step.turnId,
+        step.stepId,
+        step.seq,
+        step.name,
+        step.status,
+        step.startedAt,
+        step.endedAt ?? null,
+      );
+  }
+
+  /** Every tool step recorded for one chat, oldest turn first and in-turn order within it. The
+   *  caller groups them; this returns rows because the grouping belongs to the surface that knows
+   *  the frame shape, not to the table. */
+  botChatToolSteps(
+    sessionId: string,
+    notBefore: number,
+  ): Array<{
+    turnId: string;
+    stepId: string;
+    seq: number;
+    name: string;
+    status: string;
+    startedAt: number;
+    endedAt: number | null;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT turn_id AS turnId, step_id AS stepId, seq, name, status,
+                started_at AS startedAt, ended_at AS endedAt
+         FROM bot_chat_tool_steps
+         WHERE session_id = ? AND started_at >= ?
+         ORDER BY started_at, seq, step_id`,
+      )
+      .all(sessionId, notBefore) as unknown as Array<{
+      turnId: string;
+      stepId: string;
+      seq: number;
+      name: string;
+      status: string;
+      startedAt: number;
+      endedAt: number | null;
+    }>;
+  }
+
+  /** Drops every tool step belonging to one bot. Called wherever a bot's chat stops being the thing
+   *  those steps described: a reset, a delete, a re-pin. */
+  deleteBotChatToolSteps(bot: string): void {
+    this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(bot);
+  }
+
+  /** Drops every tool step older than the TTL. Returns how many went, so a caller can log it. */
+  sweepBotChatToolSteps(now: number, ttlMs: number): number {
+    return this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE started_at < ?").run(now - ttlMs)
+      .changes as number;
+  }
+
   /** Drops every trace of a bot from the cache: its roster row, its mirrored `ui_meta` blob, its
    *  canonical-chat pin, and the sessions its resets retired. Called when the profile is deleted
    *  Hermes-side, so a name that gets reused later starts clean rather than inheriting a dead pin,
@@ -764,6 +880,9 @@ export class Storage {
       // them. Keying on a name rather than an identity cuts the same way it does for the retired set:
       // a rebuilt bot reusing the name must not inherit its predecessor's pictures.
       this.#db.prepare("DELETE FROM bot_chat_attachments WHERE bot = ?").run(name);
+      // The tool steps go with them, same name-keying argument: a rebuilt bot reusing the name must
+      // not show a history strip describing what its predecessor did.
+      this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(name);
       this.#db.exec("COMMIT");
     } catch (err) {
       this.#db.exec("ROLLBACK");

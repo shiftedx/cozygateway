@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 11 }
+"capabilities": { "com.cozylabs.bots": 12 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -583,9 +583,19 @@ Three v1 properties worth knowing before writing a client:
   running: boolean,
   inflight: boolean,
   updatedAt: integer,
-  suggestion?: string                 // capability >= 11, only while `messages` is empty
+  suggestion?: string,                // capability >= 11, only while `messages` is empty
+  toolSteps?: BotTurnToolSteps[]      // capability >= 12, absent when the chat has run no tools
 }
 404 not_found                         // no profile named `name` exists
+```
+
+```
+BotTurnToolSteps = {
+  turnId: string,
+  startedAt: integer,                 // ms: when the turn's FIRST step started
+  endedAt?: integer,                  // ms: absent while any step is still `running`
+  steps: BotToolStep[]                // same shape the live `bot_tool_activity` frame carries
+}
 ```
 
 History of the canonical chat. The chat is resolved exactly as `GET /bots/:name/chat` resolves it,
@@ -598,6 +608,18 @@ is its durable record that it minted the chat and nothing has been said in it si
 performs. And no longer a time window either: up to capability 10 the tolerance expired with the
 180 s turn cap, which was right only while an auto-submitted opener meant the row was seconds away.
 Every other Hermes failure is passed through.
+
+**`toolSteps` (capability `>= 12`).** The tool steps of the turns this chat has already run, oldest
+turn first and in `seq` order within each, so a collapsed "what did it do" strip under an old reply
+can be expanded long after the socket that watched it live is gone. ABSENT, not empty, when the chat
+has run no tools, so a client at 12 can tell "nothing happened" from "nothing was recorded" and a
+client below 12 is unaffected by a field it never heard of. Steps are retained for 90 days and swept
+hourly; a chat reset or a profile delete drops them immediately, with everything else keyed on the
+bot's name.
+
+It names TURNS and never messages. See "bot_tool_activity, the live tool-step strip" in section 6
+for why the gateway will not guess which transcript row a turn produced, and for the chronological
+join a client uses instead -- `startedAt` and `BotChatMessage.at` are the same millisecond clock.
 
 **`suggestion` (capability `>= 11`).** An opener the client MAY offer while the chat is empty.
 Present ONLY when `messages` is empty AND the deployment configured one (`hermes.chatSuggestion`,
@@ -2101,6 +2123,96 @@ Exactly one `bot_approval_resolved` is ever emitted per `toolCallId`: the first 
 and every later one is swallowed. A pending approval this gateway is already tracking is never
 re-announced either, so a reconnect that replays the same entry costs no second banner.
 
+### bot_tool_activity, the live tool-step strip
+
+Version 12 and up. What a bot's turn is DOING right now: the tool steps it has run so far, as a
+FULL-REPLACE snapshot, so a client can render step-by-step chips that fill in while the turn runs
+instead of showing an undifferentiated "thinking".
+
+```
+{ "type": "bot_tool_activity", "bot": "scout", "sessionId": "sess-1",
+  "turnId": "sess-1#1800000000000-4", "seq": 3, "updatedAt": 1800000000000,
+  "done": true, "room": "Release Room",
+  "steps": [ { "stepId": "call_1", "seq": 1, "name": "terminal",
+               "status": "ok", "startedAt": 1800000000000, "endedAt": 1800000001200 } ] }
+```
+
+Snapshot, not a delta, for the same reason `bot_chat_delta` carries the full accumulated text: every
+frame is independently sufficient, so any subset of them can be dropped and a client never
+reassembles anything. `steps` carries every step of the turn so far in `seq` order; a step that has
+ended stays in the array carrying its terminal status rather than being removed. "What happened this
+turn" is therefore read off ONE frame.
+
+- `stepId` IS the Hermes `tool_id`, the correlation key its `tool.start` and `tool.complete` share.
+  Unique within the turn.
+- `seq` on a STEP is that step's position in the turn, from 1, assigned when the gateway first sees
+  it and never moved afterwards. It is the order steps STARTED in. Tools run concurrently inside
+  Hermes, so completions routinely arrive out of that order and each step carries its own two
+  timestamps.
+- `seq` on the FRAME is a different number: monotonic within one `turnId`, from 1, so a frame that
+  arrives out of order is dropped by comparing it against the last one rendered.
+- `turnId` is the GATEWAY's own turn id, the same value `bot_chat_delta` and `bot_approval_pending`
+  carry for that chat, so all three frames agree about which turn a client is looking at. The Hermes
+  tool events are session-scoped and name no turn at all.
+- `status` is the CORE vocabulary of `contract/v1.md`'s `ToolCall`: `running` | `ok` | `error`, and
+  deliberately not a fourth word, so one client switch renders a threads chip and a bots chip.
+- `done` marks the last frame of a turn: every step in it is terminal and no further frame will be
+  sent for that `turnId`.
+- `room` is present only for a member's turn inside a group room, exactly as on `bot_chat_delta`.
+
+**`error` means the step did not report success, which is broader than "the tool threw."** Hermes
+puts no status flag on `tool.complete` at all -- its executor computes one and drops it before the
+event is built -- so the gateway classifies the completion itself, from structure it can trust: a
+non-zero `exit_code`, an `error` key or `success: false`, a `status` of `cancelled`/`failed`/`error`,
+or one of the fixed error prefixes Hermes writes when it returns an unparsed string. Two further
+things land in `error`: a call Hermes cancelled or timed out, and a step whose completion the gateway
+never saw because the turn ended first (Hermes does not guarantee a `tool.complete` for every
+`tool.start`; a turn that dies mid-tool emits only the start). Leaving such a step `running` would
+spin a chip forever and calling it `ok` would claim an outcome nobody observed. **Nothing about WHY
+is ever reported**, on this or any other member.
+
+There is deliberately **no `detail`, `args`, `argSummary`, `context`, `result`, `summary`,
+`inlineDiff` or `todos` member**, and there never will be one. The Hermes tool events carry all of
+those and every one of them is radioactive: `args` is the raw argument map (full file contents on a
+write, full shell commands, full patches), `context` is an 80-character preview of the raw command
+or path, `result` gets no redaction of any kind, `inline_diff` is verbatim file content, `todos` is
+user-authored text, and `summary` has one branch that is arbitrary tool text. The gateway reads
+`result` exactly once, to choose between `ok` and `error`, and forwards none of it into a frame, a
+stored row, a push payload or a log line. This mirrors the threads surface, where the same `detail`
+member exists in the schema and the adapter refuses to populate it for the same reason. A member
+that does not exist cannot leak one.
+
+`name` is the Hermes tool identifier, narrowed to `[A-Za-z0-9_.:-]`, capped at 120 characters, and
+falling back to the literal `tool` rather than to any other member of the payload. It is the one
+piece of Hermes-side text on this frame, and it names a tool rather than describing what the tool was
+asked to do. MCP tools keep their `mcp__server__tool` namespacing.
+
+**These frames are NEVER pushed.** Tool activity is a foreground surface: it is worth showing to
+somebody watching a turn run and worth nothing to a phone in a pocket, where it would be a stream of
+notifications about something nobody was asked to decide. `contract/push-v0.md` keeps its three
+payload kinds -- `message`, `approval_pending`, `approval_resolved` -- and this capability adds none.
+
+A turn that runs no tools emits no frame at all, so an idle or purely conversational bot is silent
+here.
+
+#### Durability, and what a client must retain
+
+Tool steps ARE durable, and a client does not have to hold them to offer expand-after-the-fact. They
+are written to the gateway's own database as they happen and served back on
+`GET /bots/:name/chat/messages` as `toolSteps` (see section 4). Hermes itself replays no tool
+lifecycle of any kind on reconnect -- nothing on `session.info`, nothing in a resume's inflight
+snapshot -- so the gateway is the only thing that can answer this after the socket is gone.
+
+What the history array does NOT do is name a message, and that is the part to build against. A step
+belongs to a TURN, and the gateway cannot say which transcript row a turn produced without guessing:
+the Hermes transcript carries no turn id, and a turn may commit more than one assistant row.
+`attachments` can name a message because a photo is bound to its row through the single-use send
+queue that accepted it; there is no equivalent join here, so none is invented. What the gateway can
+say honestly is WHEN, and `startedAt` / `endedAt` are the same millisecond clock as
+`BotChatMessage.at`. **A client places a turn's strip chronologically**: it belongs after the last
+message whose `at` precedes `startedAt`. A client that was connected during the turn additionally
+already knows the `turnId` from the live frames and can key on it exactly.
+
 ### Deployment: what a bridged profile must pin
 
 Two Hermes settings decide whether an approval ever reaches this surface. Neither is visible on the
@@ -2115,6 +2227,11 @@ writes and verifies the first and refuses to proceed on the second.
 - **`security.approval.transport` MUST be unset (or `builtin`).** Setting it routes the whole
   approval prompt to a registered plugin BEFORE the gateway branch is reached, so approvals never
   touch the dashboard WebSocket and this bridge goes permanently blind.
+- **`display.tool_progress` MUST NOT be `off`** for `bot_tool_activity` (capability 12) to carry
+  anything. It defaults to `all`, so the ordinary case works untouched; set to `off` it suppresses
+  both the `tool.start` and the `tool.complete` events at their source and a bridged profile goes
+  silent on this frame while looking perfectly healthy everywhere else. Same shape of hazard as
+  `approvals.mode`: the capability version cannot assert a deployment fact.
 
 A related knob is the gateway's own: `hermes.approvalTimeoutSeconds` mirrors the Hermes
 `approvals.timeout`. Hermes does not expose that value over its RPC surface, so the two are kept in
