@@ -31,7 +31,14 @@ beforeAll(async () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      agents: [{ id: "conformance-echo", name: "Echo", backend: "mock" }],
+      agents: [
+        { id: "conformance-echo", name: "Echo", backend: "mock" },
+        // Issue #21: the stall hook's reference implementation. The mock-steer backend stays in
+        // flight after one draft and honors a hard interrupt, which is exactly what the suite's
+        // live-202 group requires; without it that group has no in-flight window to interrupt and
+        // skips. A third-party gateway may satisfy the hook with any backend of its own.
+        { id: "conformance-stall", name: "Stall", backend: "mock-steer" },
+      ],
       capabilities: { [FAKE_VENDOR_CAPABILITY]: 1 },
     },
     { notifierLog: (message) => notifierLogLines.push(message) },
@@ -51,6 +58,7 @@ registerConformanceSuite({
   baseUrl: () => gateway.url,
   issueSetupCode: () => Promise.resolve(gateway.issueSetupCode()),
   echoAgentId: "conformance-echo",
+  stallAgentId: "conformance-stall",
 });
 
 // This end-to-end check is specific to the reference gateway's own fixture (a fake

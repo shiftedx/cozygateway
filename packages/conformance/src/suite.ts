@@ -20,6 +20,7 @@ import {
   AgentSchema,
   CommittedFrameSchema,
   DeviceSchema,
+  DoneFrameSchema,
   DraftFrameSchema,
   ErrorBodySchema,
   ErrorFrameSchema,
@@ -45,6 +46,21 @@ export interface ConformanceEnv {
   issueSetupCode: () => Promise<string>;
   /** Agent id of the reference echo backend on the gateway under test. */
   echoAgentId: string;
+  /** OPTIONAL stall hook (issue #21). Agent id of a stall-capable, interruptible backend on the
+   *  gateway under test. Declaring it activates the live in-flight interrupt group, which is the
+   *  only way a black-box run can prove the 202 path of POST /threads/:id/interrupt end to end.
+   *
+   *  A gateway that declares this id promises the backend behind it:
+   *  - on a send, emits at least one `draft` frame for the turn and then STAYS IN FLIGHT: it
+   *    never commits, never emits `done`, and never fails on its own;
+   *  - honors a hard interrupt, so `POST /threads/:id/interrupt` during that window answers
+   *    `202 { "status": "interrupting" }` and the turn then ends as a committed `role: "system"`
+   *    message carrying `marker: "turn.interrupted"` followed by a `done` frame for the same
+   *    turn, with no `error` frame (contract v1.md section 5, POST /threads/:id/interrupt).
+   *
+   *  Omit it and the suite skips that group; every other assertion is unaffected, so a gateway
+   *  with no stall-capable backend still passes exactly what it passes today. */
+  stallAgentId?: string;
 }
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -101,14 +117,18 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
     });
   }
 
-  async function createThread(token: string, title?: string): Promise<Thread> {
+  async function createThreadWith(token: string, agentId: string, title?: string): Promise<Thread> {
     const res = await authFetch(token, "/threads", {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ agentId: env.echoAgentId, ...(title === undefined ? {} : { title }) }),
+      body: JSON.stringify({ agentId, ...(title === undefined ? {} : { title }) }),
     });
     expect(res.status).toBe(200);
     return assertValid(ThreadSchema, await res.json());
+  }
+
+  function createThread(token: string, title?: string): Promise<Thread> {
+    return createThreadWith(token, env.echoAgentId, title);
   }
 
   async function sendMessage(token: string, threadId: string, text: string): Promise<Message> {
@@ -852,6 +872,130 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
         const { delivery: _drop, ...withoutDelivery } = userMsg;
         expect(check(MessageSchema, withoutDelivery)).toBe(true);
       });
+    });
+
+    // Spec section 5, POST /threads/:id/interrupt, 202 path: "when a turn was in flight and the
+    // interrupt was dispatched to the backend. For a steer-capable backend the turn ends as a
+    // committed system message with `marker: "turn.interrupted"` followed by a `done` frame."
+    //
+    // The group above can only schema-check that body, because the reference echo backend is
+    // queue-only: it finishes a turn immediately, so no in-flight window exists to interrupt.
+    // This group drives the real thing, and therefore needs the OPTIONAL stall hook
+    // (`ConformanceEnv.stallAgentId`, issue #21): an agent whose backend stalls in flight after
+    // one draft and honors a hard interrupt. A gateway that declares no such agent skips this
+    // group and is held to exactly what it was held to before the hook existed.
+    describe("mid-turn interrupt, live 202 (requires the stall hook)", () => {
+      const stallAgentId = env.stallAgentId;
+      // `it.skip` rather than an empty describe: a skipped-and-named case in the report is the
+      // honest signal that this gateway declared no stall backend, not that the case vanished.
+      const liveIt = stallAgentId === undefined ? it.skip : it;
+
+      liveIt(
+        "interrupting an in-flight turn is 202 {status:interrupting}, then turn.interrupted then done",
+        async () => {
+          if (stallAgentId === undefined) throw new Error("unreachable: skipped without stall hook");
+          const { token } = await pairDevice("interrupt-live");
+          const thread = await createThreadWith(token, stallAgentId, "live interrupt");
+          const socket = await authedSocket(token);
+          try {
+            await sendMessage(token, thread.id, "a long task");
+
+            // The hook's contract: at least one draft, and then the turn stays in flight.
+            await waitFor(
+              socket,
+              () => framesOfType(socket.frames, "draft").some((d) => d.threadId === thread.id),
+              "draft from the stall backend",
+            );
+            const draft = framesOfType(socket.frames, "draft").find((d) => d.threadId === thread.id);
+            if (draft === undefined) throw new Error("no draft frame");
+            assertValid(DraftFrameSchema, draft);
+            const turnId = draft.turnId;
+
+            // The in-flight window is real: nothing has finished this turn yet.
+            expect(socket.frames.some((f) => f.type === "done" && f.turnId === turnId)).toBe(false);
+            expect(
+              framesOfType(socket.frames, "committed").some(
+                (c) => c.threadId === thread.id && c.message.role === "agent",
+              ),
+            ).toBe(false);
+
+            const res = await authFetch(token, `/threads/${thread.id}/interrupt`, { method: "POST" });
+            expect(res.status).toBe(202);
+            const body = assertValid(InterruptResponseSchema, await res.json());
+            expect(body.status).toBe("interrupting");
+
+            // The turn ends as a turn.interrupted system commit, THEN a done frame for that turn.
+            await waitFor(
+              socket,
+              () => socket.frames.some((f) => f.type === "done" && f.turnId === turnId),
+              "done for the interrupted turn",
+            );
+            const systemCommit = framesOfType(socket.frames, "committed").find(
+              (c) => c.threadId === thread.id && c.message.role === "system",
+            );
+            expect(systemCommit).toBeDefined();
+            if (systemCommit === undefined) throw new Error("no system commit");
+            assertValid(CommittedFrameSchema, systemCommit);
+            expect(systemCommit.message.marker).toBe("turn.interrupted");
+            expect(systemCommit.message.turnId).toBe(turnId);
+
+            const doneFrame = socket.frames.find((f) => f.type === "done" && f.turnId === turnId);
+            assertValid(DoneFrameSchema, doneFrame);
+            const systemIdx = socket.frames.indexOf(systemCommit);
+            const doneIdx = socket.frames.findIndex((f) => f.type === "done" && f.turnId === turnId);
+            expect(doneIdx).toBeGreaterThan(systemIdx);
+
+            // A deliberate interrupt is not a failure: no error frame for this thread, and in
+            // particular not turn_failed or interrupt_unsupported.
+            const errors = framesOfType(socket.frames, "error").filter(
+              (e) => e.threadId === undefined || e.threadId === thread.id,
+            );
+            expect(errors).toEqual([]);
+
+            // The outcome is durable, not just a broadcast: the system message is in history.
+            const history = await listMessages(token, thread.id);
+            expect(history.some((m) => m.role === "system" && m.marker === "turn.interrupted")).toBe(
+              true,
+            );
+            expect(history.some((m) => m.role === "agent")).toBe(false);
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      liveIt(
+        "the thread is idle again after the interrupt: a second interrupt is 204",
+        async () => {
+          if (stallAgentId === undefined) throw new Error("unreachable: skipped without stall hook");
+          const { token } = await pairDevice("interrupt-live-then-idle");
+          const thread = await createThreadWith(token, stallAgentId, "interrupt then idle");
+          const socket = await authedSocket(token);
+          try {
+            await sendMessage(token, thread.id, "another long task");
+            await waitFor(
+              socket,
+              () => framesOfType(socket.frames, "draft").some((d) => d.threadId === thread.id),
+              "draft from the stall backend",
+            );
+            const first = await authFetch(token, `/threads/${thread.id}/interrupt`, { method: "POST" });
+            expect(first.status).toBe(202);
+            await waitFor(
+              socket,
+              () => socket.frames.some((f) => f.type === "done" && f.threadId === thread.id),
+              "done for the interrupted turn",
+            );
+
+            const second = await authFetch(token, `/threads/${thread.id}/interrupt`, { method: "POST" });
+            expect(second.status).toBe(204);
+            expect(await second.text()).toBe("");
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
     });
   });
 }
