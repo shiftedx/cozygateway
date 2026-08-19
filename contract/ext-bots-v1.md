@@ -613,8 +613,9 @@ Capability `>= 8`.
 ```
 (no request body)
 200 { name: string, sessionId: string, previousSessionId?: string }
+400 invalid_request                   // `name` is not a legal profile id
 404 not_found                         // no profile named `name` exists
-502 backend_unavailable               // hermes refused to create the replacement chat
+502 backend_unavailable + hermesError // hermes refused to create the replacement chat
 ```
 
 Retires the bot's current canonical chat and pins a freshly minted one in its place. This is what a
@@ -652,6 +653,16 @@ turn poll is cancelled, its delta watermark and pending sends are dropped, and t
 bindings are forgotten. So no `bot_chat`, `bot_chat_state` or `bot_chat_delta` frame for the retired
 session arrives after this route answers. A poll left running would have kept broadcasting for a
 chat nobody is in and would have rewritten the very watermark the reset dropped.
+
+**A retired chat never comes back as the canonical one.** The replacement is minted with the same
+title as the chat it replaces, so a bot reset several times has several sessions titled `Bot Chat`
+and only the pin says which is live. The gateway therefore remembers the ids it has retired (the
+most recent few dozen per bot, on disk) and refuses to adopt any of them, whatever their title and
+wherever they sort in `session.list`. That matters because the pin is losable: pushing it to
+`ui_meta` is never allowed to fail a reset, so a gateway that cannot store it keeps the pin local.
+Without the refusal, the first resolve after a lost pin could re-adopt the conversation the user
+cleared. A bot whose every listed session has been retired gets a freshly minted chat rather than
+any of them.
 
 A reset is mutually exclusive with the canonical-chat resolve for that bot. A resolve already in
 flight is awaited first, and a resolve that arrives while the reset runs joins it and receives the

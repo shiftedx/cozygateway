@@ -172,7 +172,8 @@ export const BotChatResetFrameSchema = Type.Object({
   bot: Type.String(),
   /** The freshly minted canonical chat. Every device rebinds to this id. */
   sessionId: Type.String(),
-  /** The chat that was retired. Absent when there was nothing to retire. */
+  /** The chat that was retired. Absent when there was nothing to retire. Retired, not deleted: this
+   *  session is still on the Hermes host and still listed by `GET /bots/:name/sessions`. */
   previousSessionId: Type.Optional(Type.String()),
   updatedAt: Type.Integer(),
 });
@@ -180,7 +181,15 @@ export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
 
 /** `POST /bots/:name/chat/reset` response. `sessionId` is the STORED id of the new canonical chat,
  *  the same value a subsequent `GET /bots/:name/chat` reports, and `previousSessionId` is what the
- *  pin used to point at, absent only when the bot had no chat to retire. */
+ *  pin used to point at, absent only when the bot had no chat to retire.
+ *
+ *  NOTHING WAS DELETED, and a client author reading only this schema needs to know it before writing
+ *  a label. Hermes exposes no session delete on this surface, so the reset is a retire-and-re-pin:
+ *  the session named by `previousSessionId` and its entire transcript stay on the Hermes host and
+ *  keep appearing in `GET /bots/:name/sessions` (and in the Hermes desktop's own session list). What
+ *  changed is which session the bot's canonical pin points at, which buys the bot a fresh context
+ *  window and the user a clean screen. A UI that promises the history is gone is promising something
+ *  this gateway did not do. */
 export const BotChatResetResponseSchema = Type.Object({
   name: Type.String(),
   sessionId: Type.String(),

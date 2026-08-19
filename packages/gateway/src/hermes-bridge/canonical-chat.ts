@@ -66,7 +66,16 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 /** Decodes a `session.list` response tolerantly. Rows without a usable id are dropped; the order
- *  the gateway returned (newest first) is preserved, since the adoption rules index into it. */
+ *  the gateway returned (newest first, by convention) is preserved, since the adoption rules index
+ *  into it.
+ *
+ *  Worth stating rather than implying: `session.list` rows carry NO timestamp on this surface (id,
+ *  title, preview, source, and that is the whole of it, see `GET /bots/:name/sessions` in
+ *  contract/ext-bots-v1.md). "Newest first" is therefore a convention this gateway observes and
+ *  cannot verify, so nothing here may treat position as a fact. It is used as a preference, never as
+ *  a guarantee, and the retired-session guard below is what keeps a wrong guess from being harmful.
+ *  Do not synthesize a recency field to paper over this: an invented timestamp would read as
+ *  authority the wire never gave. */
 export function parseSessionList(result: unknown): SessionRow[] {
   const record = asRecord(result);
   const rows = Array.isArray(record?.["sessions"]) ? (record["sessions"] as unknown[]) : [];
@@ -115,6 +124,24 @@ export interface CanonicalChatDeps {
    *
    *  Nothing to check on the adopt paths: those resolve a session that already exists. */
   assertStillExists?: () => Promise<void>;
+  /** True when `sessionId` is a chat a RESET already retired for this bot, and therefore a session
+   *  the user asked to leave behind.
+   *
+   *  Passed in rather than read from storage here on purpose: this module speaks to `rpc` and `pins`
+   *  and nothing else, and that narrowness is what makes it testable with two plain objects. The
+   *  bridge owns the durable set (`Storage.botChatRetired`).
+   *
+   *  It exists because a reset mints the replacement chat with the SAME title as the one it retires,
+   *  which is deliberate (a reset chat has to be byte-compatible with a resolved one) and which makes
+   *  the two adoption heuristics below ambiguous by construction: after N resets a bot has N+1
+   *  sessions titled `Bot Chat` and only the pin says which is live. Lose the pin, which is reachable
+   *  because `saveServerPin` is allowed to fail silently, and adoption would pick one by title or by
+   *  position and could hand the user back the very conversation they cleared. A retired id is
+   *  therefore never a candidate, wherever it sorts.
+   *
+   *  Defaults to "nothing is retired", which is the correct answer for a caller that has never reset
+   *  a chat and keeps every existing test honest. */
+  isRetired?: (sessionId: string) => boolean;
   /** How many sessions to consider when adopting. The desktop uses 100. */
   listLimit?: number;
 }
@@ -205,21 +232,47 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
     return { sessionId: created.storedId, adoption: "created", runtimeId: created.runtimeId };
   }
 
+  // Retired sessions are removed from consideration BEFORE either heuristic runs, not filtered out
+  // of their answer afterwards, so "the canonical title" and "the newest row" both mean "the newest
+  // one the user has not already cleared". See `CanonicalChatDeps.isRetired`.
+  const isRetired = deps.isRetired ?? (() => false);
+  const candidates = rows.filter((row) => !isRetired(row.id));
+
   if (pin === undefined || pin === null) {
     // Grandfather path: a bot that already has history (from the CLI, a cron run, or a bot-to-bot
-    // exchange) adopts the session carrying the canonical title, else the newest one.
-    const titled = rows.find((row) => row.title === CANONICAL_CHAT_TITLE);
-    const adopted = titled ?? rows[0]!;
-    deps.pins.set(name, adopted.id);
-    return { sessionId: adopted.id, adoption: titled === undefined ? "latest" : "title" };
+    // exchange) adopts the session carrying the canonical title, else the first row, which is the
+    // newest by the ordering convention `parseSessionList` documents and cannot verify.
+    const titled = candidates.find((row) => row.title === CANONICAL_CHAT_TITLE);
+    const adopted = titled ?? candidates[0];
+    if (adopted !== undefined) {
+      deps.pins.set(name, adopted.id);
+      return { sessionId: adopted.id, adoption: titled === undefined ? "latest" : "title" };
+    }
+    // Every session this bot has was retired and there is no pin left to point at the replacement.
+    // Adopting one anyway is the one outcome that is never acceptable (it is the cleared conversation
+    // coming back), so mint instead: the user ends up with a working chat, which is the promise this
+    // function actually makes. This cannot become a mint-per-open loop, because minting sets the pin,
+    // and the pin paths below never mint.
+    deps.pins.clear(name);
+    const created = await mintCanonicalChat(name, deps);
+    return { sessionId: created.storedId, adoption: "created", runtimeId: created.runtimeId };
   }
 
   if (!rows.some((row) => row.id === pin)) {
     // Recovery path: compaction rewrote the lineage and the pinned id no longer exists. The
-    // desktop re-pins the newest session outright, so this does too.
-    const newest = rows[0]!;
-    deps.pins.set(name, newest.id);
-    return { sessionId: newest.id, adoption: "recovery" };
+    // desktop re-pins the newest session outright, so this does too, minus anything retired.
+    const newest = candidates[0];
+    if (newest !== undefined) {
+      deps.pins.set(name, newest.id);
+      return { sessionId: newest.id, adoption: "recovery" };
+    }
+    // A pin that names nothing listed, and nothing listed worth adopting. Keeping the pin is right
+    // and minting here would be wrong: the commonest way to reach this is a chat minted seconds ago
+    // whose kickoff has not persisted yet (the same lazy window the empty-list branch above reasons
+    // about), where the pin is the only pointer to the new chat and every listed session is one a
+    // reset just retired. Minting would spawn a fresh chat on EVERY open until the kickoff lands.
+    deps.pins.set(name, pin);
+    return { sessionId: pin, adoption: "pin" };
   }
 
   deps.pins.set(name, pin);

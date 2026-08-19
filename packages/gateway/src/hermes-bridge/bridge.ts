@@ -566,6 +566,7 @@ export class HermesBridge implements BotsSurface {
             hideBotChats: this.#hideBotChats,
             serverPin,
             saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
+            isRetired: this.#retiredOf(name),
             // The guard above is cache-first, so it can be satisfied by a snapshot taken before the
             // bot was deleted. That is harmless on every path but this one: minting the chat means
             // `session.create`, and Hermes 0.20.x answers that for an unknown name by CREATING the
@@ -620,6 +621,13 @@ export class HermesBridge implements BotsSurface {
    *  changed underneath it, which is exactly the shape a re-pin has, so even a poll opened in the
    *  gap would be cancelled by the first send into the new chat rather than run out its cap.
    *
+   *  The retired session id is RECORDED, durably, in `bot_chat_retired`. That is not bookkeeping: the
+   *  replacement is minted with the same title as the chat it replaces, so once the pin is gone
+   *  nothing else tells the two apart, and the pin is losable by design (`#saveServerPin` swallows
+   *  its own failures). Without the record, an adoption after a restart could pick the retired chat
+   *  by title or by list position and hand the user back the conversation they cleared. With it, a
+   *  retired session is never adopted, wherever it sorts. See `CanonicalChatDeps.isRetired`.
+   *
    *  Mutually exclusive with `canonicalChat` by design, through the same `#chatInflight` map: a
    *  resolve that is already on the wire is awaited first (its failure is swallowed, since the reset
    *  is about to replace whatever it was resolving), and while the reset runs a concurrent resolve
@@ -663,6 +671,7 @@ export class HermesBridge implements BotsSurface {
               hideBotChats: this.#hideBotChats,
               serverPin,
               saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
+              isRetired: this.#retiredOf(name),
               assertStillExists: async () => {
                 if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
               },
@@ -680,6 +689,22 @@ export class HermesBridge implements BotsSurface {
           this.#chat.cancel(name);
           this.#kickoffs.delete(name);
           this.#pins.clear(name);
+          // Mark the outgoing session retired, on disk, and do it BEFORE the pin is replaced so a
+          // crash between the two leaves the stronger state: a session recorded as retired that no
+          // pin points at is simply never adopted, whereas a pin moved without the record is the
+          // hazard this set exists for. Only when there genuinely was something to retire: a reset
+          // that could not resolve an outgoing chat has no id to refuse, and writing a placeholder
+          // would poison the set for whatever that id later turns out to be.
+          //
+          // Why this outlives the process: the retired session keeps the canonical title (the mint is
+          // shared with the resolve path on purpose), so the pin is the ONLY thing distinguishing it
+          // from the fresh chat, and the pin can be lost, because `#saveServerPin` swallows its own
+          // failures and a gateway too old to store `ui_meta` keeps the pin local to a database that
+          // a restart may not carry. Adoption would then pick a "Bot Chat" by title or by list
+          // position and could resurrect the conversation the user just cleared.
+          if (previousSessionId !== undefined) {
+            this.#storage.retireBotChat(name, previousSessionId, this.#now());
+          }
 
           const minted = await mintCanonicalChat(name, {
             rpc: this.#client,
@@ -737,6 +762,16 @@ export class HermesBridge implements BotsSurface {
         ? {}
         : { previousSessionId: result.previousSessionId }),
     };
+  }
+
+  /** The retired-session test handed to `resolveCanonicalChat`, as a SNAPSHOT: the set is read once,
+   *  here, rather than queried per candidate row, so one resolve costs one small SELECT instead of
+   *  one per session in a list of up to a hundred. Snapshotting is also the honest reading, since the
+   *  question the adoption paths ask is "what had been retired when this resolve began"; a reset that
+   *  lands mid-resolve is serialized behind it by `#chatInflight` anyway. */
+  #retiredOf(name: string): (sessionId: string) => boolean {
+    const retired = this.#storage.botChatRetired(name);
+    return (sessionId) => retired.has(sessionId);
   }
 
   async sessions(name: string, limit: number): Promise<SessionRow[]> {

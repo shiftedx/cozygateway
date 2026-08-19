@@ -473,6 +473,13 @@ export function registerBotRoutes(
 
   // Retire the canonical chat and pin a fresh one. Capability 8.
   //
+  // NOTHING IS DELETED, and this is the first place a reader lands, so it is said here too. Hermes
+  // exposes no session delete on this surface: the retired session and its whole transcript stay on
+  // the Hermes host and keep appearing in `GET /bots/:name/sessions`. The only thing that changes is
+  // which session the bot's canonical pin points at. The action a client hangs off this will be
+  // labelled "clear chat", and that label is generous: what the user really gets is a fresh context
+  // window for the bot and a clean screen, not a deletion.
+  //
   // No ambiguity with `/bots/:name/chat/messages` above, though both patterns are four segments and
   // share the first three: the last segment is a LITERAL on both, so `reset` and `messages` can only
   // ever match their own route and the registration order does not matter. Registered here, after
