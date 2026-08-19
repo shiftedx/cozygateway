@@ -56,6 +56,15 @@ const HermesBridgeConfigSchema = Type.Object({
    *  RPC surface reports the profile a SESSION is routed to, never the one the gateway process was
    *  launched under) and a wrong guess would make a real bot undeletable. */
   profile: Type.Optional(Type.String({ minLength: 1 })),
+  /** How long a pending tool-call approval waits before this gateway calls it `expired`
+   *  (capability 10, issue #19). MIRRORS the hermes `approvals.timeout`, whose default is 300 s.
+   *
+   *  It has to be mirrored rather than read: hermes emits no expiry event of any kind (it drops
+   *  the queue entry silently) and does not expose the timeout on its JSON-RPC surface, so the
+   *  gateway runs its own timer. An operator who changes `approvals.timeout` hermes-side sets this
+   *  to match; leaving them out of step only shifts when the gateway stops offering the buttons,
+   *  and never resolves anything on its own. */
+  approvalTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
 

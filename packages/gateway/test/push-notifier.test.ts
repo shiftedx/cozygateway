@@ -269,3 +269,125 @@ describe("RelayNotifier", () => {
     storage.close();
   });
 });
+
+/** The approval push leg (issue #19 section 2, contract/push-v0.md). What is different from a
+ *  message push is the two CLEARTEXT fields the relay is allowed to see -- the category and the
+ *  collapse id -- and the fact that everything describing the tool call stays inside the
+ *  ciphertext, exactly as the message preview does. */
+describe("RelayNotifier.notifyApproval", () => {
+  const registration = { deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" };
+  const pendingPayload = {
+    kind: "approval_pending" as const,
+    threadId: "th_1",
+    agentId: "scout",
+    turnId: "t_5",
+    toolCallId: "call_1",
+    name: "run_shell",
+  };
+
+  it("sends the pending payload with the category and the toolCallId as the collapse id", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notifyApproval(pendingPayload, new Set());
+    await settle();
+
+    expect(sent).toHaveLength(1);
+    const body = sent[0]!.body as unknown as { category: string; collapseId: string; ciphertext: string };
+    expect(body.category).toBe("approval.pending");
+    // Coalescing key: a resolved or expired approval replaces its own pending banner in place.
+    expect(body.collapseId).toBe("call_1");
+    expect(JSON.parse(JSON.stringify(decrypt("key-1", body.ciphertext)))).toEqual(pendingPayload);
+    // Nothing describing the tool call is in the clear.
+    expect(JSON.stringify(sent[0]!.body)).not.toContain("run_shell");
+    storage.close();
+  });
+
+  it("sends the resolved payload on the SAME collapse id, under its own category", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notifyApproval(
+      {
+        kind: "approval_resolved",
+        threadId: "th_1",
+        agentId: "scout",
+        turnId: "t_5",
+        toolCallId: "call_1",
+        outcome: "expired",
+      },
+      new Set(),
+    );
+    await settle();
+    const body = sent[0]!.body as unknown as { category: string; collapseId: string };
+    expect(body.category).toBe("approval.resolved");
+    expect(body.collapseId).toBe("call_1");
+    storage.close();
+  });
+
+  it("carries an argSummary when one is supplied, and omits the field otherwise", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {} });
+    notifier.notifyApproval({ ...pendingPayload, argSummary: { command: "string" } }, new Set());
+    await settle();
+    expect(decrypt("key-1", sent[0]!.body.ciphertext)).toMatchObject({ argSummary: { command: "string" } });
+    // The bots bridge omits it entirely: hermes has no structured arguments to summarize.
+    notifier.notifyApproval(pendingPayload, new Set());
+    await settle();
+    expect(decrypt("key-1", sent[1]!.body.ciphertext)).not.toHaveProperty("argSummary");
+    storage.close();
+  });
+
+  it("excludes a device that already has a live socket, exactly as a message push does", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notifyApproval(
+      pendingPayload,
+      new Set(["d1"]),
+    );
+    await settle();
+    expect(sent).toHaveLength(0);
+    storage.close();
+  });
+
+  it("REFUSES a toolCallId that cannot be a collapse id rather than truncating it", async () => {
+    // Two ids sharing a 64-byte prefix would collapse into one notification, and a wrongly
+    // collapsed approval is a wrongly answered approval. The frame already went out over every
+    // live socket, so what is lost is the banner and not the approval.
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    const log: string[] = [];
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: (line) => log.push(line) });
+    for (const toolCallId of ["x".repeat(65), "has space", "rm -rf /", "", "sla/sh"]) {
+      notifier.notifyApproval({ ...pendingPayload, toolCallId }, new Set());
+    }
+    await settle();
+    expect(sent).toHaveLength(0);
+    expect(log).toHaveLength(5);
+    expect(log[0]).toMatch(/collapse id/);
+    storage.close();
+  });
+
+  it("prunes a registration the relay no longer knows, same as the message path", async () => {
+    const storage = seeded([registration]);
+    const { impl } = fetchStub(() => 404);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notifyApproval(pendingPayload, new Set());
+    await settle();
+    expect(storage.pushRegistrations()).toHaveLength(0);
+    storage.close();
+  });
+
+  it("never throws and never rejects, whatever the relay does", async () => {
+    const storage = seeded([registration]);
+    const { impl } = fetchStub(() => "reject");
+    const log: string[] = [];
+    expect(() =>
+      new RelayNotifier({ storage, fetchImpl: impl, log: (line) => log.push(line) }).notifyApproval(
+        pendingPayload,
+        new Set(),
+      ),
+    ).not.toThrow();
+    await settle();
+    expect(log.join("\n")).toContain("approval notify failed");
+    storage.close();
+  });
+});

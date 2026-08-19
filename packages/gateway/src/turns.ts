@@ -4,6 +4,7 @@ import type { ApprovalOutcome, Message, RichBlock, ServerFrame } from "cozygatew
 import { ApprovalPendingFrameSchema, ContractViolation, assertValid } from "cozygateway-contract";
 
 import type { Storage } from "./storage.ts";
+import type { ApprovalPushPayload } from "./push-crypto.ts";
 import type {
   ApprovalDecision,
   ApprovalRequest,
@@ -18,6 +19,13 @@ export interface Notifier {
     event: { threadId: string; agentName: string; preview: string },
     connectedDeviceIds: ReadonlySet<string>,
   ): void;
+  /** OPTIONAL, and optional on purpose: `Notifier` is public surface, so a host that supplies its
+   *  own notifier keeps compiling. The runner therefore calls it as `notifier.notifyApproval?.(...)`
+   *  and a notifier that does not implement it simply keeps approvals in-band.
+   *
+   *  The out-of-band leg of the approval lifecycle (issue #19 section 2): a device with no live
+   *  socket gets an actionable notification instead of the frame. */
+  notifyApproval?(payload: ApprovalPushPayload, connectedDeviceIds: ReadonlySet<string>): void;
 }
 
 export const nullNotifier: Notifier = { notify: () => {} };
@@ -257,6 +265,17 @@ export class TurnRunner {
       byId.delete(oldest.value);
     }
     this.#hub.broadcast(frame);
+    this.#notifyApproval({
+      kind: "approval_pending",
+      threadId,
+      agentId: this.#agentOf(threadId),
+      turnId,
+      toolCallId: request.toolCallId,
+      name: request.name,
+      // Carried only when the adapter supplied one, and it has already passed the wire schema
+      // above, so it is key names and type tags and cannot be a raw value.
+      ...(request.argSummary === undefined ? {} : { argSummary: request.argSummary }),
+    });
   }
 
   /** A terminal state the BACKEND decided (in practice: its approval timeout lapsed). */
@@ -284,6 +303,26 @@ export class TurnRunner {
       toolCallId,
       outcome,
     });
+    this.#notifyApproval({
+      kind: "approval_resolved",
+      threadId,
+      agentId: this.#agentOf(threadId),
+      turnId: record.turnId,
+      toolCallId,
+      outcome,
+    });
+  }
+
+  /** The push half of an approval transition. Same targeting rule a committed reply gets: a device
+   *  holding a live socket saw the frame and is excluded here rather than told twice. */
+  #notifyApproval(payload: ApprovalPushPayload): void {
+    this.#notifier.notifyApproval?.(payload, this.#hub.connectedDeviceIds());
+  }
+
+  /** The thread's agent, for the push payload. The frames do not carry it (a client already knows
+   *  a thread's agent) but a notification arrives with no such context, so push-v0 asks for it. */
+  #agentOf(threadId: string): string {
+    return this.#storage.threadById(threadId)?.agentId ?? "";
   }
 
   /** No approval outlives its turn. Whatever is still pending when a turn ends (committed,

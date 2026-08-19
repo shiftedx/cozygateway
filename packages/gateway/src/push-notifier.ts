@@ -1,9 +1,23 @@
 import type { Storage, PushRegistrationRow } from "./storage.ts";
 import type { Notifier } from "./turns.ts";
-import { encryptPushPayload, type PushPayload } from "./push-crypto.ts";
+import { encryptPushPayload, type ApprovalPushPayload, type PushPayload } from "./push-crypto.ts";
 
 export const PREVIEW_MAX_CHARS = 200;
 const NOTIFY_TIMEOUT_MS = 10_000;
+
+/** The relay's registered push categories (contract/push-v0.md, "POST /notify"). They are the ONE
+ *  piece of routing metadata the relay sees in the clear; everything describing the tool call
+ *  rides inside the ciphertext it has no key for. */
+const APPROVAL_CATEGORY = {
+  approval_pending: "approval.pending",
+  approval_resolved: "approval.resolved",
+} as const;
+
+/** The collapse-id charset and bound the relay enforces (`[A-Za-z0-9_.:-]`, 1 to 64). It is the
+ *  only caller-controlled cleartext string besides the ciphertext, so a raw command or path cannot
+ *  pass it. Checked HERE as well, so a toolCallId that could not be a collapse id is caught before
+ *  a doomed request goes out rather than as an opaque relay 400. */
+const COLLAPSE_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 /** Slices `text` to at most `maxUnits` UTF-16 code units, but never mid-surrogate-pair. A
  *  plain `.slice(0, maxUnits)` can land the cut between a surrogate pair's high and low half,
@@ -77,7 +91,52 @@ export class RelayNotifier implements Notifier {
     }
   }
 
-  async #send(registration: PushRegistrationRow, payload: PushPayload): Promise<void> {
+  /** The out-of-band leg of the approval lifecycle (issue #19 section 2). Same fire-and-forget
+   *  contract as `notify`, and the SAME targeting rule: a device holding a live socket already got
+   *  the `approval_pending` / `approval_resolved` frame, so it is excluded rather than told twice.
+   *
+   *  What is different from a message push is the two cleartext fields the relay is allowed to see:
+   *  the category (so the app can attach Approve and Deny buttons to the notification without the
+   *  relay learning anything) and the collapse id, which is the `toolCallId` so a resolved or
+   *  expired approval REPLACES its own pending banner in place instead of leaving a lock-screen
+   *  "approve this?" for a decision that is already made. */
+  notifyApproval(payload: ApprovalPushPayload, connectedDeviceIds: ReadonlySet<string>): void {
+    const collapseId = payload.toolCallId;
+    if (!COLLAPSE_ID_RE.test(collapseId)) {
+      // Refused rather than truncated or silently downgraded to an uncategorized push: two ids
+      // sharing a 64-byte prefix would collapse into one notification, and a wrongly collapsed
+      // approval is a wrongly answered approval. The frame already went out over every live
+      // socket, so what is lost is the banner, not the approval.
+      this.#log(
+        `push: approval ${payload.kind} not sent: its toolCallId cannot be a collapse id (contract/push-v0.md)`,
+      );
+      return;
+    }
+    let registrations: PushRegistrationRow[];
+    try {
+      registrations = this.#storage.pushRegistrations();
+    } catch (err) {
+      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    if (targets.length === 0) return;
+    const category = APPROVAL_CATEGORY[payload.kind];
+    for (const registration of targets) {
+      void this.#send(registration, payload, { category, collapseId }).catch((err: unknown) => {
+        this.#log(
+          `push: approval notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
+  async #send(
+    registration: PushRegistrationRow,
+    payload: PushPayload,
+    /** Both or neither, per contract/push-v0.md: the relay 400s a body carrying only one. */
+    routing?: { category: string; collapseId: string },
+  ): Promise<void> {
     // Yield one macrotask before the presence recheck. Without this yield the recheck would
     // run in the same synchronous span as notify()'s commit-time snapshot and could never
     // observe anything newer. setImmediate callbacks run after pending I/O callbacks, so a WS
@@ -95,7 +154,11 @@ export class RelayNotifier implements Notifier {
     const res = await this.#fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pushId: registration.pushId, ciphertext }),
+      body: JSON.stringify({
+        pushId: registration.pushId,
+        ciphertext,
+        ...(routing === undefined ? {} : routing),
+      }),
       signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
     });
     if (res.status === 404) {

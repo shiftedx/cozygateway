@@ -16,6 +16,7 @@
 import { type Static, Type } from "@sinclair/typebox";
 
 import { AttachmentBlockSchema } from "./rich-blocks.ts";
+import { ApprovalOutcomeSchema } from "./resources.ts";
 
 /** The roster preview line, already classified. `a2a` is a bot-to-bot delivery whose
  *  `Message from ... :` prefix has been stripped, with the sender handle carried separately;
@@ -165,6 +166,57 @@ export const BotChatDeltaFrameSchema = Type.Object({
   room: Type.Optional(Type.String()),
 });
 export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
+
+/** A tool call inside a bot's turn is waiting on a human decision. Capability 10 (issue #19,
+ *  bridge lane).
+ *
+ *  Why this is a bots frame and not the core `approval_pending` of contract v1.md section 5a: the
+ *  bots surface is a PARALLEL path. It has no threads, no `TurnRunner`, and no `BackendAdapter`;
+ *  every frame on it is keyed `bot` + `sessionId`, and a bot chat has no `threadId` to put in the
+ *  core frame. So the pair is mirrored onto this channel's keying and is otherwise field for field
+ *  the core pair, so one client view renders both.
+ *
+ *  Field provenance, all of it from the hermes `approval.request` event:
+ *  - `toolCallId` is the hermes `request_id`, a uuid4 hex. It is the correlation id the pending
+ *    frame, the resolve route, the resolved frame and the push collapse id all key on.
+ *  - `turnId` is the GATEWAY's own turn id for the chat, the same value `bot_chat_delta` carries.
+ *    The hermes event is session-scoped and names no turn, so the gateway supplies its own.
+ *  - `name` is DERIVED from the hermes `pattern_key` (the rule the approval matched), never from
+ *    the free-text `command`. See the derivation rule in the gateway's `approvals.ts`.
+ *
+ *  There is deliberately NO `argSummary` member: the hermes surface carries no structured
+ *  arguments to summarize, and its free-text `command` / `description` are never forwarded into
+ *  any frame, push payload, or log line. A member that does not exist cannot leak. */
+export const BotApprovalPendingFrameSchema = Type.Object({
+  type: Type.Literal("bot_approval_pending"),
+  bot: Type.String(),
+  /** The STORED canonical-chat id, the one every other bots frame uses. Never the hermes runtime
+   *  session id, which is an internal no client has ever seen. */
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  toolCallId: Type.String(),
+  name: Type.String(),
+  updatedAt: Type.Integer(),
+});
+export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
+
+/** That approval reached one of its three terminal states. Exactly one of these is ever emitted
+ *  per `toolCallId`: the first terminal state wins and every later one is swallowed.
+ *
+ *  `expired` is SYNTHESIZED by the gateway from its own timer, because hermes emits no expiry
+ *  event of any kind: it drops the queue entry silently when `approvals.timeout` (default 300 s)
+ *  lapses. It is also what a resolve answered `{"resolved": 0}` maps to, since that answer means
+ *  "the entry is gone" and therefore that nobody's decision took effect. */
+export const BotApprovalResolvedFrameSchema = Type.Object({
+  type: Type.Literal("bot_approval_resolved"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  toolCallId: Type.String(),
+  outcome: ApprovalOutcomeSchema,
+  updatedAt: Type.Integer(),
+});
+export type BotApprovalResolvedFrame = Static<typeof BotApprovalResolvedFrameSchema>;
 
 /** A bot's canonical chat was RETIRED and a fresh one pinned in its place, by
  *  `POST /bots/:name/chat/reset`. Broadcast to every paired device, which is the whole point of the
@@ -678,6 +730,16 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    A client below 9 keeps working unchanged, because `attachments` is an optional field it can
  *    ignore and no existing route or frame changed shape. What a client CANNOT infer from the
  *    version is whether the bot on the other end can see pixels: that is decided per turn inside
- *    hermes by the bot's own model, and a text-only model quietly gets a description instead. */
+ *    hermes by the bot's own model, and a text-only model quietly gets a description instead.
+ *  - `10`: mobile approve/deny for bot chats (issue #19, bridge lane). The
+ *    `bot_approval_pending` / `bot_approval_resolved` frames plus
+ *    `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny`. A client that offers an
+ *    approve/deny UI MUST require `>= 10`: a version 9 gateway 404s both routes and never sends
+ *    either frame, so the buttons would do nothing. A client below 10 keeps working unchanged --
+ *    it simply never learns that a bot is blocked on a decision, which is exactly where it was
+ *    before. What the version does NOT promise is that any approval will ever be raised: that
+ *    depends on the hermes profile running with `approvals.mode: manual` and without
+ *    `security.approval.transport`, both of which are deployment facts the wire cannot assert
+ *    (see contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin"). */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 9;
+export const BOTS_CAPABILITY_VERSION = 10;

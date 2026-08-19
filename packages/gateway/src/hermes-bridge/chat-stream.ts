@@ -214,6 +214,29 @@ export class BotChatStream implements ChatStreamBinder {
     this.#bindings.clear();
   }
 
+  /** Who a runtime session belongs to, or undefined for one this gateway is not driving.
+   *
+   *  Read by the approval bridge (`approvals.ts`), which receives `approval.request` events keyed
+   *  on the runtime id and has to answer the same question this module answers on every delta:
+   *  which bot, and which STORED session, is this. The bindings live here because here is where
+   *  they are written -- both turn paths call `bind` just before `prompt.submit`, which is the one
+   *  place in the gateway where both ids are in hand. */
+  binding(runtimeSessionId: string): StreamBinding | undefined {
+    const found = this.#bindings.get(runtimeSessionId);
+    return found === undefined ? undefined : { ...found };
+  }
+
+  /** The turn id a client is currently rendering for this runtime session, or undefined when no
+   *  turn has started. It is the value `bot_chat_delta.turnId` carries, deliberately: an approval
+   *  belongs to the turn whose bubble the user is looking at, and giving it a second, private turn
+   *  id would mean the two frames disagreed about the same turn.
+   *
+   *  A FINISHED turn still answers. The record is kept until the next bind or `message.start`, and
+   *  an approval raised as the reply lands still belongs to the turn that raised it. */
+  turnId(runtimeSessionId: string): string | undefined {
+    return this.#turns.get(runtimeSessionId)?.turnId;
+  }
+
   /** Test seam: is a draft in flight for this runtime session? A finished turn is not one. */
   drafting(runtimeSessionId: string): boolean {
     const turn = this.#turns.get(runtimeSessionId);

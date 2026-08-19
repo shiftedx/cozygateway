@@ -21,6 +21,7 @@ import { createApp } from "./http.ts";
 import { WsHub } from "./ws-hub.ts";
 import { TurnRunner } from "./turns.ts";
 import { RelayNotifier } from "./push-notifier.ts";
+import type { ApprovalPushPayload } from "./push-crypto.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { createUpgradeDispatcher, type UpgradeHandler } from "./upgrade-dispatcher.ts";
 import { createHermesClient } from "./hermes-bridge/client.ts";
@@ -107,6 +108,9 @@ export async function startGateway(
   // the whole of the coupling: unset until the notifier exists, which is before the listener is
   // bound and therefore before any room can run a round.
   let raisePush: (event: { threadId: string; agentName: string; preview: string }) => void = () => {};
+  // Same indirection, for the bots bridge's approval lifecycle (issue #19 bridge lane): the
+  // notifier does not exist yet, and no approval can be raised before the listener is bound.
+  let raiseApprovalPush: (payload: ApprovalPushPayload) => void = () => {};
 
   let bridge: HermesBridge | undefined;
   if (hermesOptions !== undefined) {
@@ -134,6 +138,37 @@ export async function startGateway(
           preview: event.text,
         });
       },
+      // Capability 10. The bots surface has no threads, so the push payload's `threadId` is the
+      // namespaced `bot:<name>` -- the same shape `group:<name>` already uses, so a client that
+      // does not know the namespace cannot mistake it for one of its threads -- and `agentId` is
+      // the bot's own profile name, which is what a bots client addresses everything else by.
+      onApproval: (event) => {
+        raiseApprovalPush(
+          event.kind === "approval_pending"
+            ? {
+                kind: "approval_pending",
+                threadId: `bot:${event.bot}`,
+                agentId: event.bot,
+                turnId: event.turnId,
+                toolCallId: event.toolCallId,
+                name: event.name,
+                // No argSummary: the hermes approval surface carries no structured arguments to
+                // summarize, so there is nothing to redact and nothing to send.
+              }
+            : {
+                kind: "approval_resolved",
+                threadId: `bot:${event.bot}`,
+                agentId: event.bot,
+                turnId: event.turnId,
+                toolCallId: event.toolCallId,
+                outcome: event.outcome,
+              },
+        );
+      },
+      ...(options.approvalLog === undefined ? {} : { approvalLog: options.approvalLog }),
+      ...(hermesOptions.approvalTimeoutMs === undefined
+        ? {}
+        : { approvalTimeoutMs: hermesOptions.approvalTimeoutMs }),
     });
   }
 
@@ -204,6 +239,7 @@ export async function startGateway(
   // Same targeting rule a 1:1 turn gets: a device holding a live socket saw the room's frame and is
   // excluded here rather than pushed to twice.
   raisePush = (event) => notifier.notify(event, hub.connectedDeviceIds());
+  raiseApprovalPush = (payload) => notifier.notifyApproval(payload, hub.connectedDeviceIds());
   const runner = new TurnRunner({
     storage,
     hub,

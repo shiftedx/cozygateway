@@ -355,6 +355,51 @@ export function registerBotRoutes(
     }
   });
 
+  // Approval verbs for a bot chat (capability 10, issue #19 bridge lane). Two sibling routes
+  // rather than one route with a decision in the body, mirroring the core
+  // `POST /threads/:id/approvals/:toolCallId/approve` exactly: the verb IS the request, there is
+  // no body, and a notification action button maps to a URL with nothing to encode. Only per-call
+  // scope exists on the wire (approve == the native `once`), so there is nothing else to say.
+  //
+  // The path carries a bot and a correlation id and NOTHING else. `turnId` travels outward on the
+  // frames and is never accepted inward, and the hermes runtime session id is never on this wire
+  // in either direction: the gateway derives the session, the turn and the pending state from its
+  // own record, so a client cannot address an approval by any reference of its own. Same IDOR
+  // posture as the core route, and the same status mapping.
+  const botApprovalRoute =
+    (decision: "approve" | "deny") =>
+    async (c: Context<Env>): Promise<Response> => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const outcome = await bots.resolveApproval(
+        resolved.name,
+        // Read through a generic Context (this handler is shared by two routes), so the param is
+        // typed as possibly absent; the router only reaches here with it present.
+        c.req.param("toolCallId") ?? "",
+        decision,
+        c.get("deviceId"),
+      );
+      switch (outcome) {
+        case "approved":
+        case "denied":
+          return c.json({ status: outcome }, 202);
+        case "unknown":
+          return c.json(errorBody("not_found", "no such pending approval"), 404);
+        case "expired":
+          return c.json(errorBody("approval_expired", "the approval expired before it was resolved"), 409);
+        case "not_pending":
+          return c.json(errorBody("approval_not_pending", "the approval is no longer pending"), 409);
+        case "unsupported":
+          // The link could not carry the decision, or this hermes has no `approval.respond`. The
+          // approval is still pending and its own timer is still what will end it, so this is
+          // honestly a backend problem rather than a decision that was refused.
+          return c.json(errorBody("backend_unavailable", "hermes could not resolve the approval"), 503);
+      }
+    };
+
+  app.post("/bots/:name/approvals/:toolCallId/approve", requireDevice, botApprovalRoute("approve"));
+  app.post("/bots/:name/approvals/:toolCallId/deny", requireDevice, botApprovalRoute("deny"));
+
   app.post("/bots/focus", requireDevice, async (c) => {
     let body: unknown;
     try {

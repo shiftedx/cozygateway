@@ -88,6 +88,14 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   changed shape. What the version does NOT promise is that the bot will SEE the picture: whether a
   photo arrives as pixels or as a description is decided per turn inside Hermes, from the bot's own
   model, and this gateway cannot observe that decision. See "What a photo actually reaches" below.
+- `10`: mobile approve/deny for bot chats. The `bot_approval_pending` and `bot_approval_resolved`
+  frames, plus `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny`. A client that offers
+  an approve/deny UI MUST require `>= 10`: a version 9 gateway 404s both routes and never sends
+  either frame, so the buttons would do nothing at all. A client below 10 keeps working unchanged;
+  it simply never learns that a bot is blocked waiting on a human, which is exactly where it was
+  before. What the version does NOT promise is that any approval will ever arrive: that depends on
+  two hermes settings this wire cannot assert, and if either is wrong the surface is silently
+  lossy. See "Deployment: what a bridged profile must pin".
 
 ## 3. Resources
 
@@ -1770,6 +1778,35 @@ restarts mid-deliberation comes back with the room, its transcript, its watermar
 intact, and the room `settled`: the process that was driving it is gone, so nothing is running, and
 the next user message starts a fresh deliberation from where the transcript left off.
 
+### POST /bots/:name/approvals/:toolCallId/approve
+### POST /bots/:name/approvals/:toolCallId/deny
+
+Version 10 and up. Resolve one pending approval. No body: the verb IS the request, exactly as
+`POST /threads/:id/interrupt` takes none, and a notification action button maps to a URL with
+nothing to encode.
+
+Only per-call scope exists on this wire. `approve` maps to the native Hermes `once`, which writes
+nothing to the session or the permanent allow-list; `deny` maps to the native `deny`. The broader
+native scopes (`session`, `always`) are deliberately not offered, a broker-boundary least-privilege
+default, and the gateway never sends either string.
+
+Server-authoritative, the same posture the core route has: the path carries a bot and a correlation
+id and NOTHING else. `turnId` travels outward on the frames and is never accepted inward, the Hermes
+runtime session id never appears on this wire in either direction, and records are kept per bot, so
+a client cannot reach another bot's approval by guessing an id.
+
+- `202 {"status": "approved"}` / `202 {"status": "denied"}`.
+- `404 not_found`: no pending approval by that id for that bot.
+- `409 approval_not_pending`: already approved or denied.
+- `409 approval_expired`: it lapsed first, deliberately distinct from denied.
+- `503 backend_unavailable`: Hermes could not carry the decision (an older build with no
+  `approval.respond`, or a link that is down). The approval is still pending, and its own timer is
+  still what will end it.
+- `401` unauthenticated, like every other route here.
+
+A resolution is audit-logged against the same `toolCallId` the frame carried, naming the bot, the
+chat, the turn, the outcome and the deciding device, and never anything describing the action.
+
 ### Errors
 
 The ordinary `ErrorBody` (`contract/v1.md` section 4) plus, when the failure came from Hermes,
@@ -1834,6 +1871,10 @@ are only ever sent by a gateway that advertises the capability.
 { type: "bot_group_state", group: string,
   state: "running" | "settled" | "needs_you",
   round: integer, epoch: integer, note?: BotGroupNote, updatedAt: integer }
+{ type: "bot_approval_pending", bot: string, sessionId: string, turnId: string,
+  toolCallId: string, name: string, updatedAt: integer }
+{ type: "bot_approval_resolved", bot: string, sessionId: string, turnId: string,
+  toolCallId: string, outcome: "approved" | "denied" | "expired", updatedAt: integer }
 ```
 
 `bot_roster` and `bot_presence` are FULL REPLACE snapshots, and both are sent only when the value
@@ -1975,13 +2016,81 @@ chat frames use. Unlike `bot_chat` there is no shared read watermark to miss: ro
 persisted with a monotonic `seq`, so a device that missed a frame recovers completely by reading
 `GET /bots/groups/:name`.
 
+### bot_approval_pending / bot_approval_resolved, the approve-deny pair
+
+Version 10 and up. A tool call inside a bot's turn is waiting on a human decision, and then reaches
+one of three terminal states. They ride the live channel, are never sealed, produce no durable
+message, and are not replayed on reconnect.
+
+These exist because the bots surface is a PARALLEL path to the core one. Contract v1.md section 5a
+already defines `approval_pending` / `approval_resolved`, keyed on `threadId` -- but a bot chat has
+no thread, no `TurnRunner` and no backend session, so those frames cannot address one. Every field
+beyond the `bot` + `sessionId` keying is copied from the core pair one for one, deliberately, so a
+client renders both with a single view.
+
+Where each field comes from, all of it out of the Hermes `approval.request` event:
+
+- `toolCallId` IS the Hermes `request_id` (a uuid4 hex). It is the correlation id the pending frame,
+  the resolve routes, the resolved frame and the push collapse id all key on. The Hermes event
+  carries no tool-call id of its own, and this is the only correlation key it offers.
+- `turnId` is the GATEWAY's own turn id for the chat: the same value `bot_chat_delta` carries, so an
+  approval lands on the bubble the user is looking at. The Hermes event is session-scoped and names
+  no turn. When no turn is in flight (an approval raised by a routine, a turn whose draft never
+  started) the gateway mints one and holds it for the life of the approval, so the pending frame and
+  the resolved frame always agree.
+- `name` is DERIVED from the Hermes `pattern_key`, the approval RULE that matched (`terminal:rm`,
+  `execute_code:python`). The rule, in order: `pattern_key` if it is a non-empty string, else the
+  first non-empty entry of `pattern_keys`, else the literal `unknown`; then capped at 120
+  characters. It is never derived from the command.
+
+There is deliberately **no `argSummary` member**, and there never will be one on this frame. The
+Hermes surface carries no structured arguments to summarize, and the free text it does carry
+(`command`, `description`) is never forwarded into any frame, push payload, or log line. A member
+that does not exist cannot leak one.
+
+`outcome` folds the three terminal states. `expired` is SYNTHESIZED by the gateway from its own
+timer: Hermes emits no expiry event of any kind, it simply drops the queue entry when its
+`approvals.timeout` (default 300 s) lapses and tells nobody. The gateway's timer mirrors that value
+and is configurable through `hermes.approvalTimeoutSeconds` in the gateway config file. `expired` is
+also what a resolve answered `{"resolved": 0}` maps to, because that answer means the entry is gone
+and therefore that nobody's decision took effect.
+
+Unlike `bot_chat_delta` there is no `room` member. An approval raised inside a group room is keyed
+on the member profile and that member's ROOM session, which is exactly how its draft is keyed, so a
+client that is already rendering the room's drafts can place it without a second field; and a
+`sessionId` that is not the bot's canonical chat is what says it is not a 1:1 approval.
+
+Exactly one `bot_approval_resolved` is ever emitted per `toolCallId`: the first terminal state wins
+and every later one is swallowed. A pending approval this gateway is already tracking is never
+re-announced either, so a reconnect that replays the same entry costs no second banner.
+
+### Deployment: what a bridged profile must pin
+
+Two Hermes settings decide whether an approval ever reaches this surface. Neither is visible on the
+wire, and neither can be inferred from the capability version, so a gateway can advertise 10
+honestly and still never send a frame if a profile is configured against it. `scripts/agent-install.sh`
+writes and verifies the first and refuses to proceed on the second.
+
+- **`approvals.mode` MUST be `manual`.** The 0.20.x default is `smart`, an aux-LLM guardian that can
+  APPROVE a dangerous call with **no event emitted at all**. Under `smart` the phone is asked
+  sometimes and not others, which reads as an approve/deny feature that is intermittently broken
+  rather than one that is absent.
+- **`security.approval.transport` MUST be unset (or `builtin`).** Setting it routes the whole
+  approval prompt to a registered plugin BEFORE the gateway branch is reached, so approvals never
+  touch the dashboard WebSocket and this bridge goes permanently blind.
+
+A related knob is the gateway's own: `hermes.approvalTimeoutSeconds` mirrors the Hermes
+`approvals.timeout`. Hermes does not expose that value over its RPC surface, so the two are kept in
+step by the operator; out of step, the only consequence is that the gateway stops offering the
+buttons earlier or later than Hermes stops accepting them, and it never resolves anything by itself.
+
 ## 7. Not in this extension yet
 
 Draft frames for anything but a bot's own reply (a user's typing, a tool call in progress), replay
 of a draft to a device that joined mid-turn, and any persistence of one; per-device chat-frame
 scoping and per-device delta watermarks; model and description writes (see
 `PATCH /bots/:name/profile`); skill install; MCP server setup and OAuth; bot duplicate; avatars;
-routine run-now and run output (the backend exposes neither over this RPC); push; attachments that
+routine run-now and run output (the backend exposes neither over this RPC); attachments that
 are not images (PDFs and arbitrary files, which Hermes does expose as `pdf.attach` and `file.attach`
 on the same surface), more than one image per send, photos into a GROUP room, and any way for a
 client to learn ahead of time whether a given bot will see pixels or a description; and

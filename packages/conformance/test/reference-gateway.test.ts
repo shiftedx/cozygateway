@@ -52,10 +52,12 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await gateway.close();
-  // The sink should only ever have collected the expected, harmless notify failure against the
+  // The sink should only ever have collected the expected, harmless notify failures against the
   // unroutable relayUrl above, never some unrelated notifier error it accidentally swallowed.
+  // Both push legs land here: an agent reply ("notify failed") and, since the approval agent above
+  // raises one per turn, the approval leg ("approval notify failed").
   for (const line of notifierLogLines) {
-    expect(line).toMatch(/^push: notify failed for device .+: fetch failed$/);
+    expect(line).toMatch(/^push: (approval )?notify failed for device .+: fetch failed$/);
   }
 });
 

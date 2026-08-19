@@ -237,3 +237,82 @@ describe("TurnRunner approvals", () => {
     adapter.finish();
   });
 });
+
+/** The push half of the approval lifecycle on the core (threads) lane -- the seam the core lane
+ *  left open. The runner announces every transition to the notifier with the payload
+ *  contract/push-v0.md specifies, and the notifier decides whether any device needs it. */
+describe("TurnRunner approval pushes", () => {
+  function pushHarness(adapter: BackendAdapter, connected: string[] = []) {
+    const storage = openStorage(":memory:");
+    storage.upsertAgent({ id: "a1", name: "A", avatar: null, backend: adapter.backend });
+    storage.createThread({ id: "t1", agentId: "a1", title: "T", createdAt: 1 });
+    const frames: ServerFrame[] = [];
+    const pushes: Array<{ payload: unknown; connected: string[] }> = [];
+    const runner = new TurnRunner({
+      storage,
+      hub: { broadcast: (f) => frames.push(f), connectedDeviceIds: () => new Set(connected) },
+      adapters: new Map([["a1", adapter]]),
+      notifier: {
+        notify: () => {},
+        notifyApproval: (payload, connectedDeviceIds) =>
+          pushes.push({ payload, connected: [...connectedDeviceIds] }),
+      },
+      now: () => 42,
+      approvalLog: () => {},
+    });
+    return { frames, runner, pushes };
+  }
+
+  it("announces pending then resolved, with the agent id the frames do not carry", async () => {
+    const adapter = approvalAdapter();
+    const { frames, runner, pushes } = pushHarness(adapter);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "rm things" }]);
+    await until(() => pendingFrames(frames).length === 1, "approval_pending");
+    const turnId = (pendingFrames(frames)[0] as { turnId: string }).turnId;
+    expect(pushes.map((p) => p.payload)).toEqual([
+      {
+        kind: "approval_pending",
+        threadId: "t1",
+        // Not on the frame: a client already knows a thread's agent, but a notification arrives
+        // with no such context, so push-v0 asks for it.
+        agentId: "a1",
+        turnId,
+        toolCallId: "call_1",
+        name: "run_shell",
+        argSummary: { command: "string" },
+      },
+    ]);
+
+    expect(await runner.resolveApproval("t1", "call_1", "deny", "d9")).toBe("denied");
+    expect(pushes[1]!.payload).toEqual({
+      kind: "approval_resolved",
+      threadId: "t1",
+      agentId: "a1",
+      turnId,
+      toolCallId: "call_1",
+      outcome: "denied",
+    });
+    adapter.finish();
+  });
+
+  it("hands the notifier the live-device set, so a connected device is not told twice", async () => {
+    const adapter = approvalAdapter();
+    const { frames, runner, pushes } = pushHarness(adapter, ["d1", "d2"]);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "rm things" }]);
+    await until(() => pendingFrames(frames).length === 1, "approval_pending");
+    expect(pushes[0]!.connected.sort()).toEqual(["d1", "d2"]);
+    adapter.finish();
+  });
+
+  it("pushes a backend-decided expiry too, so a stale banner is always replaced", async () => {
+    const adapter = approvalAdapter();
+    const { frames, runner, pushes } = pushHarness(adapter);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "rm things" }]);
+    await until(() => pendingFrames(frames).length === 1, "approval_pending");
+    adapter.expire();
+    await until(() => resolvedFrames(frames).length === 1, "approval_resolved");
+    expect(pushes).toHaveLength(2);
+    expect(pushes[1]!.payload).toMatchObject({ kind: "approval_resolved", outcome: "expired" });
+    adapter.finish();
+  });
+});
