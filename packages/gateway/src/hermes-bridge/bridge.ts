@@ -17,6 +17,7 @@ import type {
 import type { Storage } from "../storage.ts";
 import { HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
 import {
+  mintCanonicalChat,
   resolveCanonicalChat,
   listBotSessions,
   type CanonicalChatResult,
@@ -117,6 +118,7 @@ export interface BotsSurface {
   /** Fire-and-forget background refresh. Never throws, never awaited by a request handler. */
   refreshSoon(reason: string): void;
   canonicalChat(name: string): Promise<CanonicalChatResult>;
+  resetChat(name: string): Promise<ChatResetResult>;
   sessions(name: string, limit: number): Promise<SessionRow[]>;
   chatHistory(name: string): Promise<BotChatHistory>;
   sendChatMessage(
@@ -141,6 +143,14 @@ export interface BotsSurface {
   deleteGroup(name: string): void;
   groupDetail(name: string): BotGroupDetail;
   sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage;
+}
+
+/** What `POST /bots/:name/chat/reset` answers with. */
+export interface ChatResetResult {
+  /** The freshly minted canonical chat. */
+  sessionId: string;
+  /** The chat that was retired, when there was one to retire. */
+  previousSessionId?: string;
 }
 
 /** What `GET /bots/:name/routines` answers with. */
@@ -583,6 +593,150 @@ export class HermesBridge implements BotsSurface {
     })();
     this.#chatInflight.set(name, run);
     return run;
+  }
+
+  /** Retires a bot's current canonical chat and pins a fresh one in its place.
+   *
+   *  Say plainly what this is NOT, because the button that calls it will be labelled "clear chat"
+   *  and the word promises more than the backend can deliver: Hermes exposes NO session delete on
+   *  this surface. Nothing is erased. THE OLD SESSION AND ITS WHOLE TRANSCRIPT STAY ON THE HERMES
+   *  HOST, untouched, and keep appearing in `session.list` and therefore in
+   *  `GET /bots/:name/sessions`. The only thing this changes is which session the bot's canonical
+   *  pin points at: the bot starts a new conversation, it does not forget the old one. A client that
+   *  tells its user otherwise is lying on this gateway's behalf.
+   *
+   *  The teardown MUST precede the mint, and for the reason `deleteBot` spells out for the same
+   *  three lines. A turn poll left running belongs to the RETIRED session: it would keep
+   *  broadcasting `bot_chat` and `bot_chat_state` frames for a chat nobody is in any more, and every
+   *  one of those polls rewrites the very watermark this reset just dropped, so the drop never takes
+   *  and the new chat inherits a high-water mark from a session it has nothing to do with.
+   *  `BotChatTurns.cancel` is what stops it, and cancelling cannot race the poll: the loop tests the
+   *  flag at every checkpoint and returns without broadcasting.
+   *
+   *  The live DRAFT is torn down on the same call. `cancel` reaches through to
+   *  `BotChatStream.forgetBot`, which drops the bot's runtime-session bindings and any half-drafted
+   *  turn, so no `bot_chat_delta` can arrive for the retired chat once this returns. There is a
+   *  second, independent guard behind it: `BotChatTurns.#startTurn` cancels a poll whose `sessionId`
+   *  changed underneath it, which is exactly the shape a re-pin has, so even a poll opened in the
+   *  gap would be cancelled by the first send into the new chat rather than run out its cap.
+   *
+   *  Mutually exclusive with `canonicalChat` by design, through the same `#chatInflight` map: a
+   *  resolve that is already on the wire is awaited first (its failure is swallowed, since the reset
+   *  is about to replace whatever it was resolving), and while the reset runs a concurrent resolve
+   *  JOINS it and receives the new chat rather than racing the mint and answering with a session
+   *  that is a moment from being retired. A second reset serializes behind the first the same way
+   *  and then mints again, which is what a user tapping "clear" twice actually asked for. */
+  async resetChat(name: string): Promise<ChatResetResult> {
+    // Checked before anything routes or mints, the same rule `canonicalChat` states: `session.create`
+    // does not validate the profile, and Hermes 0.20.x answers an unknown name by creating one.
+    await this.#assertBotKnown(name);
+
+    const pending = this.#chatInflight.get(name);
+    if (pending !== undefined) {
+      // Awaited, not joined: the reset needs to know what it is retiring, and a resolve that failed
+      // still tells it nothing worth failing over.
+      try {
+        await pending;
+      } catch {
+        /* The chat this reset is replacing could not be resolved. It is being replaced anyway. */
+      }
+    }
+
+    const run = (async (): Promise<{ chat: CanonicalChatResult; previousSessionId?: string }> => {
+      try {
+        this.#routedProfile = name;
+        this.#busyDepth += 1;
+        try {
+          // Read ONCE, before anything writes: this is the pin the server carried going in, and it
+          // is what tells the writeback below the difference between "the server never had a pin"
+          // and "someone cleared the pin while this reset was running".
+          const serverPin = await this.#serverPinOf(name);
+
+          // What is being retired. This resolve may itself MINT a chat, for a bot nobody has ever
+          // opened, and that is honest rather than wasteful: the reset then retires the chat it just
+          // resolved, and the user gets the fresh chat they asked for either way.
+          let previousSessionId: string | undefined;
+          try {
+            const current = await resolveCanonicalChat(name, {
+              rpc: this.#client,
+              pins: this.#pins,
+              hideBotChats: this.#hideBotChats,
+              serverPin,
+              saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
+              assertStillExists: async () => {
+                if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
+              },
+            });
+            previousSessionId = current.sessionId;
+          } catch (err) {
+            // A chat that cannot even be resolved is the strongest possible reason to want a new
+            // one, so this does not fail the reset: the answer simply carries no `previousSessionId`,
+            // which is the wire's way of saying there was nothing to retire.
+            const detail = err instanceof Error ? err.message : "unknown";
+            this.#log(`chat reset for ${name} could not resolve the outgoing chat: ${detail}`);
+          }
+
+          // Teardown BEFORE the mint. See the doc comment: order is the whole correctness argument.
+          this.#chat.cancel(name);
+          this.#kickoffs.delete(name);
+          this.#pins.clear(name);
+
+          const minted = await mintCanonicalChat(name, {
+            rpc: this.#client,
+            pins: this.#pins,
+            hideBotChats: this.#hideBotChats,
+            assertStillExists: async () => {
+              if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
+            },
+          });
+          // Born lazy, exactly like a chat `canonicalChat` created: no row exists until the kickoff
+          // lands, so the runtime id and the moment are what make the next few seconds work at all.
+          this.#kickoffs.set(name, {
+            sessionId: minted.storedId,
+            runtimeId: minted.runtimeId,
+            at: this.#now(),
+          });
+          // Push the new pin cross-machine. Never allowed to fail the reset (it swallows its own
+          // failures): a gateway that cannot store `ui_meta` still reset the chat, the pin just
+          // stays gateway-local, which is the same trade the resolve path makes.
+          await this.#saveServerPin(name, minted.storedId, serverPin);
+
+          this.#broadcast({
+            type: "bot_chat_reset",
+            bot: name,
+            sessionId: minted.storedId,
+            ...(previousSessionId === undefined ? {} : { previousSessionId }),
+            updatedAt: this.#now(),
+          });
+
+          return {
+            chat: { sessionId: minted.storedId, adoption: "created", runtimeId: minted.runtimeId },
+            ...(previousSessionId === undefined ? {} : { previousSessionId }),
+          };
+        } finally {
+          this.#busyDepth = Math.max(0, this.#busyDepth - 1);
+          if (this.#busyDepth === 0) this.#routedProfile = null;
+          this.refreshSoon("chat reset");
+        }
+      } finally {
+        this.#chatInflight.delete(name);
+      }
+    })();
+
+    // The map is typed for what a RESOLVE answers, which is what a joining `canonicalChat` caller
+    // expects, so the reset's own richer result is narrowed on the way in. The rejection handler is
+    // not cosmetic: nothing awaits this derived promise when no resolve joins, and an unhandled
+    // rejection on it would be reported even though `run` itself is awaited right below.
+    const joinable = run.then((result) => result.chat);
+    void joinable.catch(() => {});
+    this.#chatInflight.set(name, joinable);
+    const result = await run;
+    return {
+      sessionId: result.chat.sessionId,
+      ...(result.previousSessionId === undefined
+        ? {}
+        : { previousSessionId: result.previousSessionId }),
+    };
   }
 
   async sessions(name: string, limit: number): Promise<SessionRow[]> {

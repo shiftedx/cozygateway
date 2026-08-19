@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 7 }
+"capabilities": { "com.cozylabs.bots": 8 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -73,6 +73,13 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   reached for it anyway would turn links that work today into broken-image chips. Below 7 a client
   keeps whatever it did before, which is to show the URL as a link. This is a route bump with no
   frame changes and no change to any existing route.
+- `8`: `POST /bots/:name/chat/reset` plus the `bot_chat_reset` frame. A client that offers a "clear
+  chat" action MUST require `>= 8`: a version 7 gateway 404s the route. Note what it is NOT: hermes
+  exposes no session delete here, so the retired chat is still on the hermes host and still appears
+  in `GET /bots/:name/sessions`; what is cleared is which session the bot's canonical chat points at.
+  The frame matters as much as the route, which is why they ride one number: a client below 8 ignores
+  `bot_chat_reset` and goes on appending to a session that is no longer canonical, which looks
+  perfectly correct on that device and diverges from every other one.
 
 ## 3. Resources
 
@@ -598,6 +605,57 @@ is an ordinary turn.
 There is exactly ONE turn poll per bot. A send that arrives while a poll is running rides that
 poll rather than starting another, and extends its deadline. Three consecutive failing polls
 abandon the turn with `phase: "failed"`; a single transient failure is ridden out.
+
+### POST /bots/:name/chat/reset
+
+Capability `>= 8`.
+
+```
+(no request body)
+200 { name: string, sessionId: string, previousSessionId?: string }
+404 not_found                         // no profile named `name` exists
+502 backend_unavailable               // hermes refused to create the replacement chat
+```
+
+Retires the bot's current canonical chat and pins a freshly minted one in its place. This is what a
+"clear chat" or "start over" action calls, and the word "clear" is generous, so read the next
+paragraph before you write that label.
+
+**Nothing is deleted.** Hermes exposes no session delete on this surface, so a reset is a
+retire-and-re-pin and never a removal. The old session and its entire transcript stay on the Hermes
+host, untouched, and keep appearing in `GET /bots/:name/sessions` and in the Hermes desktop's own
+session list. The only thing that changes is which session the bot's canonical pin points at: the
+bot starts a new conversation, it does not forget the old one. A client that promises its user the
+history is gone is promising something this gateway did not do. What a reset genuinely buys is a
+fresh context window for the bot and a clean chat screen for the user, which is what the action is
+usually wanted for.
+
+**The new chat is not empty.** It is minted exactly as `GET /bots/:name/chat` mints one on the
+`created` path: a session titled `Bot Chat`, hidden by default, born with the kickoff prompt,
+because Hermes persists no row for a session until its first prompt lands. So the reset chat comes
+back with the bot's greeting rather than with nothing, and for the first few seconds it cannot be
+resumed at all, exactly like any freshly created chat (the kickoff-window tolerance described under
+`GET /bots/:name/chat/messages` applies unchanged).
+
+`previousSessionId` is the id the pin pointed at before this call. It is ABSENT only when there was
+nothing to retire, which in practice means the outgoing chat could not be resolved at all; a bot
+that has simply never been opened gets its chat resolved (and therefore minted) first, and is then
+reset, so it answers with both ids like everything else.
+
+**200, not 202.** Unlike a send, the work this route describes is finished when it answers: the new
+chat exists, it is pinned locally and pushed to `ui_meta`, the retired chat's turn poll is
+cancelled, and the `bot_chat_reset` frame has gone out. Only the kickoff reply is still in flight,
+and that reply is not what was asked for; it arrives over `bot_chat` like any other.
+
+What the gateway tears down before it mints, and why a client can rely on it: the retired chat's
+turn poll is cancelled, its delta watermark and pending sends are dropped, and the live-draft
+bindings are forgotten. So no `bot_chat`, `bot_chat_state` or `bot_chat_delta` frame for the retired
+session arrives after this route answers. A poll left running would have kept broadcasting for a
+chat nobody is in and would have rewritten the very watermark the reset dropped.
+
+A reset is mutually exclusive with the canonical-chat resolve for that bot. A resolve already in
+flight is awaited first, and a resolve that arrives while the reset runs joins it and receives the
+NEW chat, so no device is ever handed a session id that is a moment from being retired.
 
 ### GET /bots/:name/media
 
@@ -1561,6 +1619,8 @@ are only ever sent by a gateway that advertises the capability.
 { type: "bot_chat_delta", bot: string, sessionId: string, turnId: string,
   text: string, seq: integer, updatedAt: integer,
   done?: boolean, room?: string }
+{ type: "bot_chat_reset", bot: string, sessionId: string,
+  previousSessionId?: string, updatedAt: integer }
 { type: "bot_routines", bot: string, routines: BotRoutine[], updatedAt: integer }
 { type: "bot_group", group: string, messages: BotGroupMessage[], updatedAt: integer }
 { type: "bot_group_state", group: string,
@@ -1664,6 +1724,19 @@ Unchanged text is never re-sent.
 Nothing derived from a model's chain of thought EVER rides this frame. Hermes emits
 `thinking.delta`, `reasoning.delta` and `reasoning.available` on the very same socket; the gateway
 reads the `message.*` family and drops everything else, and there is no setting that changes it.
+
+`bot_chat_reset` says a bot's canonical chat was RETIRED and a fresh one pinned in its place, by
+`POST /bots/:name/chat/reset`. Version 8 and up. `sessionId` is the new chat, `previousSessionId` the
+one that was retired (absent when there was nothing to retire). It is broadcast to every paired
+device, which is the whole reason it exists: a second device sitting on the old chat has no other way
+to learn that the session it is appending to is no longer the bot's. On receipt, rebind to
+`sessionId`, drop any draft you were rendering, and read `GET /bots/:name/chat/messages` for the new
+chat, which will be the bot's greeting once the kickoff lands.
+
+It is not a deletion notice. The retired session is still on the hermes host and still in
+`GET /bots/:name/sessions`; only the pin moved. No further `bot_chat`, `bot_chat_state` or
+`bot_chat_delta` frame will arrive for the retired session, because the gateway cancels its turn poll
+and forgets its draft bindings before it mints the replacement.
 
 `bot_routines` is a FULL REPLACE for one bot, sent only when that bot's routine list actually
 changed, so an idle cron store is silent. It fires when this gateway changed a routine, and when a

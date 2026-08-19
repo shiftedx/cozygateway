@@ -127,8 +127,15 @@ export async function listBotSessions(rpc: HermesRpc, name: string, limit: numbe
  *  then submit the kickoff
  *  prompt against the RUNTIME id (the stored id is what gets pinned; they are different values).
  *  A failed submit rolls the pin back, exactly as the desktop does, so a half-created chat never
- *  becomes the permanent pointer. */
-async function createCanonicalChat(
+ *  becomes the permanent pointer.
+ *
+ *  Exported because there are now TWO ways a chat gets minted, and they must mint it identically or
+ *  a reset chat would not be byte-compatible with a resolved one: `resolveCanonicalChat` below,
+ *  which mints only when a bot has no chat at all, and the RESET path in the bridge
+ *  (`HermesBridge.resetChat`), which retires the current pin and mints a replacement on purpose.
+ *  Keeping one implementation is what guarantees both are born with the exact title, the hidden
+ *  flag, and the kickoff prompt that makes the session persist at all. */
+export async function mintCanonicalChat(
   name: string,
   deps: CanonicalChatDeps,
 ): Promise<{ storedId: string; runtimeId: string }> {
@@ -194,7 +201,7 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
     // No pin and no history: the pin, if any, points at nothing. Clear it before creating so a
     // failed creation cannot leave a stale pointer behind.
     deps.pins.clear(name);
-    const created = await createCanonicalChat(name, deps);
+    const created = await mintCanonicalChat(name, deps);
     return { sessionId: created.storedId, adoption: "created", runtimeId: created.runtimeId };
   }
 
