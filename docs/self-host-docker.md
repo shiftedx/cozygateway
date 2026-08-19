@@ -176,4 +176,10 @@ Relay APNs environment:
 | `APNS_TOPIC` | the app bundle id (`com.cozylabs.cozychat`) |
 | `APNS_ENVIRONMENT` | `development` or `production` |
 
-When any of these is set they must all be set, or the relay fails to start.
+When any of these is set they must all be set, or the relay fails to start. The relay also parses
+the `.p8` at startup: a present-but-unreadable key fails loud immediately (naming the path) rather
+than starting green and rejecting every push. Leaving all five unset keeps APNs off, and the relay
+starts normally.
+
+Each push opens its own HTTP/2 session to APNs and closes it on the way out, with a 10-second
+per-push delivery deadline so a silent APNs session cannot wedge the sender.
