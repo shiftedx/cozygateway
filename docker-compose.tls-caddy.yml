@@ -1,0 +1,52 @@
+# TLS option A: a Caddy sidecar in front of the gateway. RECOMMENDED for most deployments.
+#
+# This is an OVERLAY, not a replacement. It is composed on top of the default file and changes
+# nothing about how the gateway itself runs:
+#
+#   cp .env.example .env                      # set COZY_TLS_HOSTNAME
+#   docker compose -f docker-compose.yml -f docker-compose.tls-caddy.yml up -d
+#
+# A deployment that never names this file is byte-for-byte the plain-HTTP deployment it always was.
+#
+# What changes: the gateway's port is no longer published to the host, so the only way in is
+# through Caddy on 443. The gateway still speaks plain HTTP, on the private compose network only.
+#
+# Caddy rather than Traefik, for a reference example: `tls internal` issues and renews a
+# certificate from a local CA with one directive and no ACME reachability, which is exactly the
+# LAN-homelab case this repo's beta ran into, and swapping that one line for a bare hostname turns
+# it into real Let's Encrypt for a public name. Traefik's equivalent is a static file plus an
+# entrypoint plus a resolver plus per-service labels, and a box that already runs Traefik as shared
+# infrastructure (as the beta box does) is exactly where a second example Traefik would be
+# dangerous to paste. Nothing here is Caddy-specific in the gateway: any terminating proxy works.
+
+services:
+  gateway:
+    # Reachable only from the compose network. Delete this block if you also want the plaintext
+    # port on the host (you almost certainly do not).
+    ports: !override []
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - gateway
+    environment:
+      # The name the phone will dial. For `tls internal` this can be a LAN name or IP; for public
+      # ACME it must be a real hostname that resolves to this machine.
+      COZY_TLS_HOSTNAME: "${COZY_TLS_HOSTNAME:?set COZY_TLS_HOSTNAME in .env}"
+      COZY_GATEWAY_UPSTREAM: "gateway:${COZYGATEWAY_PORT:-8787}"
+    ports:
+      - "443:443"
+      # Only needed for public ACME (HTTP-01 challenge and the http->https redirect). Harmless
+      # otherwise; drop it on a LAN-only box that has nothing to redirect.
+      - "80:80"
+    volumes:
+      - ./docker/Caddyfile.example:/etc/caddy/Caddyfile:ro
+      # Persist the issued certificates (and the local CA root, for `tls internal`) so a restart
+      # does not mint a new identity and re-trip the app's TOFU pin.
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

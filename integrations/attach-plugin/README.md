@@ -19,9 +19,13 @@ variables for the harness process:
   the environment variable that holds it (`options.tokenEnv`); generate your own value
   and give it to both processes. It is presented header-only and never rides a URL.
 
-Optional: `COZYGATEWAY_CA_FILE` (private-CA TLS, unused on the current plaintext
-loopback gateway), `COZYGATEWAY_RECONNECT_INITIAL_SECONDS` (0.5),
-`COZYGATEWAY_RECONNECT_MAX_SECONDS` (30).
+Set `COZYGATEWAY_URL` to an `https://` origin when the gateway terminates TLS (see
+`docs/tls.md`); the plugin swaps the scheme to `wss` for the attach socket by itself, so
+nothing else about this setup changes.
+
+Optional: `COZYGATEWAY_CA_FILE` (a PEM to verify a private-CA or self-signed gateway
+certificate against; ignored on a plaintext gateway),
+`COZYGATEWAY_RECONNECT_INITIAL_SECONDS` (0.5), `COZYGATEWAY_RECONNECT_MAX_SECONDS` (30).
 
 Also set `COZYGATEWAY_HOME_CHANNEL=thread` (any non-empty value works). Some harnesses
 prompt to pick a "home channel" the first time a new platform delivers a message, and that

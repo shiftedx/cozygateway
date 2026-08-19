@@ -415,6 +415,11 @@ own remote-gateway story. Two shapes that work:
   public hostname as a separate gateway entry, so it needs its own pairing code.
 - **Tailscale.** Install it on the gateway machine and the phone, then use the machine's tailnet
   address. No public exposure, no certificate work.
+- **TLS on the gateway itself.** `docs/tls.md` covers two shipped options: a Caddy sidecar overlay
+  that issues its own certificate, or gateway-native TLS from a cert/key pair you supply. Neither
+  changes anything you did in this playbook -- the install above sets no TLS variables and the
+  gateway it produced serves plain HTTP as documented. Treat TLS as a follow-on the human can ask
+  for once pairing works, not a step here.
 
 Do not put the gateway on the open internet without one of these in front of it. This applies
 double to the Hermes dashboard if you bound it to `0.0.0.0` in Step 3: it is the human's whole

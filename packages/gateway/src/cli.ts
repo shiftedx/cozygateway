@@ -5,6 +5,7 @@ import { applyEnvOverrides, loadConfig } from "./config.ts";
 import { openStorage } from "./storage.ts";
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
+import { gatewayScheme } from "./tls.ts";
 
 const USAGE = `usage: cozygateway <serve|pair> --config <path>`;
 
@@ -34,7 +35,11 @@ export async function runCli(argv: string[]): Promise<number> {
     const code = newSetupCode();
     storage.createSetupCode(code, Date.now() + SETUP_CODE_TTL_MS);
     storage.close();
-    const payload = { gatewayUrl: `http://127.0.0.1:${config.port}`, setupCode: code };
+    // The scheme comes from the config, not a literal: the payload is what the phone dials, so an
+    // https gateway advertising `http://` would send every scan at a port that is not speaking
+    // plaintext. Derived without opening the cert files, since `pair` binds no listener; a broken
+    // pair is `serve`'s to shout about.
+    const payload = { gatewayUrl: `${gatewayScheme(config)}://127.0.0.1:${config.port}`, setupCode: code };
     console.log(JSON.stringify(payload));
     console.log(`Setup code ${code} is valid for 10 minutes. Scan or type it in the app.`);
     return 0;
