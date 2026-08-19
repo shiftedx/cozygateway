@@ -361,6 +361,68 @@ const photo = (fileId = "f1") => ({
   block: { type: "attachment" as const, fileId, name: "photo.png", mimeType: "image/png", size: 3 },
 });
 
+/** A hermes stub that models the attached-image QUEUE the way 0.20.4 really does it, because the
+ *  bug this guards against is entirely about that queue and a stub that merely records calls cannot
+ *  see it. Read off `tui_gateway/methods_prompt.py` and `tui_gateway/server.py`:
+ *
+ *  - `image.attach_bytes` writes the bytes into the profile's images dir and pushes the resulting
+ *    ABSOLUTE PATH onto `session["attached_images"]`, answering `{ attached: true, path, count }`.
+ *  - `prompt.submit` takes the whole queue and clears it (`server.py:10495`), so an image is spent on
+ *    exactly one turn, whichever turn comes next.
+ *  - `image.detach` (`methods_prompt.py:1139`) REQUIRES `path`, rejects an empty one with
+ *    `4015 path required`, and removes exactly that entry. It is not a "clear the queue" call.
+ *
+ *  That third rule is the one worth modelling strictly. A stub that answered any detach with success
+ *  let a pathless call look like protection while hermes rejected it every time. */
+function queueingHermes(opts: { failSubmit?: boolean } = {}) {
+  const calls: string[] = [];
+  const queue: string[] = [];
+  const written: string[] = [];
+  const detaches: Array<Record<string, unknown>> = [];
+  const spent: Array<{ text: string; images: string[] }> = [];
+  let seq = 0;
+  const stub = {
+    calls,
+    queue,
+    written,
+    detaches,
+    spent,
+    failSubmit: opts.failSubmit ?? false,
+    methods: (): string[] => calls,
+    request: async (method: string, params?: unknown): Promise<unknown> => {
+      calls.push(method);
+      const record = (params ?? {}) as Record<string, unknown>;
+      if (method === "image.attach_bytes") {
+        seq += 1;
+        const path = `/Users/operator/.hermes/profiles/scout/images/upload_2026_${seq}.png`;
+        queue.push(path);
+        written.push(path);
+        return { attached: true, path, count: queue.length, bytes: 16 };
+      }
+      if (method === "image.detach") {
+        detaches.push(record);
+        const path = typeof record["path"] === "string" ? record["path"] : "";
+        // Verbatim from the real method: no path, no detach.
+        if (path === "") throw Object.assign(new Error("4015 path required"), { code: 4015 });
+        const before = queue.length;
+        const kept = queue.filter((entry) => entry !== path);
+        queue.length = 0;
+        queue.push(...kept);
+        return { detached: queue.length !== before, count: queue.length };
+      }
+      if (method === "prompt.submit") {
+        if (stub.failSubmit) throw new Error("5003 session went away");
+        // Consume and clear, exactly as the turn start does.
+        spent.push({ text: String(record["text"] ?? ""), images: [...queue] });
+        queue.length = 0;
+        return { ok: true };
+      }
+      return { session_id: "runtime-1", message_count: 0, running: false, inflight: false, messages: [] };
+    },
+  };
+  return stub;
+}
+
 describe("BotChatTurns, the attach-then-submit pair", () => {
   it("attaches BEFORE it submits, against the runtime id, and answers with the block", async () => {
     const rpc = rpcStub();
@@ -432,25 +494,86 @@ describe("BotChatTurns, the attach-then-submit pair", () => {
     // Hermes' attached-image queue is spent by the NEXT prompt, whatever it is. Leaving one behind
     // means the user's next unrelated question silently carries a picture the transcript does not
     // show, or a retry of the photo puts it in twice.
-    const calls: string[] = [];
-    const detached: Array<Record<string, unknown>> = [];
+    //
+    // The stub models the REAL method rather than accepting anything: `image.detach` requires a
+    // `path` (methods_prompt.py:1139-1146) and removes exactly that entry. A lenient stub is what let
+    // a pathless detach look green while the protection it stood for was inert.
+    const hermes = queueingHermes({ failSubmit: true });
+    const turns = new BotChatTurns({
+      rpc: hermes,
+      broadcast: () => {},
+      now: tickingClock(),
+      pollMs: 5,
+      timeoutMs: 50,
+    });
+    await expect(turns.send("scout", "stored-1", "look", { photo: photo() })).rejects.toThrow(/5003/);
+
+    expect(hermes.methods()).toEqual(["session.resume", "image.attach_bytes", "prompt.submit", "image.detach"]);
+    // The detach carries the EXACT path the attach reported, which is the only handle hermes accepts.
+    expect(hermes.detaches).toEqual([{ session_id: "runtime-1", path: hermes.written[0] }]);
+    // And the property that actually matters: hermes is no longer holding the picture.
+    expect(hermes.queue).toEqual([]);
+  });
+
+  it("leaves nothing for the user's next turn to pick up after a failed photo send (review I2, live shape)", async () => {
+    // The user-visible defect, end to end: photo 502s, user shrugs and types something unrelated, and
+    // that turn carries the orphaned picture into the model's context. Asserted on what the next
+    // prompt actually consumes rather than on the RPC that was supposed to prevent it.
+    const hermes = queueingHermes({ failSubmit: true });
+    const turns = new BotChatTurns({
+      rpc: hermes,
+      broadcast: () => {},
+      now: tickingClock(),
+      pollMs: 5,
+      timeoutMs: 50,
+    });
+    await expect(turns.send("scout", "stored-1", "what is this", { photo: photo() })).rejects.toThrow(/5003/);
+
+    hermes.failSubmit = false;
+    await turns.send("scout", "stored-1", "what is the weather");
+    expect(hermes.spent).toEqual([{ text: "what is the weather", images: [] }]);
+    await turns.settled("scout");
+  });
+
+  it("does not pretend to unwind when hermes reported no path", async () => {
+    // An attach with no path leaves no handle to detach with, so the gateway says so rather than
+    // sending a call it knows hermes will reject. The send still fails on the submit, as it must.
+    const logs: string[] = [];
     const rpc = {
-      request: async (method: string, params?: unknown): Promise<unknown> => {
-        calls.push(method);
-        if (method === "image.attach_bytes") return { attached: true };
+      request: async (method: string): Promise<unknown> => {
+        if (method === "image.attach_bytes") return { attached: true, count: 1 };
         if (method === "prompt.submit") throw new Error("5003 session went away");
-        if (method === "image.detach") {
-          detached.push((params ?? {}) as Record<string, unknown>);
-          return { detached: true };
-        }
+        if (method === "image.detach") throw new Error("4015 path required");
+        return { session_id: "runtime-1", message_count: 0, running: false, inflight: false, messages: [] };
+      },
+    };
+    const turns = new BotChatTurns({
+      rpc,
+      broadcast: () => {},
+      now: tickingClock(),
+      pollMs: 5,
+      timeoutMs: 50,
+      log: (line) => logs.push(line),
+    });
+    await expect(turns.send("scout", "stored-1", "look", { photo: photo() })).rejects.toThrow(/5003/);
+    expect(logs.some((line) => /reported no path/.test(line))).toBe(true);
+  });
+
+  it("treats an attach result that is not an object at all as a failure", async () => {
+    // The `attached === true` check has to survive a build that answers with a bare value; a truthy
+    // test on a non-object would read `undefined` and stop, but a coercing one would not.
+    const calls: string[] = [];
+    const rpc = {
+      request: async (method: string): Promise<unknown> => {
+        calls.push(method);
+        if (method === "image.attach_bytes") return "ok";
+        if (method === "prompt.submit") return { ok: true };
         return { session_id: "runtime-1", message_count: 0, running: false, inflight: false, messages: [] };
       },
     };
     const turns = new BotChatTurns({ rpc, broadcast: () => {}, now: tickingClock(), pollMs: 5, timeoutMs: 50 });
-    await expect(turns.send("scout", "stored-1", "look", { photo: photo() })).rejects.toThrow(/5003/);
-
-    expect(calls).toEqual(["session.resume", "image.attach_bytes", "prompt.submit", "image.detach"]);
-    expect(detached).toEqual([{ session_id: "runtime-1" }]);
+    await expect(turns.send("scout", "stored-1", "look", { photo: photo() })).rejects.toThrow(/did not attach/);
+    expect(calls).not.toContain("prompt.submit");
   });
 
   it("does not detach when nothing was ever attached", async () => {
@@ -639,8 +762,13 @@ interface Harness {
 function fakeBotMode(messages: Array<Record<string, unknown>> = []): {
   behavior: FakeHermesBehavior;
   attaches: Array<Record<string, unknown>>;
+  /** The session's `attached_images` list, modelled the way hermes really keeps it, so a test can
+   *  assert what the NEXT turn would pick up rather than which RPC was called. */
+  queue: string[];
 } {
   const attaches: Array<Record<string, unknown>> = [];
+  const queue: string[] = [];
+  let seq = 0;
   const behavior: FakeHermesBehavior = {
     methods: {
       "profiles.list": () => ({
@@ -665,12 +793,30 @@ function fakeBotMode(messages: Array<Record<string, unknown>> = []): {
       "session.create": () => ({ stored_session_id: "canonical", session_id: "runtime-1" }),
       "image.attach_bytes": (params) => {
         attaches.push(params);
-        return { attached: true, count: 1, bytes: 16, width: 1, height: 1 };
+        seq += 1;
+        // The real response carries the absolute path it wrote, and that path is the only handle
+        // `image.detach` will take.
+        const path = `/Users/operator/.hermes/profiles/scout/images/upload_2026_${seq}.png`;
+        queue.push(path);
+        return { attached: true, path, count: queue.length, bytes: 16, width: 1, height: 1 };
+      },
+      // Verbatim from `tui_gateway/methods_prompt.py:1139-1156`: `path` is required, an empty one is
+      // `4015`, and exactly that entry is removed.
+      "image.detach": (params) => {
+        const path = typeof params["path"] === "string" ? params["path"] : "";
+        if (path === "") throw { code: 4015, message: "path required" };
+        const before = queue.length;
+        const kept = queue.filter((entry) => entry !== path);
+        queue.length = 0;
+        queue.push(...kept);
+        return { detached: queue.length !== before, count: queue.length };
       },
       "prompt.submit": (params) => {
         if (params["session_id"] !== "runtime-1") {
           throw { code: 5003, message: `prompt.submit needs the runtime session id, got ${String(params["session_id"])}` };
         }
+        // Consume and clear: an image is spent on exactly one turn, whichever comes next.
+        queue.length = 0;
         return { ok: true };
       },
       "session.resume": (params) => ({
@@ -683,7 +829,7 @@ function fakeBotMode(messages: Array<Record<string, unknown>> = []): {
       "profiles.configure": () => ({ applied: { ui_meta: true } }),
     },
   };
-  return { behavior, attaches };
+  return { behavior, attaches, queue };
 }
 
 async function setup(
@@ -929,6 +1075,30 @@ describe("POST /bots/:name/chat/photos", () => {
     } as RequestInit);
     expect(res.status).toBe(413);
     expect(((await res.json()) as { reason: string }).reason).toBe("too_large");
+  });
+
+  it("leaves hermes holding nothing when the attach landed and the submit failed", async () => {
+    // The whole route, against the fake hermes' real queue semantics. A 502 here promises "nothing
+    // was submitted"; this asserts the half of that promise the RPC-level tests cannot see, which is
+    // that hermes is not still holding the picture for whatever turn comes next.
+    const { behavior, queue } = fakeBotMode();
+    behavior.methods!["prompt.submit"] = () => {
+      throw { code: 5003, message: "session went away" };
+    };
+    const { authed, server } = await setup(behavior);
+    const res = await authed("/bots/scout/chat/photos", upload(PNG, "image/png", { text: "look" }));
+    expect(res.status).toBe(502);
+
+    expect(queue).toEqual([]);
+    // And the detach that emptied it carried the exact path the attach reported, because that is the
+    // only thing hermes' `image.detach` accepts (`4015 path required` otherwise).
+    const attachPath = (server.callsOf("image.attach_bytes")[0] !== undefined
+      ? "/Users/operator/.hermes/profiles/scout/images/upload_2026_1.png"
+      : "");
+    const detach = server.callsOf("image.detach")[0];
+    expect(detach).toBeDefined();
+    expect(detach!.params["path"]).toBe(attachPath);
+    expect(detach!.params["session_id"]).toBe("runtime-1");
   });
 
   it("leaves no stored bytes behind when the send failed", async () => {
