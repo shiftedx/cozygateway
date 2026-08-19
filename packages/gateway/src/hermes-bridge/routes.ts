@@ -28,6 +28,19 @@ import {
   normalizeProfileName,
 } from "./crud.ts";
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
+import {
+  MEDIA_CACHE_CONTROL,
+  MEDIA_MAX_CONCURRENT,
+  MediaBusy,
+  MediaRefused,
+  MediaTimedOut,
+  MediaUpstreamFailed,
+  type MediaFetch,
+  type MediaLimiter,
+  type MediaLookup,
+  fetchMedia,
+  resolveMediaSource,
+} from "./media.ts";
 import { RoutineNotFound, RoutineRefused, RoutineUnconfirmed, patchNeedsRewrite } from "./routines.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
@@ -63,9 +76,14 @@ function errorBody(code: ErrorCode, message: string): ErrorBody {
 /** Error codes this extension adds to the frozen core list (`contract/v1.md` section 4 keeps
  *  `error.code` a plain string precisely so an extension can). A client that does not know them
  *  treats them as a generic failure, which the HTTP status already conveys. */
-function extensionErrorBody(code: "conflict" | "command_blocked", message: string): ErrorBody {
+function extensionErrorBody(code: "conflict" | "command_blocked" | "media_refused", message: string): ErrorBody {
   return { error: { code, message } };
 }
+
+/** Longest `src` `GET /bots/:name/media` accepts. A URL in a bot's reply is an ordinary URL; the cap
+ *  exists so an unbounded query string cannot be pushed through the route, and it is checked before
+ *  anything is parsed. */
+export const MEDIA_SRC_MAX = 2048;
 
 /** The ONE canonicalization every `/bots/:name` route applies to its path parameter, so a bot has
  *  exactly one identity no matter what casing or padding a client used in the URL.
@@ -216,6 +234,13 @@ export function registerBotRoutes(
   app: Hono<Env>,
   requireDevice: MiddlewareHandler<Env>,
   bots: BotsSurface,
+  mediaOptions: {
+    fetchImpl?: MediaFetch;
+    timeoutMs?: number;
+    lookup?: MediaLookup;
+    limiter?: MediaLimiter;
+    queueWaitMs?: number;
+  } = {},
 ): void {
   // Cache-first: the snapshot answers immediately, even on a cold link, and a refresh runs in the
   // background so the next read (or the /ws bot_roster frame) carries fresh state.
@@ -557,6 +582,48 @@ export function registerBotRoutes(
     }
   });
 
+  // The media proxy. `name` scopes the route to a bot for symmetry with everything else under
+  // `/bots/:name`, and is validated the same way, but it is NOT resolved against Hermes: the answer
+  // does not depend on which bot's reply carried the URL, and making an image load wait on a roster
+  // round trip would put a Hermes outage between the user and a picture already sitting on a CDN.
+  //
+  // A range request is not supported and is not needed: the cap is 10 MB, so the answer is always a
+  // single whole image, and `Accept-Ranges` is left off rather than implied.
+  app.get("/bots/:name/media", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const src = c.req.query("src");
+    if (src === undefined || src.trim() === "") {
+      return c.json(errorBody("invalid_request", "src is required"), 400);
+    }
+    if (src.length > MEDIA_SRC_MAX) {
+      return c.json(errorBody("invalid_request", `src must be at most ${MEDIA_SRC_MAX} characters`), 400);
+    }
+    try {
+      const source = resolveMediaSource(src);
+      const media = await fetchMedia(source, mediaOptions);
+      return new Response(media.body, {
+        status: 200,
+        headers: {
+          "content-type": media.contentType,
+          "cache-control": MEDIA_CACHE_CONTROL,
+          // The bytes came from a host a bot's text named, and this is an authenticated same-origin
+          // route, so the browser or web view is told to take the declared type and not go looking
+          // for a better one. The type is already off an allow-list of raster formats; this stops a
+          // sniffer from promoting something that slipped past it into markup.
+          "x-content-type-options": "nosniff",
+          // The app keys its cache on the source, not on this URL, so the source rides back on the
+          // answer: a client that followed a redirect chain server-side otherwise has no way to know
+          // what it actually got.
+          "x-cozy-media-source": source.toString(),
+          ...(media.contentLength === undefined ? {} : { "content-length": String(media.contentLength) }),
+        },
+      });
+    } catch (err) {
+      return mediaFailure(c, err);
+    }
+  });
+
   app.get("/bots/:name/sessions", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
@@ -645,6 +712,61 @@ export function registerBotRoutes(
       return groupFailure(c, err);
     }
   });
+}
+
+/** Media-proxy errors. Nothing here reaches Hermes, so `failure`'s Hermes mapping does not apply and
+ *  the statuses say what actually happened to the fetch:
+ *
+ *  - `400 media_refused`: the SOURCE is one this gateway will not dial (a local path, a non-https
+ *    scheme, a non-public address, credentials in the URL). Nothing was fetched. A client shows its
+ *    fallback chip and never retries: retrying cannot change the answer.
+ *  - `415 media_refused`: something was fetched and it is not a proxied image type. Same finality.
+ *  - `413 media_refused`: over the size cap, either declared or delivered.
+ *  - `503 backend_unavailable` with `busy: true`: nothing was dialed, because this gateway was
+ *    already fetching as many images as it will fetch at once and no slot came free. A retry is not
+ *    just reasonable, it is expected: the client backs off and asks again.
+ *  - `502 backend_unavailable`: the source host failed, did not resolve, or answered non-2xx. A retry
+ *    is reasonable.
+ *  - `504 backend_unavailable` with `timedOut: true`: it did not answer in time.
+ *
+ *  `reason` rides every refusal so a client can render a specific fallback ("this bot pointed at a
+ *  file on its own machine") without parsing English out of `message`. */
+function mediaFailure(c: Context<Env>, err: unknown) {
+  if (err instanceof MediaRefused) {
+    const status = err.reason === "content_type" ? 415 : err.reason === "too_large" ? 413 : 400;
+    return c.json({ ...extensionErrorBody("media_refused", err.message), reason: err.reason }, status);
+  }
+  if (err instanceof MediaBusy) {
+    // `retry-after` in whole seconds, which is all the header allows, and 1 rather than 0 so a client
+    // that obeys it literally does not spin. The wait already spent is in the body for a client that
+    // wants to be smarter about it.
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", `the gateway is already fetching ${MEDIA_MAX_CONCURRENT} images`),
+        busy: true,
+        waitedMs: err.waitedMs,
+      },
+      503,
+      { "retry-after": "1" },
+    );
+  }
+  if (err instanceof MediaTimedOut) {
+    return c.json(
+      { ...errorBody("backend_unavailable", "the image source did not answer in time"), timedOut: true },
+      504,
+    );
+  }
+  if (err instanceof MediaUpstreamFailed) {
+    return c.json(
+      {
+        ...errorBody("backend_unavailable", "the image source could not be fetched"),
+        sourceError: err.message,
+        ...(err.status === undefined ? {} : { sourceStatus: err.status }),
+      },
+      502,
+    );
+  }
+  throw err;
 }
 
 /** Room errors on top of the shared `failure` mapping. A room is this gateway's own object, so its

@@ -585,6 +585,12 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    ride this bump: it exists so a client can tell "this gateway will stream" from "this gateway
  *    is quiet right now", since a bot that never streams and a gateway that cannot stream look
  *    identical otherwise. Everything works unchanged without it; the draft is decoration and the
- *    `bot_chat` frame remains the record. */
+ *    `bot_chat` frame remains the record.
+ *  - `7`: `GET /bots/:name/media`, the image proxy. A client that renders the image references in a
+ *    bot's reply as pictures MUST require `>= 7`: a v6 gateway 404s the route, so an app that
+ *    reached for it anyway would replace working links with broken-image chips. Below 7 a client
+ *    keeps whatever it did before, which is to show the link. The route serves `https` sources only;
+ *    a LOCAL path on the Hermes box is refused, and the refusal is part of the contract so the app
+ *    can say so rather than spin. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 6;
+export const BOTS_CAPABILITY_VERSION = 7;

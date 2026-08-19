@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 6 }
+"capabilities": { "com.cozylabs.bots": 7 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -68,6 +68,11 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   stream and a bot that simply has not produced a token yet look identical on the wire: a client
   that wants to show "typing" as a growing bubble gates that on `>= 6` and otherwise keeps its
   spinner. A client that ignores the frame entirely loses nothing but the animation.
+- `7`: `GET /bots/:name/media`, the image proxy. A client that renders the image references in a
+  bot's reply as pictures MUST require `>= 7`: a version 6 gateway 404s the route, so a client that
+  reached for it anyway would turn links that work today into broken-image chips. Below 7 a client
+  keeps whatever it did before, which is to show the URL as a link. This is a route bump with no
+  frame changes and no change to any existing route.
 
 ## 3. Resources
 
@@ -593,6 +598,117 @@ is an ordinary turn.
 There is exactly ONE turn poll per bot. A send that arrives while a poll is running rides that
 poll rather than starting another, and extends its deadline. Three consecutive failing polls
 abandon the turn with `phase: "failed"`; a single transient failure is ridden out.
+
+### GET /bots/:name/media
+
+Capability `>= 7`.
+
+```
+GET /bots/:name/media?src=<url-encoded absolute https URL>
+
+200  <the image bytes>
+     content-type: one of the allowed image types below
+     cache-control: private, max-age=86400
+     x-content-type-options: nosniff
+     x-cozy-media-source: the URL that was actually fetched, after redirects
+
+400  invalid_request                  // src missing, empty, or over 2048 characters
+400  media_refused  reason: "local_path" | "scheme" | "host" | "credentials"
+413  media_refused  reason: "too_large"
+415  media_refused  reason: "content_type"
+502  backend_unavailable              // the source host failed, did not resolve, or answered non-2xx
+                                      // + sourceError, and sourceStatus when there was one
+503  backend_unavailable  busy: true  // nothing was dialed: the gateway is already fetching as many
+                                      // images as it will at once. + waitedMs, retry-after: 1
+504  backend_unavailable  timedOut: true
+```
+
+A bot writes image references into its replies two ways: an `https` URL, and a path on the machine
+Hermes runs on (an `image_gen` output, a screenshot). This route answers the first kind and REFUSES
+the second, which is the whole of what version 7 adds.
+
+**Local paths are refused, deliberately.** A `reason: "local_path"` answer is what a client gets for
+`/Users/kyle/out.png`, `C:\out.png`, `~/shot.png`, and `file:///tmp/x.png` alike. Serving an
+arbitrary local path from an authenticated route is a file-read primitive over the whole box, and
+the containment that would make it safe (a resolved allow-root, realpath checks against symlinks, a
+per-bot output directory Hermes does not currently promise) is a design rather than a guard. The
+refusal is in the contract, and carries its own `reason`, so a client can render an honest chip
+("this bot pointed at a file on its own machine") instead of a spinner that never resolves or a
+generic failure. A later version may add local sources; it will be additive and gated on its own
+number.
+
+The `:name` in the path scopes the route to a bot for symmetry with everything else under
+`/bots/:name`, and is validated the same way, but it is NOT resolved against Hermes. The answer does
+not depend on which bot's reply carried the URL, and a Hermes outage must not stop an image that is
+already sitting on a CDN from loading. A name that could not name a profile is still a 400.
+
+What the proxy will fetch:
+
+- `https` ONLY. `http`, `file`, `data` and everything else is `reason: "scheme"`.
+- No credentials in the URL (`reason: "credentials"`).
+- Not a loopback, private, link-local, carrier-grade-NAT or multicast address (`reason: "host"`).
+  The gateway sits inside the operator's network and the `src` it is handed comes out of model
+  output, so without this an authenticated app route becomes a probe of the operator's LAN and of
+  every cloud metadata endpoint on `169.254.169.254`. The rule is applied TWICE: to the address
+  literal in the URL, and to every address the URL's hostname resolves to, on the initial URL and on
+  each redirect hop. A name is resolved before anything is dialed, so `https://10.0.0.5.nip.io/` is
+  refused for the same reason `https://10.0.0.5/` is. A v4 address written inside a v6 one
+  (`::ffff:`, the deprecated `::` form, the `64:ff9b::` NAT64 prefix) is unwrapped and judged as the
+  v4 address it carries, so no spelling of a private address gets a different answer than another,
+  and a public address inside those prefixes stays allowed. A trailing FQDN root dot is stripped
+  before any of it, so `localhost.` and `nas.local.` are the same names as `localhost` and
+  `nas.local`.
+
+  What this does NOT close, stated plainly rather than implied away: the resolver is asked here and
+  the socket asks again, so a name that answers publicly at the check and privately a moment later
+  (DNS rebinding, a short-TTL record) still reaches a private address. Only pinning the connection to
+  the address that was checked closes that, and this version does not do it. What is closed is the
+  part that costs an attacker nothing: pointing a public hostname at a private address.
+- At most 3 redirects, each hop re-checked against every rule above rather than followed blind.
+- 15 s for the whole exchange, headers and body, so an upstream that dribbles cannot hold a
+  connection open.
+- At most 10 MB, enforced against the declared `Content-Length` AND against the bytes that actually
+  arrive, because the header is a claim and the body is the fact. A body that runs past the cap
+  mid-stream is cut off, so a client can see a truncated image; the declared-length case is a clean
+  413.
+- Content type on an allow-list: `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/heic`,
+  `image/heif`, `image/avif`, `image/bmp`, `image/tiff`. Note what is NOT on it: `image/svg+xml`.
+  SVG is a document format carrying script and external references, and passing one through an
+  authenticated route hands a bot's text a way to run markup inside whatever renders it. The
+  allow-list is a list, not an `image/*` prefix test, for exactly that reason.
+
+**At most 5 of these run at once, per GATEWAY.** Not per device: what is being protected is the
+gateway process's sockets and the household's uplink, and both are shared by every paired device, so
+a per-device cap would multiply the fan-out by the number of phones instead of bounding it. The slot
+is held for the whole fetch including the body, because a socket dribbling bytes costs what a socket
+being negotiated costs. The bound matters because one reply can carry fifty image references and a
+client asks for all of them: without it that reply is fifty simultaneous outbound fetches, each
+allowed 10 MB and 15 s.
+
+A request that arrives with all five slots busy WAITS, for at most 5 seconds, and is then refused
+with `503` and `busy: true`. The bounded wait is the middle of two worse answers. An unbounded queue
+is wrong because the 15 s fetch timeout only starts once a slot is held: a queued request's total
+latency would be unbounded no matter what the per-fetch timeout says, and a client would have no way
+to tell a request stuck in a queue from a host that is simply slow. Refusing instantly is wrong the other way: the ordinary deep
+queue is a burst of thumbnails that each finish in well under a second, and refusing those would make
+a normal gallery flicker with errors. So: wait through the burst, give up before a stalled upstream
+can hide behind the queue.
+
+`503 busy` says nothing about the source. It carries `waitedMs` and a `retry-after: 1` header, and a
+client should treat it as "ask again", ideally when the image is scrolled back into view, rather than
+as a failure to show in a fallback chip. It is the one error here that a retry of the same URL is
+expected to clear.
+
+`x-content-type-options: nosniff` rides every 200. The content type is already taken from the
+allow-list below, and this stops anything downstream from improving on it.
+
+Range requests are not supported and `Accept-Ranges` is not sent: the cap is 10 MB, so the answer is
+always one whole image.
+
+`cache-control: private, max-age=86400` is the point of the header set. The source URL is in practice
+immutable (a generated asset, a CDN object), so a day of caching removes the re-fetch every time a
+transcript is scrolled back through; `private` because the bytes came through a device-token route
+and belong to that device, not to any shared cache.
 
 ### GET /bots/:name/sessions
 
