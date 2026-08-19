@@ -19,6 +19,9 @@ import {
   BotRoutinePatchSchema,
   BotRoutineSchema,
   BotSummarySchema,
+  BotToolActivityFrameSchema,
+  BotToolStepSchema,
+  BotTurnToolStepsSchema,
   ServerFrameSchema,
   check,
 } from "../src/index.ts";
@@ -120,6 +123,85 @@ describe("bots server frames", () => {
 
   it("still rejects an unknown frame type, since the union stays closed", () => {
     expect(check(ServerFrameSchema, { type: "bot_routines", jobs: [] })).toBe(false);
+  });
+});
+
+describe("tool activity (capability 12)", () => {
+  const step = { stepId: "call_1", seq: 1, name: "terminal", status: "running", startedAt: 1_800_000_000_000 };
+  const frame = {
+    type: "bot_tool_activity",
+    bot: "scout",
+    sessionId: "sess-1",
+    turnId: "sess-1#1800000000000-1",
+    steps: [step],
+    seq: 1,
+    updatedAt: 1_800_000_000_000,
+  };
+
+  it("accepts a running step, a terminal one, and the frame that carries them", () => {
+    expect(check(BotToolStepSchema, step)).toBe(true);
+    expect(check(BotToolStepSchema, { ...step, status: "ok", endedAt: 1_800_000_001_000 })).toBe(true);
+    expect(check(BotToolStepSchema, { ...step, status: "error", endedAt: 1_800_000_001_000 })).toBe(true);
+    expect(check(BotToolActivityFrameSchema, frame)).toBe(true);
+    expect(check(BotToolActivityFrameSchema, { ...frame, done: true, room: "standup" })).toBe(true);
+    expect(check(ServerFrameSchema, frame)).toBe(true);
+  });
+
+  it("keeps the status vocabulary closed, and closed on the CORE three words", () => {
+    // Shape parity with `ToolCall` in contract/v1.md is the point: one client switch renders a
+    // threads chip and a bots chip. A fourth word here would fork that.
+    expect(check(BotToolStepSchema, { ...step, status: "done" })).toBe(false);
+    expect(check(BotToolStepSchema, { ...step, status: "failed" })).toBe(false);
+    expect(check(BotToolStepSchema, { ...step, status: "pending" })).toBe(false);
+  });
+
+  it("declares NO member that could carry tool input or tool output", () => {
+    // The redaction guard is the shape itself, so this pins the shape. Asserted as the declared
+    // property SET rather than by feeding extras through `check`: every schema in this contract is
+    // deliberately open, because a client must ignore members it does not know for the whole
+    // additive-versioning scheme to work. What must never happen is this contract GROWING one of
+    // the names below -- each is a field hermes offers on `tool.start` / `tool.complete` and this
+    // wire refuses (see `tool-activity.ts` for what each one leaks).
+    expect(Object.keys(BotToolStepSchema.properties).sort()).toEqual([
+      "endedAt",
+      "name",
+      "seq",
+      "startedAt",
+      "status",
+      "stepId",
+    ]);
+    for (const leak of ["args", "argSummary", "context", "detail", "result", "summary", "inlineDiff", "todos"]) {
+      expect(BotToolStepSchema.properties).not.toHaveProperty(leak);
+    }
+  });
+
+  it("holds the ordinals as integers, since both seqs are drop-stale keys and not stamps", () => {
+    expect(check(BotToolStepSchema, { ...step, seq: 1.5 })).toBe(false);
+    expect(check(BotToolActivityFrameSchema, { ...frame, seq: 1.5 })).toBe(false);
+    expect(check(BotToolActivityFrameSchema, { ...frame, turnId: 7 })).toBe(false);
+    // `steps` is required and may be empty; it is never absent.
+    expect(check(BotToolActivityFrameSchema, { ...frame, steps: undefined })).toBe(false);
+    expect(check(BotToolActivityFrameSchema, { ...frame, steps: [] })).toBe(true);
+  });
+
+  it("accepts the history shape, whose end is absent while any step is still running", () => {
+    expect(check(BotTurnToolStepsSchema, { turnId: "t1", startedAt: 1_800_000_000_000, steps: [step] })).toBe(true);
+    expect(
+      check(BotTurnToolStepsSchema, {
+        turnId: "t1",
+        startedAt: 1_800_000_000_000,
+        endedAt: 1_800_000_002_000,
+        steps: [{ ...step, status: "ok", endedAt: 1_800_000_002_000 }],
+      }),
+    ).toBe(true);
+    // It names a TURN and never a message: the gateway will not guess which row a turn produced,
+    // so there is no `messageId` here to guess with.
+    expect(Object.keys(BotTurnToolStepsSchema.properties).sort()).toEqual([
+      "endedAt",
+      "startedAt",
+      "steps",
+      "turnId",
+    ]);
   });
 });
 
@@ -337,7 +419,10 @@ describe("capability advertisement", () => {
     // both routes and never sends either frame, so the buttons would do nothing),
     // 11 for fresh bot chats being born EMPTY plus the optional `suggestion` field on
     // `GET /bots/:name/chat/messages` (a v10 gateway submits a canned opener by itself and never
-    // sends the field, so a client cannot offer a chip and cannot assume an untouched chat is bare).
-    expect(BOTS_CAPABILITY_VERSION).toBe(11);
+    // sends the field, so a client cannot offer a chip and cannot assume an untouched chat is bare),
+    // 12 for live tool activity: the `bot_tool_activity` frame and the `toolSteps` array on
+    // `GET /bots/:name/chat/messages` (a v11 gateway sends neither, so a step-by-step chip strip
+    // offered against one would sit permanently empty while the turn looked like plain "thinking").
+    expect(BOTS_CAPABILITY_VERSION).toBe(12);
   });
 });

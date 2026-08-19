@@ -224,6 +224,13 @@ a frame, so a misconfigured box looks like a broken app rather than a missing se
 If you deliberately run with `--skip-dashboard`, `config.yaml` is not touched at all and **both of
 these are yours to get right**, or mobile approve/deny will be silently dead.
 
+**A third key, same shape of hazard: `display.tool_progress`.** It gates the live tool-step chips a
+bot chat shows while a turn runs (cozygateway#60, ext-bots capability 12). It defaults to `all`, so
+the ordinary install needs nothing and the installer does not touch it. Set to `off`, Hermes stops
+emitting `tool.start` and `tool.complete` at the source, the gateway sends no `bot_tool_activity`
+frame, and a long turn shows plain "thinking" again with nothing anywhere saying why. If chips are
+missing on an otherwise healthy box, check this key before anything else.
+
 **Check:**
 
     ls -l ~/cozygateway/local/install-env.sh ~/cozygateway/local/dashboard-credentials.txt
