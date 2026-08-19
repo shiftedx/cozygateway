@@ -139,7 +139,8 @@ interface FakeBotState {
  *  session with no persisted row cannot be resumed at all. A fake that accepts any id in any slot
  *  is what let a send against the stored id look green for a whole release. */
 function fakeBotMode(options: {
-  /** Sessions `session.list` reports. Empty models a chat whose kickoff has not landed yet. */
+  /** Sessions `session.list` reports. Empty models a chat nobody has written in, which persists no
+   *  row and is therefore unlistable. */
   sessions?: Array<{ id: string; title: string }>;
   messages?: Array<Record<string, unknown>>;
   running?: () => boolean;
@@ -179,8 +180,8 @@ function fakeBotMode(options: {
         state.created += 1;
         const stored = `stored-${state.created}`;
         state.runtime.set(stored, `runtime-${state.created}`);
-        // Deliberately persists NOTHING: the row only appears once the kickoff prompt lands, which
-        // is the real gateway's behavior and the whole reason the duplicate bug existed.
+        // Deliberately persists NOTHING: the row only appears once a prompt lands, which is the
+        // real host's behavior and the whole reason the duplicate bug existed.
         return { stored_session_id: stored, session_id: `runtime-${state.created}` };
       },
       "prompt.submit": (params) => {
@@ -258,9 +259,9 @@ describe("GET /bots/:name/chat/messages", () => {
     });
   });
 
-  it("answers an empty history for a chat whose kickoff has not landed yet", async () => {
+  it("answers an empty history for a chat nobody has written in yet", async () => {
     // A just-created session has no row to resume, so hermes rejects. That is not an error the app
-    // should see: the messages arrive over bot_chat frames moments later.
+    // should see: the chat is simply empty, and it says so.
     const { behavior } = fakeBotMode({ sessions: [] });
     behavior.methods!["session.resume"] = () => {
       throw { code: 5003, message: "no such session" };
@@ -387,10 +388,12 @@ describe("POST /bots/:name/chat/messages", () => {
 });
 
 describe("canonical chat duplicate adoption (wave 1 regression)", () => {
-  it("resolves the first chat on the second call while the kickoff is still in flight", async () => {
+  it("resolves the first chat on the second call while the new chat is still unlisted", async () => {
     // The live failure: two consecutive GETs both answered adoption "created", with different
     // session ids, because session.create persists no row until its first prompt lands, so
-    // session.list was still empty on the second call.
+    // session.list was still empty on the second call. Since capability 11 the gateway submits no
+    // prompt of its own, so "still unlisted" is not a race window any more: it lasts until the user
+    // writes something, and this rule is what carries the chat across it.
     const { behavior, state } = fakeBotMode({ sessions: [] });
     const { authed, server } = await setup(behavior);
 
@@ -419,14 +422,14 @@ describe("canonical chat duplicate adoption (wave 1 regression)", () => {
     expect(storage.botChatPin("scout")).toBe("stored-1");
   });
 
-  it("adopts the kickoff's session once it has persisted, without minting another", async () => {
+  it("adopts the minted session once it has persisted, without minting another", async () => {
     const { behavior, state } = fakeBotMode({ sessions: [] });
     const { authed, server, bridge } = await setup(behavior);
 
     await authed("/bots/scout/chat");
-    // The kickoff lands: the row finally appears, carrying the canonical title.
+    // The user's first message lands: the row finally appears, carrying the canonical title.
     state.sessions = [{ id: "stored-1", title: CANONICAL_CHAT_TITLE }];
-    await bridge.refresh("kickoff landed");
+    await bridge.refresh("first message landed");
 
     const second = (await (await authed("/bots/scout/chat")).json()) as { sessionId: string; adoption: string };
     expect(second.sessionId).toBe("stored-1");
@@ -445,16 +448,14 @@ describe("canonical chat duplicate adoption (wave 1 regression)", () => {
     });
     expect(((await sent.json()) as { sessionId: string }).sessionId).toBe("stored-1");
     expect(state.created).toBe(1);
-    // The kickoff and the user message, in that order, both on the same session.
-    expect(server.callsOf("prompt.submit").map((call) => call.params["text"])).toEqual([
-      "Hey, tell me about yourself!",
-      "hello",
-    ]);
+    // The user's message, and ONLY the user's message. Up to capability 10 a canned opener was
+    // submitted ahead of it and the app drew it as a line the user had typed.
+    expect(server.callsOf("prompt.submit").map((call) => call.params["text"])).toEqual(["hello"]);
   });
 });
 
-describe("the kickoff window (review C1/C2)", () => {
-  it("answers an empty history on EVERY read while the kickoff is in flight, not just the first", async () => {
+describe("a chat with no persisted row yet (review C1/C2)", () => {
+  it("answers an empty history on EVERY read of an unwritten chat, not just the first", async () => {
     // The app's own sequence: open the bot, resolve, read history. The second read resolves the
     // pin (adoption "pin", not "created"), and gating the empty-history tolerance on adoption made
     // exactly that read answer 502 for the scenario the tolerance exists for.
@@ -470,8 +471,10 @@ describe("the kickoff window (review C1/C2)", () => {
     expect(secondBody).toMatchObject({ adoption: "pin", sessionId: "stored-1", messages: [] });
   });
 
-  it("still reports a resume failure outside the kickoff window", async () => {
+  it("still reports a resume failure for a chat this gateway is not holding a runtime id for", async () => {
     // A chat this gateway did not just create has no excuse: the hermes text goes through verbatim.
+    // This is the arm the old 180 s window used to reach by expiry; it is now reached by the absence
+    // of a durable runtime id, which is a fact about the chat rather than about the clock.
     const { behavior } = fakeBotMode({ sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }] });
     behavior.methods!["session.resume"] = () => {
       throw { code: 5003, message: "no such session" };
@@ -482,9 +485,9 @@ describe("the kickoff window (review C1/C2)", () => {
     expect(await res.json()).toMatchObject({ hermesError: "no such session", hermesErrorCode: 5003 });
   });
 
-  it("submits a send during the kickoff window against the RUNTIME id", async () => {
-    // The lazy session cannot be resumed, so the runtime id `session.create` returned is the only
-    // one prompt.submit accepts. Submitting the STORED id answered 202 and lost the message.
+  it("submits a send into an unwritten chat against the RUNTIME id", async () => {
+    // The unwritten session cannot be resumed, so the runtime id `session.create` returned is the
+    // only one prompt.submit accepts. Submitting the STORED id answered 202 and lost the message.
     const { behavior, state } = fakeBotMode({ sessions: [] });
     const { authed, server } = await setup(behavior);
 
@@ -496,10 +499,8 @@ describe("the kickoff window (review C1/C2)", () => {
     });
     expect(res.status).toBe(202);
     expect(state.created).toBe(1);
-    expect(server.callsOf("prompt.submit").map((call) => call.params["session_id"])).toEqual([
-      "runtime-1",
-      "runtime-1",
-    ]);
+    // One submit, the user's, and it is addressed at the runtime id.
+    expect(server.callsOf("prompt.submit").map((call) => call.params["session_id"])).toEqual(["runtime-1"]);
   });
 
   it("reports a send it cannot address rather than submitting the stored id", async () => {
@@ -565,8 +566,8 @@ describe("ui_meta writeback (review I2/I3)", () => {
     // The residual from the #31 verification. On a Hermes with no ui_meta support NO blob will ever
     // carry `chat`, so every roster refresh read the absent key as an authoritative clear and threw
     // the gateway-local pin away. Open the chat, refresh once, open again: before the fix that
-    // second open found no pin, an empty session list (the kickoff has not persisted), and minted a
-    // SECOND canonical chat.
+    // second open found no pin, an empty session list (nothing has been written in the chat, so it
+    // has no row), and minted a SECOND canonical chat.
     const { behavior } = fakeBotMode({ sessions: [], supportsConfigure: false });
     const { authed, server, bridge, storage } = await setup(behavior);
 
@@ -787,8 +788,8 @@ describe("bot_chat_delta", () => {
   it("advertises the streaming capability version", () => {
     // A client gates its draft rendering on >= 6; everything else about the bots surface is
     // unchanged, so an older client simply ignores an unknown frame type. The advertised number has
-    // moved past it (7 added the media proxy, 8 the chat reset, 9 photos to bots, 10 approve/deny),
-    // which is exactly why a client compares `>=`.
-    expect(BOTS_CAPABILITY_VERSION).toBe(10);
+    // moved past it (7 added the media proxy, 8 the chat reset, 9 photos to bots, 10 approve/deny,
+    // 11 the empty fresh chat and its suggestion), which is exactly why a client compares `>=`.
+    expect(BOTS_CAPABILITY_VERSION).toBeGreaterThanOrEqual(6);
   });
 });

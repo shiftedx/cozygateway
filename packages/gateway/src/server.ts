@@ -124,6 +124,7 @@ export async function startGateway(
       broadcast: (frame) => hub.broadcast(frame),
       now: () => Date.now(),
       hideBotChats: hermesOptions.hideBotChats,
+      chatSuggestion: hermesOptions.chatSuggestion,
       hiddenProfiles: hermesOptions.hiddenProfiles,
       ...(hermesOptions.bridgeProfile === undefined ? {} : { bridgeProfile: hermesOptions.bridgeProfile }),
       // Spec section 4's `@user` escalation. The room's own state and frame already went out; this

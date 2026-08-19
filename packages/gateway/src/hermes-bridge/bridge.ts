@@ -17,6 +17,7 @@ import type {
 import type { Storage } from "../storage.ts";
 import { HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
 import {
+  DEFAULT_CHAT_SUGGESTION,
   mintCanonicalChat,
   resolveCanonicalChat,
   listBotSessions,
@@ -44,7 +45,7 @@ import {
   type BotApprovalPush,
   type BotApprovalResolveOutcome,
 } from "./approvals.ts";
-import { BotChatTurns, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
+import { BotChatTurns } from "./chat-turns.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName } from "./photos.ts";
 import {
@@ -226,6 +227,14 @@ export interface BotChatHistory {
   running: boolean;
   inflight: boolean;
   updatedAt: number;
+  /** An opener the client MAY offer while this chat is empty (ext-bots capability 11).
+   *
+   *  Presentation only, and what it is NOT is the whole point: the gateway never submits it, it is
+   *  not in the transcript, and it becomes part of the conversation only if the user chooses to send
+   *  it AS THEIR OWN message through the ordinary composer. Present only when `messages` is empty and
+   *  the deployment configured a suggestion; ABSENT otherwise, so a client that has never heard of it
+   *  sees exactly the payload it always saw. */
+  suggestion?: string;
 }
 
 export interface HermesBridgeOptions {
@@ -235,6 +244,12 @@ export interface HermesBridgeOptions {
   now: () => number;
   /** New canonical chats are born hidden (desktop default). */
   hideBotChats?: boolean;
+  /** The opener an empty bot chat offers a client (capability 11). Defaults to
+   *  `DEFAULT_CHAT_SUGGESTION`, the line this gateway used to submit by itself. An EMPTY string (or
+   *  one that is only whitespace) turns the field off, which is how a deployment says "offer
+   *  nothing"; there is deliberately no separate boolean, because "no text" and "no suggestion" are
+   *  the same state and two ways to say it would eventually disagree. */
+  chatSuggestion?: string;
   /** Profile names kept off the roster this gateway serves. See `RosterBuildOptions.hidden`. */
   hiddenProfiles?: Iterable<string>;
   /** The Hermes profile this bridge's own link runs on, when the operator has told us. Deleting it
@@ -343,12 +358,9 @@ export class HermesBridge implements BotsSurface {
   readonly #lastRoutinesJson = new Map<string, string>();
   #routineDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 
-  /** Chats THIS bridge created whose kickoff has not been observed to land yet, by bot name. Two
-   *  things hang off it: the empty-history tolerance (a session with no persisted row cannot be
-   *  resumed, and Hermes answers that with an error, which is not a failure the app should see),
-   *  and the RUNTIME session id, which `prompt.submit` requires and which nothing else can hand
-   *  back while the chat is still lazy. Cleared the moment a resume of that session succeeds. */
-  readonly #kickoffs = new Map<string, { sessionId: string; runtimeId: string; at: number }>();
+  /** The opener an empty chat offers, or `undefined` when this deployment offers none. Never
+   *  submitted anywhere; see `BotChatHistory.suggestion`. */
+  readonly #chatSuggestion: string | undefined;
 
   /** False once this Hermes has shown it cannot store `ui_meta` (an unknown-method rejection, or a
    *  reply carrying no `applied` object at all: dissection 3.1's `unsupported` outcome). Retrying
@@ -358,7 +370,7 @@ export class HermesBridge implements BotsSurface {
 
   /** The profile the Hermes gateway is routed to, and whether it is mid-turn. Both feed the
    *  presence rule (dissection 7.1). The bridge only knows the routed profile when it is the one
-   *  driving a turn, which in wave 1 is the canonical-chat kickoff. */
+   *  driving a turn, which on this surface is a chat send or a group round. */
   #routedProfile: string | null = null;
   #busyDepth = 0;
 
@@ -391,6 +403,8 @@ export class HermesBridge implements BotsSurface {
     this.#routinesPollMs = opts.routinesPollMs ?? ROUTINES_POLL_MS;
     this.#focusTtlMs = opts.focusTtlMs ?? FOCUS_TTL_MS;
     this.#sweepMs = opts.attachmentSweepMs ?? PHOTO_SWEEP_MS;
+    const suggestion = (opts.chatSuggestion ?? DEFAULT_CHAT_SUGGESTION).trim();
+    this.#chatSuggestion = suggestion.length === 0 ? undefined : suggestion;
     const sink = opts.logSink ?? ((line: string) => void process.stderr.write(line));
     this.#log = (message: string) => sink(`[hermes-bridge] ${message}\n`);
     this.#pins = {
@@ -697,10 +711,11 @@ export class HermesBridge implements BotsSurface {
               if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
             },
           });
-          // A chat this call created is lazy until its kickoff lands: remember the runtime id and
-          // the moment, because for the next few seconds it cannot be resumed at all.
+          // A chat this call created has no persisted row and cannot be resumed until the USER
+          // writes to it, which may be never: remember its runtime id, durably, because that is the
+          // only id their first message can be addressed to.
           if (result.adoption === "created" && result.runtimeId !== undefined) {
-            this.#kickoffs.set(name, { sessionId: result.sessionId, runtimeId: result.runtimeId, at: this.#now() });
+            this.#rememberUnwritten(name, result.sessionId, result.runtimeId);
           }
           return result;
         } finally {
@@ -810,7 +825,8 @@ export class HermesBridge implements BotsSurface {
           // Teardown BEFORE the mint. See the doc comment: order is the whole correctness argument.
           this.#chat.cancel(name);
           this.#approvals.forgetBot(name);
-          this.#kickoffs.delete(name);
+          // The pin row goes, and the outgoing chat's runtime id goes with it. Nothing may be left
+          // that could address a send at the session this reset is leaving behind.
           this.#pins.clear(name);
           // Mark the outgoing session retired, on disk, and do it BEFORE the pin is replaced so a
           // crash between the two leaves the stronger state: a session recorded as retired that no
@@ -837,13 +853,10 @@ export class HermesBridge implements BotsSurface {
               if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
             },
           });
-          // Born lazy, exactly like a chat `canonicalChat` created: no row exists until the kickoff
-          // lands, so the runtime id and the moment are what make the next few seconds work at all.
-          this.#kickoffs.set(name, {
-            sessionId: minted.storedId,
-            runtimeId: minted.runtimeId,
-            at: this.#now(),
-          });
+          // Born empty and unlisted, exactly like a chat `canonicalChat` created: no row exists
+          // until the user's first prompt, so the runtime id is what the reply to their first
+          // message depends on.
+          this.#rememberUnwritten(name, minted.storedId, minted.runtimeId);
           // Push the new pin cross-machine. Never allowed to fail the reset (it swallows its own
           // failures): a gateway that cannot store `ui_meta` still reset the chat, the pin just
           // stays gateway-local, which is the same trade the resolve path makes.
@@ -947,21 +960,28 @@ export class HermesBridge implements BotsSurface {
   /** History of a bot's canonical chat. Resolving the chat first is what makes this route usable
    *  as the app's only entry point: the app never has to know a session id.
    *
-   *  A chat that was just created has no resumable row until its kickoff lands (dissection 5.1),
-   *  and Hermes answers that with an error. That case reads as an empty history rather than a
-   *  failure, since the messages arrive over `bot_chat` frames moments later. Any other failure
-   *  propagates so the route can pass the Hermes text through verbatim.
+   *  A chat nobody has written in has no resumable row (dissection 5.1) and Hermes answers a resume
+   *  of it with an error. That case reads as an EMPTY history rather than a failure. Any other
+   *  failure propagates so the route can pass the Hermes text through verbatim.
    *
-   *  The tolerance keys on the KICKOFF WINDOW, not on `adoption`. Adoption only says `created` on
-   *  the call that did the creating; the second open inside that same window (open bot, resolve,
-   *  read history: the exact sequence the app performs) correctly answers `pin`, and gating on
-   *  `created` made that second read a 502 for the one scenario this whole path exists for. */
+   *  What decides which of the two it is: whether this gateway is holding a runtime id for exactly
+   *  this session, which is the durable record that it minted the chat and nothing has been said in
+   *  it since (`Storage.botChatRuntimeId`). NOT `adoption`, which only says `created` on the call
+   *  that did the creating -- the second open (open bot, resolve, read history: the exact sequence
+   *  the app performs) correctly answers `pin`, and gating on `created` made that second read a 502
+   *  for the one scenario this whole path exists for. And no longer a 180 s WINDOW either, which was
+   *  right only while an auto-submitted kickoff meant the row was seconds away: capability 11 sends
+   *  nothing, so "unresumable" is the resting state of an untouched chat and a timer would turn every
+   *  chat older than three minutes into a 502.
+   *
+   *  The empty transcript is where `suggestion` rides, on both arms, because both arms describe the
+   *  same thing to the user: a chat with nothing in it yet. */
   async chatHistory(name: string): Promise<BotChatHistory> {
     const chat = await this.canonicalChat(name);
     try {
       const snapshot = await this.#chat.history(name, chat.sessionId);
-      // The session resumed, so it is no longer lazy.
-      if (this.#kickoffs.get(name)?.sessionId === chat.sessionId) this.#kickoffs.delete(name);
+      // The session resumed, so it has a row: the runtime id is stale from here on.
+      this.#storage.clearBotChatRuntimeId(name, chat.sessionId);
       return {
         sessionId: chat.sessionId,
         adoption: chat.adoption,
@@ -969,9 +989,10 @@ export class HermesBridge implements BotsSurface {
         running: snapshot.running,
         inflight: snapshot.inflight,
         updatedAt: this.#now(),
+        ...this.#suggestionFor(snapshot.messages),
       };
     } catch (err) {
-      if (!this.#inKickoffWindow(name, chat.sessionId)) throw err;
+      if (this.#storage.botChatRuntimeId(name, chat.sessionId) === undefined) throw err;
       return {
         sessionId: chat.sessionId,
         adoption: chat.adoption,
@@ -979,24 +1000,39 @@ export class HermesBridge implements BotsSurface {
         running: false,
         inflight: false,
         updatedAt: this.#now(),
+        ...this.#suggestionFor([]),
       };
     }
+  }
+
+  /** The `suggestion` field, or nothing at all. Two conditions, both required: the transcript is
+   *  empty (a suggestion next to an existing conversation is noise, and worse, it invites a client to
+   *  re-offer an opener the user already answered) and this deployment configured one. */
+  #suggestionFor(messages: BotChatMessage[]): { suggestion?: string } {
+    if (messages.length > 0 || this.#chatSuggestion === undefined) return {};
+    return { suggestion: this.#chatSuggestion };
+  }
+
+  /** Records, durably, that `sessionId` is a chat this gateway minted and nobody has written in, so
+   *  the user's first message can be addressed at all. See `Storage.setBotChatRuntimeId`. */
+  #rememberUnwritten(name: string, sessionId: string, runtimeId: string): void {
+    this.#storage.setBotChatRuntimeId(name, sessionId, runtimeId);
   }
 
   /** Submits into the canonical chat and leaves a turn poll running behind it. The reply is
    *  delivered over `/ws`, never in this response.
    *
-   *  The runtime id of a chat still inside its kickoff window is handed down: that session cannot
-   *  be resumed yet, and `prompt.submit` accepts nothing else. */
+   *  The runtime id of a chat nobody has written in is handed down: that session has no row to
+   *  resume, and `prompt.submit` accepts nothing else. Since capability 11 that is the state EVERY
+   *  chat starts in and stays in until this very call, so the id is read from the durable record
+   *  rather than from memory -- a restart in between is ordinary now, not a two-second race. */
   async sendChatMessage(
     name: string,
     text: string,
     opts: { clientId?: string } = {},
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const chat = await this.canonicalChat(name);
-    const kickoff = this.#kickoffs.get(name);
-    const runtimeId =
-      chat.runtimeId ?? (kickoff !== undefined && kickoff.sessionId === chat.sessionId ? kickoff.runtimeId : undefined);
+    const runtimeId = chat.runtimeId ?? this.#storage.botChatRuntimeId(name, chat.sessionId);
     const message = await this.#chat.send(name, chat.sessionId, text, {
       ...(runtimeId === undefined ? {} : { runtimeId }),
       ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
@@ -1024,9 +1060,7 @@ export class HermesBridge implements BotsSurface {
     photo: BotChatPhotoUpload,
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const chat = await this.canonicalChat(name);
-    const kickoff = this.#kickoffs.get(name);
-    const runtimeId =
-      chat.runtimeId ?? (kickoff !== undefined && kickoff.sessionId === chat.sessionId ? kickoff.runtimeId : undefined);
+    const runtimeId = chat.runtimeId ?? this.#storage.botChatRuntimeId(name, chat.sessionId);
 
     const fileId = newPhotoFileId();
     const displayName = photoDisplayName(photo.ext);
@@ -1112,19 +1146,6 @@ export class HermesBridge implements BotsSurface {
     this.#sweepTimer.unref();
   }
 
-  /** True while a chat this bridge created is still lazy: the kickoff has not been seen to land,
-   *  so `session.resume` on it legitimately fails. The window is the turn cap, after which a
-   *  session that still cannot be resumed is a real failure and is reported as one. */
-  #inKickoffWindow(name: string, sessionId: string): boolean {
-    const kickoff = this.#kickoffs.get(name);
-    if (kickoff === undefined || kickoff.sessionId !== sessionId) return false;
-    if (this.#now() - kickoff.at > CHAT_TURN_TIMEOUT_MS) {
-      this.#kickoffs.delete(name);
-      return false;
-    }
-    return true;
-  }
-
   /** Creates a bot, then refreshes the roster so the caller receives the same row every device is
    *  about to get on its `bot_roster` frame rather than one this method invented.
    *
@@ -1188,7 +1209,8 @@ export class HermesBridge implements BotsSurface {
     this.#chat.cancel(canonical);
     this.#approvals.forgetBot(canonical);
     this.#chatInflight.delete(canonical);
-    this.#kickoffs.delete(canonical);
+    // The unwritten-chat runtime id needs no line of its own: `forgetBot` drops the whole pin row it
+    // lives on.
     // Nothing left to watch: a deleted profile's cron store goes with it, and a `cron.changed` that
     // kept re-reading it would spend a round trip per burst on a 404.
     this.#routineWatch.delete(canonical);

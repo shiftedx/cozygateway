@@ -135,9 +135,9 @@ export function uiMetaBytes(meta: Record<string, unknown>): number {
  *
  *  `uiMetaSupported: false` disables the clear entirely. On a Hermes that cannot store `ui_meta`
  *  at all, NO blob will ever carry `chat`, so every refresh read as an authoritative clear and threw
- *  the local pin away; a chat opened again inside its kickoff window (nothing in `session.list`
- *  yet, no pin to fall back on) then minted a SECOND canonical chat. A server that cannot record a
- *  pin cannot be asserting that the pin is gone. */
+ *  the local pin away; a chat opened again while it was still unlisted (nothing in `session.list`
+ *  yet, because nobody has written in it, and no pin to fall back on) then minted a SECOND canonical
+ *  chat. A server that cannot record a pin cannot be asserting that the pin is gone. */
 export function resolveChatPin(
   meta: Record<string, unknown> | null,
   localPin: { sessionId: string; updatedAt: number } | undefined,

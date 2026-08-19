@@ -6,6 +6,7 @@ import { BOTS_CAPABILITY_VERSION, type GatewayInfo, type ServerFrame } from "coz
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { applyEnvOverrides } from "../src/config.ts";
+import { DEFAULT_CHAT_SUGGESTION } from "../src/hermes-bridge/canonical-chat.ts";
 import { parseHermesOptions } from "../src/hermes-bridge/config.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
@@ -34,6 +35,9 @@ describe("hermes bridge options", () => {
       auth: { mode: "token", token: "s3cret", param: "token" },
       hideBotChats: true,
       hiddenProfiles: [],
+      // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
+      // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
+      chatSuggestion: DEFAULT_CHAT_SUGGESTION,
     });
 
     expect(() => parseHermesOptions({ url: "ws://h/api/ws", tokenEnv: "HERMES_TOKEN" }, {})).toThrow(
@@ -63,6 +67,9 @@ describe("hermes bridge options", () => {
       },
       hideBotChats: true,
       hiddenProfiles: [],
+      // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
+      // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
+      chatSuggestion: DEFAULT_CHAT_SUGGESTION,
     });
   });
 

@@ -77,8 +77,9 @@ export interface ChatTurnsOptions {
 /** What the caller knows about the chat that the turn loop cannot learn on its own. */
 export interface SendOptions {
   /** The RUNTIME id `session.create` handed back, when this chat was created by this gateway and
-   *  its kickoff has not persisted yet. That session has no row to resume, so the resume throws and
-   *  this is the only id `prompt.submit` will accept. */
+   *  nobody has written in it yet. That session has no persisted row to resume, so the resume throws
+   *  and this is the only id `prompt.submit` will accept. Since ext-bots capability 11 the gateway
+   *  submits no opener of its own, so EVERY chat is in that state until this very send. */
   runtimeId?: string;
   /** The sender's own id for this message, echoed back on the committed message and on the same
    *  message when the poll finds it. */
@@ -378,8 +379,8 @@ export class BotChatTurns {
       runtimeId = opts.runtimeId;
     }
     if (runtimeId === undefined && resumeError !== undefined) {
-      // One retry: the kickoff may have landed in the meantime, which turns the lazy session into
-      // a resumable one and hands back the runtime id.
+      // One retry: another device's message may have landed in the meantime, which persists the
+      // session and hands back the runtime id the first resume could not produce.
       try {
         const retry = await this.#resume(sessionId, name, true);
         baseline = retry.messageCount;

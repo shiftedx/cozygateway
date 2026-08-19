@@ -67,10 +67,21 @@ CREATE TABLE IF NOT EXISTS bot_meta (
   meta_json TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 ) STRICT;
+-- runtime_id is the RUNTIME session id of a pinned chat NOBODY HAS WRITTEN IN YET, and it is NULL
+-- for every chat that has a transcript (ext-bots capability 11). Since the gateway stopped
+-- submitting an opener on the user's behalf, a freshly minted chat holds no prompt at all, and
+-- hermes persists no database row for a session until its first one: the session cannot be listed
+-- and cannot be resumed, so the runtime id session.create handed back is the ONLY id
+-- prompt.submit will accept for it. Held in memory it was lost on restart, and the first thing the
+-- user ever typed into that chat then failed with no way back. That was survivable while the gap was
+-- the second or two a kickoff prompt took; it is not survivable now the gap lasts until the user
+-- decides to speak. Cleared the moment the session resumes, because from then on the stored id is
+-- resolvable and this value is stale.
 CREATE TABLE IF NOT EXISTS bot_chat_pins (
   name TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  runtime_id TEXT
 ) STRICT;
 -- Sessions a chat RESET retired, per bot. Not a cache and not optional bookkeeping: it is the only
 -- thing that tells a retired "Bot Chat" apart from the live one. A reset mints the replacement with
@@ -522,13 +533,52 @@ export class Storage {
     return new Map(rows.map((row) => [row.name, row.sessionId]));
   }
 
+  /** Pins `sessionId` for `name`. Re-pinning the SAME session keeps whatever `runtime_id` the row
+   *  carries (the adoption paths call this on every resolve, and an unwritten chat must not lose the
+   *  only id its first message can be addressed to); moving the pin to a DIFFERENT session drops it,
+   *  because a runtime id belongs to exactly one session and keeping it would be pointing the next
+   *  send at the chat that was just replaced. */
   setBotChatPin(name: string, sessionId: string, updatedAt: number): void {
     this.#db
       .prepare(
-        `INSERT INTO bot_chat_pins (name, session_id, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at`,
+        `INSERT INTO bot_chat_pins (name, session_id, updated_at, runtime_id) VALUES (?, ?, ?, NULL)
+         ON CONFLICT(name) DO UPDATE SET
+           session_id = excluded.session_id,
+           updated_at = excluded.updated_at,
+           runtime_id = CASE WHEN session_id = excluded.session_id THEN runtime_id ELSE NULL END`,
       )
       .run(name, sessionId, updatedAt);
+  }
+
+  /** The runtime id of `name`'s pinned chat, when that chat has never been written in and the pin
+   *  still names `sessionId`. `undefined` for every chat with a transcript, which is the answer that
+   *  says "resume it, the stored id works".
+   *
+   *  The `session_id` guard is the load-bearing half: a runtime id that outlived its own session
+   *  would submit the user's message into a chat nobody is looking at. */
+  botChatRuntimeId(name: string, sessionId: string): string | undefined {
+    const row = this.#db
+      .prepare("SELECT runtime_id AS runtimeId FROM bot_chat_pins WHERE name = ? AND session_id = ?")
+      .get(name, sessionId) as { runtimeId: string | null } | undefined;
+    return row?.runtimeId ?? undefined;
+  }
+
+  /** Records the runtime id of a chat this gateway just minted and nobody has written in yet. A
+   *  no-op unless the pin still names `sessionId`, so a mint that lost a race to a reset cannot
+   *  write its id over the survivor's. */
+  setBotChatRuntimeId(name: string, sessionId: string, runtimeId: string): void {
+    this.#db
+      .prepare("UPDATE bot_chat_pins SET runtime_id = ? WHERE name = ? AND session_id = ?")
+      .run(runtimeId, name, sessionId);
+  }
+
+  /** Forgets the runtime id of `name`'s pinned chat: the session has a row now, so the stored id
+   *  resumes and this value can only go stale. Idempotent, and scoped to `sessionId` for the same
+   *  reason the read is. */
+  clearBotChatRuntimeId(name: string, sessionId: string): void {
+    this.#db
+      .prepare("UPDATE bot_chat_pins SET runtime_id = NULL WHERE name = ? AND session_id = ?")
+      .run(name, sessionId);
   }
 
   clearBotChatPin(name: string): void {
@@ -902,6 +952,14 @@ export function openStorage(dbPath: string): Storage {
   // COLUMN throws "duplicate column name" on an up-to-date DB, which is the no-op we want.
   try {
     db.exec("ALTER TABLE messages ADD COLUMN delivery TEXT");
+  } catch {
+    // column already present: nothing to do
+  }
+  // Same shape, for a DB created before ext-bots capability 11 gave an unwritten chat a durable
+  // runtime id. NULL on every existing row is exactly right: a pin written by an older gateway
+  // points at a chat its kickoff already persisted, so there is nothing to remember for it.
+  try {
+    db.exec("ALTER TABLE bot_chat_pins ADD COLUMN runtime_id TEXT");
   } catch {
     // column already present: nothing to do
   }

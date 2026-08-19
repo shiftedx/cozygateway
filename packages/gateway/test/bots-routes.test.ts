@@ -7,7 +7,7 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient, type HermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import { CANONICAL_CHAT_TITLE, KICKOFF_PROMPT } from "../src/hermes-bridge/canonical-chat.ts";
+import { CANONICAL_CHAT_TITLE } from "../src/hermes-bridge/canonical-chat.ts";
 import {
   startFakeHermesServer,
   NO_REPLY,
@@ -216,8 +216,8 @@ describe("GET /bots", () => {
 });
 
 describe("GET /bots/:name/chat", () => {
-  it("creates the canonical chat with the exact title, hidden flag and kickoff prompt", async () => {
-    const { authed, server } = await setup({
+  it("creates the canonical chat with the exact title and hidden flag, and says nothing in it", async () => {
+    const { authed, server, storage } = await setup({
       methods: {
         "profiles.list": () => profilesListResult([scoutRow]),
         "session.list": () => ({ sessions: [] }),
@@ -232,21 +232,23 @@ describe("GET /bots/:name/chat", () => {
     const create = server.callsOf("session.create")[0]!;
     expect(create.params).toEqual({ profile: "scout", title: CANONICAL_CHAT_TITLE, hidden: true });
     expect(CANONICAL_CHAT_TITLE).toBe("Bot Chat");
-    // The kickoff rides the RUNTIME id, not the stored one, and exists because session.create
-    // persists no row until the first prompt.
-    expect(server.callsOf("prompt.submit")[0]!.params).toEqual({
-      session_id: "runtime-1",
-      text: KICKOFF_PROMPT,
-    });
+    // Capability 11: the chat is born EMPTY. Up to 10 this same call submitted a canned opener
+    // against the RUNTIME id, and the app rendered the result as a message the user had sent.
+    expect(server.callsOf("prompt.submit")).toHaveLength(0);
+    // The session has no persisted row because nothing was ever prompted into it, so the runtime id
+    // is written down: it is the only id the user's first message can be addressed to.
+    expect(storage.botChatRuntimeId("scout", "stored-1")).toBe("runtime-1");
   });
 
-  it("rolls the pin back when the kickoff prompt fails", async () => {
+  it("leaves no pin behind when the create itself fails", async () => {
+    // The successor to the old kickoff rollback. There is no prompt to fail any more, so the last
+    // thing that can fail is `session.create`, and the invariant it guarded still holds: a chat that
+    // was not created never becomes the permanent pointer.
     const { authed, storage } = await setup({
       methods: {
         "profiles.list": () => profilesListResult([scoutRow]),
         "session.list": () => ({ sessions: [] }),
-        "session.create": () => ({ stored_session_id: "stored-1", session_id: "runtime-1" }),
-        "prompt.submit": () => {
+        "session.create": () => {
           throw { code: 5007, message: "session db unavailable" };
         },
       },

@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 9 }
+"capabilities": { "com.cozylabs.bots": 11 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -96,6 +96,19 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   before. What the version does NOT promise is that any approval will ever arrive: that depends on
   two hermes settings this wire cannot assert, and if either is wrong the surface is silently
   lossy. See "Deployment: what a bridged profile must pin".
+- `11`: fresh bot chats are BORN EMPTY, and the canned opener becomes a client-side SUGGESTION. The
+  one entry in this list that changes BEHAVIOUR rather than only adding surface, so read it as that
+  first: up to 10, opening a bot with no chat (and, from 8, resetting one) created the session and
+  SUBMITTED a canned opener into it, which the app rendered as a message the USER had sent and which
+  the bot answered before the user had typed anything. Neither path does that any more, on the
+  ruling that the user's own input is the only thing this API ever submits in a conversation. In its
+  place, `GET /bots/:name/chat/messages` carries an optional `suggestion` string while the transcript
+  is empty; it is presentation-only, and a client MAY show it and MAY let the user send it as their
+  own message. A client that offers a suggestion chip MUST require `>= 11`. A client below 11 keeps
+  working and keeps ignoring an unknown optional field, but it will see one difference against an 11
+  gateway: a freshly opened bot chat is genuinely empty where it used to hold an exchange. That is
+  the same empty payload a version 10 gateway already answered with while a chat was being created,
+  so nothing breaks; the chat simply no longer fills itself in.
 
 ## 3. Resources
 
@@ -521,9 +534,9 @@ Resolve-or-create the canonical Bot Chat. The gateway lists the bot's sessions a
 - `title`: first open of a bot with history, adopt the session titled `Bot Chat`;
 - `latest`: first open with history but no canonical title, adopt the newest session;
 - `recovery`: the pinned id vanished (compaction rewrote the lineage), re-pin the newest session;
-- `created`: no history at all, create a session titled `Bot Chat` (hidden by default) and send
-  the kickoff prompt, because Hermes persists no row for a session until its first prompt. A
-  failed kickoff rolls the pin back and the route reports the failure.
+- `created`: no history at all, create a session titled `Bot Chat` (hidden by default). Since
+  capability 11 NOTHING is submitted into it: the chat is born empty and stays empty until the user
+  writes in it. A failed create leaves no pin behind and the route reports the failure.
 
 The returned `sessionId` is the STORED session id.
 
@@ -548,13 +561,16 @@ Three v1 properties worth knowing before writing a client:
   that rejects the method, or answers without an `applied` map at all, is not asked again and the
   pin stays gateway-local, which still works. A writeback failure never fails the request.
 - **A pin the gateway just wrote survives an empty session list.** `session.create` persists no row
-  until its first prompt lands, so for a few seconds after a chat is created `session.list` still
-  answers empty. An empty list therefore does NOT mean "this bot has no chat": a pin the gateway
-  holds wins, and only a bot with no pin at all gets a new chat. This is the fix for the wave 1
-  duplicate-adoption bug, where two consecutive calls both answered `created` with different
-  session ids and the app ended up rendering a different chat than the roster previewed.
-- **This GET has side effects.** On a bot with no history it creates a session and submits the
-  kickoff prompt, which costs tokens. Do not use it as a prefetch and do not retry it blindly.
+  until its first prompt lands, so a chat nobody has written in is absent from `session.list`
+  entirely. An empty list therefore does NOT mean "this bot has no chat": a pin the gateway holds
+  wins, and only a bot with no pin at all gets a new chat. This is the fix for the wave 1
+  duplicate-adoption bug, where two consecutive calls both answered `created` with different session
+  ids and the app ended up rendering a different chat than the roster previewed. From capability 11
+  this is no longer a few-second race but the resting state of an untouched chat, so the rule holds
+  for as long as the chat stays untouched.
+- **This GET has side effects.** On a bot with no history it CREATES a session. It costs no tokens
+  since capability 11 (nothing is prompted into it), but it is still a write: it mints a session on
+  the Hermes host and moves the pin. Do not use it as a prefetch.
 
 ### GET /bots/:name/chat/messages
 
@@ -566,19 +582,39 @@ Three v1 properties worth knowing before writing a client:
   messages: BotChatMessage[],
   running: boolean,
   inflight: boolean,
-  updatedAt: integer
+  updatedAt: integer,
+  suggestion?: string                 // capability >= 11, only while `messages` is empty
 }
 404 not_found                         // no profile named `name` exists
 ```
 
 History of the canonical chat. The chat is resolved exactly as `GET /bots/:name/chat` resolves it,
 so the app never has to hold a session id, and the same side effect applies: a bot with no history
-gets a chat created and a kickoff submitted. A chat whose kickoff has not landed yet has no row to
-resume, and Hermes rejects the resume; that specific case answers `messages: []` rather than an
-error, because the messages arrive over `bot_chat` frames moments later. The tolerance follows the
-KICKOFF WINDOW (a chat this gateway created whose first prompt has not been seen to land, up to the
-180 s turn cap), NOT the `adoption` value: the second read inside that window correctly reports
-`pin`, and it is exactly the read the app performs. Every other Hermes failure is passed through.
+gets a chat created. A chat nobody has written in has no row to resume, and Hermes rejects the
+resume; that specific case answers `messages: []` rather than an error, because the chat is simply
+empty. What decides it is whether the gateway is holding the runtime id of that exact session, which
+is its durable record that it minted the chat and nothing has been said in it since. NOT the
+`adoption` value: the second read correctly reports `pin`, and it is exactly the read the app
+performs. And no longer a time window either: up to capability 10 the tolerance expired with the
+180 s turn cap, which was right only while an auto-submitted opener meant the row was seconds away.
+Every other Hermes failure is passed through.
+
+**`suggestion` (capability `>= 11`).** An opener the client MAY offer while the chat is empty.
+Present ONLY when `messages` is empty AND the deployment configured one (`hermes.chatSuggestion`,
+which defaults to `Hey, tell me about yourself!` and is turned off with an empty string); absent in
+every other case, including the moment the transcript stops being empty.
+
+It is **presentation only**, and that is the whole of the contract. The gateway does not submit it,
+it is in no transcript, and it appears in no frame. A client may render it (a chip, a placeholder,
+a tappable line) and may let the user send it AS THEIR OWN message through the ordinary
+`POST /bots/:name/chat/messages`, at which point it is that user's message like any other and the
+field disappears from the next read. A client must not send it automatically, must not display it as
+though the user or the bot had said it, and must not treat its absence as an error.
+
+Why it exists rather than the gateway just saying it: up to capability 10 this gateway submitted that
+line itself on both fresh-chat paths, and the app drew the result as a message the USER had sent to a
+bot that had already answered it. The user's own input is the only thing this API ever submits in a
+conversation.
 
 `running` and `inflight` are Hermes' own flags for the session: a client rendering a "thinking"
 state should trust the `bot_chat_state` frames over this snapshot, which is only ever a point in
@@ -623,7 +659,8 @@ which is why this rides capability 6.
 
 Delivery of the reply: the gateway submits against the session's RUNTIME id (learned from a cheap
 `session.resume`, which is also the message-count baseline, or from `session.create` for a chat
-whose kickoff has not persisted and therefore cannot be resumed at all). The stored pin is NEVER
+nobody has written in and which therefore cannot be resumed at all -- since capability 11 that is
+every chat until this very send, so the gateway keeps that runtime id on disk rather than in memory). The stored pin is NEVER
 used in that slot: a send whose runtime id cannot be established answers 502 rather than submitting
 somewhere the message is lost. The gateway then polls `session.resume` every 2 seconds until the
 transcript ENDS on an assistant message AND the session reports neither `running` nor `inflight`,
@@ -667,12 +704,12 @@ history is gone is promising something this gateway did not do. What a reset gen
 fresh context window for the bot and a clean chat screen for the user, which is what the action is
 usually wanted for.
 
-**The new chat is not empty.** It is minted exactly as `GET /bots/:name/chat` mints one on the
-`created` path: a session titled `Bot Chat`, hidden by default, born with the kickoff prompt,
-because Hermes persists no row for a session until its first prompt lands. So the reset chat comes
-back with the bot's greeting rather than with nothing, and for the first few seconds it cannot be
-resumed at all, exactly like any freshly created chat (the kickoff-window tolerance described under
-`GET /bots/:name/chat/messages` applies unchanged).
+**The new chat IS empty** (capability `>= 11`; up to 10 it came back carrying the bot's greeting).
+It is minted exactly as `GET /bots/:name/chat` mints one on the `created` path: a session titled
+`Bot Chat`, hidden by default, and nothing submitted into it. Because Hermes persists no row for a
+session until its first prompt lands, that chat cannot be resumed until the user writes in it, which
+is the same state any freshly created chat is in and which `GET /bots/:name/chat/messages` answers as
+an empty history (with the `suggestion` field, when one is configured).
 
 `previousSessionId` is the id the pin pointed at before this call. It is ABSENT only when there was
 nothing to retire, which in practice means the outgoing chat could not be resolved at all; a bot
@@ -681,8 +718,8 @@ reset, so it answers with both ids like everything else.
 
 **200, not 202.** Unlike a send, the work this route describes is finished when it answers: the new
 chat exists, it is pinned locally and pushed to `ui_meta`, the retired chat's turn poll is
-cancelled, and the `bot_chat_reset` frame has gone out. Only the kickoff reply is still in flight,
-and that reply is not what was asked for; it arrives over `bot_chat` like any other.
+cancelled, and the `bot_chat_reset` frame has gone out. Nothing at all is left in flight: the
+replacement chat is empty and stays empty until the user writes in it.
 
 What the gateway tears down before it mints, and why a client can rely on it: the retired chat's
 turn poll is cancelled, its delta watermark and pending sends are dropped, and the live-draft
@@ -1980,7 +2017,7 @@ one that was retired (absent when there was nothing to retire). It is broadcast 
 device, which is the whole reason it exists: a second device sitting on the old chat has no other way
 to learn that the session it is appending to is no longer the bot's. On receipt, rebind to
 `sessionId`, drop any draft you were rendering, and read `GET /bots/:name/chat/messages` for the new
-chat, which will be the bot's greeting once the kickoff lands.
+chat, which is empty until the user writes in it (and may carry a `suggestion` to offer them).
 
 It is not a deletion notice. The retired session is still on the hermes host and still in
 `GET /bots/:name/sessions`; only the pin moved. No further `bot_chat`, `bot_chat_state` or

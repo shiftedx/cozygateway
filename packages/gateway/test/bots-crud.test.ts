@@ -454,7 +454,8 @@ describe("review fixes", () => {
           state.created += 1;
           return { stored_session_id: `stored-${state.created}`, session_id: `runtime-${state.created}` };
         },
-        // The kickoff prompt a fresh canonical chat is opened with.
+        // Present so a stray submit would be recorded rather than rejected: since capability 11
+        // nothing here should reach it unless a user sends something.
         "prompt.submit": () => ({ ok: true }),
         "profiles.configure": (params) => {
           const blob = (params["ui_meta"] as Record<string, unknown>)["hermes-bots"];
@@ -737,7 +738,7 @@ describe("unknown bot (contract/ext-bots-v1.md section 4)", () => {
     expect(del.status).toBe(404);
 
     // The exact bug this closes: nothing hermes-side was ever touched for a profile that is not
-    // there, chat's own kickoff (`session.create` + `prompt.submit`) included.
+    // there, the canonical chat's own mint (`session.create`) included.
     expect(server.callsOf("session.create")).toHaveLength(0);
     expect(server.callsOf("session.list")).toHaveLength(0);
     expect(server.callsOf("prompt.submit")).toHaveLength(0);

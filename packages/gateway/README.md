@@ -132,6 +132,7 @@ proceed on the second.
 
 | Hermes bridge option | Type | Default | Meaning |
 | --- | --- | --- | --- |
+| `hermes.chatSuggestion` | string | `Hey, tell me about yourself!` | The opener an EMPTY bot chat offers a client (capability 11). A SUGGESTION and nothing more: the gateway never submits it, and it enters the conversation only if the user chooses to send it as their own message. Set it to the empty string to offer nothing, leaving a fresh chat completely bare. |
 | `hermes.approvalTimeoutSeconds` | integer | `300` | How long a pending approval waits before the gateway synthesizes `expired`. MIRRORS the Hermes `approvals.timeout`, which Hermes does not expose over its RPC surface and for which it emits no expiry event: it drops the entry silently, so the gateway runs its own timer. Out of step with Hermes, the only consequence is that the buttons stop being offered earlier or later than Hermes stops accepting a decision; the gateway never resolves anything by itself. |
 
 ## Backends
