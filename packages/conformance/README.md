@@ -12,9 +12,12 @@ and the `cozygateway-contract` schemas, never from any gateway's source code. Th
 and writes only the public REST and WebSocket surface, so a green run is evidence the
 implementation matches the contract, not that it shares the reference code.
 
-The suite covers twelve groups: health, capabilities, pairing, the auth wall, device lifecycle,
+The suite covers fourteen groups: health, capabilities, pairing, the auth wall, device lifecycle,
 agents, thread lifecycle, message round trip and seq discipline, WebSocket lifecycle, streaming
-order, reconnect dedup, and turn failure.
+order, reconnect dedup, turn failure, mid-turn interrupt, and the live in-flight interrupt. Every
+group but the last runs against any gateway; the last one activates only when the gateway
+declares the optional stall hook (see "The optional stall hook" below) and is otherwise reported
+as skipped.
 
 The capabilities group checks the additive `GatewayInfo.capabilities` block (contract v1.md
 section 5, issue #16) generically: that it agrees across `GET /health`, the pair response, and
@@ -60,6 +63,8 @@ export interface ConformanceEnv {
   issueSetupCode: () => Promise<string>;
   /** Agent id of the reference echo backend on the gateway under test. */
   echoAgentId: string;
+  /** Optional: agent id of a stall-capable, interruptible backend. See "The optional stall hook". */
+  stallAgentId?: string;
 }
 ```
 
@@ -92,11 +97,49 @@ Your gateway must expose the reference echo backend under the `echoAgentId` you 
 on an ephemeral port with an in-memory or temp-dir database so the run stays isolated. Peer
 dependency: `vitest >= 3`.
 
+## The optional stall hook
+
+The echo backend is queue-only: it finishes a turn as fast as it can, so a black-box run has no
+in-flight window in which to interrupt it. That leaves the 202 path of
+`POST /threads/:id/interrupt` (contract v1.md section 5) provable only at the schema level. The
+stall hook closes that gap.
+
+Declare `stallAgentId` and the suite adds one group that drives the real sequence: it sends into
+a thread on that agent, waits for the draft, interrupts mid-flight, and holds your gateway to the
+contract's 202 semantics.
+
+**What the hook promises.** `stallAgentId` names an agent on the gateway under test whose backend:
+
+1. on a send, emits at least one `draft` frame for the turn and then **stays in flight**: it never
+   commits, never emits `done`, and never fails on its own. It ends only when interrupted.
+2. honors a hard interrupt, so that while that turn is in flight
+   `POST /threads/:id/interrupt` answers `202` with body `{"status":"interrupting"}`, and the turn
+   then ends as a committed `role: "system"` message carrying `marker: "turn.interrupted"` with
+   the interrupted turn's `turnId`, followed by a `done` frame for that same turn, and **no**
+   `error` frame (in particular neither `turn_failed` nor `interrupt_unsupported`). The system
+   message is durable: it shows up in `GET /threads/:id/messages`, and no agent message does.
+3. leaves the thread idle afterward, so a second interrupt on it is `204`.
+
+Anything satisfying that is a valid hook. The reference gateway implements it with its
+`mock-steer` backend (one draft, then it waits for a steer or an interrupt); a third-party gateway
+can point it at any test backend of its own, or at a real backend it can reliably park.
+
+**It is optional on purpose.** Omit `stallAgentId` and the group is reported as skipped while
+every other assertion runs unchanged, so a gateway with no stall-capable backend passes exactly
+what it passed before the hook existed. This repo keeps a second runner
+(`test/reference-gateway-hookless.test.ts`) that declares no hook, as standing proof that the
+suite stays portable.
+
 ## Running the reference gateway's own conformance
 
-This repo ships a runner (`test/reference-gateway.test.ts`) that starts the reference gateway
-with the mock echo adapter and runs the suite against it:
+This repo ships two runners, both exercised by one command:
 
 ```bash
 pnpm --filter cozygateway-conformance test
 ```
+
+- `test/reference-gateway.test.ts` starts the reference gateway with the mock echo adapter **and**
+  the `mock-steer` stall backend, declares the stall hook, and runs the whole suite including the
+  live in-flight interrupt group.
+- `test/reference-gateway-hookless.test.ts` starts it with the echo adapter alone and declares no
+  hook, so the live-202 cases are skipped and the rest must still be green.
