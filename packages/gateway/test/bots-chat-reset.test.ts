@@ -199,7 +199,9 @@ describe("POST /bots/:name/chat/reset", () => {
     // Which makes the replacement unresumable until the user writes in it, so the reset writes down
     // the RUNTIME id the same way the resolve path does. `prompt.submit` accepts nothing else, and
     // it has to outlive this process: the chat can sit untouched indefinitely now.
-    expect(storage.botChatRuntimeId("scout", "stored-2")).toBe("runtime-2");
+    // Stamped with the link generation that minted it (issue #66): the send path compares that stamp
+    // before it trusts the id, so a reset that wrote none would leave the replacement unaddressable.
+    expect(storage.botChatRuntimeId("scout", "stored-2", bridge.linkGeneration())).toBe("runtime-2");
   });
 
   it("cancels the live turn poll belonging to the retired chat", async () => {

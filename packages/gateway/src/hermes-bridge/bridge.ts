@@ -17,7 +17,7 @@ import type {
 } from "cozygateway-contract";
 
 import type { Storage } from "../storage.ts";
-import { HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
+import { HermesRpcError, HermesUnavailable, type HermesClient, type HermesState } from "./client.ts";
 import {
   DEFAULT_CHAT_SUGGESTION,
   mintCanonicalChat,
@@ -48,7 +48,8 @@ import {
   type BotApprovalPush,
   type BotApprovalResolveOutcome,
 } from "./approvals.ts";
-import { BotChatTurns } from "./chat-turns.ts";
+import { BotChatTurns, RuntimeSessionUnknown } from "./chat-turns.ts";
+import { firstLocalGeneration, nextLocalGeneration, readyIdentity } from "./link-generation.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName } from "./photos.ts";
 import {
@@ -110,6 +111,25 @@ const CHANGE_DEBOUNCE_MS = 250;
  *  closed for five minutes is not worth a round trip. A device that is still looking at the pane
  *  keeps its bot warm simply by reading it. */
 export const ROUTINE_WATCH_TTL_MS = 5 * 60_000;
+
+/** The hermes error code for "there is no such session". Same family as
+ *  `HERMES_PROFILE_NOT_FOUND` in `routes.ts`, kept here because this one is not a status mapping: it
+ *  is the fact the send path acts on. */
+export const HERMES_SESSION_NOT_FOUND = 5003;
+
+/** True when a failed send says the chat itself is gone rather than that the prompt was refused.
+ *
+ *  Two shapes mean it. `RuntimeSessionUnknown` is this gateway's own: the resume produced no runtime
+ *  id and there was none on disk either, so the send was never addressable. A hermes `5003` is
+ *  hermes' own: the stored id names no session it knows. The message check behind the code is there
+ *  because the code is the one part of this that a hermes build could reasonably vary, and a heal is
+ *  cheap where a permanent 502 is not. */
+export function isChatSessionGone(err: unknown): boolean {
+  if (err instanceof RuntimeSessionUnknown) return true;
+  if (!(err instanceof HermesRpcError)) return false;
+  if (err.code === HERMES_SESSION_NOT_FOUND) return true;
+  return /no such session|session not found|unknown session/i.test(err.message);
+}
 
 export type BotFocusScreen = "roster" | "routines";
 
@@ -404,9 +424,19 @@ export class HermesBridge implements BotsSurface {
   #lastRosterJson = "";
   #lastActiveJson = "";
 
+  /** The hermes link generation every durable runtime id is stamped with and checked against; see
+   *  `link-generation.ts`. Seeded from disk so a gateway restart against an untouched hermes keeps
+   *  honouring the ids it was already holding. */
+  #linkGeneration: string;
+  /** True once this process has seen a `gateway.ready`. The FIRST one is the link this gateway
+   *  started on and says nothing about hermes having restarted; every one after it followed a
+   *  disconnect, which is exactly what a hermes restart looks like from here. */
+  #sawReady = false;
+
   constructor(opts: HermesBridgeOptions) {
     this.#client = opts.client;
     this.#storage = opts.storage;
+    this.#linkGeneration = opts.storage.hermesLinkGeneration() ?? firstLocalGeneration();
     this.#broadcast = opts.broadcast;
     this.#now = opts.now;
     this.#hideBotChats = opts.hideBotChats ?? true;
@@ -581,6 +611,12 @@ export class HermesBridge implements BotsSurface {
     return this.#approvals.resolve(name, toolCallId, decision, deviceId);
   }
 
+  /** The hermes link generation durable runtime ids are currently stamped with. Observability, and
+   *  the seam a test needs to ask the storage layer the same question the bridge asks it. */
+  linkGeneration(): string {
+    return this.#linkGeneration;
+  }
+
   /** Test seam: is this approval still awaiting a decision? */
   approvalPending(name: string, toolCallId: string): boolean {
     return this.#approvals.pending(name, toolCallId);
@@ -612,6 +648,10 @@ export class HermesBridge implements BotsSurface {
       }
     });
     this.#client.onEvent((event) => {
+      // The link generation, before anything else reads it. `gateway.ready` is the one event that
+      // says "this is a live link to a hermes"; whether it is the SAME hermes as last time is what
+      // `#observeReady` decides, and every durable runtime id is stamped with the answer.
+      if (event.type === "gateway.ready") this.#observeReady(event.payload);
       // The token stream (`message.start` / `message.delta` / `message.complete`). Everything else
       // this gateway does with events is below; the stream reads its three types and ignores the
       // rest, chain-of-thought events emphatically included.
@@ -1070,7 +1110,11 @@ export class HermesBridge implements BotsSurface {
         ...this.#suggestionFor(snapshot.messages),
       };
     } catch (err) {
-      if (this.#storage.botChatRuntimeId(name, chat.sessionId) === undefined) throw err;
+      // Generation-BLIND on purpose (`botChatUnwritten`, not `botChatRuntimeId`): the question here
+      // is whether the chat is empty, not whether it can still be addressed. A chat orphaned by a
+      // hermes restart is empty, and answering the resume failure instead would 502 the whole screen
+      // and put the composer out of reach -- the composer whose first send is what heals the chat.
+      if (!this.#storage.botChatUnwritten(name, chat.sessionId)) throw err;
       return {
         sessionId: chat.sessionId,
         adoption: chat.adoption,
@@ -1092,9 +1136,57 @@ export class HermesBridge implements BotsSurface {
   }
 
   /** Records, durably, that `sessionId` is a chat this gateway minted and nobody has written in, so
-   *  the user's first message can be addressed at all. See `Storage.setBotChatRuntimeId`. */
+   *  the user's first message can be addressed at all. See `Storage.setBotChatRuntimeId`.
+   *
+   *  Stamped with the CURRENT link generation, which is what makes the record expire with the hermes
+   *  that issued it rather than outliving it (issue #66). */
   #rememberUnwritten(name: string, sessionId: string, runtimeId: string): void {
-    this.#storage.setBotChatRuntimeId(name, sessionId, runtimeId);
+    this.#storage.setBotChatRuntimeId(name, sessionId, runtimeId, this.#linkGeneration);
+  }
+
+  /** Settles the link generation for the link that just came up.
+   *
+   *  Three cases, and the middle one is the one worth naming. Hermes reporting an identity of its own
+   *  is the strong answer: it is true across a gateway restart and false across a hermes restart,
+   *  which is exactly the question being asked. The FIRST ready of this process with no identity
+   *  keeps whatever the database carried, because a gateway starting up has learned nothing about
+   *  hermes having restarted and inventing a new generation here would throw away every runtime id
+   *  the gateway legitimately still holds (the PR #61 win). Every LATER ready with no identity
+   *  followed a disconnect, and a disconnect is what a hermes restart looks like from this side, so
+   *  the generation moves on. That is deliberately conservative in one direction only: a hermes that
+   *  merely blipped costs the unwritten chats a re-mint on their first send, which the user sees as a
+   *  chat that works, while trusting a stale id costs them a message that silently goes nowhere. */
+  #observeReady(payload: unknown): void {
+    const identity = readyIdentity(payload);
+    const previous = this.#linkGeneration;
+    const next =
+      identity !== undefined
+        ? `hermes:${identity}`
+        : this.#sawReady
+          ? nextLocalGeneration(previous)
+          : previous;
+    this.#sawReady = true;
+    if (next !== previous) {
+      this.#linkGeneration = next;
+      this.#log(`hermes link generation is now ${next}; runtime ids from ${previous} are no longer addressable`);
+    }
+    // The write is guarded for the reason cozygateway#65 gives (SQLITE_BUSY and friends are real on
+    // this path) and for one more that belongs to where this runs: it is the FIRST thing in the
+    // bridge's event fan-out, so an exception here would take the token stream, the approvals leg and
+    // the tool-activity leg down with it for that frame. The in-memory generation above is what this
+    // process actually enforces; failing to write it down costs only the next process's memory of it,
+    // and that process re-derives a fresh one on its first reconnect.
+    try {
+      // Persisted even when unchanged, but only when the database has never held one: a database
+      // that answers `undefined` after a restart would re-seed a different generation and throw away
+      // every runtime id the gateway legitimately still holds.
+      if (next !== previous || this.#storage.hermesLinkGeneration() === undefined) {
+        this.#storage.setHermesLinkGeneration(next);
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      this.#log(`could not record the hermes link generation ${next}; it holds in memory only (${detail})`);
+    }
   }
 
   /** Submits into the canonical chat and leaves a turn poll running behind it. The reply is
@@ -1103,19 +1195,63 @@ export class HermesBridge implements BotsSurface {
    *  The runtime id of a chat nobody has written in is handed down: that session has no row to
    *  resume, and `prompt.submit` accepts nothing else. Since capability 11 that is the state EVERY
    *  chat starts in and stays in until this very call, so the id is read from the durable record
-   *  rather than from memory -- a restart in between is ordinary now, not a two-second race. */
+   *  rather than from memory -- a restart in between is ordinary now, not a two-second race.
+   *
+   *  When BOTH of those fail -- the stored session cannot be resumed and no runtime id addresses it
+   *  either -- the chat is not merely erroring, it is gone, and it cannot come back: hermes restarted
+   *  under an unwritten chat, the session it was holding was never persisted, and nothing on either
+   *  side can resurrect it. Left alone that pinned chat answers 502 on EVERY send, forever, until
+   *  somebody thinks to press reset (issue #66, live on the household box the night hermes crashed:
+   *  6 of 7 pins were carrying an unwritten chat). So the send heals it instead of reporting it: the
+   *  dead chat is retired, a replacement is minted through the very same path a reset uses, the
+   *  user's message goes into the new chat and the route answers 202.
+   *
+   *  Re-homing is ANNOUNCED, not silent, and that is what makes it safe for a client that caches the
+   *  session id: the heal goes through `resetChat`, so every device gets the ordinary
+   *  `bot_chat_reset` frame (capability 8) naming the new session and the one it replaced, which is
+   *  the frame they already handle, and this call answers with the new `sessionId` in the 202 body.
+   *  A client that keys its transcript on the session id therefore learns the id changed by the same
+   *  mechanism it learns it from a user-initiated reset.
+   *
+   *  Exactly one heal per send. A second failure is the honest error the route was always going to
+   *  report, and retrying a mint in a loop would answer a broken hermes by filling it with chats. */
   async sendChatMessage(
     name: string,
     text: string,
     opts: { clientId?: string } = {},
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const chat = await this.canonicalChat(name);
-    const runtimeId = chat.runtimeId ?? this.#storage.botChatRuntimeId(name, chat.sessionId);
-    const message = await this.#chat.send(name, chat.sessionId, text, {
-      ...(runtimeId === undefined ? {} : { runtimeId }),
-      ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
-    });
-    return { sessionId: chat.sessionId, message };
+    const runtimeId =
+      chat.runtimeId ?? this.#storage.botChatRuntimeId(name, chat.sessionId, this.#linkGeneration);
+    try {
+      const message = await this.#chat.send(name, chat.sessionId, text, {
+        ...(runtimeId === undefined ? {} : { runtimeId }),
+        ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
+      });
+      return { sessionId: chat.sessionId, message };
+    } catch (err) {
+      // Only the unaddressable shape heals. A send that HAD a runtime id got as far as
+      // `prompt.submit`, so its failure describes the submit and not a missing session, and a send
+      // that failed for any other reason (the link is down, hermes refused the prompt) is a failure
+      // a re-mint cannot fix and would only hide behind a brand new empty chat.
+      if (runtimeId !== undefined || !isChatSessionGone(err)) throw err;
+      const detail = err instanceof Error ? err.message : "unknown";
+      this.#log(`${name}'s pinned chat could not be addressed (${detail}); minting a replacement and re-sending`);
+      const healed = await this.resetChat(name);
+      // Re-cache the roster before anything else resolves this bot. The cached `ui_meta` blob still
+      // names the DEAD session, and a cached blob that names a chat is preferred over the local pin
+      // (`resolveChatPin`), so the next open inside the debounce window would re-pin the chat that
+      // was just retired and drop the replacement's runtime id with it. The reset path already asks
+      // for this refresh; the heal waits for it, because the very next thing a healing client does
+      // is read the chat back.
+      await this.refresh("chat re-homed after a lost session");
+      const healedRuntimeId = this.#storage.botChatRuntimeId(name, healed.sessionId, this.#linkGeneration);
+      const message = await this.#chat.send(name, healed.sessionId, text, {
+        ...(healedRuntimeId === undefined ? {} : { runtimeId: healedRuntimeId }),
+        ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
+      });
+      return { sessionId: healed.sessionId, message };
+    }
   }
 
   /** One photo, with its caption, into the canonical chat (capability 9).
@@ -1138,7 +1274,14 @@ export class HermesBridge implements BotsSurface {
     photo: BotChatPhotoUpload,
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const chat = await this.canonicalChat(name);
-    const runtimeId = chat.runtimeId ?? this.#storage.botChatRuntimeId(name, chat.sessionId);
+    // Generation-scoped, exactly as the text send is: a runtime id from a hermes that has since
+    // restarted addresses nothing, and a photo submitted at it would be accepted into a phantom
+    // session. No re-mint here, deliberately -- a photo send that fails deletes its own bytes and the
+    // client still holds the picture to retry, so the failure is recoverable in a way a lost text is
+    // not, and re-sending the bytes into a chat the user has not been told about yet is not something
+    // this path should decide on their behalf.
+    const runtimeId =
+      chat.runtimeId ?? this.#storage.botChatRuntimeId(name, chat.sessionId, this.#linkGeneration);
 
     const fileId = newPhotoFileId();
     const displayName = photoDisplayName(photo.ext);

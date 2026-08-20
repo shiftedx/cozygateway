@@ -683,8 +683,8 @@ Delivery of the reply: the gateway submits against the session's RUNTIME id (lea
 `session.resume`, which is also the message-count baseline, or from `session.create` for a chat
 nobody has written in and which therefore cannot be resumed at all -- since capability 11 that is
 every chat until this very send, so the gateway keeps that runtime id on disk rather than in memory). The stored pin is NEVER
-used in that slot: a send whose runtime id cannot be established answers 502 rather than submitting
-somewhere the message is lost. The gateway then polls `session.resume` every 2 seconds until the
+used in that slot: a send whose runtime id cannot be established is never submitted against the pin,
+because that answers 202 for a message that goes nowhere. The gateway then polls `session.resume` every 2 seconds until the
 transcript ENDS on an assistant message AND the session reports neither `running` nor `inflight`,
 giving up after 180 seconds. Growth alone is not enough, because `prompt.submit` persists the
 sender's own message. That is the desktop plugin's own turn loop, moved server-side, so a
@@ -700,6 +700,18 @@ is an ordinary turn.
 There is exactly ONE turn poll per bot. A send that arrives while a poll is running rides that
 poll rather than starting another, and extends its deadline. Three consecutive failing polls
 abandon the turn with `phase: "failed"`; a single transient failure is ridden out.
+
+**A send may answer with a DIFFERENT `sessionId` than the chat the client was in.** A chat whose
+hermes session no longer exists (hermes restarted while the chat sat unwritten in, and an unwritten
+session was never persisted) cannot be addressed and cannot be repaired, so rather than failing that
+send, and every send after it, the gateway retires the dead pin, mints a replacement exactly as
+`POST /bots/:name/chat/reset` does, submits the message into it, and answers 202 naming the NEW
+session. It is announced, not silent: every device also receives the ordinary `bot_chat_reset` frame
+(section 6) carrying the new `sessionId` and the `previousSessionId` it replaced. A client that keys
+its transcript on the session id must therefore read the `sessionId` in this response, and not
+assume it is the one it sent against. If the replacement cannot be minted, or the message cannot be
+submitted into it either, the send answers 502 with the hermes text; the gateway heals once per send
+and never loops.
 
 ### POST /bots/:name/chat/reset
 
