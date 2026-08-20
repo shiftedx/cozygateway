@@ -50,11 +50,20 @@ GATEWAY_PORT="8787"
 BRIDGE_USER="cozybridge"
 BRIDGE_PASSWORD=""
 RUNTIME="auto"
+RUNTIME_EXPLICIT=""
+# The no-docker, no-clone path: a prebuilt single-file gateway (dist-bundle/cozygateway.mjs, built
+# by `pnpm bundle`) run straight by node. Empty means the bundle runtime was not asked for.
+BUNDLE_PATH=""
+COZY_NODE="${COZYGATEWAY_NODE:-node}"
 HIDDEN_PROFILES="default"
 GATEWAY_NAME="cozy-bots"
 SKIP_DASHBOARD=0
 NO_START=0
 PAIR_ONLY=0
+# Supervision. nohup gives a process that dies with the terminal and never comes back after a
+# crash or a reboot; --service hands the same two processes to the OS service manager instead.
+SERVICE=0
+UNINSTALL_SERVICE=0
 
 usage() {
   cat <<'USAGE'
@@ -77,10 +86,20 @@ usage: bash scripts/agent-install.sh [flags]
   --password VALUE          dashboard password (default: generated, '$'-free)
   --hidden-profiles A,B     Hermes profiles kept off the bots roster (default: default)
   --gateway-name NAME       gateway display name (default: cozy-bots)
-  --runtime docker|node     force a runtime (default: auto, docker when present)
+  --runtime docker|node|bundle
+                            force a runtime (default: auto, docker when present)
+  --bundle PATH             run a prebuilt single-file gateway (dist-bundle/cozygateway.mjs) at
+                            PATH instead of cloning and building. Implies --runtime bundle; needs
+                            node 24+ (set COZYGATEWAY_NODE to name a different node) and no pnpm.
   --skip-dashboard          do not touch config.yaml and do not start `hermes dashboard`
   --no-start                configure everything, start nothing
   --pair-only               skip straight to minting a pairing code against a running gateway
+  --service                 supervise the gateway (and the dashboard, unless --skip-dashboard)
+                            with the OS service manager instead of nohup, so both survive a crash,
+                            a logout and a reboot. macOS: launchd LaunchAgents. Linux: systemd
+                            --user units. Not for --runtime docker, which supervises itself.
+  --uninstall-service       stop and remove the service units this script installed, print what
+                            went, and exit. Needs neither hermes nor docker.
   -h, --help                this text
 
 Everything it generates lands in <gateway-dir>/local (git-ignored) plus <gateway-dir>/.env.
@@ -105,15 +124,38 @@ while [ $# -gt 0 ]; do
     --password) need_value "$1" $#; BRIDGE_PASSWORD="$2"; shift ;;
     --hidden-profiles) need_value "$1" $#; HIDDEN_PROFILES="$2"; shift ;;
     --gateway-name) need_value "$1" $#; GATEWAY_NAME="$2"; shift ;;
-    --runtime) need_value "$1" $#; RUNTIME="$2"; shift ;;
+    --runtime) need_value "$1" $#; RUNTIME="$2"; RUNTIME_EXPLICIT="$2"; shift ;;
+    --bundle)
+      need_value "$1" $#
+      # An EMPTY value is not the same as no flag at all. Left alone it reads as "--bundle was
+      # never passed", RUNTIME stays auto, and the run quietly clones and builds under docker:
+      # the opposite of what was asked for, with nothing said out loud.
+      [ -n "$2" ] || { printf 'FAIL  --bundle needs a path, got an empty value\n' >&2; exit 2; }
+      BUNDLE_PATH="$2"; shift ;;
     --skip-dashboard) SKIP_DASHBOARD=1 ;;
     --no-start) NO_START=1 ;;
     --pair-only) PAIR_ONLY=1 ;;
+    --service) SERVICE=1 ;;
+    --uninstall-service) UNINSTALL_SERVICE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+# --bundle IS the runtime choice, so it forces RUNTIME=bundle. Saying both and disagreeing is a
+# typo worth stopping for, not something to silently resolve one way or the other.
+if [ -n "$BUNDLE_PATH" ]; then
+  if [ -n "$RUNTIME_EXPLICIT" ] && [ "$RUNTIME_EXPLICIT" != "bundle" ]; then
+    printf 'FAIL  --bundle implies --runtime bundle, but --runtime %s was also given\n' \
+      "$RUNTIME_EXPLICIT" >&2
+    exit 2
+  fi
+  RUNTIME="bundle"
+elif [ "$RUNTIME" = "bundle" ]; then
+  printf 'FAIL  --runtime bundle needs --bundle PATH naming the prebuilt cozygateway.mjs\n' >&2
+  exit 2
+fi
 
 for pair in "--gateway-port:$GATEWAY_PORT" "--dashboard-port:$DASHBOARD_PORT"; do
   flag="${pair%%:*}"; value="${pair#*:}"
@@ -123,6 +165,18 @@ for pair in "--gateway-port:$GATEWAY_PORT" "--dashboard-port:$DASHBOARD_PORT"; d
   [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || {
     printf 'FAIL  %s must be 1-65535, got %s\n' "$flag" "$value" >&2; exit 2; }
 done
+
+# Does THIS install start the dashboard, or does it only point at somebody else's?
+#
+# The distinction has teeth at uninstall time. --skip-dashboard means the operator owns the
+# dashboard and merely told us its port; --no-start and --pair-only start nothing at all. In every
+# one of those cases the dashboard on $DASHBOARD_PORT is a stranger's, and anything this script does
+# to it is vandalism. The answer is knowable here, from the flags alone, so it is recorded in
+# install-env.sh rather than re-guessed later from a port that cannot tell you who owns it.
+DASHBOARD_OWNED=1
+if [ "$SKIP_DASHBOARD" = "1" ] || [ "$NO_START" = "1" ] || [ "$PAIR_ONLY" = "1" ]; then
+  DASHBOARD_OWNED=0
+fi
 
 LOCAL_DIR="$GATEWAY_DIR/local"
 CONFIG_JSON="$LOCAL_DIR/cozygateway.config.json"
@@ -156,6 +210,456 @@ dry() { [ "$DRY_RUN" = "1" ]; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# port_listening PORT: is anything holding a listening socket on it. The honest question when the
+# question is "can a unit bind this", which HTTP health cannot answer: a socket in the wrong state,
+# or a process wedged after its HTTP stack died, still keeps the next bind out.
+port_listening() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------- supervision
+#
+# --service replaces the nohup starts in phases 5 and 7 with real OS-supervised units. The unit
+# never carries the dashboard password: unit files and launchd plists are world-readable, so each
+# unit execs a WRAPPER in $LOCAL_DIR (mode 700) that sources $INSTALL_ENV and reads the password out
+# of the mode-600 credentials file at exec time.
+#
+# The wrapper also cannot rely on this shell's PATH. launchd hands a job /usr/bin:/bin:/usr/sbin:
+# /sbin and nothing else, so `hermes` and a Homebrew `node` are both absent there; every interpreter
+# and binary the wrappers exec is therefore resolved to an absolute path at WRITE time.
+
+# Binding names. macOS reverse-DNS labels, Linux unit filenames; they are what --uninstall-service
+# looks for, so they must never drift from what the writers below install.
+SERVICE_LABEL_GATEWAY="ai.cozylabs.cozygateway"
+SERVICE_LABEL_DASHBOARD="ai.cozylabs.hermes-dashboard"
+SERVICE_UNIT_GATEWAY="cozygateway.service"
+SERVICE_UNIT_DASHBOARD="cozygateway-hermes-dashboard.service"
+SERVICE_PLATFORM=""
+
+# resolve_service_platform: launchd or systemd, or a clear stop. Called by both --service and
+# --uninstall-service, and by nothing else, so an install that never asks for supervision never
+# cares what init system this box runs.
+resolve_service_platform() {
+  case "$(uname -s)" in
+    Darwin) SERVICE_PLATFORM="launchd" ;;
+    Linux)  SERVICE_PLATFORM="systemd" ;;
+    *) die "--service supports macOS (launchd) and Linux (systemd --user); this box reports '$(uname -s)'. Start the gateway by hand, or drop --service to use nohup." ;;
+  esac
+}
+
+# service_unit_name KIND: the platform's name for the gateway or dashboard unit.
+service_unit_name() {
+  case "$SERVICE_PLATFORM:$1" in
+    launchd:gateway)   printf '%s' "$SERVICE_LABEL_GATEWAY" ;;
+    launchd:dashboard) printf '%s' "$SERVICE_LABEL_DASHBOARD" ;;
+    systemd:gateway)   printf '%s' "$SERVICE_UNIT_GATEWAY" ;;
+    systemd:dashboard) printf '%s' "$SERVICE_UNIT_DASHBOARD" ;;
+    *) die "internal: no unit name for '$1' on '$SERVICE_PLATFORM'" ;;
+  esac
+}
+
+# service_write_gateway_wrapper: $LOCAL_DIR/run-gateway.sh, mode 700.
+#
+# It branches on COZY_RUNTIME, not on whether COZY_BUNDLE_PATH looks empty: install-env.sh records
+# that variable unconditionally, empty included, so emptiness means nothing on its own.
+service_write_gateway_wrapper() {
+  local wrapper="$LOCAL_DIR/run-gateway.sh" node_bin="$COZY_NODE"
+  # The node runtime never canonicalized $COZY_NODE (only the bundle preflight does), and a bare
+  # `node` is not on launchd's PATH. Resolve it here or the unit dies with "command not found".
+  case "$node_bin" in
+    /*) : ;;
+    *) node_bin="$(command -v "$node_bin" 2>/dev/null || printf '%s' "$node_bin")" ;;
+  esac
+  if dry; then
+    printf 'DRY   write %s (mode 700): sources %s, reads the password from %s at exec time, execs the %s runtime\n' \
+      "$wrapper" "$INSTALL_ENV" "$CRED_FILE" "$RUNTIME"
+    return 0
+  fi
+  umask 077
+  cat > "$wrapper" <<WRAPPER
+#!/usr/bin/env bash
+# Generated by agent-install.sh --service. Reads the dashboard password at exec
+# time so it never sits in the unit file (which is world-readable).
+set -euo pipefail
+. "$INSTALL_ENV"
+COZYGATEWAY_HERMES_PASSWORD="\${COZYGATEWAY_HERMES_PASSWORD:-}"
+# --skip-dashboard installs can legitimately have no credentials file: the operator owns the
+# dashboard elsewhere and passes the password in through the environment.
+if [ -f "\$COZY_CRED_FILE" ]; then
+  COZYGATEWAY_HERMES_PASSWORD="\$(sed -n '/^password=/{s///p;q;}' "\$COZY_CRED_FILE")"
+fi
+export COZYGATEWAY_HERMES_PASSWORD
+# Both branches cd first: launchd starts a job in /, so anything either runtime resolves relative
+# to the working directory would land at the filesystem root without this.
+if [ "\$COZY_RUNTIME" = "bundle" ]; then
+  cd "\$COZY_GATEWAY_DIR" && exec "\$COZY_NODE" "\$COZY_BUNDLE_PATH" serve --config "\$COZY_CONFIG_JSON"
+else
+  cd "\$COZY_GATEWAY_DIR" && exec $(printf '%q' "$node_bin") packages/gateway/dist/cli.js serve --config "\$COZY_CONFIG_JSON"
+fi
+WRAPPER
+  chmod 700 "$wrapper"
+  ok "wrote $wrapper (mode 700); the unit execs it, and it reads the password from $CRED_FILE"
+}
+
+# service_write_dashboard_wrapper: $LOCAL_DIR/run-dashboard.sh, mode 700. Only ever called when
+# SKIP_DASHBOARD=0, which is also the only case in which `hermes` is guaranteed present.
+service_write_dashboard_wrapper() {
+  local wrapper="$LOCAL_DIR/run-dashboard.sh" hermes_bin
+  hermes_bin="$(command -v hermes 2>/dev/null || true)"
+  [ -n "$hermes_bin" ] || die "--service needs an absolute path to hermes for the dashboard unit (launchd's PATH is minimal), and 'hermes' is not on PATH"
+  if dry; then
+    printf 'DRY   write %s (mode 700): exec %s dashboard --host %s --port %s --no-open --skip-build\n' \
+      "$wrapper" "$hermes_bin" "$DASHBOARD_HOST" "$DASHBOARD_PORT"
+    return 0
+  fi
+  umask 077
+  cat > "$wrapper" <<WRAPPER
+#!/usr/bin/env bash
+# Generated by agent-install.sh --service.
+set -euo pipefail
+. "$INSTALL_ENV"
+export HERMES_HOME="\$COZY_HERMES_HOME"
+# launchd starts a job in /, and systemd --user in the user's home only by default. The nohup path
+# deliberately runs \`hermes dashboard\` from \$HOME; match it, so anything hermes resolves relative
+# to the working directory resolves to the same place under supervision as it does without it.
+cd "\$HOME"
+exec $(printf '%q' "$hermes_bin") dashboard --host "\$COZY_DASHBOARD_HOST" --port "\$COZY_DASHBOARD_PORT" --no-open --skip-build
+WRAPPER
+  chmod 700 "$wrapper"
+  ok "wrote $wrapper (mode 700); the unit execs it with HERMES_HOME=$HERMES_HOME_DIR"
+}
+
+# service_install_launchd LABEL WRAPPER LOG: write the plist and (re)bootstrap the job.
+#
+# KeepAlive/SuccessfulExit=false is "restart unless it exited 0": a crash or a kill comes back, a
+# clean shutdown stays down. ThrottleInterval caps the restart rate at one per 10s so a unit that
+# cannot start at all does not spin.
+service_install_launchd() {
+  local label="$1" wrapper="$2" log="$3"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$wrapper</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>$log</string>
+  <key>StandardErrorPath</key><string>$log</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict></plist>
+PLIST
+  # Bootout first so a re-run replaces the loaded job rather than colliding with it. Both calls are
+  # tolerant: bootout fails when nothing is loaded, and bootstrap is unavailable on very old macOS,
+  # where load -w is the equivalent.
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
+  ok "launchd: $label bootstrapped from $plist (RunAtLoad, KeepAlive on non-zero exit, log $log)"
+}
+
+# service_install_systemd UNIT WRAPPER LOG: write the unit file and (re)enable it.
+#
+# StandardOutput/StandardError=append:$log gives systemd the same job launchd's StandardOutPath/
+# StandardErrorPath does: the failure paths in phases 5 and 7 (`tail -30 "$DASH_LOG"` / "$GW_LOG")
+# read real content on Linux instead of an empty file, and journalctl --user -u UNIT still works on
+# top of it.
+#
+# Restart=on-failure + RestartSec=5 mirrors launchd's KeepAlive-on-nonzero-exit + 10s
+# ThrottleInterval closely enough: both come back after a crash, both leave a clean exit down.
+service_install_systemd() {
+  local unit="$1" wrapper="$2" log="$3" dir="$HOME/.config/systemd/user" desc err
+  case "$unit" in
+    "$SERVICE_UNIT_GATEWAY")   desc="CozyGateway" ;;
+    "$SERVICE_UNIT_DASHBOARD") desc="CozyGateway Hermes dashboard" ;;
+    *) desc="$unit" ;;
+  esac
+  mkdir -p "$dir"
+  cat > "$dir/$unit" <<UNIT
+[Unit]
+Description=$desc
+
+[Service]
+ExecStart=/bin/bash $wrapper
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:$log
+StandardError=append:$log
+
+[Install]
+WantedBy=default.target
+UNIT
+  # A user unit needs a user D-Bus session, which some SSH setups never start (no login session, no
+  # lingering). Both calls below are the honest test for that: fail here, loudly, with the fix,
+  # rather than leaving a unit file on disk that nothing ever loads.
+  if ! err="$(systemctl --user daemon-reload 2>&1)"; then
+    die "systemctl --user daemon-reload failed: $err. This usually means no systemd --user D-Bus session is available (common over a plain SSH command, without a full login). Run: sudo loginctl enable-linger $USER, log in with a real session (or ssh -t), then re-run with --service."
+  fi
+  if ! err="$(systemctl --user enable --now "$unit" 2>&1)"; then
+    die "systemctl --user enable --now $unit failed: $err. This usually means no systemd --user D-Bus session is available. Run: sudo loginctl enable-linger $USER, log in with a real session (or ssh -t), then re-run with --service."
+  fi
+  loginctl enable-linger "$USER" 2>/dev/null || \
+    warn "could not enable lingering; the service stops at logout. Run: sudo loginctl enable-linger $USER"
+  ok "systemd --user: $unit enabled and started from $dir/$unit (log: $log, or journalctl --user -u $unit -f)"
+}
+
+# service_install_unit KIND WRAPPER LOG
+service_install_unit() {
+  local kind="$1" wrapper="$2" log="$3" name
+  name="$(service_unit_name "$kind")"
+  if dry; then
+    if [ "$SERVICE_PLATFORM" = "launchd" ]; then
+      printf 'DRY   write ~/Library/LaunchAgents/%s.plist (exec /bin/bash %s, RunAtLoad, KeepAlive, log %s)\n' "$name" "$wrapper" "$log"
+      printf 'DRY   launchctl bootout gui/%s/%s ; launchctl bootstrap gui/%s ~/Library/LaunchAgents/%s.plist\n' \
+        "$(id -u)" "$name" "$(id -u)" "$name"
+    else
+      printf 'DRY   install and start the systemd --user unit %s (exec %s, log %s)\n' "$name" "$wrapper" "$log"
+    fi
+    return 0
+  fi
+  case "$SERVICE_PLATFORM" in
+    launchd) service_install_launchd "$name" "$wrapper" "$log" ;;
+    systemd) service_install_systemd "$name" "$wrapper" "$log" ;;
+    *) die "internal: no service platform resolved" ;;
+  esac
+}
+
+# service_stop_unit KIND: unload the unit if it is loaded, and say nothing if it is not.
+#
+# This exists for one reason: KeepAlive. Any attempt to stop a supervised process from OUTSIDE its
+# supervisor is a race the supervisor wins, so `hermes dashboard --stop` against a loaded unit stops
+# a process that launchd immediately starts again, and the caller's "wait for the port to free" loop
+# then times out on a dashboard that never went away. The unit has to be unloaded FIRST.
+service_stop_unit() {
+  local kind="$1" name
+  name="$(service_unit_name "$kind")"
+  case "$SERVICE_PLATFORM" in
+    launchd)
+      launchctl print "gui/$(id -u)/$name" >/dev/null 2>&1 || return 0
+      if dry; then
+        printf 'DRY   launchctl bootout gui/%s/%s (unload before stopping, so KeepAlive cannot restart it)\n' "$(id -u)" "$name"
+        return 0
+      fi
+      launchctl bootout "gui/$(id -u)/$name" 2>/dev/null || true
+      info "unloaded the existing $name unit so it cannot restart under us"
+      ;;
+    systemd)
+      have systemctl || return 0
+      systemctl --user cat "$name" >/dev/null 2>&1 || return 0
+      if dry; then
+        printf 'DRY   systemctl --user stop %s (stop before restarting, so Restart= cannot race)\n' "$name"
+        return 0
+      fi
+      systemctl --user stop "$name" >/dev/null 2>&1 || true
+      info "stopped the existing $name unit so it cannot restart under us"
+      ;;
+  esac
+}
+
+# adopt_unsupervised_gateway: free $GATEWAY_PORT so the unit can actually have it.
+#
+# The same defect the dashboard had, in the gateway's clothes, and quieter. An earlier non-service
+# run leaves a nohup'd gateway holding the port. Install a unit on top and the unit crash-loops on
+# EADDRINUSE forever, while `GET /health` answers 200 from the UNSUPERVISED process the whole time:
+# the 90s poll passes, the capability check passes, the roster check passes, the run ends green, and
+# nothing is supervised. Every symptom says success.
+#
+# Called only after `service_stop_unit gateway`, so anything still on the port is by definition not
+# ours. It is still a cozygateway serving this install's config and database, so stopping it is
+# adoption, not a coin flip -- but it is a kill by pid, so it says so at the top of its voice first.
+adopt_unsupervised_gateway() {
+  local pids pid waited=0
+  port_listening "$GATEWAY_PORT" || return 0
+  if dry; then
+    printf 'DRY   stop whatever still holds port %s after the unit is unloaded, so the unit can bind it\n' "$GATEWAY_PORT"
+    return 0
+  fi
+  pids="$(lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  [ -n "$pids" ] || return 0
+  warn "port $GATEWAY_PORT is still held after the $SERVICE_PLATFORM unit was unloaded, so an UNSUPERVISED gateway is running (a nohup start from an earlier run). Left alone, the unit would crash-loop on EADDRINUSE while /health answered 200 from that process, and this run would end green with nothing supervised. Stopping it so the unit can own the port."
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    info "  stopping pid $pid ($(ps -p "$pid" -o command= 2>/dev/null | cut -c1-90 || true))"
+    kill "$pid" 2>/dev/null || true
+  done <<EOF
+$pids
+EOF
+  while [ "$waited" -lt 20 ]; do
+    port_listening "$GATEWAY_PORT" || { ok "the unsupervised gateway is stopped and port $GATEWAY_PORT is free"; return 0; }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warn "the unsupervised gateway ignored SIGTERM for 20s; sending SIGKILL"
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    kill -9 "$pid" 2>/dev/null || true
+  done <<EOF
+$pids
+EOF
+  waited=0
+  while [ "$waited" -lt 10 ]; do
+    port_listening "$GATEWAY_PORT" || { ok "port $GATEWAY_PORT is free"; return 0; }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  die "port $GATEWAY_PORT is still held by something that will not stop. Free it by hand (\`lsof -nP -iTCP:$GATEWAY_PORT -sTCP:LISTEN\`) and re-run, or pass --gateway-port."
+}
+
+# uninstall_services: stop and remove both units, say what actually went, and never fail because
+# something was already absent. It deliberately touches nothing else: the config, the credentials,
+# the database and the wrapper scripts all survive, so re-running with --service is a one-liner.
+uninstall_services() {
+  local removed=0 dash_removed=0 this_removed=0 label plist unit unit_file uid
+  case "$SERVICE_PLATFORM" in
+    launchd)
+      uid="$(id -u)"
+      for label in "$SERVICE_LABEL_GATEWAY" "$SERVICE_LABEL_DASHBOARD"; do
+        this_removed=0
+        plist="$HOME/Library/LaunchAgents/$label.plist"
+        if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+          if dry; then
+            printf 'DRY   launchctl bootout gui/%s/%s\n' "$uid" "$label"
+          else
+            launchctl bootout "gui/$uid/$label" 2>/dev/null || launchctl unload -w "$plist" 2>/dev/null || true
+            # bootout returns before the job is gone when the job still has live children, and a
+            # job that is still registered is one a later `--service` run would collide with. Give
+            # it a moment and say the second word if the first was not heard.
+            for _ in 1 2 3 4 5; do
+              launchctl print "gui/$uid/$label" >/dev/null 2>&1 || break
+              sleep 1
+              launchctl bootout "gui/$uid/$label" 2>/dev/null || true
+            done
+            ok "booted out $label"
+          fi
+          removed=1; this_removed=1
+        fi
+        if [ -f "$plist" ]; then
+          if dry; then
+            printf 'DRY   rm %s\n' "$plist"
+          else
+            rm -f "$plist"
+            ok "removed $plist"
+          fi
+          removed=1; this_removed=1
+        fi
+        if [ "$label" = "$SERVICE_LABEL_DASHBOARD" ] && [ "$this_removed" = "1" ]; then
+          dash_removed=1
+        fi
+      done
+      ;;
+    systemd)
+      for unit in "$SERVICE_UNIT_GATEWAY" "$SERVICE_UNIT_DASHBOARD"; do
+        this_removed=0
+        unit_file="$HOME/.config/systemd/user/$unit"
+        # `systemctl --user cat` succeeds only for a unit systemd can actually see, which is the
+        # honest test for "is there something here to stop", file on disk or not.
+        if have systemctl && systemctl --user cat "$unit" >/dev/null 2>&1; then
+          if dry; then
+            printf 'DRY   systemctl --user disable --now %s\n' "$unit"
+          else
+            systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
+            ok "stopped and disabled $unit"
+          fi
+          removed=1; this_removed=1
+        fi
+        if [ -f "$unit_file" ]; then
+          if dry; then
+            printf 'DRY   rm %s\n' "$unit_file"
+          else
+            rm -f "$unit_file"
+            ok "removed $unit_file"
+          fi
+          removed=1; this_removed=1
+        fi
+        if [ "$unit" = "$SERVICE_UNIT_DASHBOARD" ] && [ "$this_removed" = "1" ]; then
+          dash_removed=1
+        fi
+      done
+      if [ "$removed" = "1" ] && ! dry && have systemctl; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        info "systemctl --user daemon-reload"
+      fi
+      ;;
+  esac
+  if [ "$removed" = "0" ]; then
+    info "nothing to remove: no cozygateway service units were installed for this user"
+  fi
+  # Only after a dashboard unit was ACTUALLY removed. An uninstall that removed nothing has no
+  # business stopping anything, and the "nothing to remove" path used to reach the sweep too.
+  if [ "$dash_removed" = "1" ]; then
+    stop_detached_dashboard
+  fi
+}
+
+# stop_detached_dashboard: the half of the dashboard the unit does not own.
+#
+# `hermes dashboard` does not BECOME the server; it starts a detached backend and the unit's process
+# tree does not contain it. So removing the unit leaves the port still listening, which is a wrong
+# answer from something called --uninstall-service, and it is the port the next --service run needs.
+# Observed live: after a clean uninstall, lsof still showed two listeners on the dashboard port.
+#
+# Narrow on purpose, and narrowed further after review pointed out that a listening port names
+# nothing. Three conditions, all required:
+#
+#   1. A dashboard UNIT was actually removed by the call above (the caller checks this).
+#   2. install-env.sh says COZY_DASHBOARD_OWNED=1, i.e. this install STARTS the dashboard. A
+#      --skip-dashboard install records the operator's port without owning what listens on it, and
+#      --no-start / --pair-only start nothing; in all three cases the process on that port belongs
+#      to somebody else and stopping it is vandalism.
+#   3. Something is still listening on that exact port after the unit is gone.
+#
+# Older install-env.sh files predate the ownership key. A missing key reads as NOT owned, so the
+# sweep declines rather than guessing: the cost of declining is a stray listener the operator can
+# see and stop, and the cost of guessing wrong is killing a dashboard we never started.
+stop_detached_dashboard() {
+  local dash_port hermes_home owned waited=0
+  [ -f "$INSTALL_ENV" ] || return 0
+  # Read in a SUBSHELL: install-env.sh exports COZY_* names this script also uses.
+  # shellcheck source=/dev/null
+  dash_port="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_DASHBOARD_PORT:-}" )"
+  # shellcheck source=/dev/null
+  hermes_home="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_HERMES_HOME:-}" )"
+  # shellcheck source=/dev/null
+  owned="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_DASHBOARD_OWNED:-0}" )"
+  if [ "${owned:-0}" != "1" ]; then
+    info "not touching whatever listens on the dashboard port: this install does not own it (--skip-dashboard, --no-start or an install-env.sh written before ownership was recorded)"
+    return 0
+  fi
+  case "${dash_port:-}" in ''|*[!0-9]*) return 0 ;; esac
+  lsof -nP -iTCP:"$dash_port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+  if dry; then
+    printf 'DRY   hermes dashboard --stop (something is still listening on %s; the unit does not parent the backend)\n' "$dash_port"
+    return 0
+  fi
+  if ! have hermes; then
+    warn "a dashboard is still listening on 127.0.0.1:$dash_port and hermes is not on PATH to stop it. The unit is gone, but the server it started is not: stop it by hand."
+    return 0
+  fi
+  info "a dashboard is still listening on 127.0.0.1:$dash_port: hermes runs the server as a detached backend that the unit never parented. Stopping it."
+  HERMES_HOME="${hermes_home:-$HERMES_HOME_DIR}" hermes dashboard --stop >/dev/null 2>&1 || \
+    warn "hermes dashboard --stop returned an error"
+  while [ "$waited" -lt 20 ]; do
+    lsof -nP -iTCP:"$dash_port" -sTCP:LISTEN >/dev/null 2>&1 || {
+      ok "the detached dashboard backend is stopped; nothing is listening on $dash_port"
+      return 0
+    }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warn "something is STILL listening on 127.0.0.1:$dash_port after hermes dashboard --stop. \`hermes dashboard --status\` names the processes; stop it by hand."
+}
+
+if [ "$UNINSTALL_SERVICE" = "1" ]; then
+  step "--uninstall-service"
+  resolve_service_platform
+  info "service manager: $SERVICE_PLATFORM"
+  uninstall_services
+  info "the config, credentials, database and wrapper scripts under $LOCAL_DIR were left alone"
+  ok "done; re-run with --service to put the units back"
+  exit 0
+fi
+
 # write_install_env: the handoff to docs/agent-install.md.
 #
 # The playbook's commands each run in a FRESH SHELL, one per tool call, so nothing can be handed
@@ -185,15 +689,25 @@ write_install_env() {
     printf 'COZY_GATEWAY_PORT=%q\n' "$GATEWAY_PORT"
     printf 'COZY_DASHBOARD_PORT=%q\n' "$DASHBOARD_PORT"
     printf 'COZY_DASHBOARD_HOST=%q\n' "$DASHBOARD_HOST"
+    # 1 only when this install actually starts the dashboard on that port. --uninstall-service
+    # refuses to touch the port otherwise.
+    printf 'COZY_DASHBOARD_OWNED=%q\n' "$DASHBOARD_OWNED"
     printf 'COZY_BRIDGE_USER=%q\n' "$BRIDGE_USER"
     printf 'COZY_RUNTIME=%q\n' "$RUNTIME"
+    # Always recorded, empty included: a later step that reads an unset variable under `set -u`
+    # dies with bash's own message instead of the empty string that honestly means "not the
+    # bundle path". Task 3's service unit execs exactly "$COZY_NODE" "$COZY_BUNDLE_PATH".
+    printf 'COZY_BUNDLE_PATH=%q\n' "$BUNDLE_PATH"
+    printf 'COZY_NODE=%q\n' "$COZY_NODE"
     printf 'COZY_HERMES_PY=%q\n' "$HERMES_PY"
     printf 'COZY_HERMES_HOME=%q\n' "$HERMES_HOME_DIR"
     printf 'COZY_GW_LOG=%q\n' "$GW_LOG"
     printf 'COZY_DASH_LOG=%q\n' "$DASH_LOG"
     printf 'export COZY_GATEWAY_DIR COZY_LOCAL_DIR COZY_CONFIG_JSON COZY_ENV_FILE COZY_CRED_FILE\n'
     printf 'export COZY_GATEWAY_PORT COZY_DASHBOARD_PORT COZY_DASHBOARD_HOST COZY_BRIDGE_USER\n'
+    printf 'export COZY_DASHBOARD_OWNED\n'
     printf 'export COZY_RUNTIME COZY_HERMES_PY COZY_HERMES_HOME COZY_GW_LOG COZY_DASH_LOG\n'
+    printf 'export COZY_BUNDLE_PATH COZY_NODE\n'
   } > "$INSTALL_ENV"
   chmod 600 "$INSTALL_ENV"
   ok "recorded the install's ports, hosts and paths in $INSTALL_ENV (mode 600); the playbook sources this"
@@ -216,6 +730,8 @@ mint_pair_raw() {
   if [ "$RUNTIME" = "docker" ]; then
     ( cd "$GATEWAY_DIR" && docker compose -f docker-compose.yml -f "$OVERRIDE_REL" \
       exec -T gateway node dist/cli.js pair --config /app/cozygateway.config.json )
+  elif [ "$RUNTIME" = "bundle" ]; then
+    "$COZY_NODE" "$BUNDLE_PATH" pair --config "$CONFIG_JSON"
   else
     ( cd "$GATEWAY_DIR" && node packages/gateway/dist/cli.js pair --config "$CONFIG_JSON" )
   fi
@@ -353,6 +869,34 @@ if [ "$RUNTIME" = "auto" ]; then
     die "neither 'docker compose' nor 'node' is available; install one of them"
   fi
 fi
+
+# --service supervises a PROCESS this script started. Under docker the restart policy in
+# docker-compose.yml already does that job, and a launchd unit on top of it would be a second
+# supervisor fighting the first. The check sits here, after the auto-resolution above, so it fires
+# on the runtime that will actually be used rather than on the flag that was typed.
+if [ "$SERVICE" = "1" ]; then
+  if [ "$RUNTIME" = "docker" ]; then
+    [ -n "$RUNTIME_EXPLICIT" ] || \
+      info "docker was chosen by autodetection, not asked for; --runtime node or --bundle PATH selects the supervised path"
+    die "docker already supervises the gateway; --service is for the no-docker path"
+  fi
+  # --service's whole job is to install units AND start them. --no-start starts nothing and
+  # --pair-only leaves before either start phase, so both would end green having installed no unit
+  # at all, after a preflight line promising supervision. Refuse rather than lie.
+  if [ "$NO_START" = "1" ]; then
+    die "--service installs and starts the service units, so it cannot be combined with --no-start. Drop one of them."
+  fi
+  if [ "$PAIR_ONLY" = "1" ]; then
+    die "--pair-only only mints a code against an already-running gateway; it never reaches the start phases, so --service would install nothing. Drop one of them."
+  fi
+  resolve_service_platform
+  if [ "$SKIP_DASHBOARD" = "1" ]; then
+    ok "supervision: $SERVICE_PLATFORM (--service); the gateway restarts after a crash and at login"
+  else
+    ok "supervision: $SERVICE_PLATFORM (--service); the gateway and the dashboard restart after a crash and at login"
+  fi
+fi
+
 case "$RUNTIME" in
   docker)
     have docker || die "--runtime docker but docker is not installed"
@@ -375,8 +919,98 @@ case "$RUNTIME" in
     have pnpm || die "pnpm is required for the node path (npm i -g pnpm@10)"
     ok "runtime: node $(node -v) with $(pnpm --version)"
     ;;
-  *) die "--runtime must be 'docker' or 'node', got '$RUNTIME'" ;;
+  bundle)
+    # Nothing is cloned and nothing is built on this path, so git/pnpm/docker are all beside the
+    # point. The two things that have to be true are the file and the interpreter, and the version
+    # check runs against $COZY_NODE (which COZYGATEWAY_NODE names) rather than whatever `node` on
+    # PATH happens to be: a box whose PATH node is 22 can still run the bundle under a 24+ binary.
+    [ -f "$BUNDLE_PATH" ] || die "--bundle $BUNDLE_PATH does not exist. Build it with 'pnpm bundle' in a cozygateway checkout and copy dist-bundle/cozygateway.mjs here."
+    # Canonicalize to an ABSOLUTE path before anything records it. A relative --bundle resolves
+    # correctly here, against the cwd this script was invoked from, and then wrong everywhere
+    # afterwards: the service unit Tasks 3/4 write execs "$COZY_NODE" "$COZY_BUNDLE_PATH" from the
+    # service manager's cwd, which is /, so a relative path yields a unit that cannot start and a
+    # preflight that said nothing. `readlink -f` is not portable to macOS, so the dirname is
+    # resolved by cd'ing into it. A path that is ALREADY absolute is left exactly as given: it
+    # needs no fixing, and rewriting it would resolve the operator's symlinks behind their back
+    # (/opt/homebrew/opt/node/bin/node is a deliberately stable alias; the Cellar path it points at
+    # names one version and disappears on the next upgrade).
+    case "$BUNDLE_PATH" in
+      /*) : ;;
+      *)  BUNDLE_PATH="$(cd "$(dirname "$BUNDLE_PATH")" && pwd -P)/$(basename "$BUNDLE_PATH")" ;;
+    esac
+    [ -f "$BUNDLE_PATH" ] || die "could not resolve --bundle to an absolute path (got $BUNDLE_PATH)"
+    # Same argument for the interpreter, and for the same consumer. A bare name is resolved through
+    # PATH here rather than left as a name, because the service manager's PATH is not this shell's.
+    case "$COZY_NODE" in
+      /*)
+        [ -x "$COZY_NODE" ] || die "node binary '$COZY_NODE' is not an executable file (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+        ;;
+      */*)
+        [ -x "$COZY_NODE" ] || die "node binary '$COZY_NODE' is not an executable file (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+        COZY_NODE="$(cd "$(dirname "$COZY_NODE")" && pwd -P)/$(basename "$COZY_NODE")"
+        ;;
+      *)
+        have "$COZY_NODE" || die "node binary '$COZY_NODE' not found on PATH (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+        COZY_NODE="$(command -v "$COZY_NODE")"
+        ;;
+    esac
+    BUNDLE_NODE_MAJOR="$("$COZY_NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+    case "${BUNDLE_NODE_MAJOR:-}" in
+      ''|*[!0-9]*) die "could not read a version out of '$COZY_NODE -p process.versions.node'" ;;
+    esac
+    [ "$BUNDLE_NODE_MAJOR" -ge 24 ] || die "$COZY_NODE is node $BUNDLE_NODE_MAJOR; the gateway requires node 24 or newer. Set COZYGATEWAY_NODE to a node 24+ binary and re-run."
+    ok "runtime: bundle $BUNDLE_PATH under $COZY_NODE ($("$COZY_NODE" -v)); no clone, no pnpm"
+    ;;
+  *) die "--runtime must be 'docker', 'node' or 'bundle', got '$RUNTIME'" ;;
 esac
+
+# TCC: the one --service failure that gives you NOTHING to read.
+#
+# macOS gates ~/Desktop, ~/Documents and ~/Downloads behind per-app consent. A Terminal has usually
+# been granted it; a launchd agent has not, and it has no UI to ask through. So a unit whose code or
+# state lives in one of those folders blocks forever inside the very first open(), before a single
+# line reaches the log: `launchctl print` says `state = running`, the log file is zero bytes, the
+# port never opens, and the 90s /health poll below dies with nothing to show for it. Observed
+# firsthand on this box with the bundle under ~/Documents.
+#
+# A warning rather than a hard stop: consent CAN be granted (System Settings > Privacy & Security >
+# Files and Folders, or Full Disk Access for /bin/bash), and only the operator knows whether it has
+# been. But it is said loudly, before the silence starts.
+#
+# macOS only: there is no such gate on Linux, and running the loop there would be noise.
+# $HERMES_HOME_DIR is in the list because the dashboard unit reads config.yaml out of it and hangs
+# in exactly the same way.
+tcc_check() { # $1 path  $2 what it is  $3 how to fix it
+  local guarded
+  [ -n "${1:-}" ] || return 0
+  for guarded in "$HOME/Desktop" "$HOME/Documents" "$HOME/Downloads"; do
+    case "$1" in
+      "$guarded"/*)
+        warn "--service: $2 is $1, inside $guarded, which macOS gates behind per-folder consent that a launchd agent cannot ask for. The unit will start, open nothing, log nothing and never answer its health check. $3 Or grant Full Disk Access to /bin/bash first."
+        return 0
+        ;;
+    esac
+  done
+}
+
+if [ "$SERVICE" = "1" ] && [ "$SERVICE_PLATFORM" = "launchd" ]; then
+  tcc_check "$GATEWAY_DIR" "the install directory" "Move it somewhere unguarded (~/cozygateway is the default for a reason)."
+  tcc_check "$BUNDLE_PATH" "the gateway bundle" "Copy it somewhere unguarded and re-run with that --bundle path."
+  if [ "$SKIP_DASHBOARD" = "0" ]; then
+    tcc_check "$HERMES_HOME_DIR" "the Hermes home the dashboard unit reads" "Point --hermes-home at a directory outside it."
+    # And the subtler one, which cost an afternoon on this very box: the dashboard unit runs
+    # $HERMES_PY, and CPython lists EVERY sys.path entry during startup while site.py processes
+    # .pth files. A single unrelated editable install whose .pth adds a ~/Documents path is enough
+    # to hang the interpreter before hermes' own code runs, so the failure looks identical to ours
+    # and has nothing to do with this install at all. Asking the interpreter for its own sys.path
+    # is the only way to see it, and it answers instantly from this (consented) shell.
+    while IFS= read -r syspath_entry; do
+      tcc_check "$syspath_entry" "a sys.path entry of $HERMES_PY" "Remove the .pth or editable install that adds it (grep -rl '$HOME/Documents' \"\$($HERMES_PY -c 'import site;print(site.getsitepackages()[0])')\"), or move that project out of the guarded folder."
+    done <<EOF
+$("$HERMES_PY" -c 'import sys; print("\n".join(p for p in sys.path if p))' 2>/dev/null || true)
+EOF
+  fi
+fi
 
 # ws host the CONTAINER (or process) uses to reach the dashboard on this machine.
 if [ "$RUNTIME" = "docker" ]; then
@@ -390,7 +1024,7 @@ info "bridge will dial ws://$HERMES_WS_HOST:$DASHBOARD_PORT/api/ws"
 # 0.0.0.0 publishes the human's whole Hermes dashboard (config, API keys, sessions) to the LAN over
 # plaintext HTTP behind basic auth. So loopback is the default and anything wider is opt-in.
 #
-# The node path never needs more than loopback: the bridge is a local process.
+# The node and bundle paths never need more than loopback: the bridge is a local process.
 # The docker path needs an address the CONTAINER can dial. On Linux that is the docker bridge
 # gateway (usually 172.17.0.1), which the host really does own and the LAN cannot reach. On Docker
 # Desktop that address lives inside the VM, not on the host, so there is nothing narrower than
@@ -421,9 +1055,9 @@ elif [ -n "$DASHBOARD_HOST" ]; then
   case "$DASHBOARD_HOST" in
     0.0.0.0|::) warn "--dashboard-host $DASHBOARD_HOST publishes the dashboard to the whole LAN over plaintext HTTP." ;;
   esac
-elif [ "$RUNTIME" = "node" ]; then
+elif [ "$RUNTIME" = "node" ] || [ "$RUNTIME" = "bundle" ]; then
   DASHBOARD_HOST="127.0.0.1"
-  ok "dashboard bind: 127.0.0.1 (loopback; the node bridge is a local process and needs nothing wider)"
+  ok "dashboard bind: 127.0.0.1 (loopback; the $RUNTIME bridge is a local process and needs nothing wider)"
 else
   BRIDGE_ADDR="$(docker_bridge_addr || true)"
   if [ -n "${BRIDGE_ADDR:-}" ] && host_owns_addr "$BRIDGE_ADDR"; then
@@ -447,7 +1081,12 @@ fi
 
 step "2/8 get the gateway source"
 
-if [ -d "$GATEWAY_DIR/.git" ]; then
+if [ "$RUNTIME" = "bundle" ]; then
+  # There is no source to get: the bundle IS the gateway. $GATEWAY_DIR degrades from "a checkout"
+  # to "the directory the install's state lives in", which is all the later phases ever ask of it.
+  info "--bundle: no clone and no build; $GATEWAY_DIR only holds this install's state"
+  run mkdir -p "$GATEWAY_DIR"
+elif [ -d "$GATEWAY_DIR/.git" ]; then
   ok "repo already at $GATEWAY_DIR"
   run git -C "$GATEWAY_DIR" fetch --quiet origin || warn "git fetch failed; using the checkout as-is"
 else
@@ -457,8 +1096,12 @@ fi
 
 run mkdir -p "$LOCAL_DIR"
 # A self-ignoring generated directory: no root .gitignore edit needed, and nothing generated here
-# can ever be committed by accident.
-if dry; then
+# can ever be committed by accident. Under --bundle $GATEWAY_DIR is normally not a checkout at all,
+# and a .gitignore in a directory git has never heard of is just litter, so it is written only when
+# there is a git checkout to ignore things from.
+if [ "$RUNTIME" = "bundle" ] && [ ! -d "$GATEWAY_DIR/.git" ]; then
+  info "generated artifacts directory: $LOCAL_DIR (no .gitignore: $GATEWAY_DIR is not a git checkout)"
+elif dry; then
   printf 'DRY   write %s/.gitignore so nothing generated here can be committed\n' "$LOCAL_DIR"
 else
   [ -f "$LOCAL_DIR/.gitignore" ] || printf '*\n!.gitignore\n' > "$LOCAL_DIR/.gitignore"
@@ -480,6 +1123,25 @@ step "3/8 dashboard credential"
 if [ "$SKIP_DASHBOARD" = "1" ]; then
   info "--skip-dashboard: not generating or merging anything Hermes-side"
   [ -n "$BRIDGE_PASSWORD" ] || die "--skip-dashboard needs --password (the existing dashboard password)"
+  # The nohup starts hand the gateway COZYGATEWAY_HERMES_PASSWORD out of this shell's environment,
+  # so --skip-dashboard never needed the credentials file. A supervised unit has no such shell to
+  # inherit from: launchd starts it at login from a clean environment, and the password must not go
+  # in the plist, which is world-readable. So --service writes the file the wrapper reads. Without
+  # it the gateway exits 1 with "COZYGATEWAY_HERMES_PASSWORD is not set" and KeepAlive turns that
+  # into a ten-second crash loop.
+  if [ "$SERVICE" = "1" ]; then
+    if dry; then
+      printf 'DRY   record username/password in %s (mode 600) so the supervised unit can read it\n' "$CRED_FILE"
+    else
+      umask 077
+      {
+        printf 'username=%s\n' "$BRIDGE_USER"
+        printf 'password=%s\n' "$BRIDGE_PASSWORD"
+      } > "$CRED_FILE"
+      chmod 600 "$CRED_FILE"
+      ok "recorded the supplied password in $CRED_FILE (mode 600); --service needs it there, not in the unit file"
+    fi
+  fi
 else
   RECORDED_HASH=""
   RECORDED_PASSWORD=""
@@ -849,6 +1511,29 @@ start_dashboard() {
   if lsof -nP -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     die "port $DASHBOARD_PORT is taken by something that is not a healthy dashboard. Free it or pass --dashboard-port."
   fi
+  if [ "$SERVICE" = "1" ]; then
+    # Supervised start. There is no --skip-build retry here on purpose: the unit is long-lived, so
+    # a first run that has to build the web UI simply takes longer inside the same poll rather than
+    # needing a second, differently-flagged launch.
+    service_write_dashboard_wrapper
+    service_install_unit dashboard "$LOCAL_DIR/run-dashboard.sh" "$DASH_LOG"
+    info "supervised as $(service_unit_name dashboard); waiting up to 120s for /api/health"
+    local waited=0
+    while [ "$waited" -lt 120 ]; do
+      dashboard_answering && return 0
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if [ -s "$DASH_LOG" ]; then
+      warn "the supervised dashboard did not answer; last 30 log lines follow"
+      tail -30 "$DASH_LOG" >&2 || true
+    else
+      # An EMPTY log with a unit that launchctl still calls "running" is the TCC signature, and it
+      # is worth naming, because the obvious next move (read the log) has nothing to show.
+      warn "the supervised dashboard did not answer and $DASH_LOG is EMPTY. A unit that runs, logs nothing and opens no port is blocked in its first directory read, which on macOS means a folder gated behind per-folder consent that a launchd agent cannot ask for. Check the --service warnings printed in the preflight above, and remember the interpreter's own sys.path counts."
+    fi
+    die "the $SERVICE_PLATFORM-supervised dashboard never answered on 127.0.0.1:$DASHBOARD_PORT (see $DASH_LOG). Re-run with --uninstall-service to remove the unit."
+  fi
   # --skip-build: its own help text recommends it for non-interactive contexts where npm may not be
   # available, which is exactly this one. If the web UI has never been built, `hermes dashboard`
   # without it will build on first run; we retry that way once before giving up.
@@ -875,9 +1560,60 @@ start_dashboard() {
 if [ "$SKIP_DASHBOARD" = "1" ] || [ "$NO_START" = "1" ]; then
   info "skipped (--skip-dashboard or --no-start)"
 elif dry; then
-  printf 'DRY   nohup hermes dashboard --host %s --port %s --no-open --skip-build > %s 2>&1 &\n' \
-    "$DASHBOARD_HOST" "$DASHBOARD_PORT" "$DASH_LOG"
+  if [ "$SERVICE" = "1" ]; then
+    service_stop_unit dashboard
+    printf 'DRY   stop any dashboard already answering on 127.0.0.1:%s, supervised or not, so the unit can own the port\n' "$DASHBOARD_PORT"
+    service_write_dashboard_wrapper
+    service_install_unit dashboard "$LOCAL_DIR/run-dashboard.sh" "$DASH_LOG"
+  else
+    printf 'DRY   nohup hermes dashboard --host %s --port %s --no-open --skip-build > %s 2>&1 &\n' \
+      "$DASHBOARD_HOST" "$DASHBOARD_PORT" "$DASH_LOG"
+  fi
   printf 'DRY   POST /auth/password-login as %s to prove the merged credential loaded\n' "$BRIDGE_USER"
+elif [ "$SERVICE" = "1" ]; then
+  # ADOPT, unconditionally. Everything --service prints promises that the dashboard comes back after
+  # a crash and at login, and only a unit can keep that promise. The tempting shortcut, "a dashboard
+  # is already answering and its credential works, so leave it alone", is exactly the case that
+  # breaks the promise: Hermes runs ONE machine-level dashboard by default, so an already-running
+  # unsupervised one is the COMMON case, not the edge case, and skipping it would end the run green
+  # with a nohup'd dashboard and a claim of supervision that is simply false.
+  #
+  # So the sequence is always the same, and it is ordered the only way that works:
+  #   1. unload our own unit, if any, so KeepAlive cannot restart what step 2 stops;
+  #   2. stop whatever is still answering, supervised or not, and wait for the port;
+  #   3. install the unit and let it own the port from here on.
+  service_stop_unit dashboard
+  if dashboard_answering; then
+    if dashboard_credential_works; then
+      info "a dashboard is already answering on 127.0.0.1:$DASHBOARD_PORT and its credential works. Nothing supervises it now (any unit of ours was just unloaded), so it is stopped and restarted under the $SERVICE_PLATFORM unit rather than left holding the port."
+    else
+      warn "a dashboard is already running with the PREVIOUS config; the credential merged in step 4 has not loaded. Stopping it so the $SERVICE_PLATFORM unit can own it."
+    fi
+    if HERMES_HOME="$HERMES_HOME_DIR" hermes dashboard --stop >>"$DASH_LOG" 2>&1; then
+      info "hermes dashboard --stop returned; waiting for the port to free"
+    else
+      warn "hermes dashboard --stop failed; see $DASH_LOG"
+    fi
+    # Wait for the SOCKET, not just for HTTP. start_dashboard's first act is an lsof LISTEN check
+    # that dies with "port taken by something that is not a healthy dashboard", so a process whose
+    # HTTP stack has died while it still holds the socket would sail past a health-only wait and
+    # then abort the run with a message describing the wrong problem.
+    for i in $(seq 1 30); do
+      dashboard_answering || port_listening "$DASHBOARD_PORT" || break
+      sleep 1
+    done
+    if dashboard_answering || port_listening "$DASHBOARD_PORT"; then
+      die "port $DASHBOARD_PORT is still held after \`hermes dashboard --stop\`, so the unit cannot take it. Stop it by hand (\`hermes dashboard --status\` names the processes, \`lsof -nP -iTCP:$DASHBOARD_PORT -sTCP:LISTEN\` names the socket) and re-run."
+    fi
+    ok "the unsupervised dashboard is stopped and the port is free"
+  fi
+  start_dashboard
+  if ! dashboard_credential_works; then
+    warn "last 30 dashboard log lines follow"
+    tail -30 "$DASH_LOG" >&2 || true
+    die "POST /auth/password-login as $BRIDGE_USER did not return 200 against the supervised dashboard, so the bridge will not log in either. Check $HERMES_HOME_DIR/config.yaml, then re-run."
+  fi
+  ok "dashboard healthy on 127.0.0.1:$DASHBOARD_PORT, supervised as $(service_unit_name dashboard), and the bridge credential logs in (log: $DASH_LOG)"
 else
   if dashboard_answering; then
     # A dashboard was ALREADY up. Hermes runs one machine-level server by default, so this is the
@@ -1043,17 +1779,45 @@ gateway_health() {
 if [ "$NO_START" = "1" ]; then
   info "--no-start: configured but not started"
 elif dry; then
-  if [ "$RUNTIME" = "docker" ]; then
+  if [ "$SERVICE" = "1" ]; then
+    if [ "$RUNTIME" = "node" ]; then
+      printf 'DRY   (cd %s && pnpm install && pnpm build)\n' "$GATEWAY_DIR"
+    fi
+    service_stop_unit gateway
+    adopt_unsupervised_gateway
+    service_write_gateway_wrapper
+    service_install_unit gateway "$LOCAL_DIR/run-gateway.sh" "$GW_LOG"
+  elif [ "$RUNTIME" = "docker" ]; then
     printf 'DRY   (cd %s && docker compose -f docker-compose.yml -f %s up -d --build gateway)\n' \
       "$GATEWAY_DIR" "$OVERRIDE_REL"
+  elif [ "$RUNTIME" = "bundle" ]; then
+    printf 'DRY   %s %s serve --config %s   (no pnpm install, no build)\n' \
+      "$COZY_NODE" "$BUNDLE_PATH" "$CONFIG_JSON"
   else
     printf 'DRY   (cd %s && pnpm install && pnpm build && node packages/gateway/dist/cli.js serve --config %s)\n' \
       "$GATEWAY_DIR" "$CONFIG_JSON"
   fi
+elif [ "$SERVICE" = "1" ]; then
+  # Supervised start, bundle or node. The health poll, the capability check and the roster probe
+  # below are untouched: they ask the running gateway the same questions either way -- which is
+  # exactly why the port has to be OURS before they run. A green poll answered by an unsupervised
+  # process is indistinguishable from a green poll answered by the unit.
+  if [ "$RUNTIME" = "node" ]; then
+    ( cd "$GATEWAY_DIR" && pnpm install --frozen-lockfile && pnpm build )
+  fi
+  service_stop_unit gateway
+  adopt_unsupervised_gateway
+  service_write_gateway_wrapper
+  service_install_unit gateway "$LOCAL_DIR/run-gateway.sh" "$GW_LOG"
+  ok "the gateway is supervised by $SERVICE_PLATFORM as $(service_unit_name gateway) (log: $GW_LOG)"
 elif [ "$RUNTIME" = "docker" ]; then
   [ -f "$GATEWAY_DIR/$OVERRIDE_REL" ] || die "missing $OVERRIDE_REL in the checkout; pull a newer main"
   ( cd "$GATEWAY_DIR" && docker compose -f docker-compose.yml -f "$OVERRIDE_REL" up -d --build gateway )
   ok "compose brought up the gateway service"
+elif [ "$RUNTIME" = "bundle" ]; then
+  ( COZYGATEWAY_HERMES_PASSWORD="$BRIDGE_PASSWORD" nohup "$COZY_NODE" \
+      "$BUNDLE_PATH" serve --config "$CONFIG_JSON" >"$GW_LOG" 2>&1 & )
+  ok "started the gateway from the bundle (log: $GW_LOG)"
 else
   ( cd "$GATEWAY_DIR" && pnpm install --frozen-lockfile && pnpm build )
   ( cd "$GATEWAY_DIR" && COZYGATEWAY_HERMES_PASSWORD="$BRIDGE_PASSWORD" nohup node \
@@ -1154,5 +1918,12 @@ else
   warn "could not determine this machine's LAN address. Do NOT give the human 127.0.0.1 or the bare hostname: find the address with 'ifconfig' / 'ip -4 addr' and hand them http://<that address>:$GATEWAY_PORT."
 fi
 info "Dashboard: http://$DASHBOARD_HOST:$DASHBOARD_PORT  (user $BRIDGE_USER; reachable on 127.0.0.1:$DASHBOARD_PORT from this machine)"
+if [ "$SERVICE" = "1" ]; then
+  if [ "$SERVICE_PLATFORM" = "launchd" ]; then
+    info "Supervised by launchd: \`launchctl print gui/$(id -u)/$SERVICE_LABEL_GATEWAY\` shows state and pid. Remove both units with \`bash scripts/agent-install.sh --uninstall-service\`."
+  else
+    info "Supervised by systemd --user: \`systemctl --user status $SERVICE_UNIT_GATEWAY\`. Remove both units with \`bash scripts/agent-install.sh --uninstall-service\`."
+  fi
+fi
 info "State the playbook reads: $INSTALL_ENV and $CRED_FILE (both mode 600)"
 info "Read docs/agent-install.md for the verification steps this script does not do."

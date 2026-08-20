@@ -4,7 +4,34 @@ Chat with your self-hosted AI agent from your phone, without handing your data t
 
 cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and drives agent backends through a small adapter interface. Two backends ship today: a reference echo backend for trying the gateway out, and an `attach` backend that lets an agent harness dial in over a small WebSocket protocol and answer turns live.
 
-## Install with your agent
+## Install
+
+There are two ways in. Pick the one that fits your machine.
+
+### Simple (recommended): one line, runs as a service
+
+```sh
+curl -fsSL https://cozylabs.ai/install.sh | bash
+```
+
+No Docker, no git, no build tools. Needs a working Hermes install (0.20.2 or newer) plus Node 24+
+(the line stops and tells you how to get either one if you do not have it). It downloads the
+latest released gateway bundle, checks its sha256, installs
+it to `~/.cozygateway`, and registers the gateway and the Hermes dashboard as login services
+(launchd on macOS, systemd `--user` on Linux) that come back after a crash, a logout, or a reboot.
+It prints a pairing code for the app when it is done. See `docs/install-service.md` for what it
+does step by step, where the files live, and how to check on it later.
+
+Uninstall:
+
+```sh
+bash ~/.cozygateway/bin/agent-install.sh --uninstall-service --gateway-dir ~/.cozygateway
+```
+
+This removes the service units only. Your config, database, and credentials stay in
+`~/.cozygateway`.
+
+### Homelab (Docker) / agent-driven
 
 You do not install this by hand. Paste one line to an AI agent you already run (Hermes, Claude Code, anything that can read a URL and run commands) and it installs cozygateway beside your existing Hermes, wires the two together, and hands you a pairing code for the app.
 
@@ -20,7 +47,7 @@ curl -fsSL https://cozylabs.ai/install
 
 `https://cozylabs.ai/install` is the canonical short address: it redirects to the raw `docs/agent-install.md` on this repo's `main`, which is always the source of truth. If you cannot reach cozylabs.ai, the raw GitHub URL works directly: `https://raw.githubusercontent.com/shiftedx/cozygateway/main/docs/agent-install.md`.
 
-The playbook is written for the agent, not for you: every step carries a check command and the output that command must produce, so the agent can tell you it worked rather than guess. It needs a working Hermes install (0.20.2 or newer) plus either Docker or Node 24. `scripts/agent-install.sh` does the mechanical half and has a `--dry-run` flag if you want to read the plan first.
+The playbook is written for the agent, not for you: every step carries a check command and the output that command must produce, so the agent can tell you it worked rather than guess. It needs a working Hermes install (0.20.2 or newer) plus either Docker or Node 24. `scripts/agent-install.sh` does the mechanical half and has a `--dry-run` flag if you want to read the plan first, and the same playbook now accepts `--service` on the Node path to run supervised instead of with `nohup`.
 
 ## What it does
 
