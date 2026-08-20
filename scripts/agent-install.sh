@@ -270,8 +270,10 @@ if [ -f "\$COZY_CRED_FILE" ]; then
   COZYGATEWAY_HERMES_PASSWORD="\$(sed -n 's/^password=//p' "\$COZY_CRED_FILE" | head -1)"
 fi
 export COZYGATEWAY_HERMES_PASSWORD
+# Both branches cd first: launchd starts a job in /, so anything either runtime resolves relative
+# to the working directory would land at the filesystem root without this.
 if [ "\$COZY_RUNTIME" = "bundle" ]; then
-  exec "\$COZY_NODE" "\$COZY_BUNDLE_PATH" serve --config "\$COZY_CONFIG_JSON"
+  cd "\$COZY_GATEWAY_DIR" && exec "\$COZY_NODE" "\$COZY_BUNDLE_PATH" serve --config "\$COZY_CONFIG_JSON"
 else
   cd "\$COZY_GATEWAY_DIR" && exec $(printf '%q' "$node_bin") packages/gateway/dist/cli.js serve --config "\$COZY_CONFIG_JSON"
 fi
@@ -298,6 +300,10 @@ service_write_dashboard_wrapper() {
 set -euo pipefail
 . "$INSTALL_ENV"
 export HERMES_HOME="\$COZY_HERMES_HOME"
+# launchd starts a job in /, and systemd --user in the user's home only by default. The nohup path
+# deliberately runs \`hermes dashboard\` from \$HOME; match it, so anything hermes resolves relative
+# to the working directory resolves to the same place under supervision as it does without it.
+cd "\$HOME"
 exec $(printf '%q' "$hermes_bin") dashboard --host "\$COZY_DASHBOARD_HOST" --port "\$COZY_DASHBOARD_PORT" --no-open --skip-build
 WRAPPER
   chmod 700 "$wrapper"
@@ -362,6 +368,38 @@ service_install_unit() {
   esac
 }
 
+# service_stop_unit KIND: unload the unit if it is loaded, and say nothing if it is not.
+#
+# This exists for one reason: KeepAlive. Any attempt to stop a supervised process from OUTSIDE its
+# supervisor is a race the supervisor wins, so `hermes dashboard --stop` against a loaded unit stops
+# a process that launchd immediately starts again, and the caller's "wait for the port to free" loop
+# then times out on a dashboard that never went away. The unit has to be unloaded FIRST.
+service_stop_unit() {
+  local kind="$1" name
+  name="$(service_unit_name "$kind")"
+  case "$SERVICE_PLATFORM" in
+    launchd)
+      launchctl print "gui/$(id -u)/$name" >/dev/null 2>&1 || return 0
+      if dry; then
+        printf 'DRY   launchctl bootout gui/%s/%s (unload before stopping, so KeepAlive cannot restart it)\n' "$(id -u)" "$name"
+        return 0
+      fi
+      launchctl bootout "gui/$(id -u)/$name" 2>/dev/null || true
+      info "unloaded the existing $name unit so it cannot restart under us"
+      ;;
+    systemd)
+      have systemctl || return 0
+      systemctl --user cat "$name" >/dev/null 2>&1 || return 0
+      if dry; then
+        printf 'DRY   systemctl --user stop %s (stop before restarting, so Restart= cannot race)\n' "$name"
+        return 0
+      fi
+      systemctl --user stop "$name" >/dev/null 2>&1 || true
+      info "stopped the existing $name unit so it cannot restart under us"
+      ;;
+  esac
+}
+
 # uninstall_services: stop and remove both units, say what actually went, and never fail because
 # something was already absent. It deliberately touches nothing else: the config, the credentials,
 # the database and the wrapper scripts all survive, so re-running with --service is a one-liner.
@@ -377,6 +415,14 @@ uninstall_services() {
             printf 'DRY   launchctl bootout gui/%s/%s\n' "$uid" "$label"
           else
             launchctl bootout "gui/$uid/$label" 2>/dev/null || launchctl unload -w "$plist" 2>/dev/null || true
+            # bootout returns before the job is gone when the job still has live children, and a
+            # job that is still registered is one a later `--service` run would collide with. Give
+            # it a moment and say the second word if the first was not heard.
+            for _ in 1 2 3 4 5; do
+              launchctl print "gui/$uid/$label" >/dev/null 2>&1 || break
+              sleep 1
+              launchctl bootout "gui/$uid/$label" 2>/dev/null || true
+            done
             ok "booted out $label"
           fi
           removed=1
@@ -425,6 +471,49 @@ uninstall_services() {
   if [ "$removed" = "0" ]; then
     info "nothing to remove: no cozygateway service units were installed for this user"
   fi
+  stop_detached_dashboard
+}
+
+# stop_detached_dashboard: the half of the dashboard the unit does not own.
+#
+# `hermes dashboard` does not BECOME the server; it starts a detached backend and the unit's process
+# tree does not contain it. So removing the unit leaves the port still listening, which is a wrong
+# answer from something called --uninstall-service, and it is the port the next --service run needs.
+# Observed live: after a clean uninstall, lsof still showed two listeners on the dashboard port.
+#
+# Narrow on purpose. It asks THIS install's install-env.sh which port and Hermes home it used, and
+# does nothing at all unless something is still listening on that exact port. Without that, a bare
+# `hermes dashboard --stop` here would reach across and stop a dashboard this install never started.
+stop_detached_dashboard() {
+  local dash_port hermes_home waited=0
+  [ -f "$INSTALL_ENV" ] || return 0
+  # Read in a SUBSHELL: install-env.sh exports COZY_* names this script also uses.
+  # shellcheck source=/dev/null
+  dash_port="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_DASHBOARD_PORT:-}" )"
+  # shellcheck source=/dev/null
+  hermes_home="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_HERMES_HOME:-}" )"
+  case "${dash_port:-}" in ''|*[!0-9]*) return 0 ;; esac
+  lsof -nP -iTCP:"$dash_port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+  if dry; then
+    printf 'DRY   hermes dashboard --stop (something is still listening on %s; the unit does not parent the backend)\n' "$dash_port"
+    return 0
+  fi
+  if ! have hermes; then
+    warn "a dashboard is still listening on 127.0.0.1:$dash_port and hermes is not on PATH to stop it. The unit is gone, but the server it started is not: stop it by hand."
+    return 0
+  fi
+  info "a dashboard is still listening on 127.0.0.1:$dash_port: hermes runs the server as a detached backend that the unit never parented. Stopping it."
+  HERMES_HOME="${hermes_home:-$HERMES_HOME_DIR}" hermes dashboard --stop >/dev/null 2>&1 || \
+    warn "hermes dashboard --stop returned an error"
+  while [ "$waited" -lt 20 ]; do
+    lsof -nP -iTCP:"$dash_port" -sTCP:LISTEN >/dev/null 2>&1 || {
+      ok "the detached dashboard backend is stopped; nothing is listening on $dash_port"
+      return 0
+    }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warn "something is STILL listening on 127.0.0.1:$dash_port after hermes dashboard --stop. \`hermes dashboard --status\` names the processes; stop it by hand."
 }
 
 if [ "$UNINSTALL_SERVICE" = "1" ]; then
@@ -653,6 +742,15 @@ if [ "$SERVICE" = "1" ]; then
       info "docker was chosen by autodetection, not asked for; --runtime node or --bundle PATH selects the supervised path"
     die "docker already supervises the gateway; --service is for the no-docker path"
   fi
+  # --service's whole job is to install units AND start them. --no-start starts nothing and
+  # --pair-only leaves before either start phase, so both would end green having installed no unit
+  # at all, after a preflight line promising supervision. Refuse rather than lie.
+  if [ "$NO_START" = "1" ]; then
+    die "--service installs and starts the service units, so it cannot be combined with --no-start. Drop one of them."
+  fi
+  if [ "$PAIR_ONLY" = "1" ]; then
+    die "--pair-only only mints a code against an already-running gateway; it never reaches the start phases, so --service would install nothing. Drop one of them."
+  fi
   resolve_service_platform
   if [ "$SKIP_DASHBOARD" = "1" ]; then
     ok "supervision: $SERVICE_PLATFORM (--service); the gateway restarts after a crash and at login"
@@ -740,17 +838,40 @@ esac
 # A warning rather than a hard stop: consent CAN be granted (System Settings > Privacy & Security >
 # Files and Folders, or Full Disk Access for /bin/bash), and only the operator knows whether it has
 # been. But it is said loudly, before the silence starts.
-if [ "$SERVICE" = "1" ]; then
+#
+# macOS only: there is no such gate on Linux, and running the loop there would be noise.
+# $HERMES_HOME_DIR is in the list because the dashboard unit reads config.yaml out of it and hangs
+# in exactly the same way.
+tcc_check() { # $1 path  $2 what it is  $3 how to fix it
+  local guarded
+  [ -n "${1:-}" ] || return 0
   for guarded in "$HOME/Desktop" "$HOME/Documents" "$HOME/Downloads"; do
-    for candidate in "$GATEWAY_DIR" "$BUNDLE_PATH"; do
-      [ -n "$candidate" ] || continue
-      case "$candidate" in
-        "$guarded"/*)
-          warn "--service and $candidate is inside $guarded, which macOS gates behind per-folder consent that a launchd agent cannot ask for. The unit will start, open nothing, log nothing and never answer /health. Move it somewhere unguarded (~/cozygateway is the default for a reason), or grant Full Disk Access to /bin/bash first."
-          ;;
-      esac
-    done
+    case "$1" in
+      "$guarded"/*)
+        warn "--service: $2 is $1, inside $guarded, which macOS gates behind per-folder consent that a launchd agent cannot ask for. The unit will start, open nothing, log nothing and never answer its health check. $3 Or grant Full Disk Access to /bin/bash first."
+        return 0
+        ;;
+    esac
   done
+}
+
+if [ "$SERVICE" = "1" ] && [ "$SERVICE_PLATFORM" = "launchd" ]; then
+  tcc_check "$GATEWAY_DIR" "the install directory" "Move it somewhere unguarded (~/cozygateway is the default for a reason)."
+  tcc_check "$BUNDLE_PATH" "the gateway bundle" "Copy it somewhere unguarded and re-run with that --bundle path."
+  if [ "$SKIP_DASHBOARD" = "0" ]; then
+    tcc_check "$HERMES_HOME_DIR" "the Hermes home the dashboard unit reads" "Point --hermes-home at a directory outside it."
+    # And the subtler one, which cost an afternoon on this very box: the dashboard unit runs
+    # $HERMES_PY, and CPython lists EVERY sys.path entry during startup while site.py processes
+    # .pth files. A single unrelated editable install whose .pth adds a ~/Documents path is enough
+    # to hang the interpreter before hermes' own code runs, so the failure looks identical to ours
+    # and has nothing to do with this install at all. Asking the interpreter for its own sys.path
+    # is the only way to see it, and it answers instantly from this (consented) shell.
+    while IFS= read -r syspath_entry; do
+      tcc_check "$syspath_entry" "a sys.path entry of $HERMES_PY" "Remove the .pth or editable install that adds it (grep -rl '$HOME/Documents' \"\$($HERMES_PY -c 'import site;print(site.getsitepackages()[0])')\"), or move that project out of the guarded folder."
+    done <<EOF
+$("$HERMES_PY" -c 'import sys; print("\n".join(p for p in sys.path if p))' 2>/dev/null || true)
+EOF
+  fi
 fi
 
 # ws host the CONTAINER (or process) uses to reach the dashboard on this machine.
@@ -1265,8 +1386,14 @@ start_dashboard() {
       sleep 1
       waited=$((waited + 1))
     done
-    warn "the supervised dashboard did not answer; last 30 log lines follow"
-    tail -30 "$DASH_LOG" >&2 || true
+    if [ -s "$DASH_LOG" ]; then
+      warn "the supervised dashboard did not answer; last 30 log lines follow"
+      tail -30 "$DASH_LOG" >&2 || true
+    else
+      # An EMPTY log with a unit that launchctl still calls "running" is the TCC signature, and it
+      # is worth naming, because the obvious next move (read the log) has nothing to show.
+      warn "the supervised dashboard did not answer and $DASH_LOG is EMPTY. A unit that runs, logs nothing and opens no port is blocked in its first directory read, which on macOS means a folder gated behind per-folder consent that a launchd agent cannot ask for. Check the --service warnings printed in the preflight above, and remember the interpreter's own sys.path counts."
+    fi
     die "the $SERVICE_PLATFORM-supervised dashboard never answered on 127.0.0.1:$DASHBOARD_PORT (see $DASH_LOG). Re-run with --uninstall-service to remove the unit."
   fi
   # --skip-build: its own help text recommends it for non-interactive contexts where npm may not be
@@ -1296,6 +1423,8 @@ if [ "$SKIP_DASHBOARD" = "1" ] || [ "$NO_START" = "1" ]; then
   info "skipped (--skip-dashboard or --no-start)"
 elif dry; then
   if [ "$SERVICE" = "1" ]; then
+    service_stop_unit dashboard
+    printf 'DRY   stop any dashboard already answering on 127.0.0.1:%s, supervised or not, so the unit can own the port\n' "$DASHBOARD_PORT"
     service_write_dashboard_wrapper
     service_install_unit dashboard "$LOCAL_DIR/run-dashboard.sh" "$DASH_LOG"
   else
@@ -1303,6 +1432,44 @@ elif dry; then
       "$DASHBOARD_HOST" "$DASHBOARD_PORT" "$DASH_LOG"
   fi
   printf 'DRY   POST /auth/password-login as %s to prove the merged credential loaded\n' "$BRIDGE_USER"
+elif [ "$SERVICE" = "1" ]; then
+  # ADOPT, unconditionally. Everything --service prints promises that the dashboard comes back after
+  # a crash and at login, and only a unit can keep that promise. The tempting shortcut, "a dashboard
+  # is already answering and its credential works, so leave it alone", is exactly the case that
+  # breaks the promise: Hermes runs ONE machine-level dashboard by default, so an already-running
+  # unsupervised one is the COMMON case, not the edge case, and skipping it would end the run green
+  # with a nohup'd dashboard and a claim of supervision that is simply false.
+  #
+  # So the sequence is always the same, and it is ordered the only way that works:
+  #   1. unload our own unit, if any, so KeepAlive cannot restart what step 2 stops;
+  #   2. stop whatever is still answering, supervised or not, and wait for the port;
+  #   3. install the unit and let it own the port from here on.
+  service_stop_unit dashboard
+  if dashboard_answering; then
+    if dashboard_credential_works; then
+      info "a dashboard is already answering on 127.0.0.1:$DASHBOARD_PORT and its credential works, but nothing supervises it. Stopping it so the $SERVICE_PLATFORM unit can own it."
+    else
+      warn "a dashboard is already running with the PREVIOUS config; the credential merged in step 4 has not loaded. Stopping it so the $SERVICE_PLATFORM unit can own it."
+    fi
+    if hermes dashboard --stop >>"$DASH_LOG" 2>&1; then
+      info "hermes dashboard --stop returned; waiting for the port to free"
+    else
+      warn "hermes dashboard --stop failed; see $DASH_LOG"
+    fi
+    for i in $(seq 1 30); do
+      dashboard_answering || break
+      sleep 1
+    done
+    dashboard_answering && die "a dashboard is still answering on 127.0.0.1:$DASHBOARD_PORT after --stop, so the unit cannot take the port. Stop it by hand (\`hermes dashboard --status\` names the processes) and re-run."
+    ok "the unsupervised dashboard is stopped and the port is free"
+  fi
+  start_dashboard
+  if ! dashboard_credential_works; then
+    warn "last 30 dashboard log lines follow"
+    tail -30 "$DASH_LOG" >&2 || true
+    die "POST /auth/password-login as $BRIDGE_USER did not return 200 against the supervised dashboard, so the bridge will not log in either. Check $HERMES_HOME_DIR/config.yaml, then re-run."
+  fi
+  ok "dashboard healthy on 127.0.0.1:$DASHBOARD_PORT, supervised as $(service_unit_name dashboard), and the bridge credential logs in (log: $DASH_LOG)"
 else
   if dashboard_answering; then
     # A dashboard was ALREADY up. Hermes runs one machine-level server by default, so this is the
