@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { HermesRpc } from "../src/hermes-bridge/canonical-chat.ts";
+import { syntheticChatId } from "../src/hermes-bridge/chat-identity.ts";
 import {
   ensureGroupSession,
   findFreshReply,
@@ -170,8 +171,8 @@ describe("ensureGroupSession", () => {
     // Five raw rows, two of which a chat renders.
     expect(session.messageCount).toBe(5);
     expect(session.renderedCount).toBe(2);
-    expect(session.lastRenderedId).toBe("stored-1#4");
-    // The anchor's TEXT comes along, because a synthesized id alone cannot survive a renumbering.
+    expect(session.lastRenderedId).toBe(syntheticChatId("stored-1", "assistant", "hi", 0));
+    // The anchor's TEXT comes along, because an id alone cannot prove it names the same row.
     expect(session.lastRenderedText).toBe("hi");
   });
 });

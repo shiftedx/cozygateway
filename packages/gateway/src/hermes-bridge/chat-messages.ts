@@ -1,5 +1,7 @@
 import type { BotChatMessage } from "cozygateway-contract";
 
+import { chatRowFingerprint, syntheticChatId } from "./chat-identity.ts";
+
 /** Decoding one `session.resume` reply into a stable wire shape, defensively.
  *
  *  Hermes message shape drifts between builds and between the paths that wrote the message (a CLI
@@ -133,16 +135,19 @@ export function stripImageDirectives(text: string): string {
  *  never surfaces (dissection 9.7), and the phone has no other filter in front of it. */
 const RENDERED_ROLES = new Set(["user", "assistant"]);
 
-/** Maps one raw message, or drops it. A row is dropped when it is not an object, when its role is
+/** One decoded row, before it has been given an identity. A row the backend named carries that name
+ *  in `id`; a row it did not carries `undefined`, and the caller mints one. */
+interface DecodedRow {
+  id: string | undefined;
+  role: string;
+  text: string;
+  at: number | null;
+}
+
+/** Decodes one raw message, or drops it. A row is dropped when it is not an object, when its role is
  *  not one a chat renders, or when it has no text at all (a tool-call-only assistant turn), which
- *  is what keeps tool chatter and blank bubbles out of the app entirely. `sessionId` and `index`
- *  only feed the synthesized id, and `index` is the raw index so ids stay stable across polls even
- *  though rows in between are dropped. */
-export function mapChatMessage(
-  raw: unknown,
-  sessionId: string,
-  index: number,
-): BotChatMessage | undefined {
+ *  is what keeps tool chatter and blank bubbles out of the app entirely. */
+function decodeChatRow(raw: unknown): DecodedRow | undefined {
   const record = asRecord(raw);
   if (record === undefined) return undefined;
   const rawRole = typeof record["role"] === "string" ? record["role"].trim().toLowerCase() : "";
@@ -157,25 +162,71 @@ export function mapChatMessage(
   const text = role === "user" ? stripImageDirectives(flattened) : flattened;
   if (text.length === 0) return undefined;
   // `row_id` is what a live 0.20.4 dashboard actually stamps on a transcript row (rows there carry
-  // `role`, `text`, `timestamp` and `row_id`, and no `id` at all). Reading it is worth more than
-  // tidiness: it is a REAL identity, so the anchors that ride on message ids survive a compaction,
-  // where the synthesized `<session>#<index>` fallback is renumbered by one.
-  const id =
-    asId(record["id"]) ?? asId(record["message_id"]) ?? asId(record["row_id"]) ?? `${sessionId}#${index}`;
+  // `role`, `text`, `timestamp` and `row_id`, and no `id` at all).
+  const id = asId(record["id"]) ?? asId(record["message_id"]) ?? asId(record["row_id"]);
   return { id, role, text, at: messageTimestamp(record) };
+}
+
+/** Maps one raw message, or drops it. The single-row form of `parseChatSnapshot`'s decode, so a row
+ *  with no id of its own is given the FIRST synthesized identity for its content. Used where one raw
+ *  row is decoded on its own; a whole transcript goes through `parseChatSnapshot`, which counts
+ *  repeated content and is the only thing that can number it. */
+export function mapChatMessage(raw: unknown, sessionId: string): BotChatMessage | undefined {
+  const row = decodeChatRow(raw);
+  if (row === undefined) return undefined;
+  return {
+    id: row.id ?? syntheticChatId(sessionId, row.role, row.text, 0),
+    role: row.role,
+    text: row.text,
+    at: row.at,
+  };
+}
+
+/** Gives an identity to a decoded transcript, in order.
+ *
+ *  A row the backend named keeps that name. A row it did not is given a CONTENT-derived id
+ *  (cozygateway#87): the raw index it used to carry moves under it the moment a compaction trims the
+ *  head of the transcript, and a renamed row is a row every client re-renders as a second bubble.
+ *  Repeated content is numbered by how many earlier unnamed rows carry the same words, so two
+ *  identical lines are still two identities. */
+function identify(rows: DecodedRow[], sessionId: string): BotChatMessage[] {
+  const ordinals = new Map<string, number>();
+  return rows.map((row) => {
+    if (row.id !== undefined) return { id: row.id, role: row.role, text: row.text, at: row.at };
+    const key = chatRowFingerprint(row.role, row.text);
+    const ordinal = ordinals.get(key) ?? 0;
+    ordinals.set(key, ordinal + 1);
+    return {
+      id: syntheticChatId(sessionId, row.role, row.text, ordinal),
+      role: row.role,
+      text: row.text,
+      at: row.at,
+    };
+  });
 }
 
 /** Decodes a `session.resume` reply. Never throws: a reply that is not an object at all reads as
  *  an empty, idle session, which is exactly what a lazily-created chat looks like before its first
- *  prompt lands. */
-export function parseChatSnapshot(result: unknown, sessionId: string): ChatSnapshot {
+ *  prompt lands.
+ *
+ *  `identity`, when a caller passes one, is what makes an id survive a transcript the backend
+ *  RE-BASED under it: the ledger hands back the id each row was first delivered under. A caller that
+ *  passes none gets the content-derived ids, which already survive everything but a compaction that
+ *  trims one copy of a repeated line. */
+export function parseChatSnapshot(
+  result: unknown,
+  sessionId: string,
+  identity?: { assign(sessionId: string, messages: BotChatMessage[]): BotChatMessage[] },
+): ChatSnapshot {
   const record = asRecord(result);
   const rawMessages = Array.isArray(record?.["messages"]) ? (record["messages"] as unknown[]) : [];
-  const messages: BotChatMessage[] = [];
-  rawMessages.forEach((raw, index) => {
-    const mapped = mapChatMessage(raw, sessionId, index);
-    if (mapped !== undefined) messages.push(mapped);
-  });
+  const rows: DecodedRow[] = [];
+  for (const raw of rawMessages) {
+    const decoded = decodeChatRow(raw);
+    if (decoded !== undefined) rows.push(decoded);
+  }
+  const identified = identify(rows, sessionId);
+  const messages = identity === undefined ? identified : identity.assign(sessionId, identified);
   const rawCount = record?.["message_count"];
   return {
     runtimeId: asId(record?.["session_id"]),

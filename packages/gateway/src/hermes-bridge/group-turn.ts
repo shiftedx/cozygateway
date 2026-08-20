@@ -74,7 +74,7 @@ export interface GroupSession {
    *  This number lives in HERMES' coordinate space, which counts every row: `system` prompts,
    *  `tool` results and tool-call-only assistant turns included. It is therefore only ever
    *  compared against another RAW count (the "did the transcript grow at all" check) and MUST NOT
-   *  be used to index `snapshot.messages`, which is the FILTERED render list `mapChatMessage`
+   *  be used to index `snapshot.messages`, which is the FILTERED render list the decoder
    *  produces. Mixing the two is what made every member turn time out for any bot whose transcript
    *  had ever carried a dropped row. */
   messageCount: number;
@@ -84,10 +84,10 @@ export interface GroupSession {
   /** Id of the last rendered message at resolve time, when there was one. The primary anchor: a
    *  count can be shifted out from under a turn, an identity match cannot. */
   lastRenderedId?: string;
-  /** That same message's text. Carried because `mapChatMessage` SYNTHESIZES an id for a row that
-   *  carries none (`<session>#<index>`), and a compaction renumbers those indices, so an anchor id
-   *  can still "match" after a rewrite while pointing at a completely different row. The text is
-   *  what tells a real anchor from a coincidence. */
+  /** That same message's text. Carried because an id alone cannot prove it names the same row: a
+   *  row that carries none of its own is given a synthesized id, and two rows can be given the same
+   *  one when their words and their role are identical. The text is what tells a real anchor from a
+   *  coincidence. */
   lastRenderedText?: string;
   /** True when this call created the session, so the caller knows to persist the stored id. */
   created: boolean;
@@ -238,10 +238,10 @@ export async function ensureGroupSession(
       const runtimeId = asId(raw?.["session_id"]);
       if (runtimeId === undefined) continue;
       const storedId = asId(raw?.["session_key"]) ?? (target === title ? runtimeId : target);
-      // Parsed under the STORED id, and so is every poll below, so the ids `mapChatMessage`
-      // synthesizes for rows carrying none (`<session>#<index>`) are comparable across the two
-      // reads. Parsing each read under whatever id it was addressed by would make the anchor miss
-      // on the first poll and silently drop back to the count.
+      // Parsed under the STORED id, and so is every poll below, so the ids synthesized for rows
+      // carrying none of their own are comparable across the two reads. Parsing each read under
+      // whatever id it was addressed by would make the anchor miss on the first poll and silently
+      // drop back to the count.
       const snapshot = parseChatSnapshot(raw, storedId);
       const lastRendered = snapshot.messages.at(-1);
       return {
@@ -368,7 +368,15 @@ export async function runMemberTurn(opts: MemberTurnOptions): Promise<GroupTurnR
     // count level or send it BACKWARDS while the reply is sitting right there, and gating on growth
     // that can never happen is how a turn burns its whole cap for nothing.
     const count = Math.max(snapshot.messages.length, snapshot.messageCount);
-    if (count <= session.messageCount && !transcriptRewritten(snapshot.messages, session)) continue;
+    // The growth gate is a CHEAP stand-in for "is there anything new here", and it is only needed
+    // when there is no anchor to ask instead. An anchor that still holds names the exact row this
+    // turn started from, so `findFreshReply` can only ever return something written after it, and
+    // asking the count as well is what made a compaction look like silence: a head trim leaves the
+    // row count level (or sends it backwards) with the reply sitting right there, and since ids
+    // survive a re-base now (`chat-identity.ts`) the anchor holds through exactly that trim, so the
+    // rewrite escape hatch below no longer fires for it either (cozygateway#87).
+    const anchored = anchorIndexOf(snapshot.messages, session) !== -1;
+    if (!anchored && count <= session.messageCount && !transcriptRewritten(snapshot.messages, session)) continue;
     const reply = findFreshReply(snapshot.messages, session);
     if (reply === undefined) continue;
     const text = reply.text.trim();

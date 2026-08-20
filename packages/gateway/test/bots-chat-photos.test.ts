@@ -287,7 +287,6 @@ describe("transcript hygiene", () => {
         row_id: 29,
       },
       "canonical",
-      0,
     );
     expect(mapped?.text).toBe("what is this");
     expect(mapped?.text).not.toContain("/Users/");
@@ -299,7 +298,6 @@ describe("transcript hygiene", () => {
     const mapped = mapChatMessage(
       { role: "assistant", content: "I saved it to /Users/operator/out.png\n[screenshot]" },
       "canonical",
-      1,
     );
     expect(mapped?.text).toContain("/Users/operator/out.png");
   });
@@ -307,7 +305,7 @@ describe("transcript hygiene", () => {
   it("drops a user row that was nothing but directives", () => {
     // Not reachable through this gateway (a photo send always submits words), but a desktop attach
     // with no caption can produce one, and a blank bubble is worse than no bubble.
-    expect(mapChatMessage({ role: "user", content: "@image:/tmp/x.png\n[screenshot]" }, "canonical", 2)).toBeUndefined();
+    expect(mapChatMessage({ role: "user", content: "@image:/tmp/x.png\n[screenshot]" }, "canonical")).toBeUndefined();
   });
 });
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { ChatIdentityLedger, syntheticChatId } from "../src/hermes-bridge/chat-identity.ts";
 import {
   extractMessageText,
   normalizeTimestamp,
@@ -75,8 +76,8 @@ describe("parseChatSnapshot", () => {
     expect(snapshot.inflight).toBe(false);
     expect(snapshot.messages).toEqual([
       { id: "m1", role: "user", text: "hey", at: 1_755_000_000_000 },
-      { id: "stored-9#1", role: "assistant", text: "hi there", at: 1_755_000_060_000 },
-      { id: "stored-9#2", role: "assistant", text: "and again", at: null },
+      { id: syntheticChatId("stored-9", "assistant", "hi there", 0), text: "hi there", role: "assistant", at: 1_755_000_060_000 },
+      { id: syntheticChatId("stored-9", "assistant", "and again", 0), text: "and again", role: "assistant", at: null },
     ]);
   });
 
@@ -115,16 +116,68 @@ describe("parseChatSnapshot", () => {
       "canonical",
     );
     expect(snapshot.messages).toEqual([
-      { id: "canonical#3", role: "user", text: "what did you find", at: null },
-      { id: "canonical#4", role: "assistant", text: "done", at: null },
+      { id: syntheticChatId("canonical", "user", "what did you find", 0), role: "user", text: "what did you find", at: null },
+      { id: syntheticChatId("canonical", "assistant", "done", 0), role: "assistant", text: "done", at: null },
     ]);
   });
 
-  it("normalizes the role's case and keeps the raw index in synthesized ids", () => {
+  it("normalizes the role's case", () => {
     const snapshot = parseChatSnapshot(
       { messages: [{ role: "SYSTEM", content: "setup" }, { role: "Assistant", content: "hi" }] },
       "s",
     );
-    expect(snapshot.messages).toEqual([{ id: "s#1", role: "assistant", text: "hi", at: null }]);
+    expect(snapshot.messages).toEqual([
+      { id: syntheticChatId("s", "assistant", "hi", 0), role: "assistant", text: "hi", at: null },
+    ]);
+  });
+
+  // cozygateway#87: the synthesized id is derived from the row's CONTENT, never from where the row
+  // sits, because a compaction rewrites the head of a transcript and every position under it moves.
+  it("gives a row with no id of its own an identity that survives a head trim", () => {
+    const before = parseChatSnapshot(
+      {
+        messages: [
+          { role: "user", content: "one" },
+          { role: "assistant", content: "two" },
+          { role: "user", content: "three" },
+        ],
+      },
+      "s",
+    );
+    const after = parseChatSnapshot(
+      {
+        messages: [
+          { role: "assistant", content: "summary so far" },
+          { role: "user", content: "three" },
+        ],
+      },
+      "s",
+    );
+    expect(after.messages[1]!.id).toBe(before.messages[2]!.id);
+    // And the summary row, which is genuinely new, does not inherit the id of the row that used to
+    // sit where it sits.
+    expect(after.messages[0]!.id).not.toBe(before.messages[0]!.id);
+  });
+
+  it("numbers repeated content, so two identical lines are two identities", () => {
+    const snapshot = parseChatSnapshot(
+      { messages: [{ role: "user", content: "ok" }, { role: "assistant", content: "sure" }, { role: "user", content: "ok" }] },
+      "s",
+    );
+    expect(snapshot.messages[0]!.id).toBe(syntheticChatId("s", "user", "ok", 0));
+    expect(snapshot.messages[2]!.id).toBe(syntheticChatId("s", "user", "ok", 1));
+  });
+
+  it("hands a re-based transcript the ids the ledger already delivered", () => {
+    const ledger = new ChatIdentityLedger();
+    const before = parseChatSnapshot(
+      { messages: [{ role: "user", content: "ok" }, { role: "assistant", content: "sure" }, { role: "user", content: "ok" }] },
+      "s",
+      ledger,
+    );
+    // The compaction took the first "ok" with it. Content alone would renumber the survivor back to
+    // occurrence 0; the ledger knows which copy it is.
+    const after = parseChatSnapshot({ messages: [{ role: "user", content: "ok" }] }, "s", ledger);
+    expect(after.messages[0]!.id).toBe(before.messages[2]!.id);
   });
 });
