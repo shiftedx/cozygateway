@@ -19,6 +19,9 @@ import {
   assertValid,
 } from "cozygateway-contract";
 
+import { Value } from "@sinclair/typebox/value";
+import { RegisterRequestSchema as RelayRegisterRequestSchema } from "cozygateway-relay";
+
 import type { GatewayConfig } from "./config.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
@@ -326,7 +329,10 @@ export function createApp(deps: AppDeps): Hono<Env> {
     }
 
     // The frozen v1 route predates the relay proxy and owns the same path. Its distinct body stays
-    // local. Every other body is relay wire data and is forwarded byte for byte.
+    // local. A body in the RELAY's register shape is wire data and is forwarded byte for byte.
+    // Anything matching neither shape keeps the frozen v1 answer, 400 invalid_request, whether or
+    // not a relay is configured: garbage must never leave the gateway, and the conformance suite
+    // pins that 400 on gateways with no relay at all.
     let registration;
     try {
       registration = assertValid(PushRegisterRequestSchema, decoded);
@@ -336,6 +342,9 @@ export function createApp(deps: AppDeps): Hono<Env> {
     if (registration !== undefined) {
       deps.storage.savePushRegistration(c.get("deviceId"), registration);
       return c.json({ ok: true });
+    }
+    if (!Value.Check(RelayRegisterRequestSchema, decoded)) {
+      return c.json(errorBody("invalid_request", "malformed push registration body"), 400);
     }
     if (deps.config.pushRelayUrl === undefined) {
       return c.json(errorBody("not_found", "push relay proxy is not configured"), 404);
