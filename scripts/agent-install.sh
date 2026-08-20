@@ -225,10 +225,21 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # COZY_* names this script also uses as its own variables ($COZY_NODE above all), so sourcing it
 # into this shell would silently overwrite the flags the operator just typed. Everything adopted
 # from it is adopted deliberately, one value at a time, by the callers below.
+# It never fails: a record that cannot be sourced yields the empty string, so a caller's
+# `X="$(install_env_value NAME)"` cannot abort the whole script under `set -e` with nothing printed.
+# Callers that need to tell "no such key" from "broken file" ask install_env_readable first.
 install_env_value() {
   [ -f "$INSTALL_ENV" ] || return 0
   # shellcheck source=/dev/null
-  ( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${!1-}" )
+  ( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${!1-}" ) || true
+}
+
+# install_env_readable: can bash actually source the record? A truncated or hand-edited
+# install-env.sh is a real failure mode, and "every value came back empty" is not something to
+# reason about silently.
+install_env_readable() {
+  # shellcheck source=/dev/null
+  ( . "$INSTALL_ENV" ) >/dev/null 2>&1
 }
 
 # node_major BIN: the major version BIN reports, or the empty string if it cannot be asked.
@@ -802,6 +813,11 @@ fi
 if [ "$PAIR_ONLY" = "1" ] && [ -f "$INSTALL_ENV" ]; then
   step "8/8 pairing code (--pair-only)"
   info "re-entering the install recorded in $INSTALL_ENV; flags given on this command line still win"
+
+  # Say it here, once, rather than letting every value below come back empty and inferring a
+  # runtime from the silence.
+  install_env_readable || \
+    die "$INSTALL_ENV exists but bash cannot source it (truncated, or hand-edited into a syntax error), so this install's runtime, bundle, node and ports cannot be read. Re-run the installer to regenerate it, or re-supply the install's flags on this command line."
 
   RECORDED_RUNTIME="$(install_env_value COZY_RUNTIME)"
   RECORDED_BUNDLE="$(install_env_value COZY_BUNDLE_PATH)"
