@@ -424,17 +424,26 @@ export class BotToolActivity {
   }
 
   #persist(turn: TurnActivity, stepId: string, step: StepState): void {
-    this.#store.record({
-      bot: turn.binding.bot,
-      sessionId: turn.binding.sessionId,
-      turnId: turn.turnId,
-      stepId,
-      seq: step.seq,
-      name: step.name,
-      status: step.status,
-      startedAt: step.startedAt,
-      endedAt: step.endedAt,
-    });
+    // Defense in depth: the ws event fan-out that calls this already guards each handler against a
+    // throw (cozygateway#65), but this write is synchronous SQLite and worth its own guard so a
+    // storage failure (SQLITE_BUSY, disk, missing table) degrades to "this step wasn't recorded"
+    // rather than propagating at all. A tool chip is never worth the link.
+    try {
+      this.#store.record({
+        bot: turn.binding.bot,
+        sessionId: turn.binding.sessionId,
+        turnId: turn.turnId,
+        stepId,
+        seq: step.seq,
+        name: step.name,
+        status: step.status,
+        startedAt: step.startedAt,
+        endedAt: step.endedAt,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      this.#log(`failed to persist tool step ${stepId} for turn ${turn.turnId}; continuing (${detail})`);
+    }
   }
 
   #schedule(runtimeId: string, turn: TurnActivity): void {

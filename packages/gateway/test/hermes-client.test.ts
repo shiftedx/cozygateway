@@ -369,4 +369,33 @@ describe("event stream", () => {
     await until(() => c2.state() === "online");
     expect(await c2.request("ping", {})).toEqual({ ok: true });
   });
+
+  it("does not let a throwing handler kill the link or block later handlers (cozygateway#65)", async () => {
+    const server = await fakeServer({ methods: { ping: () => ({ ok: true }) } });
+    const lines: string[] = [];
+    const c = client(server.url, { logSink: (line) => lines.push(line) });
+
+    const seenByLater: string[] = [];
+    c.onEvent(function boom() {
+      throw new Error("tool-activity persist blew up");
+    });
+    c.onEvent((event) => seenByLater.push(event.type));
+
+    c.start();
+    await until(() => c.state() === "online");
+    // "gateway.ready" already ran both handlers once during the handshake; the throwing handler
+    // must not have taken the link down under it.
+    expect(seenByLater).toContain("gateway.ready");
+
+    server.sendEvent("sessions.changed", { reason: "prompt" });
+    await until(() => seenByLater.includes("sessions.changed"));
+
+    // The socket is still the same working link: RPC settlement (the other consumer of this exact
+    // message listener) is unaffected by the handler that threw.
+    expect(await c.request("ping", {})).toEqual({ ok: true });
+    expect(c.state()).toBe("online");
+
+    expect(lines.join("")).toContain("boom");
+    expect(lines.join("")).toContain("gateway.ready");
+  });
 });
