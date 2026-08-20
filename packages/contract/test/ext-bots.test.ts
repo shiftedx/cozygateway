@@ -435,6 +435,10 @@ describe("capability advertisement", () => {
     // `bot_routines` frame also carry the untagged jobs of that bot's own cron store, each with
     // `legacy: true` (a v12 gateway never sends the field and never sends those rows, and a client
     // that renders them has to know not to offer Edit, which they answer with a 400).
-    expect(BOTS_CAPABILITY_VERSION).toBe(13);
+    // 14 for the canonical-chat pin FOLLOWING the bot's latest conversational session, plus the
+    // `bot_chat_adopted` frame that announces the move (a v13 gateway pins once and then holds, so a
+    // conversation held from a second device updates the roster preview and never appears in the
+    // chat the app opens, and nothing on the wire ever says the pin moved).
+    expect(BOTS_CAPABILITY_VERSION).toBe(14);
   });
 });

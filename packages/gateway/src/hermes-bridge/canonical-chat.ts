@@ -18,7 +18,14 @@
  *  things carry the gateway across that gap and both are durable rather than in-memory: the pin
  *  (`bot_chat_pins.session_id`), which is why an empty session list never means "this bot has no
  *  chat", and the RUNTIME id (`bot_chat_pins.runtime_id`), which is the only id `prompt.submit`
- *  accepts for a session that has no row yet. See `Storage.setBotChatRuntimeId`. */
+ *  accepts for a session that has no row yet. See `Storage.setBotChatRuntimeId`.
+ *
+ *  The pin FOLLOWS the bot's latest conversational session (issue #88). It is not a one-time
+ *  adoption: when a newer conversation than the pinned one shows up in `session.list`, the pin moves
+ *  to it and the caller announces the move. See `isConversationalSession` for what "conversation"
+ *  means here and `resolvePin` for the guards. */
+
+import { A2A_RE } from "./roster.ts";
 
 /** The session title the Hermes prompt builder gates its bot-mode protocol injection on. Exact
  *  match, including case. */
@@ -39,7 +46,9 @@ export type ChatAdoption =
   | "pin"
   /** First open of a bot with history: adopted the session carrying the canonical title. */
   | "title"
-  /** First open of a bot with history and no canonical title: adopted the newest session. */
+  /** The newest CONVERSATIONAL session. Two ways to arrive here, and they are the same rule seen at
+   *  two moments: the first open of a bot with history and no canonical title, and a later open
+   *  where a newer conversation than the pinned one has appeared (issue #88), which RE-ADOPTS. */
   | "latest"
   /** The pinned id vanished (compaction rewrote the lineage): re-pinned the newest session. */
   | "recovery"
@@ -54,6 +63,15 @@ export interface CanonicalChatResult {
    *  that gets pinned; a chat with no persisted row cannot be resumed, so this is the only way to
    *  learn it. Absent for every adoption path other than `created`. */
   runtimeId?: string;
+  /** The session the pin pointed at immediately before this call MOVED it, present ONLY on a
+   *  re-adoption (issue #88): a pin that already resolved, and that a newer conversational session
+   *  outran. The caller announces the move on the socket so paired devices rebind and re-read.
+   *
+   *  Deliberately not set on the first-adoption paths (`title`, `latest` from no pin, `recovery`,
+   *  `created`). Those answer "which session IS this bot's chat" for a client that did not have one;
+   *  a re-adoption answers "the chat you are holding is no longer it", which is the only case where
+   *  a device already on screen has to be told something. */
+  previousSessionId?: string;
 }
 
 export interface HermesRpc {
@@ -111,6 +129,47 @@ export function parseSessionList(result: unknown): SessionRow[] {
     });
   }
   return parsed;
+}
+
+/** Titles that name a session belonging to a machine, not to the user's conversation with this bot.
+ *  Both are conventions this gateway and the desktop write themselves, so matching on them is
+ *  matching on our own output rather than guessing at a user's title. */
+const ROUTINE_TITLE_PREFIX = "Routine: ";
+const GROUP_TITLE_PREFIX = "Group: ";
+
+/** Whether a session is one the ROSTER PREVIEW would present as a conversation, which is exactly
+ *  the set the canonical chat may follow (issue #88). One rule, four exclusions, and each exclusion
+ *  is a session kind whose transcript would be wrong to open when the user taps the bot:
+ *
+ *  - **cron**, by `source` and by the `cron_<job_id>_<timestamp>` id shape. Every routine fire mints
+ *    its own session DELIBERATELY (contract/ext-bots-v1.md, "Where a routine's runs land"), so a
+ *    bot with an hourly routine would otherwise re-adopt away from the user's conversation once an
+ *    hour and hand them a machine transcript. The id shape is checked as well as the source because
+ *    `source` is `string | null` on this wire and a hermes that omits it must not defeat the rule.
+ *  - **delegated routine runs**, titled `Routine: <title>`. Same fires, different delivery: when the
+ *    routine's bot is not the profile the gateway's own hermes runs as, the run is delegated with
+ *    `hermes -p <bot> chat -c "Routine: <title>"`, which lands in the bot's own history with source
+ *    `cli` rather than `cron`. Excluding only `source: cron` would have caught one half of routines
+ *    and missed the other.
+ *  - **group rooms**, titled `Group: <name>`. A room member's session is the room's half of a
+ *    multi-bot conversation, and re-adopting it would splice room traffic (other members' lines,
+ *    the room protocol prompt) into the 1:1 chat the user opened.
+ *  - **bot-to-bot deliveries**, recognized on the preview by the same regex the roster classifies
+ *    them with. The preview renders these as `kind: "a2a"` and not as plain conversation, so by the
+ *    rule above they cannot move the pin.
+ *
+ *  Everything else counts, including a session with no title and no source: the point of the rule is
+ *  that a conversation held from a SECOND DEVICE (a desktop, the CLI) becomes the bot's chat, and
+ *  those sessions carry whatever title that client gave them. The exclusions are the closed list;
+ *  conversation is the default. */
+export function isConversationalSession(row: SessionRow): boolean {
+  const source = row.source?.trim().toLowerCase();
+  if (source === "cron") return false;
+  if (row.id.startsWith("cron_")) return false;
+  if (row.title.startsWith(ROUTINE_TITLE_PREFIX)) return false;
+  if (row.title.startsWith(GROUP_TITLE_PREFIX)) return false;
+  if (row.preview !== null && A2A_RE.test(row.preview.trim())) return false;
+  return true;
 }
 
 export interface CanonicalChatDeps {
@@ -308,6 +367,35 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
     const created = await mintCanonicalChat(name, deps);
     return { sessionId: created.storedId, adoption: "created", runtimeId: created.runtimeId };
   }
+
+  // RE-ADOPTION (issue #88). The pin resolves, but the pin is not automatically the bot's
+  // conversation any more: a chat held from a second device mints a session of its own, and up to
+  // now the roster preview followed that session while the canonical chat stayed on the pin. The two
+  // surfaces then described different conversations, and the messages the preview was quoting were
+  // absent from the transcript the app opened. The pin FOLLOWS the latest conversational session.
+  //
+  // "Newer" is list POSITION, which `parseSessionList` documents as a convention this wire cannot
+  // verify. It is used the same way every other heuristic here uses it -- as a preference, never as
+  // a fact -- and the guards around it are what make a wrong guess harmless: nothing retired is a
+  // candidate (a reset's conversation never comes back), and nothing a machine wrote is a candidate
+  // (`isConversationalSession`), so the worst a mis-ordered list can do is prefer one conversation
+  // the user actually held over another.
+  //
+  // Resets cannot be outrun by this, and the ordering is worth stating because it is the race the
+  // cozychat work surfaced: a reset retires the outgoing session and pins a freshly minted one, and
+  // that replacement has NO row in `session.list` until the user writes in it. A just-reset bot is
+  // therefore resolved by the pin-not-listed branch above and never reaches this one, and once the
+  // replacement does become listed it is the newest row, so there is nothing above it to re-adopt.
+  // The retired session, meanwhile, is not a candidate at any point.
+  const pinIndex = rows.findIndex((row) => row.id === pin);
+  const newer = rows
+    .slice(0, pinIndex)
+    .find((row) => !isRetired(row.id) && isConversationalSession(row));
+  if (newer !== undefined) {
+    deps.pins.set(name, newer.id);
+    return { sessionId: newer.id, adoption: "latest", previousSessionId: pin };
+  }
+
   deps.pins.set(name, pin);
   return { sessionId: pin, adoption: "pin" };
 }

@@ -309,7 +309,10 @@ describe("GET /bots/:name/chat", () => {
     const { authed, storage } = await setup({
       methods: {
         "profiles.list": () => profilesListResult([scoutNoMeta]),
-        "session.list": () => ({ sessions: [{ id: "newest", title: "x" }, { id: "pinned", title: "Bot Chat" }] }),
+        // The pin is the newest row. "Still resolves" is the property here; since issue #88 a pin
+        // that a newer CONVERSATION outruns is re-adopted away from, which is a different rule with
+        // its own tests (bots-chat-readoption.test.ts).
+        "session.list": () => ({ sessions: [{ id: "pinned", title: "Bot Chat" }, { id: "older", title: "x" }] }),
       },
     });
     storage.setBotChatPin("scout", "pinned", NOW);
@@ -366,11 +369,17 @@ describe("GET /bots/:name/chat", () => {
             row("cleared", { chat: null }),
             row("absent", null),
           ]),
-        "session.list": () => ({
+        // Per profile, each list carrying that bot's own pin at the top. Which pin the two routes
+        // read is the property under test; since issue #88 a pin outrun by a newer conversation is
+        // re-adopted away from, and one shared list would make two of these three bots answer the
+        // re-adoption rule's question instead of this one. Re-adoption has its own tests.
+        "session.list": (params) => ({
           sessions: [
-            { id: "server-pinned", title: "An older chat" },
+            {
+              id: params["profile"] === "set" ? "server-pinned" : "local-pinned",
+              title: "An older chat",
+            },
             { id: "canonical", title: CANONICAL_CHAT_TITLE },
-            { id: "local-pinned", title: "Older still" },
           ],
         }),
       },

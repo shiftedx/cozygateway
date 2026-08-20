@@ -126,6 +126,23 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   `>= 13`, MUST hide or disable Edit on a row carrying `legacy`, and offers the conversion as delete
   then create. What the version does NOT promise is that any legacy job will be found; see the
   ownership rule under `GET /bots/:name/routines`.
+- `14`: THE CANONICAL CHAT PIN FOLLOWS THE BOT'S LATEST CONVERSATION, plus the `bot_chat_adopted`
+  frame that announces the move. Like 11, this changes BEHAVIOUR rather than only adding surface, so
+  read it as that first. Up to 13 the pin was adopted once and then held, while `GET /bots` derived
+  a bot's preview and `lastActiveAt` from its last activity across ALL its sessions. A conversation
+  held from a second device therefore updated the roster row and never appeared in the chat the app
+  opened: the two surfaces disagreed about which session was "this bot's conversation", and the
+  missing messages were absent from the wire rather than dropped by the client. From 14 they cannot
+  disagree. See "The pin follows the bot's latest conversation" under `GET /bots/:name/chat` for the
+  rule, for what may never move the pin (routine fires, bot-to-bot deliveries, group rooms), and for
+  how it stays out of a reset's way.
+
+  A client that offers a chat screen SHOULD require `>= 14` before it relies on the transcript
+  matching the roster preview, and MUST require `>= 14` to act on `bot_chat_adopted`. A client below
+  14 keeps working: it ignores a frame type it does not know, and its next ordinary read of
+  `GET /bots/:name/chat/messages` returns the re-adopted transcript anyway, so what it loses is
+  promptness, not correctness. A re-adoption retires nothing and deletes nothing, and the previous
+  session stays listed by `GET /bots/:name/sessions`.
 
 ## 3. Resources
 
@@ -590,15 +607,70 @@ real profile and stays chattable by name on every one of these routes, exactly a
 
 Resolve-or-create the canonical Bot Chat. The gateway lists the bot's sessions and:
 
-- `pin`: the known pin still resolves, return it;
+- `pin`: the known pin still resolves and nothing newer outranks it, return it;
 - `title`: first open of a bot with history, adopt the session titled `Bot Chat`;
-- `latest`: first open with history but no canonical title, adopt the newest session;
+- `latest`: the newest CONVERSATIONAL session, which is both the first open of a bot with history
+  and no canonical title AND, since capability 14, a later open where a newer conversation has
+  outrun the pin. See the next section;
 - `recovery`: the pinned id vanished (compaction rewrote the lineage), re-pin the newest session;
 - `created`: no history at all, create a session titled `Bot Chat` (hidden by default). Since
   capability 11 NOTHING is submitted into it: the chat is born empty and stays empty until the user
   writes in it. A failed create leaves no pin behind and the route reports the failure.
 
 The returned `sessionId` is the STORED session id.
+
+### The pin follows the bot's latest conversation
+
+Capability `>= 14`. The canonical chat is not adopted once and held: **when a newer conversational
+session outruns the pinned one, the canonical chat RE-ADOPTS it**, this route reports
+`adoption: "latest"`, and a `bot_chat_adopted` frame goes to every paired device.
+
+Why it has to. `GET /bots` derives a bot's preview and `lastActiveAt` from its last activity across
+ALL its sessions, while `GET /bots/:name/chat/messages` is scoped to the single pinned session. Up
+to 13 the two could describe different conversations, and did: a chat held from a second device
+(a desktop, the CLI) mints a session of its own, which moved the roster preview and never became the
+chat the app opened. The messages were absent from the wire, not dropped by the client. Following
+the latest conversation is what makes the two surfaces answer one question.
+
+**What may move the pin.** Exactly the sessions the roster preview would present as CONVERSATION.
+Everything else is a session a machine wrote into the bot's history, and each exclusion is a
+transcript that would be wrong to open when a user taps the bot:
+
+- **cron sessions** (`source: "cron"`, and the `cron_<job_id>_<timestamp>` id shape, checked as well
+  because `source` is nullable on this wire). Every routine fire deliberately mints its own session,
+  as "Where a routine's runs land" describes, so a bot with an hourly routine would otherwise
+  re-adopt away from its owner's conversation once an hour;
+- **delegated routine runs**, titled `Routine: <title>`. The same feature's other delivery: a
+  routine whose bot is not the gateway's own profile runs through
+  `hermes -p <bot> chat -c "Routine: <title>"`, which lands in that bot's own history with source
+  `cli` rather than `cron`. Excluding only `source: cron` would have caught half of routines;
+- **group-room sessions**, titled `Group: <name>`. A member's room session is the room's half of a
+  multi-bot conversation, and adopting it would splice room traffic into the 1:1 chat;
+- **bot-to-bot deliveries**, recognized on the session preview by the same rule that classifies a
+  roster preview as `BotPreview.kind: "a2a"`.
+
+Everything else counts, including a session with no title and no source, because the second device
+whose conversation this rule exists to follow titles its sessions however it likes. The exclusions
+are the closed list; conversation is the default.
+
+**Re-adoption never fights a reset**, and the ordering is worth stating because the two look alike
+from a distance. A reset retires the outgoing session, records it, and pins a freshly minted
+replacement that has NO row in `session.list` until the user writes in it. So a just-reset bot is
+resolved by the pin the gateway holds rather than by any listed session, and once the replacement
+does become listed it is the newest row with nothing above it to follow. A retired session is not a
+re-adoption candidate at any point, whatever its title and wherever it sorts, by the same rule the
+reset section states. Clearing a chat cannot undo itself on the next open.
+
+**"Newer" means list position**, which `GET /bots/:name/sessions` documents as a convention this
+wire cannot verify: rows carry no timestamp. It is used as a preference and never as a fact, and the
+two guards above are what make a wrong guess harmless: the worst a mis-ordered list can do is prefer
+one conversation the user actually held over another.
+
+One related fix rides the same capability, because a client can observe it. A pin THIS gateway wrote
+after its last `profiles.list` snapshot now outranks that snapshot whatever the snapshot carries,
+not only when the snapshot carries no pin. Both a reset and a re-adoption repoint the pin, and a
+client that reads back inside the refresh window used to be handed the session that had just been
+moved away from.
 
 Three v1 properties worth knowing before writing a client:
 
@@ -608,7 +680,11 @@ Three v1 properties worth knowing before writing a client:
   Only a profile with no bot blob at all falls back to that local record, with ONE exception, and
   `GET /bots` applies it identically so the two routes cannot disagree: a pin this gateway wrote
   AFTER the `profiles.list` snapshot in hand is newer than that snapshot, not contradicted by it, so
-  it survives an absent `chat` key until a later snapshot has had a chance to see it.
+  it wins until a later snapshot has had a chance to see it. From capability 14 that exception
+  covers a snapshot naming a DIFFERENT session as well as one naming none, which is the same
+  statement about the same staleness; before 14 it covered only the absent key, and a reset or a
+  re-adoption read back inside the refresh window was handed the session it had just moved away
+  from.
 - **The pin IS written back.** When the resolved pin differs from what the profile's
   `ui_meta["hermes-bots"]` carries, the gateway pushes it with `profiles.configure`. Because that
   RPC replaces the blob WHOLE, the write is a read-modify-write against a FRESH `profiles.list`,
@@ -2160,6 +2236,26 @@ It is not a deletion notice. The retired session is still on the hermes host and
 `GET /bots/:name/sessions`; only the pin moved. No further `bot_chat`, `bot_chat_state` or
 `bot_chat_delta` frame will arrive for the retired session, because the gateway cancels its turn poll
 and forgets its draft bindings before it mints the replacement.
+
+`bot_chat_adopted` says a bot's canonical chat RE-ADOPTED a newer conversational session. Version 14
+and up. `sessionId` is the session the chat now points at and `previousSessionId` is the one the pin
+held until this moment; unlike the reset frame's, that field is always present, because a
+re-adoption by definition replaces a pin that resolved. It is broadcast to every paired device, for
+the same reason `bot_chat_reset` is: a device sitting on the previous transcript has no other way to
+learn that the conversation it is appending to is no longer the bot's. On receipt, rebind to
+`sessionId` and read `GET /bots/:name/chat/messages` for the new chat.
+
+That is the same handling `bot_chat_reset` gets, and a client MAY implement the two together, but
+they say different things about the session they name, so read the difference before collapsing
+them. A reset says the previous chat was RETIRED: the user asked to leave it behind, it will never be
+adopted again, and no further live frame arrives for it. `bot_chat_adopted` says nothing of the kind.
+The previous session is an ordinary conversation that simply stopped being the newest one; it stays
+listed, stays resumable, and would become canonical again if something wrote to it. Nothing is
+retired, and a turn still running in it may deliver its `bot_chat` frames, which carry that session's
+id and its own message ids and which a rebound client ignores.
+
+Never emitted for a routine fire, a bot-to-bot delivery or a group-room session. See "The pin follows
+the bot's latest conversation".
 
 `bot_routines` is a FULL REPLACE for one bot, sent only when that bot's routine list actually
 changed, so an idle cron store is silent. It fires when this gateway changed a routine, and when a
