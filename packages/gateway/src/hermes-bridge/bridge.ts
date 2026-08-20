@@ -815,6 +815,22 @@ export class HermesBridge implements BotsSurface {
           if (result.adoption === "created" && result.runtimeId !== undefined) {
             this.#rememberUnwritten(name, result.sessionId, result.runtimeId);
           }
+          // The pin MOVED under a device that may already be looking at the old chat (issue #88):
+          // a conversation held from another device outran the pinned session and the canonical chat
+          // followed it. Announced for the same reason `bot_chat_reset` is announced, and it is the
+          // only case in this resolve worth a frame: every other adoption path answers "which session
+          // is this bot's chat" for a caller that did not have one, while this one contradicts a
+          // caller that did. Broadcast, not returned only, because the device that triggered the
+          // resolve is usually not the device sitting on the stale transcript.
+          if (result.previousSessionId !== undefined) {
+            this.#broadcast({
+              type: "bot_chat_adopted",
+              bot: name,
+              sessionId: result.sessionId,
+              previousSessionId: result.previousSessionId,
+              updatedAt: this.#now(),
+            });
+          }
           return result;
         } finally {
           this.#busyDepth = Math.max(0, this.#busyDepth - 1);

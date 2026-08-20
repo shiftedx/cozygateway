@@ -206,6 +206,26 @@ describe("roster build", () => {
     expect(resolveChatPin({ title: "Scout" }, { sessionId: "stored-1", updatedAt: OLD_PIN }, NOW)).toBeNull();
   });
 
+  it("keeps a pin written after a snapshot that names a DIFFERENT session", () => {
+    // Same rule, the case it used to miss (issue #88). A snapshot naming another session is exactly
+    // as old as one naming none, and it beat the newer local pin every time: a reset repointed the
+    // pin, the app read back inside the refresh debounce, and the cached blob handed it the session
+    // the reset had just retired. Adoption then refused that retired chat and minted a third one,
+    // throwing away the replacement the reset had made. Both surfaces must read the newer write.
+    const fresh = pinEntries({ scout: "stored-2" }, NOW + 1);
+    const { profiles } = parseProfilesList({
+      profiles: [profileRow({ name: "scout", ui_meta: { "hermes-bots": { title: "Scout", chat: "stored-1" } } })],
+    });
+    expect(buildRoster(profiles, { ...idle, pins: fresh })[0]!.chatSessionId).toBe("stored-2");
+    expect(
+      resolveChatPin({ title: "Scout", chat: "stored-1" }, { sessionId: "stored-2", updatedAt: NOW + 1 }, NOW),
+    ).toBeUndefined();
+    // Older than the snapshot: the server's pin is the newer statement and wins, as it always did.
+    expect(
+      resolveChatPin({ title: "Scout", chat: "stored-1" }, { sessionId: "stored-2", updatedAt: OLD_PIN }, NOW),
+    ).toBe("stored-1");
+  });
+
   it("orders pinned bots first, then by most recent activity", () => {
     const { profiles } = parseProfilesList({
       profiles: [

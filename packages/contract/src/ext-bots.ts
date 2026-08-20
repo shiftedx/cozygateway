@@ -365,6 +365,37 @@ export const BotChatResetFrameSchema = Type.Object({
 });
 export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
 
+/** A bot's canonical chat RE-ADOPTED a newer conversational session (capability 14, issue #88). The
+ *  pin follows the bot's latest conversation: when a chat held somewhere else -- another device, the
+ *  desktop, the CLI -- outruns the pinned session, the canonical chat moves to it, and this frame is
+ *  how every paired device learns that the transcript on its screen is no longer the bot's.
+ *
+ *  On receipt, rebind to `sessionId` and re-read `GET /bots/:name/chat/messages`. That is the same
+ *  handling `bot_chat_reset` gets, and a client MAY implement the two together; what separates them
+ *  is what they say about the previous session, so read that difference before collapsing them:
+ *
+ *  - `bot_chat_reset` says the previous chat was RETIRED. The user asked to leave it behind, it will
+ *    never be adopted again, and no further live frame will arrive for it.
+ *  - `bot_chat_adopted` says nothing of the kind. The previous session is an ordinary conversation
+ *    that simply stopped being the newest one; it is still listed, still resumable, and could become
+ *    canonical again if something writes to it. A turn already running in it may still deliver its
+ *    `bot_chat` frames, which carry that session's id and which a rebound client ignores.
+ *
+ *  Never emitted for a routine run or a bot-to-bot delivery. Those mint sessions of their own by
+ *  design and cannot move the pin -- see contract/ext-bots-v1.md, "The pin follows the bot's latest
+ *  conversation". */
+export const BotChatAdoptedFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_adopted"),
+  bot: Type.String(),
+  /** The session the canonical chat now points at. Every device rebinds to this id. */
+  sessionId: Type.String(),
+  /** The session the pin pointed at until this moment. Present always: a re-adoption by definition
+   *  replaces a pin that resolved, which is what distinguishes it from a first adoption. */
+  previousSessionId: Type.String(),
+  updatedAt: Type.Integer(),
+});
+export type BotChatAdoptedFrame = Static<typeof BotChatAdoptedFrameSchema>;
+
 /** `POST /bots/:name/chat/reset` response. `sessionId` is the STORED id of the new canonical chat,
  *  the same value a subsequent `GET /bots/:name/chat` reports, and `previousSessionId` is what the
  *  pin used to point at, absent only when the bot had no chat to retire.
@@ -918,6 +949,26 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    What the version does NOT promise is that any legacy job will be found: the gateway claims only
  *    the untagged jobs of a store the backend agrees is that bot's, so a hermes that answers a
  *    `profile`-scoped list with another profile's store contributes none (see
- *    contract/ext-bots-v1.md, routines). */
+ *    contract/ext-bots-v1.md, routines).
+ *  - `14`: THE CANONICAL CHAT PIN FOLLOWS THE BOT'S LATEST CONVERSATION (issue #88), plus the
+ *    `bot_chat_adopted` frame that announces the move. A BEHAVIOUR change, like 11, so read it as
+ *    that first: up to 13 the pin was adopted once and then held, while `GET /bots` derived a bot's
+ *    preview and `lastActiveAt` from its last activity across ALL its sessions. A conversation held
+ *    from a second device therefore updated the roster preview and never appeared in the chat the
+ *    app opened, because the two surfaces disagreed about which session was "this bot's
+ *    conversation". From 14 they cannot: when a newer CONVERSATIONAL session outruns the pinned one,
+ *    the canonical chat re-adopts it, `GET /bots/:name/chat` reports `adoption: "latest"`, and every
+ *    paired device is told on the socket.
+ *
+ *    Routine runs and bot-to-bot deliveries never move the pin, and neither do group-room sessions.
+ *    The exclusions and the reasoning are in `contract/ext-bots-v1.md` under "The pin follows the
+ *    bot's latest conversation".
+ *
+ *    A client that offers a chat screen SHOULD require `>= 14` before it relies on the transcript
+ *    matching the roster preview, and MUST require `>= 14` to handle `bot_chat_adopted`. A client
+ *    below 14 keeps working: it ignores a frame type it does not know, and its next ordinary read of
+ *    `GET /bots/:name/chat/messages` returns the re-adopted transcript anyway, so what it loses is
+ *    promptness, not correctness. What it does NOT lose is history: a re-adoption retires nothing
+ *    and deletes nothing, and the previous session stays listed by `GET /bots/:name/sessions`. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 13;
+export const BOTS_CAPABILITY_VERSION = 14;

@@ -15,8 +15,14 @@ export const UI_META_KEY = "hermes-bots";
 export const ACTIVE_WINDOW_S = 90;
 
 /** A bot-to-bot delivery preview, and the prefix stripped off it for display. Both are copied
- *  from the desktop plugin verbatim so the same previews classify the same way. */
-const A2A_RE = /^Message from (?:agent '([^']+)'|🤖\s*([^\s(@]+))/i;
+ *  from the desktop plugin verbatim so the same previews classify the same way.
+ *
+ *  `A2A_RE` is exported because the canonical-chat re-adoption rule (issue #88) has to answer the
+ *  same question this file answers for the roster preview: is this line a conversation the user
+ *  held, or a delivery from another bot? Two regexes would be two answers, and the whole point of
+ *  the rule is that the preview and the canonical chat cannot disagree about what a bot's
+ *  conversation is. */
+export const A2A_RE = /^Message from (?:agent '([^']+)'|🤖\s*([^\s(@]+))/i;
 const A2A_PREFIX_RE = /^Message from (?:agent '[^']+'|🤖[^:]+):\s*/i;
 
 /** One `profiles.list` row, after tolerant decoding. Unknown fields on the wire are ignored;
@@ -129,9 +135,21 @@ export function uiMetaBytes(meta: Record<string, unknown>): number {
  *    (dissection 3.2), and it must not be resurrected from the local record;
  *  - `undefined` is "the server knows nothing", which is the only case the local record fills.
  *
- *  The clear is only authoritative about state the snapshot could have seen. A pin THIS gateway
- *  wrote after the snapshot was taken is newer than the server's answer, not contradicted by it,
- *  so it reads as `undefined` and the local record wins.
+ *  The server's answer is only authoritative about state the snapshot could have seen. A pin THIS
+ *  gateway wrote after the snapshot was taken is newer than that answer, not contradicted by it, so
+ *  it reads as `undefined` and the local record wins.
+ *
+ *  That exception used to apply only to an absent `chat` key, and the narrowing was a bug (issue
+ *  #88). A snapshot that names a DIFFERENT session is exactly as old as one that names none, and
+ *  it beat the newer local pin every time. Two ways to reach it, both ordinary: a RESET repoints the
+ *  pin and the app reads back immediately, inside the refresh debounce, so the cached blob still
+ *  names the session the reset just retired -- and adoption, refusing to hand back a retired chat,
+ *  minted a THIRD one, discarding the replacement the reset had made. And a re-adoption moves the
+ *  pin the same way, so the same stale blob dragged the chat back to the previous session and the
+ *  next open re-adopted it again, announcing the move on the socket every time. Both are the same
+ *  mistake: reading a snapshot as an opinion about a write it predates. The window this opens in the
+ *  other direction is one refresh long, and it closes by itself: the next snapshot HAS seen the
+ *  write, so a desktop's own newer pin wins again from that moment on.
  *
  *  `uiMetaSupported: false` disables the clear entirely. On a Hermes that cannot store `ui_meta`
  *  at all, NO blob will ever carry `chat`, so every refresh read as an authoritative clear and threw
@@ -145,10 +163,15 @@ export function resolveChatPin(
   uiMetaSupported = true,
 ): string | null | undefined {
   if (meta === null) return undefined;
+  // Asked BEFORE the blob is read, not after: a pin written since the snapshot was taken settles
+  // the question whatever the snapshot says, and asking afterwards is what let a stale `chat` value
+  // outrank it. See the note above.
+  const localIsNewer =
+    localPin !== undefined && (snapshotAt === null || localPin.updatedAt > snapshotAt);
+  if (localIsNewer) return undefined;
   const chat = asString(meta["chat"]);
   if (chat !== undefined && chat.length > 0) return chat;
   if (!uiMetaSupported) return undefined;
-  if (localPin !== undefined && (snapshotAt === null || localPin.updatedAt > snapshotAt)) return undefined;
   return null;
 }
 
