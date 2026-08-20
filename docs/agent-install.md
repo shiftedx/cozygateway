@@ -39,6 +39,12 @@ run on this machine, Appendix A does the same work by hand, writing the same two
 
 Ask, and record the answers. Do not guess.
 
+0. **Docker, Node checkout, or prebuilt bundle?** If the human answering is not technical, and
+   just wants cozygateway running with the least fuss, stop here and hand them the one-liner
+   instead of this playbook: `curl -fsSL https://cozylabs.ai/install.sh | bash` (see
+   `docs/install-service.md`). It needs Node 24+, no Docker and no git, and it registers both the
+   gateway and the Hermes dashboard as login services on its own. This playbook is for the Docker
+   path, a Node checkout you build, or a prebuilt bundle (`--bundle PATH`) you already have.
 1. **Which machine runs the gateway?** It must be the same machine as Hermes, or one that can
    reach Hermes over the network. The phone must be able to reach the gateway (same LAN, VPN, or a
    tunnel; see Step 8).
@@ -179,6 +185,9 @@ Flags you may need, from the Step 0 answers:
 | Port 8787 or 9119 already in use | `--gateway-port 9000` / `--dashboard-port 9120` |
 | Hermes home somewhere else | `--hermes-home /srv/hermes` |
 | A dashboard password the human already has | none, see below |
+| A prebuilt single-file gateway instead of a clone/build | `--bundle /path/to/cozygateway.mjs` (implies `--runtime bundle`; needs node 24+) |
+| Run the gateway (and dashboard) as an OS-supervised login service instead of `nohup` | `--service` (launchd on macOS, systemd `--user` on Linux; not for `--runtime docker`, which already supervises itself) |
+| Remove service units this script installed | `--uninstall-service` (stops and removes both units, prints what went, needs neither hermes nor docker) |
 
 The installer has a `--password` flag and you should not use it. A password on a command line is
 visible in `ps` to every user on the machine and lands in shell history. If the human already has a
@@ -532,6 +541,9 @@ Every row here is an incident we actually hit.
 | Pairing code **rejected as expired or used** | Codes are single use with a 10-minute TTL. | Mint another. There is no limit and no cleanup needed. |
 | Step 7 shows `bots:200` with an **empty array** | The human has no Hermes bot profiles yet, or they are all in `hiddenProfiles`. | Not a failure. Check `hiddenProfiles` against the Step 0 answers, then have the human create a bot. |
 | A device named **install-check** appears in the app | Step 7's throwaway device was not revoked (its `revoked:` line was not `200`). | Delete it from the app's device list, or `DELETE /devices/<id>` with a paired token. |
+| `--service` on Linux: unit installed but **stops after the human logs out** | The user session does not linger, so systemd tears down user services at logout. | `sudo loginctl enable-linger $USER`, then re-run with `--service`. The installer attempts this itself and warns when it fails. |
+| `--service` on macOS: **launchd job crashed** and did not come back | `KeepAlive` only restarts a non-zero exit, and `ThrottleInterval` holds it to one restart per 10s; a job that keeps crash-looping inside that window can look stuck. A job stopped by hand (SIGTERM, exit 0) is not restarted at all; that is by design. | `launchctl print gui/$UID/ai.cozylabs.cozygateway` for state and the last exit status; the log named in that output has the real error. Restart by hand with `launchctl kickstart -k gui/$UID/ai.cozylabs.cozygateway`. |
+| `--bundle`: install refuses with **bundle sha256 mismatch** | The download was corrupted, interrupted, or the release asset does not match its published hash. `install.sh` refuses to run an unverified bundle on purpose. | Re-download (re-run `curl -fsSL https://cozylabs.ai/install.sh \| bash`, or re-fetch the release asset by hand). If it mismatches repeatedly, treat the asset as possibly tampered and say so before retrying. |
 
 ---
 
@@ -556,20 +568,25 @@ COZY_DASHBOARD_PORT=9119
 COZY_DASHBOARD_HOST=127.0.0.1
 COZY_BRIDGE_USER=cozybridge
 COZY_RUNTIME=docker
+COZY_BUNDLE_PATH=
+COZY_NODE=
 COZY_HERMES_PY=$(hermes --version | sed -n 's/^Install directory: *//p')/venv/bin/python3
 COZY_HERMES_HOME=${HERMES_HOME:-$HOME/.hermes}
 COZY_GW_LOG=$HOME/cozygateway/local/cozygateway.log
 COZY_DASH_LOG=$HOME/cozygateway/local/hermes-dashboard.log
 export COZY_GATEWAY_DIR COZY_LOCAL_DIR COZY_CONFIG_JSON COZY_ENV_FILE COZY_CRED_FILE
 export COZY_GATEWAY_PORT COZY_DASHBOARD_PORT COZY_DASHBOARD_HOST COZY_BRIDGE_USER
-export COZY_RUNTIME COZY_HERMES_PY COZY_HERMES_HOME COZY_GW_LOG COZY_DASH_LOG
+export COZY_RUNTIME COZY_BUNDLE_PATH COZY_NODE COZY_HERMES_PY COZY_HERMES_HOME COZY_GW_LOG COZY_DASH_LOG
 EOF
 chmod 600 ~/cozygateway/local/install-env.sh
 ```
 
 Edit the ports, `COZY_RUNTIME` and `COZY_DASHBOARD_HOST` to match the Step 0 answers before
 continuing. `COZY_DASHBOARD_HOST` must be `0.0.0.0` on Docker Desktop or a remote gateway; see the
-warning in Step 0.
+warning in Step 0. `COZY_BUNDLE_PATH` and `COZY_NODE` are left empty here on purpose: some scripts
+that source this file run under `set -u`, and an unset variable there would abort with a bash
+error instead of the empty string that honestly means "not the bundle path". Fill them in only if
+`COZY_RUNTIME=bundle`.
 
 **Check:** `. ~/cozygateway/local/install-env.sh && "$COZY_HERMES_PY" -c 'import yaml; from plugins.dashboard_auth.basic import hash_password; print("ok")'`
 **Expect:** `ok`.
