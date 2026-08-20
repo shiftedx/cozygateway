@@ -1062,25 +1062,41 @@ export class Storage {
   }
 }
 
+/** True for the one error ADD COLUMN is expected to throw: the column is already there because
+ *  this DB was already migrated. Anything else (locked, busy, read-only, disk full, ...) is a real
+ *  failure and must not be swallowed, or every query against the column throws "no such column"
+ *  gateway-wide while /health stays green. */
+function isDuplicateColumnError(err: unknown): boolean {
+  return err instanceof Error && /duplicate column name/i.test(err.message);
+}
+
+/** Additive migration: adds `column` to `table` if it is not already there. Safe to run on every
+ *  boot. Swallows only the duplicate-column error a re-run produces; anything else propagates.
+ *  Verifies the column exists afterward via PRAGMA table_info so a swallowed-but-wrong error (or a
+ *  driver that reports success without applying the change) fails loudly instead of leaving the
+ *  gateway to discover the missing column mid-query later. */
+export function addColumnIfMissing(db: DatabaseSync, table: string, column: string, type: string): void {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch (err) {
+    if (!isDuplicateColumnError(err)) throw err;
+  }
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === column)) {
+    throw new Error(`migration failed: "${table}.${column}" missing after ALTER TABLE`);
+  }
+}
+
 export function openStorage(dbPath: string): Storage {
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
-  // Additive migration for a DB created before the delivery column existed. ALTER TABLE ADD
-  // COLUMN throws "duplicate column name" on an up-to-date DB, which is the no-op we want.
-  try {
-    db.exec("ALTER TABLE messages ADD COLUMN delivery TEXT");
-  } catch {
-    // column already present: nothing to do
-  }
+  // Additive migration for a DB created before the delivery column existed.
+  addColumnIfMissing(db, "messages", "delivery", "TEXT");
   // Same shape, for a DB created before ext-bots capability 11 gave an unwritten chat a durable
   // runtime id. NULL on every existing row is exactly right: a pin written by an older gateway
   // points at a chat its kickoff already persisted, so there is nothing to remember for it.
-  try {
-    db.exec("ALTER TABLE bot_chat_pins ADD COLUMN runtime_id TEXT");
-  } catch {
-    // column already present: nothing to do
-  }
+  addColumnIfMissing(db, "bot_chat_pins", "runtime_id", "TEXT");
   return new Storage(db);
 }
