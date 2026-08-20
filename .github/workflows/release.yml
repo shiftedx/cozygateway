@@ -1,0 +1,35 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm bundle
+      - name: smoke the bundle
+        run: |
+          cat > /tmp/smoke.json <<'EOF'
+          { "name": "smoke", "port": 18787, "host": "127.0.0.1",
+            "dbPath": "/tmp/smoke.db",
+            "agents": [{ "id": "mock", "name": "Mock", "backend": "mock" }] }
+          EOF
+          node dist-bundle/cozygateway.mjs serve --config /tmp/smoke.json &
+          sleep 2
+          curl -fsS http://127.0.0.1:18787/health | grep -q '"contract":"v1"'
+          kill %1
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-bundle/cozygateway.mjs
+            dist-bundle/cozygateway.mjs.sha256
+          generate_release_notes: true
