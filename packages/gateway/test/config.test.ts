@@ -108,6 +108,15 @@ describe("loadConfig", () => {
     expect(loadConfig(path).capabilities).toEqual({ "com.cozylabs.test": 1 });
   });
 
+  it("loads the private push relay target", () => {
+    const path = writeConfig({
+      name: "test-gateway",
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      pushRelayUrl: "http://relay:8788",
+    });
+    expect(loadConfig(path).pushRelayUrl).toBe("http://relay:8788");
+  });
+
   it("rejects a non-integer capability version", () => {
     const path = writeConfig({
       name: "g",
@@ -186,5 +195,13 @@ describe("applyEnvOverrides", () => {
   it("throws on a non-integer or out-of-range COZYGATEWAY_PORT", () => {
     expect(() => applyEnvOverrides(base, { COZYGATEWAY_PORT: "not-a-port" })).toThrow(/COZYGATEWAY_PORT/);
     expect(() => applyEnvOverrides(base, { COZYGATEWAY_PORT: "70000" })).toThrow(/COZYGATEWAY_PORT/);
+  });
+
+  it("overrides the private push relay target", () => {
+    const next = applyEnvOverrides(base, {
+      COZYGATEWAY_PUSH_RELAY_URL: "http://relay:8788",
+    });
+    expect(next.pushRelayUrl).toBe("http://relay:8788");
+    expect(base.pushRelayUrl).toBeUndefined();
   });
 });

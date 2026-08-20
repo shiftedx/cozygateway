@@ -9,6 +9,9 @@ services:
       COZYGATEWAY_HOST: "0.0.0.0"
       COZYGATEWAY_PORT: "8787"
       COZYGATEWAY_DB_PATH: "/data/cozygateway.db"
+      # The gateway reaches the push relay only over the private compose network. Phones use the
+      # authenticated /push proxy on the gateway's public origin.
+      COZYGATEWAY_PUSH_RELAY_URL: "http://relay:${COZY_RELAY_PORT:-8788}"
       # The bearer token the attaching Hermes plugin must present on /attach. Named by the mounted
       # config's options.tokenEnv. Required: compose fails fast if unset.
       COZYGATEWAY_ATTACH_TOKEN: "${COZYGATEWAY_ATTACH_TOKEN:?set a strong attach token in .env}"
@@ -54,8 +57,8 @@ services:
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
       APNS_TOPIC: "${APNS_TOPIC:-}"
       APNS_ENVIRONMENT: "${APNS_ENVIRONMENT:-}"
-    ports:
-      - "${COZY_RELAY_PORT:-8788}:${COZY_RELAY_PORT:-8788}"
+    expose:
+      - "${COZY_RELAY_PORT:-8788}"
     volumes:
       - relay-data:/data
       # - "${APNS_KEY_P8_HOST_PATH}:/keys/apns.p8:ro"

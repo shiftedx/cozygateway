@@ -19,6 +19,9 @@ import {
   assertValid,
 } from "cozygateway-contract";
 
+import { Value } from "@sinclair/typebox/value";
+import { RegisterRequestSchema as RelayRegisterRequestSchema } from "cozygateway-relay";
+
 import type { GatewayConfig } from "./config.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
@@ -51,6 +54,8 @@ export interface AppDeps {
   photoLimiter?: MediaLimiter;
   photoQueueWaitMs?: number;
   photoRateLimiter?: PhotoRateLimiter;
+  /** Test seam for the private relay boundary. Production uses the global fetch. */
+  pushRelayFetch?: typeof fetch;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
   presenceOf: (agentId: string) => PresenceState;
@@ -315,10 +320,63 @@ export function createApp(deps: AppDeps): Hono<Env> {
   app.post("/threads/:id/approvals/:toolCallId/deny", requireDevice, approvalRoute("deny"));
 
   app.post("/push/register", requireDevice, async (c) => {
-    const parsed = parseOr400(c, PushRegisterRequestSchema, await readBody(c));
-    if (!parsed.ok) return parsed.response;
-    deps.storage.savePushRegistration(c.get("deviceId"), parsed.value);
-    return c.json({ ok: true });
+    const body = await c.req.text();
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(body);
+    } catch {
+      decoded = undefined;
+    }
+
+    // The frozen v1 route predates the relay proxy and owns the same path. Its distinct body stays
+    // local. A body in the RELAY's register shape is wire data and is forwarded byte for byte.
+    // Anything matching neither shape keeps the frozen v1 answer, 400 invalid_request, whether or
+    // not a relay is configured: garbage must never leave the gateway, and the conformance suite
+    // pins that 400 on gateways with no relay at all.
+    let registration;
+    try {
+      registration = assertValid(PushRegisterRequestSchema, decoded);
+    } catch {
+      registration = undefined;
+    }
+    if (registration !== undefined) {
+      deps.storage.savePushRegistration(c.get("deviceId"), registration);
+      return c.json({ ok: true });
+    }
+    if (!Value.Check(RelayRegisterRequestSchema, decoded)) {
+      return c.json(errorBody("invalid_request", "malformed push registration body"), 400);
+    }
+    if (deps.config.pushRelayUrl === undefined) {
+      return c.json(errorBody("not_found", "push relay proxy is not configured"), 404);
+    }
+    const relayFetch = deps.pushRelayFetch ?? fetch;
+    const upstream = await relayFetch(`${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register`, {
+      method: "POST",
+      headers: { "content-type": c.req.header("content-type") ?? "application/json" },
+      body,
+    });
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: upstream.headers,
+    });
+  });
+
+  app.delete("/push/register/:pushId", requireDevice, async (c) => {
+    if (deps.config.pushRelayUrl === undefined) {
+      return c.json(errorBody("not_found", "push relay proxy is not configured"), 404);
+    }
+    const relayFetch = deps.pushRelayFetch ?? fetch;
+    const pushId = encodeURIComponent(c.req.param("pushId"));
+    const upstream = await relayFetch(
+      `${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register/${pushId}`,
+      { method: "DELETE" },
+    );
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: upstream.headers,
+    });
   });
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).

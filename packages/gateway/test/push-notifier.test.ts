@@ -92,6 +92,24 @@ describe("RelayNotifier", () => {
     storage.close();
   });
 
+  it("uses the configured private relay target for notify calls", async () => {
+    const storage = seeded([
+      { deviceId: "d1", pushId: "p1", relayUrl: "https://public-relay.example", pushKey: "key-1" },
+    ]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({
+      storage,
+      fetchImpl: impl,
+      relayBaseUrl: "http://relay.internal:8788/",
+      log: () => {},
+    }).notify({ threadId: "t1", agentName: "Agent", preview: "hello" }, new Set());
+
+    await settle();
+
+    expect(sent.map((request) => request.url)).toEqual(["http://relay.internal:8788/notify"]);
+    storage.close();
+  });
+
   it("truncates the preview to PREVIEW_MAX_CHARS", async () => {
     const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
     const { impl, sent } = fetchStub(() => 202);

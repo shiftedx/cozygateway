@@ -12,6 +12,11 @@ wire contract (`contract/v1.md`) is frozen and is not modified by this document;
 - **Client**: registers with a relay, hands `pushId` + `relayUrl` + `pushKey` to its
   gateway via `POST /push/register` (contract v1), decrypts notifications on-device.
 
+A relay may stay private. A gateway advertising `com.cozylabs.push-proxy: 1` exposes the
+authenticated registration lifecycle at `POST /push/register` and
+`DELETE /push/register/:pushId`; see `contract/ext-push-proxy-v1.md`. The gateway never proxies
+`POST /notify`.
+
 ## Relay endpoints
 
 All bodies are JSON. Errors use `{"error": {"code": string, "message": string}}` with

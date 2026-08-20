@@ -21,8 +21,9 @@ The image ships a default `mock` ("echo") agent. In another terminal, mint a pai
     cp .env.example .env      # then edit COZYGATEWAY_ATTACH_TOKEN
     docker compose up --build
 
-- The gateway listens on `8787`, the relay on `8788` (override the relay port with
-  `COZY_RELAY_PORT`).
+- The gateway is published on `8787`. The relay listens on `8788` inside the compose network
+  (override it with `COZY_RELAY_PORT`) and is not published on the host. Phones reach relay
+  registration through the gateway's authenticated `/push` proxy.
 - The mounted `docker/cozygateway.config.json` selects the `attach` backend; point your agent
   harness's plugin at `http://<host>:8787/attach` with `COZYGATEWAY_TOKEN` equal to
   `COZYGATEWAY_ATTACH_TOKEN`.
@@ -37,6 +38,7 @@ Gateway:
 | `COZYGATEWAY_HOST` | `127.0.0.1` (image sets `0.0.0.0`) | bind address |
 | `COZYGATEWAY_PORT` | `8787` | listen port |
 | `COZYGATEWAY_DB_PATH` | `cozygateway.db` (image sets `/data/cozygateway.db`) | SQLite path |
+| `COZYGATEWAY_PUSH_RELAY_URL` | (unset) | private relay origin for the authenticated `/push` proxy; compose sets `http://relay:8788` |
 | `COZYGATEWAY_ATTACH_TOKEN` | (required for the attach config) | bearer token the plugin presents on `/attach` |
 | `COZYGATEWAY_HERMES_URL` | (config value) | retargets the optional hermes bots bridge; ignored when no bridge is configured |
 | `COZY_TLS_CERT_FILE` | (unset: plain HTTP) | PEM certificate chain; set with the key to serve HTTPS (`docs/tls.md`) |
@@ -148,7 +150,11 @@ Relay:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `COZY_RELAY_PORT` | `8788` | listen port (compose maps and passes it to the relay CLI) |
+| `COZY_RELAY_PORT` | `8788` | private listen port passed to the relay CLI and gateway target |
+
+With the push proxy enabled, the relay port does not need to be exposed beyond the compose
+network. The reference compose file uses `expose`, not a host `ports` mapping. Keep the gateway's
+public TLS endpoint reachable by the phone and keep the relay listener private.
 
 ## TLS
 

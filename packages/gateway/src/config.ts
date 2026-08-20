@@ -107,6 +107,9 @@ const GatewayConfigSchema = Type.Object({
    *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
    *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
+  /** Private push relay origin used by the authenticated `/push` proxy. The gateway and relay may
+   *  share a Docker network without exposing the relay listener on the public host. */
+  pushRelayUrl: Type.Optional(Type.String({ minLength: 1 })),
   hermes: Type.Optional(HermesBridgeConfigSchema),
   tls: Type.Optional(TlsConfigSchema),
 });
@@ -140,10 +143,8 @@ export function loadConfig(path: string): GatewayConfig {
   return config;
 }
 
-/** Apply container-friendly environment overrides on top of a loaded config. Only host, port, and
- *  dbPath are env-driven; everything else (name, agents, capabilities, and the attach token, whose
- *  env var NAME lives in options.tokenEnv) comes from the config file. Returns a new object; the
- *  input is not mutated. */
+/** Apply container-friendly environment overrides on top of a loaded config. Returns a new object;
+ *  the input is not mutated. */
 const nonEmpty = (value: string | undefined): string | undefined =>
   value !== undefined && value.length > 0 ? value : undefined;
 
@@ -164,6 +165,8 @@ export function applyEnvOverrides(
   }
   const dbPath = env["COZYGATEWAY_DB_PATH"];
   if (dbPath !== undefined && dbPath.length > 0) next.dbPath = dbPath;
+  const pushRelayUrl = env["COZYGATEWAY_PUSH_RELAY_URL"];
+  if (pushRelayUrl !== undefined && pushRelayUrl.length > 0) next.pushRelayUrl = pushRelayUrl;
   // Container-friendly override for the hermes bridge's TARGET only. It never carries the
   // credential: that still rides the env var named by hermes.tokenEnv. Ignored when no bridge is
   // configured, so setting it cannot switch the bots surface on by accident.
