@@ -1,5 +1,5 @@
 # Reference deployment: the gateway plus the push relay, each as its own container with a named
-# SQLite volume and a /health healthcheck. Copy .env.example to .env and set a strong attach token.
+# SQLite volume and a healthcheck. Copy .env.example to .env and set a strong attach token.
 services:
   gateway:
     build:
@@ -17,18 +17,28 @@ services:
     volumes:
       - gateway-data:/data
       - ./docker/cozygateway.config.json:/app/cozygateway.config.json:ro
+    # Pointed at /ready, not /health: docker's restart policy below only reacts to the container
+    # process exiting, never to a failing healthcheck, so nothing here restarts on an unhealthy
+    # result. That is exactly why /ready is the right target -- when the hermes bridge is offline,
+    # /ready correctly reports unhealthy and docker ps shows "(unhealthy)", a truthful signal an
+    # operator or monitor can alarm on, with no restart loop cycling a gateway process that was
+    # never the thing that broke. A dead upstream bridge is not fixed by restarting this container.
     healthcheck:
       test:
         [
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:'+(process.env.COZYGATEWAY_PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+          "fetch('http://127.0.0.1:'+(process.env.COZYGATEWAY_PORT||8787)+'/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
         ]
       interval: 10s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      # 30s, not 5s: the hermes bridge needs a login plus a ws-ticket handshake to come online
+      # after the process starts, and a 5s start_period would show the gateway "(unhealthy)" for
+      # that entire ordinary startup window before the bridge has had a chance to connect.
+      start_period: 30s
+    # Only reacts to the process exiting (a crash), never to a failing healthcheck above.
     restart: unless-stopped
 
   relay:
@@ -49,6 +59,9 @@ services:
     volumes:
       - relay-data:/data
       # - "${APNS_KEY_P8_HOST_PATH}:/keys/apns.p8:ro"
+    # Stays on /health, unlike the gateway above: the relay has no backend link of its own to be
+    # ready for (no bridge, no upstream it proxies), so its liveness IS its readiness and a
+    # separate /ready would report nothing /health does not already say.
     healthcheck:
       test:
         [

@@ -332,6 +332,69 @@ describe("startGateway with a hermes bridge", () => {
     delete process.env["TEST_HERMES_TOKEN"];
   });
 
+  // Follow-up to issue #63 (tracked separately): /health kept a bridge outage invisible behind a
+  // green process-liveness check; /ready is the signal a router or monitor should actually alarm
+  // or de-route on, so it has to track the same live bridge state /health does, not a value
+  // frozen at startup.
+  it("reports /ready 200 while the hermes bridge is online, then 503 naming it once the link dies", async () => {
+    const hermes = await startFakeHermesServer({
+      methods: { "profiles.list": () => ({ profiles: [], bot_mode_protocol: true }) },
+    });
+    servers.push(hermes);
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    const gateway = await startGateway({
+      name: "e2e",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN" },
+    });
+    gateways.push(gateway);
+
+    type ReadyBody = { ready: boolean; bridges?: Record<string, { online: boolean; reconnectAttempt: number }> };
+    const readReady = async (): Promise<{ status: number; body: ReadyBody }> => {
+      const res = await fetch(`${gateway.url}/ready`);
+      return { status: res.status, body: (await res.json()) as ReadyBody };
+    };
+
+    await until(async () => (await readReady()).body.bridges?.["hermes"]?.online === true);
+    const up = await readReady();
+    expect(up.status).toBe(200);
+    expect(up.body).toMatchObject({ ready: true, bridges: { hermes: { online: true } } });
+
+    // Kill the fake hermes host out from under the bridge, exactly what a dead dashboard looks
+    // like from the gateway's side.
+    await hermes.close();
+    servers.splice(servers.indexOf(hermes), 1);
+
+    await until(async () => (await readReady()).status === 503);
+    const down = await readReady();
+    expect(down.status).toBe(503);
+    expect(down.body.ready).toBe(false);
+    expect(down.body.bridges?.["hermes"]?.online).toBe(false);
+    expect(down.body.bridges?.["hermes"]?.reconnectAttempt).toBeGreaterThanOrEqual(1);
+
+    delete process.env["TEST_HERMES_TOKEN"];
+  });
+
+  it("answers /ready 200 with no bridges reported when no bridge is configured", async () => {
+    const gateway = await startGateway({
+      name: "e2e",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+    });
+    gateways.push(gateway);
+
+    const res = await fetch(`${gateway.url}/ready`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ready: boolean; bridges?: unknown };
+    expect(body.ready).toBe(true);
+    expect(body.bridges).toBeUndefined();
+  });
+
   it("fails startup when the bridge credential is missing, before the port is bound", async () => {
     delete process.env["MISSING_HERMES_TOKEN"];
     await expect(
