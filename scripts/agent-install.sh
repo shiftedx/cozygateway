@@ -284,7 +284,7 @@ COZYGATEWAY_HERMES_PASSWORD="\${COZYGATEWAY_HERMES_PASSWORD:-}"
 # --skip-dashboard installs can legitimately have no credentials file: the operator owns the
 # dashboard elsewhere and passes the password in through the environment.
 if [ -f "\$COZY_CRED_FILE" ]; then
-  COZYGATEWAY_HERMES_PASSWORD="\$(sed -n 's/^password=//p' "\$COZY_CRED_FILE" | head -1)"
+  COZYGATEWAY_HERMES_PASSWORD="\$(sed -n '/^password=/{s///p;q;}' "\$COZY_CRED_FILE")"
 fi
 export COZYGATEWAY_HERMES_PASSWORD
 # Both branches cd first: launchd starts a job in /, so anything either runtime resolves relative

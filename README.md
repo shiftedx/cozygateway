@@ -14,8 +14,9 @@ There are two ways in. Pick the one that fits your machine.
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
-No Docker, no git, no build tools. Needs Node 24+ (the line stops and tells you how to get one if
-you do not have it). It downloads the latest released gateway bundle, checks its sha256, installs
+No Docker, no git, no build tools. Needs a working Hermes install (0.20.2 or newer) plus Node 24+
+(the line stops and tells you how to get either one if you do not have it). It downloads the
+latest released gateway bundle, checks its sha256, installs
 it to `~/.cozygateway`, and registers the gateway and the Hermes dashboard as login services
 (launchd on macOS, systemd `--user` on Linux) that come back after a crash, a logout, or a reboot.
 It prints a pairing code for the app when it is done. See `docs/install-service.md` for what it

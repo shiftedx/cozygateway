@@ -3,19 +3,27 @@
 This page is for you, the human, not for an agent. If you want an AI agent to install cozygateway
 for you (Docker, or a Node checkout it builds itself), send it `docs/agent-install.md` instead.
 
+## What you need
+
+A working Hermes install (0.20.2 or newer) and Node 24 or newer. cozygateway connects your phone
+to a Hermes agent, so Hermes has to already be there; the one-liner checks for both and stops with
+instructions if either is missing.
+
 ## What the one-liner does
 
 ```sh
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
-1. Checks for Node 24 or newer. If it cannot find one, it stops and tells you how to get one
+1. Checks that Hermes is installed. If it cannot find it, it stops and tells you to install Hermes
+   first, since cozygateway connects your phone to a Hermes agent.
+2. Checks for Node 24 or newer. If it cannot find one, it stops and tells you how to get one
    (`brew install node` on macOS, your distro's package or nodejs.org on Linux).
-2. Downloads the latest released `cozygateway.mjs` bundle and its `.sha256` file, and verifies the
+3. Downloads the latest released `cozygateway.mjs` bundle and its `.sha256` file, and verifies the
    hash before it will run anything. A mismatch aborts with no install performed.
-3. Downloads `scripts/agent-install.sh` and hands off to it with `--bundle` pointing at the
+4. Downloads `scripts/agent-install.sh` and hands off to it with `--bundle` pointing at the
    verified bundle and `--service`.
-4. `agent-install.sh` generates a dashboard password, writes the gateway config, registers the
+5. `agent-install.sh` generates a dashboard password, writes the gateway config, registers the
    gateway and the Hermes dashboard as login services, starts them, and prints a pairing code for
    the phone app.
 
@@ -113,4 +121,4 @@ your network can reach them without going through the phone app's pairing and it
 path. The dashboard password lives in a mode-600 file, readable only by your user, and is never
 written into the service definition itself, since those files are world-readable. The bundle you
 run is the exact file whose sha256 was checked against the one published alongside the release, so
-a tampered download is refused rather than executed.
+a corrupted or truncated download is refused rather than executed.

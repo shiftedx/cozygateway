@@ -85,6 +85,8 @@ main() {
 
   command -v curl >/dev/null 2>&1 || die "curl is required"
 
+  command -v hermes >/dev/null 2>&1 || die "cozygateway connects your phone to a Hermes agent, so Hermes must be installed first. Install Hermes, then re-run this line. (Running the gateway without Hermes is an advanced setup: see https://github.com/shiftedx/cozygateway)"
+
   # --- Node >= 24 ----------------------------------------------------------
   node_bin="$(resolve_node)"
   say "Using node: $node_bin ($("$node_bin" -v))"
