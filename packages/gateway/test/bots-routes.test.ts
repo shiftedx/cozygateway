@@ -217,7 +217,7 @@ describe("GET /bots", () => {
 
 describe("GET /bots/:name/chat", () => {
   it("creates the canonical chat with the exact title and hidden flag, and says nothing in it", async () => {
-    const { authed, server, storage } = await setup({
+    const { authed, bridge, server, storage } = await setup({
       methods: {
         "profiles.list": () => profilesListResult([scoutRow]),
         "session.list": () => ({ sessions: [] }),
@@ -237,7 +237,9 @@ describe("GET /bots/:name/chat", () => {
     expect(server.callsOf("prompt.submit")).toHaveLength(0);
     // The session has no persisted row because nothing was ever prompted into it, so the runtime id
     // is written down: it is the only id the user's first message can be addressed to.
-    expect(storage.botChatRuntimeId("scout", "stored-1")).toBe("runtime-1");
+    // Stamped with the current hermes link generation, which is the only form of it the send path
+    // will accept (issue #66).
+    expect(storage.botChatRuntimeId("scout", "stored-1", bridge.linkGeneration())).toBe("runtime-1");
   });
 
   it("leaves no pin behind when the create itself fails", async () => {

@@ -77,11 +77,33 @@ CREATE TABLE IF NOT EXISTS bot_meta (
 -- the second or two a kickoff prompt took; it is not survivable now the gap lasts until the user
 -- decides to speak. Cleared the moment the session resumes, because from then on the stored id is
 -- resolvable and this value is stale.
+-- runtime_generation is the HERMES LINK GENERATION the runtime id above was minted under, and it is
+-- what bounds a durable runtime id by the lifetime of the hermes process that issued it (issue #66).
+-- A runtime session id is meaningful only inside the hermes that created it: hermes restarts, every
+-- unwritten session it was holding is gone, and the id this table carries now names nothing. Held in
+-- memory (before capability 11) that was self-correcting, because the id died with the gateway
+-- process and expired on a 180 s timer; on disk it has no such bound, and submitting against it is
+-- worse than failing -- hermes can accept the prompt into a phantom session, the app renders the user
+-- bubble, the gateway answers 202, and no reply is ever coming. So the stamp is compared on every
+-- read: a runtime id whose generation is not the current one is treated as absent, and the send falls
+-- through to the mint-a-replacement path instead.
 CREATE TABLE IF NOT EXISTS bot_chat_pins (
   name TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
-  runtime_id TEXT
+  runtime_id TEXT,
+  runtime_generation TEXT
+) STRICT;
+-- The hermes link generation this gateway last observed, one row, id always 1. On disk rather than in
+-- memory on purpose, and that is the whole point of the table: a GATEWAY restart against a hermes
+-- that never went down must NOT invalidate the runtime ids it is holding (that is the win PR #61
+-- bought, and losing it would put the first message a user ever types back in the 502 hole), so the
+-- generation has to be the same value after the restart as before it. What it cannot do is see a
+-- hermes restart that happened while the gateway itself was down; that case is handled the other way,
+-- by the send path re-minting a chat whose session hermes no longer knows.
+CREATE TABLE IF NOT EXISTS hermes_link (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  generation TEXT NOT NULL
 ) STRICT;
 -- Sessions a chat RESET retired, per bot. Not a cache and not optional bookkeeping: it is the only
 -- thing that tells a retired "Bot Chat" apart from the live one. A reset mints the replacement with
@@ -569,35 +591,62 @@ export class Storage {
   setBotChatPin(name: string, sessionId: string, updatedAt: number): void {
     this.#db
       .prepare(
-        `INSERT INTO bot_chat_pins (name, session_id, updated_at, runtime_id) VALUES (?, ?, ?, NULL)
+        `INSERT INTO bot_chat_pins (name, session_id, updated_at, runtime_id, runtime_generation)
+           VALUES (?, ?, ?, NULL, NULL)
          ON CONFLICT(name) DO UPDATE SET
            session_id = excluded.session_id,
            updated_at = excluded.updated_at,
-           runtime_id = CASE WHEN session_id = excluded.session_id THEN runtime_id ELSE NULL END`,
+           runtime_id = CASE WHEN session_id = excluded.session_id THEN runtime_id ELSE NULL END,
+           runtime_generation =
+             CASE WHEN session_id = excluded.session_id THEN runtime_generation ELSE NULL END`,
       )
       .run(name, sessionId, updatedAt);
   }
 
-  /** The runtime id of `name`'s pinned chat, when that chat has never been written in and the pin
-   *  still names `sessionId`. `undefined` for every chat with a transcript, which is the answer that
-   *  says "resume it, the stored id works".
+  /** The runtime id of `name`'s pinned chat, when that chat has never been written in, the pin still
+   *  names `sessionId`, AND the id was minted under `linkGeneration`. `undefined` for every chat with
+   *  a transcript, which is the answer that says "resume it, the stored id works".
    *
-   *  The `session_id` guard is the load-bearing half: a runtime id that outlived its own session
-   *  would submit the user's message into a chat nobody is looking at. */
-  botChatRuntimeId(name: string, sessionId: string): string | undefined {
+   *  Two guards, both load-bearing and for the same underlying reason: an id that no longer addresses
+   *  the chat the user is looking at must never carry their message. The `session_id` guard covers a
+   *  runtime id that outlived its own session (a reset moved the pin); the generation guard covers a
+   *  runtime id that outlived its own HERMES (issue #66), which is the case a durable id introduced
+   *  and which nothing else can detect: hermes will happily accept a `prompt.submit` against an id it
+   *  no longer knows, so a stale one buys a 202 and silence rather than an error. */
+  botChatRuntimeId(name: string, sessionId: string, linkGeneration: string): string | undefined {
     const row = this.#db
-      .prepare("SELECT runtime_id AS runtimeId FROM bot_chat_pins WHERE name = ? AND session_id = ?")
-      .get(name, sessionId) as { runtimeId: string | null } | undefined;
+      .prepare(
+        `SELECT runtime_id AS runtimeId FROM bot_chat_pins
+           WHERE name = ? AND session_id = ? AND runtime_generation = ?`,
+      )
+      .get(name, sessionId, linkGeneration) as { runtimeId: string | null } | undefined;
     return row?.runtimeId ?? undefined;
   }
 
-  /** Records the runtime id of a chat this gateway just minted and nobody has written in yet. A
-   *  no-op unless the pin still names `sessionId`, so a mint that lost a race to a reset cannot
-   *  write its id over the survivor's. */
-  setBotChatRuntimeId(name: string, sessionId: string, runtimeId: string): void {
+  /** True when `name`'s pinned chat is one this gateway minted and nobody has written in yet,
+   *  WHATEVER generation minted it.
+   *
+   *  Deliberately generation-blind, and the difference from `botChatRuntimeId` is the point. The
+   *  generation answers "can this chat still be addressed"; this answers "is this chat empty", and a
+   *  chat orphaned by a hermes restart is still empty. Reading a history for it must therefore keep
+   *  answering an empty transcript rather than the resume failure: the alternative is that the whole
+   *  screen 502s and the user cannot even reach the composer whose first send would heal the chat. */
+  botChatUnwritten(name: string, sessionId: string): boolean {
+    const row = this.#db
+      .prepare("SELECT runtime_id AS runtimeId FROM bot_chat_pins WHERE name = ? AND session_id = ?")
+      .get(name, sessionId) as { runtimeId: string | null } | undefined;
+    return (row?.runtimeId ?? undefined) !== undefined;
+  }
+
+  /** Records the runtime id of a chat this gateway just minted and nobody has written in yet,
+   *  stamped with the hermes link generation that minted it. A no-op unless the pin still names
+   *  `sessionId`, so a mint that lost a race to a reset cannot write its id over the survivor's. */
+  setBotChatRuntimeId(name: string, sessionId: string, runtimeId: string, linkGeneration: string): void {
     this.#db
-      .prepare("UPDATE bot_chat_pins SET runtime_id = ? WHERE name = ? AND session_id = ?")
-      .run(runtimeId, name, sessionId);
+      .prepare(
+        "UPDATE bot_chat_pins SET runtime_id = ?, runtime_generation = ? WHERE name = ? AND session_id = ?",
+      )
+      .run(runtimeId, linkGeneration, name, sessionId);
   }
 
   /** Forgets the runtime id of `name`'s pinned chat: the session has a row now, so the stored id
@@ -605,8 +654,28 @@ export class Storage {
    *  reason the read is. */
   clearBotChatRuntimeId(name: string, sessionId: string): void {
     this.#db
-      .prepare("UPDATE bot_chat_pins SET runtime_id = NULL WHERE name = ? AND session_id = ?")
+      .prepare(
+        "UPDATE bot_chat_pins SET runtime_id = NULL, runtime_generation = NULL WHERE name = ? AND session_id = ?",
+      )
       .run(name, sessionId);
+  }
+
+  /** The hermes link generation this gateway last wrote down, or `undefined` on a database that has
+   *  never seen one. */
+  hermesLinkGeneration(): string | undefined {
+    const row = this.#db.prepare("SELECT generation FROM hermes_link WHERE id = 1").get() as
+      | { generation: string }
+      | undefined;
+    return row?.generation;
+  }
+
+  setHermesLinkGeneration(generation: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO hermes_link (id, generation) VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET generation = excluded.generation`,
+      )
+      .run(generation);
   }
 
   clearBotChatPin(name: string): void {
@@ -1098,5 +1167,11 @@ export function openStorage(dbPath: string): Storage {
   // runtime id. NULL on every existing row is exactly right: a pin written by an older gateway
   // points at a chat its kickoff already persisted, so there is nothing to remember for it.
   addColumnIfMissing(db, "bot_chat_pins", "runtime_id", "TEXT");
+  // Issue #66: the generation stamp that bounds a durable runtime id by the life of the hermes that
+  // issued it. NULL on every existing row is right and is the safe direction: a stamp that matches
+  // nothing reads as "this id cannot be trusted", so a pin written before the upgrade falls through
+  // to the mint-a-replacement path instead of submitting at a session hermes may have forgotten.
+  addColumnIfMissing(db, "bot_chat_pins", "runtime_generation", "TEXT");
   return new Storage(db);
 }
+

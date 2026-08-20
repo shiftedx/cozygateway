@@ -503,9 +503,13 @@ describe("a chat with no persisted row yet (review C1/C2)", () => {
     expect(server.callsOf("prompt.submit").map((call) => call.params["session_id"])).toEqual(["runtime-1"]);
   });
 
-  it("reports a send it cannot address rather than submitting the stored id", async () => {
-    // No runtime id anywhere: the resume fails and this gateway did not create the chat. The send
-    // fails loudly instead of answering 202 for a prompt that went to the wrong slot.
+  it("never submits the STORED id for a send it cannot address, and heals the chat instead", async () => {
+    // No runtime id anywhere: the resume fails and this gateway did not create the chat. Up to
+    // issue #66 this answered 502, and kept answering 502 on every send forever, because nothing
+    // ever minted a replacement for a PINNED chat. It now heals (see
+    // `bots-chat-session-heal.test.ts`), and the invariant this test has always been about survives
+    // the change intact: the STORED id is never what gets submitted, because a prompt aimed at it
+    // is a 202 for a message that went nowhere.
     const { behavior } = fakeBotMode({ sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }] });
     behavior.methods!["session.resume"] = () => {
       throw { code: 5003, message: "no such session" };
@@ -516,8 +520,11 @@ describe("a chat with no persisted row yet (review C1/C2)", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: "hello" }),
     });
-    expect(res.status).toBe(502);
-    expect(server.callsOf("prompt.submit")).toHaveLength(0);
+    expect(res.status).toBe(202);
+    const submitted = server.callsOf("prompt.submit").map((call) => call.params["session_id"]);
+    expect(submitted).not.toContain("canonical");
+    // One submit, into the chat the heal minted, addressed by its RUNTIME id.
+    expect(submitted).toEqual(["runtime-1"]);
   });
 });
 

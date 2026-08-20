@@ -46,6 +46,10 @@ const config: GatewayConfig = {
 
 const NOW = 1_800_000_000_000;
 
+/** A stand-in hermes link generation for the storage-level tests, which do not run a bridge and so
+ *  never observe a `gateway.ready` of their own. */
+const GEN = "link-0";
+
 const servers: FakeHermesServer[] = [];
 const bridges: HermesBridge[] = [];
 const storages: Storage[] = [];
@@ -355,20 +359,20 @@ describe("bot_chat_pins.runtime_id", () => {
     storages.push(storage);
 
     storage.setBotChatPin("scout", "stored-1", NOW);
-    storage.setBotChatRuntimeId("scout", "stored-1", "runtime-1");
-    expect(storage.botChatRuntimeId("scout", "stored-1")).toBe("runtime-1");
+    storage.setBotChatRuntimeId("scout", "stored-1", "runtime-1", GEN);
+    expect(storage.botChatRuntimeId("scout", "stored-1", GEN)).toBe("runtime-1");
 
     // Every resolve of an already-pinned chat re-writes the same pin. Losing the runtime id there
     // would lose it on the second open of a chat nobody has written in.
     storage.setBotChatPin("scout", "stored-1", NOW + 1);
-    expect(storage.botChatRuntimeId("scout", "stored-1")).toBe("runtime-1");
+    expect(storage.botChatRuntimeId("scout", "stored-1", GEN)).toBe("runtime-1");
 
     // Asked about a session that is not the pinned one, the answer is nothing, whatever is stored.
-    expect(storage.botChatRuntimeId("scout", "stored-2")).toBeUndefined();
+    expect(storage.botChatRuntimeId("scout", "stored-2", GEN)).toBeUndefined();
 
     // A reset moves the pin. The old runtime id must not survive that.
     storage.setBotChatPin("scout", "stored-2", NOW + 2);
-    expect(storage.botChatRuntimeId("scout", "stored-2")).toBeUndefined();
+    expect(storage.botChatRuntimeId("scout", "stored-2", GEN)).toBeUndefined();
   });
 
   it("is forgotten once the session has a row, and with the pin when the pin is cleared", () => {
@@ -376,15 +380,17 @@ describe("bot_chat_pins.runtime_id", () => {
     storages.push(storage);
 
     storage.setBotChatPin("scout", "stored-1", NOW);
-    storage.setBotChatRuntimeId("scout", "stored-1", "runtime-1");
+    storage.setBotChatRuntimeId("scout", "stored-1", "runtime-1", GEN);
     storage.clearBotChatRuntimeId("scout", "stored-1");
-    expect(storage.botChatRuntimeId("scout", "stored-1")).toBeUndefined();
+    expect(storage.botChatRuntimeId("scout", "stored-1", GEN)).toBeUndefined();
+    // And the chat stops counting as unwritten, which is what the history read asks.
+    expect(storage.botChatUnwritten("scout", "stored-1")).toBe(false);
     // The pin itself is untouched: the chat is still the bot's, it just resumes now.
     expect(storage.botChatPin("scout")).toBe("stored-1");
 
-    storage.setBotChatRuntimeId("scout", "stored-1", "runtime-1");
+    storage.setBotChatRuntimeId("scout", "stored-1", "runtime-1", GEN);
     storage.clearBotChatPin("scout");
-    expect(storage.botChatRuntimeId("scout", "stored-1")).toBeUndefined();
+    expect(storage.botChatRuntimeId("scout", "stored-1", GEN)).toBeUndefined();
   });
 
   it("is added to a database created before capability 11", () => {
@@ -413,11 +419,11 @@ describe("bot_chat_pins.runtime_id", () => {
       expect(storage.botChatPin("scout")).toBe("legacy-1");
       // NULL for the pre-existing row, which is the honest answer: a pin an older gateway wrote
       // points at a chat its auto-submitted opener already persisted.
-      expect(storage.botChatRuntimeId("scout", "legacy-1")).toBeUndefined();
+      expect(storage.botChatRuntimeId("scout", "legacy-1", GEN)).toBeUndefined();
       // And the column is writable, so the very next mint works.
       storage.setBotChatPin("scout", "stored-2", NOW + 1);
-      storage.setBotChatRuntimeId("scout", "stored-2", "runtime-2");
-      expect(storage.botChatRuntimeId("scout", "stored-2")).toBe("runtime-2");
+      storage.setBotChatRuntimeId("scout", "stored-2", "runtime-2", GEN);
+      expect(storage.botChatRuntimeId("scout", "stored-2", GEN)).toBe("runtime-2");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
