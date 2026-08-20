@@ -10,7 +10,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with: { version: 10 }
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
@@ -24,9 +23,13 @@ jobs:
             "agents": [{ "id": "mock", "name": "Mock", "backend": "mock" }] }
           EOF
           node dist-bundle/cozygateway.mjs serve --config /tmp/smoke.json &
-          sleep 2
-          curl -fsS http://127.0.0.1:18787/health | grep -q '"contract":"v1"'
+          ok=
+          for i in $(seq 1 15); do
+            curl -fsS http://127.0.0.1:18787/health | grep -q '"contract":"v1"' && ok=1 && break
+            sleep 1
+          done
           kill %1
+          [ "${ok:-}" = 1 ]
       - uses: softprops/action-gh-release@v2
         with:
           files: |
