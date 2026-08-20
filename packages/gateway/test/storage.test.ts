@@ -1,6 +1,8 @@
+import { DatabaseSync } from "node:sqlite";
+
 import { describe, expect, it } from "vitest";
 
-import { openStorage } from "../src/storage.ts";
+import { addColumnIfMissing, openStorage } from "../src/storage.ts";
 
 function seeded() {
   const storage = openStorage(":memory:");
@@ -172,5 +174,67 @@ describe("bots cache", () => {
     storage.clearBotChatPin("scout");
     expect(storage.botChatPin("scout")).toBeUndefined();
     storage.clearBotChatPin("scout");
+  });
+});
+
+describe("addColumnIfMissing", () => {
+  function columnNames(db: DatabaseSync, table: string): string[] {
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
+    return rows.map((row) => row.name);
+  }
+
+  it("adds the column to a fresh table", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE widgets (id TEXT PRIMARY KEY)");
+    addColumnIfMissing(db, "widgets", "runtime_id", "TEXT");
+    expect(columnNames(db, "widgets")).toContain("runtime_id");
+  });
+
+  it("is a no-op when the column is already there", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE widgets (id TEXT PRIMARY KEY, runtime_id TEXT)");
+    db.exec("INSERT INTO widgets (id, runtime_id) VALUES ('w1', 'r1')");
+    expect(() => addColumnIfMissing(db, "widgets", "runtime_id", "TEXT")).not.toThrow();
+    expect(columnNames(db, "widgets")).toEqual(["id", "runtime_id"]);
+    const row = db.prepare("SELECT runtime_id FROM widgets WHERE id = 'w1'").get() as { runtime_id: string };
+    expect(row.runtime_id).toBe("r1");
+  });
+
+  it("propagates a non-duplicate-column ALTER failure instead of swallowing it", () => {
+    const fakeDb = {
+      exec: () => {
+        throw new Error("SQLITE_BUSY: database is locked");
+      },
+      prepare: () => {
+        throw new Error("prepare should not be reached when exec throws a real error");
+      },
+    } as unknown as DatabaseSync;
+    expect(() => addColumnIfMissing(fakeDb, "widgets", "runtime_id", "TEXT")).toThrow(/database is locked/);
+  });
+
+  it("fails loudly if the column is still missing after a swallowed duplicate-column error", () => {
+    // Simulates a driver that reports "duplicate column name" without the column actually being
+    // present. The post-ALTER PRAGMA verification must catch this and refuse to silently continue.
+    const fakeDb = {
+      exec: () => {
+        throw new Error("duplicate column name: runtime_id");
+      },
+      prepare: () => ({
+        all: () => [],
+      }),
+    } as unknown as DatabaseSync;
+    expect(() => addColumnIfMissing(fakeDb, "widgets", "runtime_id", "TEXT")).toThrow(
+      /migration failed.*widgets\.runtime_id/,
+    );
+  });
+});
+
+describe("openStorage migrations", () => {
+  it("boots a fresh in-memory DB with the migrated columns present", () => {
+    const storage = openStorage(":memory:");
+    // Surfacing through public behavior: setBotChatPin/botChatPin round-trip via bot_chat_pins,
+    // which only works once runtime_id (and the rest of the additive migrations) has landed.
+    storage.setBotChatPin("scout", "sess-1", 1);
+    expect(storage.botChatPin("scout")).toBe("sess-1");
   });
 });
