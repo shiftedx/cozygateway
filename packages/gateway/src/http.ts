@@ -19,8 +19,8 @@ import {
   assertValid,
 } from "cozygateway-contract";
 
+import { Type } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
-import { RegisterRequestSchema as RelayRegisterRequestSchema } from "cozygateway-relay";
 
 import type { GatewayConfig } from "./config.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
@@ -30,6 +30,16 @@ import type { BotsSurface } from "./hermes-bridge/bridge.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import type { MediaFetch, MediaLimiter, MediaLookup } from "./hermes-bridge/media.ts";
 import type { PhotoRateLimiter } from "./hermes-bridge/photos.ts";
+
+/** The relay's register body, mirrored here rather than imported: the gateway's docker image
+ *  bundles only its own package, so a runtime import of cozygateway-relay crashes the container
+ *  (proven in production, 2026-08-20). Kept structurally identical to
+ *  packages/relay/src/schemas.ts RegisterRequestSchema; the relay still authoritatively validates
+ *  every forwarded body, so drift here can only over- or under-eagerly 400, never corrupt. */
+const RelayRegisterRequestSchema = Type.Object({
+  platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns")]),
+  token: Type.String({ minLength: 1, maxLength: 2048 }),
+});
 
 export interface AppDeps {
   storage: Storage;
