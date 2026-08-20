@@ -88,15 +88,35 @@ export const DeviceSchema = Type.Object({
 });
 export type Device = Static<typeof DeviceSchema>;
 
+/** Liveness of one backend bridge behind a `GatewayInfo.capabilities` entry (issue #63): a
+ *  capability id says the gateway CAN speak a protocol, never whether the link behind it is up
+ *  right now, so a client that wants a true "sends will actually deliver" signal reads this
+ *  instead. `online` is the only field a caller needs for a red/green check; `since` (epoch ms)
+ *  and `reconnectAttempt` are diagnostic, letting an operator see how long a bridge has been down
+ *  and how hard it is trying to come back without a second request. */
+export const BridgeLivenessSchema = Type.Object({
+  online: Type.Boolean(),
+  since: Type.Integer(),
+  reconnectAttempt: Type.Integer({ minimum: 0 }),
+});
+export type BridgeLiveness = Static<typeof BridgeLivenessSchema>;
+
 /** `capabilities` maps a capability id to its integer version. Optional: absent on gateways
  *  that predate this field, and a receiver must tolerate both that absence and ids it does not
  *  recognize. Ids under `com.cozylabs.*` are vendor extensions, documented and versioned
- *  independently of the frozen `contract: "v1"` value; see contract/v1.md section 5. */
+ *  independently of the frozen `contract: "v1"` value; see contract/v1.md section 5.
+ *
+ *  `bridges` is additive and optional for the same reason: it does not replace or gate any
+ *  capability entry (a capability is a shape promise, `bridges` is a liveness reading of one
+ *  backend that shape happens to be backed by), so a client that does not know the field yet sees
+ *  exactly the payload it always saw. Keyed by bridge name (`"hermes"` today); absent when a
+ *  gateway has no bridge to report on, e.g. no `com.cozylabs.bots` configured at all. */
 export const GatewayInfoSchema = Type.Object({
   name: Type.String(),
   version: Type.String(),
   contract: Type.Literal("v1"),
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
+  bridges: Type.Optional(Type.Record(Type.String(), BridgeLivenessSchema)),
 });
 export type GatewayInfo = Static<typeof GatewayInfoSchema>;
 

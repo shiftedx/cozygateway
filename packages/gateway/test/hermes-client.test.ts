@@ -94,6 +94,51 @@ describe("handshake and auth", () => {
   });
 });
 
+describe("liveness", () => {
+  // Issue #63: a monitor that only reads `state()`/the capability id cannot tell "online" from
+  // "stuck reconnecting for hours", because neither of those ever changes shape while a bridge is
+  // down. `liveness()` is the snapshot that answers it -- a boolean-shaped `online`, when it last
+  // changed, and how many consecutive reconnects have failed since.
+  it("reports online with a zeroed reconnectAttempt once the handshake completes", async () => {
+    const server = await fakeServer();
+    const c = client(server.url);
+    const before = c.liveness();
+    expect(before.state).toBe("absent");
+    expect(before.reconnectAttempt).toBe(0);
+    c.start();
+    await until(() => c.state() === "online");
+    const after = c.liveness();
+    expect(after.state).toBe("online");
+    expect(after.reconnectAttempt).toBe(0);
+    expect(after.since).toBeGreaterThanOrEqual(before.since);
+  });
+
+  it("keeps state connecting and counts up reconnectAttempt while the link cannot come up", async () => {
+    const server = await fakeServer({ neverSendReady: true });
+    const c = client(server.url, { handshakeTimeoutMs: 30 });
+    c.start();
+    await until(() => server.totalConnections() >= 3, 4_000);
+    const liveness = c.liveness();
+    expect(liveness.state).toBe("connecting");
+    expect(liveness.reconnectAttempt).toBeGreaterThanOrEqual(2);
+  });
+
+  it("stamps `since` at the moment state last changed, not on every read", async () => {
+    const server = await fakeServer({ neverSendReady: true });
+    const c = client(server.url, { handshakeTimeoutMs: 30 });
+    c.start();
+    await until(() => c.liveness().reconnectAttempt >= 1);
+    const first = c.liveness();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const second = c.liveness();
+    // Still `connecting` on both reads (the same state), so `since` must not have moved just
+    // because time passed between the two calls.
+    if (second.state === first.state) {
+      expect(second.since).toBe(first.since);
+    }
+  });
+});
+
 describe("gated password auth", () => {
   const USERNAME = "cozybridge";
   const PASSWORD = "SECRET-DASH-PASSWORD-9f8e7d6c";

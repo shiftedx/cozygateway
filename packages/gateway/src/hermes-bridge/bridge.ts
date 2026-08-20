@@ -12,6 +12,7 @@ import type {
   BotRoutinePatch,
   BotSummary,
   BotTurnToolSteps,
+  BridgeLiveness,
   ServerFrame,
 } from "cozygateway-contract";
 
@@ -125,6 +126,12 @@ export interface BotRosterView {
  *  be tested against a stub with no sockets. */
 export interface BotsSurface {
   roster(): BotRosterView;
+  /** Liveness of the hermes link itself (issue #63), for `GET /health` to fold into
+   *  `GatewayInfo.bridges.hermes`. Deliberately NOT part of `roster()`: that view answers "what can
+   *  I show", already covers staleness via `stale`/`hermesState`, and is read only by the bots
+   *  routes, while this is read by `/health` on every unauthenticated probe a monitor makes, for a
+   *  bridge that may have nothing to do with the roster screen at all. */
+  health(): BridgeLiveness;
   /** Fire-and-forget background refresh. Never throws, never awaited by a request handler. */
   refreshSoon(reason: string): void;
   canonicalChat(name: string): Promise<CanonicalChatResult>;
@@ -641,6 +648,18 @@ export class HermesBridge implements BotsSurface {
       updatedAt: cached.updatedAt,
       stale: hermesState !== "online",
       hermesState,
+    };
+  }
+
+  /** See `BotsSurface.health`. A thin reshape of the client's own snapshot: the bridge adds no
+   *  state of its own here, because the socket is the only thing that knows whether sends can
+   *  actually be delivered right now. */
+  health(): BridgeLiveness {
+    const liveness = this.#client.liveness();
+    return {
+      online: liveness.state === "online",
+      since: liveness.since,
+      reconnectAttempt: liveness.reconnectAttempt,
     };
   }
 
