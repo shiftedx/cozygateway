@@ -351,7 +351,19 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       ticketRetries = 0;
       setState("online");
     }
-    for (const handler of eventHandlers) handler(event);
+    for (const [i, handler] of eventHandlers.entries()) {
+      try {
+        handler(event);
+      } catch (err) {
+        // A throwing handler must not escape here: this is the same ws `message` listener that
+        // settles RPC replies above, so an uncaught exception would tear down the whole link over a
+        // single downstream side effect (e.g. a tool-chip write). Log and move on to the next
+        // handler; a tool chip is never worth the link.
+        const identity = handler.name.length > 0 ? handler.name : `handler#${i}`;
+        const detail = err instanceof Error ? err.message : String(err);
+        log(`event handler "${identity}" threw on "${event.type}"; continuing (${detail})`);
+      }
+    }
   }
 
   function scheduleReconnect(): void {

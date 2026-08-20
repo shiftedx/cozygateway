@@ -35,7 +35,13 @@ import {
 const RUNTIME = "runtime-1";
 type ActivityFrame = Extract<ServerFrame, { type: "bot_tool_activity" }>;
 
-function harness(opts: { turnId?: string | undefined; throttleMs?: number } = {}) {
+function harness(
+  opts: {
+    turnId?: string | undefined;
+    throttleMs?: number;
+    store?: { record: (step: ToolStepRecord) => void };
+  } = {},
+) {
   const frames: ActivityFrame[] = [];
   const stored: ToolStepRecord[] = [];
   const logs: string[] = [];
@@ -51,7 +57,7 @@ function harness(opts: { turnId?: string | undefined; throttleMs?: number } = {}
       if (frame.type === "bot_tool_activity") frames.push(frame);
     },
     now: () => clock,
-    store: { record: (step) => void stored.push(step) },
+    store: opts.store ?? { record: (step) => void stored.push(step) },
     log: (line) => void logs.push(line),
     // Zero by default: these tests drive a FAKE clock, and a pending real-timer throttle window
     // would swallow every later emit. The throttle itself is exercised in its own test below,
@@ -539,5 +545,32 @@ describe("BotToolActivity: bounds and lifecycle", () => {
 
     expect(h.frames).toHaveLength(0);
     expect(h.stored).toHaveLength(0);
+  });
+
+  it("logs and continues when the store throws, instead of taking the event stream down with it (cozygateway#65)", () => {
+    const h = harness({
+      store: {
+        record: () => {
+          throw new Error("SQLITE_BUSY: database is locked");
+        },
+      },
+    });
+    h.bind(RUNTIME, BOUND);
+
+    // The write on start throws; the module must not propagate it back through handleEvent.
+    expect(() => h.start("call_1")).not.toThrow();
+    h.settle();
+    // The stream keeps going: a later step, and the completion of the first, both still process
+    // and still broadcast, even though every store write for them throws too.
+    expect(() => h.complete("call_1")).not.toThrow();
+    h.start("call_2");
+    expect(() => h.complete("call_2")).not.toThrow();
+
+    expect(h.frames.at(-1)?.steps.map((s) => [s.stepId, s.status])).toEqual([
+      ["call_1", "ok"],
+      ["call_2", "ok"],
+    ]);
+    expect(h.logs.join(" ")).toContain("call_1");
+    expect(h.logs.join(" ")).toContain("SQLITE_BUSY");
   });
 });

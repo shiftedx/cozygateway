@@ -1025,9 +1025,19 @@ export class HermesBridge implements BotsSurface {
       const snapshot = await this.#chat.history(name, chat.sessionId);
       // The session resumed, so it has a row: the runtime id is stale from here on.
       this.#storage.clearBotChatRuntimeId(name, chat.sessionId);
-      const steps = groupToolSteps(
-        this.#storage.botChatToolSteps(chat.sessionId, this.#now() - TOOL_STEP_TTL_MS),
-      );
+      // Capability 12 is a strip of chips riding alongside the transcript, not part of it. A
+      // failure reading it (cozygateway#65: same SQLITE_BUSY/disk exposure as the write side)
+      // degrades to "no tool steps this read" rather than failing the whole history response --
+      // the transcript hermes already returned is real and worth serving on its own.
+      let steps: ReturnType<typeof groupToolSteps> = [];
+      try {
+        steps = groupToolSteps(
+          this.#storage.botChatToolSteps(chat.sessionId, this.#now() - TOOL_STEP_TTL_MS),
+        );
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        this.#log(`failed to read tool steps for ${name}; serving history without them (${detail})`);
+      }
       return {
         sessionId: chat.sessionId,
         adoption: chat.adoption,
