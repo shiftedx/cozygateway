@@ -47,6 +47,10 @@ DASHBOARD_HOST=""
 EXPOSE_DASHBOARD_LAN=0
 DASHBOARD_PORT="9119"
 GATEWAY_PORT="8787"
+# Was the port a DEFAULT or an answer? A re-entry (--pair-only) into a recorded install has to know
+# the difference: it adopts what the install recorded, but never over a port the operator typed.
+DASHBOARD_PORT_EXPLICIT=0
+GATEWAY_PORT_EXPLICIT=0
 BRIDGE_USER="cozybridge"
 BRIDGE_PASSWORD=""
 RUNTIME="auto"
@@ -93,7 +97,11 @@ usage: bash scripts/agent-install.sh [flags]
                             node 24+ (set COZYGATEWAY_NODE to name a different node) and no pnpm.
   --skip-dashboard          do not touch config.yaml and do not start `hermes dashboard`
   --no-start                configure everything, start nothing
-  --pair-only               skip straight to minting a pairing code against a running gateway
+  --pair-only               skip straight to minting a pairing code against a running gateway. It
+                            re-enters an existing install: the runtime, bundle, node, config and
+                            ports come from <gateway-dir>/local/install-env.sh unless a flag here
+                            says otherwise, and it needs neither hermes nor docker on the bundle
+                            path.
   --service                 supervise the gateway (and the dashboard, unless --skip-dashboard)
                             with the OS service manager instead of nohup, so both survive a crash,
                             a logout and a reboot. macOS: launchd LaunchAgents. Linux: systemd
@@ -118,8 +126,8 @@ while [ $# -gt 0 ]; do
     --hermes-home) need_value "$1" $#; HERMES_HOME_DIR="$2"; shift ;;
     --dashboard-host) need_value "$1" $#; DASHBOARD_HOST="$2"; shift ;;
     --expose-dashboard-lan) EXPOSE_DASHBOARD_LAN=1 ;;
-    --dashboard-port) need_value "$1" $#; DASHBOARD_PORT="$2"; shift ;;
-    --gateway-port) need_value "$1" $#; GATEWAY_PORT="$2"; shift ;;
+    --dashboard-port) need_value "$1" $#; DASHBOARD_PORT="$2"; DASHBOARD_PORT_EXPLICIT=1; shift ;;
+    --gateway-port) need_value "$1" $#; GATEWAY_PORT="$2"; GATEWAY_PORT_EXPLICIT=1; shift ;;
     --username) need_value "$1" $#; BRIDGE_USER="$2"; shift ;;
     --password) need_value "$1" $#; BRIDGE_PASSWORD="$2"; shift ;;
     --hidden-profiles) need_value "$1" $#; HIDDEN_PROFILES="$2"; shift ;;
@@ -209,6 +217,33 @@ run() {
 dry() { [ "$DRY_RUN" = "1" ]; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# install_env_value NAME: one COZY_* value out of <gateway-dir>/local/install-env.sh, or the empty
+# string when there is no such file or no such key.
+#
+# Read in a SUBSHELL, for the same reason stop_detached_dashboard does: install-env.sh exports
+# COZY_* names this script also uses as its own variables ($COZY_NODE above all), so sourcing it
+# into this shell would silently overwrite the flags the operator just typed. Everything adopted
+# from it is adopted deliberately, one value at a time, by the callers below.
+# It never fails: a record that cannot be sourced yields the empty string, so a caller's
+# `X="$(install_env_value NAME)"` cannot abort the whole script under `set -e` with nothing printed.
+# Callers that need to tell "no such key" from "broken file" ask install_env_readable first.
+install_env_value() {
+  [ -f "$INSTALL_ENV" ] || return 0
+  # shellcheck source=/dev/null
+  ( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${!1-}" ) || true
+}
+
+# install_env_readable: can bash actually source the record? A truncated or hand-edited
+# install-env.sh is a real failure mode, and "every value came back empty" is not something to
+# reason about silently.
+install_env_readable() {
+  # shellcheck source=/dev/null
+  ( . "$INSTALL_ENV" ) >/dev/null 2>&1
+}
+
+# node_major BIN: the major version BIN reports, or the empty string if it cannot be asked.
+node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null || true; }
 
 # port_listening PORT: is anything holding a listening socket on it. The honest question when the
 # question is "can a unit bind this", which HTTP health cannot answer: a socket in the wrong state,
@@ -752,6 +787,86 @@ mint_pair() {
   ok "pairing code minted (single use, valid 10 minutes; re-run with --pair-only for another)"
 }
 
+# ---------------------------------------------------------- --pair-only: re-enter, do not re-plan
+#
+# --pair-only is a RE-ENTRY into an install that already exists, not a fresh one, so it belongs up
+# here beside --uninstall-service rather than after the phase-1 preflight.
+#
+# It used to sit after preflight, which meant every value it needed was re-derived from flag
+# defaults instead of read from the install it was pairing against. On the bundle track that turned
+# the documented re-pair command into a docker error (RUNTIME fell back to auto -> docker) and made
+# the script briefly reason about dashboard port 9119, which on a --dashboard-port install belongs
+# to somebody else entirely. Minting a code needs no dashboard, no docker and no hermes: it runs one
+# CLI command against a gateway that is already up.
+#
+# So: read <gateway-dir>/local/install-env.sh, adopt what it recorded, and let any flag the operator
+# actually typed win over it. Only the values mint_pair_raw uses are adopted (runtime, bundle path,
+# node, config path), plus the ports, which are recorded facts about this install and have no
+# business being defaults on a re-entry.
+#
+# With no install-env.sh there is nothing to re-enter from, so this says so and falls through to the
+# old path: full preflight, then the --pair-only branch in phase 2.
+if [ "$PAIR_ONLY" = "1" ] && [ "$SERVICE" = "1" ]; then
+  die "--pair-only only mints a code against an already-running gateway; it never reaches the start phases, so --service would install nothing. Drop one of them."
+fi
+
+if [ "$PAIR_ONLY" = "1" ] && [ -f "$INSTALL_ENV" ]; then
+  step "8/8 pairing code (--pair-only)"
+  info "re-entering the install recorded in $INSTALL_ENV; flags given on this command line still win"
+
+  # Say it here, once, rather than letting every value below come back empty and inferring a
+  # runtime from the silence.
+  install_env_readable || \
+    die "$INSTALL_ENV exists but bash cannot source it (truncated, or hand-edited into a syntax error), so this install's runtime, bundle, node and ports cannot be read. Re-run the installer to regenerate it, or re-supply the install's flags on this command line."
+
+  RECORDED_RUNTIME="$(install_env_value COZY_RUNTIME)"
+  RECORDED_BUNDLE="$(install_env_value COZY_BUNDLE_PATH)"
+  RECORDED_NODE="$(install_env_value COZY_NODE)"
+  RECORDED_CONFIG="$(install_env_value COZY_CONFIG_JSON)"
+  RECORDED_GATEWAY_PORT="$(install_env_value COZY_GATEWAY_PORT)"
+  RECORDED_DASHBOARD_PORT="$(install_env_value COZY_DASHBOARD_PORT)"
+
+  if [ -z "$RUNTIME_EXPLICIT" ] && [ -n "$RECORDED_RUNTIME" ]; then
+    RUNTIME="$RECORDED_RUNTIME"
+  fi
+  if [ -z "$BUNDLE_PATH" ] && [ -n "$RECORDED_BUNDLE" ]; then
+    BUNDLE_PATH="$RECORDED_BUNDLE"
+  fi
+  # COZYGATEWAY_NODE is the operator's explicit answer; $COZY_NODE is it, or the bare default.
+  if [ -z "${COZYGATEWAY_NODE:-}" ] && [ -n "$RECORDED_NODE" ]; then
+    COZY_NODE="$RECORDED_NODE"
+  fi
+  [ -n "$RECORDED_CONFIG" ] && CONFIG_JSON="$RECORDED_CONFIG"
+  [ "$GATEWAY_PORT_EXPLICIT" = "0" ] && [ -n "$RECORDED_GATEWAY_PORT" ] && GATEWAY_PORT="$RECORDED_GATEWAY_PORT"
+  [ "$DASHBOARD_PORT_EXPLICIT" = "0" ] && [ -n "$RECORDED_DASHBOARD_PORT" ] && DASHBOARD_PORT="$RECORDED_DASHBOARD_PORT"
+
+  case "$RUNTIME" in
+    bundle)
+      [ -n "$BUNDLE_PATH" ] || die "the recorded runtime is bundle but no bundle path was recorded in $INSTALL_ENV and none was given; pass --bundle PATH"
+      [ -f "$BUNDLE_PATH" ] || die "the recorded bundle $BUNDLE_PATH does not exist; pass --bundle PATH naming the gateway bundle this install runs"
+      case "$COZY_NODE" in
+        */*) [ -x "$COZY_NODE" ] || die "node binary '$COZY_NODE' is not an executable file (set COZYGATEWAY_NODE to an absolute path to node 24+)" ;;
+        *)   have "$COZY_NODE" || die "node binary '$COZY_NODE' not found on PATH (set COZYGATEWAY_NODE to an absolute path to node 24+)" ;;
+      esac
+      ok "runtime: bundle $BUNDLE_PATH under $COZY_NODE; no docker and no hermes are needed to mint a code"
+      ;;
+    docker)
+      have docker || die "the recorded runtime is docker but docker is not installed; pass --runtime node or --bundle PATH if this install moved"
+      ok "runtime: docker (recorded by this install)"
+      ;;
+    node)
+      have node || die "the recorded runtime is node but node is not installed"
+      ok "runtime: node (recorded by this install)"
+      ;;
+    *) die "$INSTALL_ENV records no usable runtime ('$RUNTIME'); pass --runtime docker|node or --bundle PATH" ;;
+  esac
+  info "config: $CONFIG_JSON (gateway port $GATEWAY_PORT)"
+  mint_pair
+  exit 0
+elif [ "$PAIR_ONLY" = "1" ]; then
+  info "--pair-only: no $INSTALL_ENV to re-enter from, so the runtime and ports come from the flags and defaults below. Pass --gateway-dir pointing at the install, or re-supply the flags the install used."
+fi
+
 # ---------------------------------------------------------------------------- 1. preflight
 
 step "1/8 preflight"
@@ -880,14 +995,11 @@ if [ "$SERVICE" = "1" ]; then
       info "docker was chosen by autodetection, not asked for; --runtime node or --bundle PATH selects the supervised path"
     die "docker already supervises the gateway; --service is for the no-docker path"
   fi
-  # --service's whole job is to install units AND start them. --no-start starts nothing and
-  # --pair-only leaves before either start phase, so both would end green having installed no unit
-  # at all, after a preflight line promising supervision. Refuse rather than lie.
+  # --service's whole job is to install units AND start them. --no-start starts nothing, so it would
+  # end green having installed no unit at all, after a preflight line promising supervision. Refuse
+  # rather than lie. (--service --pair-only is refused earlier, before the re-entry block.)
   if [ "$NO_START" = "1" ]; then
     die "--service installs and starts the service units, so it cannot be combined with --no-start. Drop one of them."
-  fi
-  if [ "$PAIR_ONLY" = "1" ]; then
-    die "--pair-only only mints a code against an already-running gateway; it never reaches the start phases, so --service would install nothing. Drop one of them."
   fi
   resolve_service_platform
   if [ "$SKIP_DASHBOARD" = "1" ]; then
@@ -939,6 +1051,32 @@ case "$RUNTIME" in
       *)  BUNDLE_PATH="$(cd "$(dirname "$BUNDLE_PATH")" && pwd -P)/$(basename "$BUNDLE_PATH")" ;;
     esac
     [ -f "$BUNDLE_PATH" ] || die "could not resolve --bundle to an absolute path (got $BUNDLE_PATH)"
+    # The node this install already runs under beats whatever `node` PATH happens to name.
+    #
+    # install.sh scans for a node 24+ (Homebrew kegs, nvm) when the PATH node is too old, and passes
+    # the winner down as COZYGATEWAY_NODE. agent-install.sh on its own has no such scan, so on a box
+    # that NEEDED the scan every later re-run of this script died on "node 22 is too old" -- while
+    # install-env.sh sat there recording the right answer. Read that one value rather than importing
+    # the whole scan: it is a recorded fact about this install, not a guess.
+    #
+    # Only when nothing better was said (no COZYGATEWAY_NODE), and only if the recorded binary still
+    # exists and is still new enough; anything else falls through to the checks below, which say
+    # exactly what is wrong.
+    if [ -z "${COZYGATEWAY_NODE:-}" ]; then
+      RECORDED_NODE="$(install_env_value COZY_NODE)"
+      if [ -n "$RECORDED_NODE" ] && [ "$RECORDED_NODE" != "$COZY_NODE" ] && [ -x "$RECORDED_NODE" ]; then
+        RECORDED_NODE_MAJOR="$(node_major "$RECORDED_NODE")"
+        case "${RECORDED_NODE_MAJOR:-}" in
+          ''|*[!0-9]*) : ;;
+          *)
+            if [ "$RECORDED_NODE_MAJOR" -ge 24 ]; then
+              COZY_NODE="$RECORDED_NODE"
+              info "using the node this install recorded in $INSTALL_ENV: $COZY_NODE (node $RECORDED_NODE_MAJOR). Set COZYGATEWAY_NODE to override."
+            fi
+            ;;
+        esac
+      fi
+    fi
     # Same argument for the interpreter, and for the same consumer. A bare name is resolved through
     # PATH here rather than left as a name, because the service manager's PATH is not this shell's.
     case "$COZY_NODE" in
@@ -1110,6 +1248,9 @@ fi
 
 write_install_env
 
+# --pair-only with nothing to re-enter from (no install-env.sh): the re-entry block above said so
+# and fell through, phase 2 has just written one, and this is the pre-existing behavior -- everything
+# derived from the flags as given.
 if [ "$PAIR_ONLY" = "1" ]; then
   step "8/8 pairing code (--pair-only)"
   mint_pair

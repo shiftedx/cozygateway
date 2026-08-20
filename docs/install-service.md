@@ -57,6 +57,18 @@ systemctl --user status cozygateway
 systemctl --user status cozygateway-hermes-dashboard
 ```
 
+## Pair another phone
+
+The install prints one pairing code, and a code is single use and expires after 10 minutes. For the
+next phone, or for the same phone again after you removed it, mint a fresh one:
+
+```sh
+bash ~/.cozygateway/bin/agent-install.sh --pair-only --gateway-dir ~/.cozygateway
+```
+
+It reads the settings of the install already running and only mints a code. It starts nothing and
+changes nothing.
+
 ## View logs
 
 ```sh
