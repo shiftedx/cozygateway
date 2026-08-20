@@ -25,75 +25,119 @@
 #   bash install.sh --hidden-profiles default,ops
 #   curl -fsSL https://cozylabs.ai/install.sh | bash -s -- --hidden-profiles default,ops
 # work.
+#
+# The whole body lives in main(), invoked on the last line. That is deliberate:
+# `curl | bash` feeds the shell a stream, and a connection cut halfway through
+# would otherwise run whatever prefix arrived and exit 0. With this shape a
+# truncated download never reaches the call, so a half-install cannot happen.
 set -euo pipefail
 
-REPO="${COZYGATEWAY_INSTALL_REPO:-shiftedx/cozygateway}"
-CGW_HOME="${COZYGATEWAY_HOME:-$HOME/.cozygateway}"
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'FAIL  %s\n' "$*" >&2; exit 1; }
 
-command -v curl >/dev/null 2>&1 || die "curl is required"
+# Always answers with an integer. A node that exits 0 while printing nothing (a
+# shim, a broken install) must read as 0 and be rejected, not sail through the
+# `-lt 24` test on an empty string.
+node_major() {
+  local v
+  v="$("$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tail -1 | tr -dc '0-9')"
+  printf '%s' "${v:-0}"
+}
 
-# --- Node >= 24 ------------------------------------------------------------
-NODE_BIN="${COZYGATEWAY_NODE:-}"
-if [ -z "$NODE_BIN" ] && command -v node >/dev/null 2>&1; then NODE_BIN="$(command -v node)"; fi
-node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
-if [ -z "$NODE_BIN" ] || [ "$(node_major "$NODE_BIN")" -lt 24 ]; then
-  # A newer node may be installed but not first on PATH (Homebrew keg, nvm).
-  for cand in /opt/homebrew/opt/node/bin/node /usr/local/opt/node/bin/node \
-              "$HOME"/.nvm/versions/node/v2[4-9]*/bin/node; do
-    if [ -x "$cand" ] && [ "$(node_major "$cand")" -ge 24 ]; then NODE_BIN="$cand"; break; fi
-  done
-fi
-if [ -z "$NODE_BIN" ] || [ "$(node_major "$NODE_BIN")" -lt 24 ]; then
-  case "$(uname -s)" in
-    Darwin) HINT="brew install node   (from https://brew.sh)" ;;
-    *)      HINT="https://nodejs.org/en/download - or your distro's nodejs 24 package" ;;
-  esac
-  die "cozygateway needs Node.js 24 or newer. Install it, then re-run this line.
-      $HINT"
-fi
-say "Using node: $NODE_BIN ($("$NODE_BIN" -v))"
+# Resolves a node >= 24, or dies naming how to get one.
+resolve_node() {
+  local node_bin hint cand
+  node_bin="${COZYGATEWAY_NODE:-}"
+  if [ -z "$node_bin" ] && command -v node >/dev/null 2>&1; then node_bin="$(command -v node)"; fi
+  if [ -z "$node_bin" ] || [ "$(node_major "$node_bin")" -lt 24 ]; then
+    # A newer node may be installed but not first on PATH (Homebrew keg, nvm).
+    for cand in /opt/homebrew/opt/node/bin/node /usr/local/opt/node/bin/node \
+                "$HOME"/.nvm/versions/node/v2[4-9]*/bin/node; do
+      if [ -x "$cand" ] && [ "$(node_major "$cand")" -ge 24 ]; then node_bin="$cand"; break; fi
+    done
+  fi
+  if [ -z "$node_bin" ] || [ "$(node_major "$node_bin")" -lt 24 ]; then
+    case "$(uname -s)" in
+      Darwin) hint="brew install node   (from https://brew.sh)" ;;
+      *)      hint="https://nodejs.org/en/download - or your distro's nodejs 24 package" ;;
+    esac
+    die "cozygateway needs Node.js 24 or newer. Install it, then re-run this line.
+      $hint"
+  fi
+  printf '%s' "$node_bin"
+}
 
-# --- Resolve the release ---------------------------------------------------
-TAG="${COZYGATEWAY_INSTALL_TAG:-}"
-if [ -z "$TAG" ] && [ -z "${COZYGATEWAY_INSTALL_ASSET_BASE:-}" ]; then
-  # Zero dependencies beyond curl and the standard text tools: pull the first
-  # "tag_name": "..." out of the release JSON, whatever GitHub's indentation is.
-  RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)"
-  TAG="$(printf '%s' "$RELEASE_JSON" |
-    grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
-  [ -n "$TAG" ] || die "could not resolve the latest release of $REPO (offline? rate-limited? no releases yet?). Set COZYGATEWAY_INSTALL_TAG=vX.Y.Z and re-run."
-fi
-ASSET_BASE="${COZYGATEWAY_INSTALL_ASSET_BASE:-https://github.com/$REPO/releases/download/$TAG}"
-RAW_BASE="https://raw.githubusercontent.com/$REPO/${TAG:-main}"
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    die "no sha256 tool found (looked for shasum and sha256sum). Install coreutils on Linux, or Perl's shasum, then re-run this line."
+  fi
+}
 
-# --- Download + verify -----------------------------------------------------
-mkdir -p "$CGW_HOME/bin"
-say "Downloading cozygateway ${TAG:-} ..."
-curl -fsSL "$ASSET_BASE/cozygateway.mjs" -o "$CGW_HOME/bin/cozygateway.mjs.new"
-curl -fsSL "$ASSET_BASE/cozygateway.mjs.sha256" -o "$CGW_HOME/bin/cozygateway.mjs.sha256"
-EXPECT="$(awk '{print $1}' "$CGW_HOME/bin/cozygateway.mjs.sha256")"
-GOT="$(shasum -a 256 "$CGW_HOME/bin/cozygateway.mjs.new" 2>/dev/null | awk '{print $1}')"
-[ -n "$GOT" ] || GOT="$(sha256sum "$CGW_HOME/bin/cozygateway.mjs.new" | awk '{print $1}')"
-[ "$EXPECT" = "$GOT" ] || die "bundle sha256 mismatch (expected $EXPECT, got $GOT); refusing to run it"
-mv "$CGW_HOME/bin/cozygateway.mjs.new" "$CGW_HOME/bin/cozygateway.mjs"
-say "Verified sha256: $GOT"
+main() {
+  local repo cgw_home node_bin tag release_json asset_base raw_base expect got arg line
 
-curl -fsSL "$RAW_BASE/scripts/agent-install.sh" -o "$CGW_HOME/bin/agent-install.sh"
+  repo="${COZYGATEWAY_INSTALL_REPO:-shiftedx/cozygateway}"
+  cgw_home="${COZYGATEWAY_HOME:-$HOME/.cozygateway}"
 
-# --- Hand off --------------------------------------------------------------
-if [ -n "${COZYGATEWAY_INSTALL_DRYRUN:-}" ]; then
-  # Testing hook: show the exact handoff, run nothing.
-  printf 'DRYRUN  env COZYGATEWAY_NODE=%s bash %s --gateway-dir %s --bundle %s --service' \
-    "$NODE_BIN" "$CGW_HOME/bin/agent-install.sh" "$CGW_HOME" "$CGW_HOME/bin/cozygateway.mjs"
-  for arg in "$@"; do printf ' %s' "$arg"; done
-  printf '\n'
-  exit 0
-fi
+  command -v curl >/dev/null 2>&1 || die "curl is required"
 
-exec env COZYGATEWAY_NODE="$NODE_BIN" bash "$CGW_HOME/bin/agent-install.sh" \
-  --gateway-dir "$CGW_HOME" \
-  --bundle "$CGW_HOME/bin/cozygateway.mjs" \
-  --service \
-  "$@"
+  # --- Node >= 24 ----------------------------------------------------------
+  node_bin="$(resolve_node)"
+  say "Using node: $node_bin ($("$node_bin" -v))"
+
+  # --- Resolve the release -------------------------------------------------
+  tag="${COZYGATEWAY_INSTALL_TAG:-}"
+  if [ -z "$tag" ] && [ -z "${COZYGATEWAY_INSTALL_ASSET_BASE:-}" ]; then
+    # Zero dependencies beyond curl and the standard text tools: pull the first
+    # "tag_name": "..." out of the release JSON, whatever the indentation is.
+    release_json="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null || true)"
+    tag="$(printf '%s' "$release_json" |
+      grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+    [ -n "$tag" ] || die "could not resolve the latest release of $repo (offline? rate-limited? no releases yet?). Set COZYGATEWAY_INSTALL_TAG=vX.Y.Z and re-run."
+  fi
+  asset_base="${COZYGATEWAY_INSTALL_ASSET_BASE:-https://github.com/$repo/releases/download/$tag}"
+  raw_base="https://raw.githubusercontent.com/$repo/${tag:-main}"
+
+  # --- Download + verify ---------------------------------------------------
+  mkdir -p "$cgw_home/bin"
+  if [ -n "$tag" ]; then say "Downloading cozygateway $tag ..."; else say "Downloading cozygateway ..."; fi
+  curl -fsSL "$asset_base/cozygateway.mjs" -o "$cgw_home/bin/cozygateway.mjs.new" 2>/dev/null ||
+    die "could not download cozygateway.mjs from $asset_base (is the release published? set COZYGATEWAY_INSTALL_TAG=vX.Y.Z or check your network)"
+  curl -fsSL "$asset_base/cozygateway.mjs.sha256" -o "$cgw_home/bin/cozygateway.mjs.sha256" 2>/dev/null ||
+    die "could not download cozygateway.mjs.sha256 from $asset_base (is the release published? set COZYGATEWAY_INSTALL_TAG=vX.Y.Z or check your network)"
+
+  expect="$(awk '{print $1}' "$cgw_home/bin/cozygateway.mjs.sha256")"
+  got="$(sha256_of "$cgw_home/bin/cozygateway.mjs.new")"
+  if [ "$expect" != "$got" ]; then
+    rm -f "$cgw_home/bin/cozygateway.mjs.new"
+    die "bundle sha256 mismatch (expected $expect, got $got); refusing to run it"
+  fi
+  mv "$cgw_home/bin/cozygateway.mjs.new" "$cgw_home/bin/cozygateway.mjs"
+  say "Verified sha256: $got"
+
+  curl -fsSL "$raw_base/scripts/agent-install.sh" -o "$cgw_home/bin/agent-install.sh" 2>/dev/null ||
+    die "could not download scripts/agent-install.sh from $raw_base (is the release published? set COZYGATEWAY_INSTALL_TAG=vX.Y.Z or check your network)"
+
+  # --- Hand off ------------------------------------------------------------
+  if [ "${COZYGATEWAY_INSTALL_DRYRUN:-}" = "1" ]; then
+    # Testing hook: show the exact handoff, run nothing. %q so the printed line
+    # is safe to paste back into a shell.
+    line="$(printf 'env COZYGATEWAY_NODE=%q bash %q --gateway-dir %q --bundle %q --service' \
+      "$node_bin" "$cgw_home/bin/agent-install.sh" "$cgw_home" "$cgw_home/bin/cozygateway.mjs")"
+    for arg in "$@"; do line="$line $(printf '%q' "$arg")"; done
+    printf 'DRYRUN  %s\n' "$line"
+    return 0
+  fi
+
+  exec env COZYGATEWAY_NODE="$node_bin" bash "$cgw_home/bin/agent-install.sh" \
+    --gateway-dir "$cgw_home" \
+    --bundle "$cgw_home/bin/cozygateway.mjs" \
+    --service \
+    "$@"
+}
+
+main "$@"
