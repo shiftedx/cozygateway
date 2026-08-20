@@ -112,6 +112,23 @@ export function createApp(deps: AppDeps): Hono<Env> {
     ),
   );
 
+  // Readiness (follow-up to issue #63, tracked separately): `/health` answers "is the process
+  // alive", which is what a supervisor restarts on. `/ready` answers a different question, "will
+  // a send actually deliver right now", which is what a router or monitor should alarm or
+  // de-route on instead. The two must never be pointed at the same action: an offline hermes link
+  // is not fixed by restarting the gateway process, so wiring a restart to this route would just
+  // cycle a healthy process while the real fault -- a dead upstream bridge -- sits untouched.
+  //
+  // Same synchronous liveness snapshot `/health` reads (`deps.bots.health()`), no new I/O per
+  // request, for the same reason `/health` does not: a readiness probe that has to make its own
+  // network call to answer is itself a new way to go dark.
+  app.get("/ready", (c) => {
+    if (deps.bots === undefined) return c.json({ ready: true });
+    const bridges = { hermes: deps.bots.health() };
+    const allOnline = Object.values(bridges).every((bridge) => bridge.online);
+    return c.json({ ready: allOnline, bridges }, allOnline ? 200 : 503);
+  });
+
   app.post("/pair", async (c) => {
     const body = await readBody(c);
     let pairRequest;
