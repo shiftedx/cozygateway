@@ -18,9 +18,9 @@ afterEach(async () => {
   for (const server of servers.splice(0)) await server.close();
 });
 
-async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
+async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -256,6 +256,80 @@ describe("startGateway with a hermes bridge", () => {
     gateways.push(gateway);
     const info = (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
     expect(info.capabilities?.["com.cozylabs.bots"]).toBeUndefined();
+  });
+
+  // Issue #63: GET /health kept advertising com.cozylabs.bots for hours with the hermes link
+  // dead behind it, so a monitor watching only `capabilities` stayed green through a full outage.
+  // `bridges.hermes` is the added liveness signal; these two prove it tracks the real socket, not
+  // a value frozen at startup.
+  it("reports the hermes bridge online in /health once the link is up", async () => {
+    const hermes = await startFakeHermesServer({
+      methods: { "profiles.list": () => ({ profiles: [], bot_mode_protocol: true }) },
+    });
+    servers.push(hermes);
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    const gateway = await startGateway({
+      name: "e2e",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN" },
+    });
+    gateways.push(gateway);
+
+    const readHealth = async (): Promise<GatewayInfo> =>
+      (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
+
+    await until(async () => (await readHealth()).bridges?.["hermes"]?.online === true);
+    const info = await readHealth();
+    expect(info.bridges?.["hermes"]).toMatchObject({ online: true, reconnectAttempt: 0 });
+    expect(typeof info.bridges?.["hermes"]?.since).toBe("number");
+
+    delete process.env["TEST_HERMES_TOKEN"];
+  });
+
+  it("flips the hermes bridge offline in /health, with a growing reconnectAttempt, once the link drops", async () => {
+    const hermes = await startFakeHermesServer({
+      methods: { "profiles.list": () => ({ profiles: [], bot_mode_protocol: true }) },
+    });
+    servers.push(hermes);
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    const gateway = await startGateway({
+      name: "e2e",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN" },
+    });
+    gateways.push(gateway);
+
+    const readHealth = async (): Promise<GatewayInfo> =>
+      (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
+
+    await until(async () => (await readHealth()).bridges?.["hermes"]?.online === true);
+
+    // Kill the fake hermes host out from under the bridge, exactly what a dead dashboard looks
+    // like from the gateway's side: the reconnect loop keeps retrying a socket nobody answers.
+    await hermes.close();
+    servers.splice(servers.indexOf(hermes), 1);
+
+    await until(async () => (await readHealth()).bridges?.["hermes"]?.online === false);
+    const first = await readHealth();
+    expect(first.bridges?.["hermes"]?.online).toBe(false);
+    expect(first.bridges?.["hermes"]?.reconnectAttempt).toBeGreaterThanOrEqual(1);
+    // capabilities.["com.cozylabs.bots"] is exactly the field issue #63 filed against: it must
+    // still be advertised while offline (a client's feature-detection contract does not change),
+    // with `bridges` as the ADDED signal a monitor reads instead.
+    expect(first.capabilities?.["com.cozylabs.bots"]).toBe(BOTS_CAPABILITY_VERSION);
+
+    await until(async () => {
+      const attempt = (await readHealth()).bridges?.["hermes"]?.reconnectAttempt ?? 0;
+      return attempt > (first.bridges?.["hermes"]?.reconnectAttempt ?? 0);
+    });
+
+    delete process.env["TEST_HERMES_TOKEN"];
   });
 
   it("fails startup when the bridge credential is missing, before the port is bound", async () => {

@@ -100,7 +100,17 @@ export function createApp(deps: AppDeps): Hono<Env> {
     }
   };
 
-  app.get("/health", (c) => c.json(deps.gatewayInfo));
+  // `deps.gatewayInfo` is a static snapshot taken once at server assembly (it also seeds `/pair`
+  // and the `ready` frame), so it cannot carry live bridge state. `bridges` is computed fresh on
+  // every call instead: it is the whole point of issue #63 that a monitor polling this route sees
+  // the hermes link's CURRENT liveness, not whatever was true when the process started.
+  app.get("/health", (c) =>
+    c.json(
+      deps.bots === undefined
+        ? deps.gatewayInfo
+        : { ...deps.gatewayInfo, bridges: { hermes: deps.bots.health() } },
+    ),
+  );
 
   app.post("/pair", async (c) => {
     const body = await readBody(c);

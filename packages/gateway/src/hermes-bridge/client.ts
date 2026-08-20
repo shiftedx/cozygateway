@@ -156,6 +156,18 @@ export interface HermesEvent {
 
 export type HermesState = "absent" | "connecting" | "online";
 
+/** A snapshot of the client's own connection state, for a health surface to report (issue #63: a
+ *  monitor watching only the advertised capability cannot tell "online" from "stuck reconnecting
+ *  for six hours", because the capability itself never goes away). `since` is when `state` last
+ *  changed, in the client's own clock (`opts.now`, defaulting to `Date.now`); `reconnectAttempt`
+ *  is the count of consecutive reconnect attempts since the last time the link was online, reset
+ *  to 0 on every `gateway.ready`, so it reads 0 while `state` is `"online"`. */
+export interface HermesLiveness {
+  state: HermesState;
+  since: number;
+  reconnectAttempt: number;
+}
+
 export interface HermesClientOptions {
   /** The gateway WebSocket URL, e.g. `ws://homelab:8790/api/ws`. Any query string already on it
    *  is preserved; the credential below is appended. */
@@ -182,6 +194,9 @@ export interface HermesClientOptions {
 
 export interface HermesClient {
   state(): HermesState;
+  /** See `HermesLiveness`. A cheap, synchronous snapshot -- no RPC involved -- so a health route
+   *  can call it on every request without adding load to the link it is reporting on. */
+  liveness(): HermesLiveness;
   /** Resolves with the `result` value. Rejects with `HermesRpcError` (message = the gateway's
    *  error text, verbatim) when the gateway answered with an error, or `HermesUnavailable` when
    *  the call could not be sent or the socket died first, or `HermesTimeout` (a subclass of it)
@@ -255,6 +270,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   const log = (message: string): void => logLine(`[hermes-bridge] ${message}\n`);
 
   let state: HermesState = "absent";
+  /** When `state` last changed, in this client's own clock. See `HermesLiveness.since`. */
+  let stateSince = now();
   let ws: WebSocket | undefined;
   let started = false;
   let closed = false;
@@ -280,6 +297,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   function setState(next: HermesState): void {
     if (state === next) return;
     state = next;
+    stateSince = now();
     for (const handler of stateHandlers) handler(next);
   }
 
@@ -553,6 +571,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
   return {
     state: () => state,
+
+    liveness: (): HermesLiveness => ({ state, since: stateSince, reconnectAttempt }),
 
     request(method: string, params: unknown = {}, opts: { timeoutMs?: number } = {}): Promise<unknown> {
       return new Promise((resolve, reject) => {
