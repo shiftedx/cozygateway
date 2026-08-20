@@ -115,7 +115,13 @@ while [ $# -gt 0 ]; do
     --hidden-profiles) need_value "$1" $#; HIDDEN_PROFILES="$2"; shift ;;
     --gateway-name) need_value "$1" $#; GATEWAY_NAME="$2"; shift ;;
     --runtime) need_value "$1" $#; RUNTIME="$2"; RUNTIME_EXPLICIT="$2"; shift ;;
-    --bundle) need_value "$1" $#; BUNDLE_PATH="$2"; shift ;;
+    --bundle)
+      need_value "$1" $#
+      # An EMPTY value is not the same as no flag at all. Left alone it reads as "--bundle was
+      # never passed", RUNTIME stays auto, and the run quietly clones and builds under docker:
+      # the opposite of what was asked for, with nothing said out loud.
+      [ -n "$2" ] || { printf 'FAIL  --bundle needs a path, got an empty value\n' >&2; exit 2; }
+      BUNDLE_PATH="$2"; shift ;;
     --skip-dashboard) SKIP_DASHBOARD=1 ;;
     --no-start) NO_START=1 ;;
     --pair-only) PAIR_ONLY=1 ;;
@@ -413,7 +419,35 @@ case "$RUNTIME" in
     # check runs against $COZY_NODE (which COZYGATEWAY_NODE names) rather than whatever `node` on
     # PATH happens to be: a box whose PATH node is 22 can still run the bundle under a 24+ binary.
     [ -f "$BUNDLE_PATH" ] || die "--bundle $BUNDLE_PATH does not exist. Build it with 'pnpm bundle' in a cozygateway checkout and copy dist-bundle/cozygateway.mjs here."
-    { [ -x "$COZY_NODE" ] || have "$COZY_NODE"; } || die "node binary '$COZY_NODE' not found (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+    # Canonicalize to an ABSOLUTE path before anything records it. A relative --bundle resolves
+    # correctly here, against the cwd this script was invoked from, and then wrong everywhere
+    # afterwards: the service unit Tasks 3/4 write execs "$COZY_NODE" "$COZY_BUNDLE_PATH" from the
+    # service manager's cwd, which is /, so a relative path yields a unit that cannot start and a
+    # preflight that said nothing. `readlink -f` is not portable to macOS, so the dirname is
+    # resolved by cd'ing into it. A path that is ALREADY absolute is left exactly as given: it
+    # needs no fixing, and rewriting it would resolve the operator's symlinks behind their back
+    # (/opt/homebrew/opt/node/bin/node is a deliberately stable alias; the Cellar path it points at
+    # names one version and disappears on the next upgrade).
+    case "$BUNDLE_PATH" in
+      /*) : ;;
+      *)  BUNDLE_PATH="$(cd "$(dirname "$BUNDLE_PATH")" && pwd -P)/$(basename "$BUNDLE_PATH")" ;;
+    esac
+    [ -f "$BUNDLE_PATH" ] || die "could not resolve --bundle to an absolute path (got $BUNDLE_PATH)"
+    # Same argument for the interpreter, and for the same consumer. A bare name is resolved through
+    # PATH here rather than left as a name, because the service manager's PATH is not this shell's.
+    case "$COZY_NODE" in
+      /*)
+        [ -x "$COZY_NODE" ] || die "node binary '$COZY_NODE' is not an executable file (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+        ;;
+      */*)
+        [ -x "$COZY_NODE" ] || die "node binary '$COZY_NODE' is not an executable file (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+        COZY_NODE="$(cd "$(dirname "$COZY_NODE")" && pwd -P)/$(basename "$COZY_NODE")"
+        ;;
+      *)
+        have "$COZY_NODE" || die "node binary '$COZY_NODE' not found on PATH (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+        COZY_NODE="$(command -v "$COZY_NODE")"
+        ;;
+    esac
     BUNDLE_NODE_MAJOR="$("$COZY_NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
     case "${BUNDLE_NODE_MAJOR:-}" in
       ''|*[!0-9]*) die "could not read a version out of '$COZY_NODE -p process.versions.node'" ;;
