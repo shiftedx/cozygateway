@@ -168,10 +168,18 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
 - `at`: the first usable value among `at`, `ts`, `timestamp`, `time`, `created_at`, `created`.
   A number at or below 10^11 is read as SECONDS and multiplied, anything larger is already
   milliseconds; numeric strings and ISO strings are accepted; anything else yields null.
-- `id`: the message's own `id` or `message_id` when it has one, otherwise `<sessionId>#<index>`,
-  where `index` is the position in the RAW list, so dropped rows do not shift the ids of the ones
-  that survive. Stable for a given session, which is what makes it safe to key a list on and to
-  de-duplicate a replayed frame with.
+- `id`: the message's own `id`, `message_id` or `row_id` when it has one, otherwise an id the
+  gateway derives from the row's CONTENT: `<sessionId>#<fingerprint>-<n>`, where the fingerprint
+  covers the role and the text and `n` distinguishes repeated lines. Position is deliberately not in
+  it. A backend transcript is not an append-only log (a `/compact` drops the head, may write a
+  summary in its place, and carries the tail over), and an id derived from where a row sat would be
+  a DIFFERENT id for the same row the moment that happens.
+  Stable for a given session, and that word is load-bearing: an id names one rendered row for the
+  life of the session, ACROSS a compaction, so keying a list on it and de-duplicating a replayed
+  frame with it both work. A gateway that cannot honour that must not re-deliver the row at all.
+  Two limits, stated so a client is not surprised by them: a row whose TEXT changes is a new row,
+  and a repeated line whose earlier copy is compacted away while the gateway is restarting can come
+  back once under the other copy's id.
 - `clientId`: present only on a message the sender submitted with one (see
   `POST /bots/:name/chat/messages`), both in the 202 body and on that same message when it comes
   back in a `bot_chat` frame. It appears on AT MOST ONE message: a clientId is never re-used for a
@@ -2044,12 +2052,16 @@ actually changed, so an idle gateway is silent. `bot_presence.active` carries pr
 roster order.
 
 `bot_chat` is a DELTA: `messages` carries only what the gateway has not broadcast before for that
-bot, in order. The watermark is per bot and is kept as the last broadcast message ID, not a count,
-so a `/compact` that SHRINKS the transcript re-bases the stream (the compacted transcript is
-delivered once) instead of silencing it. It also resets when the bot's session id changes; a
-`GET /bots/:name/chat/messages` re-bases it on what that response returned, so a client that reads
-history and then listens receives each message exactly once. Keying on `BotChatMessage.id` makes a
-duplicate harmless anyway.
+bot, in order. The watermark is per bot and is kept as the SET of message ids already delivered,
+not as a count and not as a position, so a `/compact` that rewrites the transcript costs exactly the
+rows it added (the summary it wrote, and whatever landed after it) rather than the whole compacted
+transcript. That is the other half of the id guarantee in section 3, and it is a guarantee rather
+than an optimisation: a row a client has already been handed is NEVER handed to it again wearing a
+different id, because every client guard is an identity guard and the same words under a fresh id
+are a second bubble, not a duplicate to fold away. The mark resets when the bot's session id
+changes; a `GET /bots/:name/chat/messages` re-bases it on what that response returned, so a client
+that reads history and then listens receives each message exactly once, and the ids in that response
+are the same ids the stream uses. Keying on `BotChatMessage.id` makes a duplicate harmless anyway.
 
 Two scoping properties to design a client around:
 

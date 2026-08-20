@@ -291,6 +291,96 @@ describe("BotChatTurns", () => {
     turns.close();
     expect(turns.polling("scout")).toBe(false);
   });
+  // cozygateway#87: a compaction that lands mid turn must not re-deliver a row the client already
+  // holds under a NEW id. Every client guard is an identity guard, so a row whose id was reborn is
+  // a second bubble with the same words, and the user sees their transcript double.
+  describe("a compaction mid turn (cozygateway#87)", () => {
+    /** Rows exactly as the hermes builds in the field write them: NO `id`, NO `row_id`. That is the
+     *  shape the synthesized id exists for, and the shape a compaction renumbers. */
+    const row = (role: string, content: string) => ({ role, content });
+
+    it("re-delivers nothing and renames nothing when the transcript is re-based", async () => {
+      let reply: Reply = {
+        messages: [row("user", "one"), row("assistant", "two"), row("user", "three"), row("assistant", "four")],
+      };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+
+      // The client opens the chat and reads history: four rows, four ids.
+      const history = await turns.history("scout", "stored-1");
+      const held = new Map(history.messages.map((message) => [message.id, message.text]));
+      expect(held.size).toBe(4);
+
+      // A send opens a turn. The bot starts a tool call, so the poll runs while hermes works.
+      reply = { messages: [...reply.messages, row("user", "five")], running: true };
+      await turns.send("scout", "stored-1", "five");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // The compaction lands MID TURN: the head is replaced by a summary and the tail survives.
+      reply = {
+        messages: [
+          row("assistant", "summary so far"),
+          row("user", "three"),
+          row("assistant", "four"),
+          row("user", "five"),
+        ],
+        running: true,
+      };
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // The reply lands against the compacted transcript and the turn settles.
+      reply = { messages: [...reply.messages, row("assistant", "six")], running: false };
+      await turns.settled("scout");
+
+      const delivered = chatFrames(frames).flatMap((frame) => frame.messages);
+      // Every row the client is handed, in the order it was handed one.
+      for (const message of delivered) {
+        const previous = held.get(message.id);
+        if (previous !== undefined) {
+          // An id the client already holds may only ever come back carrying the SAME words.
+          expect(previous).toBe(message.text);
+        }
+        held.set(message.id, message.text);
+      }
+
+      // The whole point: the transcript the client ends up holding is the transcript hermes has,
+      // plus the two rows compaction took away. No row appears twice under two ids.
+      const texts = [...held.values()].sort();
+      expect(texts).toEqual(["five", "four", "one", "six", "summary so far", "three", "two"].sort());
+
+      // And a wholesale history read after the compaction agrees with the stream about identity,
+      // so the client that self-heals by re-reading finds nothing to heal.
+      const after = await turns.history("scout", "stored-1");
+      for (const message of after.messages) {
+        expect(held.get(message.id)).toBe(message.text);
+      }
+    });
+
+    it("keeps the identity of a repeated line when compaction trims the earlier copy", async () => {
+      // Two rows with identical words are two lines, and a content fingerprint alone would make
+      // them one. The surviving copy must keep the id it was delivered under, not inherit the
+      // trimmed copy's.
+      let reply: Reply = {
+        messages: [row("user", "ok"), row("assistant", "filler"), row("user", "ok")],
+      };
+      const { turns, frames } = harness(() => reply, { pollMs: 5, timeoutMs: 400 });
+      const history = await turns.history("scout", "stored-1");
+      expect(history.messages).toHaveLength(3);
+      const secondOk = history.messages[2]!;
+      expect(secondOk.id).not.toBe(history.messages[0]!.id);
+
+      reply = { messages: [row("user", "ok"), row("assistant", "next")], running: true };
+      await turns.send("scout", "stored-1", "ok");
+      reply = { messages: [row("user", "ok"), row("assistant", "next")], running: false };
+      await turns.settled("scout");
+
+      const delivered = chatFrames(frames).flatMap((frame) => frame.messages);
+      // The surviving "ok" is the SECOND one, and it is not re-delivered at all.
+      expect(delivered.some((message) => message.text === "ok")).toBe(false);
+      const after = await turns.history("scout", "stored-1");
+      expect(after.messages[0]!.id).toBe(secondOk.id);
+    });
+  });
+
   // ext-bots-v1 sections 3 and 4: the `clientId` a sender put on a send comes back on THAT send's
   // message and on no other. Two sends of the same words are two different lines, and the app keys
   // its transcript on the id it is handed, so a clientId that crosses turns collapses two rows into

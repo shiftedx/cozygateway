@@ -1,6 +1,7 @@
 import type { AttachmentBlock, BotChatMessage, ServerFrame } from "cozygateway-contract";
 
 import type { HermesRpc } from "./canonical-chat.ts";
+import { ChatIdentityLedger } from "./chat-identity.ts";
 import { parseChatSnapshot, stripImageDirectives, type ChatSnapshot } from "./chat-messages.ts";
 import type { ChatStreamBinder } from "./chat-stream.ts";
 import { PhotoAttachFailed } from "./photos.ts";
@@ -154,23 +155,30 @@ interface PendingSend {
   photo?: SendPhoto;
 }
 
-/** How far a bot's chat has been broadcast. Kept as the LAST BROADCAST MESSAGE ID rather than a
- *  count, because the canonical chat is the surface where `/new` is rerouted to `/compact`
- *  (dissection 5.5) and compaction SHRINKS the message list. A count-only mark can only move up,
- *  so one compaction silenced the bot forever. */
+/** How far a bot's chat has been broadcast: the SET of message ids already handed out for this
+ *  session, and nothing positional at all.
+ *
+ *  Position cannot be the mark here. The canonical chat is the surface where `/new` is rerouted to
+ *  `/compact` (dissection 5.5), and compaction REPLACES the message list: a count-only mark could
+ *  only move up, so one compaction silenced the bot forever, and a mark that held the last id
+ *  re-based to the START of the compacted transcript and broadcast the whole of it again
+ *  (cozygateway#87). Ids survive a compaction now (`chat-identity.ts`), so asking "has this row been
+ *  delivered" of each row answers both: a re-based transcript delivers only what is genuinely new,
+ *  in whatever position it turns up. */
 interface Watermark {
   sessionId: string;
-  lastId: string | undefined;
-  count: number;
-  /** Every message id this bot's chat has already handed out for this session. A re-base replays
-   *  rows the client already has, and a replayed row must never be stamped with the clientId of a
-   *  send still in flight: that is the same collapse the FIFO queue exists to prevent, arriving
-   *  from the other direction. Bounded, so a long chat cannot grow this without limit. */
+  /** Every message id this bot's chat has already handed out for this session. Also read on the way
+   *  out: a row the client already has must never be stamped with the clientId of a send still in
+   *  flight, which is the same collapse the FIFO queue exists to prevent, arriving from the other
+   *  direction. Bounded, so a long chat cannot grow this without limit. */
   seen: Set<string>;
 }
 
-/** How many message ids a watermark remembers. Comfortably more than a compaction replays, and
- *  small enough that the set is never a memory concern. */
+/** How many message ids a watermark remembers: every row delivered for the session, up to this many.
+ *  Small enough that the set is never a memory concern, and past it a chat this long has to give
+ *  something up. What it gives up is the oldest id whose row is still in the transcript, which can
+ *  then be delivered a second time; the trim below spends the rows that are already GONE first, so
+ *  that is a corner a compacting session does not usually reach. */
 const MAX_SEEN_IDS = 1_000;
 
 const EMPTY_IDS: ReadonlySet<string> = new Set<string>();
@@ -202,6 +210,10 @@ export class BotChatTurns {
    *  no matter how fast a user taps send. */
   readonly #turns = new Map<string, ActiveTurn>();
   readonly #watermarks = new Map<string, Watermark>();
+  /** Message identity that survives a transcript the backend re-based under us (cozygateway#87).
+   *  Keyed on the STORED session id, and shared by the turn poll and the history read so the two
+   *  can never disagree about which row is which. */
+  readonly #identity = new ChatIdentityLedger();
   readonly #pending = new Map<string, PendingSend[]>();
   readonly #lastState = new Map<string, string>();
   #nextTurnId = 0;
@@ -539,6 +551,7 @@ export class BotChatTurns {
     for (const turn of this.#turns.values()) turn.cancelled = true;
     this.#turns.clear();
     this.#watermarks.clear();
+    this.#identity.clear();
     this.#lastState.clear();
     this.#pending.clear();
     // Safe only because the process is going away: a lock dropped while a send holds it would let the
@@ -634,20 +647,17 @@ export class BotChatTurns {
     return turn.sawActivity;
   }
 
-  /** Broadcasts whatever is past the watermark, keyed on message IDENTITY rather than on a count,
-   *  and re-bases when the id it held is gone (a compaction rewrote the transcript) instead of
-   *  going permanently silent. A session id change also re-bases, so switching chats replays the
-   *  new chat's messages once rather than diffing across sessions. */
+  /** Broadcasts every row this session has not been handed yet, keyed on message IDENTITY and never
+   *  on a position. A compaction that re-bases the transcript therefore costs exactly the rows it
+   *  added (the summary it wrote, and whatever landed after it) rather than the whole transcript
+   *  under fresh ids, which is what a client renders as a doubled conversation (cozygateway#87). A
+   *  session id change starts a new mark, so switching chats replays the new chat's messages once
+   *  rather than diffing across sessions. */
   #emitMessages(name: string, sessionId: string, messages: BotChatMessage[]): void {
     const mark = this.#watermarks.get(name);
-    let seen = 0;
-    if (mark !== undefined && mark.sessionId === sessionId && mark.lastId !== undefined) {
-      const index = messages.findIndex((message) => message.id === mark.lastId);
-      seen = index === -1 ? 0 : index + 1;
-    }
     const already = mark !== undefined && mark.sessionId === sessionId ? mark.seen : EMPTY_IDS;
     const fresh = messages
-      .slice(seen)
+      .filter((message) => !already.has(message.id))
       .map((message) => this.#decorate(sessionId, this.#reconcile(name, message, already)));
     this.#setWatermark(name, sessionId, messages);
     if (fresh.length === 0) return;
@@ -700,14 +710,22 @@ export class BotChatTurns {
     // A different session is a different transcript, so its ids carry nothing over.
     const seen = previous !== undefined && previous.sessionId === sessionId ? previous.seen : new Set<string>();
     for (const message of messages) seen.add(message.id);
-    // Insertion ordered, so trimming from the front drops the oldest ids first.
     if (seen.size > MAX_SEEN_IDS) {
+      // Trimmed in two passes, and the order matters now that the mark is the only thing standing
+      // between a client and a re-delivery. Ids no longer IN the transcript go first: hermes cannot
+      // hand those rows back, so forgetting them costs nothing. Only if that is not enough does the
+      // oldest live id go, and forgetting one of those does mean it can be delivered twice.
+      const live = new Set(messages.map((message) => message.id));
+      for (const id of seen) {
+        if (seen.size <= MAX_SEEN_IDS) break;
+        if (!live.has(id)) seen.delete(id);
+      }
       for (const id of seen) {
         if (seen.size <= MAX_SEEN_IDS) break;
         seen.delete(id);
       }
     }
-    this.#watermarks.set(name, { sessionId, lastId: messages.at(-1)?.id, count: messages.length, seen });
+    this.#watermarks.set(name, { sessionId, seen });
   }
 
   /** State frames are edge-triggered: a poll that finds nothing changed is silent on the wire. */
@@ -738,7 +756,7 @@ export class BotChatTurns {
       profile,
       omit_messages: omitMessages,
     });
-    return parseChatSnapshot(result, sessionId);
+    return parseChatSnapshot(result, sessionId, this.#identity);
   }
 
   #sleep(ms: number): Promise<void> {

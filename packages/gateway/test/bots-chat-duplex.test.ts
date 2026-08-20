@@ -7,6 +7,7 @@ import { openStorage, type Storage } from "../src/storage.ts";
 import { createApp } from "../src/http.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
+import { syntheticChatId } from "../src/hermes-bridge/chat-identity.ts";
 import { createHermesClient, type HermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
 import { CANONICAL_CHAT_TITLE } from "../src/hermes-bridge/canonical-chat.ts";
@@ -247,7 +248,12 @@ describe("GET /bots/:name/chat/messages", () => {
     expect(body.sessionId).toBe("canonical");
     expect(body.messages).toEqual([
       { id: "m1", role: "user", text: "morning", at: NOW },
-      { id: "canonical#1", role: "assistant", text: "morning yourself", at: null },
+      {
+        id: syntheticChatId("canonical", "assistant", "morning yourself", 0),
+        role: "assistant",
+        text: "morning yourself",
+        at: null,
+      },
     ]);
     expect(body.running).toBe(false);
     expect(body.inflight).toBe(false);
@@ -641,8 +647,8 @@ describe("what reaches the phone (review I6/I9)", () => {
       messages: Array<{ role: string; text: string }>;
     };
     expect(body.messages).toEqual([
-      { id: "canonical#3", role: "user", text: "what did you find", at: null },
-      { id: "canonical#4", role: "assistant", text: "done", at: null },
+      { id: syntheticChatId("canonical", "user", "what did you find", 0), role: "user", text: "what did you find", at: null },
+      { id: syntheticChatId("canonical", "assistant", "done", 0), role: "assistant", text: "done", at: null },
     ]);
   });
 
