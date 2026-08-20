@@ -359,9 +359,49 @@ PLIST
   ok "launchd: $label bootstrapped from $plist (RunAtLoad, KeepAlive on non-zero exit, log $log)"
 }
 
-# service_install_systemd LABEL WRAPPER LOG: Task 4 (the Linux service task) fills this in.
+# service_install_systemd UNIT WRAPPER LOG: write the unit file and (re)enable it.
+#
+# StandardOutput/StandardError=append:$log gives systemd the same job launchd's StandardOutPath/
+# StandardErrorPath does: the failure paths in phases 5 and 7 (`tail -30 "$DASH_LOG"` / "$GW_LOG")
+# read real content on Linux instead of an empty file, and journalctl --user -u UNIT still works on
+# top of it.
+#
+# Restart=on-failure + RestartSec=5 mirrors launchd's KeepAlive-on-nonzero-exit + 10s
+# ThrottleInterval closely enough: both come back after a crash, both leave a clean exit down.
 service_install_systemd() {
-  die "installing systemd --user units lands with the Linux service task; on this box, run the gateway with nohup (drop --service) for now"
+  local unit="$1" wrapper="$2" log="$3" dir="$HOME/.config/systemd/user" desc err
+  case "$unit" in
+    "$SERVICE_UNIT_GATEWAY")   desc="CozyGateway" ;;
+    "$SERVICE_UNIT_DASHBOARD") desc="CozyGateway Hermes dashboard" ;;
+    *) desc="$unit" ;;
+  esac
+  mkdir -p "$dir"
+  cat > "$dir/$unit" <<UNIT
+[Unit]
+Description=$desc
+
+[Service]
+ExecStart=/bin/bash $wrapper
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:$log
+StandardError=append:$log
+
+[Install]
+WantedBy=default.target
+UNIT
+  # A user unit needs a user D-Bus session, which some SSH setups never start (no login session, no
+  # lingering). Both calls below are the honest test for that: fail here, loudly, with the fix,
+  # rather than leaving a unit file on disk that nothing ever loads.
+  if ! err="$(systemctl --user daemon-reload 2>&1)"; then
+    die "systemctl --user daemon-reload failed: $err. This usually means no systemd --user D-Bus session is available (common over a plain SSH command, without a full login). Run: sudo loginctl enable-linger $USER, log in with a real session (or ssh -t), then re-run with --service."
+  fi
+  if ! err="$(systemctl --user enable --now "$unit" 2>&1)"; then
+    die "systemctl --user enable --now $unit failed: $err. This usually means no systemd --user D-Bus session is available. Run: sudo loginctl enable-linger $USER, log in with a real session (or ssh -t), then re-run with --service."
+  fi
+  loginctl enable-linger "$USER" 2>/dev/null || \
+    warn "could not enable lingering; the service stops at logout. Run: sudo loginctl enable-linger $USER"
+  ok "systemd --user: $unit enabled and started from $dir/$unit (log: $log, or journalctl --user -u $unit -f)"
 }
 
 # service_install_unit KIND WRAPPER LOG
@@ -521,7 +561,7 @@ uninstall_services() {
             systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
             ok "stopped and disabled $unit"
           fi
-          removed=1
+          removed=1; this_removed=1
         fi
         if [ -f "$unit_file" ]; then
           if dry; then
