@@ -58,7 +58,13 @@ import {
   redactHostPaths,
   type PhotoRateLimiter,
 } from "./photos.ts";
-import { RoutineNotFound, RoutineRefused, RoutineUnconfirmed, patchNeedsRewrite } from "./routines.ts";
+import {
+  LegacyRoutineNotRewritable,
+  RoutineNotFound,
+  RoutineRefused,
+  RoutineUnconfirmed,
+  patchNeedsRewrite,
+} from "./routines.ts";
 
 /** The `/bots` read path, vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Same
  *  device-token auth as every other route; nothing here speaks a Hermes method name, that all
@@ -163,6 +169,11 @@ function failure(c: Context<Env>, err: unknown) {
   // another bot or to an untagged cron job the operator owns. Not found, not forbidden: this API
   // does not confirm the existence of jobs outside the bot that was asked about.
   if (err instanceof RoutineNotFound) return c.json(errorBody("not_found", err.message), 404);
+  // A rewrite aimed at a LEGACY row. Not a 404 and not a backend failure: the routine is right
+  // there, the client can see it, and pause, resume and delete all work on it. What it cannot do is
+  // edit one, because the edit would recreate the job under the `[bot:]` tag with a new id, which is
+  // a conversion the user has to ask for. A 400 says which, and the message says how.
+  if (err instanceof LegacyRoutineNotRewritable) return c.json(errorBody("invalid_request", err.message), 400);
   // A create the backend accepted whose stored row could not be read back. A 502 rather than a 201,
   // because there is no routine to put in a 201 body: the alternative is echoing the request, and
   // the request is not what the backend stores. `createdId` rides along when the `add` reported one,

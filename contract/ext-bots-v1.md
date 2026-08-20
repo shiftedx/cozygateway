@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 12 }
+"capabilities": { "com.cozylabs.bots": 13 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -109,6 +109,23 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   gateway: a freshly opened bot chat is genuinely empty where it used to hold an exchange. That is
   the same empty payload a version 10 gateway already answered with while a chat was being created,
   so nothing breaks; the chat simply no longer fills itself in.
+- `12`: live tool activity for bot chats. The `bot_tool_activity` frame, a full-replace snapshot of
+  a turn's tool steps as they run, plus a `toolSteps` array on `GET /bots/:name/chat/messages`
+  carrying the same steps for turns that have already finished. A client that offers step-by-step
+  chips MUST require `>= 12`: a version 11 gateway sends neither, so a chip strip would sit
+  permanently empty. It adds no push, changes no existing field, and carries no tool arguments,
+  output or preview text of any kind.
+- `13`: LEGACY CRONJOBS become visible as routines. `GET /bots/:name/routines` and the
+  `bot_routines` frame also carry the UNTAGGED cron jobs in that bot's own store, each with
+  `BotRoutine.legacy: true`, and the row actions accept their ids. No route, frame or existing field
+  changed shape, and a tagged routine is byte-for-byte what it was.
+
+  A client below 13 keeps working and keeps ignoring an optional field, but against a 13 gateway it
+  will see rows it never saw before and will offer Edit on them, which answers 400. That is why this
+  is a version rather than a silent widening: a client that renders legacy rows MUST require
+  `>= 13`, MUST hide or disable Edit on a row carrying `legacy`, and offers the conversion as delete
+  then create. What the version does NOT promise is that any legacy job will be found; see the
+  ownership rule under `GET /bots/:name/routines`.
 
 ## 3. Resources
 
@@ -273,6 +290,7 @@ Read by `GET /bots/catalog`. It is the MENU, shared by every bot; a bot's own st
   enabled: boolean,                   // the row switch: on unless paused, disabled, or legacyUnsafe
   state?: string,                     // the backend's own word, e.g. "paused"
   legacyUnsafe: boolean,              // a pre-marker delegated routine; see the auto-pause below
+  legacy?: boolean,                   // an UNTAGGED cron job in this bot's own store; never false
   autoPaused?: boolean,               // this response is the one that paused it
   prompt?: string,                    // the backend's PREVIEW, truncated at 100 characters
   lastRun: integer | null,            // MILLISECONDS
@@ -283,14 +301,48 @@ Read by `GET /bots/catalog`. It is the MENU, shared by every bot; a bot's own st
 }
 ```
 
-A routine is an ordinary Hermes cron job whose NAME is `[bot:<name>] <title>`. That tag is the
-ENTIRE relationship between a bot and a routine: there is no bot field on a cron job and no per-bot
-cron API. Consequences a client should hold onto:
+A bot owns a cron job by one of two facts, and they are not equally strong.
 
-- the gateway filters every list and every write through that tag, so another bot's jobs and the
-  operator's own unrelated cron jobs are invisible on these routes, whatever id is sent;
+**The tag.** A routine either client CREATES is an ordinary Hermes cron job whose NAME is
+`[bot:<name>] <title>`. There is no bot field on a cron job and no per-bot cron API, so that tag is
+the whole relationship. Consequences a client should hold onto:
+
+- the gateway filters every list and every write through that tag, so another bot's jobs are
+  invisible on these routes, whatever id is sent;
 - the tag is written exactly as the Hermes desktop writes it, so routines created on a phone appear
   in the desktop's Routines pane and vice versa.
+
+**The store** (`legacy`, from version 13). Cron storage is per Hermes home, so an UNTAGGED job in a
+bot's own cron store is that bot's schedule: it was created before routines existed, it still fires,
+and hiding it made every routines client blind to it. Those rows carry `legacy: true`. What is
+different about them:
+
+- `title` is the job's RAW name, verbatim. Nothing is stripped and nothing is prettified, because
+  the operator named the job themselves and that name is how they recognize it everywhere else.
+  `schedule` (with `human` where the gateway can name the shape), `enabled`, `state`, `prompt`,
+  `lastRun`, `nextRun`, `lastStatus`, `repeat` and `continuity` are all read exactly as for a tagged
+  routine.
+- pause, resume and delete accept a legacy id. A schedule a user can see and cannot stop would be
+  worse than one they never saw.
+- a REWRITE does not: `PATCH` carrying anything but `enabled` answers 400. The rewrite would recreate
+  the job under the `[bot:]` tag with a new id, which is a conversion rather than an edit. A client
+  that wants the conversion does it in the open, by deleting the legacy job and creating a routine.
+- `legacy` is absent on every tagged routine, and is never `false`.
+
+The field is not `legacyUnsafe` and the two are independent. `legacy` says "untagged, and yours by
+the store"; `legacyUnsafe` says "a pre-marker delegated routine", which is a TAGGED shape only. A
+legacy row is never `legacyUnsafe` and is never auto-paused: see the auto-pause under
+`GET /bots/:name/routines`.
+
+**The ownership rule.** The gateway claims a bot's untagged jobs only out of a store the backend
+agrees is that bot's. Every cron call carries `profile`; a Hermes that honors it scopes the call to
+that bot's home, and one that does not answers with the launch profile's store instead. Where the
+backend names the store it read, an answer naming a DIFFERENT profile contributes no legacy rows at
+all. Where it names nothing, the requested scope is taken at its word, which is the only reading
+under which pre-routines jobs are reachable on a backend that does not echo. Two things hold under
+every backend: the tag filter is unconditional, so no answer ever hands one bot another bot's tagged
+routines; and a name beginning `[bot:` is somebody's tag claim even when the gateway refuses to parse
+it, so it is never claimed as a legacy job.
 
 `schedule.raw` is the backend's stored schedule string, which is a NORMALIZED echo rather than what
 was sent: an interval comes back in minutes (`every 2h` is stored and reported as `every 120m`), a
@@ -1420,9 +1472,10 @@ profile called `a]b` would write `[bot:a]b] Title`, which reads as bot `a`: it w
 and DELETE another's routines, and orphan its own on creation. Profiles this gateway creates cannot
 hold such a name; profiles created elsewhere can, so the routes check.
 
-Every routine in this bot's `[bot:<name>]` namespace, and nothing else. Read fresh on every call:
-the answer carries next-run times that go stale by the second, and the read has a side effect (see
-below) that a cache would skip. Two devices reading at once share one round trip.
+Every routine in this bot's `[bot:<name>]` namespace, plus the untagged jobs of its own cron store
+(`legacy: true`, from version 13), and nothing else. Read fresh on every call: the answer carries
+next-run times that go stale by the second, and the read has a side effect (see below) that a cache
+would skip. Two devices reading at once share one round trip.
 
 Full response example:
 
@@ -1454,11 +1507,28 @@ Full response example:
       "nextRun": null,
       "repeat": "3 times",
       "continuity": true
+    },
+    {
+      "id": "job_9c31de",
+      "title": "nightly backup",
+      "schedule": { "raw": "0 3 * * *" },
+      "enabled": true,
+      "state": "active",
+      "legacyUnsafe": false,
+      "legacy": true,
+      "prompt": "back up /srv to the NAS",
+      "lastRun": 1755392400000,
+      "nextRun": 1755478800000,
+      "repeat": "forever"
     }
   ],
   "updatedAt": 1755428400000
 }
 ```
+
+The third row is a legacy one: an untagged cron job in `scout`'s own store, titled by its raw name,
+carrying `legacy: true`. Its schedule, timestamps and switch read exactly like the two above it. It
+can be paused, resumed and deleted; it cannot be rewritten (see `PATCH` below).
 
 **The legacy auto-pause.** A routine is `legacyUnsafe` when it carries the `[bot:]` tag AND its
 prompt begins with `You are running the scheduled routine "`. That is the pre-marker delegation
@@ -1476,8 +1546,19 @@ Three properties of that behavior are load-bearing and a client should not work 
 - `legacyUnsafe` rows cannot be resumed through this API. Render them disabled with the desktop's
   own wording, *"Paused for security: delete and recreate this legacy cronjob before running it
   again."*, and offer delete only.
-- a routine this gateway creates is never legacy: its delegation prompt is prefixed with the marker
-  `[bot-mode:routine:v2] `, which is what keeps it out of the `startsWith` check.
+- a routine this gateway creates is never `legacyUnsafe`: its delegation prompt is prefixed with the
+  marker `[bot-mode:routine:v2] `, which is what keeps it out of the `startsWith` check.
+
+**How the auto-pause composes with legacy rows.** It does not reach them. The tag requirement in the
+`legacyUnsafe` rule above is load-bearing rather than incidental, and listing untagged jobs did not
+relax it: the danger in the pre-marker shape is that it interpolates a title synced from `ui_meta`
+into a shell command, so anything that can write a bot's LOOK can write a command line. An untagged
+job has no bot whose look could rewrite it, so it is not that shape however its prompt reads. A
+`legacy` row therefore comes back `legacyUnsafe: false`, is never paused by a read, and is offered
+with its switch live. This is the deliberate half of the trade: making a pre-routines schedule
+visible must not be the same act as silently switching it off, which is the opposite of why it is
+listed. An untagged job whose prompt happens to begin with the legacy sentence is still just an
+untagged job.
 
 ### POST /bots/:name/routines
 
@@ -1552,8 +1633,8 @@ another live schedule. List first.
 body { title?: string, schedule?: string, prompt?: string, enabled?: boolean,
        repeat?: integer, continuity?: boolean }
 200  { name: string, routine: BotRoutine, replacedId?: string, orphanedId?: string }
-400  invalid_request                  // no fields, a rewrite field without prompt, or a `name` that
-                                      // is not a legal profile id
+400  invalid_request                  // no fields, a rewrite field without prompt, a rewrite of a
+                                      // `legacy` routine, or a `name` that is not a legal profile id
 400  invalid_request + hermesError    // hermes ANSWERED the `add` with a refusal (`success: false`)
 404  not_found                        // no profile named `name`, or no routine `id` for this bot
 502  backend_unavailable + hermesError // hermes REJECTED the call, or ANSWERED a pause/resume/remove
@@ -1565,7 +1646,15 @@ body { title?: string, schedule?: string, prompt?: string, enabled?: boolean,
 Two very different operations, and the difference is the backend's rather than this API's invention:
 
 **`enabled` alone is the row switch.** `true` resumes, `false` pauses, and the routine keeps its
-`id`. This is the desktop's switch, and the pause/resume it performs is the same one.
+`id`. This is the desktop's switch, and the pause/resume it performs is the same one. It is the only
+patch a `legacy` routine takes.
+
+**A rewrite of a `legacy` routine is a 400, always.** Not a 404 and not a backend failure: the job is
+right there, it is listed, and pause, resume and delete all work on it. What the gateway will not do
+is recreate it under the `[bot:]` tag with a new id, which is what any rewrite would mean and which
+is a conversion rather than an edit. Convert one by DELETING it and creating a routine with the
+schedule and instruction you want; the new routine gets a new id and appears without `legacy`. The
+gateway never renames or rewrites a legacy job on its own.
 
 **Anything else is a REWRITE, and the routine's `id` CHANGES.** `repeat` and `continuity` are on
 that side of the line too: neither reaches the backend except on an `add`, so a patch naming one
@@ -1617,7 +1706,9 @@ Two rules follow from the backend and cannot be papered over:
 ```
 
 Not idempotent: a second delete answers 404, by the same rule `DELETE /bots/:name` follows. An id
-that names a job outside this bot's `[bot:]` namespace is a 404, never a delete.
+that names a job this bot does not own is a 404, never a delete: another bot's tagged routine, and
+any job in another store, are both refused here exactly as they are hidden from the list. A `legacy`
+routine deletes like any other, and delete-then-create is how a client converts one.
 
 ### Where a routine's runs land
 
@@ -2067,6 +2158,11 @@ and the gateway re-reads the bots it has reason to believe someone is watching: 
 whose routines pane has been open longer than that should re-read on foreground rather than assume
 the frames kept coming. Where a gateway sends no `cron.changed` at all, `POST /bots/focus` with
 `screen: "routines"` drives the same re-read on the desktop's own 20 s cadence.
+
+The frame carries the same rows the route does, `legacy` ones included, and `cron.changed`
+invalidation is untouched by them: it was already a whole-list, per-bot re-read that names no job, so
+an untagged job changing anywhere in a watched bot's store moves that bot's list exactly as a tagged
+one does.
 
 `bot_group` is a DELTA on the same terms as `bot_chat`: `messages` carries only the room entries the
 gateway has not broadcast before, in `seq` order, and one frame is sent per entry as the
