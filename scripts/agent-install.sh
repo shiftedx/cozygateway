@@ -50,6 +50,11 @@ GATEWAY_PORT="8787"
 BRIDGE_USER="cozybridge"
 BRIDGE_PASSWORD=""
 RUNTIME="auto"
+RUNTIME_EXPLICIT=""
+# The no-docker, no-clone path: a prebuilt single-file gateway (dist-bundle/cozygateway.mjs, built
+# by `pnpm bundle`) run straight by node. Empty means the bundle runtime was not asked for.
+BUNDLE_PATH=""
+COZY_NODE="${COZYGATEWAY_NODE:-node}"
 HIDDEN_PROFILES="default"
 GATEWAY_NAME="cozy-bots"
 SKIP_DASHBOARD=0
@@ -77,7 +82,11 @@ usage: bash scripts/agent-install.sh [flags]
   --password VALUE          dashboard password (default: generated, '$'-free)
   --hidden-profiles A,B     Hermes profiles kept off the bots roster (default: default)
   --gateway-name NAME       gateway display name (default: cozy-bots)
-  --runtime docker|node     force a runtime (default: auto, docker when present)
+  --runtime docker|node|bundle
+                            force a runtime (default: auto, docker when present)
+  --bundle PATH             run a prebuilt single-file gateway (dist-bundle/cozygateway.mjs) at
+                            PATH instead of cloning and building. Implies --runtime bundle; needs
+                            node 24+ (set COZYGATEWAY_NODE to name a different node) and no pnpm.
   --skip-dashboard          do not touch config.yaml and do not start `hermes dashboard`
   --no-start                configure everything, start nothing
   --pair-only               skip straight to minting a pairing code against a running gateway
@@ -105,7 +114,8 @@ while [ $# -gt 0 ]; do
     --password) need_value "$1" $#; BRIDGE_PASSWORD="$2"; shift ;;
     --hidden-profiles) need_value "$1" $#; HIDDEN_PROFILES="$2"; shift ;;
     --gateway-name) need_value "$1" $#; GATEWAY_NAME="$2"; shift ;;
-    --runtime) need_value "$1" $#; RUNTIME="$2"; shift ;;
+    --runtime) need_value "$1" $#; RUNTIME="$2"; RUNTIME_EXPLICIT="$2"; shift ;;
+    --bundle) need_value "$1" $#; BUNDLE_PATH="$2"; shift ;;
     --skip-dashboard) SKIP_DASHBOARD=1 ;;
     --no-start) NO_START=1 ;;
     --pair-only) PAIR_ONLY=1 ;;
@@ -114,6 +124,20 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# --bundle IS the runtime choice, so it forces RUNTIME=bundle. Saying both and disagreeing is a
+# typo worth stopping for, not something to silently resolve one way or the other.
+if [ -n "$BUNDLE_PATH" ]; then
+  if [ -n "$RUNTIME_EXPLICIT" ] && [ "$RUNTIME_EXPLICIT" != "bundle" ]; then
+    printf 'FAIL  --bundle implies --runtime bundle, but --runtime %s was also given\n' \
+      "$RUNTIME_EXPLICIT" >&2
+    exit 2
+  fi
+  RUNTIME="bundle"
+elif [ "$RUNTIME" = "bundle" ]; then
+  printf 'FAIL  --runtime bundle needs --bundle PATH naming the prebuilt cozygateway.mjs\n' >&2
+  exit 2
+fi
 
 for pair in "--gateway-port:$GATEWAY_PORT" "--dashboard-port:$DASHBOARD_PORT"; do
   flag="${pair%%:*}"; value="${pair#*:}"
@@ -187,6 +211,11 @@ write_install_env() {
     printf 'COZY_DASHBOARD_HOST=%q\n' "$DASHBOARD_HOST"
     printf 'COZY_BRIDGE_USER=%q\n' "$BRIDGE_USER"
     printf 'COZY_RUNTIME=%q\n' "$RUNTIME"
+    # Always recorded, empty included: a later step that reads an unset variable under `set -u`
+    # dies with bash's own message instead of the empty string that honestly means "not the
+    # bundle path". Task 3's service unit execs exactly "$COZY_NODE" "$COZY_BUNDLE_PATH".
+    printf 'COZY_BUNDLE_PATH=%q\n' "$BUNDLE_PATH"
+    printf 'COZY_NODE=%q\n' "$COZY_NODE"
     printf 'COZY_HERMES_PY=%q\n' "$HERMES_PY"
     printf 'COZY_HERMES_HOME=%q\n' "$HERMES_HOME_DIR"
     printf 'COZY_GW_LOG=%q\n' "$GW_LOG"
@@ -194,6 +223,7 @@ write_install_env() {
     printf 'export COZY_GATEWAY_DIR COZY_LOCAL_DIR COZY_CONFIG_JSON COZY_ENV_FILE COZY_CRED_FILE\n'
     printf 'export COZY_GATEWAY_PORT COZY_DASHBOARD_PORT COZY_DASHBOARD_HOST COZY_BRIDGE_USER\n'
     printf 'export COZY_RUNTIME COZY_HERMES_PY COZY_HERMES_HOME COZY_GW_LOG COZY_DASH_LOG\n'
+    printf 'export COZY_BUNDLE_PATH COZY_NODE\n'
   } > "$INSTALL_ENV"
   chmod 600 "$INSTALL_ENV"
   ok "recorded the install's ports, hosts and paths in $INSTALL_ENV (mode 600); the playbook sources this"
@@ -216,6 +246,8 @@ mint_pair_raw() {
   if [ "$RUNTIME" = "docker" ]; then
     ( cd "$GATEWAY_DIR" && docker compose -f docker-compose.yml -f "$OVERRIDE_REL" \
       exec -T gateway node dist/cli.js pair --config /app/cozygateway.config.json )
+  elif [ "$RUNTIME" = "bundle" ]; then
+    "$COZY_NODE" "$BUNDLE_PATH" pair --config "$CONFIG_JSON"
   else
     ( cd "$GATEWAY_DIR" && node packages/gateway/dist/cli.js pair --config "$CONFIG_JSON" )
   fi
@@ -375,7 +407,21 @@ case "$RUNTIME" in
     have pnpm || die "pnpm is required for the node path (npm i -g pnpm@10)"
     ok "runtime: node $(node -v) with $(pnpm --version)"
     ;;
-  *) die "--runtime must be 'docker' or 'node', got '$RUNTIME'" ;;
+  bundle)
+    # Nothing is cloned and nothing is built on this path, so git/pnpm/docker are all beside the
+    # point. The two things that have to be true are the file and the interpreter, and the version
+    # check runs against $COZY_NODE (which COZYGATEWAY_NODE names) rather than whatever `node` on
+    # PATH happens to be: a box whose PATH node is 22 can still run the bundle under a 24+ binary.
+    [ -f "$BUNDLE_PATH" ] || die "--bundle $BUNDLE_PATH does not exist. Build it with 'pnpm bundle' in a cozygateway checkout and copy dist-bundle/cozygateway.mjs here."
+    { [ -x "$COZY_NODE" ] || have "$COZY_NODE"; } || die "node binary '$COZY_NODE' not found (set COZYGATEWAY_NODE to an absolute path to node 24+)"
+    BUNDLE_NODE_MAJOR="$("$COZY_NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+    case "${BUNDLE_NODE_MAJOR:-}" in
+      ''|*[!0-9]*) die "could not read a version out of '$COZY_NODE -p process.versions.node'" ;;
+    esac
+    [ "$BUNDLE_NODE_MAJOR" -ge 24 ] || die "$COZY_NODE is node $BUNDLE_NODE_MAJOR; the gateway requires node 24 or newer. Set COZYGATEWAY_NODE to a node 24+ binary and re-run."
+    ok "runtime: bundle $BUNDLE_PATH under $COZY_NODE ($("$COZY_NODE" -v)); no clone, no pnpm"
+    ;;
+  *) die "--runtime must be 'docker', 'node' or 'bundle', got '$RUNTIME'" ;;
 esac
 
 # ws host the CONTAINER (or process) uses to reach the dashboard on this machine.
@@ -390,7 +436,7 @@ info "bridge will dial ws://$HERMES_WS_HOST:$DASHBOARD_PORT/api/ws"
 # 0.0.0.0 publishes the human's whole Hermes dashboard (config, API keys, sessions) to the LAN over
 # plaintext HTTP behind basic auth. So loopback is the default and anything wider is opt-in.
 #
-# The node path never needs more than loopback: the bridge is a local process.
+# The node and bundle paths never need more than loopback: the bridge is a local process.
 # The docker path needs an address the CONTAINER can dial. On Linux that is the docker bridge
 # gateway (usually 172.17.0.1), which the host really does own and the LAN cannot reach. On Docker
 # Desktop that address lives inside the VM, not on the host, so there is nothing narrower than
@@ -421,9 +467,9 @@ elif [ -n "$DASHBOARD_HOST" ]; then
   case "$DASHBOARD_HOST" in
     0.0.0.0|::) warn "--dashboard-host $DASHBOARD_HOST publishes the dashboard to the whole LAN over plaintext HTTP." ;;
   esac
-elif [ "$RUNTIME" = "node" ]; then
+elif [ "$RUNTIME" = "node" ] || [ "$RUNTIME" = "bundle" ]; then
   DASHBOARD_HOST="127.0.0.1"
-  ok "dashboard bind: 127.0.0.1 (loopback; the node bridge is a local process and needs nothing wider)"
+  ok "dashboard bind: 127.0.0.1 (loopback; the $RUNTIME bridge is a local process and needs nothing wider)"
 else
   BRIDGE_ADDR="$(docker_bridge_addr || true)"
   if [ -n "${BRIDGE_ADDR:-}" ] && host_owns_addr "$BRIDGE_ADDR"; then
@@ -447,7 +493,12 @@ fi
 
 step "2/8 get the gateway source"
 
-if [ -d "$GATEWAY_DIR/.git" ]; then
+if [ "$RUNTIME" = "bundle" ]; then
+  # There is no source to get: the bundle IS the gateway. $GATEWAY_DIR degrades from "a checkout"
+  # to "the directory the install's state lives in", which is all the later phases ever ask of it.
+  info "--bundle: no clone and no build; $GATEWAY_DIR only holds this install's state"
+  run mkdir -p "$GATEWAY_DIR"
+elif [ -d "$GATEWAY_DIR/.git" ]; then
   ok "repo already at $GATEWAY_DIR"
   run git -C "$GATEWAY_DIR" fetch --quiet origin || warn "git fetch failed; using the checkout as-is"
 else
@@ -457,8 +508,12 @@ fi
 
 run mkdir -p "$LOCAL_DIR"
 # A self-ignoring generated directory: no root .gitignore edit needed, and nothing generated here
-# can ever be committed by accident.
-if dry; then
+# can ever be committed by accident. Under --bundle $GATEWAY_DIR is normally not a checkout at all,
+# and a .gitignore in a directory git has never heard of is just litter, so it is written only when
+# there is a git checkout to ignore things from.
+if [ "$RUNTIME" = "bundle" ] && [ ! -d "$GATEWAY_DIR/.git" ]; then
+  info "generated artifacts directory: $LOCAL_DIR (no .gitignore: $GATEWAY_DIR is not a git checkout)"
+elif dry; then
   printf 'DRY   write %s/.gitignore so nothing generated here can be committed\n' "$LOCAL_DIR"
 else
   [ -f "$LOCAL_DIR/.gitignore" ] || printf '*\n!.gitignore\n' > "$LOCAL_DIR/.gitignore"
@@ -1046,6 +1101,9 @@ elif dry; then
   if [ "$RUNTIME" = "docker" ]; then
     printf 'DRY   (cd %s && docker compose -f docker-compose.yml -f %s up -d --build gateway)\n' \
       "$GATEWAY_DIR" "$OVERRIDE_REL"
+  elif [ "$RUNTIME" = "bundle" ]; then
+    printf 'DRY   %s %s serve --config %s   (no pnpm install, no build)\n' \
+      "$COZY_NODE" "$BUNDLE_PATH" "$CONFIG_JSON"
   else
     printf 'DRY   (cd %s && pnpm install && pnpm build && node packages/gateway/dist/cli.js serve --config %s)\n' \
       "$GATEWAY_DIR" "$CONFIG_JSON"
@@ -1054,6 +1112,10 @@ elif [ "$RUNTIME" = "docker" ]; then
   [ -f "$GATEWAY_DIR/$OVERRIDE_REL" ] || die "missing $OVERRIDE_REL in the checkout; pull a newer main"
   ( cd "$GATEWAY_DIR" && docker compose -f docker-compose.yml -f "$OVERRIDE_REL" up -d --build gateway )
   ok "compose brought up the gateway service"
+elif [ "$RUNTIME" = "bundle" ]; then
+  ( COZYGATEWAY_HERMES_PASSWORD="$BRIDGE_PASSWORD" nohup "$COZY_NODE" \
+      "$BUNDLE_PATH" serve --config "$CONFIG_JSON" >"$GW_LOG" 2>&1 & )
+  ok "started the gateway from the bundle (log: $GW_LOG)"
 else
   ( cd "$GATEWAY_DIR" && pnpm install --frozen-lockfile && pnpm build )
   ( cd "$GATEWAY_DIR" && COZYGATEWAY_HERMES_PASSWORD="$BRIDGE_PASSWORD" nohup node \
