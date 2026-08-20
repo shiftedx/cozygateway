@@ -166,6 +166,18 @@ for pair in "--gateway-port:$GATEWAY_PORT" "--dashboard-port:$DASHBOARD_PORT"; d
     printf 'FAIL  %s must be 1-65535, got %s\n' "$flag" "$value" >&2; exit 2; }
 done
 
+# Does THIS install start the dashboard, or does it only point at somebody else's?
+#
+# The distinction has teeth at uninstall time. --skip-dashboard means the operator owns the
+# dashboard and merely told us its port; --no-start and --pair-only start nothing at all. In every
+# one of those cases the dashboard on $DASHBOARD_PORT is a stranger's, and anything this script does
+# to it is vandalism. The answer is knowable here, from the flags alone, so it is recorded in
+# install-env.sh rather than re-guessed later from a port that cannot tell you who owns it.
+DASHBOARD_OWNED=1
+if [ "$SKIP_DASHBOARD" = "1" ] || [ "$NO_START" = "1" ] || [ "$PAIR_ONLY" = "1" ]; then
+  DASHBOARD_OWNED=0
+fi
+
 LOCAL_DIR="$GATEWAY_DIR/local"
 CONFIG_JSON="$LOCAL_DIR/cozygateway.config.json"
 ENV_FILE="$GATEWAY_DIR/.env"
@@ -197,6 +209,11 @@ run() {
 dry() { [ "$DRY_RUN" = "1" ]; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# port_listening PORT: is anything holding a listening socket on it. The honest question when the
+# question is "can a unit bind this", which HTTP health cannot answer: a socket in the wrong state,
+# or a process wedged after its HTTP stack died, still keeps the next bind out.
+port_listening() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------------------- supervision
 #
@@ -400,15 +417,65 @@ service_stop_unit() {
   esac
 }
 
+# adopt_unsupervised_gateway: free $GATEWAY_PORT so the unit can actually have it.
+#
+# The same defect the dashboard had, in the gateway's clothes, and quieter. An earlier non-service
+# run leaves a nohup'd gateway holding the port. Install a unit on top and the unit crash-loops on
+# EADDRINUSE forever, while `GET /health` answers 200 from the UNSUPERVISED process the whole time:
+# the 90s poll passes, the capability check passes, the roster check passes, the run ends green, and
+# nothing is supervised. Every symptom says success.
+#
+# Called only after `service_stop_unit gateway`, so anything still on the port is by definition not
+# ours. It is still a cozygateway serving this install's config and database, so stopping it is
+# adoption, not a coin flip -- but it is a kill by pid, so it says so at the top of its voice first.
+adopt_unsupervised_gateway() {
+  local pids pid waited=0
+  port_listening "$GATEWAY_PORT" || return 0
+  if dry; then
+    printf 'DRY   stop whatever still holds port %s after the unit is unloaded, so the unit can bind it\n' "$GATEWAY_PORT"
+    return 0
+  fi
+  pids="$(lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  [ -n "$pids" ] || return 0
+  warn "port $GATEWAY_PORT is still held after the $SERVICE_PLATFORM unit was unloaded, so an UNSUPERVISED gateway is running (a nohup start from an earlier run). Left alone, the unit would crash-loop on EADDRINUSE while /health answered 200 from that process, and this run would end green with nothing supervised. Stopping it so the unit can own the port."
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    info "  stopping pid $pid ($(ps -p "$pid" -o command= 2>/dev/null | cut -c1-90 || true))"
+    kill "$pid" 2>/dev/null || true
+  done <<EOF
+$pids
+EOF
+  while [ "$waited" -lt 20 ]; do
+    port_listening "$GATEWAY_PORT" || { ok "the unsupervised gateway is stopped and port $GATEWAY_PORT is free"; return 0; }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warn "the unsupervised gateway ignored SIGTERM for 20s; sending SIGKILL"
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    kill -9 "$pid" 2>/dev/null || true
+  done <<EOF
+$pids
+EOF
+  waited=0
+  while [ "$waited" -lt 10 ]; do
+    port_listening "$GATEWAY_PORT" || { ok "port $GATEWAY_PORT is free"; return 0; }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  die "port $GATEWAY_PORT is still held by something that will not stop. Free it by hand (\`lsof -nP -iTCP:$GATEWAY_PORT -sTCP:LISTEN\`) and re-run, or pass --gateway-port."
+}
+
 # uninstall_services: stop and remove both units, say what actually went, and never fail because
 # something was already absent. It deliberately touches nothing else: the config, the credentials,
 # the database and the wrapper scripts all survive, so re-running with --service is a one-liner.
 uninstall_services() {
-  local removed=0 label plist unit unit_file uid
+  local removed=0 dash_removed=0 this_removed=0 label plist unit unit_file uid
   case "$SERVICE_PLATFORM" in
     launchd)
       uid="$(id -u)"
       for label in "$SERVICE_LABEL_GATEWAY" "$SERVICE_LABEL_DASHBOARD"; do
+        this_removed=0
         plist="$HOME/Library/LaunchAgents/$label.plist"
         if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
           if dry; then
@@ -425,7 +492,7 @@ uninstall_services() {
             done
             ok "booted out $label"
           fi
-          removed=1
+          removed=1; this_removed=1
         fi
         if [ -f "$plist" ]; then
           if dry; then
@@ -434,12 +501,16 @@ uninstall_services() {
             rm -f "$plist"
             ok "removed $plist"
           fi
-          removed=1
+          removed=1; this_removed=1
+        fi
+        if [ "$label" = "$SERVICE_LABEL_DASHBOARD" ] && [ "$this_removed" = "1" ]; then
+          dash_removed=1
         fi
       done
       ;;
     systemd)
       for unit in "$SERVICE_UNIT_GATEWAY" "$SERVICE_UNIT_DASHBOARD"; do
+        this_removed=0
         unit_file="$HOME/.config/systemd/user/$unit"
         # `systemctl --user cat` succeeds only for a unit systemd can actually see, which is the
         # honest test for "is there something here to stop", file on disk or not.
@@ -459,7 +530,10 @@ uninstall_services() {
             rm -f "$unit_file"
             ok "removed $unit_file"
           fi
-          removed=1
+          removed=1; this_removed=1
+        fi
+        if [ "$unit" = "$SERVICE_UNIT_DASHBOARD" ] && [ "$this_removed" = "1" ]; then
+          dash_removed=1
         fi
       done
       if [ "$removed" = "1" ] && ! dry && have systemctl; then
@@ -471,7 +545,11 @@ uninstall_services() {
   if [ "$removed" = "0" ]; then
     info "nothing to remove: no cozygateway service units were installed for this user"
   fi
-  stop_detached_dashboard
+  # Only after a dashboard unit was ACTUALLY removed. An uninstall that removed nothing has no
+  # business stopping anything, and the "nothing to remove" path used to reach the sweep too.
+  if [ "$dash_removed" = "1" ]; then
+    stop_detached_dashboard
+  fi
 }
 
 # stop_detached_dashboard: the half of the dashboard the unit does not own.
@@ -481,17 +559,33 @@ uninstall_services() {
 # answer from something called --uninstall-service, and it is the port the next --service run needs.
 # Observed live: after a clean uninstall, lsof still showed two listeners on the dashboard port.
 #
-# Narrow on purpose. It asks THIS install's install-env.sh which port and Hermes home it used, and
-# does nothing at all unless something is still listening on that exact port. Without that, a bare
-# `hermes dashboard --stop` here would reach across and stop a dashboard this install never started.
+# Narrow on purpose, and narrowed further after review pointed out that a listening port names
+# nothing. Three conditions, all required:
+#
+#   1. A dashboard UNIT was actually removed by the call above (the caller checks this).
+#   2. install-env.sh says COZY_DASHBOARD_OWNED=1, i.e. this install STARTS the dashboard. A
+#      --skip-dashboard install records the operator's port without owning what listens on it, and
+#      --no-start / --pair-only start nothing; in all three cases the process on that port belongs
+#      to somebody else and stopping it is vandalism.
+#   3. Something is still listening on that exact port after the unit is gone.
+#
+# Older install-env.sh files predate the ownership key. A missing key reads as NOT owned, so the
+# sweep declines rather than guessing: the cost of declining is a stray listener the operator can
+# see and stop, and the cost of guessing wrong is killing a dashboard we never started.
 stop_detached_dashboard() {
-  local dash_port hermes_home waited=0
+  local dash_port hermes_home owned waited=0
   [ -f "$INSTALL_ENV" ] || return 0
   # Read in a SUBSHELL: install-env.sh exports COZY_* names this script also uses.
   # shellcheck source=/dev/null
   dash_port="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_DASHBOARD_PORT:-}" )"
   # shellcheck source=/dev/null
   hermes_home="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_HERMES_HOME:-}" )"
+  # shellcheck source=/dev/null
+  owned="$( . "$INSTALL_ENV" >/dev/null 2>&1 && printf '%s' "${COZY_DASHBOARD_OWNED:-0}" )"
+  if [ "${owned:-0}" != "1" ]; then
+    info "not touching whatever listens on the dashboard port: this install does not own it (--skip-dashboard, --no-start or an install-env.sh written before ownership was recorded)"
+    return 0
+  fi
   case "${dash_port:-}" in ''|*[!0-9]*) return 0 ;; esac
   lsof -nP -iTCP:"$dash_port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
   if dry; then
@@ -555,6 +649,9 @@ write_install_env() {
     printf 'COZY_GATEWAY_PORT=%q\n' "$GATEWAY_PORT"
     printf 'COZY_DASHBOARD_PORT=%q\n' "$DASHBOARD_PORT"
     printf 'COZY_DASHBOARD_HOST=%q\n' "$DASHBOARD_HOST"
+    # 1 only when this install actually starts the dashboard on that port. --uninstall-service
+    # refuses to touch the port otherwise.
+    printf 'COZY_DASHBOARD_OWNED=%q\n' "$DASHBOARD_OWNED"
     printf 'COZY_BRIDGE_USER=%q\n' "$BRIDGE_USER"
     printf 'COZY_RUNTIME=%q\n' "$RUNTIME"
     # Always recorded, empty included: a later step that reads an unset variable under `set -u`
@@ -568,6 +665,7 @@ write_install_env() {
     printf 'COZY_DASH_LOG=%q\n' "$DASH_LOG"
     printf 'export COZY_GATEWAY_DIR COZY_LOCAL_DIR COZY_CONFIG_JSON COZY_ENV_FILE COZY_CRED_FILE\n'
     printf 'export COZY_GATEWAY_PORT COZY_DASHBOARD_PORT COZY_DASHBOARD_HOST COZY_BRIDGE_USER\n'
+    printf 'export COZY_DASHBOARD_OWNED\n'
     printf 'export COZY_RUNTIME COZY_HERMES_PY COZY_HERMES_HOME COZY_GW_LOG COZY_DASH_LOG\n'
     printf 'export COZY_BUNDLE_PATH COZY_NODE\n'
   } > "$INSTALL_ENV"
@@ -1447,20 +1545,26 @@ elif [ "$SERVICE" = "1" ]; then
   service_stop_unit dashboard
   if dashboard_answering; then
     if dashboard_credential_works; then
-      info "a dashboard is already answering on 127.0.0.1:$DASHBOARD_PORT and its credential works, but nothing supervises it. Stopping it so the $SERVICE_PLATFORM unit can own it."
+      info "a dashboard is already answering on 127.0.0.1:$DASHBOARD_PORT and its credential works. Nothing supervises it now (any unit of ours was just unloaded), so it is stopped and restarted under the $SERVICE_PLATFORM unit rather than left holding the port."
     else
       warn "a dashboard is already running with the PREVIOUS config; the credential merged in step 4 has not loaded. Stopping it so the $SERVICE_PLATFORM unit can own it."
     fi
-    if hermes dashboard --stop >>"$DASH_LOG" 2>&1; then
+    if HERMES_HOME="$HERMES_HOME_DIR" hermes dashboard --stop >>"$DASH_LOG" 2>&1; then
       info "hermes dashboard --stop returned; waiting for the port to free"
     else
       warn "hermes dashboard --stop failed; see $DASH_LOG"
     fi
+    # Wait for the SOCKET, not just for HTTP. start_dashboard's first act is an lsof LISTEN check
+    # that dies with "port taken by something that is not a healthy dashboard", so a process whose
+    # HTTP stack has died while it still holds the socket would sail past a health-only wait and
+    # then abort the run with a message describing the wrong problem.
     for i in $(seq 1 30); do
-      dashboard_answering || break
+      dashboard_answering || port_listening "$DASHBOARD_PORT" || break
       sleep 1
     done
-    dashboard_answering && die "a dashboard is still answering on 127.0.0.1:$DASHBOARD_PORT after --stop, so the unit cannot take the port. Stop it by hand (\`hermes dashboard --status\` names the processes) and re-run."
+    if dashboard_answering || port_listening "$DASHBOARD_PORT"; then
+      die "port $DASHBOARD_PORT is still held after \`hermes dashboard --stop\`, so the unit cannot take it. Stop it by hand (\`hermes dashboard --status\` names the processes, \`lsof -nP -iTCP:$DASHBOARD_PORT -sTCP:LISTEN\` names the socket) and re-run."
+    fi
     ok "the unsupervised dashboard is stopped and the port is free"
   fi
   start_dashboard
@@ -1639,6 +1743,8 @@ elif dry; then
     if [ "$RUNTIME" = "node" ]; then
       printf 'DRY   (cd %s && pnpm install && pnpm build)\n' "$GATEWAY_DIR"
     fi
+    service_stop_unit gateway
+    adopt_unsupervised_gateway
     service_write_gateway_wrapper
     service_install_unit gateway "$LOCAL_DIR/run-gateway.sh" "$GW_LOG"
   elif [ "$RUNTIME" = "docker" ]; then
@@ -1653,10 +1759,14 @@ elif dry; then
   fi
 elif [ "$SERVICE" = "1" ]; then
   # Supervised start, bundle or node. The health poll, the capability check and the roster probe
-  # below are untouched: they ask the running gateway the same questions either way.
+  # below are untouched: they ask the running gateway the same questions either way -- which is
+  # exactly why the port has to be OURS before they run. A green poll answered by an unsupervised
+  # process is indistinguishable from a green poll answered by the unit.
   if [ "$RUNTIME" = "node" ]; then
     ( cd "$GATEWAY_DIR" && pnpm install --frozen-lockfile && pnpm build )
   fi
+  service_stop_unit gateway
+  adopt_unsupervised_gateway
   service_write_gateway_wrapper
   service_install_unit gateway "$LOCAL_DIR/run-gateway.sh" "$GW_LOG"
   ok "the gateway is supervised by $SERVICE_PLATFORM as $(service_unit_name gateway) (log: $GW_LOG)"
