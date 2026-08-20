@@ -36,6 +36,9 @@ function truncateAtCodePointBoundary(text: string, maxUnits: number): string {
 export interface RelayNotifierDeps {
   storage: Storage;
   fetchImpl?: typeof fetch;
+  /** Optional process-wide relay target. When configured, notification delivery and the device
+   *  registration proxy use the same private relay origin. */
+  relayBaseUrl?: string;
   log?: (message: string) => void;
   /** Live per-device presence check (see `WsHub.isDeviceConnected`). Optional: when omitted,
    *  `#send` skips the late recheck and relies solely on the `connectedDeviceIds` snapshot
@@ -51,12 +54,14 @@ export interface RelayNotifierDeps {
 export class RelayNotifier implements Notifier {
   readonly #storage: Storage;
   readonly #fetch: typeof fetch;
+  readonly #relayBaseUrl: string | undefined;
   readonly #log: (message: string) => void;
   readonly #isDeviceConnected: ((deviceId: string) => boolean) | undefined;
 
   constructor(deps: RelayNotifierDeps) {
     this.#storage = deps.storage;
     this.#fetch = deps.fetchImpl ?? fetch;
+    this.#relayBaseUrl = deps.relayBaseUrl;
     this.#log = deps.log ?? ((message: string) => process.stderr.write(`${message}\n`));
     this.#isDeviceConnected = deps.isDeviceConnected;
   }
@@ -150,7 +155,8 @@ export class RelayNotifier implements Notifier {
     // registration row, which is prunable only on a relay 404, not on this kind of skip.
     if (this.#isDeviceConnected?.(registration.deviceId) === true) return;
     const ciphertext = encryptPushPayload(registration.pushKey, payload);
-    const url = `${registration.relayUrl.replace(/\/+$/, "")}/notify`;
+    const relayBaseUrl = this.#relayBaseUrl ?? registration.relayUrl;
+    const url = `${relayBaseUrl.replace(/\/+$/, "")}/notify`;
     const res = await this.#fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },

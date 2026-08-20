@@ -30,6 +30,8 @@ import { HermesBridge } from "./hermes-bridge/bridge.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 
 export const GATEWAY_VERSION = "0.1.0";
+export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
+export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
 export interface RunningGateway {
   url: string;
@@ -60,6 +62,23 @@ export interface StartGatewayOptions {
   approvalLog?: (message: string) => void;
 }
 
+/** One shared immutable GatewayInfo for health, pairing, and the ready frame. */
+export function gatewayInfoForConfig(config: GatewayConfig): GatewayInfo {
+  return {
+    name: config.name,
+    version: GATEWAY_VERSION,
+    contract: "v1",
+    capabilities: {
+      ...(config.capabilities ?? {}),
+      [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
+      ...(config.hermes === undefined ? {} : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION }),
+      ...(config.pushRelayUrl === undefined
+        ? {}
+        : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),
+    },
+  };
+}
+
 export async function startGateway(
   config: GatewayConfig,
   options: StartGatewayOptions = {},
@@ -78,26 +97,10 @@ export async function startGateway(
   // /health, the pair response, and the ready frame (contract v1.md section 5). Absence is a
   // valid wire shape too (older gateways), but this implementation always advertises the field.
   //
-  // The bots bridge advertises itself the sanctioned way: a vendor capability id, versioned
-  // independently of the frozen contract literal. The wire value is the integer version the
-  // capabilities map is typed for (contract/v1.md section 5); the design's "{ v: 1 }" shorthand
-  // means exactly this version 1. Only advertised when a hermes bridge is actually configured.
+  // Built-in optional surfaces advertise vendor capability ids only when their backing config is
+  // present. Each integer version advances independently of the frozen contract literal.
   const hermesOptions = config.hermes === undefined ? undefined : parseHermesOptions(config.hermes, process.env);
-  const gatewayInfo: GatewayInfo = {
-    name: config.name,
-    version: GATEWAY_VERSION,
-    contract: "v1",
-    capabilities: {
-      ...(config.capabilities ?? {}),
-      // The approval surface (contract v1.md section 5a) is a CORE capability, not a vendor one,
-      // and this gateway always registers the approve/deny routes and can always fan out the
-      // frames, so it is advertised unconditionally. It says "this gateway speaks approvals", not
-      // "some backend here will raise one"; whether a given agent ever raises an approval is a
-      // property of that backend, which the wire has no way to promise in advance.
-      [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
-      ...(hermesOptions === undefined ? {} : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION }),
-    },
-  };
+  const gatewayInfo = gatewayInfoForConfig(config);
   const hub = new WsHub({ storage, gatewayInfo, now: () => Date.now() });
 
   // Dial-out JSON-RPC client to the Hermes gateway plus the cache/refresh/focus machinery on top
@@ -234,6 +237,7 @@ export async function startGateway(
   );
   const notifier = new RelayNotifier({
     storage,
+    ...(config.pushRelayUrl === undefined ? {} : { relayBaseUrl: config.pushRelayUrl }),
     log: options.notifierLog,
     isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
   });
