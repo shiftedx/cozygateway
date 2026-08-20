@@ -10,6 +10,7 @@ import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
 import {
   LEGACY_DELEGATED_ROUTINE_PREFIX,
   SAFE_ROUTINE_MARKER,
+  isUntaggedCronJob,
   mapRoutine,
   routineBot,
   routineJobName,
@@ -18,6 +19,7 @@ import {
   routineTitle,
   scheduleHuman,
   selectRoutineJobs,
+  selectRoutineRows,
   shellQuote,
 } from "../src/hermes-bridge/routines.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
@@ -69,6 +71,11 @@ const profilesListResult = {
 interface FakeJob {
   id: string;
   name: string;
+  /** Which profile's cron store holds this job. Cron storage is per Hermes home, so this is the
+   *  fact that decides whether an UNTAGGED job is a bot's legacy routine. It is only consulted when
+   *  the fake is put in `scoped` mode, which is what a hermes that honors the `profile` param does;
+   *  unscoped, every call sees one shared store, which is what an older one does. */
+  store?: string;
   /** What the backend STORES, which is the normalized display string. */
   schedule: string;
   prompt: string;
@@ -117,6 +124,12 @@ interface CronFake {
   /** An `add` that reports success and an id for a job the store does not hold. Implies
    *  `omitAddJob`: it is the read-back, not the reply, that catches this one. */
   phantomAdd: boolean;
+  /** A hermes that HONORS `profile`: every action sees only that profile's own cron store, and the
+   *  list says which store it read (`scoped`). Off by default, which is the older build that ignores
+   *  the param and hands over one shared store. */
+  scoped: boolean;
+  /** The store a job with no `store` of its own lives in, once `scoped` is on. */
+  defaultStore: string;
   methods: Record<string, (params: Record<string, unknown>) => unknown>;
 }
 
@@ -130,6 +143,8 @@ function cronFake(initial: FakeJob[] = []): CronFake {
     failAdd: false,
     omitAddJob: false,
     phantomAdd: false,
+    scoped: false,
+    defaultStore: "default",
   };
   let seq = 0;
 
@@ -151,7 +166,18 @@ function cronFake(initial: FakeJob[] = []): CronFake {
     ...(job.continuity === true ? { continuity: true } : {}),
   });
 
-  const find = (id: unknown): FakeJob | undefined => fake.jobs?.find((job) => job.id === id);
+  /** The jobs one call can see. Unscoped that is the whole store, which is the older build's answer
+   *  to every profile alike; scoped it is one profile's home and nothing else, which is what makes a
+   *  job in ANOTHER store unreachable rather than merely unlisted. */
+  const visible = (params: Record<string, unknown>): FakeJob[] => {
+    const jobs = fake.jobs ?? [];
+    if (fake.scoped !== true) return jobs;
+    const profile = String(params["profile"] ?? "");
+    return jobs.filter((job) => (job.store ?? fake.defaultStore) === profile);
+  };
+
+  const find = (id: unknown, params: Record<string, unknown>): FakeJob | undefined =>
+    visible(params).find((job) => job.id === id);
   const notFound = (id: unknown): Record<string, unknown> => ({
     success: false,
     error: `Job with ID or name '${String(id)}' not found. Use cronjob(action='list') to inspect jobs.`,
@@ -163,7 +189,14 @@ function cronFake(initial: FakeJob[] = []): CronFake {
       fake.calls?.push({ action, params });
       if (action === "list") {
         if (fake.failList === true) return { success: false, error: "unknown profile scope" };
-        return { success: true, count: fake.jobs?.length ?? 0, jobs: (fake.jobs ?? []).map(format) };
+        const jobs = visible(params);
+        return {
+          success: true,
+          count: jobs.length,
+          jobs: jobs.map(format),
+          // 0.20.4 says which store it read; older builds say nothing at all.
+          ...(fake.scoped === true ? { scoped: String(params["profile"] ?? "") } : {}),
+        };
       }
       if (action === "add") {
         if (fake.failAdd === true) return { success: false, error: "refused the add" };
@@ -177,6 +210,7 @@ function cronFake(initial: FakeJob[] = []): CronFake {
         const job: FakeJob = {
           id: `job_${++seq}`,
           name: String(params["name"] ?? ""),
+          ...(fake.scoped === true ? { store: String(params["profile"] ?? "") } : {}),
           schedule,
           prompt: String(params["prompt"] ?? ""),
           enabled: true,
@@ -198,7 +232,7 @@ function cronFake(initial: FakeJob[] = []): CronFake {
         return { ...reply, job: format(job) };
       }
       const id = params["name"];
-      const job = find(id);
+      const job = find(id, params);
       if (job === undefined) return notFound(id);
       if (action === "pause") {
         if (fake.failPause?.has(job.id) === true) return { success: false, error: `Failed to pause '${job.id}'` };
@@ -234,9 +268,11 @@ interface Harness {
 
 async function setup(
   jobs: FakeJob[] = [],
-  opts: { bridgeProfile?: string; profiles?: string[] } = {},
+  opts: { bridgeProfile?: string; profiles?: string[]; scoped?: boolean; defaultStore?: string } = {},
 ): Promise<Harness> {
   const cron = cronFake(jobs);
+  if (opts.scoped === true) cron.scoped = true;
+  if (opts.defaultStore !== undefined) cron.defaultStore = opts.defaultStore;
   // A roster that can hold names this gateway would never CREATE, because a profile made outside it
   // can, and the routines surface has to survive one.
   const profiles =
@@ -455,13 +491,21 @@ describe("the legacy auto-pause", () => {
     expect(routines[0]).toMatchObject({ legacyUnsafe: true, enabled: false });
   });
 
-  it("does not touch an untagged job that merely looks legacy", async () => {
+  it("does not pause an untagged job that merely looks legacy, though it now lists it", async () => {
+    // The two "legacy" words meet here. The job is LISTED, because an untagged job in this bot's
+    // store is its legacy routine (#85). It is not `legacyUnsafe` and it is not paused, because the
+    // auto-pause exists for the pre-marker DELEGATION shape, whose danger is a title synced from
+    // `ui_meta` reaching a shell command; an untagged job has no bot whose look could rewrite it.
+    // Listing the operator's own schedule must not be a reason to switch it off.
     const h = await setup([
       job({ id: "j1", name: "nightly backup", prompt: `${LEGACY_DELEGATED_ROUTINE_PREFIX}Nightly" for agent 'ops'.` }),
     ]);
     const { routines } = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
-    expect(routines).toHaveLength(0);
+    expect(routines).toHaveLength(1);
+    expect(routines[0]).toMatchObject({ id: "j1", legacy: true, legacyUnsafe: false, enabled: true });
+    expect(routines[0]?.autoPaused).toBeUndefined();
     expect(h.cron.calls.some((call) => call.action === "pause")).toBe(false);
+    expect(h.cron.jobs[0]?.paused).toBe(false);
   });
 
   it("writes a marker-prefixed delegation, so a routine this gateway creates is never legacy", () => {
@@ -858,6 +902,154 @@ describe("the bot name is held to the profile-id rule", () => {
   });
 });
 
+/** Issue #85: the cron jobs that predate routines. Untagged, still firing, and until now invisible
+ *  in every routines client, which left a user unable to see or stop a schedule that runs on their
+ *  own machine. They are listed as `legacy` rows owned by the STORE rather than by a tag, which is
+ *  the second and weaker of this surface's two ownership facts and is fenced accordingly. */
+describe("legacy cronjobs", () => {
+  const mixed = (): FakeJob[] => [
+    job({ id: "j1", name: "[bot:scout] Morning digest", schedule: "every 120m" }),
+    job({ id: "j2", name: "nightly backup", schedule: "0 3 * * *", prompt: "back up /srv" }),
+    job({ id: "j3", name: "[bot:pip] Theirs" }),
+  ];
+
+  it("lists a bot's untagged cron jobs beside its tagged routines", async () => {
+    const h = await setup(mixed());
+    const { routines } = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
+    expect(routines.map((routine) => routine.id)).toEqual(["j1", "j2"]);
+
+    // The tagged row is byte-for-byte what it was: the field is absent, not false.
+    expect(routines[0]).toMatchObject({ id: "j1", title: "Morning digest", legacyUnsafe: false });
+    expect(routines[0]?.legacy).toBeUndefined();
+    expect("legacy" in (routines[0] ?? {})).toBe(false);
+
+    // The legacy row carries the flag, its RAW name as the title, and a schedule read exactly the
+    // way a tagged job's is.
+    expect(routines[1]).toMatchObject({
+      id: "j2",
+      title: "nightly backup",
+      legacy: true,
+      legacyUnsafe: false,
+      enabled: true,
+      schedule: { raw: "0 3 * * *" },
+    });
+  });
+
+  it("populates `human` on a legacy schedule exactly as on a tagged one", async () => {
+    const h = await setup([job({ id: "j1", name: "hourly sweep", schedule: "every 60m" })]);
+    const { routines } = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
+    expect(routines[0]?.schedule).toEqual({ raw: "every 60m", human: "Hourly" });
+  });
+
+  it("does not strip anything from a legacy title, including a tag-shaped one", () => {
+    expect(mapRoutine({ job_id: "j1", name: "[weekly] rotate logs" }, { legacy: true }).title).toBe(
+      "[weekly] rotate logs",
+    );
+    // A job the backend named nothing still needs a label.
+    expect(mapRoutine({ job_id: "j1" }, { legacy: true }).title).toBe("Untitled cronjob");
+  });
+
+  it("pauses, resumes and deletes a legacy job by its id", async () => {
+    const h = await setup(mixed());
+    const paused = await h.authed("/bots/scout/routines/j2", body("PATCH", { enabled: false }));
+    expect(paused.status).toBe(200);
+    const off = (await paused.json()) as { routine: BotRoutine };
+    // Still a legacy row on the way back out, still titled by its raw name.
+    expect(off.routine).toMatchObject({ id: "j2", legacy: true, enabled: false, title: "nightly backup" });
+    expect(h.cron.jobs.find((entry) => entry.id === "j2")?.paused).toBe(true);
+
+    const resumed = await h.authed("/bots/scout/routines/j2", body("PATCH", { enabled: true }));
+    expect(resumed.status).toBe(200);
+    expect(((await resumed.json()) as { routine: BotRoutine }).routine).toMatchObject({ legacy: true, enabled: true });
+    expect(h.cron.jobs.find((entry) => entry.id === "j2")?.paused).toBe(false);
+
+    expect((await h.authed("/bots/scout/routines/j2", { method: "DELETE" })).status).toBe(204);
+    expect(h.cron.jobs.map((entry) => entry.id)).toEqual(["j1", "j3"]);
+  });
+
+  it("refuses to REWRITE a legacy job, and leaves it exactly as it was", async () => {
+    const h = await setup(mixed());
+    const res = await h.authed(
+      "/bots/scout/routines/j2",
+      body("PATCH", { title: "Nightly backup", prompt: "back up /srv" }),
+    );
+    expect(res.status).toBe(400);
+    const failed = (await res.json()) as { error: { code: string; message: string } };
+    expect(failed.error.code).toBe("invalid_request");
+    // The message has to say what to do instead, because delete-and-recreate is the whole answer.
+    expect(failed.error.message).toContain("Delete it and create a routine");
+    // Nothing was written: a rewrite would have paused it first, then re-added it under a tag.
+    expect(h.cron.calls.some((call) => call.action === "pause" || call.action === "add")).toBe(false);
+    expect(h.cron.jobs.find((entry) => entry.id === "j2")).toMatchObject({ name: "nightly backup", paused: false });
+  });
+
+  it("keeps refusing an id from another store, and lists nothing out of one", async () => {
+    // A hermes that honors `profile` and says so. `ops` holds a cron job of its own, and it is not
+    // scout's under any reading: not tagged for scout, and not in scout's home.
+    const h = await setup(
+      [
+        job({ id: "j1", name: "[bot:scout] Mine", store: "scout" }),
+        job({ id: "j9", name: "ops-only sweep", store: "ops" }),
+      ],
+      { scoped: true },
+    );
+    const { routines } = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
+    expect(routines.map((routine) => routine.id)).toEqual(["j1"]);
+
+    expect((await h.authed("/bots/scout/routines/j9", body("PATCH", { enabled: false }))).status).toBe(404);
+    expect((await h.authed("/bots/scout/routines/j9", { method: "DELETE" })).status).toBe(404);
+    expect(h.cron.jobs.find((entry) => entry.id === "j9")).toMatchObject({ paused: false });
+  });
+
+  it("claims no untagged job when the backend says it read a different store", async () => {
+    // The narrow case the `scoped` echo exists for: the call asked for scout and the backend
+    // answered with somebody else's home. Its tagged jobs are still filtered by tag, as always, and
+    // its untagged ones are claimed by nobody.
+    const jobs = [{ name: "[bot:scout] Mine" }, { name: "nightly backup" }];
+    expect(selectRoutineRows(jobs, "scout", "ops").map((row) => [row.job.name, row.legacy])).toEqual([
+      ["[bot:scout] Mine", false],
+    ]);
+    // Its own store, echoed back, claims both.
+    expect(selectRoutineRows(jobs, "scout", "scout")).toHaveLength(2);
+  });
+
+  it("never claims a job whose tag it merely cannot parse", () => {
+    // `[bot:a]b] Theirs` is bot `a]b`'s routine and BOT_TAG_RE deliberately refuses to read it.
+    // Untagged means no tag CLAIM, or "belongs to nobody" would quietly become "belongs to whoever
+    // is listing" and hand bot `a` a row it could delete.
+    expect(isUntaggedCronJob({ name: "[bot:a]b] Theirs" })).toBe(false);
+    expect(isUntaggedCronJob({ name: "[bot:scout] Mine" })).toBe(false);
+    expect(isUntaggedCronJob({ name: "nightly backup" })).toBe(true);
+    expect(selectRoutineRows([{ name: "[bot:a]b] Theirs" }], "a")).toHaveLength(0);
+  });
+
+  it("puts legacy rows on the bot_routines frame too", async () => {
+    const h = await setup(mixed());
+    await h.authed("/bots/scout/routines");
+    await until(() => h.frames.filter((frame) => frame.type === "bot_routines").length === 1);
+    const frame = h.frames.find((entry) => entry.type === "bot_routines") as
+      | { routines: BotRoutine[] }
+      | undefined;
+    expect(frame?.routines.map((routine) => [routine.id, routine.legacy])).toEqual([
+      ["j1", undefined],
+      ["j2", true],
+    ]);
+  });
+
+  it("creates a routine as a TAGGED job even when the store is full of legacy ones", async () => {
+    const h = await setup(mixed());
+    const res = await h.authed(
+      "/bots/scout/routines",
+      body("POST", { title: "Sweep", schedule: "every 2h", prompt: "sweep the inbox" }),
+    );
+    expect(res.status).toBe(201);
+    const created = (await res.json()) as { routine: BotRoutine };
+    expect(created.routine.legacy).toBeUndefined();
+    expect(created.routine.title).toBe("Sweep");
+    expect(h.cron.jobs.find((entry) => entry.id === created.routine.id)?.name).toBe("[bot:scout] Sweep");
+  });
+});
+
 describe("scoping", () => {
   const store = (): FakeJob[] => [
     job({ id: "j1", name: "[bot:scout] Mine" }),
@@ -865,25 +1057,31 @@ describe("scoping", () => {
     job({ id: "j3", name: "nightly backup" }),
   ];
 
-  it("keeps another bot's routines and the operator's own cron jobs out of a list", async () => {
+  it("keeps another bot's routines out of a list, and claims the store's untagged ones", async () => {
     const h = await setup(store());
     const mine = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
-    expect(mine.routines.map((routine) => routine.id)).toEqual(["j1"]);
+    // `j2` is pip's by tag and can never be scout's. `j3` carries no tag at all, so the store it
+    // sits in is what owns it, and this call read scout's store.
+    expect(mine.routines.map((routine) => routine.id)).toEqual(["j1", "j3"]);
     const theirs = (await (await h.authed("/bots/pip/routines")).json()) as { routines: BotRoutine[] };
-    expect(theirs.routines.map((routine) => routine.id)).toEqual(["j2"]);
+    expect(theirs.routines.map((routine) => routine.id)).toEqual(["j2", "j3"]);
   });
 
   it("filters at the seam, so a gateway that ignored the profile scope is still correct", () => {
     const jobs = [{ name: "[bot:scout] Mine" }, { name: "[bot:pip] Theirs" }, { name: "nightly backup" }];
+    // The TAG filter is unconditional: no store, no scope and no backend widens it.
     expect(selectRoutineJobs(jobs, "scout").map((entry) => entry.name)).toEqual(["[bot:scout] Mine"]);
+    // The row selector adds the untagged job, and only the untagged one.
+    expect(selectRoutineRows(jobs, "scout").map((row) => [row.job.name, row.legacy])).toEqual([
+      ["[bot:scout] Mine", false],
+      ["nightly backup", true],
+    ]);
   });
 
-  it("404s a write against a job id outside the bot's namespace, and never touches it", async () => {
+  it("404s a write against another bot's routine, and never touches it", async () => {
     const h = await setup(store());
-    for (const id of ["j2", "j3"]) {
-      expect((await h.authed(`/bots/scout/routines/${id}`, body("PATCH", { enabled: false }))).status).toBe(404);
-      expect((await h.authed(`/bots/scout/routines/${id}`, { method: "DELETE" })).status).toBe(404);
-    }
+    expect((await h.authed("/bots/scout/routines/j2", body("PATCH", { enabled: false }))).status).toBe(404);
+    expect((await h.authed("/bots/scout/routines/j2", { method: "DELETE" })).status).toBe(404);
     expect(h.cron.jobs).toHaveLength(3);
     expect(h.cron.calls.some((call) => call.action === "pause" || call.action === "remove")).toBe(false);
   });

@@ -344,6 +344,14 @@ describe("routines", () => {
     expect(check(BotRoutineSchema, { ...routine, nextRun: "2026-08-18T09:00:00Z" })).toBe(false);
   });
 
+  it("carries `legacy` as an optional flag, absent on every tagged routine", () => {
+    // A legacy row is an untagged cron job in the bot's own store (#85), titled by its raw name.
+    expect(check(BotRoutineSchema, { ...routine, title: "nightly backup", legacy: true })).toBe(true);
+    // Optional, so the tagged rows every client already renders are unchanged and stay valid.
+    expect(check(BotRoutineSchema, routine)).toBe(true);
+    expect(check(BotRoutineSchema, { ...routine, legacy: "true" })).toBe(false);
+  });
+
   it("refuses a NUL and a whitespace-only field on a create", () => {
     const create = { title: "Digest", schedule: "0 9 * * *", prompt: "summarize the overnight builds" };
     expect(check(BotRoutineCreateRequestSchema, create)).toBe(true);
@@ -422,7 +430,11 @@ describe("capability advertisement", () => {
     // sends the field, so a client cannot offer a chip and cannot assume an untouched chat is bare),
     // 12 for live tool activity: the `bot_tool_activity` frame and the `toolSteps` array on
     // `GET /bots/:name/chat/messages` (a v11 gateway sends neither, so a step-by-step chip strip
-    // offered against one would sit permanently empty while the turn looked like plain "thinking").
-    expect(BOTS_CAPABILITY_VERSION).toBe(12);
+    // offered against one would sit permanently empty while the turn looked like plain "thinking"),
+    // 13 for legacy cronjobs surfacing as routines: `GET /bots/:name/routines` and the
+    // `bot_routines` frame also carry the untagged jobs of that bot's own cron store, each with
+    // `legacy: true` (a v12 gateway never sends the field and never sends those rows, and a client
+    // that renders them has to know not to offer Edit, which they answer with a 400).
+    expect(BOTS_CAPABILITY_VERSION).toBe(13);
   });
 });

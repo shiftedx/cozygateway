@@ -583,11 +583,13 @@ export const BotRoutineScheduleSchema = Type.Object({
 });
 export type BotRoutineSchedule = Static<typeof BotRoutineScheduleSchema>;
 
-/** One routine (a Hermes cron job in this bot's `[bot:<name>]` namespace).
+/** One routine: a Hermes cron job this bot owns, either by carrying the `[bot:<name>]` tag or by
+ *  sitting untagged in the bot's own cron store (`legacy`).
  *
  *  `id` is the backend's `job_id` and is the ONLY identifier the write routes accept; the display
  *  title is not unique and is not an id. `title` is the job name with the `[bot:<name>] ` tag
- *  stripped, and falls back to `Untitled cronjob` for a tagged job with nothing after the tag.
+ *  stripped, and falls back to `Untitled cronjob` for a tagged job with nothing after the tag; on a
+ *  `legacy` row it is the raw job name, verbatim.
  *
  *  `enabled` is the ROW STATE the desktop's switch renders, which folds three backend facts into
  *  one: a job is enabled only when the backend's `enabled` is not false, its `state` is not
@@ -608,6 +610,11 @@ export const BotRoutineSchema = Type.Object({
   enabled: Type.Boolean(),
   state: Type.Optional(Type.String()),
   legacyUnsafe: Type.Boolean(),
+  /** True for an UNTAGGED cron job in this bot's own store: a schedule that predates routines and
+   *  still fires. Absent on every tagged routine, never false. Its `title` is the job's raw name
+   *  verbatim, and it cannot be REWRITTEN (a `PATCH` carrying anything but `enabled` is a 400);
+   *  pause, resume and delete all work, and delete-then-create is how a client converts one. */
+  legacy: Type.Optional(Type.Boolean()),
   autoPaused: Type.Optional(Type.Boolean()),
   /** The job's prompt as the backend reported it, which on a list is often a PREVIEW rather than
    *  the whole thing. Absent when the backend sent neither. */
@@ -896,6 +903,21 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    What the version does NOT promise, exactly as with 10, is that any step will ever be reported:
  *    hermes gates its whole tool lifecycle on `display.tool_progress`, which defaults to `all` but
  *    which an operator can set to `off`, and a profile running that way is silent here (see
- *    contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin"). */
+ *    contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin").
+ *  - `13`: LEGACY CRONJOBS become visible as routines (issue #85). `GET /bots/:name/routines` and
+ *    the `bot_routines` frame now also carry the UNTAGGED jobs in that bot's own cron store, each
+ *    with `BotRoutine.legacy: true`; the row actions accept their ids. No route, frame or existing
+ *    field changed shape, and a tagged routine is byte-for-byte what it was.
+ *
+ *    A client below 13 keeps working and keeps ignoring an optional field, but against a 13 gateway
+ *    it will see rows it did not see before and will offer Edit on them, which answers 400. That is
+ *    the whole reason this is a version rather than a silent widening: a client that renders legacy
+ *    rows MUST require `>= 13`, must hide or disable its edit affordance on a row carrying `legacy`,
+ *    and offers the conversion as delete-then-create.
+ *
+ *    What the version does NOT promise is that any legacy job will be found: the gateway claims only
+ *    the untagged jobs of a store the backend agrees is that bot's, so a hermes that answers a
+ *    `profile`-scoped list with another profile's store contributes none (see
+ *    contract/ext-bots-v1.md, routines). */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 12;
+export const BOTS_CAPABILITY_VERSION = 13;

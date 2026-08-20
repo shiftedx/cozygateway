@@ -5,23 +5,33 @@ import type { HermesRpc } from "./canonical-chat.ts";
 /** The routines surface: the desktop's Routines pane (dissection section 8), reimplemented
  *  server-side so a phone schedules a bot's cron jobs exactly as a desktop does.
  *
- *  Everything here rests on ONE convention, and it is the whole reason a routine belongs to a bot
- *  at all: a routine is an ordinary Hermes cron job whose NAME is `[bot:<name>] <title>`. There is
- *  no bot field on a cron job, no per-bot cron API, nothing server-side that says a job belongs to
- *  a bot. The tag in the name is the entire relationship, which means:
+ *  A routine belongs to a bot by ONE of two facts, and the order matters because only the first is
+ *  a claim the job itself makes:
  *
- *  - a job whose tag names another bot is NOT this bot's routine and must never appear in its list,
- *    even when the backend hands both over in the same answer (an older gateway that ignores the
- *    `profile` param returns the launch profile's whole store);
- *  - an untagged job is nobody's routine and stays invisible here, which is what keeps a routine
- *    pane from offering to delete the operator's own unrelated cron jobs;
- *  - the tag must be written byte-for-byte the way the desktop writes it, or the two clients stop
- *    seeing each other's routines.
+ *  1. THE TAG. A routine both clients write is an ordinary Hermes cron job whose NAME is
+ *     `[bot:<name>] <title>`. There is no bot field on a cron job and no per-bot cron API, so that
+ *     tag is the entire relationship. Consequences:
  *
- *  The `profile` param is sent on every call anyway (dissection 8.2): a gateway that understands it
- *  scopes the call to that bot's own cron store, and one that does not ignores it, at which point
- *  the tag filter is what keeps the answer correct. Neither behavior is probed for, because the tag
- *  filter is required under both. */
+ *     - a job whose tag names another bot is NOT this bot's routine and must never appear in its
+ *       list, even when the backend hands both over in the same answer (an older gateway that
+ *       ignores the `profile` param returns the launch profile's whole store);
+ *     - the tag must be written byte-for-byte the way the desktop writes it, or the two clients stop
+ *       seeing each other's routines.
+ *
+ *  2. THE STORE (issue #85). Cron storage is per Hermes home, so an UNTAGGED job sitting in a bot's
+ *     own cron store is that bot's schedule and nobody else's: it predates routines, it still fires,
+ *     and hiding it made every routines client blind to it. Those jobs are listed with `legacy:
+ *     true` and are writable by the same three row actions, because a schedule a user cannot see is
+ *     a schedule they cannot stop.
+ *
+ *  The second fact is only true when the store really is this bot's, which is what `profile` on
+ *  every call is for (dissection 8.2). A gateway that understands the param scopes the call to that
+ *  bot's home; one that does not ignores it and answers with the launch profile's store instead.
+ *  Where the backend says which store it read (`scoped`), a store belonging to someone else
+ *  contributes NO untagged jobs: the tag filter still holds there, exactly as before. Where it says
+ *  nothing, the param is taken at its word, which is the only reading under which pre-routines jobs
+ *  are reachable at all on a backend that does not echo. The tag filter is unconditional either way,
+ *  so no answer can ever hand one bot another bot's tagged routines. */
 
 /** The desktop's own three constants (plugin.js:5230-5232), with ONE deliberate tightening.
  *
@@ -37,6 +47,16 @@ import type { HermesRpc } from "./canonical-chat.ts";
  *  The routes apply the profile-id charset rule as well, which keeps this gateway from ever writing
  *  such a name. This is the half that also holds for a job some other client wrote. */
 export const BOT_TAG_RE = /^\[bot:([a-z0-9][a-z0-9_-]*)\](?=\s|$)\s*/i;
+
+/** A name that CLAIMS a bot tag, whether or not `BOT_TAG_RE` can read the claim.
+ *
+ *  The gap between the two is the whole reason this exists. `[bot:a]b] Theirs` is bot `a]b`'s
+ *  routine and `BOT_TAG_RE` deliberately refuses it, which used to mean "belongs to nobody, and
+ *  nobody can see it". Now that an untagged job in a bot's store is claimed as that bot's LEGACY
+ *  routine, "belongs to nobody" would quietly become "belongs to whoever is listing", handing bot
+ *  `a` a row it may delete and that was never its own. A name starting `[bot:` is somebody's tag
+ *  under every reading, so it is never a legacy job. */
+export const BOT_TAG_CLAIM_RE = /^\[bot:/i;
 export const SAFE_ROUTINE_MARKER = "[bot-mode:routine:v2] ";
 export const LEGACY_DELEGATED_ROUTINE_PREFIX = 'You are running the scheduled routine "';
 
@@ -119,6 +139,26 @@ export class RoutineUnconfirmed extends Error {
   }
 }
 
+/** A patch that would REWRITE a legacy (untagged) job, which this API does not do.
+ *
+ *  A rewrite is a delete and a create, and the create writes the `[bot:<name>]` tag: the job would
+ *  come back as a tagged routine under a NEW id, silently converted, with its old name gone. That is
+ *  a conversion, not an edit, and it is the user's call rather than a side effect of fixing a typo.
+ *  The row actions (pause, resume, delete) are unaffected; a client that wants the conversion does
+ *  it the honest way, by deleting the legacy job and creating a routine. */
+export class LegacyRoutineNotRewritable extends Error {
+  readonly id: string;
+
+  constructor(id: string) {
+    super(
+      `routine "${id}" is a legacy cronjob: it carries no [bot:] tag, so it can be paused, resumed or deleted but not rewritten. ` +
+        `Delete it and create a routine to convert it.`,
+    );
+    this.name = "LegacyRoutineNotRewritable";
+    this.id = id;
+  }
+}
+
 export interface CronJob {
   job_id?: unknown;
   name?: unknown;
@@ -150,10 +190,27 @@ export function routineBot(job: CronJob): string | null {
   return match === null ? null : (match[1] ?? "").toLowerCase();
 }
 
+/** True for a job that is nobody's tagged routine AND makes no tag claim at all: the pre-routines
+ *  shape #85 is about. See `BOT_TAG_CLAIM_RE` for why an unreadable claim is not one of these. */
+export function isUntaggedCronJob(job: CronJob): boolean {
+  return routineBot(job) === null && !BOT_TAG_CLAIM_RE.test(asString(job.name) ?? "");
+}
+
 /** The display title: the job name with its tag stripped. */
 export function routineTitle(job: CronJob): string {
   const stripped = (asString(job.name) ?? "").replace(BOT_TAG_RE, "");
   return stripped.length === 0 ? UNTITLED_ROUTINE : stripped;
+}
+
+/** The title of a LEGACY row: the job's name VERBATIM.
+ *
+ *  Nothing is stripped and nothing is prettified, because the operator named this job themselves and
+ *  the name is how they recognize it wherever else they look at it (the desktop, `hermes cron`, a
+ *  crontab they wrote). A name that is empty still needs a label, and gets the same one a tagged job
+ *  with nothing after its tag gets. */
+export function legacyRoutineTitle(job: CronJob): string {
+  const name = asString(job.name) ?? "";
+  return name.length === 0 ? UNTITLED_ROUTINE : name;
 }
 
 /** The cron job name a routine is stored under. The ONE place the namespace is written. */
@@ -231,7 +288,8 @@ export function routineTimestamp(value: unknown): number | null {
 /** Maps one cron job into the wire shape. Tolerant throughout: a job that is missing a field the
  *  backend did not send degrades to a sane value rather than failing the list, because ONE
  *  malformed job must not blank a routines pane. */
-export function mapRoutine(job: CronJob, opts: { autoPaused?: boolean } = {}): BotRoutine {
+export function mapRoutine(job: CronJob, opts: { autoPaused?: boolean; legacy?: boolean } = {}): BotRoutine {
+  const legacy = opts.legacy === true;
   const legacyUnsafe = isLegacyDelegatedRoutine(job);
   const raw = asString(job.schedule) ?? "";
   const human = scheduleHuman(raw);
@@ -241,13 +299,16 @@ export function mapRoutine(job: CronJob, opts: { autoPaused?: boolean } = {}): B
   const lastStatus = asString(job.last_status);
   return {
     id: asString(job.job_id) ?? "",
-    title: routineTitle(job),
+    title: legacy ? legacyRoutineTitle(job) : routineTitle(job),
     schedule: { raw, ...(human === undefined ? {} : { human }) },
     // An auto-paused job reads as paused in the very response that paused it, exactly as the
     // desktop's overlay does, so a pane never renders a legacy job as running.
     enabled: opts.autoPaused === true ? false : routineActive(job),
     ...(state === undefined || state.length === 0 ? {} : { state: opts.autoPaused === true ? "paused" : state }),
     legacyUnsafe,
+    // Present only when true. A tagged routine never carries the field at all, so a client that
+    // ignores it sees exactly the rows it saw before.
+    ...(legacy ? { legacy: true } : {}),
     ...(opts.autoPaused === true ? { autoPaused: true } : {}),
     ...(prompt === undefined ? {} : { prompt }),
     lastRun: routineTimestamp(job.last_run_at),
@@ -281,9 +342,48 @@ export function cronJobsOf(result: unknown): CronJob[] {
   return Array.isArray(jobs) ? jobs.flatMap((entry) => (asRecord(entry) === undefined ? [] : [entry as CronJob])) : [];
 }
 
-/** The jobs that belong to ONE bot. The single scoping rule of this whole module. */
+/** The TAGGED jobs that belong to ONE bot. Never widened by anything: a job carrying another bot's
+ *  tag, or a tag this gateway cannot read, is not in here under any store and any scope. */
 export function selectRoutineJobs(jobs: readonly CronJob[], bot: string): CronJob[] {
   return jobs.filter((job) => routineBot(job) === bot);
+}
+
+/** One row of a bot's routines list, and which of the two ownership facts put it there. */
+export interface RoutineRow {
+  job: CronJob;
+  /** True for an UNTAGGED job owned by the store rather than by a tag. */
+  legacy: boolean;
+}
+
+/** What a bot's cron store answered with. */
+export interface CronStore {
+  jobs: CronJob[];
+  /** The profile the backend says it read, when it says. Older builds send nothing. */
+  scope: string | undefined;
+}
+
+/** Every row this bot's routines surface owns, in the backend's own order.
+ *
+ *  Two rules, and only the second one is new (issue #85):
+ *
+ *  - a job tagged for this bot is this bot's, always;
+ *  - an UNTAGGED job is this bot's when the store it came out of is this bot's, and is `legacy`.
+ *    Untagged means no tag CLAIM, not merely no tag this gateway can parse: see `BOT_TAG_CLAIM_RE`.
+ *
+ *  `scope` is the backend's own word for which store it read. When it names a DIFFERENT profile the
+ *  `profile` param was not honored the way this call meant it, so the untagged jobs in that answer
+ *  belong to someone else and are dropped: that is the whole of "a job in another store stays
+ *  invisible", enforced with the only evidence the wire carries. When the backend says nothing, the
+ *  scope it was asked for is taken at its word, because a backend that never echoes would otherwise
+ *  hide every pre-routines job forever. Tagged jobs are unaffected by any of it. */
+export function selectRoutineRows(jobs: readonly CronJob[], bot: string, scope?: string | undefined): RoutineRow[] {
+  const read = (scope ?? "").trim().toLowerCase();
+  const otherStore = read.length > 0 && read !== bot;
+  return jobs.flatMap((job): RoutineRow[] => {
+    if (routineBot(job) === bot) return [{ job, legacy: false }];
+    if (!otherStore && isUntaggedCronJob(job)) return [{ job, legacy: true }];
+    return [];
+  });
 }
 
 /** The raw cron store this bot's routines live in, scoped by `profile`.
@@ -292,25 +392,30 @@ export function selectRoutineJobs(jobs: readonly CronJob[], bot: string): CronJo
  *  entirely, which in any surface with an on/off switch reads as the routine having been DELETED.
  *
  *  0.20.4 echoes `scoped: "<profile>"` to prove it honored the scope, and 0.20.3 does not. The echo
- *  is deliberately NOT branched on. A scoped store still holds the operator's own unrelated cron
- *  jobs, so the `[bot:]` tag filter is required either way, and a probe whose only effect would be
- *  to WIDEN what a bot claims to own is a probe worth not having. */
-export async function listCronJobs(rpc: HermesRpc, bot: string): Promise<CronJob[]> {
+ *  is carried out rather than dropped, and `selectRoutineRows` is the only thing that reads it: it
+ *  decides whether the UNTAGGED jobs in this answer are this bot's legacy schedules or somebody
+ *  else's business. It can never widen what a bot claims of the TAGGED jobs, which stay behind the
+ *  same filter under every backend. */
+export async function listCronStore(rpc: HermesRpc, bot: string): Promise<CronStore> {
   const result = await rpc.request("cron.manage", { action: "list", include_disabled: true, profile: bot });
-  readCronReply("list", result);
-  return cronJobsOf(result);
+  const reply = readCronReply("list", result);
+  return { jobs: cronJobsOf(result), scope: asString(reply["scoped"]) };
 }
 
-/** One of a bot's routines by job id, or `RoutineNotFound`.
+/** One of a bot's routine rows by job id, or `RoutineNotFound`.
  *
- *  Scoped through the same tag filter as the list, which is what makes a job id from ANOTHER bot's
- *  namespace (or from an untagged operator cron job) a 404 rather than an edit: ids are guessable
- *  strings, and `cron.manage` itself will happily pause any job in the store by id. */
-export async function findBotRoutineJob(rpc: HermesRpc, bot: string, jobId: string): Promise<CronJob> {
-  const mine = selectRoutineJobs(await listCronJobs(rpc, bot), bot);
-  const job = mine.find((entry) => asString(entry.job_id) === jobId);
-  if (job === undefined) throw new RoutineNotFound(jobId);
-  return job;
+ *  Scoped through the same two rules as the list, which is what makes a job id from ANOTHER bot's
+ *  namespace, or from another store entirely, a 404 rather than an edit: ids are guessable strings,
+ *  and `cron.manage` itself will happily pause any job in the store by id. A legacy id resolves
+ *  here, which is the point of listing those jobs at all: a schedule a user can see and cannot stop
+ *  is worse than one they never saw. */
+export async function findBotRoutineJob(rpc: HermesRpc, bot: string, jobId: string): Promise<RoutineRow> {
+  const store = await listCronStore(rpc, bot);
+  const row = selectRoutineRows(store.jobs, bot, store.scope).find(
+    (entry) => asString(entry.job.job_id) === jobId,
+  );
+  if (row === undefined) throw new RoutineNotFound(jobId);
+  return row;
 }
 
 export interface RoutineListResult {
@@ -335,18 +440,27 @@ export interface RoutineListResult {
  *
  *  Scoped with `profile` on every call, and filtered by tag regardless: see the module note. */
 export async function listBotRoutines(rpc: HermesRpc, bot: string): Promise<RoutineListResult> {
-  const jobs = await listCronJobs(rpc, bot);
-  const mine = selectRoutineJobs(jobs, bot);
+  const store = await listCronStore(rpc, bot);
+  const rows = selectRoutineRows(store.jobs, bot, store.scope);
 
-  // A job with no id cannot be paused: `cron.manage` resolves the row by the `name` param, and an
-  // empty one names nothing, so the call is a guaranteed refusal against a store this gateway would
-  // rather not be poking blind. It stays in the list, reported as the legacy row it is.
-  const legacyActive = mine.filter(
-    (job) =>
-      isLegacyDelegatedRoutine(job) &&
-      (asString(job.job_id) ?? "").length > 0 &&
-      job.enabled !== false &&
-      job.state !== "paused",
+  // The security auto-pause reaches TAGGED jobs only, and `isLegacyDelegatedRoutine` is what says so.
+  // The two "legacy" words in this file mean different things and this is where they meet: a
+  // `legacy: true` row is an untagged job the operator wrote themselves, while `legacyUnsafe` is the
+  // pre-marker DELEGATION shape, whose danger is that it interpolates a title synced from `ui_meta`
+  // into a shell command. An untagged job has no bot whose look could rewrite it, so listing it is
+  // not a reason to start switching off the operator's own schedules. Making them visible is the
+  // whole point of #85; silently stopping them would be the opposite of it.
+  //
+  // A job with no id cannot be paused either: `cron.manage` resolves the row by the `name` param, and
+  // an empty one names nothing, so the call is a guaranteed refusal against a store this gateway
+  // would rather not be poking blind. It stays in the list, reported as the unsafe row it is.
+  const legacyActive = rows.flatMap(({ job }) =>
+    isLegacyDelegatedRoutine(job) &&
+    (asString(job.job_id) ?? "").length > 0 &&
+    job.enabled !== false &&
+    job.state !== "paused"
+      ? [job]
+      : [],
   );
   const paused = await Promise.all(
     legacyActive.map(async (job) => {
@@ -367,9 +481,9 @@ export async function listBotRoutines(rpc: HermesRpc, bot: string): Promise<Rout
   const autoPaused = new Set(paused.filter((id): id is string => id !== undefined && id.length > 0));
 
   return {
-    routines: mine.map((job) => {
+    routines: rows.map(({ job, legacy }) => {
       const id = asString(job.job_id) ?? "";
-      return mapRoutine(job, { autoPaused: autoPaused.has(id) });
+      return mapRoutine(job, { autoPaused: autoPaused.has(id), legacy });
     }),
     autoPaused: [...autoPaused],
   };
@@ -543,16 +657,18 @@ export async function createBotRoutine(
   // answer is that this gateway cannot say which one.
   if (createdId.length === 0) throw new RoutineUnconfirmed(undefined, "the reply carried no job_id");
 
-  let stored: CronJob;
+  let stored: RoutineRow;
   try {
     stored = await findBotRoutineJob(rpc, bot, createdId);
   } catch (err) {
     throw new RoutineUnconfirmed(createdId, err instanceof Error ? err.message : String(err));
   }
-  return mapRoutine(stored);
+  // A routine this gateway creates is tagged by construction, so this row is never a legacy one.
+  return mapRoutine(stored.job);
 }
 
-/** Deletes a routine. Scoped: an id that is not in this bot's namespace is a 404, never a delete. */
+/** Deletes a routine. Scoped: an id that is not one of this bot's rows is a 404, never a delete. A
+ *  legacy row deletes like any other, and delete-then-create is how a client converts one. */
 export async function deleteBotRoutine(rpc: HermesRpc, bot: string, jobId: string): Promise<void> {
   await findBotRoutineJob(rpc, bot, jobId);
   readCronReply("remove", await rpc.request("cron.manage", buildRoutineActionParams("remove", bot, jobId)));
@@ -589,16 +705,26 @@ export async function patchBotRoutine(
   patch: BotRoutinePatch,
   schedulerProfile?: string,
 ): Promise<RoutineWriteResult> {
-  const existing = await findBotRoutineJob(rpc, bot, jobId);
+  const row = await findBotRoutineJob(rpc, bot, jobId);
+  const existing = row.job;
+
+  // A legacy row is switchable but not rewritable: the rewrite would recreate the job under the
+  // `[bot:]` tag with a new id, converting it rather than editing it. See
+  // `LegacyRoutineNotRewritable`.
+  if (row.legacy && patchNeedsRewrite(patch)) throw new LegacyRoutineNotRewritable(jobId);
 
   if (!patchNeedsRewrite(patch)) {
-    if (patch.enabled === undefined) return { routine: mapRoutine(existing) };
+    if (patch.enabled === undefined) return { routine: mapRoutine(existing, { legacy: row.legacy }) };
     const action = patch.enabled ? "resume" : "pause";
     const reply = readCronReply(action, await rpc.request("cron.manage", buildRoutineActionParams(action, bot, jobId)));
     const job = asRecord(reply["job"]) as CronJob | undefined;
     // `pause` and `resume` echo the updated row. When they do not, the local view is updated the
     // same way the desktop's optimistic switch does, rather than reporting the pre-call state.
-    return { routine: mapRoutine(job ?? { ...existing, enabled: patch.enabled, state: patch.enabled ? "active" : "paused" }) };
+    return {
+      routine: mapRoutine(job ?? { ...existing, enabled: patch.enabled, state: patch.enabled ? "active" : "paused" }, {
+        legacy: row.legacy,
+      }),
+    };
   }
 
   const wasActive = routineActive(existing);
