@@ -58,7 +58,9 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.appendNativeBotMessage({ bot: "sage", sessionId: chat.sessionId, messageId: "native-1", role: "assistant", text: "new native reply", at: 30 });
     const attachmentInfo = vi.fn(() => ({ mime: "image/png", name: "old.png", size: 4 }));
     const attachmentSlice = vi.fn(() => new Uint8Array([1, 2, 3, 4]));
-    const chatHistory = vi.fn(async () => ({
+    const chatHistory = vi.fn()
+      .mockRejectedValueOnce(new Error("dashboard still connecting"))
+      .mockResolvedValue({
       sessionId: "dashboard-sage",
       adoption: "pin" as const,
       messages: [
@@ -68,7 +70,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       running: false,
       inflight: false,
       updatedAt: 20,
-    }));
+      });
     const control = {
       chatHistory,
       roster: () => ({
@@ -81,7 +83,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       chatAttachmentSlice: attachmentSlice,
     } as unknown as BotsSurface;
     const logs: string[] = [];
-    const plane = new NativeBotDataPlane({ control, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], broadcast: () => undefined, now: () => 40, log: (message) => logs.push(message) });
+    const plane = new NativeBotDataPlane({ control, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], broadcast: () => undefined, now: () => 40, log: (message) => logs.push(message), historyRetryMs: 0 });
 
     // A canary that already has native traffic keeps showing that newer native reply while the
     // historical import is pending; a completely empty native chat keeps the Dashboard row.
@@ -92,7 +94,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     const history = await plane.surface().chatHistory("sage");
     expect(history.sessionId).toBe(chat.sessionId);
     expect(history.messages.map((message) => message.text)).toEqual(["old question", "old answer", "new native reply"]);
-    expect(chatHistory).toHaveBeenCalledTimes(1);
+    expect(chatHistory).toHaveBeenCalledTimes(2);
     expect(plane.surface().roster().bots[0]).toMatchObject({ chatSessionId: chat.sessionId, preview: { kind: "plain", text: "new native reply" }, lastActiveAt: 30 });
     expect(plane.surface().chatAttachmentInfo("sage", "old-file")).toEqual({ mime: "image/png", name: "old.png", size: 4 });
     expect(plane.surface().chatAttachmentSlice("sage", "old-file", 0, 4)).toEqual(new Uint8Array([1, 2, 3, 4]));
