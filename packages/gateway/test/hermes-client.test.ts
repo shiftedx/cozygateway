@@ -94,6 +94,68 @@ describe("handshake and auth", () => {
   });
 });
 
+describe("authenticated dashboard media reads", () => {
+  it("uses /api/media first and falls back to /api/fs/read-data-url with the held token", async () => {
+    const calls: Array<{ path: string; token: string | undefined; file: string | null }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      calls.push({
+        path: url.pathname,
+        token: headers.get("x-hermes-session-token") ?? undefined,
+        file: url.searchParams.get("path"),
+      });
+      if (url.pathname === "/api/media" && url.searchParams.get("path") === "/outside/roots.png") {
+        return new Response(JSON.stringify({ detail: "Path outside media roots" }), { status: 403 });
+      }
+      const key = url.pathname === "/api/media" ? "data_url" : "dataUrl";
+      return new Response(JSON.stringify({ [key]: "data:image/png;base64,iVBORw0KGgo=" }), { status: 200 });
+    };
+    const c = client("ws://hermes.test:8790/api/ws", { fetchImpl });
+    expect(await c.readMediaDataUrl("/images/one.png")).toBe("data:image/png;base64,iVBORw0KGgo=");
+    expect(await c.readMediaDataUrl("/outside/roots.png")).toBe("data:image/png;base64,iVBORw0KGgo=");
+    expect(calls.map((call) => call.path)).toEqual(["/api/media", "/api/media", "/api/fs/read-data-url"]);
+    expect(calls.every((call) => call.token === TOKEN)).toBe(true);
+    expect(calls.map((call) => call.file)).toEqual([
+      "/images/one.png",
+      "/outside/roots.png",
+      "/outside/roots.png",
+    ]);
+  });
+
+  it("reuses the dashboard login cookie in password mode", async () => {
+    const calls: Array<{ path: string; cookie: string | null }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      calls.push({ path: url.pathname, cookie: headers.get("cookie") });
+      if (url.pathname === "/auth/password-login") {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "set-cookie": "hermes_session=session-1; Path=/; HttpOnly" },
+        });
+      }
+      expect(headers.get("cookie")).toBe("hermes_session=session-1");
+      return new Response(JSON.stringify({ data_url: "data:image/png;base64,iVBORw0KGgo=" }), { status: 200 });
+    };
+    const c = client("ws://hermes.test:8790/api/ws", {
+      auth: {
+        mode: "password",
+        baseUrl: "http://hermes.test:9119",
+        username: "bridge",
+        password: "secret",
+      },
+      fetchImpl,
+      logSink: () => {},
+    });
+    expect(await c.readMediaDataUrl("/images/one.png")).toBe("data:image/png;base64,iVBORw0KGgo=");
+    expect(calls).toEqual([
+      { path: "/auth/password-login", cookie: null },
+      { path: "/api/media", cookie: "hermes_session=session-1" },
+    ]);
+  });
+});
+
 describe("liveness", () => {
   // Issue #63: a monitor that only reads `state()`/the capability id cannot tell "online" from
   // "stuck reconnecting for hours", because neither of those ever changes shape while a bridge is

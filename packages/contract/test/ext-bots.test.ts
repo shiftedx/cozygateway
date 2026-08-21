@@ -5,6 +5,7 @@ import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotChatDeltaFrameSchema,
+  BotChatMessageSchema,
   BotChatResetFrameSchema,
   BotChatResetResponseSchema,
   BotFocusRequestSchema,
@@ -439,6 +440,28 @@ describe("capability advertisement", () => {
     // `bot_chat_adopted` frame that announces the move (a v13 gateway pins once and then holds, so a
     // conversation held from a second device updates the roster preview and never appears in the
     // chat the app opens, and nothing on the wire ever says the pin moved).
-    expect(BOTS_CAPABILITY_VERSION).toBe(14);
+    // 15 for settled assistant MEDIA lines becoming attachment blocks. The field is optional, so
+    // clients below 15 keep rendering text and ignore the new block.
+    expect(BOTS_CAPABILITY_VERSION).toBe(15);
+  });
+
+  it("accepts attachments on an assistant chat row", () => {
+    expect(
+      check(BotChatMessageSchema, {
+        id: "assistant-1",
+        role: "assistant",
+        text: "Here it is.",
+        at: 1_800_000_000_000,
+        attachments: [
+          {
+            type: "attachment",
+            fileId: "0123456789abcdef0123456789abcdef",
+            name: "photo.png",
+            mimeType: "image/png",
+            size: 9,
+          },
+        ],
+      }),
+    ).toBe(true);
   });
 });

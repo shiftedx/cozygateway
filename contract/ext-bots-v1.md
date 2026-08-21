@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 13 }
+"capabilities": { "com.cozylabs.bots": 15 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -143,6 +143,17 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   `GET /bots/:name/chat/messages` returns the re-adopted transcript anyway, so what it loses is
   promptness, not correctness. A re-adoption retires nothing and deletes nothing, and the previous
   session stays listed by `GET /bots/:name/sessions`.
+- `15`: BOT-TO-APP IMAGE ATTACHMENTS. When a turn settles, standalone `MEDIA:<path>` lines in an
+  assistant message, outside code fences, may become `attachments` on that assistant row. The
+  gateway attempts at most three directives per message. It reads through Hermes' authenticated
+  dashboard, tries `/api/media` before `/api/fs/read-data-url`, accepts only png, jpeg, gif and webp
+  bytes up to 8 MB, and stores a gateway-owned copy under a gateway-minted `fileId`. A successful
+  directive line is removed from the settled text. A missing, denied, oversized or wrong-type file
+  leaves its line untouched, as does every directive after the first three.
+
+  A client below 15 ignores the optional assistant `attachments` field. `bot_chat` frames and chat
+  history carry the blocks. `bot_chat_adopted` continues to trigger the history reread that carries
+  them rather than gaining a message payload of its own.
 
 ## 3. Resources
 
@@ -210,29 +221,32 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
   therefore the identity of a rendered row and `clientId` is only the join back to the sender's
   optimistic copy; a client that keys its list on the clientId instead collapses two identical sends
   into one row.
-- `attachments` (capability `>= 9`): the photos sent WITH this message, each one the frozen
+- `attachments`: images associated with this message, each one the frozen
   `attachment` block from `contract/v1.md` section 2:
   `{ "type": "attachment", "fileId": string, "name": string, "mimeType": string, "size": integer }`.
   `fileId` is gateway-scoped and opaque; it is never a URL and never a path, and it is fetched from
   `GET /bots/:name/chat/attachments/:fileId`. `name` is GENERATED (`photo.jpg`, `photo.png`), never
-  the filename the sender uploaded, and `mimeType` is what the BYTES are rather than what the upload
-  claimed. The field is absent, not an empty array, on a message with no attachments, and it appears
-  on user rows only. It rides the 202 body of the photo send, the `bot_chat` frame that later carries
-  the same row, and every history read of that row from then on, so a photo survives a restart and a
-  scroll-back rather than existing only in the frame it arrived on.
+  any source filename, and `mimeType` is what the BYTES are rather than what an upload or dashboard
+  claimed. The field is absent, not an empty array, on a message with no attachments. Since
+  capability 9 it appears on user rows for photos sent with that row, riding the 202 body, later
+  `bot_chat` frame and every history read. Since capability 15 it may also appear on assistant rows
+  for successfully ingested `MEDIA:<path>` lines after the turn settles. Failed lines remain in
+  `text`; successful lines are removed and stay removed on later history reads.
 - Hermes writes its own bookkeeping into the user row it persists for an image turn: an
   `@image:/absolute/path/on/the/hermes/host.png` directive line and a `[screenshot]` marker (and, on
   other paths, `[Image attached at: ...]` or `[User attached image: ...]`). Those lines are STRIPPED
-  from `text` before it reaches this wire, on user rows only. No path on the Hermes host ever reaches
-  a device: the block above is what replaces them, and it names bytes this gateway holds rather than
-  a file on somebody's machine. An assistant's own words are never edited this way, because a bot
-  writing about a file it made is conversation, not machinery (and `GET /bots/:name/media` already
-  answers that case with `reason: "local_path"`).
+  from `text` before it reaches this wire, on user rows only. No path from this bookkeeping reaches
+  a device: the block above is what replaces it, and it names bytes this gateway holds. Assistant
+  text has a separate capability-15 rule: only a whole-line `MEDIA:<path>` directive outside code
+  fences is machinery, and only a successfully ingested line is removed. Every other mention of a
+  path remains conversation.
 - Rows are DROPPED, never rendered as blank bubbles: anything that is not an object, anything whose
   role is not `user` or `assistant` (a `system` prompt, a `tool` result), and anything whose text is
-  empty after flattening (an assistant turn whose whole content was a `tool_use` part). Only the two
-  conversational roles reach the app, from BOTH the history route and the frames, so a client never
-  has to filter tool chatter itself.
+  empty after flattening (an assistant turn whose whole content was a `tool_use` part). A settled
+  capability-15 row whose text becomes empty only because every directive succeeded is retained with
+  its attachments, so an image-only answer remains visible. Only the two conversational roles reach
+  the app, from BOTH the history route and the frames, so a client never has to filter tool chatter
+  itself.
 
 A reply the bridge cannot parse at all reads as an empty, idle session. It never raises.
 
@@ -1030,7 +1044,7 @@ Capability `>= 9`.
 
 ```
 200  <the image bytes>
-     content-type: the sniffed type of the stored photo
+     content-type: the sniffed type of the stored image
      content-length: its size in bytes
      cache-control: private, max-age=86400
      x-content-type-options: nosniff
@@ -1039,16 +1053,16 @@ Capability `>= 9`.
 404  not_found         // no attachment with that id belongs to this bot
 ```
 
-Serves the gateway's OWN copy of a photo a device sent. Not Hermes' copy: the same upload also
-produced a file at an absolute path on the Hermes host, and that file stays unreachable, because
-`GET /bots/:name/media` already refuses local paths on the grounds that serving one from an
-authenticated route is a file-read primitive over the whole box, and that judgement is not walked
-back here. What is served is the bytes the device itself uploaded, under an id this gateway minted,
-which never came out of model output.
+Serves the gateway's OWN copy of an image. For a user row, these are the bytes a device uploaded.
+For a capability-15 assistant row, these are bytes the gateway copied through Hermes' authenticated,
+size-capped and path-guarded dashboard read endpoints after the turn settled. In both cases the id
+was minted by this gateway and never contains a host path.
 
 `fileId` is opaque, fixed-shape (32 hex characters) and gateway-scoped, and is checked against that
 shape before any lookup: a path parameter that could be anything is how an id becomes a path. The
 lookup is scoped to the bot in the URL as well, so one bot's route never serves another bot's photo.
+There is no uploader-device scope: any paired device may read an assistant-bound or user-bound row,
+matching the chat frames and history that are already shared across paired devices.
 
 The header set is the capability-7 posture, for the same reasons: `nosniff` because the type was
 taken from an allow-list and confirmed against the bytes and nothing downstream should improve on it,
@@ -1057,9 +1071,11 @@ went through a device-token route, so they belong to that device rather than to 
 Range requests are not supported and `Accept-Ranges` is not sent: the cap is 8 MB, so the answer is
 always one whole image.
 
-**Photos expire, conversations do not.** A stored photo is kept for 14 days. After that the message
-keeps its text and simply stops carrying the attachment block, and this route answers `404` for the
-id. A client should render that as a picture that is no longer available rather than as a broken chat.
+**Images expire, conversations do not.** Stored bytes are kept for 14 days. After that the message
+keeps its post-ingest text and simply stops carrying the attachment block, and this route answers
+`404` for the id. A successfully consumed assistant directive does not reappear when its bytes
+expire. A client should render the missing block as a picture that is no longer available rather
+than as a broken chat.
 
 The expiry is a property of the READ, not of a sweep having run: a photo past 14 days is unreachable
 from the moment it expires, whether or not the gateway has got around to reclaiming the disk. That
@@ -2177,6 +2193,10 @@ and, for a member speaking inside a group room:
 ```
 
 Read it as a DRAFT and never as a message:
+
+- Capability 15 does not extract media from drafts. A streaming draft may briefly show a raw
+  standalone `MEDIA:<path>` line. Extraction, attachment storage and successful-line removal happen
+  only when the turn settles; the settled `bot_chat` row replaces the draft as usual.
 
 - `text` is the FULL accumulated assistant text so far, not an increment. There is nothing to
   reassemble, re-ordering is harmless, and any subset of the frames can be dropped: render the

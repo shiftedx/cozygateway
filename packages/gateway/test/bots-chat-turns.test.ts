@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { ServerFrame } from "cozygateway-contract";
 
-import { BotChatTurns, CHAT_POLL_MS, CHAT_TURN_TIMEOUT_MS } from "../src/hermes-bridge/chat-turns.ts";
+import {
+  BotChatTurns,
+  CHAT_POLL_MS,
+  CHAT_TURN_TIMEOUT_MS,
+  type AssistantMediaStore,
+  type ChatAttachmentStore,
+} from "../src/hermes-bridge/chat-turns.ts";
 
 /** The turn poll, in isolation. The cadence and the cap are scaled down here so the loop's real
  *  behavior (one poll per bot, deltas only, an idle session ends the turn, the cap ends it anyway)
@@ -43,7 +49,16 @@ function stub(replies: () => Reply, opts: { failResume?: number } = {}) {
   };
 }
 
-function harness(replies: () => Reply, overrides: { pollMs?: number; timeoutMs?: number; failResume?: number } = {}) {
+function harness(
+  replies: () => Reply,
+  overrides: {
+    pollMs?: number;
+    timeoutMs?: number;
+    failResume?: number;
+    attachments?: ChatAttachmentStore;
+    assistantMedia?: AssistantMediaStore;
+  } = {},
+) {
   const frames: ServerFrame[] = [];
   const rpc = stub(replies, overrides.failResume === undefined ? {} : { failResume: overrides.failResume });
   // A fake epoch that advances with real time, so a scaled-down cap expires in scaled-down wall
@@ -55,6 +70,8 @@ function harness(replies: () => Reply, overrides: { pollMs?: number; timeoutMs?:
     now: () => 1_800_000_000_000 + (Date.now() - started),
     pollMs: overrides.pollMs ?? 5,
     timeoutMs: overrides.timeoutMs ?? 300,
+    ...(overrides.attachments === undefined ? {} : { attachments: overrides.attachments }),
+    ...(overrides.assistantMedia === undefined ? {} : { assistantMedia: overrides.assistantMedia }),
   });
   return { turns, frames, rpc };
 }
@@ -111,6 +128,58 @@ describe("BotChatTurns", () => {
     expect(new Set(messages.map((message) => message.id)).size).toBe(messages.length);
     expect(stateFrames(frames).at(0)?.phase).toBe("polling");
     expect(stateFrames(frames).at(-1)).toMatchObject({ phase: "complete", running: false, inflight: false });
+  });
+
+  it("extracts at settlement only, caps attempts at three, and preserves every failed or unattempted line", async () => {
+    const text = [
+      "done",
+      "MEDIA:/tmp/one.png",
+      "`MEDIA:/tmp/missing.png`",
+      "MEDIA:\"/tmp/three.webp\"",
+      "MEDIA:/tmp/four.gif",
+    ].join("\n");
+    let reply: Reply = { messages: [], running: true };
+    const keys = new Map<string, string[]>();
+    const blocks = new Map<string, Array<{ type: "attachment"; fileId: string; name: string; mimeType: string; size: number }>>();
+    const attempts: string[] = [];
+    const attachments: ChatAttachmentStore = {
+      bind: () => {},
+      forMessage: (_sessionId, messageId) => blocks.get(messageId) ?? [],
+      assistantMediaKeys: (_sessionId, messageId) => keys.get(messageId) ?? [],
+    };
+    const assistantMedia: AssistantMediaStore = {
+      ingest: async ({ messageId, path, sourceKey }) => {
+        attempts.push(path);
+        if (path.includes("missing")) throw new Error("not found");
+        keys.set(messageId, [...(keys.get(messageId) ?? []), sourceKey]);
+        blocks.set(messageId, [
+          ...(blocks.get(messageId) ?? []),
+          { type: "attachment", fileId: `photo_${attempts.length}`, name: "photo.png", mimeType: "image/png", size: 9 },
+        ]);
+      },
+    };
+    const { turns, frames } = harness(() => reply, { attachments, assistantMedia });
+    await turns.send("scout", "stored-1", "make images");
+    reply = { messages: [{ id: "a1", role: "assistant", content: text }], running: true };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(attempts).toEqual([]);
+    expect(chatFrames(frames).flatMap((frame) => frame.messages).some((message) => message.id === "a1")).toBe(false);
+
+    reply = { messages: [{ id: "a1", role: "assistant", content: text }] };
+    await turns.settled("scout");
+    expect(attempts).toEqual(["/tmp/one.png", "/tmp/missing.png", "/tmp/three.webp"]);
+    const assistant = chatFrames(frames).flatMap((frame) => frame.messages).find((message) => message.id === "a1");
+    expect(assistant).toMatchObject({
+      role: "assistant",
+      text: "done\n`MEDIA:/tmp/missing.png`\nMEDIA:/tmp/four.gif",
+      attachments: [
+        { type: "attachment", fileId: "photo_1" },
+        { type: "attachment", fileId: "photo_3" },
+      ],
+    });
+
+    const history = await turns.history("scout", "stored-1");
+    expect(history.messages.find((message) => message.id === "a1")).toEqual(assistant);
   });
 
   it("gives up at the cap and says so", async () => {

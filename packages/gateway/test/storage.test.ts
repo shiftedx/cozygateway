@@ -238,3 +238,34 @@ describe("openStorage migrations", () => {
     expect(storage.botChatPin("scout")).toBe("sess-1");
   });
 });
+
+describe("assistant chat attachment storage", () => {
+  it("ingests already bound bytes and keeps the consumed-line marker after byte expiry", () => {
+    const storage = openStorage(":memory:");
+    const ttl = 14 * 24 * 60 * 60 * 1000;
+    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47]);
+    storage.putBotChatAttachment(
+      {
+        fileId: "f".repeat(32),
+        bot: "scout",
+        sessionId: "canonical",
+        messageId: "assistant-41",
+        sourceKey: "digest-41",
+        mime: "image/png",
+        name: "photo.png",
+        size: bytes.byteLength,
+        bytes,
+      },
+      1_000,
+      ttl,
+    );
+    expect(storage.botChatAttachmentsFor("canonical", "assistant-41", 0)).toEqual([
+      expect.objectContaining({ fileId: "f".repeat(32) }),
+    ]);
+    expect(storage.botChatAssistantMediaKeys("canonical", "assistant-41")).toEqual(["digest-41"]);
+
+    storage.sweepBotChatAttachments(1_000 + ttl + 1, ttl);
+    expect(storage.botChatAttachmentsFor("canonical", "assistant-41", 1_001)).toEqual([]);
+    expect(storage.botChatAssistantMediaKeys("canonical", "assistant-41")).toEqual(["digest-41"]);
+  });
+});

@@ -51,7 +51,8 @@ import {
 import { BotChatTurns, RuntimeSessionUnknown } from "./chat-turns.ts";
 import { firstLocalGeneration, nextLocalGeneration, readyIdentity } from "./link-generation.ts";
 import { GroupRooms } from "./group-rooms.ts";
-import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName } from "./photos.ts";
+import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName, sniffImageType } from "./photos.ts";
+import { decodeAssistantMediaDataUrl } from "./assistant-media.ts";
 import {
   BotDeleteRefused,
   BotNotFound,
@@ -170,8 +171,8 @@ export interface BotsSurface {
     name: string,
     photo: BotChatPhotoUpload,
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
-  /** The gateway's own copy of a photo, for `GET /bots/:name/chat/attachments/:fileId`. Scoped to
-   *  the bot, so one bot's URL never serves another's picture. */
+  /** The gateway's own copy of a chat image, for `GET /bots/:name/chat/attachments/:fileId`. Scoped
+   *  to the bot, so one bot's URL never serves another's picture. */
   chatAttachment(name: string, fileId: string): BotChatAttachmentBytes | undefined;
   createBot(input: BotCreateRequest): Promise<BotCreated>;
   deleteBot(name: string): Promise<DeletePath>;
@@ -486,6 +487,29 @@ export class HermesBridge implements BotsSurface {
             mimeType: row.mime,
             size: row.size,
           })),
+        assistantMediaKeys: (sessionId, messageId) =>
+          this.#storage.botChatAssistantMediaKeys(sessionId, messageId),
+      },
+      assistantMedia: {
+        ingest: async ({ bot, sessionId, messageId, path, sourceKey }) => {
+          const dataUrl = await this.#client.readMediaDataUrl(path);
+          const media = decodeAssistantMediaDataUrl(dataUrl, sniffImageType);
+          this.#storage.putBotChatAttachment(
+            {
+              fileId: newPhotoFileId(),
+              bot,
+              sessionId,
+              messageId,
+              sourceKey,
+              mime: media.mime,
+              name: photoDisplayName(media.ext),
+              size: media.bytes.byteLength,
+              bytes: media.bytes,
+            },
+            this.#now(),
+            PHOTO_TTL_MS,
+          );
+        },
       },
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
       ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),

@@ -120,11 +120,8 @@ CREATE TABLE IF NOT EXISTS bot_chat_retired (
   retired_at INTEGER NOT NULL,
   PRIMARY KEY (name, session_id)
 ) STRICT, WITHOUT ROWID;
--- Photos a device sent to a bot (contract/ext-bots-v1.md, capability 9). NOT a cache: these bytes
--- are the gateway's OWN copy of what the device uploaded, and they are the only copy any device can
--- ever be served. The hermes-side file the same upload produced is deliberately unreachable, for the
--- reason GET /bots/:name/media already refuses local paths: serving an arbitrary path on the hermes
--- host from an authenticated route is a file-read primitive over the whole box.
+-- Chat images (contract/ext-bots-v1.md, capabilities 9 and 15). NOT a cache: these bytes are the
+-- gateway's OWN copy, either uploaded by a device or fetched through Hermes' guarded dashboard read.
 --
 -- file_id is opaque, random and gateway-scoped; it is the only handle that ever leaves this process.
 -- message_id is NULL until the turn poll (or a history read) sees the user row this photo was sent
@@ -144,6 +141,16 @@ CREATE TABLE IF NOT EXISTS bot_chat_attachments (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS bot_chat_attachments_row
   ON bot_chat_attachments (session_id, message_id);
+-- Successful capability-15 assistant directives. Only a digest of line position plus line text is
+-- retained, never the Hermes-host path. This marker outlives the attachment bytes so a 14-day byte
+-- expiry does not make a previously consumed host path reappear in chat history.
+CREATE TABLE IF NOT EXISTS bot_chat_assistant_media (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  PRIMARY KEY (session_id, message_id, source_key)
+) STRICT, WITHOUT ROWID;
 -- Tool steps a bot's turn ran (contract/ext-bots-v1.md, capability 12). A CACHE of nothing: hermes
 -- keeps its tool lifecycle on a live event stream and replays none of it, so if these rows are not
 -- written here the activity exists for exactly as long as a socket stayed open, and the collapsed
@@ -728,7 +735,7 @@ export class Storage {
 
   // --- Photos sent to a bot (contract/ext-bots-v1.md, capability 9). -----------------------------
 
-  /** Stores the gateway's own copy of an uploaded photo and sweeps anything past the TTL in the same
+  /** Stores the gateway's own copy of a chat image and sweeps anything past the TTL in the same
    *  transaction.
    *
    *  The sweep rides the insert rather than a timer on purpose: this table only ever grows on an
@@ -743,6 +750,8 @@ export class Storage {
       name: string;
       size: number;
       bytes: Uint8Array;
+      messageId?: string;
+      sourceKey?: string;
     },
     createdAt: number,
     ttlMs: number,
@@ -751,19 +760,29 @@ export class Storage {
     try {
       this.#db
         .prepare(
-          `INSERT INTO bot_chat_attachments (file_id, bot, session_id, message_id, mime, name, size, bytes, created_at)
-           VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+          `INSERT INTO bot_chat_attachments
+             (file_id, bot, session_id, message_id, mime, name, size, bytes, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           entry.fileId,
           entry.bot,
           entry.sessionId,
+          entry.messageId ?? null,
           entry.mime,
           entry.name,
           entry.size,
           entry.bytes,
           createdAt,
         );
+      if (entry.messageId !== undefined && entry.sourceKey !== undefined) {
+        this.#db
+          .prepare(
+            `INSERT OR IGNORE INTO bot_chat_assistant_media (bot, session_id, message_id, source_key)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(entry.bot, entry.sessionId, entry.messageId, entry.sourceKey);
+      }
       this.#db.prepare("DELETE FROM bot_chat_attachments WHERE created_at < ?").run(createdAt - ttlMs);
       this.#db.exec("COMMIT");
     } catch (err) {
@@ -818,6 +837,18 @@ export class Storage {
       mime: string;
       size: number;
     }>;
+  }
+
+  /** Successful assistant directives for one transcript row. These are durable text-rewrite
+   *  markers, not attachment-byte rows, so attachment expiry never makes a consumed path visible. */
+  botChatAssistantMediaKeys(sessionId: string, messageId: string): string[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT source_key AS sourceKey FROM bot_chat_assistant_media
+         WHERE session_id = ? AND message_id = ? ORDER BY source_key`,
+      )
+      .all(sessionId, messageId) as unknown as Array<{ sourceKey: string }>;
+    return rows.map((row) => row.sourceKey);
   }
 
   /** Binds a stored photo to the transcript row it was sent with, ONCE. The `message_id IS NULL`
@@ -944,11 +975,11 @@ export class Storage {
       this.#db.prepare("DELETE FROM bot_meta WHERE name = ?").run(name);
       this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
       this.#db.prepare("DELETE FROM bot_chat_retired WHERE name = ?").run(name);
-      // The photos too, and for a stronger reason than the rows above: they are BYTES a person
-      // uploaded, and a deleted bot is the clearest signal there is that nobody is coming back for
-      // them. Keying on a name rather than an identity cuts the same way it does for the retired set:
-      // a rebuilt bot reusing the name must not inherit its predecessor's pictures.
+      // The images and assistant rewrite markers too. A deleted bot is the clearest signal there is
+      // that nobody is coming back for them, and a rebuilt bot reusing the name must not inherit its
+      // predecessor's pictures or transcript rewrites.
       this.#db.prepare("DELETE FROM bot_chat_attachments WHERE bot = ?").run(name);
+      this.#db.prepare("DELETE FROM bot_chat_assistant_media WHERE bot = ?").run(name);
       // The tool steps go with them, same name-keying argument: a rebuilt bot reusing the name must
       // not show a history strip describing what its predecessor did.
       this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(name);
@@ -1174,4 +1205,3 @@ export function openStorage(dbPath: string): Storage {
   addColumnIfMissing(db, "bot_chat_pins", "runtime_generation", "TEXT");
   return new Storage(db);
 }
-

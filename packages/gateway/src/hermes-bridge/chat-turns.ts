@@ -5,6 +5,11 @@ import { ChatIdentityLedger } from "./chat-identity.ts";
 import { parseChatSnapshot, stripImageDirectives, type ChatSnapshot } from "./chat-messages.ts";
 import type { ChatStreamBinder } from "./chat-stream.ts";
 import { PhotoAttachFailed } from "./photos.ts";
+import {
+  ASSISTANT_MEDIA_MAX_PER_MESSAGE,
+  assistantMediaDirectives,
+  stripAssistantMediaDirectives,
+} from "./assistant-media.ts";
 
 /** Duplex over the canonical Bot Chat: read the history, submit a prompt, and deliver the reply.
  *
@@ -57,6 +62,20 @@ export interface ChatAttachmentStore {
   bind(fileId: string, messageId: string): void;
   /** The blocks belonging to a row, or an empty array, which is the answer for almost every row. */
   forMessage(sessionId: string, messageId: string): AttachmentBlock[];
+  /** Successful assistant directive keys for later history reads. */
+  assistantMediaKeys?(sessionId: string, messageId: string): string[];
+}
+
+export interface AssistantMediaStore {
+  /** Fetches, validates and stores one directive already bound to its assistant row. Rejects on any
+   *  failure, which deliberately leaves the directive visible as text. */
+  ingest(input: {
+    bot: string;
+    sessionId: string;
+    messageId: string;
+    path: string;
+    sourceKey: string;
+  }): Promise<void>;
 }
 
 export interface ChatTurnsOptions {
@@ -66,6 +85,7 @@ export interface ChatTurnsOptions {
   /** Optional: with no store, photo sends are unavailable and every message goes out undecorated,
    *  which is exactly how this module behaved before capability 9. */
   attachments?: ChatAttachmentStore;
+  assistantMedia?: AssistantMediaStore;
   /** Where the live draft of a reply is assembled. Optional: with no stream the turn behaves exactly
    *  as it always has, which is also what happens on a Hermes build that sends no `message.*`
    *  events. The poll below is unaffected either way and remains the source of the reply. */
@@ -192,6 +212,7 @@ export class BotChatTurns {
   readonly #log: (message: string) => void;
   readonly #stream: ChatStreamBinder | undefined;
   readonly #attachments: ChatAttachmentStore | undefined;
+  readonly #assistantMedia: AssistantMediaStore | undefined;
 
   /** One send at a time per bot, held across the attach-and-submit pair.
    *
@@ -228,6 +249,7 @@ export class BotChatTurns {
     this.#log = opts.log ?? (() => {});
     this.#stream = opts.stream;
     this.#attachments = opts.attachments;
+    this.#assistantMedia = opts.assistantMedia;
   }
 
   /** Asks hermes to drop ONE queued image, by the path it told us it wrote, swallowing every failure.
@@ -304,13 +326,42 @@ export class BotChatTurns {
     return { ...snapshot, messages: snapshot.messages.map((message) => this.#decorate(sessionId, message)) };
   }
 
-  /** Hangs a row's stored attachments off it. Answers the message untouched for every row that has
-   *  none, which is almost all of them, and for every non-user row, since only a user sends photos on
-   *  this surface. */
+  /** Hangs stored attachments off either conversational role. For an assistant row, the keys stored
+   *  with successful capability-15 ingests also remove exactly those directive lines on history. */
   #decorate(sessionId: string, message: BotChatMessage): BotChatMessage {
-    if (message.role !== "user" || this.#attachments === undefined) return message;
+    if (this.#attachments === undefined) return message;
     const blocks = this.#attachments.forMessage(sessionId, message.id);
-    return blocks.length === 0 ? message : { ...message, attachments: blocks };
+    const keys =
+      message.role === "assistant" ? new Set(this.#attachments.assistantMediaKeys?.(sessionId, message.id) ?? []) : undefined;
+    const text = keys === undefined ? message.text : stripAssistantMediaDirectives(message.text, keys);
+    if (blocks.length === 0 && text === message.text) return message;
+    return { ...message, text, ...(blocks.length === 0 ? {} : { attachments: blocks }) };
+  }
+
+  async #extractAssistantMedia(
+    name: string,
+    sessionId: string,
+    message: BotChatMessage,
+  ): Promise<BotChatMessage> {
+    if (message.role !== "assistant" || this.#assistantMedia === undefined) return this.#decorate(sessionId, message);
+    const directives = assistantMediaDirectives(message.text).slice(0, ASSISTANT_MEDIA_MAX_PER_MESSAGE);
+    const successful = new Set(this.#attachments?.assistantMediaKeys?.(sessionId, message.id) ?? []);
+    for (const directive of directives) {
+      if (successful.has(directive.key)) continue;
+      try {
+        await this.#assistantMedia.ingest({
+          bot: name,
+          sessionId,
+          messageId: message.id,
+          path: directive.path,
+          sourceKey: directive.key,
+        });
+        successful.add(directive.key);
+      } catch {
+        // Failure is intentionally represented by keeping the original line in the text.
+      }
+    }
+    return this.#decorate(sessionId, { ...message, text: stripAssistantMediaDirectives(message.text, successful) });
   }
 
   /** A history read hands the client every row it returns AND re-bases the delta watermark past
@@ -616,9 +667,20 @@ export class BotChatTurns {
       }
       if (turn.cancelled) return;
 
-      this.#emitMessages(name, turn.sessionId, snapshot.messages);
+      const settled = this.#settled(turn, snapshot);
+      let messages = snapshot.messages;
+      if (settled && this.#assistantMedia !== undefined) {
+        const mark = this.#watermarks.get(name);
+        const already = mark !== undefined && mark.sessionId === turn.sessionId ? mark.seen : EMPTY_IDS;
+        messages = await Promise.all(
+          messages.map((message) =>
+            already.has(message.id) ? message : this.#extractAssistantMedia(name, turn.sessionId, message),
+          ),
+        );
+      }
+      this.#emitMessages(name, turn.sessionId, messages, settled);
       if (snapshot.running || snapshot.inflight) turn.sawActivity = true;
-      if (this.#settled(turn, snapshot)) {
+      if (settled) {
         this.#emitState(name, turn.sessionId, "complete", false, false);
         return;
       }
@@ -653,13 +715,20 @@ export class BotChatTurns {
    *  under fresh ids, which is what a client renders as a doubled conversation (cozygateway#87). A
    *  session id change starts a new mark, so switching chats replays the new chat's messages once
    *  rather than diffing across sessions. */
-  #emitMessages(name: string, sessionId: string, messages: BotChatMessage[]): void {
+  #emitMessages(name: string, sessionId: string, messages: BotChatMessage[], settled = true): void {
     const mark = this.#watermarks.get(name);
     const already = mark !== undefined && mark.sessionId === sessionId ? mark.seen : EMPTY_IDS;
-    const fresh = messages
+    const visible = messages.filter(
+      (message) =>
+        settled ||
+        this.#assistantMedia === undefined ||
+        message.role !== "assistant" ||
+        assistantMediaDirectives(message.text).length === 0,
+    );
+    const fresh = visible
       .filter((message) => !already.has(message.id))
       .map((message) => this.#decorate(sessionId, this.#reconcile(name, message, already)));
-    this.#setWatermark(name, sessionId, messages);
+    this.#setWatermark(name, sessionId, visible);
     if (fresh.length === 0) return;
     this.#broadcast({
       type: "bot_chat",
