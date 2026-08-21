@@ -1780,7 +1780,7 @@ export class HermesBridge implements BotsSurface {
 
     const run = (async () => {
       try {
-        const created = await createBotProfile(this.#client, input, this.#now());
+        const created = await createBotProfile(this.#client, input, this.#now(), this.#bridgeProfile);
         await this.refresh(`bot ${created.name} created`);
         const row = this.#storage.botRoster().bots.find((bot) => bot.name === created.name);
         return {

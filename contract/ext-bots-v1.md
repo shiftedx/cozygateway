@@ -525,14 +525,38 @@ body {
 409  conflict                         // a profile of that name already exists
 ```
 
-Creates a bot, which upstream calls a profile. Two Hermes calls, in this order:
+Creates a bot, which upstream calls a profile. Creation performs these Hermes operations, in this
+order:
 
 1. `profiles.create` with the canonical name, the `description` verbatim, and **`share_auth: true`
    sent explicitly**. That flag is load-bearing: the backend defaults it to false, which COPIES the
    launch profile's `auth.json` rather than sharing it, and a forked OAuth pool means the first
    token refresh on either side invalidates the other. The description is the profile's own;
    `title` is a client-side label and stays out of it.
-2. `profiles.configure` writing `ui_meta["hermes-bots"] = { title?, shape?, color?, created }`,
+2. The bridge reads its operator profile through `GET /api/config` (or
+   `GET /api/config?profile=<bridge-profile>` when configured), then deep-merges this creation seed
+   into the new profile through `PUT /api/config?profile=<new-name>`:
+
+   ```yaml
+   display:
+     busy_input_mode: steer
+   agent:
+     max_turns: 90
+     gateway_timeout: 1800
+     clarify_timeout: 600
+     gateway_timeout_warning: 900
+     gateway_notify_interval: 600
+   providers: <the operator profile's providers map, when present>
+   ```
+
+   This happens only after `profiles.create` succeeds. A pre-existing profile, including a create
+   that answers 409, is never rewritten. Operators own existing profile config.
+
+   Only the operator profile's root `providers` map is copied. Neighboring sections such as auth,
+   env, MCP servers, approvals, and their secrets are not duplicated. The providers map itself is
+   copied verbatim, including any credential fields the operator deliberately stored inside a
+   provider entry, because both the source and destination are that operator's own profiles.
+3. `profiles.configure` writing `ui_meta["hermes-bots"] = { title?, shape?, color?, created }`,
    where `created` is MILLISECONDS. The namespace key and the field names are the desktop plugin's,
    so a bot made from a phone renders identically on a desktop.
 

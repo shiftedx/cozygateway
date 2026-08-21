@@ -1,8 +1,9 @@
 import type { BotCreateRequest } from "cozygateway-contract";
 
-import { HermesRpcError, HermesUnavailable } from "./client.ts";
+import { HermesRpcError, HermesUnavailable, type HermesClient } from "./client.ts";
 import { UI_META_KEY } from "./roster.ts";
 import type { HermesRpc } from "./canonical-chat.ts";
+import { seedCreatedProfile } from "./profile-seed.ts";
 
 /** Creating and deleting bots, which upstream calls profiles. There is no `bots.*` namespace and
  *  no create/delete convenience anywhere in Hermes 0.20.3: a bot is born from `profiles.create`
@@ -214,9 +215,10 @@ function metaOutcomeOf(result: unknown): MetaOutcome {
  *  A failed look write never fails the create: the profile exists either way, and losing a color
  *  is not worth orphaning a bot the caller believes was not made. */
 export async function createBotProfile(
-  rpc: HermesRpc,
+  rpc: HermesClient,
   input: BotCreateRequest & { name: string },
   now: number,
+  bridgeProfile?: string,
 ): Promise<CreatedBot> {
   const name = validateNewBotName(input.name);
   const description = input.description?.trim() ?? "";
@@ -230,6 +232,11 @@ export async function createBotProfile(
     if (isDuplicateProfileError(err)) throw new BotNameTaken(name);
     throw err;
   }
+
+  // Creation-only by construction: this is reached only after `profiles.create` succeeds. A 4062
+  // duplicate exits through BotNameTaken above, so adopting or merely addressing an existing
+  // profile never rewrites operator-owned config.
+  await seedCreatedProfile(rpc, name, bridgeProfile);
 
   const meta: BotMetaBlob = {
     ...(input.title === undefined ? {} : { title: input.title }),
