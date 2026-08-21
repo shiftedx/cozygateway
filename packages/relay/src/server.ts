@@ -26,6 +26,8 @@ export interface RelayConfig {
   /** Restrict webhook egress to public addresses (design decision, issue #8). See
    *  `parseCliConfig` in `cli.ts` for how the CLI derives this default from `host`. */
   restrictEgress: boolean;
+  /** Honor the rightmost X-Forwarded-For hop. Enable only behind a trusted proxy. */
+  trustForwarded?: boolean;
   /** When set, the relay serves the "apns" platform; unset means webhook-only. */
   apns?: ApnsConfig;
 }
@@ -52,6 +54,7 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
     version: RELAY_VERSION,
     now: () => Date.now(),
     restrictEgress: config.restrictEgress,
+    trustForwarded: config.trustForwarded,
   });
   const server = await new Promise<Server>((resolve) => {
     const s = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () => {

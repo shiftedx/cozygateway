@@ -1,7 +1,8 @@
 # Self-hosting cozygateway with Docker
 
-Two containers: the gateway (your agent as a chat contact) and the push relay (ciphertext-only
-notification forwarder). Both build from this monorepo and store SQLite on a named volume.
+The gateway container uses the CozyLabs hosted push relay by default. An optional local relay
+container is available through the `local-push` profile for developers with their own app and
+publisher-team APNs key. Both services build from this monorepo and use named SQLite volumes.
 
 Prefer not to do this by hand? `docs/agent-install.md` is the same install written as a playbook an
 AI agent can execute for you, end to end, including the Hermes dashboard wiring and the pairing
@@ -16,18 +17,17 @@ The image ships a default `mock` ("echo") agent. In another terminal, mint a pai
 
     docker exec <container> node dist/cli.js pair --config /app/cozygateway.config.json
 
-## Full deployment (gateway + relay via compose)
+## Full deployment via Compose
 
     cp .env.example .env      # then edit COZYGATEWAY_ATTACH_TOKEN
     docker compose up --build
 
-- The gateway is published on `8787`. The relay listens on `8788` inside the compose network
-  (override it with `COZY_RELAY_PORT`) and is not published on the host. Phones reach relay
-  registration through the gateway's authenticated `/push` proxy.
+- The gateway is published on `8787`. Its authenticated `/push` proxy forwards to
+  `https://push.cozylabs.ai` by default, with end-to-end encrypted notification payloads.
 - The mounted `docker/cozygateway.config.json` selects the `attach` backend; point your agent
   harness's plugin at `http://<host>:8787/attach` with `COZYGATEWAY_TOKEN` equal to
   `COZYGATEWAY_ATTACH_TOKEN`.
-- SQLite persists in the `gateway-data` and `relay-data` named volumes.
+- SQLite persists in the `gateway-data` named volume. The optional local relay uses `relay-data`.
 
 ## Environment
 
@@ -38,7 +38,7 @@ Gateway:
 | `COZYGATEWAY_HOST` | `127.0.0.1` (image sets `0.0.0.0`) | bind address |
 | `COZYGATEWAY_PORT` | `8787` | listen port |
 | `COZYGATEWAY_DB_PATH` | `cozygateway.db` (image sets `/data/cozygateway.db`) | SQLite path |
-| `COZYGATEWAY_PUSH_RELAY_URL` | (unset) | private relay origin for the authenticated `/push` proxy; compose sets `http://relay:8788` |
+| `COZYGATEWAY_PUSH_RELAY_URL` | `https://push.cozylabs.ai` in Compose | relay origin for the authenticated `/push` proxy |
 | `COZYGATEWAY_ATTACH_TOKEN` | (required for the attach config) | bearer token the plugin presents on `/attach` |
 | `COZYGATEWAY_HERMES_URL` | (config value) | retargets the optional hermes bots bridge; ignored when no bridge is configured |
 | `COZY_TLS_CERT_FILE` | (unset: plain HTTP) | PEM certificate chain; set with the key to serve HTTPS (`docs/tls.md`) |
@@ -152,9 +152,11 @@ Relay:
 | --- | --- | --- |
 | `COZY_RELAY_PORT` | `8788` | private listen port passed to the relay CLI and gateway target |
 
-With the push proxy enabled, the relay port does not need to be exposed beyond the compose
-network. The reference compose file uses `expose`, not a host `ports` mapping. Keep the gateway's
-public TLS endpoint reachable by the phone and keep the relay listener private.
+The local relay is disabled during an ordinary `docker compose up`. To use it, set
+`COZYGATEWAY_PUSH_RELAY_URL=http://relay:8788` in `.env` and start with
+`docker compose --profile local-push up --build`. Its port does not need to be exposed beyond the
+Compose network. Keep the gateway's public TLS endpoint reachable by the phone and keep the local
+relay listener private.
 
 ## TLS
 
@@ -175,10 +177,11 @@ and for what the app's trust-on-first-use certificate pinning expects.
 
 Whatever you choose, do not put a plaintext gateway on the open internet.
 
-## Push over APNs (optional)
+## Local push over APNs (developer option)
 
-The relay is webhook-only by default. To deliver real iOS push, configure APNs token auth and
-mount your `.p8` key:
+The hosted relay is the zero-config path for the store app. A self-hosted relay cannot push to the
+store app because APNs keys are scoped to the publisher team. If you sign your own app with your
+own Apple team, configure APNs token auth and mount that team's `.p8` key:
 
 1. In the Apple developer portal, create an APNs auth key (`.p8`), and note the key id, your team
    id, and the app bundle id (`com.cozylabs.cozychat`).
@@ -186,6 +189,8 @@ mount your `.p8` key:
 3. Set in `.env`: `APNS_KEY_P8_HOST_PATH`, `APNS_KEY_P8_PATH=/keys/apns.p8`, `APNS_KEY_ID`,
    `APNS_TEAM_ID`, `APNS_TOPIC=com.cozylabs.cozychat`, `APNS_ENVIRONMENT` (`development` for a dev
    build, `production` for TestFlight/App Store).
+4. Set `COZYGATEWAY_PUSH_RELAY_URL=http://relay:8788` and start Compose with
+   `--profile local-push`.
 
 Relay APNs environment:
 

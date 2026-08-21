@@ -1,5 +1,6 @@
-# Reference deployment: the gateway plus the push relay, each as its own container with a named
-# SQLite volume and a healthcheck. Copy .env.example to .env and set a strong attach token.
+# Reference deployment: the gateway uses the CozyLabs hosted push relay by default. The optional
+# local relay is in the local-push profile for developers with their own publisher-team APNs key.
+# Copy .env.example to .env and set a strong attach token.
 services:
   gateway:
     build:
@@ -9,9 +10,9 @@ services:
       COZYGATEWAY_HOST: "0.0.0.0"
       COZYGATEWAY_PORT: "8787"
       COZYGATEWAY_DB_PATH: "/data/cozygateway.db"
-      # The gateway reaches the push relay only over the private compose network. Phones use the
-      # authenticated /push proxy on the gateway's public origin.
-      COZYGATEWAY_PUSH_RELAY_URL: "http://relay:${COZY_RELAY_PORT:-8788}"
+      # Hosted push works with the store app because CozyLabs holds that publisher team's APNs key.
+      # Payloads are end-to-end encrypted. Override for a local-push developer relay if needed.
+      COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"
       # The bearer token the attaching Hermes plugin must present on /attach. Named by the mounted
       # config's options.tokenEnv. Required: compose fails fast if unset.
       COZYGATEWAY_ATTACH_TOKEN: "${COZYGATEWAY_ATTACH_TOKEN:?set a strong attach token in .env}"
@@ -45,6 +46,9 @@ services:
     restart: unless-stopped
 
   relay:
+    # A self-hosted relay cannot push to the store app: APNs keys are scoped to the publisher team.
+    # This profile is for developers signing their own app with their own Apple team.
+    profiles: ["local-push"]
     build:
       context: .
       dockerfile: packages/relay/Dockerfile

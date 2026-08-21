@@ -15,19 +15,33 @@ ciphertext construction.
 The relay binds `127.0.0.1` by default. A hosted instance runs behind its own
 TLS-terminating reverse proxy; that proxy is out of scope here.
 
+## Hosted relay posture
+
+The CozyLabs public relay is intentionally accountless. It accepts only opaque push
+identifiers, bounded ciphertext, and the allowlisted category and collapse metadata.
+Per-source rate limits and the storage and delivery caps below bound abuse without
+adding an account or identity service to the notification path. The existing auth
+middleware remains the single future unlock seam if operating experience requires it.
+
+`POST /register` allows 10 requests per minute per source IP. `POST /notify` allows 60.
+Both use in-memory token buckets, return 429 with `Retry-After`, and discard idle bucket
+state lazily. The socket peer is the source by default. A public instance directly
+behind a trusted proxy can pass `--trust-forwarded` to use the rightmost non-empty
+`X-Forwarded-For` value instead. Never enable that flag when clients can connect to the
+relay directly, since they could choose the header themselves.
+
 ## Storage growth caps
 
 Two independent bounds keep the sqlite file from growing without limit:
 
 - **Registration cap** (`--max-registrations`, default 10000): a total-row cap on
   `registrations`. The reserved auth-hook middleware slot (see below) is the intended
-  long-term gate on who can register at all; this cap protects the window before that
-  lands, so an unauthenticated flood cannot grow the DB past a fixed size. Exceeding it
-  refuses the new registration with `429 over_cap`. Refreshing an existing `pushId`
+  future gate if the accountless posture changes. This cap ensures an unauthenticated
+  flood cannot grow the DB past a fixed size. Exceeding it refuses the new registration
+  with `429 over_cap`. Refreshing an existing `pushId`
   (re-registering the same id, e.g. a future token-refresh flow) is never refused by the
   cap, since it does not add a row. There is deliberately no per-source-IP registration
-  rate limit in this cap; the auth-hook slot is where that kind of finer-grained gating
-  belongs once it lands.
+  count in storage; the in-memory token bucket is the source-level bound.
 - **`notify_counts` retention**: rows are kept for `NOTIFY_COUNT_RETENTION_DAYS` (7 UTC
   days) and then swept. The sweep is lazy: it runs inline on every `POST /notify` call
   rather than on a timer, which keeps the relay dependency-free and trivial to shut down.

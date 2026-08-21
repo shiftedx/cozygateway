@@ -102,6 +102,14 @@ export class RelayStorage {
     return row?.count ?? 0;
   }
 
+  /** Aggregate count for operator health reporting. Never returns push identifiers. */
+  totalNotifyCount(day: string): number {
+    const row = this.#db
+      .prepare("SELECT COALESCE(SUM(count), 0) AS n FROM notify_counts WHERE day = ?")
+      .get(day) as { n: number };
+    return row.n;
+  }
+
   incrementNotifyCount(pushId: string, day: string): void {
     this.#db
       .prepare(

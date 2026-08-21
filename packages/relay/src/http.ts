@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 
+import { getConnInfo } from "@hono/node-server/conninfo";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { createMiddleware } from "hono/factory";
@@ -7,6 +8,7 @@ import { Value } from "@sinclair/typebox/value";
 import type { Static, TSchema } from "@sinclair/typebox";
 
 import { isBlockedLiteralHost, stripIpv6Brackets } from "./egress.ts";
+import { PerMinuteRateLimiter } from "./rate-limit.ts";
 import { NotifyRequestSchema, RegisterRequestSchema, relayError } from "./schemas.ts";
 import { DEFAULT_REGISTRATION_TTL_DAYS, utcDay, type RelayStorage } from "./storage.ts";
 import type { Transport } from "./transports.ts";
@@ -31,8 +33,18 @@ export interface RelayAppDeps {
    *  restricted range (loopback, link-local, private, unspecified). A DNS-name host is
    *  not resolved here; it is vetted again at delivery time (design decision, issue #8). */
   restrictEgress: boolean;
+  /** Trust the rightmost X-Forwarded-For value as the source IP. Enable only when the
+   *  relay is directly behind a trusted reverse proxy. */
+  trustForwarded?: boolean;
+  registerRateLimitPerMinute?: number;
+  notifyRateLimitPerMinute?: number;
+  /** Test seam for requests not backed by a Node socket. */
+  sourceIp?: (c: Context) => string;
   log?: (message: string) => void;
 }
+
+export const DEFAULT_REGISTER_RATE_LIMIT_PER_MINUTE = 10;
+export const DEFAULT_NOTIFY_RATE_LIMIT_PER_MINUTE = 60;
 
 function isHttpUrl(value: string): boolean {
   try {
@@ -54,11 +66,50 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   const registrationTtlDays = deps.registrationTtlDays ?? DEFAULT_REGISTRATION_TTL_DAYS;
   const app = new Hono();
 
-  // Auth hook: the hosted instance's future unlock check lands in this single middleware slot.
-  // v0 ships open with abuse caps only (design spec, section 2, decision 2).
+  const directSourceIp = deps.sourceIp ?? ((c: Context): string => {
+    try {
+      return getConnInfo(c).remote.address ?? "unknown";
+    } catch {
+      // Hono's in-process app.request() has no socket. Production requests always do.
+      return "unknown";
+    }
+  });
+  const sourceIp = (c: Context): string => {
+    if (deps.trustForwarded === true) {
+      const forwarded = c.req.header("x-forwarded-for")
+        ?.split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0)
+        .at(-1);
+      if (forwarded !== undefined) return forwarded;
+    }
+    return directSourceIp(c);
+  };
+  const registerLimiter = new PerMinuteRateLimiter(
+    deps.registerRateLimitPerMinute ?? DEFAULT_REGISTER_RATE_LIMIT_PER_MINUTE,
+  );
+  const notifyLimiter = new PerMinuteRateLimiter(
+    deps.notifyRateLimitPerMinute ?? DEFAULT_NOTIFY_RATE_LIMIT_PER_MINUTE,
+  );
+  const rateLimit = (limiter: PerMinuteRateLimiter) => createMiddleware(async (c, next) => {
+    const decision = limiter.consume(sourceIp(c), deps.now());
+    if (!decision.allowed) {
+      return c.json(
+        relayError("over_cap", "source rate limit exceeded"),
+        429,
+        { "retry-after": String(decision.retryAfterSeconds) },
+      );
+    }
+    await next();
+  });
+
+  // Accountless by design: ciphertext-only payloads and the layered caps bound abuse without
+  // adding an identity service. A future unlock check can land in this single middleware slot.
   const authHook = createMiddleware(async (_c, next) => {
     await next();
   });
+  app.use("/register", rateLimit(registerLimiter));
+  app.use("/notify", rateLimit(notifyLimiter));
   app.use("/register", authHook);
   app.use("/notify", authHook);
 
@@ -73,7 +124,12 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   const parseBody = <S extends TSchema>(schema: S, body: unknown): Static<S> | undefined =>
     Value.Check(schema, body) ? (body as Static<S>) : undefined;
 
-  app.get("/health", (c) => c.json({ name: "cozygateway-relay", version: deps.version }));
+  app.get("/health", (c) => c.json({
+    name: "cozygateway-relay",
+    version: deps.version,
+    registrations: deps.storage.registrationCount(),
+    todaysNotifies: deps.storage.totalNotifyCount(utcDay(deps.now())),
+  }));
 
   app.post("/register", async (c) => {
     const parsed = parseBody(RegisterRequestSchema, await readBody(c));

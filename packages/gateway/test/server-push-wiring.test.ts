@@ -9,6 +9,7 @@ describe("bot chat push server wiring", () => {
       displayName: "Scout",
       messageId: "m1",
       chatSessionId: "stored-1",
+      preview: "the reply",
     };
     const connected = new Set(["phone"]);
     const calls: unknown[] = [];

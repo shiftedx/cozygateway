@@ -22,6 +22,10 @@ function harness(overrides?: {
   restrictEgress?: boolean;
   maxRegistrations?: number;
   registrationTtlDays?: number;
+  trustForwarded?: boolean;
+  registerRateLimitPerMinute?: number;
+  notifyRateLimitPerMinute?: number;
+  sourceIp?: string;
 }): { app: ReturnType<typeof createRelayApp>; storage: RelayStorage; deliveries: Delivery[] } {
   const storage = openRelayStorage(":memory:");
   cleanups.push(() => storage.close());
@@ -43,22 +47,34 @@ function harness(overrides?: {
     log: () => {},
     restrictEgress: overrides?.restrictEgress ?? false,
     registrationTtlDays: overrides?.registrationTtlDays,
+    trustForwarded: overrides?.trustForwarded,
+    registerRateLimitPerMinute: overrides?.registerRateLimitPerMinute,
+    notifyRateLimitPerMinute: overrides?.notifyRateLimitPerMinute,
+    sourceIp: () => overrides?.sourceIp ?? "socket-ip",
   });
   return { app, storage, deliveries };
 }
 
-async function register(app: ReturnType<typeof createRelayApp>, body: unknown): Promise<Response> {
+async function register(
+  app: ReturnType<typeof createRelayApp>,
+  body: unknown,
+  headers?: Record<string, string>,
+): Promise<Response> {
   return app.request("/register", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
 }
 
-async function notify(app: ReturnType<typeof createRelayApp>, body: unknown): Promise<Response> {
+async function notify(
+  app: ReturnType<typeof createRelayApp>,
+  body: unknown,
+  headers?: Record<string, string>,
+): Promise<Response> {
   return app.request("/notify", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
 }
@@ -162,6 +178,31 @@ describe("POST /register", () => {
       expect((await register(app, { platform: "webhook", token: "https://x.example/hook" })).status).toBe(201);
     });
   });
+
+  describe("per-source rate limiting", () => {
+    it("returns 429 with retry-after after the default ten-register burst", async () => {
+      const { app } = harness();
+      for (let i = 0; i < 10; i += 1) expect((await register(app, {})).status).toBe(400);
+      const limited = await register(app, {});
+      expect(limited.status).toBe(429);
+      expect(limited.headers.get("retry-after")).toBe("6");
+    });
+
+    it("uses only the rightmost forwarded hop when explicitly trusted", async () => {
+      const { app } = harness({ trustForwarded: true, registerRateLimitPerMinute: 1 });
+      const body = { platform: "webhook", token: "https://x.example/hook" };
+      expect((await register(app, body, { "x-forwarded-for": "198.51.100.1, 203.0.113.9" })).status).toBe(201);
+      expect((await register(app, body, { "x-forwarded-for": "198.51.100.2, 203.0.113.9" })).status).toBe(429);
+      expect((await register(app, body, { "x-forwarded-for": "198.51.100.1, 203.0.113.10" })).status).toBe(201);
+    });
+
+    it("ignores forwarded values unless trust-forwarded is enabled", async () => {
+      const { app } = harness({ registerRateLimitPerMinute: 1, sourceIp: "real-peer" });
+      const body = { platform: "webhook", token: "https://x.example/hook" };
+      expect((await register(app, body, { "x-forwarded-for": "198.51.100.1" })).status).toBe(201);
+      expect((await register(app, body, { "x-forwarded-for": "198.51.100.2" })).status).toBe(429);
+    });
+  });
 });
 
 describe("POST /notify", () => {
@@ -263,6 +304,32 @@ describe("POST /notify", () => {
     nowRef.value = Date.UTC(2026, 6, 20, 0, 0, 0);
     expect((await notify(app, { pushId, ciphertext: "C" })).status).toBe(202);
     expect(storage.notifyCount(pushId, oldDay)).toBe(0);
+  });
+
+  it("has a separate default sixty-per-minute source bucket", async () => {
+    const { app } = harness();
+    const pushId = await registeredPushId(app);
+    for (let i = 0; i < 60; i += 1) {
+      expect((await notify(app, { pushId: "unknown", ciphertext: "C" })).status).toBe(404);
+    }
+    const limited = await notify(app, { pushId, ciphertext: "C" });
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("1");
+  });
+});
+
+describe("GET /health", () => {
+  it("reports aggregate registrations and today's notifies without identifiers", async () => {
+    const { app } = harness();
+    const pushId = await registeredPushId(app);
+    expect((await notify(app, { pushId, ciphertext: "C" })).status).toBe(202);
+    const res = await app.request("/health");
+    expect(await res.json()).toEqual({
+      name: "cozygateway-relay",
+      version: "test",
+      registrations: 1,
+      todaysNotifies: 1,
+    });
   });
 });
 
@@ -469,7 +536,12 @@ describe("envelope faults", () => {
     const { app } = harness();
     const res = await app.request("/health");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ name: "cozygateway-relay", version: "test" });
+    expect(await res.json()).toEqual({
+      name: "cozygateway-relay",
+      version: "test",
+      registrations: 0,
+      todaysNotifies: 0,
+    });
   });
 
   it("500s with the internal error envelope when a route handler throws unexpectedly", async () => {

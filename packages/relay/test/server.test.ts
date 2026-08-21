@@ -21,7 +21,12 @@ describe("startRelay", () => {
     expect(relay.url).toBe(`http://127.0.0.1:${relay.port}`);
     const health = await fetch(`${relay.url}/health`);
     expect(health.status).toBe(200);
-    expect(await health.json()).toEqual({ name: "cozygateway-relay", version: RELAY_VERSION });
+    expect(await health.json()).toEqual({
+      name: "cozygateway-relay",
+      version: RELAY_VERSION,
+      registrations: 0,
+      todaysNotifies: 0,
+    });
     const res = await fetch(`${relay.url}/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },

@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -161,6 +161,15 @@ describe("loadConfig", () => {
       turnTimeoutSeconds: -1,
     });
     expect(() => loadConfig(path)).toThrow(ContractViolation);
+  });
+});
+
+describe("reference deployment", () => {
+  it("defaults push to the hosted CozyLabs relay", () => {
+    const compose = readFileSync(new URL("../../../docker-compose.yml", import.meta.url), "utf8");
+    expect(compose).toContain(
+      'COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"',
+    );
   });
 });
 

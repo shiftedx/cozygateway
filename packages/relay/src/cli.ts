@@ -10,7 +10,7 @@ import { DEFAULT_REGISTRATION_TTL_DAYS } from "./storage.ts";
 const USAGE =
   "usage: cozy-push-relay [--port 8788] [--host 127.0.0.1] [--db relay.db] [--daily-cap 500] " +
   `[--max-registrations ${DEFAULT_MAX_REGISTRATIONS}] [--registration-ttl-days ${DEFAULT_REGISTRATION_TTL_DAYS}] ` +
-  "[--restrict-egress | --no-restrict-egress]";
+  "[--restrict-egress | --no-restrict-egress] [--trust-forwarded]";
 
 export function parseCliConfig(argv: string[]): RelayConfig {
   const { values } = parseArgs({
@@ -24,6 +24,7 @@ export function parseCliConfig(argv: string[]): RelayConfig {
       "registration-ttl-days": { type: "string", default: String(DEFAULT_REGISTRATION_TTL_DAYS) },
       "restrict-egress": { type: "boolean", default: false },
       "no-restrict-egress": { type: "boolean", default: false },
+      "trust-forwarded": { type: "boolean", default: false },
     },
   });
   const port = Number(values.port);
@@ -49,7 +50,16 @@ export function parseCliConfig(argv: string[]): RelayConfig {
       : values["no-restrict-egress"] === true
         ? false
         : !isLoopbackBindHost(values.host);
-  return { port, host: values.host, dbPath: values.db, dailyCap, maxRegistrations, registrationTtlDays, restrictEgress };
+  return {
+    port,
+    host: values.host,
+    dbPath: values.db,
+    dailyCap,
+    maxRegistrations,
+    registrationTtlDays,
+    restrictEgress,
+    trustForwarded: values["trust-forwarded"],
+  };
 }
 
 export async function runCli(argv: string[]): Promise<number> {

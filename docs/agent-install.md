@@ -33,6 +33,18 @@ mints a pairing code. It writes everything a later step needs into two mode-600 
 Steps 4 through 9 read those files. That is the whole state-passing mechanism. If the script cannot
 run on this machine, Appendix A does the same work by hand, writing the same two files.
 
+## How push works
+
+The installer configures `https://push.cozylabs.ai` without asking a new question. The
+gateway encrypts every notification end to end before sending it. The hosted relay sees
+only an opaque push ID, ciphertext, optional category and collapse ID, and the source IP
+transiently for rate limiting. It never sees message content or device identity. Set
+`COZYGATEWAY_PUSH_RELAY_URL` before running the installer to persist a different relay URL.
+
+A self-hosted relay cannot push to the store app because APNs keys are scoped to the
+publisher team. Developers signing their own app with their own Apple team can instead
+use the Compose `local-push` profile described in `docs/self-host-docker.md`.
+
 ---
 
 ## Step 0. Decide the shape, with the human
@@ -743,6 +755,7 @@ print(json.dumps({
     "port": int(os.environ["COZY_GATEWAY_PORT"]),
     "host": "0.0.0.0",
     "dbPath": db,
+    "pushRelayUrl": "https://push.cozylabs.ai",
     "agents": [],
     "hermes": {
         "url": f"ws://{ws_host}:{os.environ['COZY_DASHBOARD_PORT']}/api/ws",
@@ -803,8 +816,8 @@ PY
   docker compose -f docker-compose.yml -f docker/agent-install.override.yml up -d --build gateway
 ```
 
-Naming `gateway` keeps the push relay out of it; a bots gateway needs no relay. On the Node path,
-read the password from the file into the environment of that one process:
+Naming `gateway` keeps the optional local relay out of it; hosted push needs no local service. On
+the Node path, read the password from the file into the environment of that one process:
 
 ```sh
 . ~/cozygateway/local/install-env.sh && cd "$COZY_GATEWAY_DIR" && \

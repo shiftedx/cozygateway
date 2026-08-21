@@ -1807,7 +1807,8 @@ fi
 CONFIG_BODY="$(
   CFG_NAME="$GATEWAY_NAME" CFG_PORT="$GATEWAY_PORT" CFG_HOST="$BIND_HOST" CFG_DB="$DB_PATH" \
   CFG_WS="ws://$HERMES_WS_HOST:$DASHBOARD_PORT/api/ws" CFG_USER="$BRIDGE_USER" \
-  CFG_HIDDEN="$HIDDEN_PROFILES" "$HERMES_PY" - <<'PY'
+  CFG_HIDDEN="$HIDDEN_PROFILES" \
+  CFG_PUSH_RELAY="${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}" "$HERMES_PY" - <<'PY'
 import json
 import os
 
@@ -1817,6 +1818,7 @@ print(json.dumps({
     "port": int(os.environ["CFG_PORT"]),
     "host": os.environ["CFG_HOST"],
     "dbPath": os.environ["CFG_DB"],
+    "pushRelayUrl": os.environ["CFG_PUSH_RELAY"],
     "agents": [],
     "hermes": {
         "url": os.environ["CFG_WS"],

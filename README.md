@@ -49,18 +49,30 @@ curl -fsSL https://cozylabs.ai/install
 
 The playbook is written for the agent, not for you: every step carries a check command and the output that command must produce, so the agent can tell you it worked rather than guess. It needs a working Hermes install (0.20.2 or newer) plus either Docker or Node 24. `scripts/agent-install.sh` does the mechanical half and has a `--dry-run` flag if you want to read the plan first, and the same playbook now accepts `--service` on the Node path to run supervised instead of with `nohup`.
 
+## How push works
+
+Self-hosted gateways use `https://push.cozylabs.ai` by default so the store app works
+without APNs setup. The gateway encrypts every notification end to end before sending it.
+The hosted relay sees only an opaque push ID, ciphertext, optional category and collapse
+ID, and the source IP transiently for rate limiting. It never sees message content or
+device identity. Override `COZYGATEWAY_PUSH_RELAY_URL` to use another relay.
+
+A relay you host with your own APNs key cannot push to the store app because APNs keys
+are scoped to the publisher team. The `local-push` Compose profile is for developers who
+sign their own app with their own Apple team.
+
 ## What it does
 
-- Pairing: scan a QR code, get a revocable device token. No accounts, no cloud.
+- Pairing: scan a QR code, get a revocable device token. No accounts.
 - Threads: multiple renameable DM threads per agent, each bound to its own backend session.
 - Streaming: agent replies stream live as typed rich content blocks over one WebSocket.
 - History: SQLite-backed message history with strict per-thread ordering and gap replay.
-- Push: encrypted notifications through a ciphertext-only relay you can self-host (platform push transports land with the phone app).
+- Push: end-to-end encrypted notifications through the accountless CozyLabs relay by default.
 
 ## Status
 
-- Shipped: contract v1 (frozen), reference gateway, conformance suite, attach backend adapter, push relay + encrypted push origination (`contract/push-v0.md`), TLS for the phone link (gateway-native, or a shipped Caddy sidecar example; `docs/tls.md`).
-- Planned: the phone app, platform push transports (APNs), additional backend adapters.
+- Shipped: contract v1 (frozen), reference gateway, conformance suite, attach backend adapter, hosted relay plus encrypted push origination and APNs delivery (`contract/push-v0.md`), TLS for the phone link (gateway-native, or a shipped Caddy sidecar example; `docs/tls.md`).
+- Planned: additional backend adapters.
 
 ## Repo layout
 
@@ -73,7 +85,7 @@ The playbook is written for the agent, not for you: every step carries a check c
 
 ## Privacy model
 
-Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends your content anywhere else. TLS for the phone link ships two ways, gateway-native or a Caddy sidecar example, and the app pins the certificate on first use; see `docs/tls.md`. Plain HTTP remains the default, for boxes that already terminate TLS in front. The push relay carries ciphertext only and is open source so you can host your own.
+Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends message content outside your box. TLS for the phone link ships two ways, gateway-native or a Caddy sidecar example, and the app pins the certificate on first use; see `docs/tls.md`. Plain HTTP remains the default, for boxes that already terminate TLS in front. Push leaves the box only as end-to-end encrypted ciphertext.
 
 ## Development
 

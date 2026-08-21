@@ -17,6 +17,26 @@ authenticated registration lifecycle at `POST /push/register` and
 `DELETE /push/register/:pushId`; see `contract/ext-push-proxy-v1.md`. The gateway never proxies
 `POST /notify`.
 
+## Hosted relay
+
+The default public relay is `https://push.cozylabs.ai`. It is accountless on purpose.
+The relay sees an opaque `pushId`, ciphertext, optional category and collapse id, and
+the request source IP transiently for rate limiting. It never receives a push key,
+message content, account identity, or device identity. Monitoring exposes only aggregate
+counts, never identifiers.
+
+The public instance applies token-bucket limits of 10 register attempts per minute per
+source IP and 60 notify attempts per minute per source IP. A limit response is 429
+`over_cap` with `Retry-After`. Its trusted reverse proxy supplies the source address;
+the relay honors the rightmost non-empty `X-Forwarded-For` value only when started with
+`--trust-forwarded`. Idle in-memory buckets expire lazily.
+
+The source limits layer with the existing public defaults: 10000 total registrations,
+500 notifications per push id per UTC day, a 30-day registration TTL, a maximum 8192
+characters of ciphertext, seven days of notify-count retention, and restricted webhook
+egress on a non-loopback bind. The auth middleware remains a future unlock seam, but
+accounts are not part of the v0 privacy or abuse-control contract.
+
 ## Relay endpoints
 
 All bodies are JSON. Errors use `{"error": {"code": string, "message": string}}` with
@@ -42,6 +62,7 @@ Response: 201 `{"pushId": string}`. The pushId is 16 random bytes, base64url. It
 unguessable and knowing it is the de-facto capability to notify that registration.
 Registering again mints a new pushId; old ids keep working until deleted.
 
+- Per-source limit (default 10 attempts per minute): 429 `over_cap` with `Retry-After`.
 - Total-registration cap (default 10000, configurable): 429 `over_cap` once the relay's
   total registration count reaches the configured bound. Bounds an unauthenticated
   registration flood ahead of the reserved auth-hook slot.
@@ -88,6 +109,7 @@ delivery failure.
 
 - Unknown pushId: 404 `not_found`. A gateway receiving this should delete its stored
   registration for that device.
+- Per-source limit (default 60 attempts per minute): 429 `over_cap` with `Retry-After`.
 - Per-pushId daily cap (default 500, UTC calendar day): 429 `over_cap`.
 - The relay retains per-day notify counts for 7 UTC days and prunes older rows lazily
   (inline on notify, not on a timer); this is an internal storage-growth bound and has no
@@ -99,7 +121,9 @@ Response: 204, idempotent.
 
 ### GET /health
 
-Response: 200 `{"name": "cozygateway-relay", "version": string}`.
+Response: 200 `{"name": "cozygateway-relay", "version": string, "registrations": number,
+"todaysNotifies": number}`. Counts are aggregate operator signals for the current UTC day
+and never include identifiers.
 
 ## Notification ciphertext
 

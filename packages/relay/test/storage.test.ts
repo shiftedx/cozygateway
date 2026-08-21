@@ -96,6 +96,9 @@ describe("relay storage", () => {
     expect(storage.notifyCount("p1", "2026-07-07")).toBe(2);
     expect(storage.notifyCount("p1", "2026-07-08")).toBe(1);
     expect(storage.notifyCount("p2", "2026-07-07")).toBe(1);
+    expect(storage.totalNotifyCount("2026-07-07")).toBe(3);
+    expect(storage.totalNotifyCount("2026-07-08")).toBe(1);
+    expect(storage.totalNotifyCount("2026-07-09")).toBe(0);
   });
 
   it("persists registrations across a reopen", () => {
