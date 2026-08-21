@@ -71,6 +71,19 @@ importers:
         specifier: ^8.5.0
         version: 8.18.1
 
+  packages/frontdoor-agent:
+    dependencies:
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.0
+        version: 8.18.1
+      cozy-frontdoor:
+        specifier: workspace:*
+        version: link:../frontdoor
+
   packages/gateway:
     dependencies:
       '@hono/node-server':

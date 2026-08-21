@@ -1,0 +1,15 @@
+{
+  "name": "cozy-frontdoor-agent",
+  "version": "0.1.0",
+  "description": "Outbound connector for Cozy Private Network household boxes.",
+  "type": "module",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/shiftedx/cozygateway.git", "directory": "packages/frontdoor-agent" },
+  "engines": { "node": ">=24" },
+  "bin": { "cozy-frontdoor-agent": "dist/cli.js" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run", "build": "tsc -p tsconfig.build.json" },
+  "dependencies": { "ws": "^8.18.0" },
+  "devDependencies": { "@types/ws": "^8.5.0", "cozy-frontdoor": "workspace:*" }
+}
