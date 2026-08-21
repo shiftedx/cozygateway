@@ -739,11 +739,9 @@ export function registerBotRoutes(
     }
   });
 
-  // The gateway's own copy of a photo a device sent. Not hermes' copy: `GET /bots/:name/media`
-  // refuses local paths precisely because serving one from an authenticated route is a file-read
-  // primitive over the operator's box, and that judgement is not walked back here. These bytes are
-  // the ones the device uploaded, stored under an id this gateway minted, and never sourced from
-  // model output.
+  // The gateway's own copy of a chat image. User rows hold bytes a device uploaded; capability-15
+  // assistant rows hold bytes fetched through Hermes' authenticated, guarded dashboard endpoints.
+  // Both use an id this gateway minted, and neither exposes a host path.
   //
   // Scoped to the bot AND to a strict id shape, both before the lookup: a path parameter that could
   // be anything is how an id becomes a path.

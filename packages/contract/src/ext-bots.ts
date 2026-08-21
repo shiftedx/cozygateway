@@ -78,12 +78,14 @@ export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
  *  when it comes back in a `bot_chat` frame, which is what lets a sender replace its optimistic row
  *  instead of rendering the message twice.
  *
- *  `attachments` (capability 9) carries the photos that were sent WITH this message, as the frozen
+ *  `attachments` carries frozen image blocks. Capability 9 permits them on user rows for photos the
+ *  user sent with that message. Capability 15 also permits them on settled assistant rows when the
+ *  bot emitted a standalone `MEDIA:<path>` directive that the gateway fetched successfully. Every
  *  `attachment` block from `contract/v1.md`. Every entry's `fileId` is gateway-scoped and opaque, is
  *  never a URL and is never a path, and is fetched from `GET /bots/:name/chat/attachments/:fileId`.
  *  A host path never reaches this wire: the bridge strips the `@image:<path>` directive lines hermes
  *  writes into its own transcript before the text is decoded, and puts this block there instead. The
- *  field is ABSENT, not empty, on a message with no attachments, so a client below 9 is unaffected. */
+ *  field is ABSENT, not empty, on a message with no attachments. */
 export const BotChatMessageSchema = Type.Object({
   id: Type.String(),
   role: Type.String(),
@@ -969,6 +971,13 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    below 14 keeps working: it ignores a frame type it does not know, and its next ordinary read of
  *    `GET /bots/:name/chat/messages` returns the re-adopted transcript anyway, so what it loses is
  *    promptness, not correctness. What it does NOT lose is history: a re-adoption retires nothing
- *    and deletes nothing, and the previous session stays listed by `GET /bots/:name/sessions`. */
+ *    and deletes nothing, and the previous session stays listed by `GET /bots/:name/sessions`.
+ *  - `15`: BOT-TO-APP IMAGE ATTACHMENTS. On settlement only, standalone `MEDIA:<path>` lines outside
+ *    code fences are fetched through the authenticated Hermes dashboard, up to three attempts per
+ *    assistant message. Successful png, jpeg, gif and webp files up to 8 MB are copied into the
+ *    gateway attachment store, the successful directive line is removed, and the assistant row
+ *    carries `BotChatMessage.attachments` in `bot_chat` frames and history. A failed or unattempted
+ *    directive stays as text. Live `bot_chat_delta` drafts are unchanged and may briefly show it.
+ *    A client below 15 ignores the optional field and continues to render the remaining text. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 14;
+export const BOTS_CAPABILITY_VERSION = 15;

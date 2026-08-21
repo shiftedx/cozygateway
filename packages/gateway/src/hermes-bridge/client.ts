@@ -190,6 +190,8 @@ export interface HermesClientOptions {
   /** Every log line goes through this sink. Lines never contain the URL query string, the token,
    *  the password, the session cookie, a ticket, or any frame content beyond a method name. */
   logSink?: (line: string) => void;
+  /** Test seam for the dashboard's authenticated HTTP legs. */
+  fetchImpl?: typeof fetch;
 }
 
 export interface HermesClient {
@@ -206,6 +208,8 @@ export interface HermesClient {
    *  Hermes operations that are legitimately slow (a profile delete stops a service and rmtrees a
    *  directory), where the default 30 s would reject a call that is going to succeed. */
   request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
+  /** Reads one Hermes-host file through the authenticated dashboard. */
+  readMediaDataUrl(path: string): Promise<string>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
    *  `cron.changed` broadcasts. Handlers cannot be removed. */
   onEvent(handler: (event: HermesEvent) => void): void;
@@ -265,6 +269,16 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   const requireReadyEvent = opts.requireReadyEvent ?? true;
   const authHttpTimeoutMs = opts.authHttpTimeoutMs ?? DEFAULT_AUTH_HTTP_TIMEOUT_MS;
   const auth = opts.auth;
+  const doFetch = opts.fetchImpl ?? fetch;
+  const dashboardBaseUrl = (() => {
+    if (auth.mode === "password") return auth.baseUrl;
+    const parsed = new URL(opts.url);
+    parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+    parsed.pathname = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+  })();
   const now = opts.now ?? Date.now;
   const logLine = opts.logSink ?? ((line: string) => void process.stderr.write(line));
   const log = (message: string): void => logLine(`[hermes-bridge] ${message}\n`);
@@ -435,7 +449,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   ): Promise<void> {
     let response: Response;
     try {
-      response = await fetch(`${baseUrl}/auth/password-login`, {
+      response = await doFetch(`${baseUrl}/auth/password-login`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ provider, username, password, next: "/" }),
@@ -476,7 +490,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     if (cookie === undefined) throw new SessionExpiredError("no hermes session cookie held");
     let response: Response;
     try {
-      response = await fetch(`${baseUrl}/api/auth/ws-ticket`, {
+      response = await doFetch(`${baseUrl}/api/auth/ws-ticket`, {
         method: "POST",
         headers: { cookie },
         signal: AbortSignal.timeout(authHttpTimeoutMs),
@@ -517,6 +531,53 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       await login(auth.baseUrl, auth.username, auth.password, provider);
       return { param: "ticket", value: await mintTicket(auth.baseUrl) };
     }
+  }
+
+  async function dashboardRequest(endpoint: string, filePath: string): Promise<Response> {
+    const url = new URL(endpoint, `${dashboardBaseUrl}/`);
+    url.searchParams.set("path", filePath);
+    const headers: Record<string, string> = {};
+    if (auth.mode === "password") {
+      if (sessionCookie === undefined) {
+        await login(auth.baseUrl, auth.username, auth.password, auth.provider ?? DEFAULT_AUTH_PROVIDER);
+      }
+      headers.cookie = sessionCookie!;
+    } else {
+      headers["x-hermes-session-token"] = auth.token;
+    }
+    return doFetch(url, { headers, signal: AbortSignal.timeout(authHttpTimeoutMs) });
+  }
+
+  async function readMediaDataUrl(filePath: string): Promise<string> {
+    let relogged = false;
+    const get = async (endpoint: string): Promise<Response> => {
+      let response = await dashboardRequest(endpoint, filePath);
+      if (auth.mode === "password" && !relogged && response.status === 401) {
+        await response.text().catch(() => "");
+        sessionCookie = undefined;
+        relogged = true;
+        response = await dashboardRequest(endpoint, filePath);
+      }
+      return response;
+    };
+
+    for (const endpoint of ["/api/media", "/api/fs/read-data-url"]) {
+      let response: Response;
+      try {
+        response = await get(endpoint);
+      } catch {
+        continue;
+      }
+      if (!response.ok) {
+        await response.text().catch(() => "");
+        continue;
+      }
+      const body: unknown = await response.json().catch(() => undefined);
+      const record = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+      const dataUrl = record["data_url"] ?? record["dataUrl"];
+      if (typeof dataUrl === "string" && dataUrl.length > 0) return dataUrl;
+    }
+    throw new Error("hermes dashboard could not read the media file");
   }
 
   function connect(): void {
@@ -592,6 +653,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
         socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
       });
     },
+
+    readMediaDataUrl,
 
     onEvent(handler: (event: HermesEvent) => void): void {
       eventHandlers.push(handler);

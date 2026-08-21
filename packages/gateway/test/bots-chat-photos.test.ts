@@ -754,6 +754,7 @@ interface Harness {
   client: HermesClient;
   frames: ServerFrame[];
   authed: (path: string, init?: RequestInit) => Promise<Response>;
+  pairAnother: () => Promise<(path: string, init?: RequestInit) => Promise<Response>>;
   request: (path: string, init?: RequestInit) => Promise<Response>;
 }
 
@@ -893,6 +894,21 @@ async function setup(
     frames,
     authed: async (path, init) =>
       app.request(path, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` } }),
+    pairAnother: async () => {
+      const nextCode = newSetupCode();
+      storage.createSetupCode(nextCode, 1_000 + SETUP_CODE_TTL_MS);
+      const nextPair = await app.request("/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: nextCode, deviceName: "tablet" }),
+      });
+      const next = (await nextPair.json()) as { deviceToken: string };
+      return async (path, init) =>
+        app.request(path, {
+          ...init,
+          headers: { ...(init?.headers ?? {}), authorization: `Bearer ${next.deviceToken}` },
+        });
+    },
     request: async (path, init) => app.request(path, init),
   };
 }
@@ -1159,6 +1175,31 @@ describe("GET /bots/:name/chat/attachments/:fileId", () => {
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(PNG);
   });
 
+  it("serves the same row to another paired device", async () => {
+    const { behavior } = fakeBotMode();
+    const harness = await setup(behavior);
+    const fileId = "a".repeat(32);
+    harness.storage.putBotChatAttachment(
+      {
+        fileId,
+        bot: "scout",
+        sessionId: "canonical",
+        messageId: "assistant-1",
+        sourceKey: "directive-1",
+        mime: "image/png",
+        name: "photo.png",
+        size: PNG.byteLength,
+        bytes: PNG,
+      },
+      NOW,
+      PHOTO_TTL_MS,
+    );
+    const tablet = await harness.pairAnother();
+    const res = await tablet(`/bots/scout/chat/attachments/${fileId}`);
+    expect(res.status).toBe(200);
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(PNG);
+  });
+
   it("is scoped to the bot in the URL, and to the shape of an attachment id", async () => {
     const { harness, fileId } = await sendOne();
     // Another bot's route must not serve this bot's photo.
@@ -1317,6 +1358,7 @@ describe("attachment storage", () => {
     expect(storage.botChatAttachmentsFor("canonical", "41", 0)).toHaveLength(1);
     expect(storage.botChatAttachmentsFor("canonical", "99", 0)).toHaveLength(0);
   });
+
 
   it("drops a bot's photos when the bot is forgotten", () => {
     const storage = openStorage(":memory:");
