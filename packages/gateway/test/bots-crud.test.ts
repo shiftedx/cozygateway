@@ -428,7 +428,15 @@ describe("hidden profiles", () => {
     // by-name route still reaches it.
     const sessions = await authed("/bots/ops-runner/sessions");
     expect(sessions.status).toBe(200);
-    expect(server.callsOf("session.list")[0]?.params).toMatchObject({ profile: "ops-runner" });
+    // Index 0 is no longer this route's call: the roster preview (cozygateway#102) issues its own
+    // session.list per visible bot before any by-name route runs. The property under test is that
+    // the hidden profile IS addressed, wherever its call lands in the order.
+    expect(
+      server.callsOf("session.list").some((call) => {
+        const params = call.params as { profile?: string };
+        return params.profile === "ops-runner";
+      }),
+    ).toBe(true);
   });
 });
 
