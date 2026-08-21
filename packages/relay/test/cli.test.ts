@@ -94,6 +94,7 @@ describe("parseCliConfig", () => {
       maxRegistrations: 10000,
       registrationTtlDays: 30,
       restrictEgress: false,
+      trustForwarded: false,
     });
   });
 
@@ -121,6 +122,7 @@ describe("parseCliConfig", () => {
       maxRegistrations: 10,
       registrationTtlDays: 7,
       restrictEgress: true,
+      trustForwarded: false,
     });
   });
 
@@ -142,6 +144,7 @@ describe("parseCliConfig", () => {
       maxRegistrations: 10000,
       registrationTtlDays: 30,
       restrictEgress: true,
+      trustForwarded: false,
     });
   });
 
@@ -154,6 +157,7 @@ describe("parseCliConfig", () => {
       maxRegistrations: 10000,
       registrationTtlDays: 30,
       restrictEgress: false,
+      trustForwarded: false,
     });
   });
 
@@ -163,6 +167,10 @@ describe("parseCliConfig", () => {
 
   it("localhost bind host also defaults restrictEgress off", () => {
     expect(parseCliConfig(["--host", "localhost"]).restrictEgress).toBe(false);
+  });
+
+  it("enables forwarded source addresses only with --trust-forwarded", () => {
+    expect(parseCliConfig(["--trust-forwarded"]).trustForwarded).toBe(true);
   });
 });
 

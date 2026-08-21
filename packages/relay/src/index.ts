@@ -8,6 +8,11 @@ export {
 } from "./server.ts";
 export { createRelayApp, type RelayAppDeps } from "./http.ts";
 export {
+  DEFAULT_NOTIFY_RATE_LIMIT_PER_MINUTE,
+  DEFAULT_REGISTER_RATE_LIMIT_PER_MINUTE,
+} from "./http.ts";
+export { PerMinuteRateLimiter, type RateLimitDecision } from "./rate-limit.ts";
+export {
   openRelayStorage,
   utcDay,
   NOTIFY_COUNT_RETENTION_DAYS,
