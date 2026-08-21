@@ -34,6 +34,10 @@ plugin commits commands and events to its SQLite spool before ACK/send. On recon
 reconciles its outbox through the authenticated plugin's durable contiguous command cursor (and
 refuses a cursor beyond the issued tail), closing the lost-command-ACK window without executing a
 command twice. Remaining frames replay after the peer cursor and are deduplicated by stable id.
+The plugin likewise reconciles the authoritative cursors in `hello_ack`: it may fast-forward a
+recreated empty spool to the gateway's durable stream, but MUST refuse an event fast-forward that
+would skip locally pending work. This makes spool replacement recoverable without replaying an
+already-ACKed command or creating a permanent gap loop.
 
 Sequences are contiguous. A receiver that observes a future sequence sends `gap` and applies
 nothing after the missing point. A sender either replays from `requestedAfter` or, after configured
