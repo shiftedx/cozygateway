@@ -134,6 +134,141 @@ describe("BotChatTurns", () => {
     expect(stateFrames(frames).at(-1)).toMatchObject({ phase: "complete", running: false, inflight: false });
   });
 
+  it("does not deliver one assistant answer twice when settle appends a duplicate segment (cozygateway#105)", async () => {
+    const answer = "I found the likely cause. I will verify it now.";
+    let reply: Reply = {
+      messages: [{ id: "u1", role: "user", content: "diagnose it" }],
+      running: true,
+      inflight: true,
+    };
+    const settled: string[] = [];
+    const { turns, frames } = harness(() => reply, {
+      onSettledAssistantMessage: ({ messageId }) => settled.push(messageId),
+    });
+    await turns.send("scout", "stored-1", "diagnose it");
+
+    reply = {
+      messages: [
+        { id: "u1", role: "user", content: "diagnose it" },
+        { id: "a-pre-tool", role: "assistant", content: answer },
+        { id: "a-tool", role: "assistant", content: [{ type: "tool_use", name: "exec" }] },
+        { id: "t1", role: "tool", content: "tool output" },
+      ],
+      running: true,
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    reply = {
+      messages: [
+        ...reply.messages,
+        { id: "a-settled", role: "assistant", content: answer },
+      ],
+    };
+    await turns.settled("scout");
+
+    const delivered = chatFrames(frames).flatMap((frame) => frame.messages);
+    expect(delivered.filter((message) => message.role === "assistant" && message.text === answer)).toHaveLength(1);
+    expect(settled).toEqual(["a-pre-tool"]);
+    const history = await turns.history("scout", "stored-1");
+    expect(history.messages.filter((message) => message.role === "assistant" && message.text === answer)).toEqual([
+      expect.objectContaining({ id: "a-pre-tool" }),
+    ]);
+  });
+
+  it("still delivers identical assistant text in separate turns", async () => {
+    const answer = "The service is healthy.";
+    let reply: Reply = { messages: [{ id: "u1", role: "user", content: "first check" }], running: true };
+    const { turns, frames } = harness(() => reply);
+    await turns.send("scout", "stored-1", "first check");
+    reply = { messages: [...reply.messages, { id: "a1", role: "assistant", content: answer }] };
+    await turns.settled("scout");
+
+    reply = {
+      messages: [...reply.messages, { id: "u2", role: "user", content: "second check" }],
+      running: true,
+    };
+    await turns.send("scout", "stored-1", "second check");
+    reply = { messages: [...reply.messages, { id: "a2", role: "assistant", content: answer }] };
+    await turns.settled("scout");
+
+    const repeated = chatFrames(frames)
+      .flatMap((frame) => frame.messages)
+      .filter((message) => message.role === "assistant" && message.text === answer);
+    expect(repeated.map((message) => message.id)).toEqual(["a1", "a2"]);
+  });
+
+  it("fingerprints the #97 compaction marker after its settle-time rewrite", async () => {
+    const summary = "--- BEGIN CONTEXT SUMMARY ---\nprivate summary\n--- END OF CONTEXT SUMMARY ---";
+    let reply: Reply = { messages: [{ id: "u1", role: "user", content: "continue" }], running: true };
+    const { turns, frames } = harness(() => reply);
+    await turns.send("scout", "stored-1", "continue");
+    reply = {
+      messages: [...reply.messages, { id: "c-pre", role: "system", content: summary }],
+      running: true,
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    reply = {
+      messages: [
+        ...reply.messages,
+        { id: "c-settled", role: "assistant", content: summary },
+        { id: "a1", role: "assistant", content: "continued" },
+      ],
+    };
+    await turns.settled("scout");
+
+    const markers = chatFrames(frames)
+      .flatMap((frame) => frame.messages)
+      .filter((message) => message.text === "[[context: compacted]]");
+    expect(markers.map((message) => message.id)).toEqual(["c-pre"]);
+    const history = await turns.history("scout", "stored-1");
+    expect(history.messages.filter((message) => message.text === "[[context: compacted]]")).toHaveLength(1);
+  });
+
+  it("fingerprints #96 assistant media after successful directive stripping", async () => {
+    const answer = "The plot is ready.";
+    const keys = new Map<string, string[]>();
+    const blocks = new Map<string, Array<{ type: "attachment"; fileId: string; name: string; mimeType: string; size: number }>>();
+    const attachments: ChatAttachmentStore = {
+      bind: () => {},
+      forMessage: (_sessionId, messageId) => blocks.get(messageId) ?? [],
+      assistantMediaKeys: (_sessionId, messageId) => keys.get(messageId) ?? [],
+    };
+    const assistantMedia: AssistantMediaStore = {
+      ingest: async ({ messageId, sourceKey }) => {
+        keys.set(messageId, [sourceKey]);
+        blocks.set(messageId, [
+          { type: "attachment", fileId: "plot-1", name: "plot.png", mimeType: "image/png", size: 9 },
+        ]);
+      },
+    };
+    let reply: Reply = { messages: [{ id: "u1", role: "user", content: "make a plot" }], running: true };
+    const { turns, frames } = harness(() => reply, { attachments, assistantMedia });
+    await turns.send("scout", "stored-1", "make a plot");
+    reply = {
+      messages: [...reply.messages, { id: "a-pre", role: "assistant", content: answer }],
+      running: true,
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    reply = {
+      messages: [
+        ...reply.messages,
+        { id: "a-settled", role: "assistant", content: `${answer}\nMEDIA:/tmp/plot.png` },
+      ],
+    };
+    await turns.settled("scout");
+
+    const matching = chatFrames(frames)
+      .flatMap((frame) => frame.messages)
+      .filter((message) => message.role === "assistant" && message.text === answer);
+    expect(new Set(matching.map((message) => message.id))).toEqual(new Set(["a-pre"]));
+    expect(matching.at(-1)?.attachments).toEqual([
+      { type: "attachment", fileId: "plot-1", name: "plot.png", mimeType: "image/png", size: 9 },
+    ]);
+    const history = await turns.history("scout", "stored-1");
+    expect(history.messages.filter((message) => message.text === answer)).toHaveLength(1);
+    expect(history.messages.find((message) => message.id === "a-pre")?.attachments).toHaveLength(1);
+  });
+
   it("raises the settled assistant seam once, after running has ended", async () => {
     let reply: Reply = { messages: [{ id: "u1", role: "user", content: "hi" }], running: true };
     const events: Array<{ bot: string; chatSessionId: string; messageId: string }> = [];
