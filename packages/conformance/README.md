@@ -72,6 +72,8 @@ export interface ConformanceEnv {
   botModelConfig?: { botName: string };
   /** Optional: one capability-19 Hermes bot. See "The optional bot chat-stop hook". */
   botChatStop?: { botName: string; prompt?: string };
+  /** Optional: one capability-19 Hermes bot. See "The optional bot new-session hook". */
+  botNewSession?: { botName: string };
 }
 ```
 
@@ -118,6 +120,14 @@ the supplied prompt until interrupted. The fixture must be idle when the group b
 checks the device-auth wall, the idle 409, a live send followed by stop, the fixed
 `{ "status": "stopped" }` response, the shared `bot_chat_state` complete frame, and the return to
 idle. Omit the hook and this group is reported as skipped.
+
+## The optional bot new-session hook
+
+Declare `botNewSession` with a capability-19 Hermes bot that has a persisted canonical
+conversation. The suite authenticates the route, creates and observes adoption of a fresh empty
+session, checks that the old conversation remains listed, then restores it through the
+capability-16 adoption route. The fixture is left pointing at its original conversation. Omit the
+hook and this group is reported as skipped.
 
 ## The optional stall hook
 

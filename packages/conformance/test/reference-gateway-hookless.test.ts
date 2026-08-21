@@ -1,5 +1,6 @@
 /** Portability guard for the OPTIONAL hooks: the stall hook (issue #21), approval hook
- *  (issue #19), Hermes bot model-config hook (issue #106), and bot stop hook (issue #114).
+ *  (issue #19), Hermes bot model-config hook (issue #106), bot stop hook (issue #114), and bot
+ *  new-session hook (issue #115).
  *
  *  The live in-flight interrupt group needs a stall-capable backend, and the approval group needs
  *  an approval-capable one; not every gateway has either. This runner is the standing proof that
@@ -41,6 +42,6 @@ registerConformanceSuite({
   baseUrl: () => gateway.url,
   issueSetupCode: () => Promise.resolve(gateway.issueSetupCode()),
   echoAgentId: "conformance-echo",
-  // Deliberately no stallAgentId, approvalAgentId, botModelConfig, or botChatStop: this is the
-  // hookless gateway a third party may be.
+  // Deliberately no stallAgentId, approvalAgentId, botModelConfig, botChatStop, or botNewSession:
+  // this is the hookless gateway a third party may be.
 });

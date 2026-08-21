@@ -27,6 +27,9 @@ import {
   BotInboxMessagesResponseSchema,
   BotInboxResponseSchema,
   BotModelConfigSchema,
+  BotNewSessionResponseSchema,
+  BotSessionAdoptResponseSchema,
+  BotSessionsResponseSchema,
   CommittedFrameSchema,
   DeviceSchema,
   DoneFrameSchema,
@@ -95,6 +98,9 @@ export interface ConformanceEnv {
   /** OPTIONAL capability-19 bot whose configured model stays in flight after a chat send until
    *  `POST /bots/:name/chat/stop` interrupts it. The fixture must be idle when the group starts. */
   botChatStop?: { botName: string; prompt?: string };
+  /** OPTIONAL capability-19 bot with a persisted canonical conversation that may be replaced and
+   *  restored by the new-session conformance group. */
+  botNewSession?: { botName: string };
 }
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -447,6 +453,77 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
               "bot chat complete after stop",
             );
             expect((await authFetch(token, path, { method: "POST" })).status).toBe(409);
+          } finally {
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+    });
+
+    describe("bot new session (optional com.cozylabs.bots capability 19)", () => {
+      const newSessionIt = env.botNewSession === undefined ? it.skip : it;
+
+      newSessionIt(
+        "requires a device, adopts a fresh session, and leaves the previous one restorable",
+        async () => {
+          const fixture = env.botNewSession;
+          if (fixture === undefined) throw new Error("unreachable: skipped without hook");
+          const botName = fixture.botName.trim().toLowerCase();
+          const path = `/bots/${encodeURIComponent(fixture.botName)}/sessions/new`;
+          expect((await fetch(`${env.baseUrl()}${path}`, { method: "POST" })).status).toBe(401);
+
+          const { token } = await pairDevice("bot-new-session");
+          const beforeResponse = await authFetch(
+            token,
+            `/bots/${encodeURIComponent(fixture.botName)}/chat`,
+          );
+          expect(beforeResponse.status).toBe(200);
+          const before = (await beforeResponse.json()) as { sessionId?: unknown };
+          expect(typeof before.sessionId).toBe("string");
+
+          const socket = await authedSocket(token);
+          try {
+            const createdResponse = await authFetch(token, path, { method: "POST" });
+            expect(createdResponse.status).toBe(200);
+            const created = assertValid(BotNewSessionResponseSchema, await createdResponse.json());
+            expect(created.name).toBe(botName);
+            expect(created.previousSessionId).toBe(before.sessionId);
+            expect(created.sessionId).not.toBe(created.previousSessionId);
+
+            await waitFor(
+              socket,
+              () =>
+                framesOfType(socket.frames, "bot_chat_adopted").some(
+                  (frame) =>
+                    frame.bot === botName &&
+                    frame.sessionId === created.sessionId &&
+                    frame.previousSessionId === created.previousSessionId,
+                ),
+              "new-session adoption",
+            );
+
+            const listedResponse = await authFetch(
+              token,
+              `/bots/${encodeURIComponent(fixture.botName)}/sessions`,
+            );
+            expect(listedResponse.status).toBe(200);
+            const listed = assertValid(BotSessionsResponseSchema, await listedResponse.json());
+            expect(listed.activeSessionId).toBe(created.sessionId);
+            expect(listed.sessions.some((session) => session.id === created.previousSessionId)).toBe(true);
+
+            const restoredResponse = await authFetch(
+              token,
+              `/bots/${encodeURIComponent(fixture.botName)}/sessions/${encodeURIComponent(created.previousSessionId)}/adopt`,
+              { method: "POST" },
+            );
+            expect(restoredResponse.status).toBe(200);
+            const restored = assertValid(BotSessionAdoptResponseSchema, await restoredResponse.json());
+            expect(restored).toEqual({
+              name: botName,
+              sessionId: created.previousSessionId,
+              previousSessionId: created.sessionId,
+            });
           } finally {
             socket.ws.close();
           }
