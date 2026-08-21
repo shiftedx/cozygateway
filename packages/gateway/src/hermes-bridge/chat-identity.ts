@@ -62,6 +62,8 @@ type SessionLedger = Map<string, string[]>;
 export class ChatIdentityLedger {
   /** Insertion ordered, so evicting the first key evicts the least recently used session. */
   readonly #sessions = new Map<string, SessionLedger>();
+  /** Backend/synthetic ids proven to be a second segment of an already delivered utterance. */
+  readonly #aliases = new Map<string, Map<string, string>>();
 
   /** Answers the rows of one freshly decoded snapshot, with every row that this session has already
    *  delivered wearing the id it was delivered under.
@@ -87,6 +89,7 @@ export class ChatIdentityLedger {
 
     const next: SessionLedger = new Map();
     const cursor = new Map<string, number>();
+    const aliases = this.#aliases.get(sessionId);
     const assigned = messages.map((message) => {
       const key = chatRowFingerprint(message.role, message.text);
       const occurrence = cursor.get(key) ?? 0;
@@ -94,7 +97,8 @@ export class ChatIdentityLedger {
       const prior = known?.get(key) ?? [];
       // Fewer copies than the ledger holds means the head was trimmed, so line up from the back.
       const offset = Math.max(0, prior.length - (counts.get(key) ?? 0));
-      const id = prior[offset + occurrence] ?? message.id;
+      const candidate = prior[offset + occurrence] ?? message.id;
+      const id = aliases?.get(candidate) ?? candidate;
       const ids = next.get(key);
       if (ids === undefined) next.set(key, [id]);
       else ids.push(id);
@@ -102,17 +106,49 @@ export class ChatIdentityLedger {
     });
 
     this.#remember(sessionId, next);
-    return assigned;
+    const unique = new Set<string>();
+    return assigned.filter((message) => {
+      if (unique.has(message.id)) return false;
+      unique.add(message.id);
+      return true;
+    });
+  }
+
+  /** Records that `duplicateId` is a settle-time segment of the row already delivered as
+   *  `deliveredId`. The alias is id-specific, not content-wide, so the same words in a later turn
+   *  still receive their own identity. */
+  coalesce(sessionId: string, duplicateId: string, deliveredId: string): string {
+    if (duplicateId === deliveredId) return deliveredId;
+    const aliases = this.#aliases.get(sessionId) ?? new Map<string, string>();
+    aliases.set(duplicateId, deliveredId);
+    while (aliases.size > MAX_IDS_PER_SESSION) {
+      const oldest = aliases.keys().next();
+      if (oldest.done === true) break;
+      aliases.delete(oldest.value);
+    }
+    this.#aliases.set(sessionId, aliases);
+
+    const ledger = this.#sessions.get(sessionId);
+    if (ledger !== undefined) {
+      for (const ids of ledger.values()) {
+        for (let index = 0; index < ids.length; index += 1) {
+          if (ids[index] === duplicateId) ids[index] = deliveredId;
+        }
+      }
+    }
+    return deliveredId;
   }
 
   /** Forgets one session's ledger. Called when a chat is retired, so a re-pinned session cannot
    *  inherit identities from the one it replaced. */
   forget(sessionId: string): void {
     this.#sessions.delete(sessionId);
+    this.#aliases.delete(sessionId);
   }
 
   clear(): void {
     this.#sessions.clear();
+    this.#aliases.clear();
   }
 
   #remember(sessionId: string, ledger: SessionLedger): void {
@@ -133,6 +169,7 @@ export class ChatIdentityLedger {
       const oldest = this.#sessions.keys().next();
       if (oldest.done === true) break;
       this.#sessions.delete(oldest.value);
+      this.#aliases.delete(oldest.value);
     }
   }
 }

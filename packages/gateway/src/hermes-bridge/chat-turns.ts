@@ -1,7 +1,7 @@
 import type { AttachmentBlock, BotChatMessage, ServerFrame } from "cozygateway-contract";
 
 import type { HermesRpc } from "./canonical-chat.ts";
-import { ChatIdentityLedger } from "./chat-identity.ts";
+import { chatRowFingerprint, ChatIdentityLedger } from "./chat-identity.ts";
 import {
   isContextCompactionMarker,
   parseChatSnapshot,
@@ -148,6 +148,10 @@ interface ActiveTurn {
   /** Set when the bot's canonical session id changed under this poll: the loop then stops without
    *  broadcasting anything else for a chat the app has left. */
   cancelled: boolean;
+  /** Assistant content delivered during THIS turn, after every wire-visible text rewrite. A later
+   *  segment with the same fingerprint is the same utterance; a later turn starts with an empty
+   *  map, so genuinely repeated replies remain distinct. */
+  deliveredAssistant: Map<string, { id: string; wire: string }>;
   done: Promise<void>;
 }
 
@@ -356,17 +360,26 @@ export class BotChatTurns {
     name: string,
     sessionId: string,
     message: BotChatMessage,
+    turn: ActiveTurn,
   ): Promise<BotChatMessage> {
     if (message.role !== "assistant" || this.#assistantMedia === undefined) return this.#decorate(sessionId, message);
     const directives = assistantMediaDirectives(message.text).slice(0, ASSISTANT_MEDIA_MAX_PER_MESSAGE);
-    const successful = new Set(this.#attachments?.assistantMediaKeys?.(sessionId, message.id) ?? []);
+    let target = message;
+    const projectedKeys = new Set(directives.map((directive) => directive.key));
+    const projectedText = stripAssistantMediaDirectives(message.text, projectedKeys);
+    const projected = turn.deliveredAssistant.get(chatRowFingerprint(message.role, projectedText));
+    if (projected !== undefined && projected.id !== message.id) {
+      const id = this.#identity.coalesce(sessionId, message.id, projected.id);
+      target = { ...message, id };
+    }
+    const successful = new Set(this.#attachments?.assistantMediaKeys?.(sessionId, target.id) ?? []);
     for (const directive of directives) {
       if (successful.has(directive.key)) continue;
       try {
         await this.#assistantMedia.ingest({
           bot: name,
           sessionId,
-          messageId: message.id,
+          messageId: target.id,
           path: directive.path,
           sourceKey: directive.key,
         });
@@ -375,7 +388,7 @@ export class BotChatTurns {
         // Failure is intentionally represented by keeping the original line in the text.
       }
     }
-    return this.#decorate(sessionId, { ...message, text: stripAssistantMediaDirectives(message.text, successful) });
+    return this.#decorate(sessionId, { ...target, text: stripAssistantMediaDirectives(message.text, successful) });
   }
 
   /** A history read hands the client every row it returns AND re-bases the delta watermark past
@@ -646,6 +659,7 @@ export class BotChatTurns {
       deadline: this.#now() + this.#timeoutMs,
       sawActivity: running || inflight,
       cancelled: false,
+      deliveredAssistant: new Map(),
       done: Promise.resolve(),
     };
     turn.done = this.#poll(name, turn, running, inflight).finally(() => {
@@ -688,11 +702,11 @@ export class BotChatTurns {
         const already = mark !== undefined && mark.sessionId === turn.sessionId ? mark.seen : EMPTY_IDS;
         messages = await Promise.all(
           messages.map((message) =>
-            already.has(message.id) ? message : this.#extractAssistantMedia(name, turn.sessionId, message),
+            already.has(message.id) ? message : this.#extractAssistantMedia(name, turn.sessionId, message, turn),
           ),
         );
       }
-      this.#emitMessages(name, turn.sessionId, messages, settled);
+      messages = this.#emitMessages(name, turn, messages, settled);
       if (snapshot.running || snapshot.inflight) turn.sawActivity = true;
       if (settled) {
         this.#emitState(name, turn.sessionId, "complete", false, false);
@@ -747,27 +761,69 @@ export class BotChatTurns {
    *  under fresh ids, which is what a client renders as a doubled conversation (cozygateway#87). A
    *  session id change starts a new mark, so switching chats replays the new chat's messages once
    *  rather than diffing across sessions. */
-  #emitMessages(name: string, sessionId: string, messages: BotChatMessage[], settled = true): void {
+  #emitMessages(name: string, turn: ActiveTurn, messages: BotChatMessage[], settled = true): BotChatMessage[] {
+    const sessionId = turn.sessionId;
     const mark = this.#watermarks.get(name);
     const already = mark !== undefined && mark.sessionId === sessionId ? mark.seen : EMPTY_IDS;
-    const visible = messages.filter(
-      (message) =>
+    const visible = messages
+      .filter(
+        (message) =>
         settled ||
         this.#assistantMedia === undefined ||
         message.role !== "assistant" ||
         assistantMediaDirectives(message.text).length === 0,
-    );
-    const fresh = visible
-      .filter((message) => !already.has(message.id))
+      )
       .map((message) => this.#decorate(sessionId, this.#reconcile(name, message, already)));
-    this.#setWatermark(name, sessionId, visible);
-    if (fresh.length === 0) return;
-    this.#broadcast({
-      type: "bot_chat",
-      bot: name,
-      sessionId,
-      messages: fresh,
-      updatedAt: this.#now(),
+    const canonical: BotChatMessage[] = [];
+    const fresh: BotChatMessage[] = [];
+    for (const message of visible) {
+      if (message.role !== "assistant") {
+        canonical.push(message);
+        if (!already.has(message.id)) fresh.push(message);
+        continue;
+      }
+
+      // Fingerprint the text the device will receive. #97 compaction replacement has already run
+      // in decode, and #96 successful MEDIA lines have already been stripped by extraction and
+      // decoration. Comparing either raw form here would let settle-time rewriting mint a second
+      // row for text that is identical on the wire.
+      const fingerprint = chatRowFingerprint(message.role, message.text);
+      const wire = JSON.stringify([message.text, message.attachments ?? []]);
+      const delivered = turn.deliveredAssistant.get(fingerprint);
+      if (delivered !== undefined) {
+        const id = this.#identity.coalesce(sessionId, message.id, delivered.id);
+        const aliased = id === message.id ? message : { ...message, id };
+        canonical.push(aliased);
+        // A settle-time media extraction may add attachments to the already visible utterance.
+        // Send that as an update under the SAME id, while an exact segment replay stays silent.
+        if (wire !== delivered.wire) {
+          fresh.push(aliased);
+          turn.deliveredAssistant.set(fingerprint, { id, wire });
+        }
+        continue;
+      }
+
+      canonical.push(message);
+      if (!already.has(message.id)) {
+        fresh.push(message);
+        turn.deliveredAssistant.set(fingerprint, { id: message.id, wire });
+      }
+    }
+    this.#setWatermark(name, sessionId, canonical);
+    if (fresh.length > 0) {
+      this.#broadcast({
+        type: "bot_chat",
+        bot: name,
+        sessionId,
+        messages: fresh,
+        updatedAt: this.#now(),
+      });
+    }
+    const unique = new Set<string>();
+    return canonical.filter((message) => {
+      if (unique.has(message.id)) return false;
+      unique.add(message.id);
+      return true;
     });
   }
 
