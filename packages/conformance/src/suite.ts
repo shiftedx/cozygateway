@@ -23,6 +23,7 @@ import {
   ApprovalPendingFrameSchema,
   ApprovalResolveResponseSchema,
   ApprovalResolvedFrameSchema,
+  BotChatStopResponseSchema,
   BotInboxMessagesResponseSchema,
   BotInboxResponseSchema,
   BotModelConfigSchema,
@@ -91,6 +92,9 @@ export interface ConformanceEnv {
   /** OPTIONAL capability-18 bot whose live Hermes model config may be read. The suite sends only a
    *  rejected unknown-model PUT, so it never changes the fixture's config. */
   botModelConfig?: { botName: string };
+  /** OPTIONAL capability-19 bot whose configured model stays in flight after a chat send until
+   *  `POST /bots/:name/chat/stop` interrupts it. The fixture must be idle when the group starts. */
+  botChatStop?: { botName: string; prompt?: string };
 }
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -387,6 +391,65 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
           });
           expect(rejected.status).toBe(400);
           expect(assertValid(ErrorBodySchema, await rejected.json()).error.code).toBe("invalid_request");
+        },
+        TEST_TIMEOUT_MS,
+      );
+    });
+
+    describe("bot chat hard stop (optional com.cozylabs.bots capability 19)", () => {
+      const stopIt = env.botChatStop === undefined ? it.skip : it;
+
+      stopIt(
+        "requires a device, 409s while idle, interrupts a live turn, and broadcasts complete",
+        async () => {
+          const fixture = env.botChatStop;
+          if (fixture === undefined) throw new Error("unreachable: skipped without hook");
+          const botName = fixture.botName.trim().toLowerCase();
+          const path = `/bots/${encodeURIComponent(fixture.botName)}/chat/stop`;
+          expect((await fetch(`${env.baseUrl()}${path}`, { method: "POST" })).status).toBe(401);
+
+          const { token } = await pairDevice("bot-chat-stop");
+          expect((await authFetch(token, path, { method: "POST" })).status).toBe(409);
+          const socket = await authedSocket(token);
+          try {
+            const sent = await authFetch(
+              token,
+              `/bots/${encodeURIComponent(fixture.botName)}/chat/messages`,
+              {
+                method: "POST",
+                headers: JSON_HEADERS,
+                body: JSON.stringify({ text: fixture.prompt ?? "wait until I stop this turn" }),
+              },
+            );
+            expect(sent.status).toBe(202);
+            await waitFor(
+              socket,
+              () =>
+                framesOfType(socket.frames, "bot_chat_state").some(
+                  (frame) => frame.bot === botName && frame.phase === "polling",
+                ),
+              "bot chat polling",
+            );
+
+            const stopped = await authFetch(token, path, { method: "POST" });
+            expect(stopped.status).toBe(200);
+            assertValid(BotChatStopResponseSchema, await stopped.json());
+            await waitFor(
+              socket,
+              () =>
+                framesOfType(socket.frames, "bot_chat_state").some(
+                  (frame) =>
+                    frame.bot === botName &&
+                    frame.phase === "complete" &&
+                    frame.running === false &&
+                    frame.inflight === false,
+                ),
+              "bot chat complete after stop",
+            );
+            expect((await authFetch(token, path, { method: "POST" })).status).toBe(409);
+          } finally {
+            socket.ws.close();
+          }
         },
         TEST_TIMEOUT_MS,
       );

@@ -193,6 +193,7 @@ function fakeBotMode(options: {
         }
         return { ok: true };
       },
+      "session.interrupt": () => ({ status: "interrupted" }),
       "session.resume": (params) => {
         const id = String(params["session_id"] ?? "");
         const stored = storedOf(id);
@@ -351,6 +352,42 @@ describe("POST /bots/:name/chat/messages", () => {
       expect(res.status).toBe(400);
       expect(await res.json()).toMatchObject({ error: { code: "invalid_request" } });
     }
+  });
+
+  it("requires a device, stops the live turn, completes every device, and 409s while idle", async () => {
+    const { behavior } = fakeBotMode({
+      sessions: [{ id: "canonical", title: CANONICAL_CHAT_TITLE }],
+      messages: [{ role: "user", content: "loop" }],
+      running: () => true,
+    });
+    const { authed, request, server, frames, bridge } = await setup(behavior, {
+      chatPollMs: 50,
+      chatTurnTimeoutMs: 1_000,
+    });
+
+    expect((await request("/bots/scout/chat/stop", { method: "POST" })).status).toBe(401);
+    expect((await authed("/bots/scout/chat/stop", { method: "POST" })).status).toBe(409);
+    expect(
+      (
+        await authed("/bots/scout/chat/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "loop" }),
+        })
+      ).status,
+    ).toBe(202);
+    expect(bridge.chatPolling("scout")).toBe(true);
+
+    const stopped = await authed("/bots/scout/chat/stop", { method: "POST" });
+    expect(stopped.status).toBe(200);
+    expect(await stopped.json()).toEqual({ status: "stopped" });
+    expect(server.callsOf("session.interrupt").at(-1)?.params).toEqual({ session_id: "runtime-1" });
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({
+      phase: "complete",
+      running: false,
+      inflight: false,
+    });
+    expect((await authed("/bots/scout/chat/stop", { method: "POST" })).status).toBe(409);
   });
 
   it("passes a submit rejection through verbatim and starts no poll", async () => {

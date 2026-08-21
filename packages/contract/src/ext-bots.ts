@@ -150,6 +150,13 @@ export const BotChatMessageSchema = Type.Object({
 });
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;
 
+/** Capability 19 hard-stop response. The cross-device terminal signal remains the existing
+ *  `bot_chat_state` frame with `phase: "complete"`. */
+export const BotChatStopResponseSchema = Type.Object({
+  status: Type.Literal("stopped"),
+});
+export type BotChatStopResponse = Static<typeof BotChatStopResponseSchema>;
+
 /** New messages in a bot's canonical chat. A DELTA, not a snapshot: `messages` carries only what
  *  the bridge has not broadcast before, in order.
  *
@@ -171,7 +178,8 @@ export const BotChatStateFrameSchema = Type.Object({
   type: Type.Literal("bot_chat_state"),
   bot: Type.String(),
   sessionId: Type.String(),
-  /** `polling` = a turn is being awaited; `complete` = the reply landed and Hermes went idle;
+  /** `polling` = a turn is being awaited; `complete` = the reply landed and Hermes went idle, or
+   *  capability 19 hard-stopped the turn;
    *  `timeout` = the cap expired with no settled reply; `failed` = the poll gave up because
    *  Hermes kept refusing. */
   phase: Type.Union([
@@ -1102,6 +1110,11 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    `/bots/:name/model-config`, backed by Hermes profile config and its configured picker catalog.
  *    Routine records and writes accept nullable model/effort selections. The surveyed cron RPC
  *    cannot scope both to one run, so they are preserved as inert metadata and the gateway never
- *    mutates a profile around a routine run. */
+ *    mutates a profile around a routine run.
+ *  - `19`: HARD STOP FOR BOT CHAT (issue #114). Adds authenticated
+ *    `POST /bots/:name/chat/stop`. It dispatches Hermes `session.interrupt` for the gateway-owned
+ *    runtime turn, answers 409 when no turn is running, and terminates every device's working state
+ *    through the existing `bot_chat_state` frame with `phase: "complete"`. Ordinary busy sends keep
+ *    their steering behavior; stop is the explicit hard escape. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 18;
+export const BOTS_CAPABILITY_VERSION = 19;

@@ -137,6 +137,8 @@ export interface SendPhoto {
 
 interface ActiveTurn {
   sessionId: string;
+  /** Hermes' live id for the turn. `session.interrupt` accepts this id, never the stored pin. */
+  runtimeId: string;
   /** Which turn this is, monotonic per process. A pending send belongs to exactly one of these, and
    *  a send that opens a NEW turn proves every entry left from an older one will never be matched
    *  (see `PendingSend`). */
@@ -151,6 +153,8 @@ interface ActiveTurn {
   /** Set when the bot's canonical session id changed under this poll: the loop then stops without
    *  broadcasting anything else for a chat the app has left. */
   cancelled: boolean;
+  /** One hard-stop dispatch per turn. Concurrent devices share its result. */
+  stop: Promise<"stopped"> | undefined;
   /** Assistant content delivered during THIS turn, after every wire-visible text rewrite. A later
    *  segment with the same fingerprint is the same utterance; a later turn starts with an empty
    *  map, so genuinely repeated replies remain distinct. */
@@ -555,7 +559,7 @@ export class BotChatTurns {
 
     const at = this.#now();
     const clientId = opts.clientId ?? `${sessionId}#local-${at}`;
-    const turnId = this.#startTurn(name, sessionId, baseline, running, inflight);
+    const turnId = this.#startTurn(name, sessionId, submitId, baseline, running, inflight);
     // Entries from a turn that is over, or that have outlived a whole turn cap inside a live one,
     // belong to a message that is never coming back around the poll (a history read re-based the
     // watermark past it, hermes dropped it, the turn was abandoned). Leaving them in the queue is
@@ -589,6 +593,40 @@ export class BotChatTurns {
   /** True while a turn poll is live for this bot. */
   polling(name: string): boolean {
     return this.#turns.has(name);
+  }
+
+  /** Hard-stops the turn this gateway is currently polling for `name`.
+   *
+   *  Surveyed both Hermes clients: the TUI's `turnController.interruptTurn` and the desktop's
+   *  prompt actions dispatch the exact JSON-RPC `session.interrupt {session_id:<runtime-id>}`.
+   *  Hermes clears that session's queued prompts and pending clarify/approval waits, requests the
+   *  agent's hard interrupt, and answers `{status:"interrupted"}`. The runtime id captured before
+   *  `prompt.submit` is therefore the only correct address; the stored canonical pin is not used.
+   *
+   *  The existing `complete` state frame is the cross-device terminal signal. No new frame or
+   *  phase is needed, and the poll is cancelled only after Hermes accepts the interrupt. */
+  async stop(name: string): Promise<"stopped" | "idle"> {
+    const turn = this.#turns.get(name);
+    if (turn === undefined) return "idle";
+    if (turn.stop !== undefined) return turn.stop;
+
+    const stopping = (async (): Promise<"stopped"> => {
+      await this.#rpc.request("session.interrupt", { session_id: turn.runtimeId });
+      if (this.#turns.get(name) === turn) {
+        turn.cancelled = true;
+        this.#turns.delete(name);
+        this.#stream?.forgetBot(name);
+        this.#emitState(name, turn.sessionId, "complete", false, false);
+      }
+      return "stopped";
+    })();
+    turn.stop = stopping;
+    try {
+      return await stopping;
+    } catch (err) {
+      if (this.#turns.get(name) === turn) turn.stop = undefined;
+      throw err;
+    }
   }
 
   /** Resolves when the bot's current turn poll has finished. Test seam; nothing in the request
@@ -641,13 +679,21 @@ export class BotChatTurns {
   }
 
   /** Opens (or joins) the poll for a send, and answers which turn the send belongs to. */
-  #startTurn(name: string, sessionId: string, baseline: number, running: boolean, inflight: boolean): number {
+  #startTurn(
+    name: string,
+    sessionId: string,
+    runtimeId: string,
+    baseline: number,
+    running: boolean,
+    inflight: boolean,
+  ): number {
     const existing = this.#turns.get(name);
     if (existing !== undefined && existing.sessionId === sessionId) {
       // Single-flight: the live poll adopts the new turn by extending its own deadline. Its
       // completion test still requires an idle session, so it cannot declare the second turn done
       // while Hermes is mid-reply.
       existing.deadline = this.#now() + this.#timeoutMs;
+      existing.runtimeId = runtimeId;
       return existing.id;
     }
     // The bot's canonical session id changed under a live poll (a compaction re-pin, a desktop
@@ -657,11 +703,13 @@ export class BotChatTurns {
 
     const turn: ActiveTurn = {
       sessionId,
+      runtimeId,
       id: (this.#nextTurnId += 1),
       baseline,
       deadline: this.#now() + this.#timeoutMs,
       sawActivity: running || inflight,
       cancelled: false,
+      stop: undefined,
       deliveredAssistant: new Map(),
       done: Promise.resolve(),
     };

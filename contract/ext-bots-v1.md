@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 18 }
+"capabilities": { "com.cozylabs.bots": 19 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -171,6 +171,11 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   reasoning effort, and the configured Hermes picker catalog. Routine records and writes also gain
   optional nullable `model` and `effort` fields. See the routine capability note before presenting
   those fields as active execution controls.
+- `19`: HARD STOP FOR BOT CHAT. `POST /bots/:name/chat/stop` interrupts the in-flight Hermes turn.
+  It is the hard escape; sending text to a busy bot continues to steer it. Every device observes the
+  stop through the existing `bot_chat_state` frame with `phase: "complete"`, so no new frame type or
+  phase is introduced. A client that changes its send button into a stop button while working MUST
+  require `>= 19`.
 
 ## 3. Resources
 
@@ -926,6 +931,32 @@ its transcript on the session id must therefore read the `sessionId` in this res
 assume it is the one it sent against. If the replacement cannot be minted, or the message cannot be
 submitted into it either, the send answers 502 with the hermes text; the gateway heals once per send
 and never loops.
+
+### POST /bots/:name/chat/stop
+
+Capability `>= 19`. Requires device authentication. Takes no request body.
+
+```
+200 { status: "stopped" }
+409 conflict                         // no turn is running for this bot
+502 backend_unavailable + hermesError // hermes refused the interrupt
+503 backend_unavailable + hermesError // the bridge is offline
+```
+
+Hard-stops the in-flight canonical-chat turn through Hermes
+`session.interrupt { session_id: <runtime-session-id> }`. The gateway uses the runtime id it captured
+before `prompt.submit`; a device supplies only the bot name and can never choose a Hermes session.
+The stop also clears Hermes' queued prompts and releases pending clarify or approval waits according
+to that RPC's native behavior.
+
+On success every paired device receives the existing `bot_chat_state` frame for this bot and stored
+chat session with `phase: "complete"`, `running: false`, and `inflight: false`. This is the terminal
+edge for the working row. There is no new stopped phase and no new frame type. The HTTP caller may
+render a local `stopped` state line from the successful action while all devices restore their
+composer from the shared complete frame.
+
+This route does not replace steering. Sending text while Hermes is busy continues to steer according
+to the profile's `display.busy_input_mode`; stop is the explicit hard escape.
 
 ### POST /bots/:name/chat/reset
 
@@ -2363,7 +2394,8 @@ Two scoping properties to design a client around:
 
 `bot_chat_state` is edge-triggered: a poll that finds nothing changed is silent. `phase` is the
 gateway's view of the turn it is polling (`polling` while awaiting, `complete` when the reply landed
-and Hermes went idle, `timeout` at the 180 s cap, `failed` when Hermes kept refusing), while
+and Hermes went idle or capability 19 hard-stopped it, `timeout` at the 180 s cap, `failed` when
+Hermes kept refusing), while
 `running` and `inflight` are Hermes' own flags passed through.
 
 ### bot_chat_delta, the live draft
