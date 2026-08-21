@@ -1,0 +1,20 @@
+{
+  "name": "cozy-frontdoor",
+  "version": "0.1.0",
+  "description": "Shared reachability front door for Cozy Private Network: routes public pooled hostnames to household boxes over outbound agent tunnels. Carries only ciphertext.",
+  "type": "module",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/shiftedx/cozygateway.git", "directory": "packages/frontdoor" },
+  "engines": { "node": ">=24" },
+  "bin": { "cozy-frontdoor": "dist/cli.js" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run", "build": "tsc -p tsconfig.build.json" },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "@sinclair/typebox": "^0.34.0",
+    "hono": "^4.6.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": { "@types/ws": "^8.5.0" }
+}
