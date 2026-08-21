@@ -179,6 +179,11 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
 carries the sending bot's handle. `plain` is an ordinary preview (falling back to the bot's
 description). `empty` means the bot has no conversation yet.
 
+For roster rows, `preview` and `lastActiveAt` are scoped to the resolved canonical chat. A newer
+cron, delegated routine, group-room, or bot-to-bot session cannot replace them. If the canonical
+chat has no persisted row yet, the preview is `empty` and `lastActiveAt` is null. Presence remains
+independent: activity in any session may still make the bot active.
+
 ### BotChatMessage
 
 ```

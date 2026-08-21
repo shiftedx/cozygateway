@@ -803,7 +803,38 @@ export class HermesBridge implements BotsSurface {
         const fetchedAt = this.#now();
         const result = await this.#client.request("profiles.list", {});
         const { profiles } = parseProfilesList(result);
+        const canonicalSessions = new Map<
+          string,
+          Array<{
+            id: string;
+            kind: ReturnType<typeof sessionKind>;
+            lastActiveAt: number;
+            preview: string | null;
+          }>
+        >();
+        await Promise.all(
+          profiles
+            .filter((profile) => !this.#hidden.has(profile.name))
+            .map(async (profile) => {
+              try {
+                const rows = await listBotSessions(this.#client, profile.name, 200);
+                canonicalSessions.set(
+                  profile.name,
+                  rows.map((row) => ({
+                    id: row.id,
+                    kind: sessionKind(row),
+                    lastActiveAt: row.lastActiveAt,
+                    preview: row.preview,
+                  })),
+                );
+              } catch (err) {
+                const detail = err instanceof Error ? err.message : "unknown failure";
+                this.#log(`canonical roster activity unavailable for ${profile.name}: ${detail}`);
+              }
+            }),
+        );
         const bots = buildRoster(profiles, {
+          canonicalSessions,
           hidden: this.#hidden,
           pins: this.#storage.botChatPinEntries(),
           uiMetaSupported: this.#uiMetaWriteback,

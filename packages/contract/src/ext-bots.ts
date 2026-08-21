@@ -993,7 +993,10 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    the canonical chat re-adopts it, `GET /bots/:name/chat` reports `adoption: "latest"`, and every
  *    paired device is told on the socket.
  *
- *    Routine runs and bot-to-bot deliveries never move the pin, and neither do group-room sessions.
+ *    The roster preview and its `lastActiveAt` now come from that resolved canonical session too,
+ *    rather than from the profile's latest activity across every session. Routine runs,
+ *    bot-to-bot deliveries and group-room sessions never feed those fields or move the pin. They
+ *    may still make the bot active because presence intentionally observes all session activity.
  *    The exclusions and the reasoning are in `contract/ext-bots-v1.md` under "The pin follows the
  *    bot's latest conversation".
  *
