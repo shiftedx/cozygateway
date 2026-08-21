@@ -32,6 +32,7 @@ export interface NativeBotDataPlaneOptions {
   onApproval?: (event: { bot: string; sessionId: string; turnId: string; toolCallId: string; name?: string; outcome?: "approved" | "denied" | "expired" }) => void;
   now?: () => number;
   log?: (message: string) => void;
+  historyRetryMs?: number;
 }
 
 interface ApprovalPayload { name: string }
@@ -51,6 +52,7 @@ export class NativeBotDataPlane {
   readonly #onApproval: NativeBotDataPlaneOptions["onApproval"];
   readonly #now: () => number;
   readonly #log: (message: string) => void;
+  readonly #historyRetryMs: number;
   readonly #historyMigrations = new Map<string, Promise<void>>();
   readonly #draftSeq = new Map<string, number>();
   readonly #toolFrames = new Map<string, { seq: number; steps: Map<string, BotToolStep> }>();
@@ -67,6 +69,7 @@ export class NativeBotDataPlane {
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
     this.#log = opts.log ?? ((message) => void process.stderr.write(`[native-bot] ${message}\n`));
+    this.#historyRetryMs = Math.max(0, opts.historyRetryMs ?? 250);
     // Scheduled/home delivery is authorized against this durable gateway-owned binding, never a
     // target asserted by an event itself. Creating it at assembly makes the target canonical even
     // before the app has opened this bot's chat.
@@ -103,14 +106,25 @@ export class NativeBotDataPlane {
    * to call before the Dashboard link is online: failures leave no marker and a later chat access
    * retries the same migration. Until the marker lands, roster reads keep the control-plane row. */
   async migrateHistory(): Promise<void> {
-    await Promise.all([...this.#native].map(async (bot) => {
-      try {
-        await this.#ensureHistory(bot);
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : "unknown failure";
-        this.#log(`history adoption deferred for ${bot}: ${detail}`);
-      }
-    }));
+    const pending = new Set(this.#native);
+    const failures = new Map<string, unknown>();
+    for (let attempt = 0; attempt < 8 && pending.size > 0; attempt += 1) {
+      await Promise.all([...pending].map(async (bot) => {
+        try {
+          await this.#ensureHistory(bot);
+          pending.delete(bot);
+          failures.delete(bot);
+        } catch (err) {
+          failures.set(bot, err);
+        }
+      }));
+      if (pending.size > 0 && attempt < 7) await this.#historyRetry(attempt);
+    }
+    for (const bot of pending) {
+      const err = failures.get(bot);
+      const detail = err instanceof Error ? err.message : "unknown failure";
+      this.#log(`history adoption deferred for ${bot}: ${detail}`);
+    }
   }
 
   /** Overlay the durable attach-v1 transcript on the dashboard-owned profile roster. Profile
@@ -382,6 +396,15 @@ export class NativeBotDataPlane {
       const detail = err instanceof Error ? err.message : "unknown failure";
       this.#log(`history adoption deferred for ${bot}: ${detail}`);
     }
+  }
+
+  #historyRetry(attempt: number): Promise<void> {
+    const delay = Math.min(this.#historyRetryMs * 2 ** attempt, 5_000);
+    if (delay === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, delay);
+      timer.unref();
+    });
   }
 
   #finish(bot: string, sessionId: string, turnId: string, phase: "complete" | "failed" = "complete"): void {
