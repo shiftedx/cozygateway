@@ -154,6 +154,14 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   A client below 15 ignores the optional assistant `attachments` field. `bot_chat` frames and chat
   history carry the blocks. `bot_chat_adopted` continues to trigger the history reread that carries
   them rather than gaining a message payload of its own.
+- `16`: SESSION HISTORY AND MANUAL RESTORE. `GET /bots/:name/sessions` returns the Hermes sessions
+  the bridge can see, newest first, with normalized times, the capability-14 classification, and
+  the active canonical-chat pin. `POST /bots/:name/sessions/:id/adopt` restores one as that pin and
+  broadcasts the existing `bot_chat_adopted` frame so every paired device re-reads it.
+
+  A manual restore holds through every session that already existed. The capability-14
+  follow-latest rule resumes when the next new conversational session appears. A client below 16
+  sees no change.
 
 ## 3. Resources
 
@@ -675,10 +683,16 @@ does become listed it is the newest row with nothing above it to follow. A retir
 re-adoption candidate at any point, whatever its title and wherever it sorts, by the same rule the
 reset section states. Clearing a chat cannot undo itself on the next open.
 
-**"Newer" means list position**, which `GET /bots/:name/sessions` documents as a convention this
-wire cannot verify: rows carry no timestamp. It is used as a preference and never as a fact, and the
-two guards above are what make a wrong guess harmless: the worst a mis-ordered list can do is prefer
-one conversation the user actually held over another.
+**"Newer" normally means list position**, which `GET /bots/:name/sessions` documents as a convention
+this wire cannot verify. It is used as a preference and never as a fact, and the two guards above are
+what make a wrong guess harmless: the worst a mis-ordered list can do is prefer one conversation the
+user actually held over another.
+
+Capability 16 adds one exception for a manual restore. The pin row records that the choice was
+manual and when it happened. Conversations already above the restored row cannot immediately undo
+the choice. Follow-latest resumes only for a conversational row whose nonzero `startedAt` is later
+than that manual choice. An older Hermes that supplies no creation time cannot prove a later session
+and therefore keeps the manual choice.
 
 One related fix rides the same capability, because a client can observe it. A pin THIS gateway wrote
 after its last `profiles.list` snapshot now outranks that snapshot whatever the snapshot carries,
@@ -1204,11 +1218,42 @@ and belong to that device, not to any shared cache.
 ### GET /bots/:name/sessions
 
 ```
-200 { sessions: [ { id: string, title: string, preview: string | null, source: string | null } ] }
+200 {
+  sessions: [ {
+    id: string,
+    startedAt: integer,                // milliseconds; 0 when Hermes omits it
+    lastActiveAt: integer,             // milliseconds; 0 when Hermes omits it
+    kind: "conversation" | "cron" | "routine" | "group" | "a2a",
+    title?: string,
+    preview?: string
+  } ],
+  activeSessionId: string | null
+}
 404 not_found                         // no profile named `name` exists
 ```
 
-Passthrough of the bot's session list, capped at 200 rows.
+The bot's visible Hermes session list, capped at 200 rows and kept in Hermes' newest-first order.
+`activeSessionId` is the canonical-chat pin and may name an unwritten session that has no list row
+yet. The `kind` classifier is the exact classifier the capability-14 pin-follow rule uses: cron
+source or id shape, `Routine: ` title, `Group: ` title, then bot-to-bot preview, with conversation as
+the default.
+
+### POST /bots/:name/sessions/:id/adopt
+
+```
+200 { name: string, sessionId: string, previousSessionId: string }
+404 not_found                         // no such bot or no visible session with this id
+409 conflict                          // the session belongs to another bot
+```
+
+Manually makes the selected session the bot's canonical chat. A session retired by a prior reset is
+restored rather than deleted or copied. The gateway broadcasts `bot_chat_adopted` with the same
+fields as an automatic capability-14 adoption, including when the selected session was already
+active, so every device rebinds and re-reads.
+
+The manual flag sticks until the next new conversational session appears. Cron, routine-titled,
+group-titled, and a2a sessions never release it. No separate persistence object is introduced: the
+existing pin row carries the flag and its existing update timestamp is the boundary.
 
 ### GET /bots/:name/profile
 
@@ -2257,8 +2302,9 @@ It is not a deletion notice. The retired session is still on the hermes host and
 `bot_chat_delta` frame will arrive for the retired session, because the gateway cancels its turn poll
 and forgets its draft bindings before it mints the replacement.
 
-`bot_chat_adopted` says a bot's canonical chat RE-ADOPTED a newer conversational session. Version 14
-and up. `sessionId` is the session the chat now points at and `previousSessionId` is the one the pin
+`bot_chat_adopted` says a bot's canonical chat adopted a conversational session, automatically from
+version 14 or manually from version 16. `sessionId` is the session the chat now points at and
+`previousSessionId` is the one the pin
 held until this moment; unlike the reset frame's, that field is always present, because a
 re-adoption by definition replaces a pin that resolved. It is broadcast to every paired device, for
 the same reason `bot_chat_reset` is: a device sitting on the previous transcript has no other way to
@@ -2274,8 +2320,9 @@ listed, stays resumable, and would become canonical again if something wrote to 
 retired, and a turn still running in it may deliver its `bot_chat` frames, which carry that session's
 id and its own message ids and which a rebound client ignores.
 
-Never emitted for a routine fire, a bot-to-bot delivery or a group-room session. See "The pin follows
-the bot's latest conversation".
+Automatic adoption is never emitted for a routine fire, a bot-to-bot delivery or a group-room
+session. A manual restore may select any listed kind. See "The pin follows the bot's latest
+conversation".
 
 `bot_routines` is a FULL REPLACE for one bot, sent only when that bot's routine list actually
 changed, so an idle cron store is silent. It fires when this gateway changed a routine, and when a

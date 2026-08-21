@@ -17,7 +17,11 @@ import {
 
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { RuntimeSessionUnknown } from "./chat-turns.ts";
-import type { BotsSurface } from "./bridge.ts";
+import {
+  BotSessionConflict,
+  BotSessionNotFound,
+  type BotsSurface,
+} from "./bridge.ts";
 import {
   BotDeleteBlocked,
   BotDeleteFailed,
@@ -165,6 +169,10 @@ function failure(c: Context<Env>, err: unknown) {
   // a backend failure of any kind, it is a 404 that says so, on every `/bots/:name/*` route the
   // same way `DELETE /bots/:name` already answers it.
   if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof BotSessionNotFound) return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof BotSessionConflict) {
+    return c.json(extensionErrorBody("conflict", err.message), 409);
+  }
   // A routine id that names nothing in this bot's namespace, which includes an id that belongs to
   // another bot or to an untagged cron job the operator owns. Not found, not forbidden: this API
   // does not confirm the existence of jobs outside the bot that was asked about.
@@ -928,7 +936,21 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const name = resolved.name;
     try {
-      return c.json({ sessions: await bots.sessions(name, SESSION_LIST_LIMIT) });
+      return c.json(await bots.sessions(name, SESSION_LIST_LIMIT));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.post("/bots/:name/sessions/:id/adopt", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const sessionId = c.req.param("id") ?? "";
+    if (sessionId.length === 0) {
+      return c.json(errorBody("invalid_request", "session id is required"), 400);
+    }
+    try {
+      return c.json(await bots.adoptSession(resolved.name, sessionId, SESSION_LIST_LIMIT));
     } catch (err) {
       return failure(c, err);
     }

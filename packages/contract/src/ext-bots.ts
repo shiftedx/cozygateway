@@ -47,6 +47,40 @@ export const BotSummarySchema = Type.Object({
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
+/** One Hermes session visible through capability 16. The five kinds reuse the canonical-chat
+ *  follow exclusions exactly: everything not excluded is a conversation. */
+export const BotSessionKindSchema = Type.Union([
+  Type.Literal("conversation"),
+  Type.Literal("cron"),
+  Type.Literal("routine"),
+  Type.Literal("group"),
+  Type.Literal("a2a"),
+]);
+export type BotSessionKind = Static<typeof BotSessionKindSchema>;
+
+export const BotSessionSummarySchema = Type.Object({
+  id: Type.String(),
+  startedAt: Type.Integer(),
+  lastActiveAt: Type.Integer(),
+  kind: BotSessionKindSchema,
+  title: Type.Optional(Type.String()),
+  preview: Type.Optional(Type.String()),
+});
+export type BotSessionSummary = Static<typeof BotSessionSummarySchema>;
+
+export const BotSessionsResponseSchema = Type.Object({
+  sessions: Type.Array(BotSessionSummarySchema),
+  activeSessionId: Type.Union([Type.String(), Type.Null()]),
+});
+export type BotSessionsResponse = Static<typeof BotSessionsResponseSchema>;
+
+export const BotSessionAdoptResponseSchema = Type.Object({
+  name: Type.String(),
+  sessionId: Type.String(),
+  previousSessionId: Type.String(),
+});
+export type BotSessionAdoptResponse = Static<typeof BotSessionAdoptResponseSchema>;
+
 /** Full-replace roster snapshot. Sent whenever the bridge's cached roster changes. */
 export const BotRosterFrameSchema = Type.Object({
   type: Type.Literal("bot_roster"),
@@ -367,10 +401,10 @@ export const BotChatResetFrameSchema = Type.Object({
 });
 export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
 
-/** A bot's canonical chat RE-ADOPTED a newer conversational session (capability 14, issue #88). The
- *  pin follows the bot's latest conversation: when a chat held somewhere else -- another device, the
- *  desktop, the CLI -- outruns the pinned session, the canonical chat moves to it, and this frame is
- *  how every paired device learns that the transcript on its screen is no longer the bot's.
+/** A bot's canonical chat adopted another session. Capability 14 emits this when the pin follows a
+ *  newer conversation; capability 16 emits the same frame when the user manually restores any
+ *  listed session. It is how every paired device learns that the transcript on its screen must be
+ *  re-read.
  *
  *  On receipt, rebind to `sessionId` and re-read `GET /bots/:name/chat/messages`. That is the same
  *  handling `bot_chat_reset` gets, and a client MAY implement the two together; what separates them
@@ -378,21 +412,18 @@ export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
  *
  *  - `bot_chat_reset` says the previous chat was RETIRED. The user asked to leave it behind, it will
  *    never be adopted again, and no further live frame will arrive for it.
- *  - `bot_chat_adopted` says nothing of the kind. The previous session is an ordinary conversation
- *    that simply stopped being the newest one; it is still listed, still resumable, and could become
- *    canonical again if something writes to it. A turn already running in it may still deliver its
- *    `bot_chat` frames, which carry that session's id and which a rebound client ignores.
+ *  - `bot_chat_adopted` says nothing of the kind. The previous session is still listed and still
+ *    resumable. A turn already running in it may still deliver its `bot_chat` frames, which carry
+ *    that session's id and which a rebound client ignores.
  *
- *  Never emitted for a routine run or a bot-to-bot delivery. Those mint sessions of their own by
- *  design and cannot move the pin -- see contract/ext-bots-v1.md, "The pin follows the bot's latest
- *  conversation". */
+ *  Automatic following never selects a routine run, group room, or bot-to-bot delivery. Manual
+ *  restoration may select any listed kind. See contract/ext-bots-v1.md. */
 export const BotChatAdoptedFrameSchema = Type.Object({
   type: Type.Literal("bot_chat_adopted"),
   bot: Type.String(),
   /** The session the canonical chat now points at. Every device rebinds to this id. */
   sessionId: Type.String(),
-  /** The session the pin pointed at until this moment. Present always: a re-adoption by definition
-   *  replaces a pin that resolved, which is what distinguishes it from a first adoption. */
+  /** The session the pin resolved to when this adoption began. Always present. */
   previousSessionId: Type.String(),
   updatedAt: Type.Integer(),
 });
@@ -978,6 +1009,12 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    gateway attachment store, the successful directive line is removed, and the assistant row
  *    carries `BotChatMessage.attachments` in `bot_chat` frames and history. A failed or unattempted
  *    directive stays as text. Live `bot_chat_delta` drafts are unchanged and may briefly show it.
- *    A client below 15 ignores the optional field and continues to render the remaining text. */
+ *    A client below 15 ignores the optional field and continues to render the remaining text.
+ *  - `16`: SESSION HISTORY AND MANUAL RESTORE (issue #94). `GET /bots/:name/sessions` returns
+ *    normalized, classified summaries plus the active canonical-chat pin, and
+ *    `POST /bots/:name/sessions/:id/adopt` restores one as the active chat. A manual choice holds
+ *    through all sessions that already existed, then capability 14 follow-latest resumes when the
+ *    next new conversational session appears. The existing `bot_chat_adopted` frame announces a
+ *    manual move exactly as it announces an automatic one. Clients below 16 see no change. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 15;
+export const BOTS_CAPABILITY_VERSION = 16;

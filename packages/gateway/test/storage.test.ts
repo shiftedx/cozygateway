@@ -175,6 +175,24 @@ describe("bots cache", () => {
     expect(storage.botChatPin("scout")).toBeUndefined();
     storage.clearBotChatPin("scout");
   });
+
+  it("keeps a manual pin boundary until an automatic adoption moves to another session", () => {
+    const storage = openStorage(":memory:");
+    storage.setBotChatPin("scout", "older", 100, true);
+    storage.setBotChatPin("scout", "older", 200);
+    expect(storage.botChatPinEntry("scout")).toEqual({
+      sessionId: "older",
+      updatedAt: 100,
+      manual: true,
+    });
+
+    storage.setBotChatPin("scout", "next", 300);
+    expect(storage.botChatPinEntry("scout")).toEqual({
+      sessionId: "next",
+      updatedAt: 300,
+      manual: false,
+    });
+  });
 });
 
 describe("addColumnIfMissing", () => {

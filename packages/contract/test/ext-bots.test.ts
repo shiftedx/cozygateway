@@ -19,6 +19,8 @@ import {
   BotRoutineCreateRequestSchema,
   BotRoutinePatchSchema,
   BotRoutineSchema,
+  BotSessionAdoptResponseSchema,
+  BotSessionsResponseSchema,
   BotSummarySchema,
   BotToolActivityFrameSchema,
   BotToolStepSchema,
@@ -442,7 +444,9 @@ describe("capability advertisement", () => {
     // chat the app opens, and nothing on the wire ever says the pin moved).
     // 15 for settled assistant MEDIA lines becoming attachment blocks. The field is optional, so
     // clients below 15 keep rendering text and ignore the new block.
-    expect(BOTS_CAPABILITY_VERSION).toBe(15);
+    // 16 for listing and manually restoring one of a bot's Hermes sessions. A manual restore emits
+    // the existing adoption frame and holds until the next new conversational session appears.
+    expect(BOTS_CAPABILITY_VERSION).toBe(16);
   });
 
   it("accepts attachments on an assistant chat row", () => {
@@ -461,6 +465,31 @@ describe("capability advertisement", () => {
             size: 9,
           },
         ],
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts capability-16 session list and adoption responses", () => {
+    expect(
+      check(BotSessionsResponseSchema, {
+        sessions: [
+          {
+            id: "session-1",
+            startedAt: 1_800_000_000_000,
+            lastActiveAt: 1_800_000_001_000,
+            kind: "conversation",
+            title: "Bot Chat",
+            preview: "hello",
+          },
+        ],
+        activeSessionId: "session-1",
+      }),
+    ).toBe(true);
+    expect(
+      check(BotSessionAdoptResponseSchema, {
+        name: "scout",
+        sessionId: "session-1",
+        previousSessionId: "session-0",
       }),
     ).toBe(true);
   });
