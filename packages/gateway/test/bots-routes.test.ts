@@ -449,6 +449,151 @@ describe("GET /bots/:name/sessions", () => {
   });
 });
 
+describe("agent inbox (capability 17)", () => {
+  it("lists only the newest a2a threads with clean peers, previews, and rendered counts", async () => {
+    const { authed, server } = await setup({
+      methods: {
+        "profiles.list": () => profilesListResult([scoutRow]),
+        "session.list": () => ({
+          sessions: [
+            {
+              id: "ordinary",
+              preview: "hello",
+              created_at: 1_800_000_000,
+              last_active: 1_800_000_000,
+              message_count: 8,
+            },
+            {
+              id: "older",
+              preview: "Message from agent 'luna': first",
+              created_at: 1_799_999_900,
+              last_active: 1_799_999_901,
+              message_count: "1",
+            },
+            {
+              id: "newer",
+              preview: "Message from 🤖 pixel (@pixel): deploy is green",
+              created_at: 1_799_999_980,
+              last_active: 1_799_999_999,
+              message_count: 2,
+            },
+          ],
+        }),
+      },
+    });
+
+    const response = await authed("/bots/scout/inbox");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      threads: [
+        {
+          id: "newer",
+          peers: ["pixel"],
+          startedAt: 1_799_999_980_000,
+          lastActiveAt: 1_799_999_999_000,
+          preview: "deploy is green",
+          messageCount: 2,
+        },
+        {
+          id: "older",
+          peers: ["luna"],
+          startedAt: 1_799_999_900_000,
+          lastActiveAt: 1_799_999_901_000,
+          preview: "first",
+          messageCount: 1,
+        },
+      ],
+    });
+    expect(server.callsOf("session.list").at(-1)?.params).toEqual({ profile: "scout", limit: 200 });
+    expect(server.callsOf("session.resume")).toHaveLength(0);
+  });
+
+  it("returns the read-only group-room transcript with an agent on every line", async () => {
+    const { authed, request } = await setup({
+      methods: {
+        "profiles.list": () => profilesListResult([scoutRow]),
+        "session.list": () => ({
+          sessions: [{ id: "delivery", preview: "Message from agent 'pixel': status?" }],
+        }),
+        "session.resume": () => ({
+          session_id: "runtime-delivery",
+          message_count: 2,
+          messages: [
+            { role: "user", text: "Message from agent 'pixel': status?", timestamp: 1_799_999_990 },
+            { role: "assistant", text: "Green.", timestamp: 1_799_999_991 },
+          ],
+        }),
+      },
+    });
+
+    const response = await authed("/bots/scout/inbox/delivery/messages");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      messages: [
+        {
+          seq: 1,
+          from: { kind: "member", name: "pixel", displayName: "Pixel" },
+          text: "status?",
+          at: 1_799_999_990_000,
+        },
+        {
+          seq: 2,
+          from: { kind: "member", name: "scout", displayName: "Scout" },
+          text: "Green.",
+          at: 1_799_999_991_000,
+        },
+      ],
+    });
+
+    expect((await authed("/bots/scout/inbox/delivery/messages", { method: "POST" })).status).toBe(404);
+    expect((await request("/bots/scout/inbox")).status).toBe(401);
+    expect((await request("/bots/scout/inbox/delivery/messages")).status).toBe(401);
+  });
+
+  it("broadcasts coarse activity when an open a2a transcript gains a rendered message", async () => {
+    const messages: Array<Record<string, unknown>> = [
+      { role: "user", text: "Message from agent 'pixel': status?", timestamp: 1_799_999_990 },
+    ];
+    const { authed, frames, server } = await setup({
+      methods: {
+        "profiles.list": () => profilesListResult([scoutRow]),
+        "session.list": () => ({
+          sessions: [{ id: "delivery", preview: "Message from agent 'pixel': status?" }],
+        }),
+        "session.resume": () => ({
+          session_id: "runtime-delivery",
+          message_count: messages.length,
+          messages,
+        }),
+      },
+    });
+
+    expect((await authed("/bots/scout/inbox/delivery/messages")).status).toBe(200);
+    messages.push({ role: "assistant", text: "Green.", timestamp: 1_799_999_991 });
+    server.sendEvent("sessions.changed", { reason: "a2a reply" });
+    await until(() => frames.some((frame) => frame.type === "bot_inbox_activity"));
+
+    expect(frames.filter((frame) => frame.type === "bot_inbox_activity")).toEqual([
+      {
+        type: "bot_inbox_activity",
+        bot: "scout",
+        threadId: "delivery",
+        updatedAt: NOW,
+      },
+    ]);
+  });
+
+  it("rejects a non-a2a session as an inbox thread", async () => {
+    const { authed } = await setup({
+      methods: {
+        "profiles.list": () => profilesListResult([scoutRow]),
+        "session.list": () => ({ sessions: [{ id: "ordinary", preview: "hello" }] }),
+      },
+    });
+    expect((await authed("/bots/scout/inbox/ordinary/messages")).status).toBe(404);
+  });
+});
+
 describe("POST /bots/:name/sessions/:id/adopt", () => {
   it("manually restores a session, broadcasts adoption, then follows the next new conversation", async () => {
     const sessions = [

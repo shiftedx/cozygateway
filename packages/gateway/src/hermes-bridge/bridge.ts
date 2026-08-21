@@ -5,6 +5,7 @@ import type {
   BotGroup,
   BotGroupDetail,
   BotGroupMessage,
+  BotInboxThread,
   BotProfile,
   BotProfilePatch,
   BotRoutine,
@@ -50,6 +51,8 @@ import {
   type BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import { BotChatTurns, RuntimeSessionUnknown } from "./chat-turns.ts";
+import { parseChatSnapshot } from "./chat-messages.ts";
+import { inboxMessages as projectInboxMessages, inboxThread } from "./inbox.ts";
 import { firstLocalGeneration, nextLocalGeneration, readyIdentity } from "./link-generation.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName, sniffImageType } from "./photos.ts";
@@ -114,6 +117,12 @@ const CHANGE_DEBOUNCE_MS = 250;
  *  keeps its bot warm simply by reading it. */
 export const ROUTINE_WATCH_TTL_MS = 5 * 60_000;
 
+/** A transcript read marks an inbox thread open for this long. Hermes change events carry no
+ *  reliable profile/thread pair, so watched threads are the bounded set re-read on a change. */
+export const INBOX_WATCH_TTL_MS = 5 * 60_000;
+export const INBOX_THREAD_LIMIT = 50;
+export const INBOX_SESSION_SCAN_LIMIT = 200;
+
 /** The hermes error code for "there is no such session". Same family as
  *  `HERMES_PROFILE_NOT_FOUND` in `routes.ts`, kept here because this one is not a status mapping: it
  *  is the fact the send path acts on. */
@@ -164,6 +173,14 @@ export interface BotSessionAdoption {
   previousSessionId: string;
 }
 
+export interface BotInboxView {
+  threads: BotInboxThread[];
+}
+
+export interface BotInboxMessagesView {
+  messages: BotGroupMessage[];
+}
+
 export class BotSessionNotFound extends Error {
   readonly sessionId: string;
 
@@ -202,6 +219,8 @@ export interface BotsSurface {
   resetChat(name: string): Promise<ChatResetResult>;
   sessions(name: string, limit: number): Promise<BotSessionsView>;
   adoptSession(name: string, sessionId: string, limit: number): Promise<BotSessionAdoption>;
+  inbox(name: string): Promise<BotInboxView>;
+  inboxMessages(name: string, threadId: string): Promise<BotInboxMessagesView>;
   chatHistory(name: string): Promise<BotChatHistory>;
   sendChatMessage(
     name: string,
@@ -441,6 +460,11 @@ export class HermesBridge implements BotsSurface {
   /** Bots whose routines something has read recently, and when. Drives the `cron.changed` fan-out;
    *  see `ROUTINE_WATCH_TTL_MS`. */
   readonly #routineWatch = new Map<string, number>();
+  /** Threads opened through the transcript route, with their last rendered count. */
+  readonly #inboxWatch = new Map<
+    string,
+    { bot: string; threadId: string; messageCount: number; at: number }
+  >();
   /** One list per bot at a time. Concurrency here is not merely wasteful: a list PAUSES legacy
    *  routines as a side effect, and two overlapping lists would both try to pause the same jobs. */
   readonly #routineInflight = new Map<string, Promise<BotRoutineList>>();
@@ -450,6 +474,9 @@ export class HermesBridge implements BotsSurface {
   /** The last routines payload broadcast per bot, so an unchanged re-read is silent on the wire. */
   readonly #lastRoutinesJson = new Map<string, string>();
   #routineDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  #inboxDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  #inboxRefreshing: Promise<void> | undefined;
+  #inboxRefreshDirty = false;
 
   /** The opener an empty chat offers, or `undefined` when this deployment offers none. Never
    *  submitted anywhere; see `BotChatHistory.suggestion`. */
@@ -771,6 +798,7 @@ export class HermesBridge implements BotsSurface {
       if (event.type === "sessions.changed" || event.type === "cron.changed") {
         this.refreshSoon(event.type);
       }
+      if (event.type === "sessions.changed") this.#refreshInboxSoon();
       // A cron change is the ONE broadcast that says something about routines, and it says only
       // that something changed: no job id, no profile. So every watched bot is re-read, debounced.
       if (event.type === "cron.changed") this.#refreshRoutinesSoon();
@@ -1183,6 +1211,119 @@ export class HermesBridge implements BotsSurface {
       })),
       activeSessionId,
     };
+  }
+
+  /** The newest a2a sessions only, using the shared capability-14 classifier. */
+  async inbox(name: string): Promise<BotInboxView> {
+    await this.#assertBotKnown(name);
+    const rows = (await listBotSessions(this.#client, name, INBOX_SESSION_SCAN_LIMIT))
+      .filter((row) => sessionKind(row) === "a2a")
+      .map((row, index) => ({ row, index }))
+      .sort(
+        (left, right) =>
+          right.row.lastActiveAt - left.row.lastActiveAt ||
+          right.row.startedAt - left.row.startedAt ||
+          left.index - right.index,
+      )
+      .slice(0, INBOX_THREAD_LIMIT)
+      .map(({ row }) => row);
+    return { threads: rows.map((row) => inboxThread(row, row.messageCount ?? 0)) };
+  }
+
+  async inboxMessages(name: string, threadId: string): Promise<BotInboxMessagesView> {
+    await this.#assertBotKnown(name);
+    const rows = await listBotSessions(this.#client, name, INBOX_SESSION_SCAN_LIMIT);
+    const row = rows.find((candidate) => candidate.id === threadId);
+    if (row === undefined || sessionKind(row) !== "a2a") throw new BotSessionNotFound(threadId);
+    const snapshot = await this.#inboxSnapshot(name, threadId);
+    const messages = projectInboxMessages(snapshot, name, (speaker) => this.#displayNameOf(speaker));
+    this.#inboxWatch.set(this.#inboxWatchKey(name, threadId), {
+      bot: name,
+      threadId,
+      messageCount: messages.length,
+      at: this.#now(),
+    });
+    return { messages };
+  }
+
+  async #inboxSnapshot(name: string, threadId: string) {
+    return parseChatSnapshot(
+      await this.#client.request("session.resume", {
+        session_id: threadId,
+        profile: name,
+        omit_messages: false,
+      }),
+      threadId,
+    );
+  }
+
+  #displayNameOf(name: string): string {
+    return this.#storage.botRoster().bots.find((bot) => bot.name === name)?.displayName ?? botDisplayName(name, null);
+  }
+
+  #inboxWatchKey(name: string, threadId: string): string {
+    return `${name}\u0000${threadId}`;
+  }
+
+  #refreshInboxSoon(): void {
+    if (this.#closed || this.#inboxWatch.size === 0) return;
+    if (this.#inboxRefreshing !== undefined) {
+      this.#inboxRefreshDirty = true;
+      return;
+    }
+    if (this.#inboxDebounceTimer !== undefined) return;
+    this.#inboxDebounceTimer = setTimeout(() => {
+      this.#inboxDebounceTimer = undefined;
+      void this.#refreshOpenInbox();
+    }, CHANGE_DEBOUNCE_MS);
+    this.#inboxDebounceTimer.unref();
+  }
+
+  async #refreshOpenInbox(): Promise<void> {
+    if (this.#inboxRefreshing !== undefined) {
+      this.#inboxRefreshDirty = true;
+      return this.#inboxRefreshing;
+    }
+    const run = (async () => {
+      const cutoff = this.#now() - INBOX_WATCH_TTL_MS;
+      const watched = [...this.#inboxWatch.entries()];
+      for (const [key, watch] of watched) {
+        if (watch.at < cutoff) {
+          this.#inboxWatch.delete(key);
+          continue;
+        }
+        try {
+          const snapshot = await this.#inboxSnapshot(watch.bot, watch.threadId);
+          const messageCount = projectInboxMessages(snapshot, watch.bot, (speaker) =>
+            this.#displayNameOf(speaker),
+          ).length;
+          const current = this.#inboxWatch.get(key);
+          if (current !== watch) continue;
+          this.#inboxWatch.set(key, { ...watch, messageCount });
+          if (messageCount > watch.messageCount) {
+            this.#broadcast({
+              type: "bot_inbox_activity",
+              bot: watch.bot,
+              threadId: watch.threadId,
+              updatedAt: this.#now(),
+            });
+          }
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          this.#log(`failed to refresh open inbox thread ${watch.bot}/${watch.threadId} (${detail})`);
+        }
+      }
+    })();
+    this.#inboxRefreshing = run;
+    try {
+      await run;
+    } finally {
+      this.#inboxRefreshing = undefined;
+      if (this.#inboxRefreshDirty && !this.#closed) {
+        this.#inboxRefreshDirty = false;
+        this.#refreshInboxSoon();
+      }
+    }
   }
 
   /** Explicitly pins one visible Hermes session. The operation shares the canonical-chat
@@ -1978,6 +2119,10 @@ export class HermesBridge implements BotsSurface {
     this.#debounceTimer = undefined;
     if (this.#routineDebounceTimer !== undefined) clearTimeout(this.#routineDebounceTimer);
     this.#routineDebounceTimer = undefined;
+    if (this.#inboxDebounceTimer !== undefined) clearTimeout(this.#inboxDebounceTimer);
+    this.#inboxDebounceTimer = undefined;
+    this.#inboxRefreshDirty = false;
+    this.#inboxWatch.clear();
     await this.#client.close();
   }
 

@@ -14,6 +14,9 @@ import {
   BotGroupMessageSchema,
   BotGroupSchema,
   BotGroupSendRequestSchema,
+  BotInboxActivityFrameSchema,
+  BotInboxMessagesResponseSchema,
+  BotInboxResponseSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
   BotRoutineCreateRequestSchema,
@@ -446,7 +449,8 @@ describe("capability advertisement", () => {
     // clients below 15 keep rendering text and ignore the new block.
     // 16 for listing and manually restoring one of a bot's Hermes sessions. A manual restore emits
     // the existing adoption frame and holds until the next new conversational session appears.
-    expect(BOTS_CAPABILITY_VERSION).toBe(16);
+    // 17 for the read-only agent inbox routes and their coarse activity invalidation frame.
+    expect(BOTS_CAPABILITY_VERSION).toBe(17);
   });
 
   it("accepts attachments on an assistant chat row", () => {
@@ -492,5 +496,42 @@ describe("capability advertisement", () => {
         previousSessionId: "session-0",
       }),
     ).toBe(true);
+  });
+
+  it("accepts capability-17 inbox responses and activity frames", () => {
+    expect(
+      check(BotInboxResponseSchema, {
+        threads: [
+          {
+            id: "a2a-1",
+            peers: ["pixel"],
+            startedAt: 1_800_000_000_000,
+            lastActiveAt: 1_800_000_001_000,
+            preview: "deploy is green",
+            messageCount: 2,
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      check(BotInboxMessagesResponseSchema, {
+        messages: [
+          {
+            seq: 1,
+            from: { kind: "member", name: "pixel", displayName: "Pixel" },
+            text: "deploy is green",
+            at: 1_800_000_000_000,
+          },
+        ],
+      }),
+    ).toBe(true);
+    const activity = {
+      type: "bot_inbox_activity",
+      bot: "scout",
+      threadId: "a2a-1",
+      updatedAt: 1_800_000_002_000,
+    };
+    expect(check(BotInboxActivityFrameSchema, activity)).toBe(true);
+    expect(check(ServerFrameSchema, activity)).toBe(true);
   });
 });

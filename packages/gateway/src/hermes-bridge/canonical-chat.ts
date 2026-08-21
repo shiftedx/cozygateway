@@ -98,6 +98,8 @@ export interface SessionRow {
   startedAt: number;
   /** Milliseconds. Zero means the Hermes build did not expose this timestamp. */
   lastActiveAt: number;
+  /** Hermes' session-list count, normalized to a non-negative integer. */
+  messageCount?: number;
 }
 
 export type BotSessionKind = "conversation" | "cron" | "routine" | "group" | "a2a";
@@ -119,6 +121,12 @@ function sessionTime(item: Record<string, unknown>, fields: readonly string[]): 
     return Math.round(value < 1_000_000_000_000 ? value * 1000 : value);
   }
   return 0;
+}
+
+function sessionMessageCount(item: Record<string, unknown>): number {
+  const raw = item["message_count"];
+  const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+  return Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
 }
 
 /** Decodes a `session.list` response tolerantly. Rows without a usable id are dropped; the order
@@ -152,6 +160,7 @@ export function parseSessionList(result: unknown): SessionRow[] {
         "lastActiveAt",
         "updated",
       ]),
+      messageCount: sessionMessageCount(item),
     });
   }
   return parsed;
