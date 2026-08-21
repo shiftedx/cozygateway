@@ -208,6 +208,9 @@ export interface HermesClient {
    *  Hermes operations that are legitimately slow (a profile delete stops a service and rmtrees a
    *  directory), where the default 30 s would reject a call that is going to succeed. */
   request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
+  /** Calls the authenticated dashboard REST surface on the same Hermes connection. `path` is
+   *  origin-relative and may include a query string. */
+  dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT"; body?: unknown }): Promise<T>;
   /** Reads one Hermes-host file through the authenticated dashboard. */
   readMediaDataUrl(path: string): Promise<string>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
@@ -580,6 +583,48 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     throw new Error("hermes dashboard could not read the media file");
   }
 
+  async function dashboardJson<T>(
+    path: string,
+    init: { method?: "GET" | "POST" | "PUT"; body?: unknown } = {},
+  ): Promise<T> {
+    let relogged = false;
+    const send = async (): Promise<Response> => {
+      const headers: Record<string, string> = { accept: "application/json" };
+      if (init.body !== undefined) headers["content-type"] = "application/json";
+      if (auth.mode === "password") {
+        if (sessionCookie === undefined) {
+          await login(auth.baseUrl, auth.username, auth.password, auth.provider ?? DEFAULT_AUTH_PROVIDER);
+        }
+        headers.cookie = sessionCookie!;
+      } else {
+        headers["x-hermes-session-token"] = auth.token;
+      }
+      return doFetch(new URL(path, `${dashboardBaseUrl}/`), {
+        method: init.method ?? "GET",
+        headers,
+        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+        signal: AbortSignal.timeout(authHttpTimeoutMs),
+      });
+    };
+
+    let response = await send();
+    if (auth.mode === "password" && response.status === 401 && !relogged) {
+      await response.text().catch(() => "");
+      sessionCookie = undefined;
+      relogged = true;
+      response = await send();
+    }
+    const body: unknown = await response.json().catch(() => undefined);
+    if (!response.ok) {
+      const detail =
+        typeof body === "object" && body !== null && typeof (body as Record<string, unknown>)["detail"] === "string"
+          ? String((body as Record<string, unknown>)["detail"])
+          : `hermes dashboard request failed (HTTP ${response.status})`;
+      throw new HermesRpcError(detail, response.status, body);
+    }
+    return body as T;
+  }
+
   function connect(): void {
     if (closed || refused) return;
     generation += 1;
@@ -653,6 +698,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
         socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
       });
     },
+
+    dashboardJson,
 
     readMediaDataUrl,
 

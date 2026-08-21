@@ -8,6 +8,7 @@ import {
   BotFocusRequestSchema,
   BotGroupCreateRequestSchema,
   BotGroupSendRequestSchema,
+  BotModelConfigPatchSchema,
   BotProfilePatchSchema,
   BotRoutineCreateRequestSchema,
   BotRoutinePatchSchema,
@@ -16,6 +17,7 @@ import {
 } from "cozygateway-contract";
 
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
+import { ModelConfigInvalid } from "./model-config.ts";
 import { RuntimeSessionUnknown } from "./chat-turns.ts";
 import {
   BotSessionConflict,
@@ -170,6 +172,7 @@ function failure(c: Context<Env>, err: unknown) {
   // same way `DELETE /bots/:name` already answers it.
   if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
   if (err instanceof BotSessionNotFound) return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof ModelConfigInvalid) return c.json(errorBody("invalid_request", err.message), 400);
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   }
@@ -513,6 +516,42 @@ export function registerBotRoutes(
     }
   });
 
+  app.get("/bots/:name/model-config", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(await bots.modelConfig(resolved.name));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.put("/bots/:name/model-config", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotModelConfigPatchSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    if (parsed.model === undefined && parsed.effort === undefined) {
+      return c.json(errorBody("invalid_request", "at least one of model or effort is required"), 400);
+    }
+    try {
+      return c.json(await bots.configureModel(resolved.name, parsed));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
   app.get("/bots/:name/chat", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
@@ -838,9 +877,17 @@ export function registerBotRoutes(
       const detail = err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
-    if (!patchNeedsRewrite(parsed) && parsed.enabled === undefined) {
+    if (
+      !patchNeedsRewrite(parsed) &&
+      parsed.enabled === undefined &&
+      parsed.model === undefined &&
+      parsed.effort === undefined
+    ) {
       return c.json(
-        errorBody("invalid_request", "at least one of title, schedule, prompt, enabled, repeat, continuity is required"),
+        errorBody(
+          "invalid_request",
+          "at least one of title, schedule, prompt, enabled, repeat, continuity, model or effort is required",
+        ),
         400,
       );
     }

@@ -17,6 +17,8 @@ import {
   BotInboxActivityFrameSchema,
   BotInboxMessagesResponseSchema,
   BotInboxResponseSchema,
+  BotModelConfigPatchSchema,
+  BotModelConfigSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
   BotRoutineCreateRequestSchema,
@@ -343,6 +345,8 @@ describe("routines", () => {
         // A DISPLAY string, never a number: the remaining run count is not recoverable from it.
         repeat: "1/3",
         continuity: true,
+        model: "openrouter:google/gemini-2.5-flash",
+        effort: "low",
       }),
     ).toBe(true);
     expect(check(BotRoutineSchema, { ...routine, repeat: 3 })).toBe(false);
@@ -367,11 +371,13 @@ describe("routines", () => {
     expect(check(BotRoutineCreateRequestSchema, { ...create, prompt: "sum\u0000marize" })).toBe(false);
     expect(check(BotRoutineCreateRequestSchema, { ...create, title: "   " })).toBe(false);
     expect(check(BotRoutineCreateRequestSchema, { ...create, repeat: 0 })).toBe(false);
+    expect(check(BotRoutineCreateRequestSchema, { ...create, model: null, effort: null })).toBe(true);
   });
 
   it("takes any single field on a patch, including the row switch alone", () => {
     expect(check(BotRoutinePatchSchema, { enabled: false })).toBe(true);
     expect(check(BotRoutinePatchSchema, { title: "Digest v2", prompt: "summarize" })).toBe(true);
+    expect(check(BotRoutinePatchSchema, { model: null, effort: "minimal" })).toBe(true);
     // Emptiness is refused at the schema level for each field; "no fields at all" is the route's
     // rule, since an empty object is a legal patch shape.
     expect(check(BotRoutinePatchSchema, { title: "" })).toBe(false);
@@ -380,6 +386,23 @@ describe("routines", () => {
   it("carries bot_routines in the ServerFrame union", () => {
     const frame: ServerFrame = { type: "bot_routines", bot: "scout", routines: [routine], updatedAt: 1_800_000_000_000 };
     expect(check(ServerFrameSchema, frame)).toBe(true);
+  });
+});
+
+describe("bot model config", () => {
+  it("fixes the catalog, nullable defaults, and partial write shapes", () => {
+    expect(
+      check(BotModelConfigSchema, {
+        model: "openrouter:google/gemini-2.5-flash",
+        effort: "low",
+        catalog: [{ id: "openrouter:google/gemini-2.5-flash", displayName: "OpenRouter: Gemini Flash" }],
+        efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+      }),
+    ).toBe(true);
+    expect(check(BotModelConfigSchema, { model: null, effort: null, catalog: [], efforts: [] })).toBe(true);
+    expect(check(BotModelConfigPatchSchema, { model: null })).toBe(true);
+    expect(check(BotModelConfigPatchSchema, { effort: "low" })).toBe(true);
+    expect(check(BotModelConfigPatchSchema, { model: 1 })).toBe(false);
   });
 });
 
@@ -450,7 +473,8 @@ describe("capability advertisement", () => {
     // 16 for listing and manually restoring one of a bot's Hermes sessions. A manual restore emits
     // the existing adoption frame and holds until the next new conversational session appears.
     // 17 for the read-only agent inbox routes and their coarse activity invalidation frame.
-    expect(BOTS_CAPABILITY_VERSION).toBe(17);
+    // 18 for bot model config plus accepted-but-inert per-routine model and effort metadata.
+    expect(BOTS_CAPABILITY_VERSION).toBe(18);
   });
 
   it("accepts attachments on an assistant chat row", () => {

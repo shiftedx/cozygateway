@@ -25,6 +25,7 @@ import {
   ApprovalResolvedFrameSchema,
   BotInboxMessagesResponseSchema,
   BotInboxResponseSchema,
+  BotModelConfigSchema,
   CommittedFrameSchema,
   DeviceSchema,
   DoneFrameSchema,
@@ -87,6 +88,9 @@ export interface ConformanceEnv {
   /** OPTIONAL agent-inbox fixture (vendor capability com.cozylabs.bots >= 17). The named bot must
    *  expose the named a2a thread in its newest 50 so both read routes can be checked black-box. */
   botInbox?: { botName: string; threadId: string };
+  /** OPTIONAL capability-18 bot whose live Hermes model config may be read. The suite sends only a
+   *  rejected unknown-model PUT, so it never changes the fixture's config. */
+  botModelConfig?: { botName: string };
 }
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -354,6 +358,35 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
           expect(body.messages.every((message) => message.from.kind === "member")).toBe(true);
           expect((await authFetch(token, path, { method: "POST" })).status).toBe(404);
           expect((await fetch(`${env.baseUrl()}${path}`)).status).toBe(401);
+        },
+        TEST_TIMEOUT_MS,
+      );
+    });
+
+    describe("bot model config (optional com.cozylabs.bots capability 18)", () => {
+      const modelIt = env.botModelConfig === undefined ? it.skip : it;
+
+      modelIt(
+        "reads the fixed live shape behind device auth and rejects an unknown model",
+        async () => {
+          const fixture = env.botModelConfig;
+          if (fixture === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("bot-model-config");
+          const path = `/bots/${encodeURIComponent(fixture.botName)}/model-config`;
+          const response = await authFetch(token, path);
+          expect(response.status).toBe(200);
+          const config = assertValid(BotModelConfigSchema, await response.json());
+          expect(config.efforts.length).toBeGreaterThan(0);
+          expect(new Set(config.catalog.map((entry) => entry.id)).size).toBe(config.catalog.length);
+          expect((await fetch(`${env.baseUrl()}${path}`)).status).toBe(401);
+
+          const rejected = await authFetch(token, path, {
+            method: "PUT",
+            headers: JSON_HEADERS,
+            body: JSON.stringify({ model: "conformance:unknown-model-that-must-not-exist" }),
+          });
+          expect(rejected.status).toBe(400);
+          expect(assertValid(ErrorBodySchema, await rejected.json()).error.code).toBe("invalid_request");
         },
         TEST_TIMEOUT_MS,
       );

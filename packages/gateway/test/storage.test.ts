@@ -257,6 +257,20 @@ describe("openStorage migrations", () => {
   });
 });
 
+describe("routine override metadata", () => {
+  it("preserves absent versus null and is removed with the bot", () => {
+    const storage = openStorage(":memory:");
+    storage.setBotRoutineOverrides("scout", "job-1", { model: null, effort: "low" });
+    expect(storage.botRoutineOverrides("scout", "job-1")).toEqual({ model: null, effort: "low" });
+
+    storage.setBotRoutineOverrides("scout", "job-1", { effort: null });
+    expect(storage.botRoutineOverrides("scout", "job-1")).toEqual({ effort: null });
+
+    storage.forgetBot("scout");
+    expect(storage.botRoutineOverrides("scout", "job-1")).toBeUndefined();
+  });
+});
+
 describe("assistant chat attachment storage", () => {
   it("ingests already bound bytes and keeps the consumed-line marker after byte expiry", () => {
     const storage = openStorage(":memory:");

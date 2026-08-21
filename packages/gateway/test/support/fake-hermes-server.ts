@@ -47,6 +47,15 @@ export interface FakeHermesBehavior {
   /** Gated mode: ticket lifetime in ms. 0 means every minted ticket is already expired, which is
    *  how the expiry path is exercised. Default 30000, matching upstream TTL_SECONDS. */
   ticketTtlMs?: number;
+  /** Optional authenticated dashboard REST handler for bridge features that use the same
+   *  connection's HTTP surface. */
+  dashboard?: (request: {
+    method: string;
+    path: string;
+    query: URLSearchParams;
+    body: unknown;
+    headers: import("node:http").IncomingHttpHeaders;
+  }) => { status?: number; body: unknown } | Promise<{ status?: number; body: unknown }>;
 }
 
 /** Upstream's TTL for a minted ws ticket (ws_tickets.TTL_SECONDS). */
@@ -130,11 +139,33 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   }
 
   const http: Server = createServer((req, res) => {
-    const path = (req.url ?? "").split("?")[0];
+    const path = (req.url ?? "").split("?")[0] ?? "/";
     const send = (status: number, body: unknown, headers: Record<string, string | string[]> = {}): void => {
       res.writeHead(status, { "content-type": "application/json", ...headers });
       res.end(JSON.stringify(body));
     };
+    if (cfg.dashboard !== undefined && path.startsWith("/api/")) {
+      void readBody(req)
+        .then(async (raw) => {
+          let body: unknown;
+          try {
+            body = raw ? JSON.parse(raw) : undefined;
+          } catch {
+            send(400, { detail: "bad body" });
+            return;
+          }
+          const result = await cfg.dashboard!({
+            method: req.method ?? "GET",
+            path,
+            query: new URL(req.url ?? "/", "http://fake").searchParams,
+            body,
+            headers: req.headers,
+          });
+          send(result.status ?? 200, result.body);
+        })
+        .catch((err: unknown) => send(500, { detail: err instanceof Error ? err.message : "dashboard handler failed" }));
+      return;
+    }
     if (cfg.gated === undefined) {
       send(404, { detail: "Not Found" });
       return;

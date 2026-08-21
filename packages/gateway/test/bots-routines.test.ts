@@ -383,6 +383,48 @@ describe("namespacing", () => {
     expect(list.routines.map((routine) => routine.title)).toEqual(["Morning digest"]);
   });
 
+  it("preserves capability-18 model and effort as accepted-but-inert metadata", async () => {
+    const h = await setup();
+    const createdResponse = await h.authed(
+      "/bots/scout/routines",
+      body("POST", {
+        title: "Cheap digest",
+        schedule: "0 9 * * *",
+        prompt: "summarize",
+        model: "openrouter:google/gemini-2.5-flash",
+        effort: "low",
+      }),
+    );
+    expect(createdResponse.status).toBe(201);
+    const created = (await createdResponse.json()) as { routine: BotRoutine };
+    expect(created.routine).toMatchObject({
+      model: "openrouter:google/gemini-2.5-flash",
+      effort: "low",
+    });
+    // Survey result: current Hermes `cron.manage {action:"add"}` does not forward either field.
+    // The contract preserves the selection, but must not pretend the backend will run it.
+    const add = h.cron.calls.find((call) => call.action === "add");
+    expect(add?.params["model"]).toBeUndefined();
+    expect(add?.params["effort"]).toBeUndefined();
+
+    const id = created.routine.id;
+    const beforeActions = h.cron.calls.filter((call) => call.action !== "list").length;
+    const patchedResponse = await h.authed(
+      `/bots/scout/routines/${id}`,
+      body("PATCH", { model: null, effort: "minimal" }),
+    );
+    expect(patchedResponse.status).toBe(200);
+    expect(((await patchedResponse.json()) as { routine: BotRoutine }).routine).toMatchObject({
+      id,
+      model: null,
+      effort: "minimal",
+    });
+    expect(h.cron.calls.filter((call) => call.action !== "list")).toHaveLength(beforeActions);
+
+    const listed = (await (await h.authed("/bots/scout/routines")).json()) as { routines: BotRoutine[] };
+    expect(listed.routines[0]).toMatchObject({ model: null, effort: "minimal" });
+  });
+
   it("sends the profile scope on every cron call", async () => {
     const h = await setup([job({ id: "j1", name: "[bot:scout] Digest" })]);
     await h.authed("/bots/scout/routines");

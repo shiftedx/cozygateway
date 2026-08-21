@@ -6,6 +6,8 @@ import type {
   BotGroupDetail,
   BotGroupMessage,
   BotInboxThread,
+  BotModelConfig,
+  BotModelConfigPatch,
   BotProfile,
   BotProfilePatch,
   BotRoutine,
@@ -84,6 +86,7 @@ import {
   patchBotRoutine,
   type RoutineWriteResult,
 } from "./routines.ts";
+import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -241,6 +244,8 @@ export interface BotsSurface {
   deleteBot(name: string): Promise<DeletePath>;
   botProfile(name: string): Promise<BotProfile>;
   configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult>;
+  modelConfig(name: string): Promise<BotModelConfig>;
+  configureModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig>;
   catalog(query: string): Promise<BotCatalog>;
   routines(name: string): Promise<BotRoutineList>;
   createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult>;
@@ -1876,6 +1881,26 @@ export class HermesBridge implements BotsSurface {
     }
   }
 
+  async modelConfig(name: string): Promise<BotModelConfig> {
+    await this.#assertBotKnown(name);
+    return readBotModelConfig(this.#client, name);
+  }
+
+  async configureModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig> {
+    await this.#assertBotKnown(name);
+    const previous = this.#configureChain.get(name);
+    const run = (async () => {
+      if (previous !== undefined) await previous.catch(() => {});
+      return writeBotModelConfig(this.#client, name, patch);
+    })();
+    this.#configureChain.set(name, run);
+    try {
+      return await run;
+    } finally {
+      if (this.#configureChain.get(name) === run) this.#configureChain.delete(name);
+    }
+  }
+
   /** The edit screen's menus, briefly cached per skill query.
    *
    *  Single-flight AND cached: opening the screen on two devices at once, or a client that reads
@@ -1958,8 +1983,17 @@ export class HermesBridge implements BotsSurface {
       // could not be read back, a pause taken before a replacement that was never confirmed), and
       // a client watching `bot_routines` must not keep showing the pre-write rows.
       try {
-        const routine = await createBotRoutine(this.#client, name, input, this.#bridgeProfile);
-        return { routine };
+        const created = await createBotRoutine(this.#client, name, input, this.#bridgeProfile);
+        // Surveyed Hermes has session-lifetime `session.create {model, provider,
+        // reasoning_effort}`, but no single-turn equivalent. Its authenticated
+        // `cron.manage {action:"add"}` forwards schedule/prompt/repeat/continuity only, so these
+        // stay inert metadata. Never set and restore the profile around a run.
+        const overrides = {
+          ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.effort === undefined ? {} : { effort: input.effort }),
+        };
+        this.#storage.setBotRoutineOverrides(name, created.id, overrides);
+        return { routine: { ...created, ...overrides } };
       } finally {
         await this.#publishRoutines(name);
       }
@@ -1970,7 +2004,16 @@ export class HermesBridge implements BotsSurface {
     await this.#assertBotKnown(name);
     return this.#chainRoutineWrite(name, async () => {
       try {
-        return await patchBotRoutine(this.#client, name, id, patch, this.#bridgeProfile);
+        const existing = this.#storage.botRoutineOverrides(name, id) ?? {};
+        const result = await patchBotRoutine(this.#client, name, id, patch, this.#bridgeProfile);
+        const overrides = {
+          ...existing,
+          ...(patch.model === undefined ? {} : { model: patch.model }),
+          ...(patch.effort === undefined ? {} : { effort: patch.effort }),
+        };
+        if (result.routine.id !== id) this.#storage.deleteBotRoutineOverrides(name, id);
+        this.#storage.setBotRoutineOverrides(name, result.routine.id, overrides);
+        return { ...result, routine: { ...result.routine, ...overrides } };
       } finally {
         await this.#publishRoutines(name);
       }
@@ -1981,6 +2024,7 @@ export class HermesBridge implements BotsSurface {
     await this.#assertBotKnown(name);
     await this.#chainRoutineWrite(name, async () => {
       await deleteBotRoutine(this.#client, name, id);
+      this.#storage.deleteBotRoutineOverrides(name, id);
       await this.#publishRoutines(name);
     });
   }
@@ -2031,7 +2075,11 @@ export class HermesBridge implements BotsSurface {
     if (inflight !== undefined) return inflight;
     const run = (async () => {
       try {
-        const { routines } = await listBotRoutines(this.#client, name);
+        const listed = await listBotRoutines(this.#client, name);
+        const routines = listed.routines.map((routine) => ({
+          ...routine,
+          ...(this.#storage.botRoutineOverrides(name, routine.id) ?? {}),
+        }));
         const view: BotRoutineList = { name, routines, updatedAt: this.#now() };
         // A read the fan-out itself performed does NOT renew the watch. Renewing it would make a
         // gateway with steady cron traffic keep every bot ever opened warm forever, which is the
