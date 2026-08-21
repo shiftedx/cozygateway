@@ -1,6 +1,10 @@
 import type { Frame } from "./frames.ts";
 
-export interface AgentLink { send(frame: Frame): void; close(): void; }
+export interface AgentLink {
+  send(frame: Frame): void;
+  close(): void;
+  bufferedAmount?(): number;
+}
 
 export class AgentRegistry {
   #links = new Map<string, AgentLink>();

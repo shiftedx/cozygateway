@@ -175,10 +175,14 @@ The lifecycle rules are:
   hashes, never the credential strings.
 - The expected `ts2021` payload is Noise-encrypted ciphertext. The front door carries that
   ciphertext and does not decrypt it or inspect the application bytes.
-- A front door compromise can observe routing metadata, refuse or interrupt connections, and
-  consume the finite provisioning pool. It cannot recover a credential from storage or read the
-  Noise-encrypted payload. Compromise impact is denial of service only for the protected tunneled
-  content.
+- A compromised front door can observe routing metadata, refuse or interrupt connections, and
+  consume the finite provisioning pool. It can also substitute the Noise server key during the
+  pre-Noise key exchange unless the client pins the household Headscale Noise key. Without that
+  pin, a compromise can enable a man-in-the-middle bootstrap and cannot honestly be described as
+  denial of service only or as unable to affect joins and reads.
+- Client-side pinning of the household Headscale Noise key, delivered out-of-band in the enrollment
+  QR, is a REQUIRED dependency for the installer and app plans. The client must enforce this pin
+  before the protected tunnel is trusted.
 - Provisioning is intentionally bounded by a per-source-IP rate limit and a total household cap.
 
 ## Future wire format

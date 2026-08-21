@@ -20,9 +20,13 @@ export interface ProvisionedHousehold { householdId: string; credential: string;
 export interface FrontdoorStorage {
   syncPool(hostnames: string[]): void;
   provisionHousehold(nowMs: number): ProvisionedHousehold | undefined;
+  rotateCredential(householdId: string): string | undefined;
+  deprovisionHousehold(householdId: string): boolean;
   householdIdForCredential(credential: string): string | undefined;
   householdIdForHostname(hostname: string): string | undefined;
   householdCount(): number;
+  hostnamePoolCount(): number;
+  freeHostnameCount(): number;
   close(): void;
 }
 
@@ -32,7 +36,7 @@ export function openFrontdoorStorage(dbPath: string): FrontdoorStorage {
   return {
     syncPool(hostnames) {
       const ins = db.prepare("INSERT OR IGNORE INTO hostname_pool (hostname, assigned_household) VALUES (?, NULL)");
-      for (const h of hostnames) ins.run(h);
+      for (const h of hostnames) ins.run(h.toLowerCase());
     },
     provisionHousehold(nowMs) {
       for (;;) {
@@ -75,6 +79,62 @@ export function openFrontdoorStorage(dbPath: string): FrontdoorStorage {
         }
       }
     },
+    rotateCredential(householdId) {
+      const credential = newCredential();
+      db.exec("BEGIN IMMEDIATE");
+      let transactionOpen = true;
+      try {
+        const result = db.prepare(
+          "UPDATE households SET credential_hash = ? WHERE household_id = ?",
+        ).run(credentialHash(credential), householdId);
+        if (result.changes !== 1) {
+          db.exec("ROLLBACK");
+          transactionOpen = false;
+          return undefined;
+        }
+        db.exec("COMMIT");
+        transactionOpen = false;
+        return credential;
+      } catch (error) {
+        if (transactionOpen) {
+          try {
+            db.exec("ROLLBACK");
+          } catch {
+            // Preserve the original transaction error.
+          }
+        }
+        throw error;
+      }
+    },
+    deprovisionHousehold(householdId) {
+      db.exec("BEGIN IMMEDIATE");
+      let transactionOpen = true;
+      try {
+        const household = db.prepare(
+          "SELECT household_id FROM households WHERE household_id = ?",
+        ).get(householdId) as { household_id: string } | undefined;
+        if (household === undefined) {
+          db.exec("ROLLBACK");
+          transactionOpen = false;
+          return false;
+        }
+        db.prepare("UPDATE hostname_pool SET assigned_household = NULL WHERE assigned_household = ?")
+          .run(householdId);
+        db.prepare("DELETE FROM households WHERE household_id = ?").run(householdId);
+        db.exec("COMMIT");
+        transactionOpen = false;
+        return true;
+      } catch (error) {
+        if (transactionOpen) {
+          try {
+            db.exec("ROLLBACK");
+          } catch {
+            // Preserve the original transaction error.
+          }
+        }
+        throw error;
+      }
+    },
     householdIdForCredential(credential) {
       const row = db.prepare("SELECT household_id FROM households WHERE credential_hash = ?")
         .get(credentialHash(credential)) as { household_id: string } | undefined;
@@ -82,11 +142,21 @@ export function openFrontdoorStorage(dbPath: string): FrontdoorStorage {
     },
     householdIdForHostname(hostname) {
       const row = db.prepare("SELECT household_id FROM households WHERE hostname = ?")
-        .get(hostname) as { household_id: string } | undefined;
+        .get(hostname.toLowerCase()) as { household_id: string } | undefined;
       return row?.household_id;
     },
     householdCount() {
       const row = db.prepare("SELECT COUNT(*) AS n FROM households").get() as { n: number };
+      return row.n;
+    },
+    hostnamePoolCount() {
+      const row = db.prepare("SELECT COUNT(*) AS n FROM hostname_pool").get() as { n: number };
+      return row.n;
+    },
+    freeHostnameCount() {
+      const row = db.prepare(
+        "SELECT COUNT(*) AS n FROM hostname_pool WHERE assigned_household IS NULL",
+      ).get() as { n: number };
       return row.n;
     },
     close() { db.close(); },

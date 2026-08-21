@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { decodeFrame, encodeFrame, type Frame } from "../src/frames.ts";
+import { decodeFrame, encodeFrame, MAX_DECODED_DATA_BYTES, MAX_MESSAGE_BYTES, type Frame } from "../src/frames.ts";
 import { AgentRegistry, type AgentLink } from "../src/registry.ts";
 
 describe("frames", () => {
@@ -21,6 +21,16 @@ describe("frames", () => {
     expect(decodeFrame(JSON.stringify({ t: "data", sid: "x", b64: "" }))).toBeUndefined();
     expect(decodeFrame(JSON.stringify({ t: "open", sid: 1, method: "GET", path: "/", headers: [["x"]], upgrade: false }))).toBeUndefined();
     expect(decodeFrame(JSON.stringify({ t: "abort", sid: 1, reason: 42 }))).toBeUndefined();
+  });
+
+  it("accepts only canonical base64 within the decoded payload limit", () => {
+    expect(decodeFrame(JSON.stringify({ t: "data", sid: 1, b64: "aA==" }))).toMatchObject({ t: "data" });
+    expect(decodeFrame(JSON.stringify({ t: "data", sid: 1, b64: "aA" }))).toBeUndefined();
+    expect(decodeFrame(JSON.stringify({ t: "data", sid: 1, b64: "aA==\n" }))).toBeUndefined();
+    expect(decodeFrame(JSON.stringify({
+      t: "data", sid: 1, b64: Buffer.alloc(MAX_DECODED_DATA_BYTES + 1).toString("base64"),
+    }))).toBeUndefined();
+    expect(decodeFrame("x".repeat(MAX_MESSAGE_BYTES + 1))).toBeUndefined();
   });
 });
 

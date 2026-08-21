@@ -130,16 +130,51 @@ it("ends a non-101 upgrade response without sending a second abort", async () =>
     if (frame?.t === "open" && frame.upgrade) {
       agent!.send(encodeFrame({
         t: "head", sid: frame.sid, status: 403,
-        headers: { "content-length": ["0"], "x-test": ["complete"] },
+        headers: { "content-length": ["3"], "x-test": ["complete"] },
       }));
+      agent!.send(encodeFrame({ t: "data", sid: frame.sid, b64: Buffer.from("err").toString("base64") }));
+      agent!.send(encodeFrame({ t: "end", sid: frame.sid }));
     }
   });
 
   await expect(rawUpgrade(fd.port)).resolves.toBe(
-    "HTTP/1.1 403 \r\ncontent-length: 0\r\nx-test: complete\r\n\r\n",
+    "HTTP/1.1 403 \r\ncontent-length: 3\r\nx-test: complete\r\n\r\nerr",
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
   expect(sawAbort).toBe(false);
+});
+
+it("forwards a large non-101 upgrade body despite socket backpressure", async () => {
+  dir = mkdtempSync(join(tmpdir(), "fd-up-large-error-"));
+  fd = await startFrontdoor({
+    port: 0, host: "127.0.0.1", dbPath: join(dir, "db.sqlite"),
+    pool: ["relay-01.cozylabs.ai"], maxHouseholds: 10, provisionsPerHourPerIp: 100, apiHostnames: [],
+  });
+  const grant = await (await fetch(`${fd.url}/provision`, { method: "POST", body: "{}" })).json() as { credential: string };
+  agent = await new Promise<WebSocket>((resolve, reject) => {
+    const ws = new WebSocket(fd!.url.replace("http", "ws") + "/agent", {
+      headers: { authorization: `Bearer ${grant.credential}` },
+    });
+    ws.on("open", () => resolve(ws));
+    ws.on("error", reject);
+  });
+
+  const body = "x".repeat(256 * 1024);
+  agent.on("message", (raw) => {
+    const frame = decodeFrame(String(raw));
+    if (frame?.t === "open" && frame.upgrade) {
+      agent!.send(encodeFrame({
+        t: "head", sid: frame.sid, status: 413,
+        headers: { "content-length": [String(body.length)] },
+      }));
+      agent!.send(encodeFrame({ t: "data", sid: frame.sid, b64: Buffer.from(body).toString("base64") }));
+      agent!.send(encodeFrame({ t: "end", sid: frame.sid }));
+    }
+  });
+
+  await expect(rawUpgrade(fd.port)).resolves.toBe(
+    `HTTP/1.1 413 \r\ncontent-length: ${body.length}\r\n\r\n${body}`,
+  );
 });
 
 it("aborts an upgraded stream when the agent sends an open frame", async () => {

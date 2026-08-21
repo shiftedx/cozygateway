@@ -94,6 +94,10 @@ async function boot() {
       req.socket.once("close", () => resolveEarlyTargetClosed?.());
       res.writeHead(413);
       res.end();
+    } else if (req.url === "/collect") {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => { res.writeHead(200); res.end(Buffer.concat(chunks)); });
     } else if (req.url === "/health") { res.writeHead(200, { "content-type": "application/json" }); res.end('{"healthy":true}'); }
     else { res.writeHead(404); res.end(); }
   });
@@ -114,6 +118,19 @@ describe("frontdoor-agent", () => {
     const res = await request(fd!.port, hostname, "/health");
     expect(res.status).toBe(200);
     expect(JSON.parse(res.text)).toEqual({ healthy: true });
+  });
+
+  it("does not abort a routine multi-chunk POST body", async () => {
+    const { hostname } = await boot();
+    const opened = openRequest(fd!.port, hostname, "/collect", "POST");
+    const first = Buffer.alloc(64 * 1024, "a");
+    const second = Buffer.alloc(64 * 1024, "b");
+    opened.req.write(first);
+    opened.req.write(second);
+    opened.req.end();
+    const res = await opened.response;
+    expect(res.status).toBe(200);
+    expect(Buffer.from(res.text)).toEqual(Buffer.concat([first, second]));
   });
 
   it("cleans up a target request after an early response", async () => {

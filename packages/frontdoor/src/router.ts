@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
-import { encodeFrame, type Frame } from "./frames.ts";
+import { MAX_BUFFERED_BYTES, MAX_DECODED_DATA_BYTES, STREAM_IDLE_TIMEOUT_MS, type Frame } from "./frames.ts";
 import type { AgentLink, AgentRegistry } from "./registry.ts";
 
 /** One in-flight proxied request. The server feeds agent frames back via onFrame. */
@@ -10,13 +10,28 @@ export interface OpenStream {
   onFrame(frame: Frame): void;
 }
 
+export interface ProxyStreamOptions {
+  onClosed?: () => void;
+  idleTimeoutMs?: number;
+}
+
+const unsafeHeaderNames = new Set(["__proto__", "constructor", "prototype"]);
+
+function isSafeHeaderName(name: string): boolean {
+  return !unsafeHeaderNames.has(name.toLowerCase());
+}
+
 export function rawHeaders(req: IncomingMessage): Record<string, string[]> {
-  const out: Record<string, string[]> = {};
+  const out = Object.create(null) as Record<string, string[]>;
   for (let i = 0; i < req.rawHeaders.length; i += 2) {
     const k = req.rawHeaders[i]!.toLowerCase();
     (out[k] ??= []).push(req.rawHeaders[i + 1]!);
   }
   return out;
+}
+
+function shouldAbortForBackpressure(link: AgentLink): boolean {
+  return (link.bufferedAmount?.() ?? 0) > MAX_BUFFERED_BYTES;
 }
 
 /** Pipe a plain (non-upgrade) request over the agent link; wires the response when head arrives. */
@@ -26,14 +41,51 @@ export function proxyRequest(
   req: IncomingMessage,
   res: ServerResponse,
   streams: Map<number, OpenStream>,
+  options: ProxyStreamOptions = {},
 ): void {
   const sid = registry.nextStreamId();
   let hasHead = false;
   let ended = false;
-  const abortStream = (reason: string) => {
-    if (!streams.delete(sid)) return;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const removeStream = (): boolean => {
+    if (!streams.delete(sid)) return false;
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    options.onClosed?.();
+    return true;
+  };
+  const sendAbort = (reason: string): void => {
+    if (shouldAbortForBackpressure(link)) return;
+    try { link.send({ t: "abort", sid, reason }); } catch { /* the link is already unavailable */ }
+  };
+  const abortStream = (reason: string): void => {
+    if (!removeStream()) return;
+    ended = true;
     res.destroy();
-    link.send({ t: "abort", sid, reason });
+    sendAbort(reason);
+  };
+  const touch = (): void => {
+    if (!streams.has(sid)) return;
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => abortStream("stream idle timeout"), options.idleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS);
+  };
+  const sendFrame = (frame: Frame): boolean => {
+    if (!streams.has(sid)) return false;
+    if (shouldAbortForBackpressure(link)) {
+      abortStream("agent backpressure");
+      return false;
+    }
+    try {
+      link.send(frame);
+      if (shouldAbortForBackpressure(link)) {
+        abortStream("agent backpressure");
+        return false;
+      }
+      touch();
+      return true;
+    } catch {
+      abortStream("agent unavailable");
+      return false;
+    }
   };
   streams.set(sid, {
     sid,
@@ -43,11 +95,14 @@ export function proxyRequest(
           abortStream("invalid response frame order");
           return;
         }
-        const headers: Record<string, string | string[]> = {};
-        for (const [k, v] of Object.entries(frame.headers)) headers[k] = v.length === 1 ? v[0]! : v;
+        const headers: Record<string, string | string[]> = Object.create(null) as Record<string, string | string[]>;
+        for (const [k, v] of Object.entries(frame.headers)) {
+          if (isSafeHeaderName(k)) headers[k] = v.length === 1 ? v[0]! : v;
+        }
         try {
           res.writeHead(frame.status, headers);
           hasHead = true;
+          touch();
         } catch {
           abortStream("invalid response frame");
         }
@@ -58,6 +113,7 @@ export function proxyRequest(
         }
         try {
           res.write(Buffer.from(frame.b64, "base64"));
+          touch();
         } catch {
           abortStream("invalid response frame");
         }
@@ -69,7 +125,7 @@ export function proxyRequest(
         ended = true;
         try {
           res.end();
-          streams.delete(sid);
+          removeStream();
         } catch {
           ended = false;
           abortStream("invalid response frame");
@@ -77,17 +133,30 @@ export function proxyRequest(
       } else if (frame.t === "abort") {
         ended = true;
         res.destroy();
-        streams.delete(sid);
+        removeStream();
       } else {
         abortStream("invalid response frame");
       }
     },
   });
-  link.send({ t: "open", sid, method: req.method ?? "GET", path: req.url ?? "/", headers: rawHeaders(req), upgrade: false });
-  req.on("data", (chunk: Buffer) => link.send({ t: "data", sid, b64: chunk.toString("base64") }));
-  req.on("end", () => link.send({ t: "end", sid }));
+  touch();
+  if (!sendFrame({ t: "open", sid, method: req.method ?? "GET", path: req.url ?? "/", headers: rawHeaders(req), upgrade: false })) return;
+  req.on("data", (chunk: Buffer) => {
+    if (!streams.has(sid)) return;
+    for (let offset = 0; offset < chunk.length; offset += MAX_DECODED_DATA_BYTES) {
+      if (!sendFrame({
+        t: "data", sid,
+        b64: chunk.subarray(offset, offset + MAX_DECODED_DATA_BYTES).toString("base64"),
+      })) {
+        req.destroy();
+        return;
+      }
+    }
+  });
+  req.on("end", () => { sendFrame({ t: "end", sid }); });
+  req.on("error", () => abortStream("client request error"));
   res.on("close", () => {
-    if (streams.delete(sid)) link.send({ t: "abort", sid, reason: "client closed" });
+    if (removeStream()) sendAbort("client closed");
   });
 }
 
@@ -99,15 +168,51 @@ export function proxyUpgrade(
   socket: Duplex,
   head: Buffer,
   streams: Map<number, OpenStream>,
+  options: ProxyStreamOptions = {},
 ): void {
   const sid = registry.nextStreamId();
   let hasHead = false;
   let ended = false;
-  const abortStream = (reason: string) => {
-    if (!streams.delete(sid)) return;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const removeStream = (): boolean => {
+    if (!streams.delete(sid)) return false;
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    options.onClosed?.();
+    return true;
+  };
+  const sendAbort = (reason: string): void => {
+    if (shouldAbortForBackpressure(link)) return;
+    try { link.send({ t: "abort", sid, reason }); } catch { /* the link is already unavailable */ }
+  };
+  const abortStream = (reason: string): void => {
+    if (!removeStream()) return;
     ended = true;
     socket.destroy();
-    link.send({ t: "abort", sid, reason });
+    sendAbort(reason);
+  };
+  const touch = (): void => {
+    if (!streams.has(sid)) return;
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => abortStream("stream idle timeout"), options.idleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS);
+  };
+  const sendFrame = (frame: Frame): boolean => {
+    if (!streams.has(sid)) return false;
+    if (shouldAbortForBackpressure(link)) {
+      abortStream("agent backpressure");
+      return false;
+    }
+    try {
+      link.send(frame);
+      if (shouldAbortForBackpressure(link)) {
+        abortStream("agent backpressure");
+        return false;
+      }
+      touch();
+      return true;
+    } catch {
+      abortStream("agent unavailable");
+      return false;
+    }
   };
   streams.set(sid, {
     sid,
@@ -120,25 +225,16 @@ export function proxyUpgrade(
         const reason = frame.status === 101 ? "Switching Protocols" : "";
         const lines = [`HTTP/1.1 ${frame.status} ${reason}`];
         for (const [k, vs] of Object.entries(frame.headers)) {
+          if (!isSafeHeaderName(k)) continue;
           for (const v of vs) lines.push(`${k}: ${v}`);
         }
         const rawResponse = lines.join("\r\n") + "\r\n\r\n";
-        if (frame.status !== 101) {
-          ended = true;
-          streams.delete(sid);
-          try {
-            socket.end(rawResponse);
-          } catch {
-            socket.destroy();
-          }
-          return;
-        }
         try {
           socket.write(rawResponse);
           hasHead = true;
+          touch();
         } catch {
           abortStream("invalid response frame");
-          return;
         }
       } else if (frame.t === "data") {
         if (!hasHead || ended) {
@@ -147,6 +243,7 @@ export function proxyUpgrade(
         }
         try {
           socket.write(Buffer.from(frame.b64, "base64"));
+          touch();
         } catch {
           abortStream("invalid response frame");
         }
@@ -156,27 +253,44 @@ export function proxyUpgrade(
           return;
         }
         ended = true;
-        streams.delete(sid);
+        removeStream();
         socket.end();
       } else if (frame.t === "abort") {
         ended = true;
-        streams.delete(sid);
+        removeStream();
         socket.destroy();
       } else {
         abortStream("invalid response frame");
       }
     },
   });
+  touch();
+  if (!sendFrame({ t: "open", sid, method: req.method ?? "GET", path: req.url ?? "/", headers: rawHeaders(req), upgrade: true })) return;
   socket.on("data", (chunk: Buffer) => {
-    if (streams.has(sid)) link.send({ t: "data", sid, b64: chunk.toString("base64") });
+    if (!streams.has(sid)) return;
+    for (let offset = 0; offset < chunk.length; offset += MAX_DECODED_DATA_BYTES) {
+      if (!sendFrame({
+        t: "data", sid,
+        b64: chunk.subarray(offset, offset + MAX_DECODED_DATA_BYTES).toString("base64"),
+      })) {
+        socket.destroy();
+        return;
+      }
+    }
   });
   socket.on("close", () => {
-    if (streams.delete(sid)) {
+    if (removeStream()) {
       ended = true;
-      link.send({ t: "abort", sid, reason: "client closed" });
+      sendAbort("client closed");
     }
   });
   socket.on("error", () => { /* close handler covers it */ });
-  link.send({ t: "open", sid, method: req.method ?? "GET", path: req.url ?? "/", headers: rawHeaders(req), upgrade: true });
-  if (head.length > 0 && streams.has(sid)) link.send({ t: "data", sid, b64: head.toString("base64") });
+  if (head.length > 0 && streams.has(sid)) {
+    for (let offset = 0; offset < head.length; offset += MAX_DECODED_DATA_BYTES) {
+      if (!sendFrame({
+        t: "data", sid,
+        b64: head.subarray(offset, offset + MAX_DECODED_DATA_BYTES).toString("base64"),
+      })) break;
+    }
+  }
 }

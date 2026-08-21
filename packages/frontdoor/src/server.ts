@@ -4,7 +4,7 @@ import type { Duplex } from "node:stream";
 import { getRequestListener } from "@hono/node-server";
 import { WebSocketServer, type WebSocket } from "ws";
 
-import { decodeFrame, encodeFrame, type Frame } from "./frames.ts";
+import { decodeFrame, encodeFrame, MAX_MESSAGE_BYTES, type Frame } from "./frames.ts";
 import { createProvisionApp } from "./provision.ts";
 import { AgentRegistry, type AgentLink } from "./registry.ts";
 import { proxyRequest, proxyUpgrade, type OpenStream } from "./router.ts";
@@ -15,6 +15,9 @@ export interface FrontdoorConfig {
   port: number; host: string; dbPath: string;
   pool: string[]; maxHouseholds: number; provisionsPerHourPerIp: number;
   apiHostnames: string[];
+  maxActiveStreams?: number;
+  maxActiveStreamsPerHousehold?: number;
+  streamIdleTimeoutMs?: number;
 }
 
 export interface RunningFrontdoor {
@@ -22,22 +25,48 @@ export interface RunningFrontdoor {
   close(): Promise<void>;
 }
 
-const hostOf = (req: IncomingMessage): string => (req.headers.host ?? "").split(":")[0]!;
+export const MAX_ACTIVE_STREAMS = 512;
+export const MAX_ACTIVE_STREAMS_PER_HOUSEHOLD = 64;
+
+const canonicalHostname = (hostname: string): string => hostname.split(":")[0]!.toLowerCase();
+const hostOf = (req: IncomingMessage): string => canonicalHostname(req.headers.host ?? "");
 
 export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFrontdoor> {
   const storage = openFrontdoorStorage(config.dbPath);
-  storage.syncPool(config.pool);
+  const pool = config.pool.map(canonicalHostname);
+  const apiHostnames = config.apiHostnames.map(canonicalHostname);
+  storage.syncPool(pool);
   const registry = new AgentRegistry();
-  const poolSet = new Set(config.pool);
+  const poolSet = new Set(pool);
+  const apiHostnamesSet = new Set(apiHostnames);
   const provisionApp = createProvisionApp({
     storage, now: () => Date.now(),
     maxHouseholds: config.maxHouseholds, provisionsPerHourPerIp: config.provisionsPerHourPerIp,
+    disconnectHousehold: (householdId) => registry.get(householdId)?.close(),
   });
   const provisionListener = getRequestListener(provisionApp.fetch);
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
   // per-agent stream tables so a dying agent aborts exactly its own streams
   const agentStreams = new Map<AgentLink, Map<number, OpenStream>>();
   const agentSockets = new Set<WebSocket>();
+  let activeStreams = 0;
+  const activeStreamsByHousehold = new Map<string, number>();
+  const maxActiveStreams = config.maxActiveStreams ?? MAX_ACTIVE_STREAMS;
+  const maxActiveStreamsPerHousehold = config.maxActiveStreamsPerHousehold ?? MAX_ACTIVE_STREAMS_PER_HOUSEHOLD;
+
+  const reserveStream = (householdId: string): boolean => {
+    const householdStreams = activeStreamsByHousehold.get(householdId) ?? 0;
+    if (activeStreams >= maxActiveStreams || householdStreams >= maxActiveStreamsPerHousehold) return false;
+    activeStreams += 1;
+    activeStreamsByHousehold.set(householdId, householdStreams + 1);
+    return true;
+  };
+  const releaseStream = (householdId: string): void => {
+    activeStreams = Math.max(0, activeStreams - 1);
+    const next = (activeStreamsByHousehold.get(householdId) ?? 1) - 1;
+    if (next <= 0) activeStreamsByHousehold.delete(householdId);
+    else activeStreamsByHousehold.set(householdId, next);
+  };
 
   const json = (res: ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -53,7 +82,11 @@ export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFr
       if (link === undefined) return json(res, 502, errorBody("agent_offline", "The household box is not connected."));
       const streams = agentStreams.get(link);
       if (streams === undefined) return json(res, 502, errorBody("agent_offline", "The household box is not connected."));
-      return proxyRequest(registry, link, req, res, streams);
+      if (!reserveStream(hh)) return json(res, 503, errorBody("stream_cap", "Too many active streams right now."));
+      return proxyRequest(registry, link, req, res, streams, {
+        idleTimeoutMs: config.streamIdleTimeoutMs,
+        onClosed: () => releaseStream(hh),
+      });
     }
     if (config.apiHostnames.length === 0 || config.apiHostnames.includes(host)) return provisionListener(req, res);
     return json(res, 404, errorBody("unknown_hostname", "Unrecognized hostname."));
@@ -65,7 +98,11 @@ export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFr
       socket.destroy();
     };
     const host = hostOf(req);
-    if (!poolSet.has(host) && req.url === "/agent") {
+    if (req.url === "/agent") {
+      if (apiHostnamesSet.size > 0 && !apiHostnamesSet.has(host)) {
+        rejectUpgrade(404, "Not Found");
+        return;
+      }
       const auth = req.headers.authorization ?? "";
       const credential = auth.startsWith("Bearer ") ? auth.slice(7) : "";
       const householdId = storage.householdIdForCredential(credential);
@@ -77,8 +114,13 @@ export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFr
       wss.handleUpgrade(req, socket, head, (ws) => {
         const streams = new Map<number, OpenStream>();
         const link: AgentLink = {
-          send(frame: Frame) { ws.send(encodeFrame(frame)); },
+          send(frame: Frame) {
+            const payload = encodeFrame(frame);
+            if (Buffer.byteLength(payload, "utf8") > MAX_MESSAGE_BYTES) throw new Error("frame too large");
+            ws.send(payload);
+          },
           close() { ws.close(); },
+          bufferedAmount() { return ws.bufferedAmount; },
         };
         agentStreams.set(link, streams);
         agentSockets.add(ws);
@@ -89,7 +131,7 @@ export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFr
           if (cleaned) return;
           cleaned = true;
           registry.detach(householdId, link);
-          for (const s of streams.values()) s.onFrame({ t: "abort", sid: s.sid, reason: "agent disconnected" });
+          for (const s of [...streams.values()]) s.onFrame({ t: "abort", sid: s.sid, reason: "agent disconnected" });
           agentStreams.delete(link);
           agentSockets.delete(ws);
         };
@@ -119,7 +161,14 @@ export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFr
         rejectUpgrade(502, "Bad Gateway");
         return;
       }
-      proxyUpgrade(registry, link, req, socket, head, streams);
+      if (!reserveStream(householdId)) {
+        rejectUpgrade(503, "Service Unavailable");
+        return;
+      }
+      proxyUpgrade(registry, link, req, socket, head, streams, {
+        idleTimeoutMs: config.streamIdleTimeoutMs,
+        onClosed: () => releaseStream(householdId),
+      });
       return;
     }
     socket.destroy();

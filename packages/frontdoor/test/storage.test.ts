@@ -56,6 +56,20 @@ describe("storage", () => {
     expect(s.householdIdForHostname("nope.cozylabs.ai")).toBeUndefined();
   });
 
+  it("rotates credentials atomically and releases a hostname on deprovision", () => {
+    const s = open();
+    s.syncPool(["relay-02.cozylabs.ai", "relay-01.cozylabs.ai"]);
+    const first = s.provisionHousehold(1000)!;
+    const rotated = s.rotateCredential(first.householdId)!;
+    expect(rotated).not.toBe(first.credential);
+    expect(s.householdIdForCredential(first.credential)).toBeUndefined();
+    expect(s.householdIdForCredential(rotated)).toBe(first.householdId);
+    expect(s.deprovisionHousehold(first.householdId)).toBe(true);
+    expect(s.householdIdForCredential(rotated)).toBeUndefined();
+    expect(s.householdIdForHostname(first.hostname)).toBeUndefined();
+    expect(s.provisionHousehold(2000)!.hostname).toBe(first.hostname);
+  });
+
   it("syncPool is idempotent and additive", () => {
     const s = open();
     s.syncPool(["relay-01.cozylabs.ai"]);

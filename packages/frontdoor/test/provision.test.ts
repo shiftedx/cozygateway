@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createProvisionApp } from "../src/provision.ts";
 import { openFrontdoorStorage, type FrontdoorStorage } from "../src/storage.ts";
@@ -78,5 +78,33 @@ describe("POST /provision", () => {
     const res = await a.request("/healthz");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, households: 1 });
+  });
+
+  it("rotates and deprovisions with the current bearer credential", async () => {
+    const a = app(["relay-01.cozylabs.ai", "relay-02.cozylabs.ai"]);
+    const first = await (await provision(a)).json() as { householdId: string; credential: string; hostname: string };
+    const rotatedResponse = await a.request("/rotate", {
+      method: "POST", headers: { authorization: `Bearer ${first.credential}` },
+    });
+    expect(rotatedResponse.status).toBe(200);
+    const rotated = await rotatedResponse.json() as { credential: string };
+    expect((await a.request("/rotate", {
+      method: "POST", headers: { authorization: `Bearer ${first.credential}` },
+    })).status).toBe(401);
+    expect((await a.request("/deprovision", {
+      method: "POST", headers: { authorization: `Bearer ${rotated.credential}` },
+    })).status).toBe(200);
+    const reused = await (await provision(a, "5.6.7.8")).json() as { hostname: string };
+    expect(reused.hostname).toBe(first.hostname);
+  });
+
+  it("warns loudly when the free pool is nearly exhausted", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await provision(app(["relay-01.cozylabs.ai"]));
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("hostname pool near exhaustion"));
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
