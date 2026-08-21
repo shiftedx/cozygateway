@@ -322,6 +322,11 @@ CREATE TABLE IF NOT EXISTS bot_native_messages (
   PRIMARY KEY (bot, session_id, seq),
   UNIQUE (bot, message_id)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS bot_native_history_migrations (
+  bot TEXT PRIMARY KEY,
+  source_session_id TEXT NOT NULL,
+  imported_at INTEGER NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS bot_native_interactions (
   bot TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('approval', 'clarify')),
@@ -1881,6 +1886,72 @@ export class Storage {
       )
       .all(bot, sessionId) as unknown as Array<{ id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null }>;
     return rows.map(nativeBotMessage);
+  }
+
+  nativeBotHistoryMigrated(bot: string): boolean {
+    return this.#db
+      .prepare("SELECT 1 FROM bot_native_history_migrations WHERE bot = ?")
+      .get(bot) !== undefined;
+  }
+
+  /** One-time cutover from the Dashboard-owned canonical transcript. Imported rows are inserted
+   * before any native rows Cleo (or another canary) may already have produced, and the durable
+   * marker prevents a later restart or an intentional chat reset from resurrecting old history. */
+  adoptNativeBotHistory(input: {
+    bot: string;
+    sessionId: string;
+    sourceSessionId: string;
+    messages: readonly BotChatMessage[];
+    now: number;
+  }): number {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const migrated = this.#db
+        .prepare("SELECT 1 FROM bot_native_history_migrations WHERE bot = ?")
+        .get(input.bot);
+      if (migrated !== undefined) {
+        this.#db.exec("COMMIT");
+        return 0;
+      }
+      const existing = new Set(
+        (this.#db
+          .prepare("SELECT message_id AS id FROM bot_native_messages WHERE bot = ?")
+          .all(input.bot) as unknown as Array<{ id: string }>).map((row) => row.id),
+      );
+      const fresh = input.messages.filter((message) => !existing.has(message.id));
+      if (fresh.length > 0) {
+        this.#db
+          .prepare("UPDATE bot_native_messages SET seq = -seq WHERE bot = ? AND session_id = ?")
+          .run(input.bot, input.sessionId);
+        this.#db
+          .prepare("UPDATE bot_native_messages SET seq = -seq + ? WHERE bot = ? AND session_id = ?")
+          .run(fresh.length, input.bot, input.sessionId);
+        const insert = this.#db.prepare(
+          `INSERT INTO bot_native_messages
+             (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        fresh.forEach((message, index) => insert.run(
+          input.bot,
+          input.sessionId,
+          index + 1,
+          message.id,
+          message.role,
+          message.text,
+          message.at,
+          message.clientId ?? null,
+          message.attachments === undefined ? null : JSON.stringify(message.attachments),
+        ));
+      }
+      this.#db
+        .prepare("INSERT INTO bot_native_history_migrations (bot, source_session_id, imported_at) VALUES (?, ?, ?)")
+        .run(input.bot, input.sourceSessionId, input.now);
+      this.#db.exec("COMMIT");
+      return fresh.length;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   nativeBotMessage(bot: string, messageId: string): BotChatMessage | undefined {

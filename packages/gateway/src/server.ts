@@ -414,6 +414,7 @@ export async function startGateway(
   // Started after the listener is up so the first roster refresh cannot race the hub it
   // broadcasts through.
   bridge?.start();
+  if (nativeBotPlane !== undefined) void nativeBotPlane.migrateHistory();
   const address = server.address();
   const port = address !== null && typeof address === "object" ? address.port : config.port;
 

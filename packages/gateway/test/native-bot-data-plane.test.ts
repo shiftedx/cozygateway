@@ -16,7 +16,10 @@ describe("attach-v1 native Bot Mode plane", () => {
     const dashboardSend = vi.fn();
     const frames: ServerFrame[] = [];
     const sent: Array<Record<string, unknown>> = [];
-    const control = { sendChatMessage: dashboardSend } as unknown as BotsSurface;
+    const control = {
+      sendChatMessage: dashboardSend,
+      chatHistory: vi.fn(async () => ({ sessionId: "dashboard-sage", adoption: "pin", messages: [], running: false, inflight: false, updatedAt: 1 })),
+    } as unknown as BotsSurface;
     const ingress = {
       sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
         sent.push(input);
@@ -46,6 +49,54 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(frames.some((frame) => frame.type === "bot_chat_delta")).toBe(true);
     expect(frames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "answer-1"))).toBe(true);
     expect(frames.at(-1)).toMatchObject({ type: "bot_chat", bot: "sage" });
+    storage.close();
+  });
+
+  it("adopts Dashboard history once before exposing the native chat and keeps migrated attachments readable", async () => {
+    const storage = openStorage(":memory:");
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.appendNativeBotMessage({ bot: "sage", sessionId: chat.sessionId, messageId: "native-1", role: "assistant", text: "new native reply", at: 30 });
+    const attachmentInfo = vi.fn(() => ({ mime: "image/png", name: "old.png", size: 4 }));
+    const attachmentSlice = vi.fn(() => new Uint8Array([1, 2, 3, 4]));
+    const chatHistory = vi.fn(async () => ({
+      sessionId: "dashboard-sage",
+      adoption: "pin" as const,
+      messages: [
+        { id: "old-user", role: "user", text: "old question", at: 10 },
+        { id: "old-answer", role: "assistant", text: "old answer", at: 20, attachments: [{ type: "attachment" as const, fileId: "old-file", name: "old.png", mimeType: "image/png", size: 4 }] },
+      ],
+      running: false,
+      inflight: false,
+      updatedAt: 20,
+    }));
+    const control = {
+      chatHistory,
+      roster: () => ({
+        bots: [{ name: "sage", displayName: "Sage", active: true, presence: "online", description: "", avatar: null, chatSessionId: "dashboard-sage", lastActiveAt: 20, preview: { kind: "plain", text: "old answer" } }],
+        fetchedAt: 20,
+        stale: false,
+        hermesState: "online",
+      }),
+      chatAttachmentInfo: attachmentInfo,
+      chatAttachmentSlice: attachmentSlice,
+    } as unknown as BotsSurface;
+    const logs: string[] = [];
+    const plane = new NativeBotDataPlane({ control, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], broadcast: () => undefined, now: () => 40, log: (message) => logs.push(message) });
+
+    // A canary that already has native traffic keeps showing that newer native reply while the
+    // historical import is pending; a completely empty native chat keeps the Dashboard row.
+    expect(plane.surface().roster().bots[0]).toMatchObject({ chatSessionId: chat.sessionId, preview: { text: "new native reply" } });
+    await plane.migrateHistory();
+    await plane.migrateHistory();
+
+    const history = await plane.surface().chatHistory("sage");
+    expect(history.sessionId).toBe(chat.sessionId);
+    expect(history.messages.map((message) => message.text)).toEqual(["old question", "old answer", "new native reply"]);
+    expect(chatHistory).toHaveBeenCalledTimes(1);
+    expect(plane.surface().roster().bots[0]).toMatchObject({ chatSessionId: chat.sessionId, preview: { kind: "plain", text: "new native reply" }, lastActiveAt: 30 });
+    expect(plane.surface().chatAttachmentInfo("sage", "old-file")).toEqual({ mime: "image/png", name: "old.png", size: 4 });
+    expect(plane.surface().chatAttachmentSlice("sage", "old-file", 0, 4)).toEqual(new Uint8Array([1, 2, 3, 4]));
+    expect(logs).toContain("adopted 2 Dashboard messages for sage");
     storage.close();
   });
 
@@ -88,8 +139,9 @@ describe("attach-v1 native Bot Mode plane", () => {
     let storage = openStorage(path);
     const chat = storage.nativeBotChat("sage", 1);
     storage.enqueueAttachCommand("sage", "turn", { kind: "turn", threadId: chat.sessionId, turnId: "turn-1", messageId: "user", text: "hello" }, 1);
+    const control = { chatHistory: vi.fn(async () => ({ sessionId: "dashboard-sage", adoption: "pin", messages: [], running: false, inflight: false, updatedAt: 1 })) } as unknown as BotsSurface;
     const first = new NativeBotDataPlane({
-      control: {} as BotsSurface,
+      control,
       storage,
       ingress: {} as AttachV1Ingress,
       nativeBots: ["sage"],
@@ -104,7 +156,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage = openStorage(path);
     const frames: ServerFrame[] = [];
     const ingress = { sendClarifyResolution: vi.fn(() => true), sendApprovalResolution: vi.fn(() => true) } as unknown as AttachV1Ingress;
-    const recovered = new NativeBotDataPlane({ control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"], broadcast: (frame) => frames.push(frame), now: () => 20 });
+    const recovered = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], broadcast: (frame) => frames.push(frame), now: () => 20 });
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(storage.nativeInteraction("sage", "approval", "approve-1")?.status).toBe("expired");
     expect(frames).toContainEqual(expect.objectContaining({ type: "bot_approval_resolved", toolCallId: "approve-1", outcome: "expired" }));
