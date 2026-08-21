@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from cozygateway.attach_spool import AttachSpool, TerminalSealed
+from cozygateway.attach_spool import AttachSpool, ResumeConflict, TerminalSealed
 
 
 class AttachSpoolTests(unittest.TestCase):
@@ -43,6 +43,26 @@ class AttachSpoolTests(unittest.TestCase):
         self.assertEqual([f["commandId"] for f in spool.pending_commands()], ["c1"])
         spool.mark_command_processed("c1")
         self.assertEqual(spool.pending_commands(), [])
+        spool.close()
+
+    def test_server_resume_fast_forwards_only_an_empty_recreated_event_stream(self):
+        spool = AttachSpool(self.path)
+        spool.reconcile_server_resume(event_sequence=2244, command_sequence=5)
+        self.assertEqual(spool.event_cursor, 2244)
+        self.assertEqual(spool.command_cursor, 5)
+        self.assertEqual(spool.enqueue_event({
+            "kind": "draft", "threadId": "t", "turnId": "u", "blocks": []
+        })["sequence"], 2245)
+        spool.close()
+
+    def test_server_resume_never_skips_a_divergent_pending_event(self):
+        spool = AttachSpool(self.path)
+        spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})
+        with self.assertRaises(ResumeConflict):
+            spool.reconcile_server_resume(event_sequence=2244, command_sequence=5)
+        self.assertEqual(spool.event_cursor, 0)
+        self.assertEqual(spool.command_cursor, 0)
+        self.assertEqual([f["sequence"] for f in spool.pending_events(10, 100000)], [1])
         spool.close()
 
 

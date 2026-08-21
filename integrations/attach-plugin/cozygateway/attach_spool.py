@@ -18,6 +18,10 @@ class TerminalSealed(RuntimeError):
     """Raised when an event attempts to mutate a turn after its terminal event."""
 
 
+class ResumeConflict(RuntimeError):
+    """Raised when server cursors would discard locally durable work."""
+
+
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS state (
@@ -72,6 +76,45 @@ class AttachSpool:
     @property
     def event_cursor(self) -> int:
         return int(self._db.execute("SELECT event_cursor FROM state WHERE id = 1").fetchone()[0])
+
+    def reconcile_server_resume(self, event_sequence: int, command_sequence: int) -> None:
+        """Adopt the authoritative cursors returned by ``hello_ack``.
+
+        A spool can be recreated while the gateway still retains this agent's durable stream. In
+        that case the first new command is necessarily ahead of the empty spool's cursor. Advancing
+        is safe because the gateway only advertises command rows it has already ACKed and event rows
+        it has already durably admitted. Locally pending events are never skipped.
+        """
+        if event_sequence < 0 or command_sequence < 0:
+            raise ResumeConflict("attach-v1 server returned a negative resume cursor")
+        with self._db:
+            row = self._db.execute(
+                "SELECT next_event_sequence, command_cursor, event_cursor FROM state WHERE id = 1"
+            ).fetchone()
+            next_event_sequence, local_command_cursor, local_event_cursor = map(int, row)
+            if command_sequence < local_command_cursor or event_sequence < local_event_cursor:
+                raise ResumeConflict("attach-v1 server resume cursor moved backwards")
+
+            issued_event_tail = next_event_sequence - 1
+            if event_sequence > issued_event_tail:
+                pending = int(self._db.execute(
+                    "SELECT COUNT(*) FROM event_outbox WHERE acked = 0"
+                ).fetchone()[0])
+                if pending:
+                    raise ResumeConflict(
+                        "attach-v1 server event cursor is ahead of locally pending events"
+                    )
+                next_event_sequence = event_sequence + 1
+            else:
+                self._db.execute(
+                    "UPDATE event_outbox SET acked = 1 WHERE sequence <= ?",
+                    (event_sequence,),
+                )
+
+            self._db.execute(
+                "UPDATE state SET next_event_sequence = ?, command_cursor = ?, event_cursor = ? WHERE id = 1",
+                (next_event_sequence, command_sequence, event_sequence),
+            )
 
     def enqueue_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         turn_id = event.get("turnId")
@@ -162,4 +205,3 @@ class AttachSpool:
 
     def close(self) -> None:
         self._db.close()
-

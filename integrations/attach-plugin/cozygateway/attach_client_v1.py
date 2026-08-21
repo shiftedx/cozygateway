@@ -278,6 +278,12 @@ class AttachV1Client:
             return
         kind = frame.get("kind")
         if kind == "hello_ack":
+            resume = frame.get("resume")
+            if isinstance(resume, dict):
+                event_sequence = resume.get("eventSequence")
+                command_sequence = resume.get("commandSequence")
+                if isinstance(event_sequence, int) and isinstance(command_sequence, int):
+                    self._spool.reconcile_server_resume(event_sequence, command_sequence)
             offered = frame.get("capabilities")
             self._capabilities = {str(item) for item in offered} if isinstance(offered, list) else set()
             self._negotiated = True

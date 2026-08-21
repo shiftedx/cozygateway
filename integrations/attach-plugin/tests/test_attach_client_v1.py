@@ -48,6 +48,28 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.socket.sent[0]["instanceId"], self.spool.instance_id)
         self.assertEqual(self.socket.sent[0]["resume"], {"eventSequence": 0, "commandSequence": 0})
 
+    async def test_hello_ack_recovers_a_recreated_empty_spool_from_server_cursors(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack",
+            "capabilities": ["draft"],
+            "resume": {"eventSequence": 2244, "commandSequence": 5},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+        command = {
+            "kind": "command",
+            "sequence": 6,
+            "commandId": "c6",
+            "command": {"kind": "turn", "threadId": "t", "turnId": "u", "messageId": "m", "text": "hi"},
+        }
+        await self.client._dispatch_inbound(json.dumps(command))
+        self.assertEqual(self.spool.command_cursor, 6)
+        self.assertEqual([turn.text for turn in self.turns], ["hi"])
+        self.assertEqual(self.socket.sent[-1], {"kind": "ack", "channel": "command", "sequence": 6, "id": "c6"})
+
+        await self.client.send_draft("t", "u", [])
+        self.assertEqual(self.socket.sent[-1]["sequence"], 2245)
+
     async def test_unacked_event_reuses_id_and_sequence_after_reconnect(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["draft"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
