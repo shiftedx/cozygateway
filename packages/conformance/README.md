@@ -12,7 +12,7 @@ and the `cozygateway-contract` schemas, never from any gateway's source code. Th
 and writes only the public REST and WebSocket surface, so a green run is evidence the
 implementation matches the contract, not that it shares the reference code.
 
-The suite covers sixteen groups: health, capabilities, pairing, the auth wall, device lifecycle,
+The suite covers the core groups: health, capabilities, pairing, the auth wall, device lifecycle,
 agents, thread lifecycle, message round trip and seq discipline, WebSocket lifecycle, streaming
 order, reconnect dedup, turn failure, mid-turn interrupt, the live in-flight interrupt, and the
 approval lifecycle, plus the agent inbox. Optional backend-specific groups activate only when the
@@ -68,6 +68,8 @@ export interface ConformanceEnv {
   approvalAgentId?: string;
   /** Optional: one seeded capability-17 a2a thread. See "The optional agent inbox hook". */
   botInbox?: { botName: string; threadId: string };
+  /** Optional: one capability-18 Hermes bot. See "The optional bot model-config hook". */
+  botModelConfig?: { botName: string };
 }
 ```
 
@@ -99,6 +101,13 @@ registerConformanceSuite({
 Your gateway must expose the reference echo backend under the `echoAgentId` you pass. Boot it
 on an ephemeral port with an in-memory or temp-dir database so the run stays isolated. Peer
 dependency: `vitest >= 3`.
+
+## The optional bot model-config hook
+
+Declare `botModelConfig` with the name of a capability-18 Hermes bot to check the fixed
+`GET /bots/:name/model-config` shape, its device-auth wall, and unknown-model validation on PUT.
+The suite deliberately sends only a model id that cannot be in the returned catalog, so the
+conformance run does not mutate the bot's live profile.
 
 ## The optional stall hook
 

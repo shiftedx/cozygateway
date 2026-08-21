@@ -180,6 +180,15 @@ CREATE TABLE IF NOT EXISTS bot_chat_tool_steps (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_session
   ON bot_chat_tool_steps (session_id, started_at);
+-- Capability 18 routine model/effort selections. Hermes' surveyed cron RPC cannot persist or
+-- apply the pair to one run, so these are deliberately gateway-owned inert contract metadata.
+-- JSON preserves the difference between an omitted field and an explicit null (follow profile).
+CREATE TABLE IF NOT EXISTS bot_routine_overrides (
+  bot TEXT NOT NULL,
+  routine_id TEXT NOT NULL,
+  overrides_json TEXT NOT NULL,
+  PRIMARY KEY (bot, routine_id)
+) STRICT, WITHOUT ROWID;
 -- Group chat rooms. Unlike the three tables above these are NOT a cache: this gateway hosts the
 -- rooms (spec section 4), so the room, its transcript, each member's watermark and the epoch are
 -- the source of truth and must survive a restart. Only the "a round loop is running right now"
@@ -243,6 +252,11 @@ export interface PushRegistrationRow {
   pushId: string;
   relayUrl: string;
   pushKey: string;
+}
+
+export interface BotRoutineOverrides {
+  model?: string | null;
+  effort?: string | null;
 }
 
 /** A group room as it sits on disk. `epoch` and `needsYou` are live protocol state, not metadata:
@@ -978,6 +992,41 @@ export class Storage {
       .changes as number;
   }
 
+  botRoutineOverrides(bot: string, routineId: string): BotRoutineOverrides | undefined {
+    const row = this.#db
+      .prepare("SELECT overrides_json AS overridesJson FROM bot_routine_overrides WHERE bot = ? AND routine_id = ?")
+      .get(bot, routineId) as { overridesJson: string } | undefined;
+    if (row === undefined) return undefined;
+    const parsed: unknown = JSON.parse(row.overridesJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    return {
+      ...(typeof record["model"] === "string" || record["model"] === null
+        ? { model: record["model"] as string | null }
+        : {}),
+      ...(typeof record["effort"] === "string" || record["effort"] === null
+        ? { effort: record["effort"] as string | null }
+        : {}),
+    };
+  }
+
+  setBotRoutineOverrides(bot: string, routineId: string, overrides: BotRoutineOverrides): void {
+    if (overrides.model === undefined && overrides.effort === undefined) {
+      this.deleteBotRoutineOverrides(bot, routineId);
+      return;
+    }
+    this.#db
+      .prepare(
+        `INSERT INTO bot_routine_overrides (bot, routine_id, overrides_json) VALUES (?, ?, ?)
+         ON CONFLICT(bot, routine_id) DO UPDATE SET overrides_json = excluded.overrides_json`,
+      )
+      .run(bot, routineId, JSON.stringify(overrides));
+  }
+
+  deleteBotRoutineOverrides(bot: string, routineId: string): void {
+    this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ? AND routine_id = ?").run(bot, routineId);
+  }
+
   /** Drops every trace of a bot from the cache: its roster row, its mirrored `ui_meta` blob, its
    *  canonical-chat pin, and the sessions its resets retired. Called when the profile is deleted
    *  Hermes-side, so a name that gets reused later starts clean rather than inheriting a dead pin,
@@ -1001,6 +1050,7 @@ export class Storage {
       // The tool steps go with them, same name-keying argument: a rebuilt bot reusing the name must
       // not show a history strip describing what its predecessor did.
       this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(name);
+      this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ?").run(name);
       this.#db.exec("COMMIT");
     } catch (err) {
       this.#db.exec("ROLLBACK");

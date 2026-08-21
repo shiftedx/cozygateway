@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 17 }
+"capabilities": { "com.cozylabs.bots": 18 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -167,6 +167,10 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   the existing group-room message shape. An open thread that gains a rendered message emits the
   coarse `bot_inbox_activity` frame, which tells the client to re-read it. There is no inbox send
   route. A client below 17 sees no new route or frame.
+- `18`: BOT MODEL CONFIG. `GET` and `PUT /bots/:name/model-config` expose the selected chat model,
+  reasoning effort, and the configured Hermes picker catalog. Routine records and writes also gain
+  optional nullable `model` and `effort` fields. See the routine capability note before presenting
+  those fields as active execution controls.
 
 ## 3. Resources
 
@@ -1589,6 +1593,40 @@ deferred rather than half-modeled. A later version can add them additively.
 
 The roster is refreshed behind a patch, so a `bot_roster` frame follows shortly.
 
+### GET /bots/:name/model-config
+
+```
+200 { model: string|null, effort: string|null,
+      catalog: [{ id: string, displayName: string }], efforts: [string] }
+404 not_found
+502 backend_unavailable + hermesError
+```
+
+This is a live Hermes read, not a gateway shadow. The gateway reads the profile-scoped dashboard
+model options and config used by Hermes' edit screen. Catalog ids use `<provider>:<model>`, split on
+the first colon only. A null axis means Hermes has no profile pin for it.
+
+`catalog` contains only configured, authenticated provider rows and their selectable models.
+`efforts` is Hermes' accepted vocabulary: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`, and `ultra`.
+
+### PUT /bots/:name/model-config
+
+```
+body { model?: string|null, effort?: string|null }
+200  { model: string|null, effort: string|null,
+       catalog: [{ id: string, displayName: string }], efforts: [string] }
+400 invalid_request                  // empty body, unknown model, or unknown effort
+404 not_found
+502 backend_unavailable + hermesError
+```
+
+Omitted leaves an axis unchanged. Explicit null clears the profile pin and restores Hermes' default.
+The model must be one of the ids in the live catalog and effort must be in `efforts`. The response is
+read back from Hermes after the write, so it reports what Hermes now holds rather than echoing input.
+The underlying Hermes config keys are `model.provider`, `model.default`, and
+`agent.reasoning_effort`.
+
 ### GET /bots/catalog
 
 The menus the edit screen offers: installable skills, the MCP server catalog, and the model
@@ -1712,7 +1750,9 @@ Full response example:
       "lastRun": 1755424800000,
       "nextRun": 1755507600000,
       "lastStatus": "success",
-      "repeat": "forever"
+      "repeat": "forever",
+      "model": "openrouter:google/gemini-2.5-flash",
+      "effort": "low"
     },
     {
       "id": "job_04ba55",
@@ -1748,6 +1788,15 @@ The third row is a legacy one: an untagged cron job in `scout`'s own store, titl
 carrying `legacy: true`. Its schedule, timestamps and switch read exactly like the two above it. It
 can be paused, resumed and deleted; it cannot be rewritten (see `PATCH` below).
 
+**Capability 18 routine model and effort note.** Both fields are optional and nullable. Absent means
+the routine predates the fields; null means follow the bot profile. The surveyed Hermes checkout has
+invocation-scoped `--model`, `--provider`, and `--reasoning`, and its cron jobs can pin a model, but
+the authenticated `cron.manage` RPC used here forwards neither model/provider nor a per-job reasoning
+field. There is therefore no honest way to apply both axes to exactly one scheduled run. This gateway
+accepts and durably returns the selections as INERT metadata. It does not mutate the bot profile,
+run, then restore it, because a crash would leave the bot permanently changed. A client must label
+these controls as saved but inactive until a later capability version removes this note.
+
 **The legacy auto-pause.** A routine is `legacyUnsafe` when it carries the `[bot:]` tag AND its
 prompt begins with `You are running the scheduled routine "`. That is the pre-marker delegation
 shape, which builds a shell command by interpolating a title that syncs from `ui_meta`: anything
@@ -1781,7 +1830,8 @@ untagged job.
 ### POST /bots/:name/routines
 
 ```
-body { title: string, schedule: string, prompt: string, repeat?: integer, continuity?: boolean }
+body { title: string, schedule: string, prompt: string, repeat?: integer, continuity?: boolean,
+       model?: string|null, effort?: string|null }
 201  { name: string, routine: BotRoutine }
 400  invalid_request                  // malformed body, a NUL in title/schedule/prompt, or a `name`
                                       // that is not a legal profile id (see below)
@@ -1849,7 +1899,7 @@ another live schedule. List first.
 
 ```
 body { title?: string, schedule?: string, prompt?: string, enabled?: boolean,
-       repeat?: integer, continuity?: boolean }
+       repeat?: integer, continuity?: boolean, model?: string|null, effort?: string|null }
 200  { name: string, routine: BotRoutine, replacedId?: string, orphanedId?: string }
 400  invalid_request                  // no fields, a rewrite field without prompt, a rewrite of a
                                       // `legacy` routine, or a `name` that is not a legal profile id
@@ -1866,6 +1916,9 @@ Two very different operations, and the difference is the backend's rather than t
 **`enabled` alone is the row switch.** `true` resumes, `false` pauses, and the routine keeps its
 `id`. This is the desktop's switch, and the pause/resume it performs is the same one. It is the only
 patch a `legacy` routine takes.
+
+**`model` and `effort` alone are metadata updates.** They keep the routine id and make no Hermes cron
+write. They also work on a `legacy` row. They remain inert for the reason stated above.
 
 **A rewrite of a `legacy` routine is a 400, always.** Not a 404 and not a backend failure: the job is
 right there, it is listed, and pause, resume and delete all work on it. What the gateway will not do

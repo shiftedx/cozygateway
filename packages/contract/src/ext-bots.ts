@@ -656,6 +656,31 @@ export const BotCatalogSchema = Type.Object({
 });
 export type BotCatalog = Static<typeof BotCatalogSchema>;
 
+/** One model the focused bot can select. `id` is the stable picker identity
+ *  `<provider>:<model>`; `displayName` is presentation-only. */
+export const BotModelCatalogEntrySchema = Type.Object({
+  id: Type.String(),
+  displayName: Type.String(),
+});
+export type BotModelCatalogEntry = Static<typeof BotModelCatalogEntrySchema>;
+
+/** `GET /bots/:name/model-config`. Null means the profile follows Hermes' default for that axis.
+ *  The catalog is the configured Hermes picker catalog, not a gateway-maintained model list. */
+export const BotModelConfigSchema = Type.Object({
+  model: Type.Union([Type.String(), Type.Null()]),
+  effort: Type.Union([Type.String(), Type.Null()]),
+  catalog: Type.Array(BotModelCatalogEntrySchema),
+  efforts: Type.Array(Type.String()),
+});
+export type BotModelConfig = Static<typeof BotModelConfigSchema>;
+
+/** `PUT /bots/:name/model-config`. Omitted leaves an axis unchanged; null clears it. */
+export const BotModelConfigPatchSchema = Type.Object({
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+});
+export type BotModelConfigPatch = Static<typeof BotModelConfigPatchSchema>;
+
 /** One routine's schedule. `raw` is the Hermes-native schedule string EXACTLY as the backend stores
  *  it (`30m`, `every 2h`, `0 9 * * 1-5`), which is also exactly what a client sends back on a write:
  *  the schedule is never re-encoded on this wire, because the picker's frequency choice is not
@@ -716,6 +741,11 @@ export const BotRoutineSchema = Type.Object({
    *  because the remaining count is not recoverable from it. */
   repeat: Type.Optional(Type.String()),
   continuity: Type.Optional(Type.Boolean()),
+  /** Capability 18 accepts and preserves these selections, but current Hermes cron RPCs cannot
+   *  apply both to one run. They are inert until Hermes exposes a true per-run pair. Null means
+   *  follow the bot profile; absent means the routine predates this field. */
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 });
 export type BotRoutine = Static<typeof BotRoutineSchema>;
 
@@ -751,6 +781,8 @@ export const BotRoutineCreateRequestSchema = Type.Object({
   repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
   /** Each run sees the previous run's output. */
   continuity: Type.Optional(Type.Boolean()),
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 });
 export type BotRoutineCreateRequest = Static<typeof BotRoutineCreateRequestSchema>;
 
@@ -778,6 +810,8 @@ export const BotRoutinePatchSchema = Type.Object({
   enabled: Type.Optional(Type.Boolean()),
   repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
   continuity: Type.Optional(Type.Boolean()),
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 });
 export type BotRoutinePatch = Static<typeof BotRoutinePatchSchema>;
 
@@ -1063,6 +1097,11 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *  - `17`: AGENT INBOX (issue #95). `GET /bots/:name/inbox` lists the newest 50 a2a sessions and
  *    `GET /bots/:name/inbox/:threadId/messages` returns a read-only transcript in the group-room
  *    message shape. An open thread that gains rendered messages emits `bot_inbox_activity`, a
- *    coarse signal telling clients to re-read it. There is deliberately no inbox send route. */
+ *    coarse signal telling clients to re-read it. There is deliberately no inbox send route.
+ *  - `18`: BOT MODEL CONFIG (issue #106). Adds authenticated GET/PUT
+ *    `/bots/:name/model-config`, backed by Hermes profile config and its configured picker catalog.
+ *    Routine records and writes accept nullable model/effort selections. The surveyed cron RPC
+ *    cannot scope both to one run, so they are preserved as inert metadata and the gateway never
+ *    mutates a profile around a routine run. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 17;
+export const BOTS_CAPABILITY_VERSION = 18;
