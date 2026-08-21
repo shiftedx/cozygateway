@@ -31,6 +31,7 @@ export interface NativeBotDataPlaneOptions {
   onChatMessage?: (event: { bot: string; displayName: string; messageId: string; chatSessionId: string; preview: string }) => void;
   onApproval?: (event: { bot: string; sessionId: string; turnId: string; toolCallId: string; name?: string; outcome?: "approved" | "denied" | "expired" }) => void;
   now?: () => number;
+  log?: (message: string) => void;
 }
 
 interface ApprovalPayload { name: string }
@@ -49,6 +50,8 @@ export class NativeBotDataPlane {
   readonly #onChatMessage: NativeBotDataPlaneOptions["onChatMessage"];
   readonly #onApproval: NativeBotDataPlaneOptions["onApproval"];
   readonly #now: () => number;
+  readonly #log: (message: string) => void;
+  readonly #historyMigrations = new Map<string, Promise<void>>();
   readonly #draftSeq = new Map<string, number>();
   readonly #toolFrames = new Map<string, { seq: number; steps: Map<string, BotToolStep> }>();
   readonly #interactionTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -63,6 +66,7 @@ export class NativeBotDataPlane {
     this.#onChatMessage = opts.onChatMessage;
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
+    this.#log = opts.log ?? ((message) => void process.stderr.write(`[native-bot] ${message}\n`));
     // Scheduled/home delivery is authorized against this durable gateway-owned binding, never a
     // target asserted by an event itself. Creating it at assembly makes the target canonical even
     // before the app has opened this bot's chat.
@@ -95,6 +99,20 @@ export class NativeBotDataPlane {
     });
   }
 
+  /** Starts the one-time Dashboard -> native transcript adoption for every native profile. Safe
+   * to call before the Dashboard link is online: failures leave no marker and a later chat access
+   * retries the same migration. Until the marker lands, roster reads keep the control-plane row. */
+  async migrateHistory(): Promise<void> {
+    await Promise.all([...this.#native].map(async (bot) => {
+      try {
+        await this.#ensureHistory(bot);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : "unknown failure";
+        this.#log(`history adoption deferred for ${bot}: ${detail}`);
+      }
+    }));
+  }
+
   /** Overlay the durable attach-v1 transcript on the dashboard-owned profile roster. Profile
    * metadata remains control-plane state, while chat identity, preview and activity come from the
    * same native rows `chatHistory` serves. */
@@ -105,6 +123,7 @@ export class NativeBotDataPlane {
       if (!this.#native.has(bot)) return summary;
       const chat = this.#storage.nativeBotChat(bot, this.#now());
       const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
+      if (!this.#storage.nativeBotHistoryMigrated(bot) && messages.length === 0) return summary;
       const latest = messages.findLast((message) => message.text.trim().length > 0);
       return {
         ...summary,
@@ -174,18 +193,22 @@ export class NativeBotDataPlane {
 
   async #canonical(name: string) {
     if (!this.#native.has(normalize(name))) return this.#control.canonicalChat(name);
-    const chat = this.#storage.nativeBotChat(normalize(name), this.#now());
+    const bot = normalize(name);
+    await this.#attemptHistory(bot);
+    const chat = this.#storage.nativeBotChat(bot, this.#now());
     return { sessionId: chat.sessionId, adoption: chat.created ? "created" as const : "pin" as const };
   }
 
   async #history(name: string) {
     if (!this.#native.has(normalize(name))) return this.#control.chatHistory(name);
-    const chat = this.#storage.nativeBotChat(normalize(name), this.#now());
-    this.#rebroadcastPending(normalize(name));
+    const bot = normalize(name);
+    await this.#attemptHistory(bot);
+    const chat = this.#storage.nativeBotChat(bot, this.#now());
+    this.#rebroadcastPending(bot);
     return {
       sessionId: chat.sessionId,
       adoption: chat.created ? "created" as const : "pin" as const,
-      messages: this.#storage.nativeBotMessages(normalize(name), chat.sessionId),
+      messages: this.#storage.nativeBotMessages(bot, chat.sessionId),
       running: chat.activeTurnId !== undefined,
       inflight: chat.activeTurnId !== undefined,
       updatedAt: this.#now(),
@@ -195,6 +218,7 @@ export class NativeBotDataPlane {
   async #send(name: string, text: string, opts?: { clientId?: string }): Promise<{ sessionId: string; message: BotChatMessage }> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return this.#control.sendChatMessage(name, text, opts);
+    await this.#attemptHistory(bot);
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const messageId = opts?.clientId ?? randomUUID();
@@ -216,6 +240,7 @@ export class NativeBotDataPlane {
   async #sendPhoto(name: string, photo: BotChatPhotoUpload): Promise<{ sessionId: string; message: BotChatMessage }> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return this.#control.sendChatPhoto(name, photo);
+    await this.#attemptHistory(bot);
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const mediaId = randomUUID().replaceAll("-", "");
@@ -261,6 +286,7 @@ export class NativeBotDataPlane {
   async #reset(name: string) {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return this.#control.resetChat(name);
+    await this.#attemptHistory(bot);
     const previousSessionId = this.#storage.nativeBotChat(bot, this.#now()).sessionId;
     const sessionId = this.#storage.resetNativeBotChat(bot, this.#now());
     this.#broadcast({ type: "bot_chat_reset", bot, sessionId, previousSessionId, updatedAt: this.#now() });
@@ -313,13 +339,49 @@ export class NativeBotDataPlane {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return this.#control.chatAttachmentInfo(name, fileId);
     const info = this.#storage.attachMediaInfo(bot, fileId, this.#now());
-    return info === undefined ? undefined : { mime: info.mime, name: info.descriptor.filename, size: info.size };
+    return info === undefined
+      ? this.#control.chatAttachmentInfo(name, fileId)
+      : { mime: info.mime, name: info.descriptor.filename, size: info.size };
   }
 
   #attachmentSlice(name: string, fileId: string, offset: number, length: number) {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return this.#control.chatAttachmentSlice(name, fileId, offset, length);
-    return this.#storage.attachMediaSlice(bot, fileId, offset, length, this.#now());
+    return this.#storage.attachMediaSlice(bot, fileId, offset, length, this.#now())
+      ?? this.#control.chatAttachmentSlice(name, fileId, offset, length);
+  }
+
+  async #ensureHistory(bot: string): Promise<void> {
+    if (this.#storage.nativeBotHistoryMigrated(bot)) return;
+    const running = this.#historyMigrations.get(bot);
+    if (running !== undefined) return running;
+    const migration = (async () => {
+      const source = await this.#control.chatHistory(bot);
+      const chat = this.#storage.nativeBotChat(bot, this.#now());
+      const imported = this.#storage.adoptNativeBotHistory({
+        bot,
+        sessionId: chat.sessionId,
+        sourceSessionId: source.sessionId,
+        messages: source.messages,
+        now: this.#now(),
+      });
+      this.#log(`adopted ${imported} Dashboard messages for ${bot}`);
+    })();
+    this.#historyMigrations.set(bot, migration);
+    try {
+      await migration;
+    } finally {
+      this.#historyMigrations.delete(bot);
+    }
+  }
+
+  async #attemptHistory(bot: string): Promise<void> {
+    try {
+      await this.#ensureHistory(bot);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "unknown failure";
+      this.#log(`history adoption deferred for ${bot}: ${detail}`);
+    }
   }
 
   #finish(bot: string, sessionId: string, turnId: string, phase: "complete" | "failed" = "complete"): void {
