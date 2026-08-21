@@ -117,6 +117,29 @@ function extensionErrorBody(
  *  anything is parsed. */
 export const MEDIA_SRC_MAX = 2048;
 
+export type ByteRange = { start: number; end: number };
+
+/** Resolves one RFC 9110 byte range. Multi-range bodies are deliberately unsupported: AVPlayer
+ *  asks for one range at a time, and multipart/byteranges would add parser surface with no product
+ *  value. `undefined` means no Range header; `null` means 416. */
+export function resolveByteRange(header: string | undefined, size: number): ByteRange | null | undefined {
+  if (header === undefined) return undefined;
+  if (!header.startsWith("bytes=") || header.includes(",") || size <= 0) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (match === null || (match[1] === "" && match[2] === "")) return null;
+  if (match[1] === "") {
+    const suffix = Number(match[2]);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return null;
+    return { start: Math.max(0, size - suffix), end: size - 1 };
+  }
+  const start = Number(match[1]);
+  const requestedEnd = match[2] === "" ? size - 1 : Number(match[2]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) || start < 0 || start >= size || requestedEnd < start) {
+    return null;
+  }
+  return { start, end: Math.min(requestedEnd, size - 1) };
+}
+
 /** The ONE canonicalization every `/bots/:name` route applies to its path parameter, so a bot has
  *  exactly one identity no matter what casing or padding a client used in the URL.
  *
@@ -803,8 +826,9 @@ export function registerBotRoutes(
     }
   });
 
-  // The gateway's own copy of a chat image. User rows hold bytes a device uploaded; capability-15
-  // assistant rows hold bytes fetched through Hermes' authenticated, guarded dashboard endpoints.
+  // The gateway's own copy of chat media. User rows hold image bytes a device uploaded;
+  // capability-20 assistant rows may also hold video/audio fetched through Hermes' authenticated,
+  // guarded dashboard endpoints.
   // Both use an id this gateway minted, and neither exposes a host path.
   //
   // Scoped to the bot AND to a strict id shape, both before the lookup: a path parameter that could
@@ -816,16 +840,31 @@ export function registerBotRoutes(
     if (!isPhotoFileId(fileId)) {
       return c.json(errorBody("invalid_request", "fileId is not a gateway attachment id"), 400);
     }
-    const found = bots.chatAttachment(resolved.name, fileId);
-    if (found === undefined) {
+    const info = bots.chatAttachmentInfo(resolved.name, fileId);
+    if (info === undefined) {
       return c.json(errorBody("not_found", "no such attachment for this bot"), 404);
     }
-    return new Response(found.bytes.slice().buffer as ArrayBuffer, {
-      status: 200,
+    const range = resolveByteRange(c.req.header("range"), info.size);
+    if (range === null) {
+      return new Response(null, {
+        status: 416,
+        headers: { "content-range": `bytes */${info.size}`, "accept-ranges": "bytes" },
+      });
+    }
+    const start = range?.start ?? 0;
+    const end = range?.end ?? info.size - 1;
+    const bytes = bots.chatAttachmentSlice(resolved.name, fileId, start, end - start + 1);
+    if (bytes === undefined) {
+      return c.json(errorBody("not_found", "no such attachment for this bot"), 404);
+    }
+    return new Response(bytes.slice().buffer as ArrayBuffer, {
+      status: range === undefined ? 200 : 206,
       headers: {
-        "content-type": found.mime,
-        "content-length": String(found.size),
+        "content-type": info.mime,
+        "content-length": String(bytes.byteLength),
         "cache-control": PHOTO_CACHE_CONTROL,
+        "accept-ranges": "bytes",
+        ...(range === undefined ? {} : { "content-range": `bytes ${start}-${end}/${info.size}` }),
         // Same posture as the capability-7 proxy. The type came off an allow-list of raster formats
         // and was confirmed against the bytes, and this stops anything downstream from improving on
         // it.

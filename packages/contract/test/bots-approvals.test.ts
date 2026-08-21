@@ -63,7 +63,7 @@ describe("bots approval frames", () => {
     expect(members).not.toContain("argSummary");
     expect(members).not.toContain("command");
     expect(members).not.toContain("description");
-    expect(members).toEqual(["type", "bot", "sessionId", "turnId", "toolCallId", "name", "updatedAt"]);
+    expect(members).toEqual(["type", "bot", "sessionId", "turnId", "toolCallId", "name", "updatedAt", "room"]);
   });
 
   it("takes the three core outcomes and nothing else", () => {

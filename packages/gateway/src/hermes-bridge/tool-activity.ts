@@ -40,11 +40,10 @@ import type { HermesEvent } from "./client.ts";
  *    at once and completions arrive out of order. Correlation is strictly by `tool_id`, never by
  *    ordering.
  *
- *  ## Redaction: the shape is the guard
+ *  ## Redaction: narrow inputs plus defense in depth
  *
- *  `BotToolStep` has no member that can hold tool input or tool output, and that is deliberate
- *  rather than incidental. Of the fields hermes offers, the probe found exactly three that are
- *  safe -- `name`, `tool_id` and `duration_s` -- and every other one radioactive:
+ *  Capability 21 permits bounded human-readable detail, but only from Hermes' already display-safe
+ *  text projections. The gateway applies its own credential redaction and 4096-character cap too:
  *
  *  - `args` is the raw argument map, unredacted but for `browser_type.text` (display.py:400-414):
  *    full file contents on a write, full shell commands, full patches.
@@ -57,9 +56,9 @@ import type { HermesEvent } from "./client.ts";
  *  - `summary` is a bounded phrasing in two branches and arbitrary tool text in a third (its
  *    `fallback_warning` branch, server.py:5804-5807), so it is treated as unbounded.
  *
- *  NONE of them is read for anything that leaves this process. `result` is read, once, to decide
- *  between two literals. Nothing is forwarded into a frame, a stored row, a push payload or a log
- *  line. A member that does not exist cannot leak.
+ *  Raw `args`, `result`, `context`, `inline_diff`, and `todos` are never forwarded. `args_text` is
+ *  eligible only at start; `summary` then `result_text` is eligible at completion. `result` is read
+ *  only to classify success/error. Tool details remain absent from push payloads and logs.
  *
  *  ## Not pushed
  *
@@ -118,6 +117,23 @@ export const TOOL_ACTIVITY_THROTTLE_MS = 200;
  *  well as the memory: past it new steps are dropped and the ones already open still finish, which
  *  keeps a runaway loop from turning one turn into an unbounded broadcast. */
 export const MAX_STEPS_PER_TURN = 200;
+export const TOOL_DETAIL_MAX = 4096;
+export const TOOL_DETAIL_TRUNCATION = "\n… (truncated)";
+
+/** Defense in depth over Hermes' already-redacted display strings. Raw args/result objects never
+ * enter this function. Common credential spellings are removed before the bounded text reaches a
+ * frame or SQLite. */
+export function toolStepDetail(value: unknown): string | undefined {
+  const raw = nonEmptyString(value);
+  if (raw === undefined) return undefined;
+  const redacted = raw
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [REDACTED]")
+    .replace(/\b(api[_-]?key|token|password|secret)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
+    .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
+    .trim();
+  if (redacted.length <= TOOL_DETAIL_MAX) return redacted;
+  return redacted.slice(0, TOOL_DETAIL_MAX - TOOL_DETAIL_TRUNCATION.length) + TOOL_DETAIL_TRUNCATION;
+}
 
 /** One step, as it is written down. The store seam is this narrow on purpose: it is the only thing
  *  in this module that touches a database, and everything it carries is already on the wire. */
@@ -131,6 +147,8 @@ export interface ToolStepRecord {
   status: BotToolStep["status"];
   startedAt: number;
   endedAt: number | undefined;
+  detail: string | undefined;
+  errorText: string | undefined;
 }
 
 /** Where a step goes to survive the socket it was seen on. */
@@ -230,6 +248,8 @@ interface StepState {
   status: BotToolStep["status"];
   startedAt: number;
   endedAt: number | undefined;
+  detail: string | undefined;
+  errorText: string | undefined;
 }
 
 interface TurnActivity {
@@ -338,12 +358,25 @@ export class BotToolActivity {
       // A completion with no start is recorded anyway. The event stream this gateway attached to
       // mid-turn delivers exactly that, and a step known only by its end is still a true thing that
       // happened.
-      step = { seq: turn.steps.size + 1, name: toolStepName(payload), status: "running", startedAt: at, endedAt: undefined };
+      step = {
+        seq: turn.steps.size + 1,
+        name: toolStepName(payload),
+        status: "running",
+        startedAt: at,
+        endedAt: undefined,
+        detail: toolStepDetail(asRecord(payload)?.["args_text"]),
+        errorText: undefined,
+      };
       turn.steps.set(stepId, step);
     }
     if (terminal && step.status === "running") {
       step.status = toolStepStatus(payload);
       step.endedAt = at;
+      const record = asRecord(payload);
+      step.detail = toolStepDetail(record?.["summary"] ?? record?.["result_text"]) ?? step.detail;
+      step.errorText = step.status === "error"
+        ? toolStepDetail(record?.["result_text"] ?? record?.["summary"])
+        : undefined;
     }
     this.#persist(turn, stepId, step);
     this.#schedule(runtimeId, turn);
@@ -416,6 +449,7 @@ export class BotToolActivity {
       // outcome nobody observed.
       step.status = "error";
       step.endedAt = at;
+      step.errorText = step.errorText ?? "The tool did not report a completion before the turn ended.";
       this.#persist(turn, stepId, step);
     }
     this.#emit(runtimeId, turn, true);
@@ -439,6 +473,8 @@ export class BotToolActivity {
         status: step.status,
         startedAt: step.startedAt,
         endedAt: step.endedAt,
+        detail: step.detail,
+        errorText: step.errorText,
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -506,6 +542,8 @@ function snapshot(turn: TurnActivity): BotToolStep[] {
     status: step.status,
     startedAt: step.startedAt,
     ...(step.endedAt === undefined ? {} : { endedAt: step.endedAt }),
+    ...(step.detail === undefined ? {} : { detail: step.detail }),
+    ...(step.errorText === undefined ? {} : { errorText: step.errorText }),
   }));
 }
 
@@ -521,6 +559,8 @@ export function groupToolSteps(
     status: string;
     startedAt: number;
     endedAt: number | null;
+    detail: string | null;
+    errorText: string | null;
   }>,
 ): Array<{ turnId: string; startedAt: number; endedAt?: number; steps: BotToolStep[] }> {
   const byTurn = new Map<string, { turnId: string; startedAt: number; endedAt: number | undefined; steps: BotToolStep[] }>();
@@ -540,6 +580,8 @@ export function groupToolSteps(
       status,
       startedAt: row.startedAt,
       ...(row.endedAt === null ? {} : { endedAt: row.endedAt }),
+      ...(row.detail === null ? {} : { detail: row.detail }),
+      ...(row.errorText === null ? {} : { errorText: row.errorText }),
     });
     // A turn whose every step ended has an end; one still holding a `running` step does not, which
     // after a restart is a turn whose end this gateway never saw.

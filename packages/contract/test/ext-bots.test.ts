@@ -165,24 +165,28 @@ describe("tool activity (capability 12)", () => {
     expect(check(BotToolStepSchema, { ...step, status: "pending" })).toBe(false);
   });
 
-  it("declares NO member that could carry tool input or tool output", () => {
-    // The redaction guard is the shape itself, so this pins the shape. Asserted as the declared
+  it("declares only bounded display detail, never raw tool input or output fields", () => {
+    // The narrow allow-list is part of the redaction guard, so this pins the shape. Asserted as the declared
     // property SET rather than by feeding extras through `check`: every schema in this contract is
     // deliberately open, because a client must ignore members it does not know for the whole
     // additive-versioning scheme to work. What must never happen is this contract GROWING one of
     // the names below -- each is a field hermes offers on `tool.start` / `tool.complete` and this
     // wire refuses (see `tool-activity.ts` for what each one leaks).
     expect(Object.keys(BotToolStepSchema.properties).sort()).toEqual([
+      "detail",
       "endedAt",
+      "errorText",
       "name",
       "seq",
       "startedAt",
       "status",
       "stepId",
     ]);
-    for (const leak of ["args", "argSummary", "context", "detail", "result", "summary", "inlineDiff", "todos"]) {
+    for (const leak of ["args", "argSummary", "context", "result", "summary", "inlineDiff", "todos"]) {
       expect(BotToolStepSchema.properties).not.toHaveProperty(leak);
     }
+    expect(check(BotToolStepSchema, { ...step, detail: "Reading calendar" })).toBe(true);
+    expect(check(BotToolStepSchema, { ...step, status: "error", errorText: "Calendar unavailable" })).toBe(true);
   });
 
   it("holds the ordinals as integers, since both seqs are drop-stale keys and not stamps", () => {
@@ -478,7 +482,8 @@ describe("capability advertisement", () => {
     // 18 for bot model config plus accepted-but-inert per-routine model and effort metadata.
     // 19 for the authenticated hard-stop route and its existing complete state-frame terminal edge,
     // plus new-session minting through the existing adoption frame without retiring the old chat.
-    expect(BOTS_CAPABILITY_VERSION).toBe(19);
+    // 20 adds assistant audio/video metadata and ranged attachment delivery.
+    expect(BOTS_CAPABILITY_VERSION).toBe(21);
   });
 
   it("accepts only the capability-19 hard-stop success body", () => {

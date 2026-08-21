@@ -34,7 +34,7 @@ describe("bot_chat_tool_steps", () => {
     storage.upsertBotChatToolStep(step({ status: "ok", endedAt: T + 1_200 }));
 
     expect(storage.botChatToolSteps("stored-1", 0)).toEqual([
-      { turnId: "turn-1", stepId: "call_1", seq: 1, name: "terminal", status: "ok", startedAt: T, endedAt: T + 1_200 },
+      { turnId: "turn-1", stepId: "call_1", seq: 1, name: "terminal", status: "ok", startedAt: T, endedAt: T + 1_200, detail: null, errorText: null },
     ]);
     storage.close();
   });

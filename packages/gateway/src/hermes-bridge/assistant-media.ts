@@ -3,13 +3,25 @@ import { createHash } from "node:crypto";
 /** Capability 15 limits one settled assistant row to three media attempts. A fourth directive stays
  *  visible as text, even when one of the first three fails. */
 export const ASSISTANT_MEDIA_MAX_PER_MESSAGE = 3;
-export const ASSISTANT_MEDIA_MAX_BYTES = 8 * 1024 * 1024;
+export const ASSISTANT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+export const ASSISTANT_AUDIO_MAX_BYTES = 40 * 1024 * 1024;
+export const ASSISTANT_VIDEO_MAX_BYTES = 40 * 1024 * 1024;
+/** Compatibility export for image-specific callers and tests. */
+export const ASSISTANT_MEDIA_MAX_BYTES = ASSISTANT_IMAGE_MAX_BYTES;
 
-export const ASSISTANT_MEDIA_TYPES = new Map<string, string>([
-  ["image/png", "png"],
-  ["image/jpeg", "jpg"],
-  ["image/gif", "gif"],
-  ["image/webp", "webp"],
+export type AssistantMediaKind = "image" | "video" | "audio";
+
+export const ASSISTANT_MEDIA_TYPES = new Map<string, { ext: string; kind: AssistantMediaKind; maxBytes: number }>([
+  ["image/png", { ext: "png", kind: "image", maxBytes: ASSISTANT_IMAGE_MAX_BYTES }],
+  ["image/jpeg", { ext: "jpg", kind: "image", maxBytes: ASSISTANT_IMAGE_MAX_BYTES }],
+  ["image/gif", { ext: "gif", kind: "image", maxBytes: ASSISTANT_IMAGE_MAX_BYTES }],
+  ["image/webp", { ext: "webp", kind: "image", maxBytes: ASSISTANT_IMAGE_MAX_BYTES }],
+  ["video/mp4", { ext: "mp4", kind: "video", maxBytes: ASSISTANT_VIDEO_MAX_BYTES }],
+  ["video/quicktime", { ext: "mov", kind: "video", maxBytes: ASSISTANT_VIDEO_MAX_BYTES }],
+  ["audio/mp4", { ext: "m4a", kind: "audio", maxBytes: ASSISTANT_AUDIO_MAX_BYTES }],
+  ["audio/mpeg", { ext: "mp3", kind: "audio", maxBytes: ASSISTANT_AUDIO_MAX_BYTES }],
+  ["audio/wav", { ext: "wav", kind: "audio", maxBytes: ASSISTANT_AUDIO_MAX_BYTES }],
+  ["audio/x-wav", { ext: "wav", kind: "audio", maxBytes: ASSISTANT_AUDIO_MAX_BYTES }],
 ]);
 
 export interface AssistantMediaDirective {
@@ -79,6 +91,36 @@ export interface DecodedAssistantMedia {
   bytes: Uint8Array;
   mime: string;
   ext: string;
+  kind: AssistantMediaKind;
+}
+
+function at(bytes: Uint8Array, offset: number, ...expected: number[]): boolean {
+  return expected.every((byte, index) => bytes[offset + index] === byte);
+}
+
+function isIsoBaseMedia(bytes: Uint8Array): boolean {
+  return bytes.byteLength >= 12 && at(bytes, 4, 0x66, 0x74, 0x79, 0x70); // ftyp
+}
+
+function isQuickTime(bytes: Uint8Array): boolean {
+  return isIsoBaseMedia(bytes) && at(bytes, 8, 0x71, 0x74, 0x20, 0x20); // QuickTime `qt  ` brand.
+}
+
+function bytesMatchMediaType(
+  declared: string,
+  bytes: Uint8Array,
+  sniffImage: (bytes: Uint8Array) => string | undefined,
+): boolean {
+  if (declared.startsWith("image/")) return sniffImage(bytes) === declared;
+  if (declared === "video/quicktime") return isQuickTime(bytes);
+  if (declared === "video/mp4" || declared === "audio/mp4") return isIsoBaseMedia(bytes) && !isQuickTime(bytes);
+  if (declared === "audio/mpeg") {
+    return at(bytes, 0, 0x49, 0x44, 0x33) || (bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0);
+  }
+  if (declared === "audio/wav" || declared === "audio/x-wav") {
+    return at(bytes, 0, 0x52, 0x49, 0x46, 0x46) && at(bytes, 8, 0x57, 0x41, 0x56, 0x45);
+  }
+  return false;
 }
 
 /** Decodes the dashboard's JSON data URL without trusting its MIME claim or allowing base64
@@ -91,18 +133,20 @@ export function decodeAssistantMediaDataUrl(
   const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/i.exec(dataUrl.trim());
   if (match === null) throw new Error("hermes returned an invalid media data URL");
   const declared = match[1]!.toLowerCase();
-  if (!ASSISTANT_MEDIA_TYPES.has(declared)) throw new Error("hermes returned a disallowed media type");
+  const accepted = ASSISTANT_MEDIA_TYPES.get(declared);
+  if (accepted === undefined) throw new Error("hermes returned a disallowed media type");
   const encoded = match[2]!;
-  if (encoded.length > Math.ceil(ASSISTANT_MEDIA_MAX_BYTES / 3) * 4) {
+  // This check happens before Buffer allocates or decodes the payload. The dashboard response has
+  // no separate byte length, so the base64 length is its declared-size equivalent.
+  if (encoded.length > Math.ceil(accepted.maxBytes / 3) * 4) {
     throw new Error("hermes returned media over the size cap");
   }
   const bytes = new Uint8Array(Buffer.from(encoded, "base64"));
-  if (bytes.byteLength === 0 || bytes.byteLength > ASSISTANT_MEDIA_MAX_BYTES) {
+  if (bytes.byteLength === 0 || bytes.byteLength > accepted.maxBytes) {
     throw new Error("hermes returned empty or oversized media");
   }
-  const actual = sniff(bytes);
-  if (actual === undefined || actual !== declared || !ASSISTANT_MEDIA_TYPES.has(actual)) {
-    throw new Error("hermes media bytes did not match an allowed raster type");
+  if (!bytesMatchMediaType(declared, bytes, sniff)) {
+    throw new Error("hermes media bytes did not match the declared allowed type");
   }
-  return { bytes, mime: actual, ext: ASSISTANT_MEDIA_TYPES.get(actual)! };
+  return { bytes, mime: declared, ext: accepted.ext, kind: accepted.kind };
 }

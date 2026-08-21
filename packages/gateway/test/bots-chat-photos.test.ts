@@ -1172,7 +1172,35 @@ describe("GET /bots/:name/chat/attachments/:fileId", () => {
     expect(res.headers.get("content-length")).toBe(String(PNG.byteLength));
     expect(res.headers.get("cache-control")).toBe("private, max-age=86400");
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("accept-ranges")).toBe("bytes");
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(PNG);
+  });
+
+  it("serves bounded and suffix ranges without returning the whole stored attachment", async () => {
+    const { harness, fileId } = await sendOne();
+    const middle = await harness.authed(`/bots/scout/chat/attachments/${fileId}`, {
+      headers: { range: "bytes=2-5" },
+    });
+    expect(middle.status).toBe(206);
+    expect(middle.headers.get("content-range")).toBe(`bytes 2-5/${PNG.byteLength}`);
+    expect(middle.headers.get("content-length")).toBe("4");
+    expect(new Uint8Array(await middle.arrayBuffer())).toEqual(PNG.slice(2, 6));
+
+    const suffix = await harness.authed(`/bots/scout/chat/attachments/${fileId}`, {
+      headers: { range: "bytes=-3" },
+    });
+    expect(suffix.status).toBe(206);
+    expect(new Uint8Array(await suffix.arrayBuffer())).toEqual(PNG.slice(-3));
+  });
+
+  it("answers unsatisfiable or multi-ranges with 416 and the full size", async () => {
+    const { harness, fileId } = await sendOne();
+    for (const range of [`bytes=${PNG.byteLength}-`, "bytes=0-1,4-5", "items=0-1"]) {
+      const res = await harness.authed(`/bots/scout/chat/attachments/${fileId}`, { headers: { range } });
+      expect(res.status).toBe(416);
+      expect(res.headers.get("content-range")).toBe(`bytes */${PNG.byteLength}`);
+      expect(res.headers.get("accept-ranges")).toBe("bytes");
+    }
   });
 
   it("serves the same row to another paired device", async () => {

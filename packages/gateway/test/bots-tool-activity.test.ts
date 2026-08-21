@@ -27,8 +27,10 @@ import {
   TOOL_ACTIVITY_THROTTLE_MS,
   TOOL_NAME_FALLBACK,
   TOOL_NAME_MAX,
+  TOOL_DETAIL_MAX,
   type ToolStepRecord,
   toolStepName,
+  toolStepDetail,
   toolStepStatus,
 } from "../src/hermes-bridge/tool-activity.ts";
 
@@ -185,6 +187,16 @@ describe("toolStepStatus", () => {
   });
 });
 
+describe("toolStepDetail", () => {
+  it("redacts common credentials and bounds the result", () => {
+    const detail = toolStepDetail(`Bearer abc.def token=hunter2 ${"x".repeat(TOOL_DETAIL_MAX + 100)}`);
+    expect(detail).toContain("Bearer [REDACTED]");
+    expect(detail).toContain("token=[REDACTED]");
+    expect(detail?.length).toBeLessThanOrEqual(TOOL_DETAIL_MAX);
+    expect(detail).not.toContain("hunter2");
+  });
+});
+
 describe("BotToolActivity: the frame", () => {
   it("raises a running step on tool.start, keyed to the chat's own turn", () => {
     const h = harness();
@@ -203,7 +215,7 @@ describe("BotToolActivity: the frame", () => {
     });
   });
 
-  it("NOTHING free-text crosses the wire: no args, no context, no result, no summary, no diff", () => {
+  it("only the bounded redacted summary crosses: raw args, context, result, and diff stay absent", () => {
     const h = harness();
     h.bind(RUNTIME, BOUND);
     h.start("call_1");
@@ -211,7 +223,7 @@ describe("BotToolActivity: the frame", () => {
     h.complete("call_1", { exit_code: 0, stdout: "AWS_SECRET=hunter2" });
 
     const serialized = JSON.stringify(h.frames);
-    for (const leak of ["rm -rf", "/tmp/x", "hunter2", "AWS_SECRET", "secret2", "Ran a thing", "command"]) {
+    for (const leak of ["rm -rf", "/tmp/x", "hunter2", "AWS_SECRET", "secret2", "command"]) {
       expect(serialized).not.toContain(leak);
     }
     // And the same for what is written to disk.
@@ -227,7 +239,7 @@ describe("BotToolActivity: the frame", () => {
     h.complete("call_1");
 
     expect(h.last().steps).toEqual([
-      { stepId: "call_1", seq: 1, name: "terminal", status: "ok", startedAt, endedAt: h.now() },
+      { stepId: "call_1", seq: 1, name: "terminal", status: "ok", startedAt, endedAt: h.now(), detail: "Ran a thing in 1.2s" },
     ]);
   });
 
@@ -274,7 +286,7 @@ describe("BotToolActivity: the frame", () => {
 
     // Order is first-STARTED, not first-finished, and each step keeps its own two timestamps.
     expect(h.last().steps).toEqual([
-      { stepId: "call_1", seq: 1, name: "terminal", status: "ok", startedAt: firstStartedAt, endedAt: h.now() },
+      { stepId: "call_1", seq: 1, name: "terminal", status: "ok", startedAt: firstStartedAt, endedAt: h.now(), detail: "Ran a thing in 1.2s" },
       {
         stepId: "call_2",
         seq: 2,
@@ -282,6 +294,7 @@ describe("BotToolActivity: the frame", () => {
         status: "ok",
         startedAt: firstStartedAt + 10,
         endedAt: secondEndedAt,
+        detail: "Ran a thing in 1.2s",
       },
     ]);
     expect(secondEndedAt).toBeLessThan(h.now());
@@ -306,7 +319,7 @@ describe("BotToolActivity: the frame", () => {
     h.complete("call_late");
 
     expect(h.last().steps).toEqual([
-      { stepId: "call_late", seq: 1, name: "terminal", status: "ok", startedAt: h.now(), endedAt: h.now() },
+      { stepId: "call_late", seq: 1, name: "terminal", status: "ok", startedAt: h.now(), endedAt: h.now(), detail: "Ran a thing in 1.2s" },
     ]);
   });
 
@@ -482,6 +495,8 @@ describe("BotToolActivity: bounds and lifecycle", () => {
         status: "running",
         startedAt: expect.any(Number),
         endedAt: undefined,
+        detail: undefined,
+        errorText: undefined,
       },
       {
         bot: "sage",
@@ -493,6 +508,8 @@ describe("BotToolActivity: bounds and lifecycle", () => {
         status: "ok",
         startedAt: expect.any(Number),
         endedAt: expect.any(Number),
+        detail: "Ran a thing in 1.2s",
+        errorText: undefined,
       },
     ]);
   });

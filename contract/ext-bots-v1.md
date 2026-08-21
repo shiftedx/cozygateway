@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 19 }
+"capabilities": { "com.cozylabs.bots": 21 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -177,6 +177,15 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   frame type or phase is introduced. `POST /bots/:name/sessions/new` mints and adopts a fresh empty
   chat without retiring the previous session, which stays listed and restorable. It broadcasts the
   existing `bot_chat_adopted` frame. A client that offers either action MUST require `>= 19`.
+- `20`: STREAMED ASSISTANT MEDIA. Assistant attachments may carry `mediaKind: "image" | "video" |
+  "audio"`. PNG, JPEG, GIF and WebP remain capped at 8 MB; MP4, MOV, M4A, MP3 and WAV are accepted
+  up to 40 MB. The authenticated attachment route supports single byte ranges so a player can seek
+  without downloading the whole file. A client MUST require `>= 20` before offering playback.
+- `21`: SAFE TOOL DETAILS. Tool steps may carry bounded, redacted `detail`, plus `errorText` only
+  for failed steps. Start detail comes only from Hermes `args_text`; completion detail comes only
+  from `summary` or `result_text`. Raw argument/result objects are never serialized. A client MUST
+  require `>= 21` before presenting a tool-detail surface; older clients keep rendering name and
+  status chips unchanged.
 
 ## 3. Resources
 
@@ -208,7 +217,7 @@ independent: activity in any session may still make the bot active.
   text: string,
   at: integer | null,                 // MILLISECONDS, null when the message carries no stamp
   clientId?: string,                  // the sender's own id, echoed; see below
-  attachments?: Attachment[]          // capability >= 9; ABSENT, never [], when there are none
+  attachments?: Attachment[]          // capability >= 9; mediaKind is available at >= 20
 }
 ```
 
@@ -253,9 +262,10 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
   therefore the identity of a rendered row and `clientId` is only the join back to the sender's
   optimistic copy; a client that keys its list on the clientId instead collapses two identical sends
   into one row.
-- `attachments`: images associated with this message, each one the frozen
+- `attachments`: media associated with this message, each one the frozen
   `attachment` block from `contract/v1.md` section 2:
-  `{ "type": "attachment", "fileId": string, "name": string, "mimeType": string, "size": integer }`.
+  `{ "type": "attachment", "fileId": string, "name": string, "mimeType": string, "size": integer,
+  "mediaKind"?: "image" | "video" | "audio" }`.
   `fileId` is gateway-scoped and opaque; it is never a URL and never a path, and it is fetched from
   `GET /bots/:name/chat/attachments/:fileId`. `name` is GENERATED (`photo.jpg`, `photo.png`), never
   any source filename, and `mimeType` is what the BYTES are rather than what an upload or dashboard
@@ -263,7 +273,9 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
   capability 9 it appears on user rows for photos sent with that row, riding the 202 body, later
   `bot_chat` frame and every history read. Since capability 15 it may also appear on assistant rows
   for successfully ingested `MEDIA:<path>` lines after the turn settles. Failed lines remain in
-  `text`; successful lines are removed and stay removed on later history reads.
+  `text`; successful lines are removed and stay removed on later history reads. From capability 20,
+  assistant rows may additionally carry MP4/MOV video or M4A/MP3/WAV audio. `mediaKind` is optional
+  so older stored rows remain valid; MIME type is the fallback classifier.
 - Hermes writes its own bookkeeping into the user row it persists for an image turn: an
   `@image:/absolute/path/on/the/hermes/host.png` directive line and a `[screenshot]` marker (and, on
   other paths, `[Image attached at: ...]` or `[User attached image: ...]`). Those lines are STRIPPED
@@ -829,6 +841,12 @@ client below 12 is unaffected by a field it never heard of. Steps are retained f
 hourly; a chat reset or a profile delete drops them immediately, with everything else keyed on the
 bot's name.
 
+At capability `>= 21`, a step may also carry `detail` and, only when its status is `error`,
+`errorText`. Each is redacted and capped at 4096 characters. The gateway reads `args_text` on start
+and `summary`/`result_text` on completion; it never forwards raw `args`, `result`, command context,
+inline diffs, or todo objects. Clients below 21 ignore the optional fields and retain the compact
+name/status strip.
+
 It names TURNS and never messages. See "bot_tool_activity, the live tool-step strip" in section 6
 for why the gateway will not guess which transcript row a turn produced, and for the chronological
 join a client uses instead -- `startedAt` and `BotChatMessage.at` are the same millisecond clock.
@@ -1023,7 +1041,7 @@ NEW chat, so no device is ever handed a session id that is a moment from being r
 
 ### POST /bots/:name/chat/photos
 
-Capability `>= 9`.
+Capability `>= 9`; byte-range behavior requires capability `>= 20`.
 
 ```
 content-type: multipart/form-data
@@ -1139,17 +1157,21 @@ is a property of the bot, best said on a bot's own screen rather than surfaced a
 Capability `>= 9`.
 
 ```
-200  <the image bytes>
-     content-type: the sniffed type of the stored image
+200  <the attachment bytes>
+206  <the requested single byte range>
+     accept-ranges: bytes
+     content-range: bytes <start>-<end>/<full-size>   // 206 only
+     content-type: the sniffed type of the stored media
      content-length: its size in bytes
      cache-control: private, max-age=86400
      x-content-type-options: nosniff
 
 400  invalid_request   // `name` is not a legal profile id, or fileId is not an attachment id
 404  not_found         // no attachment with that id belongs to this bot
+416  range_not_satisfiable
 ```
 
-Serves the gateway's OWN copy of an image. For a user row, these are the bytes a device uploaded.
+Serves the gateway's OWN copy of an attachment. For a user row, these are image bytes a device uploaded.
 For a capability-15 assistant row, these are bytes the gateway copied through Hermes' authenticated,
 size-capped and path-guarded dashboard read endpoints after the turn settled. In both cases the id
 was minted by this gateway and never contains a host path.
@@ -1164,8 +1186,9 @@ The header set is the capability-7 posture, for the same reasons: `nosniff` beca
 taken from an allow-list and confirmed against the bytes and nothing downstream should improve on it,
 and `private, max-age=86400` because the bytes are immutable (an id names one upload forever) and
 went through a device-token route, so they belong to that device rather than to any shared cache.
-Range requests are not supported and `Accept-Ranges` is not sent: the cap is 8 MB, so the answer is
-always one whole image.
+Capability 20 responses advertise `Accept-Ranges: bytes` and accept one closed, open-ended, or
+suffix range. Multiple ranges are rejected with 416. This lets AVPlayer fetch metadata and seek
+through a 40 MB audio/video attachment without buffering the complete object.
 
 **Images expire, conversations do not.** Stored bytes are kept for 14 days. After that the message
 keeps its post-ingest text and simply stops carrying the attachment block, and this route answers
@@ -1696,7 +1719,16 @@ This is a live Hermes read, not a gateway shadow. The gateway reads the profile-
 model options and config used by Hermes' edit screen. Catalog ids use `<provider>:<model>`, split on
 the first colon only. A null axis means Hermes has no profile pin for it.
 
-`catalog` contains only configured, authenticated provider rows and their selectable models.
+`catalog` contains only configured, authenticated provider rows and their selectable models. For
+each configured provider with an `api_url`, the gateway also probes its OpenAI-compatible
+`/v1/models` endpoint with a 750 ms timeout and a 30-second cache, then merges returned model ids.
+Static Hermes picker entries are the cold-start fallback. After a provider has answered
+successfully once, a failed refresh drops its stale discovered ids while leaving other providers
+available; one down provider never fails the whole catalog read.
+
+An operator runs one local model server instance per port and gives each instance its own provider
+entry and `api_url` in Hermes. That provider-to-port mapping is the source of truth; the gateway
+does not infer local processes or scan ports.
 `efforts` is Hermes' accepted vocabulary: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
 `max`, and `ultra`.
 

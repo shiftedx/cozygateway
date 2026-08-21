@@ -155,6 +155,7 @@ interface ApprovalRecord {
    *  from here on resolve, so nothing a client sends can steer which session gets answered. */
   runtimeId: string;
   turnId: string;
+  room: string | undefined;
   name: string;
   state: "pending" | ApprovalOutcome;
   timer: ReturnType<typeof setTimeout> | undefined;
@@ -291,6 +292,7 @@ export class BotApprovals {
       // draft never started) one is minted and then held for the life of the approval, so the
       // pending frame and the resolved frame always agree.
       turnId: this.#chat.turnId(runtimeSessionId) ?? `${runtimeSessionId}#approval-${this.#now()}-${(this.#mintSeq += 1)}`,
+      room: binding.room,
       name: approvalName(payload),
       state: "pending",
       timer: undefined,
@@ -320,6 +322,7 @@ export class BotApprovals {
       toolCallId,
       name: record.name,
       updatedAt: this.#now(),
+      ...(record.room === undefined ? {} : { room: record.room }),
     });
     this.#raisePush?.({
       kind: "approval_pending",
@@ -428,6 +431,7 @@ export class BotApprovals {
       toolCallId,
       outcome,
       updatedAt: this.#now(),
+      ...(record.room === undefined ? {} : { room: record.room }),
     });
     this.#raisePush?.({
       kind: "approval_resolved",
