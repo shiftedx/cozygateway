@@ -57,6 +57,7 @@ function canonicalSession(
   row: {
     id: string;
     kind?: "conversation" | "cron" | "routine" | "group" | "a2a";
+    startedAt?: number;
     lastActiveAt?: number;
     preview?: string | null;
   },
@@ -65,6 +66,7 @@ function canonicalSession(
   Array<{
     id: string;
     kind: "conversation" | "cron" | "routine" | "group" | "a2a";
+    startedAt: number;
     lastActiveAt: number;
     preview: string | null;
   }>
@@ -76,6 +78,7 @@ function canonicalSession(
         {
           id: row.id,
           kind: row.kind ?? "conversation",
+          startedAt: row.startedAt ?? NOW - 60_000,
           lastActiveAt: row.lastActiveAt ?? NOW - 30_000,
           preview: row.preview ?? null,
         },
@@ -236,6 +239,70 @@ describe("roster build", () => {
       active: true,
       lastActiveAt: NOW - 60_000,
       preview: { kind: "plain", text: "the canonical reply" },
+    });
+  });
+
+  it.each([
+    { manual: true, unwritten: false },
+    { manual: false, unwritten: true },
+  ])("uses a divergent $manual/$unwritten local pin just like the chat route", (localState) => {
+    const { profiles } = parseProfilesList({
+      profiles: [
+        profileRow({
+          ui_meta: { "hermes-bots": { chat: "stale-server-chat" } },
+        }),
+      ],
+    });
+    const pins = new Map([
+      [
+        "scout",
+        {
+          sessionId: "resolved-local-chat",
+          updatedAt: OLD_PIN,
+          ...localState,
+        },
+      ],
+    ]);
+    const [bot] = buildRoster(profiles, {
+      ...idle,
+      pins,
+      canonicalSessions: canonicalSession("scout", {
+        id: "resolved-local-chat",
+        preview: "the conversation the messages route serves",
+      }),
+    });
+
+    expect(bot).toMatchObject({
+      chatSessionId: "resolved-local-chat",
+      preview: { kind: "plain", text: "the conversation the messages route serves" },
+    });
+  });
+
+  it("follows a newer written conversation when the server pin is stale", () => {
+    const { profiles } = parseProfilesList({
+      profiles: [profileRow({ ui_meta: { "hermes-bots": { chat: "stale-server-chat" } } })],
+    });
+    const sessions = canonicalSession("scout", {
+      id: "resolved-local-chat",
+      preview: "the conversation the messages route serves",
+    });
+    sessions.get("scout")!.push({
+      id: "stale-server-chat",
+      kind: "conversation",
+      startedAt: NOW - 120_000,
+      lastActiveAt: NOW - 120_000,
+      preview: "old conversation",
+    });
+
+    const [bot] = buildRoster(profiles, {
+      ...idle,
+      pins: new Map([["scout", { sessionId: "resolved-local-chat", updatedAt: OLD_PIN }]]),
+      canonicalSessions: sessions,
+    });
+
+    expect(bot).toMatchObject({
+      chatSessionId: "resolved-local-chat",
+      preview: { kind: "plain", text: "the conversation the messages route serves" },
     });
   });
 

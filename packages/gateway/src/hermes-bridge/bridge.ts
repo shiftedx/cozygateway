@@ -26,6 +26,7 @@ import {
   mintCanonicalChat,
   resolveCanonicalChat,
   listBotSessions,
+  isConversationalSession,
   isConversationalSessionId,
   sessionKind,
   type CanonicalChatResult,
@@ -55,6 +56,7 @@ import {
 import { BotChatTurns, RuntimeSessionUnknown } from "./chat-turns.ts";
 import { parseChatSnapshot } from "./chat-messages.ts";
 import { ScheduledPushObserver } from "./scheduled-push.ts";
+import { effectiveChatPin, followLatestChatPin } from "./chat-pin.ts";
 import { inboxMessages as projectInboxMessages, inboxThread } from "./inbox.ts";
 import { firstLocalGeneration, nextLocalGeneration, readyIdentity } from "./link-generation.ts";
 import { GroupRooms } from "./group-rooms.ts";
@@ -911,6 +913,7 @@ export class HermesBridge implements BotsSurface {
           Array<{
             id: string;
             kind: ReturnType<typeof sessionKind>;
+            startedAt: number;
             lastActiveAt: number;
             preview: string | null;
           }>
@@ -926,6 +929,7 @@ export class HermesBridge implements BotsSurface {
                   rows.map((row) => ({
                     id: row.id,
                     kind: sessionKind(row),
+                    startedAt: row.startedAt,
                     lastActiveAt: row.lastActiveAt,
                     preview: row.preview,
                   })),
@@ -1331,15 +1335,27 @@ export class HermesBridge implements BotsSurface {
     // its own failures by design, so a local pin that is MANUAL (the user's explicit restore) or
     // UNWRITTEN (a freshly minted empty chat, invisible to session.list until its first prompt)
     // outranks a server pin that still names the chat it replaced.
-    let activeSessionId = serverPin !== undefined ? serverPin : (this.#storage.botChatPin(name) ?? null);
     const localEntry = this.#storage.botChatPinEntry(name);
-    if (
-      localEntry !== undefined &&
-      localEntry.sessionId !== activeSessionId &&
-      (localEntry.manual || this.#storage.botChatUnwritten(name, localEntry.sessionId))
-    ) {
-      activeSessionId = localEntry.sessionId;
-    }
+    const basePin = effectiveChatPin(
+      serverPin,
+      localEntry === undefined
+        ? undefined
+        : {
+            ...localEntry,
+            unwritten: this.#storage.botChatUnwritten(name, localEntry.sessionId),
+          },
+    );
+    const activeSessionId =
+      (typeof basePin === "string"
+        ? followLatestChatPin(basePin, rows, {
+            isConversational: isConversationalSession,
+            isRetired: this.#retiredOf(name),
+            manualSince:
+              localEntry?.manual === true && localEntry.sessionId === basePin
+                ? localEntry.updatedAt
+                : undefined,
+          })
+        : basePin) ?? null;
     return {
       sessions: rows.map((row) => ({
         id: row.id,

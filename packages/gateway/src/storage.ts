@@ -592,11 +592,34 @@ export class Storage {
   /** Every pin with the stamp of the write that made it. The roster build needs the stamps: a pin
    *  written after the `profiles.list` it is being merged with cannot have been contradicted by
    *  that snapshot, and it is what keeps `GET /bots` agreeing with `GET /bots/:name/chat`. */
-  botChatPinEntries(): Map<string, { sessionId: string; updatedAt: number }> {
+  botChatPinEntries(): Map<
+    string,
+    { sessionId: string; updatedAt: number; manual: boolean; unwritten: boolean }
+  > {
     const rows = this.#db
-      .prepare("SELECT name, session_id AS sessionId, updated_at AS updatedAt FROM bot_chat_pins")
-      .all() as unknown as Array<{ name: string; sessionId: string; updatedAt: number }>;
-    return new Map(rows.map((row) => [row.name, { sessionId: row.sessionId, updatedAt: row.updatedAt }]));
+      .prepare(
+        `SELECT name, session_id AS sessionId, updated_at AS updatedAt, manual,
+                runtime_id IS NOT NULL AS unwritten
+           FROM bot_chat_pins`,
+      )
+      .all() as unknown as Array<{
+        name: string;
+        sessionId: string;
+        updatedAt: number;
+        manual: number;
+        unwritten: number;
+      }>;
+    return new Map(
+      rows.map((row) => [
+        row.name,
+        {
+          sessionId: row.sessionId,
+          updatedAt: row.updatedAt,
+          manual: row.manual === 1,
+          unwritten: row.unwritten === 1,
+        },
+      ]),
+    );
   }
 
   botChatPins(): Map<string, string> {

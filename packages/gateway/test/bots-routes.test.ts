@@ -213,6 +213,51 @@ describe("GET /bots", () => {
     await bridge.refresh("test");
     expect(frames.length).toBe(before);
   });
+
+  it("previews the newer resolved conversation instead of a stale server pin", async () => {
+    const { authed, bridge, storage } = await setup({
+      methods: {
+        "profiles.list": () =>
+          profilesListResult([
+            { ...scoutRow, ui_meta: { "hermes-bots": { title: "Scout", chat: "stale-chat" } } },
+          ]),
+        "session.list": () => ({
+          sessions: [
+            {
+              id: "resolved-chat",
+              title: CANONICAL_CHAT_TITLE,
+              preview: "latest real reply",
+              created_at: NOW / 1000 - 30,
+              last_active: NOW / 1000 - 5,
+            },
+            {
+              id: "stale-chat",
+              title: CANONICAL_CHAT_TITLE,
+              preview: "older reply",
+              created_at: NOW / 1000 - 120,
+              last_active: NOW / 1000 - 90,
+            },
+          ],
+        }),
+      },
+    });
+    storage.setBotChatPin("scout", "resolved-chat", NOW - 60_000);
+    await bridge.refresh("resolved chat regression");
+
+    const body = (await (await authed("/bots")).json()) as {
+      bots: Array<{ chatSessionId: string | null; preview: { kind: string; text: string } }>;
+    };
+    expect(body.bots[0]).toMatchObject({
+      chatSessionId: "resolved-chat",
+      preview: { kind: "plain", text: "latest real reply" },
+    });
+    expect(await (await authed("/bots/scout/sessions")).json()).toMatchObject({
+      activeSessionId: "resolved-chat",
+    });
+    expect(await (await authed("/bots/scout/chat")).json()).toMatchObject({
+      sessionId: "resolved-chat",
+    });
+  });
 });
 
 describe("GET /bots/:name/chat", () => {

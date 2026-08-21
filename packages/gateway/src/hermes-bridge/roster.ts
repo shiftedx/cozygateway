@@ -1,5 +1,7 @@
 import type { BotPreview, BotSummary } from "cozygateway-contract";
 
+import { effectiveChatPin, followLatestChatPin, type LocalChatPin } from "./chat-pin.ts";
+
 /** Pure roster construction: everything the bridge derives from a `profiles.list` response, with
  *  no sockets, no clock of its own, and no storage. Kept pure so the desktop conventions it
  *  reimplements (dissection sections 2, 3 and 7) are directly unit-testable.
@@ -285,16 +287,16 @@ export function botActivityAt(profile: ParsedProfile): number {
 }
 
 export interface RosterBuildOptions extends PresenceContext {
-  /** Canonical-chat pins the gateway holds locally, by profile name, each with the stamp of the
-   *  write that made it. Consulted through `resolveChatPin`, so `GET /bots` reports exactly the
-   *  pin `GET /bots/:name/chat` would resolve: a profile with no bot blob falls back to the local
-   *  record, a blob without `chat` is an authoritative clear (dissection 3.2), and a local pin
-   *  written AFTER this snapshot was taken outlives that clear because the snapshot cannot have
-   *  seen it.
+  /** Canonical-chat pins the gateway holds locally, by profile name, each with the state needed by
+   *  the chat route's precedence rules. `GET /bots` first merges the server and local pins, then
+   *  applies the same follow-latest rule as `GET /bots/:name/chat`: a profile with no bot blob falls
+   *  back to the local record, a blob without `chat` is an authoritative clear (dissection 3.2), a
+   *  manual/unwritten local choice survives losable server writeback, and a newer conversational
+   *  session can outrun an older pin.
    *
    *  `now` doubles as the snapshot stamp, so the caller must pass the moment it asked Hermes for
    *  this data and stamp the cached roster with the same value. */
-  pins: ReadonlyMap<string, { sessionId: string; updatedAt: number }>;
+  pins: ReadonlyMap<string, LocalChatPin>;
   /** Profile names the operator has hidden (`hiddenProfiles` in the bridge config). They stay REAL
    *  profiles Hermes-side and every by-name route still addresses them; they are simply left off
    *  the roster this gateway serves, which is how a box whose Hermes also runs automation profiles
@@ -314,6 +316,7 @@ export interface RosterBuildOptions extends PresenceContext {
     readonly {
       id: string;
       kind: "conversation" | "cron" | "routine" | "group" | "a2a";
+      startedAt: number;
       lastActiveAt: number;
       preview: string | null;
     }[]
@@ -327,17 +330,25 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
   const visible = opts.hidden === undefined ? profiles : profiles.filter((p) => !opts.hidden?.has(p.name));
   const rows = visible.map((profile) => {
     const meta = profile.meta;
-    // One rule, shared with the chat route (`resolveChatPin`): a server blob is the whole truth
-    // about `chat` unless this gateway wrote a newer pin than the snapshot could have seen.
+    // These are the same two decisions the chat route makes: merge its server/local evidence, then
+    // let a newer conversational session outrun the resulting pin. Keeping both shared prevents the
+    // roster preview from quoting a different conversation than the transcript route opens.
     const local = opts.pins.get(profile.name);
-    const resolved = resolveChatPin(meta, local, opts.now, opts.uiMetaSupported ?? true);
-    const chatSessionId = resolved === undefined ? (local?.sessionId ?? null) : resolved;
+    const serverPin = resolveChatPin(meta, local, opts.now, opts.uiMetaSupported ?? true);
+    const basePin = effectiveChatPin(serverPin, local);
+    const sessions = opts.canonicalSessions.get(profile.name) ?? [];
+    const chatSessionId =
+      (typeof basePin === "string"
+        ? followLatestChatPin(basePin, sessions, {
+            isConversational: (session) => session.kind === "conversation",
+            manualSince:
+              local?.manual === true && local.sessionId === basePin ? local.updatedAt : undefined,
+          })
+        : basePin) ?? null;
     const canonical =
       chatSessionId === null
         ? undefined
-        : opts.canonicalSessions
-            .get(profile.name)
-            ?.find((session) => session.id === chatSessionId && session.kind === "conversation");
+        : sessions.find((session) => session.id === chatSessionId && session.kind === "conversation");
     const group = asString(meta?.["group"])?.trim();
     const summary: BotSummary = {
       name: profile.name,

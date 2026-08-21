@@ -26,6 +26,7 @@
  *  means here and `resolvePin` for the guards. */
 
 import { A2A_RE } from "./roster.ts";
+import { effectiveChatPin, followLatestChatPin } from "./chat-pin.ts";
 
 /** The session title the Hermes prompt builder gates its bot-mode protocol injection on. Exact
  *  match, including case. */
@@ -334,8 +335,8 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
   const limit = deps.listLimit ?? 100;
   // `??` would be wrong here: it collapses an explicit server clear (null) back onto the local
   // pin, which is exactly the resurrection dissection 3.2 forbids.
-  let pin = deps.serverPin !== undefined ? deps.serverPin : deps.pins.get(name);
   const localEntry = deps.pins.entry?.(name);
+  const localId = localEntry?.sessionId ?? deps.pins.get(name);
   // A MANUAL restore is the user's explicit choice, and `#saveServerPin` swallows its own
   // failures by design, so a server pin that still names the pre-restore chat is stale
   // evidence, not a countermand. The durable manual record is the only witness of the choice
@@ -345,14 +346,17 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
   // The same rule extends to an UNWRITTEN local pin (capability 19 sessions/new): the fresh empty
   // chat is invisible to session.list and the server-pin write may have been swallowed, so a stale
   // server pin naming the replaced conversation must not outrank the chat the user just started.
-  if (
-    typeof pin === "string" &&
-    localEntry !== undefined &&
-    localEntry.sessionId !== pin &&
-    (localEntry.manual === true || deps.isUnwritten?.(localEntry.sessionId) === true)
-  ) {
-    pin = localEntry.sessionId;
-  }
+  let pin = effectiveChatPin(
+    deps.serverPin,
+    localId === undefined
+      ? undefined
+      : {
+          sessionId: localId,
+          updatedAt: localEntry?.updatedAt ?? 0,
+          manual: localEntry?.manual === true,
+          unwritten: deps.isUnwritten?.(localId) === true,
+        },
+  );
   const manualSince =
     localEntry?.manual === true && localEntry.sessionId === pin ? localEntry.updatedAt : undefined;
   const rows = await listBotSessions(deps.rpc, name, limit);
@@ -483,21 +487,17 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
   // therefore resolved by the pin-not-listed branch above and never reaches this one, and once the
   // replacement does become listed it is the newest row, so there is nothing above it to re-adopt.
   // The retired session, meanwhile, is not a candidate at any point.
-  const pinIndex = rows.findIndex((row) => row.id === pin);
-  const newer = rows
-    .slice(0, pinIndex)
-    .find(
-      (row) =>
-        !isRetired(row.id) &&
-        isConversationalSession(row) &&
-        // A manual choice ignores conversations that already existed above it. Its pin resumes
-        // following only when a conversation CREATED after the choice appears. An older Hermes
-        // row without a creation stamp cannot prove that, so it does not override a manual choice.
-        (manualSince === undefined || (row.startedAt !== 0 && row.startedAt > manualSince)),
-    );
-  if (newer !== undefined) {
-    deps.pins.set(name, newer.id);
-    return { sessionId: newer.id, adoption: "latest", previousSessionId: pin };
+  const followedPin = followLatestChatPin(pin, rows, {
+    isConversational: isConversationalSession,
+    isRetired,
+    // A manual choice ignores conversations that already existed above it. Its pin resumes
+    // following only when a conversation CREATED after the choice appears. An older Hermes row
+    // without a creation stamp cannot prove that, so it does not override a manual choice.
+    manualSince,
+  });
+  if (followedPin !== pin) {
+    deps.pins.set(name, followedPin);
+    return { sessionId: followedPin, adoption: "latest", previousSessionId: pin };
   }
 
   deps.pins.set(name, pin);
