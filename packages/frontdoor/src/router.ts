@@ -78,6 +78,8 @@ export function proxyRequest(
         ended = true;
         res.destroy();
         streams.delete(sid);
+      } else {
+        abortStream("invalid response frame");
       }
     },
   });
@@ -160,6 +162,8 @@ export function proxyUpgrade(
         ended = true;
         streams.delete(sid);
         socket.destroy();
+      } else {
+        abortStream("invalid response frame");
       }
     },
   });

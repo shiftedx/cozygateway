@@ -192,6 +192,17 @@ describe("frontdoor server", () => {
     await expect(aborted).resolves.toMatchObject({ t: "abort" });
   });
 
+  it("aborts a stream when the agent sends an open frame", async () => {
+    const { fd, credential, hostname } = await boot();
+    agent = await connectAgent(fd.url, credential);
+    const aborted = abortOnResponseFrames((sid) => [{
+      t: "open", sid, method: "GET", path: "/wrong-direction", headers: {}, upgrade: false,
+    }]);
+    const pending = request(fd.port, hostname, "/invalid-open");
+    await expect(pending).rejects.toThrow();
+    await expect(aborted).resolves.toMatchObject({ t: "abort" });
+  });
+
   it("treats a registry link without a server stream table as offline", async () => {
     const { fd, hostname } = await boot();
     const householdId = fd.storage.householdIdForHostname(hostname);

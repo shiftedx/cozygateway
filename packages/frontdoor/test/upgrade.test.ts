@@ -142,5 +142,38 @@ it("ends a non-101 upgrade response without sending a second abort", async () =>
   expect(sawAbort).toBe(false);
 });
 
+it("aborts an upgraded stream when the agent sends an open frame", async () => {
+  dir = mkdtempSync(join(tmpdir(), "fd-up-invalid-"));
+  fd = await startFrontdoor({
+    port: 0, host: "127.0.0.1", dbPath: join(dir, "db.sqlite"),
+    pool: ["relay-01.cozylabs.ai"], maxHouseholds: 10, provisionsPerHourPerIp: 100, apiHostnames: [],
+  });
+  const grant = await (await fetch(`${fd.url}/provision`, { method: "POST", body: "{}" })).json() as { credential: string };
+  agent = await new Promise<WebSocket>((resolve, reject) => {
+    const ws = new WebSocket(fd!.url.replace("http", "ws") + "/agent", {
+      headers: { authorization: `Bearer ${grant.credential}` },
+    });
+    ws.on("open", () => resolve(ws));
+    ws.on("error", reject);
+  });
+
+  const aborted = new Promise<void>((resolve, reject) => {
+    agent!.on("message", (raw) => {
+      const frame = decodeFrame(String(raw));
+      if (frame?.t === "open" && frame.upgrade) {
+        agent!.send(encodeFrame({
+          t: "open", sid: frame.sid, method: "GET", path: "/wrong-direction", headers: {}, upgrade: true,
+        }));
+      } else if (frame?.t === "abort") {
+        resolve();
+      }
+    });
+    agent!.on("error", reject);
+  });
+
+  await expect(rawUpgrade(fd.port)).resolves.toBe("");
+  await expect(aborted).resolves.toBeUndefined();
+});
+
 const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const acceptKey = (key: string) => createHash("sha1").update(key + WS_MAGIC).digest("base64");
