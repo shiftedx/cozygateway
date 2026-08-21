@@ -27,6 +27,7 @@ beforeEach(async () => {
     gatewayInfo: { name: "g", version: "0.1.0", contract: "v1" },
     now: () => 1_000,
     authTimeoutMs: 200,
+    heartbeatMs: 25,
   });
   server = createServer();
   server.on("upgrade", (req, socket, head) => hub.handleUpgrade(req, socket, head));
@@ -249,5 +250,17 @@ describe("per-device presence", () => {
     expect(hub.isDeviceConnected("d1")).toBe(true);
     hub.closeDevice("d1");
     await until(() => !hub.isDeviceConnected("d1"));
+  });
+
+  it("expires an authenticated socket that stops answering heartbeat pings", async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { autoPong: false } as never);
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((frame) => frame.type === "ready"));
+    expect(hub.isDeviceConnected("d1")).toBe(true);
+
+    await until(() => !hub.isDeviceConnected("d1"), 500);
+    expect(ws.readyState).toBe(WebSocket.CLOSED);
   });
 });

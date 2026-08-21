@@ -60,7 +60,18 @@ interface Harness {
 
 async function setup(
   behavior: FakeHermesBehavior = {},
-  overrides: { chatPollMs?: number; chatTurnTimeoutMs?: number; chatDeltaThrottleMs?: number } = {},
+  overrides: {
+    chatPollMs?: number;
+    chatTurnTimeoutMs?: number;
+    chatDeltaThrottleMs?: number;
+    onChatMessage?: (event: {
+      bot: string;
+      displayName: string;
+      messageId: string;
+      chatSessionId: string;
+      preview: string;
+    }) => void;
+  } = {},
 ): Promise<Harness> {
   const server = await startFakeHermesServer(behavior);
   servers.push(server);
@@ -85,6 +96,7 @@ async function setup(
     chatPollMs: overrides.chatPollMs ?? 10,
     chatTurnTimeoutMs: overrides.chatTurnTimeoutMs ?? 2_000,
     chatDeltaThrottleMs: overrides.chatDeltaThrottleMs ?? 10,
+    ...(overrides.onChatMessage === undefined ? {} : { onChatMessage: overrides.onChatMessage }),
   });
   bridges.push(bridge);
 
@@ -126,7 +138,7 @@ async function setup(
 
 interface FakeBotState {
   meta: Record<string, unknown> | null;
-  sessions: Array<{ id: string; title: string }>;
+  sessions: Array<{ id: string; title: string; source?: string; preview?: string; last_active?: number }>;
   created: number;
   /** stored session id -> RUNTIME session id, the only id `prompt.submit` accepts. */
   runtime: Map<string, string>;
@@ -142,7 +154,7 @@ interface FakeBotState {
 function fakeBotMode(options: {
   /** Sessions `session.list` reports. Empty models a chat nobody has written in, which persists no
    *  row and is therefore unlistable. */
-  sessions?: Array<{ id: string; title: string }>;
+  sessions?: Array<{ id: string; title: string; source?: string; preview?: string; last_active?: number }>;
   messages?: Array<Record<string, unknown>>;
   running?: () => boolean;
   /** Omit to make `profiles.configure` an unknown method, which is what an old gateway does. */
@@ -841,5 +853,80 @@ describe("bot_chat_delta", () => {
     // moved past it (7 added the media proxy, 8 the chat reset, 9 photos to bots, 10 approve/deny,
     // 11 the empty fresh chat and its suggestion), which is exactly why a client compares `>=`.
     expect(BOTS_CAPABILITY_VERSION).toBeGreaterThanOrEqual(6);
+  });
+});
+
+describe("scheduled assistant push seam (cozygateway#119)", () => {
+  it("raises a settled message for an unbound cron session", async () => {
+    const sessionId = "cron_job7_1755600000";
+    const messages = [{ id: "cron-a1", role: "assistant", content: "scheduled digest" }];
+    const { behavior } = fakeBotMode({
+      sessions: [{ id: sessionId, title: "Nightly digest · Aug 20 03:00", source: "cron" }],
+      messages,
+    });
+    const events: Array<{
+      bot: string;
+      displayName: string;
+      messageId: string;
+      chatSessionId: string;
+      preview: string;
+    }> = [];
+    const { server } = await setup(behavior, { onChatMessage: (event) => events.push(event) });
+
+    // Scheduler-originated work was not submitted through CozyChat, so its runtime session has no
+    // BotChatStream binding. The bridge still has to resolve the settled session and raise push.
+    server.streamMessage("runtime-1", { deltas: ["scheduled digest"] });
+    await until(() => events.length > 0, 1_000);
+
+    expect(events).toEqual([
+      {
+        bot: "scout",
+        displayName: "Scout",
+        messageId: "cron-a1",
+        chatSessionId: sessionId,
+        preview: "scheduled digest",
+      },
+    ]);
+
+    // A replayed completion (Hermes reconnects can replay event edges) must not produce a second
+    // push for the same persisted assistant row.
+    server.streamMessage("runtime-1", { deltas: ["scheduled digest"] });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(events).toHaveLength(1);
+  });
+
+  it.each([
+    { title: CANONICAL_CHAT_TITLE },
+    { title: "Group: Release Room" },
+    { title: "handoff", preview: "Message from agent 'scout': scheduled digest" },
+  ])("does not raise an unbound $title session", async (session) => {
+    const { behavior } = fakeBotMode({
+      sessions: [{ id: "other-1", ...session }],
+      messages: [{ id: "other-a1", role: "assistant", content: "scheduled digest" }],
+    });
+    const events: unknown[] = [];
+    const { server } = await setup(behavior, { onChatMessage: (event) => events.push(event) });
+
+    server.streamMessage("runtime-1", { deltas: ["scheduled digest"] });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(events).toHaveLength(0);
+    expect(server.callsOf("session.resume")).toHaveLength(0);
+  });
+
+  it("retries until the completed cron row becomes listable", async () => {
+    const messages = [{ id: "late-a1", role: "assistant", content: "late digest" }];
+    const { behavior, state } = fakeBotMode({ messages });
+    const events: Array<{ messageId: string }> = [];
+    const { server } = await setup(behavior, { onChatMessage: (event) => events.push(event) });
+
+    server.streamMessage("runtime-late", { deltas: ["late digest"] });
+    setTimeout(() => {
+      state.sessions.push({ id: "cron_late_1755600000", title: "Late digest", source: "cron" });
+      state.runtime.set("cron_late_1755600000", "runtime-late");
+    }, 25);
+
+    await until(() => events.length === 1, 1_000);
+    expect(events.map((event) => event.messageId)).toEqual(["late-a1"]);
   });
 });
