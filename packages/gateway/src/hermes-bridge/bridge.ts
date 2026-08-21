@@ -54,6 +54,7 @@ import {
 } from "./approvals.ts";
 import { BotChatTurns, RuntimeSessionUnknown } from "./chat-turns.ts";
 import { parseChatSnapshot } from "./chat-messages.ts";
+import { ScheduledPushObserver } from "./scheduled-push.ts";
 import { inboxMessages as projectInboxMessages, inboxThread } from "./inbox.ts";
 import { firstLocalGeneration, nextLocalGeneration, readyIdentity } from "./link-generation.ts";
 import { GroupRooms } from "./group-rooms.ts";
@@ -438,6 +439,7 @@ export class HermesBridge implements BotsSurface {
   readonly #hidden: ReadonlySet<string>;
   readonly #bridgeProfile: string | undefined;
   readonly #deleteTimeoutMs: number;
+  readonly #scheduledPush: ScheduledPushObserver | undefined;
   readonly #rosterPollMs: number;
   readonly #routinesPollMs: number;
   readonly #focusTtlMs: number;
@@ -564,6 +566,24 @@ export class HermesBridge implements BotsSurface {
       now: this.#now,
       ...(opts.chatDeltaThrottleMs === undefined ? {} : { throttleMs: opts.chatDeltaThrottleMs }),
     });
+    this.#scheduledPush =
+      opts.onChatMessage === undefined
+        ? undefined
+        : new ScheduledPushObserver({
+            rpc: this.#client,
+            hidden: this.#hidden,
+            binding: (runtimeId) => this.#stream.binding(runtimeId),
+            deliver: (event) => {
+              opts.onChatMessage?.({
+                bot: event.bot,
+                displayName: this.#memberInfo(event.bot).displayName,
+                messageId: event.messageId,
+                chatSessionId: event.chatSessionId,
+                preview: event.text,
+              });
+            },
+            log: this.#log,
+          });
     this.#chat = new BotChatTurns({
       rpc: this.#client,
       broadcast: this.#broadcast,
@@ -805,6 +825,7 @@ export class HermesBridge implements BotsSurface {
       // this gateway does with events is below; the stream reads its three types and ignores the
       // rest, chain-of-thought events emphatically included.
       this.#stream.handleEvent(event);
+      this.#scheduledPush?.handleEvent(event);
       // The approval leg. Registered here, at the fan-out, and NOT as a case inside
       // `chat-stream.ts`'s switch, whose `default:` is a deliberate reasoning-leak allow-list that
       // must keep dropping everything it does not name.
@@ -2276,6 +2297,7 @@ export class HermesBridge implements BotsSurface {
     this.#stream.close();
     this.#approvals.close();
     this.#toolActivity.close();
+    this.#scheduledPush?.close();
     // Awaited: a room drive that is mid-turn holds a reference to the storage the caller is about
     // to close, and it must be finished with it before this resolves.
     await this.#groups.close();

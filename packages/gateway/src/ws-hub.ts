@@ -15,13 +15,17 @@ import { hashToken } from "./auth.ts";
 interface Client {
   socket: WebSocket;
   deviceId: string;
+  heartbeatAlive: boolean;
 }
+
+const HEARTBEAT_MS = 5_000;
 
 export class WsHub {
   readonly #storage: Storage;
   readonly #gatewayInfo: GatewayInfo;
   readonly #now: () => number;
   readonly #authTimeoutMs: number;
+  readonly #heartbeatTimer: ReturnType<typeof setInterval>;
   readonly #clients = new Set<Client>();
   // Counts sockets per device rather than a boolean, so a second socket for the same device
   // (e.g. a reconnect racing a still-closing prior connection) doesn't get "undone" by the
@@ -34,17 +38,21 @@ export class WsHub {
     gatewayInfo: GatewayInfo;
     now: () => number;
     authTimeoutMs?: number;
+    heartbeatMs?: number;
   }) {
     this.#storage = deps.storage;
     this.#gatewayInfo = deps.gatewayInfo;
     this.#now = deps.now;
     this.#authTimeoutMs = deps.authTimeoutMs ?? 10_000;
+    const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_MS;
     // noServer: true means this WebSocketServer never attaches its own 'upgrade' listener; the
     // caller routes matching requests to handleUpgrade() below. See upgrade-dispatcher.ts.
     this.#wss = new WebSocketServer({ noServer: true });
     // Swallow server-level errors: an unhandled 'error' event would crash the process.
     this.#wss.on("error", () => {});
     this.#wss.on("connection", (socket) => this.#onConnection(socket));
+    this.#heartbeatTimer = setInterval(() => this.#heartbeat(), heartbeatMs);
+    this.#heartbeatTimer.unref?.();
   }
 
   /** Completes a WebSocket handshake for an upgrade request already routed to this hub by
@@ -101,7 +109,7 @@ export class WsHub {
         }
         clearTimeout(authTimer);
         this.#storage.touchDevice(device.id, this.#now());
-        client = { socket, deviceId: device.id };
+        client = { socket, deviceId: device.id, heartbeatAlive: true };
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
         this.#send(socket, { type: "ready", deviceId: device.id, gateway: this.#gatewayInfo });
@@ -122,6 +130,10 @@ export class WsHub {
       this.#send(socket, { type: "synced" });
     });
 
+    socket.on("pong", () => {
+      if (client !== undefined) client.heartbeatAlive = true;
+    });
+
     socket.on("close", () => {
       clearTimeout(authTimer);
       if (client !== undefined) {
@@ -138,6 +150,24 @@ export class WsHub {
     const count = (this.#deviceCounts.get(deviceId) ?? 1) - 1;
     if (count <= 0) this.#deviceCounts.delete(deviceId);
     else this.#deviceCounts.set(deviceId, count);
+  }
+
+  /** A socket can remain OPEN in Node after the phone process has disappeared and before TCP's own
+   *  much longer timeout notices. One missed application heartbeat is tolerated; the next tick
+   *  terminates it, so dead sockets stop suppressing push within two short intervals. */
+  #heartbeat(): void {
+    for (const client of this.#clients) {
+      if (!client.heartbeatAlive) {
+        client.socket.terminate();
+        continue;
+      }
+      client.heartbeatAlive = false;
+      try {
+        client.socket.ping();
+      } catch {
+        client.socket.terminate();
+      }
+    }
   }
 
   broadcast(frame: ServerFrame): void {
@@ -166,6 +196,7 @@ export class WsHub {
   }
 
   close(): void {
+    clearInterval(this.#heartbeatTimer);
     for (const client of this.#clients) client.socket.close(1001, "server shutdown");
     this.#wss.close();
   }
