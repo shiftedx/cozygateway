@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS bot_chat_tool_steps (
   status TEXT NOT NULL,
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
+  detail TEXT,
+  error_text TEXT,
   PRIMARY KEY (bot, turn_id, step_id)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_session
@@ -870,6 +872,38 @@ export class Storage {
     return row;
   }
 
+  /** Metadata-only attachment lookup for HTTP range negotiation. This deliberately leaves the BLOB
+   *  out of the SELECT so a 40 MB video HEAD request or rejected range does not materialize it. */
+  botChatAttachmentInfo(
+    bot: string,
+    fileId: string,
+    notBefore: number,
+  ): { mime: string; name: string; size: number } | undefined {
+    return this.#db
+      .prepare(
+        "SELECT mime, name, size FROM bot_chat_attachments WHERE bot = ? AND file_id = ? AND created_at >= ?",
+      )
+      .get(bot, fileId, notBefore) as { mime: string; name: string; size: number } | undefined;
+  }
+
+  /** Reads one byte slice directly in SQLite. SQLite `substr` is one-indexed for BLOBs, while the
+   *  HTTP range passed here is zero-indexed. No full attachment buffer is created for ranged reads. */
+  botChatAttachmentSlice(
+    bot: string,
+    fileId: string,
+    notBefore: number,
+    offset: number,
+    length: number,
+  ): Uint8Array | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT substr(bytes, ?, ?) AS bytes FROM bot_chat_attachments
+         WHERE bot = ? AND file_id = ? AND created_at >= ?`,
+      )
+      .get(offset + 1, length, bot, fileId, notBefore) as { bytes: Uint8Array } | undefined;
+    return row?.bytes;
+  }
+
   /** The attachment blocks belonging to one transcript row, in insert order. Answers `[]` for the
    *  overwhelming majority of rows, which is why the index is on `(session_id, message_id)`.
    *
@@ -945,15 +979,19 @@ export class Storage {
     status: string;
     startedAt: number;
     endedAt: number | undefined;
+    detail?: string | undefined;
+    errorText?: string | undefined;
   }): void {
     this.#db
       .prepare(
         `INSERT INTO bot_chat_tool_steps
-           (bot, session_id, turn_id, step_id, seq, name, status, started_at, ended_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (bot, session_id, turn_id, step_id, seq, name, status, started_at, ended_at, detail, error_text)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(bot, turn_id, step_id) DO UPDATE SET
            status = excluded.status,
            ended_at = COALESCE(excluded.ended_at, bot_chat_tool_steps.ended_at),
+           detail = COALESCE(excluded.detail, bot_chat_tool_steps.detail),
+           error_text = COALESCE(excluded.error_text, bot_chat_tool_steps.error_text),
            name = CASE WHEN bot_chat_tool_steps.name = '' THEN excluded.name ELSE bot_chat_tool_steps.name END`,
       )
       .run(
@@ -966,6 +1004,8 @@ export class Storage {
         step.status,
         step.startedAt,
         step.endedAt ?? null,
+        step.detail ?? null,
+        step.errorText ?? null,
       );
   }
 
@@ -983,11 +1023,13 @@ export class Storage {
     status: string;
     startedAt: number;
     endedAt: number | null;
+    detail: string | null;
+    errorText: string | null;
   }> {
     return this.#db
       .prepare(
         `SELECT turn_id AS turnId, step_id AS stepId, seq, name, status,
-                started_at AS startedAt, ended_at AS endedAt
+                started_at AS startedAt, ended_at AS endedAt, detail, error_text AS errorText
          FROM bot_chat_tool_steps
          WHERE session_id = ? AND started_at >= ?
          ORDER BY started_at, seq, step_id`,
@@ -1000,6 +1042,8 @@ export class Storage {
       status: string;
       startedAt: number;
       endedAt: number | null;
+      detail: string | null;
+      errorText: string | null;
     }>;
   }
 
@@ -1297,5 +1341,9 @@ export function openStorage(dbPath: string): Storage {
   // Capability 16: an explicit session adoption holds until a later conversational session is
   // created. Existing pins are automatic, which is exactly the zero default.
   addColumnIfMissing(db, "bot_chat_pins", "manual", "INTEGER NOT NULL DEFAULT 0 CHECK (manual IN (0, 1))");
+  // Capability 21: bounded redacted tool detail. Existing rows remain valid and simply have no
+  // detail, which keeps older transcript history honest rather than manufacturing descriptions.
+  addColumnIfMissing(db, "bot_chat_tool_steps", "detail", "TEXT");
+  addColumnIfMissing(db, "bot_chat_tool_steps", "error_text", "TEXT");
   return new Storage(db);
 }

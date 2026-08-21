@@ -62,6 +62,7 @@ import { firstLocalGeneration, nextLocalGeneration, readyIdentity } from "./link
 import { GroupRooms } from "./group-rooms.ts";
 import { PHOTO_SWEEP_MS, PHOTO_TTL_MS, newPhotoFileId, photoDisplayName, sniffImageType } from "./photos.ts";
 import { decodeAssistantMediaDataUrl } from "./assistant-media.ts";
+import { createMediaLimiter } from "./media.ts";
 import {
   BotDeleteRefused,
   BotNotFound,
@@ -248,9 +249,10 @@ export interface BotsSurface {
     name: string,
     photo: BotChatPhotoUpload,
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
-  /** The gateway's own copy of a chat image, for `GET /bots/:name/chat/attachments/:fileId`. Scoped
-   *  to the bot, so one bot's URL never serves another's picture. */
-  chatAttachment(name: string, fileId: string): BotChatAttachmentBytes | undefined;
+  /** Metadata and sliced bytes for the authenticated attachment route. Kept separate so range
+   *  negotiation and HEAD-like probes never materialize a large media BLOB. */
+  chatAttachmentInfo(name: string, fileId: string): BotChatAttachmentInfo | undefined;
+  chatAttachmentSlice(name: string, fileId: string, offset: number, length: number): Uint8Array | undefined;
   createBot(input: BotCreateRequest): Promise<BotCreated>;
   deleteBot(name: string): Promise<DeletePath>;
   botProfile(name: string): Promise<BotProfile>;
@@ -300,6 +302,8 @@ export interface BotChatAttachmentBytes {
   name: string;
   size: number;
 }
+
+export type BotChatAttachmentInfo = Omit<BotChatAttachmentBytes, "bytes">;
 
 /** What `POST /bots/:name/chat/reset` answers with. */
 export interface ChatResetResult {
@@ -450,6 +454,9 @@ export class HermesBridge implements BotsSurface {
 
   readonly #catalogTtlMs: number;
   readonly #catalogDegradedTtlMs: number;
+  /** Assistant dashboard reads decode base64 into memory. Two at a time bounds the 40 MB media
+   *  expansion across bots while each bot's directives remain serialized by BotChatTurns. */
+  readonly #assistantMediaLimiter = createMediaLimiter(2);
 
   readonly #focus = new Map<string, { screen: BotFocusScreen; at: number }>();
   /** The last catalog fetched, per skill query, and the fetch in flight for it. Keyed on the query
@@ -604,29 +611,37 @@ export class HermesBridge implements BotsSurface {
             name: row.name,
             mimeType: row.mime,
             size: row.size,
+            mediaKind: row.mime.startsWith("video/") ? "video" as const
+              : row.mime.startsWith("audio/") ? "audio" as const
+                : "image" as const,
           })),
         assistantMediaKeys: (sessionId, messageId) =>
           this.#storage.botChatAssistantMediaKeys(sessionId, messageId),
       },
       assistantMedia: {
         ingest: async ({ bot, sessionId, messageId, path, sourceKey }) => {
-          const dataUrl = await this.#client.readMediaDataUrl(path);
-          const media = decodeAssistantMediaDataUrl(dataUrl, sniffImageType);
-          this.#storage.putBotChatAttachment(
-            {
-              fileId: newPhotoFileId(),
-              bot,
-              sessionId,
-              messageId,
-              sourceKey,
-              mime: media.mime,
-              name: photoDisplayName(media.ext),
-              size: media.bytes.byteLength,
-              bytes: media.bytes,
-            },
-            this.#now(),
-            PHOTO_TTL_MS,
-          );
+          const slot = await this.#assistantMediaLimiter.acquire();
+          try {
+            const dataUrl = await this.#client.readMediaDataUrl(path);
+            const media = decodeAssistantMediaDataUrl(dataUrl, sniffImageType);
+            this.#storage.putBotChatAttachment(
+              {
+                fileId: newPhotoFileId(),
+                bot,
+                sessionId,
+                messageId,
+                sourceKey,
+                mime: media.mime,
+                name: `${media.kind}.${media.ext}`,
+                size: media.bytes.byteLength,
+                bytes: media.bytes,
+              },
+              this.#now(),
+              PHOTO_TTL_MS,
+            );
+          } finally {
+            slot();
+          }
         },
       },
       ...(opts.onChatMessage === undefined
@@ -1874,10 +1889,12 @@ export class HermesBridge implements BotsSurface {
    *  TTL. A photo past its expiry is not found, whether or not a sweep has got to it yet: the
    *  contract promises a 404 after 14 days, and a promise that depends on a timer having fired is not
    *  a promise. */
-  chatAttachment(name: string, fileId: string): BotChatAttachmentBytes | undefined {
-    const row = this.#storage.botChatAttachment(name, fileId, this.#now() - PHOTO_TTL_MS);
-    if (row === undefined) return undefined;
-    return { bytes: row.bytes, mime: row.mime, name: row.name, size: row.size };
+  chatAttachmentInfo(name: string, fileId: string): BotChatAttachmentInfo | undefined {
+    return this.#storage.botChatAttachmentInfo(name, fileId, this.#now() - PHOTO_TTL_MS);
+  }
+
+  chatAttachmentSlice(name: string, fileId: string, offset: number, length: number): Uint8Array | undefined {
+    return this.#storage.botChatAttachmentSlice(name, fileId, this.#now() - PHOTO_TTL_MS, offset, length);
   }
 
   /** Reclaims the disk behind photos the reads above have already stopped serving.

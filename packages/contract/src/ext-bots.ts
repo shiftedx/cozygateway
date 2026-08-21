@@ -142,14 +142,15 @@ export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
  *  when it comes back in a `bot_chat` frame, which is what lets a sender replace its optimistic row
  *  instead of rendering the message twice.
  *
- *  `attachments` carries frozen image blocks. Capability 9 permits them on user rows for photos the
+ *  `attachments` carries frozen media blocks. Capability 9 permits them on user rows for photos the
  *  user sent with that message. Capability 15 also permits them on settled assistant rows when the
  *  bot emitted a standalone `MEDIA:<path>` directive that the gateway fetched successfully. Every
  *  `attachment` block from `contract/v1.md`. Every entry's `fileId` is gateway-scoped and opaque, is
  *  never a URL and is never a path, and is fetched from `GET /bots/:name/chat/attachments/:fileId`.
  *  A host path never reaches this wire: the bridge strips the `@image:<path>` directive lines hermes
  *  writes into its own transcript before the text is decoded, and puts this block there instead. The
- *  field is ABSENT, not empty, on a message with no attachments. */
+ *  field is ABSENT, not empty, on a message with no attachments. Capability 20 adds the optional
+ *  `mediaKind` discriminator and permits assistant video/audio blocks. */
 export const BotChatMessageSchema = Type.Object({
   id: Type.String(),
   role: Type.String(),
@@ -275,13 +276,9 @@ export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
  *    threads chips renders these with the same switch.
  *  - `seq` and the timestamps are added because a bots frame is a snapshot with an ordering, not an
  *    implicitly ordered array on a draft (see `BotToolActivityFrame`).
- *  - the core `detail` member is deliberately ABSENT. On the threads surface the OpenClaw adapter
- *    already refuses to populate it, because the wire's `title`/`meta`/`error` strings carry
- *    argument-derived content (file names, host paths). The hermes surface is the same hazard and
- *    worse: its `tool.start` carries `args`, `context` and `args_text`, and its `tool.complete`
- *    carries `args`, `result`, `result_text`, `summary` and `inline_diff`. NONE of them is
- *    forwarded, into a frame, a stored row, a push payload or a log line. A member that does not
- *    exist cannot leak.
+ *  - capability 21 adds optional bounded, redacted `detail` and error-only `errorText`. Only
+ *    Hermes' display-safe `args_text`, `summary`, and `result_text` strings are candidates. Raw
+ *    args/results, context, inline diffs, and todos are never forwarded.
  *
  *  `name` is the hermes tool identifier, passed through and length-capped. It is the ONE piece of
  *  hermes-side text on this frame, and it is a tool's name rather than anything a tool was asked to
@@ -309,6 +306,10 @@ export const BotToolStepSchema = Type.Object({
   startedAt: Type.Integer(),
   /** MILLISECONDS. Absent while `running`, present on every terminal step. */
   endedAt: Type.Optional(Type.Integer()),
+  /** Bounded, redacted human-readable activity. Capability 21. */
+  detail: Type.Optional(Type.String()),
+  /** Bounded, redacted failure text; present only for an error step. Capability 21. */
+  errorText: Type.Optional(Type.String()),
 });
 export type BotToolStep = Static<typeof BotToolStepSchema>;
 
@@ -395,6 +396,8 @@ export const BotApprovalPendingFrameSchema = Type.Object({
   toolCallId: Type.String(),
   name: Type.String(),
   updatedAt: Type.Integer(),
+  /** Present for an approval raised by a member turn inside a group room. */
+  room: Type.Optional(Type.String()),
 });
 export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
 
@@ -413,6 +416,7 @@ export const BotApprovalResolvedFrameSchema = Type.Object({
   toolCallId: Type.String(),
   outcome: ApprovalOutcomeSchema,
   updatedAt: Type.Integer(),
+  room: Type.Optional(Type.String()),
 });
 export type BotApprovalResolvedFrame = Static<typeof BotApprovalResolvedFrameSchema>;
 
@@ -1055,7 +1059,8 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *      still `message`, `approval_pending` and `approval_resolved`. Chips are a foreground surface.
  *    - it does not change `BotChatMessage`. The steps are NOT attached to a transcript row, because
  *      the gateway cannot honestly say which row a turn produced (see `BotTurnToolSteps`).
- *    - it carries no tool arguments, output, or preview text of any kind. See `BotToolStep`.
+ *    - capability 12 carries no tool arguments, output, or preview text. Capability 21 later adds
+ *      only bounded, redacted display text; raw argument/result objects remain excluded.
  *
  *    What the version does NOT promise, exactly as with 10, is that any step will ever be reported:
  *    hermes gates its whole tool lifecycle on `display.tool_progress`, which defaults to `all` but
@@ -1129,6 +1134,11 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    hard escape. New session mints an empty canonical chat through the existing Hermes creation
  *    surface, leaves the previous session unretired and restorable, and broadcasts the existing
  *    `bot_chat_adopted` frame. Its automatic pin also releases a manual restore boundary so
- *    follow-latest resumes with the next new conversational session. */
+ *    follow-latest resumes with the next new conversational session.
+ *  - `20`: STREAMED ASSISTANT MEDIA (issues #118 / cozychat#220). Assistant attachments carry an
+ *    optional `mediaKind`; video and audio are ingested up to their per-kind 40 MB cap and the
+ *    authenticated attachment route supports byte ranges for AVPlayer.
+ *  - `21`: SAFE TOOL DETAILS (cozychat#224). Steps may carry bounded, defense-in-depth-redacted
+ *    `detail` and error-only `errorText`; raw argument and result objects never cross the bridge. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 19;
+export const BOTS_CAPABILITY_VERSION = 21;

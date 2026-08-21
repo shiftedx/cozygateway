@@ -52,6 +52,15 @@ interface ModelChoice {
   baseUrl?: string;
 }
 
+export const MODEL_DISCOVERY_TIMEOUT_MS = 750;
+export const MODEL_DISCOVERY_CACHE_MS = 30_000;
+type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+const discoveryCache = new Map<string, { expiresAt: number; succeeded: boolean; models: string[] }>();
+
+export function clearModelDiscoveryCache(): void {
+  discoveryCache.clear();
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -89,9 +98,93 @@ function choicesOf(options: HermesModelOptions): ModelChoice[] {
   });
 }
 
+function modelsEndpoint(baseUrl: string): string | undefined {
+  try {
+    const url = new URL(baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    url.pathname = `${url.pathname.replace(/\/$/, "").replace(/\/v1$/, "")}/v1/models`;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+async function discoverProviderModels(baseUrl: string, fetcher: FetchLike): Promise<string[] | undefined> {
+  const endpoint = modelsEndpoint(baseUrl);
+  if (endpoint === undefined) return undefined;
+  const now = Date.now();
+  const cached = discoveryCache.get(endpoint);
+  if (cached !== undefined && cached.expiresAt > now) return cached.succeeded ? cached.models : undefined;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MODEL_DISCOVERY_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await fetcher(endpoint, { signal: controller.signal, headers: { accept: "application/json" } });
+    if (!response.ok) throw new Error(`provider answered ${response.status}`);
+    const payload = (await response.json()) as unknown;
+    const rows = asRecord(payload)?.["data"];
+    const models = Array.isArray(rows)
+      ? [...new Set(rows.flatMap((row) => {
+          const id = asRecord(row)?.["id"];
+          return typeof id === "string" && id.trim() ? [id.trim()] : [];
+        }))]
+      : [];
+    discoveryCache.set(endpoint, { expiresAt: now + MODEL_DISCOVERY_CACHE_MS, succeeded: true, models });
+    return models;
+  } catch {
+    // Before the first successful probe, `undefined` asks the caller to retain Hermes' static row.
+    // After a server has proven discoverable, a failed refresh makes it unavailable instead of
+    // leaving a stale model in the app forever.
+    const succeeded = cached?.succeeded === true;
+    discoveryCache.set(endpoint, {
+      expiresAt: now + Math.min(MODEL_DISCOVERY_CACHE_MS, 5_000),
+      succeeded,
+      models: [],
+    });
+    return succeeded ? [] : undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function discoveredChoices(options: HermesModelOptions, fetcher: FetchLike): Promise<ModelChoice[]> {
+  const staticChoices = choicesOf(options);
+  const providers = Array.isArray(options.providers) ? (options.providers as HermesModelProvider[]) : [];
+  const groups = await Promise.all(providers.map(async (row) => {
+    const provider = typeof row.slug === "string" ? row.slug.trim() : "";
+    const label = typeof row.name === "string" && row.name.trim() ? row.name.trim() : provider;
+    const baseUrl = typeof row.api_url === "string" ? row.api_url.trim() : "";
+    if (!provider || !baseUrl || row.authenticated === false) return [] as ModelChoice[];
+    const discovered = await discoverProviderModels(baseUrl, fetcher);
+    if (discovered === undefined) return staticChoices.filter((choice) => choice.provider === provider);
+    return discovered.map((model) => ({
+      id: `${provider}:${model}`,
+      provider,
+      model,
+      displayName: `${label}: ${model}`,
+      aliases: Array.isArray(row.aliases)
+        ? row.aliases.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+        : [],
+      baseUrl,
+    }));
+  }));
+  const liveProviders = new Set(providers.flatMap((row) =>
+    typeof row.slug === "string" && typeof row.api_url === "string" && row.api_url.trim()
+      ? [row.slug.trim()]
+      : []));
+  const merged = [
+    ...staticChoices.filter((choice) => !liveProviders.has(choice.provider)),
+    ...groups.flat(),
+  ];
+  return [...new Map(merged.map((choice) => [choice.id, choice])).values()];
+}
+
 async function readHermesModelState(
   client: HermesClient,
   name: string,
+  fetcher: FetchLike = fetch,
 ): Promise<{ config: HermesWebConfig; options: HermesModelOptions; choices: ModelChoice[] }> {
   const query = profileQuery(name);
   // Hermes dashboard REST is the profile-aware edit-screen authority. Its JSON-RPC equivalents
@@ -102,7 +195,7 @@ async function readHermesModelState(
     client.dashboardJson<HermesWebConfig>(`/api/config?${query}`),
     client.dashboardJson<HermesModelOptions>(`/api/model/options?${query}&explicit_only=1`),
   ]);
-  return { config, options, choices: choicesOf(options) };
+  return { config, options, choices: await discoveredChoices(options, fetcher) };
 }
 
 function responseOf(state: {
@@ -127,8 +220,10 @@ function responseOf(state: {
   };
 }
 
-export async function readBotModelConfig(client: HermesClient, name: string): Promise<BotModelConfig> {
-  return responseOf(await readHermesModelState(client, name));
+export async function readBotModelConfig(
+  client: HermesClient, name: string, fetcher: FetchLike = fetch,
+): Promise<BotModelConfig> {
+  return responseOf(await readHermesModelState(client, name, fetcher));
 }
 
 export async function writeBotModelConfig(
