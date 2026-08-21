@@ -49,6 +49,7 @@ export const RESERVED_GROUP_NAMES: ReadonlySet<string> = new Set([
   "profile",
   "chat",
   "sessions",
+  "inbox",
   "messages",
   "catalog",
   "focus",

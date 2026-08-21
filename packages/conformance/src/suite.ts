@@ -23,6 +23,8 @@ import {
   ApprovalPendingFrameSchema,
   ApprovalResolveResponseSchema,
   ApprovalResolvedFrameSchema,
+  BotInboxMessagesResponseSchema,
+  BotInboxResponseSchema,
   CommittedFrameSchema,
   DeviceSchema,
   DoneFrameSchema,
@@ -82,6 +84,9 @@ export interface ConformanceEnv {
    *  Omit it and the suite skips that group; every other assertion is unaffected, so a gateway
    *  with no approval-capable backend still passes exactly what it passes today. */
   approvalAgentId?: string;
+  /** OPTIONAL agent-inbox fixture (vendor capability com.cozylabs.bots >= 17). The named bot must
+   *  expose the named a2a thread in its newest 50 so both read routes can be checked black-box. */
+  botInbox?: { botName: string; threadId: string };
 }
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -307,6 +312,51 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
         };
         expect(check(GatewayInfoSchema, withUnknown)).toBe(true);
       });
+    });
+
+    describe("agent inbox (optional com.cozylabs.bots capability 17)", () => {
+      const inboxIt = env.botInbox === undefined ? it.skip : it;
+
+      inboxIt(
+        "lists a bounded newest-first a2a inbox behind device authentication",
+        async () => {
+          const fixture = env.botInbox;
+          if (fixture === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("bot-inbox-list");
+          const path = `/bots/${encodeURIComponent(fixture.botName)}/inbox`;
+          const response = await authFetch(token, path);
+          expect(response.status).toBe(200);
+          const body = assertValid(BotInboxResponseSchema, await response.json());
+          expect(body.threads.length).toBeLessThanOrEqual(50);
+          expect(body.threads.some((thread) => thread.id === fixture.threadId)).toBe(true);
+          for (let index = 1; index < body.threads.length; index += 1) {
+            expect(body.threads[index - 1]!.lastActiveAt).toBeGreaterThanOrEqual(
+              body.threads[index]!.lastActiveAt,
+            );
+          }
+          expect((await fetch(`${env.baseUrl()}${path}`)).status).toBe(401);
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      inboxIt(
+        "returns a read-only group-room transcript with per-agent attribution",
+        async () => {
+          const fixture = env.botInbox;
+          if (fixture === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("bot-inbox-messages");
+          const path =
+            `/bots/${encodeURIComponent(fixture.botName)}/inbox/` +
+            `${encodeURIComponent(fixture.threadId)}/messages`;
+          const response = await authFetch(token, path);
+          expect(response.status).toBe(200);
+          const body = assertValid(BotInboxMessagesResponseSchema, await response.json());
+          expect(body.messages.every((message) => message.from.kind === "member")).toBe(true);
+          expect((await authFetch(token, path, { method: "POST" })).status).toBe(404);
+          expect((await fetch(`${env.baseUrl()}${path}`)).status).toBe(401);
+        },
+        TEST_TIMEOUT_MS,
+      );
     });
 
     // Spec section 4: pairing binds a device and mints a single-use-consuming token.

@@ -15,6 +15,7 @@ import {
   BotChatStateFrameSchema,
   BotGroupFrameSchema,
   BotGroupStateFrameSchema,
+  BotInboxActivityFrameSchema,
   BotPresenceFrameSchema,
   BotRosterFrameSchema,
   BotRoutinesFrameSchema,
@@ -143,5 +144,6 @@ export const ServerFrameSchema = Type.Union([
   BotApprovalPendingFrameSchema,
   BotApprovalResolvedFrameSchema,
   BotToolActivityFrameSchema,
+  BotInboxActivityFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

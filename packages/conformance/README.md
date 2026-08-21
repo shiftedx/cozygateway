@@ -12,12 +12,11 @@ and the `cozygateway-contract` schemas, never from any gateway's source code. Th
 and writes only the public REST and WebSocket surface, so a green run is evidence the
 implementation matches the contract, not that it shares the reference code.
 
-The suite covers fifteen groups: health, capabilities, pairing, the auth wall, device lifecycle,
+The suite covers sixteen groups: health, capabilities, pairing, the auth wall, device lifecycle,
 agents, thread lifecycle, message round trip and seq discipline, WebSocket lifecycle, streaming
 order, reconnect dedup, turn failure, mid-turn interrupt, the live in-flight interrupt, and the
-approval lifecycle. Every group but the last two runs against any gateway; those two activate
-only when the gateway declares the matching optional hook (see "The optional stall hook" and
-"The optional approval hook" below) and are otherwise reported as skipped.
+approval lifecycle, plus the agent inbox. Optional backend-specific groups activate only when the
+gateway declares the matching hook and are otherwise reported as skipped.
 
 The capabilities group checks the additive `GatewayInfo.capabilities` block (contract v1.md
 section 5, issue #16) generically: that it agrees across `GET /health`, the pair response, and
@@ -67,6 +66,8 @@ export interface ConformanceEnv {
   stallAgentId?: string;
   /** Optional: agent id of an approval-capable backend. See "The optional approval hook". */
   approvalAgentId?: string;
+  /** Optional: one seeded capability-17 a2a thread. See "The optional agent inbox hook". */
+  botInbox?: { botName: string; threadId: string };
 }
 ```
 
@@ -170,6 +171,17 @@ is reported as skipped while every other assertion runs unchanged. The same hook
 The reference gateway implements it with its `mock-approval` backend (one draft, one pending
 approval, then it parks until the approval is resolved or its own bounded window lapses).
 
+## The optional agent inbox hook
+
+The agent inbox is a vendor extension backed by Hermes rather than the reference echo backend, so a
+portable conformance run cannot create its own a2a fixture. Declare `botInbox` when the gateway under
+test has a seeded capability-17 thread. `botName` names its owning bot and `threadId` names a thread
+that must appear in that bot's newest 50 inbox rows.
+
+The suite validates both authenticated GET routes against the contract schemas. It also checks the
+50-row bound, newest-first ordering, device authentication, per-agent `member` attribution, and the
+absence of a POST send route. Omit `botInbox` and this group is reported as skipped.
+
 ## Running the reference gateway's own conformance
 
 This repo ships two runners, both exercised by one command:
@@ -182,4 +194,4 @@ pnpm --filter cozygateway-conformance test
   `mock-steer` stall backend **and** the `mock-approval` backend, declares both hooks, and runs
   the whole suite including the live in-flight interrupt and approval groups.
 - `test/reference-gateway-hookless.test.ts` starts it with the echo adapter alone and declares no
-  hooks, so the live-202 and approval cases are skipped and the rest must still be green.
+  hooks, so the live-202, approval, and agent-inbox cases are skipped and the rest must still be green.
