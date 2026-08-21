@@ -1,4 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -254,6 +257,36 @@ describe("openStorage migrations", () => {
     // which only works once runtime_id (and the rest of the additive migrations) has landed.
     storage.setBotChatPin("scout", "sess-1", 1);
     expect(storage.botChatPin("scout")).toBe("sess-1");
+  });
+
+  it("adds external_id before creating its index on a legacy database", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cozygateway-legacy-messages-"));
+    const path = join(dir, "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE messages (
+        thread_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        blocks_json TEXT NOT NULL,
+        turn_id TEXT,
+        marker TEXT,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (thread_id, seq)
+      ) STRICT, WITHOUT ROWID;
+    `);
+    legacy.close();
+
+    const storage = openStorage(path);
+    storage.close();
+
+    const migrated = new DatabaseSync(path);
+    const columns = migrated.prepare("PRAGMA table_info(messages)").all() as unknown as Array<{ name: string }>;
+    const indexes = migrated.prepare("PRAGMA index_list(messages)").all() as unknown as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("external_id");
+    expect(indexes.map((index) => index.name)).toContain("messages_external_id");
+    migrated.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 
