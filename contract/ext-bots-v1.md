@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 15 }
+"capabilities": { "com.cozylabs.bots": 17 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -162,6 +162,11 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   A manual restore holds through every session that already existed. The capability-14
   follow-latest rule resumes when the next new conversational session appears. A client below 16
   sees no change.
+- `17`: AGENT INBOX. `GET /bots/:name/inbox` surfaces the newest 50 a2a-classified sessions and
+  `GET /bots/:name/inbox/:threadId/messages` renders one as a read-only multi-speaker transcript in
+  the existing group-room message shape. An open thread that gains a rendered message emits the
+  coarse `bot_inbox_activity` frame, which tells the client to re-read it. There is no inbox send
+  route. A client below 17 sees no new route or frame.
 
 ## 3. Resources
 
@@ -1255,6 +1260,57 @@ The manual flag sticks until the next new conversational session appears. Cron, 
 group-titled, and a2a sessions never release it. No separate persistence object is introduced: the
 existing pin row carries the flag and its existing update timestamp is the boundary.
 
+### GET /bots/:name/inbox
+
+Capability 17 and up.
+
+```
+200 {
+  threads: [ {
+    id: string,
+    peers: [string],
+    startedAt: integer,
+    lastActiveAt: integer,
+    preview: string,
+    messageCount: integer
+  } ]
+}
+404 not_found                         // no profile named `name` exists
+```
+
+Only sessions classified `a2a` by the capability-14 classifier are present. The gateway considers
+the newest 200 visible Hermes sessions, orders matching threads by `lastActiveAt` newest first with
+`startedAt` as the tie break, and returns at most 50. A missing Hermes timestamp is the normalized
+integer `0`, exactly as on the sessions route.
+
+`peers` contains the counterpart handle parsed from the same `Message from ...:` prefix used by
+`BotPreview`; the bot addressed by `:name` is not repeated. `preview` has that protocol prefix
+removed. `messageCount` is Hermes' normalized session-list `message_count`, or `0` when an older
+Hermes omits it.
+
+### GET /bots/:name/inbox/:threadId/messages
+
+Capability 17 and up.
+
+```
+200 { messages: BotGroupMessage[] }
+404 not_found                         // no such bot, or the id is not one of that bot's a2a sessions
+```
+
+Every entry uses the existing group-room `BotGroupMessage` shape. `from.kind` is always `member`.
+An inbound a2a row attributes the clean text to the agent named by its `Message from ...:` prefix;
+an assistant row attributes the reply to the bot addressed by `:name`. `seq` is the one-based
+position in this transcript projection, and a missing Hermes message timestamp is `0`.
+
+The route is READ-ONLY. No `POST /bots/:name/inbox/:threadId/messages` route exists, and no other
+inbox send route exists. These sessions record agent-to-agent traffic; a paired device may inspect
+them but may not speak as either agent.
+
+Reading the transcript marks that thread open for five minutes. While open, a Hermes
+`sessions.changed` event causes the gateway to re-read it. If its rendered message count grew, the
+gateway broadcasts one `bot_inbox_activity` frame. The frame is deliberately coarse rather than a
+room delta: clients already have one authoritative transcript read and simply repeat it.
+
 ### GET /bots/:name/profile
 
 One bot's full edit-screen state: SOUL.md, its skills, its toolsets, its MCP servers, and its model
@@ -1947,9 +2003,9 @@ profile that no later roster could tell from a real one. For the same reason a m
 while a room is deliberating is dropped from the round with a `bot_group_state` note ("<bot> is no
 longer a bot on this gateway") instead of having a session minted for it.
 
-Six room names are RESERVED and answer 400: `profile`, `chat`, `sessions`, `messages`, `catalog`,
-`focus`. `/bots/groups/:name` and `/bots/:name/<suffix>` are both three segments, and the per-bot
-routes are matched first so that a bot literally named `groups` keeps working. Refusing those six
+Seven room names are RESERVED and answer 400: `profile`, `chat`, `sessions`, `inbox`, `messages`,
+`catalog`, `focus`. `/bots/groups/:name` and `/bots/:name/<suffix>` are both three segments, and the
+per-bot routes are matched first so that a bot literally named `groups` keeps working. Refusing those seven
 names is the other half of that bargain: no room can exist at an address that would not reach it.
 
 On the same reasoning, a name carrying `/`, `\`, `?`, `#`, `%` or a control character answers 400.
@@ -2182,6 +2238,7 @@ are only ever sent by a gateway that advertises the capability.
   toolCallId: string, name: string, updatedAt: integer }
 { type: "bot_approval_resolved", bot: string, sessionId: string, turnId: string,
   toolCallId: string, outcome: "approved" | "denied" | "expired", updatedAt: integer }
+{ type: "bot_inbox_activity", bot: string, threadId: string, updatedAt: integer }
 ```
 
 `bot_roster` and `bot_presence` are FULL REPLACE snapshots, and both are sent only when the value
@@ -2323,6 +2380,12 @@ id and its own message ids and which a rebound client ignores.
 Automatic adoption is never emitted for a routine fire, a bot-to-bot delivery or a group-room
 session. A manual restore may select any listed kind. See "The pin follows the bot's latest
 conversation".
+
+`bot_inbox_activity` is a coarse invalidation for a capability-17 inbox transcript. It is emitted
+only after a thread has been read and only when a later `sessions.changed` re-read finds more
+rendered messages. `bot` and `threadId` identify the same route to read again. It carries no message
+delta, no sender, and no text, so the REST transcript remains the single projection that assigns
+speakers and sequence numbers.
 
 `bot_routines` is a FULL REPLACE for one bot, sent only when that bot's routine list actually
 changed, so an idle cron store is silent. It fires when this gateway changed a routine, and when a
