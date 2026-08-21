@@ -2,7 +2,12 @@ import type { AttachmentBlock, BotChatMessage, ServerFrame } from "cozygateway-c
 
 import type { HermesRpc } from "./canonical-chat.ts";
 import { ChatIdentityLedger } from "./chat-identity.ts";
-import { parseChatSnapshot, stripImageDirectives, type ChatSnapshot } from "./chat-messages.ts";
+import {
+  isContextCompactionMarker,
+  parseChatSnapshot,
+  stripImageDirectives,
+  type ChatSnapshot,
+} from "./chat-messages.ts";
 import type { ChatStreamBinder } from "./chat-stream.ts";
 import { PhotoAttachFailed } from "./photos.ts";
 import {
@@ -705,7 +710,7 @@ export class BotChatTurns {
     const grew = Math.max(snapshot.messages.length, snapshot.messageCount) > turn.baseline;
     if (!grew) return false;
     const last = snapshot.messages.at(-1);
-    if (last !== undefined) return last.role === "assistant";
+    if (last !== undefined) return last.role === "assistant" && !isContextCompactionMarker(last);
     return turn.sawActivity;
   }
 

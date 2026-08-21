@@ -104,8 +104,10 @@ export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
  *  drop a replayed frame. `at` is MILLISECONDS, or null when the message carries no timestamp at
  *  all (Hermes stamps in seconds on some builds and not at all on others).
  *
- *  `role` is always `user` or `assistant` on this wire: the bridge drops `system` and `tool` rows,
- *  and any row whose text is empty, so tool chatter never reaches a chat bubble.
+ *  `role` is always `user` or `assistant` on this wire: the bridge drops ordinary `system` and
+ *  `tool` rows, and any row whose text is empty, so tool chatter never reaches a chat bubble.
+ *  Hermes context-management rows are the narrow exception. A whole-row compaction shape becomes
+ *  exactly `[[context: compacted]]`; a system-role compaction uses assistant on this wire.
  *
  *  `clientId` is the echo of what the sender put on `POST /bots/:name/chat/messages` (or the
  *  gateway's own local id when the sender sent none). It rides the 202 body AND the same message

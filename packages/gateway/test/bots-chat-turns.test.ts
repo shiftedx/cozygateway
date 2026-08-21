@@ -130,6 +130,34 @@ describe("BotChatTurns", () => {
     expect(stateFrames(frames).at(-1)).toMatchObject({ phase: "complete", running: false, inflight: false });
   });
 
+  it("broadcasts a compaction marker without treating it as the settled assistant reply", async () => {
+    let reply: Reply = { messages: [{ role: "user", content: "hi" }], running: true };
+    const { turns, frames } = harness(() => reply);
+    await turns.send("scout", "stored-1", "hi");
+    reply = {
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "system",
+          content: "--- BEGIN CONTEXT SUMMARY ---\nprivate summary\n--- END OF CONTEXT SUMMARY ---",
+        },
+      ],
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(turns.polling("scout")).toBe(true);
+
+    reply = {
+      messages: [...reply.messages, { role: "assistant", content: "all green" }],
+    };
+    await turns.settled("scout");
+    expect(chatFrames(frames).flatMap((frame) => frame.messages).map((message) => message.text)).toEqual([
+      "hi",
+      "[[context: compacted]]",
+      "all green",
+    ]);
+    expect(stateFrames(frames).at(-1)?.phase).toBe("complete");
+  });
+
   it("extracts at settlement only, caps attempts at three, and preserves every failed or unattempted line", async () => {
     const text = [
       "done",

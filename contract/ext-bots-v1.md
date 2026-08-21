@@ -206,6 +206,10 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
   `content` at all, `text` is `msg.text`. The result is trimmed.
 - `role`: the message's `role`, or `"assistant"` when it carries none. Roles are NOT an enum on
   this wire: a build that invents `tool` must not break a client.
+- Hermes context-management rows never carry their full summary text. A whole user, assistant, or
+  system row matching the compaction sentinels becomes exactly `[[context: compacted]]`. System
+  compaction rows use role `assistant`; ordinary system and tool rows remain dropped. The marker is
+  ordinary text on the v1 wire, so clients may render it as a chip without a capability bump.
 - `at`: the first usable value among `at`, `ts`, `timestamp`, `time`, `created_at`, `created`.
   A number at or below 10^11 is read as SECONDS and multiplied, anything larger is already
   milliseconds; numeric strings and ISO strings are accepted; anything else yields null.
