@@ -218,7 +218,7 @@ class IncrementalNormalizer:
     newly arrived text instead of the whole accumulated reply.
 
     A draft flush hands this the FULL accumulated text every time (full-replace
-    wire semantics; see ``adapter.send_draft`` and ``contract/attach-v0.md`` --
+    wire semantics; see ``adapter.send_draft`` and ``contract/attach-v1.md`` --
     unchanged by this cache). Calling :func:`normalize_text_to_blocks` on that
     whole string on every flush is what makes a reply of n chunks cost O(n^2)
     total: this class instead remembers the already-normalized STABLE prefix (the

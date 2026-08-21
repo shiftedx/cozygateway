@@ -33,6 +33,7 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     });
     const pair = await fetch(`${gateway.url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });
     const deviceToken = ((await pair.json()) as { deviceToken: string }).deviceToken;
+    expect((await fetch(`${gateway.url}/attach`)).status).toBe(404);
 
     const clientFrames: ServerFrame[] = [];
     const client = new WebSocket(`${gateway.url.replace("http", "ws")}/ws`);
@@ -41,6 +42,7 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     await once(client, "open");
     client.send(JSON.stringify({ type: "auth", token: deviceToken }));
     await until(() => clientFrames.some((frame) => frame.type === "ready"));
+    await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "sage"));
 
     const pluginFrames: any[] = [];
     const plugin = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
@@ -73,6 +75,14 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     const historyResponse = await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } });
     const history = (await historyResponse.json()) as { messages: BotChatMessage[] };
     expect(history.messages.map((message) => [message.role, message.text])).toEqual([["user", "hello native"], ["assistant", "native answer"]]);
+
+    const rosterResponse = await fetch(`${gateway.url}/bots`, { headers: { authorization: `Bearer ${deviceToken}` } });
+    const roster = (await rosterResponse.json()) as { bots: Array<{ name: string; chatSessionId: string | null; preview: { kind: string; text: string }; lastActiveAt: number | null }> };
+    expect(roster.bots.find((bot) => bot.name === "sage")).toMatchObject({
+      chatSessionId: command.command.threadId,
+      preview: { kind: "plain", text: "native answer" },
+    });
+    expect(roster.bots.find((bot) => bot.name === "sage")?.lastActiveAt).not.toBeNull();
 
     const clarifyTurnResponse = await fetch(`${gateway.url}/bots/sage/chat/messages`, {
       method: "POST",

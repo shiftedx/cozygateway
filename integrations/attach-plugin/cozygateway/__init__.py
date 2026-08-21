@@ -3,8 +3,8 @@
 Public surface:
 
 * ``register(ctx)`` -- the plugin entry point the loader calls.
-* ``AttachClient`` / ``AttachClientConfig`` -- the harness-free outbound ``/attach``
-  transport.
+* ``AttachV1Client`` / ``AttachV1ClientConfig`` -- the durable outbound
+  ``/attach/v1`` transport.
 * ``normalize_text_to_blocks`` -- the markdown to typed-blocks normalizer.
 * ``ToolChipTracker`` -- the per-turn tool-chip tracker.
 
@@ -15,14 +15,14 @@ the path.
 """
 
 from .adapter import register
-from .attach_client import AttachClient, AttachClientConfig
+from .attach_client_v1 import AttachV1Client, AttachV1ClientConfig
 from .text_blocks import normalize_text_to_blocks
 from .tool_chips import ToolChipTracker
 
 __all__ = [
     "register",
-    "AttachClient",
-    "AttachClientConfig",
+    "AttachV1Client",
+    "AttachV1ClientConfig",
     "normalize_text_to_blocks",
     "ToolChipTracker",
 ]

@@ -81,7 +81,7 @@ sign their own app with their own Apple team.
 - `packages/gateway`: the gateway process, implementing contract v1.
 - `packages/relay`: the push relay service (opaque push ids in, ciphertext through).
 - `packages/conformance`: contract conformance suite that runs against any gateway implementation, validated against the reference gateway.
-- `integrations/attach-plugin`: a reference Python platform plugin speaking attach v0 by default and the durable attach-v1 native data plane when enabled per bot; see `contract/attach-v1.md` and `docs/attach-v1-operations.md`.
+- `integrations/attach-plugin`: the reference Python platform plugin for the durable attach-v1 data plane; see `contract/attach-v1.md` and `docs/attach-v1-operations.md`.
 
 ## Privacy model
 

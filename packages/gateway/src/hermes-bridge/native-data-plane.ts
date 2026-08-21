@@ -11,6 +11,7 @@ import type {
   BotClarifyResolvedFrame,
   BotToolActivityFrame,
   BotToolStep,
+  BotSummary,
   ServerFrame,
 } from "cozygateway-contract";
 
@@ -73,6 +74,7 @@ export class NativeBotDataPlane {
 
   surface(): BotsSurface {
     const overrides: Partial<BotsSurface> = {
+      roster: () => this.#roster(),
       canonicalChat: (name) => this.#canonical(name),
       chatHistory: (name) => this.#history(name),
       sendChatMessage: (name, text, opts) => this.#send(name, text, opts),
@@ -91,6 +93,29 @@ export class NativeBotDataPlane {
         return typeof value === "function" ? value.bind(override === undefined ? target : overrides) : value;
       },
     });
+  }
+
+  /** Overlay the durable attach-v1 transcript on the dashboard-owned profile roster. Profile
+   * metadata remains control-plane state, while chat identity, preview and activity come from the
+   * same native rows `chatHistory` serves. */
+  #roster() {
+    const view = this.#control.roster();
+    const bots = view.bots.map((summary): BotSummary => {
+      const bot = normalize(summary.name);
+      if (!this.#native.has(bot)) return summary;
+      const chat = this.#storage.nativeBotChat(bot, this.#now());
+      const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
+      const latest = messages.findLast((message) => message.text.trim().length > 0);
+      return {
+        ...summary,
+        chatSessionId: chat.sessionId,
+        lastActiveAt: latest?.at ?? null,
+        preview: latest === undefined
+          ? { kind: "empty", text: "No conversations yet, say hi" }
+          : { kind: "plain", text: latest.text.trim() },
+      };
+    });
+    return { ...view, bots };
   }
 
   handles(bot: string): boolean { return this.#native.has(normalize(bot)) || this.#shadow.has(normalize(bot)); }

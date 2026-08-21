@@ -6,8 +6,12 @@ import { check } from "cozygateway-contract";
 import { WebSocket, WebSocketServer } from "ws";
 
 import type { Storage } from "../../storage.ts";
-import type { TurnEndpoint } from "./adapter.ts";
-import type { AttachInterruptFrame, AttachSteerFrame, AttachTurnFrame } from "./protocol.ts";
+import type {
+  AttachInterruptFrame,
+  AttachSteerFrame,
+  AttachTurnFrame,
+  TurnEndpoint,
+} from "./adapter.ts";
 import {
   AttachV1ClientFrameSchema,
   type AttachV1Capability,

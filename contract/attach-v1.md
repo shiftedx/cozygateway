@@ -15,7 +15,7 @@ Dashboard `prompt.submit` or settle by polling/resuming a Dashboard session.
 - WebSocket: `GET /attach/v1`, authenticated with `Authorization: Bearer <token>` during upgrade.
 - Media bytes: `POST` and `GET /attach/v1/media/:mediaId`, with the same bearer token.
 - The plugin sends `hello` first. Any other first frame closes the socket. Version 1 is selected by
-  the endpoint plus `hello.version: 1`; v0 remains available unchanged at `/attach`.
+  the endpoint plus `hello.version: 1`; no unversioned attach endpoint exists.
 - `hello` carries a stable plugin `instanceId`, supported capabilities, event/command resume
   cursors, and bounded receive limits. `hello_ack` returns the authenticated `agentId`, negotiated
   limits/capabilities, authoritative cursors, and heartbeat interval. Its capabilities are the
@@ -108,5 +108,5 @@ Rollout is per bot under `hermes.nativeDataPlane.<profile>`:
   `clarify`, and `scheduled`. Every field defaults to true for backward compatibility.
 - Omitting the entry leaves Dashboard chat behavior unchanged.
 
-Downgrade is explicit: v0 plugins dial `/attach`; v1 plugins dial `/attach/v1`. The reference
-plugin defaults to v0 until `COZYGATEWAY_ATTACH_VERSION=1` is set.
+There is no protocol downgrade. Peers that do not speak attach-v1 are rejected rather than routed
+through a less reliable transport.

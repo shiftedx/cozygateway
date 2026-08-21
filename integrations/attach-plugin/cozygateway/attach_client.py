@@ -1,43 +1,14 @@
-"""Outbound ``/attach`` WebSocket client for the gateway attach protocol.
+"""Shared attach-v1 wire values and transport helpers.
 
-This is the transport half of the adapter and holds NO harness imports, so it can
-be exercised in isolation with only ``websockets`` installed.
-
-What it speaks:
-
-* It dials OUT to ``<gateway origin>/attach`` (http/https swapped to ws/wss) and
-  authenticates header-only with ``Authorization: Bearer <token>``. The token is
-  never placed in the URL, so it can never ride a log or referrer.
-* The gateway pushes ``turn`` frames down the socket; the client parses each one
-  and hands a :class:`TurnFrame` to the ``on_turn`` callback. Malformed or
-  unknown inbound frames are dropped (defense in depth).
-* The client sends ``{"threadId": str, "update": SessionUpdate}`` frames where
-  ``update`` is one of ``draft`` | ``done`` | ``failed``. Each ``draft`` carries
-  the COMPLETE current view of the turn (full replace); the gateway keeps the
-  latest and seals it on ``done``.
-
-Two fatal close conditions are surfaced as distinct exceptions:
-
-* :class:`AttachAuthError` -- the dial was rejected (HTTP 401), or the socket
-  closed with code 1008 (policy: bad or revoked token). Either way the
-  credential is bad; there is no point retrying.
-* :class:`AttachSupersededError` -- the socket closed with code 4000, meaning a
-  newer connection now owns this agent. Retrying would fight that owner, so the
-  adapter stops reconnecting.
-
-Every other close is a benign disconnect (gateway restart, network blip) that the
-adapter re-dials with backoff.
+The executable client lives in :mod:`attach_client_v1`. This module contains only
+the rich-block values, command parsers, close classifications, URL derivation and
+WebSocket dial helper it uses; there is no legacy transport implementation.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
+from typing import Any, Dict, List, Optional
 
 # The gateway closes the socket with this code when a newer connection supersedes
 # this one; the adapter treats it as terminal.
@@ -263,28 +234,7 @@ def parse_interrupt_frame(frame: Any) -> Optional[InterruptFrame]:
     return InterruptFrame(thread_id=thread_id, turn_id=turn_id)
 
 
-@dataclass
-class AttachClientConfig:
-    """Connection inputs for :class:`AttachClient`.
-
-    ``gateway_url`` is the gateway's HTTP(S) base; the ``/attach`` WS path hangs off
-    its origin. ``token`` is presented header-only. ``on_turn`` receives each parsed
-    inbound :class:`TurnFrame`. ``on_steer`` and ``on_interrupt`` receive their parsed
-    frame kinds. ``connect_factory`` is a test seam.
-    """
-
-    gateway_url: str
-    token: str
-    path: str = "/attach"
-    ca_file: Optional[str] = None
-    on_turn: Optional[Callable[[TurnFrame], None]] = None
-    on_steer: Optional[Callable[[SteerFrame], None]] = None
-    on_interrupt: Optional[Callable[[InterruptFrame], None]] = None
-    # Test seam: an async factory (ws_url, headers, ssl_ctx) -> connection.
-    connect_factory: Optional[Callable[..., Any]] = None
-
-
-def derive_attach_ws_url(gateway_url: str, path: str = "/attach") -> str:
+def derive_attach_ws_url(gateway_url: str, path: str = "/attach/v1") -> str:
     """Derive ``ws(s)://host/<path>`` from the gateway's HTTP base.
 
     Takes the origin (scheme + host) of the configured URL, swaps http to ws (and
@@ -298,160 +248,6 @@ def derive_attach_ws_url(gateway_url: str, path: str = "/attach") -> str:
     netloc = parsed.netloc or parsed.path  # tolerate a bare "host:port" with no scheme
     clean_path = path if path.startswith("/") else f"/{path}"
     return f"{scheme}://{netloc}{clean_path}"
-
-
-class AttachClient:
-    """An outbound, single-socket client to the gateway ``/attach`` WS.
-
-    Lifecycle: ``await connect()`` then ``watch()`` (drains inbound turns until the
-    socket closes) with ``send_draft`` / ``send_done`` / ``send_failed`` called
-    concurrently, then ``await close()``. The raw send is serialized behind a lock
-    because two coroutines may emit frames on the one socket at once.
-    """
-
-    def __init__(self, config: AttachClientConfig) -> None:
-        self._config = config
-        self._ws: Any = None
-        self._ws_url = derive_attach_ws_url(config.gateway_url, config.path)
-        self._closed = False
-        # websockets forbids concurrent send() on one connection, and both the
-        # streaming path and the tool-chip tap can send at once; serialize them.
-        self._send_lock = asyncio.Lock()
-
-    async def connect(self) -> None:
-        """Dial OUT to the gateway ``/attach`` WS, header-only auth.
-
-        Raises :class:`AttachAuthError` if the handshake is rejected with HTTP 401.
-        Any other dial failure is raised as-is (a benign transient the adapter
-        backs off on).
-        """
-        headers = {"Authorization": f"Bearer {self._config.token}"}
-        ssl_ctx = self._build_ssl_context()
-        factory = self._config.connect_factory or _default_connect
-        try:
-            self._ws = await factory(self._ws_url, headers, ssl_ctx)
-        except AttachAuthError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - classify a 401 as fatal auth
-            if _http_status(exc) == 401:
-                raise AttachAuthError("attach rejected (HTTP 401)") from exc
-            raise
-        self._closed = False
-
-    def _build_ssl_context(self) -> Any:
-        if self._config.ca_file and self._ws_url.startswith("wss://"):
-            import ssl
-
-            ctx = ssl.create_default_context()
-            ctx.load_verify_locations(self._config.ca_file)
-            return ctx
-        return None
-
-    async def _send_update(self, thread_id: str, update: Dict[str, Any]) -> None:
-        if self._ws is None or self._closed:
-            raise RuntimeError("attach client is not connected")
-        frame = {"threadId": thread_id, "update": update}
-        async with self._send_lock:
-            await self._ws.send(json.dumps(frame))
-
-    async def send_draft(
-        self,
-        thread_id: str,
-        turn_id: str,
-        blocks: List[RichBlock],
-        tool_calls: Optional[List[ToolChip]] = None,
-    ) -> None:
-        """Emit one full-replace ``draft`` for the turn: the complete blocks so far
-        plus the complete tool-call list so far. ``toolCalls`` is omitted when empty."""
-        update: Dict[str, Any] = {
-            "kind": "draft",
-            "turnId": turn_id,
-            "blocks": [block.to_wire() for block in blocks],
-        }
-        if tool_calls:
-            update["toolCalls"] = [chip.to_wire() for chip in tool_calls]
-        await self._send_update(thread_id, update)
-
-    async def send_done(self, thread_id: str, turn_id: str) -> None:
-        """End a successful turn. The gateway seals the latest draft as the reply."""
-        await self._send_update(thread_id, {"kind": "done", "turnId": turn_id})
-
-    async def send_failed(self, thread_id: str, turn_id: str, message: str) -> None:
-        """Report that the turn errored or produced no visible content."""
-        await self._send_update(
-            thread_id, {"kind": "failed", "turnId": turn_id, "message": message}
-        )
-
-    async def watch(self) -> None:
-        """Drain inbound frames until the socket closes.
-
-        Each decoded frame is dispatched to ``on_turn`` (dropped if malformed or not
-        a turn). Returns normally on a benign close. Raises
-        :class:`AttachSupersededError` if the socket closed with code 4000, or
-        :class:`AttachAuthError` if the socket closed with code 1008 (policy: bad
-        or revoked token).
-        """
-        if self._ws is None:
-            return
-        try:
-            async for raw in self._ws:
-                self._dispatch_inbound(raw)
-        except Exception as exc:  # noqa: BLE001 - classify the close code
-            code = _close_code(exc)
-            if code == SUPERSEDED_CLOSE_CODE:
-                self._closed = True
-                raise AttachSupersededError("connection superseded by a newer attach") from exc
-            if code == POLICY_CLOSE_CODE:
-                self._closed = True
-                raise AttachAuthError("attach rejected (policy close 1008)") from exc
-        finally:
-            self._closed = True
-        close_code = getattr(self._ws, "close_code", None)
-        if close_code == SUPERSEDED_CLOSE_CODE:
-            raise AttachSupersededError("connection superseded by a newer attach")
-        if close_code == POLICY_CLOSE_CODE:
-            raise AttachAuthError("attach rejected (policy close 1008)")
-
-    @staticmethod
-    def _safe_call(handler: Callable[[Any], None], arg: Any) -> None:
-        try:
-            handler(arg)
-        except Exception:  # noqa: BLE001 - a handler error must never kill the drain loop
-            logger.debug("attach: inbound handler raised", exc_info=True)
-
-    def _dispatch_inbound(self, raw: Any) -> None:
-        try:
-            frame = json.loads(raw)
-        except Exception:  # noqa: BLE001 - malformed inbound frame, drop
-            logger.debug("attach: dropping non-JSON inbound frame")
-            return
-        kind = frame.get("kind") if isinstance(frame, dict) else None
-        if kind == "turn":
-            turn = parse_turn_frame(frame)
-            if turn is not None and self._config.on_turn is not None:
-                self._safe_call(self._config.on_turn, turn)
-            return
-        if kind == "steer":
-            steer = parse_steer_frame(frame)
-            if steer is not None and self._config.on_steer is not None:
-                self._safe_call(self._config.on_steer, steer)
-            return
-        if kind == "interrupt":
-            interrupt = parse_interrupt_frame(frame)
-            if interrupt is not None and self._config.on_interrupt is not None:
-                self._safe_call(self._config.on_interrupt, interrupt)
-            return
-        logger.debug("attach: dropping unknown/malformed inbound frame")
-
-    async def close(self) -> None:
-        self._closed = True
-        ws = self._ws
-        self._ws = None
-        if ws is not None:
-            try:
-                await ws.close()
-            except Exception:  # noqa: BLE001 - already closing
-                pass
 
 
 def _http_status(exc: Exception) -> Optional[int]:

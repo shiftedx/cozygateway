@@ -69,7 +69,7 @@ or put them in the config file, which the environment then overrides:
 Rules, all of them checked before the listener binds:
 
 - **Neither set: plain HTTP, unchanged.** This is the default and it stays silent.
-- **Both set and usable: HTTPS.** `/ws` and `/attach` become `wss` with it, automatically; nothing
+- **Both set and usable: HTTPS.** `/ws` and `/attach/v1` become `wss` with it, automatically; nothing
   about the WebSocket endpoints is configured separately.
 - **Set but broken: the gateway refuses to start,** naming the file and the reason. An unreadable
   path, an empty file, a garbage PEM, an encrypted key, and a key that does not match the
