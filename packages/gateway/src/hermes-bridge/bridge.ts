@@ -398,6 +398,9 @@ export interface HermesBridgeOptions {
     displayName: string;
     messageId: string;
     chatSessionId: string;
+    /** The settled reply's wire-visible text. Rides only inside the encrypted push payload; the
+     *  relay never sees it. */
+    preview: string;
   }) => void;
   /** Audit sink for approval resolutions, one line per terminal transition. Defaults to the
    *  bridge's own log. The line names the bot, the chat, the turn, the toolCallId, the outcome and
@@ -603,14 +606,17 @@ export class HermesBridge implements BotsSurface {
               bot: string;
               chatSessionId: string;
               messageId: string;
+              text: string;
             }) => {
               void (async () => {
                 try {
                   const rows = await listBotSessions(this.#client, event.bot, 200);
                   if (!isConversationalSessionId(rows, event.chatSessionId)) return;
+                  const { text, ...rest } = event;
                   opts.onChatMessage?.({
-                    ...event,
+                    ...rest,
                     displayName: this.#memberInfo(event.bot).displayName,
+                    preview: text,
                   });
                 } catch (err) {
                   this.#log(

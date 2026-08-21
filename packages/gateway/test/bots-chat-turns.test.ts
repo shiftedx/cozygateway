@@ -286,7 +286,7 @@ describe("BotChatTurns", () => {
 
     reply = { messages: reply.messages };
     await turns.settled("scout");
-    expect(events).toEqual([{ bot: "scout", chatSessionId: "stored-1", messageId: "a1" }]);
+    expect(events).toEqual([{ bot: "scout", chatSessionId: "stored-1", messageId: "a1", text: "all green" }]);
   });
 
   it("does not raise the settled assistant seam for a timeout", async () => {

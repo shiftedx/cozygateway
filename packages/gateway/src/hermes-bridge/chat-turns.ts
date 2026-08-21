@@ -104,6 +104,9 @@ export interface ChatTurnsOptions {
     bot: string;
     chatSessionId: string;
     messageId: string;
+    /** The settled row's wire-visible text (post media strip and marker rewrite), so the push
+     *  preview matches what the transcript will show. Truncation is the notifier's job. */
+    text: string;
   }) => void;
 }
 
@@ -721,6 +724,7 @@ export class BotChatTurns {
               bot: name,
               chatSessionId: turn.sessionId,
               messageId: assistant.id,
+              text: assistant.text,
             });
           } catch (err) {
             this.#log(

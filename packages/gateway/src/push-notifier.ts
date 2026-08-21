@@ -22,6 +22,9 @@ export interface ChatMessagePushEvent {
   displayName: string;
   messageId: string;
   chatSessionId: string;
+  /** The settled reply's text. Truncated here to PREVIEW_MAX_CHARS; encrypted end to end, so the
+   *  relay sees only ciphertext (the redaction boundary is unchanged). */
+  preview: string;
 }
 
 /** A stable, opaque APNs coalescing key for one bot chat. Digesting instead of truncating preserves
@@ -135,7 +138,7 @@ export class RelayNotifier implements Notifier {
       kind: "message",
       threadId: `bot:${event.bot}`,
       agentName: event.displayName,
-      preview: "",
+      preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),
     };
     const routing = {
       category: CHAT_MESSAGE_CATEGORY,
