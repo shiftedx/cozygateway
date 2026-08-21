@@ -61,7 +61,14 @@ async function setup(
   hiddenProfiles: string[] = [],
   extra: { bridgeProfile?: string; deleteTimeoutMs?: number } = {},
 ): Promise<Harness> {
-  const server = await startFakeHermesServer(behavior);
+  const server = await startFakeHermesServer({
+    ...behavior,
+    // Profile creation now seeds through Hermes' profile-aware dashboard config surface. Tests
+    // whose subject is not that surface get a neutral empty operator config and successful merge.
+    dashboard:
+      behavior.dashboard ??
+      ((request) => ({ body: request.method === "GET" ? {} : { ok: true } })),
+  });
   servers.push(server);
   const storage = openStorage(":memory:");
   storages.push(storage);
@@ -157,6 +164,87 @@ describe("bot name validation", () => {
 });
 
 describe("POST /bots", () => {
+  it("seeds only a newly created profile with house defaults and the operator providers map", async () => {
+    const names = new Set<string>(["default", "operator"]);
+    const dashboardCalls: Array<{ method: string; profile: string | null; body: unknown }> = [];
+    const operatorConfig = {
+      providers: {
+        mtplx: {
+          base_url: "http://127.0.0.1:1234/v1",
+          models: ["aeon"],
+          // Provider-local fields are operator-owned and copied verbatim.
+          api_key: "local-only",
+        },
+      },
+      // Neighboring secrets-bearing sections are not part of the providers copy.
+      auth: { dashboard_password: "do-not-copy" },
+      mcp_servers: { inherited: { token: "do-not-copy" } },
+    };
+    const { authed } = await setup(
+      {
+        methods: {
+          "profiles.list": liveProfiles(names),
+          "profiles.create": (params) => {
+            names.add(String(params["name"]));
+            return {};
+          },
+          "profiles.configure": () => ({ applied: { ui_meta: true } }),
+        },
+        dashboard: (request) => {
+          dashboardCalls.push({
+            method: request.method,
+            profile: request.query.get("profile"),
+            body: request.body,
+          });
+          return { body: request.method === "GET" ? operatorConfig : { ok: true } };
+        },
+      },
+      [],
+      { bridgeProfile: "operator" },
+    );
+
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+    expect(dashboardCalls).toEqual([
+      { method: "GET", profile: "operator", body: undefined },
+      {
+        method: "PUT",
+        profile: "night-owl",
+        body: {
+          config: {
+            display: { busy_input_mode: "steer" },
+            agent: {
+              max_turns: 90,
+              gateway_timeout: 1800,
+              clarify_timeout: 600,
+              gateway_timeout_warning: 900,
+              gateway_notify_interval: 600,
+            },
+            providers: operatorConfig.providers,
+          },
+        },
+      },
+    ]);
+  });
+
+  it("does not read or write config when the profile already exists", async () => {
+    let dashboardCalls = 0;
+    const { authed } = await setup({
+      methods: {
+        "profiles.list": liveProfiles(new Set(["default", "scout"])),
+        "profiles.create": () => {
+          throw { code: 4062, message: "Profile 'scout' already exists" };
+        },
+      },
+      dashboard: () => {
+        dashboardCalls += 1;
+        return { body: {} };
+      },
+    });
+
+    expect((await authed("/bots", post({ name: "scout" }))).status).toBe(409);
+    expect(dashboardCalls).toBe(0);
+  });
+
   it("creates the profile with share_auth on, writes the look, and answers with the roster row", async () => {
     const names = new Set<string>(["default"]);
     const meta = new Map<string, Record<string, unknown>>();

@@ -32,6 +32,7 @@ function stub(replies: () => Reply, opts: { failResume?: number } = {}) {
       const record = (params ?? {}) as Record<string, unknown>;
       calls.push({ method, params: record });
       if (method === "prompt.submit") return { ok: true };
+      if (method === "session.interrupt") return { status: "interrupted" };
       if (method !== "session.resume") throw new Error(`unexpected method ${method}`);
       if (failures > 0) {
         failures -= 1;
@@ -105,6 +106,29 @@ describe("BotChatTurns", () => {
       params: { session_id: "stored-1", profile: "scout", omit_messages: true },
     });
     await turns.settled("scout");
+  });
+
+  it("hard-stops the active runtime turn and broadcasts the existing complete state", async () => {
+    const { turns, frames, rpc } = harness(
+      () => ({ messages: [{ role: "user", content: "hi" }], running: true, inflight: true }),
+      { pollMs: 50, timeoutMs: 1_000 },
+    );
+    await turns.send("scout", "stored-1", "hi");
+
+    expect(await turns.stop("scout")).toBe("stopped");
+    expect(rpc.calls.find((call) => call.method === "session.interrupt")?.params).toEqual({
+      session_id: "runtime-1",
+    });
+    expect(turns.polling("scout")).toBe(false);
+    expect(stateFrames(frames).at(-1)).toMatchObject({
+      type: "bot_chat_state",
+      bot: "scout",
+      sessionId: "stored-1",
+      phase: "complete",
+      running: false,
+      inflight: false,
+    });
+    expect(await turns.stop("scout")).toBe("idle");
   });
 
   it("broadcasts each new message once and ends the turn when hermes goes idle", async () => {

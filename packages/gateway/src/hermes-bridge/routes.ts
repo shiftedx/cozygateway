@@ -608,6 +608,23 @@ export function registerBotRoutes(
     }
   });
 
+  // Capability 19. Stop is the hard escape while ordinary sends remain steering input. The turn
+  // owner addresses Hermes' `session.interrupt` with the runtime session id it captured at submit;
+  // this route never accepts a session id from a device.
+  app.post("/bots/:name/chat/stop", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      const outcome = await bots.stopChat(resolved.name);
+      if (outcome === "idle") {
+        return c.json(extensionErrorBody("conflict", "no bot chat turn is running"), 409);
+      }
+      return c.json({ status: "stopped" });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
   // Retire the canonical chat and pin a fresh one. Capability 8.
   //
   // NOTHING IS DELETED, and this is the first place a reader lands, so it is said here too. Hermes

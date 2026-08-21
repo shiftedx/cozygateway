@@ -230,6 +230,8 @@ export interface BotsSurface {
     text: string,
     opts?: { clientId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
+  /** Capability 19: hard-stop the bot turn this bridge is currently driving. */
+  stopChat(name: string): Promise<"stopped" | "idle">;
   /** Capability 9: one photo, with an optional caption, into the canonical chat. The bytes have
    *  already passed the inbound rules (`photos.ts`) by the time this is called; what this owns is
    *  storing the gateway's own copy and getting the RPC pair right. */
@@ -1642,6 +1644,11 @@ export class HermesBridge implements BotsSurface {
     }
   }
 
+  /** Hard-stops the in-flight canonical-chat turn, when this bridge owns one. */
+  async stopChat(name: string): Promise<"stopped" | "idle"> {
+    return this.#chat.stop(name);
+  }
+
   /** One photo, with its caption, into the canonical chat (capability 9).
    *
    *  The gateway's own copy is written FIRST, before hermes hears about the picture at all, and that
@@ -1780,7 +1787,7 @@ export class HermesBridge implements BotsSurface {
 
     const run = (async () => {
       try {
-        const created = await createBotProfile(this.#client, input, this.#now());
+        const created = await createBotProfile(this.#client, input, this.#now(), this.#bridgeProfile);
         await this.refresh(`bot ${created.name} created`);
         const row = this.#storage.botRoster().bots.find((bot) => bot.name === created.name);
         return {

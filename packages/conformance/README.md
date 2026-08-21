@@ -70,6 +70,8 @@ export interface ConformanceEnv {
   botInbox?: { botName: string; threadId: string };
   /** Optional: one capability-18 Hermes bot. See "The optional bot model-config hook". */
   botModelConfig?: { botName: string };
+  /** Optional: one capability-19 Hermes bot. See "The optional bot chat-stop hook". */
+  botChatStop?: { botName: string; prompt?: string };
 }
 ```
 
@@ -108,6 +110,14 @@ Declare `botModelConfig` with the name of a capability-18 Hermes bot to check th
 `GET /bots/:name/model-config` shape, its device-auth wall, and unknown-model validation on PUT.
 The suite deliberately sends only a model id that cannot be in the returned catalog, so the
 conformance run does not mutate the bot's live profile.
+
+## The optional bot chat-stop hook
+
+Declare `botChatStop` with a capability-19 Hermes bot whose configured model stays in flight after
+the supplied prompt until interrupted. The fixture must be idle when the group begins. The suite
+checks the device-auth wall, the idle 409, a live send followed by stop, the fixed
+`{ "status": "stopped" }` response, the shared `bot_chat_state` complete frame, and the return to
+idle. Omit the hook and this group is reported as skipped.
 
 ## The optional stall hook
 
