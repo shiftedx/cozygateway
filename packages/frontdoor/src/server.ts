@@ -7,7 +7,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { decodeFrame, encodeFrame, type Frame } from "./frames.ts";
 import { createProvisionApp } from "./provision.ts";
 import { AgentRegistry, type AgentLink } from "./registry.ts";
-import { proxyRequest, type OpenStream } from "./router.ts";
+import { proxyRequest, proxyUpgrade, type OpenStream } from "./router.ts";
 import { errorBody } from "./schemas.ts";
 import { openFrontdoorStorage, type FrontdoorStorage } from "./storage.ts";
 
@@ -60,6 +60,10 @@ export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFr
   });
 
   server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    const rejectUpgrade = (status: number, reason: string) => {
+      socket.write(`HTTP/1.1 ${status} ${reason}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
+      socket.destroy();
+    };
     const host = hostOf(req);
     if (!poolSet.has(host) && req.url === "/agent") {
       const auth = req.headers.authorization ?? "";
@@ -99,7 +103,25 @@ export async function startFrontdoor(config: FrontdoorConfig): Promise<RunningFr
       });
       return;
     }
-    // Upgrade requests bound for a pool hostname are the ts2021 path: Task 5.
+    if (poolSet.has(host)) {
+      const householdId = storage.householdIdForHostname(host);
+      if (householdId === undefined) {
+        rejectUpgrade(404, "Not Found");
+        return;
+      }
+      const link = registry.get(householdId);
+      if (link === undefined) {
+        rejectUpgrade(502, "Bad Gateway");
+        return;
+      }
+      const streams = agentStreams.get(link);
+      if (streams === undefined) {
+        rejectUpgrade(502, "Bad Gateway");
+        return;
+      }
+      proxyUpgrade(registry, link, req, socket, head, streams);
+      return;
+    }
     socket.destroy();
   });
 

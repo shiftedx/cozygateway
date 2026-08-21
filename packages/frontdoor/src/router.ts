@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 
 import { encodeFrame, type Frame } from "./frames.ts";
 import type { AgentLink, AgentRegistry } from "./registry.ts";
@@ -86,4 +87,92 @@ export function proxyRequest(
   res.on("close", () => {
     if (streams.delete(sid)) link.send({ t: "abort", sid, reason: "client closed" });
   });
+}
+
+/** Pipe an HTTP upgrade over the agent link, preserving the upgraded byte stream. */
+export function proxyUpgrade(
+  registry: AgentRegistry,
+  link: AgentLink,
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  streams: Map<number, OpenStream>,
+): void {
+  const sid = registry.nextStreamId();
+  let hasHead = false;
+  let ended = false;
+  const abortStream = (reason: string) => {
+    if (!streams.delete(sid)) return;
+    ended = true;
+    socket.destroy();
+    link.send({ t: "abort", sid, reason });
+  };
+  streams.set(sid, {
+    sid,
+    onFrame(frame) {
+      if (frame.t === "head") {
+        if (hasHead || ended) {
+          abortStream("invalid response frame order");
+          return;
+        }
+        const reason = frame.status === 101 ? "Switching Protocols" : "";
+        const lines = [`HTTP/1.1 ${frame.status} ${reason}`];
+        for (const [k, vs] of Object.entries(frame.headers)) {
+          for (const v of vs) lines.push(`${k}: ${v}`);
+        }
+        const rawResponse = lines.join("\r\n") + "\r\n\r\n";
+        if (frame.status !== 101) {
+          ended = true;
+          streams.delete(sid);
+          try {
+            socket.end(rawResponse);
+          } catch {
+            socket.destroy();
+          }
+          return;
+        }
+        try {
+          socket.write(rawResponse);
+          hasHead = true;
+        } catch {
+          abortStream("invalid response frame");
+          return;
+        }
+      } else if (frame.t === "data") {
+        if (!hasHead || ended) {
+          abortStream("invalid response frame order");
+          return;
+        }
+        try {
+          socket.write(Buffer.from(frame.b64, "base64"));
+        } catch {
+          abortStream("invalid response frame");
+        }
+      } else if (frame.t === "end") {
+        if (!hasHead || ended) {
+          abortStream("invalid response frame order");
+          return;
+        }
+        ended = true;
+        streams.delete(sid);
+        socket.end();
+      } else if (frame.t === "abort") {
+        ended = true;
+        streams.delete(sid);
+        socket.destroy();
+      }
+    },
+  });
+  socket.on("data", (chunk: Buffer) => {
+    if (streams.has(sid)) link.send({ t: "data", sid, b64: chunk.toString("base64") });
+  });
+  socket.on("close", () => {
+    if (streams.delete(sid)) {
+      ended = true;
+      link.send({ t: "abort", sid, reason: "client closed" });
+    }
+  });
+  socket.on("error", () => { /* close handler covers it */ });
+  link.send({ t: "open", sid, method: req.method ?? "GET", path: req.url ?? "/", headers: rawHeaders(req), upgrade: true });
+  if (head.length > 0 && streams.has(sid)) link.send({ t: "data", sid, b64: head.toString("base64") });
 }
