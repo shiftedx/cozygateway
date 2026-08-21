@@ -50,7 +50,7 @@ export const NotifyRequestSchema = Type.Object(
     ciphertext: Type.String({ minLength: 1, maxLength: CIPHERTEXT_MAX_LENGTH }),
     /** Optional routing metadata (issue #19, section 2). Omitted = today's message push. */
     category: Type.Optional(Type.Union(PUSH_CATEGORY_IDS.map((id) => Type.Literal(id)))),
-    /** Coalescing key; the approval categories use the `toolCallId`. */
+    /** Coalescing key; approvals use `toolCallId`, bot messages use a bot/chat digest. */
     collapseId: Type.Optional(
       Type.String({ minLength: 1, maxLength: COLLAPSE_ID_MAX_LENGTH, pattern: COLLAPSE_ID_PATTERN }),
     ),

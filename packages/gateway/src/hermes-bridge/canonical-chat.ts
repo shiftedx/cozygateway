@@ -210,6 +210,14 @@ export function isConversationalSession(row: SessionRow): boolean {
   return sessionKind(row) === "conversation";
 }
 
+/** The settled-message push gate: the id must still name a listed conversational session. Using
+ *  the shared classifier here keeps cron, routine, group and a2a exclusions identical to pin
+ *  adoption and roster preview behavior. */
+export function isConversationalSessionId(rows: readonly SessionRow[], sessionId: string): boolean {
+  const row = rows.find((candidate) => candidate.id === sessionId);
+  return row !== undefined && isConversationalSession(row);
+}
+
 export interface CanonicalChatDeps {
   rpc: HermesRpc;
   pins: PinStore;

@@ -128,6 +128,41 @@ export function stripImageDirectives(text: string): string {
     .trim();
 }
 
+/** The one-line replacement for Hermes context-management rows. The marker is deliberately plain
+ *  text and needs no capability bump: old clients render one short line, while clients that know
+ *  the convention may render it as a compact chip. */
+export const CONTEXT_COMPACTION_MARKER = "[[context: compacted]]";
+
+const CONTEXT_COMPACTION_HEADER_RE =
+  /^\[CONTEXT COMPACTION [-\u2013\u2014] REFERENCE ONLY\]$/;
+const PRIOR_CONTEXT_HEADER_RE =
+  /^\[PRIOR CONTEXT [-\u2013\u2014] for reference only; not a new message\]$/;
+const PRIOR_CONTEXT_SUMMARY_RE =
+  /^\[END OF PRIOR CONTEXT [-\u2013\u2014] COMPACTION SUMMARY BELOW\]$/;
+const CONTEXT_SUMMARY_BEGIN_RE = /^--- BEGIN(?: OF)? CONTEXT SUMMARY(?: ---)?$/;
+const CONTEXT_SUMMARY_END_RE = /^--- END(?: OF)? CONTEXT SUMMARY(?: ---)?$/;
+const SKILL_PRUNED_RE =
+  /^\[SKILL_PRUNED: content lost in compression; reload with skill_view\(name=[^)]+\)\]$/;
+
+/** Recognizes only whole Hermes context-management rows from the live corpus. A marker pasted
+ *  after ordinary prose is not a match, nor is a bare SKILL_PRUNED line: shapes without a complete
+ *  sentinel boundary pass through because conversation wins when the evidence is ambiguous. */
+export function isContextCompactionText(text: string): boolean {
+  const lines = text.split(/\r?\n/);
+  const first = lines[0] ?? "";
+  const second = lines[1] ?? "";
+  const last = lines.at(-1) ?? "";
+  if (CONTEXT_COMPACTION_HEADER_RE.test(first)) return true;
+  if (PRIOR_CONTEXT_HEADER_RE.test(first) && PRIOR_CONTEXT_SUMMARY_RE.test(second)) return true;
+  const closedSummary = CONTEXT_SUMMARY_END_RE.test(last);
+  if (CONTEXT_SUMMARY_BEGIN_RE.test(first) && closedSummary) return true;
+  return SKILL_PRUNED_RE.test(first) && closedSummary;
+}
+
+export function isContextCompactionMarker(message: Pick<BotChatMessage, "text">): boolean {
+  return message.text === CONTEXT_COMPACTION_MARKER;
+}
+
 /** The only two roles that reach a chat bubble. Everything else in a Hermes transcript is turn
  *  machinery: a `system` prompt, a `tool` result, and an assistant message whose content is a bare
  *  `tool_use` part all belong to the turn, not to the conversation. The desktop consumer this is
@@ -152,19 +187,27 @@ function decodeChatRow(raw: unknown): DecodedRow | undefined {
   if (record === undefined) return undefined;
   const rawRole = typeof record["role"] === "string" ? record["role"].trim().toLowerCase() : "";
   const role = rawRole.length > 0 ? rawRole : "assistant";
-  if (!RENDERED_ROLES.has(role)) return undefined;
+  const flattened = extractMessageText(record);
+  const compaction =
+    (role === "user" || role === "assistant" || role === "system") &&
+    isContextCompactionText(flattened);
+  if (!compaction && !RENDERED_ROLES.has(role)) return undefined;
   // User rows only, and that scoping matters. These directives are written by hermes into the row it
   // persists for a turn the USER sent, so a user row carrying one is machinery. An assistant that
   // writes `/Users/kyle/out.png` into its reply is writing prose about a file it made, which is the
   // very thing `GET /bots/:name/media` refuses to fetch and the app renders as a chip, and editing it
   // out of the bot's own words would be rewriting the conversation.
-  const flattened = extractMessageText(record);
-  const text = role === "user" ? stripImageDirectives(flattened) : flattened;
+  const renderedRole = role === "system" ? "assistant" : role;
+  const text = compaction
+    ? CONTEXT_COMPACTION_MARKER
+    : renderedRole === "user"
+      ? stripImageDirectives(flattened)
+      : flattened;
   if (text.length === 0) return undefined;
   // `row_id` is what a live 0.20.4 dashboard actually stamps on a transcript row (rows there carry
   // `role`, `text`, `timestamp` and `row_id`, and no `id` at all).
   const id = asId(record["id"]) ?? asId(record["message_id"]) ?? asId(record["row_id"]);
-  return { id, role, text, at: messageTimestamp(record) };
+  return { id, role: renderedRole, text, at: messageTimestamp(record) };
 }
 
 /** Maps one raw message, or drops it. The single-row form of `parseChatSnapshot`'s decode, so a row

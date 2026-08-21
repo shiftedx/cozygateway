@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { HermesRpc } from "../src/hermes-bridge/canonical-chat.ts";
 import { syntheticChatId } from "../src/hermes-bridge/chat-identity.ts";
+import { CONTEXT_COMPACTION_MARKER } from "../src/hermes-bridge/chat-messages.ts";
 import {
   ensureGroupSession,
   findFreshReply,
@@ -52,6 +53,14 @@ describe("findFreshReply", () => {
     // The user's prompt has landed but the model has not answered yet: the previous turn's reply is
     // not this turn's, and a walk back over the whole transcript would return it.
     expect(findFreshReply(messages, { renderedCount: 2 })).toBeUndefined();
+  });
+
+  it("never treats a context-compaction marker as a member reply", () => {
+    const messages = [
+      rendered("s", 0, "user", "turn prompt"),
+      rendered("s", 1, "assistant", CONTEXT_COMPACTION_MARKER),
+    ];
+    expect(findFreshReply(messages, { renderedCount: 1 })).toBeUndefined();
   });
 
   it("prefers the identity anchor when a compaction moved the count", () => {

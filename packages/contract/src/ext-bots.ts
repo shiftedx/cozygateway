@@ -122,8 +122,10 @@ export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
  *  drop a replayed frame. `at` is MILLISECONDS, or null when the message carries no timestamp at
  *  all (Hermes stamps in seconds on some builds and not at all on others).
  *
- *  `role` is always `user` or `assistant` on this wire: the bridge drops `system` and `tool` rows,
- *  and any row whose text is empty, so tool chatter never reaches a chat bubble.
+ *  `role` is always `user` or `assistant` on this wire: the bridge drops ordinary `system` and
+ *  `tool` rows, and any row whose text is empty, so tool chatter never reaches a chat bubble.
+ *  Hermes context-management rows are the narrow exception. A whole-row compaction shape becomes
+ *  exactly `[[context: compacted]]`; a system-role compaction uses assistant on this wire.
  *
  *  `clientId` is the echo of what the sender put on `POST /bots/:name/chat/messages` (or the
  *  gateway's own local id when the sender sent none). It rides the 202 body AND the same message
@@ -149,7 +151,11 @@ export const BotChatMessageSchema = Type.Object({
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;
 
 /** New messages in a bot's canonical chat. A DELTA, not a snapshot: `messages` carries only what
- *  the bridge has not broadcast before, in order. */
+ *  the bridge has not broadcast before, in order.
+ *
+ *  A settled assistant row in the canonical conversational session also raises the existing
+ *  encrypted `message` push for registered devices without a live socket. This changes no frame or
+ *  capability: drafts, user echoes, context markers and machine-classified sessions stay in-band. */
 export const BotChatFrameSchema = Type.Object({
   type: Type.Literal("bot_chat"),
   bot: Type.String(),
@@ -1028,7 +1034,10 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    the canonical chat re-adopts it, `GET /bots/:name/chat` reports `adoption: "latest"`, and every
  *    paired device is told on the socket.
  *
- *    Routine runs and bot-to-bot deliveries never move the pin, and neither do group-room sessions.
+ *    The roster preview and its `lastActiveAt` now come from that resolved canonical session too,
+ *    rather than from the profile's latest activity across every session. Routine runs,
+ *    bot-to-bot deliveries and group-room sessions never feed those fields or move the pin. They
+ *    may still make the bot active because presence intentionally observes all session activity.
  *    The exclusions and the reasoning are in `contract/ext-bots-v1.md` under "The pin follows the
  *    bot's latest conversation".
  *

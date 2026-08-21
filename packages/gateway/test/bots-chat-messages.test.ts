@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { ChatIdentityLedger, syntheticChatId } from "../src/hermes-bridge/chat-identity.ts";
 import {
+  CONTEXT_COMPACTION_MARKER,
   extractMessageText,
   normalizeTimestamp,
   parseChatSnapshot,
@@ -55,6 +56,110 @@ describe("normalizeTimestamp", () => {
 });
 
 describe("parseChatSnapshot", () => {
+  const compactionCorpus = [
+    {
+      role: "user",
+      text: [
+        "[CONTEXT COMPACTION - REFERENCE ONLY]",
+        "Earlier messages were compressed for the next turn.",
+      ].join("\n"),
+    },
+    {
+      role: "assistant",
+      text: [
+        "[PRIOR CONTEXT - for reference only; not a new message]",
+        "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW]",
+        "The user is working on a gateway.",
+        "--- END OF CONTEXT SUMMARY ---",
+      ].join("\n"),
+    },
+    {
+      role: "system",
+      text: [
+        "--- BEGIN CONTEXT SUMMARY ---",
+        "Keep the current implementation plan.",
+        "--- END OF CONTEXT SUMMARY ---",
+      ].join("\n"),
+    },
+    {
+      role: "user",
+      text: [
+        "[SKILL_PRUNED: content lost in compression; reload with skill_view(name=diagnosing-bugs)]",
+        "The remaining context summary follows.",
+        "--- END OF CONTEXT SUMMARY",
+      ].join("\n"),
+    },
+    {
+      role: "assistant",
+      text: [
+        "[CONTEXT COMPACTION \u2014 REFERENCE ONLY]",
+        "The live wire can use a Unicode dash.",
+      ].join("\n"),
+    },
+  ] as const;
+
+  it.each(compactionCorpus)("replaces a $role compaction corpus row with one marker", ({ role, text }) => {
+    const snapshot = parseChatSnapshot({ messages: [{ role, content: text }] }, "canonical");
+    expect(snapshot.messages).toHaveLength(1);
+    expect(snapshot.messages[0]).toMatchObject({ text: CONTEXT_COMPACTION_MARKER });
+    expect(snapshot.messages[0]!.text).not.toContain("SKILL_PRUNED");
+    expect(snapshot.messages[0]!.text).not.toContain("CONTEXT SUMMARY");
+  });
+
+  it.each([
+    "I pasted [SKILL_PRUNED: content lost in compression; reload with skill_view(name=demo)] in a normal message.",
+    "Normal preface\n[CONTEXT COMPACTION - REFERENCE ONLY]\nquoted sentinel",
+    "[SKILL_PRUNED: content lost in compression; reload with skill_view(name=demo)]",
+    "--- BEGIN CONTEXT SUMMARY ---\nmissing the final sentinel",
+    "Please explain --- END OF CONTEXT SUMMARY --- in prose.",
+    "[PRIOR CONTEXT - for reference only; not a new message]\nnormal second line",
+  ])("passes through a compaction near-miss: %s", (text) => {
+    const snapshot = parseChatSnapshot({ messages: [{ role: "user", content: text }] }, "canonical");
+    expect(snapshot.messages).toHaveLength(1);
+    expect(snapshot.messages[0]!.text).toBe(text);
+  });
+
+  it("keeps marker ids stable across rereads and never fingerprints the full summary", () => {
+    const first = parseChatSnapshot(
+      {
+        messages: [
+          {
+            role: "user",
+            content: "[CONTEXT COMPACTION - REFERENCE ONLY]\nfirst private summary",
+          },
+          {
+            id: "backend-marker-id",
+            role: "assistant",
+            content: "--- BEGIN CONTEXT SUMMARY ---\nprivate body\n--- END OF CONTEXT SUMMARY ---",
+          },
+        ],
+      },
+      "canonical",
+    );
+    const reread = parseChatSnapshot(
+      {
+        messages: [
+          {
+            role: "user",
+            content: "[CONTEXT COMPACTION - REFERENCE ONLY]\nchanged private summary",
+          },
+          {
+            id: "backend-marker-id",
+            role: "assistant",
+            content: "--- BEGIN CONTEXT SUMMARY ---\nchanged body\n--- END OF CONTEXT SUMMARY ---",
+          },
+        ],
+      },
+      "canonical",
+    );
+    expect(reread.messages.map((message) => message.id)).toEqual(first.messages.map((message) => message.id));
+    expect(reread.messages.map((message) => message.text)).toEqual([
+      CONTEXT_COMPACTION_MARKER,
+      CONTEXT_COMPACTION_MARKER,
+    ]);
+    expect(first.messages[1]!.id).toBe("backend-marker-id");
+  });
+
   it("maps a mixed-shape message list to the stable wire shape", () => {
     const snapshot = parseChatSnapshot(
       {

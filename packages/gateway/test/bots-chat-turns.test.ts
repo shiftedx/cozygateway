@@ -57,6 +57,7 @@ function harness(
     failResume?: number;
     attachments?: ChatAttachmentStore;
     assistantMedia?: AssistantMediaStore;
+    onSettledAssistantMessage?: (event: { bot: string; chatSessionId: string; messageId: string }) => void;
   } = {},
 ) {
   const frames: ServerFrame[] = [];
@@ -72,6 +73,9 @@ function harness(
     timeoutMs: overrides.timeoutMs ?? 300,
     ...(overrides.attachments === undefined ? {} : { attachments: overrides.attachments }),
     ...(overrides.assistantMedia === undefined ? {} : { assistantMedia: overrides.assistantMedia }),
+    ...(overrides.onSettledAssistantMessage === undefined
+      ? {}
+      : { onSettledAssistantMessage: overrides.onSettledAssistantMessage }),
   });
   return { turns, frames, rpc };
 }
@@ -128,6 +132,65 @@ describe("BotChatTurns", () => {
     expect(new Set(messages.map((message) => message.id)).size).toBe(messages.length);
     expect(stateFrames(frames).at(0)?.phase).toBe("polling");
     expect(stateFrames(frames).at(-1)).toMatchObject({ phase: "complete", running: false, inflight: false });
+  });
+
+  it("raises the settled assistant seam once, after running has ended", async () => {
+    let reply: Reply = { messages: [{ id: "u1", role: "user", content: "hi" }], running: true };
+    const events: Array<{ bot: string; chatSessionId: string; messageId: string }> = [];
+    const { turns } = harness(() => reply, { onSettledAssistantMessage: (event) => events.push(event) });
+    await turns.send("scout", "stored-1", "hi");
+    reply = {
+      messages: [
+        { id: "u1", role: "user", content: "hi" },
+        { id: "a1", role: "assistant", content: "all green" },
+      ],
+      running: true,
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(events).toEqual([]);
+
+    reply = { messages: reply.messages };
+    await turns.settled("scout");
+    expect(events).toEqual([{ bot: "scout", chatSessionId: "stored-1", messageId: "a1" }]);
+  });
+
+  it("does not raise the settled assistant seam for a timeout", async () => {
+    const events: unknown[] = [];
+    const { turns } = harness(
+      () => ({ messages: [{ role: "user", content: "hi" }], running: true }),
+      { timeoutMs: 30, onSettledAssistantMessage: (event) => events.push(event) },
+    );
+    await turns.send("scout", "stored-1", "hi");
+    await turns.settled("scout");
+    expect(events).toEqual([]);
+  });
+
+  it("broadcasts a compaction marker without treating it as the settled assistant reply", async () => {
+    let reply: Reply = { messages: [{ role: "user", content: "hi" }], running: true };
+    const { turns, frames } = harness(() => reply);
+    await turns.send("scout", "stored-1", "hi");
+    reply = {
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "system",
+          content: "--- BEGIN CONTEXT SUMMARY ---\nprivate summary\n--- END OF CONTEXT SUMMARY ---",
+        },
+      ],
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(turns.polling("scout")).toBe(true);
+
+    reply = {
+      messages: [...reply.messages, { role: "assistant", content: "all green" }],
+    };
+    await turns.settled("scout");
+    expect(chatFrames(frames).flatMap((frame) => frame.messages).map((message) => message.text)).toEqual([
+      "hi",
+      "[[context: compacted]]",
+      "all green",
+    ]);
+    expect(stateFrames(frames).at(-1)?.phase).toBe("complete");
   });
 
   it("extracts at settlement only, caps attempts at three, and preserves every failed or unattempted line", async () => {

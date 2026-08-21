@@ -184,6 +184,11 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
 carries the sending bot's handle. `plain` is an ordinary preview (falling back to the bot's
 description). `empty` means the bot has no conversation yet.
 
+For roster rows, `preview` and `lastActiveAt` are scoped to the resolved canonical chat. A newer
+cron, delegated routine, group-room, or bot-to-bot session cannot replace them. If the canonical
+chat has no persisted row yet, the preview is `empty` and `lastActiveAt` is null. Presence remains
+independent: activity in any session may still make the bot active.
+
 ### BotChatMessage
 
 ```
@@ -206,6 +211,10 @@ bridge flattens them and this is what a client sees. The mapping, exactly:
   `content` at all, `text` is `msg.text`. The result is trimmed.
 - `role`: the message's `role`, or `"assistant"` when it carries none. Roles are NOT an enum on
   this wire: a build that invents `tool` must not break a client.
+- Hermes context-management rows never carry their full summary text. A whole user, assistant, or
+  system row matching the compaction sentinels becomes exactly `[[context: compacted]]`. System
+  compaction rows use role `assistant`; ordinary system and tool rows remain dropped. The marker is
+  ordinary text on the v1 wire, so clients may render it as a chip without a capability bump.
 - `at`: the first usable value among `at`, `ts`, `timestamp`, `time`, `created_at`, `created`.
   A number at or below 10^11 is read as SECONDS and multiplied, anything larger is already
   milliseconds; numeric strings and ISO strings are accepted; anything else yields null.
@@ -860,6 +869,14 @@ sender's own message. That is the desktop plugin's own turn loop, moved server-s
 phone that is backgrounded (or a second device that was never in the room) still receives the whole
 turn. Each poll that finds new messages emits a `bot_chat` delta; each change of state emits a
 `bot_chat_state`.
+
+When the terminal row is a settled assistant message in the canonical conversational session, the
+gateway also raises the existing encrypted `message` push for registered devices without a live
+socket. Drafts, user echoes, compaction markers, cron sessions, delegated routines, group sessions,
+and bot-to-bot deliveries never raise it. The relay category is `message`; its opaque collapse id is
+stable for the bot name plus canonical chat session, so a burst from one conversation coalesces.
+Relay failure and daily caps affect only the banner and never the `bot_chat` frame path. This is
+server behavior over the existing push contract and does not change the bots capability version.
 
 While the turn runs, the gateway also streams a LIVE DRAFT of the reply as `bot_chat_delta` frames
 (section 6), built from Hermes' own token events rather than from the poll. It is decoration: the

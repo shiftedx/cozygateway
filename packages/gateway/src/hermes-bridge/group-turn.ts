@@ -1,7 +1,7 @@
 import type { BotChatMessage } from "cozygateway-contract";
 
 import type { HermesRpc } from "./canonical-chat.ts";
-import { parseChatSnapshot } from "./chat-messages.ts";
+import { isContextCompactionMarker, parseChatSnapshot } from "./chat-messages.ts";
 import type { ChatStreamBinder } from "./chat-stream.ts";
 import { CHAT_POLL_MS, CHAT_TURN_TIMEOUT_MS } from "./chat-turns.ts";
 import { groupSessionTitle } from "./group-protocol.ts";
@@ -148,7 +148,7 @@ export function findFreshReply(
       : Math.min(session.renderedCount, messages.length);
   for (let index = messages.length - 1; index >= baseline; index -= 1) {
     const message = messages[index];
-    if (message?.role === "assistant") return message;
+    if (message?.role === "assistant" && !isContextCompactionMarker(message)) return message;
   }
   return undefined;
 }

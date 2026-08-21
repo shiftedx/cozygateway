@@ -428,7 +428,15 @@ describe("hidden profiles", () => {
     // by-name route still reaches it.
     const sessions = await authed("/bots/ops-runner/sessions");
     expect(sessions.status).toBe(200);
-    expect(server.callsOf("session.list")[0]?.params).toMatchObject({ profile: "ops-runner" });
+    // Index 0 is no longer this route's call: the roster preview (cozygateway#102) issues its own
+    // session.list per visible bot before any by-name route runs. The property under test is that
+    // the hidden profile IS addressed, wherever its call lands in the order.
+    expect(
+      server.callsOf("session.list").some((call) => {
+        const params = call.params as { profile?: string };
+        return params.profile === "ops-runner";
+      }),
+    ).toBe(true);
   });
 });
 
@@ -718,6 +726,8 @@ describe("unknown bot (contract/ext-bots-v1.md section 4)", () => {
       },
     });
 
+    const sessionListCallsBefore = server.callsOf("session.list").length;
+
     const chat = await authed("/bots/probe-bot/chat");
     expect(chat.status).toBe(404);
     expect(((await chat.json()) as { error: { code: string } }).error.code).toBe("not_found");
@@ -740,7 +750,7 @@ describe("unknown bot (contract/ext-bots-v1.md section 4)", () => {
     // The exact bug this closes: nothing hermes-side was ever touched for a profile that is not
     // there, the canonical chat's own mint (`session.create`) included.
     expect(server.callsOf("session.create")).toHaveLength(0);
-    expect(server.callsOf("session.list")).toHaveLength(0);
+    expect(server.callsOf("session.list")).toHaveLength(sessionListCallsBefore);
     expect(server.callsOf("prompt.submit")).toHaveLength(0);
   });
 

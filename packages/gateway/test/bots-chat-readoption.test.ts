@@ -63,6 +63,7 @@ interface SessionRow {
   title: string;
   preview?: string;
   source?: string;
+  last_active?: number;
 }
 
 /** The mutable hermes this suite drives. `sessions` is NEWEST FIRST, the ordering convention the
@@ -74,6 +75,7 @@ interface HermesState {
   sessions: SessionRow[];
   transcripts: Record<string, string>;
   preview: string;
+  lastActive: number;
 }
 
 function behaviorFor(state: HermesState): FakeHermesBehavior {
@@ -87,7 +89,7 @@ function behaviorFor(state: HermesState): FakeHermesBehavior {
             description: "watches CI",
             has_avatar: false,
             ui_meta: { "hermes-bots": state.meta },
-            last_session: { last_active: Math.round(NOW / 1000), preview: state.preview },
+            last_session: { last_active: state.lastActive, preview: state.preview },
           },
         ],
         bot_mode_protocol: true,
@@ -133,9 +135,17 @@ interface Harness {
 async function setup(): Promise<Harness> {
   const state: HermesState = {
     meta: { title: "Scout", chat: "sess-1" },
-    sessions: [{ id: "sess-1", title: CANONICAL_CHAT_TITLE }],
+    sessions: [
+      {
+        id: "sess-1",
+        title: CANONICAL_CHAT_TITLE,
+        preview: "from the phone",
+        last_active: Math.round(NOW / 1000) - 30,
+      },
+    ],
     transcripts: { "sess-1": "from the phone" },
     preview: "from the phone",
+    lastActive: Math.round(NOW / 1000),
   };
   const server = await startFakeHermesServer(behaviorFor(state));
   servers.push(server);
@@ -201,14 +211,30 @@ async function chatOf(authed: Harness["authed"]): Promise<{ sessionId: string; a
 /** The roster row `GET /bots` serves, after a refresh, so the cache reflects the pin just written. */
 async function rosterRow(
   harness: Harness,
-): Promise<{ chatSessionId: string | null; preview: { kind: string; text: string } }> {
+): Promise<{
+  active: boolean;
+  chatSessionId: string | null;
+  lastActiveAt: number | null;
+  preview: { kind: string; text: string };
+}> {
   await harness.bridge.refresh("test");
   const listed = (await (await harness.authed("/bots")).json()) as {
-    bots: Array<{ name: string; chatSessionId: string | null; preview: { kind: string; text: string } }>;
+    bots: Array<{
+      active: boolean;
+      name: string;
+      chatSessionId: string | null;
+      lastActiveAt: number | null;
+      preview: { kind: string; text: string };
+    }>;
   };
   const row = listed.bots.find((bot) => bot.name === "scout");
   if (row === undefined) throw new Error("scout is not on the roster");
-  return { chatSessionId: row.chatSessionId, preview: row.preview };
+  return {
+    active: row.active,
+    chatSessionId: row.chatSessionId,
+    lastActiveAt: row.lastActiveAt,
+    preview: row.preview,
+  };
 }
 
 function adoptedFrames(frames: ServerFrame[]): Array<Record<string, unknown>> {
@@ -218,6 +244,78 @@ function adoptedFrames(frames: ServerFrame[]): Array<Record<string, unknown>> {
 }
 
 describe("canonical chat re-adoption", () => {
+  it("sources the roster preview and timestamp from the pinned chat while a newer cron exists", async () => {
+    const harness = await setup();
+    const { state, authed } = harness;
+    await chatOf(authed);
+
+    state.sessions = [
+      {
+        id: "cron_job7_1755600000",
+        title: "Nightly digest Aug 20 03:00",
+        source: "cron",
+        preview: "Both zones are 79F. Tie rotation applied.",
+        last_active: Math.round(NOW / 1000),
+      },
+      ...state.sessions,
+    ];
+    state.preview = "Both zones are 79F. Tie rotation applied.";
+
+    const row = await rosterRow(harness);
+    expect(row).toMatchObject({
+      active: true,
+      chatSessionId: "sess-1",
+      lastActiveAt: NOW - 30_000,
+      preview: { kind: "plain", text: "from the phone" },
+    });
+  });
+
+  it("keeps an unlisted empty canonical chat empty while newer machine sessions exist", async () => {
+    const harness = await setup();
+    const { state, authed } = harness;
+    await chatOf(authed);
+
+    state.sessions = [
+      {
+        id: "sess-r",
+        title: "Routine: Nightly digest",
+        source: "cli",
+        preview: "digest done",
+        last_active: Math.round(NOW / 1000),
+      },
+    ];
+    state.preview = "digest done";
+
+    const row = await rosterRow(harness);
+    expect(row.active).toBe(true);
+    expect(row.chatSessionId).toBe("sess-1");
+    expect(row.lastActiveAt).toBeNull();
+    expect(row.preview.kind).toBe("empty");
+    expect(row.preview.text).not.toContain("digest done");
+    expect(row.preview.text).not.toContain("watches CI");
+  });
+
+  it.each([
+    ["routine", { id: "sess-r", title: "Routine: Nightly digest", source: "cli" }],
+    ["group", { id: "sess-g", title: "Group: Release Room" }],
+    ["a2a", { id: "sess-a2a", title: "Chat", preview: "Message from agent 'pixel': deploy is green" }],
+  ])("does not source the roster from a newer %s session", async (_kind, machine) => {
+    const harness = await setup();
+    const { state, authed } = harness;
+    await chatOf(authed);
+
+    state.sessions = [
+      { ...machine, last_active: Math.round(NOW / 1000) },
+      ...state.sessions,
+    ];
+    state.preview = "preview" in machine ? machine.preview : "machine output";
+
+    const row = await rosterRow(harness);
+    expect(row.chatSessionId).toBe("sess-1");
+    expect(row.lastActiveAt).toBe(NOW - 30_000);
+    expect(row.preview).toEqual({ kind: "plain", text: "from the phone" });
+  });
+
   it("follows a conversation held from a second device, and says so on the socket", async () => {
     const harness = await setup();
     const { state, authed, frames } = harness;
@@ -236,7 +334,15 @@ describe("canonical chat re-adoption", () => {
     // The PC now holds a conversation with the same bot. Hermes mints a session for it, and the
     // profile's `last_session` (what the roster preview reads) moves to it. This is the exact state
     // the bug reported: the preview updated, the chat did not.
-    state.sessions = [{ id: "sess-2", title: "Chat with scout" }, ...state.sessions];
+    state.sessions = [
+      {
+        id: "sess-2",
+        title: "Chat with scout",
+        preview: "from the PC",
+        last_active: Math.round(NOW / 1000),
+      },
+      ...state.sessions,
+    ];
     state.transcripts["sess-2"] = "from the PC";
     state.preview = "from the PC";
 

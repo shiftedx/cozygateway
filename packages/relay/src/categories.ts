@@ -4,12 +4,11 @@
  * A category is the ONE piece of routing metadata the relay is allowed to see in the clear.
  * It tells a transport how to shape the envelope (which actionable notification category the
  * app should attach buttons to, and that this push coalesces), and nothing about the content:
- * every field describing the tool call itself -- `toolCallId`, `name`, the redacted
- * `argSummary`, the addressing ids -- rides inside the opaque ciphertext the relay cannot
- * read, exactly like today's message payload. See the relay README, "Push categories".
+ * every field describing the notification itself rides inside the opaque ciphertext the relay
+ * cannot read. See the relay README, "Push categories".
  */
 
-export const PUSH_CATEGORY_IDS = ["approval.pending", "approval.resolved"] as const;
+export const PUSH_CATEGORY_IDS = ["message", "approval.pending", "approval.resolved"] as const;
 export type PushCategoryId = (typeof PUSH_CATEGORY_IDS)[number];
 
 export interface PushCategorySpec {
@@ -35,6 +34,12 @@ export interface PushCategorySpec {
  * tions`) is the app's job when it is running to see the replacement.
  */
 export const PUSH_CATEGORIES: Readonly<Record<PushCategoryId, PushCategorySpec>> = {
+  message: {
+    id: "message",
+    pushType: "alert",
+    requiresCollapseId: true,
+    alert: { title: "CozyChat", body: "New message" },
+  },
   "approval.pending": {
     id: "approval.pending",
     pushType: "alert",

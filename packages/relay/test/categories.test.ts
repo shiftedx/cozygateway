@@ -9,8 +9,8 @@ import {
 } from "../src/categories.ts";
 
 describe("push category registry", () => {
-  it("exposes the approval pair the app registers actions against (issue #19, section 2)", () => {
-    expect(PUSH_CATEGORY_IDS).toEqual(["approval.pending", "approval.resolved"]);
+  it("exposes message coalescing and the approval pair", () => {
+    expect(PUSH_CATEGORY_IDS).toEqual(["message", "approval.pending", "approval.resolved"]);
   });
 
   it("keys every spec by its own id, so a category cannot be mis-mapped", () => {
@@ -19,7 +19,8 @@ describe("push category registry", () => {
     }
   });
 
-  it("requires a collapse id for both approval categories so a resolve can replace its pending banner", () => {
+  it("requires a collapse id for every coalescing category", () => {
+    expect(PUSH_CATEGORIES["message"].requiresCollapseId).toBe(true);
     expect(PUSH_CATEGORIES["approval.pending"].requiresCollapseId).toBe(true);
     expect(PUSH_CATEGORIES["approval.resolved"].requiresCollapseId).toBe(true);
   });
@@ -33,6 +34,7 @@ describe("push category registry", () => {
   });
 
   it("recognizes exactly the registered ids", () => {
+    expect(isPushCategoryId("message")).toBe(true);
     expect(isPushCategoryId("approval.pending")).toBe(true);
     expect(isPushCategoryId("approval.granted")).toBe(false);
     expect(isPushCategoryId("")).toBe(false);

@@ -44,7 +44,45 @@ const OLD_PIN = NOW - 10_000;
 const pinEntries = (entries: Record<string, string>, updatedAt = OLD_PIN): PinEntries =>
   new Map(Object.entries(entries).map(([name, sessionId]) => [name, { sessionId, updatedAt }]));
 
-const idle = { routedProfile: null, gatewayState: "open" as const, now: NOW, pins: new Map() as PinEntries };
+const idle = {
+  routedProfile: null,
+  gatewayState: "open" as const,
+  now: NOW,
+  pins: new Map() as PinEntries,
+  canonicalSessions: new Map(),
+};
+
+function canonicalSession(
+  name: string,
+  row: {
+    id: string;
+    kind?: "conversation" | "cron" | "routine" | "group" | "a2a";
+    lastActiveAt?: number;
+    preview?: string | null;
+  },
+): Map<
+  string,
+  Array<{
+    id: string;
+    kind: "conversation" | "cron" | "routine" | "group" | "a2a";
+    lastActiveAt: number;
+    preview: string | null;
+  }>
+> {
+  return new Map([
+    [
+      name,
+      [
+        {
+          id: row.id,
+          kind: row.kind ?? "conversation",
+          lastActiveAt: row.lastActiveAt ?? NOW - 30_000,
+          preview: row.preview ?? null,
+        },
+      ],
+    ],
+  ]);
+}
 
 describe("profiles.list decoding", () => {
   it("converts last_active seconds to milliseconds and keeps meta.created in milliseconds", () => {
@@ -153,12 +191,15 @@ describe("roster build", () => {
         profileRow({
           name: "scout",
           has_avatar: true,
-          last_session: lastSession(5, "Message from 🤖 luna (@luna): ping"),
+          last_session: lastSession(5, "newer machine output"),
           ui_meta: { "hermes-bots": { title: "Scout", group: "Ops", pinned: true, chat: "sess-9" } },
         }),
       ],
     });
-    const [bot] = buildRoster(profiles, idle);
+    const [bot] = buildRoster(profiles, {
+      ...idle,
+      canonicalSessions: canonicalSession("scout", { id: "sess-9", preview: "canonical reply" }),
+    });
     expect(bot).toMatchObject({
       name: "scout",
       displayName: "Scout",
@@ -168,9 +209,77 @@ describe("roster build", () => {
       pinned: true,
       active: true,
       chatSessionId: "sess-9",
-      preview: { kind: "a2a", text: "ping", sender: "luna" },
+      lastActiveAt: NOW - 30_000,
+      preview: { kind: "plain", text: "canonical reply" },
     });
   });
+
+  it("uses only the pinned conversational session for preview and display time", () => {
+    const { profiles } = parseProfilesList({
+      profiles: [
+        profileRow({
+          description: "watches CI",
+          last_session: lastSession(1, "Both zones are 79F. Tie rotation applied."),
+          ui_meta: { "hermes-bots": { chat: "chat-1" } },
+        }),
+      ],
+    });
+    const [bot] = buildRoster(profiles, {
+      ...idle,
+      canonicalSessions: canonicalSession("scout", {
+        id: "chat-1",
+        preview: "the canonical reply",
+        lastActiveAt: NOW - 60_000,
+      }),
+    });
+    expect(bot).toMatchObject({
+      active: true,
+      lastActiveAt: NOW - 60_000,
+      preview: { kind: "plain", text: "the canonical reply" },
+    });
+  });
+
+  it("keeps an unlisted canonical chat empty instead of borrowing profile activity or description", () => {
+    const { profiles } = parseProfilesList({
+      profiles: [
+        profileRow({
+          description: "watches CI",
+          last_session: lastSession(1, "cron output"),
+          ui_meta: { "hermes-bots": { chat: "empty-chat" } },
+        }),
+      ],
+    });
+    const bot = buildRoster(profiles, idle)[0]!;
+    expect(bot.active).toBe(true);
+    expect(bot.lastActiveAt).toBeNull();
+    expect(bot.preview.kind).toBe("empty");
+    expect(bot.preview.text).not.toContain("cron output");
+    expect(bot.preview.text).not.toContain("watches CI");
+  });
+
+  it.each(["cron", "routine", "group", "a2a"] as const)(
+    "keeps a pinned %s session out of the roster preview",
+    (kind) => {
+      const { profiles } = parseProfilesList({
+        profiles: [
+          profileRow({
+            last_session: lastSession(1, "machine output"),
+            ui_meta: { "hermes-bots": { chat: "machine-session" } },
+          }),
+        ],
+      });
+      const bot = buildRoster(profiles, {
+        ...idle,
+        canonicalSessions: canonicalSession("scout", {
+          id: "machine-session",
+          kind,
+          preview: "machine output",
+        }),
+      })[0]!;
+      expect(bot.lastActiveAt).toBeNull();
+      expect(bot.preview.kind).toBe("empty");
+    },
+  );
 
   it("uses the local pin only for a profile the server carries no bot blob for", () => {
     const pins = pinEntries({ blobless: "local-1", keyless: "local-2", cleared: "local-3" });

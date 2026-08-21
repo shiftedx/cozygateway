@@ -24,6 +24,7 @@ import {
   mintCanonicalChat,
   resolveCanonicalChat,
   listBotSessions,
+  isConversationalSessionId,
   sessionKind,
   type CanonicalChatResult,
   type ChatAdoption,
@@ -385,6 +386,14 @@ export interface HermesBridgeOptions {
    *  push notifier at server assembly; unset (as in every test that does not care) means the
    *  approval lifecycle stays in-band. */
   onApproval?: (event: BotApprovalPush) => void;
+  /** Raised after a settled assistant row lands in the listed conversational canonical session.
+   *  Drafts, user echoes, context markers and machine-classified sessions never reach this seam. */
+  onChatMessage?: (event: {
+    bot: string;
+    displayName: string;
+    messageId: string;
+    chatSessionId: string;
+  }) => void;
   /** Audit sink for approval resolutions, one line per terminal transition. Defaults to the
    *  bridge's own log. The line names the bot, the chat, the turn, the toolCallId, the outcome and
    *  the deciding device, and never anything describing the action. */
@@ -582,6 +591,32 @@ export class HermesBridge implements BotsSurface {
           );
         },
       },
+      ...(opts.onChatMessage === undefined
+        ? {}
+        : {
+            onSettledAssistantMessage: (event: {
+              bot: string;
+              chatSessionId: string;
+              messageId: string;
+            }) => {
+              void (async () => {
+                try {
+                  const rows = await listBotSessions(this.#client, event.bot, 200);
+                  if (!isConversationalSessionId(rows, event.chatSessionId)) return;
+                  opts.onChatMessage?.({
+                    ...event,
+                    displayName: this.#memberInfo(event.bot).displayName,
+                  });
+                } catch (err) {
+                  this.#log(
+                    `chat push classification failed for ${event.bot}: ${
+                      err instanceof Error ? err.message : "unknown"
+                    }`,
+                  );
+                }
+              })();
+            },
+          }),
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
       ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),
     });
@@ -831,7 +866,38 @@ export class HermesBridge implements BotsSurface {
         const fetchedAt = this.#now();
         const result = await this.#client.request("profiles.list", {});
         const { profiles } = parseProfilesList(result);
+        const canonicalSessions = new Map<
+          string,
+          Array<{
+            id: string;
+            kind: ReturnType<typeof sessionKind>;
+            lastActiveAt: number;
+            preview: string | null;
+          }>
+        >();
+        await Promise.all(
+          profiles
+            .filter((profile) => !this.#hidden.has(profile.name))
+            .map(async (profile) => {
+              try {
+                const rows = await listBotSessions(this.#client, profile.name, 200);
+                canonicalSessions.set(
+                  profile.name,
+                  rows.map((row) => ({
+                    id: row.id,
+                    kind: sessionKind(row),
+                    lastActiveAt: row.lastActiveAt,
+                    preview: row.preview,
+                  })),
+                );
+              } catch (err) {
+                const detail = err instanceof Error ? err.message : "unknown failure";
+                this.#log(`canonical roster activity unavailable for ${profile.name}: ${detail}`);
+              }
+            }),
+        );
         const bots = buildRoster(profiles, {
+          canonicalSessions,
           hidden: this.#hidden,
           pins: this.#storage.botChatPinEntries(),
           uiMetaSupported: this.#uiMetaWriteback,

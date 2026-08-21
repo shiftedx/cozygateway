@@ -87,11 +87,12 @@ the clear. `POST /notify` takes an optional pair:
     { "pushId": "...", "ciphertext": "...", "category": "approval.pending", "collapseId": "<toolCallId>" }
 
 `category` and `collapseId` are sent together or not at all (400 `invalid_request`
-otherwise); omitting both is the ordinary message push, byte-identical to what shipped
-before. Registered categories (cozygateway issue #19, mobile approve/deny):
+otherwise); omitting both is the ordinary uncollapsed message push, byte-identical to what
+shipped before. Registered categories:
 
 | category | APNs push type | `aps.category` | fallback alert | collapse id |
 | --- | --- | --- | --- | --- |
+| `message` | `alert` | `message` | CozyChat / "New message" | digest of bot name + canonical chat session, required |
 | `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
 | `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
 

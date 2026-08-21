@@ -306,6 +306,18 @@ export interface RosterBuildOptions extends PresenceContext {
    *  `resolveChatPin`, where it disables the authoritative-clear reading: see that function. Default
    *  true, which is the state of every gateway that has not yet proven otherwise. */
   uiMetaSupported?: boolean;
+  /** Session-list rows keyed by profile name. The summary uses only the row matching the resolved
+   *  canonical pin, and only when the shared session classifier calls it conversational. Profile
+   *  activity remains separate because cron and other machine sessions still count as presence. */
+  canonicalSessions: ReadonlyMap<
+    string,
+    readonly {
+      id: string;
+      kind: "conversation" | "cron" | "routine" | "group" | "a2a";
+      lastActiveAt: number;
+      preview: string | null;
+    }[]
+  >;
 }
 
 /** Builds the merged roster: profiles plus their `ui_meta` blob, preview classification, presence
@@ -320,6 +332,12 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
     const local = opts.pins.get(profile.name);
     const resolved = resolveChatPin(meta, local, opts.now, opts.uiMetaSupported ?? true);
     const chatSessionId = resolved === undefined ? (local?.sessionId ?? null) : resolved;
+    const canonical =
+      chatSessionId === null
+        ? undefined
+        : opts.canonicalSessions
+            .get(profile.name)
+            ?.find((session) => session.id === chatSessionId && session.kind === "conversation");
     const group = asString(meta?.["group"])?.trim();
     const summary: BotSummary = {
       name: profile.name,
@@ -330,9 +348,9 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
       group: group === undefined || group.length === 0 ? null : group,
       pinned: meta?.["pinned"] === true,
       active: isBotActive(profile, opts),
-      lastActiveAt: profile.lastActiveAt,
+      lastActiveAt: canonical?.lastActiveAt ?? null,
       chatSessionId,
-      preview: classifyPreview(profile.preview, profile.description),
+      preview: classifyPreview(canonical?.preview ?? null, null),
       meta,
     };
     return { summary, activityAt: botActivityAt(profile) };
