@@ -295,6 +295,7 @@ describe("RelayNotifier.notifyChatMessage", () => {
     displayName: "Scout",
     messageId: "m1",
     chatSessionId: "stored-1",
+    preview: "the reply text",
   };
 
   it("uses the message category and a stable bot-plus-chat collapse id", async () => {
@@ -314,7 +315,7 @@ describe("RelayNotifier.notifyChatMessage", () => {
       kind: "message",
       threadId: "bot:scout",
       agentName: "Scout",
-      preview: "",
+      preview: "the reply text",
     });
 
     const { impl: otherImpl, sent: otherSent } = fetchStub(() => 202);
