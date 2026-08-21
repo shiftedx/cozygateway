@@ -123,6 +123,25 @@ function bytesMatchMediaType(
   return false;
 }
 
+/** Shared byte-side acceptance for dashboard media and attach-v1's HTTP side channel. The latter
+ * carries no data URL, but must preserve the exact same type allow-list, caps and magic checks. */
+export function acceptAssistantMediaBytes(
+  declared: string,
+  bytes: Uint8Array,
+  sniff: (bytes: Uint8Array) => string | undefined,
+): DecodedAssistantMedia {
+  const normalized = declared.toLowerCase();
+  const accepted = ASSISTANT_MEDIA_TYPES.get(normalized);
+  if (accepted === undefined) throw new Error("hermes returned a disallowed media type");
+  if (bytes.byteLength === 0 || bytes.byteLength > accepted.maxBytes) {
+    throw new Error("hermes returned empty or oversized media");
+  }
+  if (!bytesMatchMediaType(normalized, bytes, sniff)) {
+    throw new Error("hermes media bytes did not match the declared allowed type");
+  }
+  return { bytes, mime: normalized, ext: accepted.ext, kind: accepted.kind };
+}
+
 /** Decodes the dashboard's JSON data URL without trusting its MIME claim or allowing base64
  *  expansion to cross the eight-megabyte cap. `sniff` is injected from photos.ts so there remains
  *  one magic-byte table in the runtime. */
@@ -142,11 +161,5 @@ export function decodeAssistantMediaDataUrl(
     throw new Error("hermes returned media over the size cap");
   }
   const bytes = new Uint8Array(Buffer.from(encoded, "base64"));
-  if (bytes.byteLength === 0 || bytes.byteLength > accepted.maxBytes) {
-    throw new Error("hermes returned empty or oversized media");
-  }
-  if (!bytesMatchMediaType(declared, bytes, sniff)) {
-    throw new Error("hermes media bytes did not match the declared allowed type");
-  }
-  return { bytes, mime: declared, ext: accepted.ext, kind: accepted.kind };
+  return acceptAssistantMediaBytes(declared, bytes, sniff);
 }

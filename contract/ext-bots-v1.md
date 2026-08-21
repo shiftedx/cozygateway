@@ -37,7 +37,7 @@ A gateway that has a bridge configured advertises it in `GatewayInfo.capabilitie
 (`contract/v1.md` section 5):
 
 ```
-"capabilities": { "com.cozylabs.bots": 21 }
+"capabilities": { "com.cozylabs.bots": 22 }
 ```
 
 The value is the extension's integer version, which is what the capabilities map is typed for.
@@ -186,6 +186,11 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   from `summary` or `result_text`. Raw argument/result objects are never serialized. A client MUST
   require `>= 21` before presenting a tool-detail surface; older clients keep rendering name and
   status chips unchanged.
+- `22`: NATIVE CLARIFICATION. `bot_clarify_pending` carries a stable clarification id, bounded
+  display prompt/options, and optional expiry; `bot_clarify_resolved` carries its first terminal
+  outcome. `POST /bots/:name/clarifications/:clarifyId` selects one advertised option. A client
+  MUST require `>= 22` before rendering a clarification card. Pending and terminal state are
+  durable across gateway/plugin restart.
 
 ## 3. Resources
 
@@ -2362,6 +2367,18 @@ a client cannot reach another bot's approval by guessing an id.
 A resolution is audit-logged against the same `toolCallId` the frame carried, naming the bot, the
 chat, the turn, the outcome and the deciding device, and never anything describing the action.
 
+### POST /bots/:name/clarifications/:clarifyId
+
+Version 22 and up. The JSON body is `{ "optionId": string }`; the id must match one option in the
+pending frame. The first terminal transition wins durably, so retries and a second device cannot
+select twice.
+
+- `202 {"outcome":"selected","selectedOptionId":"..."}`.
+- `400 invalid_request`: malformed body or an option not advertised by this clarification.
+- `404 not_found`: no clarification by that id for that bot.
+- `409 approval_not_pending` / `approval_expired`: it already settled or expired.
+- `503 backend_unavailable`: the native data plane could not durably queue the resolution.
+
 ### Errors
 
 The ordinary `ErrorBody` (`contract/v1.md` section 4) plus, when the failure came from Hermes,
@@ -2430,6 +2447,12 @@ are only ever sent by a gateway that advertises the capability.
   toolCallId: string, name: string, updatedAt: integer }
 { type: "bot_approval_resolved", bot: string, sessionId: string, turnId: string,
   toolCallId: string, outcome: "approved" | "denied" | "expired", updatedAt: integer }
+{ type: "bot_clarify_pending", bot: string, sessionId: string, turnId: string,
+  clarifyId: string, prompt: string, options: { id: string, label: string }[],
+  expiresAt?: integer, updatedAt: integer }
+{ type: "bot_clarify_resolved", bot: string, sessionId: string, turnId: string,
+  clarifyId: string, outcome: "selected" | "expired" | "cancelled",
+  selectedOptionId?: string, updatedAt: integer }
 { type: "bot_inbox_activity", bot: string, threadId: string, updatedAt: integer }
 ```
 

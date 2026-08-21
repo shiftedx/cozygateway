@@ -45,6 +45,8 @@ describe("server frames", () => {
       { type: "done", threadId: "t1", turnId: "turn-1" },
       { type: "presence", agentId: "a1", state: "absent" },
       { type: "error", code: "backend_unavailable", message: "agent offline", threadId: "t1" },
+      { type: "bot_clarify_pending", bot: "sage", sessionId: "s1", turnId: "turn-1", clarifyId: "question-1", prompt: "Choose", options: [{ id: "a", label: "A" }], expiresAt: 100, updatedAt: 1 },
+      { type: "bot_clarify_resolved", bot: "sage", sessionId: "s1", turnId: "turn-1", clarifyId: "question-1", outcome: "selected", selectedOptionId: "a", updatedAt: 2 },
       { type: "synced" },
     ];
     for (const frame of frames) {

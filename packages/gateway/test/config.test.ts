@@ -63,6 +63,24 @@ describe("loadConfig", () => {
     expect(loadConfig(path).hermes?.hiddenProfiles).toEqual(["ops-runner"]);
   });
 
+  it("accepts per-bot attach-v1 native and shadow migration gates", () => {
+    const path = writeConfig({
+      name: "native-bots",
+      hermes: {
+        url: "ws://homelab:8790/api/ws",
+        tokenEnv: "HERMES_TOKEN",
+        nativeDataPlane: {
+          sage: { tokenEnv: "SAGE_ATTACH_TOKEN", mode: "native", features: { media: false, tools: true, interactions: false, clarify: true, scheduled: false } },
+          pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", mode: "shadow" },
+        },
+      },
+    });
+    expect(loadConfig(path).hermes?.nativeDataPlane).toEqual({
+      sage: { tokenEnv: "SAGE_ATTACH_TOKEN", mode: "native", features: { media: false, tools: true, interactions: false, clarify: true, scheduled: false } },
+      pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", mode: "shadow" },
+    });
+  });
+
   it("normalizes the bridge's own profile name, which DELETE then refuses", () => {
     const path = writeConfig({
       name: "bots-only",

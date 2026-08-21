@@ -1,17 +1,17 @@
 # attach-plugin
 
 A reference plugin for agent harnesses that support Python platform plugins. It is the
-harness side of the gateway's attach protocol (`contract/attach-v0.md`): the plugin dials
-OUT to the gateway's `/attach` WebSocket, receives turn prompts, and streams the agent's
-reply back as typed rich blocks with live tool-call chips.
+harness side of the gateway's attach protocols (`contract/attach-v0.md` and
+`contract/attach-v1.md`). v0 dials `/attach`; v1 dials `/attach/v1`, adds durable replay,
+native Bot Mode events, media, approvals, structured clarification, and scheduled delivery.
 
 Outbound-only: nothing listens on the agent host, so it works from behind NAT with no
 port forwarding.
 
 ## Install
 
-Copy this directory into your harness's plugin directory as `cozygateway/` content plus
-`plugin.yaml` (the usual directory-plugin layout), enable it, and set two environment
+Copy this directory as one entry in your harness's plugin directory (it already contains the root
+`__init__.py`, `plugin.yaml`, and implementation package), enable it, and set two environment
 variables for the harness process:
 
 - `COZYGATEWAY_URL`: the gateway base URL (for example `http://127.0.0.1:8787`).
@@ -26,6 +26,10 @@ nothing else about this setup changes.
 Optional: `COZYGATEWAY_CA_FILE` (a PEM to verify a private-CA or self-signed gateway
 certificate against; ignored on a plaintext gateway),
 `COZYGATEWAY_RECONNECT_INITIAL_SECONDS` (0.5), `COZYGATEWAY_RECONNECT_MAX_SECONDS` (30).
+
+The safe default is v0. Set `COZYGATEWAY_ATTACH_VERSION=1` to enable v1 and set
+`COZYGATEWAY_SPOOL_PATH` to a persistent writable SQLite path (default
+`~/.hermes/cozygateway-attach-v1.sqlite`). Never place the spool on ephemeral container storage.
 
 Also set `COZYGATEWAY_HOME_CHANNEL=thread` (any non-empty value works). Some harnesses
 prompt to pick a "home channel" the first time a new platform delivers a message, and that
@@ -46,10 +50,16 @@ Dependencies: Python 3.10+ and the `websockets` package.
   streams text and simply omits chips.
 - A turn ends with `done` (the gateway seals the latest draft as the durable reply) or
   `failed` (the gateway records a failed turn the client can retry).
+- v1 journals events and accepted commands before sending/ACKing, replays after reconnect,
+  deduplicates stable ids, and keeps negotiated count/byte windows for live traffic in both
+  directions. It honors the capability intersection returned by `hello_ack` and does not emit a
+  newly disabled feature. Hermes' native `send_clarify` callback becomes an app-visible option card; a selected
+  stable option resolves the original blocking Hermes clarify primitive rather than starting a new
+  chat turn. Media carries only metadata on WS and uses authenticated HTTP for bytes.
 - Disconnects re-dial with capped, jittered backoff. Two closes are terminal: a rejected
   token (close 1008) and being superseded by a newer connection (close 4000).
 
 ## Status
 
-Reference implementation, validated manually against a live harness. It is not covered
-by this repo's CI (the gateway's protocol suite runs against a scripted fake instead).
+Reference implementation. The Python unit suite covers v0 compatibility plus v1 spool, handshake,
+ACK/replay, command dedupe, and media behavior; gateway integration tests cover the wire boundary.

@@ -8,6 +8,8 @@ import { RichBlockSchema } from "./rich-blocks.ts";
 import {
   BotApprovalPendingFrameSchema,
   BotApprovalResolvedFrameSchema,
+  BotClarifyPendingFrameSchema,
+  BotClarifyResolvedFrameSchema,
   BotChatAdoptedFrameSchema,
   BotChatDeltaFrameSchema,
   BotChatFrameSchema,
@@ -143,6 +145,8 @@ export const ServerFrameSchema = Type.Union([
   BotGroupStateFrameSchema,
   BotApprovalPendingFrameSchema,
   BotApprovalResolvedFrameSchema,
+  BotClarifyPendingFrameSchema,
+  BotClarifyResolvedFrameSchema,
   BotToolActivityFrameSchema,
   BotInboxActivityFrameSchema,
 ]);

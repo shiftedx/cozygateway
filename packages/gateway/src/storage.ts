@@ -1,6 +1,13 @@
 import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 
-import type { BotSummary, Message, MessageRole, RichBlock } from "cozygateway-contract";
+import type { AttachmentBlock, BotChatMessage, BotSummary, Message, MessageRole, RichBlock } from "cozygateway-contract";
+import type {
+  AttachV1Command,
+  AttachV1CommandFrame,
+  AttachV1EventFrame,
+  AttachV1MediaDescriptor,
+} from "./adapters/attach/protocol-v1.ts";
 
 /** How many retired chat sessions are remembered per bot. Sized against what it has to defend: the
  *  adoption paths only ever see the sessions `session.list` returns (100 rows), and a bot with more
@@ -43,9 +50,11 @@ CREATE TABLE IF NOT EXISTS messages (
   turn_id TEXT,
   marker TEXT,
   delivery TEXT,
+  external_id TEXT,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (thread_id, seq)
 ) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS push_registrations (
   device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
   push_id TEXT NOT NULL,
@@ -226,6 +235,106 @@ CREATE TABLE IF NOT EXISTS bot_group_members (
   watermark INTEGER NOT NULL,
   session_id TEXT,
   PRIMARY KEY (group_key, member)
+) STRICT, WITHOUT ROWID;
+-- attach-v1 is an at-least-once transport. Both journals are gateway-owned durability boundaries:
+-- commands survive until the plugin ACKs them, and events are ACKed only after the inbox commit.
+CREATE TABLE IF NOT EXISTS attach_streams (
+  agent_id TEXT PRIMARY KEY,
+  next_command_sequence INTEGER NOT NULL DEFAULT 1,
+  last_event_sequence INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS attach_command_outbox (
+  agent_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  command_id TEXT NOT NULL,
+  command_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  acked_at INTEGER,
+  cancelled_at INTEGER,
+  cancel_reason TEXT,
+  PRIMARY KEY (agent_id, sequence),
+  UNIQUE (agent_id, command_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS attach_event_inbox (
+  agent_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  event_id TEXT NOT NULL,
+  frame_json TEXT NOT NULL,
+  received_at INTEGER NOT NULL,
+  disposition TEXT NOT NULL,
+  applied_at INTEGER,
+  projection_attempts INTEGER NOT NULL DEFAULT 0,
+  projection_error TEXT,
+  dead_lettered_at INTEGER,
+  PRIMARY KEY (agent_id, sequence),
+  UNIQUE (agent_id, event_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS attach_turn_terminals (
+  agent_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  terminal_kind TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  PRIMARY KEY (agent_id, turn_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS attach_media (
+  agent_id TEXT NOT NULL,
+  media_id TEXT NOT NULL,
+  descriptor_json TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  PRIMARY KEY (agent_id, media_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS attach_scheduled_deliveries (
+  agent_id TEXT NOT NULL,
+  delivery_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  projected_at INTEGER,
+  PRIMARY KEY (agent_id, delivery_id),
+  UNIQUE (agent_id, message_id),
+  UNIQUE (agent_id, event_id)
+) STRICT, WITHOUT ROWID;
+-- App-facing Bot Mode projection for profiles whose chat plane is attach-v1. Dashboard JSON-RPC
+-- remains management-only for these profiles; the transcript therefore has to be gateway-owned.
+CREATE TABLE IF NOT EXISTS bot_native_chats (
+  bot TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  active_turn_id TEXT,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS bot_native_messages (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  message_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER,
+  client_id TEXT,
+  attachments_json TEXT,
+  PRIMARY KEY (bot, session_id, seq),
+  UNIQUE (bot, message_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS bot_native_interactions (
+  bot TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('approval', 'clarify')),
+  interaction_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  selected_option_id TEXT,
+  expires_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, kind, interaction_id)
 ) STRICT, WITHOUT ROWID;
 `;
 
@@ -449,18 +558,33 @@ export class Storage {
       turnId?: string;
       marker?: "turn.failed" | "turn.interrupted";
       delivery?: "turn" | "steer";
+      /** Stable attach-v1 message id. Replays return the existing row without appending. */
+      externalId?: string;
     },
     createdAt: number,
   ): Message {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
+      if (entry.externalId !== undefined) {
+        const prior = this.#db
+          .prepare(
+            `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
+                    marker, delivery, created_at AS createdAt
+             FROM messages WHERE thread_id = ? AND external_id = ?`,
+          )
+          .get(threadId, entry.externalId) as MessageDbRow | undefined;
+        if (prior !== undefined) {
+          this.#db.exec("COMMIT");
+          return toMessage(prior);
+        }
+      }
       const row = this.#db
         .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE thread_id = ?")
         .get(threadId) as { next: number };
       this.#db
         .prepare(
-          `INSERT INTO messages (thread_id, seq, role, blocks_json, turn_id, marker, delivery, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (thread_id, seq, role, blocks_json, turn_id, marker, delivery, external_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           threadId,
@@ -470,6 +594,7 @@ export class Storage {
           entry.turnId ?? null,
           entry.marker ?? null,
           entry.delivery ?? null,
+          entry.externalId ?? null,
           createdAt,
         );
       this.#db.prepare("UPDATE threads SET last_message_at = ? WHERE id = ?").run(createdAt, threadId);
@@ -500,6 +625,17 @@ export class Storage {
       )
       .all(threadId, sinceSeq) as unknown as MessageDbRow[];
     return rows.map(toMessage);
+  }
+
+  messageByExternalId(threadId: string, externalId: string): Message | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
+                marker, delivery, created_at AS createdAt
+         FROM messages WHERE thread_id = ? AND external_id = ?`,
+      )
+      .get(threadId, externalId) as MessageDbRow | undefined;
+    return row === undefined ? undefined : toMessage(row);
   }
 
   messagesBefore(threadId: string, before: number | null, limit: number): Message[] {
@@ -1292,9 +1428,567 @@ export class Storage {
     this.#db.prepare("UPDATE bot_groups SET needs_you = ? WHERE key = ?").run(needsYou ? 1 : 0, key);
   }
 
+  /** Durably queues one gateway→plugin command. Reusing commandId is idempotent and returns the
+   * original frame, which lets a caller safely retry after an ambiguous local failure. */
+  enqueueAttachCommand(
+    agentId: string,
+    commandId: string,
+    command: AttachV1Command,
+    createdAt: number,
+  ): AttachV1CommandFrame {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const prior = this.#db
+        .prepare(
+          `SELECT sequence, command_json AS commandJson FROM attach_command_outbox
+           WHERE agent_id = ? AND command_id = ?`,
+        )
+        .get(agentId, commandId) as { sequence: number; commandJson: string } | undefined;
+      if (prior !== undefined) {
+        this.#db.exec("COMMIT");
+        return { kind: "command", sequence: prior.sequence, commandId, command: JSON.parse(prior.commandJson) as AttachV1Command };
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
+           VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
+        )
+        .run(agentId, createdAt);
+      const stream = this.#db
+        .prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+        .get(agentId) as { sequence: number };
+      this.#db
+        .prepare(
+          `INSERT INTO attach_command_outbox
+             (agent_id, sequence, command_id, command_json, created_at, acked_at)
+           VALUES (?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(agentId, stream.sequence, commandId, JSON.stringify(command), createdAt);
+      this.#db
+        .prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
+        .run(stream.sequence + 1, createdAt, agentId);
+      this.#db.exec("COMMIT");
+      return { kind: "command", sequence: stream.sequence, commandId, command };
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  pendingAttachCommands(agentId: string, afterSequence: number, limit: number): AttachV1CommandFrame[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT sequence, command_id AS commandId, command_json AS commandJson,
+                cancelled_at AS cancelledAt, cancel_reason AS cancelReason
+         FROM attach_command_outbox
+         WHERE agent_id = ? AND sequence > ? AND acked_at IS NULL
+         ORDER BY sequence LIMIT ?`,
+      )
+      .all(agentId, afterSequence, limit) as unknown as Array<{ sequence: number; commandId: string; commandJson: string; cancelledAt: number | null; cancelReason: string | null }>;
+    return rows.map((row) => ({
+      kind: "command",
+      sequence: row.sequence,
+      commandId: row.commandId,
+      command: row.cancelledAt === null
+        ? JSON.parse(row.commandJson) as AttachV1Command
+        : {
+            kind: "discard" as const,
+            originalKind: (JSON.parse(row.commandJson) as AttachV1Command).kind as Exclude<AttachV1Command["kind"], "discard">,
+            reason: row.cancelReason ?? "capability no longer negotiated",
+          },
+    }));
+  }
+
+  cancelAttachCommand(agentId: string, sequence: number, commandId: string, reason: string, cancelledAt: number): AttachV1CommandFrame | undefined {
+    this.#db
+      .prepare(
+        `UPDATE attach_command_outbox
+         SET cancelled_at = COALESCE(cancelled_at, ?), cancel_reason = COALESCE(cancel_reason, ?)
+         WHERE agent_id = ? AND sequence = ? AND command_id = ? AND acked_at IS NULL`,
+      )
+      .run(cancelledAt, reason.slice(0, 512), agentId, sequence, commandId);
+    return this.pendingAttachCommands(agentId, sequence - 1, 1)[0];
+  }
+
+  attachCommandCancellation(agentId: string, sequence: number): { reason: string; cancelledAt: number } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT cancel_reason AS reason, cancelled_at AS cancelledAt
+         FROM attach_command_outbox WHERE agent_id = ? AND sequence = ? AND cancelled_at IS NOT NULL`,
+      )
+      .get(agentId, sequence) as { reason: string; cancelledAt: number } | undefined;
+    return row;
+  }
+
+  ackAttachCommand(agentId: string, sequence: number, commandId: string, ackedAt: number): boolean {
+    return this.#db
+      .prepare(
+        `UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?)
+         WHERE agent_id = ? AND sequence = ? AND command_id = ?`,
+      )
+      .run(ackedAt, agentId, sequence, commandId).changes === 1;
+  }
+
+  /** Reconciles a plugin's durable contiguous processed-command cursor after an ACK was lost.
+   * Refusing cursors beyond the issued tail prevents a corrupt peer from skipping future rows. */
+  reconcileAttachCommandResume(agentId: string, processedThrough: number, ackedAt: number): boolean {
+    const row = this.#db
+      .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM attach_command_outbox WHERE agent_id = ?")
+      .get(agentId) as { sequence: number };
+    if (processedThrough < 0 || processedThrough > row.sequence) return false;
+    this.#db
+      .prepare(
+        `UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?)
+         WHERE agent_id = ? AND sequence <= ?`,
+      )
+      .run(ackedAt, agentId, processedThrough);
+    return true;
+  }
+
+  attachCommandCursor(agentId: string): number {
+    const row = this.#db
+      .prepare(
+        `SELECT COALESCE(
+           MIN(CASE WHEN acked_at IS NULL THEN sequence END) - 1,
+           MAX(sequence),
+           0
+         ) AS sequence
+         FROM attach_command_outbox WHERE agent_id = ?`,
+      )
+      .get(agentId) as { sequence: number };
+    return row.sequence;
+  }
+
+  attachEventCursor(agentId: string): number {
+    const row = this.#db
+      .prepare("SELECT last_event_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { sequence: number } | undefined;
+    return row?.sequence ?? 0;
+  }
+
+  /** Inbox admission is the ACK boundary. Sequence must be contiguous; duplicates by eventId are
+   * harmless; and a terminal transition seals its turn so a late draft is journaled/ACKed but never
+   * applied. */
+  acceptAttachEvent(
+    agentId: string,
+    frame: AttachV1EventFrame,
+    receivedAt: number,
+  ):
+    | { status: "accepted" | "duplicate" | "ignored_terminal" | "ignored_delivery"; acknowledgedSequence: number }
+    | { status: "gap"; expectedSequence: number; receivedSequence: number }
+    | { status: "conflict"; acknowledgedSequence: number } {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const duplicate = this.#db
+        .prepare("SELECT sequence FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?")
+        .get(agentId, frame.eventId) as { sequence: number } | undefined;
+      if (duplicate !== undefined) {
+        this.#db.exec("COMMIT");
+        return duplicate.sequence === frame.sequence
+          ? { status: "duplicate", acknowledgedSequence: duplicate.sequence }
+          : { status: "conflict", acknowledgedSequence: duplicate.sequence };
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
+           VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
+        )
+        .run(agentId, receivedAt);
+      const stream = this.#db
+        .prepare("SELECT last_event_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+        .get(agentId) as { sequence: number };
+      if (frame.sequence !== stream.sequence + 1) {
+        this.#db.exec("COMMIT");
+        if (frame.sequence <= stream.sequence) return { status: "conflict", acknowledgedSequence: stream.sequence };
+        return { status: "gap", expectedSequence: stream.sequence + 1, receivedSequence: frame.sequence };
+      }
+      const event = frame.event;
+      const turnId = "turnId" in event ? event.turnId : undefined;
+      const terminal = event.kind === "commit" || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
+      const sealed = turnId === undefined
+        ? undefined
+        : (this.#db.prepare("SELECT event_id AS eventId FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(agentId, turnId) as { eventId: string } | undefined);
+      let disposition: "accepted" | "ignored_terminal" | "ignored_delivery" =
+        sealed === undefined ? "accepted" : "ignored_terminal";
+      if (event.kind === "scheduled") {
+        const prior = this.#db
+          .prepare(
+            `SELECT thread_id AS threadId, message_id AS messageId FROM attach_scheduled_deliveries
+             WHERE agent_id = ? AND delivery_id = ?`,
+          )
+          .get(agentId, event.deliveryId) as { threadId: string; messageId: string } | undefined;
+        if (prior !== undefined) {
+          if (prior.threadId !== event.threadId || prior.messageId !== event.messageId) {
+            this.#db.exec("COMMIT");
+            return { status: "conflict", acknowledgedSequence: stream.sequence };
+          }
+          disposition = "ignored_delivery";
+        } else {
+          this.#db
+            .prepare(
+              `INSERT INTO attach_scheduled_deliveries
+                 (agent_id, delivery_id, thread_id, message_id, event_id, projected_at)
+               VALUES (?, ?, ?, ?, ?, NULL)`,
+            )
+            .run(agentId, event.deliveryId, event.threadId, event.messageId, frame.eventId);
+        }
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO attach_event_inbox
+             (agent_id, sequence, event_id, frame_json, received_at, disposition, applied_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt, disposition);
+      if (terminal && sealed === undefined) {
+        this.#db
+          .prepare(
+            `INSERT INTO attach_turn_terminals
+               (agent_id, turn_id, event_id, terminal_kind, message_id, sequence)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(agentId, event.turnId, frame.eventId, event.kind, event.messageId, frame.sequence);
+      }
+      this.#db
+        .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
+        .run(frame.sequence, receivedAt, agentId);
+      this.#db.exec("COMMIT");
+      return { status: disposition, acknowledgedSequence: frame.sequence };
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  markAttachEventApplied(agentId: string, eventId: string, appliedAt: number): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("UPDATE attach_event_inbox SET applied_at = ? WHERE agent_id = ? AND event_id = ?").run(appliedAt, agentId, eventId);
+      this.#db.prepare("UPDATE attach_scheduled_deliveries SET projected_at = COALESCE(projected_at, ?) WHERE agent_id = ? AND event_id = ?").run(appliedAt, agentId, eventId);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  recordAttachProjectionFailure(agentId: string, eventId: string, error: string, failedAt: number, maxAttempts: number): { attempts: number; deadLettered: boolean } {
+    this.#db
+      .prepare(
+        `UPDATE attach_event_inbox
+         SET projection_attempts = projection_attempts + 1,
+             projection_error = ?,
+             dead_lettered_at = CASE WHEN projection_attempts + 1 >= ? THEN COALESCE(dead_lettered_at, ?) ELSE dead_lettered_at END
+         WHERE agent_id = ? AND event_id = ? AND applied_at IS NULL`,
+      )
+      .run(error.slice(0, 512), maxAttempts, failedAt, agentId, eventId);
+    const row = this.#db
+      .prepare(
+        `SELECT projection_attempts AS attempts, dead_lettered_at AS deadLetteredAt
+         FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?`,
+      )
+      .get(agentId, eventId) as { attempts: number; deadLetteredAt: number | null };
+    return { attempts: row.attempts, deadLettered: row.deadLetteredAt !== null };
+  }
+
+  attachProjectionFailure(agentId: string, eventId: string): { attempts: number; error?: string; deadLetteredAt?: number } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT projection_attempts AS attempts, projection_error AS error, dead_lettered_at AS deadLetteredAt
+         FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?`,
+      )
+      .get(agentId, eventId) as { attempts: number; error: string | null; deadLetteredAt: number | null } | undefined;
+    if (row === undefined) return undefined;
+    return { attempts: row.attempts, ...(row.error === null ? {} : { error: row.error }), ...(row.deadLetteredAt === null ? {} : { deadLetteredAt: row.deadLetteredAt }) };
+  }
+
+  releaseAttachProjectionDeadLetter(agentId: string, eventId: string): boolean {
+    const earliest = this.#db
+      .prepare(
+        `SELECT event_id AS eventId FROM attach_event_inbox
+         WHERE agent_id = ? AND dead_lettered_at IS NOT NULL ORDER BY sequence LIMIT 1`,
+      )
+      .get(agentId) as { eventId: string } | undefined;
+    if (earliest?.eventId !== eventId) return false;
+    return this.#db
+      .prepare(
+        `UPDATE attach_event_inbox
+         SET projection_attempts = 0, projection_error = NULL, dead_lettered_at = NULL
+         WHERE agent_id = ? AND event_id = ? AND applied_at IS NULL`,
+      )
+      .run(agentId, eventId).changes === 1;
+  }
+
+  unappliedAttachEvents(agentId: string, limit = 256): AttachV1EventFrame[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT frame_json AS frameJson FROM attach_event_inbox
+         WHERE agent_id = ? AND disposition = 'accepted' AND applied_at IS NULL
+           AND dead_lettered_at IS NULL
+           AND sequence < COALESCE(
+             (SELECT MIN(blocked.sequence) FROM attach_event_inbox AS blocked
+              WHERE blocked.agent_id = ? AND blocked.dead_lettered_at IS NOT NULL),
+             9223372036854775807
+           )
+         ORDER BY sequence LIMIT ?`,
+      )
+      .all(agentId, agentId, limit) as unknown as Array<{ frameJson: string }>;
+    return rows.map((row) => JSON.parse(row.frameJson) as AttachV1EventFrame);
+  }
+
+  attachTurnCommand(agentId: string, turnId: string): { threadId: string; messageId: string } | undefined {
+    const rows = this.#db
+      .prepare(
+        `SELECT command_json AS commandJson, cancelled_at AS cancelledAt FROM attach_command_outbox
+         WHERE agent_id = ? ORDER BY sequence DESC`,
+      )
+      .all(agentId) as unknown as Array<{ commandJson: string; cancelledAt: number | null }>;
+    for (const row of rows) {
+      if (row.cancelledAt !== null) continue;
+      const command = JSON.parse(row.commandJson) as AttachV1Command;
+      if (command.kind === "turn" && command.turnId === turnId) return { threadId: command.threadId, messageId: command.messageId };
+    }
+    return undefined;
+  }
+
+  attachScheduledDelivery(agentId: string, deliveryId: string): { threadId: string; messageId: string; projectedAt: number | null } | undefined {
+    return this.#db
+      .prepare(
+        `SELECT thread_id AS threadId, message_id AS messageId, projected_at AS projectedAt
+         FROM attach_scheduled_deliveries WHERE agent_id = ? AND delivery_id = ?`,
+      )
+      .get(agentId, deliveryId) as { threadId: string; messageId: string; projectedAt: number | null } | undefined;
+  }
+
+  saveAttachMedia(
+    agentId: string,
+    descriptor: AttachV1MediaDescriptor,
+    bytes: Uint8Array,
+    createdAt: number,
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT INTO attach_media
+           (agent_id, media_id, descriptor_json, mime, size, sha256, bytes, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        agentId,
+        descriptor.mediaId,
+        JSON.stringify(descriptor),
+        descriptor.mimeType,
+        bytes.byteLength,
+        descriptor.sha256,
+        bytes,
+        createdAt,
+        descriptor.expiresAt ?? null,
+      );
+  }
+
+  attachMediaInfo(
+    agentId: string,
+    mediaId: string,
+    now: number,
+  ): { descriptor: AttachV1MediaDescriptor; mime: string; size: number; sha256: string } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT descriptor_json AS descriptorJson, mime, size, sha256 FROM attach_media
+         WHERE agent_id = ? AND media_id = ? AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .get(agentId, mediaId, now) as { descriptorJson: string; mime: string; size: number; sha256: string } | undefined;
+    return row === undefined ? undefined : { descriptor: JSON.parse(row.descriptorJson) as AttachV1MediaDescriptor, mime: row.mime, size: row.size, sha256: row.sha256 };
+  }
+
+  attachMediaSlice(agentId: string, mediaId: string, start: number, length: number, now: number): Uint8Array | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT substr(bytes, ?, ?) AS bytes FROM attach_media
+         WHERE agent_id = ? AND media_id = ? AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .get(start + 1, length, agentId, mediaId, now) as { bytes: Uint8Array } | undefined;
+    return row?.bytes;
+  }
+
+  nativeBotChat(bot: string, now: number): { sessionId: string; created: boolean; activeTurnId?: string } {
+    const prior = this.#db
+      .prepare("SELECT session_id AS sessionId, active_turn_id AS activeTurnId FROM bot_native_chats WHERE bot = ?")
+      .get(bot) as { sessionId: string; activeTurnId: string | null } | undefined;
+    if (prior !== undefined) return { sessionId: prior.sessionId, created: false, ...(prior.activeTurnId === null ? {} : { activeTurnId: prior.activeTurnId }) };
+    const sessionId = `native:${bot}:${randomUUID()}`;
+    this.#db.prepare("INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)").run(bot, sessionId, now);
+    return { sessionId, created: true };
+  }
+
+  resetNativeBotChat(bot: string, now: number): string {
+    const sessionId = `native:${bot}:${randomUUID()}`;
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)
+         ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, active_turn_id = NULL, updated_at = excluded.updated_at`,
+      )
+      .run(bot, sessionId, now);
+    return sessionId;
+  }
+
+  setNativeBotTurn(bot: string, turnId: string | undefined, now: number): void {
+    this.#db.prepare("UPDATE bot_native_chats SET active_turn_id = ?, updated_at = ? WHERE bot = ?").run(turnId ?? null, now, bot);
+  }
+
+  appendNativeBotMessage(input: {
+    bot: string;
+    sessionId: string;
+    messageId: string;
+    role: string;
+    text: string;
+    at: number;
+    clientId?: string;
+    attachments?: AttachmentBlock[];
+  }): BotChatMessage {
+    const prior = this.#db
+      .prepare(
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson
+         FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
+      )
+      .get(input.bot, input.messageId) as { id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null } | undefined;
+    if (prior !== undefined) return nativeBotMessage(prior);
+    const next = this.#db
+      .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM bot_native_messages WHERE bot = ? AND session_id = ?")
+      .get(input.bot, input.sessionId) as { seq: number };
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_messages
+           (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.bot,
+        input.sessionId,
+        next.seq,
+        input.messageId,
+        input.role,
+        input.text,
+        input.at,
+        input.clientId ?? null,
+        input.attachments === undefined ? null : JSON.stringify(input.attachments),
+      );
+    return { id: input.messageId, role: input.role, text: input.text, at: input.at, ...(input.clientId === undefined ? {} : { clientId: input.clientId }), ...(input.attachments === undefined ? {} : { attachments: input.attachments }) };
+  }
+
+  nativeBotMessages(bot: string, sessionId: string): BotChatMessage[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson
+         FROM bot_native_messages WHERE bot = ? AND session_id = ? ORDER BY seq`,
+      )
+      .all(bot, sessionId) as unknown as Array<{ id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null }>;
+    return rows.map(nativeBotMessage);
+  }
+
+  nativeBotMessage(bot: string, messageId: string): BotChatMessage | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson
+         FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
+      )
+      .get(bot, messageId) as { id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null } | undefined;
+    return row === undefined ? undefined : nativeBotMessage(row);
+  }
+
+  recordNativeInteraction(input: {
+    bot: string;
+    kind: "approval" | "clarify";
+    interactionId: string;
+    sessionId: string;
+    turnId: string;
+    payload: unknown;
+    status: string;
+    selectedOptionId?: string;
+    expiresAt?: number;
+    updatedAt: number;
+  }): "inserted" | "updated" | "duplicate" {
+    const prior = this.nativeInteraction(input.bot, input.kind, input.interactionId);
+    if (prior === undefined) {
+      this.#db
+        .prepare(
+          `INSERT INTO bot_native_interactions
+             (bot, kind, interaction_id, session_id, turn_id, payload_json, status,
+              selected_option_id, expires_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.bot, input.kind, input.interactionId, input.sessionId, input.turnId, JSON.stringify(input.payload), input.status, input.selectedOptionId ?? null, input.expiresAt ?? null, input.updatedAt);
+      return "inserted";
+    }
+    if (prior.status !== "pending") return "duplicate";
+    if (input.status === "pending") return "duplicate";
+    this.#db
+      .prepare(
+        `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
+         WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
+      )
+      .run(input.status, input.selectedOptionId ?? null, input.updatedAt, input.bot, input.kind, input.interactionId);
+    return "updated";
+  }
+
+  resolveNativeInteraction(
+    bot: string,
+    kind: "approval" | "clarify",
+    interactionId: string,
+    status: string,
+    updatedAt: number,
+    selectedOptionId?: string,
+  ): boolean {
+    return this.#db
+      .prepare(
+        `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
+         WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
+      )
+      .run(status, selectedOptionId ?? null, updatedAt, bot, kind, interactionId).changes === 1;
+  }
+
+  nativeInteraction(
+    bot: string,
+    kind: "approval" | "clarify",
+    interactionId: string,
+  ): { sessionId: string; turnId: string; payload: unknown; status: string; selectedOptionId: string | null; expiresAt: number | null; updatedAt: number } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT session_id AS sessionId, turn_id AS turnId, payload_json AS payloadJson, status,
+                selected_option_id AS selectedOptionId, expires_at AS expiresAt, updated_at AS updatedAt
+         FROM bot_native_interactions WHERE bot = ? AND kind = ? AND interaction_id = ?`,
+      )
+      .get(bot, kind, interactionId) as { sessionId: string; turnId: string; payloadJson: string; status: string; selectedOptionId: string | null; expiresAt: number | null; updatedAt: number } | undefined;
+    return row === undefined ? undefined : { ...row, payload: JSON.parse(row.payloadJson) as unknown };
+  }
+
+  pendingNativeInteractions(bot?: string): Array<{
+    bot: string; kind: "approval" | "clarify"; interactionId: string; sessionId: string; turnId: string;
+    payload: unknown; expiresAt: number | null; updatedAt: number;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT bot, kind, interaction_id AS interactionId, session_id AS sessionId, turn_id AS turnId,
+                payload_json AS payloadJson, expires_at AS expiresAt, updated_at AS updatedAt
+         FROM bot_native_interactions WHERE status = 'pending' AND (? IS NULL OR bot = ?)
+         ORDER BY updated_at, interaction_id`,
+      )
+      .all(bot ?? null, bot ?? null) as unknown as Array<{ bot: string; kind: "approval" | "clarify"; interactionId: string; sessionId: string; turnId: string; payloadJson: string; expiresAt: number | null; updatedAt: number }>;
+    return rows.map(({ payloadJson, ...row }) => ({ ...row, payload: JSON.parse(payloadJson) as unknown }));
+  }
+
   close(): void {
     this.#db.close();
   }
+}
+
+function nativeBotMessage(row: { id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null }): BotChatMessage {
+  return {
+    id: row.id,
+    role: row.role,
+    text: row.text,
+    at: row.at,
+    ...(row.clientId === null ? {} : { clientId: row.clientId }),
+    ...(row.attachmentsJson === null ? {} : { attachments: JSON.parse(row.attachmentsJson) as AttachmentBlock[] }),
+  };
 }
 
 /** True for the one error ADD COLUMN is expected to throw: the column is already there because
@@ -1329,6 +2023,8 @@ export function openStorage(dbPath: string): Storage {
   db.exec(SCHEMA);
   // Additive migration for a DB created before the delivery column existed.
   addColumnIfMissing(db, "messages", "delivery", "TEXT");
+  addColumnIfMissing(db, "messages", "external_id", "TEXT");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL");
   // Same shape, for a DB created before ext-bots capability 11 gave an unwritten chat a durable
   // runtime id. NULL on every existing row is exactly right: a pin written by an older gateway
   // points at a chat its kickoff already persisted, so there is nothing to remember for it.
@@ -1345,5 +2041,10 @@ export function openStorage(dbPath: string): Storage {
   // detail, which keeps older transcript history honest rather than manufacturing descriptions.
   addColumnIfMissing(db, "bot_chat_tool_steps", "detail", "TEXT");
   addColumnIfMissing(db, "bot_chat_tool_steps", "error_text", "TEXT");
+  addColumnIfMissing(db, "attach_event_inbox", "projection_attempts", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "attach_event_inbox", "projection_error", "TEXT");
+  addColumnIfMissing(db, "attach_event_inbox", "dead_lettered_at", "INTEGER");
+  addColumnIfMissing(db, "attach_command_outbox", "cancelled_at", "INTEGER");
+  addColumnIfMissing(db, "attach_command_outbox", "cancel_reason", "TEXT");
   return new Storage(db);
 }

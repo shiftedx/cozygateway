@@ -281,6 +281,14 @@ export interface BotsSurface {
     decision: BotApprovalDecision,
     deviceId: string,
   ): Promise<BotApprovalResolveOutcome>;
+  /** Capability 22: resolve one durable native clarification option. Dashboard-backed bots do not
+   * expose this interaction and return unsupported; native-data-plane decorators own it. */
+  resolveClarify(
+    name: string,
+    clarifyId: string,
+    optionId: string,
+    deviceId: string,
+  ): Promise<"selected" | "unknown" | "not_pending" | "expired" | "invalid_option" | "unsupported">;
 }
 
 /** One accepted photo on its way to a bot. Everything here has already been decided: the bytes were
@@ -795,6 +803,15 @@ export class HermesBridge implements BotsSurface {
     deviceId: string,
   ): Promise<BotApprovalResolveOutcome> {
     return this.#approvals.resolve(name, toolCallId, decision, deviceId);
+  }
+
+  async resolveClarify(
+    _name: string,
+    _clarifyId: string,
+    _optionId: string,
+    _deviceId: string,
+  ): Promise<"unsupported"> {
+    return "unsupported";
   }
 
   /** The hermes link generation durable runtime ids are currently stamped with. Observability, and

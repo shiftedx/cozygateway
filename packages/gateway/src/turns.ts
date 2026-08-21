@@ -512,4 +512,18 @@ export class TurnRunner {
     }
     this.#sessions.clear();
   }
+
+  /** Process-shutdown path for durable transports. attach-v1 owns recovery in SQLite, so waiting
+   * for an in-memory turn promise after the listener has closed would deadlock shutdown until its
+   * minutes-long timeout. Drop runtime bookkeeping; the event journal/native sink completes it
+   * after restart. */
+  abandonAll(): void {
+    this.#queues.clear();
+    this.#inflight.clear();
+    this.#approvals.clear();
+    for (const sessionPromise of this.#sessions.values()) {
+      void sessionPromise.then((session) => session.close()).catch(() => {});
+    }
+    this.#sessions.clear();
+  }
 }

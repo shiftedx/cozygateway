@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { PresenceState, RichBlock } from "cozygateway-contract";
+import type { PresenceState, RichBlock, ToolCall } from "cozygateway-contract";
 
 import type { AgentConfig } from "../../config.ts";
 import type { BackendAdapter, BackendSession, TurnHandlers } from "../types.ts";
@@ -10,20 +10,28 @@ import type {
   AttachTurnFrame,
   AttachUpdate,
 } from "./protocol.ts";
+import type { AttachV1EventFrame } from "./protocol-v1.ts";
 import { blocksToText } from "./blocks-to-text.ts";
 
 /** The slice of the ingress a turn needs. A seam so adapter tests run with no sockets;
  *  AttachIngress satisfies it structurally. */
 export interface TurnEndpoint {
   isAttached(agentId: string): boolean;
+  /** v1 durable endpoints can accept while absent; v0 endpoints omit this and retain fail-fast. */
+  canQueue?(agentId: string): boolean;
   sendTurn(agentId: string, frame: AttachTurnFrame): boolean;
   sendSteer(agentId: string, frame: AttachSteerFrame): boolean;
   sendInterrupt(agentId: string, frame: AttachInterruptFrame): boolean;
+  sendApprovalResolution?(
+    agentId: string,
+    input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" },
+  ): boolean;
 }
 
 /** A BackendAdapter that also receives routed ingress events for its agent. */
 export interface AttachAdapter extends BackendAdapter {
   handleUpdate(threadId: string, update: AttachUpdate): void;
+  handleV1Event(frame: AttachV1EventFrame): boolean;
   handleDisconnect(): void;
 }
 
@@ -93,6 +101,7 @@ interface InflightTurn {
   threadId: string;
   handlers: TurnHandlers;
   latest: RichBlock[] | undefined;
+  toolCalls: Map<string, ToolCall>;
   timer: ReturnType<typeof setTimeout>;
   resolve: () => void;
   reject: (err: Error) => void;
@@ -132,7 +141,7 @@ export function createAttachAdapter(deps: {
     async startSession(threadId: string): Promise<BackendSession> {
       return {
         send(blocks: RichBlock[], handlers: TurnHandlers): Promise<void> {
-          if (!deps.endpoint.isAttached(deps.agentId)) {
+          if (!deps.endpoint.isAttached(deps.agentId) && deps.endpoint.canQueue?.(deps.agentId) !== true) {
             return Promise.reject(new Error(`agent "${deps.agentId}" is not attached`));
           }
           const turnId = randomUUID();
@@ -142,7 +151,7 @@ export function createAttachAdapter(deps: {
               deps.turnTimeoutMs,
             );
             timer.unref();
-            turns.set(turnId, { threadId, handlers, latest: undefined, timer, resolve, reject });
+            turns.set(turnId, { threadId, handlers, latest: undefined, toolCalls: new Map(), timer, resolve, reject });
             inflightByThread.set(threadId, turnId);
             let sent: boolean;
             try {
@@ -191,6 +200,16 @@ export function createAttachAdapter(deps: {
           }
           failTurn(turnId, "interrupted by user");
         },
+        async resolveApproval(approvalId, decision): Promise<boolean> {
+          const turnId = inflightByThread.get(threadId);
+          if (turnId === undefined || deps.endpoint.sendApprovalResolution === undefined) return false;
+          return deps.endpoint.sendApprovalResolution(deps.agentId, {
+            threadId,
+            turnId,
+            approvalId,
+            decision,
+          });
+        },
         async close(): Promise<void> {},
       };
     },
@@ -223,6 +242,58 @@ export function createAttachAdapter(deps: {
       settled.resolve();
     },
 
+    handleV1Event(frame: AttachV1EventFrame): boolean {
+      const event = frame.event;
+      if (!("turnId" in event) || !("threadId" in event)) return false;
+      const turn = turns.get(event.turnId);
+      if (turn === undefined || turn.threadId !== event.threadId) return false;
+      switch (event.kind) {
+        case "draft":
+          turn.latest = event.blocks;
+          turn.handlers.onDraft({ blocks: event.blocks, toolCalls: [...turn.toolCalls.values()] });
+          return true;
+        case "tool": {
+          const call: ToolCall = {
+            id: event.callId,
+            name: event.name,
+            status: event.status,
+            ...(event.detail === undefined ? {} : { detail: event.detail }),
+          };
+          turn.toolCalls.set(event.callId, call);
+          turn.handlers.onDraft({ blocks: turn.latest ?? [], toolCalls: [...turn.toolCalls.values()] });
+          return true;
+        }
+        case "approval":
+          if (event.status === "pending") {
+            turn.handlers.onApprovalPending?.({ toolCallId: event.approvalId, name: event.name });
+          } else {
+            const outcome = event.status === "approved" ? "approved"
+              : event.status === "denied" ? "denied"
+                : event.status === "expired" ? "expired" : "expired";
+            turn.handlers.onApprovalResolved?.({ toolCallId: event.approvalId, outcome });
+          }
+          return true;
+        case "commit":
+          turn.latest = event.blocks;
+          turn.handlers.onDraft({ blocks: event.blocks, toolCalls: [...turn.toolCalls.values()] });
+          this.handleUpdate(event.threadId, { kind: "done", turnId: event.turnId });
+          return true;
+        case "failed":
+          this.handleUpdate(event.threadId, { kind: "failed", turnId: event.turnId, message: event.message });
+          return true;
+        case "cancelled":
+          this.handleUpdate(event.threadId, { kind: "failed", turnId: event.turnId, message: "the agent cancelled the turn" });
+          return true;
+        case "interrupted":
+          this.handleUpdate(event.threadId, { kind: "failed", turnId: event.turnId, message: "the agent interrupted the turn" });
+          return true;
+        case "clarify":
+          // Clarification is a distinct v1 interaction and has no frozen core-thread frame yet.
+          // It remains durably journaled and is projected by the Bot Mode native sink.
+          return true;
+      }
+    },
+
     handleDisconnect(): void {
       for (const turnId of [...turns.keys()]) {
         failTurn(turnId, "the attached connection dropped mid-turn");
@@ -246,5 +317,9 @@ export class AttachRouter {
 
   onDisconnect(agentId: string): void {
     this.#adapters.get(agentId)?.handleDisconnect();
+  }
+
+  onV1Event(agentId: string, frame: AttachV1EventFrame): boolean {
+    return this.#adapters.get(agentId)?.handleV1Event(frame) ?? false;
   }
 }

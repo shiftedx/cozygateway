@@ -420,6 +420,42 @@ export const BotApprovalResolvedFrameSchema = Type.Object({
 });
 export type BotApprovalResolvedFrame = Static<typeof BotApprovalResolvedFrameSchema>;
 
+/** Capability 22: a native bot paused its turn to ask the user to choose one bounded option. The
+ * stable clarifyId is the REST resolution key and options are identifiers plus display labels;
+ * arbitrary model reasoning is never present. */
+export const BotClarifyOptionSchema = Type.Object({
+  id: Type.String(),
+  label: Type.String(),
+});
+export type BotClarifyOption = Static<typeof BotClarifyOptionSchema>;
+export const BotClarifyResolveRequestSchema = Type.Object({ optionId: Type.String({ minLength: 1 }) });
+export type BotClarifyResolveRequest = Static<typeof BotClarifyResolveRequestSchema>;
+
+export const BotClarifyPendingFrameSchema = Type.Object({
+  type: Type.Literal("bot_clarify_pending"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  clarifyId: Type.String(),
+  prompt: Type.String(),
+  options: Type.Array(BotClarifyOptionSchema),
+  expiresAt: Type.Optional(Type.Integer()),
+  updatedAt: Type.Integer(),
+});
+export type BotClarifyPendingFrame = Static<typeof BotClarifyPendingFrameSchema>;
+
+export const BotClarifyResolvedFrameSchema = Type.Object({
+  type: Type.Literal("bot_clarify_resolved"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  clarifyId: Type.String(),
+  outcome: Type.Union([Type.Literal("selected"), Type.Literal("expired"), Type.Literal("cancelled")]),
+  selectedOptionId: Type.Optional(Type.String()),
+  updatedAt: Type.Integer(),
+});
+export type BotClarifyResolvedFrame = Static<typeof BotClarifyResolvedFrameSchema>;
+
 /** A bot's canonical chat was RETIRED and a fresh one pinned in its place, by
  *  `POST /bots/:name/chat/reset`. Broadcast to every paired device, which is the whole point of the
  *  frame: another device sitting on the old chat has no other way to learn that the session it is
@@ -1139,6 +1175,9 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    optional `mediaKind`; video and audio are ingested up to their per-kind 40 MB cap and the
  *    authenticated attachment route supports byte ranges for AVPlayer.
  *  - `21`: SAFE TOOL DETAILS (cozychat#224). Steps may carry bounded, defense-in-depth-redacted
- *    `detail` and error-only `errorText`; raw argument and result objects never cross the bridge. */
+ *    `detail` and error-only `errorText`; raw argument and result objects never cross the bridge.
+ *  - `22`: NATIVE CLARIFICATION. Adds `bot_clarify_pending` / `bot_clarify_resolved` and the
+ *    authenticated option-resolution route. Pending/options/expiry are durable and stable-id
+ *    idempotent across gateway/plugin restart. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 21;
+export const BOTS_CAPABILITY_VERSION = 22;
