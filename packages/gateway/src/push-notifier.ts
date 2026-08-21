@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { Storage, PushRegistrationRow } from "./storage.ts";
 import type { Notifier } from "./turns.ts";
 import { encryptPushPayload, type ApprovalPushPayload, type PushPayload } from "./push-crypto.ts";
@@ -12,6 +14,27 @@ const APPROVAL_CATEGORY = {
   approval_pending: "approval.pending",
   approval_resolved: "approval.resolved",
 } as const;
+
+const CHAT_MESSAGE_CATEGORY = "message";
+
+export interface ChatMessagePushEvent {
+  bot: string;
+  displayName: string;
+  messageId: string;
+  chatSessionId: string;
+}
+
+/** A stable, opaque APNs coalescing key for one bot chat. Digesting instead of truncating preserves
+ *  uniqueness for arbitrary Hermes session ids while staying inside the relay's 64-character and
+ *  identifier-only rules. */
+export function chatMessageCollapseId(bot: string, chatSessionId: string): string {
+  const digest = createHash("sha256")
+    .update(bot)
+    .update("\0")
+    .update(chatSessionId)
+    .digest("base64url");
+  return `botmsg.${digest}`;
+}
 
 /** The collapse-id charset and bound the relay enforces (`[A-Za-z0-9_.:-]`, 1 to 64). It is the
  *  only caller-controlled cleartext string besides the ciphertext, so a raw command or path cannot
@@ -91,6 +114,39 @@ export class RelayNotifier implements Notifier {
       void this.#send(registration, payload).catch((err: unknown) => {
         this.#log(
           `push: notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
+  /** A settled canonical bot reply. It uses the existing encrypted message payload and adds only
+   *  the relay-visible category/collapse pair needed for a burst from one bot chat to coalesce. */
+  notifyChatMessage(event: ChatMessagePushEvent, connectedDeviceIds: ReadonlySet<string>): void {
+    let registrations: PushRegistrationRow[];
+    try {
+      registrations = this.#storage.pushRegistrations();
+    } catch (err) {
+      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    if (targets.length === 0) return;
+    const payload: PushPayload = {
+      kind: "message",
+      threadId: `bot:${event.bot}`,
+      agentName: event.displayName,
+      preview: "",
+    };
+    const routing = {
+      category: CHAT_MESSAGE_CATEGORY,
+      collapseId: chatMessageCollapseId(event.bot, event.chatSessionId),
+    };
+    for (const registration of targets) {
+      void this.#send(registration, payload, routing).catch((err: unknown) => {
+        this.#log(
+          `push: chat message notify failed for device ${registration.deviceId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
         );
       });
     }

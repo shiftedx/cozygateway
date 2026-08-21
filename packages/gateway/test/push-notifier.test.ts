@@ -3,7 +3,7 @@ import { createDecipheriv, hkdfSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { openStorage } from "../src/storage.ts";
-import { PREVIEW_MAX_CHARS, RelayNotifier } from "../src/push-notifier.ts";
+import { PREVIEW_MAX_CHARS, RelayNotifier, chatMessageCollapseId } from "../src/push-notifier.ts";
 
 function decrypt(pushKey: string, wire: string): { kind?: string; threadId: string; agentName: string; preview: string } {
   const key = Buffer.from(
@@ -18,7 +18,7 @@ function decrypt(pushKey: string, wire: string): { kind?: string; threadId: stri
 
 interface Sent {
   url: string;
-  body: { pushId: string; ciphertext: string };
+  body: { pushId: string; ciphertext: string; category?: string; collapseId?: string };
 }
 
 /** fetch stub: returns per-URL statuses, records calls. */
@@ -284,6 +284,55 @@ describe("RelayNotifier", () => {
     await settle();
     expect(sent).toHaveLength(0);
     expect(storage.pushRegistrations().map((r) => r.deviceId)).toEqual(["d1"]); // no pruning on skip
+    storage.close();
+  });
+});
+
+describe("RelayNotifier.notifyChatMessage", () => {
+  const registration = { deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" };
+  const message = {
+    bot: "scout",
+    displayName: "Scout",
+    messageId: "m1",
+    chatSessionId: "stored-1",
+  };
+
+  it("uses the message category and a stable bot-plus-chat collapse id", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {} });
+    notifier.notifyChatMessage(message, new Set());
+    notifier.notifyChatMessage({ ...message, messageId: "m2" }, new Set());
+    await settle();
+
+    expect(sent).toHaveLength(2);
+    expect(sent.map((request) => request.body.category)).toEqual(["message", "message"]);
+    expect(sent[0]!.body.collapseId).toBe(sent[1]!.body.collapseId);
+    expect(sent[0]!.body.collapseId).toMatch(/^[A-Za-z0-9_.:-]{1,64}$/);
+    expect(chatMessageCollapseId("luna", message.chatSessionId)).not.toBe(sent[0]!.body.collapseId);
+    expect(decrypt("key-1", sent[0]!.body.ciphertext)).toEqual({
+      kind: "message",
+      threadId: "bot:scout",
+      agentName: "Scout",
+      preview: "",
+    });
+
+    const { impl: otherImpl, sent: otherSent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: otherImpl, log: () => {} }).notifyChatMessage(
+      { ...message, chatSessionId: "stored-2" },
+      new Set(),
+    );
+    await settle();
+    expect(otherSent[0]!.body.collapseId).not.toBe(sent[0]!.body.collapseId);
+    storage.close();
+  });
+
+  it("does not push to a device whose socket is connected", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notifyChatMessage(message, new Set(["d1"]));
+    await settle();
+    expect(sent).toEqual([]);
     storage.close();
   });
 });

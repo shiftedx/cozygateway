@@ -136,8 +136,8 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
           "apns-push-type": spec?.pushType ?? "alert",
           "content-type": "application/json",
           // Coalescing: a later push with the same collapse id REPLACES the delivered one on
-          // device. The approval categories pass the toolCallId, so a resolve overwrites the
-          // pending banner for exactly that tool call and nothing else.
+          // device. Approvals pass the toolCallId; bot messages pass a bot/chat digest so a burst
+          // from one canonical conversation coalesces.
           ...(push?.collapseId === undefined ? {} : { "apns-collapse-id": push.collapseId }),
         });
         let status = 0;

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   CANONICAL_CHAT_TITLE,
   resolveCanonicalChat,
+  isConversationalSessionId,
+  parseSessionList,
   type PinStore,
 } from "../src/hermes-bridge/canonical-chat.ts";
 
@@ -275,5 +277,23 @@ describe("resolveCanonicalChat re-adoption", () => {
     });
     expect(result).toEqual({ sessionId: "fresh", adoption: "pin" });
     expect(pins.map.get("scout")).toBe("fresh");
+  });
+});
+
+describe("settled chat push classification", () => {
+  it("accepts only an existing conversational session id", () => {
+    const rows = parseSessionList({
+      sessions: [
+        { id: "chat", title: CANONICAL_CHAT_TITLE },
+        { id: "cron_job7_1", title: "digest", source: "cron" },
+        { id: "routine", title: "Routine: digest", source: "cli" },
+        { id: "group", title: "Group: release" },
+        { id: "a2a", title: "Chat", preview: "Message from agent 'pixel': done" },
+      ],
+    });
+    expect(isConversationalSessionId(rows, "chat")).toBe(true);
+    for (const id of ["cron_job7_1", "routine", "group", "a2a", "missing"]) {
+      expect(isConversationalSessionId(rows, id)).toBe(false);
+    }
   });
 });

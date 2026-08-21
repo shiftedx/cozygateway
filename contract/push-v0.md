@@ -54,17 +54,20 @@ field is 400 `invalid_request` and nothing is delivered, so no cleartext descrip
 call can exist at the relay boundary even by accident.
 
 `category` and `collapseId` travel together or not at all (400 `invalid_request` otherwise).
-Omitting both is the ordinary message push, byte-identical to what shipped before. Registered
-categories (cozygateway issue #19, mobile approve/deny):
+Omitting both is the ordinary uncollapsed message push, byte-identical to what shipped before.
+Registered categories:
 
 | category | APNs push type | `aps.category` | fallback alert | collapse id |
 | --- | --- | --- | --- | --- |
+| `message` | `alert` | `message` | CozyChat / "New message" | digest of bot name + canonical chat session, required |
 | `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
 | `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
 
 On APNs the category becomes `aps.category` and the collapse id becomes the `apns-collapse-id`
-header; on a webhook both fields are added to the delivered JSON body next to `ciphertext`. A
-category outside the allowlist is 400. `collapseId` is bounded to an opaque-id charset
+header; on a webhook both fields are added to the delivered JSON body next to `ciphertext`. Bot
+chat replies use category `message`; the stable collapse id coalesces a burst from one bot's
+canonical chat without exposing its raw name or Hermes session id. A category outside the
+allowlist is 400. `collapseId` is bounded to an opaque-id charset
 (`[A-Za-z0-9_.:-]`, 1 to 64 characters), the only caller-controlled cleartext string besides the
 ciphertext: a raw command, path, or JSON blob cannot pass it, and an over-long id is refused
 rather than truncated, since two ids sharing a 64-byte prefix would collapse into one

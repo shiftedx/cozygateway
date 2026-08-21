@@ -133,7 +133,11 @@ export const BotChatMessageSchema = Type.Object({
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;
 
 /** New messages in a bot's canonical chat. A DELTA, not a snapshot: `messages` carries only what
- *  the bridge has not broadcast before, in order. */
+ *  the bridge has not broadcast before, in order.
+ *
+ *  A settled assistant row in the canonical conversational session also raises the existing
+ *  encrypted `message` push for registered devices without a live socket. This changes no frame or
+ *  capability: drafts, user echoes, context markers and machine-classified sessions stay in-band. */
 export const BotChatFrameSchema = Type.Object({
   type: Type.Literal("bot_chat"),
   bot: Type.String(),

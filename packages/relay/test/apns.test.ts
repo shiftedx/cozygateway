@@ -178,9 +178,9 @@ describe("apnsTransport.deliver", () => {
   });
 });
 
-describe("apnsTransport approval category (issue #19 push lane)", () => {
+describe("apnsTransport push categories", () => {
   async function deliverWithCategory(
-    category: "approval.pending" | "approval.resolved",
+    category: "message" | "approval.pending" | "approval.resolved",
     collapseId: string,
   ): Promise<{ headers: Record<string, unknown>; body: Record<string, unknown> }> {
     const { config } = testConfig();
@@ -198,6 +198,15 @@ describe("apnsTransport approval category (issue #19 push lane)", () => {
     const { body } = await deliverWithCategory("approval.pending", "toolu_01");
     expect(body["aps"]).toMatchObject({ category: "approval.pending", "mutable-content": 1 });
     expect(body["c"]).toBe("CIPHERBLOB");
+  });
+
+  it("uses the content-free message alert and caller collapse id for bot replies", async () => {
+    const { headers, body } = await deliverWithCategory("message", "botmsg.abc123");
+    expect(headers["apns-collapse-id"]).toBe("botmsg.abc123");
+    expect(body["aps"]).toMatchObject({
+      category: "message",
+      alert: { title: "CozyChat", body: "New message" },
+    });
   });
 
   it("coalesces on the caller's collapse id (apns-collapse-id = toolCallId)", async () => {

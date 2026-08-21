@@ -23,6 +23,7 @@ import {
   mintCanonicalChat,
   resolveCanonicalChat,
   listBotSessions,
+  isConversationalSessionId,
   sessionKind,
   type CanonicalChatResult,
   type ChatAdoption,
@@ -366,6 +367,14 @@ export interface HermesBridgeOptions {
    *  push notifier at server assembly; unset (as in every test that does not care) means the
    *  approval lifecycle stays in-band. */
   onApproval?: (event: BotApprovalPush) => void;
+  /** Raised after a settled assistant row lands in the listed conversational canonical session.
+   *  Drafts, user echoes, context markers and machine-classified sessions never reach this seam. */
+  onChatMessage?: (event: {
+    bot: string;
+    displayName: string;
+    messageId: string;
+    chatSessionId: string;
+  }) => void;
   /** Audit sink for approval resolutions, one line per terminal transition. Defaults to the
    *  bridge's own log. The line names the bot, the chat, the turn, the toolCallId, the outcome and
    *  the deciding device, and never anything describing the action. */
@@ -555,6 +564,32 @@ export class HermesBridge implements BotsSurface {
           );
         },
       },
+      ...(opts.onChatMessage === undefined
+        ? {}
+        : {
+            onSettledAssistantMessage: (event: {
+              bot: string;
+              chatSessionId: string;
+              messageId: string;
+            }) => {
+              void (async () => {
+                try {
+                  const rows = await listBotSessions(this.#client, event.bot, 200);
+                  if (!isConversationalSessionId(rows, event.chatSessionId)) return;
+                  opts.onChatMessage?.({
+                    ...event,
+                    displayName: this.#memberInfo(event.bot).displayName,
+                  });
+                } catch (err) {
+                  this.#log(
+                    `chat push classification failed for ${event.bot}: ${
+                      err instanceof Error ? err.message : "unknown"
+                    }`,
+                  );
+                }
+              })();
+            },
+          }),
       ...(opts.chatPollMs === undefined ? {} : { pollMs: opts.chatPollMs }),
       ...(opts.chatTurnTimeoutMs === undefined ? {} : { timeoutMs: opts.chatTurnTimeoutMs }),
     });

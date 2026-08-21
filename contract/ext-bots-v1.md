@@ -865,6 +865,14 @@ phone that is backgrounded (or a second device that was never in the room) still
 turn. Each poll that finds new messages emits a `bot_chat` delta; each change of state emits a
 `bot_chat_state`.
 
+When the terminal row is a settled assistant message in the canonical conversational session, the
+gateway also raises the existing encrypted `message` push for registered devices without a live
+socket. Drafts, user echoes, compaction markers, cron sessions, delegated routines, group sessions,
+and bot-to-bot deliveries never raise it. The relay category is `message`; its opaque collapse id is
+stable for the bot name plus canonical chat session, so a burst from one conversation coalesces.
+Relay failure and daily caps affect only the banner and never the `bot_chat` frame path. This is
+server behavior over the existing push contract and does not change the bots capability version.
+
 While the turn runs, the gateway also streams a LIVE DRAFT of the reply as `bot_chat_delta` frames
 (section 6), built from Hermes' own token events rather than from the poll. It is decoration: the
 message a client stores is still the one that arrives in `bot_chat`, and a turn that streams nothing

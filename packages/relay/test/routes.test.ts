@@ -316,7 +316,7 @@ describe("registration TTL (issue #28)", () => {
   });
 });
 
-describe("POST /notify, approval push category (issue #19 push lane)", () => {
+describe("POST /notify, push categories", () => {
   async function errorCode(res: Response): Promise<string> {
     const body = (await res.json()) as { error: { code: string } };
     return body.error.code;
@@ -340,6 +340,20 @@ describe("POST /notify, approval push category (issue #19 push lane)", () => {
         options: { category: "approval.pending", collapseId: "toolu_01" },
       },
     ]);
+  });
+
+  it("passes the message category and bot-chat collapse id through to the transport", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const res = await notify(app, {
+      pushId,
+      ciphertext: "CIPHER",
+      category: "message",
+      collapseId: "botmsg.abc123",
+    });
+    expect(res.status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries[0]?.options).toEqual({ category: "message", collapseId: "botmsg.abc123" });
   });
 
   it("carries approval.resolved on the same collapse id, so a resolve replaces its own pending push", async () => {

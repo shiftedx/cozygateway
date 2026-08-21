@@ -98,6 +98,13 @@ export interface ChatTurnsOptions {
   pollMs?: number;
   timeoutMs?: number;
   log?: (message: string) => void;
+  /** Raised once when an idle terminal assistant row settles the turn. The caller owns any
+   *  out-of-band work and must not throw; the frame and complete state are emitted first. */
+  onSettledAssistantMessage?: (event: {
+    bot: string;
+    chatSessionId: string;
+    messageId: string;
+  }) => void;
 }
 
 /** What the caller knows about the chat that the turn loop cannot learn on its own. */
@@ -218,6 +225,7 @@ export class BotChatTurns {
   readonly #stream: ChatStreamBinder | undefined;
   readonly #attachments: ChatAttachmentStore | undefined;
   readonly #assistantMedia: AssistantMediaStore | undefined;
+  readonly #onSettledAssistantMessage: ChatTurnsOptions["onSettledAssistantMessage"];
 
   /** One send at a time per bot, held across the attach-and-submit pair.
    *
@@ -255,6 +263,7 @@ export class BotChatTurns {
     this.#stream = opts.stream;
     this.#attachments = opts.attachments;
     this.#assistantMedia = opts.assistantMedia;
+    this.#onSettledAssistantMessage = opts.onSettledAssistantMessage;
   }
 
   /** Asks hermes to drop ONE queued image, by the path it told us it wrote, swallowing every failure.
@@ -687,6 +696,24 @@ export class BotChatTurns {
       if (snapshot.running || snapshot.inflight) turn.sawActivity = true;
       if (settled) {
         this.#emitState(name, turn.sessionId, "complete", false, false);
+        const assistant = messages.at(-1);
+        if (
+          assistant?.role === "assistant" &&
+          !isContextCompactionMarker(assistant) &&
+          this.#onSettledAssistantMessage !== undefined
+        ) {
+          try {
+            this.#onSettledAssistantMessage({
+              bot: name,
+              chatSessionId: turn.sessionId,
+              messageId: assistant.id,
+            });
+          } catch (err) {
+            this.#log(
+              `settled assistant callback failed for ${name}: ${err instanceof Error ? err.message : "unknown"}`,
+            );
+          }
+        }
         return;
       }
       this.#emitState(name, turn.sessionId, "polling", snapshot.running, snapshot.inflight);

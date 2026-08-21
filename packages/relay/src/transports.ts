@@ -24,8 +24,8 @@ export const DELIVERY_TIMEOUT_MS = 10_000;
 export interface PushDeliveryOptions {
   /** Actionable category id; becomes `aps.category` on APNs. */
   category?: PushCategoryId;
-  /** Coalescing key; becomes `apns-collapse-id` on APNs. The approval categories pass the
-   *  `toolCallId`, so a resolve replaces the pending notification it belongs to. */
+  /** Coalescing key; becomes `apns-collapse-id` on APNs. Approvals pass the `toolCallId`; bot
+   *  messages pass an opaque digest of bot name and canonical chat session. */
   collapseId?: string;
 }
 

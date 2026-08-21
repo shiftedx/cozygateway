@@ -20,7 +20,7 @@ import { parseOpenClawOptions } from "./adapters/openclaw/config.ts";
 import { createApp } from "./http.ts";
 import { WsHub } from "./ws-hub.ts";
 import { TurnRunner } from "./turns.ts";
-import { RelayNotifier } from "./push-notifier.ts";
+import { RelayNotifier, type ChatMessagePushEvent } from "./push-notifier.ts";
 import type { ApprovalPushPayload } from "./push-crypto.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { createUpgradeDispatcher, type UpgradeHandler } from "./upgrade-dispatcher.ts";
@@ -60,6 +60,15 @@ export interface StartGatewayOptions {
    *  toolCallId, outcome, and deciding device, and never the approval's argument summary. Exists
    *  so a test can read the audit trail without scraping real stderr. */
   approvalLog?: (message: string) => void;
+}
+
+/** The assembly seam between Hermes' settled-chat event and the relay notifier. Kept pure so the
+ *  live hub snapshot, rather than a startup-time set, is pinned by a unit test. */
+export function createChatMessagePushHandler(
+  notifier: Pick<RelayNotifier, "notifyChatMessage">,
+  connectedDeviceIds: () => ReadonlySet<string>,
+): (event: ChatMessagePushEvent) => void {
+  return (event) => notifier.notifyChatMessage(event, connectedDeviceIds());
 }
 
 /** One shared immutable GatewayInfo for health, pairing, and the ready frame. */
@@ -114,6 +123,7 @@ export async function startGateway(
   // Same indirection, for the bots bridge's approval lifecycle (issue #19 bridge lane): the
   // notifier does not exist yet, and no approval can be raised before the listener is bound.
   let raiseApprovalPush: (payload: ApprovalPushPayload) => void = () => {};
+  let raiseChatMessagePush: (event: ChatMessagePushEvent) => void = () => {};
 
   let bridge: HermesBridge | undefined;
   if (hermesOptions !== undefined) {
@@ -169,6 +179,7 @@ export async function startGateway(
               },
         );
       },
+      onChatMessage: (event) => raiseChatMessagePush(event),
       ...(options.approvalLog === undefined ? {} : { approvalLog: options.approvalLog }),
       ...(hermesOptions.approvalTimeoutMs === undefined
         ? {}
@@ -245,6 +256,7 @@ export async function startGateway(
   // excluded here rather than pushed to twice.
   raisePush = (event) => notifier.notify(event, hub.connectedDeviceIds());
   raiseApprovalPush = (payload) => notifier.notifyApproval(payload, hub.connectedDeviceIds());
+  raiseChatMessagePush = createChatMessagePushHandler(notifier, () => hub.connectedDeviceIds());
   const runner = new TurnRunner({
     storage,
     hub,
