@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -28,8 +28,12 @@ import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
 import type { BotsSurface } from "./hermes-bridge/bridge.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
+import { resolveByteRange } from "./hermes-bridge/routes.ts";
 import type { MediaFetch, MediaLimiter, MediaLookup } from "./hermes-bridge/media.ts";
-import type { PhotoRateLimiter } from "./hermes-bridge/photos.ts";
+import { readCappedBody, sniffImageType, type PhotoRateLimiter } from "./hermes-bridge/photos.ts";
+import { ASSISTANT_MEDIA_TYPES, acceptAssistantMediaBytes } from "./hermes-bridge/assistant-media.ts";
+import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
+import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 
 /** The relay's register body, mirrored here rather than imported: the gateway's docker image
  *  bundles only its own package, so a runtime import of cozygateway-relay crashes the container
@@ -47,6 +51,11 @@ export interface AppDeps {
    *  routes are not registered at all and the capability is not advertised, so an app probing
    *  `GatewayInfo.capabilities` sees the truth. */
   bots?: BotsSurface;
+  /** attach-v1 bearer token → authenticated agent. Enables only the media side channel; device
+   * routes never accept this credential. */
+  attachTokens?: ReadonlyMap<string, string>;
+  /** Per-agent media rollout gate, evaluated after constant-time attach authentication. */
+  attachMediaAllowed?: (agentId: string) => boolean;
   /** Test seam for `GET /bots/:name/media`. Left undefined in production, where the proxy uses the
    *  global `fetch`; a test supplies its own so the media rules can be exercised without a socket. */
   mediaFetch?: MediaFetch;
@@ -106,6 +115,20 @@ export function createApp(deps: AppDeps): Hono<Env> {
     c.set("deviceId", device.id);
     await next();
   });
+
+  const requireAttach = createMiddleware<Env>(async (c, next) => {
+    const agentId = deps.attachTokens === undefined
+      ? undefined
+      : resolveAttachBearer(deps.attachTokens, c.req.header("authorization"));
+    if (agentId === undefined) return c.json(errorBody("unauthorized", "missing or unknown attach token"), 401);
+    if (deps.attachMediaAllowed?.(agentId) === false) {
+      return c.json(errorBody("invalid_request", "attach media is disabled for this agent"), 403);
+    }
+    await next();
+  });
+  const attachAgent = (c: Context<Env>): string => {
+    return resolveAttachBearer(deps.attachTokens!, c.req.header("authorization"))!;
+  };
 
   const readBody = async (c: Context<Env>): Promise<unknown> => {
     try {
@@ -408,6 +431,87 @@ export function createApp(deps: AppDeps): Hono<Env> {
         now: deps.now,
       },
     );
+  }
+
+  if (deps.attachTokens !== undefined && deps.attachTokens.size > 0) {
+    app.post("/attach/v1/media/:mediaId", requireAttach, async (c) => {
+      const mediaId = c.req.param("mediaId");
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId)) {
+        return c.json(errorBody("invalid_request", "invalid attach media id"), 400);
+      }
+      const mimeType = (c.req.header("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+      const acceptedType = ASSISTANT_MEDIA_TYPES.get(mimeType);
+      if (acceptedType === undefined) return c.json({ ...errorBody("invalid_request", "disallowed media type"), reason: "content_type" }, 415);
+      const declared = Number(c.req.header("content-length") ?? "");
+      if (Number.isFinite(declared) && declared > acceptedType.maxBytes) {
+        return c.json({ ...errorBody("invalid_request", "media is over the size cap"), reason: "too_large" }, 413);
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = await readCappedBody(c.req.raw.body, acceptedType.maxBytes);
+        acceptAssistantMediaBytes(mimeType, bytes, sniffImageType);
+      } catch (err) {
+        const tooLarge = err instanceof Error && /large|size|cap|ran past/i.test(err.message);
+        return c.json(
+          { ...errorBody("invalid_request", err instanceof Error ? err.message : "invalid media"), reason: tooLarge ? "too_large" : "content_type" },
+          tooLarge ? 413 : 415,
+        );
+      }
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const claimedHash = (c.req.header("x-attach-sha256") ?? "").toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(claimedHash) || claimedHash !== sha256) {
+        return c.json({ ...errorBody("invalid_request", "media sha256 mismatch"), reason: "digest" }, 422);
+      }
+      const filename = c.req.header("x-attach-filename")?.trim() ?? "";
+      if (filename.length === 0 || filename.length > 512 || /[\r\n]/.test(filename)) {
+        return c.json(errorBody("invalid_request", "invalid attach media filename"), 400);
+      }
+      const expiresRaw = c.req.header("x-attach-expires-at");
+      const expiresAt = expiresRaw === undefined ? undefined : Number(expiresRaw);
+      if (expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || expiresAt <= deps.now())) {
+        return c.json(errorBody("invalid_request", "invalid attach media expiry"), 400);
+      }
+      const descriptor: AttachV1MediaDescriptor = {
+        mediaId,
+        mimeType,
+        byteCount: bytes.byteLength,
+        sha256,
+        filename,
+        family: acceptedType.kind,
+        ...(expiresAt === undefined ? {} : { expiresAt }),
+      };
+      try {
+        deps.storage.saveAttachMedia(attachAgent(c), descriptor, bytes, deps.now());
+      } catch {
+        return c.json(errorBody("invalid_request", "attach media id already exists"), 409);
+      }
+      return c.json({ media: descriptor }, 201);
+    });
+
+    app.get("/attach/v1/media/:mediaId", requireAttach, (c) => {
+      const mediaId = c.req.param("mediaId");
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId)) return c.json(errorBody("invalid_request", "invalid attach media id"), 400);
+      const agentId = attachAgent(c);
+      const info = deps.storage.attachMediaInfo(agentId, mediaId, deps.now());
+      if (info === undefined) return c.json(errorBody("not_found", "no such attach media"), 404);
+      const range = resolveByteRange(c.req.header("range"), info.size);
+      if (range === null) return new Response(null, { status: 416, headers: { "content-range": `bytes */${info.size}`, "accept-ranges": "bytes" } });
+      const start = range?.start ?? 0;
+      const end = range?.end ?? info.size - 1;
+      const bytes = deps.storage.attachMediaSlice(agentId, mediaId, start, end - start + 1, deps.now());
+      if (bytes === undefined) return c.json(errorBody("not_found", "no such attach media"), 404);
+      return new Response(bytes.slice().buffer as ArrayBuffer, {
+        status: range === undefined ? 200 : 206,
+        headers: {
+          "content-type": info.mime,
+          "content-length": String(bytes.byteLength),
+          "accept-ranges": "bytes",
+          "cache-control": "private, max-age=86400",
+          "x-content-type-options": "nosniff",
+          ...(range === undefined ? {} : { "content-range": `bytes ${start}-${end}/${info.size}` }),
+        },
+      });
+    });
   }
 
   app.notFound((c) => c.json(errorBody("not_found", "no such route"), 404));

@@ -3,6 +3,7 @@ import {
   type ErrorBody,
   type ErrorCode,
   BotChatPhotoFieldsSchema,
+  BotClarifyResolveRequestSchema,
   BotChatSendRequestSchema,
   BotCreateRequestSchema,
   BotFocusRequestSchema,
@@ -444,6 +445,32 @@ export function registerBotRoutes(
 
   app.post("/bots/:name/approvals/:toolCallId/approve", requireDevice, botApprovalRoute("approve"));
   app.post("/bots/:name/approvals/:toolCallId/deny", requireDevice, botApprovalRoute("deny"));
+
+  app.post("/bots/:name/clarifications/:clarifyId", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { body = undefined; }
+    let parsed;
+    try { parsed = assertValid(BotClarifyResolveRequestSchema, body); }
+    catch (err) {
+      return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"), 400);
+    }
+    const outcome = await bots.resolveClarify(
+      resolved.name,
+      c.req.param("clarifyId") ?? "",
+      parsed.optionId,
+      c.get("deviceId"),
+    );
+    switch (outcome) {
+      case "selected": return c.json({ outcome, selectedOptionId: parsed.optionId }, 202);
+      case "unknown": return c.json(errorBody("not_found", "no such pending clarification"), 404);
+      case "expired": return c.json(errorBody("approval_expired", "the clarification expired before it was resolved"), 409);
+      case "not_pending": return c.json(errorBody("approval_not_pending", "the clarification is no longer pending"), 409);
+      case "invalid_option": return c.json(errorBody("invalid_request", "the option does not belong to this clarification"), 400);
+      case "unsupported": return c.json(errorBody("backend_unavailable", "hermes could not resolve the clarification"), 503);
+    }
+  });
 
   app.post("/bots/focus", requireDevice, async (c) => {
     let body: unknown;

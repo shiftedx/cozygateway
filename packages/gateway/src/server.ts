@@ -14,6 +14,9 @@ import type { GatewayConfig } from "./config.ts";
 import { openStorage, type Storage } from "./storage.ts";
 import { buildAdapters } from "./adapters/registry.ts";
 import { AttachIngress } from "./adapters/attach/ingress.ts";
+import { ATTACH_V1_CAPABILITIES, AttachV1Ingress } from "./adapters/attach/ingress-v1.ts";
+import type { AttachV1Capability } from "./adapters/attach/protocol-v1.ts";
+import { AttachNativeSink } from "./adapters/attach/native-sink.ts";
 import { AttachRouter, collectAttachTokens } from "./adapters/attach/adapter.ts";
 import type { OpenClawClient } from "./adapters/openclaw/client.ts";
 import { parseOpenClawOptions } from "./adapters/openclaw/config.ts";
@@ -26,12 +29,19 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { createUpgradeDispatcher, type UpgradeHandler } from "./upgrade-dispatcher.ts";
 import { createHermesClient } from "./hermes-bridge/client.ts";
 import { parseHermesOptions } from "./hermes-bridge/config.ts";
-import { HermesBridge } from "./hermes-bridge/bridge.ts";
+import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
+import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 
 export const GATEWAY_VERSION = "0.1.0";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
+
+function allowedAttachMedia(config: GatewayConfig, agentId: string): boolean {
+  const entry = Object.entries(config.hermes?.nativeDataPlane ?? {})
+    .find(([bot]) => bot.trim().toLowerCase() === agentId)?.[1];
+  return entry?.features?.media !== false;
+}
 
 export interface RunningGateway {
   url: string;
@@ -190,10 +200,28 @@ export async function startGateway(
   // The attach ingress exists only when an attach agent is configured. Token resolution fails
   // closed BEFORE the listener opens, so a misconfigured gateway never half-starts.
   const attachAgents = config.agents.filter((a) => a.backend === "attach");
+  const nativeBotEntries = Object.entries(config.hermes?.nativeDataPlane ?? {});
   const router = new AttachRouter();
+  let nativeSink: AttachNativeSink | undefined;
   let attachIngress: AttachIngress | undefined;
-  if (attachAgents.length > 0) {
+  let attachV1Ingress: AttachV1Ingress | undefined;
+  let attachEndpoint: import("./adapters/attach/adapter.ts").TurnEndpoint | undefined;
+  let attachTokens: Map<string, string> | undefined;
+  let nativeBotPlane: NativeBotDataPlane | undefined;
+  let botsSurface: BotsSurface | undefined = bridge;
+  if (attachAgents.length > 0 || nativeBotEntries.length > 0) {
     const tokens = collectAttachTokens(config.agents, process.env);
+    for (const [rawBot, native] of nativeBotEntries) {
+      const bot = rawBot.trim().toLowerCase();
+      const token = process.env[native.tokenEnv];
+      if (token === undefined || token.length === 0) {
+        throw new Error(`native bot "${bot}": environment variable "${native.tokenEnv}" is not set`);
+      }
+      const holder = tokens.get(token);
+      if (holder !== undefined) throw new Error(`native bot "${bot}": attach token collides with "${holder}"`);
+      tokens.set(token, bot);
+    }
+    attachTokens = tokens;
     attachIngress = new AttachIngress({
       tokens,
       events: {
@@ -202,6 +230,53 @@ export async function startGateway(
         onPresence: (agentId, state) => hub.broadcast({ type: "presence", agentId, state }),
       },
     });
+    const allowedCapabilities = new Map<string, ReadonlySet<AttachV1Capability>>();
+    for (const [rawBot, native] of nativeBotEntries) {
+      const features = native.features;
+      allowedCapabilities.set(rawBot.trim().toLowerCase(), new Set(ATTACH_V1_CAPABILITIES.filter((capability) => {
+        if (capability === "media") return features?.media !== false;
+        if (capability === "tools") return features?.tools !== false;
+        if (capability === "approvals") return features?.interactions !== false;
+        if (capability === "clarify") return features?.clarify !== false;
+        if (capability === "scheduled") return features?.scheduled !== false;
+        return true;
+      })));
+    }
+    attachV1Ingress = new AttachV1Ingress({
+      tokens,
+      storage,
+      allowedCapabilities,
+      events: {
+        canAcceptEvent: (agentId, frame) => {
+          if (nativeBotPlane?.handles(agentId)) return nativeBotPlane.canAccept(agentId, frame);
+          if (frame.event.kind !== "scheduled") return true;
+          const thread = storage.threadById(frame.event.threadId);
+          return thread !== undefined && thread.agentId === agentId;
+        },
+        onEvent: (agentId, frame) => {
+          if (router.onV1Event(agentId, frame)) return true;
+          if (nativeBotPlane?.handle(agentId, frame)) return true;
+          if (frame.event.kind === "media" || frame.event.kind === "presence") return true;
+          return nativeSink?.handle(agentId, frame) ?? false;
+        },
+        onPresence: (agentId, state) =>
+          hub.broadcast({ type: "presence", agentId, state: state === "online" ? "online" : "absent" }),
+      },
+    });
+    const v0 = attachIngress;
+    const v1 = attachV1Ingress;
+    attachEndpoint = {
+      isAttached: (agentId) => v1.isAttached(agentId) || v0.isAttached(agentId),
+      canQueue: (agentId) => v1.hasNegotiated(agentId),
+      sendTurn: (agentId, frame) =>
+        v1.hasNegotiated(agentId) ? v1.sendTurn(agentId, frame) : v0.sendTurn(agentId, frame),
+      sendSteer: (agentId, frame) =>
+        v1.hasNegotiated(agentId) ? v1.sendSteer(agentId, frame) : v0.sendSteer(agentId, frame),
+      sendInterrupt: (agentId, frame) =>
+        v1.hasNegotiated(agentId) ? v1.sendInterrupt(agentId, frame) : v0.sendInterrupt(agentId, frame),
+      sendApprovalResolution: (agentId, input) =>
+        v1.hasNegotiated(agentId) ? v1.sendApprovalResolution(agentId, input) : false,
+    };
   }
 
   // The openclaw backend dials OUT (one OpenClawClient per configured agent, no shared ingress).
@@ -223,12 +298,14 @@ export async function startGateway(
 
   const adapters = buildAdapters(
     config.agents,
-    attachIngress === undefined
+    attachEndpoint === undefined
       ? undefined
       : {
-          endpoint: attachIngress,
+          endpoint: attachEndpoint,
           env: process.env,
-          register: (agentId, adapter) => router.register(agentId, adapter),
+          register: (agentId, adapter) => {
+            router.register(agentId, adapter);
+          },
         },
     openclawAgents.length === 0
       ? undefined
@@ -257,6 +334,37 @@ export async function startGateway(
   raisePush = (event) => notifier.notify(event, hub.connectedDeviceIds());
   raiseApprovalPush = (payload) => notifier.notifyApproval(payload, hub.connectedDeviceIds());
   raiseChatMessagePush = createChatMessagePushHandler(notifier, () => hub.connectedDeviceIds());
+  if (bridge !== undefined && attachV1Ingress !== undefined && nativeBotEntries.length > 0) {
+    nativeBotPlane = new NativeBotDataPlane({
+      control: bridge,
+      storage,
+      ingress: attachV1Ingress,
+      nativeBots: nativeBotEntries.filter(([, item]) => (item.mode ?? "native") === "native").map(([bot]) => bot),
+      shadowBots: nativeBotEntries.filter(([, item]) => item.mode === "shadow").map(([bot]) => bot),
+      broadcast: (frame) => hub.broadcast(frame),
+      onChatMessage: (event) => raiseChatMessagePush(event),
+      onApproval: (event) => {
+        raiseApprovalPush(
+          event.outcome === undefined
+            ? { kind: "approval_pending", threadId: `bot:${event.bot}`, agentId: event.bot, turnId: event.turnId, toolCallId: event.toolCallId, name: event.name ?? "tool" }
+            : { kind: "approval_resolved", threadId: `bot:${event.bot}`, agentId: event.bot, turnId: event.turnId, toolCallId: event.toolCallId, outcome: event.outcome },
+        );
+      },
+      now: () => Date.now(),
+    });
+    botsSurface = nativeBotPlane.surface();
+  }
+  nativeSink = new AttachNativeSink({
+    storage,
+    broadcast: (frame) => hub.broadcast(frame),
+    notifier,
+    connectedDeviceIds: () => hub.connectedDeviceIds(),
+    now: () => Date.now(),
+  });
+  if (attachV1Ingress !== undefined) {
+    for (const agent of attachAgents) attachV1Ingress.replayUnapplied(agent.id);
+    for (const [bot] of nativeBotEntries) attachV1Ingress.replayUnapplied(bot.trim().toLowerCase());
+  }
   const runner = new TurnRunner({
     storage,
     hub,
@@ -271,7 +379,9 @@ export async function startGateway(
     storage,
     config,
     gatewayInfo,
-    ...(bridge === undefined ? {} : { bots: bridge }),
+    ...(botsSurface === undefined ? {} : { bots: botsSurface }),
+    ...(attachTokens === undefined ? {} : { attachTokens }),
+    ...(attachTokens === undefined ? {} : { attachMediaAllowed: (agentId: string) => allowedAttachMedia(config, agentId) }),
     presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",
     submitUserMessage: (threadId, blocks) => runner.submitUserMessage(threadId, blocks),
     // The runner's "unsupported" outcome collapses to "interrupting" here: a turn WAS in
@@ -314,6 +424,7 @@ export async function startGateway(
   ]);
   if (attachIngress !== undefined) {
     routes.set("/attach", (req, socket, head) => attachIngress.handleUpgrade(req, socket, head));
+    routes.set("/attach/v1", (req, socket, head) => attachV1Ingress!.handleUpgrade(req, socket, head));
   }
   server.on("upgrade", createUpgradeDispatcher(routes));
   // Started after the listener is up so the first roster refresh cannot race the hub it
@@ -332,19 +443,23 @@ export async function startGateway(
       return code;
     },
     close: async () => {
+      const durableAttachShutdown = attachV1Ingress !== undefined && [...attachAgents.map((agent) => agent.id), ...nativeBotEntries.map(([bot]) => bot.trim().toLowerCase())].some((agentId) => attachV1Ingress!.hasNegotiated(agentId));
       hub.close();
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
       // runner's per-thread chains settle before closeAll drains them.
       attachIngress?.close();
+      attachV1Ingress?.close();
       // Same ordering for openclaw: close every dial-out client (cancels any pending reconnect
       // timer and fails in-flight turns) before the HTTP server stops and the runner drains.
       await Promise.all([...openclawClients.values()].map((client) => client.close()));
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await bridge?.close();
+      nativeBotPlane?.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
-      await runner.closeAll();
+      if (durableAttachShutdown) runner.abandonAll();
+      else await runner.closeAll();
       storage.close();
     },
   };

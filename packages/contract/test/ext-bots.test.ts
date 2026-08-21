@@ -483,7 +483,8 @@ describe("capability advertisement", () => {
     // 19 for the authenticated hard-stop route and its existing complete state-frame terminal edge,
     // plus new-session minting through the existing adoption frame without retiring the old chat.
     // 20 adds assistant audio/video metadata and ranged attachment delivery.
-    expect(BOTS_CAPABILITY_VERSION).toBe(21);
+    // 22 adds durable native clarification cards plus their idempotent selection route.
+    expect(BOTS_CAPABILITY_VERSION).toBe(22);
   });
 
   it("accepts only the capability-19 hard-stop success body", () => {

@@ -72,6 +72,29 @@ const HermesBridgeConfigSchema = Type.Object({
    *  conversation only if the user chooses to send it as their own message. Set it to the empty
    *  string to offer nothing at all, which leaves a fresh chat completely bare. */
   chatSuggestion: Type.Optional(Type.String()),
+  /** Per-profile attach-v1 rollout. Management remains on the dashboard bridge; chat traffic for
+   *  a profile in `native` mode uses only the durable attach-v1 data plane. `shadow` authenticates
+   *  and journals the native stream without taking ownership of app-visible chat submission. */
+  nativeDataPlane: Type.Optional(
+    Type.Record(
+      Type.String({ minLength: 1 }),
+      Type.Object({
+        tokenEnv: Type.String({ minLength: 1 }),
+        mode: Type.Optional(Type.Union([Type.Literal("native"), Type.Literal("shadow")])),
+        /** Independently reversible attach-v1 feature gates. Omitted fields default true so an
+         * existing native/shadow config retains the complete v1 surface. */
+        features: Type.Optional(
+          Type.Object({
+            media: Type.Optional(Type.Boolean()),
+            tools: Type.Optional(Type.Boolean()),
+            interactions: Type.Optional(Type.Boolean()),
+            clarify: Type.Optional(Type.Boolean()),
+            scheduled: Type.Optional(Type.Boolean()),
+          }),
+        ),
+      }),
+    ),
+  ),
 });
 export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
 

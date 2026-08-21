@@ -1,6 +1,5 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { timingSafeEqual } from "node:crypto";
 
 import { WebSocketServer, WebSocket } from "ws";
 import { check } from "cozygateway-contract";
@@ -12,6 +11,7 @@ import {
   type AttachTurnFrame,
   type AttachUpdate,
 } from "./protocol.ts";
+import { resolveAttachBearer } from "./token-auth.ts";
 
 /** What the ingress reports upward. The server maps presence transitions to contract v1
  *  presence frames; the router maps updates/disconnects to the owning agent's adapter. */
@@ -19,14 +19,6 @@ export interface AttachEvents {
   onUpdate(agentId: string, threadId: string, update: AttachUpdate): void;
   onDisconnect(agentId: string): void;
   onPresence(agentId: string, state: "online" | "absent"): void;
-}
-
-/** Constant-time secret comparison; a length mismatch returns false without a timing oracle
- *  on where the strings diverge. */
-function tokenEquals(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
 }
 
 /** The adapter-facing /attach WebSocket server. Authenticates each connection by bearer token
@@ -57,13 +49,7 @@ export class AttachIngress {
   }
 
   #agentForRequest(req: IncomingMessage): string | undefined {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
-    if (token === "") return undefined;
-    for (const [candidate, agentId] of this.#tokens) {
-      if (tokenEquals(candidate, token)) return agentId;
-    }
-    return undefined;
+    return resolveAttachBearer(this.#tokens, req.headers.authorization);
   }
 
   #onConnection(socket: WebSocket, req: IncomingMessage): void {

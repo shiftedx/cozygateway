@@ -25,11 +25,14 @@ How the harness's native stream maps onto the attach protocol:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
 import random
 import threading
+import time
+import uuid
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -42,7 +45,9 @@ from .attach_client import (
     SteerFrame,
     TurnFrame,
 )
-from .text_blocks import IncrementalNormalizer
+from .attach_client_v1 import AttachV1Client, AttachV1ClientConfig
+from .attach_spool import AttachSpool
+from .text_blocks import IncrementalNormalizer, normalize_text_to_blocks
 from .tool_chips import ToolChipTracker
 
 logger = logging.getLogger(__name__)
@@ -120,7 +125,9 @@ class AttachAdapter:
         self.ca_file: Optional[str] = (
             os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None
         )
-        self._client: Optional[AttachClient] = None
+        self._attach_version: int = 1 if str(os.getenv("COZYGATEWAY_ATTACH_VERSION") or extra.get("attach_version") or "0") == "1" else 0
+        self._spool: Optional[AttachSpool] = None
+        self._client: Optional[Any] = None
         self._watcher: Optional[asyncio.Task] = None
         self._closing: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -160,6 +167,9 @@ class AttachAdapter:
         self._normalizers: Dict[str, IncrementalNormalizer] = {}
         # Whether any draft for a turn has carried visible content yet.
         self._content_seen: Dict[str, bool] = {}
+        # Hermes' clarify callback gives the platform stable clarify ids plus display choices.
+        # Keep the bounded id→answer map until the durable resolution command is executed.
+        self._clarify_choices: Dict[str, Dict[str, str]] = {}
         # Strong refs to fire-and-forget tasks; the loop keeps only a weak ref to a
         # bare create_task result, so hold each here until it finishes.
         self._background_tasks: Set[asyncio.Task] = set()
@@ -198,16 +208,36 @@ class AttachAdapter:
             )
             return False
         self._closing = False
-        self._client = AttachClient(
-            AttachClientConfig(
-                gateway_url=self.gateway_url,
-                token=self.token,
-                ca_file=self.ca_file,
-                on_turn=self._on_turn,
-                on_steer=self._on_steer,
-                on_interrupt=self._on_interrupt,
+        if self._attach_version == 1:
+            if self._spool is None:
+                spool_path = os.getenv("COZYGATEWAY_SPOOL_PATH") or extra.get("spool_path")
+                if not spool_path:
+                    spool_path = os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
+                self._spool = AttachSpool(str(spool_path))
+            self._client = AttachV1Client(
+                AttachV1ClientConfig(
+                    gateway_url=self.gateway_url,
+                    token=self.token,
+                    spool=self._spool,
+                    ca_file=self.ca_file,
+                    on_turn=self._on_turn,
+                    on_steer=self._on_steer,
+                    on_interrupt=self._on_interrupt,
+                    on_approval=self._dispatch_approval_command,
+                    on_clarify=self._dispatch_clarify_command,
+                )
             )
-        )
+        else:
+            self._client = AttachClient(
+                AttachClientConfig(
+                    gateway_url=self.gateway_url,
+                    token=self.token,
+                    ca_file=self.ca_file,
+                    on_turn=self._on_turn,
+                    on_steer=self._on_steer,
+                    on_interrupt=self._on_interrupt,
+                )
+            )
         try:
             await self._client.connect()
         except AttachAuthError as exc:
@@ -228,7 +258,7 @@ class AttachAdapter:
         self._watcher = asyncio.create_task(self._watch_loop())
         self._mark_connected()  # type: ignore[attr-defined]
         _register_active_adapter(self)
-        logger.info("attach: connected /attach to %s", self.gateway_url)
+        logger.info("attach: connected attach-v%s to %s", self._attach_version, self.gateway_url)
         return True
 
     async def _watch_loop(self) -> None:
@@ -305,6 +335,9 @@ class AttachAdapter:
         if self._client is not None:
             await self._client.close()
             self._client = None
+        if self._spool is not None:
+            self._spool.close()
+            self._spool = None
 
     def _inbound_source(self, thread_id: str) -> Any:
         """Build the synthetic-inbound ``source`` shared by turn, steer, and interrupt.
@@ -443,6 +476,133 @@ class AttachAdapter:
             await self.handle_message(event)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - an interrupt must never crash the drain loop
             logger.debug("attach: interrupt injection raised", exc_info=True)
+
+    def _on_approval_command(self, command: Dict[str, Any]) -> None:
+        """Resolve a durable v1 approval through Hermes' native slash-command seam."""
+        thread_id = command.get("threadId")
+        decision = command.get("decision")
+        if not isinstance(thread_id, str) or decision not in {"approve", "deny"}:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_approval_command(thread_id, decision))
+
+    async def _dispatch_approval_command(self, command: Dict[str, Any]) -> None:
+        thread_id = command.get("threadId")
+        decision = command.get("decision")
+        if isinstance(thread_id, str) and decision in {"approve", "deny"}:
+            await self._handle_approval_command(thread_id, decision)
+
+    async def _handle_approval_command(self, thread_id: str, decision: str) -> None:
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        event = MessageEvent(
+            text="/approve" if decision == "approve" else "/deny",
+            source=self._inbound_source(thread_id),
+        )
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            logger.debug("attach: approval command injection raised", exc_info=True)
+            raise
+
+    def _on_clarify_command(self, command: Dict[str, Any]) -> None:
+        """Feed the selected stable option back into the same native conversation."""
+        thread_id = command.get("threadId")
+        clarify_id = command.get("clarifyId")
+        option_id = command.get("optionId")
+        if not isinstance(thread_id, str) or not isinstance(clarify_id, str) or not isinstance(option_id, str) or not option_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_clarify_command(thread_id, clarify_id, option_id))
+
+    async def _dispatch_clarify_command(self, command: Dict[str, Any]) -> None:
+        thread_id = command.get("threadId")
+        clarify_id = command.get("clarifyId")
+        option_id = command.get("optionId")
+        if isinstance(thread_id, str) and isinstance(clarify_id, str) and isinstance(option_id, str) and option_id:
+            await self._handle_clarify_command(thread_id, clarify_id, option_id)
+
+    async def _handle_clarify_command(self, thread_id: str, clarify_id: str, option_id: str) -> None:
+        del thread_id
+        # Resolve Hermes' actual blocking clarify primitive. Injecting the option id as ordinary
+        # chat text can be rejected as an invalid selection and can start/steer an unrelated turn.
+        # The pending map is established by send_clarify below and uses stable wire ids.
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify  # harness-defined identifier
+
+            choices = self._clarify_choices.get(clarify_id, {})
+            answer = choices.get(option_id)
+            if not clarify_id or answer is None:
+                raise RuntimeError("clarification mapping is unavailable")
+            if not resolve_gateway_clarify(clarify_id, answer):
+                raise RuntimeError("Hermes no longer has the clarification pending")
+            self._clarify_choices.pop(clarify_id, None)
+        except Exception:  # noqa: BLE001
+            logger.debug("attach: clarify response injection raised", exc_info=True)
+            raise
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[List[Any]],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Project Hermes' blocking clarify callback into attach-v1 instead of plain chat text."""
+        del session_key, metadata
+        from gateway.platforms.base import SendResult  # harness-defined identifier
+
+        client = self._client
+        turn_id = self._active_turn.get(chat_id)
+        labels = [str(choice).strip()[:512] for choice in (choices or []) if str(choice).strip()]
+        if not isinstance(client, AttachV1Client) or not turn_id or not labels:
+            return SendResult(success=False, error="attach-v1 clarification requires an active turn and choices")
+        wire_options = [{"id": f"option-{index}", "label": label} for index, label in enumerate(labels[:20], start=1)]
+        self._clarify_choices[clarify_id] = {item["id"]: item["label"] for item in wire_options}
+        expires_at: Optional[int] = None
+        try:
+            from tools.clarify_gateway import get_clarify_timeout  # harness-defined identifier
+
+            expires_at = int((time.time() + float(get_clarify_timeout())) * 1000)
+        except Exception:
+            pass
+        queued = await client.send_clarify(
+            chat_id, turn_id, clarify_id, str(question)[:4096], wire_options, expires_at,
+        )
+        if queued is None:
+            self._clarify_choices.pop(clarify_id, None)
+            return SendResult(success=False, error="clarification turn is already terminal")
+        return SendResult(success=True, message_id=clarify_id)
+
+    def observe_approval_event(
+        self,
+        chat_id: str,
+        approval_id: str,
+        name: str,
+        status: str,
+    ) -> None:
+        loop = self._loop
+        if loop is None or self._attach_version != 1:
+            return
+        turn_id = self._active_turn.get(chat_id)
+        client = self._client
+        if not turn_id or not isinstance(client, AttachV1Client):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                client.send_approval(chat_id, turn_id, approval_id, approval_id, name, status),
+                loop,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("attach: approval lifecycle emit failed", exc_info=True)
 
     # -- streaming drafts -----------------------------------------------------
     def supports_draft_streaming(
@@ -587,15 +747,34 @@ class AttachAdapter:
             )
             blocks = self._normalize(turn_id, final_text)
             chips = self._chips(turn_id)
+            media_ids: List[str] = []
+            if isinstance(client, AttachV1Client) and isinstance(metadata, dict):
+                raw_media = metadata.get("media_files") or metadata.get("media") or []
+                if isinstance(raw_media, (list, tuple)):
+                    for raw_path in raw_media[:16]:
+                        if not isinstance(raw_path, str) or not raw_path:
+                            continue
+                        media_id = uuid.uuid4().hex
+                        try:
+                            await client.upload_media(media_id, raw_path, "file")
+                            media_ids.append(media_id)
+                        except Exception:  # noqa: BLE001 - text and other media still commit
+                            logger.warning("attach: one reply media upload failed; committing the remaining reply")
             had_content = self._content_seen.get(turn_id, False)
             if blocks or chips:
                 # Full replace with the final view, then seal it.
                 await client.send_draft(chat_id, turn_id, blocks, tool_calls=chips)
-                await client.send_done(chat_id, turn_id)
+                if isinstance(client, AttachV1Client):
+                    await client.send_done(chat_id, turn_id, media_ids=media_ids)
+                else:
+                    await client.send_done(chat_id, turn_id)
             elif had_content:
                 # Nothing new to draw, but earlier drafts carried content: seal the
                 # latest good draft. Do not send an empty draft (it would wipe it).
-                await client.send_done(chat_id, turn_id)
+                if isinstance(client, AttachV1Client):
+                    await client.send_done(chat_id, turn_id, media_ids=media_ids)
+                else:
+                    await client.send_done(chat_id, turn_id)
             else:
                 # No content ever materialized for this turn.
                 await client.send_failed(chat_id, turn_id, "empty reply")
@@ -766,6 +945,40 @@ def _post_tool_call(**kwargs: Any) -> None:
     _dispatch_tool_hook("complete", kwargs)
 
 
+def _dispatch_approval_hook(phase: str, kwargs: Dict[str, Any]) -> None:
+    """Observer-only Hermes approval hook → attach-v1 lifecycle event."""
+    try:
+        platform, chat_id = _current_turn_platform_and_chat()
+        if platform != PLATFORM_NAME or not chat_id:
+            return
+        approval_id = _tool_call_id(kwargs)
+        if approval_id is None:
+            return
+        if phase == "pending":
+            status = "pending"
+        else:
+            choice = str(kwargs.get("choice") or "").lower()
+            status = (
+                "approved" if choice in {"once", "session", "always", "approve", "approved", "allow"}
+                else "denied" if choice in {"deny", "denied"}
+                else "expired" if choice in {"timeout", "expired"}
+                else "cancelled"
+            )
+        name = str(kwargs.get("pattern_key") or kwargs.get("tool_name") or "tool")
+        for adapter in _active_adapters_snapshot():
+            adapter.observe_approval_event(chat_id, approval_id, name, status)
+    except Exception:  # noqa: BLE001
+        logger.debug("attach: approval-hook dispatch failed", exc_info=True)
+
+
+def _pre_approval_request(**kwargs: Any) -> None:
+    _dispatch_approval_hook("pending", kwargs)
+
+
+def _post_approval_response(**kwargs: Any) -> None:
+    _dispatch_approval_hook("resolved", kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Registration.
 # ---------------------------------------------------------------------------
@@ -805,6 +1018,66 @@ def is_connected(*_args: Any) -> bool:
     return bool(os.getenv("COZYGATEWAY_URL") and os.getenv("COZYGATEWAY_TOKEN"))
 
 
+async def _standalone_send(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Out-of-process cron sender.
+
+    Cron and the live gateway share the Hermes home directory, so this process appends to the same
+    WAL-backed event spool. The live adapter notices it on the next heartbeat and delivers it with
+    the stream's one monotonic sequence; opening a competing socket here would incorrectly
+    supersede the resident adapter.
+    """
+    del force_document
+    target_thread = str(thread_id or chat_id or "").strip()
+    if not target_thread:
+        return {
+            "success": False,
+            "error": "attach-v1 scheduled delivery requires a target thread",
+        }
+    extra = getattr(pconfig, "extra", {}) or {}
+    spool_path = os.getenv("COZYGATEWAY_SPOOL_PATH") or extra.get("spool_path")
+    if not spool_path:
+        spool_path = os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
+    spool = AttachSpool(str(spool_path))
+    try:
+        # A cron session id is caller-owned and unique per execution while remaining stable across
+        # delivery retries. Fall back to a content-addressed key for older harnesses that do not
+        # expose session context; this still prevents retry duplication without inventing a clock.
+        run_key = ""
+        try:
+            from gateway.session_context import get_session_env  # harness-defined identifier
+
+            run_key = str(get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or "").strip()
+        except Exception:
+            pass
+        if not run_key:
+            run_key = hashlib.sha256(f"{target_thread}\0{message}".encode("utf-8")).hexdigest()
+        delivery_id = "scheduled:" + run_key
+        message_id = "scheduled-" + hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()[:32]
+        blocks = [block.to_wire() for block in normalize_text_to_blocks(str(message))]
+        frame = spool.enqueue_event({
+            "kind": "scheduled",
+            "threadId": target_thread,
+            "deliveryId": delivery_id,
+            "messageId": message_id,
+            "blocks": blocks,
+        })
+        return {
+            "success": True,
+            "message_id": frame["eventId"],
+            **({"media_errors": ["standalone media waits for native upload support"]} if media_files else {}),
+        }
+    finally:
+        spool.close()
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point: register the platform and the tool-chip hooks.
 
@@ -821,6 +1094,8 @@ def register(ctx: Any) -> None:
         install_hint="Needs the 'websockets' package (pip install websockets)",
         emoji="🧵",
         pii_safe=True,
+        cron_deliver_env_var="COZYGATEWAY_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
         platform_hint=(
             "You are in a live session. Your reply streams live and is committed to "
             "the conversation. Markdown renders richly: use ## headings, - bullet / "
@@ -835,5 +1110,7 @@ def register(ctx: Any) -> None:
     try:
         ctx.register_hook("pre_tool_call", _pre_tool_call)
         ctx.register_hook("post_tool_call", _post_tool_call)
+        ctx.register_hook("pre_approval_request", _pre_approval_request)
+        ctx.register_hook("post_approval_response", _post_approval_response)
     except Exception:  # noqa: BLE001 - no chips, never crash
         logger.debug("attach: tool-lifecycle hooks unavailable; chips disabled", exc_info=True)
