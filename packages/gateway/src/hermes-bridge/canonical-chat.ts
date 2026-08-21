@@ -83,6 +83,9 @@ export interface HermesRpc {
 export interface PinStore {
   get(name: string): string | undefined;
   set(name: string, sessionId: string): void;
+  /** The durable local pin metadata used by capability 16. `manualSince` is the instant a user
+   *  explicitly selected this session. It applies only while the local and effective pins agree. */
+  entry?(name: string): { sessionId: string; manual: boolean; updatedAt: number } | undefined;
   clear(name: string): void;
 }
 
@@ -91,7 +94,13 @@ export interface SessionRow {
   title: string;
   preview: string | null;
   source: string | null;
+  /** Milliseconds. Zero means the Hermes build did not expose this timestamp. */
+  startedAt: number;
+  /** Milliseconds. Zero means the Hermes build did not expose this timestamp. */
+  lastActiveAt: number;
 }
+
+export type BotSessionKind = "conversation" | "cron" | "routine" | "group" | "a2a";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -99,17 +108,26 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+/** Hermes timestamps have appeared as seconds, milliseconds, and numeric strings. Capability 16
+ *  normalizes every usable form to integer milliseconds and uses zero when an older Hermes omits
+ *  the field entirely. */
+function sessionTime(item: Record<string, unknown>, fields: readonly string[]): number {
+  for (const field of fields) {
+    const raw = item[field];
+    const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+    if (!Number.isFinite(value) || value < 0) continue;
+    return Math.round(value < 1_000_000_000_000 ? value * 1000 : value);
+  }
+  return 0;
+}
+
 /** Decodes a `session.list` response tolerantly. Rows without a usable id are dropped; the order
  *  the gateway returned (newest first, by convention) is preserved, since the adoption rules index
  *  into it.
  *
- *  Worth stating rather than implying: `session.list` rows carry NO timestamp on this surface (id,
- *  title, preview, source, and that is the whole of it, see `GET /bots/:name/sessions` in
- *  contract/ext-bots-v1.md). "Newest first" is therefore a convention this gateway observes and
- *  cannot verify, so nothing here may treat position as a fact. It is used as a preference, never as
- *  a guarantee, and the retired-session guard below is what keeps a wrong guess from being harmful.
- *  Do not synthesize a recency field to paper over this: an invented timestamp would read as
- *  authority the wire never gave. */
+ *  "Newest first" remains a convention this gateway observes and cannot verify. Newer Hermes
+ *  builds also expose creation and activity stamps; older builds do not, so their normalized value
+ *  is zero rather than an invented time. */
 export function parseSessionList(result: unknown): SessionRow[] {
   const record = asRecord(result);
   const rows = Array.isArray(record?.["sessions"]) ? (record["sessions"] as unknown[]) : [];
@@ -126,6 +144,14 @@ export function parseSessionList(result: unknown): SessionRow[] {
       title: typeof item["title"] === "string" ? item["title"] : "",
       preview: typeof item["preview"] === "string" ? item["preview"] : null,
       source: typeof item["source"] === "string" ? item["source"] : null,
+      startedAt: sessionTime(item, ["started_at", "created_at", "started", "created"]),
+      lastActiveAt: sessionTime(item, [
+        "last_active",
+        "last_active_at",
+        "updated_at",
+        "lastActiveAt",
+        "updated",
+      ]),
     });
   }
   return parsed;
@@ -162,14 +188,17 @@ const GROUP_TITLE_PREFIX = "Group: ";
  *  that a conversation held from a SECOND DEVICE (a desktop, the CLI) becomes the bot's chat, and
  *  those sessions carry whatever title that client gave them. The exclusions are the closed list;
  *  conversation is the default. */
-export function isConversationalSession(row: SessionRow): boolean {
+export function sessionKind(row: SessionRow): BotSessionKind {
   const source = row.source?.trim().toLowerCase();
-  if (source === "cron") return false;
-  if (row.id.startsWith("cron_")) return false;
-  if (row.title.startsWith(ROUTINE_TITLE_PREFIX)) return false;
-  if (row.title.startsWith(GROUP_TITLE_PREFIX)) return false;
-  if (row.preview !== null && A2A_RE.test(row.preview.trim())) return false;
-  return true;
+  if (source === "cron" || row.id.startsWith("cron_")) return "cron";
+  if (row.title.startsWith(ROUTINE_TITLE_PREFIX)) return "routine";
+  if (row.title.startsWith(GROUP_TITLE_PREFIX)) return "group";
+  if (row.preview !== null && A2A_RE.test(row.preview.trim())) return "a2a";
+  return "conversation";
+}
+
+export function isConversationalSession(row: SessionRow): boolean {
+  return sessionKind(row) === "conversation";
 }
 
 export interface CanonicalChatDeps {
@@ -283,7 +312,19 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
   const limit = deps.listLimit ?? 100;
   // `??` would be wrong here: it collapses an explicit server clear (null) back onto the local
   // pin, which is exactly the resurrection dissection 3.2 forbids.
-  const pin = deps.serverPin !== undefined ? deps.serverPin : deps.pins.get(name);
+  let pin = deps.serverPin !== undefined ? deps.serverPin : deps.pins.get(name);
+  const localEntry = deps.pins.entry?.(name);
+  // A MANUAL restore is the user's explicit choice, and `#saveServerPin` swallows its own
+  // failures by design, so a server pin that still names the pre-restore chat is stale
+  // evidence, not a countermand. The durable manual record is the only witness of the choice
+  // and it wins here; it stops winning the moment a conversation CREATED after it appears
+  // (the manualSince rule below) or the local record is rewritten by any automatic adoption,
+  // including the reset path, which always writes manual=false.
+  if (localEntry?.manual === true && typeof pin === "string" && localEntry.sessionId !== pin) {
+    pin = localEntry.sessionId;
+  }
+  const manualSince =
+    localEntry?.manual === true && localEntry.sessionId === pin ? localEntry.updatedAt : undefined;
   const rows = await listBotSessions(deps.rpc, name, limit);
 
   if (rows.length === 0) {
@@ -390,7 +431,15 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
   const pinIndex = rows.findIndex((row) => row.id === pin);
   const newer = rows
     .slice(0, pinIndex)
-    .find((row) => !isRetired(row.id) && isConversationalSession(row));
+    .find(
+      (row) =>
+        !isRetired(row.id) &&
+        isConversationalSession(row) &&
+        // A manual choice ignores conversations that already existed above it. Its pin resumes
+        // following only when a conversation CREATED after the choice appears. An older Hermes
+        // row without a creation stamp cannot prove that, so it does not override a manual choice.
+        (manualSince === undefined || (row.startedAt !== 0 && row.startedAt > manualSince)),
+    );
   if (newer !== undefined) {
     deps.pins.set(name, newer.id);
     return { sessionId: newer.id, adoption: "latest", previousSessionId: pin };

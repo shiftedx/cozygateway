@@ -23,10 +23,10 @@ import {
   mintCanonicalChat,
   resolveCanonicalChat,
   listBotSessions,
+  sessionKind,
   type CanonicalChatResult,
   type ChatAdoption,
   type PinStore,
-  type SessionRow,
 } from "./canonical-chat.ts";
 import {
   botDisplayName,
@@ -143,6 +143,48 @@ export interface BotRosterView {
   hermesState: HermesState;
 }
 
+export interface BotSessionSummary {
+  id: string;
+  startedAt: number;
+  lastActiveAt: number;
+  kind: ReturnType<typeof sessionKind>;
+  title?: string;
+  preview?: string;
+}
+
+export interface BotSessionsView {
+  sessions: BotSessionSummary[];
+  activeSessionId: string | null;
+}
+
+export interface BotSessionAdoption {
+  name: string;
+  sessionId: string;
+  previousSessionId: string;
+}
+
+export class BotSessionNotFound extends Error {
+  readonly sessionId: string;
+
+  constructor(sessionId: string) {
+    super(`no Hermes session named "${sessionId}" exists`);
+    this.name = "BotSessionNotFound";
+    this.sessionId = sessionId;
+  }
+}
+
+export class BotSessionConflict extends Error {
+  readonly sessionId: string;
+  readonly owner: string;
+
+  constructor(sessionId: string, owner: string) {
+    super(`Hermes session "${sessionId}" belongs to bot "${owner}"`);
+    this.name = "BotSessionConflict";
+    this.sessionId = sessionId;
+    this.owner = owner;
+  }
+}
+
 /** What the REST layer is allowed to ask of the bridge. Keeping it an interface lets the routes
  *  be tested against a stub with no sockets. */
 export interface BotsSurface {
@@ -157,7 +199,8 @@ export interface BotsSurface {
   refreshSoon(reason: string): void;
   canonicalChat(name: string): Promise<CanonicalChatResult>;
   resetChat(name: string): Promise<ChatResetResult>;
-  sessions(name: string, limit: number): Promise<SessionRow[]>;
+  sessions(name: string, limit: number): Promise<BotSessionsView>;
+  adoptSession(name: string, sessionId: string, limit: number): Promise<BotSessionAdoption>;
   chatHistory(name: string): Promise<BotChatHistory>;
   sendChatMessage(
     name: string,
@@ -461,6 +504,7 @@ export class HermesBridge implements BotsSurface {
     this.#pins = {
       get: (name) => this.#storage.botChatPin(name),
       set: (name, sessionId) => this.#storage.setBotChatPin(name, sessionId, this.#now()),
+      entry: (name) => this.#storage.botChatPinEntry(name),
       clear: (name) => this.#storage.clearBotChatPin(name),
     };
     this.#stream = new BotChatStream({
@@ -1052,12 +1096,98 @@ export class HermesBridge implements BotsSurface {
     return (sessionId) => retired.has(sessionId);
   }
 
-  async sessions(name: string, limit: number): Promise<SessionRow[]> {
+  async sessions(name: string, limit: number): Promise<BotSessionsView> {
     // Same guard as `canonicalChat`: `session.list` on an unknown profile answers empty rather than
     // an error, which without this check reads as "this bot has no sessions" instead of "this bot
     // does not exist".
     await this.#assertBotKnown(name);
-    return listBotSessions(this.#client, name, limit);
+    const [rows, serverPin] = await Promise.all([
+      listBotSessions(this.#client, name, limit),
+      this.#serverPinOf(name),
+    ]);
+    const activeSessionId = serverPin !== undefined ? serverPin : (this.#storage.botChatPin(name) ?? null);
+    return {
+      sessions: rows.map((row) => ({
+        id: row.id,
+        startedAt: row.startedAt,
+        lastActiveAt: row.lastActiveAt,
+        kind: sessionKind(row),
+        ...(row.title.length === 0 ? {} : { title: row.title }),
+        ...(row.preview === null || row.preview.length === 0 ? {} : { preview: row.preview }),
+      })),
+      activeSessionId,
+    };
+  }
+
+  /** Explicitly pins one visible Hermes session. The operation shares the canonical-chat
+   *  single-flight so a simultaneous open or reset cannot race the choice. The existing adoption
+   *  frame is emitted even when the selected id was already active: the user's action is also the
+   *  cross-device instruction to re-read that transcript. */
+  async adoptSession(name: string, sessionId: string, limit: number): Promise<BotSessionAdoption> {
+    await this.#assertBotKnown(name);
+
+    const pending = this.#chatInflight.get(name);
+    if (pending !== undefined) {
+      try {
+        await pending;
+      } catch {
+        /* The manual selection validates and establishes its own pin below. */
+      }
+    }
+
+    const run = (async (): Promise<BotSessionAdoption> => {
+      try {
+        const rows = await listBotSessions(this.#client, name, limit);
+        if (!rows.some((row) => row.id === sessionId)) {
+          // Session ids are gateway-wide Hermes handles. Only on a miss do the extra reads needed
+          // to distinguish an unknown id (404) from one in another bot's namespace (409).
+          const profiles = await this.#freshProfileNames();
+          for (const profile of profiles) {
+            if (profile === name) continue;
+            const foreign = await listBotSessions(this.#client, profile, limit);
+            if (foreign.some((row) => row.id === sessionId)) {
+              throw new BotSessionConflict(sessionId, profile);
+            }
+          }
+          throw new BotSessionNotFound(sessionId);
+        }
+
+        const serverPin = await this.#serverPinOf(name);
+        const current = await resolveCanonicalChat(name, {
+          rpc: this.#client,
+          pins: this.#pins,
+          hideBotChats: this.#hideBotChats,
+          serverPin,
+          saveServerPin: (resolvedId) => this.#saveServerPin(name, resolvedId, serverPin),
+          isRetired: this.#retiredOf(name),
+        });
+
+        // This is the only writer of a manual pin. Every automatic PinStore.set call writes false,
+        // so the flag clears at the first qualifying follow-latest adoption.
+        this.#storage.restoreBotChat(name, sessionId);
+        this.#storage.setBotChatPin(name, sessionId, this.#now(), true);
+        await this.#saveServerPin(name, sessionId, serverPin);
+        this.#broadcast({
+          type: "bot_chat_adopted",
+          bot: name,
+          sessionId,
+          previousSessionId: current.sessionId,
+          updatedAt: this.#now(),
+        });
+        this.refreshSoon("chat manually adopted");
+        return { name, sessionId, previousSessionId: current.sessionId };
+      } finally {
+        this.#chatInflight.delete(name);
+      }
+    })();
+
+    const joinable = run.then((result): CanonicalChatResult => ({
+      sessionId: result.sessionId,
+      adoption: "pin",
+    }));
+    void joinable.catch(() => {});
+    this.#chatInflight.set(name, joinable);
+    return run;
   }
 
   /** True when `name` names no Hermes profile at all, so a bug like Hermes' own `session.create`

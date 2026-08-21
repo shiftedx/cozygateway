@@ -21,6 +21,21 @@ function pinStore(initial: Record<string, string> = {}): PinStore & { map: Map<s
   };
 }
 
+function manualPinStore(sessionId: string, updatedAt: number): PinStore & {
+  current: () => { sessionId: string; manual: boolean; updatedAt: number };
+} {
+  let row = { sessionId, manual: true, updatedAt };
+  return {
+    get: () => row.sessionId,
+    entry: () => row,
+    set: (_name, next) => {
+      if (next !== row.sessionId) row = { sessionId: next, manual: false, updatedAt: updatedAt + 1 };
+    },
+    clear: () => {},
+    current: () => row,
+  };
+}
+
 const SESSIONS = {
   sessions: [
     { id: "newest", title: "Debugging the deploy" },
@@ -167,6 +182,39 @@ describe("resolveCanonicalChat re-adoption", () => {
       serverPin: "pinned",
     });
     expect(result).toEqual({ sessionId: "pinned", adoption: "pin" });
+  });
+
+  it("holds a manual selection past existing conversations and resumes for the next new one", async () => {
+    const selectedAt = 1_800_000_000_000;
+    const pins = manualPinStore("older", selectedAt);
+    const existing = { id: "existing", title: "Existing", created_at: selectedAt / 1000 - 1 };
+    const selected = { id: "older", title: "Older", created_at: selectedAt / 1000 - 10 };
+
+    expect(
+      await resolveCanonicalChat("scout", {
+        rpc: rpc({ sessions: [existing, selected] }),
+        pins,
+        hideBotChats: true,
+        serverPin: "older",
+      }),
+    ).toEqual({ sessionId: "older", adoption: "pin" });
+    expect(pins.current()).toMatchObject({ sessionId: "older", manual: true });
+
+    expect(
+      await resolveCanonicalChat("scout", {
+        rpc: rpc({
+          sessions: [
+            { id: "next", title: "Next", created_at: selectedAt / 1000 + 1 },
+            existing,
+            selected,
+          ],
+        }),
+        pins,
+        hideBotChats: true,
+        serverPin: "older",
+      }),
+    ).toEqual({ sessionId: "next", adoption: "latest", previousSessionId: "older" });
+    expect(pins.current()).toMatchObject({ sessionId: "next", manual: false });
   });
 
   for (const { what, row } of excluded) {

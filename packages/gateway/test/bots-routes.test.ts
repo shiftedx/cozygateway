@@ -417,16 +417,109 @@ describe("GET /bots/:name/chat", () => {
 });
 
 describe("GET /bots/:name/sessions", () => {
-  it("passes session.list through with a 200 row limit", async () => {
+  it("returns classified session summaries, normalized times, and the active pin", async () => {
     const { authed, server } = await setup({
       methods: {
-        "profiles.list": () => profilesListResult([scoutRow]),
-        "session.list": () => ({ sessions: [{ id: "s1", title: "one", preview: "hi", source: "desktop" }] }),
+        "profiles.list": () =>
+          profilesListResult([
+            { ...scoutRow, ui_meta: { "hermes-bots": { title: "Scout", chat: "s1" } } },
+          ]),
+        "session.list": () => ({
+          sessions: [
+            { id: "s1", title: "one", preview: "hi", source: "desktop", created_at: 1_799_999_980, last_active: 1_799_999_995 },
+            { id: "cron_job_1", title: "fire", source: "cron", created_at: 1_799_999_970, last_active: 1_799_999_971 },
+            { id: "routine", title: "Routine: Digest", source: "cli", created_at: 1_799_999_960, last_active: 1_799_999_961 },
+            { id: "group", title: "Group: Launch", created_at: 1_799_999_950, last_active: 1_799_999_951 },
+            { id: "delivery", preview: "Message from agent 'pixel': hello", created_at: 1_799_999_940, last_active: 1_799_999_941 },
+          ],
+        }),
       },
     });
-    const body = (await (await authed("/bots/scout/sessions")).json()) as { sessions: unknown[] };
-    expect(body.sessions).toEqual([{ id: "s1", title: "one", preview: "hi", source: "desktop" }]);
+    expect(await (await authed("/bots/scout/sessions")).json()).toEqual({
+      sessions: [
+        { id: "s1", startedAt: 1_799_999_980_000, lastActiveAt: 1_799_999_995_000, kind: "conversation", title: "one", preview: "hi" },
+        { id: "cron_job_1", startedAt: 1_799_999_970_000, lastActiveAt: 1_799_999_971_000, kind: "cron", title: "fire" },
+        { id: "routine", startedAt: 1_799_999_960_000, lastActiveAt: 1_799_999_961_000, kind: "routine", title: "Routine: Digest" },
+        { id: "group", startedAt: 1_799_999_950_000, lastActiveAt: 1_799_999_951_000, kind: "group", title: "Group: Launch" },
+        { id: "delivery", startedAt: 1_799_999_940_000, lastActiveAt: 1_799_999_941_000, kind: "a2a", preview: "Message from agent 'pixel': hello" },
+      ],
+      activeSessionId: "s1",
+    });
     expect(server.callsOf("session.list")[0]!.params).toEqual({ profile: "scout", limit: 200 });
+  });
+});
+
+describe("POST /bots/:name/sessions/:id/adopt", () => {
+  it("manually restores a session, broadcasts adoption, then follows the next new conversation", async () => {
+    const sessions = [
+      { id: "current", title: "Current", created_at: NOW / 1000 - 1, last_active: NOW / 1000 - 1 },
+      { id: "older", title: "Older", created_at: NOW / 1000 - 10, last_active: NOW / 1000 - 5 },
+    ];
+    const { authed, frames, storage } = await setup({
+      methods: {
+        "profiles.list": () =>
+          profilesListResult([
+            { ...scoutRow, ui_meta: { "hermes-bots": { title: "Scout", chat: "current" } } },
+          ]),
+        "session.list": () => ({ sessions }),
+      },
+    });
+
+    const adopted = await authed("/bots/scout/sessions/older/adopt", { method: "POST" });
+    expect(adopted.status).toBe(200);
+    expect(await adopted.json()).toEqual({
+      name: "scout",
+      sessionId: "older",
+      previousSessionId: "current",
+    });
+    expect(storage.botChatPinEntry("scout")).toMatchObject({ sessionId: "older", manual: true });
+    expect(frames.filter((frame) => frame.type === "bot_chat_adopted")).toEqual([
+      {
+        type: "bot_chat_adopted",
+        bot: "scout",
+        sessionId: "older",
+        previousSessionId: "current",
+        updatedAt: NOW,
+      },
+    ]);
+
+    // The conversation that was already newer cannot undo the user's selection.
+    expect(await (await authed("/bots/scout/chat")).json()).toMatchObject({
+      sessionId: "older",
+      adoption: "pin",
+    });
+
+    sessions.unshift({
+      id: "next",
+      title: "Next",
+      created_at: NOW / 1000 + 1,
+      last_active: NOW / 1000 + 1,
+    });
+    expect(await (await authed("/bots/scout/chat")).json()).toMatchObject({
+      sessionId: "next",
+      adoption: "latest",
+    });
+    expect(storage.botChatPinEntry("scout")).toMatchObject({ sessionId: "next", manual: false });
+  });
+
+  it("returns 404 for an unknown session and 409 for another bot's session", async () => {
+    const other = { ...scoutRow, name: "pixel", ui_meta: { "hermes-bots": { title: "Pixel" } } };
+    const { authed } = await setup({
+      methods: {
+        "profiles.list": () => profilesListResult([scoutRow, other]),
+        "session.list": (params) => ({
+          sessions: params["profile"] === "pixel" ? [{ id: "pixel-session", title: "Pixel chat" }] : [],
+        }),
+      },
+    });
+
+    const unknown = await authed("/bots/scout/sessions/missing/adopt", { method: "POST" });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toMatchObject({ error: { code: "not_found" } });
+
+    const conflict = await authed("/bots/scout/sessions/pixel-session/adopt", { method: "POST" });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ error: { code: "conflict" } });
   });
 });
 

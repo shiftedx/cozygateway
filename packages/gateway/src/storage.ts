@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS bot_chat_pins (
   session_id TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
   runtime_id TEXT,
-  runtime_generation TEXT
+  runtime_generation TEXT,
+  manual INTEGER NOT NULL DEFAULT 0 CHECK (manual IN (0, 1))
 ) STRICT;
 -- The hermes link generation this gateway last observed, one row, id always 1. On disk rather than in
 -- memory on purpose, and that is the whole point of the table: a GATEWAY restart against a hermes
@@ -567,10 +568,11 @@ export class Storage {
   /** The pin plus the stamp of the write that made it. The stamp is what lets the bridge tell a
    *  pin it wrote itself moments ago from one the cached roster has already had a chance to see,
    *  which is the difference between adopting the existing chat and minting a duplicate. */
-  botChatPinEntry(name: string): { sessionId: string; updatedAt: number } | undefined {
-    return this.#db
-      .prepare("SELECT session_id AS sessionId, updated_at AS updatedAt FROM bot_chat_pins WHERE name = ?")
-      .get(name) as { sessionId: string; updatedAt: number } | undefined;
+  botChatPinEntry(name: string): { sessionId: string; updatedAt: number; manual: boolean } | undefined {
+    const row = this.#db
+      .prepare("SELECT session_id AS sessionId, updated_at AS updatedAt, manual FROM bot_chat_pins WHERE name = ?")
+      .get(name) as { sessionId: string; updatedAt: number; manual: number } | undefined;
+    return row === undefined ? undefined : { ...row, manual: row.manual === 1 };
   }
 
   /** Every pin with the stamp of the write that made it. The roster build needs the stamps: a pin
@@ -591,23 +593,32 @@ export class Storage {
   }
 
   /** Pins `sessionId` for `name`. Re-pinning the SAME session keeps whatever `runtime_id` the row
-   *  carries (the adoption paths call this on every resolve, and an unwritten chat must not lose the
-   *  only id its first message can be addressed to); moving the pin to a DIFFERENT session drops it,
-   *  because a runtime id belongs to exactly one session and keeping it would be pointing the next
-   *  send at the chat that was just replaced. */
-  setBotChatPin(name: string, sessionId: string, updatedAt: number): void {
+   *  carries. It also preserves a manual flag and its original timestamp, so an ordinary resolve
+   *  cannot erase or move the boundary that capability 16 waits past. Moving to a DIFFERENT session
+   *  drops both pieces of session-specific state. Passing `manual: true` establishes or refreshes
+   *  the explicit choice even when the id was already pinned. */
+  setBotChatPin(name: string, sessionId: string, updatedAt: number, manual = false): void {
     this.#db
       .prepare(
-        `INSERT INTO bot_chat_pins (name, session_id, updated_at, runtime_id, runtime_generation)
-           VALUES (?, ?, ?, NULL, NULL)
+        `INSERT INTO bot_chat_pins (name, session_id, updated_at, runtime_id, runtime_generation, manual)
+           VALUES (?, ?, ?, NULL, NULL, ?)
          ON CONFLICT(name) DO UPDATE SET
            session_id = excluded.session_id,
-           updated_at = excluded.updated_at,
+           updated_at = CASE
+             WHEN session_id = excluded.session_id AND manual = 1 AND excluded.manual = 0
+               THEN updated_at
+             ELSE excluded.updated_at
+           END,
+           manual = CASE
+             WHEN excluded.manual = 1 THEN 1
+             WHEN session_id = excluded.session_id THEN manual
+             ELSE 0
+           END,
            runtime_id = CASE WHEN session_id = excluded.session_id THEN runtime_id ELSE NULL END,
            runtime_generation =
              CASE WHEN session_id = excluded.session_id THEN runtime_generation ELSE NULL END`,
       )
-      .run(name, sessionId, updatedAt);
+      .run(name, sessionId, updatedAt, manual ? 1 : 0);
   }
 
   /** The runtime id of `name`'s pinned chat, when that chat has never been written in, the pin still
@@ -731,6 +742,13 @@ export class Storage {
       this.#db.exec("ROLLBACK");
       throw err;
     }
+  }
+
+  /** Makes a previously reset session eligible again after the user explicitly restores it. */
+  restoreBotChat(name: string, sessionId: string): void {
+    this.#db
+      .prepare("DELETE FROM bot_chat_retired WHERE name = ? AND session_id = ?")
+      .run(name, sessionId);
   }
 
   // --- Photos sent to a bot (contract/ext-bots-v1.md, capability 9). -----------------------------
@@ -1203,5 +1221,8 @@ export function openStorage(dbPath: string): Storage {
   // nothing reads as "this id cannot be trusted", so a pin written before the upgrade falls through
   // to the mint-a-replacement path instead of submitting at a session hermes may have forgotten.
   addColumnIfMissing(db, "bot_chat_pins", "runtime_generation", "TEXT");
+  // Capability 16: an explicit session adoption holds until a later conversational session is
+  // created. Existing pins are automatic, which is exactly the zero default.
+  addColumnIfMissing(db, "bot_chat_pins", "manual", "INTEGER NOT NULL DEFAULT 0 CHECK (manual IN (0, 1))");
   return new Storage(db);
 }
