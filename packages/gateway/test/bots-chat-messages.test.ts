@@ -106,6 +106,30 @@ describe("parseChatSnapshot", () => {
     expect(snapshot.messages[0]!.text).not.toContain("CONTEXT SUMMARY");
   });
 
+  it("collapses the live prior-context preamble even when blank lines precede its summary sentinel", () => {
+    const triggeringUserText = "check both services and tell me what changed";
+    const text = [
+      "[PRIOR CONTEXT — for reference only; not a new message]",
+      "",
+      "",
+      "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]",
+      "",
+      "[CONTEXT COMPACTION SUMMARY]",
+      `The user asked: ${triggeringUserText}`,
+      "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+    ].join("\n");
+
+    const snapshot = parseChatSnapshot(
+      { messages: [{ id: "captured-compaction-row", role: "assistant", content: text }] },
+      "canonical",
+    );
+
+    expect(snapshot.messages).toEqual([
+      expect.objectContaining({ id: "captured-compaction-row", text: CONTEXT_COMPACTION_MARKER }),
+    ]);
+    expect(snapshot.messages[0]!.text).not.toContain(triggeringUserText);
+  });
+
   it.each([
     "I pasted [SKILL_PRUNED: content lost in compression; reload with skill_view(name=demo)] in a normal message.",
     "Normal preface\n[CONTEXT COMPACTION - REFERENCE ONLY]\nquoted sentinel",

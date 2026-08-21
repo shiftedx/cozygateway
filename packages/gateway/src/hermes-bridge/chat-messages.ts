@@ -150,10 +150,10 @@ const SKILL_PRUNED_RE =
 export function isContextCompactionText(text: string): boolean {
   const lines = text.split(/\r?\n/);
   const first = lines[0] ?? "";
-  const second = lines[1] ?? "";
+  const nextNonEmpty = lines.slice(1).find((line) => line.trim().length > 0)?.trim() ?? "";
   const last = lines.at(-1) ?? "";
   if (CONTEXT_COMPACTION_HEADER_RE.test(first)) return true;
-  if (PRIOR_CONTEXT_HEADER_RE.test(first) && PRIOR_CONTEXT_SUMMARY_RE.test(second)) return true;
+  if (PRIOR_CONTEXT_HEADER_RE.test(first) && PRIOR_CONTEXT_SUMMARY_RE.test(nextNonEmpty)) return true;
   const closedSummary = CONTEXT_SUMMARY_END_RE.test(last);
   if (CONTEXT_SUMMARY_BEGIN_RE.test(first) && closedSummary) return true;
   return SKILL_PRUNED_RE.test(first) && closedSummary;
