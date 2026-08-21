@@ -18,6 +18,7 @@
 #                                   release lookup; file:///... works
 #   COZYGATEWAY_HOME                default $HOME/.cozygateway
 #   COZYGATEWAY_NODE                node 24+ binary to use
+#   COZYGATEWAY_PUSH_RELAY_URL      default https://push.cozylabs.ai
 #   COZYGATEWAY_INSTALL_DRYRUN=1    print the agent-install.sh command instead
 #                                   of running it
 #
@@ -78,10 +79,11 @@ sha256_of() {
 }
 
 main() {
-  local repo cgw_home node_bin tag release_json asset_base raw_base expect got arg line
+  local repo cgw_home node_bin tag release_json asset_base raw_base expect got arg line push_relay_url
 
   repo="${COZYGATEWAY_INSTALL_REPO:-shiftedx/cozygateway}"
   cgw_home="${COZYGATEWAY_HOME:-$HOME/.cozygateway}"
+  push_relay_url="${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"
 
   command -v curl >/dev/null 2>&1 || die "curl is required"
 
@@ -125,17 +127,19 @@ main() {
     die "could not download scripts/agent-install.sh from $raw_base (is the release published? set COZYGATEWAY_INSTALL_TAG=vX.Y.Z or check your network)"
 
   # --- Hand off ------------------------------------------------------------
+  say "Push routes through $push_relay_url, end to end encrypted. CozyLabs is the default; override with COZYGATEWAY_PUSH_RELAY_URL."
   if [ "${COZYGATEWAY_INSTALL_DRYRUN:-}" = "1" ]; then
     # Testing hook: show the exact handoff, run nothing. %q so the printed line
     # is safe to paste back into a shell.
-    line="$(printf 'env COZYGATEWAY_NODE=%q bash %q --gateway-dir %q --bundle %q --service' \
-      "$node_bin" "$cgw_home/bin/agent-install.sh" "$cgw_home" "$cgw_home/bin/cozygateway.mjs")"
+    line="$(printf 'env COZYGATEWAY_NODE=%q COZYGATEWAY_PUSH_RELAY_URL=%q bash %q --gateway-dir %q --bundle %q --service' \
+      "$node_bin" "$push_relay_url" "$cgw_home/bin/agent-install.sh" "$cgw_home" "$cgw_home/bin/cozygateway.mjs")"
     for arg in "$@"; do line="$line $(printf '%q' "$arg")"; done
     printf 'DRYRUN  %s\n' "$line"
     return 0
   fi
 
-  exec env COZYGATEWAY_NODE="$node_bin" bash "$cgw_home/bin/agent-install.sh" \
+  exec env COZYGATEWAY_NODE="$node_bin" COZYGATEWAY_PUSH_RELAY_URL="$push_relay_url" \
+    bash "$cgw_home/bin/agent-install.sh" \
     --gateway-dir "$cgw_home" \
     --bundle "$cgw_home/bin/cozygateway.mjs" \
     --service \
