@@ -1,8 +1,8 @@
 import { type Static, Type } from "@sinclair/typebox";
 import { RichBlockSchema } from "cozygateway-contract";
 
-/** Stable attach-v1 data-plane contract. v0 remains in protocol.ts and is intentionally not
- * widened: a peer selects v1 by dialing /attach/v1 and completing hello negotiation. */
+/** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
+ * before either side accepts application frames. */
 const Id = Type.String({ minLength: 1, maxLength: 256 });
 const Sequence = Type.Integer({ minimum: 0 });
 

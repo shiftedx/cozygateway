@@ -8,7 +8,7 @@ harness on the path. The wire logic lives in the harness-free siblings:
 
 How the harness's native stream maps onto the attach protocol:
 
-* The adapter dials OUT to the gateway ``/attach`` WS and authenticates header-only
+* The adapter dials OUT to the gateway ``/attach/v1`` WS and authenticates header-only
   with a bearer token. Nothing listens on the agent host.
 * A gateway ``turn`` frame is injected as a synthetic inbound message. The frame's
   ``threadId`` becomes the harness chat id (so a thread resumes one session) and
@@ -38,8 +38,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .attach_client import (
     AttachAuthError,
-    AttachClient,
-    AttachClientConfig,
     AttachSupersededError,
     InterruptFrame,
     SteerFrame,
@@ -125,7 +123,7 @@ class AttachAdapter:
         self.ca_file: Optional[str] = (
             os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None
         )
-        self._attach_version: int = 1 if str(os.getenv("COZYGATEWAY_ATTACH_VERSION") or extra.get("attach_version") or "0") == "1" else 0
+        self._spool_path: Optional[str] = os.getenv("COZYGATEWAY_SPOOL_PATH") or extra.get("spool_path") or None
         self._spool: Optional[AttachSpool] = None
         self._client: Optional[Any] = None
         self._watcher: Optional[asyncio.Task] = None
@@ -208,36 +206,24 @@ class AttachAdapter:
             )
             return False
         self._closing = False
-        if self._attach_version == 1:
-            if self._spool is None:
-                spool_path = os.getenv("COZYGATEWAY_SPOOL_PATH") or extra.get("spool_path")
-                if not spool_path:
-                    spool_path = os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
-                self._spool = AttachSpool(str(spool_path))
-            self._client = AttachV1Client(
-                AttachV1ClientConfig(
-                    gateway_url=self.gateway_url,
-                    token=self.token,
-                    spool=self._spool,
-                    ca_file=self.ca_file,
-                    on_turn=self._on_turn,
-                    on_steer=self._on_steer,
-                    on_interrupt=self._on_interrupt,
-                    on_approval=self._dispatch_approval_command,
-                    on_clarify=self._dispatch_clarify_command,
-                )
+        if self._spool is None:
+            spool_path = self._spool_path or os.path.join(
+                os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite"
             )
-        else:
-            self._client = AttachClient(
-                AttachClientConfig(
-                    gateway_url=self.gateway_url,
-                    token=self.token,
-                    ca_file=self.ca_file,
-                    on_turn=self._on_turn,
-                    on_steer=self._on_steer,
-                    on_interrupt=self._on_interrupt,
-                )
+            self._spool = AttachSpool(str(spool_path))
+        self._client = AttachV1Client(
+            AttachV1ClientConfig(
+                gateway_url=self.gateway_url,
+                token=self.token,
+                spool=self._spool,
+                ca_file=self.ca_file,
+                on_turn=self._on_turn,
+                on_steer=self._on_steer,
+                on_interrupt=self._on_interrupt,
+                on_approval=self._dispatch_approval_command,
+                on_clarify=self._dispatch_clarify_command,
             )
+        )
         try:
             await self._client.connect()
         except AttachAuthError as exc:
@@ -247,7 +233,7 @@ class AttachAdapter:
             )
             return False
         except Exception as exc:  # noqa: BLE001
-            logger.error("attach: failed to dial /attach -- %s", exc)
+            logger.error("attach-v1: failed to dial /attach/v1 -- %s", exc)
             self._set_fatal_error(  # type: ignore[attr-defined]
                 "connect_failed", str(exc), retryable=True
             )
@@ -258,7 +244,7 @@ class AttachAdapter:
         self._watcher = asyncio.create_task(self._watch_loop())
         self._mark_connected()  # type: ignore[attr-defined]
         _register_active_adapter(self)
-        logger.info("attach: connected attach-v%s to %s", self._attach_version, self.gateway_url)
+        logger.info("attach-v1: connected to %s", self.gateway_url)
         return True
 
     async def _watch_loop(self) -> None:
@@ -280,7 +266,7 @@ class AttachAdapter:
             if self._closing:
                 return
             self._mark_disconnected()  # type: ignore[attr-defined]
-            logger.warning("attach: /attach dropped; reconnecting")
+            logger.warning("attach-v1: /attach/v1 dropped; reconnecting")
             if not await self._redial():
                 return
 
@@ -313,7 +299,7 @@ class AttachAdapter:
                 delay = min(delay * 2, self._reconnect_max)
                 continue
             self._mark_connected()  # type: ignore[attr-defined]
-            logger.info("attach: reconnected /attach to %s", self.gateway_url)
+            logger.info("attach-v1: reconnected /attach/v1 to %s", self.gateway_url)
             return True
         return False
 
@@ -590,7 +576,7 @@ class AttachAdapter:
         status: str,
     ) -> None:
         loop = self._loop
-        if loop is None or self._attach_version != 1:
+        if loop is None:
             return
         turn_id = self._active_turn.get(chat_id)
         client = self._client

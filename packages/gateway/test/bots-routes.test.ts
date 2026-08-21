@@ -258,6 +258,51 @@ describe("GET /bots", () => {
       sessionId: "resolved-chat",
     });
   });
+
+  it("hydrates the resolved chat preview from its transcript when session.list omits it", async () => {
+    const { authed, bridge, storage, server } = await setup({
+      methods: {
+        "profiles.list": () =>
+          profilesListResult([
+            { ...scoutRow, ui_meta: { "hermes-bots": { title: "Scout", chat: "resolved-chat" } } },
+          ]),
+        "session.list": () => ({
+          sessions: [{
+            id: "resolved-chat",
+            title: CANONICAL_CHAT_TITLE,
+            preview: null,
+            created_at: NOW / 1000 - 60,
+            last_active: NOW / 1000 - 5,
+          }],
+        }),
+        "session.resume": () => ({
+          session_id: "resolved-chat",
+          messages: [
+            { role: "user", content: "Are the checks green?", timestamp: NOW / 1000 - 10 },
+            { role: "assistant", content: "Everything is green.", timestamp: NOW / 1000 - 5 },
+          ],
+          running: false,
+          inflight: false,
+        }),
+      },
+    });
+    storage.setBotChatPin("scout", "resolved-chat", NOW - 30_000);
+    await bridge.refresh("missing session-list preview regression");
+
+    const body = (await (await authed("/bots")).json()) as {
+      bots: Array<{ chatSessionId: string | null; preview: { kind: string; text: string }; lastActiveAt: number | null }>;
+    };
+    expect(body.bots[0]).toMatchObject({
+      chatSessionId: "resolved-chat",
+      preview: { kind: "plain", text: "Everything is green." },
+      lastActiveAt: NOW - 5_000,
+    });
+    expect(server.callsOf("session.resume").at(-1)?.params).toEqual({
+      session_id: "resolved-chat",
+      profile: "scout",
+      omit_messages: false,
+    });
+  });
 });
 
 describe("GET /bots/:name/chat", () => {

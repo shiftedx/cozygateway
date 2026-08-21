@@ -72,7 +72,7 @@ never sends that content anywhere else: there is no cloud relay, no third-party 
 telemetry in the loop. By default `cozygateway serve` binds `127.0.0.1` only, plain HTTP, and
 answers on loopback alone: the gateway does not expose itself on your network by itself. Give it a
 `tls` block (or `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`) and it serves HTTPS instead, with `/ws`
-and `/attach` becoming `wss` along with it; the app pins the certificate on first use, so a
+and `/attach/v1` becoming `wss` along with it; the app pins the certificate on first use, so a
 self-signed pair on a LAN is a supported posture. See [`docs/tls.md`](../../docs/tls.md), which also
 covers the shipped Caddy sidecar overlay for operators who would rather not manage a pair. A tunnel
 or reverse proxy you set up and control remains a perfectly good alternative.
@@ -88,7 +88,7 @@ or reverse proxy you set up and control remains a perfectly good alternative.
 | `agents` | array | required, at least one | Agents this gateway exposes, each with `id`, `name`, an optional `avatar`, a `backend`, and adapter-specific `options`. |
 | `capabilities` | object | `{}` | Map of capability id to integer version, surfaced verbatim as `GatewayInfo.capabilities` (the `GET /health` response, the pair response, and the `ready` frame all carry it). Ids under `com.cozylabs.*` are vendor extensions, versioned independently of the contract; see contract/v1.md section 5. |
 | `pushRelayUrl` | string | absent | Private relay origin shared by authenticated `/push` registration proxy calls and the gateway's own `/notify` calls. Setting it advertises `com.cozylabs.push-proxy: 1`. Overridable with `COZYGATEWAY_PUSH_RELAY_URL`. |
-| `tls` | object | absent (plain HTTP) | `{ "certFile", "keyFile" }`, paths to a PEM certificate chain and its matching unencrypted key. Present means the listener serves HTTPS and `/ws` and `/attach` become `wss`; absent means plain HTTP, unchanged. Overridable with `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`. Present-but-unusable (missing file, garbage PEM, encrypted key, key that does not match the certificate, only one of the two set) fails startup before the port binds rather than falling back to plaintext. See [`docs/tls.md`](../../docs/tls.md). |
+| `tls` | object | absent (plain HTTP) | `{ "certFile", "keyFile" }`, paths to a PEM certificate chain and its matching unencrypted key. Present means the listener serves HTTPS and `/ws` and `/attach/v1` become `wss`; absent means plain HTTP, unchanged. Overridable with `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`. Present-but-unusable (missing file, garbage PEM, encrypted key, key that does not match the certificate, only one of the two set) fails startup before the port binds rather than falling back to plaintext. See [`docs/tls.md`](../../docs/tls.md). |
 
 ## Approvals
 

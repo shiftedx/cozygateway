@@ -17,7 +17,7 @@
 {$COZY_TLS_HOSTNAME} {
 	tls internal
 
-	# The gateway's WebSocket endpoints (/ws for devices, /attach for the agent plugin) need no
+	# The gateway's WebSocket endpoints (/ws for devices, /attach/v1 for the agent plugin) need no
 	# special handling: reverse_proxy passes an Upgrade through as a matter of course.
 	reverse_proxy {$COZY_GATEWAY_UPSTREAM}
 }

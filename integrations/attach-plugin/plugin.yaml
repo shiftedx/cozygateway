@@ -5,8 +5,8 @@ version: 0.1.0
 description: >
   Native CozyGateway messaging data plane for Hermes. Dials OUT to a gateway's
   attach WebSocket, authenticates header-only with a bearer token, and streams
-  replies, tools, approvals, scheduled messages, and media. Version 0 remains the
-  safe default; version 1 adds a durable SQLite spool with ACK/replay. Outbound-only:
+  replies, tools, approvals, scheduled messages, and media through attach-v1 with
+  a durable SQLite spool and ACK/replay. Outbound-only:
   nothing listens on the Hermes host. Needs only the `websockets` package.
 author: cozygateway
 # These keys are surfaced by the harness config UI; a str or a {name, ...} dict
@@ -34,10 +34,6 @@ optional_env:
   - name: COZYGATEWAY_RECONNECT_MAX_SECONDS
     description: "Maximum reconnect backoff in seconds (default 30)."
     prompt: "Reconnect max seconds"
-    password: false
-  - name: COZYGATEWAY_ATTACH_VERSION
-    description: "Attach protocol version: 0 (default) or 1 (durable native data plane)."
-    prompt: "Attach protocol version"
     password: false
   - name: COZYGATEWAY_SPOOL_PATH
     description: "Persistent SQLite spool path used by attach-v1."

@@ -13,7 +13,7 @@ services:
       # Hosted push works with the store app because CozyLabs holds that publisher team's APNs key.
       # Payloads are end-to-end encrypted. Override for a local-push developer relay if needed.
       COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"
-      # The bearer token the attaching Hermes plugin must present on /attach. Named by the mounted
+      # The bearer token the attaching Hermes plugin must present on /attach/v1. Named by the mounted
       # config's options.tokenEnv. Required: compose fails fast if unset.
       COZYGATEWAY_ATTACH_TOKEN: "${COZYGATEWAY_ATTACH_TOKEN:?set a strong attach token in .env}"
     ports:

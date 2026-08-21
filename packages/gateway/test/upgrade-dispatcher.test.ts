@@ -30,7 +30,7 @@ describe("createUpgradeDispatcher", () => {
     const dispatch = createUpgradeDispatcher(
       new Map([
         ["/ws", wsHandler],
-        ["/attach", attachHandler],
+        ["/attach/v1", attachHandler],
       ]),
     );
     const socket = fakeSocket();
@@ -50,11 +50,11 @@ describe("createUpgradeDispatcher", () => {
     const dispatch = createUpgradeDispatcher(
       new Map([
         ["/ws", wsHandler],
-        ["/attach", attachHandler],
+        ["/attach/v1", attachHandler],
       ]),
     );
 
-    dispatch(req("/attach"), fakeSocket(), Buffer.from(""));
+    dispatch(req("/attach/v1"), fakeSocket(), Buffer.from(""));
 
     expect(attachHandler).toHaveBeenCalledTimes(1);
     expect(wsHandler).not.toHaveBeenCalled();

@@ -1,9 +1,9 @@
 # attach-plugin
 
 A reference plugin for agent harnesses that support Python platform plugins. It is the
-harness side of the gateway's attach protocols (`contract/attach-v0.md` and
-`contract/attach-v1.md`). v0 dials `/attach`; v1 dials `/attach/v1`, adds durable replay,
-native Bot Mode events, media, approvals, structured clarification, and scheduled delivery.
+harness side of the gateway's attach-v1 protocol (`contract/attach-v1.md`). It dials
+`/attach/v1` with durable replay, native Bot Mode events, media, approvals, structured
+clarification, and scheduled delivery. There is no legacy fallback.
 
 Outbound-only: nothing listens on the agent host, so it works from behind NAT with no
 port forwarding.
@@ -27,8 +27,7 @@ Optional: `COZYGATEWAY_CA_FILE` (a PEM to verify a private-CA or self-signed gat
 certificate against; ignored on a plaintext gateway),
 `COZYGATEWAY_RECONNECT_INITIAL_SECONDS` (0.5), `COZYGATEWAY_RECONNECT_MAX_SECONDS` (30).
 
-The safe default is v0. Set `COZYGATEWAY_ATTACH_VERSION=1` to enable v1 and set
-`COZYGATEWAY_SPOOL_PATH` to a persistent writable SQLite path (default
+Set `COZYGATEWAY_SPOOL_PATH` to a persistent writable SQLite path (default
 `~/.hermes/cozygateway-attach-v1.sqlite`). Never place the spool on ephemeral container storage.
 
 Also set `COZYGATEWAY_HOME_CHANNEL=thread` (any non-empty value works). Some harnesses
@@ -50,7 +49,7 @@ Dependencies: Python 3.10+ and the `websockets` package.
   streams text and simply omits chips.
 - A turn ends with `done` (the gateway seals the latest draft as the durable reply) or
   `failed` (the gateway records a failed turn the client can retry).
-- v1 journals events and accepted commands before sending/ACKing, replays after reconnect,
+- The plugin journals events and accepted commands before sending/ACKing, replays after reconnect,
   deduplicates stable ids, and keeps negotiated count/byte windows for live traffic in both
   directions. It honors the capability intersection returned by `hello_ack` and does not emit a
   newly disabled feature. Hermes' native `send_clarify` callback becomes an app-visible option card; a selected
@@ -61,5 +60,5 @@ Dependencies: Python 3.10+ and the `websockets` package.
 
 ## Status
 
-Reference implementation. The Python unit suite covers v0 compatibility plus v1 spool, handshake,
+Reference implementation. The Python unit suite covers the v1 spool, handshake,
 ACK/replay, command dedupe, and media behavior; gateway integration tests cover the wire boundary.

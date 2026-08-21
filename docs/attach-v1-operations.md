@@ -2,8 +2,7 @@
 
 ## Gateway configuration
 
-Classic attach agents keep their existing config. The gateway serves both `/attach` and
-`/attach/v1`; the plugin selects its version.
+Attach agents use `/attach/v1` exclusively. The gateway does not expose an unversioned fallback.
 
 For native Bot Mode, keep the `hermes` Dashboard bridge configured for management and add a
 per-profile gate:
@@ -46,7 +45,6 @@ by the gateway for that profile.
 ```sh
 COZYGATEWAY_URL=https://gateway.example
 COZYGATEWAY_TOKEN=<same per-profile token>
-COZYGATEWAY_ATTACH_VERSION=1
 COZYGATEWAY_SPOOL_PATH=/var/lib/hermes/cozygateway-attach-v1.sqlite
 COZYGATEWAY_HOME_CHANNEL=thread
 ```
@@ -58,17 +56,17 @@ WebSocket upgrades.
 
 ## Deployment sequence
 
-1. Deploy the gateway with schema changes and v0 compatibility first.
-2. Deploy the v1-capable plugin with version still set to `0`; verify ordinary chat. CozyLabs'
+1. Deploy the attach-v1 gateway and plugin as one lockstep change. CozyLabs'
    `integrations/hermes/attach` copy is lockstep vendored: after this cozygateway change has a
    commit, re-vendor the complete plugin directory and record that exact cozygateway ref in the
    paired CozyLabs change. Never patch the vendored copy independently.
-3. Set version `1` and configure a `shadow` bot. Verify hello, presence, ACK progress, replay after a
+2. Configure a `shadow` bot. Verify hello, presence, ACK progress, replay after a
    forced reconnect, and spool growth returning to steady state.
-4. Promote that bot to `native`. Verify text, interrupt, tool/approval/clarify (including restart
+3. Promote that bot to `native`. Verify text, interrupt, tool/approval/clarify (including restart
    recovery and expiry), one scheduled message/push across a forced retry, and media range download
    from a paired client.
-5. Expand per bot. Retain `/attach` and the v0 plugin setting until every classic agent has migrated.
+4. Expand per bot. A peer that has not migrated remains unavailable until its attach-v1 plugin is
+   installed; it is never silently downgraded.
 
 On recovery, preserve both the gateway SQLite database and plugin spool. Deleting either side's
 journal destroys its dedupe/replay history and requires an operator reconciliation; it is not a

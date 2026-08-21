@@ -13,7 +13,6 @@ import {
 import type { GatewayConfig } from "./config.ts";
 import { openStorage, type Storage } from "./storage.ts";
 import { buildAdapters } from "./adapters/registry.ts";
-import { AttachIngress } from "./adapters/attach/ingress.ts";
 import { ATTACH_V1_CAPABILITIES, AttachV1Ingress } from "./adapters/attach/ingress-v1.ts";
 import type { AttachV1Capability } from "./adapters/attach/protocol-v1.ts";
 import { AttachNativeSink } from "./adapters/attach/native-sink.ts";
@@ -203,7 +202,6 @@ export async function startGateway(
   const nativeBotEntries = Object.entries(config.hermes?.nativeDataPlane ?? {});
   const router = new AttachRouter();
   let nativeSink: AttachNativeSink | undefined;
-  let attachIngress: AttachIngress | undefined;
   let attachV1Ingress: AttachV1Ingress | undefined;
   let attachEndpoint: import("./adapters/attach/adapter.ts").TurnEndpoint | undefined;
   let attachTokens: Map<string, string> | undefined;
@@ -222,14 +220,6 @@ export async function startGateway(
       tokens.set(token, bot);
     }
     attachTokens = tokens;
-    attachIngress = new AttachIngress({
-      tokens,
-      events: {
-        onUpdate: (agentId, threadId, update) => router.onUpdate(agentId, threadId, update),
-        onDisconnect: (agentId) => router.onDisconnect(agentId),
-        onPresence: (agentId, state) => hub.broadcast({ type: "presence", agentId, state }),
-      },
-    });
     const allowedCapabilities = new Map<string, ReadonlySet<AttachV1Capability>>();
     for (const [rawBot, native] of nativeBotEntries) {
       const features = native.features;
@@ -263,19 +253,14 @@ export async function startGateway(
           hub.broadcast({ type: "presence", agentId, state: state === "online" ? "online" : "absent" }),
       },
     });
-    const v0 = attachIngress;
     const v1 = attachV1Ingress;
     attachEndpoint = {
-      isAttached: (agentId) => v1.isAttached(agentId) || v0.isAttached(agentId),
-      canQueue: (agentId) => v1.hasNegotiated(agentId),
-      sendTurn: (agentId, frame) =>
-        v1.hasNegotiated(agentId) ? v1.sendTurn(agentId, frame) : v0.sendTurn(agentId, frame),
-      sendSteer: (agentId, frame) =>
-        v1.hasNegotiated(agentId) ? v1.sendSteer(agentId, frame) : v0.sendSteer(agentId, frame),
-      sendInterrupt: (agentId, frame) =>
-        v1.hasNegotiated(agentId) ? v1.sendInterrupt(agentId, frame) : v0.sendInterrupt(agentId, frame),
-      sendApprovalResolution: (agentId, input) =>
-        v1.hasNegotiated(agentId) ? v1.sendApprovalResolution(agentId, input) : false,
+      isAttached: (agentId) => v1.isAttached(agentId),
+      canQueue: (agentId) => v1.canQueue(agentId),
+      sendTurn: (agentId, frame) => v1.sendTurn(agentId, frame),
+      sendSteer: (agentId, frame) => v1.sendSteer(agentId, frame),
+      sendInterrupt: (agentId, frame) => v1.sendInterrupt(agentId, frame),
+      sendApprovalResolution: (agentId, input) => v1.sendApprovalResolution(agentId, input),
     };
   }
 
@@ -398,7 +383,7 @@ export async function startGateway(
     // The TLS branch swaps only the factory and its options; the fetch handler, the port, the
     // hostname, and the upgrade dispatcher below are identical either way. https.Server extends
     // http.Server, so everything downstream (including the 'upgrade' listener that carries /ws and
-    // /attach, which therefore become wss automatically) is unchanged.
+    // /attach/v1, which therefore become wss automatically) is unchanged.
     const s = serve(
       {
         fetch: app.fetch,
@@ -422,9 +407,8 @@ export async function startGateway(
   const routes = new Map<string, UpgradeHandler>([
     ["/ws", (req, socket, head) => hub.handleUpgrade(req, socket, head)],
   ]);
-  if (attachIngress !== undefined) {
-    routes.set("/attach", (req, socket, head) => attachIngress.handleUpgrade(req, socket, head));
-    routes.set("/attach/v1", (req, socket, head) => attachV1Ingress!.handleUpgrade(req, socket, head));
+  if (attachV1Ingress !== undefined) {
+    routes.set("/attach/v1", (req, socket, head) => attachV1Ingress.handleUpgrade(req, socket, head));
   }
   server.on("upgrade", createUpgradeDispatcher(routes));
   // Started after the listener is up so the first roster refresh cannot race the hub it
@@ -447,7 +431,6 @@ export async function startGateway(
       hub.close();
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
       // runner's per-thread chains settle before closeAll drains them.
-      attachIngress?.close();
       attachV1Ingress?.close();
       // Same ordering for openclaw: close every dial-out client (cancels any pending reconnect
       // timer and fails in-flight turns) before the HTTP server stops and the runner drains.

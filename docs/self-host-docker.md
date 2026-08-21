@@ -25,7 +25,7 @@ The image ships a default `mock` ("echo") agent. In another terminal, mint a pai
 - The gateway is published on `8787`. Its authenticated `/push` proxy forwards to
   `https://push.cozylabs.ai` by default, with end-to-end encrypted notification payloads.
 - The mounted `docker/cozygateway.config.json` selects the `attach` backend; point your agent
-  harness's plugin at `http://<host>:8787/attach` with `COZYGATEWAY_TOKEN` equal to
+  harness's plugin at `http://<host>:8787` (it dials `/attach/v1`) with `COZYGATEWAY_TOKEN` equal to
   `COZYGATEWAY_ATTACH_TOKEN`.
 - SQLite persists in the `gateway-data` named volume. The optional local relay uses `relay-data`.
 
@@ -39,7 +39,7 @@ Gateway:
 | `COZYGATEWAY_PORT` | `8787` | listen port |
 | `COZYGATEWAY_DB_PATH` | `cozygateway.db` (image sets `/data/cozygateway.db`) | SQLite path |
 | `COZYGATEWAY_PUSH_RELAY_URL` | `https://push.cozylabs.ai` in Compose | relay origin for the authenticated `/push` proxy |
-| `COZYGATEWAY_ATTACH_TOKEN` | (required for the attach config) | bearer token the plugin presents on `/attach` |
+| `COZYGATEWAY_ATTACH_TOKEN` | (required for the attach config) | bearer token the plugin presents on `/attach/v1` |
 | `COZYGATEWAY_HERMES_URL` | (config value) | retargets the optional hermes bots bridge; ignored when no bridge is configured |
 | `COZY_TLS_CERT_FILE` | (unset: plain HTTP) | PEM certificate chain; set with the key to serve HTTPS (`docs/tls.md`) |
 | `COZY_TLS_KEY_FILE` | (unset: plain HTTP) | matching unencrypted PEM private key |

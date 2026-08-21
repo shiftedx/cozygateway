@@ -972,7 +972,7 @@ export class HermesBridge implements BotsSurface {
               }
             }),
         );
-        const bots = buildRoster(profiles, {
+        const projectedBots = buildRoster(profiles, {
           canonicalSessions,
           hidden: this.#hidden,
           pins: this.#storage.botChatPinEntries(),
@@ -981,6 +981,38 @@ export class HermesBridge implements BotsSurface {
           gatewayState: this.#gatewayState(),
           now: fetchedAt,
         });
+        // Some Hermes builds omit `preview` from `session.list` even though the listed canonical
+        // chat has a real transcript. Hydrate only that exact listed session. An unlisted pin may be
+        // a deliberately retired/empty chat while a newer machine session exists, so resuming it
+        // here would let routine or group output leak into the human-chat roster projection.
+        const bots = await Promise.all(projectedBots.map(async (bot): Promise<BotSummary> => {
+          if (bot.chatSessionId === null || bot.preview.kind !== "empty") return bot;
+          const listedCanonical = canonicalSessions
+            .get(bot.name)
+            ?.some((session) => session.id === bot.chatSessionId);
+          if (listedCanonical !== true) return bot;
+          try {
+            const snapshot = parseChatSnapshot(
+              await this.#client.request("session.resume", {
+                session_id: bot.chatSessionId,
+                profile: bot.name,
+                omit_messages: false,
+              }),
+              bot.chatSessionId,
+            );
+            const latest = snapshot.messages.findLast((message) => message.text.trim().length > 0);
+            if (latest === undefined) return bot;
+            return {
+              ...bot,
+              preview: classifyPreview(latest.text, null),
+              lastActiveAt: latest.at ?? bot.lastActiveAt,
+            };
+          } catch (err) {
+            const detail = err instanceof Error ? err.message : "unknown failure";
+            this.#log(`canonical roster preview unavailable for ${bot.name}: ${detail}`);
+            return bot;
+          }
+        }));
         this.#storage.replaceBotRoster(
           bots.map((summary) => ({ name: summary.name, summary })),
           fetchedAt,

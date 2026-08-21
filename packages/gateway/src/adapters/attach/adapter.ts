@@ -4,21 +4,18 @@ import type { PresenceState, RichBlock, ToolCall } from "cozygateway-contract";
 
 import type { AgentConfig } from "../../config.ts";
 import type { BackendAdapter, BackendSession, TurnHandlers } from "../types.ts";
-import type {
-  AttachInterruptFrame,
-  AttachSteerFrame,
-  AttachTurnFrame,
-  AttachUpdate,
-} from "./protocol.ts";
 import type { AttachV1EventFrame } from "./protocol-v1.ts";
 import { blocksToText } from "./blocks-to-text.ts";
 
-/** The slice of the ingress a turn needs. A seam so adapter tests run with no sockets;
- *  AttachIngress satisfies it structurally. */
+export interface AttachTurnFrame { kind: "turn"; threadId: string; turnId: string; text: string }
+export interface AttachSteerFrame { kind: "steer"; threadId: string; turnId: string; text: string }
+export interface AttachInterruptFrame { kind: "interrupt"; threadId: string; turnId: string }
+
+/** The slice of the v1 ingress a turn needs. A seam so adapter tests run with no sockets. */
 export interface TurnEndpoint {
   isAttached(agentId: string): boolean;
-  /** v1 durable endpoints can accept while absent; v0 endpoints omit this and retain fail-fast. */
-  canQueue?(agentId: string): boolean;
+  /** Durable v1 endpoints accept while absent and replay after reconnection. */
+  canQueue(agentId: string): boolean;
   sendTurn(agentId: string, frame: AttachTurnFrame): boolean;
   sendSteer(agentId: string, frame: AttachSteerFrame): boolean;
   sendInterrupt(agentId: string, frame: AttachInterruptFrame): boolean;
@@ -30,7 +27,6 @@ export interface TurnEndpoint {
 
 /** A BackendAdapter that also receives routed ingress events for its agent. */
 export interface AttachAdapter extends BackendAdapter {
-  handleUpdate(threadId: string, update: AttachUpdate): void;
   handleV1Event(frame: AttachV1EventFrame): boolean;
   handleDisconnect(): void;
 }
@@ -77,7 +73,7 @@ export function parseAttachOptions(
 }
 
 /** Build the token-to-agentId map the ingress authenticates against. The token IS the agent
- *  identity on /attach, so a shared token is a hard startup error, not a warning. */
+ *  identity on /attach/v1, so a shared token is a hard startup error, not a warning. */
 export function collectAttachTokens(
   agents: AgentConfig[],
   env: Record<string, string | undefined>,
@@ -134,6 +130,21 @@ export function createAttachAdapter(deps: {
     settle(turnId)?.reject(new Error(message));
   };
 
+  const completeTurn = (threadId: string, turnId: string): void => {
+    const turn = turns.get(turnId);
+    if (turn === undefined || turn.threadId !== threadId) return;
+    const latest = turn.latest;
+    if (latest === undefined || latest.length === 0) {
+      failTurn(turnId, "the agent finished the turn without any reply content");
+      return;
+    }
+    const settled = settle(turnId);
+    if (settled === undefined) return;
+    settled.handlers.onCommit({ blocks: latest });
+    settled.handlers.onDone();
+    settled.resolve();
+  };
+
   return {
     backend: "attach",
     midTurnDelivery: "steer",
@@ -141,7 +152,7 @@ export function createAttachAdapter(deps: {
     async startSession(threadId: string): Promise<BackendSession> {
       return {
         send(blocks: RichBlock[], handlers: TurnHandlers): Promise<void> {
-          if (!deps.endpoint.isAttached(deps.agentId) && deps.endpoint.canQueue?.(deps.agentId) !== true) {
+          if (!deps.endpoint.isAttached(deps.agentId) && !deps.endpoint.canQueue(deps.agentId)) {
             return Promise.reject(new Error(`agent "${deps.agentId}" is not attached`));
           }
           const turnId = randomUUID();
@@ -216,32 +227,6 @@ export function createAttachAdapter(deps: {
 
     presence: (): PresenceState => (deps.endpoint.isAttached(deps.agentId) ? "online" : "absent"),
 
-    handleUpdate(threadId: string, update: AttachUpdate): void {
-      const turn = turns.get(update.turnId);
-      if (turn === undefined || turn.threadId !== threadId) return;
-      if (update.kind === "draft") {
-        turn.latest = update.blocks;
-        turn.handlers.onDraft({ blocks: update.blocks, toolCalls: update.toolCalls ?? [] });
-        return;
-      }
-      if (update.kind === "failed") {
-        failTurn(update.turnId, update.message ?? "the agent reported a failed turn");
-        return;
-      }
-      // kind === "done": seal the latest draft. A turn with no draft content is a failure, so
-      // the runner records turn.failed instead of committing an empty reply.
-      const latest = turn.latest;
-      if (latest === undefined || latest.length === 0) {
-        failTurn(update.turnId, "the agent finished the turn without any reply content");
-        return;
-      }
-      const settled = settle(update.turnId);
-      if (settled === undefined) return;
-      settled.handlers.onCommit({ blocks: latest });
-      settled.handlers.onDone();
-      settled.resolve();
-    },
-
     handleV1Event(frame: AttachV1EventFrame): boolean {
       const event = frame.event;
       if (!("turnId" in event) || !("threadId" in event)) return false;
@@ -276,16 +261,16 @@ export function createAttachAdapter(deps: {
         case "commit":
           turn.latest = event.blocks;
           turn.handlers.onDraft({ blocks: event.blocks, toolCalls: [...turn.toolCalls.values()] });
-          this.handleUpdate(event.threadId, { kind: "done", turnId: event.turnId });
+          completeTurn(event.threadId, event.turnId);
           return true;
         case "failed":
-          this.handleUpdate(event.threadId, { kind: "failed", turnId: event.turnId, message: event.message });
+          failTurn(event.turnId, event.message ?? "the agent reported a failed turn");
           return true;
         case "cancelled":
-          this.handleUpdate(event.threadId, { kind: "failed", turnId: event.turnId, message: "the agent cancelled the turn" });
+          failTurn(event.turnId, "the agent cancelled the turn");
           return true;
         case "interrupted":
-          this.handleUpdate(event.threadId, { kind: "failed", turnId: event.turnId, message: "the agent interrupted the turn" });
+          failTurn(event.turnId, "the agent interrupted the turn");
           return true;
         case "clarify":
           // Clarification is a distinct v1 interaction and has no frozen core-thread frame yet.
@@ -309,10 +294,6 @@ export class AttachRouter {
 
   register(agentId: string, adapter: AttachAdapter): void {
     this.#adapters.set(agentId, adapter);
-  }
-
-  onUpdate(agentId: string, threadId: string, update: AttachUpdate): void {
-    this.#adapters.get(agentId)?.handleUpdate(threadId, update);
   }
 
   onDisconnect(agentId: string): void {
