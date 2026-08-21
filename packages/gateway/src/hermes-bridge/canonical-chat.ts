@@ -263,6 +263,11 @@ export interface CanonicalChatDeps {
    *  Defaults to "nothing is retired", which is the correct answer for a caller that has never reset
    *  a chat and keeps every existing test honest. */
   isRetired?: (sessionId: string) => boolean;
+  /** True when `sessionId` is the current gateway-minted chat whose first prompt has not persisted
+   *  yet. Such a chat has no `session.list` row, even when older sessions do, so a missing pin is
+   *  not compaction evidence. The pin holds until a conversational session with a creation time
+   *  after the pin appears, which preserves follow-latest for genuinely new conversations. */
+  isUnwritten?: (sessionId: string) => boolean;
   /** How many sessions to consider when adopting. The desktop uses 100. */
   listLimit?: number;
 }
@@ -337,7 +342,15 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
   // and it wins here; it stops winning the moment a conversation CREATED after it appears
   // (the manualSince rule below) or the local record is rewritten by any automatic adoption,
   // including the reset path, which always writes manual=false.
-  if (localEntry?.manual === true && typeof pin === "string" && localEntry.sessionId !== pin) {
+  // The same rule extends to an UNWRITTEN local pin (capability 19 sessions/new): the fresh empty
+  // chat is invisible to session.list and the server-pin write may have been swallowed, so a stale
+  // server pin naming the replaced conversation must not outrank the chat the user just started.
+  if (
+    typeof pin === "string" &&
+    localEntry !== undefined &&
+    localEntry.sessionId !== pin &&
+    (localEntry.manual === true || deps.isUnwritten?.(localEntry.sessionId) === true)
+  ) {
     pin = localEntry.sessionId;
   }
   const manualSince =
@@ -357,6 +370,10 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
     // stays unlisted for as long as it stays untouched. The rule was already right; what changed is
     // how long it has to hold.
     if (typeof pin === "string" && pin.length > 0) {
+      // Rewriting an automatic pin refreshes its timestamp. Keep a minted chat's original creation
+      // boundary so a later conversational session can release it even if Hermes briefly reports
+      // an empty list while that later row is becoming visible.
+      if (deps.isUnwritten?.(pin) === true) return { sessionId: pin, adoption: "pin" };
       deps.pins.set(name, pin);
       return { sessionId: pin, adoption: "pin" };
     }
@@ -394,6 +411,27 @@ async function resolvePin(name: string, deps: CanonicalChatDeps): Promise<Canoni
   }
 
   if (!rows.some((row) => row.id === pin)) {
+    // A freshly minted empty chat is absent from `session.list` until its first prompt persists.
+    // Older unretired sessions may still be listed, especially after capability-19 new session, so
+    // treating the missing pin as compaction would immediately re-adopt the conversation the user
+    // just left. Hold the durable unwritten pin unless a genuinely later conversational session
+    // has appeared. That later row is capability-14 follow-latest resuming at the right boundary.
+    if (deps.isUnwritten?.(pin) === true) {
+      const pinSince = localEntry?.sessionId === pin ? localEntry.updatedAt : undefined;
+      const newer = candidates.find(
+        (row) =>
+          isConversationalSession(row) &&
+          pinSince !== undefined &&
+          row.startedAt !== 0 &&
+          row.startedAt > pinSince,
+      );
+      if (newer !== undefined) {
+        deps.pins.set(name, newer.id);
+        return { sessionId: newer.id, adoption: "latest", previousSessionId: pin };
+      }
+      return { sessionId: pin, adoption: "pin" };
+    }
+
     // Recovery path: compaction rewrote the lineage and the pinned id no longer exists. The
     // desktop re-pins the newest session outright, so this does too, minus anything retired.
     const newest = candidates[0];

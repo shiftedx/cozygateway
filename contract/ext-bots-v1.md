@@ -171,11 +171,12 @@ Versions are ADDITIVE, so a client compares `>=`, never `===`:
   reasoning effort, and the configured Hermes picker catalog. Routine records and writes also gain
   optional nullable `model` and `effort` fields. See the routine capability note before presenting
   those fields as active execution controls.
-- `19`: HARD STOP FOR BOT CHAT. `POST /bots/:name/chat/stop` interrupts the in-flight Hermes turn.
-  It is the hard escape; sending text to a busy bot continues to steer it. Every device observes the
-  stop through the existing `bot_chat_state` frame with `phase: "complete"`, so no new frame type or
-  phase is introduced. A client that changes its send button into a stop button while working MUST
-  require `>= 19`.
+- `19`: HARD STOP AND NEW BOT CHAT. `POST /bots/:name/chat/stop` interrupts the in-flight Hermes
+  turn. It is the hard escape; sending text to a busy bot continues to steer it. Every device
+  observes the stop through the existing `bot_chat_state` frame with `phase: "complete"`, so no new
+  frame type or phase is introduced. `POST /bots/:name/sessions/new` mints and adopts a fresh empty
+  chat without retiring the previous session, which stays listed and restorable. It broadcasts the
+  existing `bot_chat_adopted` frame. A client that offers either action MUST require `>= 19`.
 
 ## 3. Resources
 
@@ -1318,6 +1319,40 @@ The bot's visible Hermes session list, capped at 200 rows and kept in Hermes' ne
 yet. The `kind` classifier is the exact classifier the capability-14 pin-follow rule uses: cron
 source or id shape, `Routine: ` title, `Group: ` title, then bot-to-bot preview, with conversation as
 the default.
+
+### POST /bots/:name/sessions/new
+
+Capability `>= 19`. Requires device authentication and takes no request body.
+
+```
+200 { name: string, sessionId: string, previousSessionId: string }
+400 invalid_request                   // `name` is not a legal profile id
+404 not_found                         // no profile named `name` exists
+502 backend_unavailable + hermesError // Hermes refused to create the new session
+503 backend_unavailable + hermesError // the bridge is offline
+```
+
+Creates a fresh Hermes session through the same creation surface used by the `created` adoption of
+`GET /bots/:name/chat`: title `Bot Chat`, hidden by default, with no prompt submitted. The stored id
+is adopted as the canonical chat and returned as `sessionId`. `previousSessionId` is the canonical
+chat that was resolved before the mint. A bot that had never been opened has that outgoing chat
+resolved first, just as reset resolves its outgoing chat before replacing it.
+
+This is not reset. The previous session is not added to the retired set, its turn is not cancelled,
+and its transcript state is not cleared. It remains in `GET /bots/:name/sessions` once Hermes has
+persisted it and can be selected again with `POST /bots/:name/sessions/:id/adopt`. A turn already
+running there may still emit frames carrying the previous session id, which a client rebound to the
+new chat ignores by the ordinary session-id rule.
+
+Every paired device receives `bot_chat_adopted` with the three response fields plus `updatedAt` and
+rebinds through the same adoption reload path used by automatic following and manual restore. The
+new pin is automatic, not manual. Starting a new session therefore releases a capability-16 manual
+selection, and capability-14 follow-latest resumes when the next new conversational session
+appears.
+
+The response is 200 because the session has been created, pinned locally, offered for server pin
+writeback, and broadcast before the request returns. The new chat can be absent from the sessions
+array until its first prompt persists it; `activeSessionId` still names it during that interval.
 
 ### POST /bots/:name/sessions/:id/adopt
 
@@ -2485,9 +2520,9 @@ It is not a deletion notice. The retired session is still on the hermes host and
 `bot_chat_delta` frame will arrive for the retired session, because the gateway cancels its turn poll
 and forgets its draft bindings before it mints the replacement.
 
-`bot_chat_adopted` says a bot's canonical chat adopted a conversational session, automatically from
-version 14 or manually from version 16. `sessionId` is the session the chat now points at and
-`previousSessionId` is the one the pin
+`bot_chat_adopted` says a bot's canonical chat adopted another session, automatically from version
+14, manually from version 16, or by starting a fresh unretired conversation from version 19.
+`sessionId` is the session the chat now points at and `previousSessionId` is the one the pin
 held until this moment; unlike the reset frame's, that field is always present, because a
 re-adoption by definition replaces a pin that resolved. It is broadcast to every paired device, for
 the same reason `bot_chat_reset` is: a device sitting on the previous transcript has no other way to

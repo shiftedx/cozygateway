@@ -81,6 +81,16 @@ export const BotSessionAdoptResponseSchema = Type.Object({
 });
 export type BotSessionAdoptResponse = Static<typeof BotSessionAdoptResponseSchema>;
 
+/** Capability 19 `POST /bots/:name/sessions/new` response. The new session is adopted, while the
+ *  previous session remains ordinary history: unretired, listed once Hermes has persisted it, and
+ *  restorable through the capability-16 adoption route. */
+export const BotNewSessionResponseSchema = Type.Object({
+  name: Type.String(),
+  sessionId: Type.String(),
+  previousSessionId: Type.String(),
+});
+export type BotNewSessionResponse = Static<typeof BotNewSessionResponseSchema>;
+
 /** One bot-to-bot session surfaced in the agent inbox (capability 17). `peers` names the
  *  counterpart agents visible in the a2a delivery prefix; the bot addressed by the route is not
  *  repeated there. */
@@ -434,9 +444,9 @@ export const BotChatResetFrameSchema = Type.Object({
 export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
 
 /** A bot's canonical chat adopted another session. Capability 14 emits this when the pin follows a
- *  newer conversation; capability 16 emits the same frame when the user manually restores any
- *  listed session. It is how every paired device learns that the transcript on its screen must be
- *  re-read.
+ *  newer conversation, capability 16 emits it when the user manually restores a listed session,
+ *  and capability 19 emits it when the user starts a fresh unretired conversation. It is how every
+ *  paired device learns that the transcript on its screen must be re-read.
  *
  *  On receipt, rebind to `sessionId` and re-read `GET /bots/:name/chat/messages`. That is the same
  *  handling `bot_chat_reset` gets, and a client MAY implement the two together; what separates them
@@ -1111,10 +1121,14 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    Routine records and writes accept nullable model/effort selections. The surveyed cron RPC
  *    cannot scope both to one run, so they are preserved as inert metadata and the gateway never
  *    mutates a profile around a routine run.
- *  - `19`: HARD STOP FOR BOT CHAT (issue #114). Adds authenticated
- *    `POST /bots/:name/chat/stop`. It dispatches Hermes `session.interrupt` for the gateway-owned
- *    runtime turn, answers 409 when no turn is running, and terminates every device's working state
- *    through the existing `bot_chat_state` frame with `phase: "complete"`. Ordinary busy sends keep
- *    their steering behavior; stop is the explicit hard escape. */
+ *  - `19`: HARD STOP AND NEW BOT CHAT (issues #114 and #115). Adds authenticated
+ *    `POST /bots/:name/chat/stop` and `POST /bots/:name/sessions/new`. Stop dispatches Hermes
+ *    `session.interrupt` for the gateway-owned runtime turn, answers 409 when no turn is running,
+ *    and terminates every device's working state through the existing `bot_chat_state` frame with
+ *    `phase: "complete"`. Ordinary busy sends keep their steering behavior; stop is the explicit
+ *    hard escape. New session mints an empty canonical chat through the existing Hermes creation
+ *    surface, leaves the previous session unretired and restorable, and broadcasts the existing
+ *    `bot_chat_adopted` frame. Its automatic pin also releases a manual restore boundary so
+ *    follow-latest resumes with the next new conversational session. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
 export const BOTS_CAPABILITY_VERSION = 19;

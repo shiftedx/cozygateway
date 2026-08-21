@@ -219,6 +219,49 @@ describe("resolveCanonicalChat re-adoption", () => {
     expect(pins.current()).toMatchObject({ sessionId: "next", manual: false });
   });
 
+  it("holds an unlisted unwritten pin past old sessions and follows the next new conversation", async () => {
+    const mintedAt = 1_800_000_000_000;
+    let row = { sessionId: "fresh", manual: false, updatedAt: mintedAt };
+    const pins: PinStore = {
+      get: () => row.sessionId,
+      entry: () => row,
+      set: (_name, sessionId) => {
+        row = { sessionId, manual: false, updatedAt: mintedAt + 2_000 };
+      },
+      clear: () => {},
+    };
+    const old = { id: "old", title: "Old", created_at: mintedAt / 1000 - 1 };
+
+    expect(
+      await resolveCanonicalChat("scout", {
+        rpc: rpc({ sessions: [old] }),
+        pins,
+        hideBotChats: true,
+        serverPin: "fresh",
+        isUnwritten: (sessionId) => sessionId === "fresh",
+      }),
+    ).toEqual({ sessionId: "fresh", adoption: "pin" });
+    // Holding the same unwritten pin must preserve its original boundary. Rewriting it here would
+    // let an eventually consistent list hide a genuinely newer session behind the last read time.
+    expect(row.updatedAt).toBe(mintedAt);
+
+    expect(
+      await resolveCanonicalChat("scout", {
+        rpc: rpc({
+          sessions: [
+            { id: "next", title: "Next", created_at: mintedAt / 1000 + 1 },
+            old,
+          ],
+        }),
+        pins,
+        hideBotChats: true,
+        serverPin: "fresh",
+        isUnwritten: (sessionId) => sessionId === "fresh",
+      }),
+    ).toEqual({ sessionId: "next", adoption: "latest", previousSessionId: "fresh" });
+    expect(row.sessionId).toBe("next");
+  });
+
   for (const { what, row } of excluded) {
     it(`never re-adopts ${what}`, async () => {
       const pins = pinStore({ scout: "pinned" });

@@ -20,6 +20,7 @@ import {
   BotInboxResponseSchema,
   BotModelConfigPatchSchema,
   BotModelConfigSchema,
+  BotNewSessionResponseSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
   BotRoutineCreateRequestSchema,
@@ -475,13 +476,30 @@ describe("capability advertisement", () => {
     // the existing adoption frame and holds until the next new conversational session appears.
     // 17 for the read-only agent inbox routes and their coarse activity invalidation frame.
     // 18 for bot model config plus accepted-but-inert per-routine model and effort metadata.
-    // 19 for the authenticated hard-stop route and its existing complete state-frame terminal edge.
+    // 19 for the authenticated hard-stop route and its existing complete state-frame terminal edge,
+    // plus new-session minting through the existing adoption frame without retiring the old chat.
     expect(BOTS_CAPABILITY_VERSION).toBe(19);
   });
 
   it("accepts only the capability-19 hard-stop success body", () => {
     expect(check(BotChatStopResponseSchema, { status: "stopped" })).toBe(true);
     expect(check(BotChatStopResponseSchema, { status: "interrupting" })).toBe(false);
+  });
+
+  it("accepts only the fixed capability-19 new-session response", () => {
+    expect(
+      check(BotNewSessionResponseSchema, {
+        name: "scout",
+        sessionId: "session-new",
+        previousSessionId: "session-old",
+      }),
+    ).toBe(true);
+    expect(
+      check(BotNewSessionResponseSchema, {
+        name: "scout",
+        sessionId: "session-new",
+      }),
+    ).toBe(false);
   });
 
   it("accepts attachments on an assistant chat row", () => {

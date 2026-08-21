@@ -176,6 +176,11 @@ export interface BotSessionAdoption {
   previousSessionId: string;
 }
 
+export interface BotNewSessionResult {
+  sessionId: string;
+  previousSessionId: string;
+}
+
 export interface BotInboxView {
   threads: BotInboxThread[];
 }
@@ -219,6 +224,7 @@ export interface BotsSurface {
   /** Fire-and-forget background refresh. Never throws, never awaited by a request handler. */
   refreshSoon(reason: string): void;
   canonicalChat(name: string): Promise<CanonicalChatResult>;
+  newSession(name: string): Promise<BotNewSessionResult>;
   resetChat(name: string): Promise<ChatResetResult>;
   sessions(name: string, limit: number): Promise<BotSessionsView>;
   adoptSession(name: string, sessionId: string, limit: number): Promise<BotSessionAdoption>;
@@ -976,6 +982,7 @@ export class HermesBridge implements BotsSurface {
             serverPin,
             saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
             isRetired: this.#retiredOf(name),
+            isUnwritten: (sessionId) => this.#storage.botChatUnwritten(name, sessionId),
             // The guard above is cache-first, so it can be satisfied by a snapshot taken before the
             // bot was deleted. That is harmless on every path but this one: minting the chat means
             // `session.create`, and Hermes 0.20.x answers that for an unknown name by CREATING the
@@ -1020,6 +1027,92 @@ export class HermesBridge implements BotsSurface {
     })();
     this.#chatInflight.set(name, run);
     return run;
+  }
+
+  /** Mints and adopts a fresh canonical chat without retiring the one it replaces.
+   *
+   *  This deliberately shares the canonical-chat single-flight with open, reset, and manual
+   *  adoption. Each request remains an action rather than a deduplicated read: it waits for an
+   *  earlier operation, then mints the fresh session it was asked for. A canonical-chat read that
+   *  arrives while this action runs joins it and receives the new pin.
+   *
+   *  Unlike `resetChat`, this does not cancel a turn, clear transcript state, or add the previous
+   *  id to the retired set. The ordinary `bot_chat_adopted` contract therefore applies: the old
+   *  session stays listed and restorable, and frames from a turn already running there may still
+   *  arrive carrying that old session id.
+   *
+   *  `mintCanonicalChat` writes an automatic pin (`manual: false`). That is the capability-16
+   *  manual-pin boundary: a manual restore is released by this explicitly new conversation, and
+   *  capability-14 follow-latest may move the pin again when the next new conversation appears. */
+  async newSession(name: string): Promise<BotNewSessionResult> {
+    await this.#assertBotKnown(name);
+
+    const pending = this.#chatInflight.get(name);
+    if (pending !== undefined) {
+      try {
+        await pending;
+      } catch {
+        /* This action resolves the outgoing chat itself before minting its replacement. */
+      }
+    }
+
+    const run = (async (): Promise<{ chat: CanonicalChatResult; previousSessionId: string }> => {
+      try {
+        this.#routedProfile = name;
+        this.#busyDepth += 1;
+        try {
+          const serverPin = await this.#serverPinOf(name);
+          const current = await resolveCanonicalChat(name, {
+            rpc: this.#client,
+            pins: this.#pins,
+            hideBotChats: this.#hideBotChats,
+            serverPin,
+            saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
+            isRetired: this.#retiredOf(name),
+            isUnwritten: (sessionId) => this.#storage.botChatUnwritten(name, sessionId),
+            assertStillExists: async () => {
+              if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
+            },
+          });
+
+          const minted = await mintCanonicalChat(name, {
+            rpc: this.#client,
+            pins: this.#pins,
+            hideBotChats: this.#hideBotChats,
+            assertStillExists: async () => {
+              if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
+            },
+          });
+          this.#rememberUnwritten(name, minted.storedId, minted.runtimeId);
+          await this.#saveServerPin(name, minted.storedId, serverPin);
+
+          this.#broadcast({
+            type: "bot_chat_adopted",
+            bot: name,
+            sessionId: minted.storedId,
+            previousSessionId: current.sessionId,
+            updatedAt: this.#now(),
+          });
+
+          return {
+            chat: { sessionId: minted.storedId, adoption: "created", runtimeId: minted.runtimeId },
+            previousSessionId: current.sessionId,
+          };
+        } finally {
+          this.#busyDepth = Math.max(0, this.#busyDepth - 1);
+          if (this.#busyDepth === 0) this.#routedProfile = null;
+          this.refreshSoon("new chat created");
+        }
+      } finally {
+        this.#chatInflight.delete(name);
+      }
+    })();
+
+    const joinable = run.then((result) => result.chat);
+    void joinable.catch(() => {});
+    this.#chatInflight.set(name, joinable);
+    const result = await run;
+    return { sessionId: result.chat.sessionId, previousSessionId: result.previousSessionId };
   }
 
   /** Retires a bot's current canonical chat and pins a fresh one in its place.
@@ -1098,6 +1191,7 @@ export class HermesBridge implements BotsSurface {
               serverPin,
               saveServerPin: (sessionId) => this.#saveServerPin(name, sessionId, serverPin),
               isRetired: this.#retiredOf(name),
+              isUnwritten: (sessionId) => this.#storage.botChatUnwritten(name, sessionId),
               assertStillExists: async () => {
                 if (!(await this.#freshProfileNames()).has(name)) throw new BotNotFound(name);
               },
@@ -1212,7 +1306,19 @@ export class HermesBridge implements BotsSurface {
       listBotSessions(this.#client, name, limit),
       this.#serverPinOf(name),
     ]);
-    const activeSessionId = serverPin !== undefined ? serverPin : (this.#storage.botChatPin(name) ?? null);
+    // Server pin first, but the SAME precedence rule resolvePin applies: `#saveServerPin` swallows
+    // its own failures by design, so a local pin that is MANUAL (the user's explicit restore) or
+    // UNWRITTEN (a freshly minted empty chat, invisible to session.list until its first prompt)
+    // outranks a server pin that still names the chat it replaced.
+    let activeSessionId = serverPin !== undefined ? serverPin : (this.#storage.botChatPin(name) ?? null);
+    const localEntry = this.#storage.botChatPinEntry(name);
+    if (
+      localEntry !== undefined &&
+      localEntry.sessionId !== activeSessionId &&
+      (localEntry.manual || this.#storage.botChatUnwritten(name, localEntry.sessionId))
+    ) {
+      activeSessionId = localEntry.sessionId;
+    }
     return {
       sessions: rows.map((row) => ({
         id: row.id,
@@ -1380,6 +1486,7 @@ export class HermesBridge implements BotsSurface {
           serverPin,
           saveServerPin: (resolvedId) => this.#saveServerPin(name, resolvedId, serverPin),
           isRetired: this.#retiredOf(name),
+          isUnwritten: (resolvedId) => this.#storage.botChatUnwritten(name, resolvedId),
         });
 
         // This is the only writer of a manual pin. Every automatic PinStore.set call writes false,

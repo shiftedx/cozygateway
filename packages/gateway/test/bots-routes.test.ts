@@ -668,6 +668,94 @@ describe("POST /bots/:name/sessions/:id/adopt", () => {
   });
 });
 
+describe("POST /bots/:name/sessions/new", () => {
+  it("mints an unretired chat, releases a manual pin, and resumes follow-latest", async () => {
+    const sessions = [
+      { id: "current", title: "Current", created_at: NOW / 1000 - 1, last_active: NOW / 1000 - 1 },
+      { id: "older", title: "Older", created_at: NOW / 1000 - 10, last_active: NOW / 1000 - 5 },
+    ];
+    let serverPin = "current";
+    const { authed, request, frames, storage, server, bridge } = await setup({
+      methods: {
+        "profiles.list": () =>
+          profilesListResult([
+            { ...scoutRow, ui_meta: { "hermes-bots": { title: "Scout", chat: serverPin } } },
+          ]),
+        "profiles.configure": (params) => {
+          const uiMeta = params["ui_meta"] as { "hermes-bots"?: { chat?: unknown } };
+          const chat = uiMeta["hermes-bots"]?.chat;
+          if (typeof chat === "string") serverPin = chat;
+          return { applied: { ui_meta: true } };
+        },
+        "session.list": () => ({ sessions }),
+        "session.create": () => ({ stored_session_id: "fresh", session_id: "runtime-fresh" }),
+      },
+    });
+    await until(() => bridge.roster().bots.length === 1, 4_000);
+
+    expect((await request("/bots/scout/sessions/new", { method: "POST" })).status).toBe(401);
+
+    // Begin from an explicit older-session selection. New session is an automatic adoption and
+    // must release this manual boundary rather than extending it around the fresh chat.
+    expect((await authed("/bots/scout/sessions/older/adopt", { method: "POST" })).status).toBe(200);
+    expect(storage.botChatPinEntry("scout")).toMatchObject({ sessionId: "older", manual: true });
+
+    const response = await authed("/bots/Scout/sessions/new", { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      name: "scout",
+      sessionId: "fresh",
+      previousSessionId: "older",
+    });
+    expect(storage.botChatPinEntry("scout")).toMatchObject({ sessionId: "fresh", manual: false });
+    expect(storage.botChatRetired("scout").has("older")).toBe(false);
+    expect(serverPin).toBe("fresh");
+    expect(server.callsOf("session.create").map((call) => call.params)).toEqual([
+      {
+        profile: "scout",
+        title: CANONICAL_CHAT_TITLE,
+        hidden: true,
+      },
+    ]);
+    expect(frames.filter((frame) => frame.type === "bot_chat_adopted").at(-1)).toEqual({
+      type: "bot_chat_adopted",
+      bot: "scout",
+      sessionId: "fresh",
+      previousSessionId: "older",
+      updatedAt: NOW,
+    });
+
+    const listed = (await (await authed("/bots/scout/sessions")).json()) as {
+      sessions: Array<{ id: string }>;
+      activeSessionId: string | null;
+    };
+    expect(listed.activeSessionId).toBe("fresh");
+    expect(listed.sessions.map((session) => session.id)).toContain("older");
+    expect(await (await authed("/bots/scout/chat")).json()).toMatchObject({
+      sessionId: "fresh",
+      adoption: "pin",
+    });
+
+    sessions.unshift({
+      id: "next",
+      title: "Next",
+      created_at: NOW / 1000 + 1,
+      last_active: NOW / 1000 + 1,
+    });
+    expect(await (await authed("/bots/scout/chat")).json()).toMatchObject({ sessionId: "next" });
+    expect(storage.botChatPinEntry("scout")).toMatchObject({ sessionId: "next", manual: false });
+  });
+
+  it("does not let an unknown bot reach session.create", async () => {
+    const { authed, server } = await setup({
+      methods: { "profiles.list": () => profilesListResult([]) },
+    });
+    const response = await authed("/bots/ghost/sessions/new", { method: "POST" });
+    expect(response.status).toBe(404);
+    expect(server.callsOf("session.create")).toEqual([]);
+  });
+});
+
 describe("POST /bots/focus", () => {
   it("rejects an unknown screen", async () => {
     const { authed } = await setup({ methods: { "profiles.list": () => profilesListResult([]) } });

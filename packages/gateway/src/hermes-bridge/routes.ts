@@ -1006,6 +1006,21 @@ export function registerBotRoutes(
     }
   });
 
+  // Capability 19. Mint and adopt a fresh conversation without retiring the previous one. The
+  // existing adoption frame is the cross-device reload signal, and the automatic pin written by
+  // this action releases any capability-16 manual selection so follow-latest can resume.
+  app.post("/bots/:name/sessions/new", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
+    try {
+      const result = await bots.newSession(name);
+      return c.json({ name, sessionId: result.sessionId, previousSessionId: result.previousSessionId });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
   app.get("/bots/:name/inbox", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
