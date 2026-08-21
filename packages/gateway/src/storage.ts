@@ -54,7 +54,6 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (thread_id, seq)
 ) STRICT, WITHOUT ROWID;
-CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS push_registrations (
   device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
   push_id TEXT NOT NULL,
