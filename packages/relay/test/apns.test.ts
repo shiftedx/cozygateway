@@ -161,6 +161,32 @@ describe("apnsTransport.deliver", () => {
     } });
   });
 
+  it("sends a terminal Live Activity alert as the only reply-ready interruption", async () => {
+    const { config } = testConfig();
+    let seen: { headers: Record<string, unknown>; body: string } | undefined;
+    const baseUrl = await fakeApns((headers, body, stream) => {
+      seen = { headers, body };
+      stream.respond({ ":status": 200 });
+      stream.end();
+    });
+
+    await apnsTransport(config, { baseUrl }).deliver("ACTIVITYTOKEN", "", { liveActivity: {
+      timestamp: 300, event: "end", priority: 10, dismissalDate: 1_200,
+      alert: { title: "CozyChat", body: "Your bot’s reply is ready", sound: "default" },
+      contentState: { phase: "completed", toolCallCount: 2, shortStatus: "Finished",
+        eventSequence: 8, elapsedSeconds: 94 },
+    } });
+
+    expect(seen?.headers["apns-push-type"]).toBe("liveactivity");
+    expect(seen?.headers["apns-priority"]).toBe("10");
+    expect(JSON.parse(seen?.body ?? "{}")).toEqual({ aps: {
+      timestamp: 300, event: "end", "dismissal-date": 1_200,
+      alert: { title: "CozyChat", body: "Your bot’s reply is ready", sound: "default" },
+      "content-state": { phase: "completed", toolCallCount: 2, shortStatus: "Finished",
+        eventSequence: 8, elapsedSeconds: 94 },
+    } });
+  });
+
   it("POSTs the alert + ciphertext under 'c' to /3/device/<token> with a bearer JWT", async () => {
     const { config, publicKey } = testConfig();
     let seen: { headers: Record<string, unknown>; body: string } | undefined;

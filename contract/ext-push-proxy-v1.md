@@ -64,17 +64,23 @@ Registers or rotates one ActivityKit push token, scoped to the authenticated dev
 
 ```json
 {
-  "activityId": "ActivityKit id", "runId": "client run id", "conversationId": "gateway id",
+  "activityId": "ActivityKit id", "runId": "client run id", "conversationId": "bot chat session id",
   "bot": "canonical bot name", "token": "lowercase hex", "environment": "development" | "production"
 }
 ```
+
+`conversationId` is the canonical bot-chat session id. It scopes terminal ownership and ordinary
+notification suppression so an unrelated scheduled message from the same bot is never mistaken for
+the user-started run represented by the Live Activity.
 
 The gateway registers the raw token with its private relay as `apns-liveactivity`, stores only the
 opaque relay push id, and deletes the replaced relay registration. Canonical bot state, tool and
 delta frames drive coarse `thinking`, `usingTools`, and `writing` updates. Only an authoritative
 terminal `bot_chat_state` ends an activity; transcript/history snapshots never do. Payloads contain
-no prompt, response text, tool names, arguments, or results. Normal updates use APNs priority 5 and
-the ordinary encrypted completion notification remains the sole alert.
+no prompt, response text, tool names, arguments, or results. Normal updates use APNs priority 5.
+For a device with an active registration, the terminal ActivityKit push is the sole reply-ready
+alert and uses priority 10; the gateway suppresses that device's ordinary encrypted completion
+notification. A device without an active registration retains the ordinary notification fallback.
 
 ### DELETE /push/live-activities/:activityId
 

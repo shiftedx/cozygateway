@@ -265,6 +265,21 @@ describe("POST /notify", () => {
     } })).status).toBe(400);
   });
 
+  it("accepts a bounded terminal Live Activity alert and passes it to the transport", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const liveActivity = {
+      timestamp: 10, event: "end", priority: 10, dismissalDate: 910,
+      alert: { title: "CozyChat", body: "Your bot’s reply is ready", sound: "default" },
+      contentState: { phase: "completed", toolCallCount: 1, shortStatus: "Finished", eventSequence: 2 },
+    };
+    expect((await notify(app, { pushId, liveActivity })).status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries).toEqual([{
+      token: "https://x.example/hook", ciphertext: "", options: { liveActivity },
+    }]);
+  });
+
   it("delivers ciphertext through the transport and 202s", async () => {
     const { app, deliveries } = harness();
     const pushId = await registeredPushId(app);

@@ -113,6 +113,7 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
           ...(push.liveActivity.dismissalDate === undefined
             ? {}
             : { "dismissal-date": push.liveActivity.dismissalDate }),
+          ...(push.liveActivity.alert === undefined ? {} : { alert: push.liveActivity.alert }),
         },
       });
       return new Promise<void>((resolve, reject) => {
