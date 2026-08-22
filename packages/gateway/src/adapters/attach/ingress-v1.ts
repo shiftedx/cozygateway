@@ -182,7 +182,6 @@ export class AttachV1Ingress implements TurnEndpoint {
         // Gateway is the sole heartbeat initiator. The inbound frame is its one acknowledgement,
         // not a request for another response; echoing it makes two healthy peers amplify heartbeats.
         this.#lastHeartbeatAt = receivedAt;
-        this.#flush(agentId, connection.commandCursor);
         return;
       }
       if (frame.kind === "ack") {
