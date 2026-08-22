@@ -151,4 +151,27 @@ describe("attach-v1 durable transport storage", () => {
     expect(storage.nativeBotSessions("sage", 10).map((session) => session.id).sort()).toEqual(["older", "selected"]);
     storage.close();
   });
+
+  it("closes orphaned running tools on restart without touching the active turn", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-v1-orphaned-tools-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const oldSessionId = storage.resetNativeBotChat("sage", 1);
+    storage.setNativeBotTurn("sage", oldSessionId, "orphaned-turn", 2);
+    const sessionId = storage.resetNativeBotChat("sage", 1);
+    storage.setNativeBotTurn("sage", sessionId, "active-turn", 2);
+    for (const [turnId, toolSessionId] of [["orphaned-turn", oldSessionId], ["active-turn", sessionId]] as const) {
+      storage.upsertBotChatToolStep({
+        bot: "sage", sessionId: toolSessionId, turnId, stepId: `${turnId}-step`, seq: 1,
+        name: "terminal", status: "running", startedAt: 3, endedAt: undefined,
+      });
+    }
+    storage.close();
+
+    storage = openStorage(path);
+    const steps = [...storage.botChatToolSteps(oldSessionId, 0), ...storage.botChatToolSteps(sessionId, 0)];
+    expect(steps.find((step) => step.turnId === "orphaned-turn")).toMatchObject({ status: "interrupted" });
+    expect(steps.find((step) => step.turnId === "orphaned-turn")?.endedAt).not.toBeNull();
+    expect(steps.find((step) => step.turnId === "active-turn")).toMatchObject({ status: "running", endedAt: null });
+    storage.close();
+  });
 });
