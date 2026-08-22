@@ -18,13 +18,32 @@ On the iPhone, install the Tailscale app, sign in to the same tailnet, and turn
 on its VPN connection. Confirm the gateway host appears in the app before
 pairing CozyChat.
 
-Use either the resulting `100.x` address or the host's MagicDNS name as the
-phone gateway URL, for example `http://100.64.0.10:8787` or
-`http://my-hermes.tailnet-name.ts.net:8787`. Limit
-the chosen TCP port to the intended phones with your tailnet ACL/grant policy
-and any host firewall policy. If you want HTTPS, arrange TLS termination
-yourself. The local Hermes attach plugins continue to use
-`http://127.0.0.1:8787` and do not need an exposed port.
+CozyChat requires HTTPS for a Tailscale address: iOS cannot use its local-network
+HTTP exception for a `100.x` address or a `.ts.net` hostname. Let Tailscale Serve
+terminate TLS and proxy its local `127.0.0.1:8787` target for the tailnet-only endpoint:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:8787
+tailscale serve status
+```
+
+If MagicDNS or HTTPS certificates are not enabled yet, Tailscale Serve prompts you
+to enable them in your tailnet's DNS settings. It provisions the certificate for the
+host's MagicDNS name and persists its own configuration; do not use Funnel, which
+would make the endpoint public. Pair CozyChat with the HTTPS MagicDNS origin reported by
+`tailscale serve status`, for example
+`https://my-hermes.tailnet-name.ts.net`, and mint its code with:
+
+```sh
+~/.cozygateway/bin/cozygateway pair --url https://my-hermes.tailnet-name.ts.net
+```
+
+Limit the service to the intended phones with your tailnet ACL/grant policy. The
+local Hermes attach plugins continue to use `http://127.0.0.1:8787` and do not
+need an exposed port. For alternatives or operational details, see Tailscale's
+[Serve](https://tailscale.com/docs/features/tailscale-serve) and
+[HTTPS certificate](https://tailscale.com/docs/how-to/set-up-https-certificates)
+documentation.
 
 ## User-managed named Cloudflare Tunnel and domain
 

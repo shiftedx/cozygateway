@@ -46,7 +46,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
 
 The gateway and attach plugin both stay on this machine. This installer never
-configures Tailscale, tunnels, DNS, routers, or firewalls.
+configures remote networking, DNS, routers, or firewalls.
 USAGE
 }
 
@@ -305,6 +305,11 @@ write_state() {
   {
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
+    # Keep the exact executable that performed the install. `--uninstall` may
+    # run long after PATH or COZYGATEWAY_HERMES_BIN changed, and must not tear
+    # down the CozyGateway service before discovering it cannot reverse the
+    # Hermes work it owns.
+    printf 'hermes_bin=%s\n' "$HERMES_RESOLVED"
     for profile in "${SELECTED[@]}"; do printf 'service_%s=%s\n' "$profile" "$(service_action_for "$profile")"; done
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -435,12 +440,16 @@ start_dashboard() {
   die "Hermes Dashboard did not accept the local control-plane credential on 127.0.0.1:$DASHBOARD_PORT"
 }
 uninstall() {
-  local profiles root p home plugin spool action
+  local profiles root hermes_bin p home plugin spool action
   [ -f "$STATE_FILE" ] || die "no CozyGateway install state at $STATE_FILE"
-  # install-state contains only profile names and the observed Hermes root; no secrets.
+  # install-state contains only profile names, paths, and lifecycle state; no secrets.
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
+  hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
   profiles="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"
-  [ -n "$root" ] && [ -n "$profiles" ] || die "install state is incomplete"
+  [ -n "$root" ] && [ -n "$hermes_bin" ] && [ -n "$profiles" ] || die "install state is incomplete"
+  case "$hermes_bin" in /*) ;; *) die "installer state has an unsafe Hermes executable path" ;; esac
+  [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || die "Hermes executable from installer state is unavailable: $hermes_bin"
+  HERMES_RESOLVED="$hermes_bin"
   resolve_platform
   if [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
@@ -454,12 +463,12 @@ uninstall() {
     valid_profile "$p" || die "unsafe profile in installer state"; home="$(profile_home "$p")"; plugin="$home/plugins/cozygateway"; spool="$home/plugin-data/cozygateway/attach-v1.sqlite"
     action="$(prior_service_action "$p")"
     case "$action" in
-      installed) run "$HERMES_BIN" -p "$p" gateway uninstall; say "OK    removed Hermes gateway service installed by CozyGateway for profile $p" ;;
-      started) run "$HERMES_BIN" -p "$p" gateway stop; say "OK    stopped Hermes gateway service started by CozyGateway for profile $p" ;;
+      installed) run "$HERMES_RESOLVED" -p "$p" gateway uninstall; say "OK    removed Hermes gateway service installed by CozyGateway for profile $p" ;;
+      started) run "$HERMES_RESOLVED" -p "$p" gateway stop; say "OK    stopped Hermes gateway service started by CozyGateway for profile $p" ;;
       preexisting) ;;
       '') die "missing Hermes gateway lifecycle state for profile $p" ;;
     esac
-    if [ -f "$plugin/.cozygateway-installer-owned" ]; then run "$HERMES_BIN" -p "$p" plugins disable cozygateway; run rm -rf "$plugin"; fi
+    if [ -f "$plugin/.cozygateway-installer-owned" ]; then run "$HERMES_RESOLVED" -p "$p" plugins disable cozygateway; run rm -rf "$plugin"; fi
     env_remove_owned "$home/.env"; run rm -f "$spool" "$spool-wal" "$spool-shm"
   done
   run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
@@ -473,7 +482,7 @@ main() {
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   write_gateway_config; ensure_hermes_gateways; write_state; write_cli_wrapper; start_dashboard; install_service
   if [ "$DRY_RUN" = 0 ]; then "$CLI_WRAPPER" pair --config "$CONFIG_JSON"; else say "DRY   mint pairing code with $CLI_WRAPPER pair"; fi
-  say "OK    CozyGateway listens on $BIND_HOST:$PORT. LAN/Tailscale/tunnel exposure is user-managed."
+  say "OK    CozyGateway listens on $BIND_HOST:$PORT. Remote exposure is user-managed."
   say "INFO  pair a remote URL with: $CLI_WRAPPER pair --url https://gateway.example.com"
 }
 main

@@ -84,12 +84,16 @@ for platform in Darwin Linux; do
 done
 
 # A non-dry macOS-path run proves the installer writes the Hermes-only config
-# and secret files without needing a real launchd or Hermes process.
-cat > "$tmp/bin/launchctl" <<'LAUNCHCTL'
+# and secret files without needing a real launchd or Hermes process. Keep the
+# service-manager fake separate from Hermes so uninstall can prove it uses the
+# executable persisted in installer state instead of whichever `hermes` PATH
+# happens to contain later.
+mkdir -p "$tmp/service-bin"
+cat > "$tmp/service-bin/launchctl" <<'LAUNCHCTL'
 #!/usr/bin/env bash
 exit 0
 LAUNCHCTL
-chmod 700 "$tmp/bin/launchctl"
+chmod 700 "$tmp/service-bin/launchctl"
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 case "$*" in
@@ -98,7 +102,7 @@ case "$*" in
 esac
 CURL
 chmod 700 "$tmp/bin/curl"
-live_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+live_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 # shellcheck disable=SC2016
 if grep -Fq 'spaces $dollar' <<<"$live_output"; then
   echo 'installer output must not contain credentials' >&2
@@ -126,6 +130,7 @@ grep -q '^active:gateway:restart$' "$tmp/commands"
 grep -q '^service_default=installed$' "$tmp/gateway-live/local/install-state"
 grep -q '^service_ops=started$' "$tmp/gateway-live/local/install-state"
 grep -q '^service_active=preexisting$' "$tmp/gateway-live/local/install-state"
+grep -Fq "hermes_bin=$tmp/bin/hermes" "$tmp/gateway-live/local/install-state"
 test ! -e "$credential_marker"
 test -x "$tmp/gateway-live/bin/cozygateway"
 if grep -Eq 'COZYGATEWAY_(HERMES_PASSWORD|ATTACH_TOKEN)' "$tmp/gateway-live/bin/cozygateway"; then
@@ -146,7 +151,7 @@ fi
 default_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 ops_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 install_count_before="$(grep -c '^default:gateway:install$' "$tmp/commands")"
-PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" >/dev/null
+PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" >/dev/null
 test "$default_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 test "$ops_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 test "$install_count_before" = "$(grep -c '^default:gateway:install$' "$tmp/commands")"
@@ -155,7 +160,9 @@ test "$(grep -c '^default:gateway:restart$' "$tmp/commands")" = 1
 # Uninstall reverses only lifecycle work owned by CozyGateway: its installed
 # default service is removed, its started existing service is stopped, and the
 # pre-existing active service is left untouched.
-PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
+# Deliberately remove the fake Hermes directory and omit COZYGATEWAY_HERMES_BIN:
+# uninstall must use the absolute executable captured at install time.
+PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
 grep -q '^default:gateway:uninstall$' "$tmp/commands"
 grep -q '^ops:gateway:stop$' "$tmp/commands"
 if grep -q '^active:gateway:\(stop\|uninstall\)$' "$tmp/commands"; then

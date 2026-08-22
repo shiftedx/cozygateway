@@ -94,8 +94,6 @@ export class GroupInvalid extends Error {
 }
 
 export interface GroupRoomsOptions {
-  /** Retained only for source compatibility while gateway assembly is migrated; never read. */
-  rpc?: unknown;
   storage: Storage;
   broadcast: (frame: ServerFrame) => void;
   now: () => number;
@@ -136,9 +134,6 @@ export interface GroupRoomsOptions {
   escalate?: (event: { group: string; member: string; displayName: string; text: string }) => void;
   /** Existing attach-v1 turn transport, injected after the ingress exists. */
   nativeTurns?: NativeGroupTurnEndpoint;
-  /** Retained only for source compatibility; group turns no longer use stream/session plumbing. */
-  hidden?: boolean;
-  stream?: unknown;
   pollMs?: number;
   turnTimeoutMs?: number;
   chainDelayMs?: number;

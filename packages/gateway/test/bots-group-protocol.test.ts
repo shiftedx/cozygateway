@@ -10,7 +10,6 @@ import {
   buildTurnPrompt,
   deltaSince,
   formatLine,
-  groupSessionTitle,
   highestSeq,
   isPassText,
   memberMentionForms,
@@ -235,11 +234,5 @@ describe("watermarks", () => {
     expect(deltaSince(trimmed, 2).map((e) => e.seq)).toEqual([3]);
     expect(highestSeq(trimmed)).toBe(3);
     expect(highestSeq([], 7)).toBe(7);
-  });
-});
-
-describe("groupSessionTitle", () => {
-  it("is the desktop's exact convention, since the title doubles as a lookup key", () => {
-    expect(groupSessionTitle("Release Room")).toBe("Group: Release Room");
   });
 });

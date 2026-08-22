@@ -46,15 +46,8 @@ export const BotSummarySchema = Type.Object({
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
-/** A session kind retained for wire compatibility. Configured attach-v1 Bot Mode sessions currently
- *  project as `conversation`; the other kinds belong to older control-plane projections. */
-export const BotSessionKindSchema = Type.Union([
-  Type.Literal("conversation"),
-  Type.Literal("cron"),
-  Type.Literal("routine"),
-  Type.Literal("group"),
-  Type.Literal("a2a"),
-]);
+/** Gateway-owned attach-v1 Bot Mode sessions are conversations. */
+export const BotSessionKindSchema = Type.Literal("conversation");
 export type BotSessionKind = Static<typeof BotSessionKindSchema>;
 
 export const BotSessionSummarySchema = Type.Object({

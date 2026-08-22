@@ -162,7 +162,7 @@ describe("bots cache", () => {
 });
 
 describe("routine override metadata", () => {
-  it("preserves absent versus null and is removed with the bot", () => {
+  it("preserves absent versus null and supports explicit removal", () => {
     const storage = openStorage(":memory:");
     storage.setBotRoutineOverrides("scout", "job-1", { model: null, effort: "low" });
     expect(storage.botRoutineOverrides("scout", "job-1")).toEqual({ model: null, effort: "low" });
@@ -170,7 +170,7 @@ describe("routine override metadata", () => {
     storage.setBotRoutineOverrides("scout", "job-1", { effort: null });
     expect(storage.botRoutineOverrides("scout", "job-1")).toEqual({ effort: null });
 
-    storage.forgetBot("scout");
+    storage.deleteBotRoutineOverrides("scout", "job-1");
     expect(storage.botRoutineOverrides("scout", "job-1")).toBeUndefined();
   });
 });

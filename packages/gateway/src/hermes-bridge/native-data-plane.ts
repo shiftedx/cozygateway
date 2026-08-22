@@ -17,6 +17,7 @@ import type {
 
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
+import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import type {
   BotApprovalDecision,
@@ -366,7 +367,22 @@ export class NativeBotDataPlane {
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const messageId = opts?.clientId ?? randomUUID();
-    const turnId = randomUUID();
+    const turnId = chat.activeTurnId ?? randomUUID();
+    const accepted = chat.activeTurnId === undefined
+      ? this.#ingress.sendNativeTurn(bot, {
+          threadId: chat.sessionId,
+          turnId,
+          messageId,
+          text,
+        })
+      : this.#ingress.sendNativeSteer(bot, {
+          threadId: chat.sessionId,
+          turnId,
+          messageId,
+          text,
+        });
+    if (!accepted)
+      throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
     const message = this.#storage.appendNativeBotMessage({
       bot,
       sessionId: chat.sessionId,
@@ -376,7 +392,12 @@ export class NativeBotDataPlane {
       at: now,
       ...(opts?.clientId === undefined ? {} : { clientId: opts.clientId }),
     });
-    this.#submitNativeTurn(bot, chat.sessionId, turnId, message, text, now);
+    if (chat.activeTurnId === undefined) {
+      this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+    }
+    this.#broadcastMessage(bot, chat.sessionId, message, now);
+    if (chat.activeTurnId === undefined)
+      this.#state(bot, chat.sessionId, "polling", true);
     return { sessionId: chat.sessionId, message };
   }
 
@@ -403,6 +424,20 @@ export class NativeBotDataPlane {
     const mediaId = randomUUID().replaceAll("-", "");
     const messageId = photo.clientId ?? randomUUID();
     const turnId = randomUUID();
+    if (chat.activeTurnId !== undefined) {
+      throw new BackendUnavailable(
+        `native attach-v1 profile "${bot}" cannot accept a photo while a turn is running`,
+      );
+    }
+    if (!this.#ingress.sendNativeTurn(bot, {
+      threadId: chat.sessionId,
+      turnId,
+      messageId,
+      text: photo.text,
+      mediaIds: [mediaId],
+    })) {
+      throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
+    }
     this.#storage.saveAttachMedia(
       bot,
       {
@@ -434,40 +469,18 @@ export class NativeBotDataPlane {
       attachments: [attachment],
       ...(photo.clientId === undefined ? {} : { clientId: photo.clientId }),
     });
-    this.#submitNativeTurn(
-      bot,
-      chat.sessionId,
-      turnId,
-      message,
-      photo.text,
-      now,
-      [mediaId],
-    );
+    this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+    this.#broadcastMessage(bot, chat.sessionId, message, now);
+    this.#state(bot, chat.sessionId, "polling", true);
     return { sessionId: chat.sessionId, message };
   }
 
-  #submitNativeTurn(
+  #broadcastMessage(
     bot: string,
     sessionId: string,
-    turnId: string,
     message: BotChatMessage,
-    text: string,
     now: number,
-    mediaIds?: string[],
   ): void {
-    this.#storage.setNativeBotTurn(bot, sessionId, turnId, now);
-    if (
-      !this.#ingress.sendNativeTurn(bot, {
-        threadId: sessionId,
-        turnId,
-        messageId: message.id,
-        text,
-        ...(mediaIds === undefined ? {} : { mediaIds }),
-      })
-    ) {
-      this.#storage.setNativeBotTurn(bot, sessionId, undefined, now);
-      throw new Error(`native attach-v1 profile "${bot}" is unavailable`);
-    }
     this.#broadcast({
       type: "bot_chat",
       bot,
@@ -475,7 +488,6 @@ export class NativeBotDataPlane {
       messages: [message],
       updatedAt: now,
     });
-    this.#state(bot, sessionId, "polling", true);
   }
 
   async #reset(name: string) {
@@ -643,7 +655,12 @@ export class NativeBotDataPlane {
     turnId: string,
     phase: "complete" | "failed" = "complete",
   ): void {
-    this.#storage.setNativeBotTurn(bot, sessionId, undefined, this.#now());
+    const settledActiveTurn = this.#storage.clearNativeBotTurn(
+      bot,
+      sessionId,
+      turnId,
+      this.#now(),
+    );
     const seq = (this.#draftSeq.get(turnId) ?? 0) + 1;
     this.#broadcast({
       type: "bot_chat_delta",
@@ -656,7 +673,7 @@ export class NativeBotDataPlane {
       done: true,
     });
     this.#draftSeq.delete(turnId);
-    this.#state(bot, sessionId, phase, false);
+    if (settledActiveTurn) this.#state(bot, sessionId, phase, false);
   }
 
   #commit(

@@ -202,12 +202,6 @@ export function buildTurnPrompt(
   ].join("\n");
 }
 
-/** Historical room title retained for desktop prompt compatibility. Native group execution uses
- *  gateway-owned attach thread ids instead of this dashboard-session convention. */
-export function groupSessionTitle(group: string): string {
-  return `Group: ${group}`;
-}
-
 /** The entries a member has not seen: everything past its watermark, oldest first.
  *
  *  ONE deliberate implementation difference from the desktop, with identical semantics. The desktop

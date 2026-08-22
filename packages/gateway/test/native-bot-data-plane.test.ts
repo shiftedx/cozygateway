@@ -8,6 +8,7 @@ import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
+import { BackendUnavailable } from "../src/errors.ts";
 import { openStorage } from "../src/storage.ts";
 
 describe("attach-v1 native Bot Mode plane", () => {
@@ -79,6 +80,120 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(frames.some((frame) => frame.type === "bot_chat_delta")).toBe(true);
     expect(frames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "answer-1"))).toBe(true);
     expect(frames.at(-1)).toMatchObject({ type: "bot_chat", bot: "sage" });
+    storage.close();
+  });
+
+  it("steers a follow-up into the active native turn without replacing its binding", async () => {
+    const storage = openStorage(":memory:");
+    const turns: Array<Record<string, unknown>> = [];
+    const steers: Array<Record<string, unknown>> = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        turns.push(input);
+        storage.enqueueAttachCommand(
+          bot,
+          `turn:${String(input.turnId)}`,
+          { kind: "turn", ...input } as never,
+          1,
+        );
+        return true;
+      },
+      sendNativeSteer: (_bot: string, input: Record<string, unknown>) => {
+        steers.push(input);
+        return true;
+      },
+      sendNativeInterrupt: () => true,
+    } as unknown as AttachV1Ingress;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 10,
+    });
+    const surface = plane.surface();
+
+    const first = await surface.sendChatMessage("sage", "first", {
+      clientId: "first",
+    });
+    await surface.sendChatMessage("sage", "follow up", { clientId: "second" });
+
+    expect(turns).toHaveLength(1);
+    expect(steers).toEqual([
+      expect.objectContaining({
+        threadId: first.sessionId,
+        turnId: turns[0]?.turnId,
+        messageId: "second",
+        text: "follow up",
+      }),
+    ]);
+    expect(await surface.chatHistory("sage")).toMatchObject({
+      running: true,
+      messages: [{ id: "first" }, { id: "second" }],
+    });
+
+    expect(
+      plane.handle("sage", {
+        kind: "event",
+        sequence: 1,
+        eventId: "done",
+        event: {
+          kind: "commit",
+          threadId: first.sessionId,
+          turnId: String(turns[0]?.turnId),
+          messageId: "answer",
+          blocks: [{ type: "paragraph", text: "done" }],
+        },
+      }),
+    ).toBe(true);
+    expect(await surface.chatHistory("sage")).toMatchObject({ running: false });
+    plane.close();
+    storage.close();
+  });
+
+  it("does not persist text, photos, or media when attach admission fails", async () => {
+    const storage = openStorage(":memory:");
+    let rejectedMediaId: string | undefined;
+    const ingress = {
+      sendNativeTurn: (
+        _bot: string,
+        input: { mediaIds?: string[] },
+      ) => {
+        rejectedMediaId = input.mediaIds?.[0];
+        return false;
+      },
+      sendNativeSteer: () => false,
+    } as unknown as AttachV1Ingress;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 10,
+    });
+    const surface = plane.surface();
+
+    await expect(surface.sendChatMessage("sage", "not queued")).rejects.toBeInstanceOf(
+      BackendUnavailable,
+    );
+    expect((await surface.chatHistory("sage")).messages).toEqual([]);
+
+    await expect(
+      surface.sendChatPhoto("sage", {
+        bytes: new Uint8Array([1, 2, 3]),
+        mime: "image/png",
+        ext: "png",
+        text: "not queued",
+      }),
+    ).rejects.toBeInstanceOf(BackendUnavailable);
+    expect(rejectedMediaId).toBeDefined();
+    expect(storage.attachMediaInfo("sage", rejectedMediaId!, 10)).toBeUndefined();
+    expect((await surface.chatHistory("sage")).messages).toEqual([]);
+    plane.close();
     storage.close();
   });
 

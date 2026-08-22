@@ -107,8 +107,12 @@ destructive erase.
 
 ### Native sends, events, and suggestions
 
-`POST /bots/:name/chat/messages` and `POST /bots/:name/chat/photos` synchronously append the user
-row to the native transcript, enqueue an attach-v1 turn command, and answer `202` with that row.
+`POST /bots/:name/chat/messages` and `POST /bots/:name/chat/photos` first admit a durable attach-v1
+command, then append the user row to the native transcript and answer `202` with that row. If the
+configured attach profile cannot accept the command, the request answers `503 backend_unavailable`
+without storing transcript or media data. A text send during an active turn is admitted as a native
+attach-v1 steer under that turn's id; a photo send during an active turn returns the same `503` so
+the client can retry after the turn settles.
 The attached plugin returns draft, commit, terminal, tool, approval, and clarification events.
 Gateway projection of those durable events emits the corresponding server frames and updates the
 same transcript read by `GET /bots/:name/chat/messages`.
@@ -120,7 +124,7 @@ row. Once any row exists, the field is absent.
 
 `running` and `inflight` in history are the gateway's durable active-turn view. Live state frames
 are the fresher source for a composing UI. `POST /bots/:name/chat/stop` sends attach-v1 interrupt
-for that active native turn; normal text sends do not use a Dashboard steering path.
+for that active native turn; follow-up text uses native attach-v1 steering, never Dashboard chat.
 
 ### Attachments and media
 
@@ -149,7 +153,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Hermes profile model update. |
 | `GET /bots/:name/chat` | — | `{ name, sessionId, adoption: "created" \| "pin" }` | Resolves the selected native chat. |
 | `GET /bots/:name/chat/messages` | — | `{ name, sessionId, adoption, messages, running, inflight, updatedAt, suggestion?, toolSteps? }` | Reads native transcript and native tool history. |
-| `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Appends locally, then queues attach-v1 turn. |
+| `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Admits a native turn or steer, then appends locally. |
 | `POST /bots/:name/chat/photos` | multipart `file`, `BotChatPhotoFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated image plus optional caption. |
 | `POST /bots/:name/chat/stop` | — | `BotChatStopResponse` | Interrupts the current native turn; returns 409 when idle. |
 | `POST /bots/:name/chat/reset` | — | `BotChatResetResponse` | Selects a fresh native chat and emits reset. |

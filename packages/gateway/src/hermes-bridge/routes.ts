@@ -16,6 +16,7 @@ import {
   assertValid,
 } from "cozygateway-contract";
 
+import { BackendUnavailable } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import {
@@ -207,6 +208,8 @@ function failure(c: Context<Env>, err: unknown) {
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   }
+  if (err instanceof BackendUnavailable)
+    return c.json(errorBody("backend_unavailable", err.message), 503);
   // A routine id that names nothing in this bot's namespace is not found, not forbidden: this API
   // does not confirm jobs outside the bot that was asked about.
   if (err instanceof RoutineNotFound)

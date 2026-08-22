@@ -882,22 +882,6 @@ export class Storage {
     this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ? AND routine_id = ?").run(bot, routineId);
   }
 
-  /** Drops cache and native Bot Mode state for a deleted profile. */
-  forgetBot(name: string): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      this.#db.prepare("DELETE FROM bot_roster WHERE name = ?").run(name);
-      // The tool steps go with them, same name-keying argument: a rebuilt bot reusing the name must
-      // not show a history strip describing what its predecessor did.
-      this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(name);
-      this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ?").run(name);
-      this.#db.exec("COMMIT");
-    } catch (err) {
-      this.#db.exec("ROLLBACK");
-      throw err;
-    }
-  }
-
   // --- Group chat rooms (contract/ext-bots-v1.md section 4, groups). ------------------------------
 
   /** Creates a room. Returns false when one already exists under the same case-insensitive key,
@@ -1632,6 +1616,21 @@ export class Storage {
     this.#db
       .prepare("UPDATE bot_native_chats SET active_turn_id = ?, updated_at = ? WHERE bot = ? AND session_id = ?")
       .run(turnId ?? null, now, bot, sessionId);
+  }
+
+  clearNativeBotTurn(bot: string, sessionId: string, turnId: string, now: number): boolean {
+    const cleared = this.#db
+      .prepare(
+        "UPDATE bot_native_sessions SET active_turn_id = NULL, updated_at = ? WHERE bot = ? AND session_id = ? AND active_turn_id = ?",
+      )
+      .run(now, bot, sessionId, turnId);
+    if (cleared.changes === 0) return false;
+    this.#db
+      .prepare(
+        "UPDATE bot_native_chats SET active_turn_id = NULL, updated_at = ? WHERE bot = ? AND session_id = ? AND active_turn_id = ?",
+      )
+      .run(now, bot, sessionId, turnId);
+    return true;
   }
 
   appendNativeBotMessage(input: {
