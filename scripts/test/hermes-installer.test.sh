@@ -146,6 +146,7 @@ remote_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/co
 grep -q '"gatewayUrl":"https://gateway.example.com"' <<<"$remote_pair"
 grep -Fq 'parseEnv(readFileSync(gatewayEnvPath' "$tmp/gateway-live/local/run-gateway.sh"
 grep -Fq '/auth/password-login' "$tmp/gateway-live/local/run-gateway.sh"
+sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' | "$real_node" --check -
 if grep -Fq '. "' "$tmp/gateway-live/local/run-gateway.sh"; then
   echo 'gateway wrapper must not source credential files' >&2
   exit 1

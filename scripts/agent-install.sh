@@ -332,6 +332,7 @@ exec "$NODE_RESOLVED" - "$GATEWAY_ENV" "$DASHBOARD_ENV" "$HERMES_ROOT" "$HERMES_
 const { readFileSync } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
+async function main() {
 const [gatewayEnvPath, dashboardEnvPath, hermesRoot, hermes, dashboardPort, cli, config] = process.argv.slice(2);
 const gatewayEnv = parseEnv(readFileSync(gatewayEnvPath, 'utf8'));
 const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
@@ -357,6 +358,8 @@ if (health) {
 const child = spawn(cli, ['serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));
 child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+}
+main();
 NODE
 WRAPPER
   chmod 700 "$WRAPPER"
