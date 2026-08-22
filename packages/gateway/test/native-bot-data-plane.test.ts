@@ -92,6 +92,25 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("queues a document as gateway-owned file media", async () => {
+    const storage = openStorage(":memory:");
+    const turns: Array<{ mediaIds?: string[] }> = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage,
+      ingress: { sendNativeTurn: (_bot: string, turn: { mediaIds?: string[] }) => { turns.push(turn); return true; } } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 10,
+    });
+    const sent = await plane.surface().sendChatAttachment("sage", {
+      bytes: new TextEncoder().encode('{"ok":true}'), mime: "application/json", name: "report.json", text: "Read this.",
+    });
+    const attachment = sent.message.attachments?.[0];
+    expect(attachment).toMatchObject({ name: "report.json", mimeType: "application/json", mediaKind: "file" });
+    expect(turns[0]?.mediaIds).toEqual([attachment?.fileId]);
+    expect(storage.attachMediaInfo("sage", attachment!.fileId, 10)?.descriptor.family).toBe("file");
+    plane.close();
+    storage.close();
+  });
+
   it("steers a follow-up into the active native turn without replacing its binding", async () => {
     const storage = openStorage(":memory:");
     const turns: Array<Record<string, unknown>> = [];
@@ -587,6 +606,18 @@ describe("attach-v1 native Bot Mode plane", () => {
         bytes: new Uint8Array([1, 2, 3]),
         mime: "image/png",
         ext: "png",
+        text: "not queued",
+      }),
+    ).rejects.toBeInstanceOf(BackendUnavailable);
+    expect(rejectedMediaId).toBeDefined();
+    expect(storage.attachMediaInfo("sage", rejectedMediaId!, 10)).toBeUndefined();
+    expect((await surface.chatHistory("sage")).messages).toEqual([]);
+
+    await expect(
+      surface.sendChatAttachment("sage", {
+        bytes: new TextEncoder().encode("%PDF-1.7\n"),
+        mime: "application/pdf",
+        name: "report.pdf",
         text: "not queued",
       }),
     ).rejects.toBeInstanceOf(BackendUnavailable);

@@ -471,8 +471,8 @@ describe("capability advertisement", () => {
     // plus new-session minting through the existing adoption frame without retiring the old chat.
     // 20 adds assistant audio/video metadata and ranged attachment delivery.
     // 22 adds durable native clarification cards plus their idempotent selection route.
-    // 23 adds exact native turn status/cause and queued-at recovery metadata.
-    expect(BOTS_CAPABILITY_VERSION).toBe(23);
+    // 23 adds exact native turn status/cause and queued-at recovery metadata; 24 adds files.
+    expect(BOTS_CAPABILITY_VERSION).toBe(24);
   });
 
   it("accepts capability-23 native turn status without changing legacy state fields", () => {

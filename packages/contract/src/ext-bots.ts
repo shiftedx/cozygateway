@@ -477,6 +477,10 @@ export const BotChatPhotoFieldsSchema = Type.Object({
 });
 export type BotChatPhotoFields = Static<typeof BotChatPhotoFieldsSchema>;
 
+/** Non-file parts of `POST /bots/:name/chat/attachments` (capability 24). */
+export const BotChatAttachmentFieldsSchema = BotChatPhotoFieldsSchema;
+export type BotChatAttachmentFields = Static<typeof BotChatAttachmentFieldsSchema>;
+
 /** `POST /bots/focus` body. The app declares what it is looking at so the bridge polls Hermes at
  *  the desktop's cadences only while a screen is open, and idles otherwise. `null` means the app
  *  left the bots surface. */
@@ -1014,6 +1018,8 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *  - `22`: NATIVE CLARIFICATION. Adds `bot_clarify_pending` / `bot_clarify_resolved` and the
  *    authenticated option-resolution route. Pending/options/expiry are durable and stable-id
  *    idempotent across gateway/plugin restart.
- *  - `23`: exact native turn status/cause and durable queued-at recovery metadata. */
+ *  - `23`: exact native turn status/cause and durable queued-at recovery metadata.
+ *  - `24`: document attachments. `POST /bots/:name/chat/attachments` accepts one validated
+ *    common document, and attachment `mediaKind: "file"` tells clients to offer download/share. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 23;
+export const BOTS_CAPABILITY_VERSION = 24;

@@ -7,7 +7,7 @@ WebSocket dial helper it uses; there is no legacy transport implementation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 # The gateway closes the socket with this code when a newer connection supersedes
@@ -164,6 +164,7 @@ class TurnFrame:
     thread_id: str
     turn_id: str
     text: str
+    media_ids: List[str] = field(default_factory=list)
 
 
 def parse_turn_frame(frame: Any) -> Optional[TurnFrame]:
@@ -183,7 +184,12 @@ def parse_turn_frame(frame: Any) -> Optional[TurnFrame]:
         return None
     if not isinstance(text, str):
         return None
-    return TurnFrame(thread_id=thread_id, turn_id=turn_id, text=text)
+    media_ids = frame.get("mediaIds")
+    if media_ids is None:
+        media_ids = []
+    if not isinstance(media_ids, list) or len(media_ids) > 16 or any(not isinstance(item, str) or not item for item in media_ids):
+        return None
+    return TurnFrame(thread_id=thread_id, turn_id=turn_id, text=text, media_ids=media_ids)
 
 
 @dataclass

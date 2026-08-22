@@ -114,6 +114,13 @@ export interface BotChatPhotoUpload {
   text: string;
   clientId?: string;
 }
+export interface BotChatFileUpload {
+  bytes: Uint8Array;
+  mime: string;
+  name: string;
+  text: string;
+  clientId?: string;
+}
 export interface BotChatAttachmentBytes {
   bytes: Uint8Array;
   mime: string;
@@ -227,6 +234,10 @@ export interface BotsSurface extends BotControlSurface {
   sendChatPhoto(
     name: string,
     photo: BotChatPhotoUpload,
+  ): Promise<{ sessionId: string; message: BotChatMessage }>;
+  sendChatAttachment(
+    name: string,
+    file: BotChatFileUpload,
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
   chatAttachmentInfo(
     name: string,

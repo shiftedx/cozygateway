@@ -438,16 +438,31 @@ class AttachAdapter:
 
     async def _handle_turn(self, turn: TurnFrame) -> None:
         """Inject one turn frame as a synthetic inbound message."""
-        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+        from gateway.platforms.base import MessageEvent, cache_media_bytes  # harness-defined identifiers
 
         self._active_turn[turn.thread_id] = turn.turn_id
         # See _inbound_source for why turn/steer/interrupt share one source builder.
         # message_id is the per-turn reply anchor.
         source = self._inbound_source(turn.thread_id)
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        client = self._client
+        if client is not None:
+            for media_id in turn.media_ids:
+                try:
+                    data, filename, mime = await client.download_media(media_id)
+                    cached = cache_media_bytes(data, filename=filename, mime_type=mime)
+                    if cached is not None:
+                        media_urls.append(cached.path)
+                        media_types.append(cached.media_type)
+                except Exception:  # noqa: BLE001 - one bad attachment must not drop the turn
+                    logger.debug("attach: could not materialize inbound media %s", media_id, exc_info=True)
         event = MessageEvent(
             text=turn.text,
             source=source,
             message_id=turn.turn_id,
+            media_urls=media_urls,
+            media_types=media_types,
         )
         try:
             await self.handle_message(event)  # type: ignore[attr-defined]

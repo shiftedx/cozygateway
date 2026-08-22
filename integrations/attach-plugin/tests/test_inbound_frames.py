@@ -14,6 +14,7 @@ from cozygateway.attach_client import (
     SteerFrame,
     TurnFrame,
     parse_interrupt_frame,
+    parse_turn_frame,
     parse_steer_frame,
 )
 
@@ -28,6 +29,13 @@ class ParseSteerFrameTests(unittest.TestCase):
         self.assertIsNone(parse_steer_frame({"kind": "steer", "threadId": "t", "turnId": "u"}))
         self.assertIsNone(parse_steer_frame({"kind": "steer", "threadId": "", "turnId": "u", "text": "x"}))
         self.assertIsNone(parse_steer_frame("nope"))
+
+
+class ParseTurnFrameTests(unittest.TestCase):
+    def test_keeps_bounded_media_ids(self):
+        frame = parse_turn_frame({"kind": "turn", "threadId": "t", "turnId": "u", "text": "hi", "mediaIds": ["m1"]})
+        self.assertEqual(frame, TurnFrame(thread_id="t", turn_id="u", text="hi", media_ids=["m1"]))
+        self.assertIsNone(parse_turn_frame({"kind": "turn", "threadId": "t", "turnId": "u", "text": "hi", "mediaIds": [1]}))
 
 
 class ParseInterruptFrameTests(unittest.TestCase):
@@ -47,10 +55,12 @@ class _FakeMessageEvent:
     assert the injected text, source addressing, and (absence of) a reply anchor.
     """
 
-    def __init__(self, text, source, message_id=None):
+    def __init__(self, text, source, message_id=None, media_urls=None, media_types=None):
         self.text = text
         self.source = source
         self.message_id = message_id
+        self.media_urls = media_urls or []
+        self.media_types = media_types or []
 
 
 class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
@@ -73,6 +83,7 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
         platforms_mod = types.ModuleType("gateway.platforms")
         base_mod = types.ModuleType("gateway.platforms.base")
         base_mod.MessageEvent = _FakeMessageEvent
+        base_mod.cache_media_bytes = lambda *_args, **_kwargs: None
         gateway_mod.platforms = platforms_mod
         platforms_mod.base = base_mod
         sys.modules["gateway"] = gateway_mod
@@ -174,6 +185,21 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
                 "role_authorized": True,
             },
         )
+
+    async def test_turn_downloads_and_caches_gateway_media_before_injecting(self):
+        adapter = self._make_adapter()
+
+        class Client:
+            async def download_media(self, media_id):
+                self.last = media_id
+                return b"%PDF-1.7\n", "report.pdf", "application/pdf"
+
+        adapter._client = Client()
+        sys.modules["gateway.platforms.base"].cache_media_bytes = lambda *_args, **_kwargs: types.SimpleNamespace(path="/cache/report.pdf", media_type="application/pdf")
+        await adapter._handle_turn(TurnFrame(thread_id="chat-1", turn_id="turn-file", text="read", media_ids=["media-1"]))
+        event = adapter.injected[0]
+        self.assertEqual(event.media_urls, ["/cache/report.pdf"])
+        self.assertEqual(event.media_types, ["application/pdf"])
 
 
 if __name__ == "__main__":

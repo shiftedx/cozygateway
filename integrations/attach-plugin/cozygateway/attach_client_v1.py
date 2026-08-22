@@ -238,6 +238,38 @@ class AttachV1Client:
         await self._queue_event({"kind": "media", "media": descriptor})
         return descriptor
 
+    async def download_media(self, media_id: str, max_bytes: int = 20 * 1024 * 1024) -> tuple[bytes, str, str]:
+        """Fetch one gateway-owned attachment through the same bearer side channel.
+
+        The cap is enforced while reading so a malformed server response cannot make the plugin
+        buffer an arbitrary file before Hermes has a chance to classify it.
+        """
+        return await asyncio.to_thread(self._download_media_sync, media_id, max_bytes)
+
+    def _download_media_sync(self, media_id: str, max_bytes: int) -> tuple[bytes, str, str]:
+        parsed = urlparse(self._config.gateway_url)
+        origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
+        request = Request(f"{origin}/attach/v1/media/{quote(media_id, safe='')}", headers={
+            "Authorization": f"Bearer {self._config.token}",
+            "User-Agent": "CozyGateway-Attach/1.0",
+        })
+        context = self._ssl_context() if origin.startswith("https://") else None
+        with urlopen(request, context=context, timeout=60) as response:
+            declared = response.headers.get("Content-Length")
+            if declared is not None and int(declared) > max_bytes:
+                raise ValueError("gateway attachment exceeds configured cap")
+            data = response.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise ValueError("gateway attachment exceeds configured cap")
+            mime = response.headers.get_content_type()
+            disposition = response.headers.get("Content-Disposition", "")
+            marker = "filename*=UTF-8''"
+            filename = "attachment"
+            if marker in disposition:
+                from urllib.parse import unquote
+                filename = unquote(disposition.split(marker, 1)[1].split(";", 1)[0].strip()) or filename
+            return data, filename, mime
+
     def _upload_media_sync(self, media_id: str, path: str, mime: str, digest: str, data: bytes, expires_at: Optional[int]) -> Dict[str, Any]:
         parsed = urlparse(self._config.gateway_url)
         origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
