@@ -22,6 +22,9 @@ export function relayError(code: RelayErrorCode, message: string): RelayErrorBod
 export const RegisterRequestSchema = Type.Object({
   platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns")]),
   token: Type.String({ minLength: 1, maxLength: 2048 }),
+  /** APNs device tokens are scoped to Apple's sandbox or production service. Older clients omit
+   * this and retain the relay's configured APNS_ENVIRONMENT for backwards compatibility. */
+  environment: Type.Optional(Type.Union([Type.Literal("development"), Type.Literal("production")])),
 });
 export type RegisterRequest = Static<typeof RegisterRequestSchema>;
 

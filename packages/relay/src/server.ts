@@ -44,7 +44,13 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
   const transports: Record<string, ReturnType<typeof webhookTransport> | undefined> = {
     webhook: webhookTransport({ restrictEgress: config.restrictEgress }),
   };
-  if (config.apns !== undefined) transports.apns = apnsTransport(config.apns);
+  if (config.apns !== undefined) {
+    // Keep the configured environment as the legacy default for clients that predate explicit
+    // APNs routing, while allowing one public relay to serve development and production tokens.
+    transports.apns = apnsTransport(config.apns);
+    transports["apns:development"] = apnsTransport({ ...config.apns, environment: "development" });
+    transports["apns:production"] = apnsTransport({ ...config.apns, environment: "production" });
+  }
   const app = createRelayApp({
     storage,
     transports,

@@ -44,7 +44,10 @@ codes `invalid_request`, `not_found`, `over_cap`, `unsupported_platform`, `inter
 
 ### POST /register
 
-Request: `{"platform": "webhook" | "apns", "token": string}`
+Request: `{"platform": "webhook" | "apns", "token": string, "environment"?: "development" | "production"}`
+
+`environment` is accepted only for APNs. It selects Apple's sandbox (`development`) or production
+service for that registration; omission uses the relay's configured default.
 
 - `webhook`: `token` is an `http(s)` URL. Delivery is `POST <token>` with body
   `{"ciphertext": string}`. The URL is registrant-supplied and untrusted. In restricted-

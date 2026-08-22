@@ -43,6 +43,7 @@ import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 const RelayRegisterRequestSchema = Type.Object({
   platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns")]),
   token: Type.String({ minLength: 1, maxLength: 2048 }),
+  environment: Type.Optional(Type.Union([Type.Literal("development"), Type.Literal("production")])),
 });
 
 export interface AppDeps {

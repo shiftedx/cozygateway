@@ -35,8 +35,13 @@ on its configured relay. The relay's response status and body pass back unchange
 body remains the one in `contract/push-v0.md`:
 
 ```json
-{ "platform": "webhook" | "apns", "token": "string" }
+{ "platform": "webhook" | "apns", "token": "string", "environment"?: "development" | "production" }
 ```
+
+`environment` is valid only for `platform: "apns"` and identifies the Apple Push Notification
+service that issued the device token. It lets one relay serve locally signed development builds and
+production/TestFlight builds without treating a sandbox token as a production token. Clients that
+omit it retain the relay's configured default for compatibility.
 
 The frozen core contract already uses `POST /push/register` for `PushRegisterRequest`. That body is
 distinct and keeps its existing local gateway behavior:
