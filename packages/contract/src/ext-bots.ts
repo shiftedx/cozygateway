@@ -9,10 +9,9 @@
  *  file, and nowhere else. Naming a number up here is how this comment came to claim "version 6"
  *  through three bumps.
  *
- *  Everything here mirrors what a Hermes gateway's Bot Mode conventions carry. The units are the
- *  ones the wire uses after the bridge has normalized them: `lastActiveAt` is MILLISECONDS (the
- *  Hermes `last_session.last_active` is seconds and is converted inside the bridge), and
- *  `meta.created` stays milliseconds as the desktop plugin writes it. */
+ *  Profile, catalog, routine, and inbox resources mirror Hermes control-plane data. Configured
+ *  Bot Mode chats, their sessions, messages, attachments, and turn state are gateway-owned
+ *  attach-v1 projections. Every timestamp on this wire is milliseconds. */
 import { type Static, Type } from "@sinclair/typebox";
 
 import { AttachmentBlockSchema } from "./rich-blocks.ts";
@@ -47,8 +46,8 @@ export const BotSummarySchema = Type.Object({
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
-/** One Hermes session visible through capability 16. The five kinds reuse the canonical-chat
- *  follow exclusions exactly: everything not excluded is a conversation. */
+/** A session kind retained for wire compatibility. Configured attach-v1 Bot Mode sessions currently
+ *  project as `conversation`; the other kinds belong to older control-plane projections. */
 export const BotSessionKindSchema = Type.Union([
   Type.Literal("conversation"),
   Type.Literal("cron"),
@@ -81,9 +80,9 @@ export const BotSessionAdoptResponseSchema = Type.Object({
 });
 export type BotSessionAdoptResponse = Static<typeof BotSessionAdoptResponseSchema>;
 
-/** Capability 19 `POST /bots/:name/sessions/new` response. The new session is adopted, while the
- *  previous session remains ordinary history: unretired, listed once Hermes has persisted it, and
- *  restorable through the capability-16 adoption route. */
+/** Capability 19 `POST /bots/:name/sessions/new` response. The new gateway-owned session is
+ *  selected while the previous native transcript remains in local history and restorable through
+ *  the capability-16 adoption route. */
 export const BotNewSessionResponseSchema = Type.Object({
   name: Type.String(),
   sessionId: Type.String(),
@@ -126,31 +125,13 @@ export const BotPresenceFrameSchema = Type.Object({
 });
 export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
 
-/** One message in a bot's canonical chat, after the bridge has flattened whatever shape Hermes
- *  returned. `id` is stable for a given session: the gateway's own message id when it carries one,
- *  otherwise the session id plus the message's position, so a client can key a list on it and
- *  drop a replayed frame. `at` is MILLISECONDS, or null when the message carries no timestamp at
- *  all (Hermes stamps in seconds on some builds and not at all on others).
+/** One durable message in a gateway-owned attach-v1 Bot Mode transcript. `id` is a stable gateway
+ *  or attach event id and `at` is the gateway clock in milliseconds. `role` is `user` or
+ *  `assistant`; tool activity is carried separately and model reasoning never enters this shape.
  *
- *  `role` is always `user` or `assistant` on this wire: the bridge drops ordinary `system` and
- *  `tool` rows, and any row whose text is empty, so tool chatter never reaches a chat bubble.
- *  Hermes context-management rows are the narrow exception. A whole-row compaction shape becomes
- *  exactly `[[context: compacted]]`; a system-role compaction uses assistant on this wire.
- *
- *  `clientId` is the echo of what the sender put on `POST /bots/:name/chat/messages` (or the
- *  gateway's own local id when the sender sent none). It rides the 202 body AND the same message
- *  when it comes back in a `bot_chat` frame, which is what lets a sender replace its optimistic row
- *  instead of rendering the message twice.
- *
- *  `attachments` carries frozen media blocks. Capability 9 permits them on user rows for photos the
- *  user sent with that message. Capability 15 also permits them on settled assistant rows when the
- *  bot emitted a standalone `MEDIA:<path>` directive that the gateway fetched successfully. Every
- *  `attachment` block from `contract/v1.md`. Every entry's `fileId` is gateway-scoped and opaque, is
- *  never a URL and is never a path, and is fetched from `GET /bots/:name/chat/attachments/:fileId`.
- *  A host path never reaches this wire: the bridge strips the `@image:<path>` directive lines hermes
- *  writes into its own transcript before the text is decoded, and puts this block there instead. The
- *  field is ABSENT, not empty, on a message with no attachments. Capability 20 adds the optional
- *  `mediaKind` discriminator and permits assistant video/audio blocks. */
+ *  `clientId` echoes an optional sender id so an optimistic row can be replaced. `attachments`
+ *  holds immutable gateway-scoped blocks for sent or received media. Their `fileId` is opaque and
+ *  resolves only through `GET /bots/:name/chat/attachments/:fileId`; it is never a URL or path. */
 export const BotChatMessageSchema = Type.Object({
   id: Type.String(),
   role: Type.String(),
@@ -168,12 +149,12 @@ export const BotChatStopResponseSchema = Type.Object({
 });
 export type BotChatStopResponse = Static<typeof BotChatStopResponseSchema>;
 
-/** New messages in a bot's canonical chat. A DELTA, not a snapshot: `messages` carries only what
- *  the bridge has not broadcast before, in order.
+/** New messages in a bot's native canonical chat. A DELTA, not a snapshot: `messages` carries only
+ *  newly committed durable rows, in order.
  *
  *  A settled assistant row in the canonical conversational session also raises the existing
  *  encrypted `message` push for registered devices without a live socket. This changes no frame or
- *  capability: drafts, user echoes, context markers and machine-classified sessions stay in-band. */
+ *  capability: drafts, user echoes, and tool activity stay in-band. */
 export const BotChatFrameSchema = Type.Object({
   type: Type.Literal("bot_chat"),
   bot: Type.String(),
@@ -183,16 +164,14 @@ export const BotChatFrameSchema = Type.Object({
 });
 export type BotChatFrame = Static<typeof BotChatFrameSchema>;
 
-/** How a bot's canonical chat is doing right now. `phase` is the bridge's own view of the turn it
- *  is polling; `running` and `inflight` are Hermes' own flags, passed through. */
+/** How a bot's native canonical chat is doing right now. `phase`, `running`, and `inflight` are the
+ *  gateway's durable attach-v1 turn projection, not Dashboard session flags. */
 export const BotChatStateFrameSchema = Type.Object({
   type: Type.Literal("bot_chat_state"),
   bot: Type.String(),
   sessionId: Type.String(),
-  /** `polling` = a turn is being awaited; `complete` = the reply landed and Hermes went idle, or
-   *  capability 19 hard-stopped the turn;
-   *  `timeout` = the cap expired with no settled reply; `failed` = the poll gave up because
-   *  Hermes kept refusing. */
+  /** `polling` = an attach-v1 turn is active; `complete` = its reply committed or capability 19
+   *  interrupted it; `timeout` = the gateway cap expired; `failed` = attach-v1 reported failure. */
   phase: Type.Union([
     Type.Literal("polling"),
     Type.Literal("complete"),
@@ -205,18 +184,17 @@ export const BotChatStateFrameSchema = Type.Object({
 });
 export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;
 
-/** A LIVE DRAFT of the assistant reply a bot is composing right now, streamed off the Hermes
- *  `message.delta` events while the turn runs. Decoration, never the record: the canonical message
- *  still arrives in a `bot_chat` frame when the turn's poll finds it, and that message is the one a
- *  client stores.
+/** A LIVE DRAFT of the assistant reply a bot is composing right now, streamed from attach-v1 while
+ *  the turn runs. Decoration, never the record: committed native transcript rows arrive in
+ *  `bot_chat` and are what a client stores.
  *
  *  Three properties make it safe to drop any subset of these frames:
  *  - `text` is the FULL accumulated assistant text so far, not an increment, so a client never
  *    reassembles anything and a missed frame costs nothing but a moment of staleness;
  *  - `seq` is monotonic within one `turnId`, so a frame that arrives out of order is dropped by
  *    comparing it against the last one rendered;
- *  - `turnId` is minted per turn and is never reused, so a new turn on the same session invalidates
- *    the previous draft outright (a Hermes session id IS reused across turns; the turn id is not).
+ *  - `turnId` is gateway-minted per turn and is never reused, so a new turn on the same native
+ *    session invalidates the previous draft outright.
  *
  *  `done` marks the last frame of a turn: no further delta for that `turnId` will be sent, and the
  *  reply itself is on its way over `bot_chat`. A client clears the draft on `done`, on a
@@ -227,9 +205,8 @@ export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;
  *  profile name and `sessionId` is that member's room session, which is not a session a client
  *  addresses anywhere else: render the draft in the room keyed on `room` + `bot`.
  *
- *  NOTHING derived from a model's chain of thought ever rides this frame. The gateway forwards the
- *  `message.*` event family and nothing else; `thinking.delta`, `reasoning.delta` and
- *  `reasoning.available` are dropped at the bridge. */
+ *  NOTHING derived from a model's chain of thought ever rides this frame. Attach-v1 does not define
+ *  a reasoning event, and the gateway projects only its display-safe draft blocks. */
 export const BotChatDeltaFrameSchema = Type.Object({
   type: Type.Literal("bot_chat_delta"),
   bot: Type.String(),
@@ -246,8 +223,7 @@ export const BotChatDeltaFrameSchema = Type.Object({
 });
 export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
 
-/** A tool call inside a bot's turn is waiting on a human decision. Capability 10 (issue #19,
- *  bridge lane).
+/** A tool call inside an attach-v1 bot turn is waiting on a human decision. Capability 10.
  *
  *  Why this is a bots frame and not the core `approval_pending` of contract v1.md section 5a: the
  *  bots surface is a PARALLEL path. It has no threads, no `TurnRunner`, and no `BackendAdapter`;
@@ -255,17 +231,9 @@ export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
  *  core frame. So the pair is mirrored onto this channel's keying and is otherwise field for field
  *  the core pair, so one client view renders both.
  *
- *  Field provenance, all of it from the hermes `approval.request` event:
- *  - `toolCallId` is the hermes `request_id`, a uuid4 hex. It is the correlation id the pending
- *    frame, the resolve route, the resolved frame and the push collapse id all key on.
- *  - `turnId` is the GATEWAY's own turn id for the chat, the same value `bot_chat_delta` carries.
- *    The hermes event is session-scoped and names no turn, so the gateway supplies its own.
- *  - `name` is DERIVED from the hermes `pattern_key` (the rule the approval matched), never from
- *    the free-text `command`. See the derivation rule in the gateway's `approvals.ts`.
- *
- *  There is deliberately NO `argSummary` member: the hermes surface carries no structured
- *  arguments to summarize, and its free-text `command` / `description` are never forwarded into
- *  any frame, push payload, or log line. A member that does not exist cannot leak. */
+ *  `toolCallId` is the attach-v1 approval id; `turnId` is the gateway's native turn id; and `name`
+ *  is the bounded display-safe tool name supplied by the plugin. There is deliberately no argument
+ *  or command summary: a member that does not exist cannot leak. */
 /** One tool step inside a bot's turn: capability 12, the live activity a client renders as chips
  *  while the turn runs.
  *
@@ -276,16 +244,15 @@ export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
  *    threads chips renders these with the same switch.
  *  - `seq` and the timestamps are added because a bots frame is a snapshot with an ordering, not an
  *    implicitly ordered array on a draft (see `BotToolActivityFrame`).
- *  - capability 21 adds optional bounded, redacted `detail` and error-only `errorText`. Only
- *    Hermes' display-safe `args_text`, `summary`, and `result_text` strings are candidates. Raw
- *    args/results, context, inline diffs, and todos are never forwarded.
+ *  - capability 21 adds optional bounded, redacted `detail` and error-only `errorText`. Attach-v1
+ *    sends display-safe detail only; raw args/results, context, inline diffs, and todos are never
+ *    forwarded.
  *
- *  `name` is the hermes tool identifier, passed through and length-capped. It is the ONE piece of
- *  hermes-side text on this frame, and it is a tool's name rather than anything a tool was asked to
- *  do. See `toolStepName` in the gateway's `tool-activity.ts` for the exact rule and its bound. */
+ *  `name` is the plugin tool identifier, passed through and length-capped. It names a tool rather
+ *  than anything the tool was asked to do. */
 export const BotToolStepSchema = Type.Object({
-  /** Stable for the life of the step and unique within its `turnId`: the hermes `tool_id`, which is
-   *  the correlation key its own start and complete events share. */
+  /** Stable for the life of the step and unique within its `turnId`: the attach-v1 `callId` that
+   *  joins its running and terminal events. */
   stepId: Type.String(),
   /** Position within the turn, from 1, assigned when the gateway FIRST sees the step. It is the
    *  order the steps started in, and it never moves once assigned. */
@@ -293,14 +260,8 @@ export const BotToolStepSchema = Type.Object({
   name: Type.String(),
   /** `running` until the step ends. `ok` and `error` are TERMINAL: a step never leaves them.
    *
-   *  `error` means THE STEP DID NOT REPORT SUCCESS, which is broader than "the tool threw". Hermes
-   *  puts no status flag on `tool.complete` at all -- the executor computes one and then drops it
-   *  before the event is built -- so the gateway classifies the completion itself, and it does that
-   *  by reading structure it can trust and nothing else (see `toolStepStatus` in the gateway's
-   *  `tool-activity.ts`). Two things therefore land in `error` that a stricter word would not
-   *  cover: a call hermes cancelled or timed out, and a step whose completion this gateway never
-   *  saw because the turn ended first. Both mean the same thing to a reader: this step did not
-   *  finish cleanly. Nothing about WHY is ever reported, on this or any other member. */
+   *  `error` means the plugin reported that the step did not finish cleanly. Nothing about WHY is
+   *  reported beyond optional bounded `errorText`. */
   status: Type.Union([Type.Literal("running"), Type.Literal("ok"), Type.Literal("error")]),
   /** MILLISECONDS, gateway clock. When the gateway first saw the step. */
   startedAt: Type.Integer(),
@@ -354,27 +315,10 @@ export const BotToolActivityFrameSchema = Type.Object({
 });
 export type BotToolActivityFrame = Static<typeof BotToolActivityFrameSchema>;
 
-/** One past turn's tool steps, as `GET /bots/:name/chat/messages` hands them back. Capability 12.
- *
- *  This is what makes the collapsed "what did it do" strip under a reply EXPANDABLE AFTER THE FACT
- *  rather than only while a socket happened to be open. Hermes replays no tool activity of any kind
- *  on reconnect and persists none of it on a surface this gateway can read back, so if the gateway
- *  did not write these down they would exist for exactly as long as one live connection.
- *
- *  ## What this deliberately does NOT say
- *
- *  It does not name a message. A step belongs to a TURN, and the gateway cannot say which transcript
- *  row a turn produced without guessing: hermes' transcript carries no turn id, a turn may commit
- *  more than one assistant row, and the position-matching that would be needed is exactly the kind
- *  of heuristic that silently attaches one turn's activity to another turn's reply. `attachments`
- *  can name a message because a photo is bound to the row through the single-use send queue that
- *  accepted it; there is no equivalent join here, so none is invented.
- *
- *  What the gateway can say honestly is WHEN, and it does: `startedAt` and `endedAt` are the same
- *  millisecond clock as `BotChatMessage.at`. A client places a turn's strip chronologically against
- *  the messages it already has -- the strip belongs after the last message that precedes
- *  `startedAt` -- which is a fact rather than a guess. A client that was connected during the turn
- *  additionally already knows the `turnId` from the live frames and can key on it exactly. */
+/** One past native turn's tool steps, persisted by the gateway so history survives reconnect and
+ *  restart. Steps belong to a turn rather than a message: attach-v1 intentionally supplies no
+ *  message-to-turn join, so the gateway does not invent one. Clients can order a strip by its
+ *  gateway-clock `startedAt`/`endedAt` timestamps or key it to a live `turnId`. */
 export const BotTurnToolStepsSchema = Type.Object({
   turnId: Type.String(),
   /** MILLISECONDS: when the turn's FIRST step started. The chronological join to the transcript. */
@@ -389,8 +333,7 @@ export type BotTurnToolSteps = Static<typeof BotTurnToolStepsSchema>;
 export const BotApprovalPendingFrameSchema = Type.Object({
   type: Type.Literal("bot_approval_pending"),
   bot: Type.String(),
-  /** The STORED canonical-chat id, the one every other bots frame uses. Never the hermes runtime
-   *  session id, which is an internal no client has ever seen. */
+  /** The gateway-owned canonical-chat id used by every Bot Mode frame. */
   sessionId: Type.String(),
   turnId: Type.String(),
   toolCallId: Type.String(),
@@ -401,13 +344,8 @@ export const BotApprovalPendingFrameSchema = Type.Object({
 });
 export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
 
-/** That approval reached one of its three terminal states. Exactly one of these is ever emitted
- *  per `toolCallId`: the first terminal state wins and every later one is swallowed.
- *
- *  `expired` is SYNTHESIZED by the gateway from its own timer, because hermes emits no expiry
- *  event of any kind: it drops the queue entry silently when `approvals.timeout` (default 300 s)
- *  lapses. It is also what a resolve answered `{"resolved": 0}` maps to, since that answer means
- *  "the entry is gone" and therefore that nobody's decision took effect. */
+/** A native approval reached a terminal state. The gateway emits at most one terminal frame per
+ *  `toolCallId`; an expiry is driven by the durable attach-v1 interaction record. */
 export const BotApprovalResolvedFrameSchema = Type.Object({
   type: Type.Literal("bot_approval_resolved"),
   bot: Type.String(),
@@ -456,50 +394,23 @@ export const BotClarifyResolvedFrameSchema = Type.Object({
 });
 export type BotClarifyResolvedFrame = Static<typeof BotClarifyResolvedFrameSchema>;
 
-/** A bot's canonical chat was RETIRED and a fresh one pinned in its place, by
- *  `POST /bots/:name/chat/reset`. Broadcast to every paired device, which is the whole point of the
- *  frame: another device sitting on the old chat has no other way to learn that the session it is
- *  appending to is no longer the bot's canonical one. On receipt a client rebinds to `sessionId`,
- *  drops whatever draft it was rendering, and reloads history for the new chat.
- *
- *  What this frame does NOT say is that anything was deleted. Hermes exposes no session delete on
- *  this surface: the retired session and its whole transcript stay on the Hermes host and keep
- *  appearing in `GET /bots/:name/sessions`. The only thing that changed is which session the bot's
- *  canonical pin points at.
- *
- *  A client that does not know this frame ignores it, per the forward-compatibility rule for unknown
- *  server frames, and then keeps writing into a session that is no longer canonical: it looks
- *  correct locally and diverges from every other device. That is exactly why the reset route rides a
- *  capability bump rather than arriving silently. */
+/** `POST /bots/:name/chat/reset` selected a fresh gateway-owned session. Rebind to `sessionId`,
+ *  drop any draft, and reload. The previous local transcript is retained; the reset frame is the
+ *  cross-device signal that the selected chat changed. */
 export const BotChatResetFrameSchema = Type.Object({
   type: Type.Literal("bot_chat_reset"),
   bot: Type.String(),
   /** The freshly minted canonical chat. Every device rebinds to this id. */
   sessionId: Type.String(),
-  /** The chat that was retired. Absent when there was nothing to retire. Retired, not deleted: this
-   *  session is still on the Hermes host and still listed by `GET /bots/:name/sessions`. */
+  /** The previously selected local session. It remains in `GET /bots/:name/sessions`. */
   previousSessionId: Type.Optional(Type.String()),
   updatedAt: Type.Integer(),
 });
 export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
 
-/** A bot's canonical chat adopted another session. Capability 14 emits this when the pin follows a
- *  newer conversation, capability 16 emits it when the user manually restores a listed session,
- *  and capability 19 emits it when the user starts a fresh unretired conversation. It is how every
- *  paired device learns that the transcript on its screen must be re-read.
- *
- *  On receipt, rebind to `sessionId` and re-read `GET /bots/:name/chat/messages`. That is the same
- *  handling `bot_chat_reset` gets, and a client MAY implement the two together; what separates them
- *  is what they say about the previous session, so read that difference before collapsing them:
- *
- *  - `bot_chat_reset` says the previous chat was RETIRED. The user asked to leave it behind, it will
- *    never be adopted again, and no further live frame will arrive for it.
- *  - `bot_chat_adopted` says nothing of the kind. The previous session is still listed and still
- *    resumable. A turn already running in it may still deliver its `bot_chat` frames, which carry
- *    that session's id and which a rebound client ignores.
- *
- *  Automatic following never selects a routine run, group room, or bot-to-bot delivery. Manual
- *  restoration may select any listed kind. See contract/ext-bots-v1.md. */
+/** A user selected an existing native session or started a new one. Every paired client rebinds to
+ *  `sessionId` and re-reads history. Both the old and new session ids are gateway-owned; the old
+ *  transcript remains available for a later manual adoption. */
 export const BotChatAdoptedFrameSchema = Type.Object({
   type: Type.Literal("bot_chat_adopted"),
   bot: Type.String(),
@@ -511,17 +422,9 @@ export const BotChatAdoptedFrameSchema = Type.Object({
 });
 export type BotChatAdoptedFrame = Static<typeof BotChatAdoptedFrameSchema>;
 
-/** `POST /bots/:name/chat/reset` response. `sessionId` is the STORED id of the new canonical chat,
- *  the same value a subsequent `GET /bots/:name/chat` reports, and `previousSessionId` is what the
- *  pin used to point at, absent only when the bot had no chat to retire.
- *
- *  NOTHING WAS DELETED, and a client author reading only this schema needs to know it before writing
- *  a label. Hermes exposes no session delete on this surface, so the reset is a retire-and-re-pin:
- *  the session named by `previousSessionId` and its entire transcript stay on the Hermes host and
- *  keep appearing in `GET /bots/:name/sessions` (and in the Hermes desktop's own session list). What
- *  changed is which session the bot's canonical pin points at, which buys the bot a fresh context
- *  window and the user a clean screen. A UI that promises the history is gone is promising something
- *  this gateway did not do. */
+/** `POST /bots/:name/chat/reset` response. `sessionId` is the selected fresh native chat and
+ *  `previousSessionId` is the prior selection. Reset changes selection; it does not erase the
+ *  gateway-owned history returned by `GET /bots/:name/sessions`. */
 export const BotChatResetResponseSchema = Type.Object({
   name: Type.String(),
   sessionId: Type.String(),
@@ -529,9 +432,8 @@ export const BotChatResetResponseSchema = Type.Object({
 });
 export type BotChatResetResponse = Static<typeof BotChatResetResponseSchema>;
 
-/** `POST /bots/:name/chat/messages` body. `clientId` is the sender's own id for this message; the
- *  gateway never interprets it, it only echoes it back on the committed message and on that same
- *  message when the turn poll finds it, so the sender can de-duplicate its optimistic row. */
+/** `POST /bots/:name/chat/messages` body. `clientId` is the sender's own id. The gateway echoes it
+ *  on the immediately committed native user row, so the sender can de-duplicate its optimistic row. */
 export const BotChatSendRequestSchema = Type.Object({
   text: Type.String({ minLength: 1, maxLength: 32_000 }),
   clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
@@ -545,29 +447,13 @@ export type BotChatSendRequest = Static<typeof BotChatSendRequestSchema>;
  *  `text` is the CAPTION, and it is what the bot is actually prompted with. It is optional and
  *  shorter-capped than a text send: a caption rides beside an image, and the 32000-character
  *  contract on `POST /bots/:name/chat/messages` is untouched by this route. An absent or blank
- *  caption is replaced by a neutral default prompt, because hermes needs SOME prompt to spend the
- *  attached image on, and the transcript then honestly shows the words that were submitted. */
+ *  caption is replaced by a neutral default prompt so the attached plugin receives an explicit
+ *  turn instruction and the transcript honestly shows the words that were submitted. */
 export const BotChatPhotoFieldsSchema = Type.Object({
   text: Type.Optional(Type.String({ maxLength: 4_000 })),
   clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
 export type BotChatPhotoFields = Static<typeof BotChatPhotoFieldsSchema>;
-
-/** `POST /bots` body: the three-field quick create, plus the two look fields the roster renders.
- *  `name` is the Hermes profile name and the id of the bot everywhere else in this API; it is
- *  validated against the Hermes profile-name rule server-side (lowercase slug, reserved names
- *  refused), so the bounds here are only the cheap ones. `title`, `shape` and `color` are pure
- *  client convention: they ride the profile's `ui_meta["hermes-bots"]` blob, while `description`
- *  is the profile's own description and reaches `profiles.create` untouched. */
-export const BotCreateRequestSchema = Type.Object({
-  name: Type.String({ minLength: 1, maxLength: 64 }),
-  title: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
-  description: Type.Optional(Type.String({ maxLength: 2_000 })),
-  shape: Type.Optional(Type.String({ minLength: 1, maxLength: 32 })),
-  /** Six-digit hex, the form the desktop's palette writes. */
-  color: Type.Optional(Type.String({ pattern: "^#[0-9a-fA-F]{6}$" })),
-});
-export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
 
 /** `POST /bots/focus` body. The app declares what it is looking at so the bridge polls Hermes at
  *  the desktop's cadences only while a screen is open, and idles otherwise. `null` means the app
@@ -754,23 +640,15 @@ export const BotRoutineScheduleSchema = Type.Object({
 });
 export type BotRoutineSchedule = Static<typeof BotRoutineScheduleSchema>;
 
-/** One routine: a Hermes cron job this bot owns, either by carrying the `[bot:<name>]` tag or by
- *  sitting untagged in the bot's own cron store (`legacy`).
+/** One current Hermes cron job carrying this bot's `[bot:<name>]` tag.
  *
  *  `id` is the backend's `job_id` and is the ONLY identifier the write routes accept; the display
  *  title is not unique and is not an id. `title` is the job name with the `[bot:<name>] ` tag
- *  stripped, and falls back to `Untitled cronjob` for a tagged job with nothing after the tag; on a
- *  `legacy` row it is the raw job name, verbatim.
+ *  stripped, and falls back to `Untitled cronjob` for a tagged job with nothing after the tag.
  *
  *  `enabled` is the ROW STATE the desktop's switch renders, which folds three backend facts into
- *  one: a job is enabled only when the backend's `enabled` is not false, its `state` is not
- *  `paused`, and it is not `legacyUnsafe`. `state` carries the backend's own word when it sent one.
- *
- *  `legacyUnsafe` marks a pre-marker delegated routine: a tagged job whose prompt begins with
- *  `You are running the scheduled routine "`. Those are auto-paused on every list (see
- *  `GET /bots/:name/routines`) and cannot be resumed through this API; a client renders the row
- *  disabled with the desktop's own wording and offers delete only. `autoPaused` is true for the one
- *  response in which this gateway actually performed that pause.
+ *  one: a job is enabled only when the backend's `enabled` is not false and its `state` is not
+ *  `paused`. `state` carries the backend's own word when it sent one.
  *
  *  `lastRun` and `nextRun` are MILLISECONDS, or null when the backend sent nothing parsable (it
  *  sends ISO strings, and older builds send neither). */
@@ -780,13 +658,6 @@ export const BotRoutineSchema = Type.Object({
   schedule: BotRoutineScheduleSchema,
   enabled: Type.Boolean(),
   state: Type.Optional(Type.String()),
-  legacyUnsafe: Type.Boolean(),
-  /** True for an UNTAGGED cron job in this bot's own store: a schedule that predates routines and
-   *  still fires. Absent on every tagged routine, never false. Its `title` is the job's raw name
-   *  verbatim, and it cannot be REWRITTEN (a `PATCH` carrying anything but `enabled` is a 400);
-   *  pause, resume and delete all work, and delete-then-create is how a client converts one. */
-  legacy: Type.Optional(Type.Boolean()),
-  autoPaused: Type.Optional(Type.Boolean()),
   /** The job's prompt as the backend reported it, which on a list is often a PREVIEW rather than
    *  the whole thing. Absent when the backend sent neither. */
   prompt: Type.Optional(Type.String()),
@@ -1042,11 +913,8 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    keeps whatever it did before, which is to show the link. The route serves `https` sources only;
  *    a LOCAL path on the Hermes box is refused, and the refusal is part of the contract so the app
  *    can say so rather than spin.
- *  - `8`: `POST /bots/:name/chat/reset` plus the `bot_chat_reset` frame. A client that offers a
- *    "clear chat" action MUST require `>= 8`: a version 7 gateway 404s the route. Note what it is
- *    NOT: hermes exposes no session delete here, so the retired chat is still on the hermes host and
- *    still appears in `GET /bots/:name/sessions`; what is cleared is which session the bot's
- *    canonical chat points at.
+ *  - `8`: `POST /bots/:name/chat/reset` plus `bot_chat_reset`. It selects a fresh gateway-owned
+ *    session; previous local history remains listed and may be adopted later.
  *  - `9`: photos to bots. `POST /bots/:name/chat/photos` sends one image with an optional caption,
  *    `GET /bots/:name/chat/attachments/:fileId` serves the gateway's own copy of it back, and
  *    `BotChatMessage.attachments` carries the `attachment` block that ties the two together. A
@@ -1102,57 +970,10 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    hermes gates its whole tool lifecycle on `display.tool_progress`, which defaults to `all` but
  *    which an operator can set to `off`, and a profile running that way is silent here (see
  *    contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin").
- *  - `13`: LEGACY CRONJOBS become visible as routines (issue #85). `GET /bots/:name/routines` and
- *    the `bot_routines` frame now also carry the UNTAGGED jobs in that bot's own cron store, each
- *    with `BotRoutine.legacy: true`; the row actions accept their ids. No route, frame or existing
- *    field changed shape, and a tagged routine is byte-for-byte what it was.
- *
- *    A client below 13 keeps working and keeps ignoring an optional field, but against a 13 gateway
- *    it will see rows it did not see before and will offer Edit on them, which answers 400. That is
- *    the whole reason this is a version rather than a silent widening: a client that renders legacy
- *    rows MUST require `>= 13`, must hide or disable its edit affordance on a row carrying `legacy`,
- *    and offers the conversion as delete-then-create.
- *
- *    What the version does NOT promise is that any legacy job will be found: the gateway claims only
- *    the untagged jobs of a store the backend agrees is that bot's, so a hermes that answers a
- *    `profile`-scoped list with another profile's store contributes none (see
- *    contract/ext-bots-v1.md, routines).
- *  - `14`: THE CANONICAL CHAT PIN FOLLOWS THE BOT'S LATEST CONVERSATION (issue #88), plus the
- *    `bot_chat_adopted` frame that announces the move. A BEHAVIOUR change, like 11, so read it as
- *    that first: up to 13 the pin was adopted once and then held, while `GET /bots` derived a bot's
- *    preview and `lastActiveAt` from its last activity across ALL its sessions. A conversation held
- *    from a second device therefore updated the roster preview and never appeared in the chat the
- *    app opened, because the two surfaces disagreed about which session was "this bot's
- *    conversation". From 14 they cannot: when a newer CONVERSATIONAL session outruns the pinned one,
- *    the canonical chat re-adopts it, `GET /bots/:name/chat` reports `adoption: "latest"`, and every
- *    paired device is told on the socket.
- *
- *    The roster preview and its `lastActiveAt` now come from that resolved canonical session too,
- *    rather than from the profile's latest activity across every session. Routine runs,
- *    bot-to-bot deliveries and group-room sessions never feed those fields or move the pin. They
- *    may still make the bot active because presence intentionally observes all session activity.
- *    The exclusions and the reasoning are in `contract/ext-bots-v1.md` under "The pin follows the
- *    bot's latest conversation".
- *
- *    A client that offers a chat screen SHOULD require `>= 14` before it relies on the transcript
- *    matching the roster preview, and MUST require `>= 14` to handle `bot_chat_adopted`. A client
- *    below 14 keeps working: it ignores a frame type it does not know, and its next ordinary read of
- *    `GET /bots/:name/chat/messages` returns the re-adopted transcript anyway, so what it loses is
- *    promptness, not correctness. What it does NOT lose is history: a re-adoption retires nothing
- *    and deletes nothing, and the previous session stays listed by `GET /bots/:name/sessions`.
- *  - `15`: BOT-TO-APP IMAGE ATTACHMENTS. On settlement only, standalone `MEDIA:<path>` lines outside
- *    code fences are fetched through the authenticated Hermes dashboard, up to three attempts per
- *    assistant message. Successful png, jpeg, gif and webp files up to 8 MB are copied into the
- *    gateway attachment store, the successful directive line is removed, and the assistant row
- *    carries `BotChatMessage.attachments` in `bot_chat` frames and history. A failed or unattempted
- *    directive stays as text. Live `bot_chat_delta` drafts are unchanged and may briefly show it.
- *    A client below 15 ignores the optional field and continues to render the remaining text.
- *  - `16`: SESSION HISTORY AND MANUAL RESTORE (issue #94). `GET /bots/:name/sessions` returns
- *    normalized, classified summaries plus the active canonical-chat pin, and
- *    `POST /bots/:name/sessions/:id/adopt` restores one as the active chat. A manual choice holds
- *    through all sessions that already existed, then capability 14 follow-latest resumes when the
- *    next new conversational session appears. The existing `bot_chat_adopted` frame announces a
- *    manual move exactly as it announces an automatic one. Clients below 16 see no change.
+ *  - `14`: `bot_chat_adopted`, emitted when the user manually selects a stored native session or
+ *    starts a fresh one. It tells paired clients to rebind and reload the durable local transcript.
+ *  - `15`: assistant attach-v1 media becomes gateway-owned `BotChatMessage.attachments`.
+ *  - `16`: `GET /bots/:name/sessions` and manual native-session adoption.
  *  - `17`: AGENT INBOX (issue #95). `GET /bots/:name/inbox` lists the newest 50 a2a sessions and
  *    `GET /bots/:name/inbox/:threadId/messages` returns a read-only transcript in the group-room
  *    message shape. An open thread that gains rendered messages emits `bot_inbox_activity`, a
@@ -1162,15 +983,7 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    Routine records and writes accept nullable model/effort selections. The surveyed cron RPC
  *    cannot scope both to one run, so they are preserved as inert metadata and the gateway never
  *    mutates a profile around a routine run.
- *  - `19`: HARD STOP AND NEW BOT CHAT (issues #114 and #115). Adds authenticated
- *    `POST /bots/:name/chat/stop` and `POST /bots/:name/sessions/new`. Stop dispatches Hermes
- *    `session.interrupt` for the gateway-owned runtime turn, answers 409 when no turn is running,
- *    and terminates every device's working state through the existing `bot_chat_state` frame with
- *    `phase: "complete"`. Ordinary busy sends keep their steering behavior; stop is the explicit
- *    hard escape. New session mints an empty canonical chat through the existing Hermes creation
- *    surface, leaves the previous session unretired and restorable, and broadcasts the existing
- *    `bot_chat_adopted` frame. Its automatic pin also releases a manual restore boundary so
- *    follow-latest resumes with the next new conversational session.
+ *  - `19`: native hard stop and fresh native chat routes.
  *  - `20`: STREAMED ASSISTANT MEDIA (issues #118 / cozychat#220). Assistant attachments carry an
  *    optional `mediaKind`; video and audio are ingested up to their per-kind 40 MB cap and the
  *    authenticated attachment route supports byte ranges for AVPlayer.

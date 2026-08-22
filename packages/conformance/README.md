@@ -7,7 +7,7 @@ the wire the contract describes.
 ## What conformance means
 
 A gateway is conformant when this suite passes against it while the gateway exposes the
-reference echo backend. Every assertion is authored from the frozen spec (`contract/v1.md`)
+reference echo peer. Every assertion is authored from the frozen spec (`contract/v1.md`)
 and the `cozygateway-contract` schemas, never from any gateway's source code. The suite reads
 and writes only the public REST and WebSocket surface, so a green run is evidence the
 implementation matches the contract, not that it shares the reference code.
@@ -28,10 +28,10 @@ one fake `com.cozylabs.*` vendor capability travels end to end (see "Running the
 gateway's own conformance" below); that check is specific to the reference gateway's fixture and
 intentionally lives outside the portable suite.
 
-## The reference echo backend
+## The reference Hermes/attach echo peer
 
-The suite drives the reference echo backend, whose semantics are frozen in section 7 of the
-contract. An agent whose reply to a message whose first block is
+The suite drives a Hermes profile through an attach-v1 peer, whose observable semantics are frozen
+in section 7 of the contract. An agent whose reply to a message whose first block is
 `{ "type": "paragraph", "text": T }` produces:
 
 1. exactly two draft frames, then
@@ -60,7 +60,7 @@ export interface ConformanceEnv {
   baseUrl: () => string;
   /** Mint a fresh single-use setup code on the gateway under test. */
   issueSetupCode: () => Promise<string>;
-  /** Agent id of the reference echo backend on the gateway under test. */
+  /** Hermes profile id of the reference attach echo peer on the gateway under test. */
   echoAgentId: string;
   /** Optional: agent id of a stall-capable, interruptible backend. See "The optional stall hook". */
   stallAgentId?: string;
@@ -102,7 +102,7 @@ registerConformanceSuite({
 });
 ```
 
-Your gateway must expose the reference echo backend under the `echoAgentId` you pass. Boot it
+Your gateway must expose the reference echo peer under the `echoAgentId` you pass. Boot it
 on an ephemeral port with an in-memory or temp-dir database so the run stays isolated. Peer
 dependency: `vitest >= 3`.
 
@@ -131,7 +131,7 @@ hook and this group is reported as skipped.
 
 ## The optional stall hook
 
-The echo backend is queue-only: it finishes a turn as fast as it can, so a black-box run has no
+The echo peer is queue-only: it finishes a turn as fast as it can, so a black-box run has no
 in-flight window in which to interrupt it. That leaves the 202 path of
 `POST /threads/:id/interrupt` (contract v1.md section 5) provable only at the schema level. The
 stall hook closes that gap.
@@ -152,9 +152,9 @@ contract's 202 semantics.
    message is durable: it shows up in `GET /threads/:id/messages`, and no agent message does.
 3. leaves the thread idle afterward, so a second interrupt on it is `204`.
 
-Anything satisfying that is a valid hook. The reference gateway implements it with its
-`mock-steer` backend (one draft, then it waits for a steer or an interrupt); a third-party gateway
-can point it at any test backend of its own, or at a real backend it can reliably park.
+Anything satisfying that is a valid hook. The reference gateway implements it with an attach-v1
+stall peer (one draft, then it waits for an interrupt); a third-party gateway can point it at any
+test peer of its own, or at a real Hermes profile it can reliably park.
 
 **It is optional on purpose.** Omit `stallAgentId` and the group is reported as skipped while
 every other assertion runs unchanged, so a gateway with no stall-capable backend passes exactly
@@ -165,7 +165,7 @@ suite stays portable.
 ## The optional approval hook
 
 The approval surface (contract v1.md section 5a, capability `approvals`) is optional, and the
-echo backend never pauses on a tool call, so a black-box run has no pending approval to decide.
+echo peer never pauses on a tool call, so a black-box run has no pending approval to decide.
 The approval hook closes that gap the same way the stall hook does.
 
 Declare `approvalAgentId` and the suite adds one group that drives the real sequence: it sends
@@ -197,12 +197,12 @@ on a timeout the suite cannot force from outside, so it stays in the implementat
 is reported as skipped while every other assertion runs unchanged. The same hookless runner
 (`test/reference-gateway-hookless.test.ts`) is the standing proof, since it declares neither hook.
 
-The reference gateway implements it with its `mock-approval` backend (one draft, one pending
-approval, then it parks until the approval is resolved or its own bounded window lapses).
+The reference gateway implements it with an attach-v1 approval peer (one draft, one pending
+approval, then it parks until the approval is resolved).
 
 ## The optional agent inbox hook
 
-The agent inbox is a vendor extension backed by Hermes rather than the reference echo backend, so a
+The agent inbox is a vendor extension backed by Hermes rather than the reference echo peer, so a
 portable conformance run cannot create its own a2a fixture. Declare `botInbox` when the gateway under
 test has a seeded capability-17 thread. `botName` names its owning bot and `threadId` names a thread
 that must appear in that bot's newest 50 inbox rows.
@@ -219,8 +219,8 @@ This repo ships two runners, both exercised by one command:
 pnpm --filter cozygateway-conformance test
 ```
 
-- `test/reference-gateway.test.ts` starts the reference gateway with the mock echo adapter, the
-  `mock-steer` stall backend **and** the `mock-approval` backend, declares both hooks, and runs
-  the whole suite including the live in-flight interrupt and approval groups.
-- `test/reference-gateway-hookless.test.ts` starts it with the echo adapter alone and declares no
+- `test/reference-gateway.test.ts` starts the reference gateway with three Hermes profiles and
+  attach-v1 echo, stall, and approval peers, declares both hooks, and runs the whole suite
+  including the live in-flight interrupt and approval groups.
+- `test/reference-gateway-hookless.test.ts` starts it with the attach-v1 echo peer alone and declares no
   hooks, so the live-202, approval, and agent-inbox cases are skipped and the rest must still be green.

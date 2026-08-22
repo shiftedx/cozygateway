@@ -1,7 +1,7 @@
 import type { BotGroup, BotGroupDetail, BotGroupMessage, BotGroupNote, ServerFrame } from "cozygateway-contract";
 
-import type { Storage, BotGroupLogRow, BotGroupRow } from "../storage.ts";
-import type { HermesRpc } from "./canonical-chat.ts";
+import type { Storage, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
+import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
 import {
   GROUP_LOG_LIMIT,
@@ -21,8 +21,8 @@ import {
   type GroupLogEntry,
   type GroupMember,
 } from "./group-protocol.ts";
-import type { ChatStreamBinder } from "./chat-stream.ts";
-import { MemberGone, ensureGroupSession, runMemberTurn, type GroupTurnResult } from "./group-turn.ts";
+import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
+import { settledGroupTurn, startNativeMemberTurn, type GroupTurnResult, type NativeGroupTurnEndpoint } from "./group-turn.ts";
 
 /** Server-side group chats: durable rooms whose deliberation rounds run HERE rather than in a
  *  client (spec section 4, the one deliberate deviation from the Hermes desktop).
@@ -32,9 +32,8 @@ import { MemberGone, ensureGroupSession, runMemberTurn, type GroupTurnResult } f
  *  a round that keeps going while the app is backgrounded, a transcript every paired device sees,
  *  and a room that survives a restart because it lives in SQLite.
  *
- *  The price, stated plainly because a user can observe it: these rooms are GATEWAY-LOCAL. A Hermes
- *  desktop connected to the same gateway will NOT see them. What it does see is each member's
- *  `Group: <name>` session, because that half is stored in Hermes exactly as the desktop stores it.
+ *  The price, stated plainly because a user can observe it: these rooms are GATEWAY-LOCAL. The
+ *  member turn threads are gateway-owned attach identities, not Dashboard chat sessions.
  *
  *  Everything about how a room behaves (who speaks, in what order, what they are asked, when it
  *  stops) is `group-protocol.ts`, verbatim from the desktop. This module is the state machine and
@@ -95,7 +94,8 @@ export class GroupInvalid extends Error {
 }
 
 export interface GroupRoomsOptions {
-  rpc: HermesRpc;
+  /** Retained only for source compatibility while gateway assembly is migrated; never read. */
+  rpc?: unknown;
   storage: Storage;
   broadcast: (frame: ServerFrame) => void;
   now: () => number;
@@ -122,8 +122,7 @@ export interface GroupRoomsOptions {
    *
    *  - when the cheap `memberKnown` gate says `false`, to confirm the news before a member is
    *    skipped for the rest of the room's life; and
-   *  - inside `ensureGroupSession`'s CREATE arm, the instant before `session.create`, which is the
-   *    one call that turns an unknown name into a NEW profile.
+   *  - before an attach turn is queued, when a stale cache says a member disappeared.
    *
    *  A member whose session already resolves therefore costs nothing, which is the whole point: the
    *  earlier shape of this guard asked once per member per round and burned a `profiles.list` on
@@ -135,11 +134,11 @@ export interface GroupRoomsOptions {
    *  BAND leg, for a phone that is not holding a socket open (spec section 4). Fire-and-forget by
    *  contract: it must not throw and must not block the round. */
   escalate?: (event: { group: string; member: string; displayName: string; text: string }) => void;
-  /** Room sessions are born hidden by the same rule canonical chats are. */
+  /** Existing attach-v1 turn transport, injected after the ingress exists. */
+  nativeTurns?: NativeGroupTurnEndpoint;
+  /** Retained only for source compatibility; group turns no longer use stream/session plumbing. */
   hidden?: boolean;
-  /** Where a member's reply is drafted while it is being written, so a room shows a member typing
-   *  the way a 1:1 chat does. Optional; the room's transcript never depends on it. */
-  stream?: ChatStreamBinder;
+  stream?: unknown;
   pollMs?: number;
   turnTimeoutMs?: number;
   chainDelayMs?: number;
@@ -147,7 +146,6 @@ export interface GroupRoomsOptions {
 }
 
 export class GroupRooms {
-  readonly #rpc: HermesRpc;
   readonly #storage: Storage;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
@@ -156,12 +154,12 @@ export class GroupRooms {
   readonly #memberKnown: (name: string) => boolean | undefined;
   readonly #memberExists: (name: string) => Promise<boolean>;
   readonly #escalate: (event: { group: string; member: string; displayName: string; text: string }) => void;
-  readonly #hidden: boolean;
-  readonly #stream: ChatStreamBinder | undefined;
+  #nativeTurns: NativeGroupTurnEndpoint | undefined;
   readonly #pollMs: number | undefined;
   readonly #turnTimeoutMs: number | undefined;
   readonly #chainDelayMs: number;
   readonly #log: (message: string) => void;
+  readonly #waiters = new Map<string, () => void>();
 
   /** The drive currently holding a room, by room key, tagged with the room GENERATION it was
    *  started for. Present means "a round loop is live", which is the room's only piece of
@@ -181,7 +179,6 @@ export class GroupRooms {
   #closed = false;
 
   constructor(opts: GroupRoomsOptions) {
-    this.#rpc = opts.rpc;
     this.#storage = opts.storage;
     this.#broadcast = opts.broadcast;
     this.#now = opts.now;
@@ -190,12 +187,50 @@ export class GroupRooms {
     this.#memberKnown = opts.memberKnown ?? ((): boolean | undefined => undefined);
     this.#memberExists = opts.memberExists ?? ((): Promise<boolean> => Promise.resolve(true));
     this.#escalate = opts.escalate ?? ((): void => {});
-    this.#hidden = opts.hidden ?? true;
-    this.#stream = opts.stream;
+    this.#nativeTurns = opts.nativeTurns;
     this.#pollMs = opts.pollMs;
     this.#turnTimeoutMs = opts.turnTimeoutMs;
     this.#chainDelayMs = opts.chainDelayMs ?? GROUP_CHAIN_DELAY_MS;
     this.#log = opts.log ?? ((): void => {});
+  }
+
+  /** The ingress is assembled after the bridge, so wiring is deliberately explicit rather than a
+   * hidden global. Commands already persisted while the socket was away replay through this sink. */
+  setNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
+    this.#nativeTurns = endpoint;
+  }
+
+  canAcceptAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean {
+    const event = frame.event;
+    if (!("threadId" in event) || !("turnId" in event)) return false;
+    return this.#storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId) !== undefined;
+  }
+
+  /** Projects only events whose target is a durable group-member turn. Other attach consumers
+   * retain their own ownership routes even when they share this profile token. */
+  handleAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean {
+    const event = frame.event;
+    if (!("threadId" in event) || !("turnId" in event)) return false;
+    const owned = this.#storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId);
+    if (owned === undefined) return false;
+    let settled: BotGroupTurnRow | undefined;
+    if (event.kind === "commit") {
+      settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, "commit", blocksToText(event.blocks), undefined, this.#now());
+    } else if (event.kind === "failed") {
+      settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, "failed", undefined, event.message, this.#now());
+    } else if (event.kind === "cancelled" || event.kind === "interrupted") {
+      settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, event.kind, undefined, undefined, this.#now());
+    } else {
+      // Draft/tool/interaction events still belong to this already-authorized turn. The room has
+      // no separate wire projection for them, but declining would dead-letter an otherwise valid
+      // at-least-once stream.
+      return true;
+    }
+    if (settled === undefined) return false;
+    const wake = this.#waiters.get(event.turnId);
+    if (wake !== undefined) wake();
+    else this.#recoverSettledTurn(settled);
+    return true;
   }
 
   list(): BotGroup[] {
@@ -237,8 +272,7 @@ export class GroupRooms {
     //
     // Cache-first would be cheaper and was what this did, and it is what let the bug in: the roster
     // snapshot still listed a bot that had just been deleted, the room was written naming it, and
-    // the first round handed that name to `session.create`, which in Hermes 0.20.x AUTO-CREATES a
-    // profile for a name it does not know. The deleted bot came back as a bare profile. A room is
+    // the first round addressed that name. A room is
     // durable and its membership is fixed at create, so this is the one place where paying for a
     // fresh answer is obviously right.
     const missing = await this.#missingMembers(members);
@@ -256,10 +290,8 @@ export class GroupRooms {
     return this.#view(room);
   }
 
-  /** Deletes a room and everything hanging off it. The members' `Group: <name>` sessions in Hermes
-   *  are deliberately LEFT ALONE: they are the members' own memory of the conversation, deleting
-   *  them is not this route's business, and a room recreated under the same name picks them straight
-   *  back up through the title lookup (dissection 9.6). */
+  /** Deletes a room while retaining terminal turn tombstones so late attach events are harmless.
+   * A recreated room gets fresh gateway-owned member threads. */
   remove(rawName: string): void {
     const key = this.#key(rawName);
     if (!this.#storage.deleteBotGroup(key)) throw new GroupNotFound(rawName.trim());
@@ -330,6 +362,8 @@ export class GroupRooms {
    *  any storage read, so this resolves in about one poll rather than in one turn cap. */
   async close(): Promise<void> {
     this.#closed = true;
+    for (const wake of this.#waiters.values()) wake();
+    this.#waiters.clear();
     const running = [...this.#drives.values()].map((entry) => entry.promise.catch(() => {}));
     this.#drives.clear();
     await Promise.all(running);
@@ -565,7 +599,8 @@ export class GroupRooms {
     }
   }
 
-  /** One member's turn: resolve its room session, ask, and interpret the answer. Never throws. */
+  /** One member's turn is an attach-v1 command/event round trip. No Dashboard session is resolved
+   * or polled here: `threadId` is a gateway-owned durable identity for this room member. */
   async #turn(args: {
     key: string;
     groupName: string;
@@ -577,62 +612,75 @@ export class GroupRooms {
     storedId?: string;
   }): Promise<GroupTurnResult> {
     const { key, groupName, member, members, delta, startEpoch, startGeneration, storedId } = args;
-    let session;
-    try {
-      session = await ensureGroupSession(this.#rpc, member.name, groupName, {
-        ...(storedId === undefined ? {} : { storedId }),
-        hidden: this.#hidden,
-        // Handed DOWN rather than run here, so it fires on the one arm that can mint a profile and
-        // fires there immediately before `session.create`. Checking at the top of this method
-        // instead would pay a round trip on every healthy turn and still leave the whole of
-        // `ensureGroupSession` (up to two full transcript reads) inside the window.
-        assertStillExists: async () => {
-          if (!(await this.#memberExists(member.name))) throw new MemberGone(member.name);
-        },
-      });
-    } catch (err) {
-      // Not a failed turn: nothing was asked, because there is nobody left to ask.
-      if (err instanceof MemberGone) return { outcome: "gone" };
-      const detail = err instanceof Error ? err.message : "unknown failure";
-      this.#log(`group ${groupName}: session for ${member.name} failed: ${detail}`);
-      return { outcome: "failed", detail };
-    }
-    // The same guard shape the post-turn write uses, and for the same reason. Resolving a session
-    // is a round trip to Hermes, and a `DELETE /bots/groups/:name` landing inside that window takes
-    // the room row with it. The member-session write is a foreign key onto that row, so it fails
-    // with `FOREIGN KEY constraint failed`, and because nothing awaits a drive that rejection
-    // escaped as an UNHANDLED one: a well-timed delete could take the process down. A closed bridge
-    // is the same hazard one level up, where the database itself is gone.
     if (this.#closed || this.#generation(key) !== startGeneration) return { outcome: "pass" };
     if (this.#storage.botGroup(key) === undefined) return { outcome: "pass" };
-    if (session.storedId !== storedId) this.#storage.setBotGroupSession(key, member.name, session.storedId);
-
     const prompt = buildTurnPrompt(groupName, members, member, delta);
-    const result = await runMemberTurn({
-      rpc: this.#rpc,
-      member: member.name,
-      group: groupName,
-      prompt,
-      session,
-      now: this.#now,
-      ...(this.#stream === undefined ? {} : { stream: this.#stream }),
-      ...(this.#pollMs === undefined ? {} : { pollMs: this.#pollMs }),
-      ...(this.#turnTimeoutMs === undefined ? {} : { timeoutMs: this.#turnTimeoutMs }),
-      // A turn whose room was superseded or deleted stops early instead of burning the rest of the
-      // 180 s cap on an answer the room has already moved past.
-      live: () => {
-        // The two in-memory checks come first, and the storage read only happens if they pass: a
-        // closed bridge has a closed database, and the read itself would throw.
-        if (this.#closed || this.#generation(key) !== startGeneration) return false;
-        const room = this.#storage.botGroup(key);
-        return room !== undefined && room.epoch === startEpoch;
-      },
-      log: this.#log,
-    });
+    const endpoint = this.#nativeTurns;
+    if (endpoint === undefined) return { outcome: "failed", detail: "native attach-v1 group transport is not configured" };
+    const watermark = this.#storage.botGroupMembers(key).get(member.name)?.watermark ?? 0;
+    const threadId = storedId ?? this.#storage.ensureBotGroupThread(key, member.name);
+    if (storedId === undefined) this.#storage.setBotGroupSession(key, member.name, threadId);
+    const started = startNativeMemberTurn({ storage: this.#storage, endpoint, key, member: member.name,
+      agentId: member.name, threadId, epoch: startEpoch, watermark, prompt, now: this.#now });
+    if ("outcome" in started) return started;
+    const result = await this.#waitForTurn(key, started.turnId, startGeneration);
     // `(pass)` in any of its shapes is a pass, and so is a blank reply. Turning a spoken `(pass)`
     // into a room message would show the protocol's own plumbing to the user.
     if (result.outcome === "spoke" && isPassText(result.text)) return { outcome: "pass" };
     return result;
+  }
+
+  async #waitForTurn(key: string, turnId: string, generation: number): Promise<GroupTurnResult> {
+    const timeoutMs = this.#turnTimeoutMs ?? 180_000;
+    const deadline = this.#now() + timeoutMs;
+    while (!this.#closed && this.#generation(key) === generation) {
+      const row = this.#storage.botGroupTurn(key, turnId);
+      if (row !== undefined) {
+        const result = settledGroupTurn(row);
+        if (result !== undefined) {
+          this.#storage.consumeBotGroupTurn(key, turnId, this.#now());
+          return result;
+        }
+      }
+      if (this.#now() >= deadline) {
+        const detail = `no reply within ${Math.round(timeoutMs / 1000)}s`;
+        this.#storage.timeoutBotGroupTurn(key, turnId, detail, this.#now());
+        return { outcome: "timeout", detail };
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => { this.#waiters.delete(turnId); resolve(); }, this.#pollMs ?? 50);
+        timer.unref?.();
+        this.#waiters.set(turnId, () => { clearTimeout(timer); this.#waiters.delete(turnId); resolve(); });
+      });
+    }
+    return { outcome: "pass" };
+  }
+
+  #recoverSettledTurn(turn: BotGroupTurnRow): void {
+    const claimed = this.#storage.consumeBotGroupTurn(turn.key, turn.turnId, this.#now());
+    if (claimed === undefined || this.#closed) return;
+    const room = this.#storage.botGroup(claimed.key);
+    if (room === undefined || room.epoch !== claimed.epoch) return;
+    const result = settledGroupTurn(claimed);
+    if (result?.outcome === "spoke" && !isPassText(result.text)) {
+      const member = this.#memberInfo(claimed.member);
+      const entry = this.#append(claimed.key, { kind: "member", name: member.name, displayName: member.displayName, text: result.text, at: this.#now() });
+      this.#storage.setBotGroupWatermark(claimed.key, claimed.member, entry.seq);
+      if (mentionsUser(result.text)) {
+        this.#storage.setBotGroupNeedsYou(claimed.key, true);
+        this.#emitState(room, "needs_you", 0, undefined, room.epoch);
+        try {
+          this.#escalate({ group: room.name, member: member.name, displayName: member.displayName, text: result.text });
+        } catch (err) {
+          this.#log(`group ${room.name}: recovered escalation for ${member.name} failed: ${err instanceof Error ? err.message : "unknown failure"}`);
+        }
+      }
+    } else {
+      this.#storage.setBotGroupWatermark(claimed.key, claimed.member, highestSeq(this.#entries(claimed.key), claimed.watermark));
+    }
+    // The previous process cannot retain its loop. Resume from durable watermarks; one serial
+    // drive owns any remaining responders and the outbox already owns the command replay.
+    this.#startDrive(claimed.key, room.epoch);
   }
 
   #entries(key: string): GroupLogEntry[] {

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { PresenceState, RichBlock, ToolCall } from "cozygateway-contract";
 
-import type { AgentConfig } from "../../config.ts";
+import type { HermesBridgeConfig } from "../../config.ts";
 import type { BackendAdapter, BackendSession, TurnHandlers } from "../types.ts";
 import type { AttachV1EventFrame } from "./protocol-v1.ts";
 import { blocksToText } from "./blocks-to-text.ts";
@@ -45,50 +45,41 @@ export interface ParsedAttachOptions {
  *  environment variable holding the connection token, never the token itself; startup fails
  *  closed when the variable is missing or empty. */
 export function parseAttachOptions(
-  agent: AgentConfig,
+  profileId: string,
+  profile: HermesBridgeConfig["profiles"][string],
   env: Record<string, string | undefined>,
+  turnTimeoutSeconds = DEFAULT_TURN_TIMEOUT_SECONDS,
 ): ParsedAttachOptions {
-  const options = agent.options ?? {};
-  const tokenEnv = options["tokenEnv"];
-  if (typeof tokenEnv !== "string" || tokenEnv.length === 0) {
-    throw new Error(
-      `agent "${agent.id}": the attach backend requires options.tokenEnv, the NAME of an environment variable holding the connection token`,
-    );
-  }
+  const tokenEnv = profile.tokenEnv;
   const token = env[tokenEnv];
   if (token === undefined || token.length === 0) {
     throw new Error(
-      `agent "${agent.id}": environment variable "${tokenEnv}" is not set; the attach token rides the environment, never the config file`,
+      `Hermes profile "${profileId}": environment variable "${tokenEnv}" is not set; the attach token rides the environment, never the config file`,
     );
   }
-  const rawTimeout = options["turnTimeoutSeconds"];
-  let turnTimeoutMs = DEFAULT_TURN_TIMEOUT_SECONDS * 1000;
-  if (rawTimeout !== undefined) {
-    if (typeof rawTimeout !== "number" || !Number.isFinite(rawTimeout) || rawTimeout <= 0) {
-      throw new Error(`agent "${agent.id}": options.turnTimeoutSeconds must be a positive number`);
-    }
-    turnTimeoutMs = rawTimeout * 1000;
+  if (!Number.isFinite(turnTimeoutSeconds) || turnTimeoutSeconds <= 0) {
+    throw new Error("turnTimeoutSeconds must be a positive number");
   }
-  return { tokenEnv, token, turnTimeoutMs };
+  return { tokenEnv, token, turnTimeoutMs: turnTimeoutSeconds * 1000 };
 }
 
 /** Build the token-to-agentId map the ingress authenticates against. The token IS the agent
  *  identity on /attach/v1, so a shared token is a hard startup error, not a warning. */
 export function collectAttachTokens(
-  agents: AgentConfig[],
+  profiles: HermesBridgeConfig["profiles"],
   env: Record<string, string | undefined>,
 ): Map<string, string> {
   const tokens = new Map<string, string>();
-  for (const agent of agents) {
-    if (agent.backend !== "attach") continue;
-    const { token } = parseAttachOptions(agent, env);
+  for (const [rawProfileId, profile] of Object.entries(profiles)) {
+    const profileId = rawProfileId.trim().toLowerCase();
+    const { token } = parseAttachOptions(profileId, profile, env);
     const holder = tokens.get(token);
     if (holder !== undefined) {
       throw new Error(
-        `agent "${agent.id}": attach token collides with agent "${holder}"; every attach agent needs its own token`,
+        `Hermes profile "${profileId}": attach token collides with profile "${holder}"; every profile needs its own token`,
       );
     }
-    tokens.set(token, agent.id);
+    tokens.set(token, profileId);
   }
   return tokens;
 }
@@ -98,7 +89,7 @@ interface InflightTurn {
   handlers: TurnHandlers;
   latest: RichBlock[] | undefined;
   toolCalls: Map<string, ToolCall>;
-  timer: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout>;
   resolve: () => void;
   reject: (err: Error) => void;
 }
@@ -122,7 +113,7 @@ export function createAttachAdapter(deps: {
     if (turn === undefined) return undefined;
     turns.delete(turnId);
     if (inflightByThread.get(turn.threadId) === turnId) inflightByThread.delete(turn.threadId);
-    clearTimeout(turn.timer);
+    if (turn.timer !== undefined) clearTimeout(turn.timer);
     return turn;
   };
 
@@ -157,12 +148,14 @@ export function createAttachAdapter(deps: {
           }
           const turnId = randomUUID();
           return new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(
-              () => failTurn(turnId, `turn timed out after ${deps.turnTimeoutMs / 1000}s`),
-              deps.turnTimeoutMs,
-            );
-            timer.unref();
-            turns.set(turnId, { threadId, handlers, latest: undefined, toolCalls: new Map(), timer, resolve, reject });
+            const timer = deps.turnTimeoutMs === 0
+              ? undefined
+              : setTimeout(
+                  () => failTurn(turnId, `turn timed out after ${deps.turnTimeoutMs / 1000}s`),
+                  deps.turnTimeoutMs,
+                );
+            timer?.unref();
+            turns.set(turnId, { threadId, handlers, latest: undefined, toolCalls: new Map(), ...(timer === undefined ? {} : { timer }), resolve, reject });
             inflightByThread.set(threadId, turnId);
             let sent: boolean;
             try {

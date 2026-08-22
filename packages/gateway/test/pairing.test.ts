@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { testHermes } from "./support/test-config.ts";
 import { openStorage } from "../src/storage.ts";
 import { createApp } from "../src/http.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
@@ -10,7 +11,7 @@ const config: GatewayConfig = {
   port: 8787,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+  hermes: testHermes(),
 };
 
 function makeApp(now = () => 1_000) {

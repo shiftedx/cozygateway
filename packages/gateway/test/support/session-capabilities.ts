@@ -10,7 +10,7 @@ import type { BackendSession } from "../../src/adapters/types.ts";
  *  so a vanished capability fails at the call site with its own name in the message. */
 export function requireSteer(
   session: BackendSession,
-): (blocks: RichBlock[]) => Promise<boolean | void> {
+): (blocks: RichBlock[]) => Promise<boolean> {
   const steer = session.steer;
   expect(typeof steer).toBe("function");
   if (steer === undefined) throw new Error("session.steer is missing on a steer-capable session");

@@ -2,12 +2,12 @@
  *  same black-box conformance suite a third party would run. The gateway is exercised only
  *  over HTTP + WebSocket; the suite (src/) never imports gateway internals. */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { startGateway, type RunningGateway } from "cozygateway";
 import type { GatewayInfo } from "cozygateway-contract";
 
 import { registerConformanceSuite } from "../src/suite.ts";
+import { ReferenceAttachGateway } from "./reference-attach.ts";
 
-let gateway: RunningGateway;
+let reference: ReferenceAttachGateway;
 
 // The push-registration group below registers a real-looking but unroutable relayUrl (spec
 // section 5 only requires the registration call to succeed, never an actual delivery), so the
@@ -25,33 +25,12 @@ const notifierLogLines: string[] = [];
 const FAKE_VENDOR_CAPABILITY = "com.cozylabs.test";
 
 beforeAll(async () => {
-  gateway = await startGateway(
-    {
-      name: "conformance-reference",
-      port: 0,
-      dbPath: ":memory:",
-      turnTimeoutSeconds: 0,
-      agents: [
-        { id: "conformance-echo", name: "Echo", backend: "mock" },
-        // Issue #21: the stall hook's reference implementation. The mock-steer backend stays in
-        // flight after one draft and honors a hard interrupt, which is exactly what the suite's
-        // live-202 group requires; without it that group has no in-flight window to interrupt and
-        // skips. A third-party gateway may satisfy the hook with any backend of its own.
-        { id: "conformance-stall", name: "Stall", backend: "mock-steer" },
-        // Issue #19: the approval hook's reference implementation. The mock-approval backend
-        // raises one pending approval per turn and parks until it is resolved, which is what the
-        // suite's approval group needs; without it that group has no pending approval to decide
-        // and skips. A third-party gateway may satisfy the hook with any backend of its own.
-        { id: "conformance-approval", name: "Approval", backend: "mock-approval" },
-      ],
-      capabilities: { [FAKE_VENDOR_CAPABILITY]: 1 },
-    },
-    { notifierLog: (message) => notifierLogLines.push(message) },
-  );
+  reference = new ReferenceAttachGateway(true, (message) => notifierLogLines.push(message));
+  await reference.start();
 });
 
 afterAll(async () => {
-  await gateway.close();
+  await reference.close();
   // The sink should only ever have collected the expected, harmless notify failures against the
   // unroutable relayUrl above, never some unrelated notifier error it accidentally swallowed.
   // Both push legs land here: an agent reply ("notify failed") and, since the approval agent above
@@ -62,8 +41,8 @@ afterAll(async () => {
 });
 
 registerConformanceSuite({
-  baseUrl: () => gateway.url,
-  issueSetupCode: () => Promise.resolve(gateway.issueSetupCode()),
+  baseUrl: () => reference.gateway?.url ?? "",
+  issueSetupCode: () => Promise.resolve(reference.gateway?.issueSetupCode() ?? ""),
   echoAgentId: "conformance-echo",
   stallAgentId: "conformance-stall",
   approvalAgentId: "conformance-approval",
@@ -76,7 +55,7 @@ registerConformanceSuite({
 // "capabilities" describe block for the assertions every gateway is held to).
 describe("reference gateway vendor capability (issue #16)", () => {
   it("advertises the configured com.cozylabs.test capability end to end via GET /health", async () => {
-    const info = (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
+    const info = (await (await fetch(`${reference.gateway?.url}/health`)).json()) as GatewayInfo;
     expect(info.capabilities?.[FAKE_VENDOR_CAPABILITY]).toBe(1);
   });
 });

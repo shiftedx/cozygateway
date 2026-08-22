@@ -3,9 +3,72 @@ import type { RichBlock, ServerFrame } from "cozygateway-contract";
 
 import { openStorage } from "../src/storage.ts";
 import { TurnRunner, nullNotifier, type Notifier } from "../src/turns.ts";
-import { createMockAdapter, createSteerMockAdapter } from "../src/adapters/mock.ts";
 import type { BackendAdapter, BackendSession, TurnHandlers } from "../src/adapters/types.ts";
 import { BackendUnavailable } from "../src/errors.ts";
+
+/** Local deterministic adapters keep the runner tests focused on runner behavior without
+ *  retaining a production mock backend. */
+function echoAdapter(): BackendAdapter {
+  const session: BackendSession = {
+    async send(blocks, handlers) {
+      const text = blocks[0]?.type === "paragraph" ? blocks[0].text : "(rich content)";
+      handlers.onDraft({ blocks: [{ type: "paragraph", text: "Echo: " }], toolCalls: [] });
+      if (text.includes("[[fail]]")) throw new Error("scripted failure");
+      const final = [{ type: "paragraph" as const, text: `Echo: ${text}` }];
+      handlers.onDraft({ blocks: final, toolCalls: [] });
+      handlers.onCommit({ blocks: final });
+      handlers.onDone();
+    },
+    async close() {},
+  };
+  return {
+    backend: "test-echo",
+    midTurnDelivery: "queue",
+    async startSession() { return session; },
+    presence: () => "online",
+  };
+}
+
+function steerAdapter(): BackendAdapter {
+  return {
+    backend: "test-steer",
+    midTurnDelivery: "steer",
+    presence: () => "online",
+    async startSession() {
+      let inflight:
+        | { handlers: TurnHandlers; text: string; resolve: () => void; reject: (error: Error) => void }
+        | undefined;
+      return {
+        send(blocks, handlers) {
+          const text = `Working: ${blocks[0]?.type === "paragraph" ? blocks[0].text : "(rich content)"}`;
+          return new Promise<void>((resolve, reject) => {
+            inflight = { handlers, text, resolve, reject };
+            handlers.onDraft({ blocks: [{ type: "paragraph", text }], toolCalls: [] });
+          });
+        },
+        async steer(blocks) {
+          const current = inflight;
+          if (current === undefined) return false;
+          const suffix = blocks[0]?.type === "paragraph" ? blocks[0].text : "(rich content)";
+          const final = [{ type: "paragraph" as const, text: `${current.text} + ${suffix}` }];
+          current.handlers.onDraft({ blocks: final, toolCalls: [] });
+          current.handlers.onCommit({ blocks: final });
+          current.handlers.onDone();
+          inflight = undefined;
+          current.resolve();
+          return true;
+        },
+        async interrupt() {
+          const current = inflight;
+          if (current === undefined) return;
+          inflight = undefined;
+          current.reject(new Error("interrupted by user"));
+        },
+        async close() {},
+      };
+    },
+  };
+}
 
 /** An adapter whose turn stalls on `gate`: it drafts immediately (so a test can observe the
  *  turn is in flight), then waits for the gate before committing. */
@@ -33,7 +96,7 @@ function gatedAdapter(gate: Promise<void>): BackendAdapter {
  *  chooses whether the stub hub reports device "d1" as connected. */
 function setup(opts?: { clients?: boolean; notifier?: Notifier }) {
   const storage = openStorage(":memory:");
-  storage.upsertAgent({ id: "a1", name: "Mock", avatar: null, backend: "mock" });
+  storage.upsertAgent({ id: "a1", name: "Echo", avatar: null, backend: "test-echo" });
   storage.createThread({ id: "t1", agentId: "a1", title: "T", createdAt: 1 });
   const frames: ServerFrame[] = [];
   const runner = new TurnRunner({
@@ -42,7 +105,7 @@ function setup(opts?: { clients?: boolean; notifier?: Notifier }) {
       broadcast: (f) => frames.push(f),
       connectedDeviceIds: () => (opts?.clients ?? true ? new Set(["d1"]) : new Set()),
     },
-    adapters: new Map([["a1", createMockAdapter()]]),
+    adapters: new Map([["a1", echoAdapter()]]),
     notifier: opts?.notifier ?? nullNotifier,
     now: () => 42,
   });
@@ -117,7 +180,7 @@ describe("TurnRunner", () => {
     const order: string[] = [];
     const notifier: Notifier = { notify: () => order.push("notify") };
     const storage = openStorage(":memory:");
-    storage.upsertAgent({ id: "a1", name: "Mock", avatar: null, backend: "mock" });
+    storage.upsertAgent({ id: "a1", name: "Echo", avatar: null, backend: "test-echo" });
     storage.createThread({ id: "t1", agentId: "a1", title: "T", createdAt: 1 });
     const runner = new TurnRunner({
       storage,
@@ -125,7 +188,7 @@ describe("TurnRunner", () => {
         broadcast: (f) => order.push(f.type === "committed" && f.message.role === "agent" ? "committed-agent" : f.type),
         connectedDeviceIds: () => new Set(),
       },
-      adapters: new Map([["a1", createMockAdapter()]]),
+      adapters: new Map([["a1", echoAdapter()]]),
       notifier,
       now: () => 42,
     });
@@ -141,7 +204,7 @@ describe("TurnRunner", () => {
 
   it("throws BackendUnavailable for an agent with no adapter", () => {
     const { storage } = setup();
-    storage.upsertAgent({ id: "ghost", name: "G", avatar: null, backend: "mock" });
+    storage.upsertAgent({ id: "ghost", name: "G", avatar: null, backend: "test-echo" });
     storage.createThread({ id: "t2", agentId: "ghost", title: "T2", createdAt: 1 });
     const runner = new TurnRunner({
       storage,
@@ -172,7 +235,7 @@ describe("TurnRunner", () => {
   it("runs turns on different threads concurrently", async () => {
     const storage = openStorage(":memory:");
     storage.upsertAgent({ id: "slow", name: "Slow", avatar: null, backend: "gated" });
-    storage.upsertAgent({ id: "fast", name: "Fast", avatar: null, backend: "mock" });
+    storage.upsertAgent({ id: "fast", name: "Fast", avatar: null, backend: "test-echo" });
     storage.createThread({ id: "ta", agentId: "slow", title: "A", createdAt: 1 });
     storage.createThread({ id: "tb", agentId: "fast", title: "B", createdAt: 1 });
     let releaseA = () => {};
@@ -185,7 +248,7 @@ describe("TurnRunner", () => {
       hub: { broadcast: (f) => frames.push(f), connectedDeviceIds: () => new Set() },
       adapters: new Map<string, BackendAdapter>([
         ["slow", gatedAdapter(gateA)],
-        ["fast", createMockAdapter()],
+        ["fast", echoAdapter()],
       ]),
       notifier: nullNotifier,
       now: () => 42,
@@ -259,13 +322,13 @@ describe("TurnRunner", () => {
 
 function steerSetup() {
   const storage = openStorage(":memory:");
-  storage.upsertAgent({ id: "s1", name: "Steer", avatar: null, backend: "mock-steer" });
+  storage.upsertAgent({ id: "s1", name: "Steer", avatar: null, backend: "test-steer" });
   storage.createThread({ id: "t1", agentId: "s1", title: "T", createdAt: 1 });
   const frames: ServerFrame[] = [];
   const runner = new TurnRunner({
     storage,
     hub: { broadcast: (f) => frames.push(f), connectedDeviceIds: () => new Set() },
-    adapters: new Map<string, BackendAdapter>([["s1", createSteerMockAdapter()]]),
+    adapters: new Map<string, BackendAdapter>([["s1", steerAdapter()]]),
     notifier: nullNotifier,
     now: () => 42,
   });
@@ -319,7 +382,7 @@ describe("TurnRunner mid-turn delivery", () => {
   });
 
   it("a mid-turn send that loses the race (turn already done) queues normally with delivery absent", async () => {
-    // The mock echo (queue backend) finishes its turn synchronously-ish; a second send after the
+    // The local echo (queue backend) finishes its turn synchronously-ish; a second send after the
     // first turn's done sees no in-flight record and queues, committing with delivery absent.
     const { frames, runner } = setup();
     runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
@@ -371,7 +434,7 @@ describe("TurnRunner stop-phrase send path", () => {
     await untilFrames(frames, (fs) =>
       fs.some((f) => f.type === "committed" && f.message.marker === "turn.interrupted"),
     );
-    // The stop message itself becomes the next queued turn (mock-steer draws "Working: stop").
+    // The stop message itself becomes the next queued turn (the local steer adapter draws "Working: stop").
     await untilFrames(frames, (fs) =>
       fs.some((f) => f.type === "draft" && f.blocks.some((b) => b.type === "paragraph" && b.text === "Working: stop")),
     );
@@ -392,7 +455,7 @@ describe("TurnRunner stop-phrase send path", () => {
   it("a mid-turn send that loses the race on a STEER-CAPABLE backend queues normally under a new turnId", async () => {
     // The queue-only echo covers this at the wrong altitude: it has no steer path at all, so it
     // proves nothing about a steer-capable backend whose turn has already ended. Here the
-    // mock-steer turn is driven to completion first, so the second send finds no in-flight record
+    // local steer turn is driven to completion first, so the second send finds no in-flight record
     // and takes the queue branch (delivery absent, fresh turnId).
     const { storage, frames, runner } = steerSetup();
     runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
@@ -412,7 +475,7 @@ describe("TurnRunner stop-phrase send path", () => {
 /** A steer-capable session whose sends never settle on their own and whose steer() reports
  *  acceptance with `result`. Records every blocks array send() received, so a test can prove a
  *  refused steer came back as a QUEUED turn carrying the same blocks rather than vanishing. */
-function acceptanceSteerAdapter(result: () => Promise<boolean | void>) {
+function acceptanceSteerAdapter(result: () => Promise<boolean>) {
   const sent: RichBlock[][] = [];
   const pending: Array<{ handlers: TurnHandlers; resolve: () => void }> = [];
   const session: BackendSession = {
@@ -497,20 +560,17 @@ describe("TurnRunner steer acceptance", () => {
     expect(fake.sent).toHaveLength(2);
   });
 
-  it("queues NO fallback turn when steer reports acceptance, including the legacy void return", async () => {
-    for (const result of [async () => true, async () => undefined]) {
-      const fake = acceptanceSteerAdapter(result);
-      const { frames, runner } = acceptanceSetup(fake.adapter);
-      runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
-      await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
-      runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]);
-      await untilFrames(frames, (fs) => fs.some((f) => f.type === "committed" && f.message.delivery === "steer"));
-      fake.finishOldest();
-      // Give any (wrongly) queued fallback turn every chance to start before asserting it did not.
-      await new Promise((r) => setTimeout(r, 20));
-      expect(fake.sent).toEqual([[{ type: "paragraph", text: "one" }]]);
-      expect(new Set(draftTurnIds(frames)).size).toBe(1);
-    }
+  it("queues NO fallback turn when steer reports acceptance", async () => {
+    const fake = acceptanceSteerAdapter(async () => true);
+    const { frames, runner } = acceptanceSetup(fake.adapter);
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "one" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "draft"));
+    runner.submitUserMessage("t1", [{ type: "paragraph", text: "two" }]);
+    await untilFrames(frames, (fs) => fs.some((f) => f.type === "committed" && f.message.delivery === "steer"));
+    fake.finishOldest();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fake.sent).toEqual([[{ type: "paragraph", text: "one" }]]);
+    expect(new Set(draftTurnIds(frames)).size).toBe(1);
   });
 });
 
@@ -532,7 +592,7 @@ function controllableSteerAdapter() {
         rejectSend = reject;
       });
     },
-    async steer() {},
+    async steer() { return true; },
     interrupt,
     async close() {},
   };

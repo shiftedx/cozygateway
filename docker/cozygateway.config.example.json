@@ -1,0 +1,19 @@
+{
+  "name": "cozygateway",
+  "host": "0.0.0.0",
+  "port": 8787,
+  "dbPath": "/data/cozygateway.db",
+  "hermes": {
+    "url": "ws://host.docker.internal:9119/api/ws",
+    "authMode": "password",
+    "username": "cozybridge",
+    "passwordEnv": "COZYGATEWAY_HERMES_PASSWORD",
+    "baseUrl": "http://host.docker.internal:9119",
+    "profiles": {
+      "sage": {
+        "name": "Sage",
+        "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_SAGE"
+      }
+    }
+  }
+}

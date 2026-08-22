@@ -1,7 +1,7 @@
 {
   "name": "cozygateway-conformance",
   "version": "0.1.0",
-  "description": "Black-box conformance suite for the cozygateway wire contract v1. Point it at any gateway implementation exposing the reference echo backend.",
+  "description": "Black-box conformance suite for the cozygateway wire contract v1. Point it at any gateway implementation exposing the reference attach echo peer.",
   "type": "module",
   "license": "MIT",
   "repository": {

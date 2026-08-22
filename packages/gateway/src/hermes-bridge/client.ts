@@ -1,7 +1,7 @@
 import { WebSocket } from "ws";
 
 /** Persistent outbound JSON-RPC WebSocket client to a Hermes gateway (`hermes serve`, the
- *  `tui_gateway` surface at `/api/ws`). Modeled on `adapters/openclaw/client.ts`: one socket at a
+ *  `tui_gateway` surface at `/api/ws`): one socket at a
  *  time, reconnect with exponential backoff and jitter, a handshake watchdog, and a generic
  *  `request(method, params)` correlated STRICTLY by id.
  *
@@ -131,7 +131,7 @@ class SessionExpiredError extends Error {
   }
 }
 
-/** Same pure backoff shape as the OpenClaw client's, duplicated rather than imported so the two
+/** Pure reconnect backoff with bounded jitter.
  *  clients stay independent (this one may tune its curve without touching the chat path).
  *  `attempt` is 1-based; jitter is +/-10% of the doubling base, clamped into the policy band. */
 export function computeReconnectDelay(
@@ -204,9 +204,8 @@ export interface HermesClient {
    *  the call could not be sent or the socket died first, or `HermesTimeout` (a subclass of it)
    *  when the call went out and nothing came back inside its bound.
    *
-   *  `opts.timeoutMs` overrides the client-wide bound for ONE call. It exists for the handful of
-   *  Hermes operations that are legitimately slow (a profile delete stops a service and rmtrees a
-   *  directory), where the default 30 s would reject a call that is going to succeed. */
+   *  `opts.timeoutMs` overrides the client-wide bound for one legitimately slow Hermes operation,
+   *  such as a catalog search or routine write. */
   request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   /** Calls the authenticated dashboard REST surface on the same Hermes connection. `path` is
    *  origin-relative and may include a query string. */

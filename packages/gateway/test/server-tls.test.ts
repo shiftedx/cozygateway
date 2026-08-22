@@ -3,16 +3,24 @@ import { join } from "node:path";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 
 import { WebSocket } from "ws";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { GatewayInfo } from "cozygateway-contract";
 
+import { testHermes } from "./support/test-config.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { generateSelfSigned, writeGarbage } from "./helpers/self-signed.ts";
 
 const running: RunningGateway[] = [];
 
+beforeEach(() => {
+  process.env.TEST_HERMES_CONTROL_TOKEN = "control-secret";
+  process.env.TEST_ATTACH_TOKEN = "attach-secret";
+});
+
 afterEach(async () => {
   while (running.length > 0) await running.pop()?.close();
+  delete process.env.TEST_HERMES_CONTROL_TOKEN;
+  delete process.env.TEST_ATTACH_TOKEN;
 });
 
 function baseConfig(): Parameters<typeof startGateway>[0] {
@@ -22,7 +30,7 @@ function baseConfig(): Parameters<typeof startGateway>[0] {
     host: "127.0.0.1",
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+    hermes: testHermes(),
   };
 }
 

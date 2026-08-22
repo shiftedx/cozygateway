@@ -11,11 +11,17 @@ import { startGateway, type RunningGateway } from "../src/server.ts";
 
 it("attach-v1 completes exactly once after a gateway restart mid-reply", async () => {
   const tokenEnv = "ATTACH_V1_RESTART_TOKEN";
+  const controlEnv = "ATTACH_V1_RESTART_CONTROL_TOKEN";
   process.env[tokenEnv] = "restart-secret";
+  process.env[controlEnv] = "control-secret";
   const dbPath = join(mkdtempSync(join(tmpdir(), "attach-restart-")), "gateway.sqlite");
   const config = {
     name: "restart", port: 0, dbPath, turnTimeoutSeconds: 0,
-    agents: [{ id: "sage", name: "Sage", backend: "attach", options: { tokenEnv, turnTimeoutSeconds: 120 } }],
+    hermes: {
+      url: "ws://127.0.0.1:1/api/ws",
+      tokenEnv: controlEnv,
+      profiles: { sage: { tokenEnv, name: "Sage" } },
+    },
   };
   let gateway: RunningGateway | undefined;
   const sockets: WebSocket[] = [];
@@ -70,6 +76,7 @@ it("attach-v1 completes exactly once after a gateway restart mid-reply", async (
     for (const socket of sockets) if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
     await gateway?.close();
     delete process.env[tokenEnv];
+    delete process.env[controlEnv];
   }
 });
 

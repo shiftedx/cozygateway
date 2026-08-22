@@ -7,13 +7,28 @@ import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { gatewayScheme } from "./tls.ts";
 
-const USAGE = `usage: cozygateway <serve|pair> --config <path>`;
+const USAGE = `usage: cozygateway <serve|pair> --config <path> [--url <http(s)://host[:port]>]`;
+
+function pairingUrl(config: ReturnType<typeof loadConfig>, advertised: string | undefined): string {
+  if (advertised === undefined) return `${gatewayScheme(config)}://127.0.0.1:${config.port}`;
+  const url = new URL(advertised);
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username !== "" || url.password !== "") {
+    throw new Error("--url must be an http(s) gateway origin without credentials");
+  }
+  if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    throw new Error("--url must be a gateway origin without a path, query, or fragment");
+  }
+  return url.origin;
+}
 
 export async function runCli(argv: string[]): Promise<number> {
   const command = argv[0];
   const { values } = parseArgs({
     args: argv.slice(1),
-    options: { config: { type: "string", default: "cozygateway.config.json" } },
+    options: {
+      config: { type: "string", default: "cozygateway.config.json" },
+      url: { type: "string" },
+    },
   });
   const configPath = values.config;
 
@@ -39,7 +54,7 @@ export async function runCli(argv: string[]): Promise<number> {
     // https gateway advertising `http://` would send every scan at a port that is not speaking
     // plaintext. Derived without opening the cert files, since `pair` binds no listener; a broken
     // pair is `serve`'s to shout about.
-    const payload = { gatewayUrl: `${gatewayScheme(config)}://127.0.0.1:${config.port}`, setupCode: code };
+    const payload = { gatewayUrl: pairingUrl(config, values.url), setupCode: code };
     console.log(JSON.stringify(payload));
     console.log(`Setup code ${code} is valid for 10 minutes. Scan or type it in the app.`);
     return 0;

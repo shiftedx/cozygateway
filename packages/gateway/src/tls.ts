@@ -26,7 +26,7 @@ export class TlsConfigurationError extends Error {
  *  no-op. Present-but-broken config throws instead, before the listener binds, so a typo'd path or
  *  a truncated PEM is a refusal to start rather than a gateway that quietly serves plaintext on the
  *  port the operator believed was encrypted. That asymmetry -- absent stays quiet, present-but-
- *  broken screams -- is the same secure-by-default posture the attach and openclaw token
+ *  broken screams -- is the same secure-by-default posture the attach token
  *  resolution already take.
  *
  *  Validation is not a file-exists check: the pair is fed to `tls.createSecureContext`, which is

@@ -2,7 +2,7 @@
 
 Chat with your self-hosted AI agent from your phone, without handing your data to anyone.
 
-cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and drives agent backends through a small adapter interface. Two backends ship today: a reference echo backend for trying the gateway out, and an `attach` backend that lets an agent harness dial in over a small WebSocket protocol and answer turns live.
+cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and uses its `attach` data plane to let an agent harness dial in over a small WebSocket protocol and answer turns live.
 
 ## Install
 
@@ -14,40 +14,29 @@ There are two ways in. Pick the one that fits your machine.
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
-No Docker, no git, no build tools. Needs a working Hermes install (0.20.2 or newer) plus Node 24+
-(the line stops and tells you how to get either one if you do not have it). It downloads the
-latest released gateway bundle, checks its sha256, installs
-it to `~/.cozygateway`, and registers the gateway and the Hermes dashboard as login services
-(launchd on macOS, systemd `--user` on Linux) that come back after a crash, a logout, or a reboot.
-It prints a pairing code for the app when it is done. See `docs/install-service.md` for what it
-does step by step, where the files live, and how to check on it later.
+No Docker, git, or build tools. It requires an existing Hermes installation and Node 24+. The
+bootstrap verifies versioned release checksums for the gateway bundle, complete Hermes attach-plugin
+archive, and installer payload. It discovers Hermes profile homes through the Hermes CLI, installs
+one attach identity per selected profile, and supervises one shared gateway service. Existing Hermes
+profile gateway services stay Hermes-owned. The default listener is local/LAN (`0.0.0.0:8787`); the
+installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. See
+`docs/install-service.md` and `docs/connectivity.md`.
 
 Uninstall:
 
 ```sh
-bash ~/.cozygateway/bin/agent-install.sh --uninstall-service --gateway-dir ~/.cozygateway
+bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
 
-This removes the service units only. Your config, database, and credentials stay in
-`~/.cozygateway`.
+This removes CozyGateway-owned service state, plugin copies, spools, and installer-written env keys;
+Hermes profiles and Hermes services remain.
 
-### Homelab (Docker) / agent-driven
+### Existing Hermes install
 
-You do not install this by hand. Paste one line to an AI agent you already run (Hermes, Claude Code, anything that can read a URL and run commands) and it installs cozygateway beside your existing Hermes, wires the two together, and hands you a pairing code for the app.
-
-```
-Read https://cozylabs.ai/install and install cozygateway on this machine, following it exactly.
-```
-
-Or fetch it yourself and hand it over:
-
-```sh
-curl -fsSL https://cozylabs.ai/install
-```
-
-`https://cozylabs.ai/install` is the canonical short address: it redirects to the raw `docs/agent-install.md` on this repo's `main`, which is always the source of truth. If you cannot reach cozylabs.ai, the raw GitHub URL works directly: `https://raw.githubusercontent.com/shiftedx/cozygateway/main/docs/agent-install.md`.
-
-The playbook is written for the agent, not for you: every step carries a check command and the output that command must produce, so the agent can tell you it worked rather than guess. It needs a working Hermes install (0.20.2 or newer) plus either Docker or Node 24. `scripts/agent-install.sh` does the mechanical half and has a `--dry-run` flag if you want to read the plan first, and the same playbook now accepts `--service` on the Node path to run supervised instead of with `nohup`.
+The installer targets Hermes profiles already on this machine. For a narrower
+selection, pass `--profiles default,ops` to the one-paste command. The command
+uses the installed Hermes CLI as the source of truth for profile homes and does
+not clone a repository or create a Docker deployment.
 
 ## How push works
 
@@ -71,8 +60,7 @@ sign their own app with their own Apple team.
 
 ## Status
 
-- Shipped: contract v1 (frozen), reference gateway, conformance suite, attach backend adapter, hosted relay plus encrypted push origination and APNs delivery (`contract/push-v0.md`), TLS for the phone link (gateway-native, or a shipped Caddy sidecar example; `docs/tls.md`).
-- Planned: additional backend adapters.
+- Shipped: contract v1 (frozen), conformance suite, attach-v1 data plane, hosted relay plus encrypted push origination and APNs delivery (`contract/push-v0.md`), TLS for the phone link (gateway-native, or a shipped Caddy sidecar example; `docs/tls.md`).
 
 ## Repo layout
 

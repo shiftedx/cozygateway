@@ -11,6 +11,33 @@ import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage } from "../src/storage.ts";
 
 describe("attach-v1 native Bot Mode plane", () => {
+  it("lists only configured attach identities", () => {
+    const storage = openStorage(":memory:");
+    const control = {
+      roster: () => ({
+        bots: [
+          { name: "sage", displayName: "Sage" },
+          { name: "unmanaged", displayName: "Unmanaged" },
+        ],
+        updatedAt: 1,
+        stale: false,
+        hermesState: "connected",
+      }),
+    } as unknown as BotsSurface;
+    const plane = new NativeBotDataPlane({
+      control,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    expect(plane.surface().roster().bots.map((bot) => bot.name)).toEqual(["sage"]);
+    plane.close();
+    storage.close();
+  });
+
   it("submits and settles native text without dashboard chat RPC", async () => {
     const storage = openStorage(":memory:");
     const dashboardSend = vi.fn();
@@ -30,8 +57,10 @@ describe("attach-v1 native Bot Mode plane", () => {
       sendApprovalResolution: () => true,
     } as unknown as AttachV1Ingress;
     let now = 100;
-    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["Sage"], broadcast: (frame) => frames.push(frame), now: () => now++ });
+    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["Sage"], chatSuggestion: "Say hello", broadcast: (frame) => frames.push(frame), now: () => now++ });
     const surface = plane.surface();
+
+    expect(await surface.chatHistory("sage")).toMatchObject({ suggestion: "Say hello", messages: [] });
 
     const accepted = await surface.sendChatMessage("sage", "hello", { clientId: "client-1" });
     expect(dashboardSend).not.toHaveBeenCalled();
@@ -44,6 +73,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "commit-1", event: { kind: "commit", threadId: accepted.sessionId, turnId, messageId: "answer-1", blocks: [{ type: "paragraph", text: "hello back" }], mediaIds: ["missing-media"] } })).toBe(true);
 
     const history = await surface.chatHistory("sage");
+    expect(history.suggestion).toBeUndefined();
     expect(history.messages.map((message) => [message.role, message.text])).toEqual([["user", "hello"], ["assistant", "hello back"]]);
     expect(history.messages.at(-1)?.attachments).toBeUndefined();
     expect(frames.some((frame) => frame.type === "bot_chat_delta")).toBe(true);
@@ -52,64 +82,14 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
-  it("adopts Dashboard history once before exposing the native chat and keeps migrated attachments readable", async () => {
-    const storage = openStorage(":memory:");
-    const chat = storage.nativeBotChat("sage", 1);
-    storage.appendNativeBotMessage({ bot: "sage", sessionId: chat.sessionId, messageId: "native-1", role: "assistant", text: "new native reply", at: 30 });
-    const attachmentInfo = vi.fn(() => ({ mime: "image/png", name: "old.png", size: 4 }));
-    const attachmentSlice = vi.fn(() => new Uint8Array([1, 2, 3, 4]));
-    const chatHistory = vi.fn()
-      .mockRejectedValueOnce(new Error("dashboard still connecting"))
-      .mockResolvedValue({
-      sessionId: "dashboard-sage",
-      adoption: "pin" as const,
-      messages: [
-        { id: "old-user", role: "user", text: "old question", at: 10 },
-        { id: "old-answer", role: "assistant", text: "old answer", at: 20, attachments: [{ type: "attachment" as const, fileId: "old-file", name: "old.png", mimeType: "image/png", size: 4 }] },
-      ],
-      running: false,
-      inflight: false,
-      updatedAt: 20,
-      });
-    const control = {
-      chatHistory,
-      roster: () => ({
-        bots: [{ name: "sage", displayName: "Sage", active: true, presence: "online", description: "", avatar: null, chatSessionId: "dashboard-sage", lastActiveAt: 20, preview: { kind: "plain", text: "old answer" } }],
-        fetchedAt: 20,
-        stale: false,
-        hermesState: "online",
-      }),
-      chatAttachmentInfo: attachmentInfo,
-      chatAttachmentSlice: attachmentSlice,
-    } as unknown as BotsSurface;
-    const logs: string[] = [];
-    const plane = new NativeBotDataPlane({ control, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], broadcast: () => undefined, now: () => 40, log: (message) => logs.push(message), historyRetryMs: 0 });
-
-    // A canary that already has native traffic keeps showing that newer native reply while the
-    // historical import is pending; a completely empty native chat keeps the Dashboard row.
-    expect(plane.surface().roster().bots[0]).toMatchObject({ chatSessionId: chat.sessionId, preview: { text: "new native reply" } });
-    await plane.migrateHistory();
-    await plane.migrateHistory();
-
-    const history = await plane.surface().chatHistory("sage");
-    expect(history.sessionId).toBe(chat.sessionId);
-    expect(history.messages.map((message) => message.text)).toEqual(["old question", "old answer", "new native reply"]);
-    expect(chatHistory).toHaveBeenCalledTimes(2);
-    expect(plane.surface().roster().bots[0]).toMatchObject({ chatSessionId: chat.sessionId, preview: { kind: "plain", text: "new native reply" }, lastActiveAt: 30 });
-    expect(plane.surface().chatAttachmentInfo("sage", "old-file")).toEqual({ mime: "image/png", name: "old.png", size: 4 });
-    expect(plane.surface().chatAttachmentSlice("sage", "old-file", 0, 4)).toEqual(new Uint8Array([1, 2, 3, 4]));
-    expect(logs).toContain("adopted 2 Dashboard messages for sage");
-    storage.close();
-  });
-
-  it("projects tools, approvals, scheduled delivery, and keeps shadow canaries invisible", async () => {
+  it("projects tools, approvals, and scheduled delivery", async () => {
     const storage = openStorage(":memory:");
     const frames: ServerFrame[] = [];
     const approvals: unknown[] = [];
     const pushes: unknown[] = [];
     const control = {} as BotsSurface;
     const ingress = { sendApprovalResolution: vi.fn(() => true) } as unknown as AttachV1Ingress;
-    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], shadowBots: ["pixel"], broadcast: (frame) => frames.push(frame), onApproval: (event) => approvals.push(event), onChatMessage: (event) => pushes.push(event), now: () => 500 });
+    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), onApproval: (event) => approvals.push(event), onChatMessage: (event) => pushes.push(event), now: () => 500 });
     const chat = storage.nativeBotChat("sage", 1);
     storage.enqueueAttachCommand("sage", "turn-command", { kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello" }, 2);
 
@@ -130,9 +110,6 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(storage.nativeBotMessages("sage", chat.sessionId).at(-1)?.text).toBe("daily note");
     expect(pushes).toEqual([expect.objectContaining({ bot: "sage", messageId: "scheduled-1", preview: "daily note" })]);
 
-    const before = frames.length;
-    expect(plane.handle("pixel", { kind: "event", sequence: 1, eventId: "shadow", event: { kind: "scheduled", threadId: "x", deliveryId: "d", messageId: "m", blocks: [{ type: "paragraph", text: "hidden" }] } })).toBe(true);
-    expect(frames).toHaveLength(before);
     storage.close();
   });
 
@@ -147,6 +124,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       storage,
       ingress: {} as AttachV1Ingress,
       nativeBots: ["sage"],
+      chatSuggestion: "",
       broadcast: () => undefined,
       now: () => 1,
     });
@@ -158,7 +136,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage = openStorage(path);
     const frames: ServerFrame[] = [];
     const ingress = { sendClarifyResolution: vi.fn(() => true), sendApprovalResolution: vi.fn(() => true) } as unknown as AttachV1Ingress;
-    const recovered = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], broadcast: (frame) => frames.push(frame), now: () => 20 });
+    const recovered = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => 20 });
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(storage.nativeInteraction("sage", "approval", "approve-1")?.status).toBe("expired");
     expect(frames).toContainEqual(expect.objectContaining({ type: "bot_approval_resolved", toolCallId: "approve-1", outcome: "expired" }));
@@ -181,14 +159,14 @@ describe("attach-v1 native Bot Mode plane", () => {
     const scheduled: AttachV1EventFrame = { kind: "event", sequence: 1, eventId: "scheduled-event", event: { kind: "scheduled", threadId: chat.sessionId, deliveryId: "daily:2026-08-21", messageId: "daily-message:2026-08-21", blocks: [{ type: "paragraph", text: "daily note" }] } };
     expect(storage.acceptAttachEvent("sage", scheduled, 1).status).toBe("accepted");
     const pushes: unknown[] = [];
-    let plane = new NativeBotDataPlane({ control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], broadcast: () => undefined, onChatMessage: (event) => pushes.push(event), now: () => 2 });
+    let plane = new NativeBotDataPlane({ control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, onChatMessage: (event) => pushes.push(event), now: () => 2 });
     expect(plane.handle("sage", scheduled)).toBe(true);
     expect(pushes).toHaveLength(1);
     plane.close();
     storage.close();
 
     storage = openStorage(path);
-    plane = new NativeBotDataPlane({ control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], broadcast: () => undefined, onChatMessage: (event) => pushes.push(event), now: () => 3 });
+    plane = new NativeBotDataPlane({ control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, onChatMessage: (event) => pushes.push(event), now: () => 3 });
     expect(plane.handle("sage", scheduled)).toBe(true);
     expect(storage.nativeBotMessages("sage", chat.sessionId).filter((message) => message.id === "daily-message:2026-08-21")).toHaveLength(1);
     expect(pushes).toHaveLength(1);

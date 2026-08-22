@@ -7,6 +7,7 @@ import { build } from "esbuild";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 
 const entry = "packages/gateway/dist/cli.js";
 if (!existsSync(entry)) {
@@ -52,4 +53,32 @@ rmSync(wrapperEntry, { force: true });
 const body = readFileSync("dist-bundle/cozygateway.mjs");
 const sha = createHash("sha256").update(body).digest("hex");
 writeFileSync("dist-bundle/cozygateway.mjs.sha256", `${sha}  cozygateway.mjs\n`);
+
+// The Hermes plugin is a complete, version-matched release artifact.  The
+// installer verifies this archive before placing its contents under each
+// selected Hermes profile; source-only caches and bytecode are deliberately
+// absent so the artifact is deterministic and contains no local machine state.
+const pluginArchive = "dist-bundle/cozygateway-hermes-attach-plugin.tar.gz";
+const archive = spawnSync(
+  "tar",
+  [
+    "-czf", pluginArchive,
+    "--exclude=__pycache__", "--exclude=.pytest_cache", "--exclude=.venv-test",
+    "-C", "integrations", "attach-plugin",
+  ],
+  { encoding: "utf8" },
+);
+if (archive.status !== 0) {
+  console.error(`build-bundle: could not create attach plugin archive: ${archive.stderr || archive.error}`);
+  process.exit(1);
+}
+
+// Ship the exact installer payload as a release asset too. The curl bootstrap
+// verifies it before executing it, rather than trusting a mutable raw branch.
+const installer = "dist-bundle/cozygateway-installer.sh";
+writeFileSync(installer, readFileSync("scripts/agent-install.sh"), { mode: 0o700 });
+for (const asset of [pluginArchive, installer]) {
+  const assetSha = createHash("sha256").update(readFileSync(asset)).digest("hex");
+  writeFileSync(`${asset}.sha256`, `${assetSha}  ${asset.split("/").at(-1)}\n`);
+}
 console.log(`bundled ${(body.length / 1024 / 1024).toFixed(1)}MB, sha256 ${sha}`);

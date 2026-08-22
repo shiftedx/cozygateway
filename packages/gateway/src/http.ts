@@ -26,12 +26,23 @@ import type { GatewayConfig } from "./config.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
-import type { BotsSurface } from "./hermes-bridge/bridge.ts";
+import type { BotControlSurface, BotsSurface } from "./hermes-bridge/bridge.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
-import type { MediaFetch, MediaLimiter, MediaLookup } from "./hermes-bridge/media.ts";
-import { readCappedBody, sniffImageType, type PhotoRateLimiter } from "./hermes-bridge/photos.ts";
-import { ASSISTANT_MEDIA_TYPES, acceptAssistantMediaBytes } from "./hermes-bridge/assistant-media.ts";
+import type {
+  MediaFetch,
+  MediaLimiter,
+  MediaLookup,
+} from "./hermes-bridge/media.ts";
+import {
+  readCappedBody,
+  sniffImageType,
+  type PhotoRateLimiter,
+} from "./hermes-bridge/photos.ts";
+import {
+  ASSISTANT_MEDIA_TYPES,
+  acceptAssistantMediaBytes,
+} from "./hermes-bridge/assistant-media.ts";
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 
@@ -41,26 +52,42 @@ import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
  *  packages/relay/src/schemas.ts RegisterRequestSchema; the relay still authoritatively validates
  *  every forwarded body, so drift here can only over- or under-eagerly 400, never corrupt. */
 const RelayRegisterRequestSchema = Type.Object({
-  platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns"), Type.Literal("apns-liveactivity")]),
+  platform: Type.Union([
+    Type.Literal("webhook"),
+    Type.Literal("apns"),
+    Type.Literal("apns-liveactivity"),
+  ]),
   token: Type.String({ minLength: 1, maxLength: 2048 }),
-  environment: Type.Optional(Type.Union([Type.Literal("development"), Type.Literal("production")])),
+  environment: Type.Optional(
+    Type.Union([Type.Literal("development"), Type.Literal("production")]),
+  ),
 });
 
-const LiveActivityRegisterRequestSchema = Type.Object({
-  activityId: Type.String({ minLength: 1, maxLength: 128 }),
-  runId: Type.String({ minLength: 1, maxLength: 128 }),
-  conversationId: Type.String({ minLength: 1, maxLength: 160 }),
-  bot: Type.String({ minLength: 1, maxLength: 120 }),
-  token: Type.String({ minLength: 32, maxLength: 512, pattern: "^[0-9a-f]+$" }),
-  environment: Type.Union([Type.Literal("development"), Type.Literal("production")]),
-}, { additionalProperties: false });
+const LiveActivityRegisterRequestSchema = Type.Object(
+  {
+    activityId: Type.String({ minLength: 1, maxLength: 128 }),
+    runId: Type.String({ minLength: 1, maxLength: 128 }),
+    conversationId: Type.String({ minLength: 1, maxLength: 160 }),
+    bot: Type.String({ minLength: 1, maxLength: 120 }),
+    token: Type.String({
+      minLength: 32,
+      maxLength: 512,
+      pattern: "^[0-9a-f]+$",
+    }),
+    environment: Type.Union([
+      Type.Literal("development"),
+      Type.Literal("production"),
+    ]),
+  },
+  { additionalProperties: false },
+);
 
 export interface AppDeps {
   storage: Storage;
   /** The bots bridge, present only when a hermes bridge is configured. When absent the `/bots`
    *  routes are not registered at all and the capability is not advertised, so an app probing
    *  `GatewayInfo.capabilities` sees the truth. */
-  bots?: BotsSurface;
+  bots?: BotControlSurface | BotsSurface;
   /** attach-v1 bearer token → authenticated agent. Enables only the media side channel; device
    * routes never accept this credential. */
   attachTokens?: ReadonlyMap<string, string>;
@@ -100,7 +127,14 @@ export interface AppDeps {
     toolCallId: string;
     decision: "approve" | "deny";
     deviceId: string;
-  }) => Promise<"approved" | "denied" | "unknown" | "not_pending" | "expired" | "unsupported">;
+  }) => Promise<
+    | "approved"
+    | "denied"
+    | "unknown"
+    | "not_pending"
+    | "expired"
+    | "unsupported"
+  >;
   onDeviceRevoked: (deviceId: string) => void;
   now: () => number;
 }
@@ -116,10 +150,18 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   const requireDevice = createMiddleware<Env>(async (c, next) => {
     const header = c.req.header("authorization") ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-    const device = token === "" ? undefined : deps.storage.deviceByTokenHash(hashToken(token));
+    const token = header.startsWith("Bearer ")
+      ? header.slice("Bearer ".length)
+      : "";
+    const device =
+      token === ""
+        ? undefined
+        : deps.storage.deviceByTokenHash(hashToken(token));
     if (device === undefined) {
-      return c.json(errorBody("unauthorized", "missing or unknown device token"), 401);
+      return c.json(
+        errorBody("unauthorized", "missing or unknown device token"),
+        401,
+      );
     }
     deps.storage.touchDevice(device.id, deps.now());
     c.set("deviceId", device.id);
@@ -127,17 +169,28 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   const requireAttach = createMiddleware<Env>(async (c, next) => {
-    const agentId = deps.attachTokens === undefined
-      ? undefined
-      : resolveAttachBearer(deps.attachTokens, c.req.header("authorization"));
-    if (agentId === undefined) return c.json(errorBody("unauthorized", "missing or unknown attach token"), 401);
+    const agentId =
+      deps.attachTokens === undefined
+        ? undefined
+        : resolveAttachBearer(deps.attachTokens, c.req.header("authorization"));
+    if (agentId === undefined)
+      return c.json(
+        errorBody("unauthorized", "missing or unknown attach token"),
+        401,
+      );
     if (deps.attachMediaAllowed?.(agentId) === false) {
-      return c.json(errorBody("invalid_request", "attach media is disabled for this agent"), 403);
+      return c.json(
+        errorBody("invalid_request", "attach media is disabled for this agent"),
+        403,
+      );
     }
     await next();
   });
   const attachAgent = (c: Context<Env>): string => {
-    return resolveAttachBearer(deps.attachTokens!, c.req.header("authorization"))!;
+    return resolveAttachBearer(
+      deps.attachTokens!,
+      c.req.header("authorization"),
+    )!;
   };
 
   const readBody = async (c: Context<Env>): Promise<unknown> => {
@@ -183,11 +236,20 @@ export function createApp(deps: AppDeps): Hono<Env> {
     try {
       pairRequest = assertValid(PairRequestSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
-    if (deps.storage.consumeSetupCode(pairRequest.setupCode, deps.now()) !== "ok") {
-      return c.json(errorBody("setup_code_invalid", "setup code is unknown, used, or expired"), 401);
+    if (
+      deps.storage.consumeSetupCode(pairRequest.setupCode, deps.now()) !== "ok"
+    ) {
+      return c.json(
+        errorBody(
+          "setup_code_invalid",
+          "setup code is unknown, used, or expired",
+        ),
+        401,
+      );
     }
     const { token, tokenHash } = mintDeviceToken();
     const device = {
@@ -199,7 +261,12 @@ export function createApp(deps: AppDeps): Hono<Env> {
     deps.storage.createDevice(device);
     return c.json({
       deviceToken: token,
-      device: { id: device.id, name: device.name, createdAt: device.createdAt, lastSeenAt: null },
+      device: {
+        id: device.id,
+        name: device.name,
+        createdAt: device.createdAt,
+        lastSeenAt: null,
+      },
       gateway: deps.gatewayInfo,
     });
   });
@@ -223,8 +290,12 @@ export function createApp(deps: AppDeps): Hono<Env> {
     try {
       return { ok: true as const, value: assertValid(schema, body) };
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
-      return { ok: false as const, response: c.json(errorBody("invalid_request", detail), 400) };
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
+      return {
+        ok: false as const,
+        response: c.json(errorBody("invalid_request", detail), 400),
+      };
     }
   };
 
@@ -248,7 +319,9 @@ export function createApp(deps: AppDeps): Hono<Env> {
     ),
   );
 
-  app.get("/threads", requireDevice, (c) => c.json(deps.storage.listThreads().map(threadToWire)));
+  app.get("/threads", requireDevice, (c) =>
+    c.json(deps.storage.listThreads().map(threadToWire)),
+  );
 
   app.post("/threads", requireDevice, async (c) => {
     const parsed = parseOr400(c, CreateThreadRequestSchema, await readBody(c));
@@ -280,27 +353,42 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   app.delete("/threads/:id", requireDevice, (c) => {
     if (!deps.storage.archiveThread(c.req.param("id"))) {
-      return c.json(errorBody("not_found", "no such thread or already archived"), 404);
+      return c.json(
+        errorBody("not_found", "no such thread or already archived"),
+        404,
+      );
     }
     return c.json({ ok: true });
   });
 
   app.get("/threads/:id/messages", requireDevice, (c) => {
     const thread = deps.storage.threadById(c.req.param("id"));
-    if (thread === undefined) return c.json(errorBody("not_found", "no such thread"), 404);
+    if (thread === undefined)
+      return c.json(errorBody("not_found", "no such thread"), 404);
     const beforeRaw = c.req.query("before");
     const limitRaw = c.req.query("limit");
-    const before = beforeRaw === undefined ? null : Number.parseInt(beforeRaw, 10);
-    const limit = Math.min(limitRaw === undefined ? 50 : Number.parseInt(limitRaw, 10), 200);
-    if ((before !== null && (Number.isNaN(before) || before < 1)) || Number.isNaN(limit) || limit < 1) {
+    const before =
+      beforeRaw === undefined ? null : Number.parseInt(beforeRaw, 10);
+    const limit = Math.min(
+      limitRaw === undefined ? 50 : Number.parseInt(limitRaw, 10),
+      200,
+    );
+    if (
+      (before !== null && (Number.isNaN(before) || before < 1)) ||
+      Number.isNaN(limit) ||
+      limit < 1
+    ) {
       return c.json(errorBody("invalid_request", "bad before/limit"), 400);
     }
-    return c.json({ messages: deps.storage.messagesBefore(thread.id, before, limit) });
+    return c.json({
+      messages: deps.storage.messagesBefore(thread.id, before, limit),
+    });
   });
 
   app.post("/threads/:id/messages", requireDevice, async (c) => {
     const thread = deps.storage.threadById(c.req.param("id"));
-    if (thread === undefined) return c.json(errorBody("not_found", "no such thread"), 404);
+    if (thread === undefined)
+      return c.json(errorBody("not_found", "no such thread"), 404);
     if (thread.archivedAt !== null) {
       return c.json(errorBody("thread_archived", "thread is archived"), 409);
     }
@@ -319,7 +407,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   app.post("/threads/:id/interrupt", requireDevice, (c) => {
     const thread = deps.storage.threadById(c.req.param("id"));
-    if (thread === undefined) return c.json(errorBody("not_found", "no such thread"), 404);
+    if (thread === undefined)
+      return c.json(errorBody("not_found", "no such thread"), 404);
     const outcome = deps.interruptThread(thread.id);
     if (outcome === "idle") return c.body(null, 204);
     return c.json({ status: "interrupting" }, 202);
@@ -329,12 +418,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
   // decision in the body: the verb is the whole request, exactly as POST /threads/:id/interrupt
   // takes no body at all, and a notification action button maps to a URL with nothing to encode.
   // Only per-call scope exists on the wire, so there is nothing else for a client to say.
-  const approvalRoute = (decision: "approve" | "deny") =>
-    async (c: Context<Env>) => {
+  const approvalRoute =
+    (decision: "approve" | "deny") => async (c: Context<Env>) => {
       // Read through a generic Context (this handler is shared by two routes), so the params are
       // typed as possibly absent; the router only reaches here with both present.
       const thread = deps.storage.threadById(c.req.param("id") ?? "");
-      if (thread === undefined) return c.json(errorBody("not_found", "no such thread"), 404);
+      if (thread === undefined)
+        return c.json(errorBody("not_found", "no such thread"), 404);
       const outcome = await deps.resolveApproval({
         threadId: thread.id,
         toolCallId: c.req.param("toolCallId") ?? "",
@@ -346,21 +436,47 @@ export function createApp(deps: AppDeps): Hono<Env> {
         case "denied":
           return c.json({ status: outcome }, 202);
         case "unknown":
-          return c.json(errorBody("not_found", "no such pending approval"), 404);
+          return c.json(
+            errorBody("not_found", "no such pending approval"),
+            404,
+          );
         case "expired":
-          return c.json(errorBody("approval_expired", "the approval expired before it was resolved"), 409);
+          return c.json(
+            errorBody(
+              "approval_expired",
+              "the approval expired before it was resolved",
+            ),
+            409,
+          );
         case "not_pending":
-          return c.json(errorBody("approval_not_pending", "the approval is no longer pending"), 409);
+          return c.json(
+            errorBody(
+              "approval_not_pending",
+              "the approval is no longer pending",
+            ),
+            409,
+          );
         case "unsupported":
           return c.json(
-            errorBody("backend_unavailable", "the agent backend cannot resolve approvals"),
+            errorBody(
+              "backend_unavailable",
+              "the agent backend cannot resolve approvals",
+            ),
             503,
           );
       }
     };
 
-  app.post("/threads/:id/approvals/:toolCallId/approve", requireDevice, approvalRoute("approve"));
-  app.post("/threads/:id/approvals/:toolCallId/deny", requireDevice, approvalRoute("deny"));
+  app.post(
+    "/threads/:id/approvals/:toolCallId/approve",
+    requireDevice,
+    approvalRoute("approve"),
+  );
+  app.post(
+    "/threads/:id/approvals/:toolCallId/deny",
+    requireDevice,
+    approvalRoute("deny"),
+  );
 
   app.post("/push/register", requireDevice, async (c) => {
     const body = await c.req.text();
@@ -387,17 +503,28 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return c.json({ ok: true });
     }
     if (!Value.Check(RelayRegisterRequestSchema, decoded)) {
-      return c.json(errorBody("invalid_request", "malformed push registration body"), 400);
+      return c.json(
+        errorBody("invalid_request", "malformed push registration body"),
+        400,
+      );
     }
     if (deps.config.pushRelayUrl === undefined) {
-      return c.json(errorBody("not_found", "push relay proxy is not configured"), 404);
+      return c.json(
+        errorBody("not_found", "push relay proxy is not configured"),
+        404,
+      );
     }
     const relayFetch = deps.pushRelayFetch ?? fetch;
-    const upstream = await relayFetch(`${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register`, {
-      method: "POST",
-      headers: { "content-type": c.req.header("content-type") ?? "application/json" },
-      body,
-    });
+    const upstream = await relayFetch(
+      `${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": c.req.header("content-type") ?? "application/json",
+        },
+        body,
+      },
+    );
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
@@ -407,7 +534,10 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   app.delete("/push/register/:pushId", requireDevice, async (c) => {
     if (deps.config.pushRelayUrl === undefined) {
-      return c.json(errorBody("not_found", "push relay proxy is not configured"), 404);
+      return c.json(
+        errorBody("not_found", "push relay proxy is not configured"),
+        404,
+      );
     }
     const relayFetch = deps.pushRelayFetch ?? fetch;
     const pushId = encodeURIComponent(c.req.param("pushId"));
@@ -425,10 +555,16 @@ export function createApp(deps: AppDeps): Hono<Env> {
   app.post("/push/live-activities/register", requireDevice, async (c) => {
     const decoded = await readBody(c);
     if (!Value.Check(LiveActivityRegisterRequestSchema, decoded)) {
-      return c.json(errorBody("invalid_request", "malformed Live Activity registration"), 400);
+      return c.json(
+        errorBody("invalid_request", "malformed Live Activity registration"),
+        400,
+      );
     }
     if (deps.config.pushRelayUrl === undefined) {
-      return c.json(errorBody("not_found", "push relay proxy is not configured"), 404);
+      return c.json(
+        errorBody("not_found", "push relay proxy is not configured"),
+        404,
+      );
     }
     const relayFetch = deps.pushRelayFetch ?? fetch;
     const relayBase = deps.config.pushRelayUrl.replace(/\/+$/, "");
@@ -436,29 +572,43 @@ export function createApp(deps: AppDeps): Hono<Env> {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        platform: "apns-liveactivity", token: decoded.token, environment: decoded.environment,
+        platform: "apns-liveactivity",
+        token: decoded.token,
+        environment: decoded.environment,
       }),
     });
     if (!upstream.ok) {
-      return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: upstream.headers,
+      });
     }
-    const result = await upstream.json() as { pushId?: unknown };
+    const result = (await upstream.json()) as { pushId?: unknown };
     if (typeof result.pushId !== "string" || result.pushId.length === 0) {
       return c.json(errorBody("internal", "relay returned no push id"), 502);
     }
     const previous = deps.storage.saveLiveActivityRegistration({
-      deviceId: c.get("deviceId"), activityId: decoded.activityId, runId: decoded.runId,
-      conversationId: decoded.conversationId, bot: decoded.bot, pushId: result.pushId,
+      deviceId: c.get("deviceId"),
+      activityId: decoded.activityId,
+      runId: decoded.runId,
+      conversationId: decoded.conversationId,
+      bot: decoded.bot,
+      pushId: result.pushId,
       createdAt: deps.now(),
     });
     if (previous !== undefined && previous !== result.pushId) {
-      void relayFetch(`${relayBase}/register/${encodeURIComponent(previous)}`, { method: "DELETE" });
+      void relayFetch(`${relayBase}/register/${encodeURIComponent(previous)}`, {
+        method: "DELETE",
+      });
     }
     return c.json({ ok: true });
   });
 
   app.delete("/push/live-activities/:activityId", requireDevice, async (c) => {
-    const row = deps.storage.deleteLiveActivityRegistration(c.get("deviceId"), c.req.param("activityId"));
+    const row = deps.storage.deleteLiveActivityRegistration(
+      c.get("deviceId"),
+      c.req.param("activityId"),
+    );
     if (row !== undefined && deps.config.pushRelayUrl !== undefined) {
       const relayFetch = deps.pushRelayFetch ?? fetch;
       await relayFetch(
@@ -476,15 +626,27 @@ export function createApp(deps: AppDeps): Hono<Env> {
       requireDevice,
       deps.bots,
       {
-        ...(deps.mediaFetch === undefined ? {} : { fetchImpl: deps.mediaFetch }),
+        ...(deps.mediaFetch === undefined
+          ? {}
+          : { fetchImpl: deps.mediaFetch }),
         ...(deps.mediaLookup === undefined ? {} : { lookup: deps.mediaLookup }),
-        ...(deps.mediaLimiter === undefined ? {} : { limiter: deps.mediaLimiter }),
-        ...(deps.mediaQueueWaitMs === undefined ? {} : { queueWaitMs: deps.mediaQueueWaitMs }),
+        ...(deps.mediaLimiter === undefined
+          ? {}
+          : { limiter: deps.mediaLimiter }),
+        ...(deps.mediaQueueWaitMs === undefined
+          ? {}
+          : { queueWaitMs: deps.mediaQueueWaitMs }),
       },
       {
-        ...(deps.photoLimiter === undefined ? {} : { limiter: deps.photoLimiter }),
-        ...(deps.photoQueueWaitMs === undefined ? {} : { queueWaitMs: deps.photoQueueWaitMs }),
-        ...(deps.photoRateLimiter === undefined ? {} : { rateLimiter: deps.photoRateLimiter }),
+        ...(deps.photoLimiter === undefined
+          ? {}
+          : { limiter: deps.photoLimiter }),
+        ...(deps.photoQueueWaitMs === undefined
+          ? {}
+          : { queueWaitMs: deps.photoQueueWaitMs }),
+        ...(deps.photoRateLimiter === undefined
+          ? {}
+          : { rateLimiter: deps.photoRateLimiter }),
         now: deps.now,
       },
     );
@@ -494,39 +656,85 @@ export function createApp(deps: AppDeps): Hono<Env> {
     app.post("/attach/v1/media/:mediaId", requireAttach, async (c) => {
       const mediaId = c.req.param("mediaId");
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId)) {
-        return c.json(errorBody("invalid_request", "invalid attach media id"), 400);
+        return c.json(
+          errorBody("invalid_request", "invalid attach media id"),
+          400,
+        );
       }
-      const mimeType = (c.req.header("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+      const mimeType = (c.req.header("content-type") ?? "")
+        .split(";")[0]!
+        .trim()
+        .toLowerCase();
       const acceptedType = ASSISTANT_MEDIA_TYPES.get(mimeType);
-      if (acceptedType === undefined) return c.json({ ...errorBody("invalid_request", "disallowed media type"), reason: "content_type" }, 415);
+      if (acceptedType === undefined)
+        return c.json(
+          {
+            ...errorBody("invalid_request", "disallowed media type"),
+            reason: "content_type",
+          },
+          415,
+        );
       const declared = Number(c.req.header("content-length") ?? "");
       if (Number.isFinite(declared) && declared > acceptedType.maxBytes) {
-        return c.json({ ...errorBody("invalid_request", "media is over the size cap"), reason: "too_large" }, 413);
+        return c.json(
+          {
+            ...errorBody("invalid_request", "media is over the size cap"),
+            reason: "too_large",
+          },
+          413,
+        );
       }
       let bytes: Uint8Array;
       try {
         bytes = await readCappedBody(c.req.raw.body, acceptedType.maxBytes);
         acceptAssistantMediaBytes(mimeType, bytes, sniffImageType);
       } catch (err) {
-        const tooLarge = err instanceof Error && /large|size|cap|ran past/i.test(err.message);
+        const tooLarge =
+          err instanceof Error && /large|size|cap|ran past/i.test(err.message);
         return c.json(
-          { ...errorBody("invalid_request", err instanceof Error ? err.message : "invalid media"), reason: tooLarge ? "too_large" : "content_type" },
+          {
+            ...errorBody(
+              "invalid_request",
+              err instanceof Error ? err.message : "invalid media",
+            ),
+            reason: tooLarge ? "too_large" : "content_type",
+          },
           tooLarge ? 413 : 415,
         );
       }
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const claimedHash = (c.req.header("x-attach-sha256") ?? "").toLowerCase();
       if (!/^[a-f0-9]{64}$/.test(claimedHash) || claimedHash !== sha256) {
-        return c.json({ ...errorBody("invalid_request", "media sha256 mismatch"), reason: "digest" }, 422);
+        return c.json(
+          {
+            ...errorBody("invalid_request", "media sha256 mismatch"),
+            reason: "digest",
+          },
+          422,
+        );
       }
       const filename = c.req.header("x-attach-filename")?.trim() ?? "";
-      if (filename.length === 0 || filename.length > 512 || /[\r\n]/.test(filename)) {
-        return c.json(errorBody("invalid_request", "invalid attach media filename"), 400);
+      if (
+        filename.length === 0 ||
+        filename.length > 512 ||
+        /[\r\n]/.test(filename)
+      ) {
+        return c.json(
+          errorBody("invalid_request", "invalid attach media filename"),
+          400,
+        );
       }
       const expiresRaw = c.req.header("x-attach-expires-at");
-      const expiresAt = expiresRaw === undefined ? undefined : Number(expiresRaw);
-      if (expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || expiresAt <= deps.now())) {
-        return c.json(errorBody("invalid_request", "invalid attach media expiry"), 400);
+      const expiresAt =
+        expiresRaw === undefined ? undefined : Number(expiresRaw);
+      if (
+        expiresAt !== undefined &&
+        (!Number.isSafeInteger(expiresAt) || expiresAt <= deps.now())
+      ) {
+        return c.json(
+          errorBody("invalid_request", "invalid attach media expiry"),
+          400,
+        );
       }
       const descriptor: AttachV1MediaDescriptor = {
         mediaId,
@@ -538,25 +746,52 @@ export function createApp(deps: AppDeps): Hono<Env> {
         ...(expiresAt === undefined ? {} : { expiresAt }),
       };
       try {
-        deps.storage.saveAttachMedia(attachAgent(c), descriptor, bytes, deps.now());
+        deps.storage.saveAttachMedia(
+          attachAgent(c),
+          descriptor,
+          bytes,
+          deps.now(),
+        );
       } catch {
-        return c.json(errorBody("invalid_request", "attach media id already exists"), 409);
+        return c.json(
+          errorBody("invalid_request", "attach media id already exists"),
+          409,
+        );
       }
       return c.json({ media: descriptor }, 201);
     });
 
     app.get("/attach/v1/media/:mediaId", requireAttach, (c) => {
       const mediaId = c.req.param("mediaId");
-      if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId)) return c.json(errorBody("invalid_request", "invalid attach media id"), 400);
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId))
+        return c.json(
+          errorBody("invalid_request", "invalid attach media id"),
+          400,
+        );
       const agentId = attachAgent(c);
       const info = deps.storage.attachMediaInfo(agentId, mediaId, deps.now());
-      if (info === undefined) return c.json(errorBody("not_found", "no such attach media"), 404);
+      if (info === undefined)
+        return c.json(errorBody("not_found", "no such attach media"), 404);
       const range = resolveByteRange(c.req.header("range"), info.size);
-      if (range === null) return new Response(null, { status: 416, headers: { "content-range": `bytes */${info.size}`, "accept-ranges": "bytes" } });
+      if (range === null)
+        return new Response(null, {
+          status: 416,
+          headers: {
+            "content-range": `bytes */${info.size}`,
+            "accept-ranges": "bytes",
+          },
+        });
       const start = range?.start ?? 0;
       const end = range?.end ?? info.size - 1;
-      const bytes = deps.storage.attachMediaSlice(agentId, mediaId, start, end - start + 1, deps.now());
-      if (bytes === undefined) return c.json(errorBody("not_found", "no such attach media"), 404);
+      const bytes = deps.storage.attachMediaSlice(
+        agentId,
+        mediaId,
+        start,
+        end - start + 1,
+        deps.now(),
+      );
+      if (bytes === undefined)
+        return c.json(errorBody("not_found", "no such attach media"), 404);
       return new Response(bytes.slice().buffer as ArrayBuffer, {
         status: range === undefined ? 200 : 206,
         headers: {
@@ -565,14 +800,18 @@ export function createApp(deps: AppDeps): Hono<Env> {
           "accept-ranges": "bytes",
           "cache-control": "private, max-age=86400",
           "x-content-type-options": "nosniff",
-          ...(range === undefined ? {} : { "content-range": `bytes ${start}-${end}/${info.size}` }),
+          ...(range === undefined
+            ? {}
+            : { "content-range": `bytes ${start}-${end}/${info.size}` }),
         },
       });
     });
   }
 
   app.notFound((c) => c.json(errorBody("not_found", "no such route"), 404));
-  app.onError((err, c) => c.json(errorBody("internal", "unexpected gateway fault"), 500));
+  app.onError((err, c) =>
+    c.json(errorBody("internal", "unexpected gateway fault"), 500),
+  );
 
   return app;
 }
