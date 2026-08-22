@@ -1960,6 +1960,19 @@ export function openStorage(dbPath: string): Storage {
     SELECT bot, session_id, MIN(created_at), MAX(updated_at), MAX(active_turn_id)
     FROM legacy_sessions GROUP BY bot, session_id
   `);
+  // A process can disappear after a tool starts but before its terminal event is persisted. Only
+  // the selected active turn can still receive that event after restart; close every older step so
+  // history never presents stale work as currently running.
+  db.prepare(`
+    UPDATE bot_chat_tool_steps
+    SET status = 'interrupted', ended_at = ?
+    WHERE ended_at IS NULL AND NOT EXISTS (
+      SELECT 1 FROM bot_native_chats AS chat
+      WHERE chat.bot = bot_chat_tool_steps.bot
+        AND chat.session_id = bot_chat_tool_steps.session_id
+        AND chat.active_turn_id = bot_chat_tool_steps.turn_id
+    )
+  `).run(Date.now());
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL");
   return new Storage(db);
 }
