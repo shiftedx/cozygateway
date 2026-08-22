@@ -110,7 +110,12 @@ if grep -Fq 'spaces $dollar' <<<"$live_output"; then
 fi
 grep -q '"profiles"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
-mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+mode_of() {
+  case "$(uname -s)" in
+    Darwin) stat -f '%Lp' "$1" ;;
+    *) stat -c '%a' "$1" ;;
+  esac
+}
 test "$(mode_of "$tmp/gateway-live/local/gateway.env")" = 600
 test "$(mode_of "$tmp/hermes/.env")" = 600
 "$real_node" - "$tmp/gateway-live/local/dashboard.env" "$tmp/gateway-live/local/gateway.env" <<'NODE'
