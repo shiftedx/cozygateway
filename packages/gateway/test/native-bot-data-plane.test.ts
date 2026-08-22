@@ -95,9 +95,14 @@ describe("attach-v1 native Bot Mode plane", () => {
   it("queues a document as gateway-owned file media", async () => {
     const storage = openStorage(":memory:");
     const turns: Array<{ mediaIds?: string[] }> = [];
+    let mediaWasAvailable = false;
     const plane = new NativeBotDataPlane({
       control: {} as BotsSurface, storage,
-      ingress: { sendNativeTurn: (_bot: string, turn: { mediaIds?: string[] }) => { turns.push(turn); return true; } } as unknown as AttachV1Ingress,
+      ingress: { sendNativeTurn: (bot: string, turn: { mediaIds?: string[] }) => {
+        turns.push(turn);
+        mediaWasAvailable = storage.attachMediaInfo(bot, turn.mediaIds?.[0] ?? "", 10) !== undefined;
+        return true;
+      } } as unknown as AttachV1Ingress,
       nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 10,
     });
     const sent = await plane.surface().sendChatAttachment("sage", {
@@ -106,6 +111,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     const attachment = sent.message.attachments?.[0];
     expect(attachment).toMatchObject({ name: "report.json", mimeType: "application/json", mediaKind: "file" });
     expect(turns[0]?.mediaIds).toEqual([attachment?.fileId]);
+    expect(mediaWasAvailable).toBe(true);
     expect(storage.attachMediaInfo("sage", attachment!.fileId, 10)?.descriptor.family).toBe("file");
     plane.close();
     storage.close();
