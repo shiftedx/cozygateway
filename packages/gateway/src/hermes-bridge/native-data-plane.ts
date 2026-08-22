@@ -31,6 +31,7 @@ import {
   BotSessionConflict,
   BotSessionNotFound,
   type BotControlSurface,
+  type BotChatFileUpload,
   type BotChatPhotoUpload,
   type BotsSurface,
 } from "./bridge.ts";
@@ -151,6 +152,7 @@ export class NativeBotDataPlane {
       chatHistory: (name) => this.#history(name),
       sendChatMessage: (name, text, opts) => this.#send(name, text, opts),
       sendChatPhoto: (name, photo) => this.#sendPhoto(name, photo),
+      sendChatAttachment: (name, file) => this.#sendFile(name, file),
       stopChat: (name) => this.#stop(name),
       resetChat: (name) => this.#reset(name),
       resolveApproval: (name, toolCallId, decision, deviceId) =>
@@ -473,57 +475,91 @@ export class NativeBotDataPlane {
     name: string,
     photo: BotChatPhotoUpload,
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
+    return this.#sendAttachment(name, {
+      bytes: photo.bytes,
+      mime: photo.mime,
+      name: `image.${photo.ext}`,
+      family: "image",
+      text: photo.text,
+      clientId: photo.clientId,
+      label: "photo",
+    });
+  }
+
+  async #sendFile(
+    name: string,
+    file: BotChatFileUpload,
+  ): Promise<{ sessionId: string; message: BotChatMessage }> {
+    return this.#sendAttachment(name, { ...file, family: "file", label: "attachment" });
+  }
+
+  /** One durable attachment turn, after each public route has validated its own file type. */
+  async #sendAttachment(
+    name: string,
+    input: {
+      bytes: Uint8Array;
+      mime: string;
+      name: string;
+      family: "image" | "file";
+      text: string;
+      clientId?: string;
+      label: "photo" | "attachment";
+    },
+  ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const mediaId = randomUUID().replaceAll("-", "");
-    const messageId = photo.clientId ?? randomUUID();
+    const messageId = input.clientId ?? randomUUID();
     const turnId = randomUUID();
     if (chat.activeTurnId !== undefined) {
       throw new BackendUnavailable(
-        `native attach-v1 profile "${bot}" cannot accept a photo while a turn is running`,
+        `native attach-v1 profile "${bot}" cannot accept a ${input.label} while a turn is running`,
       );
     }
-    if (!this.#ingress.sendNativeTurn(bot, {
-      threadId: chat.sessionId,
-      turnId,
-      messageId,
-      text: photo.text,
-      mediaIds: [mediaId],
-    })) {
-      throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
-    }
+    // Persist before the socket can carry the command into another process. If enqueue rejects,
+    // remove this exact unreferenced row so failure stays atomic from the app's point of view.
     this.#storage.saveAttachMedia(
       bot,
       {
         mediaId,
-        mimeType: photo.mime,
-        byteCount: photo.bytes.byteLength,
-        sha256: createHash("sha256").update(photo.bytes).digest("hex"),
-        filename: `image.${photo.ext}`,
-        family: "image",
+        mimeType: input.mime,
+        byteCount: input.bytes.byteLength,
+        sha256: createHash("sha256").update(input.bytes).digest("hex"),
+        filename: input.name,
+        family: input.family,
       },
-      photo.bytes,
+      input.bytes,
       now,
     );
+    if (!this.#ingress.sendNativeTurn(bot, {
+      threadId: chat.sessionId,
+      turnId,
+      messageId,
+      text: input.text,
+      mediaIds: [mediaId],
+    })) {
+      this.#storage.deleteAttachMedia(bot, mediaId);
+      throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
+    }
     const attachment: AttachmentBlock = {
       type: "attachment",
       fileId: mediaId,
-      name: `image.${photo.ext}`,
-      mimeType: photo.mime,
-      size: photo.bytes.byteLength,
-      mediaKind: "image",
+      name: input.name,
+      mimeType: input.mime,
+      size: input.bytes.byteLength,
+      mediaKind: input.family,
     };
     const message = this.#storage.appendNativeBotMessage({
       bot,
       sessionId: chat.sessionId,
       messageId,
       role: "user",
-      text: photo.text,
+      text: input.text,
       at: now,
       attachments: [attachment],
-      ...(photo.clientId === undefined ? {} : { clientId: photo.clientId }),
+      ...(input.clientId === undefined ? {} : { clientId: input.clientId }),
     });
     this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
     this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
@@ -780,7 +816,7 @@ export class NativeBotDataPlane {
           name: info.descriptor.filename,
           mimeType: info.mime,
           size: info.size,
-          ...(family === "image" || family === "audio" || family === "video"
+          ...(family === "image" || family === "audio" || family === "video" || family === "file"
             ? { mediaKind: family }
             : {}),
         },

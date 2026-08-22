@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 23. This extension is independent of the frozen core
+Status: v1 extension, capability version 24. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -108,7 +108,8 @@ destructive erase.
 
 ### Native sends, events, and suggestions
 
-`POST /bots/:name/chat/messages` and `POST /bots/:name/chat/photos` first admit a durable attach-v1
+`POST /bots/:name/chat/messages`, `POST /bots/:name/chat/photos`, and
+`POST /bots/:name/chat/attachments` first admit a durable attach-v1
 command, then append the user row to the native transcript and answer `202` with that row. If the
 configured attach profile cannot accept the command, the request answers `503 backend_unavailable`
 without storing transcript or media data. A text send during an active turn is admitted as a native
@@ -133,6 +134,10 @@ Photo bytes are validated and stored by the gateway before the associated attach
 sent. Plugin events refer to media by opaque ids; the gateway commits acceptable media into its own
 store. `GET /bots/:name/chat/attachments/:fileId` serves only those gateway-owned bytes and
 supports a single byte range for capability 20 playback. It never exposes a Hermes-host path.
+Capability 24 additionally admits one 20 MiB document per turn: PDF; UTF-8 plain text, Markdown,
+CSV, JSON, or RTF; legacy Office; OOXML; and OpenDocument files. The gateway checks the declared
+allow-listed MIME against lightweight format bytes, stores the sanitized filename as metadata, and
+serves every attachment with `Content-Disposition: attachment` and `nosniff`.
 
 `GET /bots/:name/media?src=` is a separate HTTPS media proxy for a public source URL in bot output;
 it is not a native attachment transport and it refuses unsafe/non-HTTPS sources.
@@ -156,6 +161,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/:name/chat/messages` | — | `{ name, sessionId, adoption, messages, running, inflight, updatedAt, suggestion?, toolSteps? }` | Reads native transcript and native tool history. |
 | `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Admits a native turn or steer, then appends locally. |
 | `POST /bots/:name/chat/photos` | multipart `file`, `BotChatPhotoFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated image plus optional caption. |
+| `POST /bots/:name/chat/attachments` | multipart `file`, `BotChatAttachmentFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated PDF, text, RTF, Office, or OpenDocument file plus optional caption. |
 | `POST /bots/:name/chat/stop` | — | `BotChatStopResponse` | Interrupts the current native turn; returns 409 when idle. |
 | `POST /bots/:name/chat/reset` | — | `BotChatResetResponse` | Selects a fresh native chat and emits reset. |
 | `GET /bots/:name/chat/attachments/:fileId` | optional single `Range` | attachment bytes | Gateway-owned attachment only. |

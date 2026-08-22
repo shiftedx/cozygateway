@@ -44,6 +44,7 @@ import {
   ASSISTANT_MEDIA_TYPES,
   acceptAssistantMediaBytes,
 } from "./hermes-bridge/assistant-media.ts";
+import { attachmentDisposition, safeFilename } from "./hermes-bridge/documents.ts";
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 
@@ -717,12 +718,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
           422,
         );
       }
-      const filename = c.req.header("x-attach-filename")?.trim() ?? "";
-      if (
-        filename.length === 0 ||
-        filename.length > 512 ||
-        /[\r\n]/.test(filename)
-      ) {
+      const filename = safeFilename(c.req.header("x-attach-filename") ?? "");
+      if (filename === undefined) {
         return c.json(
           errorBody("invalid_request", "invalid attach media filename"),
           400,
@@ -804,6 +801,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
           "accept-ranges": "bytes",
           "cache-control": "private, max-age=86400",
           "x-content-type-options": "nosniff",
+          "content-disposition": attachmentDisposition(info.descriptor.filename),
           ...(range === undefined
             ? {}
             : { "content-range": `bytes ${start}-${end}/${info.size}` }),

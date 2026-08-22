@@ -27,7 +27,7 @@ export const AttachmentBlockSchema = Type.Object({
   name: Type.String(),
   mimeType: Type.String(),
   size: Type.Integer({ minimum: 0 }),
-  mediaKind: Type.Optional(Type.Union([Type.Literal("image"), Type.Literal("video"), Type.Literal("audio")])),
+  mediaKind: Type.Optional(Type.Union([Type.Literal("image"), Type.Literal("video"), Type.Literal("audio"), Type.Literal("file")])),
 });
 export type AttachmentBlock = Static<typeof AttachmentBlockSchema>;
 

@@ -3,6 +3,7 @@ import {
   type ErrorBody,
   type ErrorCode,
   BotChatPhotoFieldsSchema,
+  BotChatAttachmentFieldsSchema,
   BotClarifyResolveRequestSchema,
   BotChatSendRequestSchema,
   BotFocusRequestSchema,
@@ -61,6 +62,7 @@ import {
   redactHostPaths,
   type PhotoRateLimiter,
 } from "./photos.ts";
+import { FILE_MAX_BYTES, acceptFileBytes, attachmentDisposition, safeFilename } from "./documents.ts";
 import {
   RoutineNotFound,
   RoutineRefused,
@@ -948,6 +950,68 @@ export function registerBotRoutes(
     }
   });
 
+  // Capability 24: the same one-file, one-turn pipeline as photos, with a deliberately small
+  // document allow-list. Files remain gateway-owned attach-v1 media; no Hermes path or URL enters
+  // the transcript.
+  app.post("/bots/:name/chat/attachments", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const name = resolved.name;
+    const maxRequestBytes = FILE_MAX_BYTES + 64 * 1024;
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > maxRequestBytes)
+      return c.json({ ...extensionErrorBody("media_refused", "the upload declares bytes over the cap"), reason: "too_large" }, 413);
+    const ticket = photoRate.take(c.get("deviceId"), photoNow());
+    if (!ticket.ok)
+      return c.json({ ...extensionErrorBody("rate_limited", "this device has sent attachments too quickly; wait and try again"), retryAfterMs: ticket.retryAfterMs }, 429, { "retry-after": String(Math.max(1, Math.ceil(ticket.retryAfterMs / 1000))) });
+    let slot;
+    try {
+      slot = await photoLimiter.acquire(photoOptions.queueWaitMs ?? PHOTO_QUEUE_WAIT_MS);
+    } catch (err) {
+      if (err instanceof MediaBusy) return c.json({ ...errorBody("backend_unavailable", `the gateway is already sending ${PHOTO_MAX_CONCURRENT} attachments`), busy: true, waitedMs: err.waitedMs }, 503, { "retry-after": "1" });
+      throw err;
+    }
+    try {
+      let form: FormData;
+      try {
+        const raw = await readCappedBody(c.req.raw.body, maxRequestBytes);
+        form = await new Response(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer, { headers: { "content-type": c.req.header("content-type") ?? "" } }).formData();
+      } catch {
+        return c.json(errorBody("invalid_request", "the body is not a multipart/form-data upload"), 400);
+      }
+      const parts = form.getAll("file");
+      if (parts.length !== 1 || !(parts[0] instanceof File))
+        return c.json(errorBody("invalid_request", 'exactly one file part named "file" is required'), 400);
+      const file = parts[0];
+      let fields;
+      try {
+        fields = assertValid(BotChatAttachmentFieldsSchema, {
+          ...(typeof form.get("text") === "string" ? { text: form.get("text") } : {}),
+          ...(typeof form.get("clientId") === "string" ? { clientId: form.get("clientId") } : {}),
+        });
+      } catch (err) {
+        return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed fields"), 400);
+      }
+      const filename = safeFilename(file.name);
+      if (filename === undefined) return c.json(errorBody("invalid_request", "invalid attachment filename"), 400);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let accepted;
+      try { accepted = acceptFileBytes(file.type.toLowerCase(), bytes); } catch (err) {
+        const message = err instanceof Error ? err.message : "invalid file";
+        const status = /size cap/.test(message) ? 413 : /no bytes/.test(message) ? 400 : 415;
+        return c.json({ ...extensionErrorBody("media_refused", message), reason: status === 413 ? "too_large" : status === 400 ? "empty" : "content_type" }, status);
+      }
+      try {
+        const sent = await chat.sendChatAttachment(name, {
+          bytes, mime: accepted.mime, name: filename,
+          text: (fields.text ?? "").trim() || "Here is an attached file.",
+          ...(fields.clientId === undefined ? {} : { clientId: fields.clientId }),
+        });
+        return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
+      } catch (err) { return failure(c, err); }
+    } finally { slot(); }
+  });
+
   // The gateway's own copy of chat media. User rows hold image bytes a device uploaded;
   // capability-20 assistant rows may also hold video/audio fetched through Hermes' authenticated,
   // guarded dashboard endpoints.
@@ -1000,6 +1064,7 @@ export function registerBotRoutes(
       status: range === undefined ? 200 : 206,
       headers: {
         "content-type": info.mime,
+        "content-disposition": attachmentDisposition(info.name),
         "content-length": String(bytes.byteLength),
         "cache-control": PHOTO_CACHE_CONTROL,
         "accept-ranges": "bytes",

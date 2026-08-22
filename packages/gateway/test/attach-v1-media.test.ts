@@ -46,4 +46,18 @@ describe("attach-v1 authenticated media side channel", () => {
     expect(ranged.headers.get("content-range")).toBe("bytes 1-3/8");
     expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(png.slice(1, 4));
   });
+
+  it("admits validated documents and returns a download-safe filename", async () => {
+    const bytes = new TextEncoder().encode("%PDF-1.7\n");
+    const sha = createHash("sha256").update(bytes).digest("hex");
+    const url = `${gateway.url}/attach/v1/media/report_1`;
+    const uploaded = await fetch(url, { method: "POST", body: bytes, headers: {
+      authorization: `Bearer ${token}`, "content-type": "application/pdf",
+      "x-attach-filename": "../report.pdf", "x-attach-sha256": sha,
+    } });
+    expect(uploaded.status).toBe(201);
+    expect(await uploaded.json()).toMatchObject({ media: { family: "file", filename: "report.pdf" } });
+    const downloaded = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    expect(downloaded.headers.get("content-disposition")).toContain('filename="report.pdf"');
+  });
 });

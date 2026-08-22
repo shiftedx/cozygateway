@@ -43,7 +43,7 @@ import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 
-export const GATEWAY_VERSION = "0.2.3";
+export const GATEWAY_VERSION = "0.2.4";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 

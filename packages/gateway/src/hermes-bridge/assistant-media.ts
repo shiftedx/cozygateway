@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { FILE_MAX_BYTES, FILE_TYPES, acceptFileBytes } from "./documents.ts";
 
 /** Capability 15 limits one settled assistant row to three media attempts. A fourth directive stays
  *  visible as text, even when one of the first three fails. */
@@ -6,10 +7,14 @@ export const ASSISTANT_MEDIA_MAX_PER_MESSAGE = 3;
 export const ASSISTANT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 export const ASSISTANT_AUDIO_MAX_BYTES = 40 * 1024 * 1024;
 export const ASSISTANT_VIDEO_MAX_BYTES = 40 * 1024 * 1024;
+export const ASSISTANT_FILE_MAX_BYTES = FILE_MAX_BYTES;
 /** Compatibility export for image-specific callers and tests. */
 export const ASSISTANT_MEDIA_MAX_BYTES = ASSISTANT_IMAGE_MAX_BYTES;
 
-export type AssistantMediaKind = "image" | "video" | "audio";
+export type AssistantMediaKind = "image" | "video" | "audio" | "file";
+
+const fileMediaTypes: [string, { ext: string; kind: AssistantMediaKind; maxBytes: number }][] =
+  [...FILE_TYPES].map(([mime, ext]) => [mime, { ext, kind: "file", maxBytes: FILE_MAX_BYTES }]);
 
 export const ASSISTANT_MEDIA_TYPES = new Map<string, { ext: string; kind: AssistantMediaKind; maxBytes: number }>([
   ["image/png", { ext: "png", kind: "image", maxBytes: ASSISTANT_IMAGE_MAX_BYTES }],
@@ -22,6 +27,7 @@ export const ASSISTANT_MEDIA_TYPES = new Map<string, { ext: string; kind: Assist
   ["audio/mpeg", { ext: "mp3", kind: "audio", maxBytes: ASSISTANT_AUDIO_MAX_BYTES }],
   ["audio/wav", { ext: "wav", kind: "audio", maxBytes: ASSISTANT_AUDIO_MAX_BYTES }],
   ["audio/x-wav", { ext: "wav", kind: "audio", maxBytes: ASSISTANT_AUDIO_MAX_BYTES }],
+  ...fileMediaTypes,
 ]);
 
 export interface AssistantMediaDirective {
@@ -119,6 +125,9 @@ function bytesMatchMediaType(
   }
   if (declared === "audio/wav" || declared === "audio/x-wav") {
     return at(bytes, 0, 0x52, 0x49, 0x46, 0x46) && at(bytes, 8, 0x57, 0x41, 0x56, 0x45);
+  }
+  if (FILE_TYPES.has(declared)) {
+    try { acceptFileBytes(declared, bytes); return true; } catch { return false; }
   }
   return false;
 }

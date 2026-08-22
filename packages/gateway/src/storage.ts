@@ -1647,6 +1647,13 @@ export class Storage {
       );
   }
 
+  /** Roll back one just-created attach row when its command could not be admitted. */
+  deleteAttachMedia(agentId: string, mediaId: string): void {
+    this.#db
+      .prepare("DELETE FROM attach_media WHERE agent_id = ? AND media_id = ?")
+      .run(agentId, mediaId);
+  }
+
   attachMediaInfo(
     agentId: string,
     mediaId: string,
