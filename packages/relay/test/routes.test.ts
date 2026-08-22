@@ -13,6 +13,7 @@ interface Delivery {
   token: string;
   ciphertext: string;
   options?: PushDeliveryOptions;
+  transport?: string;
 }
 
 function harness(overrides?: {
@@ -26,6 +27,7 @@ function harness(overrides?: {
   registerRateLimitPerMinute?: number;
   notifyRateLimitPerMinute?: number;
   sourceIp?: string;
+  apnsEnvironments?: boolean;
 }): { app: ReturnType<typeof createRelayApp>; storage: RelayStorage; deliveries: Delivery[] } {
   const storage = openRelayStorage(":memory:");
   cleanups.push(() => storage.close());
@@ -37,9 +39,24 @@ function harness(overrides?: {
     },
   };
   const nowRef = overrides?.nowRef ?? { value: Date.UTC(2026, 6, 7, 12, 0, 0) };
+  const transports: Record<string, Transport> = { webhook: transport };
+  if (overrides?.apnsEnvironments === true) {
+    for (const environment of ["development", "production"] as const) {
+      transports[`apns:${environment}`] = {
+        deliver: async (token, ciphertext, options) => {
+          deliveries.push({
+            token,
+            ciphertext,
+            ...(options === undefined ? {} : { options }),
+            transport: environment,
+          });
+        },
+      };
+    }
+  }
   const app = createRelayApp({
     storage,
-    transports: { webhook: transport },
+    transports,
     dailyCap: overrides?.dailyCap ?? 500,
     maxRegistrations: overrides?.maxRegistrations ?? 10000,
     version: "test",
@@ -115,6 +132,38 @@ describe("POST /register", () => {
     expect(res.status).toBe(501);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("unsupported_platform");
+  });
+
+  it("routes APNs registrations to the environment that issued the token", async () => {
+    const { app, storage, deliveries } = harness({ apnsEnvironments: true });
+    const registered = await register(app, {
+      platform: "apns",
+      token: "sandbox-device-token",
+      environment: "development",
+    });
+    expect(registered.status).toBe(201);
+    const { pushId } = (await registered.json()) as { pushId: string };
+    expect(storage.registrationByPushId(pushId)).toEqual({
+      pushId,
+      platform: "apns:development",
+      token: "sandbox-device-token",
+    });
+
+    expect((await notify(app, { pushId, ciphertext: "CIPHER" })).status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries).toEqual([
+      { token: "sandbox-device-token", ciphertext: "CIPHER", transport: "development" },
+    ]);
+  });
+
+  it("rejects APNs environment metadata on webhook registrations", async () => {
+    const { app } = harness();
+    const res = await register(app, {
+      platform: "webhook",
+      token: "https://x.example/hook",
+      environment: "development",
+    });
+    expect(res.status).toBe(400);
   });
 
   describe("with restrictEgress on", () => {

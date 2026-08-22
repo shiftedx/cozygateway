@@ -73,7 +73,7 @@ async function setup() {
 describe("authenticated push relay proxy", () => {
   it("round-trips relay registration bodies and statuses", async () => {
     const { authed, calls } = await setup();
-    const body = '{"platform":"apns","token":"device-token"}';
+    const body = '{"platform":"apns","token":"device-token","environment":"development"}';
 
     const response = await authed("/push/register", {
       method: "POST",

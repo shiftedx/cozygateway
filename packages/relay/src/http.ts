@@ -134,7 +134,13 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   app.post("/register", async (c) => {
     const parsed = parseBody(RegisterRequestSchema, await readBody(c));
     if (parsed === undefined) return c.json(relayError("invalid_request", "malformed register body"), 400);
-    if (deps.transports[parsed.platform] === undefined) {
+    if (parsed.platform !== "apns" && parsed.environment !== undefined) {
+      return c.json(relayError("invalid_request", "environment is only valid for apns registrations"), 400);
+    }
+    const transportKey = parsed.platform === "apns" && parsed.environment !== undefined
+      ? `apns:${parsed.environment}`
+      : parsed.platform;
+    if (deps.transports[transportKey] === undefined) {
       return c.json(
         relayError("unsupported_platform", `platform "${parsed.platform}" is not available on this relay yet`),
         501,
@@ -152,7 +158,7 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
     deps.storage.pruneRegistrations(now, registrationTtlDays);
     const pushId = randomBytes(16).toString("base64url");
     const saved = deps.storage.saveRegistration(
-      { pushId, platform: parsed.platform, token: parsed.token, createdAt: now },
+      { pushId, platform: transportKey, token: parsed.token, createdAt: now },
       deps.maxRegistrations,
     );
     if (!saved) {

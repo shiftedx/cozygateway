@@ -30,6 +30,9 @@ describe("schemas", () => {
   it("accepts a webhook register request and rejects unknown platforms", () => {
     expect(Value.Check(RegisterRequestSchema, { platform: "webhook", token: "https://x.example/hook" })).toBe(true);
     expect(Value.Check(RegisterRequestSchema, { platform: "apns", token: "abc" })).toBe(true);
+    expect(Value.Check(RegisterRequestSchema, { platform: "apns", token: "abc", environment: "development" })).toBe(true);
+    expect(Value.Check(RegisterRequestSchema, { platform: "apns", token: "abc", environment: "production" })).toBe(true);
+    expect(Value.Check(RegisterRequestSchema, { platform: "apns", token: "abc", environment: "staging" })).toBe(false);
     expect(Value.Check(RegisterRequestSchema, { platform: "smoke-signal", token: "abc" })).toBe(false);
     expect(Value.Check(RegisterRequestSchema, { platform: "webhook", token: "" })).toBe(false);
   });
