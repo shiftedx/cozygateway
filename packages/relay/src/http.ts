@@ -134,11 +134,11 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   app.post("/register", async (c) => {
     const parsed = parseBody(RegisterRequestSchema, await readBody(c));
     if (parsed === undefined) return c.json(relayError("invalid_request", "malformed register body"), 400);
-    if (parsed.platform !== "apns" && parsed.environment !== undefined) {
+    if (parsed.platform !== "apns" && parsed.platform !== "apns-liveactivity" && parsed.environment !== undefined) {
       return c.json(relayError("invalid_request", "environment is only valid for apns registrations"), 400);
     }
-    const transportKey = parsed.platform === "apns" && parsed.environment !== undefined
-      ? `apns:${parsed.environment}`
+    const transportKey = (parsed.platform === "apns" || parsed.platform === "apns-liveactivity") && parsed.environment !== undefined
+      ? `${parsed.platform}:${parsed.environment}`
       : parsed.platform;
     if (deps.transports[transportKey] === undefined) {
       return c.json(
@@ -170,6 +170,9 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   app.post("/notify", async (c) => {
     const parsed = parseBody(NotifyRequestSchema, await readBody(c));
     if (parsed === undefined) return c.json(relayError("invalid_request", "malformed notify body"), 400);
+    if ((parsed.ciphertext === undefined) === (parsed.liveActivity === undefined)) {
+      return c.json(relayError("invalid_request", "send exactly one of ciphertext or liveActivity"), 400);
+    }
     // Category and collapse id are one unit (issue #19, section 2): a categorized push that
     // cannot coalesce could never be retracted or updated when its approval resolves, and a
     // collapse id with no category is a coalescing key the app has nothing to render against.
@@ -202,7 +205,10 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
       parsed.category === undefined
         ? undefined
         : { category: parsed.category, collapseId: parsed.collapseId };
-    void transport.deliver(registration.token, parsed.ciphertext, push).catch((err: unknown) => {
+    const delivery = parsed.liveActivity === undefined
+      ? push
+      : { liveActivity: parsed.liveActivity };
+    void transport.deliver(registration.token, parsed.ciphertext ?? "", delivery).catch((err: unknown) => {
       log(`push id ${registration.pushId}: delivery failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     return c.json({}, 202);

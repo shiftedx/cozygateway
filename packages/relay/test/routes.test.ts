@@ -255,6 +255,16 @@ describe("POST /register", () => {
 });
 
 describe("POST /notify", () => {
+  it("requires exactly one of ciphertext and Live Activity state", async () => {
+    const { app } = harness();
+    const pushId = await registeredPushId(app);
+    expect((await notify(app, { pushId })).status).toBe(400);
+    expect((await notify(app, { pushId, ciphertext: "C", liveActivity: {
+      timestamp: 1, event: "update", priority: 5,
+      contentState: { phase: "thinking", toolCallCount: 0, shortStatus: "Thinking", eventSequence: 1 },
+    } })).status).toBe(400);
+  });
+
   it("delivers ciphertext through the transport and 202s", async () => {
     const { app, deliveries } = harness();
     const pushId = await registeredPushId(app);

@@ -8,6 +8,7 @@ import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   type GatewayInfo,
+  type ServerFrame,
 } from "cozygateway-contract";
 
 import type { GatewayConfig } from "./config.ts";
@@ -23,6 +24,7 @@ import { createApp } from "./http.ts";
 import { WsHub } from "./ws-hub.ts";
 import { TurnRunner } from "./turns.ts";
 import { RelayNotifier, type ChatMessagePushEvent } from "./push-notifier.ts";
+import { LiveActivityNotifier } from "./live-activity-notifier.ts";
 import type { ApprovalPushPayload } from "./push-crypto.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { createUpgradeDispatcher, type UpgradeHandler } from "./upgrade-dispatcher.ts";
@@ -133,6 +135,7 @@ export async function startGateway(
   // notifier does not exist yet, and no approval can be raised before the listener is bound.
   let raiseApprovalPush: (payload: ApprovalPushPayload) => void = () => {};
   let raiseChatMessagePush: (event: ChatMessagePushEvent) => void = () => {};
+  let raiseLiveActivityFrame: (frame: ServerFrame) => void = () => {};
 
   let bridge: HermesBridge | undefined;
   if (hermesOptions !== undefined) {
@@ -143,7 +146,10 @@ export async function startGateway(
     bridge = new HermesBridge({
       client,
       storage,
-      broadcast: (frame) => hub.broadcast(frame),
+      broadcast: (frame) => {
+        hub.broadcast(frame);
+        raiseLiveActivityFrame(frame);
+      },
       now: () => Date.now(),
       hideBotChats: hermesOptions.hideBotChats,
       chatSuggestion: hermesOptions.chatSuggestion,
@@ -315,6 +321,12 @@ export async function startGateway(
     log: options.notifierLog,
     isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
   });
+  const liveActivityNotifier = new LiveActivityNotifier({
+    storage,
+    ...(config.pushRelayUrl === undefined ? {} : { relayBaseUrl: config.pushRelayUrl }),
+    log: options.notifierLog,
+  });
+  raiseLiveActivityFrame = (frame) => liveActivityNotifier.handleFrame(frame);
   // Same targeting rule a 1:1 turn gets: a device holding a live socket saw the room's frame and is
   // excluded here rather than pushed to twice.
   raisePush = (event) => notifier.notify(event, hub.connectedDeviceIds());
@@ -327,7 +339,10 @@ export async function startGateway(
       ingress: attachV1Ingress,
       nativeBots: nativeBotEntries.filter(([, item]) => (item.mode ?? "native") === "native").map(([bot]) => bot),
       shadowBots: nativeBotEntries.filter(([, item]) => item.mode === "shadow").map(([bot]) => bot),
-      broadcast: (frame) => hub.broadcast(frame),
+      broadcast: (frame) => {
+        hub.broadcast(frame);
+        raiseLiveActivityFrame(frame);
+      },
       onChatMessage: (event) => raiseChatMessagePush(event),
       onApproval: (event) => {
         raiseApprovalPush(
@@ -342,7 +357,10 @@ export async function startGateway(
   }
   nativeSink = new AttachNativeSink({
     storage,
-    broadcast: (frame) => hub.broadcast(frame),
+    broadcast: (frame) => {
+      hub.broadcast(frame);
+      raiseLiveActivityFrame(frame);
+    },
     notifier,
     connectedDeviceIds: () => hub.connectedDeviceIds(),
     now: () => Date.now(),

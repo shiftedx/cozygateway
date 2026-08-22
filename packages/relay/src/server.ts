@@ -50,6 +50,9 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
     transports.apns = apnsTransport(config.apns);
     transports["apns:development"] = apnsTransport({ ...config.apns, environment: "development" });
     transports["apns:production"] = apnsTransport({ ...config.apns, environment: "production" });
+    transports["apns-liveactivity"] = apnsTransport(config.apns);
+    transports["apns-liveactivity:development"] = apnsTransport({ ...config.apns, environment: "development" });
+    transports["apns-liveactivity:production"] = apnsTransport({ ...config.apns, environment: "production" });
   }
   const app = createRelayApp({
     storage,

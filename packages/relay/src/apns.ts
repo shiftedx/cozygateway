@@ -97,13 +97,23 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
       // a fixed, content-free string per category; the NSE decrypts and rewrites it on device.
       const spec = push?.category === undefined ? undefined : PUSH_CATEGORIES[push.category];
       const alert = spec?.alert ?? DEFAULT_ALERT;
-      const body = JSON.stringify({
+      const body = push?.liveActivity === undefined ? JSON.stringify({
         aps: {
           alert: { title: alert.title, body: alert.body },
           "mutable-content": 1,
           ...(spec === undefined ? {} : { category: spec.id }),
         },
         c: ciphertext,
+      }) : JSON.stringify({
+        aps: {
+          timestamp: push.liveActivity.timestamp,
+          event: push.liveActivity.event,
+          "content-state": push.liveActivity.contentState,
+          ...(push.liveActivity.staleDate === undefined ? {} : { "stale-date": push.liveActivity.staleDate }),
+          ...(push.liveActivity.dismissalDate === undefined
+            ? {}
+            : { "dismissal-date": push.liveActivity.dismissalDate }),
+        },
       });
       return new Promise<void>((resolve, reject) => {
         let session: ClientHttp2Session;
@@ -132,8 +142,11 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
           ":method": "POST",
           ":path": `/3/device/${token}`,
           authorization: `bearer ${providerJwt()}`,
-          "apns-topic": config.topic,
-          "apns-push-type": spec?.pushType ?? "alert",
+          "apns-topic": push?.liveActivity === undefined
+            ? config.topic
+            : `${config.topic}.push-type.liveactivity`,
+          "apns-push-type": push?.liveActivity === undefined ? (spec?.pushType ?? "alert") : "liveactivity",
+          "apns-priority": String(push?.liveActivity?.priority ?? 10),
           "content-type": "application/json",
           // Coalescing: a later push with the same collapse id REPLACES the delivered one on
           // device. Approvals pass the toolCallId; bot messages pass a bot/chat digest so a burst

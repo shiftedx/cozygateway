@@ -136,6 +136,25 @@ describe("authenticated push relay proxy", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("registers and removes a device-scoped Live Activity token through the relay", async () => {
+    const { authed, calls } = await setup();
+    const response = await authed("/push/live-activities/register", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ activityId: "activity-1", runId: "run-1",
+        conversationId: "gateway-1", bot: "sage", token: "aa".repeat(32), environment: "development" }),
+    });
+    expect(response.status).toBe(200);
+    expect(calls[0]).toMatchObject({ method: "POST", url: "http://relay.internal:8788/register" });
+    expect(JSON.parse(calls[0]!.body)).toEqual({
+      platform: "apns-liveactivity", token: "aa".repeat(32), environment: "development",
+    });
+
+    expect((await authed("/push/live-activities/activity-1", { method: "DELETE" })).status).toBe(204);
+    expect(calls[1]).toMatchObject({
+      method: "DELETE", url: "http://relay.internal:8788/register/relay-push-id",
+    });
+  });
+
   it("advertises the push proxy capability in health", async () => {
     const { app } = await setup();
 

@@ -136,6 +136,31 @@ describe("buildProviderJwt", () => {
 });
 
 describe("apnsTransport.deliver", () => {
+  it("sends ActivityKit payloads directly with the liveactivity topic and quiet priority", async () => {
+    const { config } = testConfig();
+    let seen: { headers: Record<string, unknown>; body: string } | undefined;
+    const baseUrl = await fakeApns((headers, body, stream) => {
+      seen = { headers, body };
+      stream.respond({ ":status": 200 });
+      stream.end();
+    });
+
+    await apnsTransport(config, { baseUrl }).deliver("ACTIVITYTOKEN", "", { liveActivity: {
+      timestamp: 100, event: "update", priority: 5, staleDate: 220,
+      contentState: { phase: "usingTools", toolCallCount: 2, shortStatus: "Using 2 tools",
+        eventSequence: 7, elapsedSeconds: 94 },
+    } });
+
+    expect(seen?.headers["apns-topic"]).toBe("com.cozylabs.cozychat.push-type.liveactivity");
+    expect(seen?.headers["apns-push-type"]).toBe("liveactivity");
+    expect(seen?.headers["apns-priority"]).toBe("5");
+    expect(JSON.parse(seen?.body ?? "{}")).toEqual({ aps: {
+      timestamp: 100, event: "update", "stale-date": 220,
+      "content-state": { phase: "usingTools", toolCallCount: 2,
+        shortStatus: "Using 2 tools", eventSequence: 7, elapsedSeconds: 94 },
+    } });
+  });
+
   it("POSTs the alert + ciphertext under 'c' to /3/device/<token> with a bearer JWT", async () => {
     const { config, publicKey } = testConfig();
     let seen: { headers: Record<string, unknown>; body: string } | undefined;

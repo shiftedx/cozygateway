@@ -41,10 +41,19 @@ import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
  *  packages/relay/src/schemas.ts RegisterRequestSchema; the relay still authoritatively validates
  *  every forwarded body, so drift here can only over- or under-eagerly 400, never corrupt. */
 const RelayRegisterRequestSchema = Type.Object({
-  platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns")]),
+  platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns"), Type.Literal("apns-liveactivity")]),
   token: Type.String({ minLength: 1, maxLength: 2048 }),
   environment: Type.Optional(Type.Union([Type.Literal("development"), Type.Literal("production")])),
 });
+
+const LiveActivityRegisterRequestSchema = Type.Object({
+  activityId: Type.String({ minLength: 1, maxLength: 128 }),
+  runId: Type.String({ minLength: 1, maxLength: 128 }),
+  conversationId: Type.String({ minLength: 1, maxLength: 160 }),
+  bot: Type.String({ minLength: 1, maxLength: 120 }),
+  token: Type.String({ minLength: 32, maxLength: 512, pattern: "^[0-9a-f]+$" }),
+  environment: Type.Union([Type.Literal("development"), Type.Literal("production")]),
+}, { additionalProperties: false });
 
 export interface AppDeps {
   storage: Storage;
@@ -411,6 +420,53 @@ export function createApp(deps: AppDeps): Hono<Env> {
       statusText: upstream.statusText,
       headers: upstream.headers,
     });
+  });
+
+  app.post("/push/live-activities/register", requireDevice, async (c) => {
+    const decoded = await readBody(c);
+    if (!Value.Check(LiveActivityRegisterRequestSchema, decoded)) {
+      return c.json(errorBody("invalid_request", "malformed Live Activity registration"), 400);
+    }
+    if (deps.config.pushRelayUrl === undefined) {
+      return c.json(errorBody("not_found", "push relay proxy is not configured"), 404);
+    }
+    const relayFetch = deps.pushRelayFetch ?? fetch;
+    const relayBase = deps.config.pushRelayUrl.replace(/\/+$/, "");
+    const upstream = await relayFetch(`${relayBase}/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        platform: "apns-liveactivity", token: decoded.token, environment: decoded.environment,
+      }),
+    });
+    if (!upstream.ok) {
+      return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+    }
+    const result = await upstream.json() as { pushId?: unknown };
+    if (typeof result.pushId !== "string" || result.pushId.length === 0) {
+      return c.json(errorBody("internal", "relay returned no push id"), 502);
+    }
+    const previous = deps.storage.saveLiveActivityRegistration({
+      deviceId: c.get("deviceId"), activityId: decoded.activityId, runId: decoded.runId,
+      conversationId: decoded.conversationId, bot: decoded.bot, pushId: result.pushId,
+      createdAt: deps.now(),
+    });
+    if (previous !== undefined && previous !== result.pushId) {
+      void relayFetch(`${relayBase}/register/${encodeURIComponent(previous)}`, { method: "DELETE" });
+    }
+    return c.json({ ok: true });
+  });
+
+  app.delete("/push/live-activities/:activityId", requireDevice, async (c) => {
+    const row = deps.storage.deleteLiveActivityRegistration(c.get("deviceId"), c.req.param("activityId"));
+    if (row !== undefined && deps.config.pushRelayUrl !== undefined) {
+      const relayFetch = deps.pushRelayFetch ?? fetch;
+      await relayFetch(
+        `${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register/${encodeURIComponent(row.pushId)}`,
+        { method: "DELETE" },
+      ).catch(() => undefined);
+    }
+    return c.body(null, 204);
   });
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
