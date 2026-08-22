@@ -244,6 +244,11 @@ class AttachV1Client:
         headers = {
             "Authorization": f"Bearer {self._config.token}",
             "Content-Type": mime,
+            # urllib's default Python-urllib signature is blocked by common
+            # Cloudflare Browser Integrity rules (error 1010). Identify this
+            # non-browser protocol client explicitly so the authenticated media
+            # side channel follows the same public route as the WebSocket.
+            "User-Agent": "CozyGateway-Attach/1.0",
             "X-Attach-Sha256": digest,
             "X-Attach-Filename": os.path.basename(path),
         }

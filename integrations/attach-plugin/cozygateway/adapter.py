@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import logging
 import math
+import mimetypes
 import os
 import random
 import threading
@@ -165,6 +166,15 @@ class AttachAdapter:
         self._normalizers: Dict[str, IncrementalNormalizer] = {}
         # Whether any draft for a turn has carried visible content yet.
         self._content_seen: Dict[str, bool] = {}
+        # Hermes strips terminal MEDIA/local-file directives only after the
+        # message handler returns. Attach-v1 must know those paths before its
+        # terminal send seals the turn, so retain them at that boundary.
+        self._turn_media: Dict[str, List[str]] = {}
+        # Hermes subsequently runs its conventional per-platform media phase.
+        # Remember successful atomic uploads so those calls can be acknowledged
+        # without a duplicate upload or a misleading fallback warning.
+        self._absorbed_media: OrderedDict[str, None] = OrderedDict()
+        self._absorbed_media_max = 512
         # Hermes' clarify callback gives the platform stable clarify ids plus display choices.
         # Keep the bounded id→answer map until the durable resolution command is executed.
         self._clarify_choices: Dict[str, Dict[str, str]] = {}
@@ -190,6 +200,57 @@ class AttachAdapter:
             normalizer = IncrementalNormalizer()
             self._normalizers[turn_id] = normalizer
         return normalizer.update(text)
+
+    def set_message_handler(self, handler: Any) -> None:
+        """Stage safe local reply media while preserving Hermes' response."""
+
+        async def wrapped(event: Any) -> Any:
+            response = await handler(event)
+            chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+            turn_id = self._active_turn.get(chat_id) if isinstance(chat_id, str) else None
+            if turn_id and isinstance(response, str):
+                self._stage_response_media(turn_id, response)
+            return response
+
+        self._message_handler = wrapped  # harness-defined callback slot
+
+    def _stage_response_media(self, turn_id: str, response: str) -> None:
+        """Mirror Hermes' safe extraction without altering its delivery input."""
+        try:
+            media, _cleaned = self.extract_media(response)  # type: ignore[attr-defined]
+            explicit = [
+                path
+                for path, _is_voice in self.filter_media_delivery_paths(media)  # type: ignore[attr-defined]
+            ]
+        except Exception:  # noqa: BLE001 - a staging fault must not lose text
+            logger.debug("attach: terminal media staging failed", exc_info=True)
+            return
+        paths = list(dict.fromkeys(str(path) for path in explicit if path))
+        if paths:
+            self._turn_media[turn_id] = paths[:16]
+
+    @staticmethod
+    def _media_family(path: str) -> str:
+        family = (mimetypes.guess_type(path)[0] or "application/octet-stream").partition("/")[0]
+        return family if family in {"image", "audio", "video"} else "file"
+
+    @staticmethod
+    def _media_key(path: str) -> str:
+        return os.path.realpath(os.path.expanduser(path))
+
+    def _remember_absorbed_media(self, path: str) -> None:
+        key = self._media_key(path)
+        self._absorbed_media[key] = None
+        self._absorbed_media.move_to_end(key)
+        while len(self._absorbed_media) > self._absorbed_media_max:
+            self._absorbed_media.popitem(last=False)
+
+    def _consume_absorbed_media(self, path: str) -> bool:
+        key = self._media_key(path)
+        if key not in self._absorbed_media:
+            return False
+        self._absorbed_media.pop(key)
+        return True
 
     # -- connection lifecycle -------------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -734,20 +795,27 @@ class AttachAdapter:
             blocks = self._normalize(turn_id, final_text)
             chips = self._chips(turn_id)
             media_ids: List[str] = []
-            if isinstance(client, AttachV1Client) and isinstance(metadata, dict):
-                raw_media = metadata.get("media_files") or metadata.get("media") or []
-                if isinstance(raw_media, (list, tuple)):
-                    for raw_path in raw_media[:16]:
-                        if not isinstance(raw_path, str) or not raw_path:
-                            continue
-                        media_id = uuid.uuid4().hex
-                        try:
-                            await client.upload_media(media_id, raw_path, "file")
-                            media_ids.append(media_id)
-                        except Exception:  # noqa: BLE001 - text and other media still commit
-                            logger.warning("attach: one reply media upload failed; committing the remaining reply")
+            uploaded_paths: List[str] = []
+            raw_media: List[Any] = list(self._turn_media.get(turn_id, []))
+            if isinstance(metadata, dict):
+                metadata_media = metadata.get("media_files") or metadata.get("media") or []
+                if isinstance(metadata_media, (list, tuple)):
+                    raw_media.extend(metadata_media)
+            if isinstance(client, AttachV1Client):
+                paths = list(dict.fromkeys(path for path in raw_media if isinstance(path, str) and path))
+                for raw_path in paths[:16]:
+                    media_id = uuid.uuid4().hex
+                    try:
+                        await client.upload_media(media_id, raw_path, self._media_family(raw_path))
+                        media_ids.append(media_id)
+                        uploaded_paths.append(raw_path)
+                    except Exception as exc:  # noqa: BLE001 - text and other media still commit
+                        logger.warning(
+                            "attach: one reply media upload failed (%s); committing the remaining reply",
+                            exc,
+                        )
             had_content = self._content_seen.get(turn_id, False)
-            if blocks or chips:
+            if blocks or chips or media_ids:
                 # Full replace with the final view, then seal it.
                 await client.send_draft(chat_id, turn_id, blocks, tool_calls=chips)
                 if isinstance(client, AttachV1Client):
@@ -765,6 +833,8 @@ class AttachAdapter:
                 # No content ever materialized for this turn.
                 await client.send_failed(chat_id, turn_id, "empty reply")
                 return SendResult(success=True)
+            for uploaded_path in uploaded_paths:
+                self._remember_absorbed_media(uploaded_path)
         except (AttachAuthError, AttachSupersededError) as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as exc:  # noqa: BLE001 - best-effort failed on the way out
@@ -787,11 +857,109 @@ class AttachAdapter:
     def _cleanup_turn(self, chat_id: str, turn_id: str) -> None:
         """Drop a turn's per-turn state once it commits, fails, or is dropped."""
         self._turn_text.pop(turn_id, None)
+        self._turn_media.pop(turn_id, None)
         self._tool_chips.pop(turn_id, None)
         self._normalizers.pop(turn_id, None)
         self._content_seen.pop(turn_id, None)
         if self._active_turn.get(chat_id) == turn_id:
             self._active_turn.pop(chat_id, None)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge video already committed atomically by ``send``."""
+        if self._consume_absorbed_media(video_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._active_turn.get(chat_id)
+        if turn_id and video_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(video_path)
+            return result
+        return await super().send_video(  # type: ignore[misc]
+            chat_id, video_path, caption, reply_to, metadata, **kwargs
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge a document already committed atomically by ``send``."""
+        if self._consume_absorbed_media(file_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._active_turn.get(chat_id)
+        if turn_id and file_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(file_path)
+            return result
+        return await super().send_document(  # type: ignore[misc]
+            chat_id, file_path, caption, file_name, reply_to, metadata, **kwargs
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge audio already committed atomically by ``send``."""
+        if self._consume_absorbed_media(audio_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._active_turn.get(chat_id)
+        if turn_id and audio_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(audio_path)
+            return result
+        return await super().send_voice(  # type: ignore[misc]
+            chat_id, audio_path, caption, reply_to, metadata, **kwargs
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge a local image already committed atomically by ``send``."""
+        if self._consume_absorbed_media(image_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._active_turn.get(chat_id)
+        if turn_id and image_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(image_path)
+            return result
+        return await super().send_image_file(  # type: ignore[misc]
+            chat_id, image_path, caption, reply_to, metadata, **kwargs
+        )
 
     # -- no-op surfaces the protocol does not model ---------------------------
     async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
