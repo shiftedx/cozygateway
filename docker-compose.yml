@@ -1,6 +1,5 @@
-# Reference deployment: the gateway uses the CozyLabs hosted push relay by default. The optional
-# local relay is in the local-push profile for developers with their own publisher-team APNs key.
-# Copy .env.example to .env and set a strong attach token.
+# Reference deployment: mount an explicit Hermes config and secret environment. The optional local
+# relay is in the local-push profile for developers with their own publisher-team APNs key.
 services:
   gateway:
     build:
@@ -13,14 +12,19 @@ services:
       # Hosted push works with the store app because CozyLabs holds that publisher team's APNs key.
       # Payloads are end-to-end encrypted. Override for a local-push developer relay if needed.
       COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"
-      # The bearer token the attaching Hermes plugin must present on /attach/v1. Named by the mounted
-      # config's options.tokenEnv. Required: compose fails fast if unset.
-      COZYGATEWAY_ATTACH_TOKEN: "${COZYGATEWAY_ATTACH_TOKEN:?set a strong attach token in .env}"
+    # This file supplies exactly the environment variables named by hermes.tokenEnv/passwordEnv and
+    # hermes.profiles.*.tokenEnv in the mounted config. It is not copied into the image.
+    env_file:
+      - "${COZYGATEWAY_SECRETS_FILE:?set COZYGATEWAY_SECRETS_FILE to a Hermes secrets env file}"
     ports:
       - "8787:8787"
     volumes:
       - gateway-data:/data
-      - ./docker/cozygateway.config.json:/app/cozygateway.config.json:ro
+      - "${COZYGATEWAY_CONFIG_PATH:?set COZYGATEWAY_CONFIG_PATH to a Hermes config}:/config/cozygateway.config.json:ro"
+    # Lets the example config reach a private Hermes Dashboard on the Docker host. For a Hermes
+    # service on the same Compose network, use that service name in hermes.url instead.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Pointed at /ready, not /health: docker's restart policy below only reacts to the container
     # process exiting, never to a failing healthcheck, so nothing here restarts on an unhealthy
     # result. That is exactly why /ready is the right target -- when the hermes bridge is offline,

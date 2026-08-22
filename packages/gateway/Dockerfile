@@ -21,9 +21,6 @@ ENV COZYGATEWAY_PORT=8787
 ENV COZYGATEWAY_DB_PATH=/data/cozygateway.db
 WORKDIR /app
 COPY --from=build /app /app
-# A default mock ("echo") config so `docker run` works out of the box and the CI smoke test needs
-# no mount. Real deployments mount their own config over this path (see docker-compose.yml).
-COPY packages/gateway/docker/cozygateway.config.json /app/cozygateway.config.json
 RUN mkdir -p /data && chown -R node:node /data /app
 VOLUME ["/data"]
 EXPOSE 8787
@@ -31,4 +28,6 @@ EXPOSE 8787
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.COZYGATEWAY_PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 USER node
-CMD ["node", "dist/cli.js", "serve", "--config", "/app/cozygateway.config.json"]
+# A real Hermes configuration and its secret environment must be supplied by the operator. The
+# image deliberately contains no fallback bot or echo runtime.
+CMD ["node", "dist/cli.js", "serve", "--config", "/config/cozygateway.config.json"]

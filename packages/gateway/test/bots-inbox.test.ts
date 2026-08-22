@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseSessionList } from "../src/hermes-bridge/canonical-chat.ts";
+import { parseSessionList } from "../src/hermes-bridge/sessions.ts";
 import { parseChatSnapshot } from "../src/hermes-bridge/chat-messages.ts";
 import { inboxMessages, inboxThread } from "../src/hermes-bridge/inbox.ts";
 

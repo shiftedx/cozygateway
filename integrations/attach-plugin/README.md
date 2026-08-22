@@ -8,7 +8,14 @@ clarification, and scheduled delivery. There is no legacy fallback.
 Outbound-only: nothing listens on the agent host, so it works from behind NAT with no
 port forwarding.
 
-## Install
+## Hermes installer
+
+The supported Hermes path downloads this directory as a checksum-verified
+release archive, installs it into each selected Hermes profile, enables it, and
+writes a distinct profile token and spool path. Use the one-paste installer in
+the repository README rather than copying an incomplete subset of this plugin.
+
+## Manual install
 
 Copy this directory as one entry in your harness's plugin directory (it already contains the root
 `__init__.py`, `plugin.yaml`, and implementation package), enable it, and set two environment
@@ -16,7 +23,7 @@ variables for the harness process:
 
 - `COZYGATEWAY_URL`: the gateway base URL (for example `http://127.0.0.1:8787`).
 - `COZYGATEWAY_TOKEN`: the attach bearer token for this agent. The gateway config names
-  the environment variable that holds it (`options.tokenEnv`); generate your own value
+  the environment variable that holds it (`hermes.profiles.<profile>.tokenEnv`); generate your own value
   and give it to both processes. It is presented header-only and never rides a URL.
 
 Set `COZYGATEWAY_URL` to an `https://` origin when the gateway terminates TLS (see

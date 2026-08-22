@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Message, RichBlock } from "cozygateway-contract";
 
+import { testHermes } from "./support/test-config.ts";
 import { openStorage } from "../src/storage.ts";
 import { createApp } from "../src/http.ts";
 import { BackendUnavailable } from "../src/errors.ts";
@@ -12,7 +13,7 @@ const config: GatewayConfig = {
   port: 8787,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+  hermes: testHermes(),
 };
 
 async function setup(opts?: { backendDown?: boolean }) {

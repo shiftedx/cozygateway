@@ -106,8 +106,8 @@ export class TurnRunner {
      *  server.ts passes config.turnTimeoutSeconds * 1000. */
     turnTimeoutMs?: number;
     /** Audit sink for approval resolutions, one line per terminal transition. Defaults to
-     *  stderr, matching how this gateway logs its other security-relevant events (the openclaw
-     *  root-token caveat, the push notifier's failures); an injected sink is how a test reads it.
+     *  stderr, matching how this gateway logs other security-relevant events (such as push
+     *  notifier failures); an injected sink is how a test reads it.
      *  A line names the thread, the turn, the toolCallId, the outcome, and the resolving device.
      *  It NEVER carries the argument summary, let alone an argument value. */
     approvalLog?: (line: string) => void;

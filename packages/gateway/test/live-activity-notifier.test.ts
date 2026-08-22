@@ -85,7 +85,7 @@ describe("live activity notifier", () => {
     storage.createDevice({ id: "device", name: "phone", tokenHash: "hash", createdAt: 1 });
     storage.saveLiveActivityRegistration({
       deviceId: "device", activityId: "activity", runId: "run",
-      conversationId: "canonical-chat", bot: "sage", pushId: "opaque", createdAt: 1,
+      conversationId: "bot-session", bot: "sage", pushId: "opaque", createdAt: 1,
     });
     const notifier = new LiveActivityNotifier({ storage, relayBaseUrl: "https://relay.test" });
 

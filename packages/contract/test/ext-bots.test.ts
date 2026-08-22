@@ -334,7 +334,6 @@ describe("routines", () => {
     title: "Morning digest",
     schedule: { raw: "every 120m", human: "Every 2h" },
     enabled: true,
-    legacyUnsafe: false,
     lastRun: null,
     nextRun: 1_800_000_600_000,
   };
@@ -345,7 +344,6 @@ describe("routines", () => {
       check(BotRoutineSchema, {
         ...routine,
         state: "paused",
-        autoPaused: true,
         prompt: "check the build...",
         lastStatus: "success",
         // A DISPLAY string, never a number: the remaining run count is not recoverable from it.
@@ -358,14 +356,6 @@ describe("routines", () => {
     expect(check(BotRoutineSchema, { ...routine, repeat: 3 })).toBe(false);
     // Timestamps are nullable but never absent, so a client has one shape to read.
     expect(check(BotRoutineSchema, { ...routine, nextRun: "2026-08-18T09:00:00Z" })).toBe(false);
-  });
-
-  it("carries `legacy` as an optional flag, absent on every tagged routine", () => {
-    // A legacy row is an untagged cron job in the bot's own store (#85), titled by its raw name.
-    expect(check(BotRoutineSchema, { ...routine, title: "nightly backup", legacy: true })).toBe(true);
-    // Optional, so the tagged rows every client already renders are unchanged and stay valid.
-    expect(check(BotRoutineSchema, routine)).toBe(true);
-    expect(check(BotRoutineSchema, { ...routine, legacy: "true" })).toBe(false);
   });
 
   it("refuses a NUL and a whitespace-only field on a create", () => {
@@ -466,10 +456,6 @@ describe("capability advertisement", () => {
     // 12 for live tool activity: the `bot_tool_activity` frame and the `toolSteps` array on
     // `GET /bots/:name/chat/messages` (a v11 gateway sends neither, so a step-by-step chip strip
     // offered against one would sit permanently empty while the turn looked like plain "thinking"),
-    // 13 for legacy cronjobs surfacing as routines: `GET /bots/:name/routines` and the
-    // `bot_routines` frame also carry the untagged jobs of that bot's own cron store, each with
-    // `legacy: true` (a v12 gateway never sends the field and never sends those rows, and a client
-    // that renders them has to know not to offer Edit, which they answer with a 400).
     // 14 for the canonical-chat pin FOLLOWING the bot's latest conversational session, plus the
     // `bot_chat_adopted` frame that announces the move (a v13 gateway pins once and then holds, so a
     // conversation held from a second device updates the roster preview and never appears in the

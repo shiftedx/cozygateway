@@ -5,13 +5,21 @@ import { afterEach, describe, expect, it } from "vitest";
 import { BOTS_CAPABILITY_VERSION, type GatewayInfo, type ServerFrame } from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
-import { applyEnvOverrides } from "../src/config.ts";
-import { DEFAULT_CHAT_SUGGESTION } from "../src/hermes-bridge/canonical-chat.ts";
-import { parseHermesOptions } from "../src/hermes-bridge/config.ts";
+import { applyEnvOverrides, type HermesBridgeConfig } from "../src/config.ts";
+const DEFAULT_CHAT_SUGGESTION = "Hey, tell me about yourself!";
+import { parseHermesOptions as parseConfiguredHermesOptions } from "../src/hermes-bridge/config.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
 const gateways: RunningGateway[] = [];
 const servers: FakeHermesServer[] = [];
+const profiles = { sage: { tokenEnv: "TEST_ATTACH_TOKEN", name: "Sage" } };
+
+function parseHermesOptions(
+  config: Omit<HermesBridgeConfig, "profiles">,
+  env: Record<string, string | undefined>,
+) {
+  return parseConfiguredHermesOptions({ ...config, profiles }, env);
+}
 
 afterEach(async () => {
   for (const gateway of gateways.splice(0)) await gateway.close();
@@ -33,7 +41,6 @@ describe("hermes bridge options", () => {
     ).toEqual({
       url: "ws://h/api/ws",
       auth: { mode: "token", token: "s3cret", param: "token" },
-      hideBotChats: true,
       hiddenProfiles: [],
       // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
       // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
@@ -65,7 +72,6 @@ describe("hermes bridge options", () => {
         password: "s3cret",
         provider: "basic",
       },
-      hideBotChats: true,
       hiddenProfiles: [],
       // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
       // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
@@ -169,14 +175,13 @@ describe("hermes bridge options", () => {
       port: 8787,
       dbPath: "db",
       turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes: { url: "ws://old/api/ws", tokenEnv: "HERMES_TOKEN", profiles },
     };
     const withBridge = applyEnvOverrides(
-      { ...base, hermes: { url: "ws://old/api/ws", tokenEnv: "HERMES_TOKEN" } },
+      base,
       { COZYGATEWAY_HERMES_URL: "ws://new/api/ws" },
     );
-    expect(withBridge.hermes?.url).toBe("ws://new/api/ws");
-    expect(applyEnvOverrides(base, { COZYGATEWAY_HERMES_URL: "ws://new/api/ws" }).hermes).toBeUndefined();
+    expect(withBridge.hermes.url).toBe("ws://new/api/ws");
   });
 });
 
@@ -187,7 +192,7 @@ describe("startGateway with a hermes bridge", () => {
         "profiles.list": () => ({
           profiles: [
             {
-              name: "scout",
+              name: "sage",
               description: "watches CI",
               has_avatar: false,
               last_session: { last_active: Math.round(Date.now() / 1000) - 3, preview: "all green" },
@@ -201,13 +206,13 @@ describe("startGateway with a hermes bridge", () => {
     servers.push(hermes);
 
     process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
     const gateway = await startGateway({
       name: "e2e",
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN" },
+      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
     });
     gateways.push(gateway);
 
@@ -231,32 +236,21 @@ describe("startGateway with a hermes bridge", () => {
 
     // A change broadcast from Hermes drives a refresh with no polling involved.
     hermes.sendEvent("sessions.changed", {});
-    await until(() => seen.some((frame) => frame.type === "bot_roster"));
-    const roster = seen.find((frame) => frame.type === "bot_roster");
+    await until(() => seen.some((frame) => frame.type === "bot_roster" && frame.bots.some((bot) => bot.name === "sage")));
+    const roster = seen.find((frame) => frame.type === "bot_roster" && frame.bots.some((bot) => bot.name === "sage"));
     expect(roster).toMatchObject({ type: "bot_roster" });
 
     const bots = (await (
       await fetch(`${gateway.url}/bots`, { headers: { authorization: `Bearer ${deviceToken}` } })
     ).json()) as { bots: Array<{ name: string; active: boolean }> };
-    expect(bots.bots.map((bot) => bot.name)).toEqual(["scout"]);
+    expect(bots.bots.map((bot) => bot.name)).toEqual(["sage"]);
     expect(bots.bots[0]!.active).toBe(true);
 
     ws.close();
     delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
   });
 
-  it("does not advertise the capability when no bridge is configured", async () => {
-    const gateway = await startGateway({
-      name: "e2e",
-      port: 0,
-      dbPath: ":memory:",
-      turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-    });
-    gateways.push(gateway);
-    const info = (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
-    expect(info.capabilities?.["com.cozylabs.bots"]).toBeUndefined();
-  });
 
   // Issue #63: GET /health kept advertising com.cozylabs.bots for hours with the hermes link
   // dead behind it, so a monitor watching only `capabilities` stayed green through a full outage.
@@ -268,13 +262,13 @@ describe("startGateway with a hermes bridge", () => {
     });
     servers.push(hermes);
     process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
     const gateway = await startGateway({
       name: "e2e",
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN" },
+      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
     });
     gateways.push(gateway);
 
@@ -287,6 +281,7 @@ describe("startGateway with a hermes bridge", () => {
     expect(typeof info.bridges?.["hermes"]?.since).toBe("number");
 
     delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
   });
 
   it("flips the hermes bridge offline in /health, with a growing reconnectAttempt, once the link drops", async () => {
@@ -295,13 +290,13 @@ describe("startGateway with a hermes bridge", () => {
     });
     servers.push(hermes);
     process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
     const gateway = await startGateway({
       name: "e2e",
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN" },
+      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
     });
     gateways.push(gateway);
 
@@ -330,6 +325,7 @@ describe("startGateway with a hermes bridge", () => {
     });
 
     delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
   });
 
   // Follow-up to issue #63 (tracked separately): /health kept a bridge outage invisible behind a
@@ -342,13 +338,13 @@ describe("startGateway with a hermes bridge", () => {
     });
     servers.push(hermes);
     process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
     const gateway = await startGateway({
       name: "e2e",
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN" },
+      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
     });
     gateways.push(gateway);
 
@@ -376,24 +372,9 @@ describe("startGateway with a hermes bridge", () => {
     expect(down.body.bridges?.["hermes"]?.reconnectAttempt).toBeGreaterThanOrEqual(1);
 
     delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
   });
 
-  it("answers /ready 200 with no bridges reported when no bridge is configured", async () => {
-    const gateway = await startGateway({
-      name: "e2e",
-      port: 0,
-      dbPath: ":memory:",
-      turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-    });
-    gateways.push(gateway);
-
-    const res = await fetch(`${gateway.url}/ready`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { ready: boolean; bridges?: unknown };
-    expect(body.ready).toBe(true);
-    expect(body.bridges).toBeUndefined();
-  });
 
   it("fails startup when the bridge credential is missing, before the port is bound", async () => {
     delete process.env["MISSING_HERMES_TOKEN"];
@@ -403,8 +384,7 @@ describe("startGateway with a hermes bridge", () => {
         port: 0,
         dbPath: ":memory:",
         turnTimeoutSeconds: 0,
-        agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-        hermes: { url: "ws://127.0.0.1:1/api/ws", tokenEnv: "MISSING_HERMES_TOKEN" },
+        hermes: { url: "ws://127.0.0.1:1/api/ws", tokenEnv: "MISSING_HERMES_TOKEN", profiles },
       }),
     ).rejects.toThrow(/MISSING_HERMES_TOKEN/);
   });
@@ -417,8 +397,7 @@ describe("startGateway with a hermes bridge", () => {
         port: 0,
         dbPath: ":memory:",
         turnTimeoutSeconds: 0,
-        agents: [{ id: "mock", name: "Mock", backend: "mock" }],
-        hermes: { url: "homelab:8790/api/ws", tokenEnv: "TEST_HERMES_TOKEN" },
+        hermes: { url: "homelab:8790/api/ws", tokenEnv: "TEST_HERMES_TOKEN", profiles },
       }),
     ).rejects.toThrow(/ws:\/\/ or wss:\/\//);
     delete process.env["TEST_HERMES_TOKEN"];

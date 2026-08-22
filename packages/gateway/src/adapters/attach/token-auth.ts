@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
-/** One constant-time bearer resolver shared by v0 WS, v1 WS, and v1 HTTP media. Token maps stay
+/** One constant-time bearer resolver shared by attach-v1 WebSocket and HTTP media. Token maps stay
  * small (one row per configured agent/profile); scan every row so none of the public attach
  * surfaces accidentally falls back to Map.get's ordinary string comparison. */
 export function resolveAttachBearer(

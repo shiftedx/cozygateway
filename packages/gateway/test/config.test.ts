@@ -15,96 +15,85 @@ function writeConfig(value: unknown): string {
   return path;
 }
 
+const hermes = {
+  url: "ws://homelab:8790/api/ws",
+  tokenEnv: "HERMES_TOKEN",
+  profiles: { sage: { tokenEnv: "SAGE_ATTACH_TOKEN", name: "Sage" } },
+};
+
 describe("loadConfig", () => {
   it("loads a valid config and applies defaults", () => {
     const path = writeConfig({
       name: "test-gateway",
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes,
     });
     const config = loadConfig(path);
     expect(config.port).toBe(8787);
     expect(config.dbPath).toBe("cozygateway.db");
-    expect(config.agents[0]?.backend).toBe("mock");
+    expect(config.hermes.profiles.sage?.tokenEnv).toBe("SAGE_ATTACH_TOKEN");
   });
 
-  it("rejects a config that serves nothing at all, naming both surfaces", () => {
-    const empty = writeConfig({ name: "g", agents: [] });
-    expect(() => loadConfig(empty)).toThrow(ContractViolation);
-    expect(() => loadConfig(empty)).toThrow(/at least one entry in "agents", or a "hermes" bridge block/);
-    // An omitted `agents` reads the same as an empty one, rather than as a schema error about a
-    // missing key.
-    expect(() => loadConfig(writeConfig({ name: "g" }))).toThrow(/at least one entry in "agents"/);
-  });
+  it("requires Hermes and at least one attach profile", () => {
+    expect(() => loadConfig(writeConfig({ name: "g" }))).toThrow(ContractViolation);
+    expect(() => loadConfig(writeConfig({ name: "g", hermes: { url: hermes.url, profiles: {} } }))).toThrow(
+      ContractViolation,
+    );
 
-  // A pure-bots gateway serves the hermes bridge and nothing else. A non-empty `agents` used to be
-  // required, which forced a placeholder attach agent into the config of a box that serves no
-  // attach agents at all.
-  it("accepts a gateway with no agents when a hermes bridge is configured", () => {
     const path = writeConfig({
       name: "bots-only",
-      agents: [],
-      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" },
+      hermes,
     });
     const config = loadConfig(path);
-    expect(config.agents).toEqual([]);
-    expect(config.hermes?.url).toBe("ws://homelab:8790/api/ws");
-
-    const omitted = loadConfig(
-      writeConfig({ name: "bots-only", hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" } }),
-    );
-    expect(omitted.agents).toEqual([]);
+    expect(config.hermes.url).toBe(hermes.url);
   });
 
   it("carries the bridge's optional roster hide list through", () => {
     const path = writeConfig({
       name: "bots-only",
-      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN", hiddenProfiles: ["ops-runner"] },
+      hermes: { ...hermes, hiddenProfiles: ["ops-runner"] },
     });
     expect(loadConfig(path).hermes?.hiddenProfiles).toEqual(["ops-runner"]);
   });
 
-  it("accepts per-bot attach-v1 native and shadow migration gates", () => {
+  it("accepts one direct attach identity per Hermes profile", () => {
     const path = writeConfig({
       name: "native-bots",
       hermes: {
         url: "ws://homelab:8790/api/ws",
         tokenEnv: "HERMES_TOKEN",
-        nativeDataPlane: {
-          sage: { tokenEnv: "SAGE_ATTACH_TOKEN", mode: "native", features: { media: false, tools: true, interactions: false, clarify: true, scheduled: false } },
-          pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", mode: "shadow" },
+        profiles: {
+          sage: { tokenEnv: "SAGE_ATTACH_TOKEN", name: "Sage" },
+          pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", avatar: "pixel.png" },
         },
       },
     });
-    expect(loadConfig(path).hermes?.nativeDataPlane).toEqual({
-      sage: { tokenEnv: "SAGE_ATTACH_TOKEN", mode: "native", features: { media: false, tools: true, interactions: false, clarify: true, scheduled: false } },
-      pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", mode: "shadow" },
+    expect(loadConfig(path).hermes.profiles).toEqual({
+      sage: { tokenEnv: "SAGE_ATTACH_TOKEN", name: "Sage" },
+      pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", avatar: "pixel.png" },
     });
   });
 
   it("normalizes the bridge's own profile name, which DELETE then refuses", () => {
     const path = writeConfig({
       name: "bots-only",
-      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN", profile: "  Ops-Host  " },
+      hermes: { ...hermes, profile: "  Ops-Host  " },
     });
     const parsed = parseHermesOptions(loadConfig(path).hermes!, { HERMES_TOKEN: "t" });
     expect(parsed.bridgeProfile).toBe("ops-host");
     // Absent by default: the guard is opt-in because the profile cannot be detected.
     const bare = writeConfig({
       name: "bots-only",
-      hermes: { url: "ws://homelab:8790/api/ws", tokenEnv: "HERMES_TOKEN" },
+      hermes,
     });
     expect(parseHermesOptions(loadConfig(bare).hermes!, { HERMES_TOKEN: "t" }).bridgeProfile).toBeUndefined();
   });
 
-  it("rejects duplicate agent ids", () => {
+  it("rejects duplicate normalized profile ids", () => {
     const path = writeConfig({
       name: "g",
-      agents: [
-        { id: "a", name: "A", backend: "mock" },
-        { id: "a", name: "B", backend: "mock" },
-      ],
+      hermes: { ...hermes, profiles: { Sage: { tokenEnv: "A" }, sage: { tokenEnv: "B" } } },
     });
-    expect(() => loadConfig(path)).toThrow(/duplicate agent id/i);
+    expect(() => loadConfig(path)).toThrow(/duplicate Hermes profile id/i);
   });
 
   // Issue #16: capabilities is an optional gateway-level config field, surfaced as
@@ -112,7 +101,7 @@ describe("loadConfig", () => {
   it("loads a config with no capabilities field (older-shape config keeps working)", () => {
     const path = writeConfig({
       name: "test-gateway",
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes,
     });
     expect(loadConfig(path).capabilities).toBeUndefined();
   });
@@ -120,7 +109,7 @@ describe("loadConfig", () => {
   it("loads a populated capabilities map, preserving vendor ids verbatim", () => {
     const path = writeConfig({
       name: "test-gateway",
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes,
       capabilities: { "com.cozylabs.test": 1 },
     });
     expect(loadConfig(path).capabilities).toEqual({ "com.cozylabs.test": 1 });
@@ -129,7 +118,7 @@ describe("loadConfig", () => {
   it("loads the private push relay target", () => {
     const path = writeConfig({
       name: "test-gateway",
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes,
       pushRelayUrl: "http://relay:8788",
     });
     expect(loadConfig(path).pushRelayUrl).toBe("http://relay:8788");
@@ -138,7 +127,7 @@ describe("loadConfig", () => {
   it("rejects a non-integer capability version", () => {
     const path = writeConfig({
       name: "g",
-      agents: [{ id: "a", name: "A", backend: "mock" }],
+      hermes,
       capabilities: { "com.cozylabs.test": "one" },
     });
     expect(() => loadConfig(path)).toThrow(ContractViolation);
@@ -149,7 +138,7 @@ describe("loadConfig", () => {
   it("defaults turnTimeoutSeconds to 600 when absent", () => {
     const path = writeConfig({
       name: "test-gateway",
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes,
     });
     expect(loadConfig(path).turnTimeoutSeconds).toBe(600);
   });
@@ -157,7 +146,7 @@ describe("loadConfig", () => {
   it("accepts an explicit turnTimeoutSeconds from the config file", () => {
     const path = writeConfig({
       name: "test-gateway",
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes,
       turnTimeoutSeconds: 120,
     });
     expect(loadConfig(path).turnTimeoutSeconds).toBe(120);
@@ -166,7 +155,7 @@ describe("loadConfig", () => {
   it("accepts turnTimeoutSeconds of 0 (disables the bound)", () => {
     const path = writeConfig({
       name: "test-gateway",
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes,
       turnTimeoutSeconds: 0,
     });
     expect(loadConfig(path).turnTimeoutSeconds).toBe(0);
@@ -175,7 +164,7 @@ describe("loadConfig", () => {
   it("rejects a negative turnTimeoutSeconds", () => {
     const path = writeConfig({
       name: "g",
-      agents: [{ id: "a", name: "A", backend: "mock" }],
+      hermes,
       turnTimeoutSeconds: -1,
     });
     expect(() => loadConfig(path)).toThrow(ContractViolation);
@@ -188,6 +177,10 @@ describe("reference deployment", () => {
     expect(compose).toContain(
       'COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"',
     );
+    expect(compose).toContain("COZYGATEWAY_CONFIG_PATH");
+    expect(compose).toContain("COZYGATEWAY_SECRETS_FILE");
+    expect(compose).not.toContain("COZYGATEWAY_ATTACH_TOKEN");
+    expect(compose).not.toContain("agents:");
   });
 });
 
@@ -196,7 +189,7 @@ const base: GatewayConfig = {
   port: 8787,
   dbPath: "cozygateway.db",
   turnTimeoutSeconds: 600,
-  agents: [{ id: "echo", name: "Echo", backend: "mock" }],
+  hermes,
 };
 
 describe("applyEnvOverrides", () => {

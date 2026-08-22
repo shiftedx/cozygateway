@@ -1,85 +1,31 @@
-# Operating attach-v1
+# Operating Hermes attach-v1
 
-## Gateway configuration
-
-Attach agents use `/attach/v1` exclusively. The gateway does not expose an unversioned fallback.
-
-For native Bot Mode, keep the `hermes` Dashboard bridge configured for management and add a
-per-profile gate:
+The Hermes installer creates one native attach identity per selected Hermes
+profile. Its gateway config keeps the local Dashboard control URL and uses the
+profile map, not a parallel `agents[]` identity or `nativeDataPlane` rollout
+entry:
 
 ```json
 {
   "hermes": {
-    "url": "ws://hermes:8790/api/ws",
-    "tokenEnv": "HERMES_DASHBOARD_TOKEN",
-    "nativeDataPlane": {
-      "sage": {
-        "tokenEnv": "SAGE_ATTACH_TOKEN",
-        "mode": "shadow",
-        "features": {
-          "media": true,
-          "tools": true,
-          "interactions": true,
-          "clarify": true,
-          "scheduled": true
-        }
-      }
+    "profiles": {
+      "ops": { "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_OPS" }
     }
   }
 }
 ```
 
-Set every named environment variable in the gateway service. Tokens must be non-empty and unique;
-startup fails closed on a missing or colliding token. Promote one bot at a time by changing
-`shadow` to `native` and restarting the gateway. Roll back by removing the entry or returning it to
-`shadow`; do not run two authoritative chat planes for one bot.
+Every profile gets a unique bearer token and a persistent spool at
+`<profile-home>/plugin-data/cozygateway/attach-v1.sqlite`. Preserve that spool
+and the gateway SQLite database during backups and recovery. Do not run two
+plugin instances with the same token.
 
-Each feature gate is independently reversible. Omit `features` (or any individual field) for the
-backward-compatible enabled default. The gateway intersects these gates with the plugin's hello
-offer, refuses disabled event/command routing, and returns 403 from the media side channel when
-media is disabled. Scheduled delivery accepts only the durable canonical Bot Chat session minted
-by the gateway for that profile.
+Tokens appear only in the selected profile `.env` and the gateway's mode-600
+runtime env file. The attach plugin connects out to the local gateway over
+loopback; it exposes no listener on a Hermes host.
 
-## Plugin environment
-
-```sh
-COZYGATEWAY_URL=https://gateway.example
-COZYGATEWAY_TOKEN=<same per-profile token>
-COZYGATEWAY_SPOOL_PATH=/var/lib/hermes/cozygateway-attach-v1.sqlite
-COZYGATEWAY_HOME_CHANNEL=thread
-```
-
-The spool directory must be writable and persistent across plugin/container restarts. Run exactly
-one active plugin instance per token. The HTTP origin must be reachable for media even when the WS
-is connected through a proxy; preserve `Authorization` and Range headers and allow `/attach/v1`
-WebSocket upgrades.
-
-## Deployment sequence
-
-1. Deploy the attach-v1 gateway and plugin as one lockstep change. CozyLabs'
-   `integrations/hermes/attach` copy is lockstep vendored: after this cozygateway change has a
-   commit, re-vendor the complete plugin directory and record that exact cozygateway ref in the
-   paired CozyLabs change. Never patch the vendored copy independently.
-2. Configure a `shadow` bot. Verify hello, presence, ACK progress, replay after a
-   forced reconnect, and spool growth returning to steady state.
-3. Promote that bot to `native`. Verify text, interrupt, tool/approval/clarify (including restart
-   recovery and expiry), one scheduled message/push across a forced retry, and media range download
-   from a paired client.
-4. Expand per bot. A peer that has not migrated remains unavailable until its attach-v1 plugin is
-   installed; it is never silently downgraded.
-
-On recovery, preserve both the gateway SQLite database and plugin spool. Deleting either side's
-journal destroys its dedupe/replay history and requires an operator reconciliation; it is not a
-routine way to clear a stuck turn.
-
-Monitor projection dead letters in `attach_event_inbox` (`dead_lettered_at`,
-`projection_attempts`, `projection_error`). A transient failure retries automatically in process;
-a dead letter is terminal/degraded operator work and blocks every later projection for that
-identity, including after restart. Correct the cause, then release only the earliest dead letter
-through the gateway's controlled `releaseProjectionDeadLetter` service seam; it retries the failed
-event before any later sequence.
-
-Monitor `attach_command_outbox.cancelled_at` and `cancel_reason` as well. If a plugin reconnects
-without a capability needed by an already queued command, the gateway durably converts that row to
-a `discard` tombstone. The plugin ACKs the sequence without invoking the unsupported action, and
-compatible later commands continue normally instead of remaining head-of-line blocked.
+Create or delete the profile with Hermes, then rerun the one-line installer;
+its default `--profiles all` selection reconciles the current set. Use an
+explicit `--profiles default,ops` only to narrow coverage. Do not hand-edit
+token values into JSON or service units. Gateway health plus each Hermes
+profile gateway status are the relevant operational checks.

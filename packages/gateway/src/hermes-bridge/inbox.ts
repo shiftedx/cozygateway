@@ -1,12 +1,11 @@
 import type { BotGroupMessage, BotInboxThread } from "cozygateway-contract";
 
-import type { SessionRow } from "./canonical-chat.ts";
+import type { SessionRow } from "./sessions.ts";
 import type { ChatSnapshot } from "./chat-messages.ts";
 import { classifyPreview } from "./roster.ts";
 
-/** The a2a prefix has already been recognized by the shared roster/canonical-chat classifier before
- *  either helper is called. This second projection extracts the counterpart and display text from
- *  that same classifier, so the inbox never grows a competing definition of a2a traffic. */
+/** The shared session classifier already recognized the a2a prefix before this projection extracts
+ * the counterpart and display text. */
 export function inboxPeerAndPreview(preview: string | null): { peers: string[]; preview: string } {
   const classified = classifyPreview(preview, null);
   if (classified.kind !== "a2a") return { peers: [], preview: preview?.trim() ?? "" };

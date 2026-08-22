@@ -16,7 +16,6 @@
 - `erasableSyntaxOnly` is on: no TS enums, no namespaces, no parameter properties.
 - Never fabricate test DATA with `as` casts; build typed literals instead (shoehorn conventions). Allowed narrowing uses of `as`: `as const`, narrowing a parsed `unknown` (e.g. `await res.json()` or `JSON.parse`) to a response shape, and post-`instanceof` narrowing; the plan's test code shows the pattern.
 - No em-dashes in any public-facing copy (README, contract spec, package descriptions, error messages).
-- "works with OpenClaw" nominative framing only; never "Claw" in a name. Never name coding-agent harnesses in public copy.
 - Every commit message and code comment states constraints, not narration.
 - Test command inside a package: `pnpm test` (vitest run). Full gate from repo root: `pnpm check`.
 - Git: work on the slice branch the executor names for your task. Do not create or switch to any other branch. Do not push. Absolute paths only inside `/Users/kmcdowell/Documents/repos/cozygateway`.
@@ -799,7 +798,7 @@ git commit -m "feat(contract): WS frame schemas (auth-first, sync replay, draft/
 
 - [ ] **Step 1: Write `contract/v1.md`**
 
-Structure (write full prose for each; PUBLIC COPY: no em-dashes, nominative OpenClaw mention only if needed, no harness names):
+Structure (write full prose for each; PUBLIC COPY: no em-dashes and no harness names):
 
 ```markdown
 # cozygateway wire contract v1
@@ -3394,6 +3393,5 @@ git commit -m "feat(conformance): black-box contract v1 suite, green against the
 
 1. First real backend adapter (attach mode against a live agent runtime; study the originating codebase's gateway session and profile runtime modules as reference, re-license clean).
 2. Push relay service + gateway push origination (replace `nullNotifier`).
-3. OpenClaw adapter (pinned protocol v4, canary CI).
-4. TLS + TOFU serving in the gateway CLI (config already reserves nothing; add `tls: {certPath, keyPath}` when the iOS work starts).
-5. Attachment upload/download endpoints (block shape is already frozen).
+3. TLS + TOFU serving in the gateway CLI (config already reserves nothing; add `tls: {certPath, keyPath}` when the iOS work starts).
+4. Attachment upload/download endpoints (block shape is already frozen).

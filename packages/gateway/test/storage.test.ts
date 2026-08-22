@@ -1,11 +1,6 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { describe, expect, it } from "vitest";
 
-import { addColumnIfMissing, openStorage } from "../src/storage.ts";
+import { openStorage } from "../src/storage.ts";
 
 function seeded() {
   const storage = openStorage(":memory:");
@@ -164,134 +159,10 @@ describe("bots cache", () => {
     expect(storage.botRoster()).toEqual({ bots: [], updatedAt: null });
   });
 
-  it("keeps canonical chat pins per bot, upserting and clearing", () => {
-    const storage = openStorage(":memory:");
-    storage.setBotChatPin("scout", "sess-1", 1);
-    storage.setBotChatPin("luna", "sess-2", 1);
-    storage.setBotChatPin("scout", "sess-3", 2);
-    expect(storage.botChatPin("scout")).toBe("sess-3");
-    expect([...storage.botChatPins().entries()].sort()).toEqual([
-      ["luna", "sess-2"],
-      ["scout", "sess-3"],
-    ]);
-    storage.clearBotChatPin("scout");
-    expect(storage.botChatPin("scout")).toBeUndefined();
-    storage.clearBotChatPin("scout");
-  });
-
-  it("keeps a manual pin boundary until an automatic adoption moves to another session", () => {
-    const storage = openStorage(":memory:");
-    storage.setBotChatPin("scout", "older", 100, true);
-    storage.setBotChatPin("scout", "older", 200);
-    expect(storage.botChatPinEntry("scout")).toEqual({
-      sessionId: "older",
-      updatedAt: 100,
-      manual: true,
-    });
-
-    storage.setBotChatPin("scout", "next", 300);
-    expect(storage.botChatPinEntry("scout")).toEqual({
-      sessionId: "next",
-      updatedAt: 300,
-      manual: false,
-    });
-  });
-});
-
-describe("addColumnIfMissing", () => {
-  function columnNames(db: DatabaseSync, table: string): string[] {
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
-    return rows.map((row) => row.name);
-  }
-
-  it("adds the column to a fresh table", () => {
-    const db = new DatabaseSync(":memory:");
-    db.exec("CREATE TABLE widgets (id TEXT PRIMARY KEY)");
-    addColumnIfMissing(db, "widgets", "runtime_id", "TEXT");
-    expect(columnNames(db, "widgets")).toContain("runtime_id");
-  });
-
-  it("is a no-op when the column is already there", () => {
-    const db = new DatabaseSync(":memory:");
-    db.exec("CREATE TABLE widgets (id TEXT PRIMARY KEY, runtime_id TEXT)");
-    db.exec("INSERT INTO widgets (id, runtime_id) VALUES ('w1', 'r1')");
-    expect(() => addColumnIfMissing(db, "widgets", "runtime_id", "TEXT")).not.toThrow();
-    expect(columnNames(db, "widgets")).toEqual(["id", "runtime_id"]);
-    const row = db.prepare("SELECT runtime_id FROM widgets WHERE id = 'w1'").get() as { runtime_id: string };
-    expect(row.runtime_id).toBe("r1");
-  });
-
-  it("propagates a non-duplicate-column ALTER failure instead of swallowing it", () => {
-    const fakeDb = {
-      exec: () => {
-        throw new Error("SQLITE_BUSY: database is locked");
-      },
-      prepare: () => {
-        throw new Error("prepare should not be reached when exec throws a real error");
-      },
-    } as unknown as DatabaseSync;
-    expect(() => addColumnIfMissing(fakeDb, "widgets", "runtime_id", "TEXT")).toThrow(/database is locked/);
-  });
-
-  it("fails loudly if the column is still missing after a swallowed duplicate-column error", () => {
-    // Simulates a driver that reports "duplicate column name" without the column actually being
-    // present. The post-ALTER PRAGMA verification must catch this and refuse to silently continue.
-    const fakeDb = {
-      exec: () => {
-        throw new Error("duplicate column name: runtime_id");
-      },
-      prepare: () => ({
-        all: () => [],
-      }),
-    } as unknown as DatabaseSync;
-    expect(() => addColumnIfMissing(fakeDb, "widgets", "runtime_id", "TEXT")).toThrow(
-      /migration failed.*widgets\.runtime_id/,
-    );
-  });
-});
-
-describe("openStorage migrations", () => {
-  it("boots a fresh in-memory DB with the migrated columns present", () => {
-    const storage = openStorage(":memory:");
-    // Surfacing through public behavior: setBotChatPin/botChatPin round-trip via bot_chat_pins,
-    // which only works once runtime_id (and the rest of the additive migrations) has landed.
-    storage.setBotChatPin("scout", "sess-1", 1);
-    expect(storage.botChatPin("scout")).toBe("sess-1");
-  });
-
-  it("adds external_id before creating its index on a legacy database", () => {
-    const dir = mkdtempSync(join(tmpdir(), "cozygateway-legacy-messages-"));
-    const path = join(dir, "gateway.sqlite");
-    const legacy = new DatabaseSync(path);
-    legacy.exec(`
-      CREATE TABLE messages (
-        thread_id TEXT NOT NULL,
-        seq INTEGER NOT NULL,
-        role TEXT NOT NULL,
-        blocks_json TEXT NOT NULL,
-        turn_id TEXT,
-        marker TEXT,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY (thread_id, seq)
-      ) STRICT, WITHOUT ROWID;
-    `);
-    legacy.close();
-
-    const storage = openStorage(path);
-    storage.close();
-
-    const migrated = new DatabaseSync(path);
-    const columns = migrated.prepare("PRAGMA table_info(messages)").all() as unknown as Array<{ name: string }>;
-    const indexes = migrated.prepare("PRAGMA index_list(messages)").all() as unknown as Array<{ name: string }>;
-    expect(columns.map((column) => column.name)).toContain("external_id");
-    expect(indexes.map((index) => index.name)).toContain("messages_external_id");
-    migrated.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
 });
 
 describe("routine override metadata", () => {
-  it("preserves absent versus null and is removed with the bot", () => {
+  it("preserves absent versus null and supports explicit removal", () => {
     const storage = openStorage(":memory:");
     storage.setBotRoutineOverrides("scout", "job-1", { model: null, effort: "low" });
     expect(storage.botRoutineOverrides("scout", "job-1")).toEqual({ model: null, effort: "low" });
@@ -299,38 +170,7 @@ describe("routine override metadata", () => {
     storage.setBotRoutineOverrides("scout", "job-1", { effort: null });
     expect(storage.botRoutineOverrides("scout", "job-1")).toEqual({ effort: null });
 
-    storage.forgetBot("scout");
+    storage.deleteBotRoutineOverrides("scout", "job-1");
     expect(storage.botRoutineOverrides("scout", "job-1")).toBeUndefined();
-  });
-});
-
-describe("assistant chat attachment storage", () => {
-  it("ingests already bound bytes and keeps the consumed-line marker after byte expiry", () => {
-    const storage = openStorage(":memory:");
-    const ttl = 14 * 24 * 60 * 60 * 1000;
-    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47]);
-    storage.putBotChatAttachment(
-      {
-        fileId: "f".repeat(32),
-        bot: "scout",
-        sessionId: "canonical",
-        messageId: "assistant-41",
-        sourceKey: "digest-41",
-        mime: "image/png",
-        name: "photo.png",
-        size: bytes.byteLength,
-        bytes,
-      },
-      1_000,
-      ttl,
-    );
-    expect(storage.botChatAttachmentsFor("canonical", "assistant-41", 0)).toEqual([
-      expect.objectContaining({ fileId: "f".repeat(32) }),
-    ]);
-    expect(storage.botChatAssistantMediaKeys("canonical", "assistant-41")).toEqual(["digest-41"]);
-
-    storage.sweepBotChatAttachments(1_000 + ttl + 1, ttl);
-    expect(storage.botChatAttachmentsFor("canonical", "assistant-41", 1_001)).toEqual([]);
-    expect(storage.botChatAssistantMediaKeys("canonical", "assistant-41")).toEqual(["digest-41"]);
   });
 });

@@ -7,7 +7,7 @@
  * gateway wires `registerConformanceSuite` into its own vitest run, points it at itself, and
  * proves conformance the same way the reference gateway does.
  *
- * The suite exercises the reference echo backend, whose semantics are frozen in section 7 of
+ * The suite exercises the reference attach echo peer, whose semantics are frozen in section 7 of
  * the contract: a reply to `{ type: "paragraph", text: T }` is exactly two draft frames then a
  * commit of `[{ type: "paragraph", text: "Echo: " + T }]`; a `T` containing `[[fail]]` fails
  * the turn as a `turn.failed` system message instead of an echo commit. */
@@ -56,7 +56,7 @@ export interface ConformanceEnv {
   baseUrl: () => string;
   /** Mint a fresh single-use setup code on the gateway under test. */
   issueSetupCode: () => Promise<string>;
-  /** Agent id of the reference echo backend on the gateway under test. */
+  /** Hermes profile id of the reference attach echo peer on the gateway under test. */
   echoAgentId: string;
   /** OPTIONAL stall hook (issue #21). Agent id of a stall-capable, interruptible backend on the
    *  gateway under test. Declaring it activates the live in-flight interrupt group, which is the
@@ -1039,7 +1039,7 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
             const failedTurnId = systemCommit?.message.turnId;
             expect(failedTurnId).toBeDefined();
 
-            // A failed turn emits no done frame (spec section 7 mock semantics).
+            // A failed turn emits no done frame (spec section 7 reference-peer semantics).
             expect(socket.frames.some((f) => f.type === "done" && f.turnId === failedTurnId)).toBe(false);
 
             // The thread stays usable: a follow-up echoes normally.

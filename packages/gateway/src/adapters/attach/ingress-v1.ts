@@ -310,6 +310,10 @@ export class AttachV1Ingress implements TurnEndpoint {
     return this.#enqueue(agentId, { kind: "turn", ...input });
   }
 
+  sendNativeSteer(agentId: string, input: { threadId: string; turnId: string; messageId: string; text: string }): boolean {
+    return this.#enqueue(agentId, { kind: "steer", ...input });
+  }
+
   sendNativeInterrupt(agentId: string, input: { threadId: string; turnId: string }): boolean {
     return this.#enqueue(agentId, { kind: "interrupt", ...input });
   }

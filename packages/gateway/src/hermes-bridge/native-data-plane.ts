@@ -17,65 +17,100 @@ import type {
 
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
+import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
-import type { BotApprovalDecision, BotApprovalResolveOutcome } from "./approvals.ts";
-import type { BotChatPhotoUpload, BotsSurface } from "./bridge.ts";
+import type {
+  BotApprovalDecision,
+  BotApprovalResolveOutcome,
+} from "./approvals.ts";
+import {
+  BotSessionConflict,
+  BotSessionNotFound,
+  type BotControlSurface,
+  type BotChatPhotoUpload,
+  type BotsSurface,
+} from "./bridge.ts";
 
 export interface NativeBotDataPlaneOptions {
-  control: BotsSurface;
+  control: BotControlSurface;
   storage: Storage;
   ingress: AttachV1Ingress;
   nativeBots: Iterable<string>;
-  shadowBots?: Iterable<string>;
+  /** Optional opener offered only while a Bot Chat transcript is empty. */
+  chatSuggestion: string;
   broadcast: (frame: ServerFrame) => void;
-  onChatMessage?: (event: { bot: string; displayName: string; messageId: string; chatSessionId: string; preview: string }) => void;
-  onApproval?: (event: { bot: string; sessionId: string; turnId: string; toolCallId: string; name?: string; outcome?: "approved" | "denied" | "expired" }) => void;
+  onChatMessage?: (event: {
+    bot: string;
+    displayName: string;
+    messageId: string;
+    chatSessionId: string;
+    preview: string;
+  }) => void;
+  onApproval?: (event: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    toolCallId: string;
+    name?: string;
+    outcome?: "approved" | "denied" | "expired";
+  }) => void;
   now?: () => number;
   log?: (message: string) => void;
-  historyRetryMs?: number;
 }
 
-interface ApprovalPayload { name: string }
-interface ClarifyPayload { prompt: string; options: Array<{ id: string; label: string }> }
+interface ApprovalPayload {
+  name: string;
+}
+interface ClarifyPayload {
+  prompt: string;
+  options: Array<{ id: string; label: string }>;
+}
 
-/** Per-profile migration gate for Bot Mode. The returned surface delegates management/control
- * methods to the dashboard bridge but owns every chat method for native profiles, making it
- * impossible for a native send or settlement to fall through to prompt.submit/session.resume. */
+/** Attach-owned Bot Mode data plane. The returned surface delegates management/control methods to
+ * the dashboard bridge but owns every chat method for configured profiles, making it impossible
+ * for a native send or settlement to fall through to the Dashboard chat transport. */
 export class NativeBotDataPlane {
-  readonly #control: BotsSurface;
+  readonly #control: BotControlSurface;
   readonly #storage: Storage;
   readonly #ingress: AttachV1Ingress;
   readonly #native: Set<string>;
-  readonly #shadow: Set<string>;
+  readonly #chatSuggestion: string;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #onChatMessage: NativeBotDataPlaneOptions["onChatMessage"];
   readonly #onApproval: NativeBotDataPlaneOptions["onApproval"];
   readonly #now: () => number;
   readonly #log: (message: string) => void;
-  readonly #historyRetryMs: number;
-  readonly #historyMigrations = new Map<string, Promise<void>>();
   readonly #draftSeq = new Map<string, number>();
-  readonly #toolFrames = new Map<string, { seq: number; steps: Map<string, BotToolStep> }>();
-  readonly #interactionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #toolFrames = new Map<
+    string,
+    { seq: number; steps: Map<string, BotToolStep> }
+  >();
+  readonly #interactionTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
 
   constructor(opts: NativeBotDataPlaneOptions) {
     this.#control = opts.control;
     this.#storage = opts.storage;
     this.#ingress = opts.ingress;
     this.#native = new Set([...opts.nativeBots].map(normalize));
-    this.#shadow = new Set([...(opts.shadowBots ?? [])].map(normalize));
+    this.#chatSuggestion = opts.chatSuggestion;
     this.#broadcast = opts.broadcast;
     this.#onChatMessage = opts.onChatMessage;
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
-    this.#log = opts.log ?? ((message) => void process.stderr.write(`[native-bot] ${message}\n`));
-    this.#historyRetryMs = Math.max(0, opts.historyRetryMs ?? 250);
+    this.#log =
+      opts.log ??
+      ((message) => void process.stderr.write(`[native-bot] ${message}\n`));
     // Scheduled/home delivery is authorized against this durable gateway-owned binding, never a
     // target asserted by an event itself. Creating it at assembly makes the target canonical even
     // before the app has opened this bot's chat.
-    for (const bot of [...this.#native, ...this.#shadow]) this.#storage.nativeBotChat(bot, this.#now());
+    for (const bot of this.#native)
+      this.#storage.nativeBotChat(bot, this.#now());
     for (const pending of this.#storage.pendingNativeInteractions()) {
-      if (this.#native.has(pending.bot)) this.#scheduleInteractionExpiry(pending);
+      if (this.#native.has(pending.bot))
+        this.#scheduleInteractionExpiry(pending);
     }
   }
 
@@ -83,81 +118,75 @@ export class NativeBotDataPlane {
     const overrides: Partial<BotsSurface> = {
       roster: () => this.#roster(),
       canonicalChat: (name) => this.#canonical(name),
+      newSession: (name) => this.#newSession(name),
+      sessions: (name, limit) => this.#sessions(name, limit),
+      adoptSession: (name, sessionId, limit) =>
+        this.#adoptSession(name, sessionId, limit),
       chatHistory: (name) => this.#history(name),
       sendChatMessage: (name, text, opts) => this.#send(name, text, opts),
       sendChatPhoto: (name, photo) => this.#sendPhoto(name, photo),
       stopChat: (name) => this.#stop(name),
       resetChat: (name) => this.#reset(name),
-      resolveApproval: (name, toolCallId, decision, deviceId) => this.#resolveApproval(name, toolCallId, decision, deviceId),
-      resolveClarify: (name, clarifyId, optionId, deviceId) => this.#resolveClarify(name, clarifyId, optionId, deviceId),
+      resolveApproval: (name, toolCallId, decision, deviceId) =>
+        this.#resolveApproval(name, toolCallId, decision, deviceId),
+      resolveClarify: (name, clarifyId, optionId, deviceId) =>
+        this.#resolveClarify(name, clarifyId, optionId, deviceId),
       chatAttachmentInfo: (name, fileId) => this.#attachmentInfo(name, fileId),
-      chatAttachmentSlice: (name, fileId, offset, length) => this.#attachmentSlice(name, fileId, offset, length),
+      chatAttachmentSlice: (name, fileId, offset, length) =>
+        this.#attachmentSlice(name, fileId, offset, length),
     };
     return new Proxy(this.#control, {
       get: (target, property) => {
         const override = overrides[property as keyof BotsSurface];
         const value = override ?? Reflect.get(target, property, target);
-        return typeof value === "function" ? value.bind(override === undefined ? target : overrides) : value;
+        return typeof value === "function"
+          ? value.bind(override === undefined ? target : overrides)
+          : value;
       },
-    });
+    }) as BotsSurface;
   }
 
-  /** Starts the one-time Dashboard -> native transcript adoption for every native profile. Safe
-   * to call before the Dashboard link is online: failures leave no marker and a later chat access
-   * retries the same migration. Until the marker lands, roster reads keep the control-plane row. */
-  async migrateHistory(): Promise<void> {
-    const pending = new Set(this.#native);
-    const failures = new Map<string, unknown>();
-    for (let attempt = 0; attempt < 8 && pending.size > 0; attempt += 1) {
-      await Promise.all([...pending].map(async (bot) => {
-        try {
-          await this.#ensureHistory(bot);
-          pending.delete(bot);
-          failures.delete(bot);
-        } catch (err) {
-          failures.set(bot, err);
-        }
-      }));
-      if (pending.size > 0 && attempt < 7) await this.#historyRetry(attempt);
-    }
-    for (const bot of pending) {
-      const err = failures.get(bot);
-      const detail = err instanceof Error ? err.message : "unknown failure";
-      this.#log(`history adoption deferred for ${bot}: ${detail}`);
-    }
-  }
-
-  /** Overlay the durable attach-v1 transcript on the dashboard-owned profile roster. Profile
-   * metadata remains control-plane state, while chat identity, preview and activity come from the
-   * same native rows `chatHistory` serves. */
+  /** Expose only attach-configured identities. Hermes may host other profiles, but this gateway
+   * has no token, plugin, or durable chat transport for them until the installer reconciles them.
+   * Overlay the native transcript on their dashboard-owned metadata. */
   #roster() {
     const view = this.#control.roster();
-    const bots = view.bots.map((summary): BotSummary => {
-      const bot = normalize(summary.name);
-      if (!this.#native.has(bot)) return summary;
-      const chat = this.#storage.nativeBotChat(bot, this.#now());
-      const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
-      if (!this.#storage.nativeBotHistoryMigrated(bot) && messages.length === 0) return summary;
-      const latest = messages.findLast((message) => message.text.trim().length > 0);
-      return {
-        ...summary,
-        chatSessionId: chat.sessionId,
-        lastActiveAt: latest?.at ?? null,
-        preview: latest === undefined
-          ? { kind: "empty", text: "No conversations yet, say hi" }
-          : { kind: "plain", text: latest.text.trim() },
-      };
-    });
+    const bots = view.bots
+      .filter((summary) => this.#native.has(normalize(summary.name)))
+      .map((summary): BotSummary => {
+        const bot = normalize(summary.name);
+        const chat = this.#storage.nativeBotChat(bot, this.#now());
+        const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
+        const latest = messages.findLast(
+          (message) => message.text.trim().length > 0,
+        );
+        return {
+          ...summary,
+          chatSessionId: chat.sessionId,
+          lastActiveAt: latest?.at ?? null,
+          preview:
+            latest === undefined
+              ? { kind: "empty", text: "No conversations yet, say hi" }
+              : { kind: "plain", text: latest.text.trim() },
+        };
+      });
     return { ...view, bots };
   }
 
-  handles(bot: string): boolean { return this.#native.has(normalize(bot)) || this.#shadow.has(normalize(bot)); }
+  handles(bot: string): boolean {
+    return this.#native.has(normalize(bot));
+  }
 
   canAccept(bot: string, frame: AttachV1EventFrame): boolean {
     const key = normalize(bot);
     if (!this.handles(key)) return false;
-    if (frame.event.kind !== "scheduled") return true;
-    return frame.event.threadId === this.#storage.nativeBotChat(key, this.#now()).sessionId;
+    if (frame.event.kind !== "scheduled") {
+      return (
+        "threadId" in frame.event &&
+        this.#storage.nativeBotHasSession(key, frame.event.threadId)
+      );
+    }
+    return this.#storage.nativeBotHasSession(key, frame.event.threadId);
   }
 
   close(): void {
@@ -168,18 +197,35 @@ export class NativeBotDataPlane {
   handle(bot: string, frame: AttachV1EventFrame): boolean {
     const key = normalize(bot);
     if (!this.handles(key)) return false;
-    // Shadow mode exercises authentication, journaling, ACK/replay and observability without
-    // producing app-visible transcript state during a canary.
-    if (this.#shadow.has(key)) return true;
     const event = frame.event;
     if (event.kind === "presence" || event.kind === "media") return true;
     if (event.kind === "scheduled") {
-      const delivery = this.#storage.attachScheduledDelivery(key, event.deliveryId);
-      if (delivery === undefined || delivery.threadId !== event.threadId || delivery.messageId !== event.messageId) return false;
-      return this.#commit(key, event.threadId, event.messageId, event.blocks, event.mediaIds);
+      if (!this.#storage.nativeBotHasSession(key, event.threadId)) return false;
+      const delivery = this.#storage.attachScheduledDelivery(
+        key,
+        event.deliveryId,
+      );
+      if (
+        delivery === undefined ||
+        delivery.threadId !== event.threadId ||
+        delivery.messageId !== event.messageId
+      )
+        return false;
+      return this.#commit(
+        key,
+        event.threadId,
+        event.messageId,
+        event.blocks,
+        event.mediaIds,
+      );
     }
     if (!("threadId" in event)) return false;
     const sessionId = event.threadId;
+    // One Hermes profile can serve both a core `/threads` agent and Bot Mode. The bearer token is
+    // therefore not enough to decide which projection owns an event: only a durable local Bot
+    // session may reach this plane. Group rooms are dispatched first by the server and use their
+    // own durable group-turn binding.
+    if (!this.#storage.nativeBotHasSession(key, sessionId)) return false;
     if ("turnId" in event) {
       const command = this.#storage.attachTurnCommand(key, event.turnId);
       if (command === undefined || command.threadId !== sessionId) return false;
@@ -187,15 +233,33 @@ export class NativeBotDataPlane {
     if (event.kind === "draft") {
       const seq = (this.#draftSeq.get(event.turnId) ?? 0) + 1;
       this.#draftSeq.set(event.turnId, seq);
-      const delta: BotChatDeltaFrame = { type: "bot_chat_delta", bot: key, sessionId, turnId: event.turnId, text: blocksText(event.blocks), seq, updatedAt: this.#now() };
+      const delta: BotChatDeltaFrame = {
+        type: "bot_chat_delta",
+        bot: key,
+        sessionId,
+        turnId: event.turnId,
+        text: blocksText(event.blocks),
+        seq,
+        updatedAt: this.#now(),
+      };
       this.#broadcast(delta);
       return true;
     }
     if (event.kind === "commit") {
       this.#finish(key, sessionId, event.turnId);
-      return this.#commit(key, sessionId, event.messageId, event.blocks, event.mediaIds);
+      return this.#commit(
+        key,
+        sessionId,
+        event.messageId,
+        event.blocks,
+        event.mediaIds,
+      );
     }
-    if (event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted") {
+    if (
+      event.kind === "failed" ||
+      event.kind === "cancelled" ||
+      event.kind === "interrupted"
+    ) {
       this.#finish(key, sessionId, event.turnId, "failed");
       return true;
     }
@@ -206,60 +270,174 @@ export class NativeBotDataPlane {
   }
 
   async #canonical(name: string) {
-    if (!this.#native.has(normalize(name))) return this.#control.canonicalChat(name);
+    if (!this.#native.has(normalize(name))) throw new BotSessionNotFound(name);
     const bot = normalize(name);
-    await this.#attemptHistory(bot);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
-    return { sessionId: chat.sessionId, adoption: chat.created ? "created" as const : "pin" as const };
-  }
-
-  async #history(name: string) {
-    if (!this.#native.has(normalize(name))) return this.#control.chatHistory(name);
-    const bot = normalize(name);
-    await this.#attemptHistory(bot);
-    const chat = this.#storage.nativeBotChat(bot, this.#now());
-    this.#rebroadcastPending(bot);
     return {
       sessionId: chat.sessionId,
-      adoption: chat.created ? "created" as const : "pin" as const,
-      messages: this.#storage.nativeBotMessages(bot, chat.sessionId),
-      running: chat.activeTurnId !== undefined,
-      inflight: chat.activeTurnId !== undefined,
-      updatedAt: this.#now(),
+      adoption: chat.created ? ("created" as const) : ("pin" as const),
     };
   }
 
-  async #send(name: string, text: string, opts?: { clientId?: string }): Promise<{ sessionId: string; message: BotChatMessage }> {
+  async #newSession(name: string) {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.sendChatMessage(name, text, opts);
-    await this.#attemptHistory(bot);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const now = this.#now();
+    const previousSessionId = this.#storage.nativeBotChat(bot, now).sessionId;
+    const sessionId = this.#storage.resetNativeBotChat(bot, now);
+    // The existing app treats this as a cross-device transcript switch; the same adoption frame
+    // remains correct even though attach-native sessions are gateway-owned rather than Hermes RPC
+    // rows.
+    this.#broadcast({
+      type: "bot_chat_adopted",
+      bot,
+      sessionId,
+      previousSessionId,
+      updatedAt: now,
+    });
+    return { sessionId, previousSessionId };
+  }
+
+  async #sessions(name: string, limit: number) {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const activeSessionId = this.#storage.nativeBotChat(
+      bot,
+      this.#now(),
+    ).sessionId;
+    return {
+      sessions: this.#storage.nativeBotSessions(bot, limit).map((session) => ({
+        ...session,
+        kind: "conversation" as const,
+      })),
+      activeSessionId,
+    };
+  }
+
+  async #adoptSession(name: string, sessionId: string, _limit: number) {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(sessionId);
+    if (!this.#storage.nativeBotHasSession(bot, sessionId)) {
+      const owner = this.#storage.nativeBotSessionOwner(sessionId);
+      if (owner !== undefined) throw new BotSessionConflict(sessionId, owner);
+      throw new BotSessionNotFound(sessionId);
+    }
+    const now = this.#now();
+    const previousSessionId = this.#storage.nativeBotChat(bot, now).sessionId;
+    // The ownership check above makes this update total. Keep the guard because the storage API is
+    // also used by tests and must never silently create a session for an arbitrary id.
+    if (!this.#storage.selectNativeBotSession(bot, sessionId, now))
+      throw new BotSessionNotFound(sessionId);
+    this.#broadcast({
+      type: "bot_chat_adopted",
+      bot,
+      sessionId,
+      previousSessionId,
+      updatedAt: now,
+    });
+    return { name, sessionId, previousSessionId };
+  }
+
+  async #history(name: string) {
+    if (!this.#native.has(normalize(name))) throw new BotSessionNotFound(name);
+    const bot = normalize(name);
+    const chat = this.#storage.nativeBotChat(bot, this.#now());
+    const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
+    this.#rebroadcastPending(bot);
+    return {
+      sessionId: chat.sessionId,
+      adoption: chat.created ? ("created" as const) : ("pin" as const),
+      messages,
+      running: chat.activeTurnId !== undefined,
+      inflight: chat.activeTurnId !== undefined,
+      updatedAt: this.#now(),
+      ...(messages.length === 0 && this.#chatSuggestion !== ""
+        ? { suggestion: this.#chatSuggestion }
+        : {}),
+    };
+  }
+
+  async #send(
+    name: string,
+    text: string,
+    opts?: { clientId?: string },
+  ): Promise<{ sessionId: string; message: BotChatMessage }> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const messageId = opts?.clientId ?? randomUUID();
-    const turnId = randomUUID();
-    const message = this.#storage.appendNativeBotMessage({ bot, sessionId: chat.sessionId, messageId, role: "user", text, at: now, ...(opts?.clientId === undefined ? {} : { clientId: opts.clientId }) });
-    this.#submitNativeTurn(bot, chat.sessionId, turnId, message, text, now);
+    const turnId = chat.activeTurnId ?? randomUUID();
+    const accepted = chat.activeTurnId === undefined
+      ? this.#ingress.sendNativeTurn(bot, {
+          threadId: chat.sessionId,
+          turnId,
+          messageId,
+          text,
+        })
+      : this.#ingress.sendNativeSteer(bot, {
+          threadId: chat.sessionId,
+          turnId,
+          messageId,
+          text,
+        });
+    if (!accepted)
+      throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
+    const message = this.#storage.appendNativeBotMessage({
+      bot,
+      sessionId: chat.sessionId,
+      messageId,
+      role: "user",
+      text,
+      at: now,
+      ...(opts?.clientId === undefined ? {} : { clientId: opts.clientId }),
+    });
+    if (chat.activeTurnId === undefined) {
+      this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+    }
+    this.#broadcastMessage(bot, chat.sessionId, message, now);
+    if (chat.activeTurnId === undefined)
+      this.#state(bot, chat.sessionId, "polling", true);
     return { sessionId: chat.sessionId, message };
   }
 
   async #stop(name: string): Promise<"stopped" | "idle"> {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.stopChat(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     if (chat.activeTurnId === undefined) return "idle";
-    this.#ingress.sendNativeInterrupt(bot, { threadId: chat.sessionId, turnId: chat.activeTurnId });
+    this.#ingress.sendNativeInterrupt(bot, {
+      threadId: chat.sessionId,
+      turnId: chat.activeTurnId,
+    });
     return "stopped";
   }
 
-  async #sendPhoto(name: string, photo: BotChatPhotoUpload): Promise<{ sessionId: string; message: BotChatMessage }> {
+  async #sendPhoto(
+    name: string,
+    photo: BotChatPhotoUpload,
+  ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.sendChatPhoto(name, photo);
-    await this.#attemptHistory(bot);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const mediaId = randomUUID().replaceAll("-", "");
     const messageId = photo.clientId ?? randomUUID();
     const turnId = randomUUID();
+    if (chat.activeTurnId !== undefined) {
+      throw new BackendUnavailable(
+        `native attach-v1 profile "${bot}" cannot accept a photo while a turn is running`,
+      );
+    }
+    if (!this.#ingress.sendNativeTurn(bot, {
+      threadId: chat.sessionId,
+      turnId,
+      messageId,
+      text: photo.text,
+      mediaIds: [mediaId],
+    })) {
+      throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
+    }
     this.#storage.saveAttachMedia(
       bot,
       {
@@ -273,55 +451,115 @@ export class NativeBotDataPlane {
       photo.bytes,
       now,
     );
-    const attachment: AttachmentBlock = { type: "attachment", fileId: mediaId, name: `image.${photo.ext}`, mimeType: photo.mime, size: photo.bytes.byteLength, mediaKind: "image" };
-    const message = this.#storage.appendNativeBotMessage({ bot, sessionId: chat.sessionId, messageId, role: "user", text: photo.text, at: now, attachments: [attachment], ...(photo.clientId === undefined ? {} : { clientId: photo.clientId }) });
-    this.#submitNativeTurn(bot, chat.sessionId, turnId, message, photo.text, now, [mediaId]);
+    const attachment: AttachmentBlock = {
+      type: "attachment",
+      fileId: mediaId,
+      name: `image.${photo.ext}`,
+      mimeType: photo.mime,
+      size: photo.bytes.byteLength,
+      mediaKind: "image",
+    };
+    const message = this.#storage.appendNativeBotMessage({
+      bot,
+      sessionId: chat.sessionId,
+      messageId,
+      role: "user",
+      text: photo.text,
+      at: now,
+      attachments: [attachment],
+      ...(photo.clientId === undefined ? {} : { clientId: photo.clientId }),
+    });
+    this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+    this.#broadcastMessage(bot, chat.sessionId, message, now);
+    this.#state(bot, chat.sessionId, "polling", true);
     return { sessionId: chat.sessionId, message };
   }
 
-  #submitNativeTurn(
+  #broadcastMessage(
     bot: string,
     sessionId: string,
-    turnId: string,
     message: BotChatMessage,
-    text: string,
     now: number,
-    mediaIds?: string[],
   ): void {
-    this.#storage.setNativeBotTurn(bot, turnId, now);
-    if (!this.#ingress.sendNativeTurn(bot, { threadId: sessionId, turnId, messageId: message.id, text, ...(mediaIds === undefined ? {} : { mediaIds }) })) {
-      this.#storage.setNativeBotTurn(bot, undefined, now);
-      throw new Error(`native attach-v1 profile "${bot}" is unavailable`);
-    }
-    this.#broadcast({ type: "bot_chat", bot, sessionId, messages: [message], updatedAt: now });
-    this.#state(bot, sessionId, "polling", true);
+    this.#broadcast({
+      type: "bot_chat",
+      bot,
+      sessionId,
+      messages: [message],
+      updatedAt: now,
+    });
   }
 
   async #reset(name: string) {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.resetChat(name);
-    await this.#attemptHistory(bot);
-    const previousSessionId = this.#storage.nativeBotChat(bot, this.#now()).sessionId;
-    const sessionId = this.#storage.resetNativeBotChat(bot, this.#now());
-    this.#broadcast({ type: "bot_chat_reset", bot, sessionId, previousSessionId, updatedAt: this.#now() });
-    return { sessionId, previousSessionId };
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const now = this.#now();
+    const previous = this.#storage.nativeBotChat(bot, now);
+    if (previous.activeTurnId !== undefined) {
+      this.#ingress.sendNativeInterrupt(bot, {
+        threadId: previous.sessionId,
+        turnId: previous.activeTurnId,
+      });
+    }
+    const sessionId = this.#storage.resetNativeBotChat(bot, now);
+    this.#broadcast({
+      type: "bot_chat_reset",
+      bot,
+      sessionId,
+      previousSessionId: previous.sessionId,
+      updatedAt: now,
+    });
+    return { sessionId, previousSessionId: previous.sessionId };
   }
 
-  async #resolveApproval(name: string, approvalId: string, decision: BotApprovalDecision, _deviceId: string): Promise<BotApprovalResolveOutcome> {
+  async #resolveApproval(
+    name: string,
+    approvalId: string,
+    decision: BotApprovalDecision,
+    _deviceId: string,
+  ): Promise<BotApprovalResolveOutcome> {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.resolveApproval(name, approvalId, decision, _deviceId);
-    const binding = this.#storage.nativeInteraction(bot, "approval", approvalId);
-    if (binding === undefined) return "unknown";
-    if (binding.status !== "pending") return binding.status === "expired" ? "expired" : "not_pending";
-    const outcome = decision === "approve" ? "approved" : "denied";
-    if (!this.#ingress.sendApprovalResolution(
+    if (!this.#native.has(bot)) return "unknown";
+    const binding = this.#storage.nativeInteraction(
       bot,
-      { threadId: binding.sessionId, turnId: binding.turnId, approvalId, decision },
-      `approval:${bot}:${approvalId}`,
-    )) return "unsupported";
-    if (!this.#storage.resolveNativeInteraction(bot, "approval", approvalId, outcome, this.#now())) return "not_pending";
+      "approval",
+      approvalId,
+    );
+    if (binding === undefined) return "unknown";
+    if (binding.status !== "pending")
+      return binding.status === "expired" ? "expired" : "not_pending";
+    const outcome = decision === "approve" ? "approved" : "denied";
+    if (
+      !this.#ingress.sendApprovalResolution(
+        bot,
+        {
+          threadId: binding.sessionId,
+          turnId: binding.turnId,
+          approvalId,
+          decision,
+        },
+        `approval:${bot}:${approvalId}`,
+      )
+    )
+      return "unsupported";
+    if (
+      !this.#storage.resolveNativeInteraction(
+        bot,
+        "approval",
+        approvalId,
+        outcome,
+        this.#now(),
+      )
+    )
+      return "not_pending";
     this.#clearInteractionTimer("approval", bot, approvalId);
-    this.#emitApprovalResolved(bot, binding.sessionId, binding.turnId, approvalId, outcome);
+    this.#emitApprovalResolved(
+      bot,
+      binding.sessionId,
+      binding.turnId,
+      approvalId,
+      outcome,
+    );
     return outcome;
   }
 
@@ -330,109 +568,179 @@ export class NativeBotDataPlane {
     clarifyId: string,
     optionId: string,
     deviceId: string,
-  ): Promise<"selected" | "unknown" | "not_pending" | "expired" | "invalid_option" | "unsupported"> {
+  ): Promise<
+    | "selected"
+    | "unknown"
+    | "not_pending"
+    | "expired"
+    | "invalid_option"
+    | "unsupported"
+  > {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.resolveClarify(name, clarifyId, optionId, deviceId);
+    if (!this.#native.has(bot)) return "unknown";
     const binding = this.#storage.nativeInteraction(bot, "clarify", clarifyId);
     if (binding === undefined) return "unknown";
-    if (binding.status !== "pending") return binding.status === "expired" ? "expired" : "not_pending";
+    if (binding.status !== "pending")
+      return binding.status === "expired" ? "expired" : "not_pending";
     const payload = binding.payload as ClarifyPayload;
-    if (!payload.options.some((option) => option.id === optionId)) return "invalid_option";
-    if (!this.#ingress.sendClarifyResolution(
-      bot,
-      { threadId: binding.sessionId, turnId: binding.turnId, clarifyId, optionId },
-      `clarify:${bot}:${clarifyId}`,
-    )) return "unsupported";
-    if (!this.#storage.resolveNativeInteraction(bot, "clarify", clarifyId, "selected", this.#now(), optionId)) return "not_pending";
+    if (!payload.options.some((option) => option.id === optionId))
+      return "invalid_option";
+    if (
+      !this.#ingress.sendClarifyResolution(
+        bot,
+        {
+          threadId: binding.sessionId,
+          turnId: binding.turnId,
+          clarifyId,
+          optionId,
+        },
+        `clarify:${bot}:${clarifyId}`,
+      )
+    )
+      return "unsupported";
+    if (
+      !this.#storage.resolveNativeInteraction(
+        bot,
+        "clarify",
+        clarifyId,
+        "selected",
+        this.#now(),
+        optionId,
+      )
+    )
+      return "not_pending";
     this.#clearInteractionTimer("clarify", bot, clarifyId);
-    this.#broadcast({ type: "bot_clarify_resolved", bot, sessionId: binding.sessionId, turnId: binding.turnId, clarifyId, outcome: "selected", selectedOptionId: optionId, updatedAt: this.#now() });
+    this.#broadcast({
+      type: "bot_clarify_resolved",
+      bot,
+      sessionId: binding.sessionId,
+      turnId: binding.turnId,
+      clarifyId,
+      outcome: "selected",
+      selectedOptionId: optionId,
+      updatedAt: this.#now(),
+    });
     return "selected";
   }
 
   #attachmentInfo(name: string, fileId: string) {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.chatAttachmentInfo(name, fileId);
+    if (!this.#native.has(bot)) return undefined;
     const info = this.#storage.attachMediaInfo(bot, fileId, this.#now());
     return info === undefined
-      ? this.#control.chatAttachmentInfo(name, fileId)
+      ? undefined
       : { mime: info.mime, name: info.descriptor.filename, size: info.size };
   }
 
-  #attachmentSlice(name: string, fileId: string, offset: number, length: number) {
+  #attachmentSlice(
+    name: string,
+    fileId: string,
+    offset: number,
+    length: number,
+  ) {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return this.#control.chatAttachmentSlice(name, fileId, offset, length);
-    return this.#storage.attachMediaSlice(bot, fileId, offset, length, this.#now())
-      ?? this.#control.chatAttachmentSlice(name, fileId, offset, length);
+    if (!this.#native.has(bot)) return undefined;
+    return this.#storage.attachMediaSlice(
+      bot,
+      fileId,
+      offset,
+      length,
+      this.#now(),
+    );
   }
 
-  async #ensureHistory(bot: string): Promise<void> {
-    if (this.#storage.nativeBotHistoryMigrated(bot)) return;
-    const running = this.#historyMigrations.get(bot);
-    if (running !== undefined) return running;
-    const migration = (async () => {
-      const source = await this.#control.chatHistory(bot);
-      const chat = this.#storage.nativeBotChat(bot, this.#now());
-      const imported = this.#storage.adoptNativeBotHistory({
-        bot,
-        sessionId: chat.sessionId,
-        sourceSessionId: source.sessionId,
-        messages: source.messages,
-        now: this.#now(),
-      });
-      this.#log(`adopted ${imported} Dashboard messages for ${bot}`);
-    })();
-    this.#historyMigrations.set(bot, migration);
-    try {
-      await migration;
-    } finally {
-      this.#historyMigrations.delete(bot);
-    }
-  }
-
-  async #attemptHistory(bot: string): Promise<void> {
-    try {
-      await this.#ensureHistory(bot);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : "unknown failure";
-      this.#log(`history adoption deferred for ${bot}: ${detail}`);
-    }
-  }
-
-  #historyRetry(attempt: number): Promise<void> {
-    const delay = Math.min(this.#historyRetryMs * 2 ** attempt, 5_000);
-    if (delay === 0) return Promise.resolve();
-    return new Promise((resolve) => {
-      const timer = setTimeout(resolve, delay);
-      timer.unref();
-    });
-  }
-
-  #finish(bot: string, sessionId: string, turnId: string, phase: "complete" | "failed" = "complete"): void {
-    this.#storage.setNativeBotTurn(bot, undefined, this.#now());
+  #finish(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    phase: "complete" | "failed" = "complete",
+  ): void {
+    const settledActiveTurn = this.#storage.clearNativeBotTurn(
+      bot,
+      sessionId,
+      turnId,
+      this.#now(),
+    );
     const seq = (this.#draftSeq.get(turnId) ?? 0) + 1;
-    this.#broadcast({ type: "bot_chat_delta", bot, sessionId, turnId, text: "", seq, updatedAt: this.#now(), done: true });
+    this.#broadcast({
+      type: "bot_chat_delta",
+      bot,
+      sessionId,
+      turnId,
+      text: "",
+      seq,
+      updatedAt: this.#now(),
+      done: true,
+    });
     this.#draftSeq.delete(turnId);
-    this.#state(bot, sessionId, phase, false);
+    if (settledActiveTurn) this.#state(bot, sessionId, phase, false);
   }
 
-  #commit(bot: string, sessionId: string, messageId: string, blocks: readonly { type: string; [key: string]: unknown }[], mediaIds?: string[]): boolean {
+  #commit(
+    bot: string,
+    sessionId: string,
+    messageId: string,
+    blocks: readonly { type: string; [key: string]: unknown }[],
+    mediaIds?: string[],
+  ): boolean {
     const now = this.#now();
-    if (this.#storage.nativeBotMessage(bot, messageId) !== undefined) return true;
+    if (this.#storage.nativeBotMessage(bot, messageId) !== undefined)
+      return true;
     const attachments = mediaIds?.flatMap((mediaId): AttachmentBlock[] => {
       const info = this.#storage.attachMediaInfo(bot, mediaId, now);
       if (info === undefined) return [];
       const family = info.descriptor.family;
-      return [{ type: "attachment", fileId: mediaId, name: info.descriptor.filename, mimeType: info.mime, size: info.size, ...(family === "image" || family === "audio" || family === "video" ? { mediaKind: family } : {}) }];
+      return [
+        {
+          type: "attachment",
+          fileId: mediaId,
+          name: info.descriptor.filename,
+          mimeType: info.mime,
+          size: info.size,
+          ...(family === "image" || family === "audio" || family === "video"
+            ? { mediaKind: family }
+            : {}),
+        },
+      ];
     });
     const text = blocksText(blocks);
-    const message = this.#storage.appendNativeBotMessage({ bot, sessionId, messageId, role: "assistant", text, at: now, ...(attachments === undefined || attachments.length === 0 ? {} : { attachments }) });
-    this.#broadcast({ type: "bot_chat", bot, sessionId, messages: [message], updatedAt: now });
-    this.#onChatMessage?.({ bot, displayName: bot, messageId, chatSessionId: sessionId, preview: text.slice(0, 240) });
+    const message = this.#storage.appendNativeBotMessage({
+      bot,
+      sessionId,
+      messageId,
+      role: "assistant",
+      text,
+      at: now,
+      ...(attachments === undefined || attachments.length === 0
+        ? {}
+        : { attachments }),
+    });
+    this.#broadcast({
+      type: "bot_chat",
+      bot,
+      sessionId,
+      messages: [message],
+      updatedAt: now,
+    });
+    this.#onChatMessage?.({
+      bot,
+      displayName: bot,
+      messageId,
+      chatSessionId: sessionId,
+      preview: text.slice(0, 240),
+    });
     return true;
   }
 
-  #tool(bot: string, sessionId: string, event: Extract<AttachV1EventFrame["event"], { kind: "tool" }>): boolean {
-    const current = this.#toolFrames.get(event.turnId) ?? { seq: 0, steps: new Map<string, BotToolStep>() };
+  #tool(
+    bot: string,
+    sessionId: string,
+    event: Extract<AttachV1EventFrame["event"], { kind: "tool" }>,
+  ): boolean {
+    const current = this.#toolFrames.get(event.turnId) ?? {
+      seq: 0,
+      steps: new Map<string, BotToolStep>(),
+    };
     const prior = current.steps.get(event.callId);
     const now = this.#now();
     const step: BotToolStep = {
@@ -447,14 +755,44 @@ export class NativeBotDataPlane {
     current.steps.set(event.callId, step);
     current.seq += 1;
     this.#toolFrames.set(event.turnId, current);
-    this.#storage.upsertBotChatToolStep({ bot, sessionId, turnId: event.turnId, stepId: step.stepId, seq: step.seq, name: step.name, status: step.status, startedAt: step.startedAt, endedAt: step.endedAt, detail: step.detail });
-    const wire: BotToolActivityFrame = { type: "bot_tool_activity", bot, sessionId, turnId: event.turnId, steps: [...current.steps.values()], seq: current.seq, updatedAt: now };
+    this.#storage.upsertBotChatToolStep({
+      bot,
+      sessionId,
+      turnId: event.turnId,
+      stepId: step.stepId,
+      seq: step.seq,
+      name: step.name,
+      status: step.status,
+      startedAt: step.startedAt,
+      endedAt: step.endedAt,
+      detail: step.detail,
+    });
+    const wire: BotToolActivityFrame = {
+      type: "bot_tool_activity",
+      bot,
+      sessionId,
+      turnId: event.turnId,
+      steps: [...current.steps.values()],
+      seq: current.seq,
+      updatedAt: now,
+    };
     this.#broadcast(wire);
     return true;
   }
 
-  #approval(bot: string, sessionId: string, event: Extract<AttachV1EventFrame["event"], { kind: "approval" }>): boolean {
-    const outcome = event.status === "approved" ? "approved" : event.status === "denied" ? "denied" : event.status === "pending" ? undefined : "expired";
+  #approval(
+    bot: string,
+    sessionId: string,
+    event: Extract<AttachV1EventFrame["event"], { kind: "approval" }>,
+  ): boolean {
+    const outcome =
+      event.status === "approved"
+        ? "approved"
+        : event.status === "denied"
+          ? "denied"
+          : event.status === "pending"
+            ? undefined
+            : "expired";
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "approval",
@@ -468,20 +806,62 @@ export class NativeBotDataPlane {
     });
     if (change === "duplicate") return true;
     if (outcome === undefined) {
-      const wire: BotApprovalPendingFrame = { type: "bot_approval_pending", bot, sessionId, turnId: event.turnId, toolCallId: event.approvalId, name: event.name, updatedAt: this.#now() };
+      const wire: BotApprovalPendingFrame = {
+        type: "bot_approval_pending",
+        bot,
+        sessionId,
+        turnId: event.turnId,
+        toolCallId: event.approvalId,
+        name: event.name,
+        updatedAt: this.#now(),
+      };
       this.#broadcast(wire);
-      this.#onApproval?.({ bot, sessionId, turnId: event.turnId, toolCallId: event.approvalId, name: event.name });
-      if (event.expiresAt !== undefined) this.#scheduleInteractionExpiry({ bot, kind: "approval", interactionId: event.approvalId, sessionId, turnId: event.turnId, payload: { name: event.name }, expiresAt: event.expiresAt, updatedAt: this.#now() });
+      this.#onApproval?.({
+        bot,
+        sessionId,
+        turnId: event.turnId,
+        toolCallId: event.approvalId,
+        name: event.name,
+      });
+      if (event.expiresAt !== undefined)
+        this.#scheduleInteractionExpiry({
+          bot,
+          kind: "approval",
+          interactionId: event.approvalId,
+          sessionId,
+          turnId: event.turnId,
+          payload: { name: event.name },
+          expiresAt: event.expiresAt,
+          updatedAt: this.#now(),
+        });
     } else {
       this.#clearInteractionTimer("approval", bot, event.approvalId);
-      this.#emitApprovalResolved(bot, sessionId, event.turnId, event.approvalId, outcome);
+      this.#emitApprovalResolved(
+        bot,
+        sessionId,
+        event.turnId,
+        event.approvalId,
+        outcome,
+      );
     }
     return true;
   }
 
-  #clarify(bot: string, sessionId: string, event: Extract<AttachV1EventFrame["event"], { kind: "clarify" }>): boolean {
-    const outcome = event.status === "resolved" ? "selected" : event.status === "pending" ? undefined : event.status;
-    const payload: ClarifyPayload = { prompt: event.prompt, options: event.options };
+  #clarify(
+    bot: string,
+    sessionId: string,
+    event: Extract<AttachV1EventFrame["event"], { kind: "clarify" }>,
+  ): boolean {
+    const outcome =
+      event.status === "resolved"
+        ? "selected"
+        : event.status === "pending"
+          ? undefined
+          : event.status;
+    const payload: ClarifyPayload = {
+      prompt: event.prompt,
+      options: event.options,
+    };
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "clarify",
@@ -490,51 +870,142 @@ export class NativeBotDataPlane {
       turnId: event.turnId,
       payload,
       status: outcome ?? "pending",
-      ...(event.selectedOptionId === undefined ? {} : { selectedOptionId: event.selectedOptionId }),
+      ...(event.selectedOptionId === undefined
+        ? {}
+        : { selectedOptionId: event.selectedOptionId }),
       ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
       updatedAt: this.#now(),
     });
     if (change === "duplicate") return true;
     if (outcome === undefined) {
-      const pending: BotClarifyPendingFrame = { type: "bot_clarify_pending", bot, sessionId, turnId: event.turnId, clarifyId: event.clarifyId, prompt: event.prompt, options: event.options, ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }), updatedAt: this.#now() };
+      const pending: BotClarifyPendingFrame = {
+        type: "bot_clarify_pending",
+        bot,
+        sessionId,
+        turnId: event.turnId,
+        clarifyId: event.clarifyId,
+        prompt: event.prompt,
+        options: event.options,
+        ...(event.expiresAt === undefined
+          ? {}
+          : { expiresAt: event.expiresAt }),
+        updatedAt: this.#now(),
+      };
       this.#broadcast(pending);
-      if (event.expiresAt !== undefined) this.#scheduleInteractionExpiry({ bot, kind: "clarify", interactionId: event.clarifyId, sessionId, turnId: event.turnId, payload, expiresAt: event.expiresAt, updatedAt: this.#now() });
+      if (event.expiresAt !== undefined)
+        this.#scheduleInteractionExpiry({
+          bot,
+          kind: "clarify",
+          interactionId: event.clarifyId,
+          sessionId,
+          turnId: event.turnId,
+          payload,
+          expiresAt: event.expiresAt,
+          updatedAt: this.#now(),
+        });
     } else {
       this.#clearInteractionTimer("clarify", bot, event.clarifyId);
-      const resolved: BotClarifyResolvedFrame = { type: "bot_clarify_resolved", bot, sessionId, turnId: event.turnId, clarifyId: event.clarifyId, outcome, ...(event.selectedOptionId === undefined ? {} : { selectedOptionId: event.selectedOptionId }), updatedAt: this.#now() };
+      const resolved: BotClarifyResolvedFrame = {
+        type: "bot_clarify_resolved",
+        bot,
+        sessionId,
+        turnId: event.turnId,
+        clarifyId: event.clarifyId,
+        outcome,
+        ...(event.selectedOptionId === undefined
+          ? {}
+          : { selectedOptionId: event.selectedOptionId }),
+        updatedAt: this.#now(),
+      };
       this.#broadcast(resolved);
     }
     return true;
   }
 
-  #emitApprovalResolved(bot: string, sessionId: string, turnId: string, approvalId: string, outcome: "approved" | "denied" | "expired"): void {
-    const wire: BotApprovalResolvedFrame = { type: "bot_approval_resolved", bot, sessionId, turnId, toolCallId: approvalId, outcome, updatedAt: this.#now() };
+  #emitApprovalResolved(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    approvalId: string,
+    outcome: "approved" | "denied" | "expired",
+  ): void {
+    const wire: BotApprovalResolvedFrame = {
+      type: "bot_approval_resolved",
+      bot,
+      sessionId,
+      turnId,
+      toolCallId: approvalId,
+      outcome,
+      updatedAt: this.#now(),
+    };
     this.#broadcast(wire);
-    this.#onApproval?.({ bot, sessionId, turnId, toolCallId: approvalId, outcome });
+    this.#onApproval?.({
+      bot,
+      sessionId,
+      turnId,
+      toolCallId: approvalId,
+      outcome,
+    });
   }
 
   #scheduleInteractionExpiry(pending: {
-    bot: string; kind: "approval" | "clarify"; interactionId: string; sessionId: string; turnId: string;
-    payload: unknown; expiresAt: number | null; updatedAt: number;
+    bot: string;
+    kind: "approval" | "clarify";
+    interactionId: string;
+    sessionId: string;
+    turnId: string;
+    payload: unknown;
+    expiresAt: number | null;
+    updatedAt: number;
   }): void {
     if (pending.expiresAt === null) return;
     const key = `${pending.kind}:${pending.bot}:${pending.interactionId}`;
     const prior = this.#interactionTimers.get(key);
     if (prior !== undefined) clearTimeout(prior);
-    const timer = setTimeout(() => {
-      if (!this.#storage.resolveNativeInteraction(pending.bot, pending.kind, pending.interactionId, "expired", this.#now())) return;
-      if (pending.kind === "approval") {
-        this.#emitApprovalResolved(pending.bot, pending.sessionId, pending.turnId, pending.interactionId, "expired");
-      } else {
-        this.#broadcast({ type: "bot_clarify_resolved", bot: pending.bot, sessionId: pending.sessionId, turnId: pending.turnId, clarifyId: pending.interactionId, outcome: "expired", updatedAt: this.#now() });
-      }
-      this.#interactionTimers.delete(key);
-    }, Math.max(0, pending.expiresAt - this.#now()));
+    const timer = setTimeout(
+      () => {
+        if (
+          !this.#storage.resolveNativeInteraction(
+            pending.bot,
+            pending.kind,
+            pending.interactionId,
+            "expired",
+            this.#now(),
+          )
+        )
+          return;
+        if (pending.kind === "approval") {
+          this.#emitApprovalResolved(
+            pending.bot,
+            pending.sessionId,
+            pending.turnId,
+            pending.interactionId,
+            "expired",
+          );
+        } else {
+          this.#broadcast({
+            type: "bot_clarify_resolved",
+            bot: pending.bot,
+            sessionId: pending.sessionId,
+            turnId: pending.turnId,
+            clarifyId: pending.interactionId,
+            outcome: "expired",
+            updatedAt: this.#now(),
+          });
+        }
+        this.#interactionTimers.delete(key);
+      },
+      Math.max(0, pending.expiresAt - this.#now()),
+    );
     timer.unref();
     this.#interactionTimers.set(key, timer);
   }
 
-  #clearInteractionTimer(kind: "approval" | "clarify", bot: string, interactionId: string): void {
+  #clearInteractionTimer(
+    kind: "approval" | "clarify",
+    bot: string,
+    interactionId: string,
+  ): void {
     const key = `${kind}:${bot}:${interactionId}`;
     const timer = this.#interactionTimers.get(key);
     if (timer !== undefined) clearTimeout(timer);
@@ -545,22 +1016,68 @@ export class NativeBotDataPlane {
     for (const pending of this.#storage.pendingNativeInteractions(bot)) {
       if (pending.kind === "approval") {
         const payload = pending.payload as ApprovalPayload;
-        this.#broadcast({ type: "bot_approval_pending", bot, sessionId: pending.sessionId, turnId: pending.turnId, toolCallId: pending.interactionId, name: payload.name, updatedAt: pending.updatedAt });
+        this.#broadcast({
+          type: "bot_approval_pending",
+          bot,
+          sessionId: pending.sessionId,
+          turnId: pending.turnId,
+          toolCallId: pending.interactionId,
+          name: payload.name,
+          updatedAt: pending.updatedAt,
+        });
       } else {
         const payload = pending.payload as ClarifyPayload;
-        this.#broadcast({ type: "bot_clarify_pending", bot, sessionId: pending.sessionId, turnId: pending.turnId, clarifyId: pending.interactionId, prompt: payload.prompt, options: payload.options, ...(pending.expiresAt === null ? {} : { expiresAt: pending.expiresAt }), updatedAt: pending.updatedAt });
+        this.#broadcast({
+          type: "bot_clarify_pending",
+          bot,
+          sessionId: pending.sessionId,
+          turnId: pending.turnId,
+          clarifyId: pending.interactionId,
+          prompt: payload.prompt,
+          options: payload.options,
+          ...(pending.expiresAt === null
+            ? {}
+            : { expiresAt: pending.expiresAt }),
+          updatedAt: pending.updatedAt,
+        });
       }
     }
   }
 
-  #state(bot: string, sessionId: string, phase: BotChatStateFrame["phase"], running: boolean): void {
-    const frame: BotChatStateFrame = { type: "bot_chat_state", bot, sessionId, phase, running, inflight: running, updatedAt: this.#now() };
+  #state(
+    bot: string,
+    sessionId: string,
+    phase: BotChatStateFrame["phase"],
+    running: boolean,
+  ): void {
+    const frame: BotChatStateFrame = {
+      type: "bot_chat_state",
+      bot,
+      sessionId,
+      phase,
+      running,
+      inflight: running,
+      updatedAt: this.#now(),
+    };
     this.#broadcast(frame);
   }
 }
 
-function normalize(value: string): string { return value.trim().toLowerCase(); }
+function normalize(value: string): string {
+  return value.trim().toLowerCase();
+}
 
-function blocksText(blocks: readonly { type: string; [key: string]: unknown }[]): string {
-  return blocks.map((block) => typeof block.text === "string" ? block.text : typeof block.code === "string" ? block.code : "").filter(Boolean).join("\n");
+function blocksText(
+  blocks: readonly { type: string; [key: string]: unknown }[],
+): string {
+  return blocks
+    .map((block) =>
+      typeof block.text === "string"
+        ? block.text
+        : typeof block.code === "string"
+          ? block.code
+          : "",
+    )
+    .filter(Boolean)
+    .join("\n");
 }

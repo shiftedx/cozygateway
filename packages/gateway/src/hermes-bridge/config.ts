@@ -1,20 +1,16 @@
 import type { HermesBridgeConfig } from "../config.ts";
-import { DEFAULT_CHAT_SUGGESTION } from "./canonical-chat.ts";
 import { DEFAULT_AUTH_PROVIDER, type HermesAuth } from "./client.ts";
+
+const DEFAULT_CHAT_SUGGESTION = "Hey, tell me about yourself!";
 
 export interface ParsedHermesOptions {
   url: string;
   auth: HermesAuth;
-  hideBotChats: boolean;
   /** Profile names kept off this gateway's roster, already normalized to the lowercase form
    *  Hermes stores them in. Empty when the operator hid nothing. */
   hiddenProfiles: string[];
   /** The profile the bridge's own Hermes link runs on, normalized, or undefined when unset. */
   bridgeProfile: string | undefined;
-  /** How long a pending approval waits before the gateway synthesizes `expired`, in milliseconds,
-   *  or undefined to take `approvals.ts`'s default (the hermes `approvals.timeout` default of
-   *  300 s). */
-  approvalTimeoutMs: number | undefined;
   /** The opener an empty bot chat offers (capability 11). Always a string, already defaulted: the
    *  empty string is the operator's "offer nothing", and the bridge reads it as such. */
   chatSuggestion: string;
@@ -79,7 +75,7 @@ function gatewayWsUrl(url: string): string {
 }
 
 /** Resolves the bridge's credential from the environment, failing closed BEFORE any socket is
- *  dialed or the port is bound, mirroring `parseOpenClawOptions`.
+ *  dialed or the port is bound.
  *
  *  Two auth modes, matching the two shapes Hermes actually serves:
  *  - "token" (default): the loopback bind, where the credential rides `?token=` (or `?ticket=`
@@ -92,13 +88,10 @@ export function parseHermesOptions(
   config: HermesBridgeConfig,
   env: Record<string, string | undefined>,
 ): ParsedHermesOptions {
-  const hideBotChats = config.hideBotChats ?? true;
   const hiddenProfiles = parseHiddenProfiles(config.hiddenProfiles);
   const trimmedProfile = config.profile?.trim().toLowerCase();
   const bridgeProfile = trimmedProfile === undefined || trimmedProfile.length === 0 ? undefined : trimmedProfile;
   const mode = config.authMode ?? "token";
-  const approvalTimeoutMs =
-    config.approvalTimeoutSeconds === undefined ? undefined : config.approvalTimeoutSeconds * 1000;
   // `??`, not `||`: an operator who wrote "" meant it, and collapsing that onto the default would
   // make the one setting that turns the suggestion off silently do nothing.
   const chatSuggestion = config.chatSuggestion ?? DEFAULT_CHAT_SUGGESTION;
@@ -129,10 +122,8 @@ export function parseHermesOptions(
         password,
         provider: config.provider ?? DEFAULT_AUTH_PROVIDER,
       },
-      hideBotChats,
       hiddenProfiles,
       bridgeProfile,
-      approvalTimeoutMs,
       chatSuggestion,
     };
   }
@@ -153,10 +144,8 @@ export function parseHermesOptions(
   return {
     url: config.url,
     auth: { mode: "token", token, param: config.authParam ?? "token" },
-    hideBotChats,
     hiddenProfiles,
     bridgeProfile,
-    approvalTimeoutMs,
     chatSuggestion,
   };
 }

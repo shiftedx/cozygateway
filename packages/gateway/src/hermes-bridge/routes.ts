@@ -5,7 +5,6 @@ import {
   BotChatPhotoFieldsSchema,
   BotClarifyResolveRequestSchema,
   BotChatSendRequestSchema,
-  BotCreateRequestSchema,
   BotFocusRequestSchema,
   BotGroupCreateRequestSchema,
   BotGroupSendRequestSchema,
@@ -17,20 +16,17 @@ import {
   assertValid,
 } from "cozygateway-contract";
 
+import { BackendUnavailable } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
-import { RuntimeSessionUnknown } from "./chat-turns.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
+  type BotControlSurface,
   type BotsSurface,
 } from "./bridge.ts";
 import {
-  BotDeleteBlocked,
-  BotDeleteFailed,
-  BotDeleteRefused,
   BotNameInvalid,
-  BotNameTaken,
   BotNotFound,
   PROFILE_ID_RE,
   normalizeProfileName,
@@ -66,7 +62,6 @@ import {
   type PhotoRateLimiter,
 } from "./photos.ts";
 import {
-  LegacyRoutineNotRewritable,
   RoutineNotFound,
   RoutineRefused,
   RoutineUnconfirmed,
@@ -107,7 +102,7 @@ function errorBody(code: ErrorCode, message: string): ErrorBody {
  *  `error.code` a plain string precisely so an extension can). A client that does not know them
  *  treats them as a generic failure, which the HTTP status already conveys. */
 function extensionErrorBody(
-  code: "conflict" | "command_blocked" | "media_refused" | "rate_limited",
+  code: "conflict" | "media_refused" | "rate_limited",
   message: string,
 ): ErrorBody {
   return { error: { code, message } };
@@ -123,9 +118,13 @@ export type ByteRange = { start: number; end: number };
 /** Resolves one RFC 9110 byte range. Multi-range bodies are deliberately unsupported: AVPlayer
  *  asks for one range at a time, and multipart/byteranges would add parser surface with no product
  *  value. `undefined` means no Range header; `null` means 416. */
-export function resolveByteRange(header: string | undefined, size: number): ByteRange | null | undefined {
+export function resolveByteRange(
+  header: string | undefined,
+  size: number,
+): ByteRange | null | undefined {
   if (header === undefined) return undefined;
-  if (!header.startsWith("bytes=") || header.includes(",") || size <= 0) return null;
+  if (!header.startsWith("bytes=") || header.includes(",") || size <= 0)
+    return null;
   const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
   if (match === null || (match[1] === "" && match[2] === "")) return null;
   if (match[1] === "") {
@@ -135,7 +134,13 @@ export function resolveByteRange(header: string | undefined, size: number): Byte
   }
   const start = Number(match[1]);
   const requestedEnd = match[2] === "" ? size - 1 : Number(match[2]);
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) || start < 0 || start >= size || requestedEnd < start) {
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(requestedEnd) ||
+    start < 0 ||
+    start >= size ||
+    requestedEnd < start
+  ) {
     return null;
   }
   return { start, end: Math.min(requestedEnd, size - 1) };
@@ -144,14 +149,13 @@ export function resolveByteRange(header: string | undefined, size: number): Byte
 /** The ONE canonicalization every `/bots/:name` route applies to its path parameter, so a bot has
  *  exactly one identity no matter what casing or padding a client used in the URL.
  *
- *  Without it the routes disagreed with each other: `GET /bots/Scout/chat` pinned under the key
- *  `"Scout"` while `DELETE /bots/scout` forgot `"scout"`, leaving behind the orphan pin and meta row
- *  that `forgetBot` exists to prevent, and giving the same bot two independent inflight and pin
- *  identities depending on how it was spelled. Normalizing at the boundary, not in each handler, is
- *  what makes that unrepresentable.
+ *  Normalizing at the boundary, not in each handler, makes every route address the same profile
+ *  identity regardless of casing or surrounding whitespace.
  *
  *  Returns the canonical name, or a 400 response for a name that cannot name a profile at all. */
-function canonicalName(c: Context<Env>): { name: string } | { response: Response } {
+function canonicalName(
+  c: Context<Env>,
+): { name: string } | { response: Response } {
   try {
     return { name: normalizeProfileName(c.req.param("name") ?? "") };
   } catch (err) {
@@ -173,7 +177,9 @@ function canonicalName(c: Context<Env>): { name: string } | { response: Response
  *  The RESERVED-name half of `assertProfileNameRule` is deliberately not applied: `default` is a real,
  *  addressable profile that is always on the roster, and refusing to list its routines would break a
  *  bot rather than protect one. What makes the tag safe is the charset. */
-function routineBotName(c: Context<Env>): { name: string } | { response: Response } {
+function routineBotName(
+  c: Context<Env>,
+): { name: string } | { response: Response } {
   const resolved = canonicalName(c);
   if ("response" in resolved) return resolved;
   if (!PROFILE_ID_RE.test(resolved.name)) {
@@ -191,24 +197,23 @@ function routineBotName(c: Context<Env>): { name: string } | { response: Respons
 }
 
 function failure(c: Context<Env>, err: unknown) {
-  // Checked first, ahead of every other mapping: a name that names no Hermes profile at all is not
-  // a backend failure of any kind, it is a 404 that says so, on every `/bots/:name/*` route the
-  // same way `DELETE /bots/:name` already answers it.
-  if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
-  if (err instanceof BotSessionNotFound) return c.json(errorBody("not_found", err.message), 404);
-  if (err instanceof ModelConfigInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+  // Checked first: a name that names no Hermes profile is a 404, not a backend failure, on every
+  // configured `/bots/:name/*` route.
+  if (err instanceof BotNotFound)
+    return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof BotSessionNotFound)
+    return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof ModelConfigInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   }
-  // A routine id that names nothing in this bot's namespace, which includes an id that belongs to
-  // another bot or to an untagged cron job the operator owns. Not found, not forbidden: this API
-  // does not confirm the existence of jobs outside the bot that was asked about.
-  if (err instanceof RoutineNotFound) return c.json(errorBody("not_found", err.message), 404);
-  // A rewrite aimed at a LEGACY row. Not a 404 and not a backend failure: the routine is right
-  // there, the client can see it, and pause, resume and delete all work on it. What it cannot do is
-  // edit one, because the edit would recreate the job under the `[bot:]` tag with a new id, which is
-  // a conversion the user has to ask for. A 400 says which, and the message says how.
-  if (err instanceof LegacyRoutineNotRewritable) return c.json(errorBody("invalid_request", err.message), 400);
+  if (err instanceof BackendUnavailable)
+    return c.json(errorBody("backend_unavailable", err.message), 503);
+  // A routine id that names nothing in this bot's namespace is not found, not forbidden: this API
+  // does not confirm jobs outside the bot that was asked about.
+  if (err instanceof RoutineNotFound)
+    return c.json(errorBody("not_found", err.message), 404);
   // A create the backend accepted whose stored row could not be read back. A 502 rather than a 201,
   // because there is no routine to put in a 201 body: the alternative is echoing the request, and
   // the request is not what the backend stores. `createdId` rides along when the `add` reported one,
@@ -216,7 +221,10 @@ function failure(c: Context<Env>, err: unknown) {
   if (err instanceof RoutineUnconfirmed) {
     return c.json(
       {
-        ...errorBody("backend_unavailable", "hermes accepted the routine but its stored schedule could not be read back"),
+        ...errorBody(
+          "backend_unavailable",
+          "hermes accepted the routine but its stored schedule could not be read back",
+        ),
         hermesError: err.message,
         ...(err.createdId === undefined ? {} : { createdId: err.createdId }),
       },
@@ -241,11 +249,23 @@ function failure(c: Context<Env>, err: unknown) {
   if (err instanceof RoutineRefused) {
     return err.clientInput
       ? c.json(
-          { ...errorBody("invalid_request", `hermes refused the cron ${err.action}`), hermesError: err.message },
+          {
+            ...errorBody(
+              "invalid_request",
+              `hermes refused the cron ${err.action}`,
+            ),
+            hermesError: err.message,
+          },
           400,
         )
       : c.json(
-          { ...errorBody("backend_unavailable", `hermes refused the cron ${err.action}`), hermesError: err.message },
+          {
+            ...errorBody(
+              "backend_unavailable",
+              `hermes refused the cron ${err.action}`,
+            ),
+            hermesError: err.message,
+          },
           502,
         );
   }
@@ -258,29 +278,26 @@ function failure(c: Context<Env>, err: unknown) {
   if (err instanceof HermesRpcError) {
     return c.json(
       {
-        ...errorBody("backend_unavailable", "the hermes gateway rejected the request"),
+        ...errorBody(
+          "backend_unavailable",
+          "the hermes gateway rejected the request",
+        ),
         hermesError: err.message,
         ...(err.code === undefined ? {} : { hermesErrorCode: err.code }),
       },
       502,
     );
   }
-  // A send whose runtime session id could not be established. Reported rather than degraded into a
-  // submit against the stored id, which answers 202 for a message that goes nowhere.
-  if (err instanceof RuntimeSessionUnknown) {
-    return c.json(
-      { ...errorBody("backend_unavailable", "the hermes gateway did not report a runtime session"), hermesError: err.message },
-      502,
-    );
-  }
   // Checked BEFORE HermesUnavailable, which it subclasses. A call that went out and did not answer
-  // in time is not "the bridge is not connected": the operation may be running to completion right
-  // now (a profile delete stops a service and rmtrees a directory), and telling a client nothing
-  // reached Hermes is factually wrong and invites a retry against work already in flight.
+  // in time is not "the bridge is not connected": the operation may still be running, and telling
+  // a client nothing reached Hermes is factually wrong and invites a duplicate retry.
   if (err instanceof HermesTimeout) {
     return c.json(
       {
-        ...errorBody("backend_unavailable", "the hermes gateway did not answer in time; the operation may still be running"),
+        ...errorBody(
+          "backend_unavailable",
+          "the hermes gateway did not answer in time; the operation may still be running",
+        ),
         hermesError: err.message,
         timedOut: true,
       },
@@ -289,7 +306,13 @@ function failure(c: Context<Env>, err: unknown) {
   }
   if (err instanceof HermesUnavailable) {
     return c.json(
-      { ...errorBody("backend_unavailable", "the hermes bridge is not connected"), hermesError: err.message },
+      {
+        ...errorBody(
+          "backend_unavailable",
+          "the hermes bridge is not connected",
+        ),
+        hermesError: err.message,
+      },
       503,
     );
   }
@@ -299,7 +322,7 @@ function failure(c: Context<Env>, err: unknown) {
 export function registerBotRoutes(
   app: Hono<Env>,
   requireDevice: MiddlewareHandler<Env>,
-  bots: BotsSurface,
+  bots: BotControlSurface | BotsSurface,
   mediaOptions: {
     fetchImpl?: MediaFetch;
     timeoutMs?: number;
@@ -317,9 +340,11 @@ export function registerBotRoutes(
     now?: () => number;
   } = {},
 ): void {
+  const chat = bots as BotsSurface;
   // One limiter per registered app, created here rather than at module scope so two gateways in one
   // process (which is what the test suite is) do not share a bound.
-  const photoLimiter = photoOptions.limiter ?? createMediaLimiter(PHOTO_MAX_CONCURRENT);
+  const photoLimiter =
+    photoOptions.limiter ?? createMediaLimiter(PHOTO_MAX_CONCURRENT);
   const photoRate = photoOptions.rateLimiter ?? createPhotoRateLimiter();
   const photoNow = photoOptions.now ?? (() => Date.now());
   // Cache-first: the snapshot answers immediately, even on a cold link, and a refresh runs in the
@@ -327,78 +352,11 @@ export function registerBotRoutes(
   app.get("/bots", requireDevice, (c) => {
     const view = bots.roster();
     bots.refreshSoon("GET /bots");
-    return c.json({ bots: view.bots, updatedAt: view.updatedAt, stale: view.stale });
-  });
-
-  // 201 with the bot's roster row, which is the same row the `bot_roster` frame that fires
-  // alongside it carries: the bridge refreshes the roster before answering, so the app never sees
-  // a bot it just made missing from its own list.
-  app.post("/bots", requireDevice, async (c) => {
-    let body: unknown;
-    try {
-      body = await c.req.json();
-    } catch {
-      body = undefined;
-    }
-    let parsed;
-    try {
-      parsed = assertValid(BotCreateRequestSchema, body);
-    } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
-      return c.json(errorBody("invalid_request", detail), 400);
-    }
-    try {
-      const created = await bots.createBot(parsed);
-      return c.json(
-        {
-          bot: created.bot,
-          metaOutcome: created.metaOutcome,
-          ...(created.metaError === undefined ? {} : { metaError: created.metaError }),
-        },
-        201,
-      );
-    } catch (err) {
-      // The name rule is Hermes', but it is checked before the RPC, so it reads as the 400 it is
-      // rather than as a backend failure.
-      if (err instanceof BotNameInvalid) return c.json(errorBody("invalid_request", err.message), 400);
-      if (err instanceof BotNameTaken) return c.json(extensionErrorBody("conflict", err.message), 409);
-      return failure(c, err);
-    }
-  });
-
-  // 204: the bot is gone, and there is nothing left to say about it. The roster frame that follows
-  // is how every other device finds out.
-  app.delete("/bots/:name", requireDevice, async (c) => {
-    const resolved = canonicalName(c);
-    if ("response" in resolved) return resolved.response;
-    try {
-      await bots.deleteBot(resolved.name);
-      return c.body(null, 204);
-    } catch (err) {
-      if (err instanceof BotNameInvalid) return c.json(errorBody("invalid_request", err.message), 400);
-      if (err instanceof BotDeleteRefused) return c.json(errorBody("invalid_request", err.message), 400);
-      // Deliberately 404 rather than 204: this route is NOT idempotent, and a client that cannot
-      // tell "already gone" from "the delete broke" cannot decide whether to retry.
-      if (err instanceof BotNotFound) return c.json(errorBody("not_found", err.message), 404);
-      // `blocked` is not a Hermes error, it is a successful `cli.exec` that refused to run the
-      // command. The hint is the gateway's own text and is what tells an operator to widen the
-      // allow-list, so it rides the body verbatim rather than being folded into the message.
-      if (err instanceof BotDeleteBlocked) {
-        return c.json({ ...extensionErrorBody("command_blocked", err.message), blocked: true, hint: err.hint }, 502);
-      }
-      if (err instanceof BotDeleteFailed) {
-        return c.json(
-          {
-            ...errorBody("backend_unavailable", err.message),
-            blocked: false,
-            exitCode: err.exitCode,
-            hermesError: err.output,
-          },
-          502,
-        );
-      }
-      return failure(c, err);
-    }
+    return c.json({
+      bots: view.bots,
+      updatedAt: view.updatedAt,
+      stale: view.stale,
+    });
   });
 
   // Approval verbs for a bot chat (capability 10, issue #19 bridge lane). Two sibling routes
@@ -408,16 +366,16 @@ export function registerBotRoutes(
   // scope exists on the wire (approve == the native `once`), so there is nothing else to say.
   //
   // The path carries a bot and a correlation id and NOTHING else. `turnId` travels outward on the
-  // frames and is never accepted inward, and the hermes runtime session id is never on this wire
+  // frames and is never accepted inward, and the internal attach-v1 binding is never on this wire
   // in either direction: the gateway derives the session, the turn and the pending state from its
-  // own record, so a client cannot address an approval by any reference of its own. Same IDOR
+  // own durable record, so a client cannot address an approval by any reference of its own. Same IDOR
   // posture as the core route, and the same status mapping.
   const botApprovalRoute =
     (decision: "approve" | "deny") =>
     async (c: Context<Env>): Promise<Response> => {
       const resolved = canonicalName(c);
       if ("response" in resolved) return resolved.response;
-      const outcome = await bots.resolveApproval(
+      const outcome = await chat.resolveApproval(
         resolved.name,
         // Read through a generic Context (this handler is shared by two routes), so the param is
         // typed as possibly absent; the router only reaches here with it present.
@@ -430,47 +388,124 @@ export function registerBotRoutes(
         case "denied":
           return c.json({ status: outcome }, 202);
         case "unknown":
-          return c.json(errorBody("not_found", "no such pending approval"), 404);
+          return c.json(
+            errorBody("not_found", "no such pending approval"),
+            404,
+          );
         case "expired":
-          return c.json(errorBody("approval_expired", "the approval expired before it was resolved"), 409);
+          return c.json(
+            errorBody(
+              "approval_expired",
+              "the approval expired before it was resolved",
+            ),
+            409,
+          );
         case "not_pending":
-          return c.json(errorBody("approval_not_pending", "the approval is no longer pending"), 409);
+          return c.json(
+            errorBody(
+              "approval_not_pending",
+              "the approval is no longer pending",
+            ),
+            409,
+          );
         case "unsupported":
           // The link could not carry the decision, or this hermes has no `approval.respond`. The
           // approval is still pending and its own timer is still what will end it, so this is
           // honestly a backend problem rather than a decision that was refused.
-          return c.json(errorBody("backend_unavailable", "hermes could not resolve the approval"), 503);
+          return c.json(
+            errorBody(
+              "backend_unavailable",
+              "hermes could not resolve the approval",
+            ),
+            503,
+          );
       }
     };
 
-  app.post("/bots/:name/approvals/:toolCallId/approve", requireDevice, botApprovalRoute("approve"));
-  app.post("/bots/:name/approvals/:toolCallId/deny", requireDevice, botApprovalRoute("deny"));
+  app.post(
+    "/bots/:name/approvals/:toolCallId/approve",
+    requireDevice,
+    botApprovalRoute("approve"),
+  );
+  app.post(
+    "/bots/:name/approvals/:toolCallId/deny",
+    requireDevice,
+    botApprovalRoute("deny"),
+  );
 
-  app.post("/bots/:name/clarifications/:clarifyId", requireDevice, async (c) => {
-    const resolved = canonicalName(c);
-    if ("response" in resolved) return resolved.response;
-    let body: unknown;
-    try { body = await c.req.json(); } catch { body = undefined; }
-    let parsed;
-    try { parsed = assertValid(BotClarifyResolveRequestSchema, body); }
-    catch (err) {
-      return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"), 400);
-    }
-    const outcome = await bots.resolveClarify(
-      resolved.name,
-      c.req.param("clarifyId") ?? "",
-      parsed.optionId,
-      c.get("deviceId"),
-    );
-    switch (outcome) {
-      case "selected": return c.json({ outcome, selectedOptionId: parsed.optionId }, 202);
-      case "unknown": return c.json(errorBody("not_found", "no such pending clarification"), 404);
-      case "expired": return c.json(errorBody("approval_expired", "the clarification expired before it was resolved"), 409);
-      case "not_pending": return c.json(errorBody("approval_not_pending", "the clarification is no longer pending"), 409);
-      case "invalid_option": return c.json(errorBody("invalid_request", "the option does not belong to this clarification"), 400);
-      case "unsupported": return c.json(errorBody("backend_unavailable", "hermes could not resolve the clarification"), 503);
-    }
-  });
+  app.post(
+    "/bots/:name/clarifications/:clarifyId",
+    requireDevice,
+    async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        body = undefined;
+      }
+      let parsed;
+      try {
+        parsed = assertValid(BotClarifyResolveRequestSchema, body);
+      } catch (err) {
+        return c.json(
+          errorBody(
+            "invalid_request",
+            err instanceof Error ? err.message : "malformed body",
+          ),
+          400,
+        );
+      }
+      const outcome = await chat.resolveClarify(
+        resolved.name,
+        c.req.param("clarifyId") ?? "",
+        parsed.optionId,
+        c.get("deviceId"),
+      );
+      switch (outcome) {
+        case "selected":
+          return c.json({ outcome, selectedOptionId: parsed.optionId }, 202);
+        case "unknown":
+          return c.json(
+            errorBody("not_found", "no such pending clarification"),
+            404,
+          );
+        case "expired":
+          return c.json(
+            errorBody(
+              "approval_expired",
+              "the clarification expired before it was resolved",
+            ),
+            409,
+          );
+        case "not_pending":
+          return c.json(
+            errorBody(
+              "approval_not_pending",
+              "the clarification is no longer pending",
+            ),
+            409,
+          );
+        case "invalid_option":
+          return c.json(
+            errorBody(
+              "invalid_request",
+              "the option does not belong to this clarification",
+            ),
+            400,
+          );
+        case "unsupported":
+          return c.json(
+            errorBody(
+              "backend_unavailable",
+              "hermes could not resolve the clarification",
+            ),
+            503,
+          );
+      }
+    },
+  );
 
   app.post("/bots/focus", requireDevice, async (c) => {
     let body: unknown;
@@ -483,7 +518,8 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotFocusRequestSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     bots.setFocus(c.get("deviceId"), parsed.screen);
@@ -498,7 +534,13 @@ export function registerBotRoutes(
   app.get("/bots/catalog", requireDevice, async (c) => {
     const query = (c.req.query("q") ?? "").trim();
     if (query.length > CATALOG_QUERY_MAX) {
-      return c.json(errorBody("invalid_request", `q must be at most ${CATALOG_QUERY_MAX} characters`), 400);
+      return c.json(
+        errorBody(
+          "invalid_request",
+          `q must be at most ${CATALOG_QUERY_MAX} characters`,
+        ),
+        400,
+      );
     }
     try {
       return c.json(await bots.catalog(query));
@@ -535,7 +577,8 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotProfilePatchSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     if (
@@ -589,11 +632,18 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotModelConfigPatchSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     if (parsed.model === undefined && parsed.effort === undefined) {
-      return c.json(errorBody("invalid_request", "at least one of model or effort is required"), 400);
+      return c.json(
+        errorBody(
+          "invalid_request",
+          "at least one of model or effort is required",
+        ),
+        400,
+      );
     }
     try {
       return c.json(await bots.configureModel(resolved.name, parsed));
@@ -607,8 +657,12 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const name = resolved.name;
     try {
-      const result = await bots.canonicalChat(name);
-      return c.json({ name, sessionId: result.sessionId, adoption: result.adoption });
+      const result = await chat.canonicalChat(name);
+      return c.json({
+        name,
+        sessionId: result.sessionId,
+        adoption: result.adoption,
+      });
     } catch (err) {
       return failure(c, err);
     }
@@ -621,16 +675,15 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const name = resolved.name;
     try {
-      const history = await bots.chatHistory(name);
+      const history = await chat.chatHistory(name);
       return c.json({ name, ...history });
     } catch (err) {
       return failure(c, err);
     }
   });
 
-  // 202, not 200: Hermes has accepted the prompt, and the reply lands later over `/ws` as
-  // `bot_chat` frames. The body carries the user message the bridge committed, so the app can
-  // render it at once instead of waiting for it to come back around the poll.
+  // 202, not 200: the gateway committed the native user row and queued an attach-v1 turn. The
+  // reply lands later over `/ws` as `bot_chat` frames, so the app can render the returned row now.
   app.post("/bots/:name/chat/messages", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
@@ -645,29 +698,35 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotChatSendRequestSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     try {
-      const sent = await bots.sendChatMessage(name, parsed.text, {
+      const sent = await chat.sendChatMessage(name, parsed.text, {
         ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
       });
-      return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
+      return c.json(
+        { name, sessionId: sent.sessionId, message: sent.message },
+        202,
+      );
     } catch (err) {
       return failure(c, err);
     }
   });
 
-  // Capability 19. Stop is the hard escape while ordinary sends remain steering input. The turn
-  // owner addresses Hermes' `session.interrupt` with the runtime session id it captured at submit;
-  // this route never accepts a session id from a device.
+  // Capability 19. Stop is the hard escape. The gateway sends attach-v1 interrupt for its durable
+  // native turn binding; this route never accepts a session id from a device.
   app.post("/bots/:name/chat/stop", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
     try {
-      const outcome = await bots.stopChat(resolved.name);
+      const outcome = await chat.stopChat(resolved.name);
       if (outcome === "idle") {
-        return c.json(extensionErrorBody("conflict", "no bot chat turn is running"), 409);
+        return c.json(
+          extensionErrorBody("conflict", "no bot chat turn is running"),
+          409,
+        );
       }
       return c.json({ status: "stopped" });
     } catch (err) {
@@ -675,14 +734,9 @@ export function registerBotRoutes(
     }
   });
 
-  // Retire the canonical chat and pin a fresh one. Capability 8.
-  //
-  // NOTHING IS DELETED, and this is the first place a reader lands, so it is said here too. Hermes
-  // exposes no session delete on this surface: the retired session and its whole transcript stay on
-  // the Hermes host and keep appearing in `GET /bots/:name/sessions`. The only thing that changes is
-  // which session the bot's canonical pin points at. The action a client hangs off this will be
-  // labelled "clear chat", and that label is generous: what the user really gets is a fresh context
-  // window for the bot and a clean screen, not a deletion.
+  // Select a fresh empty gateway-owned canonical chat. Capability 8. The previous local transcript
+  // remains in `GET /bots/:name/sessions`; reset changes the selected chat and interrupts its active
+  // attach-v1 turn when one exists.
   //
   // No ambiguity with `/bots/:name/chat/messages` above, though both patterns are four segments and
   // share the first three: the last segment is a LITERAL on both, so `reset` and `messages` can only
@@ -690,8 +744,7 @@ export function registerBotRoutes(
   // the duplex pair, purely so the chat routes read in the order a client uses them.
   //
   // 200, not the 202 the send route answers with: the work this route describes is FINISHED when it
-  // answers. The new chat exists, it is pinned, the old poll is cancelled, every device has been
-  // told, and nothing at all is in flight -- the replacement chat is empty and stays empty until the
+  // answers. The fresh local chat exists, every device has been told, and it stays empty until the
   // user writes in it (capability 11).
   //
   // No request body at all. There is nothing to parameterize: a reset is a reset.
@@ -700,7 +753,7 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const name = resolved.name;
     try {
-      const result = await bots.resetChat(name);
+      const result = await chat.resetChat(name);
       return c.json({
         name,
         sessionId: result.sessionId,
@@ -734,7 +787,10 @@ export function registerBotRoutes(
     if (Number.isFinite(declared) && declared > PHOTO_MAX_REQUEST_BYTES) {
       return c.json(
         {
-          ...extensionErrorBody("media_refused", `the upload declares ${declared} bytes, over the cap`),
+          ...extensionErrorBody(
+            "media_refused",
+            `the upload declares ${declared} bytes, over the cap`,
+          ),
           reason: "too_large",
         },
         413,
@@ -753,7 +809,10 @@ export function registerBotRoutes(
       const seconds = Math.max(1, Math.ceil(ticket.retryAfterMs / 1000));
       return c.json(
         {
-          ...extensionErrorBody("rate_limited", "this device has sent photos too quickly; wait and try again"),
+          ...extensionErrorBody(
+            "rate_limited",
+            "this device has sent photos too quickly; wait and try again",
+          ),
           retryAfterMs: ticket.retryAfterMs,
         },
         429,
@@ -763,12 +822,17 @@ export function registerBotRoutes(
 
     let slot;
     try {
-      slot = await photoLimiter.acquire(photoOptions.queueWaitMs ?? PHOTO_QUEUE_WAIT_MS);
+      slot = await photoLimiter.acquire(
+        photoOptions.queueWaitMs ?? PHOTO_QUEUE_WAIT_MS,
+      );
     } catch (err) {
       if (err instanceof MediaBusy) {
         return c.json(
           {
-            ...errorBody("backend_unavailable", `the gateway is already sending ${PHOTO_MAX_CONCURRENT} photos`),
+            ...errorBody(
+              "backend_unavailable",
+              `the gateway is already sending ${PHOTO_MAX_CONCURRENT} photos`,
+            ),
             busy: true,
             waitedMs: err.waitedMs,
           },
@@ -786,13 +850,28 @@ export function registerBotRoutes(
       // multipart parser does the parsing.
       let form: FormData;
       try {
-        const raw = await readCappedBody(c.req.raw.body, PHOTO_MAX_REQUEST_BYTES);
-        form = await new Response(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer, {
-          headers: { "content-type": c.req.header("content-type") ?? "" },
-        }).formData();
+        const raw = await readCappedBody(
+          c.req.raw.body,
+          PHOTO_MAX_REQUEST_BYTES,
+        );
+        form = await new Response(
+          raw.buffer.slice(
+            raw.byteOffset,
+            raw.byteOffset + raw.byteLength,
+          ) as ArrayBuffer,
+          {
+            headers: { "content-type": c.req.header("content-type") ?? "" },
+          },
+        ).formData();
       } catch (err) {
         if (err instanceof PhotoRefused) return photoFailure(c, err);
-        return c.json(errorBody("invalid_request", "the body is not a multipart/form-data upload"), 400);
+        return c.json(
+          errorBody(
+            "invalid_request",
+            "the body is not a multipart/form-data upload",
+          ),
+          400,
+        );
       }
 
       // ONE image per send, stated as a refusal rather than by taking the first. Hermes queues
@@ -800,11 +879,20 @@ export function registerBotRoutes(
       // upload would put several pictures on one turn with one attachment block to describe them.
       const parts = form.getAll("file");
       if (parts.length > 1) {
-        return c.json(errorBody("invalid_request", "exactly one photo per send"), 400);
+        return c.json(
+          errorBody("invalid_request", "exactly one photo per send"),
+          400,
+        );
       }
       const file = parts[0];
       if (!(file instanceof File)) {
-        return c.json(errorBody("invalid_request", 'a single file part named "file" is required'), 400);
+        return c.json(
+          errorBody(
+            "invalid_request",
+            'a single file part named "file" is required',
+          ),
+          400,
+        );
       }
 
       const textPart = form.get("text");
@@ -813,10 +901,13 @@ export function registerBotRoutes(
       try {
         fields = assertValid(BotChatPhotoFieldsSchema, {
           ...(typeof textPart === "string" ? { text: textPart } : {}),
-          ...(typeof clientIdPart === "string" ? { clientId: clientIdPart } : {}),
+          ...(typeof clientIdPart === "string"
+            ? { clientId: clientIdPart }
+            : {}),
         });
       } catch (err) {
-        const detail = err instanceof ContractViolation ? err.message : "malformed fields";
+        const detail =
+          err instanceof ContractViolation ? err.message : "malformed fields";
         return c.json(errorBody("invalid_request", detail), 400);
       }
 
@@ -834,17 +925,21 @@ export function registerBotRoutes(
 
       const caption = (fields.text ?? "").trim();
       try {
-        const sent = await bots.sendChatPhoto(name, {
+        const sent = await chat.sendChatPhoto(name, {
           bytes,
           mime: accepted.mime,
           ext: accepted.ext,
-          // A photo still needs words: hermes spends an attached image on the next prompt and
-          // nothing else, so an empty caption would leave the picture queued for whatever the user
-          // typed afterwards. The default is neutral and the transcript shows it honestly.
+          // A photo turn still needs words. The default is neutral and the native transcript shows
+          // it honestly rather than leaving a queued attachment for a later send.
           text: caption === "" ? PHOTO_DEFAULT_PROMPT : caption,
-          ...(fields.clientId === undefined ? {} : { clientId: fields.clientId }),
+          ...(fields.clientId === undefined
+            ? {}
+            : { clientId: fields.clientId }),
         });
-        return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
+        return c.json(
+          { name, sessionId: sent.sessionId, message: sent.message },
+          202,
+        );
       } catch (err) {
         return photoFailure(c, err);
       }
@@ -865,24 +960,41 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const fileId = c.req.param("fileId") ?? "";
     if (!isPhotoFileId(fileId)) {
-      return c.json(errorBody("invalid_request", "fileId is not a gateway attachment id"), 400);
+      return c.json(
+        errorBody("invalid_request", "fileId is not a gateway attachment id"),
+        400,
+      );
     }
-    const info = bots.chatAttachmentInfo(resolved.name, fileId);
+    const info = chat.chatAttachmentInfo(resolved.name, fileId);
     if (info === undefined) {
-      return c.json(errorBody("not_found", "no such attachment for this bot"), 404);
+      return c.json(
+        errorBody("not_found", "no such attachment for this bot"),
+        404,
+      );
     }
     const range = resolveByteRange(c.req.header("range"), info.size);
     if (range === null) {
       return new Response(null, {
         status: 416,
-        headers: { "content-range": `bytes */${info.size}`, "accept-ranges": "bytes" },
+        headers: {
+          "content-range": `bytes */${info.size}`,
+          "accept-ranges": "bytes",
+        },
       });
     }
     const start = range?.start ?? 0;
     const end = range?.end ?? info.size - 1;
-    const bytes = bots.chatAttachmentSlice(resolved.name, fileId, start, end - start + 1);
+    const bytes = chat.chatAttachmentSlice(
+      resolved.name,
+      fileId,
+      start,
+      end - start + 1,
+    );
     if (bytes === undefined) {
-      return c.json(errorBody("not_found", "no such attachment for this bot"), 404);
+      return c.json(
+        errorBody("not_found", "no such attachment for this bot"),
+        404,
+      );
     }
     return new Response(bytes.slice().buffer as ArrayBuffer, {
       status: range === undefined ? 200 : 206,
@@ -891,7 +1003,9 @@ export function registerBotRoutes(
         "content-length": String(bytes.byteLength),
         "cache-control": PHOTO_CACHE_CONTROL,
         "accept-ranges": "bytes",
-        ...(range === undefined ? {} : { "content-range": `bytes ${start}-${end}/${info.size}` }),
+        ...(range === undefined
+          ? {}
+          : { "content-range": `bytes ${start}-${end}/${info.size}` }),
         // Same posture as the capability-7 proxy. The type came off an allow-list of raster formats
         // and was confirmed against the bytes, and this stops anything downstream from improving on
         // it.
@@ -931,7 +1045,8 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotRoutineCreateRequestSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     try {
@@ -957,7 +1072,8 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotRoutinePatchSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     if (
@@ -997,17 +1113,20 @@ export function registerBotRoutes(
       return c.json({
         name,
         routine: result.routine,
-        ...(result.replacedId === undefined ? {} : { replacedId: result.replacedId }),
-        ...(result.orphanedId === undefined ? {} : { orphanedId: result.orphanedId }),
+        ...(result.replacedId === undefined
+          ? {}
+          : { replacedId: result.replacedId }),
+        ...(result.orphanedId === undefined
+          ? {}
+          : { orphanedId: result.orphanedId }),
       });
     } catch (err) {
       return failure(c, err);
     }
   });
 
-  // 204, and NOT idempotent: a second delete of the same routine is a 404, by the same rule
-  // `DELETE /bots/:name` follows. A client that cannot tell "already gone" from "the delete broke"
-  // cannot decide whether to retry.
+  // 204, and NOT idempotent: a second delete of the same routine is a 404. A client that cannot
+  // tell "already gone" from "the delete broke" cannot decide whether to retry.
   app.delete("/bots/:name/routines/:id", requireDevice, async (c) => {
     const resolved = routineBotName(c);
     if ("response" in resolved) return resolved.response;
@@ -1034,7 +1153,13 @@ export function registerBotRoutes(
       return c.json(errorBody("invalid_request", "src is required"), 400);
     }
     if (src.length > MEDIA_SRC_MAX) {
-      return c.json(errorBody("invalid_request", `src must be at most ${MEDIA_SRC_MAX} characters`), 400);
+      return c.json(
+        errorBody(
+          "invalid_request",
+          `src must be at most ${MEDIA_SRC_MAX} characters`,
+        ),
+        400,
+      );
     }
     try {
       const source = resolveMediaSource(src);
@@ -1053,7 +1178,9 @@ export function registerBotRoutes(
           // answer: a client that followed a redirect chain server-side otherwise has no way to know
           // what it actually got.
           "x-cozy-media-source": source.toString(),
-          ...(media.contentLength === undefined ? {} : { "content-length": String(media.contentLength) }),
+          ...(media.contentLength === undefined
+            ? {}
+            : { "content-length": String(media.contentLength) }),
         },
       });
     } catch (err) {
@@ -1066,7 +1193,7 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const name = resolved.name;
     try {
-      return c.json(await bots.sessions(name, SESSION_LIST_LIMIT));
+      return c.json(await chat.sessions(name, SESSION_LIST_LIMIT));
     } catch (err) {
       return failure(c, err);
     }
@@ -1080,8 +1207,12 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const name = resolved.name;
     try {
-      const result = await bots.newSession(name);
-      return c.json({ name, sessionId: result.sessionId, previousSessionId: result.previousSessionId });
+      const result = await chat.newSession(name);
+      return c.json({
+        name,
+        sessionId: result.sessionId,
+        previousSessionId: result.previousSessionId,
+      });
     } catch (err) {
       return failure(c, err);
     }
@@ -1118,10 +1249,15 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     const sessionId = c.req.param("id") ?? "";
     if (sessionId.length === 0) {
-      return c.json(errorBody("invalid_request", "session id is required"), 400);
+      return c.json(
+        errorBody("invalid_request", "session id is required"),
+        400,
+      );
     }
     try {
-      return c.json(await bots.adoptSession(resolved.name, sessionId, SESSION_LIST_LIMIT));
+      return c.json(
+        await chat.adoptSession(resolved.name, sessionId, SESSION_LIST_LIMIT),
+      );
     } catch (err) {
       return failure(c, err);
     }
@@ -1133,9 +1269,10 @@ export function registerBotRoutes(
   // half of that bargain is `RESERVED_GROUP_NAMES`, which refuses those suffixes as room names, so
   // no room can be created at an address that would not reach it.
   //
-  // `/bots/groups` itself is two segments and collides with nothing: the only two-segment per-bot
-  // route is `DELETE /bots/:name`, and rooms are deleted at `/bots/groups/:name`.
-  app.get("/bots/groups", requireDevice, (c) => c.json({ groups: bots.groups() }));
+  // `/bots/groups` itself is two segments and collides with no configured per-bot route.
+  app.get("/bots/groups", requireDevice, (c) =>
+    c.json({ groups: bots.groups() }),
+  );
 
   app.post("/bots/groups", requireDevice, async (c) => {
     let body: unknown;
@@ -1148,11 +1285,15 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotGroupCreateRequestSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     try {
-      return c.json({ group: await bots.createGroup(parsed.name, parsed.members) }, 201);
+      return c.json(
+        { group: await bots.createGroup(parsed.name, parsed.members) },
+        201,
+      );
     } catch (err) {
       return groupFailure(c, err);
     }
@@ -1166,8 +1307,7 @@ export function registerBotRoutes(
     }
   });
 
-  // 204: the room is gone, along with its transcript and its per-member watermarks. The members'
-  // own `Group: <name>` sessions in Hermes are left standing (see `GroupRooms.remove`).
+  // 204: the gateway-owned room, transcript, and per-member turn bindings are gone.
   app.delete("/bots/groups/:group", requireDevice, (c) => {
     try {
       bots.deleteGroup(c.req.param("group") ?? "");
@@ -1191,7 +1331,8 @@ export function registerBotRoutes(
     try {
       parsed = assertValid(BotGroupSendRequestSchema, body);
     } catch (err) {
-      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      const detail =
+        err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
     try {
@@ -1225,8 +1366,19 @@ export function registerBotRoutes(
  *  file on its own machine") without parsing English out of `message`. */
 function mediaFailure(c: Context<Env>, err: unknown) {
   if (err instanceof MediaRefused) {
-    const status = err.reason === "content_type" ? 415 : err.reason === "too_large" ? 413 : 400;
-    return c.json({ ...extensionErrorBody("media_refused", err.message), reason: err.reason }, status);
+    const status =
+      err.reason === "content_type"
+        ? 415
+        : err.reason === "too_large"
+          ? 413
+          : 400;
+    return c.json(
+      {
+        ...extensionErrorBody("media_refused", err.message),
+        reason: err.reason,
+      },
+      status,
+    );
   }
   if (err instanceof MediaBusy) {
     // `retry-after` in whole seconds, which is all the header allows, and 1 rather than 0 so a client
@@ -1234,7 +1386,10 @@ function mediaFailure(c: Context<Env>, err: unknown) {
     // wants to be smarter about it.
     return c.json(
       {
-        ...errorBody("backend_unavailable", `the gateway is already fetching ${MEDIA_MAX_CONCURRENT} images`),
+        ...errorBody(
+          "backend_unavailable",
+          `the gateway is already fetching ${MEDIA_MAX_CONCURRENT} images`,
+        ),
         busy: true,
         waitedMs: err.waitedMs,
       },
@@ -1244,14 +1399,23 @@ function mediaFailure(c: Context<Env>, err: unknown) {
   }
   if (err instanceof MediaTimedOut) {
     return c.json(
-      { ...errorBody("backend_unavailable", "the image source did not answer in time"), timedOut: true },
+      {
+        ...errorBody(
+          "backend_unavailable",
+          "the image source did not answer in time",
+        ),
+        timedOut: true,
+      },
       504,
     );
   }
   if (err instanceof MediaUpstreamFailed) {
     return c.json(
       {
-        ...errorBody("backend_unavailable", "the image source could not be fetched"),
+        ...errorBody(
+          "backend_unavailable",
+          "the image source could not be fetched",
+        ),
         sourceError: err.message,
         ...(err.status === undefined ? {} : { sourceStatus: err.status }),
       },
@@ -1277,8 +1441,19 @@ function mediaFailure(c: Context<Env>, err: unknown) {
  *  not exist, a runtime session that could not be addressed, and every transport state. */
 function photoFailure(c: Context<Env>, err: unknown) {
   if (err instanceof PhotoRefused) {
-    const status = err.reason === "content_type" ? 415 : err.reason === "too_large" ? 413 : 400;
-    return c.json({ ...extensionErrorBody("media_refused", err.message), reason: err.reason }, status);
+    const status =
+      err.reason === "content_type"
+        ? 415
+        : err.reason === "too_large"
+          ? 413
+          : 400;
+    return c.json(
+      {
+        ...extensionErrorBody("media_refused", err.message),
+        reason: err.reason,
+      },
+      status,
+    );
   }
   // Hermes' own text, with anything path-shaped redacted. Every other route on this surface passes
   // that text through verbatim on purpose and still does; this route is the exception because it is
@@ -1289,7 +1464,10 @@ function photoFailure(c: Context<Env>, err: unknown) {
   if (err instanceof PhotoAttachFailed) {
     return c.json(
       {
-        ...errorBody("backend_unavailable", "the hermes gateway did not accept the photo; nothing was submitted"),
+        ...errorBody(
+          "backend_unavailable",
+          "the hermes gateway did not accept the photo; nothing was submitted",
+        ),
         hermesError: redactHostPaths(err.message),
       },
       502,
@@ -1300,7 +1478,10 @@ function photoFailure(c: Context<Env>, err: unknown) {
   if (err instanceof HermesRpcError && err.code !== HERMES_PROFILE_NOT_FOUND) {
     return c.json(
       {
-        ...errorBody("backend_unavailable", "the hermes gateway rejected the photo"),
+        ...errorBody(
+          "backend_unavailable",
+          "the hermes gateway rejected the photo",
+        ),
         hermesError: redactHostPaths(err.message),
         ...(err.code === undefined ? {} : { hermesErrorCode: err.code }),
       },
@@ -1315,9 +1496,13 @@ function photoFailure(c: Context<Env>, err: unknown) {
  *  reaches Hermes at all, and that arrives here as `BotNotFound`, which `failure` already answers
  *  as the 404 it is. */
 function groupFailure(c: Context<Env>, err: unknown) {
-  if (err instanceof GroupNotFound) return c.json(errorBody("not_found", err.message), 404);
-  if (err instanceof GroupExists) return c.json(extensionErrorBody("conflict", err.message), 409);
-  if (err instanceof GroupInvalid) return c.json(errorBody("invalid_request", err.message), 400);
-  if (err instanceof BotNameInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+  if (err instanceof GroupNotFound)
+    return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof GroupExists)
+    return c.json(extensionErrorBody("conflict", err.message), 409);
+  if (err instanceof GroupInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
+  if (err instanceof BotNameInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
   return failure(c, err);
 }

@@ -1838,7 +1838,7 @@ Run:
 
 ```bash
 cd /Users/kmcdowell/Documents/repos/cozygateway && grep -rn $'—' packages/relay contract/push-v0.md packages/gateway/src/push-crypto.ts packages/gateway/src/push-notifier.ts docs/plans/2026-07-07-push-relay.md README.md | grep -v Binary || echo "no em-dashes"
-cd /Users/kmcdowell/Documents/repos/cozygateway && grep -rni "hermes\|cozylabs\|openclaw\|claude" packages/relay contract/push-v0.md packages/gateway/src/push-crypto.ts packages/gateway/src/push-notifier.ts README.md || echo "copy clean"
+cd /Users/kmcdowell/Documents/repos/cozygateway && grep -rni "hermes\|cozylabs\|claude" packages/relay contract/push-v0.md packages/gateway/src/push-crypto.ts packages/gateway/src/push-notifier.ts README.md || echo "copy clean"
 ```
 
 Expected: `no em-dashes` and `copy clean`.

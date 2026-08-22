@@ -22,6 +22,7 @@ jobs:
       - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm test:installer
       - run: pnpm --filter cozygateway-contract lint:package
 
   docker:
@@ -33,6 +34,5 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      # ws (used by the smoke driver) resolves from the gateway package after install
       - run: pnpm install --frozen-lockfile
       - run: bash scripts/docker-smoke.sh

@@ -6,9 +6,10 @@ Status: versioned adapter contract. It is independent of the frozen CozyChat `v1
 
 attach-v1 is the native Hermes plugin ↔ CozyGateway messaging data plane. CozyChat does not
 connect to it: clients continue to use the existing REST, `/ws`, attachment, and push surfaces.
-Hermes Dashboard JSON-RPC remains the control plane for profiles, roster, configuration, models,
-sessions, and routines. A bot whose native migration gate is enabled MUST NOT submit chat through
-Dashboard `prompt.submit` or settle by polling/resuming a Dashboard session.
+Hermes Dashboard JSON-RPC remains the control/read plane for profiles, roster, configuration,
+models, sessions, and routines. Attach-v1 is authoritative for every configured Hermes profile's
+chat sends, live turns, and groups; CozyGateway MUST NOT submit those chats through Dashboard
+`prompt.submit` or settle them by polling/resuming a Dashboard session.
 
 ## Transport and negotiation
 
@@ -96,21 +97,17 @@ sniffed family/MIME, declared size, and SHA-256 before commit. Downloads support
 expiry. A failed media item does not invalidate text or other valid media in the same committed
 message; missing items are omitted from the app attachment list.
 
-## Bot Mode projection and rollout
+## Bot Mode projection
 
 Native events are translated into the ext-bots-v1 `bot_chat_delta`, `bot_chat`, `bot_chat_state`,
 `bot_tool_activity`, `bot_approval_*`, capability-22 `bot_clarify_*`, authenticated attachment
 downloads, transcript history, and encrypted push behavior. CozyChat still has only its existing
 gateway connection; it never connects to Hermes or attach-v1.
 
-Rollout is per bot under `hermes.nativeDataPlane.<profile>`:
-
-- `mode: "shadow"` enables authentication, durable journaling, ACK/replay, and health observation,
-  but suppresses app-visible native projection.
-- `mode: "native"` makes attach-v1 authoritative for that bot's chat data plane.
-- Optional `features` booleans independently gate `media`, `tools`, approval `interactions`,
-  `clarify`, and `scheduled`. Every field defaults to true for backward compatibility.
-- Omitting the entry leaves Dashboard chat behavior unchanged.
+Configuration is one identity per profile under `hermes.profiles.<profile>`, whose `tokenEnv`
+names the unique attach bearer token. That same identity powers both the core `/agents` and
+`/threads` surface and Bot Mode `/bots`; it is not duplicated in `agents[]`, and there are no
+`shadow`, `native`, or feature-rollout modes.
 
 There is no protocol downgrade. Peers that do not speak attach-v1 are rejected rather than routed
 through a less reliable transport.

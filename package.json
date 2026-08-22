@@ -12,6 +12,7 @@
     "test": "pnpm -r test",
     "build": "pnpm -r build",
     "bundle": "node scripts/build-bundle.mjs",
+    "test:installer": "bash scripts/test/hermes-installer.test.sh",
     "check": "pnpm build && pnpm typecheck && pnpm test"
   },
   "devDependencies": {

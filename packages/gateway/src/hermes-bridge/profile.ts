@@ -7,7 +7,7 @@ import type {
 } from "cozygateway-contract";
 
 import { HermesRpcError, HermesTimeout } from "./client.ts";
-import type { HermesRpc } from "./canonical-chat.ts";
+import type { HermesRpc } from "./rpc.ts";
 
 /** The edit-profile surface: everything the desktop's `EditProfileDialog` reads and everything its
  *  `applyAdvancedConfig` writes (dissection sections 4.2 and 4.3), reimplemented server-side so a

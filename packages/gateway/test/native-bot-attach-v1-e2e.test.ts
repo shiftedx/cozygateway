@@ -24,11 +24,10 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      agents: [],
       hermes: {
         url: hermes.url,
         tokenEnv: "NATIVE_DASHBOARD_TOKEN",
-        nativeDataPlane: { sage: { tokenEnv: "NATIVE_SAGE_TOKEN", mode: "native", features: { media: false } } },
+        profiles: { sage: { tokenEnv: "NATIVE_SAGE_TOKEN", name: "Sage" } },
       },
     });
     const pair = await fetch(`${gateway.url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });
@@ -52,11 +51,6 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     plugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
     expect(pluginFrames.find((frame) => frame.kind === "hello_ack")?.capabilities).not.toContain("media");
-    expect((await fetch(`${gateway.url}/attach/v1/media/disabled`, {
-      method: "POST",
-      headers: { authorization: "Bearer attach-secret", "content-type": "image/png", "x-attach-filename": "x.png", "x-attach-sha256": "0".repeat(64) },
-      body: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
-    })).status).toBe(403);
 
     const send = await fetch(`${gateway.url}/bots/sage/chat/messages`, {
       method: "POST",

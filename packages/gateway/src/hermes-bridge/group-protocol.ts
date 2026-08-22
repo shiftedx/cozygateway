@@ -202,13 +202,6 @@ export function buildTurnPrompt(
   ].join("\n");
 }
 
-/** The session title a member's room session carries. Byte-compatible with the desktop
- *  (dissection 9.6): the title doubles as a lookup key, since `session.resume` accepts a TITLE in
- *  the `session_id` slot, which is how a room whose stored session id was lost rehydrates. */
-export function groupSessionTitle(group: string): string {
-  return `Group: ${group}`;
-}
-
 /** The entries a member has not seen: everything past its watermark, oldest first.
  *
  *  ONE deliberate implementation difference from the desktop, with identical semantics. The desktop

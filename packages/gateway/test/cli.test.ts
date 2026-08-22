@@ -17,7 +17,11 @@ function tempConfig(extra: Record<string, unknown> = {}): { configPath: string; 
       name: "cli-gw",
       port: 18787,
       dbPath,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes: {
+        url: "ws://127.0.0.1:1/api/ws",
+        tokenEnv: "TEST_HERMES_CONTROL_TOKEN",
+        profiles: { sage: { tokenEnv: "TEST_ATTACH_TOKEN", name: "Sage" } },
+      },
       ...extra,
     }),
   );
@@ -68,6 +72,16 @@ describe("cozygateway pair", () => {
     // still says http, every scan pairs against a port that is not speaking plaintext.
     const { configPath } = tempConfig({ tls: { certFile: "/certs/cert.pem", keyFile: "/certs/key.pem" } });
     expect((await pairPayload(configPath)).gatewayUrl).toMatch(/^https:\/\//);
+  });
+
+  it("uses an explicit externally reachable URL verbatim", async () => {
+    const { configPath } = tempConfig();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => lines.push(String(line)));
+    expect(await runCli(["pair", "--config", configPath, "--url", "https://gateway.example.com"])).toBe(0);
+    vi.restoreAllMocks();
+    const payload = JSON.parse(lines.find((line) => line.startsWith("{")) ?? "{}") as { gatewayUrl: string };
+    expect(payload.gatewayUrl).toBe("https://gateway.example.com");
   });
 
   it("fails with a usage message on an unknown command", async () => {

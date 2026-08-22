@@ -9,12 +9,6 @@ import type {
   AttachV1MediaDescriptor,
 } from "./adapters/attach/protocol-v1.ts";
 
-/** How many retired chat sessions are remembered per bot. Sized against what it has to defend: the
- *  adoption paths only ever see the sessions `session.list` returns (100 rows), and a bot with more
- *  than a handful of resets in that window is already unusual, so 32 is generous while still being a
- *  hard bound on a table nothing else prunes. */
-export const BOT_CHAT_RETIRED_LIMIT = 32;
-
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
@@ -72,106 +66,14 @@ CREATE TABLE IF NOT EXISTS live_activity_registrations (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (device_id, activity_id)
 ) STRICT;
--- Bots bridge cache (vendor extension com.cozylabs.bots, contract/ext-bots-v1.md). These three
--- tables are a CACHE of Hermes state, never the source of truth: the roster snapshot lets GET
--- /bots answer a cold app instantly while a refresh runs in the background, and bot_chat_pins
--- holds the canonical "Bot Chat" pointer for profiles whose ui_meta does not carry one yet.
+-- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
+-- tables below.
 CREATE TABLE IF NOT EXISTS bot_roster (
   name TEXT PRIMARY KEY,
   summary_json TEXT NOT NULL,
   position INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 ) STRICT;
-CREATE TABLE IF NOT EXISTS bot_meta (
-  name TEXT PRIMARY KEY,
-  meta_json TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-) STRICT;
--- runtime_id is the RUNTIME session id of a pinned chat NOBODY HAS WRITTEN IN YET, and it is NULL
--- for every chat that has a transcript (ext-bots capability 11). Since the gateway stopped
--- submitting an opener on the user's behalf, a freshly minted chat holds no prompt at all, and
--- hermes persists no database row for a session until its first one: the session cannot be listed
--- and cannot be resumed, so the runtime id session.create handed back is the ONLY id
--- prompt.submit will accept for it. Held in memory it was lost on restart, and the first thing the
--- user ever typed into that chat then failed with no way back. That was survivable while the gap was
--- the second or two a kickoff prompt took; it is not survivable now the gap lasts until the user
--- decides to speak. Cleared the moment the session resumes, because from then on the stored id is
--- resolvable and this value is stale.
--- runtime_generation is the HERMES LINK GENERATION the runtime id above was minted under, and it is
--- what bounds a durable runtime id by the lifetime of the hermes process that issued it (issue #66).
--- A runtime session id is meaningful only inside the hermes that created it: hermes restarts, every
--- unwritten session it was holding is gone, and the id this table carries now names nothing. Held in
--- memory (before capability 11) that was self-correcting, because the id died with the gateway
--- process and expired on a 180 s timer; on disk it has no such bound, and submitting against it is
--- worse than failing -- hermes can accept the prompt into a phantom session, the app renders the user
--- bubble, the gateway answers 202, and no reply is ever coming. So the stamp is compared on every
--- read: a runtime id whose generation is not the current one is treated as absent, and the send falls
--- through to the mint-a-replacement path instead.
-CREATE TABLE IF NOT EXISTS bot_chat_pins (
-  name TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
-  runtime_id TEXT,
-  runtime_generation TEXT,
-  manual INTEGER NOT NULL DEFAULT 0 CHECK (manual IN (0, 1))
-) STRICT;
--- The hermes link generation this gateway last observed, one row, id always 1. On disk rather than in
--- memory on purpose, and that is the whole point of the table: a GATEWAY restart against a hermes
--- that never went down must NOT invalidate the runtime ids it is holding (that is the win PR #61
--- bought, and losing it would put the first message a user ever types back in the 502 hole), so the
--- generation has to be the same value after the restart as before it. What it cannot do is see a
--- hermes restart that happened while the gateway itself was down; that case is handled the other way,
--- by the send path re-minting a chat whose session hermes no longer knows.
-CREATE TABLE IF NOT EXISTS hermes_link (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  generation TEXT NOT NULL
-) STRICT;
--- Sessions a chat RESET retired, per bot. Not a cache and not optional bookkeeping: it is the only
--- thing that tells a retired "Bot Chat" apart from the live one. A reset mints the replacement with
--- the exact same title as the chat it retires (that byte-compatibility is deliberate), so after N
--- resets the host holds N+1 sessions all titled "Bot Chat" and nothing but the pin says which one is
--- current. Lose the pin (a gateway restart against a Hermes too old to store ui_meta is enough,
--- because the pin writeback is allowed to fail silently) and the title/position heuristics in
--- canonical-chat.ts would happily adopt a session the user asked to leave behind, handing back the
--- conversation they just cleared. Hence: on disk, so it survives the restart that is the whole
--- hazard, and consulted by every adoption path.
-CREATE TABLE IF NOT EXISTS bot_chat_retired (
-  name TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  retired_at INTEGER NOT NULL,
-  PRIMARY KEY (name, session_id)
-) STRICT, WITHOUT ROWID;
--- Chat images (contract/ext-bots-v1.md, capabilities 9 and 15). NOT a cache: these bytes are the
--- gateway's OWN copy, either uploaded by a device or fetched through Hermes' guarded dashboard read.
---
--- file_id is opaque, random and gateway-scoped; it is the only handle that ever leaves this process.
--- message_id is NULL until the turn poll (or a history read) sees the user row this photo was sent
--- with and binds the two. That binding is what makes the attachment durable: without it the photo
--- would ride exactly one live frame and vanish from the transcript on the next read, since the match
--- from a send to its persisted row is single-use by design.
-CREATE TABLE IF NOT EXISTS bot_chat_attachments (
-  file_id TEXT PRIMARY KEY,
-  bot TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  message_id TEXT,
-  mime TEXT NOT NULL,
-  name TEXT NOT NULL,
-  size INTEGER NOT NULL,
-  bytes BLOB NOT NULL,
-  created_at INTEGER NOT NULL
-) STRICT;
-CREATE INDEX IF NOT EXISTS bot_chat_attachments_row
-  ON bot_chat_attachments (session_id, message_id);
--- Successful capability-15 assistant directives. Only a digest of line position plus line text is
--- retained, never the Hermes-host path. This marker outlives the attachment bytes so a 14-day byte
--- expiry does not make a previously consumed host path reappear in chat history.
-CREATE TABLE IF NOT EXISTS bot_chat_assistant_media (
-  bot TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  message_id TEXT NOT NULL,
-  source_key TEXT NOT NULL,
-  PRIMARY KEY (session_id, message_id, source_key)
-) STRICT, WITHOUT ROWID;
 -- Tool steps a bot's turn ran (contract/ext-bots-v1.md, capability 12). A CACHE of nothing: hermes
 -- keeps its tool lifecycle on a live event stream and replays none of it, so if these rows are not
 -- written here the activity exists for exactly as long as a socket stayed open, and the collapsed
@@ -247,6 +149,29 @@ CREATE TABLE IF NOT EXISTS bot_group_members (
   session_id TEXT,
   PRIMARY KEY (group_key, member)
 ) STRICT, WITHOUT ROWID;
+-- A group turn is a durable hand-off to an attach-v1 profile.  It records the one member turn a
+-- serial room may have outstanding, so a restart can authenticate its eventual event and resume
+-- the room without consulting the Dashboard chat plane.
+CREATE TABLE IF NOT EXISTS bot_group_turns (
+  -- Intentionally no FK: a late terminal event after DELETE must still be acknowledged rather
+  -- than poison the profile's ordered inbox. The row is a harmless ownership tombstone then.
+  group_key TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  member TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  watermark INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  text TEXT,
+  detail TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  consumed_at INTEGER,
+  PRIMARY KEY (group_key, turn_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_group_turns_target ON bot_group_turns(agent_id, thread_id, turn_id);
 -- attach-v1 is an at-least-once transport. Both journals are gateway-owned durability boundaries:
 -- commands survive until the plugin ACKs them, and events are ACKed only after the inbox commit.
 CREATE TABLE IF NOT EXISTS attach_streams (
@@ -321,6 +246,19 @@ CREATE TABLE IF NOT EXISTS bot_native_chats (
   active_turn_id TEXT,
   updated_at INTEGER NOT NULL
 ) STRICT;
+-- bot_native_chats is deliberately only the active-session pointer. A bot can have more than
+-- one local attach conversation, so the durable session rows live separately rather than being
+-- overwritten by reset/new-session actions.
+CREATE TABLE IF NOT EXISTS bot_native_sessions (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  active_turn_id TEXT,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_native_sessions_recent
+  ON bot_native_sessions (bot, updated_at DESC, created_at DESC);
 CREATE TABLE IF NOT EXISTS bot_native_messages (
   bot TEXT NOT NULL,
   session_id TEXT NOT NULL,
@@ -334,11 +272,6 @@ CREATE TABLE IF NOT EXISTS bot_native_messages (
   PRIMARY KEY (bot, session_id, seq),
   UNIQUE (bot, message_id)
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS bot_native_history_migrations (
-  bot TEXT PRIMARY KEY,
-  source_session_id TEXT NOT NULL,
-  imported_at INTEGER NOT NULL
-) STRICT;
 CREATE TABLE IF NOT EXISTS bot_native_interactions (
   bot TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('approval', 'clarify')),
@@ -421,6 +354,25 @@ export interface BotGroupLogRow {
   clientId?: string;
 }
 
+/** Durable ownership and settlement of one attach-v1 member turn. `pending` is the only state a
+ * room may wait for; completed rows remain so at-least-once event replays stay authorized. */
+export interface BotGroupTurnRow {
+  key: string;
+  turnId: string;
+  member: string;
+  agentId: string;
+  threadId: string;
+  messageId: string;
+  epoch: number;
+  watermark: number;
+  state: "pending" | "commit" | "failed" | "cancelled" | "interrupted" | "timeout";
+  text?: string;
+  detail?: string;
+  createdAt: number;
+  completedAt?: number;
+  consumedAt?: number;
+}
+
 interface BotGroupDbRow {
   key: string;
   name: string;
@@ -441,6 +393,25 @@ function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
     epoch: row.epoch,
     needsYou: row.needsYou === 1,
     nextSeq: row.nextSeq,
+  };
+}
+
+function toBotGroupTurnRow(row: Record<string, unknown>): BotGroupTurnRow {
+  const state = row["state"];
+  if (state !== "pending" && state !== "commit" && state !== "failed" && state !== "cancelled" && state !== "interrupted" && state !== "timeout") {
+    throw new Error("invalid stored group turn state");
+  }
+  const optional = (key: "text" | "detail" | "completedAt" | "consumedAt"): string | number | undefined =>
+    row[key] === null || row[key] === undefined ? undefined : row[key] as string | number;
+  return {
+    key: String(row["key"]), turnId: String(row["turnId"]), member: String(row["member"]),
+    agentId: String(row["agentId"]), threadId: String(row["threadId"]), messageId: String(row["messageId"]),
+    epoch: Number(row["epoch"]), watermark: Number(row["watermark"]), state,
+    ...(typeof optional("text") === "string" ? { text: optional("text") as string } : {}),
+    ...(typeof optional("detail") === "string" ? { detail: optional("detail") as string } : {}),
+    createdAt: Number(row["createdAt"]),
+    ...(typeof optional("completedAt") === "number" ? { completedAt: optional("completedAt") as number } : {}),
+    ...(typeof optional("consumedAt") === "number" ? { consumedAt: optional("consumedAt") as number } : {}),
   };
 }
 
@@ -748,9 +719,7 @@ export class Storage {
     return row;
   }
 
-  /** Replaces the whole cached roster in one transaction, preserving the order it was built in
-   *  (`position`), and mirrors each bot's `ui_meta` blob into `bot_meta`. A full replace, not a
-   *  merge: a profile that disappeared from Hermes must disappear from the cache too. */
+  /** Replaces the whole cached roster in one transaction, preserving build order. */
   replaceBotRoster(bots: Array<{ name: string; summary: BotSummary }>, updatedAt: number): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
@@ -758,13 +727,8 @@ export class Storage {
       const insert = this.#db.prepare(
         "INSERT INTO bot_roster (name, summary_json, position, updated_at) VALUES (?, ?, ?, ?)",
       );
-      const meta = this.#db.prepare(
-        `INSERT INTO bot_meta (name, meta_json, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET meta_json = excluded.meta_json, updated_at = excluded.updated_at`,
-      );
       bots.forEach((bot, index) => {
         insert.run(bot.name, JSON.stringify(bot.summary), index, updatedAt);
-        if (bot.summary.meta !== null) meta.run(bot.name, JSON.stringify(bot.summary.meta), updatedAt);
       });
       this.#db.exec("COMMIT");
     } catch (err) {
@@ -783,393 +747,6 @@ export class Storage {
       bots: rows.map((row) => JSON.parse(row.summaryJson) as BotSummary),
       updatedAt: rows.length === 0 ? null : rows[0]!.updatedAt,
     };
-  }
-
-  botChatPin(name: string): string | undefined {
-    const row = this.#db.prepare("SELECT session_id AS sessionId FROM bot_chat_pins WHERE name = ?").get(name) as
-      | { sessionId: string }
-      | undefined;
-    return row?.sessionId;
-  }
-
-  /** The pin plus the stamp of the write that made it. The stamp is what lets the bridge tell a
-   *  pin it wrote itself moments ago from one the cached roster has already had a chance to see,
-   *  which is the difference between adopting the existing chat and minting a duplicate. */
-  botChatPinEntry(name: string): { sessionId: string; updatedAt: number; manual: boolean } | undefined {
-    const row = this.#db
-      .prepare("SELECT session_id AS sessionId, updated_at AS updatedAt, manual FROM bot_chat_pins WHERE name = ?")
-      .get(name) as { sessionId: string; updatedAt: number; manual: number } | undefined;
-    return row === undefined ? undefined : { ...row, manual: row.manual === 1 };
-  }
-
-  /** Every pin with the stamp of the write that made it. The roster build needs the stamps: a pin
-   *  written after the `profiles.list` it is being merged with cannot have been contradicted by
-   *  that snapshot, and it is what keeps `GET /bots` agreeing with `GET /bots/:name/chat`. */
-  botChatPinEntries(): Map<
-    string,
-    { sessionId: string; updatedAt: number; manual: boolean; unwritten: boolean }
-  > {
-    const rows = this.#db
-      .prepare(
-        `SELECT name, session_id AS sessionId, updated_at AS updatedAt, manual,
-                runtime_id IS NOT NULL AS unwritten
-           FROM bot_chat_pins`,
-      )
-      .all() as unknown as Array<{
-        name: string;
-        sessionId: string;
-        updatedAt: number;
-        manual: number;
-        unwritten: number;
-      }>;
-    return new Map(
-      rows.map((row) => [
-        row.name,
-        {
-          sessionId: row.sessionId,
-          updatedAt: row.updatedAt,
-          manual: row.manual === 1,
-          unwritten: row.unwritten === 1,
-        },
-      ]),
-    );
-  }
-
-  botChatPins(): Map<string, string> {
-    const rows = this.#db
-      .prepare("SELECT name, session_id AS sessionId FROM bot_chat_pins")
-      .all() as unknown as Array<{ name: string; sessionId: string }>;
-    return new Map(rows.map((row) => [row.name, row.sessionId]));
-  }
-
-  /** Pins `sessionId` for `name`. Re-pinning the SAME session keeps whatever `runtime_id` the row
-   *  carries. It also preserves a manual flag and its original timestamp, so an ordinary resolve
-   *  cannot erase or move the boundary that capability 16 waits past. Moving to a DIFFERENT session
-   *  drops both pieces of session-specific state. Passing `manual: true` establishes or refreshes
-   *  the explicit choice even when the id was already pinned. */
-  setBotChatPin(name: string, sessionId: string, updatedAt: number, manual = false): void {
-    this.#db
-      .prepare(
-        `INSERT INTO bot_chat_pins (name, session_id, updated_at, runtime_id, runtime_generation, manual)
-           VALUES (?, ?, ?, NULL, NULL, ?)
-         ON CONFLICT(name) DO UPDATE SET
-           session_id = excluded.session_id,
-           updated_at = CASE
-             WHEN session_id = excluded.session_id AND manual = 1 AND excluded.manual = 0
-               THEN updated_at
-             ELSE excluded.updated_at
-           END,
-           manual = CASE
-             WHEN excluded.manual = 1 THEN 1
-             WHEN session_id = excluded.session_id THEN manual
-             ELSE 0
-           END,
-           runtime_id = CASE WHEN session_id = excluded.session_id THEN runtime_id ELSE NULL END,
-           runtime_generation =
-             CASE WHEN session_id = excluded.session_id THEN runtime_generation ELSE NULL END`,
-      )
-      .run(name, sessionId, updatedAt, manual ? 1 : 0);
-  }
-
-  /** The runtime id of `name`'s pinned chat, when that chat has never been written in, the pin still
-   *  names `sessionId`, AND the id was minted under `linkGeneration`. `undefined` for every chat with
-   *  a transcript, which is the answer that says "resume it, the stored id works".
-   *
-   *  Two guards, both load-bearing and for the same underlying reason: an id that no longer addresses
-   *  the chat the user is looking at must never carry their message. The `session_id` guard covers a
-   *  runtime id that outlived its own session (a reset moved the pin); the generation guard covers a
-   *  runtime id that outlived its own HERMES (issue #66), which is the case a durable id introduced
-   *  and which nothing else can detect: hermes will happily accept a `prompt.submit` against an id it
-   *  no longer knows, so a stale one buys a 202 and silence rather than an error. */
-  botChatRuntimeId(name: string, sessionId: string, linkGeneration: string): string | undefined {
-    const row = this.#db
-      .prepare(
-        `SELECT runtime_id AS runtimeId FROM bot_chat_pins
-           WHERE name = ? AND session_id = ? AND runtime_generation = ?`,
-      )
-      .get(name, sessionId, linkGeneration) as { runtimeId: string | null } | undefined;
-    return row?.runtimeId ?? undefined;
-  }
-
-  /** True when `name`'s pinned chat is one this gateway minted and nobody has written in yet,
-   *  WHATEVER generation minted it.
-   *
-   *  Deliberately generation-blind, and the difference from `botChatRuntimeId` is the point. The
-   *  generation answers "can this chat still be addressed"; this answers "is this chat empty", and a
-   *  chat orphaned by a hermes restart is still empty. Reading a history for it must therefore keep
-   *  answering an empty transcript rather than the resume failure: the alternative is that the whole
-   *  screen 502s and the user cannot even reach the composer whose first send would heal the chat. */
-  botChatUnwritten(name: string, sessionId: string): boolean {
-    const row = this.#db
-      .prepare("SELECT runtime_id AS runtimeId FROM bot_chat_pins WHERE name = ? AND session_id = ?")
-      .get(name, sessionId) as { runtimeId: string | null } | undefined;
-    return (row?.runtimeId ?? undefined) !== undefined;
-  }
-
-  /** Records the runtime id of a chat this gateway just minted and nobody has written in yet,
-   *  stamped with the hermes link generation that minted it. A no-op unless the pin still names
-   *  `sessionId`, so a mint that lost a race to a reset cannot write its id over the survivor's. */
-  setBotChatRuntimeId(name: string, sessionId: string, runtimeId: string, linkGeneration: string): void {
-    this.#db
-      .prepare(
-        "UPDATE bot_chat_pins SET runtime_id = ?, runtime_generation = ? WHERE name = ? AND session_id = ?",
-      )
-      .run(runtimeId, linkGeneration, name, sessionId);
-  }
-
-  /** Forgets the runtime id of `name`'s pinned chat: the session has a row now, so the stored id
-   *  resumes and this value can only go stale. Idempotent, and scoped to `sessionId` for the same
-   *  reason the read is. */
-  clearBotChatRuntimeId(name: string, sessionId: string): void {
-    this.#db
-      .prepare(
-        "UPDATE bot_chat_pins SET runtime_id = NULL, runtime_generation = NULL WHERE name = ? AND session_id = ?",
-      )
-      .run(name, sessionId);
-  }
-
-  /** The hermes link generation this gateway last wrote down, or `undefined` on a database that has
-   *  never seen one. */
-  hermesLinkGeneration(): string | undefined {
-    const row = this.#db.prepare("SELECT generation FROM hermes_link WHERE id = 1").get() as
-      | { generation: string }
-      | undefined;
-    return row?.generation;
-  }
-
-  setHermesLinkGeneration(generation: string): void {
-    this.#db
-      .prepare(
-        `INSERT INTO hermes_link (id, generation) VALUES (1, ?)
-         ON CONFLICT(id) DO UPDATE SET generation = excluded.generation`,
-      )
-      .run(generation);
-  }
-
-  clearBotChatPin(name: string): void {
-    this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
-  }
-
-  /** Every session this gateway has retired for `name`, as a set the adoption paths can test in a
-   *  loop. Read once per resolve rather than queried per row: a bot keeps at most
-   *  `BOT_CHAT_RETIRED_LIMIT` of these, so the whole set is smaller than the session list it filters. */
-  botChatRetired(name: string): Set<string> {
-    const rows = this.#db
-      .prepare("SELECT session_id AS sessionId FROM bot_chat_retired WHERE name = ?")
-      .all(name) as unknown as Array<{ sessionId: string }>;
-    return new Set(rows.map((row) => row.sessionId));
-  }
-
-  /** Records that `sessionId` was retired for `name`, then trims the bot back to the newest
-   *  `BOT_CHAT_RETIRED_LIMIT` entries.
-   *
-   *  The bound is what keeps this table from being an unbounded log: a bot reset a thousand times
-   *  would otherwise carry a thousand rows forever, for a guard that only ever matters against the
-   *  sessions `session.list` still returns (100 rows on the adoption path, 200 on the passthrough).
-   *  Dropping the OLDEST entries is the right end to lose: an id old enough to have fallen off both
-   *  the bound and the list cannot be adopted anyway, and the ids a fresh restart is most likely to
-   *  meet are the recent ones. Writing an id that is already there refreshes its stamp rather than
-   *  duplicating it, so a repeated retire cannot push the newest entries out. */
-  retireBotChat(name: string, sessionId: string, retiredAt: number): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      this.#db
-        .prepare(
-          `INSERT INTO bot_chat_retired (name, session_id, retired_at) VALUES (?, ?, ?)
-           ON CONFLICT(name, session_id) DO UPDATE SET retired_at = excluded.retired_at`,
-        )
-        .run(name, sessionId, retiredAt);
-      this.#db
-        .prepare(
-          `DELETE FROM bot_chat_retired WHERE name = ? AND session_id NOT IN (
-             SELECT session_id FROM bot_chat_retired WHERE name = ?
-             ORDER BY retired_at DESC, session_id DESC LIMIT ?
-           )`,
-        )
-        .run(name, name, BOT_CHAT_RETIRED_LIMIT);
-      this.#db.exec("COMMIT");
-    } catch (err) {
-      this.#db.exec("ROLLBACK");
-      throw err;
-    }
-  }
-
-  /** Makes a previously reset session eligible again after the user explicitly restores it. */
-  restoreBotChat(name: string, sessionId: string): void {
-    this.#db
-      .prepare("DELETE FROM bot_chat_retired WHERE name = ? AND session_id = ?")
-      .run(name, sessionId);
-  }
-
-  // --- Photos sent to a bot (contract/ext-bots-v1.md, capability 9). -----------------------------
-
-  /** Stores the gateway's own copy of a chat image and sweeps anything past the TTL in the same
-   *  transaction.
-   *
-   *  The sweep rides the insert rather than a timer on purpose: this table only ever grows on an
-   *  insert, so that is exactly when it is worth trimming, and a gateway nobody sends photos to costs
-   *  nothing to keep tidy. */
-  putBotChatAttachment(
-    entry: {
-      fileId: string;
-      bot: string;
-      sessionId: string;
-      mime: string;
-      name: string;
-      size: number;
-      bytes: Uint8Array;
-      messageId?: string;
-      sourceKey?: string;
-    },
-    createdAt: number,
-    ttlMs: number,
-  ): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      this.#db
-        .prepare(
-          `INSERT INTO bot_chat_attachments
-             (file_id, bot, session_id, message_id, mime, name, size, bytes, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          entry.fileId,
-          entry.bot,
-          entry.sessionId,
-          entry.messageId ?? null,
-          entry.mime,
-          entry.name,
-          entry.size,
-          entry.bytes,
-          createdAt,
-        );
-      if (entry.messageId !== undefined && entry.sourceKey !== undefined) {
-        this.#db
-          .prepare(
-            `INSERT OR IGNORE INTO bot_chat_assistant_media (bot, session_id, message_id, source_key)
-             VALUES (?, ?, ?, ?)`,
-          )
-          .run(entry.bot, entry.sessionId, entry.messageId, entry.sourceKey);
-      }
-      this.#db.prepare("DELETE FROM bot_chat_attachments WHERE created_at < ?").run(createdAt - ttlMs);
-      this.#db.exec("COMMIT");
-    } catch (err) {
-      this.#db.exec("ROLLBACK");
-      throw err;
-    }
-  }
-
-  /** The bytes behind one `fileId`, scoped to the bot whose route asked for them, and to the TTL.
-   *
-   *  The bot scoping is not decoration: `/bots/:name/chat/attachments/:fileId` promises an answer
-   *  about THAT bot, and a lookup by id alone would let any bot's URL serve any other bot's photo to
-   *  a device that guessed or kept an id.
-   *
-   *  `notBefore` is what makes the contract's expiry TRUE rather than aspirational. A sweep is a
-   *  reclamation of disk and it only runs when something runs it; a household that sends photos for
-   *  a week and then stops has nothing left to trigger one, and every one of those photos would go
-   *  on being served for years. Expiry has to be a property of the READ, and the sweep is then just
-   *  housekeeping behind an answer that is already correct. */
-  botChatAttachment(
-    bot: string,
-    fileId: string,
-    notBefore: number,
-  ): { mime: string; name: string; size: number; bytes: Uint8Array } | undefined {
-    const row = this.#db
-      .prepare(
-        "SELECT mime, name, size, bytes FROM bot_chat_attachments WHERE bot = ? AND file_id = ? AND created_at >= ?",
-      )
-      .get(bot, fileId, notBefore) as { mime: string; name: string; size: number; bytes: Uint8Array } | undefined;
-    return row;
-  }
-
-  /** Metadata-only attachment lookup for HTTP range negotiation. This deliberately leaves the BLOB
-   *  out of the SELECT so a 40 MB video HEAD request or rejected range does not materialize it. */
-  botChatAttachmentInfo(
-    bot: string,
-    fileId: string,
-    notBefore: number,
-  ): { mime: string; name: string; size: number } | undefined {
-    return this.#db
-      .prepare(
-        "SELECT mime, name, size FROM bot_chat_attachments WHERE bot = ? AND file_id = ? AND created_at >= ?",
-      )
-      .get(bot, fileId, notBefore) as { mime: string; name: string; size: number } | undefined;
-  }
-
-  /** Reads one byte slice directly in SQLite. SQLite `substr` is one-indexed for BLOBs, while the
-   *  HTTP range passed here is zero-indexed. No full attachment buffer is created for ranged reads. */
-  botChatAttachmentSlice(
-    bot: string,
-    fileId: string,
-    notBefore: number,
-    offset: number,
-    length: number,
-  ): Uint8Array | undefined {
-    const row = this.#db
-      .prepare(
-        `SELECT substr(bytes, ?, ?) AS bytes FROM bot_chat_attachments
-         WHERE bot = ? AND file_id = ? AND created_at >= ?`,
-      )
-      .get(offset + 1, length, bot, fileId, notBefore) as { bytes: Uint8Array } | undefined;
-    return row?.bytes;
-  }
-
-  /** The attachment blocks belonging to one transcript row, in insert order. Answers `[]` for the
-   *  overwhelming majority of rows, which is why the index is on `(session_id, message_id)`.
-   *
-   *  Same `notBefore` cut as the read above, and for the same reason plus one more: a block naming a
-   *  file the download route would 404 is worse than no block at all, because a client renders it as
-   *  a picture that is coming and then never resolves. The two reads have to expire together. */
-  botChatAttachmentsFor(
-    sessionId: string,
-    messageId: string,
-    notBefore: number,
-  ): Array<{ fileId: string; name: string; mime: string; size: number }> {
-    return this.#db
-      .prepare(
-        `SELECT file_id AS fileId, name, mime, size FROM bot_chat_attachments
-         WHERE session_id = ? AND message_id = ? AND created_at >= ? ORDER BY created_at, file_id`,
-      )
-      .all(sessionId, messageId, notBefore) as unknown as Array<{
-      fileId: string;
-      name: string;
-      mime: string;
-      size: number;
-    }>;
-  }
-
-  /** Successful assistant directives for one transcript row. These are durable text-rewrite
-   *  markers, not attachment-byte rows, so attachment expiry never makes a consumed path visible. */
-  botChatAssistantMediaKeys(sessionId: string, messageId: string): string[] {
-    const rows = this.#db
-      .prepare(
-        `SELECT source_key AS sourceKey FROM bot_chat_assistant_media
-         WHERE session_id = ? AND message_id = ? ORDER BY source_key`,
-      )
-      .all(sessionId, messageId) as unknown as Array<{ sourceKey: string }>;
-    return rows.map((row) => row.sourceKey);
-  }
-
-  /** Binds a stored photo to the transcript row it was sent with, ONCE. The `message_id IS NULL`
-   *  guard is what makes it once: the send-to-row match is single-use by design, but a re-bind from a
-   *  replayed row would move a photo off the message it belongs to and onto a later one with the same
-   *  words, which is the exact collapse the pending-send queue exists to prevent. */
-  bindBotChatAttachment(fileId: string, messageId: string): void {
-    this.#db
-      .prepare("UPDATE bot_chat_attachments SET message_id = ? WHERE file_id = ? AND message_id IS NULL")
-      .run(messageId, fileId);
-  }
-
-  /** Drops one stored photo. Used when the send it belonged to failed, so a refused or unsubmitted
-   *  upload leaves no bytes behind. */
-  deleteBotChatAttachment(fileId: string): void {
-    this.#db.prepare("DELETE FROM bot_chat_attachments WHERE file_id = ?").run(fileId);
-  }
-
-  /** Drops every stored photo older than the TTL. Returns how many went, so a caller can log it. */
-  sweepBotChatAttachments(now: number, ttlMs: number): number {
-    return this.#db.prepare("DELETE FROM bot_chat_attachments WHERE created_at < ?").run(now - ttlMs).changes as number;
   }
 
   /** Writes one tool step, or updates the one already there (capability 12). Upsert rather than
@@ -1305,37 +882,6 @@ export class Storage {
     this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ? AND routine_id = ?").run(bot, routineId);
   }
 
-  /** Drops every trace of a bot from the cache: its roster row, its mirrored `ui_meta` blob, its
-   *  canonical-chat pin, and the sessions its resets retired. Called when the profile is deleted
-   *  Hermes-side, so a name that gets reused later starts clean rather than inheriting a dead pin,
-   *  which would send the first open of the new bot into a `session.resume` for a session that no
-   *  longer exists. The next roster refresh rewrites `bot_roster` wholesale anyway; the pin, the meta
-   *  blob and the retired set are the rows that would otherwise outlive the profile. (The retired set
-   *  goes for the same reason as the pin: it is keyed on a name, not on an identity, so a rebuilt bot
-   *  reusing the name would inherit refusals aimed at sessions belonging to its predecessor.) */
-  forgetBot(name: string): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      this.#db.prepare("DELETE FROM bot_roster WHERE name = ?").run(name);
-      this.#db.prepare("DELETE FROM bot_meta WHERE name = ?").run(name);
-      this.#db.prepare("DELETE FROM bot_chat_pins WHERE name = ?").run(name);
-      this.#db.prepare("DELETE FROM bot_chat_retired WHERE name = ?").run(name);
-      // The images and assistant rewrite markers too. A deleted bot is the clearest signal there is
-      // that nobody is coming back for them, and a rebuilt bot reusing the name must not inherit its
-      // predecessor's pictures or transcript rewrites.
-      this.#db.prepare("DELETE FROM bot_chat_attachments WHERE bot = ?").run(name);
-      this.#db.prepare("DELETE FROM bot_chat_assistant_media WHERE bot = ?").run(name);
-      // The tool steps go with them, same name-keying argument: a rebuilt bot reusing the name must
-      // not show a history strip describing what its predecessor did.
-      this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(name);
-      this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ?").run(name);
-      this.#db.exec("COMMIT");
-    } catch (err) {
-      this.#db.exec("ROLLBACK");
-      throw err;
-    }
-  }
-
   // --- Group chat rooms (contract/ext-bots-v1.md section 4, groups). ------------------------------
 
   /** Creates a room. Returns false when one already exists under the same case-insensitive key,
@@ -1355,9 +901,9 @@ export class Storage {
         )
         .run(room.key, room.name, JSON.stringify(room.members), room.createdAt);
       const member = this.#db.prepare(
-        "INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, NULL)",
+        "INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, ?)",
       );
-      for (const name of room.members) member.run(room.key, name);
+      for (const name of room.members) member.run(room.key, name, `group:${room.key}:${name}`);
       this.#db.exec("COMMIT");
       return true;
     } catch (err) {
@@ -1390,7 +936,20 @@ export class Storage {
 
   /** Drops a room and, by cascade, its transcript and its per-member state. */
   deleteBotGroup(key: string): boolean {
-    return this.#db.prepare("DELETE FROM bot_groups WHERE key = ?").run(key).changes === 1;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      // Preserve attach-event authorization after delete/recreate, but make it impossible for an
+      // old pending command to block the new room under the same case-insensitive key.
+      this.#db.prepare(
+        "UPDATE bot_group_turns SET state = 'cancelled', detail = 'group deleted', completed_at = COALESCE(completed_at, 0) WHERE group_key = ? AND state = 'pending'",
+      ).run(key);
+      const deleted = this.#db.prepare("DELETE FROM bot_groups WHERE key = ?").run(key).changes === 1;
+      this.#db.exec("COMMIT");
+      return deleted;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   /** Appends one entry and hands back the room-local `seq` it was given. The counter lives on the
@@ -1501,6 +1060,104 @@ export class Storage {
 
   setBotGroupNeedsYou(key: string, needsYou: boolean): void {
     this.#db.prepare("UPDATE bot_groups SET needs_you = ? WHERE key = ?").run(needsYou ? 1 : 0, key);
+  }
+
+  /** Returns the gateway-owned attach thread for this member.  Older rooms gain the deterministic
+   * binding lazily, which is safe because it is scoped by the room key and never derived from a
+   * Dashboard session. */
+  ensureBotGroupThread(key: string, member: string): string {
+    const existing = this.#db.prepare(
+      "SELECT session_id AS sessionId FROM bot_group_members WHERE group_key = ? AND member = ?",
+    ).get(key, member) as { sessionId: string | null } | undefined;
+    if (existing?.sessionId !== null && existing?.sessionId !== undefined) return existing.sessionId;
+    const threadId = `group:${key}:${member}`;
+    this.#db.prepare(
+      `INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, ?)
+       ON CONFLICT(group_key, member) DO UPDATE SET session_id = excluded.session_id`,
+    ).run(key, member, threadId);
+    return threadId;
+  }
+
+  beginBotGroupTurn(turn: Omit<BotGroupTurnRow, "state" | "createdAt" | "completedAt" | "consumedAt" | "text" | "detail"> & { createdAt: number }): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const active = this.#db.prepare(
+        "SELECT 1 FROM bot_group_turns WHERE group_key = ? AND state = 'pending' LIMIT 1",
+      ).get(turn.key);
+      if (active !== undefined) {
+        this.#db.exec("COMMIT");
+        return false;
+      }
+      this.#db.prepare(
+        `INSERT INTO bot_group_turns
+           (group_key, turn_id, member, agent_id, thread_id, message_id, epoch, watermark, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      ).run(turn.key, turn.turnId, turn.member, turn.agentId, turn.threadId, turn.messageId, turn.epoch, turn.watermark, turn.createdAt);
+      this.#db.exec("COMMIT");
+      return true;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  botGroupTurnForAttach(agentId: string, threadId: string, turnId: string): BotGroupTurnRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
+              message_id AS messageId, epoch, watermark, state, text, detail, created_at AS createdAt,
+              completed_at AS completedAt, consumed_at AS consumedAt
+       FROM bot_group_turns WHERE agent_id = ? AND thread_id = ? AND turn_id = ?`,
+    ).get(agentId, threadId, turnId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotGroupTurnRow(row);
+  }
+
+  completeBotGroupTurn(agentId: string, threadId: string, turnId: string, state: Exclude<BotGroupTurnRow["state"], "pending" | "timeout">, text: string | undefined, detail: string | undefined, completedAt: number): BotGroupTurnRow | undefined {
+    const prior = this.botGroupTurnForAttach(agentId, threadId, turnId);
+    if (prior === undefined) return undefined;
+    if (prior.state === "pending") {
+      this.#db.prepare(
+        `UPDATE bot_group_turns SET state = ?, text = ?, detail = ?, completed_at = ?
+         WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
+      ).run(state, text ?? null, detail ?? null, completedAt, prior.key, prior.turnId);
+    }
+    return this.botGroupTurnForAttach(agentId, threadId, turnId);
+  }
+
+  timeoutBotGroupTurn(key: string, turnId: string, detail: string, completedAt: number): void {
+    this.#db.prepare(
+      `UPDATE bot_group_turns SET state = 'timeout', detail = ?, completed_at = ?
+       WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
+    ).run(detail, completedAt, key, turnId);
+  }
+
+  botGroupTurn(key: string, turnId: string): BotGroupTurnRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
+              message_id AS messageId, epoch, watermark, state, text, detail, created_at AS createdAt,
+              completed_at AS completedAt, consumed_at AS consumedAt
+       FROM bot_group_turns WHERE group_key = ? AND turn_id = ?`,
+    ).get(key, turnId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotGroupTurnRow(row);
+  }
+
+  /** Atomically assigns a completed settlement to one orchestrator. */
+  consumeBotGroupTurn(key: string, turnId: string, consumedAt: number): BotGroupTurnRow | undefined {
+    const row = this.botGroupTurn(key, turnId);
+    if (row === undefined || row.state === "pending" || row.consumedAt !== undefined) return undefined;
+    const changed = this.#db.prepare(
+      "UPDATE bot_group_turns SET consumed_at = ? WHERE group_key = ? AND turn_id = ? AND consumed_at IS NULL",
+    ).run(consumedAt, key, turnId).changes;
+    return changed === 1 ? { ...row, consumedAt } : undefined;
+  }
+
+  pendingBotGroupTurns(): BotGroupTurnRow[] {
+    const rows = this.#db.prepare(
+      `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
+              message_id AS messageId, epoch, watermark, state, text, detail, created_at AS createdAt,
+              completed_at AS completedAt, consumed_at AS consumedAt
+       FROM bot_group_turns WHERE state = 'pending'`,
+    ).all() as Record<string, unknown>[];
+    return rows.map(toBotGroupTurnRow);
   }
 
   /** Durably queues one gateway→plugin command. Reusing commandId is idempotent and returns the
@@ -1884,18 +1541,26 @@ export class Storage {
     return row?.bytes;
   }
 
+  /** Return the selected local conversation, creating the first empty conversation on demand. */
   nativeBotChat(bot: string, now: number): { sessionId: string; created: boolean; activeTurnId?: string } {
-    const prior = this.#db
-      .prepare("SELECT session_id AS sessionId, active_turn_id AS activeTurnId FROM bot_native_chats WHERE bot = ?")
-      .get(bot) as { sessionId: string; activeTurnId: string | null } | undefined;
-    if (prior !== undefined) return { sessionId: prior.sessionId, created: false, ...(prior.activeTurnId === null ? {} : { activeTurnId: prior.activeTurnId }) };
-    const sessionId = `native:${bot}:${randomUUID()}`;
-    this.#db.prepare("INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)").run(bot, sessionId, now);
-    return { sessionId, created: true };
+    const selected = this.#db
+      .prepare("SELECT session_id AS sessionId, active_turn_id AS activeTurnId, updated_at AS updatedAt FROM bot_native_chats WHERE bot = ?")
+      .get(bot) as { sessionId: string; activeTurnId: string | null; updatedAt: number } | undefined;
+    if (selected === undefined) {
+      const sessionId = this.#insertNativeBotSession(bot, now);
+      this.#db.prepare("INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)").run(bot, sessionId, now);
+      return { sessionId, created: true };
+    }
+    const session = this.#db
+      .prepare("SELECT active_turn_id AS activeTurnId FROM bot_native_sessions WHERE bot = ? AND session_id = ?")
+      .get(bot, selected.sessionId) as { activeTurnId: string | null };
+    return { sessionId: selected.sessionId, created: false, ...(session.activeTurnId === null ? {} : { activeTurnId: session.activeTurnId }) };
   }
 
+  /** Mint and select a fresh empty local conversation. `reset` and `new session` intentionally
+   * share this primitive: the wire distinguishes them by frame type, not by storage semantics. */
   resetNativeBotChat(bot: string, now: number): string {
-    const sessionId = `native:${bot}:${randomUUID()}`;
+    const sessionId = this.#insertNativeBotSession(bot, now);
     this.#db
       .prepare(
         `INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)
@@ -1905,8 +1570,67 @@ export class Storage {
     return sessionId;
   }
 
-  setNativeBotTurn(bot: string, turnId: string | undefined, now: number): void {
-    this.#db.prepare("UPDATE bot_native_chats SET active_turn_id = ?, updated_at = ? WHERE bot = ?").run(turnId ?? null, now, bot);
+  nativeBotSessions(bot: string, limit: number): Array<{
+    id: string; startedAt: number; lastActiveAt: number; title?: string; preview?: string;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT session_id AS id, created_at AS startedAt, updated_at AS lastActiveAt
+         FROM bot_native_sessions WHERE bot = ?
+         ORDER BY updated_at DESC, created_at DESC, session_id DESC LIMIT ?`,
+      )
+      .all(bot, limit) as unknown as Array<{ id: string; startedAt: number; lastActiveAt: number }>;
+    const latestMessage = this.#db.prepare(
+      `SELECT text FROM bot_native_messages
+       WHERE bot = ? AND session_id = ? AND trim(text) <> ''
+       ORDER BY seq DESC LIMIT 1`,
+    );
+    return rows.map((row) => {
+      const preview = (latestMessage.get(bot, row.id) as { text: string } | undefined)?.text.trim();
+      return { ...row, title: "Bot Chat", ...(preview === undefined || preview.length === 0 ? {} : { preview }) };
+    });
+  }
+
+  nativeBotSessionOwner(sessionId: string): string | undefined {
+    return (this.#db
+      .prepare("SELECT bot FROM bot_native_sessions WHERE session_id = ? LIMIT 1")
+      .get(sessionId) as { bot: string } | undefined)?.bot;
+  }
+
+  nativeBotHasSession(bot: string, sessionId: string): boolean {
+    return this.#db
+      .prepare("SELECT 1 AS found FROM bot_native_sessions WHERE bot = ? AND session_id = ?")
+      .get(bot, sessionId) !== undefined;
+  }
+
+  selectNativeBotSession(bot: string, sessionId: string, now: number): boolean {
+    if (!this.nativeBotHasSession(bot, sessionId)) return false;
+    this.#db.prepare("UPDATE bot_native_chats SET session_id = ?, active_turn_id = NULL, updated_at = ? WHERE bot = ?").run(sessionId, now, bot);
+    return true;
+  }
+
+  setNativeBotTurn(bot: string, sessionId: string, turnId: string | undefined, now: number): void {
+    this.#db
+      .prepare("UPDATE bot_native_sessions SET active_turn_id = ?, updated_at = ? WHERE bot = ? AND session_id = ?")
+      .run(turnId ?? null, now, bot, sessionId);
+    this.#db
+      .prepare("UPDATE bot_native_chats SET active_turn_id = ?, updated_at = ? WHERE bot = ? AND session_id = ?")
+      .run(turnId ?? null, now, bot, sessionId);
+  }
+
+  clearNativeBotTurn(bot: string, sessionId: string, turnId: string, now: number): boolean {
+    const cleared = this.#db
+      .prepare(
+        "UPDATE bot_native_sessions SET active_turn_id = NULL, updated_at = ? WHERE bot = ? AND session_id = ? AND active_turn_id = ?",
+      )
+      .run(now, bot, sessionId, turnId);
+    if (cleared.changes === 0) return false;
+    this.#db
+      .prepare(
+        "UPDATE bot_native_chats SET active_turn_id = NULL, updated_at = ? WHERE bot = ? AND session_id = ? AND active_turn_id = ?",
+      )
+      .run(now, bot, sessionId, turnId);
+    return true;
   }
 
   appendNativeBotMessage(input: {
@@ -1946,6 +1670,12 @@ export class Storage {
         input.clientId ?? null,
         input.attachments === undefined ? null : JSON.stringify(input.attachments),
       );
+    this.#db
+      .prepare("UPDATE bot_native_sessions SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
+      .run(input.at, input.bot, input.sessionId);
+    this.#db
+      .prepare("UPDATE bot_native_chats SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
+      .run(input.at, input.bot, input.sessionId);
     return { id: input.messageId, role: input.role, text: input.text, at: input.at, ...(input.clientId === undefined ? {} : { clientId: input.clientId }), ...(input.attachments === undefined ? {} : { attachments: input.attachments }) };
   }
 
@@ -1959,72 +1689,6 @@ export class Storage {
     return rows.map(nativeBotMessage);
   }
 
-  nativeBotHistoryMigrated(bot: string): boolean {
-    return this.#db
-      .prepare("SELECT 1 FROM bot_native_history_migrations WHERE bot = ?")
-      .get(bot) !== undefined;
-  }
-
-  /** One-time cutover from the Dashboard-owned canonical transcript. Imported rows are inserted
-   * before any native rows Cleo (or another canary) may already have produced, and the durable
-   * marker prevents a later restart or an intentional chat reset from resurrecting old history. */
-  adoptNativeBotHistory(input: {
-    bot: string;
-    sessionId: string;
-    sourceSessionId: string;
-    messages: readonly BotChatMessage[];
-    now: number;
-  }): number {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      const migrated = this.#db
-        .prepare("SELECT 1 FROM bot_native_history_migrations WHERE bot = ?")
-        .get(input.bot);
-      if (migrated !== undefined) {
-        this.#db.exec("COMMIT");
-        return 0;
-      }
-      const existing = new Set(
-        (this.#db
-          .prepare("SELECT message_id AS id FROM bot_native_messages WHERE bot = ?")
-          .all(input.bot) as unknown as Array<{ id: string }>).map((row) => row.id),
-      );
-      const fresh = input.messages.filter((message) => !existing.has(message.id));
-      if (fresh.length > 0) {
-        this.#db
-          .prepare("UPDATE bot_native_messages SET seq = -seq WHERE bot = ? AND session_id = ?")
-          .run(input.bot, input.sessionId);
-        this.#db
-          .prepare("UPDATE bot_native_messages SET seq = -seq + ? WHERE bot = ? AND session_id = ?")
-          .run(fresh.length, input.bot, input.sessionId);
-        const insert = this.#db.prepare(
-          `INSERT INTO bot_native_messages
-             (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        );
-        fresh.forEach((message, index) => insert.run(
-          input.bot,
-          input.sessionId,
-          index + 1,
-          message.id,
-          message.role,
-          message.text,
-          message.at,
-          message.clientId ?? null,
-          message.attachments === undefined ? null : JSON.stringify(message.attachments),
-        ));
-      }
-      this.#db
-        .prepare("INSERT INTO bot_native_history_migrations (bot, source_session_id, imported_at) VALUES (?, ?, ?)")
-        .run(input.bot, input.sourceSessionId, input.now);
-      this.#db.exec("COMMIT");
-      return fresh.length;
-    } catch (err) {
-      this.#db.exec("ROLLBACK");
-      throw err;
-    }
-  }
-
   nativeBotMessage(bot: string, messageId: string): BotChatMessage | undefined {
     const row = this.#db
       .prepare(
@@ -2033,6 +1697,14 @@ export class Storage {
       )
       .get(bot, messageId) as { id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null } | undefined;
     return row === undefined ? undefined : nativeBotMessage(row);
+  }
+
+  #insertNativeBotSession(bot: string, now: number): string {
+    const sessionId = `native:${bot}:${randomUUID()}`;
+    this.#db
+      .prepare("INSERT INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, NULL)")
+      .run(bot, sessionId, now, now);
+    return sessionId;
   }
 
   recordNativeInteraction(input: {
@@ -2132,60 +1804,11 @@ function nativeBotMessage(row: { id: string; role: string; text: string; at: num
   };
 }
 
-/** True for the one error ADD COLUMN is expected to throw: the column is already there because
- *  this DB was already migrated. Anything else (locked, busy, read-only, disk full, ...) is a real
- *  failure and must not be swallowed, or every query against the column throws "no such column"
- *  gateway-wide while /health stays green. */
-function isDuplicateColumnError(err: unknown): boolean {
-  return err instanceof Error && /duplicate column name/i.test(err.message);
-}
-
-/** Additive migration: adds `column` to `table` if it is not already there. Safe to run on every
- *  boot. Swallows only the duplicate-column error a re-run produces; anything else propagates.
- *  Verifies the column exists afterward via PRAGMA table_info so a swallowed-but-wrong error (or a
- *  driver that reports success without applying the change) fails loudly instead of leaving the
- *  gateway to discover the missing column mid-query later. */
-export function addColumnIfMissing(db: DatabaseSync, table: string, column: string, type: string): void {
-  try {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-  } catch (err) {
-    if (!isDuplicateColumnError(err)) throw err;
-  }
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
-  if (!columns.some((c) => c.name === column)) {
-    throw new Error(`migration failed: "${table}.${column}" missing after ALTER TABLE`);
-  }
-}
-
 export function openStorage(dbPath: string): Storage {
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
-  // Additive migration for a DB created before the delivery column existed.
-  addColumnIfMissing(db, "messages", "delivery", "TEXT");
-  addColumnIfMissing(db, "messages", "external_id", "TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL");
-  // Same shape, for a DB created before ext-bots capability 11 gave an unwritten chat a durable
-  // runtime id. NULL on every existing row is exactly right: a pin written by an older gateway
-  // points at a chat its kickoff already persisted, so there is nothing to remember for it.
-  addColumnIfMissing(db, "bot_chat_pins", "runtime_id", "TEXT");
-  // Issue #66: the generation stamp that bounds a durable runtime id by the life of the hermes that
-  // issued it. NULL on every existing row is right and is the safe direction: a stamp that matches
-  // nothing reads as "this id cannot be trusted", so a pin written before the upgrade falls through
-  // to the mint-a-replacement path instead of submitting at a session hermes may have forgotten.
-  addColumnIfMissing(db, "bot_chat_pins", "runtime_generation", "TEXT");
-  // Capability 16: an explicit session adoption holds until a later conversational session is
-  // created. Existing pins are automatic, which is exactly the zero default.
-  addColumnIfMissing(db, "bot_chat_pins", "manual", "INTEGER NOT NULL DEFAULT 0 CHECK (manual IN (0, 1))");
-  // Capability 21: bounded redacted tool detail. Existing rows remain valid and simply have no
-  // detail, which keeps older transcript history honest rather than manufacturing descriptions.
-  addColumnIfMissing(db, "bot_chat_tool_steps", "detail", "TEXT");
-  addColumnIfMissing(db, "bot_chat_tool_steps", "error_text", "TEXT");
-  addColumnIfMissing(db, "attach_event_inbox", "projection_attempts", "INTEGER NOT NULL DEFAULT 0");
-  addColumnIfMissing(db, "attach_event_inbox", "projection_error", "TEXT");
-  addColumnIfMissing(db, "attach_event_inbox", "dead_lettered_at", "INTEGER");
-  addColumnIfMissing(db, "attach_command_outbox", "cancelled_at", "INTEGER");
-  addColumnIfMissing(db, "attach_command_outbox", "cancel_reason", "TEXT");
   return new Storage(db);
 }

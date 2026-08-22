@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Message, RichBlock } from "cozygateway-contract";
 
+import { testHermes } from "./support/test-config.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createApp } from "../src/http.ts";
@@ -36,7 +37,7 @@ async function setup() {
     port: 8787,
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+    hermes: testHermes(),
     pushRelayUrl: "http://relay.internal:8788/",
   };
   const storage = openStorage(":memory:");

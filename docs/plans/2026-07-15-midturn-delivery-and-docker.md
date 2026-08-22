@@ -18,7 +18,7 @@
 - New REST action: `POST /threads/:id/interrupt`. Responses: `202` with JSON body `{"status":"interrupting"}` when a turn was in flight and interrupt was dispatched; `204` with no body when the thread is idle (no-op). Auth like every other route.
 - A deliberately interrupted turn ends with a committed system message with marker `"turn.interrupted"` (mirroring the existing `"turn.failed"` marker mechanics) followed by the normal `done` frame.
 - Stop-phrase spec (gateway-side detection in the send path): exactly `["stop", "stop it", "cancel", "abort"]`; normalization = trim whitespace, casefold, strip terminal `[.!?]+` characters; match the WHOLE message only. A phrase match routes the send to the interrupt path AND still commits the user message normally (delivery absent, it becomes the next turn per backend queue semantics). Everything else passes through.
-- Adapter capability: `BackendAdapter` declares `midTurnDelivery: "steer" | "queue"` (static declaration). Steer-capable sessions expose `steer(blocks: RichBlock[]): Promise<void>` and `interrupt(): Promise<void>`. Hermes attach adapter declares `"steer"` (the plugin injects inbound events; the agent-side Hermes config `busy_input_mode=steer` makes injection steer natively, that config is NOT this repo's concern). OpenClaw declares `"queue"` and keeps today's behavior; interrupt on OpenClaw returns a clean error frame with message `"interrupt unsupported"`.
+- Adapter capability: `BackendAdapter` declares `midTurnDelivery: "steer" | "queue"` (static declaration). Steer-capable sessions expose `steer(blocks: RichBlock[]): Promise<void>` and `interrupt(): Promise<void>`. Hermes attach declares `"steer"`; the agent-side Hermes config `busy_input_mode=steer` makes injection steer natively.
 - TurnRunner policy on a send while a turn is in flight for that thread: stop-phrase match -> interrupt path; else adapter steer-capable -> deliver mid-turn into the in-flight turn, NO new `turnId` (drafts continue under the existing `turnId`), commit the user message with `delivery: "steer"`; else queue exactly as today. Race rule: a steer send that loses the race with turn completion falls back to a normal queued turn and commits with delivery absent.
 - Docker: multi-stage Dockerfiles (node 24 base matching `engines >=24`, pnpm build, pruned production stage) for gateway and relay; reference `docker-compose.yml` with both services, a named volume for the gateway SQLite path, env-driven configuration (backend attach URL, API key, relay URL), and a container healthcheck.
 - Health route: `GET /health` ALREADY EXISTS on both the gateway (`packages/gateway/src/http.ts:66`, unauthenticated, 200, returns `GatewayInfo`) and the relay (`packages/relay/src/http.ts:70`, 200, returns `{name, version}`). This plan REUSES `/health` for the container healthcheck and does NOT add `/healthz`.
@@ -455,7 +455,6 @@ with:
 Run: `cd packages/gateway && pnpm exec vitest run test/mock-adapter.test.ts && pnpm typecheck`
 Expected: the new tests pass. `tsc --noEmit` (typecheck) compiles both `src` and `test` (see `packages/gateway/tsconfig.json` include), so it now flags every `BackendAdapter` value missing the required `midTurnDelivery` field. Fix all of them in this step so the task stays green in isolation:
 - `packages/gateway/src/adapters/attach/adapter.ts` return object (line 118): add `midTurnDelivery: "steer",` (real behavior added in Task 7).
-- `packages/gateway/src/adapters/openclaw/adapter.ts` return object (line 77): add `midTurnDelivery: "queue",` (confirmed in Task 9).
 - `packages/gateway/test/turns.test.ts` `gatedAdapter` return (line 22): add `midTurnDelivery: "queue",`.
 
 Run again: `cd packages/gateway && pnpm typecheck`
@@ -2206,69 +2205,6 @@ git commit -m "attach-plugin: parse and dispatch steer + interrupt frames"
 
 ---
 
-### Task 9: OpenClaw honest queue + unsupported interrupt
-
-**Files:**
-- Modify: `packages/gateway/src/adapters/openclaw/adapter.ts` (return object at line 76-80; `midTurnDelivery: "queue"` was added as a placeholder in Task 2 Step 6, confirmed real here).
-- Test: `packages/gateway/test/openclaw-adapter.test.ts` (reuses the existing `FakeOpenClawClient`; append a describe block).
-
-**Interfaces:**
-- Consumes: `createOpenClawAdapter` and `FakeOpenClawClient` (existing in the test file); the generic queue-only interrupt behavior lives in `TurnRunner.#dispatchInterrupt` (Task 3), which emits `interrupt_unsupported` for ANY adapter whose session exposes no `interrupt`. This task proves OpenClaw is exactly that: `midTurnDelivery: "queue"` and a session with no `steer`/`interrupt`.
-
-- [ ] **Step 1: Write the failing declaration test**
-
-Append to `packages/gateway/test/openclaw-adapter.test.ts`:
-
-```ts
-describe("openclaw mid-turn delivery capability", () => {
-  it("declares queue and exposes no steer/interrupt on its session", async () => {
-    const client = new FakeOpenClawClient();
-    const adapter = createOpenClawAdapter({
-      agentId: "oc1",
-      client,
-      turnTimeoutMs: DEFAULT_TURN_TIMEOUT_SECONDS * 1000,
-    });
-    expect(adapter.midTurnDelivery).toBe("queue");
-    const session = await adapter.startSession("t1");
-    expect(session.steer).toBeUndefined();
-    expect(session.interrupt).toBeUndefined();
-  });
-});
-```
-
-- [ ] **Step 2: Run and confirm status**
-
-Run: `cd packages/gateway && pnpm exec vitest run test/openclaw-adapter.test.ts`
-Expected: if the Task 2 Step 6 placeholder is present, `midTurnDelivery` already equals `"queue"` and the session already exposes no steer/interrupt, so this test passes immediately (it is the regression guard that pins the honest declaration). If the placeholder was not added, `midTurnDelivery` is `undefined` and the test fails; then apply Step 3.
-
-- [ ] **Step 3: Confirm the declaration in the adapter**
-
-In `packages/gateway/src/adapters/openclaw/adapter.ts`, the returned adapter object (lines 76-80) must read:
-
-```ts
-  return {
-    backend: "openclaw",
-    midTurnDelivery: "queue",
-
-    presence(): PresenceState {
-      return deps.client.state() === "online" ? "online" : "absent";
-    },
-```
-
-The session returned by `startSession` (lines 86-194) is unchanged: it exposes only `send` and `close`, so `TurnRunner` treats it as queue-only. A mid-turn interrupt against it (via `POST /interrupt` or a stop phrase) yields a clean `interrupt_unsupported` error frame through `TurnRunner.#dispatchInterrupt` (already covered by the queue-only interrupt test in Task 3).
-
-- [ ] **Step 4: Run and commit**
-
-Run: `cd packages/gateway && pnpm exec vitest run test/openclaw-adapter.test.ts && pnpm typecheck`
-Expected: green.
-Commit:
-```
-git add packages/gateway/src/adapters/openclaw/adapter.ts packages/gateway/test/openclaw-adapter.test.ts
-git commit -m "openclaw: declare queue mid-turn delivery (interrupt stays honestly unsupported)"
-```
-
----
-
 ### Task 10: Configurable bind host + env overrides (Docker prerequisite)
 
 **Files:**
@@ -3311,7 +3247,7 @@ git commit -m "relay: first-class APNs transport (ES256 JWT, node:http2, ciphert
 Run: `pnpm check`
 Expected: `pnpm build` then `pnpm typecheck` then `pnpm test` (all packages) pass. In particular:
 - `cozygateway-contract`: additive delivery/marker/error-code/InterruptResponse tests green.
-- `cozygateway`: adapter capability, steerable mock, TurnRunner policy, stop-phrase, interrupt route, attach steer/interrupt (unit + e2e), openclaw declaration, config env overrides green.
+- `cozygateway`: adapter capability, steerable mock, TurnRunner policy, stop-phrase, interrupt route, attach steer/interrupt (unit + e2e), and config env overrides green.
 - `cozygateway-conformance`: the full black-box suite plus the four interrupt assertions green against the reference gateway.
 - `cozygateway-relay`: APNs transport, config-from-env, plus the existing relay suite green.
 
@@ -3347,6 +3283,6 @@ If Steps 1-4 were already green with no changes, there is nothing to commit and 
 - `POST /threads/:id/interrupt`: 202 `{"status":"interrupting"}` when a turn was in flight; 204 no body when idle. Auth like every route.
 - Interrupted turn: committed system message `marker: "turn.interrupted"` then the normal `done` frame.
 - Stop-phrase set: exactly `["stop", "stop it", "cancel", "abort"]`; normalize = trim, casefold, strip terminal `[.!?]+`; whole-message match only. A match interrupts the in-flight turn AND commits the message normally (delivery absent) as the next queued turn.
-- Adapter `midTurnDelivery: "steer" | "queue"`; steer-capable sessions expose `steer(blocks)` and `interrupt()`. Attach declares `"steer"`; OpenClaw declares `"queue"` and its interrupt yields a clean `interrupt_unsupported` error frame.
+- Adapter `midTurnDelivery: "steer" | "queue"`; steer-capable sessions expose `steer(blocks)` and `interrupt()`. Attach declares `"steer"`.
 - APNs push payload: `{"aps":{"alert":{"title":"CozyChat","body":"New message"},"mutable-content":1},"c":"<base64url ciphertext>"}`. The iOS NSE reads exactly `payload["c"]`.
 - Compose env var names (the deployment plan depends on these): gateway `COZYGATEWAY_HOST`, `COZYGATEWAY_PORT`, `COZYGATEWAY_DB_PATH`, `COZYGATEWAY_ATTACH_TOKEN`; relay `COZY_RELAY_PORT`; relay APNs (optional) `APNS_KEY_P8_PATH`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`, `APNS_ENVIRONMENT` (plus `APNS_KEY_P8_HOST_PATH` as the host-side mount source in compose).

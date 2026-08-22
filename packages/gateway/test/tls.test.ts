@@ -2,6 +2,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { testHermes } from "./support/test-config.ts";
 import { applyEnvOverrides, type GatewayConfig } from "../src/config.ts";
 import { resolveTlsMaterial, gatewayScheme } from "../src/tls.ts";
 import { generateSelfSigned, writeGarbage } from "./helpers/self-signed.ts";
@@ -11,7 +12,7 @@ const baseConfig: GatewayConfig = {
   port: 8787,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+  hermes: testHermes(),
 };
 
 describe("resolveTlsMaterial", () => {

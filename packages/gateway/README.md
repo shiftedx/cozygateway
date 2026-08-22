@@ -1,47 +1,30 @@
 # cozygateway
 
 A self-hosted gateway that turns your AI agent into a chat contact on your phone. It speaks
-the cozygateway wire contract v1 and drives agent backends through a small adapter interface.
+the cozygateway wire contract v1 and connects an agent harness through attach-v1.
 
 Requires Node.js >= 24.
 
 ## Install
 
-```bash
-npm i -g cozygateway
+For an existing Hermes installation, use the supported one-paste installer:
+
+```sh
+curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
-This installs the `cozygateway` command.
+It installs the stable operator command at
+`~/.cozygateway/bin/cozygateway`. See
+[`docs/agent-install.md`](../../docs/agent-install.md) for the Hermes profile
+and local Dashboard setup it performs.
 
 ## Quickstart
 
-Create a config file. This example uses the built-in `mock` backend, a deterministic echo
-agent good for trying the gateway out before wiring up a real one:
+The installer creates the Hermes-only configuration and starts its service.
+To pair a device with a remote URL, run:
 
-`cozygateway.config.json`:
-
-```json
-{
-  "name": "my-gateway",
-  "port": 8787,
-  "dbPath": "cozygateway.db",
-  "agents": [{ "id": "echo", "name": "Echo", "backend": "mock" }]
-}
-```
-
-Start the gateway:
-
-```bash
-cozygateway serve --config cozygateway.config.json
-```
-
-It prints the version and the URL it is listening on, then runs until you stop it with
-Ctrl-C.
-
-In a second terminal, pair a device:
-
-```bash
-cozygateway pair --config cozygateway.config.json
+```sh
+~/.cozygateway/bin/cozygateway pair --url https://gateway.example.com
 ```
 
 This prints a JSON line like:
@@ -69,8 +52,10 @@ checks an implementation against it end to end.
 Your threads and message history live in SQLite, on your machine, at whatever `dbPath` you
 configure. The gateway reads plaintext to drive your agent and stream replies back, and it
 never sends that content anywhere else: there is no cloud relay, no third-party server, and no
-telemetry in the loop. By default `cozygateway serve` binds `127.0.0.1` only, plain HTTP, and
-answers on loopback alone: the gateway does not expose itself on your network by itself. Give it a
+telemetry in the loop. By default the bundle's `~/.cozygateway/bin/cozygateway serve` binds `127.0.0.1` only, plain HTTP, and
+answers on loopback alone: the gateway does not expose itself on your network by itself. The
+Hermes one-paste installer deliberately overrides that bind to `0.0.0.0` for local/LAN use, but it
+does not configure Tailscale, tunnels, DNS, or firewalls. Give it a
 `tls` block (or `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`) and it serves HTTPS instead, with `/ws`
 and `/attach/v1` becoming `wss` along with it; the app pins the certificate on first use, so a
 self-signed pair on a LAN is a supported posture. See [`docs/tls.md`](../../docs/tls.md), which also
@@ -84,8 +69,8 @@ or reverse proxy you set up and control remains a perfectly good alternative.
 | `name` | string | required | Human-readable gateway name, surfaced to clients as `GatewayInfo.name`. |
 | `port` | integer | `8787` | TCP port to listen on. |
 | `dbPath` | string | `cozygateway.db` | SQLite file path (or `:memory:` for ephemeral runs). |
-| `turnTimeoutSeconds` | integer | `600` | Per-turn wall-clock bound, in seconds. A single agent turn that runs longer than this is interrupted server-side through the ordinary interrupt path (the same one a manual stop uses), so a device that disconnects mid-turn cannot leave the agent looping tool calls forever. `0` disables the bound. Applies to every interruptible backend; config-file only, not env-driven. Distinct from the openclaw backend's per-agent `options.turnTimeoutSeconds` below. |
-| `agents` | array | required, at least one | Agents this gateway exposes, each with `id`, `name`, an optional `avatar`, a `backend`, and adapter-specific `options`. |
+| `turnTimeoutSeconds` | integer | `600` | Per-turn wall-clock bound, in seconds. A single agent turn that runs longer than this is interrupted server-side through the ordinary interrupt path (the same one a manual stop uses), so a device that disconnects mid-turn cannot leave the agent looping tool calls forever. `0` disables the bound. Applies to every interruptible backend; config-file only, not env-driven. |
+| `hermes` | object | required | Hermes Dashboard control/read connection and the single attach identity for each profile: `url`, password-auth fields, and `profiles.<name>.tokenEnv`. The installer writes this object; it does not use a separate `agents` list. |
 | `capabilities` | object | `{}` | Map of capability id to integer version, surfaced verbatim as `GatewayInfo.capabilities` (the `GET /health` response, the pair response, and the `ready` frame all carry it). Ids under `com.cozylabs.*` are vendor extensions, versioned independently of the contract; see contract/v1.md section 5. |
 | `pushRelayUrl` | string | absent | Private relay origin shared by authenticated `/push` registration proxy calls and the gateway's own `/notify` calls. Setting it advertises `com.cozylabs.push-proxy: 1`. Overridable with `COZYGATEWAY_PUSH_RELAY_URL`. |
 | `tls` | object | absent (plain HTTP) | `{ "certFile", "keyFile" }`, paths to a PEM certificate chain and its matching unencrypted key. Present means the listener serves HTTPS and `/ws` and `/attach/v1` become `wss`; absent means plain HTTP, unchanged. Overridable with `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`. Present-but-unusable (missing file, garbage PEM, encrypted key, key that does not match the certificate, only one of the two set) fails startup before the port binds rather than falling back to plaintext. See [`docs/tls.md`](../../docs/tls.md). |
@@ -105,10 +90,6 @@ NAMES mapped to JSON type TAGS only, never argument values, and the gateway re-v
 against the wire schema before broadcasting: an adapter that puts a raw value there gets its
 approval refused with an `invalid_request` error frame instead of leaking it to every device.
 Every resolution is audit-logged (thread, turn, `toolCallId`, outcome, deciding device).
-
-The built-in `mock-approval` backend implements the whole loop with no real backend behind it
-(one draft, one pending approval, parked until it is resolved or its bounded window lapses); it
-is what the conformance suite's optional approval hook points at.
 
 A pending approval is also pushed out of band, so a phone with no live socket still learns about
 it: category `approval.pending` collapsed on the `toolCallId`, and `approval.resolved` on the same
@@ -136,47 +117,10 @@ proceed on the second.
 | `hermes.chatSuggestion` | string | `Hey, tell me about yourself!` | The opener an EMPTY bot chat offers a client (capability 11). A SUGGESTION and nothing more: the gateway never submits it, and it enters the conversation only if the user chooses to send it as their own message. Set it to the empty string to offer nothing, leaving a fresh chat completely bare. |
 | `hermes.approvalTimeoutSeconds` | integer | `300` | How long a pending approval waits before the gateway synthesizes `expired`. MIRRORS the Hermes `approvals.timeout`, which Hermes does not expose over its RPC surface and for which it emits no expiry event: it drops the entry silently, so the gateway runs its own timer. Out of step with Hermes, the only consequence is that the buttons stop being offered earlier or later than Hermes stops accepting a decision; the gateway never resolves anything by itself. |
 
-## Backends
-
-Each agent names a `backend`. Alongside the built-in backends, cozygateway works with OpenClaw:
-a `backend: "openclaw"` agent dials OUT to a running OpenClaw gateway (WebSocket protocol v4,
-operator role) and relays a turn's streamed reply back over the cozygateway contract.
-
-```json5
-{
-  id: "sage",
-  name: "Sage",
-  backend: "openclaw",
-  options: {
-    url: "wss://host:port",        // the OpenClaw gateway's WebSocket URL
-    tokenEnv: "OPENCLAW_TOKEN",    // NAME of the env var holding the operator token
-    turnTimeoutSeconds: 600,        // optional, default 600
-    protocolVersion: 4,             // optional, default 4
-  },
-}
-```
-
-**Root-token caveat.** An OpenClaw operator token is ROOT on the target OpenClaw gateway: it can
-read and drive every session on it. cozygateway therefore takes the token by the NAME of an
-environment variable (`tokenEnv`), never inline in the config file, fails closed at startup if
-that variable is unset, logs a one-line caveat naming the agent and env var (never the token
-value) when it constructs the client, and never writes the token to any log or error. Treat the
-env var as a root secret.
-
-The connection authenticates with a per-run Ed25519 device key answering the gateway's
-`connect.challenge` (device-auth v3); a fresh operator device is accepted with the gateway token
-and needs no pairing step. Streamed assistant text is relayed as rich blocks. Tool-call chips are
-not yet surfaced for OpenClaw threads (turns are text-only for now).
-
-The exact OpenClaw wire facts this backend depends on were pinned by a live study against a real
-gateway; see `docs/specs/2026-07-08-openclaw-wire-study.md`. A non-gating live canary
-(`packages/gateway/scripts/openclaw-canary.mjs`, run when `OPENCLAW_CANARY_URL` and the token env
-are set) dials a real gateway and asserts a non-empty streamed reply.
-
 ## Commands
 
-- `cozygateway serve --config <path>`: start the gateway and run until interrupted.
-- `cozygateway pair --config <path>`: mint a fresh setup code against the configured
+- `~/.cozygateway/bin/cozygateway serve --config <path>`: start the gateway and run until interrupted.
+- `~/.cozygateway/bin/cozygateway pair --config <path>`: mint a fresh setup code against the configured
   database and print the QR payload for the app to scan.
 
 ## License

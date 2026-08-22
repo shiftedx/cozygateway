@@ -7,17 +7,23 @@ import { startGateway, type RunningGateway } from "../src/server.ts";
 describe("attach-v1 authenticated media side channel", () => {
   let gateway: RunningGateway;
   const env = "ATTACH_V1_MEDIA_TOKEN";
+  const controlEnv = "ATTACH_V1_MEDIA_CONTROL_TOKEN";
   const token = "media-secret";
   const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
   beforeEach(async () => {
     process.env[env] = token;
+    process.env[controlEnv] = "control-secret";
     gateway = await startGateway({
       name: "media", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
-      agents: [{ id: "sage", name: "Sage", backend: "attach", options: { tokenEnv: env } }],
+      hermes: {
+        url: "ws://127.0.0.1:1/api/ws",
+        tokenEnv: controlEnv,
+        profiles: { sage: { tokenEnv: env, name: "Sage" } },
+      },
     });
   });
-  afterEach(async () => { await gateway.close(); delete process.env[env]; });
+  afterEach(async () => { await gateway.close(); delete process.env[env]; delete process.env[controlEnv]; });
 
   it("validates auth, hash, type and size then supports range download", async () => {
     const url = `${gateway.url}/attach/v1/media/media_1`;

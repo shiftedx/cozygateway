@@ -11,36 +11,28 @@
  *  either hook mandatory (assert it in the env, or reach for it outside its gated group), this
  *  file goes red first. */
 import { afterAll, beforeAll } from "vitest";
-import { startGateway, type RunningGateway } from "cozygateway";
 
 import { registerConformanceSuite } from "../src/suite.ts";
+import { ReferenceAttachGateway } from "./reference-attach.ts";
 
-let gateway: RunningGateway;
+let reference: ReferenceAttachGateway;
 
 // Same rationale as the primary runner: the push group registers an unroutable relayUrl, so the
 // notifier's one failed delivery attempt goes to this sink instead of stderr.
 const notifierLogLines: string[] = [];
 
 beforeAll(async () => {
-  gateway = await startGateway(
-    {
-      name: "conformance-reference-hookless",
-      port: 0,
-      dbPath: ":memory:",
-      turnTimeoutSeconds: 0,
-      agents: [{ id: "conformance-echo", name: "Echo", backend: "mock" }],
-    },
-    { notifierLog: (message) => notifierLogLines.push(message) },
-  );
+  reference = new ReferenceAttachGateway(false, (message) => notifierLogLines.push(message));
+  await reference.start();
 });
 
 afterAll(async () => {
-  await gateway.close();
+  await reference.close();
 });
 
 registerConformanceSuite({
-  baseUrl: () => gateway.url,
-  issueSetupCode: () => Promise.resolve(gateway.issueSetupCode()),
+  baseUrl: () => reference.gateway?.url ?? "",
+  issueSetupCode: () => Promise.resolve(reference.gateway?.issueSetupCode() ?? ""),
   echoAgentId: "conformance-echo",
   // Deliberately no stallAgentId, approvalAgentId, botModelConfig, botChatStop, or botNewSession:
   // this is the hookless gateway a third party may be.

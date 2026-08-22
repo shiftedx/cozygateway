@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
+import { testHermes } from "./support/test-config.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
@@ -88,7 +89,7 @@ async function setup() {
       port: 8787,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      agents: [{ id: "mock", name: "Mock", backend: "mock" }],
+      hermes: testHermes(),
     },
     bots: bridge,
     gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 18 } },
