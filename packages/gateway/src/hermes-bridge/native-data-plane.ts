@@ -6,16 +6,20 @@ import type {
   BotApprovalResolvedFrame,
   BotChatDeltaFrame,
   BotChatMessage,
+  BotChatStateCause,
   BotChatStateFrame,
+  BotChatStatus,
   BotClarifyPendingFrame,
   BotClarifyResolvedFrame,
   BotToolActivityFrame,
   BotToolStep,
+  BotTurnToolSteps,
   BotSummary,
   ServerFrame,
 } from "cozygateway-contract";
 
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
+import { emitTrace, traceId, type TraceLog } from "../trace.ts";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -55,7 +59,10 @@ export interface NativeBotDataPlaneOptions {
     outcome?: "approved" | "denied" | "expired";
   }) => void;
   now?: () => number;
+  /** Existing gateway wall-clock bound; durable attach queueing lasts until this deadline. */
+  turnTimeoutMs?: number;
   log?: (message: string) => void;
+  trace?: TraceLog;
 }
 
 interface ApprovalPayload {
@@ -64,6 +71,17 @@ interface ApprovalPayload {
 interface ClarifyPayload {
   prompt: string;
   options: Array<{ id: string; label: string }>;
+}
+
+interface ToolFrameState {
+  seq: number;
+  steps: Map<string, BotToolStep>;
+}
+
+interface NativeTurnState {
+  status: BotChatStatus;
+  cause?: BotChatStateCause;
+  queuedAt?: number;
 }
 
 /** Attach-owned Bot Mode data plane. The returned surface delegates management/control methods to
@@ -79,16 +97,18 @@ export class NativeBotDataPlane {
   readonly #onChatMessage: NativeBotDataPlaneOptions["onChatMessage"];
   readonly #onApproval: NativeBotDataPlaneOptions["onApproval"];
   readonly #now: () => number;
+  readonly #turnTimeoutMs: number;
   readonly #log: (message: string) => void;
+  readonly #trace: TraceLog | undefined;
   readonly #draftSeq = new Map<string, number>();
-  readonly #toolFrames = new Map<
-    string,
-    { seq: number; steps: Map<string, BotToolStep> }
-  >();
+  readonly #toolFrames = new Map<string, ToolFrameState>();
+  readonly #tracedTurnStates = new Map<string, string>();
+  readonly #attachPresence = new Map<string, "online" | "degraded" | "absent">();
   readonly #interactionTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
   >();
+  readonly #turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(opts: NativeBotDataPlaneOptions) {
     this.#control = opts.control;
@@ -100,14 +120,20 @@ export class NativeBotDataPlane {
     this.#onChatMessage = opts.onChatMessage;
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
+    this.#turnTimeoutMs = opts.turnTimeoutMs ?? 600_000;
     this.#log =
       opts.log ??
       ((message) => void process.stderr.write(`[native-bot] ${message}\n`));
+    this.#trace = opts.trace;
     // Scheduled/home delivery is authorized against this durable gateway-owned binding, never a
     // target asserted by an event itself. Creating it at assembly makes the target canonical even
     // before the app has opened this bot's chat.
-    for (const bot of this.#native)
-      this.#storage.nativeBotChat(bot, this.#now());
+    for (const bot of this.#native) {
+      const chat = this.#storage.nativeBotChat(bot, this.#now());
+      this.#restoreToolFrames(bot);
+      if (chat.activeTurnId !== undefined)
+        this.#scheduleTurnTimeout(bot, chat.sessionId, chat.activeTurnId);
+    }
     for (const pending of this.#storage.pendingNativeInteractions()) {
       if (this.#native.has(pending.bot))
         this.#scheduleInteractionExpiry(pending);
@@ -189,9 +215,22 @@ export class NativeBotDataPlane {
     return this.#storage.nativeBotHasSession(key, frame.event.threadId);
   }
 
+  /** Attach transport presence is the only connectivity signal. Commands remain durably queued;
+   * this projects that fact without creating a second retry or timeout policy. */
+  handleAttachPresence(bot: string, state: "online" | "degraded" | "absent"): void {
+    const key = normalize(bot);
+    if (!this.handles(key)) return;
+    this.#attachPresence.set(key, state);
+    const chat = this.#storage.nativeBotChat(key, this.#now());
+    if (chat.activeTurnId !== undefined)
+      this.#state(key, chat.sessionId, "polling", true);
+  }
+
   close(): void {
     for (const timer of this.#interactionTimers.values()) clearTimeout(timer);
     this.#interactionTimers.clear();
+    for (const timer of this.#turnTimers.values()) clearTimeout(timer);
+    this.#turnTimers.clear();
   }
 
   handle(bot: string, frame: AttachV1EventFrame): boolean {
@@ -227,6 +266,7 @@ export class NativeBotDataPlane {
     // own durable group-turn binding.
     if (!this.#storage.nativeBotHasSession(key, sessionId)) return false;
     if ("turnId" in event) {
+      if (this.#storage.nativeBotTurnTerminal(key, sessionId, event.turnId)) return true;
       const command = this.#storage.attachTurnCommand(key, event.turnId);
       if (command === undefined || command.threadId !== sessionId) return false;
     }
@@ -243,10 +283,14 @@ export class NativeBotDataPlane {
         updatedAt: this.#now(),
       };
       this.#broadcast(delta);
+      this.#state(key, sessionId, "polling", true);
       return true;
     }
     if (event.kind === "commit") {
-      this.#finish(key, sessionId, event.turnId);
+      this.#finish(key, sessionId, event.turnId, {
+        phase: "complete",
+        status: "completed",
+      });
       return this.#commit(
         key,
         sessionId,
@@ -260,7 +304,11 @@ export class NativeBotDataPlane {
       event.kind === "cancelled" ||
       event.kind === "interrupted"
     ) {
-      this.#finish(key, sessionId, event.turnId, "failed");
+      this.#finish(key, sessionId, event.turnId, {
+        phase: "failed",
+        status: event.kind === "failed" ? "failed" : "interrupted",
+        ...(event.kind === "cancelled" ? { cause: "cancelled" as const } : {}),
+      });
       return true;
     }
     if (event.kind === "tool") return this.#tool(key, sessionId, event);
@@ -343,6 +391,7 @@ export class NativeBotDataPlane {
     const bot = normalize(name);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
+    const state = this.#turnState(bot, chat.sessionId, chat.activeTurnId);
     this.#rebroadcastPending(bot);
     return {
       sessionId: chat.sessionId,
@@ -350,6 +399,8 @@ export class NativeBotDataPlane {
       messages,
       running: chat.activeTurnId !== undefined,
       inflight: chat.activeTurnId !== undefined,
+      ...(state === undefined ? {} : state),
+      ...this.#historyToolSteps(chat.sessionId),
       updatedAt: this.#now(),
       ...(messages.length === 0 && this.#chatSuggestion !== ""
         ? { suggestion: this.#chatSuggestion }
@@ -394,6 +445,7 @@ export class NativeBotDataPlane {
     });
     if (chat.activeTurnId === undefined) {
       this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+      this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
     }
     this.#broadcastMessage(bot, chat.sessionId, message, now);
     if (chat.activeTurnId === undefined)
@@ -406,10 +458,14 @@ export class NativeBotDataPlane {
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     if (chat.activeTurnId === undefined) return "idle";
-    this.#ingress.sendNativeInterrupt(bot, {
+    if (!this.#ingress.sendNativeInterrupt(bot, {
       threadId: chat.sessionId,
       turnId: chat.activeTurnId,
-    });
+    })) {
+      throw new BackendUnavailable(
+        `native attach-v1 profile "${bot}" cannot queue an interrupt`,
+      );
+    }
     return "stopped";
   }
 
@@ -470,6 +526,7 @@ export class NativeBotDataPlane {
       ...(photo.clientId === undefined ? {} : { clientId: photo.clientId }),
     });
     this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+    this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
     this.#broadcastMessage(bot, chat.sessionId, message, now);
     this.#state(bot, chat.sessionId, "polling", true);
     return { sessionId: chat.sessionId, message };
@@ -560,6 +617,7 @@ export class NativeBotDataPlane {
       approvalId,
       outcome,
     );
+    this.#state(bot, binding.sessionId, "polling", true);
     return outcome;
   }
 
@@ -620,6 +678,7 @@ export class NativeBotDataPlane {
       selectedOptionId: optionId,
       updatedAt: this.#now(),
     });
+    this.#state(bot, binding.sessionId, "polling", true);
     return "selected";
   }
 
@@ -653,13 +712,37 @@ export class NativeBotDataPlane {
     bot: string,
     sessionId: string,
     turnId: string,
-    phase: "complete" | "failed" = "complete",
+    terminal: Pick<NativeTurnState, "status" | "cause"> & {
+      phase: Exclude<BotChatStateFrame["phase"], "polling">;
+    } = { phase: "complete", status: "completed" },
   ): void {
     const settledActiveTurn = this.#storage.clearNativeBotTurn(
       bot,
       sessionId,
       turnId,
       this.#now(),
+    );
+    if (!settledActiveTurn) return;
+    this.#clearTurnTimeout(bot, sessionId, turnId);
+    this.#storage.recordNativeBotTerminal({
+      bot,
+      sessionId,
+      turnId,
+      status: terminal.status as "completed" | "failed" | "interrupted" | "timed_out",
+      ...(terminal.cause === "cancelled" ? { cause: "cancelled" as const } : {}),
+      completedAt: this.#now(),
+    });
+    emitTrace(this.#trace, "native_turn_transition", {
+      profile: traceId(bot), session: traceId(sessionId), turn: traceId(turnId),
+      status: terminal.status, reason: terminal.cause ?? terminal.phase,
+    });
+    this.#tracedTurnStates.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#expireTurnInteractions(bot, sessionId, turnId);
+    this.#sealTools(
+      bot,
+      sessionId,
+      turnId,
+      terminal.status === "completed" ? "ok" : "error",
     );
     const seq = (this.#draftSeq.get(turnId) ?? 0) + 1;
     this.#broadcast({
@@ -673,7 +756,7 @@ export class NativeBotDataPlane {
       done: true,
     });
     this.#draftSeq.delete(turnId);
-    if (settledActiveTurn) this.#state(bot, sessionId, phase, false);
+    this.#state(bot, sessionId, terminal.phase, false, terminal);
   }
 
   #commit(
@@ -737,7 +820,8 @@ export class NativeBotDataPlane {
     sessionId: string,
     event: Extract<AttachV1EventFrame["event"], { kind: "tool" }>,
   ): boolean {
-    const current = this.#toolFrames.get(event.turnId) ?? {
+    const key = this.#nativeTurnKey(bot, sessionId, event.turnId);
+    const current = this.#toolFrames.get(key) ?? {
       seq: 0,
       steps: new Map<string, BotToolStep>(),
     };
@@ -754,7 +838,7 @@ export class NativeBotDataPlane {
     };
     current.steps.set(event.callId, step);
     current.seq += 1;
-    this.#toolFrames.set(event.turnId, current);
+    this.#toolFrames.set(key, current);
     this.#storage.upsertBotChatToolStep({
       bot,
       sessionId,
@@ -777,7 +861,211 @@ export class NativeBotDataPlane {
       updatedAt: now,
     };
     this.#broadcast(wire);
+    this.#state(bot, sessionId, "polling", true);
     return true;
+  }
+
+  /** The REST history is the sole reconnect recovery path. It deliberately includes active turns
+   * too: after a Gateway restart the next terminal event can rebuild and seal this same state. */
+  #historyToolSteps(sessionId: string): { toolSteps?: BotTurnToolSteps[] } {
+    const turns = new Map<string, BotTurnToolSteps>();
+    for (const row of this.#storage.botChatToolSteps(sessionId, 0)) {
+      const turn = turns.get(row.turnId) ?? {
+        turnId: row.turnId,
+        startedAt: row.startedAt,
+        steps: [],
+      };
+      const step: BotToolStep = {
+        stepId: row.stepId,
+        seq: row.seq,
+        name: row.name,
+        status: row.status as BotToolStep["status"],
+        startedAt: row.startedAt,
+        ...(row.endedAt === null ? {} : { endedAt: row.endedAt }),
+        ...(row.detail === null ? {} : { detail: row.detail }),
+        ...(row.errorText === null ? {} : { errorText: row.errorText }),
+      };
+      turn.steps.push(step);
+      turns.set(row.turnId, turn);
+    }
+    const toolSteps = [...turns.values()].map((turn) => {
+      turn.steps.sort((a, b) => a.seq - b.seq);
+      const endedAt = turn.steps.reduce<number | undefined>(
+        (latest, step) =>
+          step.status === "running" || step.endedAt === undefined
+            ? undefined
+            : Math.max(latest ?? step.endedAt, step.endedAt),
+        undefined,
+      );
+      return { ...turn, ...(endedAt === undefined ? {} : { endedAt }) };
+    });
+    return toolSteps.length === 0 ? {} : { toolSteps };
+  }
+
+  #turnState(
+    bot: string,
+    sessionId: string,
+    turnId: string | undefined,
+  ): NativeTurnState | undefined {
+    if (turnId === undefined) {
+      const terminal = this.#storage.nativeBotLastTerminal(bot, sessionId);
+      if (terminal === undefined) return undefined;
+      return {
+        status: terminal.status,
+        ...(terminal.cause === undefined ? {} : { cause: terminal.cause }),
+      };
+    }
+    const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
+    const presence = this.#attachPresence.get(bot);
+    const detached = presence === undefined
+      ? this.#ingress.isAttached?.(bot) !== true
+      : presence !== "online";
+    const connection = detached
+      ? presence === "degraded"
+        ? "attach_degraded" as const
+        : delivery?.acknowledgedAt === null || delivery === undefined
+        ? "attach_absent" as const
+        : "attach_lost" as const
+      : undefined;
+    const pending = this.#storage.pendingNativeInteractions(bot).some(
+      (interaction) =>
+        interaction.sessionId === sessionId && interaction.turnId === turnId,
+    );
+    if (pending) {
+      return {
+        status: "awaiting_input",
+        ...(connection === undefined ? {} : { cause: connection }),
+      };
+    }
+    const tools = this.#toolFrames.get(this.#nativeTurnKey(bot, sessionId, turnId));
+    if ([...(tools?.steps.values() ?? [])].some((step) => step.status === "running")) {
+      return {
+        status: "using_tools",
+        ...(connection === undefined ? {} : { cause: connection }),
+      };
+    }
+    if (!detached) return { status: "executing" };
+    if (delivery !== undefined && delivery.acknowledgedAt !== null)
+      return { status: "connectivity_lost", cause: "attach_lost" };
+    return {
+      status: "queued",
+      cause: "attach_absent",
+      ...(delivery === undefined ? {} : { queuedAt: delivery.queuedAt }),
+    };
+  }
+
+  #scheduleTurnTimeout(bot: string, sessionId: string, turnId: string): void {
+    if (this.#turnTimeoutMs <= 0) return;
+    const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
+    if (delivery === undefined) return;
+    this.#clearTurnTimeout(bot, sessionId, turnId);
+    const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    const timer = setTimeout(
+      () => this.#timeoutTurn(bot, sessionId, turnId),
+      Math.max(0, delivery.queuedAt + this.#turnTimeoutMs - this.#now()),
+    );
+    timer.unref();
+    this.#turnTimers.set(key, timer);
+  }
+
+  #timeoutTurn(bot: string, sessionId: string, turnId: string): void {
+    this.#turnTimers.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    const chat = this.#storage.nativeBotChat(bot, this.#now());
+    if (chat.sessionId !== sessionId || chat.activeTurnId !== turnId) return;
+    const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
+    if (delivery === undefined) return;
+    if (delivery.acknowledgedAt === null) {
+      this.#storage.cancelAttachCommand(
+        bot,
+        delivery.sequence,
+        delivery.commandId,
+        "native turn timed out",
+        this.#now(),
+      );
+    } else {
+      this.#ingress.sendNativeInterrupt(bot, { threadId: sessionId, turnId });
+    }
+    this.#finish(bot, sessionId, turnId, {
+      phase: "timeout",
+      status: "timed_out",
+    });
+  }
+
+  #clearTurnTimeout(bot: string, sessionId: string, turnId: string): void {
+    const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    const timer = this.#turnTimers.get(key);
+    if (timer !== undefined) clearTimeout(timer);
+    this.#turnTimers.delete(key);
+  }
+
+  #nativeTurnKey(bot: string, sessionId: string, turnId: string): string {
+    return `${bot}:${sessionId}:${turnId}`;
+  }
+
+  #restoreToolFrames(bot: string): void {
+    for (const session of this.#storage.nativeBotSessions(bot, 10_000)) {
+      for (const row of this.#storage.botChatToolSteps(session.id, 0)) {
+        const key = this.#nativeTurnKey(bot, session.id, row.turnId);
+        const current = this.#toolFrames.get(key) ?? {
+          seq: 0,
+          steps: new Map<string, BotToolStep>(),
+        };
+        current.steps.set(row.stepId, {
+          stepId: row.stepId,
+          seq: row.seq,
+          name: row.name,
+          status: row.status as BotToolStep["status"],
+          startedAt: row.startedAt,
+          ...(row.endedAt === null ? {} : { endedAt: row.endedAt }),
+          ...(row.detail === null ? {} : { detail: row.detail }),
+          ...(row.errorText === null ? {} : { errorText: row.errorText }),
+        });
+        this.#toolFrames.set(key, current);
+      }
+    }
+  }
+
+  #sealTools(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    status: "ok" | "error",
+  ): void {
+    const current = this.#toolFrames.get(this.#nativeTurnKey(bot, sessionId, turnId));
+    if (current === undefined || current.steps.size === 0) return;
+    const now = this.#now();
+    for (const [stepId, step] of current.steps) {
+      if (step.status !== "running") continue;
+      const sealed = { ...step, status, endedAt: now } as BotToolStep;
+      current.steps.set(stepId, sealed);
+      this.#storage.upsertBotChatToolStep({
+        bot,
+        sessionId,
+        turnId,
+        stepId: sealed.stepId,
+        seq: sealed.seq,
+        name: sealed.name,
+        status: sealed.status,
+        startedAt: sealed.startedAt,
+        endedAt: sealed.endedAt,
+        detail: sealed.detail,
+        errorText: sealed.errorText,
+      });
+    }
+    current.seq += 1;
+    this.#broadcast({
+      type: "bot_tool_activity",
+      bot,
+      sessionId,
+      turnId,
+      steps: [...current.steps.values()],
+      seq: current.seq,
+      updatedAt: now,
+      done: true,
+    });
+    emitTrace(this.#trace, "native_tool_terminalization", {
+      profile: traceId(bot), session: traceId(sessionId), turn: traceId(turnId), reason: status,
+    });
   }
 
   #approval(
@@ -834,6 +1122,7 @@ export class NativeBotDataPlane {
           expiresAt: event.expiresAt,
           updatedAt: this.#now(),
         });
+      this.#state(bot, sessionId, "polling", true);
     } else {
       this.#clearInteractionTimer("approval", bot, event.approvalId);
       this.#emitApprovalResolved(
@@ -843,6 +1132,7 @@ export class NativeBotDataPlane {
         event.approvalId,
         outcome,
       );
+      this.#state(bot, sessionId, "polling", true);
     }
     return true;
   }
@@ -903,6 +1193,7 @@ export class NativeBotDataPlane {
           expiresAt: event.expiresAt,
           updatedAt: this.#now(),
         });
+      this.#state(bot, sessionId, "polling", true);
     } else {
       this.#clearInteractionTimer("clarify", bot, event.clarifyId);
       const resolved: BotClarifyResolvedFrame = {
@@ -918,6 +1209,7 @@ export class NativeBotDataPlane {
         updatedAt: this.#now(),
       };
       this.#broadcast(resolved);
+      this.#state(bot, sessionId, "polling", true);
     }
     return true;
   }
@@ -1012,6 +1304,39 @@ export class NativeBotDataPlane {
     this.#interactionTimers.delete(key);
   }
 
+  #expireTurnInteractions(bot: string, sessionId: string, turnId: string): void {
+    for (const pending of this.#storage.pendingNativeInteractions(bot)) {
+      if (pending.sessionId !== sessionId || pending.turnId !== turnId) continue;
+      if (!this.#storage.resolveNativeInteraction(
+        bot,
+        pending.kind,
+        pending.interactionId,
+        "expired",
+        this.#now(),
+      )) continue;
+      this.#clearInteractionTimer(pending.kind, bot, pending.interactionId);
+      if (pending.kind === "approval") {
+        this.#emitApprovalResolved(
+          bot,
+          sessionId,
+          turnId,
+          pending.interactionId,
+          "expired",
+        );
+      } else {
+        this.#broadcast({
+          type: "bot_clarify_resolved",
+          bot,
+          sessionId,
+          turnId,
+          clarifyId: pending.interactionId,
+          outcome: "expired",
+          updatedAt: this.#now(),
+        });
+      }
+    }
+  }
+
   #rebroadcastPending(bot: string): void {
     for (const pending of this.#storage.pendingNativeInteractions(bot)) {
       if (pending.kind === "approval") {
@@ -1049,7 +1374,21 @@ export class NativeBotDataPlane {
     sessionId: string,
     phase: BotChatStateFrame["phase"],
     running: boolean,
+    terminal?: NativeTurnState,
   ): void {
+    const chat = this.#storage.nativeBotChat(bot, this.#now());
+    const state = terminal ?? this.#turnState(bot, sessionId, chat.activeTurnId);
+    if (chat.activeTurnId !== undefined && state !== undefined) {
+      const key = this.#nativeTurnKey(bot, sessionId, chat.activeTurnId);
+      const signature = `${state.status}:${state.cause ?? ""}`;
+      if (this.#tracedTurnStates.get(key) !== signature) {
+        this.#tracedTurnStates.set(key, signature);
+        emitTrace(this.#trace, "native_turn_transition", {
+          profile: traceId(bot), session: traceId(sessionId), turn: traceId(chat.activeTurnId),
+          status: state.status, reason: state.cause ?? phase,
+        });
+      }
+    }
     const frame: BotChatStateFrame = {
       type: "bot_chat_state",
       bot,
@@ -1057,6 +1396,7 @@ export class NativeBotDataPlane {
       phase,
       running,
       inflight: running,
+      ...(state === undefined ? {} : state),
       updatedAt: this.#now(),
     };
     this.#broadcast(frame);

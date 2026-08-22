@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 22. This extension is independent of the frozen core
+Status: v1 extension, capability version 23. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 22 }
+"capabilities": { "com.cozylabs.bots": 23 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -61,6 +61,7 @@ extension omits the capability and does not register `/bots` routes.
 | 20 | Audio/video attachment playback with byte ranges. |
 | 21 | Redacted tool-step details. |
 | 22 | Durable native clarification events and resolution. |
+| 23 | Exact native turn status/cause and durable queued-at metadata. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -189,6 +190,12 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
 - `bot_presence`: complete active profile-name set.
 - `bot_chat`: native transcript delta. `messages` contains only newly committed rows.
 - `bot_chat_state`: current native-turn phase: `polling`, `complete`, `timeout`, or `failed`.
+  Capability 23 additionally carries exact `status`: `queued`, `executing`, `using_tools`,
+  `awaiting_input`, `completed`, `failed`, `interrupted`, `timed_out`, or `connectivity_lost`.
+  `cause` distinguishes absent/degraded/lost attach transport and cancellation; `queuedAt` is the
+  durable outbox admission time. The existing gateway turn-timeout bound starts at `queuedAt`; on
+  expiry the gateway discards an unacknowledged command or queues an interrupt for an acknowledged
+  one, then projects `timed_out`.
 - `bot_chat_delta`: full accumulated assistant draft for one native turn. `seq` is monotonic within
   `turnId`; `done` ends that draft. Clients may drop drafts and rely on committed `bot_chat` rows.
 - `bot_chat_reset`: a reset selected a fresh native session. Rebind and reload its history.

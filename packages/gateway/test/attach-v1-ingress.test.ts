@@ -17,6 +17,7 @@ describe("attach-v1 ingress", () => {
   let presence: string[];
   let clock: number;
   let projectionSucceeds: boolean;
+  let traces: string[];
 
   beforeEach(async () => {
     storage = openStorage(":memory:");
@@ -24,13 +25,19 @@ describe("attach-v1 ingress", () => {
     presence = [];
     clock = 0;
     projectionSucceeds = true;
+    traces = [];
     ingress = new AttachV1Ingress({
-      tokens: new Map([["secret", "sage"]]), storage,
+      tokens: new Map([
+        ["secret", "sage"],
+        ["soak-1", "soak-1"], ["soak-2", "soak-2"], ["soak-3", "soak-3"],
+        ["soak-4", "soak-4"], ["soak-5", "soak-5"], ["soak-6", "soak-6"],
+      ]), storage,
       events: { onEvent: (_agent, frame) => { accepted.push(frame); return projectionSucceeds; }, onPresence: (_agent, state) => presence.push(state) },
       now: () => clock,
       heartbeatIntervalMs: 1000, heartbeatTimeoutMs: 5000,
       projectionRetryMs: 10,
       projectionMaxAttempts: 3,
+      trace: (line) => traces.push(line),
     });
     server = createServer();
     server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
@@ -49,12 +56,21 @@ describe("attach-v1 ingress", () => {
     limits?: { maxInFlightEvents: number; maxInFlightBytes: number },
     capabilities: string[] = ["draft"],
     resume = { eventSequence: 0, commandSequence: 0 },
+    peer: { token?: string; instanceId?: string; heartbeatAckLimit?: number } = {},
   ): Promise<{ ws: WebSocket; frames: AttachV1ServerFrame[] }> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: "Bearer secret" } });
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: `Bearer ${peer.token ?? "secret"}` } });
     const frames: AttachV1ServerFrame[] = [];
-    ws.on("message", (data) => frames.push(JSON.parse(String(data)) as AttachV1ServerFrame));
+    let acknowledgedHeartbeats = 0;
+    ws.on("message", (data) => {
+      const frame = JSON.parse(String(data)) as AttachV1ServerFrame;
+      frames.push(frame);
+      if (frame.kind === "heartbeat" && acknowledgedHeartbeats < (peer.heartbeatAckLimit ?? 0)) {
+        acknowledgedHeartbeats += 1;
+        ws.send(JSON.stringify({ kind: "heartbeat", sentAt: frame.sentAt }));
+      }
+    });
     await once(ws, "open");
-    ws.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }) }));
+    ws.send(JSON.stringify({ kind: "hello", version: 1, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }) }));
     await until(() => frames.some((frame) => frame.kind === "hello_ack"));
     return { ws, frames };
   }
@@ -243,6 +259,66 @@ describe("attach-v1 ingress", () => {
     clock = 6_000;
     await until(() => presence.includes("absent"), 1_500);
     await until(() => ws.readyState !== WebSocket.OPEN, 1_500);
+  });
+
+  it("treats plugin heartbeats as acknowledgements instead of echoing them", async () => {
+    const { ws, frames } = await dial();
+    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 42 }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(frames.filter((frame) => frame.kind === "heartbeat")).toEqual([]);
+    ws.close();
+  });
+
+  it("summarizes aggregate connection state and the last actual heartbeat without identities", async () => {
+    expect(ingress.health()).toMatchObject({ configured: 7, online: 0, degraded: 0, absent: 7, lastHeartbeatAt: null });
+    const { ws } = await dial();
+    expect(ingress.health()).toMatchObject({ configured: 7, online: 1, degraded: 0, absent: 6, lastHeartbeatAt: null });
+    clock = 123;
+    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 123 }));
+    await until(() => ingress.health().lastHeartbeatAt === 123);
+    expect(ingress.health()).toMatchObject({ lastHeartbeatAt: 123, queueDepth: 0, deadLetters: 0 });
+    ws.close();
+  });
+
+  it("traces transitions without heartbeat volume or frame content", async () => {
+    const { ws } = await dial();
+    await until(() => traces.some((line) => JSON.parse(line).event === "attach_hello"));
+    const beforeHeartbeats = traces.length;
+    clock = 99;
+    for (let index = 0; index < 5; index += 1) ws.send(JSON.stringify({ kind: "heartbeat", sentAt: index }));
+    await until(() => ingress.health().lastHeartbeatAt === 99);
+    expect(traces).toHaveLength(beforeHeartbeats);
+    const joined = traces.join("\n");
+    expect(joined).not.toContain("secret");
+    expect(joined).not.toContain("hello required");
+    expect(traces.every((line) => /^[0-9a-f]{16}$/.test(JSON.parse(line).profile))).toBe(true);
+    ws.close();
+  });
+
+  it("closes safely after storage teardown while a trace sink is installed", async () => {
+    const { ws } = await dial();
+    storage.close();
+    // Preserve afterEach ownership while the ingress deliberately retains the closed handle.
+    storage = openStorage(":memory:");
+    ws.close();
+    await once(ws, "close");
+    await until(() => traces.some((line) => JSON.parse(line).event === "attach_close"));
+  });
+
+  it("keeps six acknowledged peers at one heartbeat per profile per interval", async () => {
+    // The cap is unused by the fixed protocol (three gateway heartbeats, three ACKs), but makes
+    // the regression bounded if an echo turns every ACK into another server heartbeat.
+    const peers = await Promise.all(Array.from({ length: 6 }, (_, index) => dial(
+      undefined,
+      ["draft"],
+      undefined,
+      { token: `soak-${index + 1}`, instanceId: `soak-${index + 1}`, heartbeatAckLimit: 3 },
+    )));
+    await until(() => peers.every(({ frames }) => frames.filter((frame) => frame.kind === "heartbeat").length >= 3), 4_000);
+    const heartbeatCounts = peers.map(({ frames }) => frames.filter((frame) => frame.kind === "heartbeat").length);
+    expect(heartbeatCounts).toEqual([3, 3, 3, 3, 3, 3]);
+    expect(heartbeatCounts.reduce((total, count) => total + count, 0)).toBe(18);
+    peers.forEach(({ ws }) => ws.close());
   });
 });
 

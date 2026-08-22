@@ -5,6 +5,7 @@ import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotChatDeltaFrameSchema,
+  BotChatStateFrameSchema,
   BotChatMessageSchema,
   BotChatResetFrameSchema,
   BotChatResetResponseSchema,
@@ -470,7 +471,17 @@ describe("capability advertisement", () => {
     // plus new-session minting through the existing adoption frame without retiring the old chat.
     // 20 adds assistant audio/video metadata and ranged attachment delivery.
     // 22 adds durable native clarification cards plus their idempotent selection route.
-    expect(BOTS_CAPABILITY_VERSION).toBe(22);
+    // 23 adds exact native turn status/cause and queued-at recovery metadata.
+    expect(BOTS_CAPABILITY_VERSION).toBe(23);
+  });
+
+  it("accepts capability-23 native turn status without changing legacy state fields", () => {
+    expect(check(BotChatStateFrameSchema, {
+      type: "bot_chat_state", bot: "sage", sessionId: "local-1",
+      phase: "polling", running: true, inflight: true,
+      status: "queued", cause: "attach_absent", queuedAt: 1,
+      updatedAt: 2,
+    })).toBe(true);
   });
 
   it("accepts only the capability-19 hard-stop success body", () => {

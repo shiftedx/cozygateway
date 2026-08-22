@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { Storage, PushRegistrationRow } from "./storage.ts";
 import type { Notifier } from "./turns.ts";
 import { encryptPushPayload, type ApprovalPushPayload, type PushPayload } from "./push-crypto.ts";
+import { emitTrace, traceId, type TraceLog } from "./trace.ts";
 
 export const PREVIEW_MAX_CHARS = 200;
 const NOTIFY_TIMEOUT_MS = 10_000;
@@ -72,6 +73,7 @@ export interface RelayNotifierDeps {
    *  device's socket becomes live between the commit-time snapshot and the fire-and-forget
    *  send actually going out (issue #11). */
   isDeviceConnected?: (deviceId: string) => boolean;
+  trace?: TraceLog;
 }
 
 /** Posts encrypted notification payloads to each registered device's relay.
@@ -83,6 +85,7 @@ export class RelayNotifier implements Notifier {
   readonly #relayBaseUrl: string | undefined;
   readonly #log: (message: string) => void;
   readonly #isDeviceConnected: ((deviceId: string) => boolean) | undefined;
+  readonly #trace: TraceLog | undefined;
 
   constructor(deps: RelayNotifierDeps) {
     this.#storage = deps.storage;
@@ -90,6 +93,7 @@ export class RelayNotifier implements Notifier {
     this.#relayBaseUrl = deps.relayBaseUrl;
     this.#log = deps.log ?? ((message: string) => process.stderr.write(`${message}\n`));
     this.#isDeviceConnected = deps.isDeviceConnected;
+    this.#trace = deps.trace;
   }
 
   notify(
@@ -216,16 +220,23 @@ export class RelayNotifier implements Notifier {
     const ciphertext = encryptPushPayload(registration.pushKey, payload);
     const relayBaseUrl = this.#relayBaseUrl ?? registration.relayUrl;
     const url = `${relayBaseUrl.replace(/\/+$/, "")}/notify`;
-    const res = await this.#fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        pushId: registration.pushId,
-        ciphertext,
-        ...(routing === undefined ? {} : routing),
-      }),
-      signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
-    });
+    let res: Response;
+    try {
+      res = await this.#fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          pushId: registration.pushId,
+          ciphertext,
+          ...(routing === undefined ? {} : routing),
+        }),
+        signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
+      });
+    } catch (error) {
+      emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: "network_error" });
+      throw error;
+    }
+    emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: res.ok ? "ok" : res.status === 404 ? "not_found" : "http_error" });
     if (res.status === 404) {
       // The relay no longer knows this id; the registration is dead weight (push-v0). Prune it.
       this.#storage.deletePushRegistration(registration.deviceId);

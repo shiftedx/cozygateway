@@ -24,6 +24,11 @@ Tokens appear only in the selected profile `.env` and the gateway's mode-600
 runtime env file. The attach plugin connects out to the local gateway over
 loopback; it exposes no listener on a Hermes host.
 
+Gateway transition diagnostics are JSON lines on stderr. They record connection,
+presence, queue, terminal, and relay outcome transitions—not heartbeat traffic.
+Identifiers are truncated SHA-256 values; tokens, message text, tool arguments,
+and push payloads are never included.
+
 Create or delete the profile with Hermes, then rerun the one-line installer;
 its default `--profiles all` selection reconciles the current set. Use an
 explicit `--profiles default,ops` only to narrow coverage. Do not hand-edit

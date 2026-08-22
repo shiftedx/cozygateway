@@ -14,13 +14,18 @@ const config: GatewayConfig = {
   hermes: testHermes(),
 };
 
-function makeApp(now = () => 1_000) {
+function makeApp(now = () => 1_000, attachHealth?: () => {
+  configured: number; online: number; degraded: number; absent: number;
+  lastHeartbeatAt: number | null; lastEventAt: number | null; lastTerminalAt: number | null;
+  queueDepth: number; deadLetters: number;
+}) {
   const storage = openStorage(":memory:");
   const revoked: string[] = [];
   const app = createApp({
     storage,
     config,
     gatewayInfo: { name: "test-gateway", version: "0.1.0", contract: "v1" },
+    ...(attachHealth === undefined ? {} : { attachHealth }),
     presenceOf: () => "online",
     submitUserMessage: () => {
       throw new Error("not under test");
@@ -88,6 +93,17 @@ describe("GET /health", () => {
     const pairRes = await pair(app, storage);
     const paired = (await pairRes.json()) as { gateway: { capabilities?: unknown } };
     expect(paired.gateway.capabilities).toEqual({ "com.cozylabs.test": 1 });
+  });
+
+  it("exposes the same aggregate non-secret attach summary on health and ready", async () => {
+    const attach = {
+      configured: 6, online: 4, degraded: 1, absent: 1,
+      lastHeartbeatAt: 1, lastEventAt: 2, lastTerminalAt: 3,
+      queueDepth: 5, deadLetters: 1,
+    };
+    const { app } = makeApp(() => 1_000, () => attach);
+    expect((await (await app.request("/health")).json()).attach).toEqual(attach);
+    expect((await (await app.request("/ready")).json()).attach).toEqual(attach);
   });
 });
 

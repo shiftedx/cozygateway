@@ -76,6 +76,12 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `app
   after missed heartbeats/backpressure, and absent after timeout/close. Clients reconnect with
   exponential backoff and jitter.
 
+`GET /health` and `GET /ready` additionally expose one aggregate `attach` summary: configured,
+online, degraded, and absent profile counts; the most recent valid heartbeat, durable event, and
+terminal timestamps; plus durable command queue depth and dead-letter count. It contains no
+profile ids, instance ids, frame ids, or payload content. A timestamp is `null` until observed in
+the current process (heartbeat) or durable journal (event/terminal).
+
 There is deliberately no thinking, reasoning, or chain-of-thought event. Unknown and invalid
 frames are never projected into the transcript.
 

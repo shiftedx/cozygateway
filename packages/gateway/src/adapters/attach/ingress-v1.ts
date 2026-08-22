@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
-import { check } from "cozygateway-contract";
+import { check, type AttachHealthSummary } from "cozygateway-contract";
 import { WebSocket, WebSocketServer } from "ws";
 
 import type { Storage } from "../../storage.ts";
@@ -22,6 +22,7 @@ import {
   type AttachV1ServerFrame,
 } from "./protocol-v1.ts";
 import { resolveAttachBearer } from "./token-auth.ts";
+import { emitTrace, traceId, type TraceLog } from "../../trace.ts";
 
 export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
@@ -69,6 +70,8 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #projectionRetryMs: number;
   readonly #projectionMaxAttempts: number;
   readonly #projectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #trace: TraceLog | undefined;
+  #lastHeartbeatAt: number | null = null;
 
   constructor(deps: {
     tokens: Map<string, string>;
@@ -80,6 +83,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     allowedCapabilities?: ReadonlyMap<string, ReadonlySet<AttachV1Capability>>;
     projectionRetryMs?: number;
     projectionMaxAttempts?: number;
+    trace?: TraceLog;
   }) {
     this.#tokens = deps.tokens;
     this.#storage = deps.storage;
@@ -90,6 +94,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#allowedCapabilities = deps.allowedCapabilities ?? new Map();
     this.#projectionRetryMs = deps.projectionRetryMs ?? 250;
     this.#projectionMaxAttempts = deps.projectionMaxAttempts ?? 8;
+    this.#trace = deps.trace;
     this.#wss = new WebSocketServer({ noServer: true });
     this.#wss.on("error", () => {});
     this.#wss.on("connection", (socket, req) => this.#onConnection(socket, req));
@@ -127,10 +132,11 @@ export class AttachV1Ingress implements TurnEndpoint {
     helloTimer.unref();
 
     socket.on("message", (data) => {
-      connection.lastSeenAt = this.#now();
+      const receivedAt = this.#now();
+      connection.lastSeenAt = receivedAt;
       if (connection.degraded && connection.hello) {
         connection.degraded = false;
-        this.#events.onPresence(agentId, "online");
+        this.#presence(agentId, "online");
       }
       let decoded: unknown;
       try { decoded = JSON.parse(String(data)); } catch { return; }
@@ -159,6 +165,7 @@ export class AttachV1Ingress implements TurnEndpoint {
         connection.maxInFlightEvents = Math.min(frame.limits?.maxInFlightEvents ?? ATTACH_V1_MAX_IN_FLIGHT_EVENTS, ATTACH_V1_MAX_IN_FLIGHT_EVENTS);
         connection.maxInFlightBytes = Math.min(frame.limits?.maxInFlightBytes ?? ATTACH_V1_MAX_IN_FLIGHT_BYTES, ATTACH_V1_MAX_IN_FLIGHT_BYTES);
         this.#current.set(agentId, connection);
+        this.#traceAttach("attach_hello", agentId, { commandCursor: connection.commandCursor, eventCursor: this.#storage.attachEventCursor(agentId) });
         this.#send(connection, {
           kind: "hello_ack", version: 1, agentId,
           capabilities: [...connection.capabilities],
@@ -166,13 +173,15 @@ export class AttachV1Ingress implements TurnEndpoint {
           limits: { maxInFlightEvents: connection.maxInFlightEvents, maxInFlightBytes: connection.maxInFlightBytes },
           heartbeatIntervalMs: this.#heartbeatIntervalMs,
         });
-        this.#events.onPresence(agentId, "online");
+        this.#presence(agentId, "online");
         this.#flush(agentId, connection.commandCursor);
         return;
       }
       if (frame.kind === "hello") return;
       if (frame.kind === "heartbeat") {
-        this.#send(connection, { kind: "heartbeat", sentAt: this.#now() });
+        // Gateway is the sole heartbeat initiator. The inbound frame is its one acknowledgement,
+        // not a request for another response; echoing it makes two healthy peers amplify heartbeats.
+        this.#lastHeartbeatAt = receivedAt;
         this.#flush(agentId, connection.commandCursor);
         return;
       }
@@ -182,6 +191,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           connection.sentCommands.delete(frame.sequence);
           connection.sentCommandBytes -= sent.bytes;
           connection.commandCursor = this.#storage.attachCommandCursor(agentId);
+          this.#traceAttach("attach_command_ack", agentId, { commandCursor: connection.commandCursor });
           this.#flush(agentId, connection.commandCursor);
         }
         return;
@@ -219,18 +229,20 @@ export class AttachV1Ingress implements TurnEndpoint {
       if (admission.status === "accepted") {
         this.#projectPending(agentId);
       }
+      this.#traceAttach("attach_event", agentId, { eventCursor: admission.acknowledgedSequence, outcome: admission.status });
       this.#send(connection, {
         kind: "ack", channel: "event", sequence: admission.acknowledgedSequence,
         id: frame.eventId, ...(admission.status === "duplicate" ? { duplicate: true } : {}),
       });
     });
 
-    socket.on("close", () => {
+    socket.on("close", (code) => {
       clearTimeout(helloTimer);
       if (this.#current.get(agentId) === connection) {
         this.#current.delete(agentId);
-        this.#events.onPresence(agentId, "absent");
+        this.#presence(agentId, "absent");
       }
+      this.#traceAttach("attach_close", agentId, { code, commandCursor: connection.commandCursor });
     });
   }
 
@@ -261,7 +273,7 @@ export class AttachV1Ingress implements TurnEndpoint {
         );
         if (cancelled === undefined) break;
         frame = cancelled;
-        this.#events.onPresence(agentId, "degraded");
+        this.#presence(agentId, "degraded");
       }
       const bytes = Buffer.byteLength(JSON.stringify(frame));
       if (connection.sentCommandBytes + bytes > connection.maxInFlightBytes) break;
@@ -292,6 +304,24 @@ export class AttachV1Ingress implements TurnEndpoint {
   isAttached(agentId: string): boolean {
     const current = this.#current.get(agentId);
     return current?.hello === true && current.socket.readyState === WebSocket.OPEN && !current.degraded;
+  }
+  health(): AttachHealthSummary {
+    let online = 0;
+    let degraded = 0;
+    for (const connection of this.#current.values()) {
+      if (!connection.hello || connection.socket.readyState !== WebSocket.OPEN) continue;
+      if (connection.degraded) degraded += 1;
+      else online += 1;
+    }
+    const durable = this.#storage.attachHealth();
+    return {
+      configured: this.#tokens.size,
+      online,
+      degraded,
+      absent: Math.max(0, this.#tokens.size - online - degraded),
+      lastHeartbeatAt: this.#lastHeartbeatAt,
+      ...durable,
+    };
   }
   sendTurn(agentId: string, frame: AttachTurnFrame): boolean {
     return this.#enqueue(agentId, { kind: "turn", threadId: frame.threadId, turnId: frame.turnId, messageId: `${frame.turnId}:user`, text: frame.text });
@@ -359,11 +389,13 @@ export class AttachV1Ingress implements TurnEndpoint {
       }
       if (projected) {
         this.#storage.markAttachEventApplied(agentId, frame.eventId, this.#now());
+        this.#traceAttach("attach_projection", agentId, { outcome: "applied" });
         continue;
       }
       const failure = this.#storage.recordAttachProjectionFailure(agentId, frame.eventId, error, this.#now(), this.#projectionMaxAttempts);
       if (failure.deadLettered) {
-        this.#events.onPresence(agentId, "degraded");
+        this.#presence(agentId, "degraded");
+        this.#traceAttach("attach_projection", agentId, { outcome: "dead_letter" });
         return;
       }
       const delay = Math.min(this.#projectionRetryMs * 2 ** Math.max(0, failure.attempts - 1), 30_000);
@@ -385,10 +417,25 @@ export class AttachV1Ingress implements TurnEndpoint {
         connection.socket.terminate();
       } else if (age >= this.#heartbeatIntervalMs * 2 && !connection.degraded) {
         connection.degraded = true;
-        this.#events.onPresence(agentId, "degraded");
+        this.#presence(agentId, "degraded");
       } else {
         this.#send(connection, { kind: "heartbeat", sentAt: now });
       }
+    }
+  }
+
+  #presence(agentId: string, state: "online" | "degraded" | "absent"): void {
+    this.#events.onPresence(agentId, state);
+    this.#traceAttach("attach_presence", agentId, { state });
+  }
+
+  #traceAttach(event: string, agentId: string, fields: Record<string, number | string> = {}): void {
+    if (this.#trace === undefined) return;
+    try {
+      const queue = this.#storage.attachQueueHealth(agentId, this.#now());
+      emitTrace(this.#trace, event, { profile: traceId(agentId), queueDepth: queue.depth, oldestQueueAgeMs: queue.oldestAgeMs, ...fields });
+    } catch {
+      emitTrace(this.#trace, event, { profile: traceId(agentId), ...fields });
     }
   }
 

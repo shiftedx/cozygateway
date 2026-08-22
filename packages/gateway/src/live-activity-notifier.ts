@@ -2,6 +2,7 @@ import type { ServerFrame } from "cozygateway-contract";
 
 import type { LiveActivityRegistrationRow, Storage } from "./storage.ts";
 import type { ChatMessagePushEvent } from "./push-notifier.ts";
+import { emitTrace, traceId, type TraceLog } from "./trace.ts";
 
 export const LIVE_ACTIVITY_TOOL_COALESCE_MS = 15_000;
 const LIVE_ACTIVITY_TIMEOUT_MS = 10_000;
@@ -23,6 +24,7 @@ export interface LiveActivityNotifierDeps {
   now?: () => number;
   toolCoalesceMs?: number;
   log?: (message: string) => void;
+  trace?: TraceLog;
 }
 
 /** Projects the already-redacted bot lifecycle into coarse ActivityKit state. No prompt, draft,
@@ -34,6 +36,7 @@ export class LiveActivityNotifier {
   readonly #now: () => number;
   readonly #toolCoalesceMs: number;
   readonly #log: (message: string) => void;
+  readonly #trace: TraceLog | undefined;
   readonly #lastProjection = new Map<string, Projection>();
   readonly #lastToolUpdate = new Map<string, number>();
   readonly #claimedActivities = new Set<string>();
@@ -46,6 +49,7 @@ export class LiveActivityNotifier {
     this.#now = deps.now ?? Date.now;
     this.#toolCoalesceMs = deps.toolCoalesceMs ?? LIVE_ACTIVITY_TOOL_COALESCE_MS;
     this.#log = deps.log ?? ((line) => process.stderr.write(`${line}\n`));
+    this.#trace = deps.trace;
   }
 
   handleFrame(frame: ServerFrame): void {
@@ -183,6 +187,11 @@ export class LiveActivityNotifier {
       body: JSON.stringify({ pushId: row.pushId, liveActivity }),
       signal: AbortSignal.timeout(LIVE_ACTIVITY_TIMEOUT_MS),
     }).then(async (response) => {
+      emitTrace(this.#trace, "relay_result", {
+        channel: "live_activity",
+        device: traceId(row.deviceId),
+        result: response.ok ? "ok" : response.status === 404 ? "not_found" : "http_error",
+      });
       if (response.status === 404 || terminal) {
         this.#storage.deleteLiveActivityRegistration(row.deviceId, row.activityId);
         this.#lastProjection.delete(key);
@@ -196,6 +205,11 @@ export class LiveActivityNotifier {
         ).catch(() => undefined);
       }
     }).catch((error: unknown) => {
+      emitTrace(this.#trace, "relay_result", {
+        channel: "live_activity",
+        device: traceId(row.deviceId),
+        result: "network_error",
+      });
       this.#log(`live activity ${row.activityId}: ${error instanceof Error ? error.message : String(error)}`);
     });
   }

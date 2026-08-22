@@ -44,6 +44,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     const dashboardSend = vi.fn();
     const frames: ServerFrame[] = [];
     const sent: Array<Record<string, unknown>> = [];
+    const traces: string[] = [];
     const control = {
       sendChatMessage: dashboardSend,
       chatHistory: vi.fn(async () => ({ sessionId: "dashboard-sage", adoption: "pin", messages: [], running: false, inflight: false, updatedAt: 1 })),
@@ -58,7 +59,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       sendApprovalResolution: () => true,
     } as unknown as AttachV1Ingress;
     let now = 100;
-    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["Sage"], chatSuggestion: "Say hello", broadcast: (frame) => frames.push(frame), now: () => now++ });
+    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["Sage"], chatSuggestion: "Say hello", broadcast: (frame) => frames.push(frame), now: () => now++, trace: (line) => traces.push(line) });
     const surface = plane.surface();
 
     expect(await surface.chatHistory("sage")).toMatchObject({ suggestion: "Say hello", messages: [] });
@@ -80,6 +81,14 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(frames.some((frame) => frame.type === "bot_chat_delta")).toBe(true);
     expect(frames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "answer-1"))).toBe(true);
     expect(frames.at(-1)).toMatchObject({ type: "bot_chat", bot: "sage" });
+    expect(traces.map((line) => JSON.parse(line))).toMatchObject([
+      { event: "native_turn_transition", status: "queued" },
+      { event: "native_turn_transition", status: "completed" },
+    ]);
+    expect(traces.join("\n")).not.toContain("hello");
+    expect(traces.join("\n")).not.toContain("answer-1");
+    expect([...new Set(traces.map((line) => JSON.parse(line).turn))]).toHaveLength(1);
+    expect(String(JSON.parse(traces[0] ?? "{}").turn)).toMatch(/^[0-9a-f]{16}$/);
     storage.close();
   });
 
@@ -151,6 +160,397 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(await surface.chatHistory("sage")).toMatchObject({ running: false });
     plane.close();
     storage.close();
+  });
+
+  it("returns durable tool history and seals a running tool when a turn commits", async () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        storage.enqueueAttachCommand(
+          bot,
+          `turn:${String(input.turnId)}`,
+          { kind: "turn", ...input } as never,
+          1,
+        );
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: (frame) => frames.push(frame),
+      now: () => now++,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "search");
+    const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "tool-running", event: {
+        kind: "tool", threadId: sent.sessionId, turnId, callId: "search-1", name: "search", status: "running",
+      },
+    })).toBe(true);
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 2, eventId: "tool-ok", event: {
+        kind: "tool", threadId: sent.sessionId, turnId, callId: "search-1", name: "search", status: "ok",
+      },
+    })).toBe(true);
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 3, eventId: "tool-still-running", event: {
+        kind: "tool", threadId: sent.sessionId, turnId, callId: "render-1", name: "render", status: "running",
+      },
+    })).toBe(true);
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 4, eventId: "commit", event: {
+        kind: "commit", threadId: sent.sessionId, turnId, messageId: "answer", blocks: [{ type: "paragraph", text: "done" }],
+      },
+    })).toBe(true);
+
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({
+      running: false,
+      toolSteps: [{ turnId, steps: [{ stepId: "search-1", status: "ok" }, { stepId: "render-1", status: "ok" }] }],
+    });
+    expect(frames.filter((frame) => frame.type === "bot_tool_activity").at(-1)).toMatchObject({
+      turnId, done: true, steps: [{ stepId: "search-1", status: "ok" }, { stepId: "render-1", status: "ok" }],
+    });
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({
+      phase: "complete", status: "completed", running: false, inflight: false,
+    });
+    plane.close();
+    storage.close();
+  });
+
+  it.each(["failed", "cancelled", "interrupted"] as const)(
+    "seals running tools as errors when attach reports %s",
+    async (kind) => {
+      const storage = openStorage(":memory:");
+      const frames: ServerFrame[] = [];
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {} as AttachV1Ingress,
+        nativeBots: ["sage"],
+        chatSuggestion: "",
+        broadcast: (frame) => frames.push(frame),
+        now: () => 100,
+      });
+      const chat = storage.nativeBotChat("sage", 1);
+      storage.enqueueAttachCommand("sage", "turn", {
+        kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+      } as never, 1);
+      storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+      expect(plane.handle("sage", {
+        kind: "event", sequence: 1, eventId: "tool", event: {
+          kind: "tool", threadId: chat.sessionId, turnId: "turn", callId: "call", name: "search", status: "running",
+        },
+      })).toBe(true);
+      expect(plane.handle("sage", {
+        kind: "event", sequence: 2, eventId: kind, event: {
+          kind, threadId: chat.sessionId, turnId: "turn", messageId: `${kind}-message`,
+        },
+      })).toBe(true);
+
+      expect(await plane.surface().chatHistory("sage")).toMatchObject({
+        running: false,
+        toolSteps: [{ turnId: "turn", steps: [{ stepId: "call", status: "error" }] }],
+      });
+      expect(frames.filter((frame) => frame.type === "bot_tool_activity").at(-1)).toMatchObject({
+        done: true, steps: [{ status: "error" }],
+      });
+      expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({
+        phase: "failed", status: kind === "failed" ? "failed" : "interrupted",
+        ...(kind === "cancelled" ? { cause: "cancelled" } : {}),
+        running: false, inflight: false,
+      });
+      plane.close();
+      storage.close();
+    },
+  );
+
+  it("reconstructs an active turn and its running tool after a gateway restart", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "native-tools-restart-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+    storage.upsertBotChatToolStep({
+      bot: "sage", sessionId: chat.sessionId, turnId: "turn", stepId: "call", seq: 1,
+      name: "search", status: "running", startedAt: 1, endedAt: undefined,
+    });
+    storage.close();
+
+    storage = openStorage(path);
+    const frames: ServerFrame[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: (frame) => frames.push(frame),
+      now: () => 100,
+    });
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({
+      running: true,
+      toolSteps: [{ turnId: "turn", steps: [{ stepId: "call", status: "running" }] }],
+    });
+    const interrupted: AttachV1EventFrame = {
+      kind: "event", sequence: 1, eventId: "interrupted", event: {
+        kind: "interrupted", threadId: chat.sessionId, turnId: "turn", messageId: "interrupted-message",
+      },
+    };
+    expect(storage.acceptAttachEvent("sage", interrupted, 100).status).toBe("accepted");
+    expect(plane.handle("sage", interrupted)).toBe(true);
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({
+      running: false,
+      toolSteps: [{ turnId: "turn", steps: [{ stepId: "call", status: "error" }] }],
+    });
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 2, eventId: "interrupted-duplicate", event: {
+        kind: "interrupted", threadId: chat.sessionId, turnId: "turn", messageId: "interrupted-message",
+      },
+    })).toBe(true);
+    expect(frames.filter((frame) => frame.type === "bot_tool_activity")).toHaveLength(1);
+    plane.close();
+    storage.close();
+
+    storage = openStorage(path);
+    const restarted = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 101,
+    });
+    expect(await restarted.surface().chatHistory("sage")).toMatchObject({
+      running: false,
+      status: "interrupted",
+      toolSteps: [{ turnId: "turn", steps: [{ stepId: "call", status: "error" }] }],
+    });
+    restarted.close();
+    storage.close();
+  });
+
+  it("does not report a stopped native turn when its interrupt cannot be queued", async () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: { sendNativeInterrupt: () => false } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 1,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+
+    await expect(plane.surface().stopChat("sage")).rejects.toBeInstanceOf(BackendUnavailable);
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({ running: true });
+    plane.close();
+    storage.close();
+  });
+
+  it("projects queued, execution, tool, input, connectivity-loss, and interrupted status", async () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    let attached = false;
+    let command: { sequence: number; commandId: string } | undefined;
+    const ingress = {
+      isAttached: () => attached,
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        const queued = storage.enqueueAttachCommand(
+          bot,
+          `turn:${String(input.turnId)}`,
+          { kind: "turn", ...input } as never,
+          10,
+        );
+        command = { sequence: queued.sequence, commandId: queued.commandId };
+        return true;
+      },
+      sendApprovalResolution: () => true,
+    } as unknown as AttachV1Ingress;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: (frame) => frames.push(frame),
+      now: () => 10,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "hello");
+    const turnId = storage.nativeBotChat("sage", 10).activeTurnId!;
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({
+      status: "queued", cause: "attach_absent", queuedAt: 10,
+    });
+
+    attached = true;
+    storage.ackAttachCommand("sage", command!.sequence, command!.commandId, 11);
+    plane.handleAttachPresence("sage", "online");
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({ status: "executing" });
+
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "tool", event: {
+        kind: "tool", threadId: sent.sessionId, turnId, callId: "call", name: "search", status: "running",
+      },
+    })).toBe(true);
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({ status: "using_tools" });
+
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 2, eventId: "approval", event: {
+        kind: "approval", threadId: sent.sessionId, turnId, approvalId: "approval", callId: "call", name: "search", status: "pending",
+      },
+    })).toBe(true);
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({ status: "awaiting_input" });
+
+    attached = false;
+    plane.handleAttachPresence("sage", "degraded");
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({
+      status: "awaiting_input", cause: "attach_degraded",
+    });
+    plane.handleAttachPresence("sage", "absent");
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({
+      status: "awaiting_input", cause: "attach_lost",
+    });
+
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 3, eventId: "interrupted", event: {
+        kind: "interrupted", threadId: sent.sessionId, turnId, messageId: "interrupted",
+      },
+    })).toBe(true);
+    expect(frames.filter((frame) => frame.type === "bot_chat_state").at(-1)).toMatchObject({
+      phase: "failed", status: "interrupted", running: false,
+    });
+    plane.close();
+    storage.close();
+  });
+
+  it("times out a durable queued turn at the existing gateway bound", async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = openStorage(":memory:");
+      let now = 0;
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {
+          sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+            storage.enqueueAttachCommand(bot, "turn", { kind: "turn", ...input } as never, now);
+            return true;
+          },
+        } as unknown as AttachV1Ingress,
+        nativeBots: ["sage"],
+        chatSuggestion: "",
+        broadcast: () => undefined,
+        now: () => now,
+        turnTimeoutMs: 50,
+      });
+      const sent = await plane.surface().sendChatMessage("sage", "offline");
+      const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+      now = 50;
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(storage.pendingAttachCommands("sage", 0, 1)[0]?.command).toMatchObject({ kind: "discard" });
+      expect(plane.handle("sage", {
+        kind: "event", sequence: 1, eventId: "late-commit", event: {
+          kind: "commit", threadId: sent.sessionId, turnId, messageId: "late", blocks: [{ type: "paragraph", text: "late" }],
+        },
+      })).toBe(true);
+      expect(await plane.surface().chatHistory("sage")).toMatchObject({
+        sessionId: sent.sessionId, running: false, status: "timed_out", messages: [{ text: "offline" }],
+      });
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("interrupts an acknowledged executing turn when the existing gateway bound expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = openStorage(":memory:");
+      let now = 0;
+      let command: { sequence: number; commandId: string } | undefined;
+      const interrupt = vi.fn(() => true);
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {
+          isAttached: () => true,
+          sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+            const queued = storage.enqueueAttachCommand(bot, "turn", { kind: "turn", ...input } as never, now);
+            command = { sequence: queued.sequence, commandId: queued.commandId };
+            return true;
+          },
+          sendNativeInterrupt: interrupt,
+        } as unknown as AttachV1Ingress,
+        nativeBots: ["sage"],
+        chatSuggestion: "",
+        broadcast: () => undefined,
+        now: () => now,
+        turnTimeoutMs: 50,
+      });
+      await plane.surface().sendChatMessage("sage", "running");
+      storage.ackAttachCommand("sage", command!.sequence, command!.commandId, 1);
+      now = 50;
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(interrupt).toHaveBeenCalledOnce();
+      expect(await plane.surface().chatHistory("sage")).toMatchObject({ running: false, status: "timed_out" });
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers the remaining durable queue deadline after a gateway restart", async () => {
+    vi.useFakeTimers();
+    try {
+      const path = join(mkdtempSync(join(tmpdir(), "native-timeout-restart-")), "gateway.sqlite");
+      let now = 0;
+      let storage = openStorage(path);
+      let plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {
+          sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+            storage.enqueueAttachCommand(bot, "turn", { kind: "turn", ...input } as never, now);
+            return true;
+          },
+        } as unknown as AttachV1Ingress,
+        nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined,
+        now: () => now, turnTimeoutMs: 50,
+      });
+      await plane.surface().sendChatMessage("sage", "restart");
+      plane.close();
+      storage.close();
+
+      now = 40;
+      storage = openStorage(path);
+      plane = new NativeBotDataPlane({
+        control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+        nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined,
+        now: () => now, turnTimeoutMs: 50,
+      });
+      now = 50;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(await plane.surface().chatHistory("sage")).toMatchObject({ running: false, status: "timed_out" });
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not persist text, photos, or media when attach admission fails", async () => {
