@@ -11,7 +11,7 @@ import {
 } from "../src/hermes-bridge/routines.ts";
 
 describe("bot routines", () => {
-  it("exposes only jobs in the current tagged namespace", async () => {
+  it("exposes tagged routines and existing cron jobs from the bot's profile", async () => {
     const calls: Array<{ method: string; params: unknown }> = [];
     const rpc = {
       request: async (method: string, params: unknown) => {
@@ -21,6 +21,7 @@ describe("bot routines", () => {
             { job_id: "mine", name: "[bot:scout] Morning digest", schedule: "every 60m", enabled: true },
             { job_id: "theirs", name: "[bot:pip] Private", schedule: "every 60m", enabled: true },
             { job_id: "old", name: "nightly backup", schedule: "0 3 * * *", enabled: true },
+            { job_id: "broken-tag", name: "[bot:scout]broken] Private", schedule: "every 60m", enabled: true },
           ],
         };
       },
@@ -29,6 +30,7 @@ describe("bot routines", () => {
     await expect(listBotRoutines(rpc, "scout")).resolves.toEqual({
       routines: [
         expect.objectContaining({ id: "mine", title: "Morning digest", schedule: { raw: "every 60m", human: "Hourly" } }),
+        expect.objectContaining({ id: "old", title: "nightly backup", schedule: { raw: "0 3 * * *" } }),
       ],
     });
     expect(calls).toEqual([{ method: "cron.manage", params: { action: "list", include_disabled: true, profile: "scout" } }]);
@@ -51,7 +53,7 @@ describe("bot routines", () => {
       lastRun: null,
       nextRun: null,
     });
-    expect(selectRoutineJobs([{ name: "[bot:scout] Mine" }, { name: "unowned" }], "scout")).toHaveLength(1);
+    expect(selectRoutineJobs([{ name: "[bot:scout] Mine" }, { name: "existing cron" }], "scout")).toHaveLength(2);
     expect(patchNeedsRewrite({ enabled: false })).toBe(false);
     expect(patchNeedsRewrite({ title: "Renamed" })).toBe(true);
   });
