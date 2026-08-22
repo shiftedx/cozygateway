@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
@@ -11,6 +12,7 @@ import {
 
 import type { Storage } from "./storage.ts";
 import { hashToken } from "./auth.ts";
+import { emitTrace, traceId, type TraceLog } from "./trace.ts";
 
 interface Client {
   socket: WebSocket;
@@ -32,6 +34,7 @@ export class WsHub {
   // first socket's close.
   readonly #deviceCounts = new Map<string, number>();
   readonly #wss: WebSocketServer;
+  readonly #trace: TraceLog | undefined;
 
   constructor(deps: {
     storage: Storage;
@@ -39,11 +42,13 @@ export class WsHub {
     now: () => number;
     authTimeoutMs?: number;
     heartbeatMs?: number;
+    trace?: TraceLog;
   }) {
     this.#storage = deps.storage;
     this.#gatewayInfo = deps.gatewayInfo;
     this.#now = deps.now;
     this.#authTimeoutMs = deps.authTimeoutMs ?? 10_000;
+    this.#trace = deps.trace;
     const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_MS;
     // noServer: true means this WebSocketServer never attaches its own 'upgrade' listener; the
     // caller routes matching requests to handleUpgrade() below. See upgrade-dispatcher.ts.
@@ -67,6 +72,8 @@ export class WsHub {
 
   #onConnection(socket: WebSocket): void {
     let client: Client | undefined;
+    const connection = traceId(randomUUID());
+    emitTrace(this.#trace, "app_ws_open", { connection });
     // A ws socket with no 'error' listener crashes the process on the first socket error.
     socket.on("error", () => {
       try {
@@ -110,6 +117,7 @@ export class WsHub {
         clearTimeout(authTimer);
         this.#storage.touchDevice(device.id, this.#now());
         client = { socket, deviceId: device.id, heartbeatAlive: true };
+        emitTrace(this.#trace, "app_ws_auth", { connection, device: traceId(device.id) });
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
         this.#send(socket, { type: "ready", deviceId: device.id, gateway: this.#gatewayInfo });
@@ -127,6 +135,7 @@ export class WsHub {
           this.#send(socket, { type: "committed", threadId, seq: message.seq, message });
         }
       }
+      emitTrace(this.#trace, "app_ws_sync", { connection, device: traceId(client.deviceId), threadCount: Object.keys(frame.threads).length });
       this.#send(socket, { type: "synced" });
     });
 
@@ -134,12 +143,13 @@ export class WsHub {
       if (client !== undefined) client.heartbeatAlive = true;
     });
 
-    socket.on("close", () => {
+    socket.on("close", (code) => {
       clearTimeout(authTimer);
       if (client !== undefined) {
         this.#clients.delete(client);
         this.#releaseDevice(client.deviceId);
       }
+      emitTrace(this.#trace, "app_ws_close", { connection, device: client === undefined ? null : traceId(client.deviceId), code });
     });
   }
 

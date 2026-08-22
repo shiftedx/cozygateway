@@ -104,6 +104,15 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([turn.text for turn in self.turns], ["hi"])
         self.assertTrue(self.socket.sent[-1]["duplicate"])
 
+    async def test_acknowledges_each_gateway_heartbeat_once(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "heartbeat", "sentAt": 10}))
+        await self.client._dispatch_inbound(json.dumps({"kind": "heartbeat", "sentAt": 20}))
+        self.assertEqual(self.socket.sent[-2:], [
+            {"kind": "heartbeat", "sentAt": 10},
+            {"kind": "heartbeat", "sentAt": 20},
+        ])
+
     async def test_discard_advances_sequence_without_executing_unsupported_action(self):
         approvals = []
         self.client._config.on_approval = approvals.append

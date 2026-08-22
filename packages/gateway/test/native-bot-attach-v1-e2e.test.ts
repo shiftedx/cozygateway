@@ -67,8 +67,9 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     await until(() => clientFrames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "native-answer")));
 
     const historyResponse = await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } });
-    const history = (await historyResponse.json()) as { messages: BotChatMessage[] };
+    const history = (await historyResponse.json()) as { messages: BotChatMessage[]; status?: string };
     expect(history.messages.map((message) => [message.role, message.text])).toEqual([["user", "hello native"], ["assistant", "native answer"]]);
+    expect(history.status).toBe("completed");
 
     const rosterResponse = await fetch(`${gateway.url}/bots`, { headers: { authorization: `Bearer ${deviceToken}` } });
     const roster = (await rosterResponse.json()) as { bots: Array<{ name: string; chatSessionId: string | null; preview: { kind: string; text: string }; lastActiveAt: number | null }> };

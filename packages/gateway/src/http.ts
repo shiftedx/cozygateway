@@ -7,6 +7,7 @@ import {
   type ErrorBody,
   type ErrorCode,
   type GatewayInfo,
+  type AttachHealthSummary,
   type Message,
   type PresenceState,
   type RichBlock,
@@ -114,6 +115,8 @@ export interface AppDeps {
   pushRelayFetch?: typeof fetch;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
+  /** Synchronous, aggregate attach-v1 state for operator health routes only. */
+  attachHealth?: () => AttachHealthSummary;
   presenceOf: (agentId: string) => PresenceState;
   submitUserMessage: (threadId: string, blocks: RichBlock[]) => Message;
   interruptThread: (threadId: string) => "interrupting" | "idle";
@@ -206,11 +209,12 @@ export function createApp(deps: AppDeps): Hono<Env> {
   // every call instead: it is the whole point of issue #63 that a monitor polling this route sees
   // the hermes link's CURRENT liveness, not whatever was true when the process started.
   app.get("/health", (c) =>
-    c.json(
-      deps.bots === undefined
+    c.json({
+      ...(deps.bots === undefined
         ? deps.gatewayInfo
-        : { ...deps.gatewayInfo, bridges: { hermes: deps.bots.health() } },
-    ),
+        : { ...deps.gatewayInfo, bridges: { hermes: deps.bots.health() } }),
+      ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }),
+    }),
   );
 
   // Readiness (follow-up to issue #63, tracked separately): `/health` answers "is the process
@@ -224,10 +228,10 @@ export function createApp(deps: AppDeps): Hono<Env> {
   // request, for the same reason `/health` does not: a readiness probe that has to make its own
   // network call to answer is itself a new way to go dark.
   app.get("/ready", (c) => {
-    if (deps.bots === undefined) return c.json({ ready: true });
+    if (deps.bots === undefined) return c.json({ ready: true, ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }) });
     const bridges = { hermes: deps.bots.health() };
     const allOnline = Object.values(bridges).every((bridge) => bridge.online);
-    return c.json({ ready: allOnline, bridges }, allOnline ? 200 : 503);
+    return c.json({ ready: allOnline, bridges, ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }) }, allOnline ? 200 : 503);
   });
 
   app.post("/pair", async (c) => {

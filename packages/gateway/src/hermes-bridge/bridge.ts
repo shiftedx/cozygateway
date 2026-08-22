@@ -1,6 +1,8 @@
 import type {
   BotCatalog,
   BotChatMessage,
+  BotChatStateCause,
+  BotChatStatus,
   BotGroup,
   BotGroupDetail,
   BotGroupMessage,
@@ -134,6 +136,10 @@ export interface BotChatHistory {
   messages: BotChatMessage[];
   running: boolean;
   inflight: boolean;
+  /** Capability 23 exact turn status. Absent only when this session has never run a turn. */
+  status?: BotChatStatus;
+  cause?: BotChatStateCause;
+  queuedAt?: number;
   toolSteps?: BotTurnToolSteps[];
   updatedAt: number;
   suggestion?: string;

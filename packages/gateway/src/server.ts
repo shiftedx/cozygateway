@@ -41,8 +41,9 @@ import { parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { resolveTlsMaterial } from "./tls.ts";
+import type { TraceLog } from "./trace.ts";
 
-export const GATEWAY_VERSION = "0.2.0";
+export const GATEWAY_VERSION = "0.2.1";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -74,6 +75,8 @@ export interface StartGatewayOptions {
    *  toolCallId, outcome, and deciding device, and never the approval's argument summary. Exists
    *  so a test can read the audit trail without scraping real stderr. */
   approvalLog?: (message: string) => void;
+  /** JSON-line, privacy-safe transport transition diagnostics. */
+  traceLog?: TraceLog;
 }
 
 /** The assembly seam between Hermes' settled-chat event and the relay notifier. Kept pure so the
@@ -115,6 +118,9 @@ export async function startGateway(
   config: GatewayConfig,
   options: StartGatewayOptions = {},
 ): Promise<RunningGateway> {
+  // Transition records deliberately have a useful production default. They remain injectable so
+  // embedded hosts and tests can collect them without intercepting stderr.
+  const traceLog = options.traceLog ?? ((line: string) => process.stderr.write(`${line}\n`));
   // First thing, before the database is opened or a single socket is dialed: if the operator asked
   // for TLS, prove the pair is usable. Absent config resolves to undefined and every line below
   // behaves exactly as it did before TLS existed. Present-but-broken throws here, so the failure is
@@ -141,7 +147,7 @@ export async function startGateway(
   // present. Each integer version advances independently of the frozen contract literal.
   const hermesOptions = parseHermesOptions(config.hermes, process.env);
   const gatewayInfo = gatewayInfoForConfig(config);
-  const hub = new WsHub({ storage, gatewayInfo, now: () => Date.now() });
+  const hub = new WsHub({ storage, gatewayInfo, now: () => Date.now(), trace: traceLog });
 
   // Dial-out JSON-RPC client to the Hermes gateway plus the cache/refresh/focus machinery on top
   // of it. Credential resolution already happened above, before the port is bound, so a
@@ -209,6 +215,7 @@ export async function startGateway(
     tokens: attachTokens,
     storage,
     allowedCapabilities,
+    trace: traceLog,
     events: {
       canAcceptEvent: (agentId, frame) => {
         if (bridge.canAcceptGroupAttachEvent(agentId, frame)) return true;
@@ -228,12 +235,14 @@ export async function startGateway(
           return true;
         return nativeSink?.handle(agentId, frame) ?? false;
       },
-      onPresence: (agentId, state) =>
+      onPresence: (agentId, state) => {
         hub.broadcast({
           type: "presence",
           agentId,
           state: state === "online" ? "online" : "absent",
-        }),
+        });
+        nativeBotPlane?.handleAttachPresence(agentId, state);
+      },
     },
   });
   const attachEndpoint: TurnEndpoint = {
@@ -268,6 +277,7 @@ export async function startGateway(
       ? {}
       : { relayBaseUrl: config.pushRelayUrl }),
     log: options.notifierLog,
+    trace: traceLog,
     isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
   });
   const liveActivityNotifier = new LiveActivityNotifier({
@@ -276,6 +286,7 @@ export async function startGateway(
       ? {}
       : { relayBaseUrl: config.pushRelayUrl }),
     log: options.notifierLog,
+    trace: traceLog,
   });
   raiseLiveActivityFrame = (frame) => liveActivityNotifier.handleFrame(frame);
   // Same targeting rule a 1:1 turn gets: a device holding a live socket saw the room's frame and is
@@ -294,6 +305,7 @@ export async function startGateway(
     ingress: attachV1Ingress,
     nativeBots: nativeBotEntries.map(([bot]) => bot),
     chatSuggestion: hermesOptions.chatSuggestion,
+    turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     broadcast: (frame) => {
       hub.broadcast(frame);
       raiseLiveActivityFrame(frame);
@@ -321,6 +333,7 @@ export async function startGateway(
       );
     },
     now: () => Date.now(),
+    trace: traceLog,
   });
   botsSurface = nativeBotPlane.surface();
   nativeSink = new AttachNativeSink({
@@ -351,6 +364,7 @@ export async function startGateway(
     storage,
     config,
     gatewayInfo,
+    attachHealth: () => attachV1Ingress.health(),
     bots: botsSurface,
     attachTokens,
     attachMediaAllowed: (agentId: string) =>

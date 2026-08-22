@@ -14,9 +14,11 @@ let storage: Storage;
 let server: ReturnType<typeof createServer>;
 let port: number;
 let token: string;
+let traces: string[];
 
 beforeEach(async () => {
   storage = openStorage(":memory:");
+  traces = [];
   const minted = mintDeviceToken();
   token = minted.token;
   storage.createDevice({ id: "d1", name: "phone", tokenHash: minted.tokenHash, createdAt: 1 });
@@ -28,6 +30,7 @@ beforeEach(async () => {
     now: () => 1_000,
     authTimeoutMs: 200,
     heartbeatMs: 25,
+    trace: (line) => traces.push(line),
   });
   server = createServer();
   server.on("upgrade", (req, socket, head) => hub.handleUpgrade(req, socket, head));
@@ -63,6 +66,26 @@ async function until(predicate: () => boolean, ms = 2_000): Promise<void> {
 }
 
 describe("auth", () => {
+  it("traces connection lifecycle without raw device IDs or tokens", async () => {
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((frame) => frame.type === "ready"));
+    ws.send(JSON.stringify({ type: "sync", threads: { t1: 0 } }));
+    await until(() => seen.some((frame) => frame.type === "synced"));
+    ws.close();
+    await once(ws, "close");
+    await until(() => traces.some((line) => JSON.parse(line).event === "app_ws_close"));
+
+    const records = traces.map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records.map((record) => record.event)).toEqual(["app_ws_open", "app_ws_auth", "app_ws_sync", "app_ws_close"]);
+    expect(records.at(-1)?.code).toBe(1005);
+    expect(traces.join("\n")).not.toContain(token);
+    expect(traces.join("\n")).not.toContain('"d1"');
+    expect(String(records[1]?.device)).toMatch(/^[0-9a-f]{16}$/);
+  });
+
   it("ready on a good token", async () => {
     const ws = connect();
     const seen = frames(ws);

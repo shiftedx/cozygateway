@@ -285,6 +285,19 @@ CREATE TABLE IF NOT EXISTS bot_native_interactions (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (bot, kind, interaction_id)
 ) STRICT, WITHOUT ROWID;
+-- Gateway-originated terminal truth complements attach's terminal journal: the wall-clock bound
+-- can settle a durable queued turn before any plugin event exists.
+CREATE TABLE IF NOT EXISTS bot_native_turn_terminals (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  cause TEXT,
+  completed_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, turn_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_native_turn_terminals_session
+  ON bot_native_turn_terminals (bot, session_id, completed_at DESC);
 `;
 
 export interface DeviceRow {
@@ -1298,6 +1311,41 @@ export class Storage {
     return row?.sequence ?? 0;
   }
 
+  /** Durable attach-v1 observability with no frame payloads or identity details. */
+  attachHealth(): {
+    lastEventAt: number | null;
+    lastTerminalAt: number | null;
+    queueDepth: number;
+    deadLetters: number;
+  } {
+    return this.#db.prepare(
+      `SELECT
+         (SELECT MAX(received_at) FROM attach_event_inbox) AS lastEventAt,
+         (SELECT MAX(at) FROM (
+            SELECT inbox.received_at AS at
+              FROM attach_turn_terminals AS terminal
+              JOIN attach_event_inbox AS inbox
+                ON inbox.agent_id = terminal.agent_id AND inbox.event_id = terminal.event_id
+            UNION ALL SELECT completed_at AS at FROM bot_native_turn_terminals
+          )) AS lastTerminalAt,
+         (SELECT COUNT(*) FROM attach_command_outbox WHERE acked_at IS NULL) AS queueDepth,
+         (SELECT COUNT(*) FROM attach_event_inbox WHERE dead_lettered_at IS NOT NULL) AS deadLetters`,
+    ).get() as {
+      lastEventAt: number | null;
+      lastTerminalAt: number | null;
+      queueDepth: number;
+      deadLetters: number;
+    };
+  }
+
+  attachQueueHealth(agentId: string, now: number): { depth: number; oldestAgeMs: number } {
+    const row = this.#db.prepare(
+      `SELECT COUNT(*) AS depth, MIN(created_at) AS oldestAt
+       FROM attach_command_outbox WHERE agent_id = ? AND acked_at IS NULL`,
+    ).get(agentId) as { depth: number; oldestAt: number | null };
+    return { depth: row.depth, oldestAgeMs: row.oldestAt === null ? 0 : Math.max(0, now - row.oldestAt) };
+  }
+
   /** Inbox admission is the ACK boundary. Sequence must be contiguous; duplicates by eventId are
    * harmless; and a terminal transition seals its turn so a late draft is journaled/ACKed but never
    * applied. */
@@ -1483,6 +1531,88 @@ export class Storage {
     return undefined;
   }
 
+  /** Durable delivery evidence for one native turn. ACK proves the plugin accepted the command;
+   * absent ACK keeps the user-visible state queued without inventing a timeout. */
+  nativeBotTurnDelivery(agentId: string, turnId: string): {
+    sequence: number;
+    commandId: string;
+    queuedAt: number;
+    acknowledgedAt: number | null;
+  } | undefined {
+    return this.#db
+      .prepare(
+        `SELECT sequence, command_id AS commandId, created_at AS queuedAt, acked_at AS acknowledgedAt
+         FROM attach_command_outbox
+         WHERE agent_id = ? AND cancelled_at IS NULL
+           AND json_extract(command_json, '$.kind') = 'turn'
+           AND json_extract(command_json, '$.turnId') = ?
+         ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(agentId, turnId) as {
+      sequence: number;
+      commandId: string;
+      queuedAt: number;
+      acknowledgedAt: number | null;
+    } | undefined;
+  }
+
+  recordNativeBotTerminal(input: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    status: "completed" | "failed" | "interrupted" | "timed_out";
+    cause?: "cancelled";
+    completedAt: number;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_turn_terminals
+           (bot, session_id, turn_id, status, cause, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot, turn_id) DO NOTHING`,
+      )
+      .run(
+        input.bot,
+        input.sessionId,
+        input.turnId,
+        input.status,
+        input.cause ?? null,
+        input.completedAt,
+      );
+  }
+
+  nativeBotTurnTerminal(bot: string, sessionId: string, turnId: string): boolean {
+    return this.#db
+      .prepare(
+        `SELECT 1 FROM bot_native_turn_terminals
+         WHERE bot = ? AND session_id = ? AND turn_id = ?`,
+      )
+      .get(bot, sessionId, turnId) !== undefined;
+  }
+
+  /** Last durable terminal for a native session, including a gateway deadline before any plugin
+   * event exists. */
+  nativeBotLastTerminal(agentId: string, sessionId: string): {
+    status: "completed" | "failed" | "interrupted" | "timed_out";
+    cause?: "cancelled";
+  } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT status, cause FROM bot_native_turn_terminals
+         WHERE bot = ? AND session_id = ? ORDER BY completed_at DESC LIMIT 1`,
+      )
+      .get(agentId, sessionId) as {
+      status: "completed" | "failed" | "interrupted" | "timed_out";
+      cause: "cancelled" | null;
+    } | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          status: row.status,
+          ...(row.cause === null ? {} : { cause: row.cause }),
+        };
+  }
+
   attachScheduledDelivery(agentId: string, deliveryId: string): { threadId: string; messageId: string; projectedAt: number | null } | undefined {
     return this.#db
       .prepare(
@@ -1553,7 +1683,15 @@ export class Storage {
     }
     const session = this.#db
       .prepare("SELECT active_turn_id AS activeTurnId FROM bot_native_sessions WHERE bot = ? AND session_id = ?")
-      .get(bot, selected.sessionId) as { activeTurnId: string | null };
+      .get(bot, selected.sessionId) as { activeTurnId: string | null } | undefined;
+    if (session === undefined) {
+      // A pre-session-table database (or a manually damaged pointer) still has authoritative
+      // selection and turn state in bot_native_chats. Restore that missing companion row.
+      this.#db
+        .prepare("INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, ?)")
+        .run(bot, selected.sessionId, selected.updatedAt, selected.updatedAt, selected.activeTurnId);
+      return { sessionId: selected.sessionId, created: false, ...(selected.activeTurnId === null ? {} : { activeTurnId: selected.activeTurnId }) };
+    }
     return { sessionId: selected.sessionId, created: false, ...(session.activeTurnId === null ? {} : { activeTurnId: session.activeTurnId }) };
   }
 
@@ -1809,6 +1947,19 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // v0.1 stored only a selected native-chat pointer and transcript rows. v0.2 split sessions
+  // into their own table; recreate every existing session without changing populated new rows.
+  db.exec(`
+    WITH legacy_sessions AS (
+      SELECT bot, session_id, updated_at AS created_at, updated_at, active_turn_id FROM bot_native_chats
+      UNION ALL
+      SELECT bot, session_id, COALESCE(MIN(at), 0), COALESCE(MAX(at), 0), NULL
+      FROM bot_native_messages GROUP BY bot, session_id
+    )
+    INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id)
+    SELECT bot, session_id, MIN(created_at), MAX(updated_at), MAX(active_turn_id)
+    FROM legacy_sessions GROUP BY bot, session_id
+  `);
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL");
   return new Storage(db);
 }

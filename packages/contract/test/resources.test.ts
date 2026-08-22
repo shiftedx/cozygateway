@@ -109,6 +109,17 @@ describe("resource schemas", () => {
       ).toBe(false);
     });
   });
+
+  it("accepts the non-secret aggregate attach health summary", () => {
+    expect(check(GatewayInfoSchema, {
+      name: "g", version: "1.0.0", contract: "v1",
+      attach: {
+        configured: 6, online: 4, degraded: 1, absent: 1,
+        lastHeartbeatAt: 1, lastEventAt: 2, lastTerminalAt: null,
+        queueDepth: 3, deadLetters: 0,
+      },
+    })).toBe(true);
+  });
 });
 
 describe("contract v1.x additive message fields", () => {

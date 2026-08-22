@@ -101,6 +101,21 @@ export const BridgeLivenessSchema = Type.Object({
 });
 export type BridgeLiveness = Static<typeof BridgeLivenessSchema>;
 
+/** Aggregate attach-v1 transport health. It intentionally contains no profile, connection, or
+ * transcript identifiers: operators need fleet state and durable backlog, not chat metadata. */
+export const AttachHealthSummarySchema = Type.Object({
+  configured: Type.Integer({ minimum: 0 }),
+  online: Type.Integer({ minimum: 0 }),
+  degraded: Type.Integer({ minimum: 0 }),
+  absent: Type.Integer({ minimum: 0 }),
+  lastHeartbeatAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  lastEventAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  lastTerminalAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  queueDepth: Type.Integer({ minimum: 0 }),
+  deadLetters: Type.Integer({ minimum: 0 }),
+});
+export type AttachHealthSummary = Static<typeof AttachHealthSummarySchema>;
+
 /** `capabilities` maps a capability id to its integer version. Optional: absent on gateways
  *  that predate this field, and a receiver must tolerate both that absence and ids it does not
  *  recognize. Ids under `com.cozylabs.*` are vendor extensions, documented and versioned
@@ -117,6 +132,7 @@ export const GatewayInfoSchema = Type.Object({
   contract: Type.Literal("v1"),
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
   bridges: Type.Optional(Type.Record(Type.String(), BridgeLivenessSchema)),
+  attach: Type.Optional(AttachHealthSummarySchema),
 });
 export type GatewayInfo = Static<typeof GatewayInfoSchema>;
 

@@ -176,10 +176,18 @@ describe("RelayNotifier", () => {
     for (const outcome of [429, 500, "reject"] as const) {
       const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://r.test", pushKey: "k" }]);
       const { impl } = fetchStub(() => outcome);
-      const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {} });
-      expect(() => notifier.notify({ threadId: "t", agentName: "A", preview: "p" }, new Set())).not.toThrow();
+      const traces: string[] = [];
+      const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {}, trace: (line) => traces.push(line) });
+      expect(() => notifier.notify({ threadId: "secret-thread", agentName: "A", preview: "secret preview" }, new Set())).not.toThrow();
       await settle();
       expect(storage.pushRegistrations()).toHaveLength(1);
+      expect(JSON.parse(traces[0] ?? "{}")).toMatchObject({
+        event: "relay_result",
+        result: outcome === "reject" ? "network_error" : "http_error",
+      });
+      expect(traces.join("\n")).not.toContain("secret");
+      expect(traces.join("\n")).not.toContain('"p1"');
+      expect(String(JSON.parse(traces[0] ?? "{}").device)).toMatch(/^[0-9a-f]{16}$/);
       storage.close();
     }
   });

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
@@ -89,6 +90,65 @@ describe("attach-v1 durable transport storage", () => {
     expect(storage.attachScheduledDelivery("sage", first.event.deliveryId)).toMatchObject({ threadId: "home", messageId: "daily:2026-08-21", projectedAt: null });
     storage.markAttachEventApplied("sage", first.eventId, 4);
     expect(storage.attachScheduledDelivery("sage", first.event.deliveryId)?.projectedAt).toBe(4);
+    storage.close();
+  });
+
+  it("summarizes durable attach backlog, event, terminal, and dead-letter state without frames", () => {
+    const storage = openStorage(":memory:");
+    storage.enqueueAttachCommand("sage", "queued", { kind: "interrupt", threadId: "t", turnId: "u" }, 1);
+    const draft = { kind: "event" as const, sequence: 1, eventId: "draft", event: { kind: "draft" as const, threadId: "t", turnId: "u", blocks: [] } };
+    const commit = { kind: "event" as const, sequence: 2, eventId: "commit", event: { kind: "commit" as const, threadId: "t", turnId: "u", messageId: "m", blocks: [] } };
+    storage.acceptAttachEvent("sage", draft, 10);
+    storage.acceptAttachEvent("sage", commit, 20);
+    storage.recordAttachProjectionFailure("sage", "draft", "projection failed", 30, 1);
+    storage.recordNativeBotTerminal({ bot: "sage", sessionId: "t", turnId: "queued-timeout", status: "timed_out", completedAt: 40 });
+    expect(storage.attachHealth()).toEqual({ lastEventAt: 20, lastTerminalAt: 40, queueDepth: 1, deadLetters: 1 });
+    storage.close();
+  });
+
+  it("repairs the deployed native-chat schema without changing its selected session or transcript", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-v1-legacy-native-")), "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE bot_native_chats (
+        bot TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        active_turn_id TEXT,
+        updated_at INTEGER NOT NULL
+      ) STRICT;
+      CREATE TABLE bot_native_messages (
+        bot TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        message_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        text TEXT NOT NULL,
+        at INTEGER,
+        client_id TEXT,
+        attachments_json TEXT,
+        PRIMARY KEY (bot, session_id, seq),
+        UNIQUE (bot, message_id)
+      ) STRICT, WITHOUT ROWID;
+    `);
+    legacy.prepare("INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, ?, ?)").run("sage", "selected", "turn-1", 40);
+    legacy.prepare("INSERT INTO bot_native_messages (bot, session_id, seq, message_id, role, text, at) VALUES (?, ?, ?, ?, ?, ?, ?)").run("sage", "selected", 1, "m1", "user", "kept", 20);
+    legacy.prepare("INSERT INTO bot_native_messages (bot, session_id, seq, message_id, role, text, at) VALUES (?, ?, ?, ?, ?, ?, ?)").run("sage", "older", 1, "m2", "assistant", "also kept", 10);
+    legacy.close();
+
+    let storage = openStorage(path);
+    expect(storage.nativeBotChat("sage", 50)).toEqual({ sessionId: "selected", created: false, activeTurnId: "turn-1" });
+    expect(storage.nativeBotMessages("sage", "selected").map((message) => message.text)).toEqual(["kept"]);
+    expect(storage.nativeBotSessions("sage", 10).map((session) => session.id).sort()).toEqual(["older", "selected"]);
+
+    const corruption = new DatabaseSync(path);
+    corruption.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run("sage", "selected");
+    corruption.close();
+    expect(storage.nativeBotChat("sage", 55)).toEqual({ sessionId: "selected", created: false, activeTurnId: "turn-1" });
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.nativeBotChat("sage", 60)).toEqual({ sessionId: "selected", created: false, activeTurnId: "turn-1" });
+    expect(storage.nativeBotSessions("sage", 10).map((session) => session.id).sort()).toEqual(["older", "selected"]);
     storage.close();
   });
 });

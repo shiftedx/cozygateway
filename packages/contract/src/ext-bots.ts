@@ -157,8 +157,32 @@ export const BotChatFrameSchema = Type.Object({
 });
 export type BotChatFrame = Static<typeof BotChatFrameSchema>;
 
+/** Capability 23's exact app-facing native-turn status. `queued` means the command is durably in
+ * the attach outbox; `connectivity_lost` keeps that same durable command for replay. */
+export const BotChatStatusSchema = Type.Union([
+  Type.Literal("queued"),
+  Type.Literal("executing"),
+  Type.Literal("using_tools"),
+  Type.Literal("awaiting_input"),
+  Type.Literal("completed"),
+  Type.Literal("failed"),
+  Type.Literal("interrupted"),
+  Type.Literal("timed_out"),
+  Type.Literal("connectivity_lost"),
+]);
+export type BotChatStatus = Static<typeof BotChatStatusSchema>;
+
+export const BotChatStateCauseSchema = Type.Union([
+  Type.Literal("attach_absent"),
+  Type.Literal("attach_degraded"),
+  Type.Literal("attach_lost"),
+  Type.Literal("cancelled"),
+]);
+export type BotChatStateCause = Static<typeof BotChatStateCauseSchema>;
+
 /** How a bot's native canonical chat is doing right now. `phase`, `running`, and `inflight` are the
- *  gateway's durable attach-v1 turn projection, not Dashboard session flags. */
+ * gateway's durable attach-v1 turn projection, not Dashboard session flags. `status`, `cause`, and
+ * `queuedAt` are capability-23 additions; clients below 23 retain the legacy phase behavior. */
 export const BotChatStateFrameSchema = Type.Object({
   type: Type.Literal("bot_chat_state"),
   bot: Type.String(),
@@ -173,6 +197,11 @@ export const BotChatStateFrameSchema = Type.Object({
   ]),
   running: Type.Boolean(),
   inflight: Type.Boolean(),
+  status: Type.Optional(BotChatStatusSchema),
+  cause: Type.Optional(BotChatStateCauseSchema),
+  /** Gateway-clock time when an offline command entered the durable outbox. The existing gateway
+   * turn-timeout bound applies from this instant, then the command is discarded or interrupted. */
+  queuedAt: Type.Optional(Type.Integer()),
   updatedAt: Type.Integer(),
 });
 export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;
@@ -984,6 +1013,7 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    `detail` and error-only `errorText`; raw argument and result objects never cross the bridge.
  *  - `22`: NATIVE CLARIFICATION. Adds `bot_clarify_pending` / `bot_clarify_resolved` and the
  *    authenticated option-resolution route. Pending/options/expiry are durable and stable-id
- *    idempotent across gateway/plugin restart. */
+ *    idempotent across gateway/plugin restart.
+ *  - `23`: exact native turn status/cause and durable queued-at recovery metadata. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 22;
+export const BOTS_CAPABILITY_VERSION = 23;
