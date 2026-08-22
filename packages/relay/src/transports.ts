@@ -39,6 +39,7 @@ export interface PushDeliveryOptions {
     };
     staleDate?: number;
     dismissalDate?: number;
+    alert?: { title: string; body: string; sound: "default" };
     priority: 5 | 10;
   };
 }

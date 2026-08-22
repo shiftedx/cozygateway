@@ -78,8 +78,12 @@ export interface StartGatewayOptions {
 export function createChatMessagePushHandler(
   notifier: Pick<RelayNotifier, "notifyChatMessage">,
   connectedDeviceIds: () => ReadonlySet<string>,
+  liveActivityDeviceIds: (event: ChatMessagePushEvent) => ReadonlySet<string> = () => new Set(),
 ): (event: ChatMessagePushEvent) => void {
-  return (event) => notifier.notifyChatMessage(event, connectedDeviceIds());
+  return (event) => notifier.notifyChatMessage(
+    event,
+    new Set([...connectedDeviceIds(), ...liveActivityDeviceIds(event)]),
+  );
 }
 
 /** One shared immutable GatewayInfo for health, pairing, and the ready frame. */
@@ -331,7 +335,11 @@ export async function startGateway(
   // excluded here rather than pushed to twice.
   raisePush = (event) => notifier.notify(event, hub.connectedDeviceIds());
   raiseApprovalPush = (payload) => notifier.notifyApproval(payload, hub.connectedDeviceIds());
-  raiseChatMessagePush = createChatMessagePushHandler(notifier, () => hub.connectedDeviceIds());
+  raiseChatMessagePush = createChatMessagePushHandler(
+    notifier,
+    () => hub.connectedDeviceIds(),
+    (event) => liveActivityNotifier.coveredDeviceIdsForChat(event),
+  );
   if (bridge !== undefined && attachV1Ingress !== undefined && nativeBotEntries.length > 0) {
     nativeBotPlane = new NativeBotDataPlane({
       control: bridge,

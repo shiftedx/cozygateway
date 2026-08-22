@@ -1,9 +1,11 @@
 import type { ServerFrame } from "cozygateway-contract";
 
 import type { LiveActivityRegistrationRow, Storage } from "./storage.ts";
+import type { ChatMessagePushEvent } from "./push-notifier.ts";
 
 export const LIVE_ACTIVITY_TOOL_COALESCE_MS = 15_000;
 const LIVE_ACTIVITY_TIMEOUT_MS = 10_000;
+const COMPLETION_COVERAGE_MS = 60_000;
 
 type Phase = "thinking" | "usingTools" | "writing" | "completed" | "failed";
 
@@ -34,6 +36,8 @@ export class LiveActivityNotifier {
   readonly #log: (message: string) => void;
   readonly #lastProjection = new Map<string, Projection>();
   readonly #lastToolUpdate = new Map<string, number>();
+  readonly #claimedActivities = new Set<string>();
+  readonly #terminalCoverage = new Map<string, ReadonlySet<string>>();
 
   constructor(deps: LiveActivityNotifierDeps) {
     this.#storage = deps.storage;
@@ -50,9 +54,9 @@ export class LiveActivityNotifier {
         if (frame.phase === "polling") {
           this.#publish(frame.bot, { phase: "thinking", toolCallCount: 0, shortStatus: "Thinking" });
         } else if (frame.phase === "timeout" || frame.phase === "failed") {
-          this.#end(frame.bot, false);
+          this.#end(frame.bot, frame.sessionId, false);
         } else if (frame.phase === "complete") {
-          this.#end(frame.bot, true);
+          this.#end(frame.bot, frame.sessionId, true);
         }
         return;
       case "bot_tool_activity":
@@ -70,6 +74,26 @@ export class LiveActivityNotifier {
       default:
         return;
     }
+  }
+
+  /** Returns devices whose reply-ready alert is owned by ActivityKit for this settled message.
+   *
+   * The bridge can report the settled assistant message either immediately before or immediately
+   * after its terminal state frame. Active rows cover the first ordering; terminal coverage covers
+   * the second. Consuming the latter makes this a one-reply decision rather than a blanket mute for
+   * later scheduled messages in the same bot chat. */
+  coveredDeviceIdsForChat(event: Pick<ChatMessagePushEvent, "bot" | "chatSessionId">): ReadonlySet<string> {
+    const completionKey = this.#completionKey(event.bot, event.chatSessionId);
+    const terminal = this.#terminalCoverage.get(completionKey);
+    if (terminal !== undefined) {
+      this.#terminalCoverage.delete(completionKey);
+      return terminal;
+    }
+
+    const rows = this.#storage.liveActivityRegistrations(event.bot)
+      .filter((row) => row.conversationId === event.chatSessionId);
+    for (const row of rows) this.#claimedActivities.add(this.#key(row));
+    return new Set(rows.map((row) => row.deviceId));
   }
 
   #publishTools(bot: string, count: number): void {
@@ -99,14 +123,29 @@ export class LiveActivityNotifier {
     }
   }
 
-  #end(bot: string, succeeded: boolean): void {
-    for (const row of this.#storage.liveActivityRegistrations(bot)) {
+  #end(bot: string, sessionId: string, succeeded: boolean): void {
+    const rows = this.#storage.liveActivityRegistrations(bot)
+      .filter((row) => row.conversationId === sessionId);
+    const uncoveredDevices = new Set<string>();
+    for (const row of rows) {
+      const key = this.#key(row);
+      if (!this.#claimedActivities.delete(key)) uncoveredDevices.add(row.deviceId);
       this.#send(row, {
         phase: succeeded ? "completed" : "failed",
-        toolCallCount: this.#lastProjection.get(this.#key(row))?.toolCallCount ?? 0,
+        toolCallCount: this.#lastProjection.get(key)?.toolCallCount ?? 0,
         shortStatus: succeeded ? "Finished" : "Could not finish",
         elapsedSeconds: Math.min(604_800, Math.max(0, Math.floor((this.#now() - row.createdAt) / 1000))),
       }, true);
+    }
+    if (uncoveredDevices.size > 0) {
+      const completionKey = this.#completionKey(bot, sessionId);
+      this.#terminalCoverage.set(completionKey, uncoveredDevices);
+      const timer = setTimeout(() => {
+        if (this.#terminalCoverage.get(completionKey) === uncoveredDevices) {
+          this.#terminalCoverage.delete(completionKey);
+        }
+      }, COMPLETION_COVERAGE_MS);
+      timer.unref();
     }
   }
 
@@ -129,8 +168,14 @@ export class LiveActivityNotifier {
       ...(terminal ? { dismissalDate: timestamp + (projection.phase === "completed" ? 15 * 60 : 0) } : {
         staleDate: timestamp + 120,
       }),
-      // No alert: the existing encrypted settled-reply notification remains the sole user alert.
-      priority: 5 as const,
+      ...(terminal ? {
+        alert: {
+          title: "CozyChat",
+          body: projection.phase === "completed" ? "Your bot’s reply is ready" : "Your bot could not finish",
+          sound: "default" as const,
+        },
+      } : {}),
+      priority: terminal ? 10 as const : 5 as const,
     };
     void this.#fetch(`${this.#relayBaseUrl.replace(/\/+$/, "")}/notify`, {
       method: "POST",
@@ -157,5 +202,9 @@ export class LiveActivityNotifier {
 
   #key(row: LiveActivityRegistrationRow): string {
     return `${row.deviceId}\0${row.activityId}`;
+  }
+
+  #completionKey(bot: string, sessionId: string): string {
+    return `${bot}\0${sessionId}`;
   }
 }

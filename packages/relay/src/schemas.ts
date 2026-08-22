@@ -66,6 +66,11 @@ export const NotifyRequestSchema = Type.Object(
       }),
       staleDate: Type.Optional(Type.Integer()),
       dismissalDate: Type.Optional(Type.Integer()),
+      alert: Type.Optional(Type.Object({
+        title: Type.String({ minLength: 1, maxLength: 80 }),
+        body: Type.String({ minLength: 1, maxLength: 160 }),
+        sound: Type.Literal("default"),
+      })),
       priority: Type.Union([Type.Literal(5), Type.Literal(10)]),
     })),
     /** Optional routing metadata (issue #19, section 2). Omitted = today's message push. */
