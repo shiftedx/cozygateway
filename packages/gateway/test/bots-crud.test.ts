@@ -59,7 +59,7 @@ interface Harness {
 async function setup(
   behavior: FakeHermesBehavior = {},
   hiddenProfiles: string[] = [],
-  extra: { bridgeProfile?: string; deleteTimeoutMs?: number } = {},
+  extra: { bridgeProfile?: string; deleteTimeoutMs?: number; steerProfiles?: string[] } = {},
 ): Promise<Harness> {
   const server = await startFakeHermesServer({
     ...behavior,
@@ -87,6 +87,7 @@ async function setup(
     hiddenProfiles,
     ...(extra.bridgeProfile === undefined ? {} : { bridgeProfile: extra.bridgeProfile }),
     ...(extra.deleteTimeoutMs === undefined ? {} : { deleteTimeoutMs: extra.deleteTimeoutMs }),
+    ...(extra.steerProfiles === undefined ? {} : { steerProfiles: extra.steerProfiles }),
   });
   bridges.push(bridge);
 
@@ -164,6 +165,45 @@ describe("bot name validation", () => {
 });
 
 describe("POST /bots", () => {
+  it("reconciles legacy gateway-managed profiles to steer when Hermes comes online", async () => {
+    const dashboardCalls: Array<{ method: string; profile: string | null; body: unknown }> = [];
+    await setup(
+      {
+        methods: { "profiles.list": liveProfiles(new Set(["legacy", "already-steering"])) },
+        dashboard: (request) => {
+          dashboardCalls.push({
+            method: request.method,
+            profile: request.query.get("profile"),
+            body: request.body,
+          });
+          return {
+            body:
+              request.method === "GET"
+                ? {
+                    display: {
+                      busy_input_mode: request.query.get("profile") === "already-steering" ? "steer" : "interrupt",
+                    },
+                  }
+                : { ok: true },
+          };
+        },
+      },
+      [],
+      { steerProfiles: [" Legacy ", "already-steering"] },
+    );
+
+    await until(() => dashboardCalls.length === 3);
+    expect(dashboardCalls).toEqual([
+      { method: "GET", profile: "legacy", body: undefined },
+      {
+        method: "PUT",
+        profile: "legacy",
+        body: { config: { display: { busy_input_mode: "steer" } } },
+      },
+      { method: "GET", profile: "already-steering", body: undefined },
+    ]);
+  });
+
   it("seeds only a newly created profile with house defaults and the operator providers map", async () => {
     const names = new Set<string>(["default", "operator"]);
     const dashboardCalls: Array<{ method: string; profile: string | null; body: unknown }> = [];

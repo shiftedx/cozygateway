@@ -91,6 +91,7 @@ import {
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
+import { ensureProfileSteering } from "./profile-seed.ts";
 
 /** The bots bridge: everything between the Hermes JSON-RPC client and the `/bots` REST routes.
  *  It owns the cache, the refresh cadence, the focus state the app declares, and the `/ws`
@@ -386,6 +387,9 @@ export interface HermesBridgeOptions {
    *  guessing wrong in either direction is worse than not guessing (a wrong guess makes a real bot
    *  undeletable; no guess leaves the operator where they already were). Unset means no guard. */
   bridgeProfile?: string;
+  /** Profiles whose chat data plane this gateway manages. Older/imported profiles may predate the
+   *  creation seed, so the first online link reconciles their follow-up policy to steer. */
+  steerProfiles?: Iterable<string>;
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
@@ -452,6 +456,7 @@ export class HermesBridge implements BotsSurface {
   readonly #hideBotChats: boolean;
   readonly #hidden: ReadonlySet<string>;
   readonly #bridgeProfile: string | undefined;
+  readonly #steerProfiles: ReadonlySet<string>;
   readonly #deleteTimeoutMs: number;
   readonly #scheduledPush: ScheduledPushObserver | undefined;
   readonly #rosterPollMs: number;
@@ -547,6 +552,8 @@ export class HermesBridge implements BotsSurface {
    *  started on and says nothing about hermes having restarted; every one after it followed a
    *  disconnect, which is exactly what a hermes restart looks like from here. */
   #sawReady = false;
+  #steerReconcileInflight: Promise<void> | undefined;
+  readonly #steerReconciled = new Set<string>();
 
   constructor(opts: HermesBridgeOptions) {
     this.#client = opts.client;
@@ -561,6 +568,11 @@ export class HermesBridge implements BotsSurface {
     this.#hidden = new Set([...(opts.hiddenProfiles ?? [])].map((name) => name.trim().toLowerCase()));
     const bridgeProfile = opts.bridgeProfile?.trim().toLowerCase();
     this.#bridgeProfile = bridgeProfile === undefined || bridgeProfile.length === 0 ? undefined : bridgeProfile;
+    this.#steerProfiles = new Set(
+      [...(opts.steerProfiles ?? [])]
+        .map((name) => name.trim().toLowerCase())
+        .filter((name) => name.length > 0),
+    );
     this.#deleteTimeoutMs = opts.deleteTimeoutMs ?? PROFILE_DELETE_TIMEOUT_MS;
     this.#catalogTtlMs = opts.catalogTtlMs ?? CATALOG_TTL_MS;
     this.#catalogDegradedTtlMs = opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
@@ -839,7 +851,10 @@ export class HermesBridge implements BotsSurface {
    *  reaches online, regardless of focus, so a cold cache fills without waiting for a device. */
   start(): void {
     this.#client.onStateChange((state) => {
-      if (state === "online") this.refreshSoon("hermes online");
+      if (state === "online") {
+        this.refreshSoon("hermes online");
+        this.#reconcileSteeringSoon();
+      }
       // A dropped socket takes any half-written draft with it. Dropping the buffers here is what
       // keeps a reconnect from resuming a reply from its middle; the reply itself still arrives
       // over the turn poll, which is the only thing that ever delivered it.
@@ -883,6 +898,31 @@ export class HermesBridge implements BotsSurface {
     // go back.
     this.#sweepAttachments();
     this.#scheduleAttachmentSweep();
+  }
+
+  /** One bounded pass per process over profiles explicitly managed by nativeDataPlane. A failed
+   *  profile remains unmarked so a later Hermes reconnect retries it; successful profiles are not
+   *  re-read on every transient socket reconnect. */
+  #reconcileSteeringSoon(): void {
+    if (this.#steerReconcileInflight !== undefined) return;
+    const pending = [...this.#steerProfiles].filter((name) => !this.#steerReconciled.has(name));
+    if (pending.length === 0) return;
+    const run = (async () => {
+      for (const name of pending) {
+        try {
+          const changed = await ensureProfileSteering(this.#client, name);
+          this.#steerReconciled.add(name);
+          if (changed) this.#log(`set ${name} follow-up delivery to steer`);
+        } catch (error) {
+          this.#log(
+            `could not reconcile ${name} follow-up delivery: ${error instanceof Error ? error.message : "unknown error"}`,
+          );
+        }
+      }
+    })();
+    this.#steerReconcileInflight = run.finally(() => {
+      this.#steerReconcileInflight = undefined;
+    });
   }
 
   roster(): BotRosterView {

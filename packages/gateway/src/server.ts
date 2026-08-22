@@ -148,6 +148,7 @@ export async function startGateway(
       hideBotChats: hermesOptions.hideBotChats,
       chatSuggestion: hermesOptions.chatSuggestion,
       hiddenProfiles: hermesOptions.hiddenProfiles,
+      steerProfiles: Object.keys(config.hermes?.nativeDataPlane ?? {}),
       ...(hermesOptions.bridgeProfile === undefined ? {} : { bridgeProfile: hermesOptions.bridgeProfile }),
       // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
       // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`

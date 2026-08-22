@@ -13,6 +13,29 @@ export const CREATED_PROFILE_SEED = {
   },
 } as const;
 
+/** Reconcile one gateway-managed profile with the mid-turn policy CozyChat relies on.
+ *
+ * Existing profiles predate {@link CREATED_PROFILE_SEED}, so creation-time defaults alone leave
+ * imported/native bots on Hermes' legacy `interrupt` behavior. The dashboard config PUT is a deep
+ * merge: only this one display preference is changed and every operator-owned sibling survives. */
+export async function ensureProfileSteering(client: HermesClient, profile: string): Promise<boolean> {
+  const current = await client.dashboardJson<Record<string, unknown>>(`/api/config${profileQuery(profile)}`);
+  const display = current["display"];
+  if (
+    typeof display === "object" &&
+    display !== null &&
+    !Array.isArray(display) &&
+    (display as Record<string, unknown>)["busy_input_mode"] === "steer"
+  ) {
+    return false;
+  }
+  await client.dashboardJson(`/api/config${profileQuery(profile)}`, {
+    method: "PUT",
+    body: { config: { display: { busy_input_mode: "steer" } } },
+  });
+  return true;
+}
+
 function profileQuery(name: string | undefined): string {
   return name === undefined ? "" : `?profile=${encodeURIComponent(name)}`;
 }
