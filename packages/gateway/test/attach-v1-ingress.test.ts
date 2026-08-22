@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 import { once } from "node:events";
 
 import { WebSocket } from "ws";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
@@ -306,6 +306,7 @@ describe("attach-v1 ingress", () => {
   });
 
   it("keeps six acknowledged peers at one heartbeat per profile per interval", async () => {
+    const pendingReads = vi.spyOn(storage, "pendingAttachCommands");
     // The cap is unused by the fixed protocol (three gateway heartbeats, three ACKs), but makes
     // the regression bounded if an echo turns every ACK into another server heartbeat.
     const peers = await Promise.all(Array.from({ length: 6 }, (_, index) => dial(
@@ -314,10 +315,12 @@ describe("attach-v1 ingress", () => {
       undefined,
       { token: `soak-${index + 1}`, instanceId: `soak-${index + 1}`, heartbeatAckLimit: 3 },
     )));
+    const readsAfterHello = pendingReads.mock.calls.length;
     await until(() => peers.every(({ frames }) => frames.filter((frame) => frame.kind === "heartbeat").length >= 3), 4_000);
     const heartbeatCounts = peers.map(({ frames }) => frames.filter((frame) => frame.kind === "heartbeat").length);
     expect(heartbeatCounts).toEqual([3, 3, 3, 3, 3, 3]);
     expect(heartbeatCounts.reduce((total, count) => total + count, 0)).toBe(18);
+    expect(pendingReads).toHaveBeenCalledTimes(readsAfterHello);
     peers.forEach(({ ws }) => ws.close());
   });
 });
