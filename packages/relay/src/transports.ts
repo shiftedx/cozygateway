@@ -27,6 +27,20 @@ export interface PushDeliveryOptions {
   /** Coalescing key; becomes `apns-collapse-id` on APNs. Approvals pass the `toolCallId`; bot
    *  messages pass an opaque digest of bot name and canonical chat session. */
   collapseId?: string;
+  liveActivity?: {
+    timestamp: number;
+    event: "update" | "end";
+    contentState: {
+      phase: "queued" | "thinking" | "usingTools" | "writing" | "completed" | "failed";
+      toolCallCount: number;
+      shortStatus: string;
+      eventSequence: number;
+      elapsedSeconds?: number;
+    };
+    staleDate?: number;
+    dismissalDate?: number;
+    priority: 5 | 10;
+  };
 }
 
 /** A delivery transport. The APNs transport plugs in here in the phone-app phase without

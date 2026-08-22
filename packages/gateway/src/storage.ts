@@ -60,6 +60,18 @@ CREATE TABLE IF NOT EXISTS push_registrations (
   relay_url TEXT NOT NULL,
   push_key TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS live_activity_registrations (
+  device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  activity_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  bot TEXT NOT NULL,
+  push_id TEXT NOT NULL,
+  event_sequence INTEGER NOT NULL DEFAULT 0,
+  last_timestamp INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (device_id, activity_id)
+) STRICT;
 -- Bots bridge cache (vendor extension com.cozylabs.bots, contract/ext-bots-v1.md). These three
 -- tables are a CACHE of Hermes state, never the source of truth: the roster snapshot lets GET
 -- /bots answer a cold app instantly while a refresh runs in the background, and bot_chat_pins
@@ -368,6 +380,17 @@ export interface PushRegistrationRow {
   relayUrl: string;
   pushKey: string;
 }
+export interface LiveActivityRegistrationRow {
+  deviceId: string;
+  activityId: string;
+  runId: string;
+  conversationId: string;
+  bot: string;
+  pushId: string;
+  eventSequence: number;
+  lastTimestamp: number;
+  createdAt: number;
+}
 
 export interface BotRoutineOverrides {
   model?: string | null;
@@ -675,6 +698,54 @@ export class Storage {
 
   deletePushRegistration(deviceId: string): void {
     this.#db.prepare("DELETE FROM push_registrations WHERE device_id = ?").run(deviceId);
+  }
+
+  saveLiveActivityRegistration(row: Omit<LiveActivityRegistrationRow, "eventSequence" | "lastTimestamp">): string | undefined {
+    const previous = this.liveActivityRegistration(row.deviceId, row.activityId)?.pushId;
+    this.#db.prepare(
+      `INSERT INTO live_activity_registrations
+       (device_id, activity_id, run_id, conversation_id, bot, push_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(device_id, activity_id) DO UPDATE SET
+         run_id = excluded.run_id, conversation_id = excluded.conversation_id,
+         bot = excluded.bot, push_id = excluded.push_id, created_at = excluded.created_at`,
+    ).run(row.deviceId, row.activityId, row.runId, row.conversationId, row.bot, row.pushId, row.createdAt);
+    return previous;
+  }
+
+  liveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {
+    return this.#db.prepare(
+      `SELECT device_id AS deviceId, activity_id AS activityId, run_id AS runId,
+       conversation_id AS conversationId, bot, push_id AS pushId,
+       event_sequence AS eventSequence, last_timestamp AS lastTimestamp, created_at AS createdAt
+       FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?`,
+    ).get(deviceId, activityId) as unknown as LiveActivityRegistrationRow | undefined;
+  }
+
+  liveActivityRegistrations(bot?: string): LiveActivityRegistrationRow[] {
+    const sql = `SELECT device_id AS deviceId, activity_id AS activityId, run_id AS runId,
+      conversation_id AS conversationId, bot, push_id AS pushId,
+      event_sequence AS eventSequence, last_timestamp AS lastTimestamp, created_at AS createdAt
+      FROM live_activity_registrations`;
+    return (bot === undefined
+      ? this.#db.prepare(`${sql} ORDER BY created_at`).all()
+      : this.#db.prepare(`${sql} WHERE bot = ? ORDER BY created_at`).all(bot)) as unknown as LiveActivityRegistrationRow[];
+  }
+
+  advanceLiveActivity(deviceId: string, activityId: string, timestamp: number): number {
+    this.#db.prepare(
+      `UPDATE live_activity_registrations SET event_sequence = event_sequence + 1,
+       last_timestamp = ? WHERE device_id = ? AND activity_id = ?`,
+    ).run(timestamp, deviceId, activityId);
+    return this.liveActivityRegistration(deviceId, activityId)?.eventSequence ?? 0;
+  }
+
+  deleteLiveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {
+    const row = this.liveActivityRegistration(deviceId, activityId);
+    this.#db.prepare(
+      "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
+    ).run(deviceId, activityId);
+    return row;
   }
 
   /** Replaces the whole cached roster in one transaction, preserving the order it was built in

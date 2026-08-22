@@ -20,7 +20,7 @@ export function relayError(code: RelayErrorCode, message: string): RelayErrorBod
 }
 
 export const RegisterRequestSchema = Type.Object({
-  platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns")]),
+  platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns"), Type.Literal("apns-liveactivity")]),
   token: Type.String({ minLength: 1, maxLength: 2048 }),
   /** APNs device tokens are scoped to Apple's sandbox or production service. Older clients omit
    * this and retain the relay's configured APNS_ENVIRONMENT for backwards compatibility. */
@@ -50,7 +50,24 @@ export const CIPHERTEXT_MAX_LENGTH = 8192;
 export const NotifyRequestSchema = Type.Object(
   {
     pushId: Type.String({ minLength: 1 }),
-    ciphertext: Type.String({ minLength: 1, maxLength: CIPHERTEXT_MAX_LENGTH }),
+    ciphertext: Type.Optional(Type.String({ minLength: 1, maxLength: CIPHERTEXT_MAX_LENGTH })),
+    liveActivity: Type.Optional(Type.Object({
+      timestamp: Type.Integer(),
+      event: Type.Union([Type.Literal("update"), Type.Literal("end")]),
+      contentState: Type.Object({
+        phase: Type.Union([
+          Type.Literal("queued"), Type.Literal("thinking"), Type.Literal("usingTools"),
+          Type.Literal("writing"), Type.Literal("completed"), Type.Literal("failed"),
+        ]),
+        toolCallCount: Type.Integer({ minimum: 0, maximum: 10_000 }),
+        shortStatus: Type.String({ minLength: 1, maxLength: 80 }),
+        eventSequence: Type.Integer({ minimum: 0 }),
+        elapsedSeconds: Type.Optional(Type.Integer({ minimum: 0, maximum: 604_800 })),
+      }),
+      staleDate: Type.Optional(Type.Integer()),
+      dismissalDate: Type.Optional(Type.Integer()),
+      priority: Type.Union([Type.Literal(5), Type.Literal(10)]),
+    })),
     /** Optional routing metadata (issue #19, section 2). Omitted = today's message push. */
     category: Type.Optional(Type.Union(PUSH_CATEGORY_IDS.map((id) => Type.Literal(id)))),
     /** Coalescing key; approvals use `toolCallId`, bot messages use a bot/chat digest. */
