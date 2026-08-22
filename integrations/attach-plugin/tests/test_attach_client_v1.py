@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
 from cozygateway.attach_spool import AttachSpool
@@ -15,6 +16,15 @@ class FakeSocket:
         self.sent.append(json.loads(value))
     async def close(self):
         pass
+
+
+class FakeHTTPResponse:
+    def __enter__(self):
+        return self
+    def __exit__(self, *_args):
+        return None
+    def read(self):
+        return b'{"media":{"mediaId":"m"}}'
 
 
 class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
@@ -135,6 +145,18 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         event = self.socket.sent[-1]["event"]
         self.assertEqual(event["mediaIds"], ["a" * 32])
         self.assertNotIn("bytes", json.dumps(event))
+
+    def test_media_upload_uses_an_explicit_client_user_agent(self):
+        captured = []
+
+        def open_request(request, **_kwargs):
+            captured.append(request)
+            return FakeHTTPResponse()
+
+        with patch("cozygateway.attach_client_v1.urlopen", side_effect=open_request):
+            self.client._upload_media_sync("m", "/tmp/movie.mp4", "video/mp4", "a" * 64, b"video", None)
+
+        self.assertEqual(captured[0].get_header("User-agent"), "CozyGateway-Attach/1.0")
 
     async def test_live_events_pause_at_negotiated_count_and_refill_on_ack(self):
         await self.client.connect()
