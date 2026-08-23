@@ -45,7 +45,7 @@ from .attach_client import (
     SteerFrame,
     TurnFrame,
 )
-from .attach_client_v1 import AttachV1Client, AttachV1ClientConfig, MOBILE_STATUS_VALUES
+from .attach_client_v1 import AttachV1Client, AttachV1ClientConfig, MOBILE_STATUS_VALUES, _is_location, normalize_location_purpose
 from .attach_spool import AttachSpool
 from .text_blocks import IncrementalNormalizer, normalize_text_to_blocks
 from .tool_chips import ToolChipTracker
@@ -400,6 +400,26 @@ class AttachAdapter:
                 return await client.request_device_status(thread_id, turn_id)
             pending = asyncio.run_coroutine_threadsafe(
                 client.request_device_status(thread_id, turn_id), loop,
+            )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            return {"status": "cancelled"}
+        except Exception:  # noqa: BLE001 - an attach fault is never a tool crash
+            return {"status": "device_unavailable"}
+
+    async def request_location(self, thread_id: str, turn_id: str, purpose: str) -> Dict[str, Any]:
+        client = self._client
+        loop = self._loop
+        if client is None or loop is None or loop.is_closed():
+            return {"status": "device_unavailable"}
+        pending = None
+        try:
+            if asyncio.get_running_loop() is loop:
+                return await client.request_location(thread_id, turn_id, purpose)
+            pending = asyncio.run_coroutine_threadsafe(
+                client.request_location(thread_id, turn_id, purpose), loop,
             )
             return await asyncio.wrap_future(pending)
         except asyncio.CancelledError:
@@ -1080,6 +1100,17 @@ def _mobile_tool_result(status: str, result: Optional[Dict[str, Any]] = None) ->
 
 async def _cozy_device_status(_args: Dict[str, Any], **_kwargs: Any) -> str:
     """The one MN-0 tool: only a live CozyGateway turn may reach the phone."""
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_device_status(chat_id, turn_id))
+
+
+async def _cozy_request_location(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose = normalize_location_purpose(args.get("purpose"))
+    if purpose is None:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_location(chat_id, turn_id, purpose), location=True)
+
+
+async def _cozy_mobile(request: Any, location: bool = False) -> str:
     try:
         platform, chat_id = _current_turn_platform_and_chat()
         message_id, cron, profile = _current_turn_message_and_cron()
@@ -1097,12 +1128,12 @@ async def _cozy_device_status(_args: Dict[str, Any], **_kwargs: Any) -> str:
     if message_id != turn_id:
         return _mobile_tool_result("policy_blocked")
     try:
-        outcome = await adapters[0].request_device_status(chat_id, turn_id)
+        outcome = await request(adapters[0], chat_id, turn_id)
     except asyncio.CancelledError:
         return _mobile_tool_result("cancelled")
     status = outcome.get("status")
     result = outcome.get("result")
-    if status == "ok" and result != {"foreground": True}:
+    if status == "ok" and (not _is_location(result) if location else result != {"foreground": True}):
         status, result = "device_unavailable", None
     return _mobile_tool_result(
         status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
@@ -1383,6 +1414,23 @@ def register(ctx: Any) -> None:
         is_async=True,
         description="Request one consented device-status reading in the active CozyGateway turn.",
         emoji="📱",
+    )
+    ctx.register_tool(
+        name="cozy_request_location",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_request_location",
+            "description": "Request one consented approximate phone location in the active CozyGateway turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}},
+                "required": ["purpose"], "additionalProperties": False,
+            },
+        },
+        handler=_cozy_request_location,
+        is_async=True,
+        description="Request one consented approximate location in the active CozyGateway turn.",
+        emoji="📍",
     )
     # Register the tool-lifecycle hooks that feed the live tool-chip tap. If the
     # harness build does not support hook registration, degrade gracefully: the

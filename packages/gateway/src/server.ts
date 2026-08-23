@@ -309,7 +309,7 @@ export async function startGateway(
     (event) => liveActivityNotifier.coveredDeviceIdsForChat(event),
   );
   mobileNode = new MobileNodeBroker({
-    available: (deviceId) => hub.isMobileNodeAvailable(deviceId),
+    available: (deviceId, command) => hub.isMobileNodeAvailable(deviceId, command),
     send: (deviceId, frame) => hub.sendToDevice(deviceId, frame),
     result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
   });

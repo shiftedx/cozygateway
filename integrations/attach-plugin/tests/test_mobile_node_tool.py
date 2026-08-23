@@ -41,6 +41,10 @@ class _Client:
         self.calls.append((thread_id, turn_id))
         return await self.result
 
+    async def request_location(self, thread_id, turn_id, purpose):
+        self.calls.append((thread_id, turn_id, purpose))
+        return await self.result
+
 
 class _Adapter:
     def __init__(self, client, active_turn=None, profile="profile-1"):
@@ -51,12 +55,16 @@ class _Adapter:
     async def request_device_status(self, thread_id, turn_id):
         return await self._client.request_device_status(thread_id, turn_id)
 
+    async def request_location(self, thread_id, turn_id, purpose):
+        return await self._client.request_location(thread_id, turn_id, purpose)
+
 
 class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.context = _PluginContext()
         adapter_module.register(self.context)
         self.tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_device_status")
+        self.location_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_request_location")
         self.original_context = adapter_module._current_turn_platform_and_chat
         self.original_message_context = adapter_module._current_turn_message_and_cron
         adapter_module._current_turn_platform_and_chat = lambda: (adapter_module.PLATFORM_NAME, "thread-1")
@@ -90,6 +98,17 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(await self.tool["handler"]({})), {"status": "policy_blocked"})
         self.assertEqual(client.calls, [])
 
+    async def test_registers_location_with_a_normalized_purpose_and_closed_result(self):
+        self.assertEqual(self.location_tool["schema"]["parameters"]["properties"]["purpose"]["maxLength"], 160)
+        client = _Client()
+        adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+        call = asyncio.create_task(self.location_tool["handler"]({"purpose": "  Find   coffee  "}))
+        await asyncio.sleep(0)
+        self.assertEqual(client.calls, [("thread-1", "turn-1", "Find coffee")])
+        client.result.set_result({"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}})
+        self.assertEqual(json.loads(await call), {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}})
+        self.assertEqual(json.loads(await self.location_tool["handler"]({"purpose": "bad\npurpose"})), {"status": "policy_blocked"})
+
     async def test_rejects_cron_and_a_noncanonical_message_before_phone_routing(self):
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
@@ -122,6 +141,18 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(await call), {"status": "cancelled"})
         self.assertEqual(client.calls, [("thread-1", "turn-1")])
 
+    async def test_location_cancellation_and_noncanonical_context_never_leak_to_the_phone(self):
+        client = _Client()
+        adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+        call = asyncio.create_task(self.location_tool["handler"]({"purpose": "Find coffee"}))
+        await asyncio.sleep(0)
+        call.cancel()
+        self.assertEqual(json.loads(await call), {"status": "cancelled"})
+        self.assertEqual(client.calls, [("thread-1", "turn-1", "Find coffee")])
+        adapter_module._current_turn_message_and_cron = lambda: ("turn-1:steer", False, "profile-1")
+        self.assertEqual(json.loads(await self.location_tool["handler"]({"purpose": "Find coffee"})), {"status": "policy_blocked"})
+        self.assertEqual(client.calls, [("thread-1", "turn-1", "Find coffee")])
+
 
 class HermesPluginContextTests(unittest.TestCase):
     @unittest.skipUnless(
@@ -146,6 +177,10 @@ class HermesPluginContextTests(unittest.TestCase):
             self.assertIsNotNone(entry)
             self.assertTrue(entry.is_async)
             self.assertEqual(entry.schema["name"], "cozy_device_status")
+            location_entry = registry.get_entry("cozy_request_location")
+            self.assertIsNotNone(location_entry)
+            self.assertTrue(location_entry.is_async)
+            self.assertEqual(location_entry.schema["parameters"]["properties"]["purpose"]["maxLength"], 160)
             ready = threading.Event()
             stopped = threading.Event()
             loop_box = []
@@ -167,6 +202,11 @@ class HermesPluginContextTests(unittest.TestCase):
                     self.loop_thread = threading.get_ident()
                     return {"status": "ok", "result": {"foreground": True}}
 
+                async def request_location(self, _thread_id, _turn_id, purpose):
+                    self.loop_thread = threading.get_ident()
+                    self.purpose = purpose
+                    return {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}}
+
             client = Client()
             adapter = adapter_module.AttachAdapter()
             adapter._client = client
@@ -183,6 +223,11 @@ class HermesPluginContextTests(unittest.TestCase):
                     json.loads(model_tools.handle_function_call("cozy_device_status", {})),
                     {"status": "ok", "result": {"foreground": True}},
                 )
+                self.assertEqual(
+                    json.loads(model_tools.handle_function_call("cozy_request_location", {"purpose": "Find coffee"})),
+                    {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}},
+                )
+                self.assertEqual(client.purpose, "Find coffee")
                 self.assertEqual(client.loop_thread, thread.ident)
             finally:
                 adapter_module._current_turn_platform_and_chat = original

@@ -128,6 +128,19 @@ active native Bot Mode turn only:
 { "kind": "mobile_request", "requestId": "...", "command": "device.status", "threadId": "...", "turnId": "...", "expiresAt": 0 }
 ```
 
+The only additional operation is one-shot `location.current`:
+
+```json
+{ "kind": "mobile_request", "requestId": "...", "command": "location.current", "threadId": "...", "turnId": "...", "expiresAt": 0, "purpose": "Find nearby coffee" }
+```
+
+`purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
+C0/C1 control characters; invalid input is rejected rather than truncated. Location expiry is at
+most 30 seconds. Success remains commandless because the pending `requestId` binds the command:
+`{ "kind": "mobile_result", "requestId": "...", "status": "ok", "result": { "latitude": 41.88, "longitude": -87.63 } }`.
+Both coordinates must be finite, range-bounded (`latitude [-90,90]`, `longitude [-180,180]`), and
+have no more than two decimal places. The gateway rejects an incompatible result shape.
+
 The gateway replies directly with one unsequenced `mobile_result`. This lane is deliberately not
 an event or command envelope, has no cursor or ACK, is never entered into either durable spool,
 and is dropped on reconnect. The only successful payload is `{ "foreground": true }`; terminal
@@ -136,4 +149,5 @@ statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground
 
 The plugin may send `{ "kind": "mobile_cancel", "requestId": "..." }` to settle its own
 pending tool. It is also negotiated, unsequenced, non-durable, and never replayed; a late phone
-result is ignored. The gateway sends no raw sensor value in either direction.
+result is ignored. Purpose and raw coordinates are in-memory request/result values only and are
+never put in the durable spool, transcript, storage, logs, traces, audit, or push payloads.

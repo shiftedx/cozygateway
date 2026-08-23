@@ -244,6 +244,32 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": request_id, "status": "ok", "result": {"foreground": True, "serial": "never forward"}}))
         self.assertEqual(await request, {"status": "device_unavailable"})
 
+    async def test_location_is_ephemeral_normalizes_purpose_and_validates_the_closed_result(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        request = __import__("asyncio").create_task(self.client.request_location("thread", "turn", "  Find   coffee  "))
+        await __import__("asyncio").sleep(0)
+        frame = self.socket.sent[-1]
+        self.assertEqual(frame, {"kind": "mobile_request", "requestId": frame["requestId"], "command": "location.current", "threadId": "thread", "turnId": "turn", "expiresAt": frame["expiresAt"], "purpose": "Find coffee"})
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "ok", "result": {"latitude": 41.881, "longitude": -87.63}}))
+        self.assertEqual(await request, {"status": "device_unavailable"})
+        accepted = __import__("asyncio").create_task(self.client.request_location("thread", "turn", "Find coffee"))
+        await __import__("asyncio").sleep(0)
+        accepted_frame = self.socket.sent[-1]
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": accepted_frame["requestId"], "status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}}))
+        self.assertEqual(await accepted, {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}})
+        self.assertEqual(await self.client.request_location("thread", "turn", "bad\npurpose"), {"status": "policy_blocked"})
+
+    async def test_location_cancellation_sends_only_an_ephemeral_cancel(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        request = __import__("asyncio").create_task(self.client.request_location("thread", "turn", "Find coffee"))
+        await __import__("asyncio").sleep(0)
+        request.cancel()
+        self.assertEqual(await request, {"status": "cancelled"})
+        self.assertEqual(self.socket.sent[-1]["kind"], "mobile_cancel")
+        self.assertEqual(self.spool.pending_events(10, 100000), [])
+
 
 if __name__ == "__main__":
     unittest.main()

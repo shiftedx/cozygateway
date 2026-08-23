@@ -21,7 +21,7 @@ interface Client {
   socket: WebSocket;
   deviceId: string;
   heartbeatAlive: boolean;
-  mobileNode: boolean;
+  mobileCommands: Set<MobileNodeRequestFrame["command"]>;
 }
 
 const HEARTBEAT_MS = 5_000;
@@ -129,7 +129,7 @@ export class WsHub {
         }
         clearTimeout(authTimer);
         this.#storage.touchDevice(device.id, this.#now());
-        client = { socket, deviceId: device.id, heartbeatAlive: true, mobileNode: false };
+        client = { socket, deviceId: device.id, heartbeatAlive: true, mobileCommands: new Set() };
         emitTrace(this.#trace, "app_ws_auth", { connection, device: traceId(device.id) });
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
@@ -144,8 +144,8 @@ export class WsHub {
       }
 
       if (frame.type === "mobile_node_advertise") {
-        client.mobileNode = frame.foreground && frame.commands.includes("device.status");
-        if (client.mobileNode) this.#mobileNodes.set(client.deviceId, client);
+        client.mobileCommands = frame.foreground ? new Set(frame.commands) : new Set();
+        if (client.mobileCommands.size) this.#mobileNodes.set(client.deviceId, client);
         return;
       }
       if (frame.type === "mobile_node_result") {
@@ -235,14 +235,14 @@ export class WsHub {
 
   sendToDevice(deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame): boolean {
     const client = this.#mobileNodes.get(deviceId);
-    if (client === undefined || client.socket.readyState !== WebSocket.OPEN) return false;
+    if (client === undefined || client.socket.readyState !== WebSocket.OPEN || (frame.type === "mobile_node_request" && !client.mobileCommands.has(frame.command))) return false;
     client.socket.send(JSON.stringify(frame));
     return true;
   }
 
-  isMobileNodeAvailable(deviceId: string): boolean {
+  isMobileNodeAvailable(deviceId: string, command: MobileNodeRequestFrame["command"] = "device.status"): boolean {
     const client = this.#mobileNodes.get(deviceId);
-    return client !== undefined && client.socket.readyState === WebSocket.OPEN;
+    return client !== undefined && client.socket.readyState === WebSocket.OPEN && client.mobileCommands.has(command);
   }
 
   close(): void {

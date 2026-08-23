@@ -22,6 +22,18 @@ describe("client frames", () => {
     expect(check(ClientFrameSchema, {
       type: "mobile_node_result", requestId: "request-1", status: "ok", result: { foreground: true, battery: 90 },
     })).toBe(false);
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true,
+    })).toBe(true);
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_result", requestId: "location-1", status: "ok", result: { latitude: 41.88, longitude: -87.63 },
+    })).toBe(true);
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_result", requestId: "location-1", status: "ok", result: { latitude: 41.881, longitude: -87.63 },
+    })).toBe(true); // integer-cent precision is enforced against the pending command in the broker.
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_result", requestId: "location-1", status: "ok", result: { latitude: 91, longitude: -87.63 },
+    })).toBe(false);
   });
 
   it("rejects a negative sinceSeq and an unknown type", () => {
@@ -61,6 +73,7 @@ describe("server frames", () => {
       { type: "bot_clarify_resolved", bot: "sage", sessionId: "s1", turnId: "turn-1", clarifyId: "question-1", outcome: "selected", selectedOptionId: "a", updatedAt: 2 },
       { type: "synced" },
       { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 100 },
+      { type: "mobile_node_request", requestId: "location-1", command: "location.current", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 100, purpose: "Find nearby coffee" },
       { type: "mobile_node_cancel", requestId: "request-1", status: "cancelled" },
     ];
     for (const frame of frames) {

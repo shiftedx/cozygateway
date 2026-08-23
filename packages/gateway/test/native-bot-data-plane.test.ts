@@ -112,9 +112,11 @@ describe("attach-v1 native Bot Mode plane", () => {
     const turnId = String(turn?.turnId);
 
     plane.mobileRequest("sage", { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: accepted.sessionId, turnId, expiresAt: 1_000 });
+    plane.mobileRequest("sage", { kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: accepted.sessionId, turnId, expiresAt: 1_000, purpose: "Find coffee" });
     plane.mobileRequest("sage", { kind: "mobile_request", requestId: "request-2", command: "device.status", threadId: accepted.sessionId, turnId: "agent-selected", expiresAt: 1_000 });
 
     expect(invoked).toHaveBeenCalledWith(expect.objectContaining({ agentId: "sage", deviceId: "origin-device", turnId }));
+    expect(invoked).toHaveBeenCalledWith(expect.objectContaining({ requestId: "location-1", command: "location.current", purpose: "Find coffee", deviceId: "origin-device", turnId }));
     expect(rejected).toHaveBeenCalledWith("sage", "request-2");
     await plane.surface().stopChat("sage");
     expect(cancelled).toHaveBeenCalledWith("sage", turnId);

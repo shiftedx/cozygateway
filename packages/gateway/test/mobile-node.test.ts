@@ -20,6 +20,28 @@ describe("MobileNodeBroker", () => {
     expect(result).not.toHaveBeenCalled();
   });
 
+  it("delivers one normalized approximate location and rejects malformed purpose or coordinates", () => {
+    const send = vi.fn(() => true);
+    const result = vi.fn();
+    const broker = new MobileNodeBroker({ available: (_device, command) => command === "location.current", send, result, now: () => 1_000 });
+    const base = { command: "location.current" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, deviceId: "origin", agentId: "sage" };
+
+    broker.invoke({ ...base, requestId: "location", purpose: "Find nearby coffee" });
+    expect(send).toHaveBeenCalledWith("origin", { type: "mobile_node_request", requestId: "location", command: "location.current", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Find nearby coffee" });
+    broker.result("origin", { type: "mobile_node_result", requestId: "location", status: "ok", result: { latitude: 41.881, longitude: -87.63 } });
+    broker.result("origin", { type: "mobile_node_result", requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } });
+    broker.invoke({ ...base, requestId: "control", purpose: "bad\npurpose" });
+    broker.invoke({ ...base, requestId: "empty", purpose: "" });
+    broker.invoke({ ...base, requestId: "oversize", purpose: "x".repeat(161) });
+
+    expect(result.mock.calls).toEqual([
+      ["sage", { requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } }],
+      ["sage", { requestId: "control", status: "policy_blocked" }],
+      ["sage", { requestId: "empty", status: "policy_blocked" }],
+      ["sage", { requestId: "oversize", status: "policy_blocked" }],
+    ]);
+  });
+
   it("settles an agent cancellation once and drops the late phone result", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();

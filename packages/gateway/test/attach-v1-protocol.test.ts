@@ -76,6 +76,12 @@ describe("attach-v1 protocol", () => {
     })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1" })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, extra: true })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee",
+    })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee", extra: true,
+    })).toBe(false);
     expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1", extra: true })).toBe(false);
     expect(check(AttachV1ServerFrameSchema, {
       kind: "mobile_result", requestId: "request-1", status: "ok", result: { foreground: true },
@@ -83,5 +89,8 @@ describe("attach-v1 protocol", () => {
     expect(check(AttachV1ServerFrameSchema, {
       kind: "mobile_result", requestId: "request-1", status: "ok", result: { foreground: true, location: "no" },
     })).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "location-1", status: "ok", result: { latitude: 41.88, longitude: -87.63 },
+    })).toBe(true);
   });
 });

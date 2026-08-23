@@ -38,6 +38,9 @@ def main() -> int:
     gateway_url = os.environ["COZYGATEWAY_URL"]
     token = os.environ["COZYGATEWAY_TOKEN"]
     profile = os.environ.get("HERMES_PROFILE", "sage")
+    tool = os.environ.get("COZY_MOBILE_TOOL", "status")
+    if tool not in {"status", "location"}:
+        raise ValueError("COZY_MOBILE_TOOL must be status or location")
     turns: queue.Queue[object] = queue.Queue()
     loop = asyncio.new_event_loop()
     loop_ready = threading.Event()
@@ -104,9 +107,9 @@ def main() -> int:
             cron_session="",
         )
         try:
-            result = model_tools.handle_function_call(
-                "cozy_device_status", {}, enabled_tools=["cozy_device_status"],
-            )
+            name = "cozy_request_location" if tool == "location" else "cozy_device_status"
+            arguments = {"purpose": "Find nearby coffee"} if tool == "location" else {}
+            result = model_tools.handle_function_call(name, arguments, enabled_tools=[name])
         finally:
             clear_session_vars(tokens)
         emit("result", threadId=thread_id, turnId=turn_id, result=json.loads(result))

@@ -124,20 +124,27 @@ const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1Med
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
 });
-export const AttachV1MobileRequestSchema = Type.Object({
+const AttachV1MobileStatusRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false });
+const AttachV1MobileLocationRequestSchema = Type.Object({
+  kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("location.current"),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: Type.String({ minLength: 1, maxLength: 160 }),
+}, { additionalProperties: false });
+export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema]);
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
 export const AttachV1MobileResultSchema = Type.Union([
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ foreground: Type.Literal(true) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ latitude: Type.Number({ minimum: -90, maximum: 90 }), longitude: Type.Number({ minimum: -180, maximum: 180 }) }, { additionalProperties: false }) }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Union([Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"), Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked")]) }, { additionalProperties: false }),
 ]);
 export type AttachV1MobileResult = Static<typeof AttachV1MobileResultSchema>;
 export type AttachV1MobileResultInput =
   | { requestId: string; status: "ok"; result: { foreground: true } }
+  | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
   | { requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" };
 
 /** Deliberately closed: no thinking/reasoning/chain-of-thought event exists. */

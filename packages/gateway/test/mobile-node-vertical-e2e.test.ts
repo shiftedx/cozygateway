@@ -31,7 +31,7 @@ it("routes one native status tool turn only through its foreground origin device
     const appA = await appSocket(gateway.url, tokenA, sockets);
     const appB = await appSocket(gateway.url, tokenB, sockets);
     expect(appA.ready.deviceId).not.toBe(appB.ready.deviceId);
-    appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true }));
     appB.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
     await pause();
 
@@ -61,6 +61,18 @@ it("routes one native status tool turn only through its foreground origin device
     appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", status: "ok", result: { foreground: true } }));
     await settledOnce(pluginFrames, "approved");
     expect(results(pluginFrames, "approved")[0]).toMatchObject({ status: "ok", result: { foreground: true } });
+
+    requestLocation(plugin, turn, "location", "Find nearby coffee");
+    await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "location"));
+    const locationRequest = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "location");
+    expect(locationRequest).toMatchObject({ command: "location.current", purpose: "Find nearby coffee" });
+    expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "location")).toBe(false);
+    appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } }));
+    await pause();
+    expect(results(pluginFrames, "location")).toEqual([]);
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } }));
+    await settledOnce(pluginFrames, "location");
+    expect(results(pluginFrames, "location")[0]).toEqual({ kind: "mobile_result", requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } });
 
     // Two tool calls stay correlated by request id even when the phone answers out of order.
     requestStatus(plugin, turn, "reverse-first");
@@ -178,6 +190,10 @@ async function appSocket(url: string, token: string, sockets: WebSocket[]): Prom
 
 function requestStatus(plugin: WebSocket, turn: { threadId: string; turnId: string }, requestId: string, expiresAt = Date.now() + 1_000): void {
   plugin.send(JSON.stringify({ kind: "mobile_request", requestId, command: "device.status", threadId: turn.threadId, turnId: turn.turnId, expiresAt }));
+}
+
+function requestLocation(plugin: WebSocket, turn: { threadId: string; turnId: string }, requestId: string, purpose: string): void {
+  plugin.send(JSON.stringify({ kind: "mobile_request", requestId, command: "location.current", threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 1_000, purpose }));
 }
 
 function results(frames: Array<Record<string, any>>, requestId: string): Array<Record<string, any>> {
