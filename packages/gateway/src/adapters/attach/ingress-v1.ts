@@ -171,13 +171,20 @@ export class AttachV1Ingress implements TurnEndpoint {
         connection.maxInFlightBytes = Math.min(frame.limits?.maxInFlightBytes ?? ATTACH_V1_MAX_IN_FLIGHT_BYTES, ATTACH_V1_MAX_IN_FLIGHT_BYTES);
         this.#current.set(agentId, connection);
         this.#traceAttach("attach_hello", agentId, { commandCursor: connection.commandCursor, eventCursor: this.#storage.attachEventCursor(agentId) });
-        this.#send(connection, {
-          kind: "hello_ack", version: 1, agentId,
-          capabilities: [...connection.capabilities],
+        const common = {
+          kind: "hello_ack" as const, agentId,
           resume: { eventSequence: this.#storage.attachEventCursor(agentId), commandSequence: this.#storage.attachCommandCursor(agentId) },
           limits: { maxInFlightEvents: connection.maxInFlightEvents, maxInFlightBytes: connection.maxInFlightBytes },
           heartbeatIntervalMs: this.#heartbeatIntervalMs,
-        });
+        };
+        if (frame.version === 1) {
+          this.#send(connection, {
+            ...common, version: 1,
+            capabilities: [...connection.capabilities].filter((capability): capability is Exclude<AttachV1Capability, "mobile_location"> => capability !== "mobile_location"),
+          });
+        } else {
+          this.#send(connection, { ...common, version: 2, capabilities: [...connection.capabilities] });
+        }
         this.#presence(agentId, "online");
         this.#flush(agentId, connection.commandCursor);
         return;

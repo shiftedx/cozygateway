@@ -12,10 +12,18 @@ class FakeSocket:
     def __init__(self):
         self.sent = []
         self.close_code = None
+        self.inbound = __import__("asyncio").Queue()
     async def send(self, value):
         self.sent.append(json.loads(value))
     async def close(self):
-        pass
+        self.inbound.put_nowait(None)
+    def __aiter__(self):
+        return self
+    async def __anext__(self):
+        value = await self.inbound.get()
+        if value is None:
+            raise StopAsyncIteration
+        return value
 
 
 class FakeHTTPResponse:
@@ -54,7 +62,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_hello_carries_durable_identity_and_resume_cursors(self):
         await self.client.connect()
         self.assertEqual(self.socket.sent[0]["kind"], "hello")
-        self.assertEqual(self.socket.sent[0]["version"], 1)
+        self.assertEqual(self.socket.sent[0]["version"], 2)
         self.assertEqual(self.socket.sent[0]["instanceId"], self.spool.instance_id)
         self.assertEqual(self.socket.sent[0]["resume"], {"eventSequence": 0, "commandSequence": 0})
         self.assertIn("mobile_node", self.socket.sent[0]["capabilities"])
@@ -81,6 +89,71 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
 
         await self.client.send_draft("t", "u", [])
         self.assertEqual(self.socket.sent[-1]["sequence"], 2245)
+
+    async def test_closed_v1_server_handshake_falls_back_without_sending_location(self):
+        first, second = FakeSocket(), FakeSocket()
+        sockets = iter([first, second])
+
+        async def old_server_factory(_url, _headers, _ssl):
+            return next(sockets)
+
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url="http://gateway.example", token="secret", spool=self.spool,
+            connect_factory=old_server_factory,
+        ))
+        await second.inbound.put(json.dumps({
+            "kind": "hello_ack", "version": 1, "agentId": "sage", "capabilities": ["mobile_node"],
+            "resume": {"eventSequence": 0, "commandSequence": 0},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}, "heartbeatIntervalMs": 15000,
+        }))
+        with patch("cozygateway.attach_client_v1.MOBILE_HELLO_ACK_TIMEOUT_SECONDS", 0.001):
+            await client.connect()
+            watcher = __import__("asyncio").create_task(client.watch())
+            for _ in range(20):
+                if client._negotiated:
+                    break
+                await __import__("asyncio").sleep(0.001)
+            self.assertTrue(client._negotiated)
+            self.assertEqual(first.sent[0]["version"], 2)
+            self.assertIn("mobile_location", first.sent[0]["capabilities"])
+            self.assertEqual(second.sent[0]["version"], 1)
+            self.assertNotIn("mobile_location", second.sent[0]["capabilities"])
+            self.assertEqual(await client.request_location("thread", "turn", "Find coffee"), {"status": "device_unavailable"})
+            request = __import__("asyncio").create_task(client.request_device_status("thread", "turn"))
+            await __import__("asyncio").sleep(0)
+            status = second.sent[-1]
+            self.assertEqual(status["command"], "device.status")
+            await second.inbound.put(json.dumps({"kind": "mobile_result", "requestId": status["requestId"], "status": "ok", "result": {"foreground": True}}))
+            self.assertEqual(await request, {"status": "ok", "result": {"foreground": True}})
+            await client.close()
+            await watcher
+
+    async def test_pre_ack_close_falls_back_to_v1(self):
+        first, second = FakeSocket(), FakeSocket()
+        sockets = iter([first, second])
+
+        async def old_server_factory(_url, _headers, _ssl):
+            return next(sockets)
+
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url="http://gateway.example", token="secret", spool=self.spool,
+            connect_factory=old_server_factory,
+        ))
+        await first.close()
+        await second.inbound.put(json.dumps({
+            "kind": "hello_ack", "version": 1, "capabilities": ["mobile_node"],
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+        await client.connect()
+        watcher = __import__("asyncio").create_task(client.watch())
+        for _ in range(20):
+            if client._negotiated:
+                break
+            await __import__("asyncio").sleep(0.001)
+        self.assertTrue(client._negotiated)
+        self.assertEqual((first.sent[0]["version"], second.sent[0]["version"]), (2, 1))
+        await client.close()
+        await watcher
 
     async def test_unacked_event_reuses_id_and_sequence_after_reconnect(self):
         await self.client.connect()

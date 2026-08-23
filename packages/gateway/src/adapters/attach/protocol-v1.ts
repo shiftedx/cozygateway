@@ -6,7 +6,7 @@ import { RichBlockSchema } from "cozygateway-contract";
 const Id = Type.String({ minLength: 1, maxLength: 256 });
 const Sequence = Type.Integer({ minimum: 0 });
 
-export const AttachV1CapabilitySchema = Type.Union([
+const AttachV1BaseCapabilitySchema = Type.Union([
   Type.Literal("draft"),
   Type.Literal("media"),
   Type.Literal("tools"),
@@ -14,6 +14,9 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("clarify"),
   Type.Literal("scheduled"),
   Type.Literal("mobile_node"),
+]);
+export const AttachV1CapabilitySchema = Type.Union([
+  AttachV1BaseCapabilitySchema,
   Type.Literal("mobile_location"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
@@ -23,14 +26,24 @@ export const AttachV1LimitsSchema = Type.Object({
   maxInFlightBytes: Type.Integer({ minimum: 1024, maximum: 64 * 1024 * 1024 }),
 });
 
-export const AttachV1HelloSchema = Type.Object({
+/** The frozen old-server hello. It deliberately cannot parse v2's location capability. */
+export const AttachV1HelloV1Schema = Type.Object({
   kind: Type.Literal("hello"),
   version: Type.Literal(1),
+  instanceId: Id,
+  capabilities: Type.Array(AttachV1BaseCapabilitySchema, { uniqueItems: true }),
+  resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
+  limits: Type.Optional(AttachV1LimitsSchema),
+});
+const AttachV1HelloV2Schema = Type.Object({
+  kind: Type.Literal("hello"),
+  version: Type.Literal(2),
   instanceId: Id,
   capabilities: Type.Array(AttachV1CapabilitySchema, { uniqueItems: true }),
   resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
   limits: Type.Optional(AttachV1LimitsSchema),
 });
+export const AttachV1HelloSchema = Type.Union([AttachV1HelloV1Schema, AttachV1HelloV2Schema]);
 export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;
 
 export const AttachV1MediaDescriptorSchema = Type.Object({
@@ -175,6 +188,13 @@ export const AttachV1GapSchema = Type.Object({
 
 export const AttachV1HelloAckSchema = Type.Object({
   kind: Type.Literal("hello_ack"), version: Type.Literal(1), agentId: Id,
+  capabilities: Type.Array(AttachV1BaseCapabilitySchema),
+  resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
+  limits: AttachV1LimitsSchema,
+  heartbeatIntervalMs: Type.Integer({ minimum: 1000 }),
+});
+const AttachV1HelloAckV2Schema = Type.Object({
+  kind: Type.Literal("hello_ack"), version: Type.Literal(2), agentId: Id,
   capabilities: Type.Array(AttachV1CapabilitySchema),
   resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
   limits: AttachV1LimitsSchema,
@@ -191,5 +211,5 @@ export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1MobileCancelSchema,
 ]);
 export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
-export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema]);
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1HelloAckV2Schema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema]);
 export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;

@@ -65,7 +65,7 @@ describe("attach-v1 ingress", () => {
     limits?: { maxInFlightEvents: number; maxInFlightBytes: number },
     capabilities: string[] = ["draft"],
     resume = { eventSequence: 0, commandSequence: 0 },
-    peer: { token?: string; instanceId?: string; heartbeatAckLimit?: number } = {},
+    peer: { token?: string; instanceId?: string; heartbeatAckLimit?: number; version?: number } = {},
   ): Promise<{ ws: WebSocket; frames: AttachV1ServerFrame[] }> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: `Bearer ${peer.token ?? "secret"}` } });
     const frames: AttachV1ServerFrame[] = [];
@@ -79,7 +79,7 @@ describe("attach-v1 ingress", () => {
       }
     });
     await once(ws, "open");
-    ws.send(JSON.stringify({ kind: "hello", version: 1, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }) }));
+    ws.send(JSON.stringify({ kind: "hello", version: peer.version ?? 1, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }) }));
     await until(() => frames.some((frame) => frame.kind === "hello_ack"));
     return { ws, frames };
   }
@@ -125,7 +125,7 @@ describe("attach-v1 ingress", () => {
     await once(oldPeer.ws, "close");
     expect(mobileRequests.some((frame) => frame.requestId === "location-old")).toBe(false);
 
-    const newPeer = await dial(undefined, ["mobile_node", "mobile_location"]);
+    const newPeer = await dial(undefined, ["mobile_node", "mobile_location"], undefined, { version: 2 });
     expect(newPeer.frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["mobile_node", "mobile_location"] });
     newPeer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "location-new", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee" }));
     await until(() => mobileRequests.some((frame) => frame.requestId === "location-new"));

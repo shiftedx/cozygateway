@@ -44,6 +44,7 @@ MobileStatus = Literal[
 ]
 MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
+MOBILE_HELLO_ACK_TIMEOUT_SECONDS = 1
 
 
 class MobileDeviceStatusResult(TypedDict, total=False):
@@ -93,6 +94,8 @@ class AttachV1Client:
         self._sent_events: Dict[int, int] = {}
         self._sent_event_bytes = 0
         self._latest_blocks: Dict[str, List[Dict[str, Any]]] = {}
+        self._hello_version = 2
+        self._hello_fallback_used = False
         # Mobile requests are intentionally outside the durable spool: a phone action
         # must not replay after a reconnect or plugin restart.
         self._mobile_requests: Dict[str, tuple[str, asyncio.Future[MobileDeviceStatusResult]]] = {}
@@ -105,30 +108,36 @@ class AttachV1Client:
         return None
 
     async def connect(self) -> None:
-        headers = {"Authorization": f"Bearer {self._config.token}"}
-        factory = self._config.connect_factory or _default_connect
-        try:
-            self._ws = await factory(self._ws_url, headers, self._ssl_context())
-        except Exception as exc:
-            if _http_status(exc) == 401:
-                raise AttachAuthError("attach-v1 rejected (HTTP 401)") from exc
-            raise
         self._closed = False
         self._negotiated = False
         self._capabilities.clear()
         self._sent_events.clear()
         self._sent_event_bytes = 0
-        await self._send({
-            "kind": "hello",
-            "version": 1,
-            "instanceId": self._spool.instance_id,
-            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location"],
-            "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
-            "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
-        })
+        self._hello_version = 2
+        self._hello_fallback_used = False
+        try:
+            await self._open(self._hello_version)
+        except Exception as exc:
+            if _http_status(exc) == 401:
+                raise AttachAuthError("attach-v1 rejected (HTTP 401)") from exc
+            raise
+
         # A command ACKed before a crash remains in the inbox until execution was recorded.
         for frame in self._spool.pending_commands():
             await self._dispatch_command(frame, replay=True)
+
+    async def _open(self, version: int) -> None:
+        headers = {"Authorization": f"Bearer {self._config.token}"}
+        factory = self._config.connect_factory or _default_connect
+        self._ws = await factory(self._ws_url, headers, self._ssl_context())
+        await self._send({
+            "kind": "hello",
+            "version": version,
+            "instanceId": self._spool.instance_id,
+            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", *( ["mobile_location"] if version >= 2 else [] )],
+            "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
+            "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
+        })
 
     async def request_device_status(self, thread_id: str, turn_id: str) -> MobileDeviceStatusResult:
         """Request one ephemeral status result for this live turn, never via the spool."""
@@ -361,7 +370,22 @@ class AttachV1Client:
         if self._ws is None:
             return
         try:
-            async for raw in self._ws:
+            while self._ws is not None:
+                socket = self._ws
+                iterator = socket.__aiter__()
+                try:
+                    raw = await asyncio.wait_for(
+                        anext(iterator),
+                        None if self._negotiated else MOBILE_HELLO_ACK_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    if not await self._fallback_to_v1(socket):
+                        return
+                    continue
+                except StopAsyncIteration:
+                    if await self._fallback_to_v1(socket):
+                        continue
+                    return
                 await self._dispatch_inbound(raw)
         except Exception as exc:
             code = _close_code(exc)
@@ -372,6 +396,20 @@ class AttachV1Client:
         finally:
             self._closed = True
             self._settle_mobile_requests("device_unavailable")
+
+    async def _fallback_to_v1(self, socket: Any) -> bool:
+        """Reconnect once with the frozen v1 hello after v2 fails before its ack."""
+        if self._negotiated or self._hello_version != 2 or self._hello_fallback_used:
+            return False
+        self._hello_fallback_used = True
+        self._hello_version = 1
+        self._capabilities.clear()
+        try:
+            await socket.close()
+            await self._open(1)
+        except Exception:
+            return False
+        return True
 
     async def _dispatch_inbound(self, raw: Any) -> None:
         try:

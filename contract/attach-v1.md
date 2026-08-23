@@ -22,6 +22,12 @@ chat sends, live turns, and groups; CozyGateway MUST NOT submit those chats thro
   limits/capabilities, authoritative cursors, and heartbeat interval. Its capabilities are the
   intersection of the plugin offer and that identity's server-side rollout gates; neither peer
   sends a feature whose capability was not negotiated.
+- The endpoint remains `/attach/v1`; `hello.version` selects this capability grammar. A v2-aware
+  plugin first sends `hello.version: 2`, which is the only hello version that may
+  offer `mobile_location`. A new gateway accepts and acknowledges both v1 and v2. To remain
+  compatible with a closed old v1 server, the plugin uses a bounded pre-ack timeout, closes that
+  attempt, then reconnects once with `hello.version: 1` and the old capability list. The v1
+  fallback is status-only: no location request is sent or replayed while it is selected.
 - A newer authenticated connection supersedes the older connection for that identity.
 
 ## Delivery and replay
