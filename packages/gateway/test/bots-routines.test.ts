@@ -38,8 +38,12 @@ describe("bot routines", () => {
 
   it("uses the tagged name and the safe current delegation marker", () => {
     expect(routineJobName("scout", "Digest")).toBe("[bot:scout] Digest");
-    expect(routinePrompt({ bot: "scout", title: "Digest", instruction: "summarize", schedulerProfile: "default" }))
-      .toMatch(/^\[bot-mode:routine:v2\] /);
+    const prompt = routinePrompt({ bot: "scout", title: "Digest", instruction: "summarize", schedulerProfile: "default" });
+    expect(prompt).toMatch(/^\[bot-mode:routine:v2\] /);
+    expect(prompt).toContain("Silence-first:");
+    expect(prompt).toContain("'scout'");
+    expect(routinePrompt({ bot: "scout", title: "Digest", instruction: "summarize", schedulerProfile: "scout" }))
+      .toMatch(/^Silence-first:.*\n\nsummarize$/s);
     expect(buildRoutineAddParams("scout", { title: " Digest ", schedule: " every 2h ", prompt: " summarize " }))
       .toMatchObject({ action: "add", name: "[bot:scout] Digest", schedule: "every 2h", profile: "scout" });
   });

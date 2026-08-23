@@ -210,13 +210,12 @@ export class NativeBotDataPlane {
   canAccept(bot: string, frame: AttachV1EventFrame): boolean {
     const key = normalize(bot);
     if (!this.handles(key)) return false;
-    if (frame.event.kind !== "scheduled") {
-      return (
-        "threadId" in frame.event &&
-        this.#storage.nativeBotHasSession(key, frame.event.threadId)
-      );
-    }
-    return this.#storage.nativeBotHasSession(key, frame.event.threadId);
+    if (frame.event.kind === "scheduled")
+      return frame.event.threadId === this.#storage.nativeBotChat(key, this.#now()).sessionId;
+    return (
+      "threadId" in frame.event &&
+      this.#storage.nativeBotHasSession(key, frame.event.threadId)
+    );
   }
 
   /** Attach transport presence is the only connectivity signal. Commands remain durably queued;
@@ -243,7 +242,7 @@ export class NativeBotDataPlane {
     const event = frame.event;
     if (event.kind === "presence" || event.kind === "media") return true;
     if (event.kind === "scheduled") {
-      if (!this.#storage.nativeBotHasSession(key, event.threadId)) return false;
+      if (event.threadId !== this.#storage.nativeBotChat(key, this.#now()).sessionId) return false;
       const delivery = this.#storage.attachScheduledDelivery(
         key,
         event.deliveryId,

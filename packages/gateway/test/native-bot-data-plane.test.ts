@@ -775,4 +775,20 @@ describe("attach-v1 native Bot Mode plane", () => {
     plane.close();
     storage.close();
   });
+
+  it("accepts scheduled delivery only for the selected native bot session", () => {
+    const storage = openStorage(":memory:");
+    const historical = storage.nativeBotChat("sage", 1);
+    const selected = storage.resetNativeBotChat("sage", 2);
+    const plane = new NativeBotDataPlane({ control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 3 });
+    const event = (threadId: string): AttachV1EventFrame => ({
+      kind: "event", sequence: 1, eventId: `scheduled-${threadId}`,
+      event: { kind: "scheduled", threadId, deliveryId: `delivery-${threadId}`, messageId: `message-${threadId}`, blocks: [{ type: "paragraph", text: "report" }] },
+    });
+    expect(plane.canAccept("sage", event(selected))).toBe(true);
+    expect(plane.canAccept("sage", event(historical.sessionId))).toBe(false);
+    expect(plane.handle("sage", event(historical.sessionId))).toBe(false);
+    plane.close();
+    storage.close();
+  });
 });

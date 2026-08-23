@@ -109,11 +109,25 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     let scheduledHistory = (await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } })).json()) as { messages: BotChatMessage[] };
     expect(scheduledHistory.messages.filter((message) => message.id === "daily-message-1")).toHaveLength(1);
 
-    plugin.send(JSON.stringify({ kind: "event", sequence: 5, eventId: "scheduled-foreign", event: { kind: "scheduled", threadId: "foreign-session", deliveryId: "foreign-delivery", messageId: "foreign-message", blocks: [{ type: "paragraph", text: "must not appear" }] } }));
+    const selectedSessionId = gateway.storage.resetNativeBotChat("sage", Date.now());
+    plugin.send(JSON.stringify({ kind: "event", sequence: 5, eventId: "scheduled-historical", event: { kind: "scheduled", threadId: command.command.threadId, deliveryId: "historical-delivery", messageId: "historical-message", blocks: [{ type: "paragraph", text: "must not appear" }] } }));
     await once(plugin, "close");
     expect(gateway.storage.attachEventCursor("sage")).toBe(4);
+    expect(pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 5)).toBe(false);
+    expect(gateway.storage.nativeBotMessages("sage", command.command.threadId).some((message) => message.id === "historical-message")).toBe(false);
+
+    const selectedPluginFrames: any[] = [];
+    const selectedPlugin = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
+    sockets.push(selectedPlugin);
+    selectedPlugin.on("message", (data) => selectedPluginFrames.push(JSON.parse(String(data))));
+    await once(selectedPlugin, "open");
+    selectedPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage-selected", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 4, commandSequence: 0 } }));
+    await until(() => selectedPluginFrames.some((frame) => frame.kind === "hello_ack"));
+    selectedPlugin.send(JSON.stringify({ kind: "event", sequence: 5, eventId: "scheduled-selected", event: { kind: "scheduled", threadId: selectedSessionId, deliveryId: "selected-delivery", messageId: "selected-message", blocks: [{ type: "paragraph", text: "selected daily" }] } }));
+    await until(() => selectedPluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 5));
+    expect(gateway.storage.attachEventCursor("sage")).toBe(5);
     scheduledHistory = (await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } })).json()) as { messages: BotChatMessage[] };
-    expect(scheduledHistory.messages.some((message) => message.id === "foreign-message")).toBe(false);
+    expect(scheduledHistory.messages.map((message) => message.id)).toContain("selected-message");
     // The fake Dashboard implements no prompt.submit/session.resume methods. Reaching this point
     // proves the authoritative native profile never attempted either chat RPC.
   } finally {

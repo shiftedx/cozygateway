@@ -66,12 +66,13 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `app
 - Tool calls use a stable `callId` with `running` → `ok|error` terminal transitions.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.
-- `scheduled` is an unanchored durable delivery: its caller supplies the target thread and a durable
-  cron-session occurrence key, from which the reference plugin preserves/derives stable delivery
-  and message ids. It does not require an active request turn. Gateway projection deduplicates the
-  delivery, commits it directly, and invokes the existing push decision once. The supplied target
-  must equal the gateway's durable canonical/home session binding for that bot; a foreign target is
-  rejected before inbox admission.
+- `scheduled` is an unanchored durable delivery: its caller supplies the target thread and a durable,
+  caller-owned occurrence key. Hermes cron is the implemented producer and uses its cron-session key;
+  a future trigger integration may supply its own durable key through the same seam. The reference plugin
+  preserves/derives stable delivery and message ids from that key. It does not require an active request
+  turn. Gateway projection deduplicates the delivery, commits it directly, and invokes the existing push
+  decision once. For native Bot Mode, the supplied target must equal the gateway's currently selected
+  canonical/home session; a foreign or historical target is rejected before inbox admission.
 - `presence` supplements transport health. The gateway reports online only after hello, degraded
   after missed heartbeats/backpressure, and absent after timeout/close. Clients reconnect with
   exponential backoff and jitter.
