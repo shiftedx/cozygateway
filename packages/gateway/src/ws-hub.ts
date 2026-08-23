@@ -149,7 +149,8 @@ export class WsHub {
         return;
       }
       if (frame.type === "mobile_node_result") {
-        this.#onMobileResult?.(client.deviceId, frame);
+        if (this.#mobileNodes.get(client.deviceId) === client)
+          this.#onMobileResult?.(client.deviceId, frame);
         return;
       }
 

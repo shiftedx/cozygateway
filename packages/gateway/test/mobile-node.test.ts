@@ -27,11 +27,47 @@ describe("MobileNodeBroker", () => {
     broker.invoke({ requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, deviceId: "device-1", agentId: "sage" });
 
     broker.cancelRequest("sage", "request-1");
+    broker.invoke({ requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, deviceId: "device-1", agentId: "sage" });
     broker.result("device-1", { type: "mobile_node_result", requestId: "request-1", status: "ok", result: { foreground: true } });
 
     expect(send).toHaveBeenLastCalledWith("device-1", { type: "mobile_node_cancel", requestId: "request-1", status: "cancelled" });
+    expect(send).toHaveBeenCalledTimes(2);
     expect(result).toHaveBeenCalledTimes(1);
     expect(result).toHaveBeenCalledWith("sage", { requestId: "request-1", status: "cancelled" });
+  });
+
+  it("holds terminal ids only through their deadline or bounded short TTL", () => {
+    let now = 1_000;
+    const send = vi.fn(() => true);
+    const broker = new MobileNodeBroker({
+      available: () => true, send, result: vi.fn(), now: () => now,
+      terminalTtlMs: 10, terminalLimit: 1,
+    });
+    const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", deviceId: "device-1", agentId: "sage" };
+    broker.invoke({ ...base, requestId: "request-1", expiresAt: 1_001 });
+    broker.cancelRequest("sage", "request-1");
+    broker.invoke({ ...base, requestId: "request-1", expiresAt: 2_000 });
+    expect(send).toHaveBeenCalledTimes(2); // request + cancel; the terminal id blocks re-prompting
+
+    now = 1_011;
+    broker.invoke({ ...base, requestId: "request-1", expiresAt: 2_000 });
+    expect(send).toHaveBeenCalledTimes(3);
+  });
+
+  it("evicts the oldest terminal id at the configured in-memory bound", () => {
+    const send = vi.fn(() => true);
+    const broker = new MobileNodeBroker({
+      available: () => true, send, result: vi.fn(), now: () => 1_000,
+      terminalLimit: 1,
+    });
+    const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, deviceId: "device-1", agentId: "sage" };
+    broker.invoke({ ...base, requestId: "oldest" });
+    broker.cancelRequest("sage", "oldest");
+    broker.invoke({ ...base, requestId: "newest" });
+    broker.cancelRequest("sage", "newest");
+    broker.invoke({ ...base, requestId: "oldest" });
+
+    expect(send).toHaveBeenCalledTimes(5); // request/cancel twice, then the intentionally evicted id
   });
 
   it("fails closed for missing origin, unavailable node, and an out-of-policy deadline", () => {

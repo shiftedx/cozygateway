@@ -16,11 +16,13 @@ let port: number;
 let token: string;
 let traces: string[];
 let mobileDisconnects: string[];
+let mobileResults: string[];
 
 beforeEach(async () => {
   storage = openStorage(":memory:");
   traces = [];
   mobileDisconnects = [];
+  mobileResults = [];
   const minted = mintDeviceToken();
   token = minted.token;
   storage.createDevice({ id: "d1", name: "phone", tokenHash: minted.tokenHash, createdAt: 1 });
@@ -34,6 +36,7 @@ beforeEach(async () => {
     heartbeatMs: 25,
     trace: (line) => traces.push(line),
     onDeviceDisconnect: (deviceId) => mobileDisconnects.push(deviceId),
+    onMobileResult: (_deviceId, frame) => mobileResults.push(frame.requestId),
   });
   server = createServer();
   server.on("upgrade", (req, socket, head) => hub.handleUpgrade(req, socket, head));
@@ -309,6 +312,12 @@ describe("mobile node selection", () => {
     expect(hub.sendToDevice("d1", { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000 })).toBe(true);
     await until(() => seenB.some((frame) => frame.type === "mobile_node_request"));
     expect(seenA.some((frame) => frame.type === "mobile_node_request")).toBe(false);
+
+    wsA.send(JSON.stringify({ type: "mobile_node_result", requestId: "forged", status: "cancelled" }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(mobileResults).toEqual([]);
+    wsB.send(JSON.stringify({ type: "mobile_node_result", requestId: "selected", status: "cancelled" }));
+    await until(() => mobileResults.includes("selected"));
 
     wsA.close();
     await once(wsA, "close");

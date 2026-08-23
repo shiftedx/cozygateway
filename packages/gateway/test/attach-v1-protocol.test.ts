@@ -75,6 +75,8 @@ describe("attach-v1 protocol", () => {
       kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000,
     })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1" })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, extra: true })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1", extra: true })).toBe(false);
     expect(check(AttachV1ServerFrameSchema, {
       kind: "mobile_result", requestId: "request-1", status: "ok", result: { foreground: true },
     })).toBe(true);

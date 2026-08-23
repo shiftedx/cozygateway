@@ -127,7 +127,7 @@ const PresenceEvent = Type.Object({
 export const AttachV1MobileRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }),
-});
+}, { additionalProperties: false });
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
