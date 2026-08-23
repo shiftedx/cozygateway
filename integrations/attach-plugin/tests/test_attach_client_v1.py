@@ -202,6 +202,48 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertEqual(self.spool.pending_events(10, 100000), [])
 
+    async def test_device_status_is_ephemeral_and_settles_once(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["draft", "mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        await __import__("asyncio").sleep(0)
+        frame = self.socket.sent[-1]
+        self.assertEqual(frame["kind"], "mobile_request")
+        self.assertEqual(frame["command"], "device.status")
+        self.assertEqual(self.spool.pending_events(10, 100000), [])
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "ok", "result": {"foreground": True}}))
+        self.assertEqual(await request, {"status": "ok", "result": {"foreground": True}})
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
+
+    async def test_device_status_cancellation_and_disconnect_do_not_leave_pending_work(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        cancelled = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        await __import__("asyncio").sleep(0)
+        cancelled.cancel()
+        self.assertEqual(await cancelled, {"status": "cancelled"})
+        self.assertEqual(self.socket.sent[-1]["kind"], "mobile_cancel")
+        pending = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        await __import__("asyncio").sleep(0)
+        await self.client.close()
+        self.assertEqual(await pending, {"status": "device_unavailable"})
+
+    async def test_device_status_deadline_sends_an_ephemeral_cancel(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        with patch("cozygateway.attach_client_v1.MOBILE_STATUS_TIMEOUT_SECONDS", 0.001):
+            self.assertEqual(await self.client.request_device_status("thread", "turn"), {"status": "expired"})
+        self.assertEqual([frame["kind"] for frame in self.socket.sent[-2:]], ["mobile_request", "mobile_cancel"])
+
+    async def test_device_status_rejects_arbitrary_result_payloads(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        await __import__("asyncio").sleep(0)
+        request_id = self.socket.sent[-1]["requestId"]
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": request_id, "status": "ok", "result": {"foreground": True, "serial": "never forward"}}))
+        self.assertEqual(await request, {"status": "device_unavailable"})
+
 
 if __name__ == "__main__":
     unittest.main()

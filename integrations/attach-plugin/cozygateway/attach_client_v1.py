@@ -9,9 +9,10 @@ import json
 import mimetypes
 import os
 import ssl
+import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
@@ -34,6 +35,23 @@ from .attach_client import (
     parse_turn_frame,
 )
 from .attach_spool import AttachSpool, TerminalSealed
+
+
+MobileStatus = Literal[
+    "ok", "denied", "expired", "cancelled", "device_unavailable",
+    "foreground_required", "policy_blocked",
+]
+MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
+MOBILE_STATUS_TIMEOUT_SECONDS = 30
+
+
+class MobileDeviceStatusResult(TypedDict, total=False):
+    status: MobileStatus
+    result: "DeviceStatus"
+
+
+class DeviceStatus(TypedDict):
+    foreground: Literal[True]
 
 
 @dataclass
@@ -69,6 +87,9 @@ class AttachV1Client:
         self._sent_events: Dict[int, int] = {}
         self._sent_event_bytes = 0
         self._latest_blocks: Dict[str, List[Dict[str, Any]]] = {}
+        # Mobile requests are intentionally outside the durable spool: a phone action
+        # must not replay after a reconnect or plugin restart.
+        self._mobile_requests: Dict[str, asyncio.Future[MobileDeviceStatusResult]] = {}
 
     def _ssl_context(self) -> Any:
         if self._config.ca_file and self._ws_url.startswith("wss://"):
@@ -95,13 +116,38 @@ class AttachV1Client:
             "kind": "hello",
             "version": 1,
             "instanceId": self._spool.instance_id,
-            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled"],
+            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node"],
             "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
             "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
         })
         # A command ACKed before a crash remains in the inbox until execution was recorded.
         for frame in self._spool.pending_commands():
             await self._dispatch_command(frame, replay=True)
+
+    async def request_device_status(self, thread_id: str, turn_id: str) -> MobileDeviceStatusResult:
+        """Request one ephemeral status result for this live turn, never via the spool."""
+        if not self._negotiated or "mobile_node" not in self._capabilities:
+            return {"status": "device_unavailable"}
+        request_id = str(uuid.uuid4())
+        future: asyncio.Future[MobileDeviceStatusResult] = asyncio.get_running_loop().create_future()
+        self._mobile_requests[request_id] = future
+        try:
+            await self._send({
+                "kind": "mobile_request", "requestId": request_id,
+                "command": "device.status", "threadId": thread_id, "turnId": turn_id,
+                "expiresAt": int(time.time() * 1000) + MOBILE_STATUS_TIMEOUT_SECONDS * 1000,
+            })
+            return await asyncio.wait_for(asyncio.shield(future), MOBILE_STATUS_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await self._cancel_mobile_request(request_id)
+            return {"status": "expired"}
+        except asyncio.CancelledError:
+            await self._cancel_mobile_request(request_id)
+            return {"status": "cancelled"}
+        except Exception:
+            return {"status": "device_unavailable"}
+        finally:
+            self._mobile_requests.pop(request_id, None)
 
     async def _send(self, frame: Dict[str, Any]) -> None:
         if self._ws is None or self._closed:
@@ -305,6 +351,7 @@ class AttachV1Client:
                 raise AttachAuthError("attach-v1 rejected (policy close 1008)") from exc
         finally:
             self._closed = True
+            self._settle_mobile_requests("device_unavailable")
 
     async def _dispatch_inbound(self, raw: Any) -> None:
         try:
@@ -329,6 +376,8 @@ class AttachV1Client:
                 self._max_events = min(self._max_events, int(limits.get("maxInFlightEvents", self._max_events)))
                 self._max_bytes = min(self._max_bytes, int(limits.get("maxInFlightBytes", self._max_bytes)))
             await self._drain_events()
+        elif kind == "mobile_result":
+            self._settle_mobile_result(frame)
         elif kind == "ack" and frame.get("channel") == "event":
             if isinstance(frame.get("sequence"), int) and isinstance(frame.get("id"), str):
                 async with self._flow_lock:
@@ -383,12 +432,46 @@ class AttachV1Client:
 
     async def close(self) -> None:
         self._closed = True
+        self._settle_mobile_requests("device_unavailable")
         ws, self._ws = self._ws, None
         if ws is not None:
             try:
                 await ws.close()
             except Exception:
                 pass
+
+    def _settle_mobile_result(self, frame: Dict[str, Any]) -> None:
+        request_id = frame.get("requestId")
+        status = frame.get("status")
+        if not isinstance(request_id, str) or not isinstance(status, str) or status not in MOBILE_STATUS_VALUES:
+            return
+        future = self._mobile_requests.pop(request_id, None)
+        if future is None or future.done():
+            return
+        result: MobileDeviceStatusResult = {"status": status}
+        payload = frame.get("result")
+        if status == "ok":
+            if not _is_device_status(payload):
+                future.set_result({"status": "device_unavailable"})
+                return
+            result["result"] = payload
+        future.set_result(result)
+
+    def _settle_mobile_requests(self, status: MobileStatus) -> None:
+        pending, self._mobile_requests = self._mobile_requests, {}
+        for future in pending.values():
+            if not future.done():
+                future.set_result({"status": status})
+
+    async def _cancel_mobile_request(self, request_id: str) -> None:
+        try:
+            await self._send({"kind": "mobile_cancel", "requestId": request_id})
+        except Exception:
+            pass
+
+
+def _is_device_status(value: Any) -> bool:
+    return isinstance(value, dict) and value == {"foreground": True}
 
 
 def _event_capabilities(event: Dict[str, Any]) -> List[str]:
