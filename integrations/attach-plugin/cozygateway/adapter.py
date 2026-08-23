@@ -114,6 +114,11 @@ class AttachAdapter:
     # far above any reply to keep a turn a single commit.
     MAX_MESSAGE_LENGTH = 1_000_000
 
+    # Attach drafts are the durable turn message under construction, not
+    # disposable previews. Keep Hermes tool-boundary segment breaks on the
+    # draft path; only the true turn-final send may emit ``done`` and clean up.
+    draft_stream_is_message = True
+
     # -- construction ---------------------------------------------------------
     def _attach_init(self, config: Any) -> None:
         extra = getattr(config, "extra", {}) or {}
