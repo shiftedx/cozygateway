@@ -32,7 +32,7 @@ const TERMINAL_LIMIT = 1_024;
 /** One foreground-only, origin-bound request at a time. Nothing here is durable. */
 export class MobileNodeBroker {
   readonly #pending = new Map<string, Pending>();
-  /** Recently terminal request ids are a bounded, volatile idempotency cache. */
+  /** Every admitted id remains here until its volatile terminal window lapses. */
   readonly #terminal = new Map<string, number>();
   readonly #available: (deviceId: string) => boolean;
   readonly #send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean;
@@ -62,17 +62,20 @@ export class MobileNodeBroker {
     // `requestId` is a one-shot idempotency key. Never replace a live timer/prompt.
     if (this.#pending.has(input.requestId) || this.#terminal.has(input.requestId)) return;
     if (!input.deviceId) {
-      this.#result(input.agentId, { requestId: input.requestId, status: "device_unavailable" });
+      this.#terminalize(input.agentId, input.requestId, "device_unavailable", input.expiresAt);
       return;
     }
     if (input.command !== "device.status" || input.expiresAt <= this.#now() || input.expiresAt > this.#now() + 30_000) {
-      this.#result(input.agentId, { requestId: input.requestId, status: "policy_blocked" });
+      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt);
       return;
     }
     if (!this.#available(input.deviceId)) {
-      this.#result(input.agentId, { requestId: input.requestId, status: "foreground_required" });
+      this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt);
       return;
     }
+    // No eviction is safe: a retained unexpired id is the only duplicate-prompt defense.
+    // Dropping a new admission while full is intentionally fail-closed and non-durable.
+    if (!this.#canAdmit()) return;
     const frame: MobileNodeRequestFrame = {
       type: "mobile_node_request", requestId: input.requestId, command: "device.status",
       bot: input.bot, threadId: input.threadId, turnId: input.turnId, expiresAt: input.expiresAt,
@@ -84,7 +87,7 @@ export class MobileNodeBroker {
   }
 
   reject(agentId: string, requestId: string, status: Exclude<MobileNodeTerminal, "ok"> = "policy_blocked"): void {
-    this.#result(agentId, { requestId, status });
+    this.#terminalize(agentId, requestId, status, this.#now());
   }
 
   result(deviceId: string, frame: MobileNodeResultFrame): void {
@@ -137,12 +140,24 @@ export class MobileNodeBroker {
 
   #rememberTerminal(requestId: string, until: number): void {
     this.#pruneTerminal();
+    if (!this.#canAdmit()) return;
     this.#terminal.set(requestId, until);
-    while (this.#terminal.size > this.#terminalLimit) {
-      const oldest = this.#terminal.keys().next().value;
-      if (oldest === undefined) return;
-      this.#terminal.delete(oldest);
-    }
+  }
+
+  #terminalize(
+    agentId: string,
+    requestId: string,
+    status: Exclude<MobileNodeTerminal, "ok">,
+    expiresAt: number,
+  ): void {
+    this.#pruneTerminal();
+    if (this.#pending.has(requestId) || this.#terminal.has(requestId) || !this.#canAdmit()) return;
+    this.#terminal.set(requestId, Math.max(expiresAt, this.#now() + this.#terminalTtlMs));
+    this.#result(agentId, { requestId, status });
+  }
+
+  #canAdmit(): boolean {
+    return this.#pending.size + this.#terminal.size < this.#terminalLimit;
   }
 
   #pruneTerminal(): void {

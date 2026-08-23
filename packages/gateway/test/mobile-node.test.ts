@@ -54,7 +54,7 @@ describe("MobileNodeBroker", () => {
     expect(send).toHaveBeenCalledTimes(3);
   });
 
-  it("evicts the oldest terminal id at the configured in-memory bound", () => {
+  it("does not admit a burst beyond the bounded pending and terminal capacity", () => {
     const send = vi.fn(() => true);
     const broker = new MobileNodeBroker({
       available: () => true, send, result: vi.fn(), now: () => 1_000,
@@ -62,12 +62,12 @@ describe("MobileNodeBroker", () => {
     });
     const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, deviceId: "device-1", agentId: "sage" };
     broker.invoke({ ...base, requestId: "oldest" });
+    broker.invoke({ ...base, requestId: "newest" });
+    broker.invoke({ ...base, requestId: "third" });
     broker.cancelRequest("sage", "oldest");
     broker.invoke({ ...base, requestId: "newest" });
-    broker.cancelRequest("sage", "newest");
-    broker.invoke({ ...base, requestId: "oldest" });
 
-    expect(send).toHaveBeenCalledTimes(5); // request/cancel twice, then the intentionally evicted id
+    expect(send).toHaveBeenCalledTimes(2); // one request and its cancellation; no unexpired id is evicted
   });
 
   it("fails closed for missing origin, unavailable node, and an out-of-policy deadline", () => {
@@ -83,6 +83,27 @@ describe("MobileNodeBroker", () => {
       ["sage", { requestId: "missing", status: "device_unavailable" }],
       ["sage", { requestId: "unavailable", status: "foreground_required" }],
       ["sage", { requestId: "late", status: "policy_blocked" }],
+    ]);
+  });
+
+  it("tombstones every pre-dispatch terminal and explicit reject before emitting it", () => {
+    const result = vi.fn();
+    const broker = new MobileNodeBroker({ available: () => false, send: () => true, result, now: () => 1_000 });
+    const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, agentId: "sage" };
+    broker.invoke({ ...base, requestId: "missing" });
+    broker.invoke({ ...base, requestId: "missing" });
+    broker.invoke({ ...base, requestId: "unavailable", deviceId: "device-1" });
+    broker.invoke({ ...base, requestId: "unavailable", deviceId: "device-1" });
+    broker.invoke({ ...base, requestId: "policy", deviceId: "device-1", expiresAt: 32_000 });
+    broker.invoke({ ...base, requestId: "policy", deviceId: "device-1", expiresAt: 32_000 });
+    broker.reject("sage", "reject");
+    broker.reject("sage", "reject");
+
+    expect(result.mock.calls).toEqual([
+      ["sage", { requestId: "missing", status: "device_unavailable" }],
+      ["sage", { requestId: "unavailable", status: "foreground_required" }],
+      ["sage", { requestId: "policy", status: "policy_blocked" }],
+      ["sage", { requestId: "reject", status: "policy_blocked" }],
     ]);
   });
 
