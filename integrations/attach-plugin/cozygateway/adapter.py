@@ -252,8 +252,10 @@ class AttachAdapter:
         self._absorbed_media: OrderedDict[str, None] = OrderedDict()
         self._absorbed_media_max = 512
         # Hermes' clarify callback gives the platform stable clarify ids plus display choices.
-        # Keep the bounded id→answer map until the durable resolution command is executed.
+        # Keep the bounded id→answer map and original wire presentation until the durable
+        # resolution command is executed and its terminal confirmation is journaled.
         self._clarify_choices: Dict[str, Dict[str, str]] = {}
+        self._clarify_context: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
         # Strong refs to fire-and-forget tasks; the loop keeps only a weak ref to a
         # bare create_task result, so hold each here until it finishes.
         self._background_tasks: Set[asyncio.Task] = set()
@@ -701,25 +703,28 @@ class AttachAdapter:
     def _on_clarify_command(self, command: Dict[str, Any]) -> None:
         """Feed the selected stable option back into the same native conversation."""
         thread_id = command.get("threadId")
+        turn_id = command.get("turnId")
         clarify_id = command.get("clarifyId")
         option_id = command.get("optionId")
-        if not isinstance(thread_id, str) or not isinstance(clarify_id, str) or not isinstance(option_id, str) or not option_id:
+        if not all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id)):
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._spawn_background(loop, self._handle_clarify_command(thread_id, clarify_id, option_id))
+        self._spawn_background(loop, self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id))
 
     async def _dispatch_clarify_command(self, command: Dict[str, Any]) -> None:
         thread_id = command.get("threadId")
+        turn_id = command.get("turnId")
         clarify_id = command.get("clarifyId")
         option_id = command.get("optionId")
-        if isinstance(thread_id, str) and isinstance(clarify_id, str) and isinstance(option_id, str) and option_id:
-            await self._handle_clarify_command(thread_id, clarify_id, option_id)
+        if all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id)):
+            await self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id)
 
-    async def _handle_clarify_command(self, thread_id: str, clarify_id: str, option_id: str) -> None:
-        del thread_id
+    async def _handle_clarify_command(
+        self, thread_id: str, turn_id: str, clarify_id: str, option_id: str,
+    ) -> None:
         # Resolve Hermes' actual blocking clarify primitive. Injecting the option id as ordinary
         # chat text can be rejected as an invalid selection and can start/steer an unrelated turn.
         # The pending map is established by send_clarify below and uses stable wire ids.
@@ -727,12 +732,20 @@ class AttachAdapter:
             from tools.clarify_gateway import resolve_gateway_clarify  # harness-defined identifier
 
             choices = self._clarify_choices.get(clarify_id, {})
+            context = self._clarify_context.get(clarify_id)
             answer = choices.get(option_id)
-            if not clarify_id or answer is None:
+            client = self._client
+            if not clarify_id or answer is None or context is None or not isinstance(client, AttachV1Client):
                 raise RuntimeError("clarification mapping is unavailable")
             if not resolve_gateway_clarify(clarify_id, answer):
                 raise RuntimeError("Hermes no longer has the clarification pending")
+            prompt, options = context
+            if await client.send_clarify_resolved(
+                thread_id, turn_id, clarify_id, prompt, options, option_id,
+            ) is None:
+                raise RuntimeError("clarification confirmation could not be journaled")
             self._clarify_choices.pop(clarify_id, None)
+            self._clarify_context.pop(clarify_id, None)
         except Exception:  # noqa: BLE001
             logger.debug("attach: clarify response injection raised", exc_info=True)
             raise
@@ -757,6 +770,8 @@ class AttachAdapter:
             return SendResult(success=False, error="attach-v1 clarification requires an active turn and choices")
         wire_options = [{"id": f"option-{index}", "label": label} for index, label in enumerate(labels[:20], start=1)]
         self._clarify_choices[clarify_id] = {item["id"]: item["label"] for item in wire_options}
+        wire_prompt = str(question)[:4096]
+        self._clarify_context[clarify_id] = (wire_prompt, wire_options)
         expires_at: Optional[int] = None
         try:
             from tools.clarify_gateway import get_clarify_timeout  # harness-defined identifier
@@ -765,10 +780,11 @@ class AttachAdapter:
         except Exception:
             pass
         queued = await client.send_clarify(
-            chat_id, turn_id, clarify_id, str(question)[:4096], wire_options, expires_at,
+            chat_id, turn_id, clarify_id, wire_prompt, wire_options, expires_at,
         )
         if queued is None:
             self._clarify_choices.pop(clarify_id, None)
+            self._clarify_context.pop(clarify_id, None)
             return SendResult(success=False, error="clarification turn is already terminal")
         return SendResult(success=True, message_id=clarify_id)
 

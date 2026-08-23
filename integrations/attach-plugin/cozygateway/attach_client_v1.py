@@ -341,6 +341,32 @@ class AttachV1Client:
             event["expiresAt"] = expires_at
         return await self._queue_event(event)
 
+    async def send_clarify_resolved(
+        self,
+        thread_id: str,
+        turn_id: str,
+        clarify_id: str,
+        prompt: str,
+        options: List[Dict[str, str]],
+        selected_option_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        event = {
+            "kind": "clarify", "threadId": thread_id, "turnId": turn_id,
+            "clarifyId": clarify_id, "prompt": prompt, "options": options,
+            "status": "resolved", "selectedOptionId": selected_option_id,
+        }
+        if self._negotiated and "clarify" not in self._capabilities:
+            return None
+        try:
+            frame = self._spool.enqueue_event(event)
+        except TerminalSealed:
+            return None
+        try:
+            await self._drain_events()
+        except Exception:  # noqa: BLE001 - the journaled event replays after reconnect
+            pass
+        return frame
+
     async def upload_media(self, media_id: str, path: str, family: str, expires_at: Optional[int] = None) -> Dict[str, Any]:
         """Upload bytes through the authenticated HTTP side channel; WS carries only metadata."""
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
