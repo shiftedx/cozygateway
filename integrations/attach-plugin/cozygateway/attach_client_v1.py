@@ -32,6 +32,7 @@ from .attach_client import (
     ToolChip,
     TurnFrame,
     _close_code,
+    _close_reason,
     _default_connect,
     _http_status,
     derive_attach_ws_url,
@@ -76,6 +77,7 @@ class AttachV1ClientConfig:
     gateway_url: str
     token: str
     spool: AttachSpool
+    token_provider: Optional[Callable[[], str]] = None
     path: str = "/attach/v1"
     ca_file: Optional[str] = None
     on_turn: Optional[Callable[[TurnFrame], None]] = None
@@ -83,6 +85,7 @@ class AttachV1ClientConfig:
     on_interrupt: Optional[Callable[[InterruptFrame], None]] = None
     on_approval: Optional[Callable[[Dict[str, Any]], None]] = None
     on_clarify: Optional[Callable[[Dict[str, Any]], None]] = None
+    on_ready: Optional[Callable[[], None]] = None
     connect_factory: Optional[Callable[..., Any]] = None
     max_in_flight_events: int = 64
     max_in_flight_bytes: int = 4 * 1024 * 1024
@@ -150,7 +153,13 @@ class AttachV1Client:
             await self._dispatch_command(frame, replay=True)
 
     async def _open(self, version: int) -> None:
-        headers = {"Authorization": f"Bearer {self._config.token}"}
+        token = self._config.token
+        if self._config.token_provider is not None:
+            try:
+                token = self._config.token_provider().strip() or token
+            except Exception:
+                logger.warning("attach-v1: credential refresh failed; using last known token")
+        headers = {"Authorization": f"Bearer {token}"}
         factory = self._config.connect_factory or _default_connect
         self._ws = await factory(self._ws_url, headers, self._ssl_context())
         hello: Dict[str, Any] = {
@@ -531,10 +540,12 @@ class AttachV1Client:
             code = _close_code(exc)
             if code == SUPERSEDED_CLOSE_CODE:
                 raise AttachSupersededError("connection superseded by a newer attach-v1") from exc
-            if code == POLICY_CLOSE_CODE:
+            if code == POLICY_CLOSE_CODE and _close_reason(exc).strip().lower() == "unauthorized":
                 raise AttachAuthError("attach-v1 rejected (policy close 1008)") from exc
         finally:
             self._closed = True
+            self._negotiated = False
+            self._capabilities.clear()
             self._settle_mobile_requests("device_unavailable")
 
     async def _fallback_to_v1(self, socket: Any) -> bool:
@@ -573,6 +584,8 @@ class AttachV1Client:
             if isinstance(limits, dict):
                 self._max_events = min(self._max_events, int(limits.get("maxInFlightEvents", self._max_events)))
                 self._max_bytes = min(self._max_bytes, int(limits.get("maxInFlightBytes", self._max_bytes)))
+            if self._config.on_ready is not None:
+                self._config.on_ready()
             await self._drain_events()
         elif kind == "mobile_result":
             self._settle_mobile_result(frame)

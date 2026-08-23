@@ -46,7 +46,14 @@ from .attach_client import (
     SteerFrame,
     TurnFrame,
 )
-from .attach_client_v1 import AttachV1Client, AttachV1ClientConfig, MOBILE_STATUS_VALUES, _is_location, normalize_location_purpose
+from .attach_client_v1 import (
+    MOBILE_HELLO_ACK_TIMEOUT_SECONDS,
+    MOBILE_STATUS_VALUES,
+    AttachV1Client,
+    AttachV1ClientConfig,
+    _is_location,
+    normalize_location_purpose,
+)
 from .attach_spool import AttachSpool
 from .text_blocks import IncrementalNormalizer, normalize_text_to_blocks
 from .tool_chips import ToolChipTracker
@@ -101,6 +108,22 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _fresh_attach_token(fallback: str) -> str:
+    """Reload the profile secret so a rotated token can heal without a process restart."""
+    hermes_home = os.getenv("HERMES_HOME", "").strip()
+    if hermes_home:
+        try:
+            from agent.secret_scope import load_env_file  # harness-defined identifier
+            from pathlib import Path
+
+            token = load_env_file(Path(hermes_home) / ".env").get("COZYGATEWAY_TOKEN", "")
+            if token.strip():
+                return token.strip()
+        except Exception:
+            logger.debug("attach: could not refresh token from the profile env", exc_info=True)
+    return (os.getenv("COZYGATEWAY_TOKEN") or fallback).strip()
 
 
 _COMMAND_NAME = re.compile(r"^/[A-Za-z0-9_-]{1,128}$")
@@ -205,6 +228,7 @@ class AttachAdapter:
         self._client: Optional[Any] = None
         self._watcher: Optional[asyncio.Task] = None
         self._closing: bool = False
+        self._ready = asyncio.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._reconnect_initial: float = _env_float(
             "COZYGATEWAY_RECONNECT_INITIAL_SECONDS", 0.5
@@ -361,6 +385,7 @@ class AttachAdapter:
             AttachV1ClientConfig(
                 gateway_url=self.gateway_url,
                 token=self.token,
+                token_provider=lambda: _fresh_attach_token(self.token),
                 spool=self._spool,
                 ca_file=self.ca_file,
                 on_turn=self._on_turn,
@@ -368,6 +393,7 @@ class AttachAdapter:
                 on_interrupt=self._on_interrupt,
                 on_approval=self._dispatch_approval_command,
                 on_clarify=self._dispatch_clarify_command,
+                on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
             )
         )
@@ -391,10 +417,29 @@ class AttachAdapter:
             self._watcher.cancel()
         self._loop = asyncio.get_running_loop()
         self._watcher = asyncio.create_task(self._watch_loop())
+        try:
+            await asyncio.wait_for(
+                self._ready.wait(),
+                2 * MOBILE_HELLO_ACK_TIMEOUT_SECONDS + 0.5,
+            )
+        except asyncio.TimeoutError:
+            await self.disconnect()
+            self._set_fatal_error(  # type: ignore[attr-defined]
+                "handshake_timeout",
+                "attach-v1 did not become writable",
+                retryable=True,
+            )
+            return False
+        return True
+
+    def _on_transport_ready(self) -> None:
+        """Publish connected state only after the server accepts the hello."""
+        if self._closing:
+            return
+        self._ready.set()
         self._mark_connected()  # type: ignore[attr-defined]
         _register_active_adapter(self)
-        logger.info("attach-v1: connected to %s", self.gateway_url)
-        return True
+        logger.info("attach-v1: connected and writable at %s", self.gateway_url)
 
     async def _watch_loop(self) -> None:
         """Drain the socket; re-dial on a benign drop, stop on a fatal close."""
@@ -409,11 +454,11 @@ class AttachAdapter:
                 await self.disconnect()
                 return
             except AttachAuthError:
-                logger.warning("attach: token rejected mid-session; stopping")
-                await self.disconnect()
-                return
+                logger.warning("attach: credential rejected; retrying with bounded backoff")
             if self._closing:
                 return
+            self._ready.clear()
+            _unregister_active_adapter(self)
             self._mark_disconnected()  # type: ignore[attr-defined]
             logger.warning("attach-v1: /attach/v1 dropped; reconnecting")
             if not await self._redial():
@@ -437,23 +482,31 @@ class AttachAdapter:
                 return False
             try:
                 await client.connect()
-            except (AttachAuthError, AttachSupersededError) as exc:
-                logger.warning("attach: reconnect refused (%s); stopping", exc)
+            except AttachSupersededError as exc:
+                logger.warning("attach: reconnect superseded (%s); stopping", exc)
                 await self.disconnect()
                 return False
+            except AttachAuthError as exc:
+                logger.warning(
+                    "attach: reconnect credential rejected (%s); retrying (backoff ~%.1fs)",
+                    exc,
+                    delay,
+                )
+                delay = min(delay * 2, self._reconnect_max)
+                continue
             except Exception as exc:  # noqa: BLE001 - transient: back off and retry
                 logger.warning(
                     "attach: reconnect failed (%s); retrying (backoff ~%.1fs)", exc, delay
                 )
                 delay = min(delay * 2, self._reconnect_max)
                 continue
-            self._mark_connected()  # type: ignore[attr-defined]
-            logger.info("attach-v1: reconnected /attach/v1 to %s", self.gateway_url)
+            logger.info("attach-v1: re-dialed %s; awaiting hello_ack", self.gateway_url)
             return True
         return False
 
     async def disconnect(self) -> None:
         self._closing = True
+        self._ready.clear()
         _unregister_active_adapter(self)
         self._mark_disconnected()  # type: ignore[attr-defined]
         watcher = self._watcher
@@ -969,10 +1022,22 @@ class AttachAdapter:
             blocks = normalize_text_to_blocks(content)
             if not isinstance(client, AttachV1Client) or not target_thread or not blocks:
                 return SendResult(success=False, error="no in-flight turn")
-            digest = hashlib.sha256(
-                f"{chat_id}\0{target_thread}\0{content}".encode("utf-8")
-            ).hexdigest()
-            delivery_id = "unanchored:" + digest
+            delivery_key = ""
+            try:
+                from gateway.session_context import get_session_env  # harness-defined identifier
+
+                delivery_key = str(
+                    get_session_env("HERMES_SESSION_ID")
+                    or get_session_env("HERMES_SESSION_KEY")
+                    or ""
+                ).strip()
+            except Exception:
+                pass
+            if not delivery_key:
+                delivery_key = hashlib.sha256(
+                    f"{chat_id}\0{target_thread}\0{content}".encode("utf-8")
+                ).hexdigest()
+            delivery_id = "scheduled:" + delivery_key
             message_id = "scheduled-" + hashlib.sha256(
                 delivery_id.encode("utf-8")
             ).hexdigest()[:32]
@@ -981,7 +1046,15 @@ class AttachAdapter:
             )
             if frame is None:
                 return SendResult(success=False, error="scheduled delivery unavailable")
-            return SendResult(success=True, message_id=message_id)
+            receipt = await _proactive_projection(client, delivery_id, 2.0)
+            if receipt is not None and receipt.get("state") == "projected":
+                return SendResult(success=True, message_id=message_id)
+            if receipt is not None and receipt.get("state") == "blocked":
+                return SendResult(success=False, error="scheduled delivery blocked")
+            return SendResult(
+                success=False,
+                error="scheduled delivery journaled; projection not yet confirmed",
+            )
         try:
             # The authoritative terminal text, or the last streamed buffer when the
             # terminal content is empty or whitespace (a draft-only turn).
@@ -1039,6 +1112,72 @@ class AttachAdapter:
         finally:
             self._cleanup_turn(chat_id, turn_id)
         return SendResult(success=True, message_id=turn_id)
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Render Hermes lifecycle status into the mutable draft, never as a terminal reply."""
+        del status_key
+        interim_metadata = dict(metadata or {})
+        interim_metadata["_interim_send"] = True
+        return await self.send(chat_id, content, metadata=interim_metadata)
+
+    async def send_proactive(
+        self,
+        chat_id: str,
+        message: str,
+        media_files: List[str],
+        *,
+        canonical_home: bool,
+        delivery_key: str,
+    ) -> Dict[str, Any]:
+        """Commit one tool-originated delivery through the resident writable socket."""
+        client = self._client
+        if not isinstance(client, AttachV1Client) or not self._ready.is_set():
+            return _proactive_failure("attach_not_writable")
+        delivery_id, message_id = _proactive_identity(delivery_key)
+        if len(media_files) > 16:
+            return _proactive_failure("media_count_exceeded", delivery_id, message_id)
+        media_ids: List[str] = []
+        media_errors: List[str] = []
+        for index, path in enumerate(media_files[:16]):
+            media_id = _proactive_media_id(delivery_id, index)
+            try:
+                await client.upload_media(media_id, path, self._media_family(path))
+                media_ids.append(media_id)
+            except Exception as exc:  # noqa: BLE001 - the atomic policy reports every failure
+                media_errors.append(_proactive_media_error(path, exc))
+        if media_errors:
+            await client.rollback_uploaded_media(media_ids)
+            return _proactive_failure(
+                "media_upload_failed", delivery_id, message_id, media_errors
+            )
+        blocks = normalize_text_to_blocks(message)
+        if not blocks and not media_ids:
+            return _proactive_failure("empty_delivery", delivery_id, message_id)
+        frame = await client.send_scheduled(
+            chat_id,
+            delivery_id,
+            message_id,
+            blocks,
+            media_ids,
+            canonical_home=canonical_home,
+        )
+        if frame is None:
+            return _proactive_failure("scheduled_delivery_unavailable", delivery_id, message_id)
+        result: Dict[str, Any] = {
+            "state": "journaled",
+            "accepted_pending": True,
+            "deliveryId": delivery_id,
+            "messageId": message_id,
+            "eventId": frame["eventId"],
+        }
+        receipt = await _proactive_projection(client, delivery_id, 2.0)
+        return _apply_projection(result, receipt)
 
     async def _safe_failed(self, chat_id: str, turn_id: str, message: str) -> None:
         """Emit a ``failed`` frame, swallowing any error (best-effort teardown)."""
@@ -1472,6 +1611,96 @@ async def _standalone_send(
     return result
 
 
+async def _hermes_standalone_send(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Translate durable Cozy states into upstream Hermes' success/error ABI."""
+    return _hermes_delivery_result(await _standalone_send(*args, **kwargs))
+
+
+def _hermes_delivery_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Make upstream Hermes treat only confirmed projection as delivery success."""
+    state = result.get("state")
+    if state == "projected":
+        return {**result, "success": True}
+    if state == "suppressed":
+        return {**result, "success": True, "delivered": False}
+    if result.get("error"):
+        return result
+    if state == "blocked":
+        return {**result, "error": "delivery was blocked before projection"}
+    if state == "journaled_partial":
+        return {
+            **result,
+            "error": "delivery is partially journaled and projection is not yet confirmed",
+        }
+    return {
+        **result,
+        "error": "delivery is durable but projection is not yet confirmed",
+    }
+
+
+def _resident_adapter() -> Optional[AttachAdapter]:
+    with _ACTIVE_ADAPTERS_LOCK:
+        return next(
+            (
+                adapter
+                for adapter in _ACTIVE_ADAPTERS
+                if isinstance(adapter, AttachAdapter) and not adapter._closing
+            ),
+            None,
+        )
+
+
+async def _send_message_handler(
+    args: Dict[str, Any], chat_id: str, platform_name: str, pconfig: Any
+) -> Dict[str, Any]:
+    """Own Hermes ``send_message`` so Cozy media is never dropped as unsupported."""
+    from gateway.platforms.base import BasePlatformAdapter  # harness-defined identifier
+
+    raw_message = str(args.get("message") or "")
+    extracted, cleaned = BasePlatformAdapter.extract_media(raw_message)
+    filtered = BasePlatformAdapter.filter_media_delivery_paths(extracted)
+    media_files = [str(path) for path, _is_voice in filtered]
+    target = str(args.get("target") or "").strip().lower()
+    canonical_home = target == platform_name
+    key_material = "\0".join([platform_name, chat_id, cleaned, *media_files])
+    session_key = ""
+    try:
+        from gateway.session_context import get_session_env  # harness-defined identifier
+
+        session_key = str(
+            get_session_env("HERMES_SESSION_ID")
+            or get_session_env("HERMES_SESSION_KEY")
+            or get_session_env("HERMES_SESSION_MESSAGE_ID")
+            or ""
+        ).strip()
+    except Exception:
+        pass
+    delivery_key = "tool:" + hashlib.sha256(
+        f"{session_key}\0{key_material}".encode("utf-8")
+    ).hexdigest()
+    resident = _resident_adapter()
+    if resident is not None and resident._ready.is_set():
+        return _hermes_delivery_result(
+            await resident.send_proactive(
+                chat_id,
+                cleaned,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+            )
+        )
+    return _hermes_delivery_result(
+        await enqueue_proactive_delivery(
+            pconfig,
+            thread_id=chat_id,
+            delivery_key=delivery_key,
+            message=cleaned,
+            media_files=media_files,
+            canonical_home=canonical_home,
+        )
+    )
+
+
 def _proactive_spool_path(pconfig: Any, spool_path: Optional[str]) -> str:
     if spool_path:
         return spool_path
@@ -1487,6 +1716,28 @@ def _proactive_media_id(delivery_id: str, index: int) -> str:
     return "scheduled_media_" + hashlib.sha256(
         f"{delivery_id}\0{index}".encode("utf-8")
     ).hexdigest()[:32]
+
+
+def _proactive_identity(delivery_key: str) -> Tuple[str, str]:
+    delivery_id = "scheduled:" + delivery_key
+    message_id = "scheduled-" + hashlib.sha256(
+        delivery_id.encode("utf-8")
+    ).hexdigest()[:32]
+    return delivery_id, message_id
+
+
+def _apply_projection(
+    result: Dict[str, Any], receipt: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    if receipt is None or receipt.get("state") not in {"projected", "blocked"}:
+        return result
+    result["state"] = receipt["state"]
+    result["accepted_pending"] = False
+    if receipt["state"] == "projected":
+        result["projectedAt"] = receipt.get("projectedAt")
+    else:
+        result["attempts"] = receipt.get("attempts")
+    return result
 
 
 def _proactive_media_error(path: str, exc: Exception) -> str:
@@ -1638,8 +1889,7 @@ async def enqueue_proactive_delivery(
     paths = [path for path in media_files or [] if isinstance(path, str) and path]
     if media_policy not in {"atomic", "allow_partial_media"}:
         return _proactive_failure("invalid_media_policy")
-    delivery_id = "scheduled:" + key
-    message_id = "scheduled-" + hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()[:32]
+    delivery_id, message_id = _proactive_identity(key)
     if len(paths) > 16:
         return _proactive_failure("media_count_exceeded", delivery_id, message_id)
     # Silence is success, not an empty transcript row or a newly-created spool.
@@ -1655,9 +1905,11 @@ async def enqueue_proactive_delivery(
     try:
         media_ids: List[str] = []
         media_errors: List[str] = []
+        configured_token = os.getenv("COZYGATEWAY_TOKEN") or extra.get("token", "")
         client = AttachV1Client(AttachV1ClientConfig(
             gateway_url=(os.getenv("COZYGATEWAY_URL") or extra.get("gateway_url") or "").rstrip("/"),
-            token=os.getenv("COZYGATEWAY_TOKEN") or extra.get("token", ""),
+            token=configured_token,
+            token_provider=lambda: _fresh_attach_token(configured_token),
             spool=spool,
             ca_file=os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None,
         ))
@@ -1708,15 +1960,7 @@ async def enqueue_proactive_delivery(
             except Exception:  # noqa: BLE001 - the durable local journal remains replayable
                 spool.release_transport_lease()
         receipt = await _proactive_projection(client, delivery_id, receipt_timeout) if watch_task is not None else None
-        if receipt is not None and receipt.get("state") == "projected":
-            result["state"] = "projected"
-            result["accepted_pending"] = False
-            result["projectedAt"] = receipt.get("projectedAt")
-        elif receipt is not None and receipt.get("state") == "blocked":
-            result["state"] = "blocked"
-            result["accepted_pending"] = False
-            result["attempts"] = receipt.get("attempts")
-        return result
+        return _apply_projection(result, receipt)
     finally:
         if watch_task is None:
             spool.close()
@@ -1747,7 +1991,8 @@ def register(ctx: Any) -> None:
         emoji="🧵",
         pii_safe=True,
         cron_deliver_env_var="COZYGATEWAY_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send,
+        standalone_sender_fn=_hermes_standalone_send,
+        send_message_handler=_send_message_handler,
         platform_hint=(
             "You are in a live session. Your reply streams live and is committed to "
             "the conversation. Markdown renders richly: use ## headings, - bullet / "

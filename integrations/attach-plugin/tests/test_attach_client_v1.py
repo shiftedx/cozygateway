@@ -82,6 +82,63 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.connect()
         self.assertEqual(self.socket.sent[0]["commands"], [])
 
+    async def test_reconnect_refreshes_a_rotated_credential(self):
+        tokens = ["old-token"]
+        headers = []
+
+        async def connect_factory(_url, request_headers, _ssl):
+            headers.append(request_headers["Authorization"])
+            return FakeSocket()
+
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url="http://gateway.example",
+            token="bootstrap-token",
+            token_provider=lambda: tokens[0],
+            spool=self.spool,
+            connect_factory=connect_factory,
+        ))
+        await client.connect()
+        await client.close()
+        tokens[0] = "rotated-token"
+        await client.connect()
+        await client.close()
+
+        self.assertEqual(headers, ["Bearer old-token", "Bearer rotated-token"])
+
+    async def test_ready_callback_requires_an_accepted_hello(self):
+        ready = []
+        self.client._config.on_ready = lambda: ready.append(True)
+        await self.client.connect()
+        self.assertEqual(ready, [])
+
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack",
+            "capabilities": ["draft"],
+            "resume": {"eventSequence": 0, "commandSequence": 0},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+
+        self.assertEqual(ready, [True])
+
+    async def test_restored_events_drain_only_after_transport_is_marked_ready(self):
+        sent_counts_at_ready = []
+        self.client._config.on_ready = lambda: sent_counts_at_ready.append(
+            len(self.socket.sent)
+        )
+        await self.client.connect()
+        await self.client.send_draft("thread", "turn", [])
+        self.assertEqual(len(self.socket.sent), 1)
+
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack",
+            "capabilities": ["draft"],
+            "resume": {"eventSequence": 0, "commandSequence": 0},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+
+        self.assertEqual(sent_counts_at_ready, [1])
+        self.assertEqual(self.socket.sent[-1]["kind"], "event")
+
     async def test_hello_ack_recovers_a_recreated_empty_spool_from_server_cursors(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({
@@ -195,6 +252,25 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first.sent[0]["version"], second.sent[0]["version"]), (2, 1))
         await client.close()
         await watcher
+
+    async def test_non_auth_policy_close_does_not_masquerade_as_token_rejection(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack", "capabilities": ["draft"],
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+        await self.socket.inbound.put(ConnectionClosedError(Close(1008, "event sequence conflict"), None, None))
+        await self.client.watch()
+
+    async def test_unauthorized_policy_close_remains_a_terminal_auth_error(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack", "capabilities": ["draft"],
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+        await self.socket.inbound.put(ConnectionClosedError(Close(1008, "unauthorized"), None, None))
+        with self.assertRaisesRegex(Exception, "rejected"):
+            await self.client.watch()
 
     async def test_unacked_event_reuses_id_and_sequence_after_reconnect(self):
         await self.client.connect()

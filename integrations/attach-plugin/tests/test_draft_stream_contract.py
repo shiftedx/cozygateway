@@ -3,8 +3,10 @@
 import sys
 import types
 import unittest
+from unittest.mock import AsyncMock
 
 from cozygateway.adapter import AttachAdapter
+from cozygateway.attach_client import AttachAuthError
 
 
 class _SendResult:
@@ -27,6 +29,11 @@ class _Client:
 
     async def send_failed(self, thread_id, turn_id, message):
         raise AssertionError(f"unexpected failure: {message}")
+
+
+class _RejectedClient:
+    async def watch(self):
+        raise AttachAuthError("temporary credential rejection")
 
 
 class DraftStreamContractTests(unittest.IsolatedAsyncioTestCase):
@@ -59,6 +66,21 @@ class DraftStreamContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(adapter.draft_stream_is_message)
 
+    async def test_mid_session_credential_rejection_enters_reconnect_backoff(self):
+        adapter = AttachAdapter()
+        adapter._attach_init(types.SimpleNamespace(extra={}))
+        adapter._client = _RejectedClient()
+        adapter._ready.set()
+        adapter._mark_disconnected = lambda: None
+        adapter._redial = AsyncMock(return_value=False)
+        adapter.disconnect = AsyncMock()
+
+        await adapter._watch_loop()
+
+        adapter._redial.assert_awaited_once()
+        adapter.disconnect.assert_not_awaited()
+        self.assertFalse(adapter._ready.is_set())
+
     async def test_interim_status_does_not_commit_or_clean_up_the_turn(self):
         adapter = AttachAdapter()
         adapter._attach_init(types.SimpleNamespace(extra={}))
@@ -86,6 +108,36 @@ class DraftStreamContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(final.success)
         self.assertEqual(client.commits, [("thread", "turn")])
         self.assertEqual(adapter._active_turn, {})
+
+    async def test_compaction_status_uses_the_host_status_seam_without_sealing_the_turn(self):
+        """Hermes status fallback must not turn compaction into the terminal answer."""
+        adapter = AttachAdapter()
+        adapter._attach_init(types.SimpleNamespace(extra={}))
+        client = _Client()
+        adapter._client = client
+        adapter._active_turn["thread"] = "turn"
+
+        sender = getattr(adapter, "send_or_update_status", None)
+        if callable(sender):
+            status = await sender(
+                "thread", "compacted",
+                "Context compaction complete — continuing turn...",
+                metadata=None,
+            )
+        else:
+            # This is upstream Hermes' exact compatibility fallback.
+            status = await adapter.send(
+                "thread", "Context compaction complete — continuing turn...",
+                metadata=None,
+            )
+
+        self.assertTrue(status.success)
+        self.assertEqual(adapter._active_turn, {"thread": "turn"})
+        self.assertEqual(client.commits, [])
+
+        final = await adapter.send("thread", "Actual answer", reply_to="turn")
+        self.assertTrue(final.success)
+        self.assertEqual(client.commits, [("thread", "turn")])
 
 
 if __name__ == "__main__":

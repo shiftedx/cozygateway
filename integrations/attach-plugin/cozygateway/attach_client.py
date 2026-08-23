@@ -286,6 +286,16 @@ def _close_code(exc: Exception) -> Optional[int]:
     return None
 
 
+def _close_reason(exc: Exception) -> str:
+    """Return the peer's bounded WebSocket close reason, if present."""
+    rcvd = getattr(exc, "rcvd", None)
+    reason = getattr(rcvd, "reason", None) if rcvd is not None else None
+    if not isinstance(reason, str):
+        sent = getattr(exc, "sent", None)
+        reason = getattr(sent, "reason", None) if sent is not None else None
+    return reason[:123] if isinstance(reason, str) else ""
+
+
 async def _default_connect(
     ws_url: str, headers: Dict[str, str], ssl_ctx: Any
 ) -> Any:

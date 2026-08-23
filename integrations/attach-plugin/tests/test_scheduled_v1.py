@@ -17,7 +17,13 @@ except ModuleNotFoundError:
     sys.modules["websockets"] = websockets
     sys.modules["websockets.exceptions"] = websocket_exceptions
 
-from cozygateway.adapter import AttachAdapter, _standalone_send, enqueue_proactive_delivery
+from cozygateway.adapter import (
+    AttachAdapter,
+    _hermes_standalone_send,
+    _send_message_handler,
+    _standalone_send,
+    enqueue_proactive_delivery,
+)
 from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
 from cozygateway.attach_spool import AttachSpool
 
@@ -47,6 +53,113 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self._connection_env.start()
         self.addCleanup(self._connection_env.stop)
+
+    async def test_send_message_handler_keeps_plugin_media_native(self):
+        resident = types.SimpleNamespace(
+            _ready=__import__("asyncio").Event(),
+            send_proactive=AsyncMock(return_value={"state": "projected"}),
+        )
+        resident._ready.set()
+
+        class BasePlatformAdapter:
+            @staticmethod
+            def extract_media(_message):
+                return [("/tmp/photo.jpg", False)], "native caption"
+
+            @staticmethod
+            def filter_media_delivery_paths(media):
+                return media
+
+        gateway = types.ModuleType("gateway")
+        platforms = types.ModuleType("gateway.platforms")
+        base = types.ModuleType("gateway.platforms.base")
+        base.BasePlatformAdapter = BasePlatformAdapter
+        gateway.platforms = platforms
+        platforms.base = base
+        with patch.dict(sys.modules, {
+            "gateway": gateway,
+            "gateway.platforms": platforms,
+            "gateway.platforms.base": base,
+        }), patch("cozygateway.adapter._resident_adapter", return_value=resident):
+            result = await _send_message_handler(
+                {"target": "cozygateway", "message": "MEDIA:/tmp/photo.jpg native caption"},
+                "old-session",
+                "cozygateway",
+                types.SimpleNamespace(extra={}),
+            )
+
+        self.assertEqual(result["state"], "projected")
+        self.assertTrue(result["success"])
+        resident.send_proactive.assert_awaited_once()
+        args, kwargs = resident.send_proactive.await_args
+        self.assertEqual(args[1:3], ("native caption", ["/tmp/photo.jpg"]))
+        self.assertTrue(kwargs["canonical_home"])
+
+    async def test_send_message_handler_never_calls_journal_admission_success(self):
+        resident = types.SimpleNamespace(
+            _ready=__import__("asyncio").Event(),
+            send_proactive=AsyncMock(
+                return_value={"state": "journaled", "accepted_pending": True}
+            ),
+        )
+        resident._ready.set()
+
+        class BasePlatformAdapter:
+            extract_media = staticmethod(lambda message: ([], message))
+            filter_media_delivery_paths = staticmethod(lambda media: media)
+
+        gateway = types.ModuleType("gateway")
+        platforms = types.ModuleType("gateway.platforms")
+        base = types.ModuleType("gateway.platforms.base")
+        base.BasePlatformAdapter = BasePlatformAdapter
+        gateway.platforms = platforms
+        platforms.base = base
+        with patch.dict(sys.modules, {
+            "gateway": gateway,
+            "gateway.platforms": platforms,
+            "gateway.platforms.base": base,
+        }), patch("cozygateway.adapter._resident_adapter", return_value=resident):
+            result = await _send_message_handler(
+                {"target": "cozygateway", "message": "daily note"},
+                "home",
+                "cozygateway",
+                types.SimpleNamespace(extra={}),
+            )
+            retry = await _send_message_handler(
+                {"target": "cozygateway", "message": "daily note"},
+                "home",
+                "cozygateway",
+                types.SimpleNamespace(extra={}),
+            )
+
+        self.assertEqual(result["state"], "journaled")
+        self.assertIn("projection is not yet confirmed", result["error"])
+        self.assertNotIn("success", result)
+        first_key = resident.send_proactive.await_args_list[0].kwargs["delivery_key"]
+        retry_key = resident.send_proactive.await_args_list[1].kwargs["delivery_key"]
+        self.assertEqual(first_key, retry_key)
+        self.assertEqual(retry["state"], "journaled")
+
+    async def test_resident_proactive_media_count_fails_instead_of_truncating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spool = AttachSpool(os.path.join(directory, "spool.sqlite"))
+            adapter = AttachAdapter()
+            adapter._attach_init(types.SimpleNamespace(extra={}))
+            adapter._spool = spool
+            adapter._client = AttachV1Client(AttachV1ClientConfig(
+                gateway_url="http://gateway.example", token="secret", spool=spool,
+            ))
+            adapter._ready.set()
+            try:
+                result = await adapter.send_proactive(
+                    "home", "report", [f"/tmp/{index}.png" for index in range(17)],
+                    canonical_home=True, delivery_key="tool:many",
+                )
+            finally:
+                spool.close()
+
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "media_count_exceeded")
 
     @staticmethod
     def _config(path):
@@ -88,7 +201,7 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._events(path)[0]["kind"], "scheduled")
             self.assertFalse(os.path.exists(hostile))
 
-    async def test_recovered_final_without_an_active_turn_uses_durable_scheduled_delivery(self):
+    async def test_recovered_final_without_an_active_turn_never_claims_unconfirmed_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "spool.sqlite")
             config = self._config(path)
@@ -121,13 +234,47 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     adapter._spool.close()
 
-            self.assertTrue(first.success)
-            self.assertTrue(retry.success)
+            self.assertFalse(first.success)
+            self.assertFalse(retry.success)
+            self.assertIn("projection not yet confirmed", first.error)
             events = self._events(path)
             self.assertEqual([event["kind"] for event in events], ["scheduled", "scheduled"])
             self.assertEqual([event["threadId"] for event in events], ["thread", "thread"])
             self.assertEqual(events[0]["deliveryId"], events[1]["deliveryId"])
             self.assertEqual(events[0]["messageId"], events[1]["messageId"])
+
+    async def test_upstream_hermes_abi_reports_journaled_delivery_as_pending_error(self):
+        with patch(
+            "cozygateway.adapter._standalone_send",
+            AsyncMock(return_value={"state": "journaled", "accepted_pending": True}),
+        ):
+            result = await _hermes_standalone_send(
+                types.SimpleNamespace(extra={}), "home", "daily note"
+            )
+        self.assertEqual(result["state"], "journaled")
+        self.assertIn("projection is not yet confirmed", result["error"])
+        self.assertNotIn("success", result)
+
+    async def test_upstream_hermes_abi_reports_only_projected_as_success(self):
+        with patch(
+            "cozygateway.adapter._standalone_send",
+            AsyncMock(return_value={"state": "projected", "accepted_pending": False}),
+        ):
+            result = await _hermes_standalone_send(
+                types.SimpleNamespace(extra={}), "home", "daily note"
+            )
+        self.assertTrue(result["success"])
+
+    async def test_upstream_hermes_abi_distinguishes_blocked_from_pending(self):
+        with patch(
+            "cozygateway.adapter._standalone_send",
+            AsyncMock(return_value={"state": "blocked", "accepted_pending": False}),
+        ):
+            result = await _hermes_standalone_send(
+                types.SimpleNamespace(extra={}), "home", "daily note"
+            )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["error"], "delivery was blocked before projection")
 
     def test_adapter_configured_spool_path_wins_over_hostile_environment(self):
         with patch.dict(os.environ, {"COZYGATEWAY_SPOOL_PATH": "/definitely/not/the/test/path.sqlite"}):
