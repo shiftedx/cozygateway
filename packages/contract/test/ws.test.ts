@@ -12,6 +12,18 @@ describe("client frames", () => {
     expect(check(ClientFrameSchema, sync)).toBe(true);
   });
 
+  it("accepts only the closed foreground mobile-node advertisement and result", () => {
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_advertise", commands: ["device.status"], foreground: true,
+    })).toBe(true);
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_result", requestId: "request-1", status: "ok", result: { foreground: true },
+    })).toBe(true);
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_result", requestId: "request-1", status: "ok", result: { foreground: true, battery: 90 },
+    })).toBe(false);
+  });
+
   it("rejects a negative sinceSeq and an unknown type", () => {
     expect(check(ClientFrameSchema, { type: "sync", threads: { t1: -1 } })).toBe(false);
     expect(check(ClientFrameSchema, { type: "send", text: "hi" })).toBe(false);
@@ -48,6 +60,8 @@ describe("server frames", () => {
       { type: "bot_clarify_pending", bot: "sage", sessionId: "s1", turnId: "turn-1", clarifyId: "question-1", prompt: "Choose", options: [{ id: "a", label: "A" }], expiresAt: 100, updatedAt: 1 },
       { type: "bot_clarify_resolved", bot: "sage", sessionId: "s1", turnId: "turn-1", clarifyId: "question-1", outcome: "selected", selectedOptionId: "a", updatedAt: 2 },
       { type: "synced" },
+      { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 100 },
+      { type: "mobile_node_cancel", requestId: "request-1", status: "cancelled" },
     ];
     for (const frame of frames) {
       expect(check(ServerFrameSchema, frame)).toBe(true);

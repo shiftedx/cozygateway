@@ -13,6 +13,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("approvals"),
   Type.Literal("clarify"),
   Type.Literal("scheduled"),
+  Type.Literal("mobile_node"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -123,6 +124,21 @@ const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1Med
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
 });
+export const AttachV1MobileRequestSchema = Type.Object({
+  kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }),
+});
+export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
+export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
+export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
+export const AttachV1MobileResultSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ foreground: Type.Literal(true) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Union([Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"), Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked")]) }, { additionalProperties: false }),
+]);
+export type AttachV1MobileResult = Static<typeof AttachV1MobileResultSchema>;
+export type AttachV1MobileResultInput =
+  | { requestId: string; status: "ok"; result: { foreground: true } }
+  | { requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" };
 
 /** Deliberately closed: no thinking/reasoning/chain-of-thought event exists. */
 export const AttachV1EventSchema = Type.Union([
@@ -163,7 +179,9 @@ export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1AckSchema,
   AttachV1GapSchema,
   AttachV1HeartbeatSchema,
+  AttachV1MobileRequestSchema,
+  AttachV1MobileCancelSchema,
 ]);
 export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
-export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema]);
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema]);
 export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;

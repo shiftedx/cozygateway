@@ -22,7 +22,8 @@ import type {
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
-import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
+import type { AttachV1EventFrame, AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
+import type { MobileNodeBroker } from "../mobile-node.ts";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import type {
@@ -66,6 +67,7 @@ export interface NativeBotDataPlaneOptions {
   turnTimeoutMs?: number;
   log?: (message: string) => void;
   trace?: TraceLog;
+  mobileNode?: MobileNodeBroker;
 }
 
 interface ApprovalPayload {
@@ -103,6 +105,8 @@ export class NativeBotDataPlane {
   readonly #turnTimeoutMs: number;
   readonly #log: (message: string) => void;
   readonly #trace: TraceLog | undefined;
+  readonly #mobileNode: MobileNodeBroker | undefined;
+  readonly #turnOrigins = new Map<string, string>();
   readonly #draftSeq = new Map<string, number>();
   readonly #toolFrames = new Map<string, ToolFrameState>();
   readonly #tracedTurnStates = new Map<string, string>();
@@ -128,6 +132,7 @@ export class NativeBotDataPlane {
       opts.log ??
       ((message) => void process.stderr.write(`[native-bot] ${message}\n`));
     this.#trace = opts.trace;
+    this.#mobileNode = opts.mobileNode;
     // Scheduled/home delivery is authorized against this durable gateway-owned binding, never a
     // target asserted by an event itself. Creating it at assembly makes the target canonical even
     // before the app has opened this bot's chat.
@@ -153,8 +158,8 @@ export class NativeBotDataPlane {
         this.#adoptSession(name, sessionId, limit),
       chatHistory: (name) => this.#history(name),
       sendChatMessage: (name, text, opts) => this.#send(name, text, opts),
-      sendChatPhoto: (name, photo) => this.#sendPhoto(name, photo),
-      sendChatAttachment: (name, file) => this.#sendFile(name, file),
+      sendChatPhoto: (name, photo, opts) => this.#sendPhoto(name, photo, opts),
+      sendChatAttachment: (name, file, opts) => this.#sendFile(name, file, opts),
       stopChat: (name) => this.#stop(name),
       resetChat: (name) => this.#reset(name),
       resolveApproval: (name, toolCallId, decision, deviceId) =>
@@ -216,6 +221,22 @@ export class NativeBotDataPlane {
       "threadId" in frame.event &&
       this.#storage.nativeBotHasSession(key, frame.event.threadId)
     );
+  }
+
+  mobileRequest(bot: string, frame: AttachV1MobileRequest): void {
+    const key = normalize(bot);
+    if (!this.handles(key)) {
+      this.#mobileNode?.reject(key, frame.requestId);
+      return;
+    }
+    const chat = this.#storage.nativeBotChat(key, this.#now());
+    if (chat.sessionId !== frame.threadId || chat.activeTurnId !== frame.turnId) {
+      this.#mobileNode?.reject(key, frame.requestId);
+      return;
+    }
+    this.#mobileNode?.invoke({
+      ...frame, bot: key, agentId: key, deviceId: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
+    });
   }
 
   /** Attach transport presence is the only connectivity signal. Commands remain durably queued;
@@ -334,7 +355,10 @@ export class NativeBotDataPlane {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const now = this.#now();
-    const previousSessionId = this.#storage.nativeBotChat(bot, now).sessionId;
+    const previous = this.#storage.nativeBotChat(bot, now);
+    if (previous.activeTurnId !== undefined)
+      this.#cancelMobileTurn(bot, previous.sessionId, previous.activeTurnId);
+    const previousSessionId = previous.sessionId;
     const sessionId = this.#storage.resetNativeBotChat(bot, now);
     // The existing app treats this as a cross-device transcript switch; the same adoption frame
     // remains correct even though attach-native sessions are gateway-owned rather than Hermes RPC
@@ -414,7 +438,7 @@ export class NativeBotDataPlane {
   async #send(
     name: string,
     text: string,
-    opts?: { clientId?: string },
+    opts?: { clientId?: string; deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
@@ -448,6 +472,7 @@ export class NativeBotDataPlane {
     });
     if (chat.activeTurnId === undefined) {
       this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+      if (opts?.deviceId !== undefined) this.#turnOrigins.set(this.#nativeTurnKey(bot, chat.sessionId, turnId), opts.deviceId);
       this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
     }
     this.#broadcastMessage(bot, chat.sessionId, message, now);
@@ -461,6 +486,7 @@ export class NativeBotDataPlane {
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     if (chat.activeTurnId === undefined) return "idle";
+    this.#cancelMobileTurn(bot, chat.sessionId, chat.activeTurnId);
     if (!this.#ingress.sendNativeInterrupt(bot, {
       threadId: chat.sessionId,
       turnId: chat.activeTurnId,
@@ -475,6 +501,7 @@ export class NativeBotDataPlane {
   async #sendPhoto(
     name: string,
     photo: BotChatPhotoUpload,
+    opts?: { deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     return this.#sendAttachment(name, {
       bytes: photo.bytes,
@@ -483,15 +510,16 @@ export class NativeBotDataPlane {
       family: "image",
       text: photo.text,
       clientId: photo.clientId,
-      label: "photo",
+      label: "photo", deviceId: opts?.deviceId,
     });
   }
 
   async #sendFile(
     name: string,
     file: BotChatFileUpload,
+    opts?: { deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
-    return this.#sendAttachment(name, { ...file, family: "file", label: "attachment" });
+    return this.#sendAttachment(name, { ...file, family: "file", label: "attachment", deviceId: opts?.deviceId });
   }
 
   /** One durable attachment turn, after each public route has validated its own file type. */
@@ -504,6 +532,7 @@ export class NativeBotDataPlane {
       family: "image" | "file";
       text: string;
       clientId?: string;
+      deviceId?: string;
       label: "photo" | "attachment";
     },
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
@@ -563,6 +592,7 @@ export class NativeBotDataPlane {
       ...(input.clientId === undefined ? {} : { clientId: input.clientId }),
     });
     this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+    if (input.deviceId !== undefined) this.#turnOrigins.set(this.#nativeTurnKey(bot, chat.sessionId, turnId), input.deviceId);
     this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
     this.#broadcastMessage(bot, chat.sessionId, message, now);
     this.#state(bot, chat.sessionId, "polling", true);
@@ -590,6 +620,7 @@ export class NativeBotDataPlane {
     const now = this.#now();
     const previous = this.#storage.nativeBotChat(bot, now);
     if (previous.activeTurnId !== undefined) {
+      this.#cancelMobileTurn(bot, previous.sessionId, previous.activeTurnId);
       this.#ingress.sendNativeInterrupt(bot, {
         threadId: previous.sessionId,
         turnId: previous.activeTurnId,
@@ -761,6 +792,7 @@ export class NativeBotDataPlane {
     );
     if (!settledActiveTurn) return;
     this.#clearTurnTimeout(bot, sessionId, turnId);
+    this.#cancelMobileTurn(bot, sessionId, turnId);
     this.#storage.recordNativeBotTerminal({
       bot,
       sessionId,
@@ -1037,6 +1069,11 @@ export class NativeBotDataPlane {
 
   #nativeTurnKey(bot: string, sessionId: string, turnId: string): string {
     return `${bot}:${sessionId}:${turnId}`;
+  }
+
+  #cancelMobileTurn(bot: string, sessionId: string, turnId: string): void {
+    this.#turnOrigins.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#mobileNode?.cancelTurn(bot, turnId);
   }
 
   #restoreToolFrames(bot: string): void {

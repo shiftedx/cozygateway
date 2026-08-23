@@ -118,3 +118,22 @@ names the unique attach bearer token. That same identity powers both the core `/
 
 There is no protocol downgrade. Peers that do not speak attach-v1 are rejected rather than routed
 through a less reliable transport.
+
+### Ephemeral Mobile Node lane
+
+When `mobile_node` is negotiated, a plugin may send an unsequenced `mobile_request` for the
+active native Bot Mode turn only:
+
+```json
+{ "kind": "mobile_request", "requestId": "...", "command": "device.status", "threadId": "...", "turnId": "...", "expiresAt": 0 }
+```
+
+The gateway replies directly with one unsequenced `mobile_result`. This lane is deliberately not
+an event or command envelope, has no cursor or ACK, is never entered into either durable spool,
+and is dropped on reconnect. The only successful payload is `{ "foreground": true }`; terminal
+statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground_required`, and
+`policy_blocked`.
+
+The plugin may send `{ "kind": "mobile_cancel", "requestId": "..." }` to settle its own
+pending tool. It is also negotiated, unsequenced, non-durable, and never replayed; a late phone
+result is ignored. The gateway sends no raw sensor value in either direction.

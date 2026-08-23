@@ -723,6 +723,7 @@ export function registerBotRoutes(
     try {
       const sent = await chat.sendChatMessage(name, parsed.text, {
         ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
+        deviceId: c.get("deviceId"),
       });
       return c.json(
         { name, sessionId: sent.sessionId, message: sent.message },
@@ -953,7 +954,7 @@ export function registerBotRoutes(
           ...(fields.clientId === undefined
             ? {}
             : { clientId: fields.clientId }),
-        });
+        }, { deviceId: c.get("deviceId") });
         return c.json(
           { name, sessionId: sent.sessionId, message: sent.message },
           202,
@@ -1022,7 +1023,7 @@ export function registerBotRoutes(
           bytes, mime: accepted.mime, name: filename,
           text: (fields.text ?? "").trim() || "Here is an attached file.",
           ...(fields.clientId === undefined ? {} : { clientId: fields.clientId }),
-        });
+        }, { deviceId: c.get("deviceId") });
         return c.json({ name, sessionId: sent.sessionId, message: sent.message }, 202);
       } catch (err) { return failure(c, err); }
     } finally { slot(); }

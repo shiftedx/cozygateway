@@ -19,6 +19,9 @@ import {
   type AttachV1Command,
   type AttachV1CommandFrame,
   type AttachV1EventFrame,
+  type AttachV1MobileCancel,
+  type AttachV1MobileRequest,
+  type AttachV1MobileResultInput,
   type AttachV1ServerFrame,
 } from "./protocol-v1.ts";
 import { resolveAttachBearer } from "./token-auth.ts";
@@ -28,7 +31,7 @@ export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node"] as const satisfies readonly AttachV1Capability[];
 
 export interface AttachV1Events {
   /** True only after the event was durably projected into its owning app/transcript state. */
@@ -36,6 +39,8 @@ export interface AttachV1Events {
   /** Authorization/canonical-target check performed before inbox admission. */
   canAcceptEvent?(agentId: string, frame: AttachV1EventFrame): boolean;
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
+  onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;
+  onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
 }
 
 interface Connection {
@@ -182,6 +187,22 @@ export class AttachV1Ingress implements TurnEndpoint {
         // Gateway is the sole heartbeat initiator. The inbound frame is its one acknowledgement,
         // not a request for another response; echoing it makes two healthy peers amplify heartbeats.
         this.#lastHeartbeatAt = receivedAt;
+        return;
+      }
+      if (frame.kind === "mobile_request") {
+        if (!connection.capabilities.has("mobile_node")) {
+          socket.close(1008, "attach-v1 capability not negotiated: mobile_node");
+          return;
+        }
+        this.#events.onMobileRequest?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "mobile_cancel") {
+        if (!connection.capabilities.has("mobile_node")) {
+          socket.close(1008, "attach-v1 capability not negotiated: mobile_node");
+          return;
+        }
+        this.#events.onMobileCancel?.(agentId, frame);
         return;
       }
       if (frame.kind === "ack") {
@@ -349,6 +370,12 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   sendClarifyResolution(agentId: string, input: { threadId: string; turnId: string; clarifyId: string; optionId: string }, commandId?: string): boolean {
     return this.#enqueue(agentId, { kind: "resolve_clarify", ...input }, commandId);
+  }
+
+  sendMobileResult(agentId: string, frame: AttachV1MobileResultInput): boolean {
+    const connection = this.#current.get(agentId);
+    if (connection === undefined || !connection.hello || !connection.capabilities.has("mobile_node")) return false;
+    return this.#send(connection, { kind: "mobile_result", ...frame });
   }
 
   replayUnapplied(agentId: string): void {

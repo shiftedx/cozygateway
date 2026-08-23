@@ -5,7 +5,7 @@ import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
-import type { AttachV1EventFrame, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
+import type { AttachV1EventFrame, AttachV1MobileRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
 
 describe("attach-v1 ingress", () => {
@@ -18,6 +18,8 @@ describe("attach-v1 ingress", () => {
   let clock: number;
   let projectionSucceeds: boolean;
   let traces: string[];
+  let mobileRequests: AttachV1MobileRequest[];
+  let mobileCancels: string[];
 
   beforeEach(async () => {
     storage = openStorage(":memory:");
@@ -26,13 +28,20 @@ describe("attach-v1 ingress", () => {
     clock = 0;
     projectionSucceeds = true;
     traces = [];
+    mobileRequests = [];
+    mobileCancels = [];
     ingress = new AttachV1Ingress({
       tokens: new Map([
         ["secret", "sage"],
         ["soak-1", "soak-1"], ["soak-2", "soak-2"], ["soak-3", "soak-3"],
         ["soak-4", "soak-4"], ["soak-5", "soak-5"], ["soak-6", "soak-6"],
       ]), storage,
-      events: { onEvent: (_agent, frame) => { accepted.push(frame); return projectionSucceeds; }, onPresence: (_agent, state) => presence.push(state) },
+      events: {
+        onEvent: (_agent, frame) => { accepted.push(frame); return projectionSucceeds; },
+        onPresence: (_agent, state) => presence.push(state),
+        onMobileRequest: (_agent, frame) => mobileRequests.push(frame),
+        onMobileCancel: (_agent, frame) => mobileCancels.push(frame.requestId),
+      },
       now: () => clock,
       heartbeatIntervalMs: 1000, heartbeatTimeoutMs: 5000,
       projectionRetryMs: 10,
@@ -90,6 +99,19 @@ describe("attach-v1 ingress", () => {
     second.ws.send(JSON.stringify({ kind: "ack", channel: "command", sequence: 1, id: (command as { commandId: string }).commandId }));
     await until(() => storage.pendingAttachCommands("sage", 0, 10).length === 0);
     second.ws.close();
+  });
+
+  it("routes negotiated mobile frames without creating a durable event or command", async () => {
+    const peer = await dial(undefined, ["mobile_node"]);
+    peer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000 }));
+    peer.ws.send(JSON.stringify({ kind: "mobile_cancel", requestId: "request-1" }));
+    await until(() => mobileRequests.length === 1 && mobileCancels.length === 1);
+
+    expect(ingress.sendMobileResult("sage", { requestId: "request-1", status: "ok", result: { foreground: true } })).toBe(true);
+    await until(() => peer.frames.some((frame) => frame.kind === "mobile_result"));
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    expect(storage.attachCommandCursor("sage")).toBe(0);
+    peer.ws.close();
   });
 
   it("reconciles a lost command ACK from the plugin's durable resume cursor without replay", async () => {
