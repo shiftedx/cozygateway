@@ -843,9 +843,30 @@ class AttachAdapter:
         from gateway.platforms.base import SendResult  # harness-defined identifier
 
         client = self._client
+        active_turn = self._active_turn.get(chat_id)
         turn_id = reply_to or self._active_turn.get(chat_id)
         if client is None:
             return SendResult(success=False, error="attach not connected")
+        if isinstance(metadata, dict) and metadata.get("_interim_send") and active_turn:
+            # Hermes emits error/status notices through the ordinary platform
+            # send surface while the agent keeps working. Render the latest
+            # notice into the mutable draft, but never seal or clean up the
+            # turn; the final reply below remains the sole owner of ``done``.
+            base_text = self._turn_text.get(active_turn, "")
+            notice = content.strip() if content else ""
+            draft_text = "\n\n".join(part for part in (base_text, notice) if part)
+            blocks = self._normalize(active_turn, draft_text)
+            chips = self._chips(active_turn)
+            if blocks or chips:
+                self._content_seen[active_turn] = True
+                try:
+                    await client.send_draft(chat_id, active_turn, blocks, tool_calls=chips)
+                except (AttachAuthError, AttachSupersededError) as exc:
+                    return SendResult(success=False, error=str(exc))
+                except Exception as exc:  # noqa: BLE001 - status is best-effort
+                    logger.debug("attach: interim draft failed", exc_info=True)
+                    return SendResult(success=False, error=str(exc))
+            return SendResult(success=True)
         if not turn_id:
             logger.warning("attach: refusing send for %r -- no in-flight turn", chat_id)
             return SendResult(success=False, error="no in-flight turn")
