@@ -41,6 +41,18 @@ const AttachV1CommandCatalogSchema = Type.Array(AttachV1SlashCommandSchema, {
   maxItems: 512,
 });
 
+/** Bounded spool counters reported only on an authenticated control frame. They intentionally
+ * contain no task, event, command, profile, or instance identifier. */
+export const AttachV1TelemetrySchema = Type.Object({
+  eventOutboxDepth: Type.Integer({ minimum: 0, maximum: 1_000_000 }),
+  // A fresh durable spool has no oldest event. `null` means unknown, never an unbounded
+  // measurement. The gateway derives ACK progress from authenticated receipt time.
+  oldestEventAgeMs: Type.Union([Type.Integer({ minimum: 0, maximum: 7 * 24 * 60 * 60 * 1_000 }), Type.Null()]),
+  eventAckCursor: Sequence,
+  commandInboxDepth: Type.Integer({ minimum: 0, maximum: 1_000_000 }),
+}, { additionalProperties: false });
+export type AttachV1Telemetry = Static<typeof AttachV1TelemetrySchema>;
+
 /** The frozen old-server hello. It deliberately cannot parse v2's location capability. */
 export const AttachV1HelloV1Schema = Type.Object({
   kind: Type.Literal("hello"),
@@ -50,7 +62,7 @@ export const AttachV1HelloV1Schema = Type.Object({
   resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
   limits: Type.Optional(AttachV1LimitsSchema),
   commands: Type.Optional(AttachV1CommandCatalogSchema),
-});
+}, { additionalProperties: false });
 const AttachV1HelloV2Schema = Type.Object({
   kind: Type.Literal("hello"),
   version: Type.Literal(2),
@@ -59,6 +71,7 @@ const AttachV1HelloV2Schema = Type.Object({
   resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
   limits: Type.Optional(AttachV1LimitsSchema),
   commands: Type.Optional(AttachV1CommandCatalogSchema),
+  telemetry: Type.Optional(AttachV1TelemetrySchema),
 });
 export const AttachV1HelloSchema = Type.Union([AttachV1HelloV1Schema, AttachV1HelloV2Schema]);
 export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;
@@ -151,6 +164,14 @@ const ScheduledEvent = Type.Object({
   kind: Type.Literal("scheduled"), threadId: Id, deliveryId: Id, messageId: Id,
   blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
 });
+/** The attach bearer already identifies the Hermes profile, so a semantic home target never
+ * carries a second caller-controlled profile field. Gateway admission binds it once to the
+ * selected native Bot Mode session; a retry reuses that durable binding. */
+const ScheduledCanonicalHomeEvent = Type.Object({
+  kind: Type.Literal("scheduled"), target: Type.Object({ kind: Type.Literal("canonical_home") }),
+  deliveryId: Id, messageId: Id,
+  blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+});
 const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1MediaDescriptorSchema });
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
@@ -181,7 +202,7 @@ export type AttachV1MobileResultInput =
 /** Deliberately closed: no thinking/reasoning/chain-of-thought event exists. */
 export const AttachV1EventSchema = Type.Union([
   DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent,
-  ApprovalEvent, ClarifyEvent, ScheduledEvent, MediaEvent, PresenceEvent,
+  ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, PresenceEvent,
 ]);
 export type AttachV1Event = Static<typeof AttachV1EventSchema>;
 
@@ -197,7 +218,10 @@ export const AttachV1AckSchema = Type.Object({
 });
 export type AttachV1Ack = Static<typeof AttachV1AckSchema>;
 
-export const AttachV1HeartbeatSchema = Type.Object({ kind: Type.Literal("heartbeat"), sentAt: Type.Integer({ minimum: 0 }) });
+export const AttachV1HeartbeatSchema = Type.Object({
+  kind: Type.Literal("heartbeat"), sentAt: Type.Integer({ minimum: 0 }),
+  telemetry: Type.Optional(AttachV1TelemetrySchema),
+}, { additionalProperties: false });
 export const AttachV1GapSchema = Type.Object({
   kind: Type.Literal("gap"), channel: Type.Union([Type.Literal("event"), Type.Literal("command")]),
   requestedAfter: Sequence, earliestAvailable: Type.Integer({ minimum: 1 }), latestAvailable: Sequence,

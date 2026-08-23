@@ -105,6 +105,13 @@ def _env_int(name: str, default: int) -> int:
 
 _COMMAND_NAME = re.compile(r"^/[A-Za-z0-9_-]{1,128}$")
 
+# A one-shot proactive sender shares its spool with the resident adapter.  Keep a
+# bounded shutdown in the foreground, but if a broken websocket watcher refuses
+# to stop, retain the lease until that watcher really exits rather than allowing
+# a second connection to supersede it.
+_ONE_SHOT_CLEANUP_SECONDS = 0.25
+_ONE_SHOT_CLEANUP_TASKS: Set[asyncio.Task] = set()
+
 
 def hermes_gateway_commands() -> List[Dict[str, str]]:
     """Return the commands this Hermes profile exposes to messaging clients.
@@ -193,7 +200,7 @@ class AttachAdapter:
         self.ca_file: Optional[str] = (
             os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None
         )
-        self._spool_path: Optional[str] = os.getenv("COZYGATEWAY_SPOOL_PATH") or extra.get("spool_path") or None
+        self._spool_path: Optional[str] = extra.get("spool_path") or os.getenv("COZYGATEWAY_SPOOL_PATH") or None
         self._spool: Optional[AttachSpool] = None
         self._client: Optional[Any] = None
         self._watcher: Optional[asyncio.Task] = None
@@ -341,6 +348,13 @@ class AttachAdapter:
                 os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite"
             )
             self._spool = AttachSpool(str(spool_path))
+        if not self._spool.acquire_transport_lease():
+            self._set_fatal_error(  # type: ignore[attr-defined]
+                "transport_owned",
+                "another CozyGateway adapter owns this durable spool",
+                retryable=True,
+            )
+            return False
         self._client = AttachV1Client(
             AttachV1ClientConfig(
                 gateway_url=self.gateway_url,
@@ -358,12 +372,14 @@ class AttachAdapter:
         try:
             await self._client.connect()
         except AttachAuthError as exc:
+            self._spool.release_transport_lease()
             logger.error("attach: dial rejected (%s)", exc)
             self._set_fatal_error(  # type: ignore[attr-defined]
                 "auth_rejected", str(exc), retryable=False
             )
             return False
         except Exception as exc:  # noqa: BLE001
+            self._spool.release_transport_lease()
             logger.error("attach-v1: failed to dial /attach/v1 -- %s", exc)
             self._set_fatal_error(  # type: ignore[attr-defined]
                 "connect_failed", str(exc), retryable=True
@@ -453,6 +469,7 @@ class AttachAdapter:
             await self._client.close()
             self._client = None
         if self._spool is not None:
+            self._spool.release_transport_lease()
             self._spool.close()
             self._spool = None
 
@@ -1415,10 +1432,149 @@ async def _standalone_send(
         thread_id=target_thread,
         delivery_key=run_key,
         message=message,
+        media_files=media_files,
+        canonical_home=True,
     )
-    if result.get("delivered") and media_files:
-        result["media_errors"] = ["standalone media waits for native upload support"]
     return result
+
+
+def _proactive_spool_path(pconfig: Any, spool_path: Optional[str]) -> str:
+    if spool_path:
+        return spool_path
+    extra = getattr(pconfig, "extra", {}) or {}
+    return str(
+        extra.get("spool_path")
+        or os.getenv("COZYGATEWAY_SPOOL_PATH")
+        or os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
+    )
+
+
+def _proactive_media_id(delivery_id: str, index: int) -> str:
+    return "scheduled_media_" + hashlib.sha256(
+        f"{delivery_id}\0{index}".encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _proactive_media_error(path: str, exc: Exception) -> str:
+    name = os.path.basename(path)[:128] or "attachment"
+    if isinstance(exc, FileNotFoundError):
+        reason = "not_found"
+    elif isinstance(exc, PermissionError):
+        reason = "access_denied"
+    elif isinstance(exc, ValueError) and "size cap" in str(exc):
+        reason = "size_limit"
+    elif isinstance(exc, OSError):
+        reason = "io_error"
+    else:
+        reason = "upload_failed"
+    return f"{name}: {reason}"
+
+
+def _proactive_failure(error: str, delivery_id: Optional[str] = None, message_id: Optional[str] = None, media_errors: Optional[List[str]] = None) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"state": "failed", "accepted_pending": False, "error": error}
+    if delivery_id is not None:
+        result["deliveryId"] = delivery_id
+    if message_id is not None:
+        result["messageId"] = message_id
+    if media_errors:
+        result["media_errors"] = media_errors
+    return result
+
+
+async def _proactive_projection(client: AttachV1Client, delivery_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+    deadline = time.monotonic() + max(0.0, min(timeout_seconds, 2.0))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining < 0:
+            return None
+        try:
+            receipt = await client.delivery_receipt(delivery_id, max(0.05, remaining))
+        except Exception:  # noqa: BLE001 - journaled state remains the honest fallback
+            return None
+        if receipt is not None and receipt.get("state") in {"projected", "blocked"}:
+            return receipt
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(0.05, remaining))
+
+
+def _release_one_shot_transport(spool: AttachSpool) -> None:
+    spool.release_transport_lease()
+    spool.close()
+
+
+def _retain_one_shot_cleanup(task: asyncio.Task) -> asyncio.Task:
+    _ONE_SHOT_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_ONE_SHOT_CLEANUP_TASKS.discard)
+    return task
+
+
+def _defer_one_shot_transport_release(
+    client: AttachV1Client, watch_task: asyncio.Task, spool: AttachSpool
+) -> None:
+    """Retain a stuck one-shot lease until socket and watcher have stopped."""
+
+    async def release_when_settled() -> None:
+        try:
+            await asyncio.shield(watch_task)
+        except BaseException:  # A failed/cancelled watcher is still settled.
+            pass
+        await client.wait_closed()
+        _release_one_shot_transport(spool)
+
+    _retain_one_shot_cleanup(asyncio.create_task(release_when_settled()))
+
+
+async def _wait_one_shot_watcher(watch_task: asyncio.Task) -> bool:
+    try:
+        await asyncio.wait_for(asyncio.shield(watch_task), _ONE_SHOT_CLEANUP_SECONDS)
+        return True
+    except asyncio.TimeoutError:
+        watch_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(watch_task), _ONE_SHOT_CLEANUP_SECONDS)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except (asyncio.CancelledError, Exception):
+            return True
+    except (asyncio.CancelledError, Exception):
+        return True
+
+
+async def _wait_one_shot_socket(client: AttachV1Client) -> bool:
+    try:
+        await asyncio.wait_for(client.wait_closed(), _ONE_SHOT_CLEANUP_SECONDS)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _settle_one_shot_transport(
+    client: AttachV1Client, watch_task: asyncio.Task, spool: AttachSpool
+) -> None:
+    """Close a one-shot client before releasing its exclusive spool lease.
+
+    The normal path waits briefly for a graceful watcher exit.  A pathological
+    watcher cannot make a cancelled cron task hang: it is cancelled after the
+    first bound and its lease is held by a small deferred finalizer until it
+    finally exits.
+    """
+    try:
+        await asyncio.wait_for(client.close(), _ONE_SHOT_CLEANUP_SECONDS)
+    except asyncio.CancelledError:
+        _defer_one_shot_transport_release(client, watch_task, spool)
+        raise
+    except Exception:
+        logger.debug("attach: one-shot client close did not complete cleanly", exc_info=True)
+
+    if not await _wait_one_shot_watcher(watch_task):
+        _defer_one_shot_transport_release(client, watch_task, spool)
+        return
+    if not await _wait_one_shot_socket(client):
+        _defer_one_shot_transport_release(client, watch_task, spool)
+        return
+    _release_one_shot_transport(spool)
 
 
 async def enqueue_proactive_delivery(
@@ -1427,42 +1583,109 @@ async def enqueue_proactive_delivery(
     thread_id: str,
     delivery_key: str,
     message: str,
+    media_files: Optional[List[str]] = None,
+    media_policy: str = "atomic",
+    spool_path: Optional[str] = None,
+    canonical_home: bool = False,
 ) -> Dict[str, Any]:
     """Journal one unanchored delivery for any proactive agent trigger.
 
     ``delivery_key`` is owned by the trigger producer and must stay stable across retries. Hermes
     cron is the implemented producer; deeper agent hooks may use this public seam with their own
-    durable occurrence ids when they are added. This text-only first slice intentionally leaves
-    media uploads on the live native delivery path.
+    durable occurrence ids when they are added.
     """
     text = str(message)
     target_thread = thread_id.strip() if isinstance(thread_id, str) else ""
     key = delivery_key.strip() if isinstance(delivery_key, str) else ""
-    if not target_thread:
-        return {"success": False, "error": "attach-v1 proactive delivery requires a target thread"}
+    if not target_thread and not canonical_home:
+        return _proactive_failure("target_required")
     if not key:
-        return {"success": False, "error": "attach-v1 proactive delivery requires a stable delivery key"}
+        return _proactive_failure("delivery_key_required")
+    paths = [path for path in media_files or [] if isinstance(path, str) and path]
+    if media_policy not in {"atomic", "allow_partial_media"}:
+        return _proactive_failure("invalid_media_policy")
+    delivery_id = "scheduled:" + key
+    message_id = "scheduled-" + hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()[:32]
+    if len(paths) > 16:
+        return _proactive_failure("media_count_exceeded", delivery_id, message_id)
     # Silence is success, not an empty transcript row or a newly-created spool.
-    if not text.strip():
-        return {"success": True, "delivered": False}
+    if not text.strip() and not paths:
+        return {"state": "suppressed", "accepted_pending": False}
     extra = getattr(pconfig, "extra", {}) or {}
-    spool_path = os.getenv("COZYGATEWAY_SPOOL_PATH") or extra.get("spool_path")
-    if not spool_path:
-        spool_path = os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
-    spool = AttachSpool(str(spool_path))
     try:
-        delivery_id = "scheduled:" + key
-        message_id = "scheduled-" + hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()[:32]
-        frame = spool.enqueue_event({
-            "kind": "scheduled",
-            "threadId": target_thread,
+        receipt_timeout = min(2.0, max(0.0, float(extra.get("receipt_timeout_seconds", 0.25))))
+    except (TypeError, ValueError):
+        receipt_timeout = 0.25
+    spool = AttachSpool(_proactive_spool_path(pconfig, spool_path))
+    watch_task: Optional[asyncio.Task] = None
+    try:
+        media_ids: List[str] = []
+        media_errors: List[str] = []
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url=(os.getenv("COZYGATEWAY_URL") or extra.get("gateway_url") or "").rstrip("/"),
+            token=os.getenv("COZYGATEWAY_TOKEN") or extra.get("token", ""),
+            spool=spool,
+            ca_file=os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None,
+        ))
+        if paths:
+            for index, path in enumerate(paths[:16]):
+                media_id = _proactive_media_id(delivery_id, index)
+                try:
+                    await client.upload_media(media_id, path, AttachAdapter._media_family(path))
+                    media_ids.append(media_id)
+                except Exception as exc:  # noqa: BLE001 - policy below determines whether text may continue
+                    media_errors.append(_proactive_media_error(path, exc))
+            if media_errors and media_policy == "atomic":
+                return _proactive_failure("media_upload_failed", delivery_id, message_id, media_errors)
+        blocks = normalize_text_to_blocks(text)
+        if not blocks and not media_ids:
+            return _proactive_failure("media_upload_failed", delivery_id, message_id, media_errors)
+        frame = await client.send_scheduled(
+            target_thread,
+            delivery_id,
+            message_id,
+            blocks,
+            media_ids,
+            canonical_home=canonical_home,
+        )
+        if frame is None:
+            return _proactive_failure("scheduled_not_supported", delivery_id, message_id, media_errors)
+        result: Dict[str, Any] = {
+            "state": "journaled_partial" if media_errors else "journaled",
+            "accepted_pending": True,
             "deliveryId": delivery_id,
             "messageId": message_id,
-            "blocks": [block.to_wire() for block in normalize_text_to_blocks(text)],
-        })
-        return {"success": True, "delivered": True, "message_id": frame["eventId"]}
+            "eventId": frame["eventId"],
+        }
+        if media_errors:
+            result["media_errors"] = media_errors
+        if spool.acquire_transport_lease():
+            try:
+                await client.connect()
+                watch_task = asyncio.create_task(client.watch())
+            except Exception:  # noqa: BLE001 - the durable local journal remains replayable
+                spool.release_transport_lease()
+        receipt = await _proactive_projection(client, delivery_id, receipt_timeout) if watch_task is not None else None
+        if receipt is not None and receipt.get("state") == "projected":
+            result["state"] = "projected"
+            result["accepted_pending"] = False
+            result["projectedAt"] = receipt.get("projectedAt")
+        elif receipt is not None and receipt.get("state") == "blocked":
+            result["state"] = "blocked"
+            result["accepted_pending"] = False
+            result["attempts"] = receipt.get("attempts")
+        return result
     finally:
-        spool.close()
+        if watch_task is None:
+            spool.close()
+        else:
+            # Shield only teardown: the caller still receives its original
+            # CancelledError, but cannot release the shared transport lease
+            # while this socket/watch pair remains live.
+            cleanup = _retain_one_shot_cleanup(
+                asyncio.create_task(_settle_one_shot_transport(client, watch_task, spool))
+            )
+            await asyncio.shield(cleanup)
 
 
 def register(ctx: Any) -> None:

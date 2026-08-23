@@ -5,6 +5,7 @@ import { openStorage } from "../src/storage.ts";
 import { createApp } from "../src/http.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
+import type { AttachHealthSummary } from "cozygateway-contract";
 
 const config: GatewayConfig = {
   name: "test-gateway",
@@ -14,11 +15,7 @@ const config: GatewayConfig = {
   hermes: testHermes(),
 };
 
-function makeApp(now = () => 1_000, attachHealth?: () => {
-  configured: number; online: number; degraded: number; absent: number;
-  lastHeartbeatAt: number | null; lastEventAt: number | null; lastTerminalAt: number | null;
-  queueDepth: number; deadLetters: number;
-}) {
+function makeApp(now = () => 1_000, attachHealth?: () => AttachHealthSummary) {
   const storage = openStorage(":memory:");
   const revoked: string[] = [];
   const app = createApp({
@@ -100,6 +97,8 @@ describe("GET /health", () => {
       configured: 6, online: 4, degraded: 1, absent: 1,
       lastHeartbeatAt: 1, lastEventAt: 2, lastTerminalAt: 3,
       queueDepth: 5, deadLetters: 1,
+      pluginOutboxDepth: 2, pluginOldestEventAgeMs: 3,
+      pluginLastAckProgressAt: 4, pluginCommandInboxDepth: 5,
     };
     const { app } = makeApp(() => 1_000, () => attach);
     expect((await (await app.request("/health")).json()).attach).toEqual(attach);

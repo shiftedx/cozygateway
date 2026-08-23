@@ -716,14 +716,23 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
-  it("projects tools, approvals, and scheduled delivery", async () => {
+  it("keeps approval requested until Hermes confirms it", async () => {
     const storage = openStorage(":memory:");
     const frames: ServerFrame[] = [];
     const approvals: unknown[] = [];
-    const pushes: unknown[] = [];
     const control = {} as BotsSurface;
-    const ingress = { sendApprovalResolution: vi.fn(() => true) } as unknown as AttachV1Ingress;
-    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), onApproval: (event) => approvals.push(event), onChatMessage: (event) => pushes.push(event), now: () => 500 });
+    const ingress = {
+      requestNativeApprovalResolution: vi.fn((bot: string, input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" }) => storage.requestNativeInteractionResolution({
+        bot,
+        kind: "approval",
+        interactionId: input.approvalId,
+        decision: input.decision,
+        commandId: `approval:${bot}:${input.approvalId}`,
+        command: { kind: "resolve_approval", ...input },
+        requestedAt: 500,
+      })),
+    } as unknown as AttachV1Ingress;
+    const plane = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), onApproval: (event) => approvals.push(event), now: () => 500 });
     const chat = storage.nativeBotChat("sage", 1);
     storage.enqueueAttachCommand("sage", "turn-command", { kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello" }, 2);
 
@@ -733,22 +742,106 @@ describe("attach-v1 native Bot Mode plane", () => {
       bot: "sage", sessionId: chat.sessionId, turnId: "turn", toolCallId: "approval-1",
       ruleName: "search", createdAt: 500,
     }]);
-    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device")).toBe("approved");
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device")).toBe("requested");
+    expect(plane.surface().pendingApprovals()).toEqual([expect.objectContaining({ toolCallId: "approval-1", resolutionRequestedAt: 500 })]);
+    expect(frames).toContainEqual(expect.objectContaining({ type: "bot_approval_resolution_requested", toolCallId: "approval-1" }));
+    expect(frames).not.toContainEqual(expect.objectContaining({ type: "bot_approval_resolved", toolCallId: "approval-1" }));
+    expect(approvals).toHaveLength(1);
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "deny", "other-device")).toBe("resolution_pending");
+    expect((ingress.requestNativeApprovalResolution as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(2);
+
+    expect(plane.handle("sage", { kind: "event", sequence: 3, eventId: "approval-approved", event: { kind: "approval", threadId: chat.sessionId, turnId: "turn", approvalId: "approval-1", callId: "call", name: "search", status: "approved" } })).toBe(true);
     expect(plane.surface().pendingApprovals()).toEqual([]);
-    expect(await plane.surface().resolveApproval("sage", "approval-1", "deny", "other-device")).toBe("not_pending");
-    expect((ingress.sendApprovalResolution as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
-    const scheduled: AttachV1EventFrame = { kind: "event", sequence: 1, eventId: "scheduled", event: { kind: "scheduled", threadId: chat.sessionId, deliveryId: "cron-1", messageId: "scheduled-1", blocks: [{ type: "paragraph", text: "daily note" }] } };
-    expect(storage.acceptAttachEvent("sage", scheduled, 3).status).toBe("accepted");
-    plane.handle("sage", scheduled);
-    expect(frames.some((frame) => frame.type === "bot_tool_activity")).toBe(true);
-    expect(frames.some((frame) => frame.type === "bot_approval_pending")).toBe(true);
     expect(approvals).toEqual([
       expect.objectContaining({ toolCallId: "approval-1" }),
       expect.objectContaining({ toolCallId: "approval-1", outcome: "approved" }),
     ]);
-    expect(storage.nativeBotMessages("sage", chat.sessionId).at(-1)?.text).toBe("daily note");
-    expect(pushes).toEqual([expect.objectContaining({ bot: "sage", messageId: "scheduled-1", preview: "daily note" })]);
 
+    plane.close();
+    storage.close();
+  });
+
+  it("rejects terminal interactions that do not match their durable session and turn binding", () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: (frame) => frames.push(frame),
+      now: () => 10,
+    });
+    const first = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn-first", {
+      kind: "turn", threadId: first.sessionId, turnId: "turn-first", messageId: "user-first", text: "first",
+    }, 1);
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "approval-pending",
+      event: {
+        kind: "approval", threadId: first.sessionId, turnId: "turn-first",
+        approvalId: "approval-1", callId: "call-first", name: "workspace.write", status: "pending",
+      },
+    })).toBe(true);
+    const secondSessionId = storage.resetNativeBotChat("sage", 2);
+    storage.enqueueAttachCommand("sage", "turn-second", {
+      kind: "turn", threadId: secondSessionId, turnId: "turn-second", messageId: "user-second", text: "second",
+    }, 2);
+
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 3, eventId: "approval-wrong-binding",
+      event: {
+        kind: "approval", threadId: secondSessionId, turnId: "turn-second",
+        approvalId: "approval-1", callId: "call-second", name: "workspace.write", status: "approved",
+      },
+    })).toBe(false);
+    expect(storage.nativeInteraction("sage", "approval", "approval-1")).toMatchObject({
+      sessionId: first.sessionId, turnId: "turn-first", status: "pending",
+    });
+
+    expect(frames).not.toContainEqual(expect.objectContaining({ type: "bot_approval_resolved", toolCallId: "approval-1" }));
+    plane.close();
+    storage.close();
+  });
+
+  it("rejects a terminal clarification option that was not in the durable prompt", () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: (frame) => frames.push(frame),
+      now: () => 10,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "choose",
+    }, 1);
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "clarify-pending",
+      event: {
+        kind: "clarify", threadId: chat.sessionId, turnId: "turn",
+        clarifyId: "clarify-1", prompt: "Choose", options: [{ id: "a", label: "A" }], status: "pending",
+      },
+    })).toBe(true);
+
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 2, eventId: "clarify-invalid-option",
+      event: {
+        kind: "clarify", threadId: chat.sessionId, turnId: "turn",
+        clarifyId: "clarify-1", prompt: "Choose", options: [{ id: "a", label: "A" }],
+        status: "resolved", selectedOptionId: "not-an-offered-option",
+      },
+    })).toBe(false);
+    expect(storage.nativeInteraction("sage", "clarify", "clarify-1")).toMatchObject({
+      status: "pending", selectedOptionId: null,
+    });
+    expect(frames).not.toContainEqual(expect.objectContaining({ type: "bot_clarify_resolved", clarifyId: "clarify-1" }));
+    plane.close();
     storage.close();
   });
 
@@ -774,7 +867,20 @@ describe("attach-v1 native Bot Mode plane", () => {
 
     storage = openStorage(path);
     const frames: ServerFrame[] = [];
-    const ingress = { sendClarifyResolution: vi.fn(() => true), sendApprovalResolution: vi.fn(() => true) } as unknown as AttachV1Ingress;
+    const ingress = {
+      requestNativeApprovalResolution: vi.fn((bot: string, input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" }) =>
+        storage.requestNativeInteractionResolution({
+          bot, kind: "approval", interactionId: input.approvalId, decision: input.decision,
+          commandId: `approval:${bot}:${input.approvalId}`,
+          command: { kind: "resolve_approval", ...input }, requestedAt: 20,
+        })),
+      requestNativeClarifyResolution: vi.fn((bot: string, input: { threadId: string; turnId: string; clarifyId: string; optionId: string }) =>
+        storage.requestNativeInteractionResolution({
+          bot, kind: "clarify", interactionId: input.clarifyId, decision: "select", optionId: input.optionId,
+          commandId: `clarify:${bot}:${input.clarifyId}`,
+          command: { kind: "resolve_clarify", ...input }, requestedAt: 20,
+        })),
+    } as unknown as AttachV1Ingress;
     const recovered = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => 20 });
     // No sleep: a user can tap the approval push in the first event-loop turn after restart.
     // Resolution itself must synchronously recognize the already-past durable deadline.
@@ -785,9 +891,13 @@ describe("attach-v1 native Bot Mode plane", () => {
 
     await recovered.surface().chatHistory("sage");
     expect(frames).toContainEqual(expect.objectContaining({ type: "bot_clarify_pending", clarifyId: "clarify-1", prompt: "Which?" }));
-    expect(await recovered.surface().resolveClarify("sage", "clarify-1", "b", "device-1")).toBe("selected");
-    expect(await recovered.surface().resolveClarify("sage", "clarify-1", "a", "device-2")).toBe("not_pending");
-    expect(ingress.sendClarifyResolution).toHaveBeenCalledTimes(1);
+    expect(await recovered.surface().resolveClarify("sage", "clarify-1", "b", "device-1")).toBe("requested");
+    expect(await recovered.surface().resolveClarify("sage", "clarify-1", "a", "device-2")).toBe("resolution_pending");
+    expect(ingress.requestNativeClarifyResolution).toHaveBeenCalledTimes(2);
+    expect(storage.nativeInteraction("sage", "clarify", "clarify-1")).toMatchObject({ status: "pending", requestedOptionId: "b" });
+    expect(frames).toContainEqual(expect.objectContaining({ type: "bot_clarify_resolution_requested", clarifyId: "clarify-1" }));
+    expect(frames).not.toContainEqual(expect.objectContaining({ type: "bot_clarify_resolved", clarifyId: "clarify-1" }));
+    expect(recovered.handle("sage", { kind: "event", sequence: 3, eventId: "clarify-selected", event: { kind: "clarify", threadId: chat.sessionId, turnId: "turn-1", clarifyId: "clarify-1", prompt: "Which?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }], status: "resolved", selectedOptionId: "b" } })).toBe(true);
     expect(storage.nativeInteraction("sage", "clarify", "clarify-1")).toMatchObject({ status: "selected", selectedOptionId: "b" });
     expect(frames).toContainEqual(expect.objectContaining({ type: "bot_clarify_resolved", clarifyId: "clarify-1", outcome: "selected", selectedOptionId: "b" }));
     recovered.close();

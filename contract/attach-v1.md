@@ -75,13 +75,17 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `app
 - Tool calls use a stable `callId` with `running` → `ok|error` terminal transitions.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.
-- `scheduled` is an unanchored durable delivery: its caller supplies the target thread and a durable,
-  caller-owned occurrence key. Hermes cron is the implemented producer and uses its cron-session key;
-  a future trigger integration may supply its own durable key through the same seam. The reference plugin
-  preserves/derives stable delivery and message ids from that key. It does not require an active request
-  turn. Gateway projection deduplicates the delivery, commits it directly, and invokes the existing push
-  decision once. For native Bot Mode, the supplied target must equal the gateway's currently selected
-  canonical/home session; a foreign or historical target is rejected before inbox admission.
+- `scheduled` is an unanchored durable delivery with a caller-owned occurrence key. Its target is either
+  an explicit `threadId`, or `{ "kind": "canonical_home" }`. The latter is meaningful only for the
+  authenticated native Bot Mode identity: admission atomically binds the delivery to that identity's
+  current home session and persists the binding. A replay of the same `deliveryId` keeps that original
+  binding even if `/new` subsequently selects another session. Hermes cron is the implemented producer
+  and uses its cron-session key; a future trigger integration may supply its own durable key through the
+  same seam. The reference plugin emits `canonical_home` for cron and preserves/derives stable
+  delivery and message ids from that key. It does not require an active request turn. Gateway projection deduplicates the delivery, commits it
+  directly, and invokes the existing push decision once. An explicit native Bot Mode target must equal
+  the gateway's currently selected canonical/home session; a foreign or historical target is rejected
+  before inbox admission.
 - `presence` supplements transport health. The gateway reports online only after hello, degraded
   after missed heartbeats/backpressure, and absent after timeout/close. Clients reconnect with
   exponential backoff and jitter.
@@ -101,6 +105,22 @@ After the configured attempt bound it becomes a durable dead letter with attempt
 the identity reports degraded. That sequence is a hard stream projection barrier across restart:
 no later event projects until an operator explicitly releases the earliest dead letter, which
 retries that event before advancing in order.
+
+## Scheduled delivery receipt
+
+`GET /attach/v1/deliveries/:deliveryId` uses the same attach bearer as the WebSocket and media side
+channel, but is not gated on the optional media rollout. It exposes only the requesting profile's
+delivery record. It returns `404` when no delivery has reached gateway admission; plugin-local
+`journaled` is therefore intentionally not represented here. A receipt is one of:
+
+- `admitted`: the event is durably in the gateway inbox and awaits ordered projection;
+- `projected`: the Bot Mode transcript commit is durable;
+- `blocked`: projection reached the durable dead-letter barrier; it includes attempt count and the
+  dead-letter timestamp, and may later progress to `projected` only after ordered operator release.
+
+The route does not claim `notified`: gateway push is intentionally fire-and-forget, and a push attempt
+is not proof that a device or a human received it. A plugin must report a local enqueue as `journaled`
+or `accepted_pending`, not delivered, until this route reports `projected`.
 
 ## Media
 

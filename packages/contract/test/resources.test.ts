@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Agent, GatewayInfo, Message, Thread } from "../src/resources.ts";
-import { AgentSchema, ERROR_CODES, GatewayInfoSchema, MessageSchema, ThreadSchema } from "../src/resources.ts";
+import { AgentSchema, AttachHealthSummarySchema, ERROR_CODES, GatewayInfoSchema, MessageSchema, ThreadSchema } from "../src/resources.ts";
 import { check } from "../src/validate.ts";
 
 describe("resource schemas", () => {
@@ -65,6 +65,29 @@ describe("resource schemas", () => {
     expect(ERROR_CODES).toContain("invalid_request");
   });
 
+  it("accepts only aggregate attach spool telemetry", () => {
+    expect(check(AttachHealthSummarySchema, {
+      configured: 1, online: 0, degraded: 1, absent: 0,
+      lastHeartbeatAt: 1, lastEventAt: 2, lastTerminalAt: 3, queueDepth: 4, deadLetters: 0,
+      pluginOutboxDepth: 5, pluginOldestEventAgeMs: 6, pluginLastAckProgressAt: 7,
+      pluginCommandInboxDepth: 8,
+    })).toBe(true);
+  });
+
+  it("accepts the pre-federation attach health shape without plugin aggregates", () => {
+    expect(check(AttachHealthSummarySchema, {
+      configured: 1, online: 0, degraded: 1, absent: 0,
+      lastHeartbeatAt: 1, lastEventAt: 2, lastTerminalAt: 3, queueDepth: 4, deadLetters: 0,
+    })).toBe(true);
+    expect(check(GatewayInfoSchema, {
+      name: "legacy", version: "1.0.0", contract: "v1",
+      attach: {
+        configured: 1, online: 0, degraded: 1, absent: 0,
+        lastHeartbeatAt: 1, lastEventAt: 2, lastTerminalAt: 3, queueDepth: 4, deadLetters: 0,
+      },
+    })).toBe(true);
+  });
+
   // Issue #16: GatewayInfo.capabilities is an additive v1.x field. A receiver must tolerate it
   // present, absent (pre-#16 gateways), and populated with ids it has never heard of.
   describe("GatewayInfo.capabilities", () => {
@@ -117,6 +140,8 @@ describe("resource schemas", () => {
         configured: 6, online: 4, degraded: 1, absent: 1,
         lastHeartbeatAt: 1, lastEventAt: 2, lastTerminalAt: null,
         queueDepth: 3, deadLetters: 0,
+        pluginOutboxDepth: 2, pluginOldestEventAgeMs: 3,
+        pluginLastAckProgressAt: 4, pluginCommandInboxDepth: 5,
       },
     })).toBe(true);
   });

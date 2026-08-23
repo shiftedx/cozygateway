@@ -47,6 +47,27 @@ describe("attach-v1 authenticated media side channel", () => {
     expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(png.slice(1, 4));
   });
 
+  it("accepts an exact retry but rejects changed bytes for the same deterministic media id", async () => {
+    const url = `${gateway.url}/attach/v1/media/scheduled_media_1`;
+    const headers = {
+      authorization: `Bearer ${token}`,
+      "content-type": "image/png",
+      "x-attach-filename": "report.png",
+      "x-attach-sha256": createHash("sha256").update(png).digest("hex"),
+    };
+    expect((await fetch(url, { method: "POST", body: png, headers })).status).toBe(201);
+    const retry = await fetch(url, { method: "POST", body: png, headers });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ media: { mediaId: "scheduled_media_1", filename: "report.png" } });
+
+    const changed = Uint8Array.from([...png, 1]);
+    const conflict = await fetch(url, {
+      method: "POST", body: changed,
+      headers: { ...headers, "x-attach-sha256": createHash("sha256").update(changed).digest("hex") },
+    });
+    expect(conflict.status).toBe(409);
+  });
+
   it("admits validated documents and returns a download-safe filename", async () => {
     const bytes = new TextEncoder().encode("%PDF-1.7\n");
     const sha = createHash("sha256").update(bytes).digest("hex");

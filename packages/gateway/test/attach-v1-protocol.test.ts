@@ -29,6 +29,20 @@ describe("attach-v1 protocol", () => {
     expect(check(AttachV1HelloV1Schema, {
       kind: "hello", version: 2, instanceId: "plugin-1", capabilities: ["mobile_node", "mobile_location"],
     })).toBe(false);
+    expect(check(AttachV1HelloSchema, {
+      kind: "hello", version: 2, instanceId: "plugin-1", capabilities: ["draft"],
+      telemetry: { eventOutboxDepth: 3, oldestEventAgeMs: 4, eventAckCursor: 5, commandInboxDepth: 7 },
+    })).toBe(true);
+    // A brand-new spool has no oldest row or ACK progress yet. Those are unknown aggregate
+    // measurements, not a malformed hello that should strand the plugin before it can reconnect.
+    expect(check(AttachV1HelloSchema, {
+      kind: "hello", version: 2, instanceId: "fresh-plugin", capabilities: ["draft"],
+      telemetry: { eventOutboxDepth: 0, oldestEventAgeMs: null, eventAckCursor: 0, commandInboxDepth: 0 },
+    })).toBe(true);
+    expect(check(AttachV1HelloV1Schema, {
+      kind: "hello", version: 1, instanceId: "plugin-1", capabilities: ["draft"],
+      telemetry: { eventOutboxDepth: 3, oldestEventAgeMs: 4, eventAckCursor: 5, commandInboxDepth: 7 },
+    })).toBe(false);
     expect(check(AttachV1HelloSchema, { kind: "hello", version: 0, instanceId: "x", capabilities: [] })).toBe(false);
     expect(check(AttachV1HelloSchema, {
       kind: "hello", version: 2, instanceId: "x", capabilities: [],
@@ -82,6 +96,14 @@ describe("attach-v1 protocol", () => {
     expect(check(AttachV1ServerFrameSchema, { kind: "gap", channel: "event", requestedAfter: 1, earliestAvailable: 8, latestAvailable: 20 })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "gap", channel: "command", requestedAfter: 1, earliestAvailable: 2, latestAvailable: 4 })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "heartbeat", sentAt: 100 })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "heartbeat", sentAt: 100,
+      telemetry: { eventOutboxDepth: 1, oldestEventAgeMs: 2, eventAckCursor: 3, commandInboxDepth: 5 },
+    })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "heartbeat", sentAt: 100,
+      telemetry: { eventOutboxDepth: 1, oldestEventAgeMs: 2, eventAckCursor: 3, commandInboxDepth: 5, lastEventAckProgressAt: 4 },
+    })).toBe(false);
     expect(check(AttachV1EventFrameSchema, { kind: "event", sequence: 1, eventId: "leak", event: { kind: "reasoning", text: "secret" } })).toBe(false);
   });
 

@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import { check, type AttachHealthSummary } from "cozygateway-contract";
 import { WebSocket, WebSocketServer } from "ws";
 
-import type { Storage } from "../../storage.ts";
+import type { NativeInteractionResolutionRequest, Storage } from "../../storage.ts";
 import type {
   AttachInterruptFrame,
   AttachSteerFrame,
@@ -24,6 +24,7 @@ import {
   type AttachV1MobileResultInput,
   type AttachV1ServerFrame,
   type AttachV1SlashCommand,
+  type AttachV1Telemetry,
 } from "./protocol-v1.ts";
 import { resolveAttachBearer } from "./token-auth.ts";
 import { emitTrace, traceId, type TraceLog } from "../../trace.ts";
@@ -50,7 +51,9 @@ interface Connection {
   instanceId?: string;
   commandCursor: number;
   lastSeenAt: number;
+  heartbeatDegraded: boolean;
   degraded: boolean;
+  telemetry?: { eventOutboxDepth: number; lastAckProgressAt: number };
   maxInFlightEvents: number;
   maxInFlightBytes: number;
   sendCursor: number;
@@ -128,6 +131,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     }
     const connection: Connection = {
       socket, hello: false, commandCursor: 0, lastSeenAt: this.#now(), degraded: false,
+      heartbeatDegraded: false,
       maxInFlightEvents: ATTACH_V1_MAX_IN_FLIGHT_EVENTS,
       maxInFlightBytes: ATTACH_V1_MAX_IN_FLIGHT_BYTES,
       sendCursor: 0,
@@ -143,10 +147,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     socket.on("message", (data) => {
       const receivedAt = this.#now();
       connection.lastSeenAt = receivedAt;
-      if (connection.degraded && connection.hello) {
-        connection.degraded = false;
-        this.#presence(agentId, "online");
-      }
+      connection.heartbeatDegraded = false;
       let decoded: unknown;
       try { decoded = JSON.parse(String(data)); } catch { return; }
       if (!check(AttachV1ClientFrameSchema, decoded)) return;
@@ -171,6 +172,8 @@ export class AttachV1Ingress implements TurnEndpoint {
         connection.sendCursor = connection.commandCursor;
         const offered = new Set(frame.capabilities);
         connection.capabilities = new Set(this.#allowed(agentId).filter((capability) => offered.has(capability)));
+        if ("telemetry" in frame && frame.telemetry !== undefined)
+          connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
         if (frame.commands !== undefined) {
           this.#commandCatalogs.set(agentId, [...frame.commands]);
         }
@@ -193,6 +196,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           this.#send(connection, { ...common, version: 2, capabilities: [...connection.capabilities] });
         }
         this.#presence(agentId, "online");
+        this.#refreshDegraded(agentId, connection);
         this.#flush(agentId, connection.commandCursor);
         return;
       }
@@ -201,6 +205,9 @@ export class AttachV1Ingress implements TurnEndpoint {
         // Gateway is the sole heartbeat initiator. The inbound frame is its one acknowledgement,
         // not a request for another response; echoing it makes two healthy peers amplify heartbeats.
         this.#lastHeartbeatAt = receivedAt;
+        if (frame.telemetry !== undefined)
+          connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
+        this.#refreshDegraded(agentId, connection);
         return;
       }
       if (frame.kind === "mobile_request") {
@@ -261,6 +268,10 @@ export class AttachV1Ingress implements TurnEndpoint {
         socket.close(1008, "event sequence conflict");
         return;
       }
+      if (admission.status === "rejected_target") {
+        socket.close(1008, "attach-v1 event target is not authorized");
+        return;
+      }
       if (admission.status === "accepted") {
         this.#projectPending(agentId);
       }
@@ -299,7 +310,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       let frame = queued;
       const missing = commandCapabilities(frame.command).find((capability) => !connection.capabilities.has(capability));
       if (missing !== undefined) {
-        const cancelled = this.#storage.cancelAttachCommand(
+        const cancelled = this.#storage.discardAttachCommandAndReopenNativeInteraction(
           agentId,
           frame.sequence,
           frame.commandId,
@@ -343,9 +354,10 @@ export class AttachV1Ingress implements TurnEndpoint {
   health(): AttachHealthSummary {
     let online = 0;
     let degraded = 0;
+    const now = this.#now();
     for (const connection of this.#current.values()) {
       if (!connection.hello || connection.socket.readyState !== WebSocket.OPEN) continue;
-      if (connection.degraded) degraded += 1;
+      if (connection.degraded || this.#pluginBacklogStalled(connection, now)) degraded += 1;
       else online += 1;
     }
     const durable = this.#storage.attachHealth();
@@ -371,6 +383,30 @@ export class AttachV1Ingress implements TurnEndpoint {
     return this.#enqueue(agentId, { kind: "resolve_approval", ...input }, commandId);
   }
 
+  /** Atomically marks the native interaction requested and appends its stable command. The ACK
+   * only means the plugin journal accepted it; callers await the later terminal attach event. */
+  requestNativeApprovalResolution(
+    agentId: string,
+    input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" },
+  ): NativeInteractionResolutionRequest | { outcome: "unsupported" } {
+    const requestedAt = this.#now();
+    const expired = this.#storage.expireNativeInteractionIfDue(agentId, "approval", input.approvalId, requestedAt);
+    if (expired !== undefined) return { outcome: "expired", ...expired };
+    if (!this.#canResolve(agentId, "approvals")) return { outcome: "unsupported" };
+    const result = this.#storage.requestNativeInteractionResolution({
+      bot: agentId,
+      kind: "approval",
+      interactionId: input.approvalId,
+      decision: input.decision,
+      commandId: `approval:${agentId}:${input.approvalId}`,
+      command: { kind: "resolve_approval", ...input },
+      requestedAt,
+    });
+    if (result.outcome === "requested" || result.outcome === "already_requested")
+      this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);
+    return result;
+  }
+
   sendNativeTurn(agentId: string, input: { threadId: string; turnId: string; messageId: string; text: string; mediaIds?: string[] }): boolean {
     return this.#enqueue(agentId, { kind: "turn", ...input });
   }
@@ -385,6 +421,29 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   sendClarifyResolution(agentId: string, input: { threadId: string; turnId: string; clarifyId: string; optionId: string }, commandId?: string): boolean {
     return this.#enqueue(agentId, { kind: "resolve_clarify", ...input }, commandId);
+  }
+
+  requestNativeClarifyResolution(
+    agentId: string,
+    input: { threadId: string; turnId: string; clarifyId: string; optionId: string },
+  ): NativeInteractionResolutionRequest | { outcome: "unsupported" } {
+    const requestedAt = this.#now();
+    const expired = this.#storage.expireNativeInteractionIfDue(agentId, "clarify", input.clarifyId, requestedAt);
+    if (expired !== undefined) return { outcome: "expired", ...expired };
+    if (!this.#canResolve(agentId, "clarify")) return { outcome: "unsupported" };
+    const result = this.#storage.requestNativeInteractionResolution({
+      bot: agentId,
+      kind: "clarify",
+      interactionId: input.clarifyId,
+      decision: "select",
+      optionId: input.optionId,
+      commandId: `clarify:${agentId}:${input.clarifyId}`,
+      command: { kind: "resolve_clarify", ...input },
+      requestedAt,
+    });
+    if (result.outcome === "requested" || result.outcome === "already_requested")
+      this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);
+    return result;
   }
 
   sendMobileResult(agentId: string, frame: AttachV1MobileResultInput): boolean {
@@ -412,6 +471,33 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   commandCatalog(agentId: string): readonly AttachV1SlashCommand[] {
     return this.#commandCatalogs.get(agentId) ?? [];
+  }
+
+  #canResolve(agentId: string, capability: "approvals" | "clarify"): boolean {
+    if (!this.#allowed(agentId).includes(capability)) return false;
+    const connection = this.#current.get(agentId);
+    return connection?.hello !== true || connection.capabilities.has(capability);
+  }
+
+  #recordTelemetry(
+    agentId: string,
+    telemetry: AttachV1Telemetry,
+    receivedAt: number,
+  ): { eventOutboxDepth: number; lastAckProgressAt: number } {
+    return this.#storage.recordAttachTelemetry(agentId, telemetry, receivedAt);
+  }
+
+  #pluginBacklogStalled(connection: Connection, now: number): boolean {
+    return connection.telemetry !== undefined
+      && connection.telemetry.eventOutboxDepth > 0
+      && now - connection.telemetry.lastAckProgressAt >= 30_000;
+  }
+
+  #refreshDegraded(agentId: string, connection: Connection): void {
+    const degraded = connection.heartbeatDegraded || this.#pluginBacklogStalled(connection, this.#now());
+    if (connection.degraded === degraded) return;
+    connection.degraded = degraded;
+    this.#presence(agentId, degraded ? "degraded" : "online");
   }
 
   #allowed(agentId: string): AttachV1Capability[] {
@@ -461,10 +547,9 @@ export class AttachV1Ingress implements TurnEndpoint {
       const age = now - connection.lastSeenAt;
       if (age >= this.#heartbeatTimeoutMs) {
         connection.socket.terminate();
-      } else if (age >= this.#heartbeatIntervalMs * 2 && !connection.degraded) {
-        connection.degraded = true;
-        this.#presence(agentId, "degraded");
       } else {
+        connection.heartbeatDegraded = age >= this.#heartbeatIntervalMs * 2;
+        this.#refreshDegraded(agentId, connection);
         this.#send(connection, { kind: "heartbeat", sentAt: now });
       }
     }

@@ -405,9 +405,16 @@ export function registerBotRoutes(
         c.get("deviceId"),
       );
       switch (outcome) {
-        case "approved":
-        case "denied":
-          return c.json({ status: outcome }, 202);
+        case "requested":
+          return c.json({ status: "requested" }, 202);
+        case "resolution_pending":
+          return c.json(
+            errorBody(
+              "approval_resolution_pending",
+              "a different decision is already awaiting confirmation",
+            ),
+            409,
+          );
         case "unknown":
           return c.json(
             errorBody("not_found", "no such pending approval"),
@@ -496,8 +503,16 @@ export function registerBotRoutes(
         c.get("deviceId"),
       );
       switch (outcome) {
-        case "selected":
-          return c.json({ outcome, selectedOptionId: parsed.optionId }, 202);
+        case "requested":
+          return c.json({ outcome: "requested" }, 202);
+        case "resolution_pending":
+          return c.json(
+            errorBody(
+              "approval_resolution_pending",
+              "a different selection is already awaiting confirmation",
+            ),
+            409,
+          );
         case "unknown":
           return c.json(
             errorBody("not_found", "no such pending clarification"),

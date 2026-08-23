@@ -7,7 +7,20 @@ import type {
   AttachV1CommandFrame,
   AttachV1EventFrame,
   AttachV1MediaDescriptor,
+  AttachV1Telemetry,
 } from "./adapters/attach/protocol-v1.ts";
+
+/** Result of atomically recording a device decision and enqueueing its attach command. This is
+ * deliberately internal: only the bot plane derives the outward REST/frame state. */
+export type NativeInteractionResolutionRequest =
+  | {
+      outcome: "requested" | "already_requested" | "resolution_pending";
+      sessionId: string;
+      turnId: string;
+      fresh: boolean;
+    }
+  | { outcome: "expired"; sessionId: string; turnId: string }
+  | { outcome: "unknown" | "not_pending" };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
@@ -178,6 +191,11 @@ CREATE TABLE IF NOT EXISTS attach_streams (
   agent_id TEXT PRIMARY KEY,
   next_command_sequence INTEGER NOT NULL DEFAULT 1,
   last_event_sequence INTEGER NOT NULL DEFAULT 0,
+  plugin_event_outbox_depth INTEGER,
+  plugin_oldest_event_age_ms INTEGER,
+  plugin_event_ack_cursor INTEGER,
+  plugin_last_ack_progress_at INTEGER,
+  plugin_command_inbox_depth INTEGER,
   updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS attach_command_outbox (
@@ -282,6 +300,10 @@ CREATE TABLE IF NOT EXISTS bot_native_interactions (
   status TEXT NOT NULL,
   selected_option_id TEXT,
   expires_at INTEGER,
+  resolution_command_id TEXT,
+  resolution_requested_at INTEGER,
+  requested_decision TEXT,
+  requested_option_id TEXT,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (bot, kind, interaction_id)
 ) STRICT, WITHOUT ROWID;
@@ -393,6 +415,21 @@ export interface BotGroupTurnRow {
   createdAt: number;
   completedAt?: number;
   consumedAt?: number;
+}
+
+/** Gateway-owned truth for an admitted scheduled delivery. `journaled` remains plugin-local and
+ * push remains deliberately absent: its fire-and-forget path cannot prove human visibility. */
+export interface AttachScheduledDeliveryReceipt {
+  deliveryId: string;
+  messageId: string;
+  target:
+    | { kind: "thread"; threadId: string }
+    | { kind: "canonical_home"; sessionId: string };
+  state: "admitted" | "projected" | "blocked";
+  admittedAt: number;
+  projectedAt?: number;
+  attempts?: number;
+  deadLetteredAt?: number;
 }
 
 interface BotGroupDbRow {
@@ -1264,6 +1301,41 @@ export class Storage {
     return this.pendingAttachCommands(agentId, sequence - 1, 1)[0];
   }
 
+  /** An unsupported negotiated capability turns a queued native resolution into a transport
+   * discard. Clear only its matching pending marker in the same transaction, so the card is
+   * actionable again instead of claiming a request Hermes can no longer receive. */
+  discardAttachCommandAndReopenNativeInteraction(
+    agentId: string,
+    sequence: number,
+    commandId: string,
+    reason: string,
+    cancelledAt: number,
+  ): AttachV1CommandFrame | undefined {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          `UPDATE attach_command_outbox
+           SET cancelled_at = COALESCE(cancelled_at, ?), cancel_reason = COALESCE(cancel_reason, ?)
+           WHERE agent_id = ? AND sequence = ? AND command_id = ? AND acked_at IS NULL`,
+        )
+        .run(cancelledAt, reason.slice(0, 512), agentId, sequence, commandId);
+      this.#db
+        .prepare(
+          `UPDATE bot_native_interactions
+           SET resolution_command_id = NULL, resolution_requested_at = NULL,
+               requested_decision = NULL, requested_option_id = NULL
+           WHERE bot = ? AND resolution_command_id = ? AND status = 'pending'`,
+        )
+        .run(agentId, commandId);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    return this.pendingAttachCommands(agentId, sequence - 1, 1)[0];
+  }
+
   attachCommandCancellation(agentId: string, sequence: number): { reason: string; cancelledAt: number } | undefined {
     const row = this.#db
       .prepare(
@@ -1326,6 +1398,10 @@ export class Storage {
     lastTerminalAt: number | null;
     queueDepth: number;
     deadLetters: number;
+    pluginOutboxDepth: number;
+    pluginOldestEventAgeMs: number;
+    pluginLastAckProgressAt: number | null;
+    pluginCommandInboxDepth: number;
   } {
     return this.#db.prepare(
       `SELECT
@@ -1336,15 +1412,64 @@ export class Storage {
               JOIN attach_event_inbox AS inbox
                 ON inbox.agent_id = terminal.agent_id AND inbox.event_id = terminal.event_id
             UNION ALL SELECT completed_at AS at FROM bot_native_turn_terminals
-          )) AS lastTerminalAt,
+         )) AS lastTerminalAt,
          (SELECT COUNT(*) FROM attach_command_outbox WHERE acked_at IS NULL) AS queueDepth,
-         (SELECT COUNT(*) FROM attach_event_inbox WHERE dead_lettered_at IS NOT NULL) AS deadLetters`,
+         (SELECT COUNT(*) FROM attach_event_inbox WHERE dead_lettered_at IS NOT NULL) AS deadLetters,
+         (SELECT COALESCE(SUM(plugin_event_outbox_depth), 0) FROM attach_streams) AS pluginOutboxDepth,
+         (SELECT COALESCE(MAX(plugin_oldest_event_age_ms), 0) FROM attach_streams) AS pluginOldestEventAgeMs,
+         (SELECT MAX(plugin_last_ack_progress_at) FROM attach_streams) AS pluginLastAckProgressAt,
+         (SELECT COALESCE(SUM(plugin_command_inbox_depth), 0) FROM attach_streams) AS pluginCommandInboxDepth`,
     ).get() as {
       lastEventAt: number | null;
       lastTerminalAt: number | null;
       queueDepth: number;
       deadLetters: number;
+      pluginOutboxDepth: number;
+      pluginOldestEventAgeMs: number;
+      pluginLastAckProgressAt: number | null;
+      pluginCommandInboxDepth: number;
     };
+  }
+
+  /** Persist only bounded spool counters from an authenticated control frame. The gateway owns
+   * progress time: a plugin-reported clock can be skewed, while a higher durable cursor is proof. */
+  recordAttachTelemetry(agentId: string, telemetry: AttachV1Telemetry, receivedAt: number): {
+    eventOutboxDepth: number;
+    lastAckProgressAt: number;
+  } {
+    this.#db
+      .prepare(
+        `INSERT INTO attach_streams
+           (agent_id, next_command_sequence, last_event_sequence, plugin_event_outbox_depth,
+            plugin_oldest_event_age_ms, plugin_event_ack_cursor, plugin_last_ack_progress_at,
+            plugin_command_inbox_depth, updated_at)
+         VALUES (?, 1, 0, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET
+           plugin_event_outbox_depth = excluded.plugin_event_outbox_depth,
+           plugin_oldest_event_age_ms = excluded.plugin_oldest_event_age_ms,
+           plugin_last_ack_progress_at = CASE
+             WHEN attach_streams.plugin_event_ack_cursor IS NULL
+               OR attach_streams.plugin_last_ack_progress_at IS NULL
+               OR excluded.plugin_event_ack_cursor > attach_streams.plugin_event_ack_cursor
+             THEN excluded.plugin_last_ack_progress_at
+             ELSE attach_streams.plugin_last_ack_progress_at
+           END,
+           plugin_event_ack_cursor = excluded.plugin_event_ack_cursor,
+           plugin_command_inbox_depth = excluded.plugin_command_inbox_depth,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        agentId, telemetry.eventOutboxDepth, telemetry.oldestEventAgeMs, telemetry.eventAckCursor,
+        receivedAt, telemetry.commandInboxDepth, receivedAt,
+      );
+    const row = this.#db
+      .prepare(
+        `SELECT plugin_event_outbox_depth AS eventOutboxDepth,
+                plugin_last_ack_progress_at AS lastAckProgressAt
+         FROM attach_streams WHERE agent_id = ?`,
+      )
+      .get(agentId) as { eventOutboxDepth: number; lastAckProgressAt: number | null };
+    return { eventOutboxDepth: row.eventOutboxDepth, lastAckProgressAt: row.lastAckProgressAt ?? receivedAt };
   }
 
   attachQueueHealth(agentId: string, now: number): { depth: number; oldestAgeMs: number } {
@@ -1364,6 +1489,7 @@ export class Storage {
     receivedAt: number,
   ):
     | { status: "accepted" | "duplicate" | "ignored_terminal" | "ignored_delivery"; acknowledgedSequence: number }
+    | { status: "rejected_target"; acknowledgedSequence: number }
     | { status: "gap"; expectedSequence: number; receivedSequence: number }
     | { status: "conflict"; acknowledgedSequence: number } {
     this.#db.exec("BEGIN IMMEDIATE");
@@ -1402,24 +1528,56 @@ export class Storage {
       if (event.kind === "scheduled") {
         const prior = this.#db
           .prepare(
-            `SELECT thread_id AS threadId, message_id AS messageId FROM attach_scheduled_deliveries
-             WHERE agent_id = ? AND delivery_id = ?`,
+            `SELECT delivery.thread_id AS threadId, delivery.message_id AS messageId,
+                    inbox.frame_json AS frameJson
+             FROM attach_scheduled_deliveries AS delivery
+             JOIN attach_event_inbox AS inbox
+               ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+             WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
           )
-          .get(agentId, event.deliveryId) as { threadId: string; messageId: string } | undefined;
+          .get(agentId, event.deliveryId) as { threadId: string; messageId: string; frameJson: string } | undefined;
         if (prior !== undefined) {
-          if (prior.threadId !== event.threadId || prior.messageId !== event.messageId) {
+          const first = JSON.parse(prior.frameJson) as AttachV1EventFrame;
+          const firstScheduled = first.event.kind === "scheduled" ? first.event : undefined;
+          const sameTarget = firstScheduled !== undefined
+            && ("target" in firstScheduled) === ("target" in event)
+            && ("target" in event || ("threadId" in firstScheduled && firstScheduled.threadId === event.threadId));
+          if (prior.messageId !== event.messageId || !sameTarget) {
             this.#db.exec("COMMIT");
             return { status: "conflict", acknowledgedSequence: stream.sequence };
           }
           disposition = "ignored_delivery";
         } else {
+          // `agentId` is the authenticated attach identity. Check the active native-session
+          // pointer while this same IMMEDIATE transaction holds admission, not only in ingress:
+          // a /new selection between a precheck and this write must not deliver to the old chat.
+          if (!("target" in event)) {
+            const selected = this.#db
+              .prepare("SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?")
+              .get(agentId) as { sessionId: string } | undefined;
+            // Core threads share this attach identity but are authorized by the server's core
+            // thread lookup. Only a known native-session id is constrained by this local pointer.
+            if (
+              selected !== undefined &&
+              selected.sessionId !== event.threadId &&
+              this.nativeBotHasSession(agentId, event.threadId)
+            ) {
+              this.#db.exec("COMMIT");
+              return { status: "rejected_target", acknowledgedSequence: stream.sequence };
+            }
+          }
+          // This is inside the admission transaction, so /new cannot race a semantic home event
+          // between its selection and its durable delivery binding.
+          const threadId = "target" in event
+            ? this.nativeBotChat(agentId, receivedAt).sessionId
+            : event.threadId;
           this.#db
             .prepare(
               `INSERT INTO attach_scheduled_deliveries
                  (agent_id, delivery_id, thread_id, message_id, event_id, projected_at)
                VALUES (?, ?, ?, ?, ?, NULL)`,
             )
-            .run(agentId, event.deliveryId, event.threadId, event.messageId, frame.eventId);
+            .run(agentId, event.deliveryId, threadId, event.messageId, frame.eventId);
         }
       }
       this.#db
@@ -1631,29 +1789,85 @@ export class Storage {
       .get(agentId, deliveryId) as { threadId: string; messageId: string; projectedAt: number | null } | undefined;
   }
 
+  /** Read the admitted event's existing durable records; it intentionally performs no projection
+   * or mutation, so an agent can distinguish pending admission from a visible transcript row. */
+  attachScheduledDeliveryReceipt(agentId: string, deliveryId: string): AttachScheduledDeliveryReceipt | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT delivery.thread_id AS threadId, delivery.message_id AS messageId,
+                inbox.frame_json AS frameJson, inbox.received_at AS admittedAt,
+                inbox.applied_at AS projectedAt, inbox.projection_attempts AS attempts,
+                inbox.dead_lettered_at AS deadLetteredAt
+         FROM attach_scheduled_deliveries AS delivery
+         JOIN attach_event_inbox AS inbox
+           ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+         WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
+      )
+      .get(agentId, deliveryId) as {
+        threadId: string; messageId: string; frameJson: string; admittedAt: number;
+        projectedAt: number | null; attempts: number; deadLetteredAt: number | null;
+      } | undefined;
+    if (row === undefined) return undefined;
+    const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
+    const semanticHome = frame.event.kind === "scheduled" && "target" in frame.event;
+    if (row.projectedAt !== null) {
+      return {
+        deliveryId, messageId: row.messageId,
+        target: semanticHome ? { kind: "canonical_home", sessionId: row.threadId } : { kind: "thread", threadId: row.threadId },
+        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt,
+      };
+    }
+    if (row.deadLetteredAt !== null) {
+      return {
+        deliveryId, messageId: row.messageId,
+        target: semanticHome ? { kind: "canonical_home", sessionId: row.threadId } : { kind: "thread", threadId: row.threadId },
+        state: "blocked", admittedAt: row.admittedAt, attempts: row.attempts,
+        deadLetteredAt: row.deadLetteredAt,
+      };
+    }
+    return {
+      deliveryId, messageId: row.messageId,
+      target: semanticHome ? { kind: "canonical_home", sessionId: row.threadId } : { kind: "thread", threadId: row.threadId },
+      state: "admitted", admittedAt: row.admittedAt,
+    };
+  }
+
   saveAttachMedia(
     agentId: string,
     descriptor: AttachV1MediaDescriptor,
     bytes: Uint8Array,
     createdAt: number,
-  ): void {
-    this.#db
-      .prepare(
-        `INSERT INTO attach_media
-           (agent_id, media_id, descriptor_json, mime, size, sha256, bytes, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        agentId,
-        descriptor.mediaId,
-        JSON.stringify(descriptor),
-        descriptor.mimeType,
-        bytes.byteLength,
-        descriptor.sha256,
-        bytes,
-        createdAt,
-        descriptor.expiresAt ?? null,
-      );
+  ): boolean {
+    const descriptorJson = JSON.stringify(descriptor);
+    try {
+      this.#db
+        .prepare(
+          `INSERT INTO attach_media
+             (agent_id, media_id, descriptor_json, mime, size, sha256, bytes, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          agentId,
+          descriptor.mediaId,
+          descriptorJson,
+          descriptor.mimeType,
+          bytes.byteLength,
+          descriptor.sha256,
+          bytes,
+          createdAt,
+          descriptor.expiresAt ?? null,
+        );
+      return true;
+    } catch {
+      const existing = this.#db
+        .prepare(
+          `SELECT descriptor_json AS descriptorJson FROM attach_media
+           WHERE agent_id = ? AND media_id = ?`,
+        )
+        .get(agentId, descriptor.mediaId) as { descriptorJson: string } | undefined;
+      if (existing?.descriptorJson === descriptorJson) return false;
+      throw new Error("attach media id already exists");
+    }
   }
 
   /** Roll back one just-created attach row when its command could not be admitted. */
@@ -1929,7 +2143,7 @@ export class Storage {
     selectedOptionId?: string;
     expiresAt?: number;
     updatedAt: number;
-  }): "inserted" | "updated" | "duplicate" {
+  }): "inserted" | "updated" | "duplicate" | "conflict" {
     const prior = this.nativeInteraction(input.bot, input.kind, input.interactionId);
     if (prior === undefined) {
       this.#db
@@ -1944,6 +2158,8 @@ export class Storage {
     }
     if (prior.status !== "pending") return "duplicate";
     if (input.status === "pending") return "duplicate";
+    if (prior.sessionId !== input.sessionId || prior.turnId !== input.turnId)
+      return "conflict";
     this.#db
       .prepare(
         `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
@@ -1973,15 +2189,126 @@ export class Storage {
     bot: string,
     kind: "approval" | "clarify",
     interactionId: string,
-  ): { sessionId: string; turnId: string; payload: unknown; status: string; selectedOptionId: string | null; expiresAt: number | null; updatedAt: number } | undefined {
+  ): { sessionId: string; turnId: string; payload: unknown; status: string; selectedOptionId: string | null; expiresAt: number | null; resolutionCommandId: string | null; resolutionRequestedAt: number | null; requestedDecision: string | null; requestedOptionId: string | null; updatedAt: number } | undefined {
     const row = this.#db
       .prepare(
         `SELECT session_id AS sessionId, turn_id AS turnId, payload_json AS payloadJson, status,
-                selected_option_id AS selectedOptionId, expires_at AS expiresAt, updated_at AS updatedAt
+                selected_option_id AS selectedOptionId, expires_at AS expiresAt,
+                resolution_command_id AS resolutionCommandId,
+                resolution_requested_at AS resolutionRequestedAt,
+                requested_decision AS requestedDecision,
+                requested_option_id AS requestedOptionId,
+                updated_at AS updatedAt
          FROM bot_native_interactions WHERE bot = ? AND kind = ? AND interaction_id = ?`,
       )
-      .get(bot, kind, interactionId) as { sessionId: string; turnId: string; payloadJson: string; status: string; selectedOptionId: string | null; expiresAt: number | null; updatedAt: number } | undefined;
+      .get(bot, kind, interactionId) as { sessionId: string; turnId: string; payloadJson: string; status: string; selectedOptionId: string | null; expiresAt: number | null; resolutionCommandId: string | null; resolutionRequestedAt: number | null; requestedDecision: string | null; requestedOptionId: string | null; updatedAt: number } | undefined;
     return row === undefined ? undefined : { ...row, payload: JSON.parse(row.payloadJson) as unknown };
+  }
+
+  /** The decision marker and command outbox append are one transaction. A restart can therefore
+   * never present a decision as submitted without retaining the exact command for replay. */
+  requestNativeInteractionResolution(input: {
+    bot: string;
+    kind: "approval" | "clarify";
+    interactionId: string;
+    decision: string;
+    optionId?: string;
+    commandId: string;
+    command: AttachV1Command;
+    requestedAt: number;
+  }): NativeInteractionResolutionRequest {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db
+        .prepare(
+          `SELECT session_id AS sessionId, turn_id AS turnId, status, expires_at AS expiresAt,
+                  resolution_command_id AS resolutionCommandId,
+                  requested_decision AS requestedDecision,
+                  requested_option_id AS requestedOptionId
+           FROM bot_native_interactions
+           WHERE bot = ? AND kind = ? AND interaction_id = ?`,
+        )
+        .get(input.bot, input.kind, input.interactionId) as {
+        sessionId: string;
+        turnId: string;
+        status: string;
+        expiresAt: number | null;
+        resolutionCommandId: string | null;
+        requestedDecision: string | null;
+        requestedOptionId: string | null;
+      } | undefined;
+      if (row === undefined) {
+        this.#db.exec("COMMIT");
+        return { outcome: "unknown" };
+      }
+      if (row.status !== "pending") {
+        this.#db.exec("COMMIT");
+        return { outcome: row.status === "expired" ? "expired" : "not_pending", ...(row.status === "expired" ? { sessionId: row.sessionId, turnId: row.turnId } : {}) } as NativeInteractionResolutionRequest;
+      }
+      if (row.expiresAt !== null && row.expiresAt <= input.requestedAt) {
+        this.#db
+          .prepare(
+            `UPDATE bot_native_interactions SET status = 'expired', updated_at = ?
+             WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'
+               AND expires_at IS NOT NULL AND expires_at <= ?`,
+          )
+          .run(input.requestedAt, input.bot, input.kind, input.interactionId, input.requestedAt);
+        this.#db.exec("COMMIT");
+        return { outcome: "expired", sessionId: row.sessionId, turnId: row.turnId };
+      }
+      if (row.resolutionCommandId !== null) {
+        const same = row.requestedDecision === input.decision && row.requestedOptionId === (input.optionId ?? null);
+        this.#db.exec("COMMIT");
+        return {
+          outcome: same ? "already_requested" : "resolution_pending",
+          sessionId: row.sessionId,
+          turnId: row.turnId,
+          fresh: false,
+        };
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
+           VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
+        )
+        .run(input.bot, input.requestedAt);
+      const stream = this.#db
+        .prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+        .get(input.bot) as { sequence: number };
+      this.#db
+        .prepare(
+          `INSERT INTO attach_command_outbox
+             (agent_id, sequence, command_id, command_json, created_at, acked_at)
+           VALUES (?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(input.bot, stream.sequence, input.commandId, JSON.stringify(input.command), input.requestedAt);
+      this.#db
+        .prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
+        .run(stream.sequence + 1, input.requestedAt, input.bot);
+      const marked = this.#db
+        .prepare(
+          `UPDATE bot_native_interactions
+           SET resolution_command_id = ?, resolution_requested_at = ?, requested_decision = ?,
+               requested_option_id = ?
+           WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'
+             AND resolution_command_id IS NULL`,
+        )
+        .run(
+          input.commandId,
+          input.requestedAt,
+          input.decision,
+          input.optionId ?? null,
+          input.bot,
+          input.kind,
+          input.interactionId,
+        ).changes;
+      if (marked !== 1) throw new Error("native interaction changed during resolution request");
+      this.#db.exec("COMMIT");
+      return { outcome: "requested", sessionId: row.sessionId, turnId: row.turnId, fresh: true };
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   pendingNativeInteractions(bot?: string): Array<{
@@ -2010,15 +2337,17 @@ export class Storage {
     toolCallId: string;
     ruleName: string;
     createdAt: number;
+    resolutionRequestedAt?: number;
   }> {
     if (bots.length === 0) return [];
     const placeholders = bots.map(() => "?").join(", ");
-    return this.#db
+    const rows = this.#db
       .prepare(
         `SELECT bot, session_id AS sessionId, turn_id AS turnId,
                 interaction_id AS toolCallId,
                 json_extract(payload_json, '$.name') AS ruleName,
-                updated_at AS createdAt
+                updated_at AS createdAt,
+                resolution_requested_at AS resolutionRequestedAt
          FROM bot_native_interactions
          WHERE kind = 'approval' AND status = 'pending' AND bot IN (${placeholders})
          ORDER BY updated_at, interaction_id
@@ -2031,7 +2360,12 @@ export class Storage {
         toolCallId: string;
         ruleName: string;
         createdAt: number;
+        resolutionRequestedAt: number | null;
       }>;
+    return rows.map(({ resolutionRequestedAt, ...row }) => ({
+      ...row,
+      ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
+    }));
   }
 
   /** Atomically transition one stale approval before a user can act on it. The conditional update
@@ -2041,22 +2375,34 @@ export class Storage {
     interactionId: string,
     now: number,
   ): { sessionId: string; turnId: string } | undefined {
+    return this.expireNativeInteractionIfDue(bot, "approval", interactionId, now);
+  }
+
+  /** A requested decision remains pending until Hermes proves a terminal result. The deadline is
+   * still authoritative during that interval, so it must be checked in the same synchronous path
+   * used by the action route, not only by a background timer. */
+  expireNativeInteractionIfDue(
+    bot: string,
+    kind: "approval" | "clarify",
+    interactionId: string,
+    now: number,
+  ): { sessionId: string; turnId: string } | undefined {
     const row = this.#db
       .prepare(
         `SELECT session_id AS sessionId, turn_id AS turnId
          FROM bot_native_interactions
-         WHERE bot = ? AND kind = 'approval' AND interaction_id = ?
+         WHERE bot = ? AND kind = ? AND interaction_id = ?
            AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
       )
-      .get(bot, interactionId, now) as { sessionId: string; turnId: string } | undefined;
+      .get(bot, kind, interactionId, now) as { sessionId: string; turnId: string } | undefined;
     if (row === undefined) return undefined;
     const changed = this.#db
       .prepare(
         `UPDATE bot_native_interactions SET status = 'expired', updated_at = ?
-         WHERE bot = ? AND kind = 'approval' AND interaction_id = ?
+         WHERE bot = ? AND kind = ? AND interaction_id = ?
            AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
       )
-      .run(now, bot, interactionId, now).changes === 1;
+      .run(now, bot, kind, interactionId, now).changes === 1;
     return changed ? row : undefined;
   }
 
@@ -2096,6 +2442,33 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // Capability 28 distinguishes a submitted device decision from Hermes' later terminal event.
+  // Existing durable rows remain pending with all request fields null after this additive migration.
+  const interactionColumns = db
+    .prepare("SELECT name FROM pragma_table_info('bot_native_interactions')")
+    .all() as Array<{ name: string }>;
+  for (const [name, definition] of [
+    ["resolution_command_id", "TEXT"],
+    ["resolution_requested_at", "INTEGER"],
+    ["requested_decision", "TEXT"],
+    ["requested_option_id", "TEXT"],
+  ] as const) {
+    if (!interactionColumns.some((column) => column.name === name))
+      db.exec(`ALTER TABLE bot_native_interactions ADD COLUMN ${name} ${definition}`);
+  }
+  const streamColumns = db
+    .prepare("SELECT name FROM pragma_table_info('attach_streams')")
+    .all() as Array<{ name: string }>;
+  for (const [name, definition] of [
+    ["plugin_event_outbox_depth", "INTEGER"],
+    ["plugin_oldest_event_age_ms", "INTEGER"],
+    ["plugin_event_ack_cursor", "INTEGER"],
+    ["plugin_last_ack_progress_at", "INTEGER"],
+    ["plugin_command_inbox_depth", "INTEGER"],
+  ] as const) {
+    if (!streamColumns.some((column) => column.name === name))
+      db.exec(`ALTER TABLE attach_streams ADD COLUMN ${name} ${definition}`);
+  }
   // v0.1 stored only a selected native-chat pointer and transcript rows. v0.2 split sessions
   // into their own table; recreate every existing session without changing populated new rows.
   db.exec(`

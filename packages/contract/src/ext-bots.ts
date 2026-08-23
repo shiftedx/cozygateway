@@ -375,6 +375,18 @@ export const BotApprovalPendingFrameSchema = Type.Object({
 });
 export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
 
+/** A paired device submitted a decision, which is durably queued for Hermes but NOT yet
+ * confirmed. The terminal frame remains the only proof that Hermes handled it. */
+export const BotApprovalResolutionRequestedFrameSchema = Type.Object({
+  type: Type.Literal("bot_approval_resolution_requested"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  toolCallId: Type.String(),
+  updatedAt: Type.Integer(),
+});
+export type BotApprovalResolutionRequestedFrame = Static<typeof BotApprovalResolutionRequestedFrameSchema>;
+
 /** A native approval reached a terminal state. The gateway emits at most one terminal frame per
  *  `toolCallId`; an expiry is driven by the durable attach-v1 interaction record. */
 export const BotApprovalResolvedFrameSchema = Type.Object({
@@ -412,6 +424,18 @@ export const BotClarifyPendingFrameSchema = Type.Object({
   updatedAt: Type.Integer(),
 });
 export type BotClarifyPendingFrame = Static<typeof BotClarifyPendingFrameSchema>;
+
+/** The option selection is durably queued for Hermes but has not yet been accepted by the
+ * blocking clarification primitive. No selected option leaks to other paired devices here. */
+export const BotClarifyResolutionRequestedFrameSchema = Type.Object({
+  type: Type.Literal("bot_clarify_resolution_requested"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  clarifyId: Type.String(),
+  updatedAt: Type.Integer(),
+});
+export type BotClarifyResolutionRequestedFrame = Static<typeof BotClarifyResolutionRequestedFrameSchema>;
 
 export const BotClarifyResolvedFrameSchema = Type.Object({
   type: Type.Literal("bot_clarify_resolved"),
@@ -967,6 +991,8 @@ export const BotPendingApprovalSchema = Type.Object({
   toolCallId: Type.String({ minLength: 1 }),
   ruleName: Type.String({ minLength: 1, maxLength: 512 }),
   createdAt: Type.Integer(),
+  /** A device has durably submitted an action; wait for the terminal Hermes event. */
+  resolutionRequestedAt: Type.Optional(Type.Integer()),
 });
 export type BotPendingApproval = Static<typeof BotPendingApprovalSchema>;
 
@@ -1096,6 +1122,9 @@ export type BotPendingApprovals = Static<typeof BotPendingApprovalsSchema>;
  *  - `27`: pending approval inbox. `GET /bots/approvals?state=pending` returns at most 100
  *    durable unresolved approvals, carrying only the bot/session/turn routing ids, tool-call id,
  *    safe rule display name, and original pending timestamp. Resolved and expired records vanish
- *    because the endpoint reads the same lifecycle truth as the existing action routes. */
+ *    because the endpoint reads the same lifecycle truth as the existing action routes.
+ *  - `28`: requested-vs-confirmed approval and clarification settlement. A decision request is
+ *    durable and replayable, but `bot_*_resolved` remains reserved for the later terminal Hermes
+ *    event. `bot_*_resolution_requested` disables duplicate actions across paired devices. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 27;
+export const BOTS_CAPABILITY_VERSION = 28;

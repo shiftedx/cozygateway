@@ -39,6 +39,80 @@ describe("attach-v1 durable transport storage", () => {
     storage.close();
   });
 
+  it("atomically records one requested native resolution with its replayable stable command", () => {
+    const storage = openStorage(":memory:");
+    storage.recordNativeInteraction({
+      bot: "sage", kind: "approval", interactionId: "approval-1", sessionId: "native:sage:one",
+      turnId: "turn-1", payload: { name: "workspace.write" }, status: "pending", updatedAt: 1,
+    });
+    const request = {
+      bot: "sage", kind: "approval" as const, interactionId: "approval-1", decision: "approve",
+      commandId: "approval:sage:approval-1",
+      command: { kind: "resolve_approval" as const, threadId: "native:sage:one", turnId: "turn-1", approvalId: "approval-1", decision: "approve" as const },
+      requestedAt: 2,
+    };
+    expect(storage.requestNativeInteractionResolution(request)).toMatchObject({ outcome: "requested", fresh: true });
+    expect(storage.nativeInteraction("sage", "approval", "approval-1")).toMatchObject({
+      status: "pending", resolutionCommandId: request.commandId, resolutionRequestedAt: 2,
+      requestedDecision: "approve", requestedOptionId: null,
+    });
+    expect(storage.pendingAttachCommands("sage", 0, 10)).toMatchObject([{
+      commandId: request.commandId, command: request.command,
+    }]);
+    expect(storage.requestNativeInteractionResolution(request)).toMatchObject({ outcome: "already_requested", fresh: false });
+    expect(storage.requestNativeInteractionResolution({
+      ...request,
+      decision: "deny",
+      command: { ...request.command, decision: "deny" },
+    })).toMatchObject({ outcome: "resolution_pending", fresh: false });
+    expect(storage.pendingAttachCommands("sage", 0, 10)).toHaveLength(1);
+    storage.close();
+  });
+
+  it("lets a clarification deadline win after a resolution was requested", () => {
+    const storage = openStorage(":memory:");
+    storage.recordNativeInteraction({
+      bot: "sage", kind: "clarify", interactionId: "clarify-1", sessionId: "native:sage:one",
+      turnId: "turn-1", payload: { options: [{ id: "a" }] }, status: "pending", expiresAt: 10, updatedAt: 1,
+    });
+    expect(storage.requestNativeInteractionResolution({
+      bot: "sage", kind: "clarify", interactionId: "clarify-1", decision: "select", optionId: "a",
+      commandId: "clarify:sage:clarify-1",
+      command: { kind: "resolve_clarify", threadId: "native:sage:one", turnId: "turn-1", clarifyId: "clarify-1", optionId: "a" },
+      requestedAt: 9,
+    })).toMatchObject({ outcome: "requested" });
+    expect(storage.expireNativeInteractionIfDue("sage", "clarify", "clarify-1", 10)).toEqual({
+      sessionId: "native:sage:one", turnId: "turn-1",
+    });
+    expect(storage.nativeInteraction("sage", "clarify", "clarify-1")?.status).toBe("expired");
+    storage.close();
+  });
+
+  it("migrates existing pending interactions without inventing a requested decision", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-v1-legacy-interaction-")), "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE bot_native_interactions (
+        bot TEXT NOT NULL, kind TEXT NOT NULL, interaction_id TEXT NOT NULL,
+        session_id TEXT NOT NULL, turn_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+        status TEXT NOT NULL, selected_option_id TEXT, expires_at INTEGER, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (bot, kind, interaction_id)
+      ) STRICT, WITHOUT ROWID;
+    `);
+    legacy.prepare(`INSERT INTO bot_native_interactions
+      (bot, kind, interaction_id, session_id, turn_id, payload_json, status, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run("sage", "approval", "old-approval", "session", "turn", JSON.stringify({ name: "search" }), "pending", 1);
+    legacy.close();
+
+    const storage = openStorage(path);
+    expect(storage.nativeInteraction("sage", "approval", "old-approval")).toMatchObject({
+      status: "pending", resolutionCommandId: null, resolutionRequestedAt: null,
+      requestedDecision: null, requestedOptionId: null,
+    });
+    storage.close();
+  });
+
   it("deduplicates ack loss, rejects gaps, and seals terminal turns", () => {
     const storage = openStorage(":memory:");
     const commit = { kind: "event" as const, sequence: 1, eventId: "e1", event: { kind: "commit" as const, threadId: "t", turnId: "u", messageId: "m", blocks: [{ type: "paragraph" as const, text: "done" }] } };
@@ -93,6 +167,92 @@ describe("attach-v1 durable transport storage", () => {
     storage.close();
   });
 
+  it("rejects an explicit scheduled target if it is no longer the selected session at admission", () => {
+    const storage = openStorage(":memory:");
+    const historicalSessionId = storage.nativeBotChat("sage", 1).sessionId;
+    const selectedSessionId = storage.resetNativeBotChat("sage", 2);
+    const frame = {
+      kind: "event" as const, sequence: 1, eventId: "stale-explicit-target",
+      event: {
+        kind: "scheduled" as const, threadId: historicalSessionId,
+        deliveryId: "stale-explicit-delivery", messageId: "stale-explicit-message",
+        blocks: [{ type: "paragraph" as const, text: "must not reach the retired session" }],
+      },
+    };
+    expect(selectedSessionId).not.toBe(historicalSessionId);
+    // This is the admission-time precondition, deliberately not a timing/sleep test. The selected
+    // session changed after an earlier authorization check but before this durable transaction.
+    expect(storage.acceptAttachEvent("sage", frame, 3).status).toBe("rejected_target");
+    expect(storage.attachScheduledDelivery("sage", frame.event.deliveryId)).toBeUndefined();
+    storage.close();
+  });
+
+  it("keeps an explicit core-thread scheduled delivery valid while Bot Mode has another selected session", () => {
+    const storage = openStorage(":memory:");
+    storage.nativeBotChat("sage", 1);
+    const frame = {
+      kind: "event" as const, sequence: 1, eventId: "core-scheduled-event",
+      event: {
+        kind: "scheduled" as const, threadId: "core-thread",
+        deliveryId: "core-scheduled-delivery", messageId: "core-scheduled-message",
+        blocks: [{ type: "paragraph" as const, text: "core report" }],
+      },
+    };
+    expect(storage.acceptAttachEvent("sage", frame, 2)).toEqual({ status: "accepted", acknowledgedSequence: 1 });
+    expect(storage.attachScheduledDelivery("sage", frame.event.deliveryId)).toMatchObject({ threadId: "core-thread" });
+    storage.close();
+  });
+
+  it("derives honest scheduled-delivery receipt stages from the durable inbox", () => {
+    const storage = openStorage(":memory:");
+    const frame = { kind: "event" as const, sequence: 1, eventId: "receipt-event", event: { kind: "scheduled" as const, threadId: "home", deliveryId: "receipt-daily", messageId: "receipt-message", blocks: [{ type: "paragraph" as const, text: "daily" }] } };
+    storage.acceptAttachEvent("sage", frame, 10);
+    expect(storage.attachScheduledDeliveryReceipt("sage", "receipt-daily")).toEqual({
+      deliveryId: "receipt-daily", messageId: "receipt-message",
+      target: { kind: "thread", threadId: "home" }, state: "admitted", admittedAt: 10,
+    });
+    expect(storage.recordAttachProjectionFailure("sage", frame.eventId, "declined", 11, 1)).toEqual({ attempts: 1, deadLettered: true });
+    expect(storage.attachScheduledDeliveryReceipt("sage", "receipt-daily")).toEqual({
+      deliveryId: "receipt-daily", messageId: "receipt-message",
+      target: { kind: "thread", threadId: "home" }, state: "blocked", admittedAt: 10,
+      attempts: 1, deadLetteredAt: 11,
+    });
+    expect(storage.releaseAttachProjectionDeadLetter("sage", frame.eventId)).toBe(true);
+    storage.markAttachEventApplied("sage", frame.eventId, 12);
+    expect(storage.attachScheduledDeliveryReceipt("sage", "receipt-daily")).toEqual({
+      deliveryId: "receipt-daily", messageId: "receipt-message",
+      target: { kind: "thread", threadId: "home" }, state: "projected", admittedAt: 10, projectedAt: 12,
+    });
+    storage.close();
+  });
+
+  it("binds canonical_home at admission and never follows a later selected session", () => {
+    const storage = openStorage(":memory:");
+    const sessionA = storage.nativeBotChat("sage", 1).sessionId;
+    const sessionB = storage.resetNativeBotChat("sage", 2);
+    const first = {
+      kind: "event" as const, sequence: 1, eventId: "canonical-first",
+      event: {
+        kind: "scheduled" as const, target: { kind: "canonical_home" as const },
+        deliveryId: "canonical-daily", messageId: "canonical-message",
+        blocks: [{ type: "paragraph" as const, text: "daily" }],
+      },
+    };
+    expect(storage.acceptAttachEvent("sage", first, 3)).toEqual({ status: "accepted", acknowledgedSequence: 1 });
+    expect(storage.attachScheduledDelivery("sage", "canonical-daily")).toMatchObject({ threadId: sessionB, messageId: "canonical-message" });
+    expect(storage.attachScheduledDeliveryReceipt("sage", "canonical-daily")).toMatchObject({
+      target: { kind: "canonical_home", sessionId: sessionB }, state: "admitted",
+    });
+
+    const sessionC = storage.resetNativeBotChat("sage", 4);
+    expect(sessionA).not.toBe(sessionB);
+    expect(sessionC).not.toBe(sessionB);
+    const retry = { ...first, sequence: 2, eventId: "canonical-retry" };
+    expect(storage.acceptAttachEvent("sage", retry, 5)).toEqual({ status: "ignored_delivery", acknowledgedSequence: 2 });
+    expect(storage.attachScheduledDelivery("sage", "canonical-daily")?.threadId).toBe(sessionB);
+    storage.close();
+  });
+
   it("summarizes durable attach backlog, event, terminal, and dead-letter state without frames", () => {
     const storage = openStorage(":memory:");
     storage.enqueueAttachCommand("sage", "queued", { kind: "interrupt", threadId: "t", turnId: "u" }, 1);
@@ -102,7 +262,11 @@ describe("attach-v1 durable transport storage", () => {
     storage.acceptAttachEvent("sage", commit, 20);
     storage.recordAttachProjectionFailure("sage", "draft", "projection failed", 30, 1);
     storage.recordNativeBotTerminal({ bot: "sage", sessionId: "t", turnId: "queued-timeout", status: "timed_out", completedAt: 40 });
-    expect(storage.attachHealth()).toEqual({ lastEventAt: 20, lastTerminalAt: 40, queueDepth: 1, deadLetters: 1 });
+    expect(storage.attachHealth()).toEqual({
+      lastEventAt: 20, lastTerminalAt: 40, queueDepth: 1, deadLetters: 1,
+      pluginOutboxDepth: 0, pluginOldestEventAgeMs: 0,
+      pluginLastAckProgressAt: null, pluginCommandInboxDepth: 0,
+    });
     storage.close();
   });
 

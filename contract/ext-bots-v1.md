@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 27. This extension is independent of the frozen core
+Status: v1 extension, capability version 28. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 27 }
+"capabilities": { "com.cozylabs.bots": 28 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -66,6 +66,7 @@ extension omits the capability and does not register `/bots` routes.
 | 25 | Profile-local discovery of Hermes gateway-safe, plugin, and installed skill commands. |
 | 26 | Searchable aggregate history of agent-sent attachments across native sessions. |
 | 27 | Bounded current-state inbox for pending native approvals. |
+| 28 | Requested-vs-confirmed native approval and clarification settlement. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -137,11 +138,15 @@ native approval, ordered oldest first. `state` is optional only for a simpler in
 when supplied it must be `pending`. The route is a recovery/read surface, not a second workflow:
 the existing `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny` routes settle the
 same durable records, and expired records are absent as soon as their lifecycle timer settles them.
+`resolutionRequestedAt`, when present, means the gateway durably appended one stable resolution
+command; it is not an approval or denial result and exposes neither a command id nor a decision.
 
 Clients MUST require capability `>= 27` before showing the global pending-requests menu or using
-this route. A client that receives an `approval.pending` push should open/reload this snapshot and
-then call the established action route for the selected record. It must never derive a decision URL
-from push text or retain an old action after a fresh snapshot no longer contains that `toolCallId`.
+this route. A client that renders the requested-versus-terminal lifecycle or submits either native
+resolution action MUST require capability `>= 28`. A client that receives an `approval.pending`
+push should open/reload this snapshot and then call the established action route for the selected
+record. It must never derive a decision URL from push text or retain an old action after a fresh
+snapshot no longer contains that `toolCallId`.
 
 ### Canonical native chat
 
@@ -232,10 +237,10 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/groups/:group` | — | `BotGroupDetail` | Reads a gateway-owned room. |
 | `DELETE /bots/groups/:group` | — | `204 No Content` | Deletes a gateway-owned room. |
 | `POST /bots/groups/:group/messages` | `BotGroupSendRequest` | `202 { group, message: BotGroupMessage }` | Queues member turns through attach-v1. |
-| `POST /bots/:name/approvals/:toolCallId/approve` | — | `202 { status }` | Resolves a pending native approval. |
-| `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status }` | Resolves a pending native approval. |
+| `POST /bots/:name/approvals/:toolCallId/approve` | — | `202 { status: "requested" }` | Durably requests a native approval; the terminal event confirms it. |
+| `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status: "requested" }` | Durably requests a native denial; the terminal event confirms it. |
 | `GET /bots/approvals` | optional `state=pending` | `BotPendingApprovals` | Bounded current pending-approval snapshot. |
-| `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { status: "selected" }` | Resolves a pending native clarification option. |
+| `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
 that exists but is not configured as a native identity must not fall through to Dashboard chat.
@@ -261,8 +266,11 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
 - `bot_chat_adopted`: a new/adopt action selected an existing native session. Rebind and reload.
 - `bot_tool_activity`: full-replace steps for a native turn. `BotToolStep.detail` and `errorText`
   are bounded/redacted display text; raw inputs and outputs never cross this contract.
-- `bot_approval_pending` and `bot_approval_resolved`: durable native tool-approval lifecycle.
-- `bot_clarify_pending` and `bot_clarify_resolved`: durable native clarification lifecycle. A
+- `bot_approval_pending`, `bot_approval_resolution_requested`, and `bot_approval_resolved`:
+  durable native tool-approval lifecycle. The requested frame means outbox admission only; a
+  terminal frame is emitted solely from the later plugin terminal event (or local expiry).
+- `bot_clarify_pending`, `bot_clarify_resolution_requested`, and `bot_clarify_resolved`: durable
+  native clarification lifecycle. A
   pending card contains only a display prompt and bounded option ids/labels, never model reasoning.
 - `bot_group`, `bot_group_state`: durable gateway-owned group-room transcript and state.
 - `bot_inbox_activity`: a currently open read-only Hermes A2A thread changed; re-read it.

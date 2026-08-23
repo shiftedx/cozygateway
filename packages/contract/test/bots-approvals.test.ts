@@ -10,7 +10,9 @@ import { describe, expect, it } from "vitest";
 import {
   BOTS_CAPABILITY_VERSION,
   BotApprovalPendingFrameSchema,
+  BotApprovalResolutionRequestedFrameSchema,
   BotApprovalResolvedFrameSchema,
+  BotClarifyResolutionRequestedFrameSchema,
   BotPendingApprovalSchema,
   BotPendingApprovalsSchema,
   ServerFrameSchema,
@@ -37,12 +39,34 @@ const resolved = {
   updatedAt: 1_800_000_000_000,
 };
 
+const approvalRequested = {
+  type: "bot_approval_resolution_requested",
+  bot: "scout",
+  sessionId: "stored-1",
+  turnId: "runtime-1#1-1",
+  toolCallId: "4e8b2c1d9f0a4c1e8b2c1d9f0a4c1e8b",
+  updatedAt: 1_800_000_000_000,
+};
+
+const clarifyRequested = {
+  type: "bot_clarify_resolution_requested",
+  bot: "scout",
+  sessionId: "stored-1",
+  turnId: "runtime-1#1-1",
+  clarifyId: "question-1",
+  updatedAt: 1_800_000_000_000,
+};
+
 describe("bots approval frames", () => {
   it("accepts both shapes, on their own schema and on the ServerFrame union", () => {
     expect(check(BotApprovalPendingFrameSchema, pending)).toBe(true);
     expect(check(ServerFrameSchema, pending)).toBe(true);
     expect(check(BotApprovalResolvedFrameSchema, resolved)).toBe(true);
     expect(check(ServerFrameSchema, resolved)).toBe(true);
+    expect(check(BotApprovalResolutionRequestedFrameSchema, approvalRequested)).toBe(true);
+    expect(check(ServerFrameSchema, approvalRequested)).toBe(true);
+    expect(check(BotClarifyResolutionRequestedFrameSchema, clarifyRequested)).toBe(true);
+    expect(check(ServerFrameSchema, clarifyRequested)).toBe(true);
   });
 
   it("requires every addressing field", () => {
@@ -81,7 +105,7 @@ describe("bots approval frames", () => {
   it("rides capability 10, and the advertised version has moved past it", () => {
     // The approval surface landed AT 10 and the number only ever goes up, so this pins the floor a
     // client must require for approve/deny while letting later, additive bumps through.
-    expect(BOTS_CAPABILITY_VERSION).toBeGreaterThanOrEqual(10);
+    expect(BOTS_CAPABILITY_VERSION).toBeGreaterThanOrEqual(28);
   });
 
   it("defines a bounded safe pending-approval inbox with no raw tool payload fields", () => {
@@ -96,7 +120,7 @@ describe("bots approval frames", () => {
     expect(check(BotPendingApprovalSchema, item)).toBe(true);
     expect(check(BotPendingApprovalsSchema, { approvals: [item] })).toBe(true);
     expect(Object.keys(BotPendingApprovalSchema.properties)).toEqual([
-      "bot", "sessionId", "turnId", "toolCallId", "ruleName", "createdAt",
+      "bot", "sessionId", "turnId", "toolCallId", "ruleName", "createdAt", "resolutionRequestedAt",
     ]);
   });
 });

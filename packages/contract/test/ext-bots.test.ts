@@ -472,8 +472,9 @@ describe("capability advertisement", () => {
     // 20 adds assistant audio/video metadata and ranged attachment delivery.
     // 22 adds durable native clarification cards plus their idempotent selection route.
     // 23 adds exact native turn status/cause and queued-at recovery metadata; 24 adds files;
-    // 25 adds slash commands; 26 adds attachment history; 27 adds pending approval recovery.
-    expect(BOTS_CAPABILITY_VERSION).toBe(27);
+    // 25 adds slash commands; 26 adds attachment history; 27 adds pending approval recovery;
+    // 28 distinguishes a durable resolution request from Hermes terminal confirmation.
+    expect(BOTS_CAPABILITY_VERSION).toBe(28);
   });
 
   it("accepts capability-23 native turn status without changing legacy state fields", () => {

@@ -95,25 +95,36 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
       body: JSON.stringify({ optionId: "b" }),
     });
     expect(clarify.status).toBe(202);
-    expect(await clarify.json()).toEqual({ outcome: "selected", selectedOptionId: "b" });
+    expect(await clarify.json()).toEqual({ outcome: "requested" });
     await until(() => pluginFrames.some((frame) => frame.kind === "command" && frame.command.kind === "resolve_clarify"));
-    expect(pluginFrames.find((frame) => frame.kind === "command" && frame.command.kind === "resolve_clarify")?.command).toMatchObject({ clarifyId: "question-1", optionId: "b", threadId: clarifyTurn.command.threadId, turnId: clarifyTurn.command.turnId });
+    const clarifyCommand = pluginFrames.find((frame) => frame.kind === "command" && frame.command.kind === "resolve_clarify");
+    expect(clarifyCommand?.command).toMatchObject({ clarifyId: "question-1", optionId: "b", threadId: clarifyTurn.command.threadId, turnId: clarifyTurn.command.turnId });
+    plugin.send(JSON.stringify({ kind: "ack", channel: "command", sequence: clarifyCommand.sequence, id: clarifyCommand.commandId }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(clientFrames.some((frame) => frame.type === "bot_clarify_resolved" && frame.clarifyId === "question-1")).toBe(false);
+    plugin.send(JSON.stringify({ kind: "event", sequence: 4, eventId: "clarify-selected", event: { kind: "clarify", threadId: clarifyTurn.command.threadId, turnId: clarifyTurn.command.turnId, clarifyId: "question-1", prompt: "Choose one", options: [{ id: "a", label: "Option A" }, { id: "b", label: "Option B" }], status: "resolved", selectedOptionId: "b" } }));
     await until(() => clientFrames.some((frame) => frame.type === "bot_clarify_resolved" && frame.clarifyId === "question-1" && frame.outcome === "selected"));
 
-    const canonicalScheduled = { kind: "event", sequence: 4, eventId: "scheduled-home", event: { kind: "scheduled", threadId: command.command.threadId, deliveryId: "daily-1", messageId: "daily-message-1", blocks: [{ type: "paragraph", text: "canonical daily" }] } };
+    const canonicalScheduled = { kind: "event", sequence: 5, eventId: "scheduled-home", event: { kind: "scheduled", target: { kind: "canonical_home" }, deliveryId: "daily-1", messageId: "daily-message-1", blocks: [{ type: "paragraph", text: "canonical daily" }] } };
     plugin.send(JSON.stringify(canonicalScheduled));
-    await until(() => pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 4));
-    // ACK loss/redelivery of the same occurrence remains exactly one app transcript row.
-    plugin.send(JSON.stringify(canonicalScheduled));
-    await until(() => pluginFrames.filter((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 4).length === 2);
+    await until(() => pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 5));
+    const receipt = await fetch(`${gateway.url}/attach/v1/deliveries/daily-1`, { headers: { authorization: "Bearer attach-secret" } });
+    expect(receipt.status).toBe(200);
+    expect(await receipt.json()).toMatchObject({
+      state: "projected",
+      target: { kind: "canonical_home", sessionId: command.command.threadId },
+    });
+    // A producer retry gets a new transport frame but remains one durable occurrence.
+    plugin.send(JSON.stringify({ ...canonicalScheduled, sequence: 6, eventId: "scheduled-home-retry" }));
+    await until(() => pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 6));
     let scheduledHistory = (await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } })).json()) as { messages: BotChatMessage[] };
     expect(scheduledHistory.messages.filter((message) => message.id === "daily-message-1")).toHaveLength(1);
 
     const selectedSessionId = gateway.storage.resetNativeBotChat("sage", Date.now());
-    plugin.send(JSON.stringify({ kind: "event", sequence: 5, eventId: "scheduled-historical", event: { kind: "scheduled", threadId: command.command.threadId, deliveryId: "historical-delivery", messageId: "historical-message", blocks: [{ type: "paragraph", text: "must not appear" }] } }));
+    plugin.send(JSON.stringify({ kind: "event", sequence: 7, eventId: "scheduled-historical", event: { kind: "scheduled", threadId: command.command.threadId, deliveryId: "historical-delivery", messageId: "historical-message", blocks: [{ type: "paragraph", text: "must not appear" }] } }));
     await once(plugin, "close");
-    expect(gateway.storage.attachEventCursor("sage")).toBe(4);
-    expect(pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 5)).toBe(false);
+    expect(gateway.storage.attachEventCursor("sage")).toBe(6);
+    expect(pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 7)).toBe(false);
     expect(gateway.storage.nativeBotMessages("sage", command.command.threadId).some((message) => message.id === "historical-message")).toBe(false);
 
     const selectedPluginFrames: any[] = [];
@@ -121,13 +132,54 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     sockets.push(selectedPlugin);
     selectedPlugin.on("message", (data) => selectedPluginFrames.push(JSON.parse(String(data))));
     await once(selectedPlugin, "open");
-    selectedPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage-selected", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 4, commandSequence: 0 } }));
+    selectedPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage-selected", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 6, commandSequence: 0 } }));
     await until(() => selectedPluginFrames.some((frame) => frame.kind === "hello_ack"));
-    selectedPlugin.send(JSON.stringify({ kind: "event", sequence: 5, eventId: "scheduled-selected", event: { kind: "scheduled", threadId: selectedSessionId, deliveryId: "selected-delivery", messageId: "selected-message", blocks: [{ type: "paragraph", text: "selected daily" }] } }));
-    await until(() => selectedPluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 5));
-    expect(gateway.storage.attachEventCursor("sage")).toBe(5);
+    selectedPlugin.send(JSON.stringify({ kind: "event", sequence: 7, eventId: "scheduled-selected", event: { kind: "scheduled", threadId: selectedSessionId, deliveryId: "selected-delivery", messageId: "selected-message", blocks: [{ type: "paragraph", text: "selected daily" }] } }));
+    await until(() => selectedPluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 7));
+    expect(gateway.storage.attachEventCursor("sage")).toBe(7);
     scheduledHistory = (await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } })).json()) as { messages: BotChatMessage[] };
     expect(scheduledHistory.messages.map((message) => message.id)).toContain("selected-message");
+
+    const offlineTurnResponse = await fetch(`${gateway.url}/bots/sage/chat/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ text: "ask while reconnecting", clientId: "client-offline-clarify" }),
+    });
+    expect(offlineTurnResponse.status).toBe(202);
+    await until(() => selectedPluginFrames.some((frame) => frame.kind === "command" && frame.command.kind === "turn" && frame.command.messageId === "client-offline-clarify"));
+    const offlineTurn = selectedPluginFrames.find((frame) => frame.kind === "command" && frame.command.kind === "turn" && frame.command.messageId === "client-offline-clarify");
+    selectedPlugin.send(JSON.stringify({
+      kind: "event", sequence: 8, eventId: "offline-clarify-pending",
+      event: {
+        kind: "clarify", threadId: offlineTurn.command.threadId, turnId: offlineTurn.command.turnId,
+        clarifyId: "offline-question", prompt: "Choose after reconnect", options: [{ id: "a", label: "A" }], status: "pending",
+      },
+    }));
+    await until(() => clientFrames.some((frame) => frame.type === "bot_clarify_pending" && frame.clarifyId === "offline-question"));
+    selectedPlugin.close();
+    await once(selectedPlugin, "close");
+
+    const queuedResolution = await fetch(`${gateway.url}/bots/sage/clarifications/offline-question`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ optionId: "a" }),
+    });
+    expect(queuedResolution.status).toBe(202);
+    expect(await queuedResolution.json()).toEqual({ outcome: "requested" });
+
+    const downgradedFrames: any[] = [];
+    const downgradedPlugin = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
+    sockets.push(downgradedPlugin);
+    downgradedPlugin.on("message", (data) => downgradedFrames.push(JSON.parse(String(data))));
+    await once(downgradedPlugin, "open");
+    downgradedPlugin.send(JSON.stringify({
+      kind: "hello", version: 1, instanceId: "hermes-sage-no-clarify", capabilities: ["draft", "scheduled"],
+      resume: { eventSequence: 8, commandSequence: 0 },
+    }));
+    await until(() => downgradedFrames.some((frame) => frame.kind === "command" && frame.command.kind === "discard" && frame.command.originalKind === "resolve_clarify"));
+    expect(gateway.storage.nativeInteraction("sage", "clarify", "offline-question")).toMatchObject({
+      status: "pending", resolutionCommandId: null, resolutionRequestedAt: null,
+    });
     // The fake Dashboard implements no prompt.submit/session.resume methods. Reaching this point
     // proves the authoritative native profile never attempted either chat RPC.
   } finally {

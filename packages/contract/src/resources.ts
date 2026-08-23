@@ -14,6 +14,7 @@ export const ERROR_CODES = [
   "turn_failed",
   "interrupt_unsupported",
   "approval_not_pending",
+  "approval_resolution_pending",
   "approval_expired",
   "internal",
 ] as const;
@@ -113,6 +114,12 @@ export const AttachHealthSummarySchema = Type.Object({
   lastTerminalAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   queueDepth: Type.Integer({ minimum: 0 }),
   deadLetters: Type.Integer({ minimum: 0 }),
+  // Optional for gateways that predate federated plugin telemetry. Current
+  // gateways still emit these bounded aggregate values when attach is present.
+  pluginOutboxDepth: Type.Optional(Type.Integer({ minimum: 0 })),
+  pluginOldestEventAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
+  pluginLastAckProgressAt: Type.Optional(Type.Union([Type.Integer({ minimum: 0 }), Type.Null()])),
+  pluginCommandInboxDepth: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 export type AttachHealthSummary = Static<typeof AttachHealthSummarySchema>;
 

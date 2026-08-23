@@ -26,8 +26,8 @@ export class AttachNativeSink {
     const event = frame.event;
     if (event.kind === "scheduled") {
       const delivery = this.#deps.storage.attachScheduledDelivery(agentId, event.deliveryId);
-      if (delivery === undefined || delivery.threadId !== event.threadId || delivery.messageId !== event.messageId) return false;
-      return this.#commit(agentId, event.threadId, event.messageId, event.blocks, event.deliveryId);
+      if (delivery === undefined || delivery.messageId !== event.messageId) return false;
+      return this.#commit(agentId, delivery.threadId, event.messageId, event.blocks, event.deliveryId);
     }
     if (!("threadId" in event) || !("turnId" in event)) return false;
     const command = this.#deps.storage.attachTurnCommand(agentId, event.turnId);

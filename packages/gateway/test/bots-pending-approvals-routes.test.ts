@@ -27,4 +27,26 @@ describe("capability-27 pending approval inbox", () => {
     expect((await response.json() as { approvals: unknown[] }).approvals).toHaveLength(PENDING_APPROVALS_LIMIT);
     expect((await app.request("/bots/approvals?state=resolved")).status).toBe(400);
   });
+
+  it("reports command admission as requested and rejects a conflicting pending choice", async () => {
+    const app = new Hono<Env>();
+    const requireDevice: MiddlewareHandler<Env> = async (c, next) => {
+      c.set("deviceId", "device-1");
+      await next();
+    };
+    const resolveApproval = vi.fn(async () => "requested" as const);
+    const resolveClarify = vi.fn(async () => "resolution_pending" as const);
+    registerBotRoutes(app, requireDevice, { resolveApproval, resolveClarify } as unknown as BotsSurface);
+
+    const approval = await app.request("/bots/sage/approvals/call-1/approve", { method: "POST" });
+    expect(approval.status).toBe(202);
+    expect(await approval.json()).toEqual({ status: "requested" });
+    expect(resolveApproval).toHaveBeenCalledWith("sage", "call-1", "approve", "device-1");
+
+    const clarify = await app.request("/bots/sage/clarifications/clarify-1", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ optionId: "b" }),
+    });
+    expect(clarify.status).toBe(409);
+    expect(await clarify.json()).toEqual({ error: { code: "approval_resolution_pending", message: "a different selection is already awaiting confirmation" } });
+  });
 });

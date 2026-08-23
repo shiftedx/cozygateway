@@ -182,6 +182,20 @@ export function createApp(deps: AppDeps): Hono<Env> {
         errorBody("unauthorized", "missing or unknown attach token"),
         401,
       );
+    await next();
+  });
+  /** Media is an optional rollout; attach-authenticated receipt reads must remain available even
+   * when uploads are disabled for this profile. */
+  const requireAttachMedia = createMiddleware<Env>(async (c, next) => {
+    const agentId =
+      deps.attachTokens === undefined
+        ? undefined
+        : resolveAttachBearer(deps.attachTokens, c.req.header("authorization"));
+    if (agentId === undefined)
+      return c.json(
+        errorBody("unauthorized", "missing or unknown attach token"),
+        401,
+      );
     if (deps.attachMediaAllowed?.(agentId) === false) {
       return c.json(
         errorBody("invalid_request", "attach media is disabled for this agent"),
@@ -658,7 +672,20 @@ export function createApp(deps: AppDeps): Hono<Env> {
   }
 
   if (deps.attachTokens !== undefined && deps.attachTokens.size > 0) {
-    app.post("/attach/v1/media/:mediaId", requireAttach, async (c) => {
+    app.get("/attach/v1/deliveries/:deliveryId", requireAttach, (c) => {
+      const deliveryId = c.req.param("deliveryId");
+      if (deliveryId.length === 0 || deliveryId.length > 256)
+        return c.json(errorBody("invalid_request", "invalid delivery id"), 400);
+      const receipt = deps.storage.attachScheduledDeliveryReceipt(
+        attachAgent(c),
+        deliveryId,
+      );
+      return receipt === undefined
+        ? c.json(errorBody("not_found", "no such attach delivery"), 404)
+        : c.json(receipt);
+    });
+
+    app.post("/attach/v1/media/:mediaId", requireAttachMedia, async (c) => {
       const mediaId = c.req.param("mediaId");
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId)) {
         return c.json(
@@ -747,22 +774,22 @@ export function createApp(deps: AppDeps): Hono<Env> {
         ...(expiresAt === undefined ? {} : { expiresAt }),
       };
       try {
-        deps.storage.saveAttachMedia(
+        const created = deps.storage.saveAttachMedia(
           attachAgent(c),
           descriptor,
           bytes,
           deps.now(),
         );
+        return c.json({ media: descriptor }, created ? 201 : 200);
       } catch {
         return c.json(
           errorBody("invalid_request", "attach media id already exists"),
           409,
         );
       }
-      return c.json({ media: descriptor }, 201);
     });
 
-    app.get("/attach/v1/media/:mediaId", requireAttach, (c) => {
+    app.get("/attach/v1/media/:mediaId", requireAttachMedia, (c) => {
       const mediaId = c.req.param("mediaId");
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId))
         return c.json(

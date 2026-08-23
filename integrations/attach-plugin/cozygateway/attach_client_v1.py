@@ -14,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
+from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
@@ -47,6 +48,9 @@ MobileStatus = Literal[
 MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
 MOBILE_HELLO_ACK_TIMEOUT_SECONDS = 1
+ATTACH_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+ATTACH_AUDIO_VIDEO_MAX_BYTES = 40 * 1024 * 1024
+ATTACH_FILE_MAX_BYTES = 20 * 1024 * 1024
 
 
 class MobileDeviceStatusResult(TypedDict, total=False):
@@ -87,6 +91,11 @@ class AttachV1Client:
         self._spool = config.spool
         self._ws_url = derive_attach_ws_url(config.gateway_url, config.path)
         self._ws: Any = None
+        # ``close()`` may be wrapped in a timeout by a one-shot producer.  Keep
+        # the raw socket close task strongly reachable after the public caller
+        # is cancelled so a shared spool cannot be handed to a second socket
+        # while the first file descriptor is still live.
+        self._socket_close_task: Optional[asyncio.Task] = None
         self._closed = False
         self._negotiated = False
         self._capabilities: set[str] = set()
@@ -111,6 +120,9 @@ class AttachV1Client:
         return None
 
     async def connect(self) -> None:
+        # A caller that timed out `close()` left its raw socket close task alive.
+        # Do not overwrite that ownership with a new connection.
+        await self.wait_closed()
         self._closed = False
         self._negotiated = False
         self._capabilities.clear()
@@ -144,6 +156,10 @@ class AttachV1Client:
             # from its previous plugin process. Older gateways ignore the open hello property.
             "commands": self._config.commands[:512],
         }
+        # v1's hello is a frozen closed schema. Never strand a fallback reconnect by sending a
+        # v2-only aggregate field to an older gateway.
+        if version >= 2:
+            hello["telemetry"] = self._spool.health_snapshot()
         await self._send(hello)
 
     async def request_device_status(self, thread_id: str, turn_id: str) -> MobileDeviceStatusResult:
@@ -276,15 +292,26 @@ class AttachV1Client:
 
     async def send_scheduled(
         self,
-        thread_id: str,
+        thread_id: Optional[str],
         delivery_id: str,
         message_id: str,
         blocks: List[RichBlock],
-    ) -> None:
-        await self._queue_event({
-            "kind": "scheduled", "threadId": thread_id, "deliveryId": delivery_id,
+        media_ids: Optional[List[str]] = None,
+        canonical_home: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        event: Dict[str, Any] = {
+            "kind": "scheduled", "deliveryId": delivery_id,
             "messageId": message_id, "blocks": self._wire_blocks(blocks),
-        })
+        }
+        if canonical_home:
+            event["target"] = {"kind": "canonical_home"}
+        elif thread_id:
+            event["threadId"] = thread_id
+        else:
+            return None
+        if media_ids:
+            event["mediaIds"] = list(media_ids[:16])
+        return await self._queue_event(event)
 
     async def send_approval(self, thread_id: str, turn_id: str, approval_id: str, call_id: str, name: str, status: str) -> None:
         await self._queue_event({
@@ -312,21 +339,45 @@ class AttachV1Client:
 
     async def upload_media(self, media_id: str, path: str, family: str, expires_at: Optional[int] = None) -> Dict[str, Any]:
         """Upload bytes through the authenticated HTTP side channel; WS carries only metadata."""
-        with open(path, "rb") as handle:
-            data = handle.read()
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        limit = _media_byte_limit(mime)
+        if os.stat(path).st_size > limit:
+            raise ValueError("media exceeds size cap")
+        with open(path, "rb") as handle:
+            data = handle.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("media exceeds size cap")
         digest = hashlib.sha256(data).hexdigest()
         descriptor = await asyncio.to_thread(self._upload_media_sync, media_id, path, mime, digest, data, expires_at)
         await self._queue_event({"kind": "media", "media": descriptor})
         return descriptor
 
-    async def download_media(self, media_id: str, max_bytes: int = 20 * 1024 * 1024) -> tuple[bytes, str, str]:
+    async def download_media(self, media_id: str, max_bytes: int = ATTACH_AUDIO_VIDEO_MAX_BYTES) -> tuple[bytes, str, str]:
         """Fetch one gateway-owned attachment through the same bearer side channel.
 
         The cap is enforced while reading so a malformed server response cannot make the plugin
         buffer an arbitrary file before Hermes has a chance to classify it.
         """
         return await asyncio.to_thread(self._download_media_sync, media_id, max_bytes)
+
+    async def delivery_receipt(self, delivery_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._delivery_receipt_sync, delivery_id, timeout_seconds)
+
+    def _delivery_receipt_sync(self, delivery_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+        parsed = urlparse(self._config.gateway_url)
+        origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
+        request = Request(f"{origin}/attach/v1/deliveries/{quote(delivery_id, safe='')}", headers={
+            "Authorization": f"Bearer {self._config.token}",
+            "User-Agent": "CozyGateway-Attach/1.0",
+        })
+        context = self._ssl_context() if origin.startswith("https://") else None
+        try:
+            with urlopen(request, context=context, timeout=max(0.05, min(timeout_seconds, 1.0))) as response:
+                return dict(json.loads(response.read()))
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
 
     def _download_media_sync(self, media_id: str, max_bytes: int) -> tuple[bytes, str, str]:
         parsed = urlparse(self._config.gateway_url)
@@ -469,7 +520,10 @@ class AttachV1Client:
             elif status == "gap":
                 await self._send({"kind": "gap", "channel": "command", "requestedAfter": self._spool.command_cursor, "earliestAvailable": self._spool.command_cursor + 1, "latestAvailable": frame["sequence"]})
         elif kind == "heartbeat":
-            await self._send({"kind": "heartbeat", "sentAt": frame.get("sentAt", 0)})
+            heartbeat = {"kind": "heartbeat", "sentAt": frame.get("sentAt", 0)}
+            if self._hello_version >= 2:
+                heartbeat["telemetry"] = self._spool.health_snapshot()
+            await self._send(heartbeat)
             await self._drain_events()
         elif kind == "gap" and frame.get("channel") == "event":
             await self.replay()
@@ -499,15 +553,34 @@ class AttachV1Client:
                 return
         self._spool.mark_command_processed(str(frame.get("commandId", "")))
 
-    async def close(self) -> None:
+    async def _close_socket(self, ws: Any) -> None:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+    def _begin_close(self) -> None:
         self._closed = True
         self._settle_mobile_requests("device_unavailable")
+        if self._socket_close_task is not None:
+            return
         ws, self._ws = self._ws, None
         if ws is not None:
+            self._socket_close_task = asyncio.create_task(self._close_socket(ws))
+
+    async def wait_closed(self) -> None:
+        """Wait for the raw websocket close task, even after a caller timeout."""
+        task = self._socket_close_task
+        if task is not None:
             try:
-                await ws.close()
-            except Exception:
-                pass
+                await asyncio.shield(task)
+            finally:
+                if task.done() and self._socket_close_task is task:
+                    self._socket_close_task = None
+
+    async def close(self) -> None:
+        self._begin_close()
+        await self.wait_closed()
 
     def _settle_mobile_result(self, frame: Dict[str, Any]) -> None:
         request_id = frame.get("requestId")
@@ -564,6 +637,14 @@ def normalize_location_purpose(value: Any) -> Optional[str]:
         return None
     purpose = " ".join(value.strip().split())
     return purpose if purpose and len(purpose.encode("utf-8")) <= 160 else None
+
+
+def _media_byte_limit(mime: str) -> int:
+    if mime.startswith("image/"):
+        return ATTACH_IMAGE_MAX_BYTES
+    if mime.startswith("audio/") or mime.startswith("video/"):
+        return ATTACH_AUDIO_VIDEO_MAX_BYTES
+    return ATTACH_FILE_MAX_BYTES
 
 
 def _event_capabilities(event: Dict[str, Any]) -> List[str]:

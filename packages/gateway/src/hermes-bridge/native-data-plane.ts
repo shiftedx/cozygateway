@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   AttachmentBlock,
   BotApprovalPendingFrame,
+  BotApprovalResolutionRequestedFrame,
   BotApprovalResolvedFrame,
   BotChatDeltaFrame,
   BotChatMessage,
@@ -10,6 +11,7 @@ import type {
   BotChatStateFrame,
   BotChatStatus,
   BotClarifyPendingFrame,
+  BotClarifyResolutionRequestedFrame,
   BotClarifyResolvedFrame,
   BotToolActivityFrame,
   BotToolStep,
@@ -29,6 +31,7 @@ import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import type {
   BotApprovalDecision,
+  BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import {
@@ -235,8 +238,10 @@ export class NativeBotDataPlane {
   canAccept(bot: string, frame: AttachV1EventFrame): boolean {
     const key = normalize(bot);
     if (!this.handles(key)) return false;
-    if (frame.event.kind === "scheduled")
+    if (frame.event.kind === "scheduled") {
+      if ("target" in frame.event) return frame.event.target.kind === "canonical_home";
       return frame.event.threadId === this.#storage.nativeBotChat(key, this.#now()).sessionId;
+    }
     return (
       "threadId" in frame.event &&
       this.#storage.nativeBotHasSession(key, frame.event.threadId)
@@ -283,20 +288,18 @@ export class NativeBotDataPlane {
     const event = frame.event;
     if (event.kind === "presence" || event.kind === "media") return true;
     if (event.kind === "scheduled") {
-      if (event.threadId !== this.#storage.nativeBotChat(key, this.#now()).sessionId) return false;
       const delivery = this.#storage.attachScheduledDelivery(
         key,
         event.deliveryId,
       );
       if (
         delivery === undefined ||
-        delivery.threadId !== event.threadId ||
         delivery.messageId !== event.messageId
       )
         return false;
       return this.#commit(
         key,
-        event.threadId,
+        delivery.threadId,
         event.messageId,
         event.blocks,
         event.mediaIds,
@@ -691,14 +694,6 @@ export class NativeBotDataPlane {
   ): Promise<BotApprovalResolveOutcome> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return "unknown";
-    const now = this.#now();
-    const expired = this.#storage.expireNativeApprovalIfDue(bot, approvalId, now);
-    if (expired !== undefined) {
-      this.#clearInteractionTimer("approval", bot, approvalId);
-      this.#emitApprovalResolved(bot, expired.sessionId, expired.turnId, approvalId, "expired");
-      this.#state(bot, expired.sessionId, "polling", true);
-      return "expired";
-    }
     const binding = this.#storage.nativeInteraction(
       bot,
       "approval",
@@ -707,55 +702,33 @@ export class NativeBotDataPlane {
     if (binding === undefined) return "unknown";
     if (binding.status !== "pending")
       return binding.status === "expired" ? "expired" : "not_pending";
-    const outcome = decision === "approve" ? "approved" : "denied";
-    if (
-      !this.#ingress.sendApprovalResolution(
-        bot,
-        {
-          threadId: binding.sessionId,
-          turnId: binding.turnId,
-          approvalId,
-          decision,
-        },
-        `approval:${bot}:${approvalId}`,
-      )
-    )
-      return "unsupported";
-    if (
-      !this.#storage.resolveNativeInteraction(
-        bot,
-        "approval",
-        approvalId,
-        outcome,
-        this.#now(),
-      )
-    )
-      return "not_pending";
-    this.#clearInteractionTimer("approval", bot, approvalId);
-    this.#emitApprovalResolved(
-      bot,
-      binding.sessionId,
-      binding.turnId,
+    const requested = this.#ingress.requestNativeApprovalResolution(bot, {
+      threadId: binding.sessionId,
+      turnId: binding.turnId,
       approvalId,
-      outcome,
-    );
-    this.#state(bot, binding.sessionId, "polling", true);
-    return outcome;
+      decision,
+    });
+    if (requested.outcome === "expired") {
+      this.#clearInteractionTimer("approval", bot, approvalId);
+      this.#emitApprovalResolved(bot, requested.sessionId, requested.turnId, approvalId, "expired");
+      this.#state(bot, requested.sessionId, "polling", true);
+      return "expired";
+    }
+    if (requested.outcome === "requested") {
+      this.#emitApprovalResolutionRequested(bot, binding.sessionId, binding.turnId, approvalId);
+      return "requested";
+    }
+    if (requested.outcome === "already_requested") return "requested";
+    if (requested.outcome === "resolution_pending") return "resolution_pending";
+    return requested.outcome;
   }
 
   async #resolveClarify(
     name: string,
     clarifyId: string,
     optionId: string,
-    deviceId: string,
-  ): Promise<
-    | "selected"
-    | "unknown"
-    | "not_pending"
-    | "expired"
-    | "invalid_option"
-    | "unsupported"
-  > {
+    _deviceId: string,
+  ): Promise<BotClarifyResolveOutcome> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return "unknown";
     const binding = this.#storage.nativeInteraction(bot, "clarify", clarifyId);
@@ -765,43 +738,33 @@ export class NativeBotDataPlane {
     const payload = binding.payload as ClarifyPayload;
     if (!payload.options.some((option) => option.id === optionId))
       return "invalid_option";
-    if (
-      !this.#ingress.sendClarifyResolution(
-        bot,
-        {
-          threadId: binding.sessionId,
-          turnId: binding.turnId,
-          clarifyId,
-          optionId,
-        },
-        `clarify:${bot}:${clarifyId}`,
-      )
-    )
-      return "unsupported";
-    if (
-      !this.#storage.resolveNativeInteraction(
-        bot,
-        "clarify",
-        clarifyId,
-        "selected",
-        this.#now(),
-        optionId,
-      )
-    )
-      return "not_pending";
-    this.#clearInteractionTimer("clarify", bot, clarifyId);
-    this.#broadcast({
-      type: "bot_clarify_resolved",
-      bot,
-      sessionId: binding.sessionId,
+    const requested = this.#ingress.requestNativeClarifyResolution(bot, {
+      threadId: binding.sessionId,
       turnId: binding.turnId,
       clarifyId,
-      outcome: "selected",
-      selectedOptionId: optionId,
-      updatedAt: this.#now(),
+      optionId,
     });
-    this.#state(bot, binding.sessionId, "polling", true);
-    return "selected";
+    if (requested.outcome === "expired") {
+      this.#clearInteractionTimer("clarify", bot, clarifyId);
+      this.#broadcast({
+        type: "bot_clarify_resolved",
+        bot,
+        sessionId: requested.sessionId,
+        turnId: requested.turnId,
+        clarifyId,
+        outcome: "expired",
+        updatedAt: this.#now(),
+      });
+      this.#state(bot, requested.sessionId, "polling", true);
+      return "expired";
+    }
+    if (requested.outcome === "requested") {
+      this.#emitClarifyResolutionRequested(bot, binding.sessionId, binding.turnId, clarifyId);
+      return "requested";
+    }
+    if (requested.outcome === "already_requested") return "requested";
+    if (requested.outcome === "resolution_pending") return "resolution_pending";
+    return requested.outcome;
   }
 
   #attachmentInfo(name: string, fileId: string) {
@@ -1209,6 +1172,14 @@ export class NativeBotDataPlane {
           : event.status === "pending"
             ? undefined
             : "expired";
+    const binding = outcome === undefined
+      ? undefined
+      : this.#storage.nativeInteraction(bot, "approval", event.approvalId);
+    if (
+      binding !== undefined &&
+      (binding.sessionId !== sessionId || binding.turnId !== event.turnId)
+    )
+      return false;
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "approval",
@@ -1221,6 +1192,7 @@ export class NativeBotDataPlane {
       updatedAt: this.#now(),
     });
     if (change === "duplicate") return true;
+    if (change === "conflict") return false;
     if (outcome === undefined) {
       const wire: BotApprovalPendingFrame = {
         type: "bot_approval_pending",
@@ -1280,6 +1252,23 @@ export class NativeBotDataPlane {
       prompt: event.prompt,
       options: event.options,
     };
+    const binding = outcome === undefined
+      ? undefined
+      : this.#storage.nativeInteraction(bot, "clarify", event.clarifyId);
+    if (
+      binding !== undefined &&
+      (binding.sessionId !== sessionId || binding.turnId !== event.turnId)
+    )
+      return false;
+    const options = binding === undefined
+      ? event.options
+      : (binding.payload as ClarifyPayload).options;
+    if (
+      outcome === "selected" &&
+      event.selectedOptionId !== undefined &&
+      !options.some((option) => option.id === event.selectedOptionId)
+    )
+      return false;
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "clarify",
@@ -1295,6 +1284,7 @@ export class NativeBotDataPlane {
       updatedAt: this.#now(),
     });
     if (change === "duplicate") return true;
+    if (change === "conflict") return false;
     if (outcome === undefined) {
       const pending: BotClarifyPendingFrame = {
         type: "bot_clarify_pending",
@@ -1366,6 +1356,40 @@ export class NativeBotDataPlane {
       toolCallId: approvalId,
       outcome,
     });
+  }
+
+  #emitApprovalResolutionRequested(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    approvalId: string,
+  ): void {
+    const wire: BotApprovalResolutionRequestedFrame = {
+      type: "bot_approval_resolution_requested",
+      bot,
+      sessionId,
+      turnId,
+      toolCallId: approvalId,
+      updatedAt: this.#now(),
+    };
+    this.#broadcast(wire);
+  }
+
+  #emitClarifyResolutionRequested(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    clarifyId: string,
+  ): void {
+    const wire: BotClarifyResolutionRequestedFrame = {
+      type: "bot_clarify_resolution_requested",
+      bot,
+      sessionId,
+      turnId,
+      clarifyId,
+      updatedAt: this.#now(),
+    };
+    this.#broadcast(wire);
   }
 
   #scheduleInteractionExpiry(pending: {

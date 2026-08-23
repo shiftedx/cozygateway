@@ -2,11 +2,19 @@
  * public bots surface with Dashboard implementation details. */
 export type BotApprovalDecision = "approve" | "deny";
 export type BotApprovalResolveOutcome =
-  | "approved"
-  | "denied"
+  | "requested"
+  | "resolution_pending"
   | "unknown"
   | "not_pending"
   | "expired"
+  | "unsupported";
+export type BotClarifyResolveOutcome =
+  | "requested"
+  | "resolution_pending"
+  | "unknown"
+  | "not_pending"
+  | "expired"
+  | "invalid_option"
   | "unsupported";
 export type BotApprovalPush =
   | {

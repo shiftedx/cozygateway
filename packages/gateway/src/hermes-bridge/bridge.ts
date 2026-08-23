@@ -46,6 +46,7 @@ import {
 import type { GroupMember } from "./group-protocol.ts";
 import type {
   BotApprovalDecision,
+  BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import { parseChatSnapshot } from "./chat-messages.ts";
@@ -281,14 +282,7 @@ export interface BotsSurface extends BotControlSurface {
     clarifyId: string,
     optionId: string,
     deviceId: string,
-  ): Promise<
-    | "selected"
-    | "unknown"
-    | "not_pending"
-    | "expired"
-    | "invalid_option"
-    | "unsupported"
-  >;
+  ): Promise<BotClarifyResolveOutcome>;
 }
 
 export interface HermesBridgeOptions {

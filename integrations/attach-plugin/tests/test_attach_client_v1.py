@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
@@ -224,10 +224,12 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "heartbeat", "sentAt": 10}))
         await self.client._dispatch_inbound(json.dumps({"kind": "heartbeat", "sentAt": 20}))
-        self.assertEqual(self.socket.sent[-2:], [
-            {"kind": "heartbeat", "sentAt": 10},
-            {"kind": "heartbeat", "sentAt": 20},
-        ])
+        heartbeats = self.socket.sent[-2:]
+        self.assertEqual(
+            [(frame["kind"], frame["sentAt"]) for frame in heartbeats],
+            [("heartbeat", 10), ("heartbeat", 20)],
+        )
+        self.assertTrue(all("telemetry" in frame for frame in heartbeats))
 
     async def test_discard_advances_sequence_without_executing_unsupported_action(self):
         approvals = []
@@ -282,6 +284,36 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             self.client._upload_media_sync("m", "/tmp/movie.mp4", "video/mp4", "a" * 64, b"video", None)
 
         self.assertEqual(captured[0].get_header("User-agent"), "CozyGateway-Attach/1.0")
+
+    async def test_media_upload_rejects_an_oversize_file_before_opening_it(self):
+        __import__("mimetypes").guess_type("/tmp/report.png")
+        with patch("cozygateway.attach_client_v1.os.stat", return_value=type("Stat", (), {"st_size": 8 * 1024 * 1024 + 1})()), \
+             patch("builtins.open", mock_open()) as opened:
+            with self.assertRaisesRegex(ValueError, "size cap"):
+                await self.client.upload_media("m", "/private/report.png", "image")
+        opened.assert_not_called()
+
+    async def test_media_upload_reads_at_most_one_byte_past_the_protocol_cap(self):
+        __import__("mimetypes").guess_type("/tmp/report.png")
+        reads = []
+
+        class File:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self, limit):
+                reads.append(limit)
+                return b"x" * limit
+
+        with patch("cozygateway.attach_client_v1.os.stat", return_value=type("Stat", (), {"st_size": 1})()), \
+             patch("builtins.open", return_value=File()):
+            with self.assertRaisesRegex(ValueError, "size cap"):
+                await self.client.upload_media("m", "/private/report.png", "image")
+        self.assertEqual(reads, [8 * 1024 * 1024 + 1])
+
+    async def test_media_download_defaults_to_the_gateway_audio_video_cap(self):
+        with patch.object(self.client, "_download_media_sync", return_value=(b"movie", "movie.mp4", "video/mp4")) as download:
+            await self.client.download_media("movie")
+        download.assert_called_once_with("movie", 40 * 1024 * 1024)
 
     async def test_live_events_pause_at_negotiated_count_and_refill_on_ack(self):
         await self.client.connect()
