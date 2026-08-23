@@ -3,6 +3,7 @@ import {
   type ErrorBody,
   type ErrorCode,
   BotChatPhotoFieldsSchema,
+  BotCreateRequestSchema,
   BotChatAttachmentFieldsSchema,
   BotClarifyResolveRequestSchema,
   BotChatSendRequestSchema,
@@ -28,6 +29,7 @@ import {
 } from "./bridge.ts";
 import {
   BotNameInvalid,
+  BotNameTaken,
   BotNotFound,
   PROFILE_ID_RE,
   normalizeProfileName,
@@ -359,6 +361,20 @@ export function registerBotRoutes(
       updatedAt: view.updatedAt,
       stale: view.stale,
     });
+  });
+
+  app.post("/bots", requireDevice, async (c) => {
+    let input;
+    try {
+      input = assertValid(BotCreateRequestSchema, await c.req.json());
+      return c.json(await bots.createBot(input), 201);
+    } catch (error) {
+      if (error instanceof ContractViolation || error instanceof BotNameInvalid)
+        return c.json(errorBody("invalid_request", error.message), 400);
+      if (error instanceof BotNameTaken)
+        return c.json(extensionErrorBody("conflict", error.message), 409);
+      return failure(c, error);
+    }
   });
 
   // Approval verbs for a bot chat (capability 10, issue #19 bridge lane). Two sibling routes
