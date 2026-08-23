@@ -948,8 +948,24 @@ class AttachAdapter:
                     return SendResult(success=False, error=str(exc))
             return SendResult(success=True)
         if not turn_id:
-            logger.warning("attach: refusing send for %r -- no in-flight turn", chat_id)
-            return SendResult(success=False, error="no in-flight turn")
+            metadata_thread = metadata.get("thread_id") if isinstance(metadata, dict) else None
+            target_thread = str(metadata_thread or chat_id).strip()
+            blocks = normalize_text_to_blocks(content)
+            if not isinstance(client, AttachV1Client) or not target_thread or not blocks:
+                return SendResult(success=False, error="no in-flight turn")
+            digest = hashlib.sha256(
+                f"{chat_id}\0{target_thread}\0{content}".encode("utf-8")
+            ).hexdigest()
+            delivery_id = "unanchored:" + digest
+            message_id = "scheduled-" + hashlib.sha256(
+                delivery_id.encode("utf-8")
+            ).hexdigest()[:32]
+            frame = await client.send_scheduled(
+                target_thread, delivery_id, message_id, blocks
+            )
+            if frame is None:
+                return SendResult(success=False, error="scheduled delivery unavailable")
+            return SendResult(success=True, message_id=message_id)
         try:
             # The authoritative terminal text, or the last streamed buffer when the
             # terminal content is empty or whitespace (a draft-only turn).

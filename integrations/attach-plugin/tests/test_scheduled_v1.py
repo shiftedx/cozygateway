@@ -18,8 +18,15 @@ except ModuleNotFoundError:
     sys.modules["websockets.exceptions"] = websocket_exceptions
 
 from cozygateway.adapter import AttachAdapter, _standalone_send, enqueue_proactive_delivery
-from cozygateway.attach_client_v1 import AttachV1Client
+from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
 from cozygateway.attach_spool import AttachSpool
+
+
+class _SendResult:
+    def __init__(self, success, message_id=None, error=None):
+        self.success = success
+        self.message_id = message_id
+        self.error = error
 
 
 class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -62,6 +69,47 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["accepted_pending"])
             self.assertEqual(self._events(path)[0]["kind"], "scheduled")
             self.assertFalse(os.path.exists(hostile))
+
+    async def test_recovered_final_without_an_active_turn_uses_durable_scheduled_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            config = self._config(path)
+            adapter = AttachAdapter()
+            adapter._attach_init(config)
+            adapter._spool = AttachSpool(path)
+            adapter._client = AttachV1Client(AttachV1ClientConfig(
+                gateway_url="http://gateway.example",
+                token="secret",
+                spool=adapter._spool,
+            ))
+
+            gateway = types.ModuleType("gateway")
+            platforms = types.ModuleType("gateway.platforms")
+            base = types.ModuleType("gateway.platforms.base")
+            base.SendResult = _SendResult
+            gateway.platforms = platforms
+            platforms.base = base
+            with patch.dict(
+                sys.modules,
+                {
+                    "gateway": gateway,
+                    "gateway.platforms": platforms,
+                    "gateway.platforms.base": base,
+                },
+            ):
+                try:
+                    first = await adapter.send("thread", "Recovered final answer")
+                    retry = await adapter.send("thread", "Recovered final answer")
+                finally:
+                    adapter._spool.close()
+
+            self.assertTrue(first.success)
+            self.assertTrue(retry.success)
+            events = self._events(path)
+            self.assertEqual([event["kind"] for event in events], ["scheduled", "scheduled"])
+            self.assertEqual([event["threadId"] for event in events], ["thread", "thread"])
+            self.assertEqual(events[0]["deliveryId"], events[1]["deliveryId"])
+            self.assertEqual(events[0]["messageId"], events[1]["messageId"])
 
     def test_adapter_configured_spool_path_wins_over_hostile_environment(self):
         with patch.dict(os.environ, {"COZYGATEWAY_SPOOL_PATH": "/definitely/not/the/test/path.sqlite"}):
