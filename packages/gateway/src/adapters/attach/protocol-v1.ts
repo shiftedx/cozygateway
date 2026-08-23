@@ -14,6 +14,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("clarify"),
   Type.Literal("scheduled"),
   Type.Literal("mobile_node"),
+  Type.Literal("mobile_location"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 

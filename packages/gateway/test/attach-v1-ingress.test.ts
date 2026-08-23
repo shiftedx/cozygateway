@@ -114,6 +114,26 @@ describe("attach-v1 ingress", () => {
     peer.ws.close();
   });
 
+  it("keeps location behind mobile_location while preserving status-only mobile_node peers", async () => {
+    const oldPeer = await dial(undefined, ["mobile_node"]);
+    expect(oldPeer.frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["mobile_node"] });
+    oldPeer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "status-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000 }));
+    await until(() => mobileRequests.some((frame) => frame.requestId === "status-1"));
+    expect(ingress.sendMobileResult("sage", { requestId: "location-old-result", status: "ok", result: { latitude: 41.88, longitude: -87.63 } })).toBe(false);
+    expect(oldPeer.frames.some((frame) => frame.kind === "mobile_result" && frame.requestId === "location-old-result")).toBe(false);
+    oldPeer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "location-old", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee" }));
+    await once(oldPeer.ws, "close");
+    expect(mobileRequests.some((frame) => frame.requestId === "location-old")).toBe(false);
+
+    const newPeer = await dial(undefined, ["mobile_node", "mobile_location"]);
+    expect(newPeer.frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["mobile_node", "mobile_location"] });
+    newPeer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "location-new", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee" }));
+    await until(() => mobileRequests.some((frame) => frame.requestId === "location-new"));
+    expect(ingress.sendMobileResult("sage", { requestId: "location-new", status: "ok", result: { latitude: 41.88, longitude: -87.63 } })).toBe(true);
+    await until(() => newPeer.frames.some((frame) => frame.kind === "mobile_result" && frame.requestId === "location-new"));
+    newPeer.ws.close();
+  });
+
   it("reconciles a lost command ACK from the plugin's durable resume cursor without replay", async () => {
     ingress.sendTurn("sage", { kind: "turn", threadId: "t", turnId: "u", text: "once" });
     const first = await dial();

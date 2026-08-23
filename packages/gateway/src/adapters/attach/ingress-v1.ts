@@ -31,7 +31,7 @@ export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location"] as const satisfies readonly AttachV1Capability[];
 
 export interface AttachV1Events {
   /** True only after the event was durably projected into its owning app/transcript state. */
@@ -190,8 +190,9 @@ export class AttachV1Ingress implements TurnEndpoint {
         return;
       }
       if (frame.kind === "mobile_request") {
-        if (!connection.capabilities.has("mobile_node")) {
-          socket.close(1008, "attach-v1 capability not negotiated: mobile_node");
+        const required = frame.command === "location.current" ? "mobile_location" : "mobile_node";
+        if (!connection.capabilities.has(required)) {
+          socket.close(1008, `attach-v1 capability not negotiated: ${required}`);
           return;
         }
         this.#events.onMobileRequest?.(agentId, frame);
@@ -374,7 +375,8 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   sendMobileResult(agentId: string, frame: AttachV1MobileResultInput): boolean {
     const connection = this.#current.get(agentId);
-    if (connection === undefined || !connection.hello || !connection.capabilities.has("mobile_node")) return false;
+    const required = "result" in frame && isLocationResult(frame.result) ? "mobile_location" : "mobile_node";
+    if (connection === undefined || !connection.hello || !connection.capabilities.has(required)) return false;
     return this.#send(connection, { kind: "mobile_result", ...frame });
   }
 
@@ -473,6 +475,10 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#current.clear();
     this.#wss.close();
   }
+}
+
+function isLocationResult(value: unknown): value is { latitude: number; longitude: number } {
+  return typeof value === "object" && value !== null && "latitude" in value && "longitude" in value;
 }
 
 function eventCapabilities(frame: AttachV1EventFrame): AttachV1Capability[] {

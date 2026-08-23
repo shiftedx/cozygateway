@@ -57,6 +57,8 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.socket.sent[0]["version"], 1)
         self.assertEqual(self.socket.sent[0]["instanceId"], self.spool.instance_id)
         self.assertEqual(self.socket.sent[0]["resume"], {"eventSequence": 0, "commandSequence": 0})
+        self.assertIn("mobile_node", self.socket.sent[0]["capabilities"])
+        self.assertIn("mobile_location", self.socket.sent[0]["capabilities"])
 
     async def test_hello_ack_recovers_a_recreated_empty_spool_from_server_cursors(self):
         await self.client.connect()
@@ -244,9 +246,15 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": request_id, "status": "ok", "result": {"foreground": True, "serial": "never forward"}}))
         self.assertEqual(await request, {"status": "device_unavailable"})
 
-    async def test_location_is_ephemeral_normalizes_purpose_and_validates_the_closed_result(self):
+    async def test_location_requires_its_own_negotiated_capability(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        self.assertEqual(await self.client.request_location("thread", "turn", "Find coffee"), {"status": "device_unavailable"})
+        self.assertEqual([frame for frame in self.socket.sent if frame["kind"] == "mobile_request"], [])
+
+    async def test_location_is_ephemeral_normalizes_purpose_and_validates_the_closed_result(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_location"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
         request = __import__("asyncio").create_task(self.client.request_location("thread", "turn", "  Find   coffee  "))
         await __import__("asyncio").sleep(0)
         frame = self.socket.sent[-1]
@@ -262,7 +270,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_location_cancellation_sends_only_an_ephemeral_cancel(self):
         await self.client.connect()
-        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_location"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
         request = __import__("asyncio").create_task(self.client.request_location("thread", "turn", "Find coffee"))
         await __import__("asyncio").sleep(0)
         request.cancel()

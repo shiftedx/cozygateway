@@ -121,14 +121,15 @@ through a less reliable transport.
 
 ### Ephemeral Mobile Node lane
 
-When `mobile_node` is negotiated, a plugin may send an unsequenced `mobile_request` for the
-active native Bot Mode turn only:
+When `mobile_node` is negotiated, a plugin may send an unsequenced status `mobile_request` for
+the active native Bot Mode turn only:
 
 ```json
 { "kind": "mobile_request", "requestId": "...", "command": "device.status", "threadId": "...", "turnId": "...", "expiresAt": 0 }
 ```
 
-The only additional operation is one-shot `location.current`:
+One-shot `location.current` additionally requires negotiated `mobile_location`; `mobile_node`
+alone remains status-only for old plugin/server pairs:
 
 ```json
 { "kind": "mobile_request", "requestId": "...", "command": "location.current", "threadId": "...", "turnId": "...", "expiresAt": 0, "purpose": "Find nearby coffee" }
@@ -149,5 +150,6 @@ statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground
 
 The plugin may send `{ "kind": "mobile_cancel", "requestId": "..." }` to settle its own
 pending tool. It is also negotiated, unsequenced, non-durable, and never replayed; a late phone
-result is ignored. Purpose and raw coordinates are in-memory request/result values only and are
+result is ignored. A gateway MUST neither accept a location request nor send a location result
+without `mobile_location` negotiated. Purpose and raw coordinates are in-memory request/result values only and are
 never put in the durable spool, transcript, storage, logs, traces, audit, or push payloads.

@@ -122,7 +122,7 @@ class AttachV1Client:
             "kind": "hello",
             "version": 1,
             "instanceId": self._spool.instance_id,
-            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node"],
+            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location"],
             "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
             "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
         })
@@ -142,7 +142,8 @@ class AttachV1Client:
         return await self._request_mobile("location.current", thread_id, turn_id, purpose)
 
     async def _request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: Optional[str] = None) -> MobileDeviceStatusResult:
-        if not self._negotiated or "mobile_node" not in self._capabilities:
+        required_capability = "mobile_location" if command == "location.current" else "mobile_node"
+        if not self._negotiated or required_capability not in self._capabilities:
             return {"status": "device_unavailable"}
         request_id = str(uuid.uuid4())
         future: asyncio.Future[MobileDeviceStatusResult] = asyncio.get_running_loop().create_future()

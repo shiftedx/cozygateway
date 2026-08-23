@@ -40,7 +40,7 @@ it("routes one native status tool turn only through its foreground origin device
     sockets.push(plugin);
     plugin.on("message", (data) => pluginFrames.push(JSON.parse(String(data))));
     await once(plugin, "open");
-    plugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "mobile-node-e2e", capabilities: ["draft", "mobile_node"], resume: { eventSequence: 0, commandSequence: 0 } }));
+    plugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "mobile-node-e2e", capabilities: ["draft", "mobile_node", "mobile_location"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
 
     await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "sage"));
@@ -150,7 +150,7 @@ it("routes one native status tool turn only through its foreground origin device
     sockets.push(pluginReconnect);
     pluginReconnect.on("message", (data) => replayedFrames.push(JSON.parse(String(data))));
     await once(pluginReconnect, "open");
-    pluginReconnect.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "mobile-node-e2e", capabilities: ["draft", "mobile_node"], resume: { eventSequence: 0, commandSequence: 0 } }));
+    pluginReconnect.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "mobile-node-e2e", capabilities: ["draft", "mobile_node", "mobile_location"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => replayedFrames.some((frame) => frame.kind === "hello_ack"));
     await pause();
     expect(replayedFrames.some((frame) => frame.kind === "mobile_result")).toBe(false);

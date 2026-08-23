@@ -14,7 +14,7 @@ describe("attach-v1 protocol", () => {
       kind: "hello",
       version: 1,
       instanceId: "plugin-1",
-      capabilities: ["draft", "media", "tools", "approvals", "clarify", "scheduled"],
+      capabilities: ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location"],
       resume: { eventSequence: 41, commandSequence: 8 },
       limits: { maxInFlightEvents: 32, maxInFlightBytes: 1048576 },
     })).toBe(true);
