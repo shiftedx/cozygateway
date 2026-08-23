@@ -89,6 +89,15 @@ interface ToolFrameState {
   steps: Map<string, BotToolStep>;
 }
 
+type LiveTurnFrame = BotChatDeltaFrame | BotToolActivityFrame | BotChatStateFrame;
+
+interface LiveTurnBatch {
+  timer: ReturnType<typeof setTimeout>;
+  frames: Map<LiveTurnFrame["type"], LiveTurnFrame>;
+}
+
+const LIVE_TURN_FLUSH_MS = 100;
+
 interface NativeTurnState {
   status: BotChatStatus;
   cause?: BotChatStateCause;
@@ -122,6 +131,7 @@ export class NativeBotDataPlane {
     ReturnType<typeof setTimeout>
   >();
   readonly #turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #liveTurnBatches = new Map<string, LiveTurnBatch>();
 
   constructor(opts: NativeBotDataPlaneOptions) {
     this.#control = opts.control;
@@ -283,8 +293,10 @@ export class NativeBotDataPlane {
     if (!this.handles(key)) return;
     this.#attachPresence.set(key, state);
     const chat = this.#storage.nativeBotChat(key, this.#now());
-    if (chat.activeTurnId !== undefined)
+    if (chat.activeTurnId !== undefined) {
+      this.#flushLiveTurn(this.#nativeTurnKey(key, chat.sessionId, chat.activeTurnId));
       this.#state(key, chat.sessionId, "polling", true);
+    }
   }
 
   close(): void {
@@ -292,6 +304,8 @@ export class NativeBotDataPlane {
     this.#interactionTimers.clear();
     for (const timer of this.#turnTimers.values()) clearTimeout(timer);
     this.#turnTimers.clear();
+    for (const batch of this.#liveTurnBatches.values()) clearTimeout(batch.timer);
+    this.#liveTurnBatches.clear();
   }
 
   handle(bot: string, frame: AttachV1EventFrame): boolean {
@@ -366,8 +380,11 @@ export class NativeBotDataPlane {
         seq,
         updatedAt: this.#now(),
       };
-      this.#broadcast(delta);
-      this.#state(key, sessionId, "polling", true);
+      this.#coalesceLiveTurn(
+        this.#nativeTurnKey(key, sessionId, event.turnId),
+        delta,
+        this.#stateFrame(key, sessionId, "polling", true),
+      );
       return true;
     }
     if (event.kind === "commit") {
@@ -442,8 +459,10 @@ export class NativeBotDataPlane {
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const now = this.#now();
     const previous = this.#storage.nativeBotChat(bot, now);
-    if (previous.activeTurnId !== undefined)
+    if (previous.activeTurnId !== undefined) {
+      this.#discardLiveTurn(this.#nativeTurnKey(bot, previous.sessionId, previous.activeTurnId));
       this.#cancelMobileTurn(bot, previous.sessionId, previous.activeTurnId);
+    }
     const previousSessionId = previous.sessionId;
     const sessionId = this.#storage.resetNativeBotChat(bot, now);
     // The existing app treats this as a cross-device transcript switch; the same adoption frame
@@ -484,7 +503,10 @@ export class NativeBotDataPlane {
       throw new BotSessionNotFound(sessionId);
     }
     const now = this.#now();
-    const previousSessionId = this.#storage.nativeBotChat(bot, now).sessionId;
+    const previous = this.#storage.nativeBotChat(bot, now);
+    const previousSessionId = previous.sessionId;
+    if (previous.activeTurnId !== undefined)
+      this.#discardLiveTurn(this.#nativeTurnKey(bot, previous.sessionId, previous.activeTurnId));
     // The ownership check above makes this update total. Keep the guard because the storage API is
     // also used by tests and must never silently create a session for an arbitrary id.
     if (!this.#storage.selectNativeBotSession(bot, sessionId, now))
@@ -706,6 +728,7 @@ export class NativeBotDataPlane {
     const now = this.#now();
     const previous = this.#storage.nativeBotChat(bot, now);
     if (previous.activeTurnId !== undefined) {
+      this.#discardLiveTurn(this.#nativeTurnKey(bot, previous.sessionId, previous.activeTurnId));
       this.#cancelMobileTurn(bot, previous.sessionId, previous.activeTurnId);
       this.#ingress.sendNativeInterrupt(bot, {
         threadId: previous.sessionId,
@@ -838,6 +861,7 @@ export class NativeBotDataPlane {
       phase: Exclude<BotChatStateFrame["phase"], "polling">;
     } = { phase: "complete", status: "completed" },
   ): void {
+    this.#flushLiveTurn(this.#nativeTurnKey(bot, sessionId, turnId));
     const settledActiveTurn = this.#storage.clearNativeBotTurn(
       bot,
       sessionId,
@@ -991,8 +1015,11 @@ export class NativeBotDataPlane {
       seq: current.seq,
       updatedAt: now,
     };
-    this.#broadcast(wire);
-    this.#state(bot, sessionId, "polling", true);
+    this.#coalesceLiveTurn(
+      key,
+      wire,
+      this.#stateFrame(bot, sessionId, "polling", true),
+    );
     return true;
   }
 
@@ -1209,6 +1236,7 @@ export class NativeBotDataPlane {
     sessionId: string,
     event: Extract<AttachV1EventFrame["event"], { kind: "approval" }>,
   ): boolean {
+    this.#flushLiveTurn(this.#nativeTurnKey(bot, sessionId, event.turnId));
     const outcome =
       event.status === "approved"
         ? "approved"
@@ -1287,6 +1315,7 @@ export class NativeBotDataPlane {
     sessionId: string,
     event: Extract<AttachV1EventFrame["event"], { kind: "clarify" }>,
   ): boolean {
+    this.#flushLiveTurn(this.#nativeTurnKey(bot, sessionId, event.turnId));
     const outcome =
       event.status === "resolved"
         ? "selected"
@@ -1566,13 +1595,63 @@ export class NativeBotDataPlane {
     }
   }
 
-  #state(
+  /** Progress frames are full replacements: send the leading state immediately, then keep only
+   * the latest draft/tool/state for each 100 ms window. Durable event projection is unchanged. */
+  #coalesceLiveTurn(key: string, ...frames: LiveTurnFrame[]): void {
+    const current = this.#liveTurnBatches.get(key);
+    if (current !== undefined) {
+      for (const frame of frames) current.frames.set(frame.type, frame);
+      return;
+    }
+    const timer = setTimeout(() => this.#tickLiveTurn(key), LIVE_TURN_FLUSH_MS);
+    timer.unref();
+    this.#liveTurnBatches.set(key, { timer, frames: new Map() });
+    for (const frame of frames) this.#broadcast(frame);
+  }
+
+  #flushLiveTurn(key: string): void {
+    const batch = this.#liveTurnBatches.get(key);
+    if (batch === undefined) return;
+    clearTimeout(batch.timer);
+    this.#liveTurnBatches.delete(key);
+    this.#broadcastLiveFrames(batch.frames);
+  }
+
+  #tickLiveTurn(key: string): void {
+    const batch = this.#liveTurnBatches.get(key);
+    if (batch === undefined) return;
+    if (batch.frames.size === 0) {
+      this.#liveTurnBatches.delete(key);
+      return;
+    }
+    const frames = new Map(batch.frames);
+    batch.frames.clear();
+    batch.timer = setTimeout(() => this.#tickLiveTurn(key), LIVE_TURN_FLUSH_MS);
+    batch.timer.unref();
+    this.#broadcastLiveFrames(frames);
+  }
+
+  #broadcastLiveFrames(frames: ReadonlyMap<LiveTurnFrame["type"], LiveTurnFrame>): void {
+    for (const type of ["bot_chat_delta", "bot_tool_activity", "bot_chat_state"] as const) {
+      const frame = frames.get(type);
+      if (frame !== undefined) this.#broadcast(frame);
+    }
+  }
+
+  #discardLiveTurn(key: string): void {
+    const batch = this.#liveTurnBatches.get(key);
+    if (batch === undefined) return;
+    clearTimeout(batch.timer);
+    this.#liveTurnBatches.delete(key);
+  }
+
+  #stateFrame(
     bot: string,
     sessionId: string,
     phase: BotChatStateFrame["phase"],
     running: boolean,
     terminal?: NativeTurnState,
-  ): void {
+  ): BotChatStateFrame {
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     const state = terminal ?? this.#turnState(bot, sessionId, chat.activeTurnId);
     if (chat.activeTurnId !== undefined && state !== undefined) {
@@ -1586,7 +1665,7 @@ export class NativeBotDataPlane {
         });
       }
     }
-    const frame: BotChatStateFrame = {
+    return {
       type: "bot_chat_state",
       bot,
       sessionId,
@@ -1596,7 +1675,16 @@ export class NativeBotDataPlane {
       ...(state === undefined ? {} : state),
       updatedAt: this.#now(),
     };
-    this.#broadcast(frame);
+  }
+
+  #state(
+    bot: string,
+    sessionId: string,
+    phase: BotChatStateFrame["phase"],
+    running: boolean,
+    terminal?: NativeTurnState,
+  ): void {
+    this.#broadcast(this.#stateFrame(bot, sessionId, phase, running, terminal));
   }
 }
 

@@ -362,6 +362,144 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("coalesces a burst of tool activity into the latest durable snapshot", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100);
+    try {
+      const storage = openStorage(":memory:");
+      const frames: ServerFrame[] = [];
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {} as AttachV1Ingress,
+        nativeBots: ["sage"],
+        chatSuggestion: "",
+        broadcast: (frame) => frames.push(frame),
+      });
+      const chat = storage.nativeBotChat("sage", 1);
+      storage.enqueueAttachCommand("sage", "turn", {
+        kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+      } as never, 1);
+      storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+
+      expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "search-running", event: {
+        kind: "tool", threadId: chat.sessionId, turnId: "turn",
+        callId: "search", name: "search", status: "running",
+      } })).toBe(true);
+      expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "search-ok", event: {
+        kind: "tool", threadId: chat.sessionId, turnId: "turn",
+        callId: "search", name: "search", status: "ok",
+      } })).toBe(true);
+      expect(plane.handle("sage", { kind: "event", sequence: 3, eventId: "render-running", event: {
+        kind: "tool", threadId: chat.sessionId, turnId: "turn",
+        callId: "render", name: "render", status: "running",
+      } })).toBe(true);
+
+      expect(frames.filter((frame) => frame.type === "bot_tool_activity")).toHaveLength(1);
+      expect(await plane.surface().chatHistory("sage")).toMatchObject({
+        toolSteps: [{ turnId: "turn", steps: [
+          { stepId: "search", status: "ok" },
+          { stepId: "render", status: "running" },
+        ] }],
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(frames.filter((frame) => frame.type === "bot_tool_activity")).toHaveLength(2);
+      expect(frames.filter((frame) => frame.type === "bot_tool_activity").at(-1)).toMatchObject({
+        seq: 3,
+        steps: [
+          { stepId: "search", status: "ok" },
+          { stepId: "render", status: "running" },
+        ],
+      });
+      expect(plane.handle("sage", { kind: "event", sequence: 4, eventId: "render-ok", event: {
+        kind: "tool", threadId: chat.sessionId, turnId: "turn",
+        callId: "render", name: "render", status: "ok",
+      } })).toBe(true);
+      expect(frames.filter((frame) => frame.type === "bot_tool_activity")).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(frames.filter((frame) => frame.type === "bot_tool_activity").at(-1)).toMatchObject({
+        seq: 4,
+        steps: [{ status: "ok" }, { status: "ok" }],
+      });
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("flushes the latest live activity before terminal frames and leaves no stale timer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100);
+    try {
+      const storage = openStorage(":memory:");
+      const frames: ServerFrame[] = [];
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {} as AttachV1Ingress,
+        nativeBots: ["sage"], chatSuggestion: "",
+        broadcast: (frame) => frames.push(frame),
+      });
+      const chat = storage.nativeBotChat("sage", 1);
+      storage.enqueueAttachCommand("sage", "turn", {
+        kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+      } as never, 1);
+      storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+
+      expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "draft-1", event: {
+        kind: "draft", threadId: chat.sessionId, turnId: "turn",
+        blocks: [{ type: "paragraph", text: "working" }],
+      } })).toBe(true);
+      expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "tool", event: {
+        kind: "tool", threadId: chat.sessionId, turnId: "turn",
+        callId: "search", name: "search", status: "running",
+      } })).toBe(true);
+      expect(plane.handle("sage", { kind: "event", sequence: 3, eventId: "draft-2", event: {
+        kind: "draft", threadId: chat.sessionId, turnId: "turn",
+        blocks: [{ type: "paragraph", text: "almost done" }],
+      } })).toBe(true);
+      expect(plane.handle("sage", { kind: "event", sequence: 4, eventId: "commit", event: {
+        kind: "commit", threadId: chat.sessionId, turnId: "turn", messageId: "answer",
+        blocks: [{ type: "paragraph", text: "done" }],
+      } })).toBe(true);
+
+      const latestDraft = frames.findIndex(
+        (frame) => frame.type === "bot_chat_delta" && frame.text === "almost done",
+      );
+      const liveTool = frames.findIndex(
+        (frame) => frame.type === "bot_tool_activity" && frame.done !== true,
+      );
+      const doneTool = frames.findIndex(
+        (frame) => frame.type === "bot_tool_activity" && frame.done === true,
+      );
+      const doneDraft = frames.findIndex(
+        (frame) => frame.type === "bot_chat_delta" && frame.done === true,
+      );
+      const terminalState = frames.findIndex(
+        (frame) => frame.type === "bot_chat_state" && frame.status === "completed",
+      );
+      const answer = frames.findIndex(
+        (frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "answer"),
+      );
+      expect(latestDraft).toBeGreaterThanOrEqual(0);
+      expect(liveTool).toBeGreaterThan(latestDraft);
+      expect(doneTool).toBeGreaterThan(liveTool);
+      expect(doneDraft).toBeGreaterThan(doneTool);
+      expect(terminalState).toBeGreaterThan(doneDraft);
+      expect(answer).toBeGreaterThan(terminalState);
+      expect(vi.getTimerCount()).toBe(0);
+      const count = frames.length;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(frames).toHaveLength(count);
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["failed", "cancelled", "interrupted"] as const)(
     "seals running tools as errors when attach reports %s",
     async (kind) => {
