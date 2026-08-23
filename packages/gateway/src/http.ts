@@ -28,6 +28,7 @@ import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
 import type { BotControlSurface, BotsSurface } from "./hermes-bridge/bridge.ts";
+import type { MemorySurface } from "./hermes-bridge/memory.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
 import type {
@@ -90,6 +91,8 @@ export interface AppDeps {
    *  routes are not registered at all and the capability is not advertised, so an app probing
    *  `GatewayInfo.capabilities` sees the truth. */
   bots?: BotControlSurface | BotsSurface;
+  /** Profile-local memory travels only over the attached plugin's bounded management lane. */
+  memory?: MemorySurface;
   /** attach-v1 bearer token → authenticated agent. Enables only the media side channel; device
    * routes never accept this credential. */
   attachTokens?: ReadonlyMap<string, string>;
@@ -668,6 +671,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
           : { rateLimiter: deps.photoRateLimiter }),
         now: deps.now,
       },
+      deps.memory,
     );
   }
 

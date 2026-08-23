@@ -23,6 +23,8 @@ import {
   type AttachV1MobileCancel,
   type AttachV1MobileRequest,
   type AttachV1MobileResultInput,
+  type AttachV1MemoryRequest,
+  type AttachV1MemoryResult,
   type AttachV1ServerFrame,
   type AttachV1SlashCommand,
   type AttachV1Telemetry,
@@ -34,7 +36,7 @@ export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management"] as const satisfies readonly AttachV1Capability[];
 
 export interface AttachV1Events {
   /** True only after the event was durably projected into its owning app/transcript state. */
@@ -44,6 +46,7 @@ export interface AttachV1Events {
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
   onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;
   onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
+  onMemoryResult?(agentId: string, frame: AttachV1MemoryResult): void;
 }
 
 interface Connection {
@@ -191,7 +194,7 @@ export class AttachV1Ingress implements TurnEndpoint {
         if (frame.version === 1) {
           this.#send(connection, {
             ...common, version: 1,
-            capabilities: [...connection.capabilities].filter((capability): capability is Exclude<AttachV1Capability, "mobile_location"> => capability !== "mobile_location"),
+            capabilities: [...connection.capabilities].filter((capability): capability is Exclude<AttachV1Capability, "mobile_location" | "memory_management"> => capability !== "mobile_location" && capability !== "memory_management"),
           });
         } else {
           this.#send(connection, { ...common, version: 2, capabilities: [...connection.capabilities] });
@@ -226,6 +229,14 @@ export class AttachV1Ingress implements TurnEndpoint {
           return;
         }
         this.#events.onMobileCancel?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "memory_result") {
+        if (!connection.capabilities.has("memory_management")) {
+          socket.close(1008, "attach-v1 capability not negotiated: memory_management");
+          return;
+        }
+        this.#events.onMemoryResult?.(agentId, frame);
         return;
       }
       if (frame.kind === "ack") {
@@ -416,6 +427,14 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   sendClarifyResolution(agentId: string, input: { threadId: string; turnId: string; clarifyId: string; optionId: string }, commandId?: string): boolean {
     return this.#enqueue(agentId, { kind: "resolve_clarify", ...input }, commandId);
+  }
+
+  /** Raw memory is a live request/reply lane and is never written to Gateway storage. */
+  sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): boolean {
+    if (![...this.#tokens.values()].includes(agentId)) return false;
+    const connection = this.#current.get(agentId);
+    if (connection?.hello !== true || !connection.capabilities.has("memory_management")) return false;
+    return this.#send(connection, input);
   }
 
   requestNativeClarifyResolution(

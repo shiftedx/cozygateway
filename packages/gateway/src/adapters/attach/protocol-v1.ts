@@ -1,5 +1,5 @@
 import { type Static, Type } from "@sinclair/typebox";
-import { RichBlockSchema } from "cozygateway-contract";
+import { RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemorySourceSchema, BotMemoryWriteResponseSchema, BotMemoryDeleteResponseSchema } from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
  * before either side accepts application frames. */
@@ -18,6 +18,7 @@ const AttachV1BaseCapabilitySchema = Type.Union([
 export const AttachV1CapabilitySchema = Type.Union([
   AttachV1BaseCapabilitySchema,
   Type.Literal("mobile_location"),
+  Type.Literal("memory_management"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -104,6 +105,16 @@ const ResolveApprovalCommand = Type.Object({
 const ResolveClarifyCommand = Type.Object({
   kind: Type.Literal("resolve_clarify"), threadId: Id, turnId: Id, clarifyId: Id, optionId: Id,
 });
+export const AttachV1MemoryRequestSchema = Type.Object({
+  kind: Type.Literal("memory_request"), requestId: Id,
+  operation: Type.Union([Type.Literal("overview"), Type.Literal("items"), Type.Literal("item"), Type.Literal("create"), Type.Literal("update"), Type.Literal("delete"), Type.Literal("graph")]),
+  input: Type.Object({
+    sourceId: Type.Optional(Id), itemId: Type.Optional(Id), q: Type.Optional(Type.String({ maxLength: 512 })), kind: Type.Optional(Type.Union([Type.Literal("memory"), Type.Literal("profile"), Type.Literal("fact"), Type.Literal("note")])),
+    since: Type.Optional(Type.Integer({ minimum: 0 })), until: Type.Optional(Type.Integer({ minimum: 0 })), cursor: Type.Optional(Type.String({ maxLength: 512 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+    content: Type.Optional(Type.String({ minLength: 1, maxLength: 32_000 })), title: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), category: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), expectedRevision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+export type AttachV1MemoryRequest = Static<typeof AttachV1MemoryRequestSchema>;
 /** Capability-free transport tombstone. It advances the durable command sequence without
  * invoking a Hermes action when a command queued while disconnected is no longer supported by
  * the plugin that reconnects. */
@@ -176,6 +187,13 @@ const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1Med
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
 });
+export const AttachV1MemoryResultSchema = Type.Object({
+  kind: Type.Literal("memory_result"), requestId: Id,
+  status: Type.Union([Type.Literal("ok"), Type.Literal("conflict"), Type.Literal("not_found"), Type.Literal("invalid_request"), Type.Literal("unavailable")]),
+  result: Type.Optional(Type.Union([BotMemoryOverviewResponseSchema, BotMemoryItemsResponseSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryWriteResponseSchema, BotMemoryDeleteResponseSchema, Type.Object({ sources: Type.Array(BotMemorySourceSchema, { maxItems: 32 }) }, { additionalProperties: false })])),
+  message: Type.Optional(Type.String({ maxLength: 512 })), current: Type.Optional(BotMemoryItemSchema),
+}, { additionalProperties: false });
+export type AttachV1MemoryResult = Static<typeof AttachV1MemoryResultSchema>;
 const AttachV1MobileStatusRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }),
@@ -257,7 +275,8 @@ export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1HeartbeatSchema,
   AttachV1MobileRequestSchema,
   AttachV1MobileCancelSchema,
+  AttachV1MemoryResultSchema,
 ]);
 export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
-export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1HelloAckV2Schema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema]);
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1HelloAckV2Schema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema]);
 export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;

@@ -1172,4 +1172,56 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    clarifications and confirmed terminal settlement receipts so a reconnect can settle an
  *    optimistic action without guessing from the action POST. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 29;
+/** Capability 30: a bounded, source-labelled projection of memory owned by the
+ * attached Hermes profile.  `attributes` deliberately does not exist: every
+ * field a client can render is named and bounded here. */
+export const BotMemoryKindSchema = Type.Union([
+  Type.Literal("memory"), Type.Literal("profile"), Type.Literal("fact"), Type.Literal("note"),
+]);
+export type BotMemoryKind = Static<typeof BotMemoryKindSchema>;
+export const BotMemoryTimestampKindSchema = Type.Union([
+  Type.Literal("created"), Type.Literal("fileCreated"), Type.Literal("firstObserved"), Type.Literal("unknown"),
+]);
+export type BotMemoryTimestampKind = Static<typeof BotMemoryTimestampKindSchema>;
+export const BotMemoryCapabilitiesSchema = Type.Object({
+  search: Type.Boolean(), browse: Type.Boolean(), create: Type.Boolean(), edit: Type.Boolean(), delete: Type.Boolean(),
+  relationships: Type.Boolean(), backlinks: Type.Boolean(), categories: Type.Boolean(), tags: Type.Boolean(),
+  trust: Type.Boolean(), capacity: Type.Boolean(), effectiveNextSession: Type.Boolean(),
+}, { additionalProperties: false });
+export const BotMemorySourceSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 120 }),
+  displayName: Type.String({ minLength: 1, maxLength: 160 }),
+  kind: Type.String({ minLength: 1, maxLength: 80 }),
+  status: Type.Union([Type.Literal("available"), Type.Literal("degraded"), Type.Literal("unavailable"), Type.Literal("unsupported")]),
+  detail: Type.Optional(Type.String({ maxLength: 512 })),
+  capabilities: BotMemoryCapabilitiesSchema,
+  counts: Type.Object({ items: Type.Integer({ minimum: 0, maximum: 1_000_000 }), entities: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000_000 })) }, { additionalProperties: false }),
+  capacity: Type.Optional(Type.Object({ used: Type.Integer({ minimum: 0 }), limit: Type.Integer({ minimum: 1 }) }, { additionalProperties: false })),
+  effectiveNextSession: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotMemorySource = Static<typeof BotMemorySourceSchema>;
+export const BotMemoryItemSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 512 }), sourceId: Type.String({ minLength: 1, maxLength: 120 }), kind: BotMemoryKindSchema,
+  title: Type.String({ maxLength: 512 }), snippet: Type.String({ maxLength: 1_000 }), content: Type.Optional(Type.String({ maxLength: 32_000 })),
+  createdAt: Type.Optional(Type.Integer({ minimum: 0 })), updatedAt: Type.Optional(Type.Integer({ minimum: 0 })), timestampKind: BotMemoryTimestampKindSchema,
+  revision: Type.String({ minLength: 1, maxLength: 256 }), category: Type.Optional(Type.String({ maxLength: 120 })),
+  tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), trustScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  retrievalCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000_000_000 })), helpfulCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000_000_000 })),
+  entities: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 64 })), relativePath: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+  backlinks: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 128 })), effectiveNextSession: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotMemoryItem = Static<typeof BotMemoryItemSchema>;
+export const BotMemoryOverviewResponseSchema = Type.Object({ sources: Type.Array(BotMemorySourceSchema, { maxItems: 32 }) }, { additionalProperties: false });
+export type BotMemoryOverviewResponse = Static<typeof BotMemoryOverviewResponseSchema>;
+export const BotMemoryItemsResponseSchema = Type.Object({ items: Type.Array(BotMemoryItemSchema, { maxItems: 100 }), nextCursor: Type.Optional(Type.String({ maxLength: 512 })), sources: Type.Optional(Type.Array(BotMemorySourceSchema, { maxItems: 32 })) }, { additionalProperties: false });
+export type BotMemoryItemsResponse = Static<typeof BotMemoryItemsResponseSchema>;
+export const BotMemoryGraphResponseSchema = Type.Object({ nodes: Type.Array(BotMemoryItemSchema, { maxItems: 200 }), edges: Type.Array(Type.Object({ from: Type.String({ maxLength: 512 }), to: Type.String({ maxLength: 512 }), kind: Type.Union([Type.Literal("entity"), Type.Literal("wikilink")]) }, { additionalProperties: false }), { maxItems: 400 }), nextCursor: Type.Optional(Type.String({ maxLength: 512 })) }, { additionalProperties: false });
+export type BotMemoryGraphResponse = Static<typeof BotMemoryGraphResponseSchema>;
+export const BotMemoryWriteRequestSchema = Type.Object({ content: Type.String({ minLength: 1, maxLength: 32_000 }), title: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), category: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), expectedRevision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })) }, { additionalProperties: false });
+export const BotMemoryDeleteRequestSchema = Type.Object({ expectedRevision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
+export const BotMemoryWriteResponseSchema = Type.Object({ item: BotMemoryItemSchema }, { additionalProperties: false });
+export type BotMemoryWriteResponse = Static<typeof BotMemoryWriteResponseSchema>;
+export const BotMemoryDeleteResponseSchema = Type.Object({ id: Type.String({ minLength: 1, maxLength: 512 }), revision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
+export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchema>;
+
+export const BOTS_CAPABILITY_VERSION = 30;

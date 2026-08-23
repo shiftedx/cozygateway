@@ -474,8 +474,9 @@ describe("capability advertisement", () => {
     // 23 adds exact native turn status/cause and queued-at recovery metadata; 24 adds files;
     // 25 adds slash commands; 26 adds attachment history; 27 adds pending approval recovery;
     // 28 distinguishes a durable resolution request from Hermes terminal confirmation;
-    // 29 adds clarification recovery and terminal settlement receipts.
-    expect(BOTS_CAPABILITY_VERSION).toBe(29);
+    // 29 adds clarification recovery and terminal settlement receipts; 30 adds
+    // attached-profile Memory management.
+    expect(BOTS_CAPABILITY_VERSION).toBe(30);
   });
 
   it("accepts capability-23 native turn status without changing legacy state fields", () => {

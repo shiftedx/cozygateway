@@ -41,10 +41,11 @@ import { createHermesClient } from "./hermes-bridge/client.ts";
 import { parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
+import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 
-export const GATEWAY_VERSION = "0.2.5";
+export const GATEWAY_VERSION = "0.2.6";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -210,6 +211,7 @@ export async function startGateway(
   let nativeSink: AttachNativeSink | undefined;
   const attachTokens = collectAttachTokens(config.hermes.profiles, process.env);
   let nativeBotPlane: NativeBotDataPlane | undefined;
+  let memorySurface: AttachMemorySurface | undefined;
   let botsSurface: BotsSurface;
   const allowedCapabilities = new Map<string, ReadonlySet<AttachV1Capability>>(
     profileEntries.map(([profileId]) => [
@@ -243,6 +245,7 @@ export async function startGateway(
       },
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
+      onMemoryResult: (agentId, frame) => { memorySurface?.handle(agentId, frame); },
       onPresence: (agentId, state) => {
         hub.broadcast({
           type: "presence",
@@ -254,6 +257,7 @@ export async function startGateway(
       },
     },
   });
+  memorySurface = new AttachMemorySurface(attachV1Ingress, 12_000, traceLog);
   const attachEndpoint: TurnEndpoint = {
     isAttached: (agentId) => attachV1Ingress.isAttached(agentId),
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
@@ -381,6 +385,7 @@ export async function startGateway(
     gatewayInfo,
     attachHealth: () => attachV1Ingress.health(),
     bots: botsSurface,
+    memory: memorySurface,
     attachTokens,
     attachMediaAllowed: (agentId: string) =>
       allowedAttachMedia(config, agentId),
@@ -463,6 +468,7 @@ export async function startGateway(
       hub.close();
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
       // runner's per-thread chains settle before closeAll drains them.
+      memorySurface?.close();
       attachV1Ingress.close();
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await bridge.close();

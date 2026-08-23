@@ -85,6 +85,7 @@ class AttachV1ClientConfig:
     on_interrupt: Optional[Callable[[InterruptFrame], None]] = None
     on_approval: Optional[Callable[[Dict[str, Any]], None]] = None
     on_clarify: Optional[Callable[[Dict[str, Any]], None]] = None
+    on_memory: Optional[Callable[[Dict[str, Any]], None]] = None
     on_ready: Optional[Callable[[], None]] = None
     connect_factory: Optional[Callable[..., Any]] = None
     max_in_flight_events: int = 64
@@ -170,7 +171,7 @@ class AttachV1Client:
             "kind": "hello",
             "version": version,
             "instanceId": self._spool.instance_id,
-            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", *( ["mobile_location"] if version >= 2 else [] )],
+            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", *( ["mobile_location", "memory_management"] if version >= 2 else [] )],
             "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
             "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
             # Present even when empty so a newly authenticated profile can clear a catalog cached
@@ -391,6 +392,23 @@ class AttachV1Client:
             pass
         return frame
 
+    async def send_memory_result(
+        self, request_id: str, status: str, *, result: Optional[Dict[str, Any]] = None,
+        message: Optional[str] = None, current: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one live management reply without writing memory to either spool."""
+        event: Dict[str, Any] = {"kind": "memory_result", "requestId": request_id, "status": status}
+        if result is not None: event["result"] = result
+        if message: event["message"] = message[:512]
+        if current is not None: event["current"] = current
+        if self._negotiated and "memory_management" not in self._capabilities:
+            return None
+        try:
+            await self._send(event)
+        except Exception:
+            return None
+        return event
+
     async def upload_media(self, media_id: str, path: str, family: str, expires_at: Optional[int] = None) -> Dict[str, Any]:
         """Upload bytes through the authenticated HTTP side channel; WS carries only metadata."""
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -600,6 +618,13 @@ class AttachV1Client:
             await self._drain_events()
         elif kind == "mobile_result":
             self._settle_mobile_result(frame)
+        elif kind == "memory_request" and self._config.on_memory is not None:
+            try:
+                outcome = self._config.on_memory(frame)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:
+                return
         elif kind == "ack" and frame.get("channel") == "event":
             if isinstance(frame.get("sequence"), int) and isinstance(frame.get("id"), str):
                 async with self._flow_lock:

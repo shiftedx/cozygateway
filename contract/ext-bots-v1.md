@@ -249,6 +249,19 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status: "requested" }` | Durably requests a native denial; the terminal event confirms it. |
 | `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |
 | `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
+| `GET /bots/:name/memory` | — | `BotMemoryOverviewResponse` | Profile-local source health/capabilities only; the gateway never opens Hermes files or provider storage. |
+| `GET /bots/:name/memory/items` | bounded `q`, `source`, `kind`, `since`, `until`, `cursor`, `limit` | `BotMemoryItemsResponse` | Stable, source-labelled page (at most 100). One unavailable source is reported in `sources` without hiding healthy results. |
+| `GET /bots/:name/memory/graph` | bounded `q`, `source`, `since`, `until`, `limit` | `BotMemoryGraphResponse` | At most 200 nodes / 400 Holographic entity or vault wikilink edges. |
+| `GET /bots/:name/memory/sources/:source/items/:id` | — | `BotMemoryItem` | Full bounded content for one source-native item. |
+| `POST /bots/:name/memory/sources/:source/items` | `BotMemoryWriteRequest` | `201 BotMemoryWriteResponse` | Native source create. |
+| `PATCH /bots/:name/memory/sources/:source/items/:id` | `BotMemoryWriteRequest` with `expectedRevision` | `BotMemoryWriteResponse` | Conditional native source edit; stale data is `409 conflict` with `current` when available. |
+| `DELETE /bots/:name/memory/sources/:source/items/:id` | `BotMemoryDeleteRequest` | `BotMemoryDeleteResponse` | Conditional native source delete; stale data is `409 conflict`. |
+
+Memory uses the attached plugin's `memory_management` attach-v1 capability and request id, not
+Dashboard file routes. `MemoryItem.timestampKind` is `created` for provider/native explicit dates,
+`fileCreated` for a vault filesystem birth time, `firstObserved` for a curated legacy entry tracked
+by the plugin-side sidecar, and `unknown` otherwise. Absolute vault roots never cross this boundary.
+Memory content never rides a websocket frame, push, heartbeat, telemetry, or trace record.
 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
 that exists but is not configured as a native identity must not fall through to Dashboard chat.

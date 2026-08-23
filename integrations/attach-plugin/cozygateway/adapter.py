@@ -58,6 +58,7 @@ from .attach_client_v1 import (
 from .attach_spool import AttachSpool
 from .text_blocks import IncrementalNormalizer, normalize_text_to_blocks
 from .tool_chips import ToolChipTracker
+from .memory import MemoryConflict, MemoryError, MemoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +285,7 @@ class AttachAdapter:
         # Strong refs to fire-and-forget tasks; the loop keeps only a weak ref to a
         # bare create_task result, so hold each here until it finishes.
         self._background_tasks: Set[asyncio.Task] = set()
+        self._memory_manager = MemoryManager(extra, os.getenv("HERMES_HOME"))
 
     def _spawn_background(self, loop: asyncio.AbstractEventLoop, coro: Any) -> None:
         task = loop.create_task(coro)
@@ -394,6 +396,7 @@ class AttachAdapter:
                 on_interrupt=self._on_interrupt,
                 on_approval=self._dispatch_approval_command,
                 on_clarify=self._dispatch_clarify_command,
+                on_memory=self._dispatch_memory_command,
                 on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
             )
@@ -767,6 +770,26 @@ class AttachAdapter:
         except RuntimeError:
             return
         self._spawn_background(loop, self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id))
+
+    async def _dispatch_memory_command(self, command: Dict[str, Any]) -> None:
+        """Serve an ephemeral request while the authenticated attach socket is live."""
+        await self._handle_memory_command(command)
+
+    async def _handle_memory_command(self, command: Dict[str, Any]) -> None:
+        request_id, operation, input = command.get("requestId"), command.get("operation"), command.get("input")
+        client = self._client
+        if not isinstance(request_id, str) or not isinstance(operation, str) or not isinstance(input, dict) or not isinstance(client, AttachV1Client):
+            return
+        try:
+            result = self._memory_manager.execute(operation, input)
+            await client.send_memory_result(request_id, "ok", result=result)
+        except MemoryConflict as error:
+            await client.send_memory_result(request_id, "conflict", message=str(error), current=error.current)
+        except MemoryError as error:
+            await client.send_memory_result(request_id, error.status, message=str(error))
+        except Exception:
+            logger.debug("attach: memory management failed", exc_info=True)
+            await client.send_memory_result(request_id, "unavailable", message="memory source is unavailable")
 
     async def _dispatch_clarify_command(self, command: Dict[str, Any]) -> None:
         thread_id = command.get("threadId")

@@ -5,7 +5,7 @@ import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
-import type { AttachV1EventFrame, AttachV1MobileRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
+import type { AttachV1EventFrame, AttachV1MemoryResult, AttachV1MobileRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
 
 describe("attach-v1 ingress", () => {
@@ -21,6 +21,7 @@ describe("attach-v1 ingress", () => {
   let mobileRequests: AttachV1MobileRequest[];
   let mobileCancels: string[];
   let acceptsTarget: boolean;
+  let memoryResults: AttachV1MemoryResult[];
 
   beforeEach(async () => {
     storage = openStorage(":memory:");
@@ -32,6 +33,7 @@ describe("attach-v1 ingress", () => {
     mobileRequests = [];
     mobileCancels = [];
     acceptsTarget = true;
+    memoryResults = [];
     ingress = new AttachV1Ingress({
       tokens: new Map([
         ["secret", "sage"],
@@ -44,6 +46,7 @@ describe("attach-v1 ingress", () => {
         onPresence: (_agent, state) => presence.push(state),
         onMobileRequest: (_agent, frame) => mobileRequests.push(frame),
         onMobileCancel: (_agent, frame) => mobileCancels.push(frame.requestId),
+        onMemoryResult: (_agent, frame) => memoryResults.push(frame),
       },
       now: () => clock,
       heartbeatIntervalMs: 1000, heartbeatTimeoutMs: 5000,
@@ -131,6 +134,25 @@ describe("attach-v1 ingress", () => {
     await until(() => peer.frames.some((frame) => frame.kind === "mobile_result"));
     expect(storage.attachEventCursor("sage")).toBe(0);
     expect(storage.attachCommandCursor("sage")).toBe(0);
+    peer.ws.close();
+  });
+
+  it("routes memory requests and results live without writing raw content to storage", async () => {
+    const peer = await dial(undefined, ["memory_management"], undefined, { version: 2 });
+    expect(ingress.sendMemoryRequest("sage", {
+      kind: "memory_request", requestId: "memory-1", operation: "update",
+      input: { sourceId: "vault:0", itemId: "note:Cleo.md", content: "private-memory", expectedRevision: "r1" },
+    })).toBe(true);
+    await until(() => peer.frames.some((frame) => frame.kind === "memory_request"));
+    peer.ws.send(JSON.stringify({
+      kind: "memory_result", requestId: "memory-1", status: "ok",
+      result: { item: { id: "note:Cleo.md", sourceId: "vault:0", kind: "note", title: "Cleo", snippet: "private-memory", timestampKind: "unknown", revision: "r2" } },
+    }));
+    await until(() => memoryResults.length === 1);
+
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    expect(storage.attachCommandCursor("sage")).toBe(0);
+    expect(storage.pendingAttachCommands("sage", 0, 10)).toEqual([]);
     peer.ws.close();
   });
 
