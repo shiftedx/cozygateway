@@ -6,13 +6,18 @@ import { RichBlockSchema } from "cozygateway-contract";
 const Id = Type.String({ minLength: 1, maxLength: 256 });
 const Sequence = Type.Integer({ minimum: 0 });
 
-export const AttachV1CapabilitySchema = Type.Union([
+const AttachV1BaseCapabilitySchema = Type.Union([
   Type.Literal("draft"),
   Type.Literal("media"),
   Type.Literal("tools"),
   Type.Literal("approvals"),
   Type.Literal("clarify"),
   Type.Literal("scheduled"),
+  Type.Literal("mobile_node"),
+]);
+export const AttachV1CapabilitySchema = Type.Union([
+  AttachV1BaseCapabilitySchema,
+  Type.Literal("mobile_location"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -21,14 +26,24 @@ export const AttachV1LimitsSchema = Type.Object({
   maxInFlightBytes: Type.Integer({ minimum: 1024, maximum: 64 * 1024 * 1024 }),
 });
 
-export const AttachV1HelloSchema = Type.Object({
+/** The frozen old-server hello. It deliberately cannot parse v2's location capability. */
+export const AttachV1HelloV1Schema = Type.Object({
   kind: Type.Literal("hello"),
   version: Type.Literal(1),
+  instanceId: Id,
+  capabilities: Type.Array(AttachV1BaseCapabilitySchema, { uniqueItems: true }),
+  resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
+  limits: Type.Optional(AttachV1LimitsSchema),
+});
+const AttachV1HelloV2Schema = Type.Object({
+  kind: Type.Literal("hello"),
+  version: Type.Literal(2),
   instanceId: Id,
   capabilities: Type.Array(AttachV1CapabilitySchema, { uniqueItems: true }),
   resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
   limits: Type.Optional(AttachV1LimitsSchema),
 });
+export const AttachV1HelloSchema = Type.Union([AttachV1HelloV1Schema, AttachV1HelloV2Schema]);
 export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;
 
 export const AttachV1MediaDescriptorSchema = Type.Object({
@@ -123,6 +138,28 @@ const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1Med
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
 });
+const AttachV1MobileStatusRequestSchema = Type.Object({
+  kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+const AttachV1MobileLocationRequestSchema = Type.Object({
+  kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("location.current"),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: Type.String({ minLength: 1, maxLength: 160 }),
+}, { additionalProperties: false });
+export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema]);
+export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
+export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
+export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
+export const AttachV1MobileResultSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ foreground: Type.Literal(true) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ latitude: Type.Number({ minimum: -90, maximum: 90 }), longitude: Type.Number({ minimum: -180, maximum: 180 }) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Union([Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"), Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked")]) }, { additionalProperties: false }),
+]);
+export type AttachV1MobileResult = Static<typeof AttachV1MobileResultSchema>;
+export type AttachV1MobileResultInput =
+  | { requestId: string; status: "ok"; result: { foreground: true } }
+  | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
+  | { requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" };
 
 /** Deliberately closed: no thinking/reasoning/chain-of-thought event exists. */
 export const AttachV1EventSchema = Type.Union([
@@ -151,6 +188,13 @@ export const AttachV1GapSchema = Type.Object({
 
 export const AttachV1HelloAckSchema = Type.Object({
   kind: Type.Literal("hello_ack"), version: Type.Literal(1), agentId: Id,
+  capabilities: Type.Array(AttachV1BaseCapabilitySchema),
+  resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
+  limits: AttachV1LimitsSchema,
+  heartbeatIntervalMs: Type.Integer({ minimum: 1000 }),
+});
+const AttachV1HelloAckV2Schema = Type.Object({
+  kind: Type.Literal("hello_ack"), version: Type.Literal(2), agentId: Id,
   capabilities: Type.Array(AttachV1CapabilitySchema),
   resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
   limits: AttachV1LimitsSchema,
@@ -163,7 +207,9 @@ export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1AckSchema,
   AttachV1GapSchema,
   AttachV1HeartbeatSchema,
+  AttachV1MobileRequestSchema,
+  AttachV1MobileCancelSchema,
 ]);
 export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
-export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema]);
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1HelloAckV2Schema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema]);
 export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;

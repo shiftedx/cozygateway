@@ -48,6 +48,11 @@ Dependencies: Python 3.10+ and the `websockets` package.
 
 - One gateway thread maps to one harness conversation (the thread id is the chat key),
   so threads keep separate memories and each thread's context persists across turns.
+- Hermes cron routines use `enqueue_proactive_delivery` to enqueue an unanchored `scheduled` delivery.
+  The public helper is also the seam for a future deeper agent hook: its caller supplies the currently
+  selected target thread plus a nonblank stable occurrence key; retries reuse that key, while distinct
+  triggers use distinct keys. Blank output is treated as a successful no-delivery. This helper is
+  text-only; media remains on the live native delivery path.
 - Drafts are full-replace: each frame carries the complete reply so far, normalized from
   the model's markdown into the gateway's closed typed-block union (headings, lists,
   tables, fenced code, display math; inline emphasis stays literal text by design).

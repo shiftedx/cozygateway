@@ -27,6 +27,7 @@ import {
 } from "./adapters/attach/adapter.ts";
 import { createApp } from "./http.ts";
 import { WsHub } from "./ws-hub.ts";
+import { MobileNodeBroker } from "./mobile-node.ts";
 import { TurnRunner } from "./turns.ts";
 import { RelayNotifier, type ChatMessagePushEvent } from "./push-notifier.ts";
 import { LiveActivityNotifier } from "./live-activity-notifier.ts";
@@ -106,7 +107,7 @@ export function gatewayInfoForConfig(config: GatewayConfig): GatewayInfo {
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
       ...(config.hermes === undefined
         ? {}
-        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION }),
+        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, "com.cozylabs.mobile-node": 2 }),
       ...(config.pushRelayUrl === undefined
         ? {}
         : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),
@@ -147,7 +148,12 @@ export async function startGateway(
   // present. Each integer version advances independently of the frozen contract literal.
   const hermesOptions = parseHermesOptions(config.hermes, process.env);
   const gatewayInfo = gatewayInfoForConfig(config);
-  const hub = new WsHub({ storage, gatewayInfo, now: () => Date.now(), trace: traceLog });
+  let mobileNode: MobileNodeBroker | undefined;
+  const hub = new WsHub({
+    storage, gatewayInfo, now: () => Date.now(), trace: traceLog,
+    onMobileResult: (deviceId, frame) => mobileNode?.result(deviceId, frame),
+    onDeviceDisconnect: (deviceId) => mobileNode?.disconnectDevice(deviceId),
+  });
 
   // Dial-out JSON-RPC client to the Hermes gateway plus the cache/refresh/focus machinery on top
   // of it. Credential resolution already happened above, before the port is bound, so a
@@ -235,6 +241,8 @@ export async function startGateway(
           return true;
         return nativeSink?.handle(agentId, frame) ?? false;
       },
+      onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
+      onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
       onPresence: (agentId, state) => {
         hub.broadcast({
           type: "presence",
@@ -242,6 +250,7 @@ export async function startGateway(
           state: state === "online" ? "online" : "absent",
         });
         nativeBotPlane?.handleAttachPresence(agentId, state);
+        if (state === "absent") mobileNode?.disconnectAgent(agentId);
       },
     },
   });
@@ -299,6 +308,11 @@ export async function startGateway(
     () => hub.connectedDeviceIds(),
     (event) => liveActivityNotifier.coveredDeviceIdsForChat(event),
   );
+  mobileNode = new MobileNodeBroker({
+    available: (deviceId, command) => hub.isMobileNodeAvailable(deviceId, command),
+    send: (deviceId, frame) => hub.sendToDevice(deviceId, frame),
+    result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
+  });
   nativeBotPlane = new NativeBotDataPlane({
     control: bridge,
     storage,
@@ -334,6 +348,7 @@ export async function startGateway(
     },
     now: () => Date.now(),
     trace: traceLog,
+    mobileNode,
   });
   botsSurface = nativeBotPlane.surface();
   nativeSink = new AttachNativeSink({
@@ -452,6 +467,7 @@ export async function startGateway(
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await bridge.close();
       nativeBotPlane.close();
+      mobileNode?.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });

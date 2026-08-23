@@ -92,6 +92,38 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("binds a mobile request to the authenticated POST device, never the agent frame", async () => {
+    const storage = openStorage(":memory:");
+    let turn: Record<string, unknown> | undefined;
+    const invoked = vi.fn();
+    const rejected = vi.fn();
+    const cancelled = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {
+        sendNativeTurn: (_bot: string, input: Record<string, unknown>) => { turn = input; return true; },
+        sendNativeInterrupt: () => true,
+      } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 10,
+      mobileNode: { invoke: invoked, reject: rejected, cancelTurn: cancelled } as never,
+    });
+    const accepted = await plane.surface().sendChatMessage("sage", "status", { deviceId: "origin-device" });
+    const turnId = String(turn?.turnId);
+
+    plane.mobileRequest("sage", { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: accepted.sessionId, turnId, expiresAt: 1_000 });
+    plane.mobileRequest("sage", { kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: accepted.sessionId, turnId, expiresAt: 1_000, purpose: "Find coffee" });
+    plane.mobileRequest("sage", { kind: "mobile_request", requestId: "request-2", command: "device.status", threadId: accepted.sessionId, turnId: "agent-selected", expiresAt: 1_000 });
+
+    expect(invoked).toHaveBeenCalledWith(expect.objectContaining({ agentId: "sage", deviceId: "origin-device", turnId }));
+    expect(invoked).toHaveBeenCalledWith(expect.objectContaining({ requestId: "location-1", command: "location.current", purpose: "Find coffee", deviceId: "origin-device", turnId }));
+    expect(rejected).toHaveBeenCalledWith("sage", "request-2");
+    await plane.surface().stopChat("sage");
+    expect(cancelled).toHaveBeenCalledWith("sage", turnId);
+    plane.close();
+    storage.close();
+  });
+
   it("preserves list items when a native bot reply is committed", async () => {
     const storage = openStorage(":memory:");
     let turnId = "";
@@ -772,6 +804,22 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(plane.handle("sage", scheduled)).toBe(true);
     expect(storage.nativeBotMessages("sage", chat.sessionId).filter((message) => message.id === "daily-message:2026-08-21")).toHaveLength(1);
     expect(pushes).toHaveLength(1);
+    plane.close();
+    storage.close();
+  });
+
+  it("accepts scheduled delivery only for the selected native bot session", () => {
+    const storage = openStorage(":memory:");
+    const historical = storage.nativeBotChat("sage", 1);
+    const selected = storage.resetNativeBotChat("sage", 2);
+    const plane = new NativeBotDataPlane({ control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 3 });
+    const event = (threadId: string): AttachV1EventFrame => ({
+      kind: "event", sequence: 1, eventId: `scheduled-${threadId}`,
+      event: { kind: "scheduled", threadId, deliveryId: `delivery-${threadId}`, messageId: `message-${threadId}`, blocks: [{ type: "paragraph", text: "report" }] },
+    });
+    expect(plane.canAccept("sage", event(selected))).toBe(true);
+    expect(plane.canAccept("sage", event(historical.sessionId))).toBe(false);
+    expect(plane.handle("sage", event(historical.sessionId))).toBe(false);
     plane.close();
     storage.close();
   });

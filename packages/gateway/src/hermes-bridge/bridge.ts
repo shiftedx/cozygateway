@@ -232,16 +232,18 @@ export interface BotsSurface extends BotControlSurface {
   sendChatMessage(
     name: string,
     text: string,
-    opts?: { clientId?: string },
+    opts?: { clientId?: string; deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
   stopChat(name: string): Promise<"stopped" | "idle">;
   sendChatPhoto(
     name: string,
     photo: BotChatPhotoUpload,
+    opts?: { deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
   sendChatAttachment(
     name: string,
     file: BotChatFileUpload,
+    opts?: { deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }>;
   chatAttachmentInfo(
     name: string,

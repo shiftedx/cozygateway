@@ -22,6 +22,12 @@ chat sends, live turns, and groups; CozyGateway MUST NOT submit those chats thro
   limits/capabilities, authoritative cursors, and heartbeat interval. Its capabilities are the
   intersection of the plugin offer and that identity's server-side rollout gates; neither peer
   sends a feature whose capability was not negotiated.
+- The endpoint remains `/attach/v1`; `hello.version` selects this capability grammar. A v2-aware
+  plugin first sends `hello.version: 2`, which is the only hello version that may
+  offer `mobile_location`. A new gateway accepts and acknowledges both v1 and v2. To remain
+  compatible with a closed old v1 server, the plugin uses a bounded pre-ack timeout, closes that
+  attempt, then reconnects once with `hello.version: 1` and the old capability list. The v1
+  fallback is status-only: no location request is sent or replayed while it is selected.
 - A newer authenticated connection supersedes the older connection for that identity.
 
 ## Delivery and replay
@@ -66,12 +72,13 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `app
 - Tool calls use a stable `callId` with `running` → `ok|error` terminal transitions.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.
-- `scheduled` is an unanchored durable delivery: its caller supplies the target thread and a durable
-  cron-session occurrence key, from which the reference plugin preserves/derives stable delivery
-  and message ids. It does not require an active request turn. Gateway projection deduplicates the
-  delivery, commits it directly, and invokes the existing push decision once. The supplied target
-  must equal the gateway's durable canonical/home session binding for that bot; a foreign target is
-  rejected before inbox admission.
+- `scheduled` is an unanchored durable delivery: its caller supplies the target thread and a durable,
+  caller-owned occurrence key. Hermes cron is the implemented producer and uses its cron-session key;
+  a future trigger integration may supply its own durable key through the same seam. The reference plugin
+  preserves/derives stable delivery and message ids from that key. It does not require an active request
+  turn. Gateway projection deduplicates the delivery, commits it directly, and invokes the existing push
+  decision once. For native Bot Mode, the supplied target must equal the gateway's currently selected
+  canonical/home session; a foreign or historical target is rejected before inbox admission.
 - `presence` supplements transport health. The gateway reports online only after hello, degraded
   after missed heartbeats/backpressure, and absent after timeout/close. Clients reconnect with
   exponential backoff and jitter.
@@ -117,3 +124,38 @@ names the unique attach bearer token. That same identity powers both the core `/
 
 There is no protocol downgrade. Peers that do not speak attach-v1 are rejected rather than routed
 through a less reliable transport.
+
+### Ephemeral Mobile Node lane
+
+When `mobile_node` is negotiated, a plugin may send an unsequenced status `mobile_request` for
+the active native Bot Mode turn only:
+
+```json
+{ "kind": "mobile_request", "requestId": "...", "command": "device.status", "threadId": "...", "turnId": "...", "expiresAt": 0 }
+```
+
+One-shot `location.current` additionally requires negotiated `mobile_location`; `mobile_node`
+alone remains status-only for old plugin/server pairs:
+
+```json
+{ "kind": "mobile_request", "requestId": "...", "command": "location.current", "threadId": "...", "turnId": "...", "expiresAt": 0, "purpose": "Find nearby coffee" }
+```
+
+`purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
+C0/C1 control characters; invalid input is rejected rather than truncated. Location expiry is at
+most 30 seconds. Success remains commandless because the pending `requestId` binds the command:
+`{ "kind": "mobile_result", "requestId": "...", "status": "ok", "result": { "latitude": 41.88, "longitude": -87.63 } }`.
+Both coordinates must be finite, range-bounded (`latitude [-90,90]`, `longitude [-180,180]`), and
+have no more than two decimal places. The gateway rejects an incompatible result shape.
+
+The gateway replies directly with one unsequenced `mobile_result`. This lane is deliberately not
+an event or command envelope, has no cursor or ACK, is never entered into either durable spool,
+and is dropped on reconnect. The only successful payload is `{ "foreground": true }`; terminal
+statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground_required`, and
+`policy_blocked`.
+
+The plugin may send `{ "kind": "mobile_cancel", "requestId": "..." }` to settle its own
+pending tool. It is also negotiated, unsequenced, non-durable, and never replayed; a late phone
+result is ignored. A gateway MUST neither accept a location request nor send a location result
+without `mobile_location` negotiated. Purpose and raw coordinates are in-memory request/result values only and are
+never put in the durable spool, transcript, storage, logs, traces, audit, or push payloads.

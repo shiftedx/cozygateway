@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import mimetypes
@@ -44,7 +45,7 @@ from .attach_client import (
     SteerFrame,
     TurnFrame,
 )
-from .attach_client_v1 import AttachV1Client, AttachV1ClientConfig
+from .attach_client_v1 import AttachV1Client, AttachV1ClientConfig, MOBILE_STATUS_VALUES, _is_location, normalize_location_purpose
 from .attach_spool import AttachSpool
 from .text_blocks import IncrementalNormalizer, normalize_text_to_blocks
 from .tool_chips import ToolChipTracker
@@ -121,6 +122,7 @@ class AttachAdapter:
         ).rstrip("/")
         # The attach bearer token. Header-only; never logged, never in a URL.
         self.token: str = os.getenv("COZYGATEWAY_TOKEN") or extra.get("token", "")
+        self._profile: str = str(extra.get("profile") or os.getenv("HERMES_PROFILE") or "").strip()
         self.ca_file: Optional[str] = (
             os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None
         )
@@ -385,6 +387,47 @@ class AttachAdapter:
         if self._spool is not None:
             self._spool.close()
             self._spool = None
+
+    async def request_device_status(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
+        """One live-turn Mobile Node request; no client means no phone action."""
+        client = self._client
+        loop = self._loop
+        if client is None or loop is None or loop.is_closed():
+            return {"status": "device_unavailable"}
+        pending = None
+        try:
+            if asyncio.get_running_loop() is loop:
+                return await client.request_device_status(thread_id, turn_id)
+            pending = asyncio.run_coroutine_threadsafe(
+                client.request_device_status(thread_id, turn_id), loop,
+            )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            return {"status": "cancelled"}
+        except Exception:  # noqa: BLE001 - an attach fault is never a tool crash
+            return {"status": "device_unavailable"}
+
+    async def request_location(self, thread_id: str, turn_id: str, purpose: str) -> Dict[str, Any]:
+        client = self._client
+        loop = self._loop
+        if client is None or loop is None or loop.is_closed():
+            return {"status": "device_unavailable"}
+        pending = None
+        try:
+            if asyncio.get_running_loop() is loop:
+                return await client.request_location(thread_id, turn_id, purpose)
+            pending = asyncio.run_coroutine_threadsafe(
+                client.request_location(thread_id, turn_id, purpose), loop,
+            )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            return {"status": "cancelled"}
+        except Exception:  # noqa: BLE001 - an attach fault is never a tool crash
+            return {"status": "device_unavailable"}
 
     def _inbound_source(self, thread_id: str) -> Any:
         """Build the synthetic-inbound ``source`` shared by turn, steer, and interrupt.
@@ -1037,6 +1080,67 @@ def _current_turn_platform_and_chat() -> Tuple[Optional[str], Optional[str]]:
     )
 
 
+def _current_turn_message_and_cron() -> Tuple[Optional[str], bool, Optional[str]]:
+    """The injected message id is the active turn id; cron never has one."""
+    from gateway.session_context import get_session_env  # harness-defined identifier
+
+    return (
+        get_session_env("HERMES_SESSION_MESSAGE_ID") or None,
+        _truthy(get_session_env("HERMES_CRON_SESSION")),
+        get_session_env("HERMES_SESSION_PROFILE") or None,
+    )
+
+
+def _mobile_tool_result(status: str, result: Optional[Dict[str, Any]] = None) -> str:
+    payload: Dict[str, Any] = {"status": status}
+    if result is not None:
+        payload["result"] = result
+    return json.dumps(payload, separators=(",", ":"))
+
+
+async def _cozy_device_status(_args: Dict[str, Any], **_kwargs: Any) -> str:
+    """The one MN-0 tool: only a live CozyGateway turn may reach the phone."""
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_device_status(chat_id, turn_id))
+
+
+async def _cozy_request_location(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose = normalize_location_purpose(args.get("purpose"))
+    if purpose is None:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_location(chat_id, turn_id, purpose), location=True)
+
+
+async def _cozy_mobile(request: Any, location: bool = False) -> str:
+    try:
+        platform, chat_id = _current_turn_platform_and_chat()
+        message_id, cron, profile = _current_turn_message_and_cron()
+    except Exception:  # noqa: BLE001 - an unavailable harness context is noninteractive
+        return _mobile_tool_result("policy_blocked")
+    if platform != PLATFORM_NAME or not chat_id or cron:
+        return _mobile_tool_result("policy_blocked")
+    adapters = [
+        adapter for adapter in _active_adapters_snapshot()
+        if getattr(adapter, "_active_turn", {}).get(chat_id)
+    ]
+    if len(adapters) != 1 or not profile or profile != getattr(adapters[0], "_profile", None):
+        return _mobile_tool_result("policy_blocked")
+    turn_id = adapters[0]._active_turn[chat_id]
+    if message_id != turn_id:
+        return _mobile_tool_result("policy_blocked")
+    try:
+        outcome = await request(adapters[0], chat_id, turn_id)
+    except asyncio.CancelledError:
+        return _mobile_tool_result("cancelled")
+    status = outcome.get("status")
+    result = outcome.get("result")
+    if status == "ok" and (not _is_location(result) if location else result != {"foreground": True}):
+        status, result = "device_unavailable", None
+    return _mobile_tool_result(
+        status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
+        result if isinstance(result, dict) else None,
+    )
+
+
 def _preview(value: Any, limit: int = 200) -> Optional[str]:
     """A short string preview of a hook payload, truncated, or None when absent."""
     if value is None:
@@ -1196,7 +1300,7 @@ async def _standalone_send(
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
-    """Out-of-process cron sender.
+    """Compatibility wrapper for Hermes' out-of-process cron sender.
 
     Cron and the live gateway share the Hermes home directory, so this process appends to the same
     WAL-backed event spool. The live adapter notices it on the next heartbeat and delivers it with
@@ -1205,44 +1309,69 @@ async def _standalone_send(
     """
     del force_document
     target_thread = str(thread_id or chat_id or "").strip()
+    # A cron session id is caller-owned and unique per execution while remaining stable across
+    # delivery retries. Fall back to a content-addressed key for older harnesses that do not
+    # expose session context; this still prevents retry duplication without inventing a clock.
+    run_key = ""
+    try:
+        from gateway.session_context import get_session_env  # harness-defined identifier
+
+        run_key = str(get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or "").strip()
+    except Exception:
+        pass
+    if not run_key:
+        run_key = hashlib.sha256(f"{target_thread}\0{message}".encode("utf-8")).hexdigest()
+    result = await enqueue_proactive_delivery(
+        pconfig,
+        thread_id=target_thread,
+        delivery_key=run_key,
+        message=message,
+    )
+    if result.get("delivered") and media_files:
+        result["media_errors"] = ["standalone media waits for native upload support"]
+    return result
+
+
+async def enqueue_proactive_delivery(
+    pconfig: Any,
+    *,
+    thread_id: str,
+    delivery_key: str,
+    message: str,
+) -> Dict[str, Any]:
+    """Journal one unanchored delivery for any proactive agent trigger.
+
+    ``delivery_key`` is owned by the trigger producer and must stay stable across retries. Hermes
+    cron is the implemented producer; deeper agent hooks may use this public seam with their own
+    durable occurrence ids when they are added. This text-only first slice intentionally leaves
+    media uploads on the live native delivery path.
+    """
+    text = str(message)
+    target_thread = thread_id.strip() if isinstance(thread_id, str) else ""
+    key = delivery_key.strip() if isinstance(delivery_key, str) else ""
     if not target_thread:
-        return {
-            "success": False,
-            "error": "attach-v1 scheduled delivery requires a target thread",
-        }
+        return {"success": False, "error": "attach-v1 proactive delivery requires a target thread"}
+    if not key:
+        return {"success": False, "error": "attach-v1 proactive delivery requires a stable delivery key"}
+    # Silence is success, not an empty transcript row or a newly-created spool.
+    if not text.strip():
+        return {"success": True, "delivered": False}
     extra = getattr(pconfig, "extra", {}) or {}
     spool_path = os.getenv("COZYGATEWAY_SPOOL_PATH") or extra.get("spool_path")
     if not spool_path:
         spool_path = os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
     spool = AttachSpool(str(spool_path))
     try:
-        # A cron session id is caller-owned and unique per execution while remaining stable across
-        # delivery retries. Fall back to a content-addressed key for older harnesses that do not
-        # expose session context; this still prevents retry duplication without inventing a clock.
-        run_key = ""
-        try:
-            from gateway.session_context import get_session_env  # harness-defined identifier
-
-            run_key = str(get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or "").strip()
-        except Exception:
-            pass
-        if not run_key:
-            run_key = hashlib.sha256(f"{target_thread}\0{message}".encode("utf-8")).hexdigest()
-        delivery_id = "scheduled:" + run_key
+        delivery_id = "scheduled:" + key
         message_id = "scheduled-" + hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()[:32]
-        blocks = [block.to_wire() for block in normalize_text_to_blocks(str(message))]
         frame = spool.enqueue_event({
             "kind": "scheduled",
             "threadId": target_thread,
             "deliveryId": delivery_id,
             "messageId": message_id,
-            "blocks": blocks,
+            "blocks": [block.to_wire() for block in normalize_text_to_blocks(text)],
         })
-        return {
-            "success": True,
-            "message_id": frame["eventId"],
-            **({"media_errors": ["standalone media waits for native upload support"]} if media_files else {}),
-        }
+        return {"success": True, "delivered": True, "message_id": frame["eventId"]}
     finally:
         spool.close()
 
@@ -1272,6 +1401,36 @@ def register(ctx: Any) -> None:
             "and $$ math. Inline bold and links show as literal text, so prefer the "
             "block forms above."
         ),
+    )
+    ctx.register_tool(
+        name="cozy_device_status",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_device_status",
+            "description": "Request one consented status reading from the phone that started this live chat turn.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        handler=_cozy_device_status,
+        is_async=True,
+        description="Request one consented device-status reading in the active CozyGateway turn.",
+        emoji="📱",
+    )
+    ctx.register_tool(
+        name="cozy_request_location",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_request_location",
+            "description": "Request one consented approximate phone location in the active CozyGateway turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}},
+                "required": ["purpose"], "additionalProperties": False,
+            },
+        },
+        handler=_cozy_request_location,
+        is_async=True,
+        description="Request one consented approximate location in the active CozyGateway turn.",
+        emoji="📍",
     )
     # Register the tool-lifecycle hooks that feed the live tool-chip tap. If the
     # harness build does not support hook registration, degrade gracefully: the

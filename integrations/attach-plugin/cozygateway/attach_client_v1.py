@@ -8,12 +8,16 @@ import inspect
 import json
 import mimetypes
 import os
+import re
 import ssl
+import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+
+from websockets.exceptions import ConnectionClosed
 
 from .attach_client import (
     AttachAuthError,
@@ -34,6 +38,29 @@ from .attach_client import (
     parse_turn_frame,
 )
 from .attach_spool import AttachSpool, TerminalSealed
+
+
+MobileStatus = Literal[
+    "ok", "denied", "expired", "cancelled", "device_unavailable",
+    "foreground_required", "policy_blocked",
+]
+MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
+MOBILE_STATUS_TIMEOUT_SECONDS = 30
+MOBILE_HELLO_ACK_TIMEOUT_SECONDS = 1
+
+
+class MobileDeviceStatusResult(TypedDict, total=False):
+    status: MobileStatus
+    result: Union["DeviceStatus", "Location"]
+
+
+class DeviceStatus(TypedDict):
+    foreground: Literal[True]
+
+
+class Location(TypedDict):
+    latitude: float
+    longitude: float
 
 
 @dataclass
@@ -69,6 +96,11 @@ class AttachV1Client:
         self._sent_events: Dict[int, int] = {}
         self._sent_event_bytes = 0
         self._latest_blocks: Dict[str, List[Dict[str, Any]]] = {}
+        self._hello_version = 2
+        self._hello_fallback_used = False
+        # Mobile requests are intentionally outside the durable spool: a phone action
+        # must not replay after a reconnect or plugin restart.
+        self._mobile_requests: Dict[str, tuple[str, asyncio.Future[MobileDeviceStatusResult]]] = {}
 
     def _ssl_context(self) -> Any:
         if self._config.ca_file and self._ws_url.startswith("wss://"):
@@ -78,30 +110,75 @@ class AttachV1Client:
         return None
 
     async def connect(self) -> None:
-        headers = {"Authorization": f"Bearer {self._config.token}"}
-        factory = self._config.connect_factory or _default_connect
-        try:
-            self._ws = await factory(self._ws_url, headers, self._ssl_context())
-        except Exception as exc:
-            if _http_status(exc) == 401:
-                raise AttachAuthError("attach-v1 rejected (HTTP 401)") from exc
-            raise
         self._closed = False
         self._negotiated = False
         self._capabilities.clear()
         self._sent_events.clear()
         self._sent_event_bytes = 0
-        await self._send({
-            "kind": "hello",
-            "version": 1,
-            "instanceId": self._spool.instance_id,
-            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled"],
-            "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
-            "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
-        })
+        self._hello_version = 2
+        self._hello_fallback_used = False
+        try:
+            await self._open(self._hello_version)
+        except Exception as exc:
+            if _http_status(exc) == 401:
+                raise AttachAuthError("attach-v1 rejected (HTTP 401)") from exc
+            raise
+
         # A command ACKed before a crash remains in the inbox until execution was recorded.
         for frame in self._spool.pending_commands():
             await self._dispatch_command(frame, replay=True)
+
+    async def _open(self, version: int) -> None:
+        headers = {"Authorization": f"Bearer {self._config.token}"}
+        factory = self._config.connect_factory or _default_connect
+        self._ws = await factory(self._ws_url, headers, self._ssl_context())
+        await self._send({
+            "kind": "hello",
+            "version": version,
+            "instanceId": self._spool.instance_id,
+            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", *( ["mobile_location"] if version >= 2 else [] )],
+            "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
+            "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
+        })
+
+    async def request_device_status(self, thread_id: str, turn_id: str) -> MobileDeviceStatusResult:
+        """Request one ephemeral status result for this live turn, never via the spool."""
+        return await self._request_mobile("device.status", thread_id, turn_id)
+
+    async def request_location(self, thread_id: str, turn_id: str, purpose: str) -> MobileDeviceStatusResult:
+        """Request one approximate foreground location, never via the spool."""
+        purpose = normalize_location_purpose(purpose)
+        if not purpose:
+            return {"status": "policy_blocked"}
+        return await self._request_mobile("location.current", thread_id, turn_id, purpose)
+
+    async def _request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: Optional[str] = None) -> MobileDeviceStatusResult:
+        required_capability = "mobile_location" if command == "location.current" else "mobile_node"
+        if not self._negotiated or required_capability not in self._capabilities:
+            return {"status": "device_unavailable"}
+        request_id = str(uuid.uuid4())
+        future: asyncio.Future[MobileDeviceStatusResult] = asyncio.get_running_loop().create_future()
+        self._mobile_requests[request_id] = (command, future)
+        try:
+            frame: Dict[str, Any] = {
+                "kind": "mobile_request", "requestId": request_id,
+                "command": command, "threadId": thread_id, "turnId": turn_id,
+                "expiresAt": int(time.time() * 1000) + MOBILE_STATUS_TIMEOUT_SECONDS * 1000,
+            }
+            if purpose is not None:
+                frame["purpose"] = purpose
+            await self._send(frame)
+            return await asyncio.wait_for(asyncio.shield(future), MOBILE_STATUS_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await self._cancel_mobile_request(request_id)
+            return {"status": "expired"}
+        except asyncio.CancelledError:
+            await self._cancel_mobile_request(request_id)
+            return {"status": "cancelled"}
+        except Exception:
+            return {"status": "device_unavailable"}
+        finally:
+            self._mobile_requests.pop(request_id, None)
 
     async def _send(self, frame: Dict[str, Any]) -> None:
         if self._ws is None or self._closed:
@@ -295,7 +372,26 @@ class AttachV1Client:
         if self._ws is None:
             return
         try:
-            async for raw in self._ws:
+            while self._ws is not None:
+                socket = self._ws
+                iterator = socket.__aiter__()
+                try:
+                    raw = await asyncio.wait_for(
+                        anext(iterator),
+                        None if self._negotiated else MOBILE_HELLO_ACK_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    if not await self._fallback_to_v1(socket):
+                        return
+                    continue
+                except StopAsyncIteration:
+                    if await self._fallback_to_v1(socket):
+                        continue
+                    return
+                except ConnectionClosed:
+                    if await self._fallback_to_v1(socket):
+                        continue
+                    raise
                 await self._dispatch_inbound(raw)
         except Exception as exc:
             code = _close_code(exc)
@@ -305,6 +401,21 @@ class AttachV1Client:
                 raise AttachAuthError("attach-v1 rejected (policy close 1008)") from exc
         finally:
             self._closed = True
+            self._settle_mobile_requests("device_unavailable")
+
+    async def _fallback_to_v1(self, socket: Any) -> bool:
+        """Reconnect once with the frozen v1 hello after v2 fails before its ack."""
+        if self._negotiated or self._hello_version != 2 or self._hello_fallback_used:
+            return False
+        self._hello_fallback_used = True
+        self._hello_version = 1
+        self._capabilities.clear()
+        try:
+            await socket.close()
+            await self._open(1)
+        except Exception:
+            return False
+        return True
 
     async def _dispatch_inbound(self, raw: Any) -> None:
         try:
@@ -329,6 +440,8 @@ class AttachV1Client:
                 self._max_events = min(self._max_events, int(limits.get("maxInFlightEvents", self._max_events)))
                 self._max_bytes = min(self._max_bytes, int(limits.get("maxInFlightBytes", self._max_bytes)))
             await self._drain_events()
+        elif kind == "mobile_result":
+            self._settle_mobile_result(frame)
         elif kind == "ack" and frame.get("channel") == "event":
             if isinstance(frame.get("sequence"), int) and isinstance(frame.get("id"), str):
                 async with self._flow_lock:
@@ -383,12 +496,69 @@ class AttachV1Client:
 
     async def close(self) -> None:
         self._closed = True
+        self._settle_mobile_requests("device_unavailable")
         ws, self._ws = self._ws, None
         if ws is not None:
             try:
                 await ws.close()
             except Exception:
                 pass
+
+    def _settle_mobile_result(self, frame: Dict[str, Any]) -> None:
+        request_id = frame.get("requestId")
+        status = frame.get("status")
+        if not isinstance(request_id, str) or not isinstance(status, str) or status not in MOBILE_STATUS_VALUES:
+            return
+        pending = self._mobile_requests.pop(request_id, None)
+        if pending is None:
+            return
+        command, future = pending
+        if future.done():
+            return
+        result: MobileDeviceStatusResult = {"status": status}
+        payload = frame.get("result")
+        if status == "ok":
+            if (command == "device.status" and not _is_device_status(payload)) or (command == "location.current" and not _is_location(payload)):
+                future.set_result({"status": "device_unavailable"})
+                return
+            result["result"] = payload
+        future.set_result(result)
+
+    def _settle_mobile_requests(self, status: MobileStatus) -> None:
+        pending, self._mobile_requests = self._mobile_requests, {}
+        for _command, future in pending.values():
+            if not future.done():
+                future.set_result({"status": status})
+
+    async def _cancel_mobile_request(self, request_id: str) -> None:
+        try:
+            await self._send({"kind": "mobile_cancel", "requestId": request_id})
+        except Exception:
+            pass
+
+
+def _is_device_status(value: Any) -> bool:
+    return isinstance(value, dict) and value == {"foreground": True}
+
+
+def _is_location(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"latitude", "longitude"}:
+        return False
+    latitude, longitude = value["latitude"], value["longitude"]
+    return (
+        isinstance(latitude, (int, float)) and not isinstance(latitude, bool)
+        and isinstance(longitude, (int, float)) and not isinstance(longitude, bool)
+        and -90 <= latitude <= 90 and -180 <= longitude <= 180
+        and abs(latitude * 100 - round(latitude * 100)) < 1e-8
+        and abs(longitude * 100 - round(longitude * 100)) < 1e-8
+    )
+
+
+def normalize_location_purpose(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or re.search(r"[\x00-\x1f\x7f-\x9f]", value):
+        return None
+    purpose = " ".join(value.strip().split())
+    return purpose if purpose and len(purpose.encode("utf-8")) <= 160 else None
 
 
 def _event_capabilities(event: Dict[str, Any]) -> List[str]:

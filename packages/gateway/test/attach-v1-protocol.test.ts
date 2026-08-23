@@ -5,6 +5,7 @@ import {
   AttachV1ClientFrameSchema,
   AttachV1EventFrameSchema,
   AttachV1HelloSchema,
+  AttachV1HelloV1Schema,
   AttachV1ServerFrameSchema,
 } from "../src/adapters/attach/protocol-v1.ts";
 
@@ -12,12 +13,18 @@ describe("attach-v1 protocol", () => {
   it("negotiates version, capabilities, cursor and backpressure limits", () => {
     expect(check(AttachV1HelloSchema, {
       kind: "hello",
-      version: 1,
+      version: 2,
       instanceId: "plugin-1",
-      capabilities: ["draft", "media", "tools", "approvals", "clarify", "scheduled"],
+      capabilities: ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location"],
       resume: { eventSequence: 41, commandSequence: 8 },
       limits: { maxInFlightEvents: 32, maxInFlightBytes: 1048576 },
     })).toBe(true);
+    expect(check(AttachV1HelloV1Schema, {
+      kind: "hello", version: 1, instanceId: "plugin-1", capabilities: ["draft", "mobile_node"],
+    })).toBe(true);
+    expect(check(AttachV1HelloV1Schema, {
+      kind: "hello", version: 2, instanceId: "plugin-1", capabilities: ["mobile_node", "mobile_location"],
+    })).toBe(false);
     expect(check(AttachV1HelloSchema, { kind: "hello", version: 0, instanceId: "x", capabilities: [] })).toBe(false);
   });
 
@@ -68,5 +75,29 @@ describe("attach-v1 protocol", () => {
     expect(check(AttachV1ClientFrameSchema, { kind: "gap", channel: "command", requestedAfter: 1, earliestAvailable: 2, latestAvailable: 4 })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "heartbeat", sentAt: 100 })).toBe(true);
     expect(check(AttachV1EventFrameSchema, { kind: "event", sequence: 1, eventId: "leak", event: { kind: "reasoning", text: "secret" } })).toBe(false);
+  });
+
+  it("keeps negotiated mobile requests and results outside the durable envelopes", () => {
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000,
+    })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1" })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, extra: true })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee",
+    })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee", extra: true,
+    })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1", extra: true })).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "request-1", status: "ok", result: { foreground: true },
+    })).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "request-1", status: "ok", result: { foreground: true, location: "no" },
+    })).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "location-1", status: "ok", result: { latitude: 41.88, longitude: -87.63 },
+    })).toBe(true);
   });
 });

@@ -53,7 +53,7 @@ describe("capability-24 bot attachment routes", () => {
     expect(await response.json()).toMatchObject({ name: "sage", sessionId: "session-1", message: { clientId: "client-1", text: "Please summarize." } });
     expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({
       mime: "application/pdf", name: "report.pdf", text: "Please summarize.", clientId: "client-1",
-    }));
+    }), { deviceId: "device-1" });
   });
 
   it.each([

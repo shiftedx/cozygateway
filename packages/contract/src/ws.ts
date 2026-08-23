@@ -45,7 +45,30 @@ export const SyncFrameSchema = Type.Object({
 });
 export type SyncFrame = Static<typeof SyncFrameSchema>;
 
-export const ClientFrameSchema = Type.Union([AuthFrameSchema, SyncFrameSchema]);
+const MobileNodeCommandSchema = Type.Union([Type.Literal("device.status"), Type.Literal("location.current")]);
+const MobileNodeStatusResultSchema = Type.Object({ foreground: Type.Literal(true) }, { additionalProperties: false });
+const MobileNodeLocationResultSchema = Type.Object({
+  // JSON Schema `multipleOf` is not stable for decimal floating-point values.
+  // The broker validates the integer-cent invariant before accepting this result.
+  latitude: Type.Number({ minimum: -90, maximum: 90 }),
+  longitude: Type.Number({ minimum: -180, maximum: 180 }),
+}, { additionalProperties: false });
+
+export const MobileNodeAdvertiseFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_advertise"),
+  commands: Type.Array(MobileNodeCommandSchema, { minItems: 1, maxItems: 2, uniqueItems: true }),
+  foreground: Type.Literal(true),
+}, { additionalProperties: false });
+export type MobileNodeAdvertiseFrame = Static<typeof MobileNodeAdvertiseFrameSchema>;
+
+export const MobileNodeResultFrameSchema = Type.Union([
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Literal("ok"), result: MobileNodeStatusResultSchema }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Literal("ok"), result: MobileNodeLocationResultSchema }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Union([Type.Literal("denied"), Type.Literal("cancelled"), Type.Literal("expired"), Type.Literal("foreground_required")]) }, { additionalProperties: false }),
+]);
+export type MobileNodeResultFrame = Static<typeof MobileNodeResultFrameSchema>;
+
+export const ClientFrameSchema = Type.Union([AuthFrameSchema, SyncFrameSchema, MobileNodeAdvertiseFrameSchema, MobileNodeResultFrameSchema]);
 export type ClientFrame = Static<typeof ClientFrameSchema>;
 
 export const ReadyFrameSchema = Type.Object({
@@ -121,6 +144,27 @@ export const ErrorFrameSchema = Type.Object({
 });
 export type ErrorFrame = Static<typeof ErrorFrameSchema>;
 
+const MobileNodeStatusRequestFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  command: Type.Literal("device.status"), bot: Type.String({ minLength: 1, maxLength: 128 }),
+  threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }),
+  expiresAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+const MobileNodeLocationRequestFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  command: Type.Literal("location.current"), bot: Type.String({ minLength: 1, maxLength: 128 }),
+  threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }),
+  expiresAt: Type.Integer({ minimum: 0 }), purpose: Type.String({ minLength: 1, maxLength: 160 }),
+}, { additionalProperties: false });
+export const MobileNodeRequestFrameSchema = Type.Union([MobileNodeStatusRequestFrameSchema, MobileNodeLocationRequestFrameSchema]);
+export type MobileNodeRequestFrame = Static<typeof MobileNodeRequestFrameSchema>;
+
+export const MobileNodeCancelFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_cancel"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  status: Type.Union([Type.Literal("cancelled"), Type.Literal("expired")]),
+}, { additionalProperties: false });
+export type MobileNodeCancelFrame = Static<typeof MobileNodeCancelFrameSchema>;
+
 export const ServerFrameSchema = Type.Union([
   ReadyFrameSchema,
   SyncedFrameSchema,
@@ -131,6 +175,8 @@ export const ServerFrameSchema = Type.Union([
   ApprovalResolvedFrameSchema,
   PresenceFrameSchema,
   ErrorFrameSchema,
+  MobileNodeRequestFrameSchema,
+  MobileNodeCancelFrameSchema,
   // Vendor extension com.cozylabs.bots v1 (contract/ext-bots-v1.md). Emitted only by a gateway
   // that advertises the capability; clients that do not know it ignore unknown frame types.
   BotRosterFrameSchema,

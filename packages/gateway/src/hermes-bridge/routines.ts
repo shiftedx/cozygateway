@@ -24,6 +24,8 @@ export const BOT_TAG_RE = /^\[bot:([a-z0-9][a-z0-9_-]*)\](?=\s|$)\s*/i;
 const BOT_TAG_CLAIM_RE = /^\[bot:/i;
 
 export const SAFE_ROUTINE_MARKER = "[bot-mode:routine:v2] ";
+const SILENCE_FIRST =
+  "Silence-first: send a user-facing reply only when there is a concrete, useful result. If there is nothing worth delivering, reply with no text.";
 
 /** The title shown for a tagged job with nothing after its tag. The desktop's own fallback. */
 export const UNTITLED_ROUTINE = "Untitled cronjob";
@@ -318,13 +320,13 @@ export function routinePrompt(input: {
   const scheduler = (input.schedulerProfile ?? "").trim().toLowerCase();
   const bot = input.bot.trim().toLowerCase();
   if (bot.length > 0 && bot === scheduler) {
-    return input.instruction;
+    return `${SILENCE_FIRST}\n\n${input.instruction}`;
   }
   return (
     `${SAFE_ROUTINE_MARKER}You are running the scheduled routine "${input.title}" for agent '${input.bot}'. ` +
-    `Execute it AS that agent so the run lands in its own history: run this in the terminal and relay the output:\n\n` +
+    `${SILENCE_FIRST} Execute it AS that agent so the run lands in its own history: run this in the terminal and relay the output:\n\n` +
     `hermes -p ${shellQuote(input.bot)} chat -c ${shellQuote(`Routine: ${input.title}`)} -q ${shellQuote(
-      `[Scheduled routine] ${input.instruction}`,
+      `[Scheduled routine] ${SILENCE_FIRST}\n\n${input.instruction}`,
     )}\n\n` +
     `If the command fails, report the error instead.`
   );
