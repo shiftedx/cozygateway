@@ -620,6 +620,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       let now = 0;
       let command: { sequence: number; commandId: string } | undefined;
       const interrupt = vi.fn(() => true);
+      const frames: ServerFrame[] = [];
       const plane = new NativeBotDataPlane({
         control: {} as BotsSurface,
         storage,
@@ -634,7 +635,7 @@ describe("attach-v1 native Bot Mode plane", () => {
         } as unknown as AttachV1Ingress,
         nativeBots: ["sage"],
         chatSuggestion: "",
-        broadcast: () => undefined,
+        broadcast: (frame) => frames.push(frame),
         now: () => now,
         turnTimeoutMs: 50,
       });
@@ -659,11 +660,64 @@ describe("attach-v1 native Bot Mode plane", () => {
         status: "completed",
         messages: [{ text: "running" }, { id: "eventual-final", text: "The real answer." }],
       });
+      expect(plane.handle("sage", {
+        kind: "event", sequence: 2, eventId: "eventual-final-retry", event: {
+          kind: "commit", threadId: sent.sessionId, turnId,
+          messageId: "eventual-final", blocks: [{ type: "paragraph", text: "The real answer." }],
+        },
+      })).toBe(true);
+      expect((await plane.surface().chatHistory("sage")).messages.filter(
+        (message) => message.id === "eventual-final",
+      )).toHaveLength(1);
+      expect(frames.filter(
+        (frame) => frame.type === "bot_chat" && frame.messages.some(
+          (message) => message.id === "eventual-final",
+        ),
+      )).toHaveLength(1);
       plane.close();
       storage.close();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does not revive a user-cancelled turn when a late final arrives", async () => {
+    const storage = openStorage(":memory:");
+    let command: { sequence: number; commandId: string } | undefined;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {
+        sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+          const queued = storage.enqueueAttachCommand(bot, "turn", { kind: "turn", ...input } as never, 1);
+          command = { sequence: queued.sequence, commandId: queued.commandId };
+          return true;
+        },
+      } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 2,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "cancel this");
+    const turnId = storage.nativeBotChat("sage", 2).activeTurnId!;
+    storage.ackAttachCommand("sage", command!.sequence, command!.commandId, 2);
+    storage.recordNativeBotTerminal({
+      bot: "sage", sessionId: sent.sessionId, turnId,
+      status: "interrupted", cause: "cancelled", completedAt: 2,
+    });
+
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "late-after-cancel", event: {
+        kind: "commit", threadId: sent.sessionId, turnId,
+        messageId: "late-after-cancel", blocks: [{ type: "paragraph", text: "Too late." }],
+      },
+    })).toBe(true);
+    expect((await plane.surface().chatHistory("sage")).messages).toEqual([
+      expect.objectContaining({ role: "user", text: "cancel this" }),
+    ]);
+    expect(storage.nativeBotLastTerminal("sage", sent.sessionId)).toEqual({
+      status: "interrupted", cause: "cancelled",
+    });
+    plane.close();
+    storage.close();
   });
 
   it("recovers the remaining durable queue deadline after a gateway restart", async () => {
