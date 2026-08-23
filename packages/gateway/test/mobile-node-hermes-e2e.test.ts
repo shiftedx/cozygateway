@@ -1,6 +1,6 @@
 import { once } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,12 +12,11 @@ import type { ReadyFrame, ServerFrame } from "cozygateway-contract";
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
-const HERMES_ROOT = "/Users/kmcdowell/.hermes/hermes-agent";
-const HERMES_PYTHON = `${HERMES_ROOT}/.venv/bin/python`;
 const PLUGIN_ROOT = fileURLToPath(new URL("../../../integrations/attach-plugin", import.meta.url));
 const HARNESS = join(PLUGIN_ROOT, "tests/live_mobile_node_harness.py");
+const PINNED_HERMES = pinnedHermes();
 
-it("runs the real Hermes status tool through the live origin-bound mobile-node path", async () => {
+it.runIf(PINNED_HERMES !== undefined)("runs the real Hermes status tool through the live origin-bound mobile-node path (requires HERMES_AGENT_ROOT)", async () => {
   process.env["MOBILE_HERMES_DASHBOARD_TOKEN"] = "dashboard-secret";
   process.env["MOBILE_HERMES_SAGE_TOKEN"] = "attach-secret";
   let gateway: RunningGateway | undefined;
@@ -46,7 +45,7 @@ it("runs the real Hermes status tool through the live origin-bound mobile-node p
     appB.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
     await pause();
 
-    harness = startHarness(gateway.url);
+    harness = startHarness(gateway.url, PINNED_HERMES!);
     await harness.until((event) => event.e2e === "ready");
     await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "sage"));
     const sent = await fetch(`${gateway.url}/bots/sage/chat/messages`, {
@@ -76,27 +75,42 @@ it("runs the real Hermes status tool through the live origin-bound mobile-node p
   }
 }, 30_000);
 
-function startHarness(gatewayUrl: string): Harness {
+function startHarness(gatewayUrl: string, hermes: HermesRuntime): Harness {
   const home = mkdtempSync(join(tmpdir(), "cozy-mobile-hermes-"));
-  const child = spawn(HERMES_PYTHON, [HARNESS], {
+  const child = spawn(hermes.python, [HARNESS], {
     env: {
-      ...process.env, HERMES_AGENT_ROOT: HERMES_ROOT, HERMES_HOME: home,
+      PATH: process.env.PATH ?? "", LANG: process.env.LANG ?? "C", TMPDIR: process.env.TMPDIR ?? tmpdir(),
+      HERMES_AGENT_ROOT: hermes.root, HERMES_HOME: home,
       HERMES_PROFILE: "sage", COZYGATEWAY_URL: gatewayUrl,
-      COZYGATEWAY_TOKEN: "attach-secret", PYTHONPATH: `${PLUGIN_ROOT}:${HERMES_ROOT}`,
+      COZYGATEWAY_TOKEN: "attach-secret", PYTHONPATH: `${PLUGIN_ROOT}:${hermes.root}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  return new Harness(child);
+  return new Harness(child, home);
+}
+
+function pinnedHermes(): HermesRuntime | undefined {
+  const root = process.env.HERMES_AGENT_ROOT?.trim();
+  if (!root) return undefined;
+  const python = process.env.HERMES_PYTHON?.trim() || join(root, ".venv", "bin", "python");
+  return existsSync(root) && existsSync(python) ? { root, python } : undefined;
+}
+
+interface HermesRuntime {
+  root: string;
+  python: string;
 }
 
 class Harness {
   readonly events: Array<Record<string, unknown>> = [];
   readonly child: ChildProcess;
+  readonly home: string;
   #stderr = "";
   #buffer = "";
 
-  constructor(child: ChildProcess) {
+  constructor(child: ChildProcess, home: string) {
     this.child = child;
+    this.home = home;
     child.stdout!.on("data", (chunk: Buffer) => this.#read(String(chunk)));
     child.stderr!.on("data", (chunk: Buffer) => { this.#stderr += String(chunk); });
   }
@@ -112,10 +126,15 @@ class Harness {
   }
 
   async close(): Promise<void> {
-    if (this.child.exitCode !== null) return;
-    this.child.kill();
-    await once(this.child, "exit");
-    if (this.#stderr) throw new Error(this.#stderr);
+    try {
+      if (this.child.exitCode === null) {
+        this.child.kill();
+        await once(this.child, "exit");
+      }
+      if (this.#stderr && this.child.exitCode !== 0) throw new Error(this.#stderr);
+    } finally {
+      rmSync(this.home, { recursive: true, force: true });
+    }
   }
 
   #read(chunk: string): void {
