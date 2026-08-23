@@ -76,9 +76,12 @@ the user-started run represented by the Live Activity.
 The gateway registers the raw token with its private relay as `apns-liveactivity`, stores only the
 opaque relay push id, and deletes the replaced relay registration. Canonical bot state, tool and
 delta frames drive coarse `thinking`, `usingTools`, and `writing` updates. Only an authoritative
-terminal `bot_chat_state` ends an activity; transcript/history snapshots never do. Payloads contain
+terminal `bot_chat_state` updates the conversation activity to its completed or failed state;
+transcript/history snapshots never do. The registration remains available so the next run in that
+same bot conversation updates the existing Activity instead of creating another Lock Screen card.
+Payloads contain
 no prompt, response text, tool names, arguments, or results. Normal updates use APNs priority 5.
-For a device with an active registration, the terminal ActivityKit push is the sole reply-ready
+For a device with an active registration, the terminal ActivityKit update is the sole reply-ready
 alert and uses priority 10; the gateway suppresses that device's ordinary encrypted completion
 notification. A device without an active registration retains the ordinary notification fallback.
 

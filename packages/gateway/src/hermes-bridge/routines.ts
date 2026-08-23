@@ -2,9 +2,10 @@ import type { BotRoutine, BotRoutineCreateRequest, BotRoutinePatch } from "cozyg
 
 import type { HermesRpc } from "./rpc.ts";
 
-/** The routines surface stores current bot routines as ordinary Hermes cron jobs named
- * `[bot:<name>] <title>`. The tag is the sole ownership rule: a job tagged for another bot, or
- * untagged by an older installation, is not part of this v1 surface. */
+/** The routines surface stores new bot routines as ordinary Hermes cron jobs named
+ * `[bot:<name>] <title>`. Existing untagged cron jobs are also shown because `cron.manage` scopes
+ * this call to the bot's profile; otherwise live schedules disappear from the only UI that can
+ * manage them. A tag naming another bot is always excluded. */
 
 /** The desktop's own three constants (plugin.js:5230-5232), with ONE deliberate tightening.
  *
@@ -20,6 +21,7 @@ import type { HermesRpc } from "./rpc.ts";
  *  The routes apply the profile-id charset rule as well, which keeps this gateway from ever writing
  *  such a name. This is the half that also holds for a job some other client wrote. */
 export const BOT_TAG_RE = /^\[bot:([a-z0-9][a-z0-9_-]*)\](?=\s|$)\s*/i;
+const BOT_TAG_CLAIM_RE = /^\[bot:/i;
 
 export const SAFE_ROUTINE_MARKER = "[bot-mode:routine:v2] ";
 
@@ -243,10 +245,14 @@ export function cronJobsOf(result: unknown): CronJob[] {
   return Array.isArray(jobs) ? jobs.flatMap((entry) => (asRecord(entry) === undefined ? [] : [entry as CronJob])) : [];
 }
 
-/** The TAGGED jobs that belong to ONE bot. Never widened by anything: a job carrying another bot's
- *  tag, or a tag this gateway cannot read, is not in here under any store and any scope. */
+/** Jobs owned by the bot profile requested from `cron.manage`: its tagged routines and its older,
+ *  untagged cron jobs. A malformed or foreign tag is still somebody else's ownership claim and is
+ *  therefore excluded rather than adopted as an existing cron. */
 export function selectRoutineJobs(jobs: readonly CronJob[], bot: string): CronJob[] {
-  return jobs.filter((job) => routineBot(job) === bot);
+  return jobs.filter((job) => {
+    const owner = routineBot(job);
+    return owner === bot || (owner === null && !BOT_TAG_CLAIM_RE.test(asString(job.name) ?? ""));
+  });
 }
 
 /** The raw cron store this bot's routines live in, scoped by `profile`.

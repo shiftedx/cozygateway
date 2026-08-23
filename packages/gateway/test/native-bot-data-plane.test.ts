@@ -92,6 +92,56 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("preserves list items when a native bot reply is committed", async () => {
+    const storage = openStorage(":memory:");
+    let turnId = "";
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        turnId = String(input.turnId);
+        storage.enqueueAttachCommand(bot, "turn-command", { kind: "turn", ...input } as never, 1);
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress,
+      nativeBots: ["cleo"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 1,
+    });
+    const surface = plane.surface();
+    const accepted = await surface.sendChatMessage("cleo", "What could be better?", {
+      clientId: "question",
+    });
+
+    expect(
+      plane.handle("cleo", {
+        kind: "event",
+        sequence: 1,
+        eventId: "commit",
+        event: {
+          kind: "commit",
+          threadId: accepted.sessionId,
+          turnId,
+          messageId: "answer",
+          blocks: [
+            { type: "heading", level: 2, text: "Biggest improvements" },
+            { type: "list", items: [{ text: "Reliable approvals" }, { text: "Better context" }] },
+            { type: "paragraph", text: "The core loop is already clean." },
+          ],
+        },
+      }),
+    ).toBe(true);
+
+    expect((await surface.chatHistory("cleo")).messages.at(-1)?.text).toBe(
+      "## Biggest improvements\n\n- Reliable approvals\n- Better context\n\nThe core loop is already clean.",
+    );
+    plane.close();
+    storage.close();
+  });
+
   it("queues a document as gateway-owned file media", async () => {
     const storage = openStorage(":memory:");
     const turns: Array<{ mediaIds?: string[] }> = [];

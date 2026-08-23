@@ -390,6 +390,56 @@ describe("GET /bots/:name/profile", () => {
   });
 });
 
+describe("POST /bots", () => {
+  it("creates a shared-auth Hermes profile, writes its title, and returns the roster row", async () => {
+    const created = {
+      name: "cozy-owl",
+      description: "Keeps watch",
+      has_avatar: false,
+      ui_meta: { "hermes-bots": { title: "Cozy Owl", created: NOW } },
+    };
+    let profiles: Array<Record<string, unknown>> = [scoutRow];
+    const { authed, server } = await setup({
+      methods: {
+        "profiles.list": () => profilesListResult(profiles),
+        "profiles.create": () => {
+          profiles = [...profiles, created];
+          return { success: true };
+        },
+        "profiles.configure": () => ({ applied: { ui_meta: true } }),
+      },
+    });
+
+    const response = await authed("/bots", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "cozy-owl", title: "Cozy Owl", description: "Keeps watch" }),
+    });
+
+    expect(response.status).toBe(201);
+    expect((await response.json() as { bot: { name: string; displayName: string } }).bot)
+      .toMatchObject({ name: "cozy-owl", displayName: "Cozy Owl" });
+    expect(server.callsOf("profiles.create")[0]?.params).toEqual({
+      name: "cozy-owl", description: "Keeps watch", share_auth: true,
+    });
+    expect(server.callsOf("profiles.configure")[0]?.params).toEqual({
+      name: "cozy-owl",
+      ui_meta: { "hermes-bots": { title: "Cozy Owl", created: NOW } },
+    });
+  });
+
+  it("rejects reserved names before calling Hermes", async () => {
+    const { authed, server } = await setup();
+    const response = await authed("/bots", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "default" }),
+    });
+    expect(response.status).toBe(400);
+    expect(server.callsOf("profiles.create")).toHaveLength(0);
+  });
+});
+
 describe("buildConfigurePayload", () => {
   it("sends only the fields the patch carries", () => {
     expect(buildConfigurePayload("scout", { soul: "hi" })).toEqual({

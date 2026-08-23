@@ -1,5 +1,6 @@
 import type {
   BotCatalog,
+  BotCreateRequest,
   BotChatMessage,
   BotChatStateCause,
   BotChatStatus,
@@ -22,6 +23,7 @@ import type {
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
 import type { Storage } from "../storage.ts";
 import {
+  HermesRpcError,
   HermesUnavailable,
   type HermesClient,
   type HermesState,
@@ -36,6 +38,7 @@ import {
   buildRoster,
   classifyPreview,
   parseProfilesList,
+  UI_META_KEY,
 } from "./roster.ts";
 import type { GroupMember } from "./group-protocol.ts";
 import type {
@@ -46,7 +49,7 @@ import { parseChatSnapshot } from "./chat-messages.ts";
 import { inboxMessages as projectInboxMessages, inboxThread } from "./inbox.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
-import { BotNotFound } from "./crud.ts";
+import { BotNameTaken, BotNotFound, validateNewBotName } from "./crud.ts";
 import {
   CATALOG_CACHE_MAX,
   CATALOG_DEGRADED_TTL_MS,
@@ -177,6 +180,7 @@ export class BotSessionConflict extends Error {
 
 export interface BotControlSurface {
   roster(): BotRosterView;
+  createBot(input: BotCreateRequest): Promise<{ bot: BotSummary }>;
   health(): BridgeLiveness;
   refreshSoon(reason: string): void;
   inbox(name: string): Promise<BotInboxView>;
@@ -418,6 +422,44 @@ export class HermesBridge implements BotControlSurface {
       stale: hermesState !== "online",
       hermesState,
     };
+  }
+  async createBot(input: BotCreateRequest): Promise<{ bot: BotSummary }> {
+    const name = validateNewBotName(input.name);
+    try {
+      await this.#client.request("profiles.create", {
+        name,
+        description: input.description?.trim() ?? "",
+        share_auth: true,
+      });
+    } catch (error) {
+      if (
+        error instanceof HermesRpcError &&
+        (error.code === 4062 || /already exists|file exists/i.test(error.message))
+      ) {
+        throw new BotNameTaken(name);
+      }
+      throw error;
+    }
+
+    const title = input.title?.trim();
+    try {
+      await this.#client.request("profiles.configure", {
+        name,
+        ui_meta: {
+          [UI_META_KEY]: {
+            ...(title ? { title } : {}),
+            created: this.#now(),
+          },
+        },
+      });
+    } catch {
+      // The profile already exists. Metadata is presentation-only, so never turn a successful
+      // create into a retry that can only collide with itself.
+    }
+    await this.refresh(`bot ${name} created`);
+    const bot = this.#storage.botRoster().bots.find((row) => row.name === name);
+    if (bot === undefined) throw new BotNotFound(name);
+    return { bot };
   }
   health(): BridgeLiveness {
     const liveness = this.#client.liveness();

@@ -46,6 +46,15 @@ export const BotSummarySchema = Type.Object({
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
+/** The minimum needed to create a Hermes profile. Its soul, model, tools, and MCP defaults come
+ * from Hermes itself and can be selectively overridden through the profile routes afterwards. */
+export const BotCreateRequestSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 64 }),
+  title: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+});
+export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
+
 /** Gateway-owned attach-v1 Bot Mode sessions are conversations. */
 export const BotSessionKindSchema = Type.Literal("conversation");
 export type BotSessionKind = Static<typeof BotSessionKindSchema>;
