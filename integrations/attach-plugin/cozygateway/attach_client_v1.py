@@ -113,6 +113,7 @@ class AttachV1Client:
         self._sent_events: Dict[int, int] = {}
         self._sent_event_bytes = 0
         self._latest_blocks: Dict[str, List[Dict[str, Any]]] = {}
+        self._latest_tools: Dict[str, Dict[str, tuple[str, str, Optional[str]]]] = {}
         self._hello_version = 2
         self._hello_fallback_used = False
         # Mobile requests are intentionally outside the durable spool: a phone action
@@ -279,16 +280,22 @@ class AttachV1Client:
         wire = self._wire_blocks(blocks)
         self._latest_blocks[turn_id] = wire
         await self._queue_event({"kind": "draft", "threadId": thread_id, "turnId": turn_id, "blocks": wire, "replace": True})
-        # v1 tools are independent lifecycle events. Snapshot chips are projected into transitions
-        # for compatibility with harnesses that expose only the older draft-chip tap.
+        # Hermes supplies the current tool snapshot with each draft. Attach-v1 carries only the
+        # lifecycle changes needed to reach that state.
+        tool_states = self._latest_tools.setdefault(turn_id, {})
         for chip in tool_calls or []:
+            state = (chip.name, chip.status, chip.detail)
+            if tool_states.get(chip.id) == state:
+                continue
             event = {"kind": "tool", "threadId": thread_id, "turnId": turn_id, "callId": chip.id, "name": chip.name, "status": chip.status}
             if chip.detail is not None:
                 event["detail"] = chip.detail
-            await self._queue_event(event)
+            if await self._queue_event(event) is not None:
+                tool_states[chip.id] = state
 
     async def send_done(self, thread_id: str, turn_id: str, media_ids: Optional[List[str]] = None) -> None:
         blocks = self._latest_blocks.pop(turn_id, [])
+        self._latest_tools.pop(turn_id, None)
         event: Dict[str, Any] = {
             "kind": "commit", "threadId": thread_id, "turnId": turn_id,
             "messageId": str(uuid.uuid4()), "blocks": blocks,
@@ -299,6 +306,7 @@ class AttachV1Client:
 
     async def send_failed(self, thread_id: str, turn_id: str, message: str) -> None:
         self._latest_blocks.pop(turn_id, None)
+        self._latest_tools.pop(turn_id, None)
         await self._queue_event({
             "kind": "failed", "threadId": thread_id, "turnId": turn_id,
             "messageId": str(uuid.uuid4()), "message": message[:4096],

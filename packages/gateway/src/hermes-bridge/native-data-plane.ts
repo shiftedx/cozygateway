@@ -924,6 +924,14 @@ export class NativeBotDataPlane {
       steps: new Map<string, BotToolStep>(),
     };
     const prior = current.steps.get(event.callId);
+    // Attach-v1 is at-least-once. A retried lifecycle state contains no new user-visible fact,
+    // so acknowledge it without rewriting SQLite or rebroadcasting the cumulative tool list.
+    if (
+      prior !== undefined &&
+      prior.name === event.name &&
+      prior.status === event.status &&
+      prior.detail === event.detail
+    ) return true;
     const now = this.#now();
     const step: BotToolStep = {
       stepId: event.callId,

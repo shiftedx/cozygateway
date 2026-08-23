@@ -8,6 +8,7 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
+from cozygateway.attach_client import ToolChip
 from cozygateway.attach_spool import AttachSpool
 
 
@@ -138,6 +139,33 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sent_counts_at_ready, [1])
         self.assertEqual(self.socket.sent[-1]["kind"], "event")
+
+    async def test_repeated_draft_snapshot_emits_only_tool_lifecycle_changes(self):
+        chip = ToolChip(id="call-1", name="search", status="running")
+
+        await self.client.send_draft("thread", "turn", [], [chip])
+        await self.client.send_draft("thread", "turn", [], [chip])
+
+        events = [
+            frame["event"]
+            for frame in self.spool.pending_events(10, 100_000)
+        ]
+        self.assertEqual([event["kind"] for event in events], ["draft", "tool", "draft"])
+
+    async def test_captured_workload_shape_stays_linear_in_tool_calls(self):
+        # Sanitized shape of the Cleo incident: 564 cumulative snapshots containing 80,430
+        # tool entries and reaching 283 distinct calls. The old implementation journaled every
+        # entry; lifecycle deltas keep the same UI state without the quadratic outbox growth.
+        snapshot_sizes = [1] + [142] * 559 + [202, 283, 283, 283]
+        self.assertEqual((len(snapshot_sizes), sum(snapshot_sizes), max(snapshot_sizes)), (564, 80_430, 283))
+
+        chips = [ToolChip(id=f"call-{index}", name="tool", status="running") for index in range(283)]
+        for size in snapshot_sizes:
+            await self.client.send_draft("thread", "turn", [], chips[:size])
+
+        events = self.spool.pending_events(1_000, 10_000_000)
+        kinds = [frame["event"]["kind"] for frame in events]
+        self.assertEqual((kinds.count("draft"), kinds.count("tool")), (564, 283))
 
     async def test_hello_ack_recovers_a_recreated_empty_spool_from_server_cursors(self):
         await self.client.connect()

@@ -331,6 +331,37 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("treats an identical tool lifecycle replay as a projected no-op", () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: (frame) => frames.push(frame),
+      now: () => 100,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+    const event = {
+      kind: "tool" as const, threadId: chat.sessionId, turnId: "turn",
+      callId: "call", name: "search", status: "running" as const, detail: "query",
+    };
+
+    expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "first", event })).toBe(true);
+    expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "repeat", event })).toBe(true);
+
+    expect(frames.filter((frame) => frame.type === "bot_tool_activity")).toHaveLength(1);
+    expect(storage.botChatToolSteps(chat.sessionId, 0)).toHaveLength(1);
+    plane.close();
+    storage.close();
+  });
+
   it.each(["failed", "cancelled", "interrupted"] as const)(
     "seals running tools as errors when attach reports %s",
     async (kind) => {
