@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS turn_terminals (
   event_id TEXT NOT NULL,
   terminal_kind TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS media_cleanup (
+  media_id TEXT PRIMARY KEY
+) STRICT;
 """
 
 _TRANSPORT_LEASES: set[str] = set()
@@ -220,6 +223,52 @@ class AttachSpool:
             result.append(json.loads(str(encoded)))
             used += size
         return result
+
+    def begin_media_cleanup(self, media_ids: List[str]) -> List[int]:
+        """Drop local descriptor events for an abandoned atomic media occurrence.
+
+        Upload bytes live outside the journal, but their descriptor events are ordinary durable
+        rows. Removing both unsent and already-ACKed descriptors is safe: ``event_cursor`` remains
+        monotonic and no terminal event can be a media descriptor. Callers delete the corresponding
+        remote bytes after this local rollback; a later scheduled/commit event must never reference
+        these ids.
+        """
+        targets = {media_id for media_id in media_ids if isinstance(media_id, str) and media_id}
+        if not targets:
+            return []
+        rows = self._db.execute(
+            "SELECT sequence, frame_json FROM event_outbox ORDER BY sequence"
+        ).fetchall()
+        sequences: List[int] = []
+        for sequence, encoded in rows:
+            try:
+                event = json.loads(str(encoded)).get("event")
+                descriptor = event.get("media") if isinstance(event, dict) else None
+                media_id = descriptor.get("mediaId") if isinstance(descriptor, dict) else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(event, dict) and event.get("kind") == "media" and media_id in targets:
+                sequences.append(int(sequence))
+        with self._db:
+            if sequences:
+                self._db.executemany(
+                    "DELETE FROM event_outbox WHERE sequence = ?",
+                    ((sequence,) for sequence in sequences),
+                )
+            self._db.executemany(
+                "INSERT OR IGNORE INTO media_cleanup (media_id) VALUES (?)",
+                ((media_id,) for media_id in targets),
+            )
+        return sequences
+
+    def pending_media_cleanups(self) -> List[str]:
+        return [str(row[0]) for row in self._db.execute(
+            "SELECT media_id FROM media_cleanup ORDER BY media_id"
+        ).fetchall()]
+
+    def mark_media_cleanup_complete(self, media_id: str) -> None:
+        with self._db:
+            self._db.execute("DELETE FROM media_cleanup WHERE media_id = ?", (media_id,))
 
     def ack_event(self, sequence: int, event_id: str) -> bool:
         with self._db:

@@ -789,6 +789,27 @@ export function createApp(deps: AppDeps): Hono<Env> {
       }
     });
 
+    /** Atomic producer rollback. An absent id is success so a retry after a crash between local
+     * spool cleanup and this request stays convergent; a referenced id is never removed. */
+    app.delete("/attach/v1/media/:mediaId", requireAttachMedia, (c) => {
+      const mediaId = c.req.param("mediaId");
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId))
+        return c.json(
+          errorBody("invalid_request", "invalid attach media id"),
+          400,
+        );
+      const result = deps.storage.deleteUnreferencedAttachMedia(
+        attachAgent(c),
+        mediaId,
+      );
+      if (result === "referenced")
+        return c.json(
+          errorBody("invalid_request", "attach media is already referenced"),
+          409,
+        );
+      return c.body(null, 204);
+    });
+
     app.get("/attach/v1/media/:mediaId", requireAttachMedia, (c) => {
       const mediaId = c.req.param("mediaId");
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(mediaId))

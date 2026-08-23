@@ -28,6 +28,38 @@ describe("capability-27 pending approval inbox", () => {
     expect((await app.request("/bots/approvals?state=resolved")).status).toBe(400);
   });
 
+  it("includes bounded clarification and terminal settlement recovery without treating a request as confirmation", async () => {
+    const app = new Hono<Env>();
+    const requireDevice: MiddlewareHandler<Env> = async (c, next) => {
+      c.set("deviceId", "device-1");
+      await next();
+    };
+    registerBotRoutes(app, requireDevice, {
+      pendingApprovals: () => [],
+      pendingClarifications: () => [{
+        bot: "sage", sessionId: "session-1", turnId: "turn-1", clarifyId: "clarify-1",
+        prompt: "Pick one", options: [{ id: "a", label: "A" }],
+        resolutionRequestedAt: 7,
+      }],
+      terminalSettlements: () => [{
+        bot: "sage", kind: "approval", interactionId: "approval-1", sessionId: "session-1",
+        turnId: "turn-1", outcome: "approved", settledAt: 8,
+      }],
+    } as unknown as BotsSurface);
+
+    expect(await (await app.request("/bots/approvals?state=pending")).json()).toEqual({
+      approvals: [],
+      clarifications: [{
+        bot: "sage", sessionId: "session-1", turnId: "turn-1", clarifyId: "clarify-1",
+        prompt: "Pick one", options: [{ id: "a", label: "A" }], resolutionRequestedAt: 7,
+      }],
+      settlements: [{
+        bot: "sage", kind: "approval", interactionId: "approval-1", sessionId: "session-1",
+        turnId: "turn-1", outcome: "approved", settledAt: 8,
+      }],
+    });
+  });
+
   it("reports command admission as requested and rejects a conflicting pending choice", async () => {
     const app = new Hono<Env>();
     const requireDevice: MiddlewareHandler<Env> = async (c, next) => {

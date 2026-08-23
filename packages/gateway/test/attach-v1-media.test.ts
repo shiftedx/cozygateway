@@ -81,4 +81,19 @@ describe("attach-v1 authenticated media side channel", () => {
     const downloaded = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
     expect(downloaded.headers.get("content-disposition")).toContain('filename="report.pdf"');
   });
+
+  it("lets the uploading identity remove an unreferenced atomic-upload rollback target", async () => {
+    const url = `${gateway.url}/attach/v1/media/atomic_rollback_1`;
+    const sha = createHash("sha256").update(png).digest("hex");
+    expect((await fetch(url, { method: "POST", body: png, headers: {
+      authorization: `Bearer ${token}`, "content-type": "image/png",
+      "x-attach-filename": "atomic.png", "x-attach-sha256": sha,
+    } })).status).toBe(201);
+
+    expect((await fetch(url, { method: "DELETE", headers: { authorization: `Bearer ${token}` } })).status).toBe(204);
+    expect((await fetch(url, { headers: { authorization: `Bearer ${token}` } })).status).toBe(404);
+    // Rollback is idempotent so a crash between local spool removal and HTTP cleanup cannot leave
+    // a retry pretending the old media remains reachable.
+    expect((await fetch(url, { method: "DELETE", headers: { authorization: `Bearer ${token}` } })).status).toBe(204);
+  });
 });

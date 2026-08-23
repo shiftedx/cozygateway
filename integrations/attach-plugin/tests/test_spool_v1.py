@@ -65,6 +65,25 @@ class AttachSpoolTests(unittest.TestCase):
         self.assertEqual([f["sequence"] for f in spool.pending_events(10, 100000)], [1])
         spool.close()
 
+    def test_atomic_media_rollback_removes_only_the_target_media_events(self):
+        spool = AttachSpool(self.path)
+        first = spool.enqueue_event({
+            "kind": "media", "media": {"mediaId": "uploaded-first"},
+        })
+        retained = spool.enqueue_event({
+            "kind": "media", "media": {"mediaId": "keep-me"},
+        })
+        removed = spool.begin_media_cleanup(["uploaded-first"])
+        self.assertEqual(removed, [first["sequence"]])
+        self.assertEqual(spool.pending_media_cleanups(), ["uploaded-first"])
+        spool.mark_media_cleanup_complete("uploaded-first")
+        self.assertEqual(spool.pending_media_cleanups(), [])
+        self.assertEqual(
+            [frame["sequence"] for frame in spool.pending_events(10, 100000)],
+            [retained["sequence"]],
+        )
+        spool.close()
+
 
 if __name__ == "__main__":
     unittest.main()

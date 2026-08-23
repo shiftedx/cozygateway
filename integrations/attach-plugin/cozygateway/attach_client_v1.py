@@ -137,6 +137,10 @@ class AttachV1Client:
                 raise AttachAuthError("attach-v1 rejected (HTTP 401)") from exc
             raise
 
+        # A prior atomic occurrence may have crashed after descriptor rollback but before its
+        # authenticated HTTP delete. Cleanup is durable and retried on each healthy reconnect.
+        await self._drain_media_cleanup()
+
         # A command ACKed before a crash remains in the inbox until execution was recorded.
         for frame in self._spool.pending_commands():
             await self._dispatch_command(frame, replay=True)
@@ -352,6 +356,20 @@ class AttachV1Client:
         await self._queue_event({"kind": "media", "media": descriptor})
         return descriptor
 
+    async def rollback_uploaded_media(self, media_ids: List[str]) -> None:
+        """Durably abandon an atomic occurrence's uploaded media.
+
+        Local descriptor rows disappear before HTTP cleanup is attempted, and failed cleanup stays
+        in the spool for the next reconnect. The return value is the still-pending remote cleanup
+        ids. Callers surface the original media failure and never call the occurrence sent.
+        """
+        async with self._flow_lock:
+            sequences = self._spool.begin_media_cleanup(media_ids)
+            for sequence in sequences:
+                byte_count = self._sent_events.pop(sequence, 0)
+                self._sent_event_bytes = max(0, self._sent_event_bytes - byte_count)
+        await self._drain_media_cleanup()
+
     async def download_media(self, media_id: str, max_bytes: int = ATTACH_AUDIO_VIDEO_MAX_BYTES) -> tuple[bytes, str, str]:
         """Fetch one gateway-owned attachment through the same bearer side channel.
 
@@ -423,6 +441,36 @@ class AttachV1Client:
         context = self._ssl_context() if origin.startswith("https://") else None
         with urlopen(request, context=context, timeout=60) as response:
             return dict(json.loads(response.read())["media"])
+
+    def _delete_media_sync(self, media_id: str) -> None:
+        parsed = urlparse(self._config.gateway_url)
+        origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
+        request = Request(
+            f"{origin}/attach/v1/media/{quote(media_id, safe='')}",
+            headers={
+                "Authorization": f"Bearer {self._config.token}",
+                "User-Agent": "CozyGateway-Attach/1.0",
+            },
+            method="DELETE",
+        )
+        context = self._ssl_context() if origin.startswith("https://") else None
+        try:
+            with urlopen(request, context=context, timeout=15):
+                return
+        except HTTPError as exc:
+            # Missing means an earlier retry won; conflict proves a separately committed event
+            # references the object, so it is not orphan media and must stay reachable.
+            if exc.code in {404, 409}:
+                return
+            raise
+
+    async def _drain_media_cleanup(self) -> None:
+        for media_id in self._spool.pending_media_cleanups():
+            try:
+                await asyncio.to_thread(self._delete_media_sync, media_id)
+            except Exception:
+                continue
+            self._spool.mark_media_cleanup_complete(media_id)
 
     async def watch(self) -> None:
         if self._ws is None:

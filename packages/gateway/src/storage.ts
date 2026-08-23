@@ -1,7 +1,16 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 
-import type { AttachmentBlock, BotChatMessage, BotSummary, Message, MessageRole, RichBlock } from "cozygateway-contract";
+import type {
+  AttachmentBlock,
+  BotChatMessage,
+  BotInteractionSettlement,
+  BotPendingClarification,
+  BotSummary,
+  Message,
+  MessageRole,
+  RichBlock,
+} from "cozygateway-contract";
 import type {
   AttachV1Command,
   AttachV1CommandFrame,
@@ -21,6 +30,10 @@ export type NativeInteractionResolutionRequest =
     }
   | { outcome: "expired"; sessionId: string; turnId: string }
   | { outcome: "unknown" | "not_pending" };
+
+/** Terminal receipts are reconnect aids, not permanent interaction history. Pending rows are
+ * never pruned; retain only the newest bounded terminal proof per profile. */
+const NATIVE_INTERACTION_SETTLEMENT_LIMIT = 100;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
@@ -1450,6 +1463,8 @@ export class Storage {
            plugin_last_ack_progress_at = CASE
              WHEN attach_streams.plugin_event_ack_cursor IS NULL
                OR attach_streams.plugin_last_ack_progress_at IS NULL
+               OR (COALESCE(attach_streams.plugin_event_outbox_depth, 0) = 0
+                   AND excluded.plugin_event_outbox_depth > 0)
                OR excluded.plugin_event_ack_cursor > attach_streams.plugin_event_ack_cursor
              THEN excluded.plugin_last_ack_progress_at
              ELSE attach_streams.plugin_last_ack_progress_at
@@ -1877,6 +1892,34 @@ export class Storage {
       .run(agentId, mediaId);
   }
 
+  /** Delete only media that cannot yet be reached from any durable attach event or native
+   * transcript. This is the rollback half of an atomic producer occurrence; a referenced object
+   * is deliberately retained rather than turning a successfully committed attachment into a 404. */
+  deleteUnreferencedAttachMedia(agentId: string, mediaId: string): "deleted" | "absent" | "referenced" {
+    const exists = this.#db
+      .prepare("SELECT 1 FROM attach_media WHERE agent_id = ? AND media_id = ?")
+      .get(agentId, mediaId) !== undefined;
+    if (!exists) return "absent";
+    const referenced = this.#db
+      .prepare(
+        `SELECT 1
+           WHERE EXISTS (
+             SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
+             WHERE inbox.agent_id = ? AND media.value = ?
+           )
+           OR EXISTS (
+             SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
+             WHERE message.bot = ? AND json_extract(attachment.value, '$.fileId') = ?
+           )`,
+      )
+      .get(agentId, mediaId, agentId, mediaId) !== undefined;
+    if (referenced) return "referenced";
+    this.#db
+      .prepare("DELETE FROM attach_media WHERE agent_id = ? AND media_id = ?")
+      .run(agentId, mediaId);
+    return "deleted";
+  }
+
   attachMediaInfo(
     agentId: string,
     mediaId: string,
@@ -2154,6 +2197,7 @@ export class Storage {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(input.bot, input.kind, input.interactionId, input.sessionId, input.turnId, JSON.stringify(input.payload), input.status, input.selectedOptionId ?? null, input.expiresAt ?? null, input.updatedAt);
+      if (input.status !== "pending") this.#trimTerminalNativeInteractions(input.bot);
       return "inserted";
     }
     if (prior.status !== "pending") return "duplicate";
@@ -2166,6 +2210,7 @@ export class Storage {
          WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
       )
       .run(input.status, input.selectedOptionId ?? null, input.updatedAt, input.bot, input.kind, input.interactionId);
+    this.#trimTerminalNativeInteractions(input.bot);
     return "updated";
   }
 
@@ -2177,12 +2222,14 @@ export class Storage {
     updatedAt: number,
     selectedOptionId?: string,
   ): boolean {
-    return this.#db
+    const resolved = this.#db
       .prepare(
         `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
          WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
       )
       .run(status, selectedOptionId ?? null, updatedAt, bot, kind, interactionId).changes === 1;
+    if (resolved) this.#trimTerminalNativeInteractions(bot);
+    return resolved;
   }
 
   nativeInteraction(
@@ -2253,6 +2300,7 @@ export class Storage {
                AND expires_at IS NOT NULL AND expires_at <= ?`,
           )
           .run(input.requestedAt, input.bot, input.kind, input.interactionId, input.requestedAt);
+        this.#trimTerminalNativeInteractions(input.bot);
         this.#db.exec("COMMIT");
         return { outcome: "expired", sessionId: row.sessionId, turnId: row.turnId };
       }
@@ -2368,6 +2416,81 @@ export class Storage {
     }));
   }
 
+  /** Bounded display-safe clarification recovery. The original payload remains private in the
+   * durable interaction row; this projects only the already-rendered prompt/options. */
+  pendingNativeClarifications(
+    bots: readonly string[],
+    limit: number,
+  ): BotPendingClarification[] {
+    if (bots.length === 0) return [];
+    const placeholders = bots.map(() => "?").join(", ");
+    const rows = this.#db
+      .prepare(
+        `SELECT bot, session_id AS sessionId, turn_id AS turnId,
+                interaction_id AS clarifyId, payload_json AS payloadJson,
+                expires_at AS expiresAt, resolution_requested_at AS resolutionRequestedAt
+         FROM bot_native_interactions
+         WHERE kind = 'clarify' AND status = 'pending' AND bot IN (${placeholders})
+         ORDER BY updated_at, interaction_id
+         LIMIT ?`,
+      )
+      .all(...bots, limit) as unknown as Array<{
+        bot: string;
+        sessionId: string;
+        turnId: string;
+        clarifyId: string;
+        payloadJson: string;
+        expiresAt: number | null;
+        resolutionRequestedAt: number | null;
+      }>;
+    return rows.map(({ payloadJson, expiresAt, resolutionRequestedAt, ...row }) => {
+      const payload = JSON.parse(payloadJson) as { prompt?: unknown; options?: unknown };
+      return {
+        ...row,
+        prompt: typeof payload.prompt === "string" ? payload.prompt : "",
+        options: Array.isArray(payload.options) ? payload.options as BotPendingClarification["options"] : [],
+        ...(expiresAt === null ? {} : { expiresAt }),
+        ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
+      };
+    });
+  }
+
+  /** Terminal interaction proof is durable but bounded. This recovery read includes neither
+   * command ids/decisions nor raw approval or model payloads. */
+  terminalNativeSettlements(
+    bots: readonly string[],
+  ): BotInteractionSettlement[] {
+    if (bots.length === 0) return [];
+    // Existing deployments predate the retention bound. Normalize their retained history when it
+    // is first read, so an upgrade cannot leave an indefinitely growing terminal table until the
+    // next incoming Hermes event happens to settle.
+    for (const bot of bots) this.#trimTerminalNativeInteractions(bot);
+    const placeholders = bots.map(() => "?").join(", ");
+    const rows = this.#db
+      .prepare(
+        `SELECT bot, kind, interaction_id AS interactionId, session_id AS sessionId,
+                turn_id AS turnId, status AS outcome, selected_option_id AS selectedOptionId,
+                updated_at AS settledAt
+         FROM bot_native_interactions
+         WHERE status <> 'pending' AND bot IN (${placeholders})
+         ORDER BY updated_at DESC, kind, interaction_id`,
+      )
+      .all(...bots) as unknown as Array<{
+        bot: string;
+        kind: "approval" | "clarify";
+        interactionId: string;
+        sessionId: string;
+        turnId: string;
+        outcome: BotInteractionSettlement["outcome"];
+        selectedOptionId: string | null;
+        settledAt: number;
+      }>;
+    return rows.map(({ selectedOptionId, ...row }) => ({
+      ...row,
+      ...(selectedOptionId === null ? {} : { selectedOptionId }),
+    }));
+  }
+
   /** Atomically transition one stale approval before a user can act on it. The conditional update
    * is authoritative, so a timer or another device winning the race cannot expire a settled row. */
   expireNativeApprovalIfDue(
@@ -2403,6 +2526,7 @@ export class Storage {
            AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
       )
       .run(now, bot, kind, interactionId, now).changes === 1;
+    if (changed) this.#trimTerminalNativeInteractions(bot);
     return changed ? row : undefined;
   }
 
@@ -2419,6 +2543,21 @@ export class Storage {
          ORDER BY expires_at, interaction_id`,
       )
       .all(now, ...bots) as unknown as Array<{ bot: string; interactionId: string }>;
+  }
+
+  #trimTerminalNativeInteractions(bot: string): void {
+    this.#db
+      .prepare(
+        `DELETE FROM bot_native_interactions
+         WHERE bot = ? AND status <> 'pending'
+           AND (kind, interaction_id) IN (
+             SELECT kind, interaction_id FROM bot_native_interactions
+             WHERE bot = ? AND status <> 'pending'
+             ORDER BY updated_at DESC, kind, interaction_id
+             LIMIT -1 OFFSET ?
+           )`,
+      )
+      .run(bot, bot, NATIVE_INTERACTION_SETTLEMENT_LIMIT);
   }
 
   close(): void {

@@ -1003,6 +1003,48 @@ export const BotPendingApprovalsSchema = Type.Object({
 });
 export type BotPendingApprovals = Static<typeof BotPendingApprovalsSchema>;
 
+/** Compact terminal proof for an approval or clarification. A client may settle an optimistic
+ * action only after it observes this receipt, never from the action POST or queued command. */
+export const BotInteractionSettlementSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  kind: Type.Union([Type.Literal("approval"), Type.Literal("clarify")]),
+  interactionId: Type.String({ minLength: 1 }),
+  sessionId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+  outcome: Type.Union([
+    Type.Literal("approved"), Type.Literal("denied"), Type.Literal("expired"),
+    Type.Literal("selected"), Type.Literal("cancelled"),
+  ]),
+  selectedOptionId: Type.Optional(Type.String({ minLength: 1 })),
+  settledAt: Type.Integer(),
+});
+export type BotInteractionSettlement = Static<typeof BotInteractionSettlementSchema>;
+
+/** Pending clarification recovery mirrors the approval inbox while retaining only display-safe
+ * prompt/options and the durable request marker. */
+export const BotPendingClarificationSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+  clarifyId: Type.String({ minLength: 1 }),
+  prompt: Type.String({ minLength: 1, maxLength: 4096 }),
+  options: Type.Array(BotClarifyOptionSchema, { minItems: 1, maxItems: 20 }),
+  expiresAt: Type.Optional(Type.Integer()),
+  resolutionRequestedAt: Type.Optional(Type.Integer()),
+});
+export type BotPendingClarification = Static<typeof BotPendingClarificationSchema>;
+
+/** One bounded reconnect snapshot. Pending items and terminal receipts intentionally remain
+ * separate so a caller cannot mistake command admission for Hermes confirmation. */
+export const BotInteractionRecoverySchema = Type.Object({
+  approvals: Type.Array(BotPendingApprovalSchema, { maxItems: 100 }),
+  clarifications: Type.Array(BotPendingClarificationSchema, { maxItems: 100 }),
+  // Retention is bounded to 100 per configured bot. The aggregate must not apply a second global
+  // cap or a busy bot could hide another bot's only terminal proof from a reconnecting device.
+  settlements: Type.Array(BotInteractionSettlementSchema),
+});
+export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>;
+
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
  *  configured.
  *
@@ -1125,6 +1167,9 @@ export type BotPendingApprovals = Static<typeof BotPendingApprovalsSchema>;
  *    because the endpoint reads the same lifecycle truth as the existing action routes.
  *  - `28`: requested-vs-confirmed approval and clarification settlement. A decision request is
  *    durable and replayable, but `bot_*_resolved` remains reserved for the later terminal Hermes
- *    event. `bot_*_resolution_requested` disables duplicate actions across paired devices. */
+ *    event. `bot_*_resolution_requested` disables duplicate actions across paired devices.
+ *  - `29`: `GET /bots/approvals?state=pending` additionally returns bounded pending
+ *    clarifications and confirmed terminal settlement receipts so a reconnect can settle an
+ *    optimistic action without guessing from the action POST. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 28;
+export const BOTS_CAPABILITY_VERSION = 29;

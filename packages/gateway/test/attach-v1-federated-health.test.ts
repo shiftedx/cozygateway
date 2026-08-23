@@ -112,6 +112,62 @@ describe("attach-v1 federated health", () => {
       pluginCommandInboxDepth: 1,
     });
   });
+
+  it("starts the stall window when an idle spool gains a fresh backlog without a new ACK", async () => {
+    const peer = await dial({
+      eventOutboxDepth: 0,
+      oldestEventAgeMs: null,
+      eventAckCursor: 7,
+      commandInboxDepth: 0,
+    });
+
+    // The profile has been idle long enough that its last ACK progress is ancient. A new queued
+    // event has not been ACKed yet, so the cursor rightly stays at 7; that must begin a fresh
+    // stall interval rather than immediately presenting the healthy reconnect as degraded.
+    clock = 60_000;
+    peer.ws.send(JSON.stringify({
+      kind: "heartbeat", sentAt: clock,
+      telemetry: {
+        eventOutboxDepth: 1,
+        oldestEventAgeMs: 0,
+        eventAckCursor: 7,
+        commandInboxDepth: 0,
+      },
+    }));
+    await until(() => ingress.health().pluginOutboxDepth === 1);
+    expect(ingress.health()).toMatchObject({
+      online: 1,
+      degraded: 0,
+      pluginLastAckProgressAt: 60_000,
+    });
+
+    clock = 89_999;
+    peer.ws.send(JSON.stringify({
+      kind: "heartbeat", sentAt: clock,
+      telemetry: {
+        eventOutboxDepth: 1,
+        oldestEventAgeMs: 29_999,
+        eventAckCursor: 7,
+        commandInboxDepth: 0,
+      },
+    }));
+    await until(() => ingress.health().online === 1);
+    expect(ingress.health().degraded).toBe(0);
+
+    clock = 90_000;
+    peer.ws.send(JSON.stringify({
+      kind: "heartbeat", sentAt: clock,
+      telemetry: {
+        eventOutboxDepth: 1,
+        oldestEventAgeMs: 30_000,
+        eventAckCursor: 7,
+        commandInboxDepth: 0,
+      },
+    }));
+    await until(() => ingress.health().degraded === 1);
+    peer.ws.close();
+    await once(peer.ws, "close");
+  });
 });
 
 async function until(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {

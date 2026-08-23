@@ -88,6 +88,83 @@ describe("attach-v1 durable transport storage", () => {
     storage.close();
   });
 
+  it("keeps a bounded durable recovery snapshot distinct from pending approval and clarification actions", () => {
+    const storage = openStorage(":memory:");
+    storage.recordNativeInteraction({
+      bot: "sage", kind: "approval", interactionId: "approval-1", sessionId: "session-1",
+      turnId: "turn-1", payload: { name: "workspace.write" }, status: "pending", updatedAt: 1,
+    });
+    storage.recordNativeInteraction({
+      bot: "sage", kind: "clarify", interactionId: "clarify-1", sessionId: "session-1",
+      turnId: "turn-1", payload: { prompt: "Pick one", options: [{ id: "a", label: "A" }] },
+      status: "pending", expiresAt: 10, updatedAt: 2,
+    });
+    storage.recordNativeInteraction({
+      bot: "sage", kind: "approval", interactionId: "approval-2", sessionId: "session-2",
+      turnId: "turn-2", payload: { name: "private args stay private" }, status: "approved", updatedAt: 3,
+    });
+    storage.recordNativeInteraction({
+      bot: "sage", kind: "clarify", interactionId: "clarify-2", sessionId: "session-2",
+      turnId: "turn-2", payload: { prompt: "private prompt", options: [] }, status: "selected",
+      selectedOptionId: "b", updatedAt: 4,
+    });
+
+    expect(storage.pendingNativeApprovals(["sage"], 100)).toEqual([{
+      bot: "sage", sessionId: "session-1", turnId: "turn-1", toolCallId: "approval-1",
+      ruleName: "workspace.write", createdAt: 1,
+    }]);
+    expect(storage.pendingNativeClarifications(["sage"], 100)).toEqual([{
+      bot: "sage", sessionId: "session-1", turnId: "turn-1", clarifyId: "clarify-1",
+      prompt: "Pick one", options: [{ id: "a", label: "A" }], expiresAt: 10,
+    }]);
+    expect(storage.terminalNativeSettlements(["sage"])).toEqual([
+      {
+        bot: "sage", kind: "clarify", interactionId: "clarify-2", sessionId: "session-2",
+        turnId: "turn-2", outcome: "selected", selectedOptionId: "b", settledAt: 4,
+      },
+      {
+        bot: "sage", kind: "approval", interactionId: "approval-2", sessionId: "session-2",
+        turnId: "turn-2", outcome: "approved", settledAt: 3,
+      },
+    ]);
+    storage.close();
+  });
+
+  it("retains only the newest bounded terminal settlement receipts per bot", () => {
+    const storage = openStorage(":memory:");
+    for (let index = 0; index <= 100; index += 1) {
+      storage.recordNativeInteraction({
+        bot: "sage", kind: "approval", interactionId: `approval-${index}`,
+        sessionId: "session", turnId: "turn", payload: { name: "tool" },
+        status: "approved", updatedAt: index,
+      });
+    }
+    const settlements = storage.terminalNativeSettlements(["sage"]);
+    expect(settlements).toHaveLength(100);
+    expect(settlements[0]).toMatchObject({ interactionId: "approval-100", settledAt: 100 });
+    expect(settlements.at(-1)).toMatchObject({ interactionId: "approval-1", settledAt: 1 });
+    expect(storage.nativeInteraction("sage", "approval", "approval-0")).toBeUndefined();
+    storage.close();
+  });
+
+  it("returns each bot's retained receipts without a second global cap", () => {
+    const storage = openStorage(":memory:");
+    for (const bot of ["sage", "cleo"]) {
+      for (let index = 0; index < 100; index += 1) {
+        storage.recordNativeInteraction({
+          bot, kind: "approval", interactionId: `${bot}-${index}`,
+          sessionId: `${bot}-session`, turnId: "turn", payload: { name: "tool" },
+          status: "approved", updatedAt: index,
+        });
+      }
+    }
+
+    const settlements = storage.terminalNativeSettlements(["sage", "cleo"]);
+    expect(settlements).toHaveLength(200);
+    expect(new Set(settlements.map((receipt) => receipt.bot))).toEqual(new Set(["sage", "cleo"]));
+    storage.close();
+  });
+
   it("migrates existing pending interactions without inventing a requested decision", () => {
     const path = join(mkdtempSync(join(tmpdir(), "attach-v1-legacy-interaction-")), "gateway.sqlite");
     const legacy = new DatabaseSync(path);

@@ -101,6 +101,12 @@ a second, hand-copied schema.
   session/turn ids, tool-call id, rule display name, and its pending timestamp. It carries no tool
   arguments, commands, descriptions, results, or model reasoning. `BotPendingApprovals` is capped
   at 100 current records and excludes all terminal history.
+- `BotPendingClarification` mirrors that recovery state for one unresolved option card. Its prompt
+  and bounded option labels are the same display-safe values already sent in the pending frame.
+- `BotInteractionSettlement` is compact terminal proof for one approval or clarification: stable
+  bot/session/turn/interaction identifiers, the terminal outcome, optional selected option id, and
+  gateway settlement time. It never includes an approval decision command, tool arguments/results,
+  or an option label. The gateway retains only the newest 100 terminal receipts per bot.
 
 Only profiles configured in `hermes.profiles` are exposed as CozyChat bots. Profile lifecycle
 belongs to Hermes: create or delete the profile there, then rerun the CozyGateway installer (its
@@ -133,8 +139,9 @@ preview, save, or share a result without the gateway duplicating media or exposi
 
 ### Pending approvals
 
-`GET /bots/approvals?state=pending` returns a bounded snapshot of every currently unresolved
-native approval, ordered oldest first. `state` is optional only for a simpler initial client call;
+`GET /bots/approvals?state=pending` returns a bounded snapshot envelope with every currently
+unresolved native approval (ordered oldest first), every unresolved clarification, and recent
+confirmed terminal settlement receipts. `state` is optional only for a simpler initial client call;
 when supplied it must be `pending`. The route is a recovery/read surface, not a second workflow:
 the existing `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny` routes settle the
 same durable records, and expired records are absent as soon as their lifecycle timer settles them.
@@ -143,10 +150,11 @@ command; it is not an approval or denial result and exposes neither a command id
 
 Clients MUST require capability `>= 27` before showing the global pending-requests menu or using
 this route. A client that renders the requested-versus-terminal lifecycle or submits either native
-resolution action MUST require capability `>= 28`. A client that receives an `approval.pending`
-push should open/reload this snapshot and then call the established action route for the selected
-record. It must never derive a decision URL from push text or retain an old action after a fresh
-snapshot no longer contains that `toolCallId`.
+resolution action MUST require capability `>= 28`; one that reads clarification recovery or terminal
+settlements from this envelope MUST require `>= 29`. A client keeps an action in `awaiting
+confirmation` after its POST until it observes the matching terminal receipt (or a terminal frame).
+It must never derive a decision URL from push text or retain an old action after a fresh snapshot no
+longer contains that `toolCallId`.
 
 ### Canonical native chat
 
@@ -239,7 +247,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots/groups/:group/messages` | `BotGroupSendRequest` | `202 { group, message: BotGroupMessage }` | Queues member turns through attach-v1. |
 | `POST /bots/:name/approvals/:toolCallId/approve` | — | `202 { status: "requested" }` | Durably requests a native approval; the terminal event confirms it. |
 | `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status: "requested" }` | Durably requests a native denial; the terminal event confirms it. |
-| `GET /bots/approvals` | optional `state=pending` | `BotPendingApprovals` | Bounded current pending-approval snapshot. |
+| `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |
 | `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile

@@ -10,6 +10,7 @@ import type {
   BotChatStateCause,
   BotChatStateFrame,
   BotChatStatus,
+  BotInteractionSettlement,
   BotClarifyPendingFrame,
   BotClarifyResolutionRequestedFrame,
   BotClarifyResolvedFrame,
@@ -17,6 +18,7 @@ import type {
   BotToolStep,
   BotTurnToolSteps,
   BotSummary,
+  BotPendingClarification,
   BotPendingApproval,
   RichBlock,
   ServerFrame,
@@ -157,6 +159,8 @@ export class NativeBotDataPlane {
       roster: () => this.#roster(),
       commands: (name) => this.#commands(name),
       pendingApprovals: () => this.#pendingApprovals(),
+      pendingClarifications: () => this.#pendingClarifications(),
+      terminalSettlements: () => this.#terminalSettlements(),
       attachmentHistory: (input) => this.#attachmentHistory(input),
       canonicalChat: (name) => this.#canonical(name),
       newSession: (name) => this.#newSession(name),
@@ -202,6 +206,14 @@ export class NativeBotDataPlane {
     // Storage also receives the configured set: a durable row from a removed/reconfigured profile
     // is intentionally invisible because its existing action route correctly rejects that bot.
     return this.#storage.pendingNativeApprovals([...this.#native], 100);
+  }
+
+  #pendingClarifications(): BotPendingClarification[] {
+    return this.#storage.pendingNativeClarifications([...this.#native], 100);
+  }
+
+  #terminalSettlements(): BotInteractionSettlement[] {
+    return this.#storage.terminalNativeSettlements([...this.#native]);
   }
 
   /** Expose only attach-configured identities. Hermes may host other profiles, but this gateway

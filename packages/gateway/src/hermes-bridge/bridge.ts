@@ -11,6 +11,8 @@ import type {
   BotInboxThread,
   BotModelConfig,
   BotModelConfigPatch,
+  BotInteractionSettlement,
+  BotPendingClarification,
   BotPendingApproval,
   BotProfile,
   BotProfilePatch,
@@ -227,6 +229,10 @@ export interface BotsSurface extends BotControlSurface {
   /** Capability 27: current durable approvals only; terminal records stay private to lifecycle
    * settlement and never appear in the user's decision inbox. */
   pendingApprovals(): readonly BotPendingApproval[];
+  /** Capability 29 recovery snapshot complements the approval inbox. Terminal receipts are
+   * confirmation from a later Hermes event or expiry, never the action POST. */
+  pendingClarifications(): readonly BotPendingClarification[];
+  terminalSettlements(): readonly BotInteractionSettlement[];
   attachmentHistory(input: {
     query?: string;
     kind?: "image" | "video" | "audio" | "file";

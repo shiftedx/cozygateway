@@ -293,6 +293,27 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
                 await self.client.upload_media("m", "/private/report.png", "image")
         opened.assert_not_called()
 
+    async def test_atomic_media_rollback_persists_then_cleans_remote_bytes_and_descriptor_event(self):
+        frame = self.spool.enqueue_event({
+            "kind": "media", "media": {"mediaId": "atomic-first"},
+        })
+        self.client._sent_events[frame["sequence"]] = 100
+        self.client._sent_event_bytes = 100
+        with patch.object(self.client, "_delete_media_sync") as delete:
+            await self.client.rollback_uploaded_media(["atomic-first"])
+        delete.assert_called_once_with("atomic-first")
+        self.assertEqual(self.spool.pending_events(10, 100_000), [])
+        self.assertEqual(self.spool.pending_media_cleanups(), [])
+        self.assertNotIn(frame["sequence"], self.client._sent_events)
+        self.assertEqual(self.client._sent_event_bytes, 0)
+
+    async def test_reconnect_retries_durable_atomic_media_cleanup(self):
+        self.spool.begin_media_cleanup(["cleanup-after-crash"])
+        with patch.object(self.client, "_delete_media_sync") as delete:
+            await self.client.connect()
+        delete.assert_called_once_with("cleanup-after-crash")
+        self.assertEqual(self.spool.pending_media_cleanups(), [])
+
     async def test_media_upload_reads_at_most_one_byte_past_the_protocol_cap(self):
         __import__("mimetypes").guess_type("/tmp/report.png")
         reads = []

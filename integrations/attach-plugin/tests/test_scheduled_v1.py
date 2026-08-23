@@ -30,6 +30,24 @@ class _SendResult:
 
 
 class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    _CONNECTION_ENV_KEYS = (
+        "COZYGATEWAY_URL",
+        "COZYGATEWAY_TOKEN",
+        "COZYGATEWAY_CA_FILE",
+        "COZYGATEWAY_SPOOL_PATH",
+    )
+
+    def setUp(self):
+        # These tests must never inherit a developer's live gateway endpoint,
+        # credentials, CA bundle, or durable spool. Empty values force every
+        # client through the disposable config/transport supplied by the test.
+        self._connection_env = patch.dict(
+            os.environ,
+            {key: "" for key in self._CONNECTION_ENV_KEYS},
+        )
+        self._connection_env.start()
+        self.addCleanup(self._connection_env.stop)
+
     @staticmethod
     def _config(path):
         return types.SimpleNamespace(extra={
@@ -205,6 +223,32 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[0]["messageId"], events[1]["messageId"])
             self.assertNotEqual(events[1]["messageId"], events[2]["messageId"])
 
+    async def test_explicit_occurrence_key_overrides_session_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            config = self._config(path)
+            gateway = types.ModuleType("gateway")
+            context = types.ModuleType("gateway.session_context")
+            context.get_session_env = lambda _key: "stale-session"
+            with patch.dict(sys.modules, {"gateway": gateway, "gateway.session_context": context}):
+                first = await _standalone_send(
+                    config, "home", "same report", delivery_key="occurrence-1"
+                )
+                retry = await _standalone_send(
+                    config, "home", "same report", delivery_key="occurrence-1"
+                )
+                second = await _standalone_send(
+                    config, "home", "same report", delivery_key="occurrence-2"
+                )
+            events = self._events(path)
+            self.assertEqual(first["state"], "journaled")
+            self.assertEqual(retry["state"], "journaled")
+            self.assertEqual(second["state"], "journaled")
+            self.assertEqual(
+                [event["deliveryId"] for event in events],
+                ["scheduled:occurrence-1", "scheduled:occurrence-1", "scheduled:occurrence-2"],
+            )
+
     async def test_standalone_text_and_png_journal_media_before_scheduled_without_a_turn(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "spool.sqlite")
@@ -286,6 +330,48 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             events = self._events(path)
             self.assertEqual([event["kind"] for event in events], ["media", "scheduled"])
             self.assertEqual(len(events[1]["mediaIds"]), 1)
+
+    async def test_atomic_media_failure_rolls_back_earlier_uploaded_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            png = os.path.join(directory, "report.png")
+            broken = os.path.join(directory, "missing.png")
+            for candidate in (png, broken):
+                with open(candidate, "wb") as handle:
+                    handle.write(b"\x89PNG\r\n\x1a\n")
+
+            def upload(media_id, upload_path, mime, digest, data, _expires_at):
+                if upload_path == broken:
+                    raise OSError("gateway.internal/private/path")
+                return {
+                    "mediaId": media_id, "mimeType": mime, "byteCount": len(data),
+                    "sha256": digest, "filename": "report.png", "family": "image",
+                }
+
+            async def rollback(client, media_ids):
+                client._spool.begin_media_cleanup(media_ids)
+                return client._spool.pending_media_cleanups()
+
+            with (
+                patch.object(AttachV1Client, "_upload_media_sync", side_effect=upload),
+                patch.object(AttachV1Client, "rollback_uploaded_media", autospec=True, side_effect=rollback) as rollback_call,
+            ):
+                result = await enqueue_proactive_delivery(
+                    self._config(path), thread_id="home", delivery_key="routine:atomic",
+                    message="daily report", media_files=[png, broken], media_policy="atomic",
+                )
+            self.assertEqual(result["state"], "failed")
+            self.assertEqual(result["error"], "media_upload_failed")
+            self.assertEqual(result["media_errors"], ["missing.png: io_error"])
+            rollback_call.assert_awaited_once()
+            rolled_back_ids = rollback_call.await_args.args[1]
+            self.assertEqual(len(rolled_back_ids), 1)
+            self.assertEqual(self._events(path), [])
+            spool = AttachSpool(path)
+            try:
+                self.assertEqual(spool.pending_media_cleanups(), rolled_back_ids)
+            finally:
+                spool.close()
 
     async def test_more_than_sixteen_media_files_fails_before_creating_a_spool(self):
         with tempfile.TemporaryDirectory() as directory:

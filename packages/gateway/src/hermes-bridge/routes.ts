@@ -461,15 +461,19 @@ export function registerBotRoutes(
     botApprovalRoute("deny"),
   );
 
-  // Capability 27. This is recovery state for push taps, offline action failures, and an explicit
-  // "Needs your approval" screen. It intentionally reads only the same durable pending rows the
-  // action routes settle -- there is no parallel queue to drift from approve, deny, or expiry.
+  // Capability 27/29. This is recovery state for push taps, offline action failures, and an
+  // explicit "Needs your approval" screen. Terminal receipts remain separate from pending work:
+  // a decision POST is only an outbox admission, never proof that Hermes handled it.
   app.get("/bots/approvals", requireDevice, (c) => {
     const state = c.req.query("state");
     if (state !== undefined && state !== "pending") {
       return c.json(errorBody("invalid_request", "approval state must be pending"), 400);
     }
-    return c.json({ approvals: [...chat.pendingApprovals()].slice(0, PENDING_APPROVALS_LIMIT) });
+    return c.json({
+      approvals: [...chat.pendingApprovals()].slice(0, PENDING_APPROVALS_LIMIT),
+      clarifications: [...(chat.pendingClarifications?.() ?? [])].slice(0, PENDING_APPROVALS_LIMIT),
+      settlements: [...(chat.terminalSettlements?.() ?? [])],
+    });
   });
 
   app.post(

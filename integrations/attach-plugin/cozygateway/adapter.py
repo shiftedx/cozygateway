@@ -1421,6 +1421,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    delivery_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compatibility wrapper for Hermes' out-of-process cron sender.
 
@@ -1434,11 +1435,12 @@ async def _standalone_send(
     # A cron session id is caller-owned and unique per execution while remaining stable across
     # delivery retries. Fall back to a content-addressed key for older harnesses that do not
     # expose session context; this still prevents retry duplication without inventing a clock.
-    run_key = ""
+    run_key = str(delivery_key or "").strip()
     try:
         from gateway.session_context import get_session_env  # harness-defined identifier
 
-        run_key = str(get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or "").strip()
+        if not run_key:
+            run_key = str(get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or "").strip()
     except Exception:
         pass
     if not run_key:
@@ -1652,6 +1654,14 @@ async def enqueue_proactive_delivery(
                 except Exception as exc:  # noqa: BLE001 - policy below determines whether text may continue
                     media_errors.append(_proactive_media_error(path, exc))
             if media_errors and media_policy == "atomic":
+                # A later upload failure abandons the entire occurrence. Roll
+                # back every earlier successful upload before reporting the
+                # original failure; the client persists failed remote deletes
+                # for safe reconnect retry.
+                try:
+                    await client.rollback_uploaded_media(media_ids)
+                except Exception:  # noqa: BLE001 - preserve the media failure as the public result
+                    logger.warning("attach: atomic scheduled-media rollback failed", exc_info=True)
                 return _proactive_failure("media_upload_failed", delivery_id, message_id, media_errors)
         blocks = normalize_text_to_blocks(text)
         if not blocks and not media_ids:

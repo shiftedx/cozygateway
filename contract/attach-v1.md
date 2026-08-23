@@ -14,7 +14,8 @@ chat sends, live turns, and groups; CozyGateway MUST NOT submit those chats thro
 ## Transport and negotiation
 
 - WebSocket: `GET /attach/v1`, authenticated with `Authorization: Bearer <token>` during upgrade.
-- Media bytes: `POST` and `GET /attach/v1/media/:mediaId`, with the same bearer token.
+- Media bytes: `POST`, `GET`, and atomic-rollback `DELETE /attach/v1/media/:mediaId`, with the
+  same bearer token.
 - The plugin sends `hello` first. Any other first frame closes the socket. Version 1 is selected by
   the endpoint plus `hello.version: 1`; no unversioned attach endpoint exists.
 - `hello` carries a stable plugin `instanceId`, supported capabilities, event/command resume
@@ -132,6 +133,12 @@ Uploads are immutable and scoped to the authenticated identity. The gateway veri
 sniffed family/MIME, declared size, and SHA-256 before commit. Downloads support byte ranges and
 expiry. A failed media item does not invalidate text or other valid media in the same committed
 message; missing items are omitted from the app attachment list.
+
+An atomic producer that abandons an occurrence removes its local descriptor events first and then
+uses authenticated `DELETE` for each uploaded id. `204` is idempotent, including when a prior
+cleanup already removed the id. The gateway refuses to remove a media item already referenced by a
+durable commit or scheduled delivery; that object is reachable and is not an orphan. A plugin keeps
+failed cleanup ids in its durable spool and retries them after reconnect.
 
 ## Bot Mode projection
 
