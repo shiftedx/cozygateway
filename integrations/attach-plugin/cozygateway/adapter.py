@@ -37,6 +37,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .attach_client import (
@@ -1327,6 +1328,9 @@ class AttachAdapter:
 
 _ACTIVE_ADAPTERS: "Set[Any]" = set()
 _ACTIVE_ADAPTERS_LOCK = threading.Lock()
+_CURRENT_TOOL_OCCURRENCE: ContextVar[Optional[str]] = ContextVar(
+    "cozygateway_tool_occurrence", default=None
+)
 
 
 def _register_active_adapter(adapter: Any) -> None:
@@ -1487,12 +1491,18 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
 
 def _pre_tool_call(**kwargs: Any) -> None:
     """``pre_tool_call`` hook: the chip-open leg. Observer only (returns None)."""
+    if str(kwargs.get("tool_name") or "") == "send_message":
+        _CURRENT_TOOL_OCCURRENCE.set(_tool_call_id(kwargs))
     _dispatch_tool_hook("start", kwargs)
 
 
 def _post_tool_call(**kwargs: Any) -> None:
     """``post_tool_call`` hook: the chip-close leg (carries the outcome)."""
-    _dispatch_tool_hook("complete", kwargs)
+    try:
+        _dispatch_tool_hook("complete", kwargs)
+    finally:
+        if str(kwargs.get("tool_name") or "") == "send_message":
+            _CURRENT_TOOL_OCCURRENCE.set(None)
 
 
 def _dispatch_approval_hook(phase: str, kwargs: Dict[str, Any]) -> None:
@@ -1663,20 +1673,23 @@ async def _send_message_handler(
     target = str(args.get("target") or "").strip().lower()
     canonical_home = target == platform_name
     key_material = "\0".join([platform_name, chat_id, cleaned, *media_files])
-    session_key = ""
+    occurrence_key = _CURRENT_TOOL_OCCURRENCE.get() or str(
+        args.get("tool_call_id") or args.get("idempotency_key") or ""
+    ).strip()
     try:
         from gateway.session_context import get_session_env  # harness-defined identifier
 
-        session_key = str(
-            get_session_env("HERMES_SESSION_ID")
-            or get_session_env("HERMES_SESSION_KEY")
-            or get_session_env("HERMES_SESSION_MESSAGE_ID")
-            or ""
-        ).strip()
+        if not occurrence_key:
+            occurrence_key = str(
+                get_session_env("HERMES_SESSION_MESSAGE_ID")
+                or get_session_env("HERMES_SESSION_ID")
+                or get_session_env("HERMES_SESSION_KEY")
+                or ""
+            ).strip()
     except Exception:
         pass
     delivery_key = "tool:" + hashlib.sha256(
-        f"{session_key}\0{key_material}".encode("utf-8")
+        f"{occurrence_key}\0{key_material}".encode("utf-8")
     ).hexdigest()
     resident = _resident_adapter()
     if resident is not None and resident._ready.is_set():

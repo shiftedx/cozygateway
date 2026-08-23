@@ -126,6 +126,15 @@ class AttachV1Client:
             return context
         return None
 
+    def _current_token(self) -> str:
+        token = self._config.token
+        if self._config.token_provider is not None:
+            try:
+                token = self._config.token_provider().strip() or token
+            except Exception:
+                logger.warning("attach-v1: credential refresh failed; using last known token")
+        return token
+
     async def connect(self) -> None:
         # A caller that timed out `close()` left its raw socket close task alive.
         # Do not overwrite that ownership with a new connection.
@@ -153,13 +162,7 @@ class AttachV1Client:
             await self._dispatch_command(frame, replay=True)
 
     async def _open(self, version: int) -> None:
-        token = self._config.token
-        if self._config.token_provider is not None:
-            try:
-                token = self._config.token_provider().strip() or token
-            except Exception:
-                logger.warning("attach-v1: credential refresh failed; using last known token")
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {"Authorization": f"Bearer {self._current_token()}"}
         factory = self._config.connect_factory or _default_connect
         self._ws = await factory(self._ws_url, headers, self._ssl_context())
         hello: Dict[str, Any] = {
@@ -424,7 +427,7 @@ class AttachV1Client:
         parsed = urlparse(self._config.gateway_url)
         origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
         request = Request(f"{origin}/attach/v1/deliveries/{quote(delivery_id, safe='')}", headers={
-            "Authorization": f"Bearer {self._config.token}",
+            "Authorization": f"Bearer {self._current_token()}",
             "User-Agent": "CozyGateway-Attach/1.0",
         })
         context = self._ssl_context() if origin.startswith("https://") else None
@@ -440,7 +443,7 @@ class AttachV1Client:
         parsed = urlparse(self._config.gateway_url)
         origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
         request = Request(f"{origin}/attach/v1/media/{quote(media_id, safe='')}", headers={
-            "Authorization": f"Bearer {self._config.token}",
+            "Authorization": f"Bearer {self._current_token()}",
             "User-Agent": "CozyGateway-Attach/1.0",
         })
         context = self._ssl_context() if origin.startswith("https://") else None
@@ -464,7 +467,7 @@ class AttachV1Client:
         parsed = urlparse(self._config.gateway_url)
         origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
         headers = {
-            "Authorization": f"Bearer {self._config.token}",
+            "Authorization": f"Bearer {self._current_token()}",
             "Content-Type": mime,
             # urllib's default Python-urllib signature is blocked by common
             # Cloudflare Browser Integrity rules (error 1010). Identify this
@@ -487,7 +490,7 @@ class AttachV1Client:
         request = Request(
             f"{origin}/attach/v1/media/{quote(media_id, safe='')}",
             headers={
-                "Authorization": f"Bearer {self._config.token}",
+                "Authorization": f"Bearer {self._current_token()}",
                 "User-Agent": "CozyGateway-Attach/1.0",
             },
             method="DELETE",

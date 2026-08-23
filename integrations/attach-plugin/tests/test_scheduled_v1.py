@@ -20,6 +20,8 @@ except ModuleNotFoundError:
 from cozygateway.adapter import (
     AttachAdapter,
     _hermes_standalone_send,
+    _post_tool_call,
+    _pre_tool_call,
     _send_message_handler,
     _standalone_send,
     enqueue_proactive_delivery,
@@ -119,6 +121,7 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "gateway.platforms": platforms,
             "gateway.platforms.base": base,
         }), patch("cozygateway.adapter._resident_adapter", return_value=resident):
+            _pre_tool_call(tool_name="send_message", tool_call_id="call-1")
             result = await _send_message_handler(
                 {"target": "cozygateway", "message": "daily note"},
                 "home",
@@ -131,13 +134,24 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "cozygateway",
                 types.SimpleNamespace(extra={}),
             )
+            _post_tool_call(tool_name="send_message", tool_call_id="call-1")
+            _pre_tool_call(tool_name="send_message", tool_call_id="call-2")
+            await _send_message_handler(
+                {"target": "cozygateway", "message": "daily note"},
+                "home",
+                "cozygateway",
+                types.SimpleNamespace(extra={}),
+            )
+            _post_tool_call(tool_name="send_message", tool_call_id="call-2")
 
         self.assertEqual(result["state"], "journaled")
         self.assertIn("projection is not yet confirmed", result["error"])
         self.assertNotIn("success", result)
         first_key = resident.send_proactive.await_args_list[0].kwargs["delivery_key"]
         retry_key = resident.send_proactive.await_args_list[1].kwargs["delivery_key"]
+        distinct_key = resident.send_proactive.await_args_list[2].kwargs["delivery_key"]
         self.assertEqual(first_key, retry_key)
+        self.assertNotEqual(first_key, distinct_key)
         self.assertEqual(retry["state"], "journaled")
 
     async def test_resident_proactive_media_count_fails_instead_of_truncating(self):

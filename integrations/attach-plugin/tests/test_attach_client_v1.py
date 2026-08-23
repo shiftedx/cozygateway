@@ -376,6 +376,34 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured[0].get_header("User-agent"), "CozyGateway-Attach/1.0")
 
+    def test_rotated_credential_is_shared_by_media_and_receipt_http_requests(self):
+        captured = []
+        self.client._config.token_provider = lambda: "rotated-token"
+
+        class Response:
+            headers = {}
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self):
+                if "/deliveries/" in captured[-1].full_url:
+                    return b'{"state":"projected"}'
+                return b'{"media":{"mediaId":"m"}}'
+
+        def open_request(request, **_kwargs):
+            captured.append(request)
+            return Response()
+
+        with patch("cozygateway.attach_client_v1.urlopen", side_effect=open_request):
+            self.client._upload_media_sync(
+                "m", "/tmp/movie.mp4", "video/mp4", "a" * 64, b"video", None
+            )
+            self.client._delivery_receipt_sync("delivery", 0.1)
+
+        self.assertEqual(
+            [request.get_header("Authorization") for request in captured],
+            ["Bearer rotated-token", "Bearer rotated-token"],
+        )
+
     async def test_media_upload_rejects_an_oversize_file_before_opening_it(self):
         __import__("mimetypes").guess_type("/tmp/report.png")
         with patch("cozygateway.attach_client_v1.os.stat", return_value=type("Stat", (), {"st_size": 8 * 1024 * 1024 + 1})()), \
