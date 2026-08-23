@@ -17,6 +17,8 @@ from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Unio
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from websockets.exceptions import ConnectionClosed
+
 from .attach_client import (
     AttachAuthError,
     AttachSupersededError,
@@ -386,6 +388,10 @@ class AttachV1Client:
                     if await self._fallback_to_v1(socket):
                         continue
                     return
+                except ConnectionClosed:
+                    if await self._fallback_to_v1(socket):
+                        continue
+                    raise
                 await self._dispatch_inbound(raw)
         except Exception as exc:
             code = _close_code(exc)

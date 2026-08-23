@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
+
 from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
 from cozygateway.attach_spool import AttachSpool
 
@@ -23,6 +26,8 @@ class FakeSocket:
         value = await self.inbound.get()
         if value is None:
             raise StopAsyncIteration
+        if isinstance(value, BaseException):
+            raise value
         return value
 
 
@@ -140,6 +145,33 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             connect_factory=old_server_factory,
         ))
         await first.close()
+        await second.inbound.put(json.dumps({
+            "kind": "hello_ack", "version": 1, "capabilities": ["mobile_node"],
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+        await client.connect()
+        watcher = __import__("asyncio").create_task(client.watch())
+        for _ in range(20):
+            if client._negotiated:
+                break
+            await __import__("asyncio").sleep(0.001)
+        self.assertTrue(client._negotiated)
+        self.assertEqual((first.sent[0]["version"], second.sent[0]["version"]), (2, 1))
+        await client.close()
+        await watcher
+
+    async def test_pre_ack_connection_closed_error_falls_back_to_v1(self):
+        first, second = FakeSocket(), FakeSocket()
+        sockets = iter([first, second])
+
+        async def old_server_factory(_url, _headers, _ssl):
+            return next(sockets)
+
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url="http://gateway.example", token="secret", spool=self.spool,
+            connect_factory=old_server_factory,
+        ))
+        await first.inbound.put(ConnectionClosedError(Close(1008, "unknown hello field"), None, None))
         await second.inbound.put(json.dumps({
             "kind": "hello_ack", "version": 1, "capabilities": ["mobile_node"],
             "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
