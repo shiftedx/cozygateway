@@ -11,6 +11,8 @@ import {
   BOTS_CAPABILITY_VERSION,
   BotApprovalPendingFrameSchema,
   BotApprovalResolvedFrameSchema,
+  BotPendingApprovalSchema,
+  BotPendingApprovalsSchema,
   ServerFrameSchema,
   check,
 } from "../src/index.ts";
@@ -80,5 +82,21 @@ describe("bots approval frames", () => {
     // The approval surface landed AT 10 and the number only ever goes up, so this pins the floor a
     // client must require for approve/deny while letting later, additive bumps through.
     expect(BOTS_CAPABILITY_VERSION).toBeGreaterThanOrEqual(10);
+  });
+
+  it("defines a bounded safe pending-approval inbox with no raw tool payload fields", () => {
+    const item = {
+      bot: "scout",
+      sessionId: "stored-1",
+      turnId: "runtime-1#1-1",
+      toolCallId: "4e8b2c1d9f0a4c1e8b2c1d9f0a4c1e8b",
+      ruleName: "terminal:rm",
+      createdAt: 1_800_000_000_000,
+    };
+    expect(check(BotPendingApprovalSchema, item)).toBe(true);
+    expect(check(BotPendingApprovalsSchema, { approvals: [item] })).toBe(true);
+    expect(Object.keys(BotPendingApprovalSchema.properties)).toEqual([
+      "bot", "sessionId", "turnId", "toolCallId", "ruleName", "createdAt",
+    ]);
   });
 });

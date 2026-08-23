@@ -11,6 +11,7 @@ import type {
   BotInboxThread,
   BotModelConfig,
   BotModelConfigPatch,
+  BotPendingApproval,
   BotProfile,
   BotProfilePatch,
   BotRoutine,
@@ -222,6 +223,9 @@ export interface BotControlSurface {
 }
 export interface BotsSurface extends BotControlSurface {
   commands(name: string): readonly BotSlashCommand[];
+  /** Capability 27: current durable approvals only; terminal records stay private to lifecycle
+   * settlement and never appear in the user's decision inbox. */
+  pendingApprovals(): readonly BotPendingApproval[];
   attachmentHistory(input: {
     query?: string;
     kind?: "image" | "video" | "audio" | "file";

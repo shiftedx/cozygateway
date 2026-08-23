@@ -92,6 +92,7 @@ export const SESSION_LIST_LIMIT = 200;
 export const CATALOG_QUERY_MAX = 200;
 export const ATTACHMENT_HISTORY_QUERY_MAX = 200;
 export const ATTACHMENT_HISTORY_LIMIT_MAX = 100;
+export const PENDING_APPROVALS_LIMIT = 100;
 
 /** Hermes' JSON-RPC code for "no profile by that name". Mapped to a 404 rather than the blanket 502
  *  every other rejection gets, so the TOCTOU window between a roster-cache hit and the call behind
@@ -452,6 +453,17 @@ export function registerBotRoutes(
     requireDevice,
     botApprovalRoute("deny"),
   );
+
+  // Capability 27. This is recovery state for push taps, offline action failures, and an explicit
+  // "Needs your approval" screen. It intentionally reads only the same durable pending rows the
+  // action routes settle -- there is no parallel queue to drift from approve, deny, or expiry.
+  app.get("/bots/approvals", requireDevice, (c) => {
+    const state = c.req.query("state");
+    if (state !== undefined && state !== "pending") {
+      return c.json(errorBody("invalid_request", "approval state must be pending"), 400);
+    }
+    return c.json({ approvals: [...chat.pendingApprovals()].slice(0, PENDING_APPROVALS_LIMIT) });
+  });
 
   app.post(
     "/bots/:name/clarifications/:clarifyId",

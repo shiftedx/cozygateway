@@ -729,7 +729,12 @@ describe("attach-v1 native Bot Mode plane", () => {
 
     plane.handle("sage", { kind: "event", sequence: 1, eventId: "tool", event: { kind: "tool", threadId: chat.sessionId, turnId: "turn", callId: "call", name: "search", status: "running" } });
     plane.handle("sage", { kind: "event", sequence: 2, eventId: "approval", event: { kind: "approval", threadId: chat.sessionId, turnId: "turn", approvalId: "approval-1", callId: "call", name: "search", status: "pending" } });
+    expect(plane.surface().pendingApprovals()).toEqual([{
+      bot: "sage", sessionId: chat.sessionId, turnId: "turn", toolCallId: "approval-1",
+      ruleName: "search", createdAt: 500,
+    }]);
     expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device")).toBe("approved");
+    expect(plane.surface().pendingApprovals()).toEqual([]);
     expect(await plane.surface().resolveApproval("sage", "approval-1", "deny", "other-device")).toBe("not_pending");
     expect((ingress.sendApprovalResolution as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
     const scheduled: AttachV1EventFrame = { kind: "event", sequence: 1, eventId: "scheduled", event: { kind: "scheduled", threadId: chat.sessionId, deliveryId: "cron-1", messageId: "scheduled-1", blocks: [{ type: "paragraph", text: "daily note" }] } };
@@ -773,6 +778,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     const recovered = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => 20 });
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(storage.nativeInteraction("sage", "approval", "approve-1")?.status).toBe("expired");
+    expect(recovered.surface().pendingApprovals()).toEqual([]);
     expect(frames).toContainEqual(expect.objectContaining({ type: "bot_approval_resolved", toolCallId: "approve-1", outcome: "expired" }));
 
     await recovered.surface().chatHistory("sage");

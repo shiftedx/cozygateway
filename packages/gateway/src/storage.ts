@@ -1999,6 +1999,39 @@ export class Storage {
     return rows.map(({ payloadJson, ...row }) => ({ ...row, payload: JSON.parse(payloadJson) as unknown }));
   }
 
+  /** Bounded current-state projection for the mobile approval inbox. `updated_at` is the pending
+   * record's creation time: records are inserted pending once and only transition to a terminal
+   * status afterwards, at which point this query excludes them. Keep the payload JSON in SQLite;
+   * this read selects only the already-safe rule display name and can never surface tool args. */
+  pendingNativeApprovals(limit: number): Array<{
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    toolCallId: string;
+    ruleName: string;
+    createdAt: number;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT bot, session_id AS sessionId, turn_id AS turnId,
+                interaction_id AS toolCallId,
+                json_extract(payload_json, '$.name') AS ruleName,
+                updated_at AS createdAt
+         FROM bot_native_interactions
+         WHERE kind = 'approval' AND status = 'pending'
+         ORDER BY updated_at, interaction_id
+         LIMIT ?`,
+      )
+      .all(limit) as unknown as Array<{
+        bot: string;
+        sessionId: string;
+        turnId: string;
+        toolCallId: string;
+        ruleName: string;
+        createdAt: number;
+      }>;
+  }
+
   close(): void {
     this.#db.close();
   }

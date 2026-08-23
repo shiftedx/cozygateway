@@ -15,6 +15,7 @@ import type {
   BotToolStep,
   BotTurnToolSteps,
   BotSummary,
+  BotPendingApproval,
   RichBlock,
   ServerFrame,
 } from "cozygateway-contract";
@@ -152,6 +153,7 @@ export class NativeBotDataPlane {
     const overrides: Partial<BotsSurface> = {
       roster: () => this.#roster(),
       commands: (name) => this.#commands(name),
+      pendingApprovals: () => this.#pendingApprovals(),
       attachmentHistory: (input) => this.#attachmentHistory(input),
       canonicalChat: (name) => this.#canonical(name),
       newSession: (name) => this.#newSession(name),
@@ -181,6 +183,10 @@ export class NativeBotDataPlane {
           : value;
       },
     }) as BotsSurface;
+  }
+
+  #pendingApprovals(): BotPendingApproval[] {
+    return this.#storage.pendingNativeApprovals(100);
   }
 
   /** Expose only attach-configured identities. Hermes may host other profiles, but this gateway

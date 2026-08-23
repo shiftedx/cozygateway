@@ -955,6 +955,28 @@ export const BotAttachmentHistorySchema = Type.Object({
 });
 export type BotAttachmentHistory = Static<typeof BotAttachmentHistorySchema>;
 
+/** One approval currently awaiting a decision. This is deliberately a compact recovery snapshot,
+ * not another approval-request payload: raw tool arguments, commands, descriptions, results, and
+ * model reasoning never enter it. `createdAt` is the durable pending-record timestamp; a pending
+ * record is immutable until its terminal transition, so it cannot be confused with a resolution
+ * time. */
+export const BotPendingApprovalSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+  toolCallId: Type.String({ minLength: 1 }),
+  ruleName: Type.String({ minLength: 1, maxLength: 512 }),
+  createdAt: Type.Integer(),
+});
+export type BotPendingApproval = Static<typeof BotPendingApprovalSchema>;
+
+/** Capability 27's bounded, current-state approval inbox. It only ever represents `pending`;
+ * terminal records remain durable for idempotency but are deliberately absent. */
+export const BotPendingApprovalsSchema = Type.Object({
+  approvals: Type.Array(BotPendingApprovalSchema, { maxItems: 100 }),
+});
+export type BotPendingApprovals = Static<typeof BotPendingApprovalsSchema>;
+
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
  *  configured.
  *
@@ -1070,6 +1092,10 @@ export type BotAttachmentHistory = Static<typeof BotAttachmentHistorySchema>;
  *    message route; no command execution logic is duplicated in CozyGateway or a client.
  *  - `26`: aggregate agent-sent attachment history. `GET /bots/attachments` searches and filters
  *    artifacts across configured profiles and every durable native session without duplicating
- *    their bytes or weakening the existing authenticated download route. */
+ *    their bytes or weakening the existing authenticated download route.
+ *  - `27`: pending approval inbox. `GET /bots/approvals?state=pending` returns at most 100
+ *    durable unresolved approvals, carrying only the bot/session/turn routing ids, tool-call id,
+ *    safe rule display name, and original pending timestamp. Resolved and expired records vanish
+ *    because the endpoint reads the same lifecycle truth as the existing action routes. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 26;
+export const BOTS_CAPABILITY_VERSION = 27;

@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 26. This extension is independent of the frozen core
+Status: v1 extension, capability version 27. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 26 }
+"capabilities": { "com.cozylabs.bots": 27 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -65,6 +65,7 @@ extension omits the capability and does not register `/bots` routes.
 | 24 | Common document attachment sends and file downloads. |
 | 25 | Profile-local discovery of Hermes gateway-safe, plugin, and installed skill commands. |
 | 26 | Searchable aggregate history of agent-sent attachments across native sessions. |
+| 27 | Bounded current-state inbox for pending native approvals. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -95,6 +96,10 @@ a second, hand-copied schema.
 - `BotAttachmentHistoryItem` identifies one assistant attachment in a durable native transcript,
   including its bot, session, message caption, timestamp, and ordinary opaque attachment block.
   `BotAttachmentHistory` is a newest-first bounded page with an optional next offset.
+- `BotPendingApproval` is the safe metadata necessary to render one unresolved approval: bot,
+  session/turn ids, tool-call id, rule display name, and its pending timestamp. It carries no tool
+  arguments, commands, descriptions, results, or model reasoning. `BotPendingApprovals` is capped
+  at 100 current records and excludes all terminal history.
 
 Only profiles configured in `hermes.profiles` are exposed as CozyChat bots. Profile lifecycle
 belongs to Hermes: create or delete the profile there, then rerun the CozyGateway installer (its
@@ -124,6 +129,19 @@ to 100 and `nextOffset` is `null` when the page is complete.
 Clients MUST require capability `>= 26`. This route indexes metadata only. Attachment bytes remain
 behind the existing authenticated `GET /bots/:name/chat/attachments/:fileId` route, so clients can
 preview, save, or share a result without the gateway duplicating media or exposing a path.
+
+### Pending approvals
+
+`GET /bots/approvals?state=pending` returns a bounded snapshot of every currently unresolved
+native approval, ordered oldest first. `state` is optional only for a simpler initial client call;
+when supplied it must be `pending`. The route is a recovery/read surface, not a second workflow:
+the existing `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny` routes settle the
+same durable records, and expired records are absent as soon as their lifecycle timer settles them.
+
+Clients MUST require capability `>= 27` before showing the global pending-requests menu or using
+this route. A client that receives an `approval.pending` push should open/reload this snapshot and
+then call the established action route for the selected record. It must never derive a decision URL
+from push text or retain an old action after a fresh snapshot no longer contains that `toolCallId`.
 
 ### Canonical native chat
 
@@ -216,6 +234,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots/groups/:group/messages` | `BotGroupSendRequest` | `202 { group, message: BotGroupMessage }` | Queues member turns through attach-v1. |
 | `POST /bots/:name/approvals/:toolCallId/approve` | — | `202 { status }` | Resolves a pending native approval. |
 | `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status }` | Resolves a pending native approval. |
+| `GET /bots/approvals` | optional `state=pending` | `BotPendingApprovals` | Bounded current pending-approval snapshot. |
 | `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { status: "selected" }` | Resolves a pending native clarification option. |
 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
