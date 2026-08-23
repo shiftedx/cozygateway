@@ -613,7 +613,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     }
   });
 
-  it("interrupts an acknowledged executing turn when the existing gateway bound expires", async () => {
+  it("projects an acknowledged turn's final answer even when it arrives after the gateway timeout", async () => {
     vi.useFakeTimers();
     try {
       const storage = openStorage(":memory:");
@@ -638,13 +638,27 @@ describe("attach-v1 native Bot Mode plane", () => {
         now: () => now,
         turnTimeoutMs: 50,
       });
-      await plane.surface().sendChatMessage("sage", "running");
+      const sent = await plane.surface().sendChatMessage("sage", "running");
+      const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
       storage.ackAttachCommand("sage", command!.sequence, command!.commandId, 1);
       now = 50;
       await vi.advanceTimersByTimeAsync(50);
 
       expect(interrupt).toHaveBeenCalledOnce();
       expect(await plane.surface().chatHistory("sage")).toMatchObject({ running: false, status: "timed_out" });
+      expect(storage.nativeBotLastTerminal("sage", sent.sessionId)?.status).toBe("timed_out");
+
+      expect(plane.handle("sage", {
+        kind: "event", sequence: 1, eventId: "eventual-final", event: {
+          kind: "commit", threadId: sent.sessionId, turnId,
+          messageId: "eventual-final", blocks: [{ type: "paragraph", text: "The real answer." }],
+        },
+      })).toBe(true);
+      expect(await plane.surface().chatHistory("sage")).toMatchObject({
+        running: false,
+        status: "completed",
+        messages: [{ text: "running" }, { id: "eventual-final", text: "The real answer." }],
+      });
       plane.close();
       storage.close();
     } finally {

@@ -1778,7 +1778,13 @@ export class Storage {
         `INSERT INTO bot_native_turn_terminals
            (bot, session_id, turn_id, status, cause, completed_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bot, turn_id) DO NOTHING`,
+         ON CONFLICT(bot, turn_id) DO UPDATE SET
+           session_id = excluded.session_id,
+           status = excluded.status,
+           cause = excluded.cause,
+           completed_at = excluded.completed_at
+         WHERE bot_native_turn_terminals.status = 'timed_out'
+           AND excluded.status = 'completed'`,
       )
       .run(
         input.bot,
@@ -1790,13 +1796,22 @@ export class Storage {
       );
   }
 
-  nativeBotTurnTerminal(bot: string, sessionId: string, turnId: string): boolean {
-    return this.#db
+  nativeBotTurnTerminal(bot: string, sessionId: string, turnId: string): {
+    status: "completed" | "failed" | "interrupted" | "timed_out";
+    cause?: "cancelled";
+  } | undefined {
+    const row = this.#db
       .prepare(
-        `SELECT 1 FROM bot_native_turn_terminals
+        `SELECT status, cause FROM bot_native_turn_terminals
          WHERE bot = ? AND session_id = ? AND turn_id = ?`,
       )
-      .get(bot, sessionId, turnId) !== undefined;
+      .get(bot, sessionId, turnId) as {
+        status: "completed" | "failed" | "interrupted" | "timed_out";
+        cause: "cancelled" | null;
+      } | undefined;
+    return row === undefined
+      ? undefined
+      : { status: row.status, ...(row.cause === null ? {} : { cause: row.cause }) };
   }
 
   /** Last durable terminal for a native session, including a gateway deadline before any plugin

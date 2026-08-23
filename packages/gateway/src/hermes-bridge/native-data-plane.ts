@@ -325,8 +325,33 @@ export class NativeBotDataPlane {
     // own durable group-turn binding.
     if (!this.#storage.nativeBotHasSession(key, sessionId)) return false;
     if ("turnId" in event) {
-      if (this.#storage.nativeBotTurnTerminal(key, sessionId, event.turnId)) return true;
       const command = this.#storage.attachTurnCommand(key, event.turnId);
+      const terminal = this.#storage.nativeBotTurnTerminal(key, sessionId, event.turnId);
+      if (terminal !== undefined) {
+        const delivery = this.#storage.nativeBotTurnDelivery(key, event.turnId);
+        // An acknowledged Hermes turn may finish after the local response deadline. Its durable
+        // answer is still authoritative; only an unacknowledged/cancelled turn stays timed out.
+        if (
+          event.kind === "commit" &&
+          terminal.status === "timed_out" &&
+          command?.threadId === sessionId &&
+          delivery !== undefined &&
+          delivery.acknowledgedAt !== null
+        ) {
+          const committed = this.#commit(
+            key, sessionId, event.messageId, event.blocks, event.mediaIds,
+          );
+          if (committed) {
+            this.#storage.recordNativeBotTerminal({
+              bot: key, sessionId, turnId: event.turnId,
+              status: "completed", completedAt: this.#now(),
+            });
+            this.#state(key, sessionId, "complete", false, { status: "completed" });
+          }
+          return committed;
+        }
+        return true;
+      }
       if (command === undefined || command.threadId !== sessionId) return false;
     }
     if (event.kind === "draft") {
