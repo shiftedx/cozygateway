@@ -751,6 +751,50 @@ describe("attach-v1 native Bot Mode plane", () => {
     }
   });
 
+  it("does not impose a wall-clock timeout when none is configured", async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = openStorage(":memory:");
+      const interrupt = vi.fn(() => true);
+      let command: { sequence: number; commandId: string } | undefined;
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {
+          isAttached: () => true,
+          sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+            const queued = storage.enqueueAttachCommand(
+              bot,
+              "turn",
+              { kind: "turn", ...input } as never,
+              Date.now(),
+            );
+            command = { sequence: queued.sequence, commandId: queued.commandId };
+            return true;
+          },
+          sendNativeInterrupt: interrupt,
+        } as unknown as AttachV1Ingress,
+        nativeBots: ["cleo"],
+        chatSuggestion: "",
+        broadcast: () => undefined,
+      });
+      const sent = await plane.surface().sendChatMessage("cleo", "keep working");
+      storage.ackAttachCommand("cleo", command!.sequence, command!.commandId, Date.now());
+
+      await vi.advanceTimersByTimeAsync(600_000);
+
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(await plane.surface().chatHistory("cleo")).toMatchObject({
+        sessionId: sent.sessionId,
+        running: true,
+      });
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("projects an acknowledged turn's final answer even when it arrives after the gateway timeout", async () => {
     vi.useFakeTimers();
     try {

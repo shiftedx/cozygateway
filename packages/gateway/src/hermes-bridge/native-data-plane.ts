@@ -143,7 +143,7 @@ export class NativeBotDataPlane {
     this.#onChatMessage = opts.onChatMessage;
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
-    this.#turnTimeoutMs = opts.turnTimeoutMs ?? 600_000;
+    this.#turnTimeoutMs = opts.turnTimeoutMs ?? 0;
     this.#log =
       opts.log ??
       ((message) => void process.stderr.write(`[native-bot] ${message}\n`));

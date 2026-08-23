@@ -31,14 +31,9 @@ export interface AttachAdapter extends BackendAdapter {
   handleDisconnect(): void;
 }
 
-/** Generous by default: agentic turns with tool use can legitimately run for minutes. The
- *  per-agent options.turnTimeoutSeconds overrides it. */
-export const DEFAULT_TURN_TIMEOUT_SECONDS = 600;
-
 export interface ParsedAttachOptions {
   tokenEnv: string;
   token: string;
-  turnTimeoutMs: number;
 }
 
 /** Parse and validate an attach agent's options. The config file carries the NAME of the
@@ -48,7 +43,6 @@ export function parseAttachOptions(
   profileId: string,
   profile: HermesBridgeConfig["profiles"][string],
   env: Record<string, string | undefined>,
-  turnTimeoutSeconds = DEFAULT_TURN_TIMEOUT_SECONDS,
 ): ParsedAttachOptions {
   const tokenEnv = profile.tokenEnv;
   const token = env[tokenEnv];
@@ -57,10 +51,7 @@ export function parseAttachOptions(
       `Hermes profile "${profileId}": environment variable "${tokenEnv}" is not set; the attach token rides the environment, never the config file`,
     );
   }
-  if (!Number.isFinite(turnTimeoutSeconds) || turnTimeoutSeconds <= 0) {
-    throw new Error("turnTimeoutSeconds must be a positive number");
-  }
-  return { tokenEnv, token, turnTimeoutMs: turnTimeoutSeconds * 1000 };
+  return { tokenEnv, token };
 }
 
 /** Build the token-to-agentId map the ingress authenticates against. The token IS the agent

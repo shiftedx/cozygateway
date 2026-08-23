@@ -133,14 +133,14 @@ describe("loadConfig", () => {
     expect(() => loadConfig(path)).toThrow(ContractViolation);
   });
 
-  // Issue #1460: turnTimeoutSeconds is a gateway-level wall-clock bound on a single agent turn,
-  // defaulting to 600 via the same schema-default-plus-pre-validation-spread mechanism as port.
-  it("defaults turnTimeoutSeconds to 600 when absent", () => {
+  // An active agent turn has no safe wall-clock ceiling: long tool runs and context compaction can
+  // legitimately exceed ten minutes. Only an explicit operator policy may interrupt one.
+  it("does not impose a turn timeout when turnTimeoutSeconds is absent", () => {
     const path = writeConfig({
       name: "test-gateway",
       hermes,
     });
-    expect(loadConfig(path).turnTimeoutSeconds).toBe(600);
+    expect(loadConfig(path).turnTimeoutSeconds).toBe(0);
   });
 
   it("accepts an explicit turnTimeoutSeconds from the config file", () => {
