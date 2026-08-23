@@ -3,7 +3,7 @@ import type { RichBlock } from "cozygateway-contract";
 /** Render typed blocks to the plain text a harness receives as its prompt. Deliberately lossy
  *  in the harness direction (markdown-ish, good enough to prompt with); the plugin normalizes
  *  the harness's reply back into typed blocks on its side. */
-export function blocksToText(blocks: RichBlock[]): string {
+export function blocksToText(blocks: readonly RichBlock[]): string {
   const parts: string[] = [];
   for (const block of blocks) {
     switch (block.type) {

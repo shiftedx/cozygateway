@@ -15,10 +15,12 @@ import type {
   BotToolStep,
   BotTurnToolSteps,
   BotSummary,
+  RichBlock,
   ServerFrame,
 } from "cozygateway-contract";
 
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
+import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
 import { BackendUnavailable } from "../errors.ts";
@@ -280,7 +282,7 @@ export class NativeBotDataPlane {
         bot: key,
         sessionId,
         turnId: event.turnId,
-        text: blocksText(event.blocks),
+        text: blocksToText(event.blocks),
         seq,
         updatedAt: this.#now(),
       };
@@ -799,7 +801,7 @@ export class NativeBotDataPlane {
     bot: string,
     sessionId: string,
     messageId: string,
-    blocks: readonly { type: string; [key: string]: unknown }[],
+    blocks: readonly RichBlock[],
     mediaIds?: string[],
   ): boolean {
     const now = this.#now();
@@ -822,7 +824,7 @@ export class NativeBotDataPlane {
         },
       ];
     });
-    const text = blocksText(blocks);
+    const text = blocksToText(blocks);
     const message = this.#storage.appendNativeBotMessage({
       bot,
       sessionId,
@@ -1441,19 +1443,4 @@ export class NativeBotDataPlane {
 
 function normalize(value: string): string {
   return value.trim().toLowerCase();
-}
-
-function blocksText(
-  blocks: readonly { type: string; [key: string]: unknown }[],
-): string {
-  return blocks
-    .map((block) =>
-      typeof block.text === "string"
-        ? block.text
-        : typeof block.code === "string"
-          ? block.code
-          : "",
-    )
-    .filter(Boolean)
-    .join("\n");
 }
