@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -39,6 +40,9 @@ from .attach_client import (
     parse_turn_frame,
 )
 from .attach_spool import AttachSpool, TerminalSealed
+
+
+logger = logging.getLogger(__name__)
 
 
 MobileStatus = Literal[
@@ -578,6 +582,11 @@ class AttachV1Client:
                     if frame["sequence"] in self._sent_events and self._spool.ack_event(frame["sequence"], frame["id"]):
                         byte_count = self._sent_events.pop(frame["sequence"], 0)
                         self._sent_event_bytes = max(0, self._sent_event_bytes - byte_count)
+                        if frame.get("discarded") is True:
+                            logger.warning(
+                                "attach-v1: gateway quarantined event (%s)",
+                                frame.get("reason", "unknown"),
+                            )
                     else:
                         byte_count = None
                 if byte_count is not None:

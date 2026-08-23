@@ -20,6 +20,7 @@ describe("attach-v1 ingress", () => {
   let traces: string[];
   let mobileRequests: AttachV1MobileRequest[];
   let mobileCancels: string[];
+  let acceptsTarget: boolean;
 
   beforeEach(async () => {
     storage = openStorage(":memory:");
@@ -30,6 +31,7 @@ describe("attach-v1 ingress", () => {
     traces = [];
     mobileRequests = [];
     mobileCancels = [];
+    acceptsTarget = true;
     ingress = new AttachV1Ingress({
       tokens: new Map([
         ["secret", "sage"],
@@ -38,6 +40,7 @@ describe("attach-v1 ingress", () => {
       ]), storage,
       events: {
         onEvent: (_agent, frame) => { accepted.push(frame); return projectionSucceeds; },
+        canAcceptEvent: () => acceptsTarget,
         onPresence: (_agent, state) => presence.push(state),
         onMobileRequest: (_agent, frame) => mobileRequests.push(frame),
         onMobileCancel: (_agent, frame) => mobileCancels.push(frame.requestId),
@@ -167,13 +170,37 @@ describe("attach-v1 ingress", () => {
     second.ws.close();
   });
 
-  it("intersects capabilities and refuses unsupported commands and events", async () => {
+  it("intersects capabilities and quarantines unsupported events without dropping the agent", async () => {
     const { ws, frames } = await dial(undefined, ["draft", "tools"]);
     expect(frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["draft", "tools"] });
     expect(ingress.sendApprovalResolution("sage", { threadId: "t", turnId: "u", approvalId: "a", decision: "approve" })).toBe(false);
     ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "approval", event: { kind: "approval", threadId: "t", turnId: "u", approvalId: "a", callId: "c", name: "tool", status: "pending" } }));
-    await once(ws, "close");
-    expect(storage.attachEventCursor("sage")).toBe(0);
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.id === "approval"));
+    expect(frames.find((frame) => frame.kind === "ack" && frame.id === "approval")).toMatchObject({
+      discarded: true, reason: "capability_not_negotiated",
+    });
+    ws.send(JSON.stringify({ kind: "event", sequence: 2, eventId: "draft-after", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.id === "draft-after"));
+    expect(storage.attachEventCursor("sage")).toBe(2);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it("quarantines an unauthorized target and continues with the next valid event", async () => {
+    const { ws, frames } = await dial(undefined, ["draft"]);
+    acceptsTarget = false;
+    ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "bad-target", event: { kind: "draft", threadId: "retired", turnId: "u", blocks: [] } }));
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.id === "bad-target"));
+    expect(frames.find((frame) => frame.kind === "ack" && frame.id === "bad-target")).toMatchObject({
+      discarded: true, reason: "unauthorized_target",
+    });
+    acceptsTarget = true;
+    ws.send(JSON.stringify({ kind: "event", sequence: 2, eventId: "good-target", event: { kind: "draft", threadId: "current", turnId: "u", blocks: [] } }));
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.id === "good-target"));
+    expect(accepted.map((frame) => frame.eventId)).toEqual(["good-target"]);
+    expect(storage.attachEventCursor("sage")).toBe(2);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
   });
 
   it("applies independent server-side feature gates during negotiation and routing", async () => {
@@ -198,8 +225,13 @@ describe("attach-v1 ingress", () => {
     expect(ingress.sendApprovalResolution("sage", { threadId: "t", turnId: "u", approvalId: "a", decision: "approve" })).toBe(false);
     expect(ingress.sendClarifyResolution("sage", { threadId: "t", turnId: "u", clarifyId: "q", optionId: "x" })).toBe(true);
     ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "scheduled-disabled", event: { kind: "scheduled", threadId: "home", deliveryId: "d", messageId: "m", blocks: [{ type: "paragraph", text: "no" }] } }));
-    await once(ws, "close");
-    expect(storage.attachEventCursor("sage")).toBe(0);
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.id === "scheduled-disabled"));
+    expect(frames.find((frame) => frame.kind === "ack" && frame.id === "scheduled-disabled")).toMatchObject({
+      discarded: true, reason: "capability_not_negotiated",
+    });
+    expect(storage.attachEventCursor("sage")).toBe(1);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
   });
 
   it("converts a downgraded queued command to a durable discard and continues compatible turns", async () => {

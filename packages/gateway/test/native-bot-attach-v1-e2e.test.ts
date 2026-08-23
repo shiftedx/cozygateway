@@ -122,21 +122,25 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
 
     const selectedSessionId = gateway.storage.resetNativeBotChat("sage", Date.now());
     plugin.send(JSON.stringify({ kind: "event", sequence: 7, eventId: "scheduled-historical", event: { kind: "scheduled", threadId: command.command.threadId, deliveryId: "historical-delivery", messageId: "historical-message", blocks: [{ type: "paragraph", text: "must not appear" }] } }));
-    await once(plugin, "close");
-    expect(gateway.storage.attachEventCursor("sage")).toBe(6);
-    expect(pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 7)).toBe(false);
+    await until(() => pluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 7));
+    expect(pluginFrames.find((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 7)).toMatchObject({
+      discarded: true, reason: "unauthorized_target",
+    });
+    expect(gateway.storage.attachEventCursor("sage")).toBe(7);
     expect(gateway.storage.nativeBotMessages("sage", command.command.threadId).some((message) => message.id === "historical-message")).toBe(false);
+    plugin.close();
+    await once(plugin, "close");
 
     const selectedPluginFrames: any[] = [];
     const selectedPlugin = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
     sockets.push(selectedPlugin);
     selectedPlugin.on("message", (data) => selectedPluginFrames.push(JSON.parse(String(data))));
     await once(selectedPlugin, "open");
-    selectedPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage-selected", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 6, commandSequence: 0 } }));
+    selectedPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage-selected", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 7, commandSequence: 0 } }));
     await until(() => selectedPluginFrames.some((frame) => frame.kind === "hello_ack"));
-    selectedPlugin.send(JSON.stringify({ kind: "event", sequence: 7, eventId: "scheduled-selected", event: { kind: "scheduled", threadId: selectedSessionId, deliveryId: "selected-delivery", messageId: "selected-message", blocks: [{ type: "paragraph", text: "selected daily" }] } }));
-    await until(() => selectedPluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 7));
-    expect(gateway.storage.attachEventCursor("sage")).toBe(7);
+    selectedPlugin.send(JSON.stringify({ kind: "event", sequence: 8, eventId: "scheduled-selected", event: { kind: "scheduled", threadId: selectedSessionId, deliveryId: "selected-delivery", messageId: "selected-message", blocks: [{ type: "paragraph", text: "selected daily" }] } }));
+    await until(() => selectedPluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 8));
+    expect(gateway.storage.attachEventCursor("sage")).toBe(8);
     scheduledHistory = (await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } })).json()) as { messages: BotChatMessage[] };
     expect(scheduledHistory.messages.map((message) => message.id)).toContain("selected-message");
 
@@ -149,7 +153,7 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     await until(() => selectedPluginFrames.some((frame) => frame.kind === "command" && frame.command.kind === "turn" && frame.command.messageId === "client-offline-clarify"));
     const offlineTurn = selectedPluginFrames.find((frame) => frame.kind === "command" && frame.command.kind === "turn" && frame.command.messageId === "client-offline-clarify");
     selectedPlugin.send(JSON.stringify({
-      kind: "event", sequence: 8, eventId: "offline-clarify-pending",
+      kind: "event", sequence: 9, eventId: "offline-clarify-pending",
       event: {
         kind: "clarify", threadId: offlineTurn.command.threadId, turnId: offlineTurn.command.turnId,
         clarifyId: "offline-question", prompt: "Choose after reconnect", options: [{ id: "a", label: "A" }], status: "pending",
@@ -174,7 +178,7 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     await once(downgradedPlugin, "open");
     downgradedPlugin.send(JSON.stringify({
       kind: "hello", version: 1, instanceId: "hermes-sage-no-clarify", capabilities: ["draft", "scheduled"],
-      resume: { eventSequence: 8, commandSequence: 0 },
+      resume: { eventSequence: 9, commandSequence: 0 },
     }));
     await until(() => downgradedFrames.some((frame) => frame.kind === "command" && frame.command.kind === "discard" && frame.command.originalKind === "resolve_clarify"));
     expect(gateway.storage.nativeInteraction("sage", "clarify", "offline-question")).toMatchObject({

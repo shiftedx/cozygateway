@@ -14,6 +14,7 @@ import type {
 import type {
   AttachV1Command,
   AttachV1CommandFrame,
+  AttachV1DiscardReason,
   AttachV1EventFrame,
   AttachV1MediaDescriptor,
   AttachV1Telemetry,
@@ -1427,7 +1428,8 @@ export class Storage {
             UNION ALL SELECT completed_at AS at FROM bot_native_turn_terminals
          )) AS lastTerminalAt,
          (SELECT COUNT(*) FROM attach_command_outbox WHERE acked_at IS NULL) AS queueDepth,
-         (SELECT COUNT(*) FROM attach_event_inbox WHERE dead_lettered_at IS NOT NULL) AS deadLetters,
+         (SELECT COUNT(*) FROM attach_event_inbox
+          WHERE disposition = 'accepted' AND dead_lettered_at IS NOT NULL) AS deadLetters,
          (SELECT COALESCE(SUM(plugin_event_outbox_depth), 0) FROM attach_streams) AS pluginOutboxDepth,
          (SELECT COALESCE(MAX(plugin_oldest_event_age_ms), 0) FROM attach_streams) AS pluginOldestEventAgeMs,
          (SELECT MAX(plugin_last_ack_progress_at) FROM attach_streams) AS pluginLastAckProgressAt,
@@ -1502,9 +1504,10 @@ export class Storage {
     agentId: string,
     frame: AttachV1EventFrame,
     receivedAt: number,
+    discardReason?: AttachV1DiscardReason,
   ):
     | { status: "accepted" | "duplicate" | "ignored_terminal" | "ignored_delivery"; acknowledgedSequence: number }
-    | { status: "rejected_target"; acknowledgedSequence: number }
+    | { status: "discarded"; acknowledgedSequence: number; reason: AttachV1DiscardReason }
     | { status: "gap"; expectedSequence: number; receivedSequence: number }
     | { status: "conflict"; acknowledgedSequence: number } {
     this.#db.exec("BEGIN IMMEDIATE");
@@ -1532,6 +1535,29 @@ export class Storage {
         if (frame.sequence <= stream.sequence) return { status: "conflict", acknowledgedSequence: stream.sequence };
         return { status: "gap", expectedSequence: stream.sequence + 1, receivedSequence: frame.sequence };
       }
+      const quarantine = (reason: AttachV1DiscardReason) => {
+        this.#db
+          .prepare(
+            `INSERT INTO attach_event_inbox
+               (agent_id, sequence, event_id, frame_json, received_at, disposition,
+                projection_error, applied_at, dead_lettered_at)
+             VALUES (?, ?, ?, ?, ?, 'discarded', ?, ?, ?)`,
+          )
+          .run(
+            agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt,
+            reason, receivedAt, receivedAt,
+          );
+        this.#db
+          .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
+          .run(frame.sequence, receivedAt, agentId);
+        this.#db.exec("COMMIT");
+        return {
+          status: "discarded" as const,
+          acknowledgedSequence: frame.sequence,
+          reason,
+        };
+      };
+      if (discardReason !== undefined) return quarantine(discardReason);
       const event = frame.event;
       const turnId = "turnId" in event ? event.turnId : undefined;
       const terminal = event.kind === "commit" || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
@@ -1577,8 +1603,7 @@ export class Storage {
               selected.sessionId !== event.threadId &&
               this.nativeBotHasSession(agentId, event.threadId)
             ) {
-              this.#db.exec("COMMIT");
-              return { status: "rejected_target", acknowledgedSequence: stream.sequence };
+              return quarantine("unauthorized_target");
             }
           }
           // This is inside the admission transaction, so /new cannot race a semantic home event
@@ -1668,7 +1693,8 @@ export class Storage {
     const earliest = this.#db
       .prepare(
         `SELECT event_id AS eventId FROM attach_event_inbox
-         WHERE agent_id = ? AND dead_lettered_at IS NOT NULL ORDER BY sequence LIMIT 1`,
+         WHERE agent_id = ? AND disposition = 'accepted' AND dead_lettered_at IS NOT NULL
+         ORDER BY sequence LIMIT 1`,
       )
       .get(agentId) as { eventId: string } | undefined;
     if (earliest?.eventId !== eventId) return false;
@@ -1676,7 +1702,7 @@ export class Storage {
       .prepare(
         `UPDATE attach_event_inbox
          SET projection_attempts = 0, projection_error = NULL, dead_lettered_at = NULL
-         WHERE agent_id = ? AND event_id = ? AND applied_at IS NULL`,
+         WHERE agent_id = ? AND event_id = ? AND disposition = 'accepted' AND applied_at IS NULL`,
       )
       .run(agentId, eventId).changes === 1;
   }
@@ -1689,7 +1715,8 @@ export class Storage {
            AND dead_lettered_at IS NULL
            AND sequence < COALESCE(
              (SELECT MIN(blocked.sequence) FROM attach_event_inbox AS blocked
-              WHERE blocked.agent_id = ? AND blocked.dead_lettered_at IS NOT NULL),
+              WHERE blocked.agent_id = ? AND blocked.disposition = 'accepted'
+                AND blocked.dead_lettered_at IS NOT NULL),
              9223372036854775807
            )
          ORDER BY sequence LIMIT ?`,

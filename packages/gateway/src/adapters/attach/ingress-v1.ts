@@ -18,6 +18,7 @@ import {
   type AttachV1ClientFrame,
   type AttachV1Command,
   type AttachV1CommandFrame,
+  type AttachV1DiscardReason,
   type AttachV1EventFrame,
   type AttachV1MobileCancel,
   type AttachV1MobileRequest,
@@ -248,15 +249,12 @@ export class AttachV1Ingress implements TurnEndpoint {
         return;
       }
       const missingCapability = eventCapabilities(frame).find((capability) => !connection.capabilities.has(capability));
-      if (missingCapability !== undefined) {
-        socket.close(1008, `attach-v1 capability not negotiated: ${missingCapability}`);
-        return;
-      }
-      if (this.#events.canAcceptEvent?.(agentId, frame) === false) {
-        socket.close(1008, "attach-v1 event target is not authorized");
-        return;
-      }
-      const admission = this.#storage.acceptAttachEvent(agentId, frame, this.#now());
+      const discardReason: AttachV1DiscardReason | undefined = missingCapability !== undefined
+        ? "capability_not_negotiated"
+        : this.#events.canAcceptEvent?.(agentId, frame) === false
+          ? "unauthorized_target"
+          : undefined;
+      const admission = this.#storage.acceptAttachEvent(agentId, frame, this.#now(), discardReason);
       if (admission.status === "gap") {
         this.#send(connection, {
           kind: "gap", channel: "event", requestedAfter: admission.expectedSequence - 1,
@@ -268,10 +266,6 @@ export class AttachV1Ingress implements TurnEndpoint {
         socket.close(1008, "event sequence conflict");
         return;
       }
-      if (admission.status === "rejected_target") {
-        socket.close(1008, "attach-v1 event target is not authorized");
-        return;
-      }
       if (admission.status === "accepted") {
         this.#projectPending(agentId);
       }
@@ -279,6 +273,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       this.#send(connection, {
         kind: "ack", channel: "event", sequence: admission.acknowledgedSequence,
         id: frame.eventId, ...(admission.status === "duplicate" ? { duplicate: true } : {}),
+        ...(admission.status === "discarded" ? { discarded: true as const, reason: admission.reason } : {}),
       });
     });
 

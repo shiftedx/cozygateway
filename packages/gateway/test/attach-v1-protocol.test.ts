@@ -93,6 +93,10 @@ describe("attach-v1 protocol", () => {
   it("has replay, ack, gap and heartbeat control frames but no reasoning event", () => {
     expect(check(AttachV1ClientFrameSchema, { kind: "ack", channel: "command", sequence: 7, id: "cmd-7" })).toBe(true);
     expect(check(AttachV1ServerFrameSchema, { kind: "ack", channel: "event", sequence: 4, id: "event-4", duplicate: true })).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "ack", channel: "event", sequence: 5, id: "event-5",
+      discarded: true, reason: "unauthorized_target",
+    })).toBe(true);
     expect(check(AttachV1ServerFrameSchema, { kind: "gap", channel: "event", requestedAfter: 1, earliestAvailable: 8, latestAvailable: 20 })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "gap", channel: "command", requestedAfter: 1, earliestAvailable: 2, latestAvailable: 4 })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "heartbeat", sentAt: 100 })).toBe(true);

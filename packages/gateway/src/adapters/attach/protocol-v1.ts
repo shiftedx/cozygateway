@@ -212,9 +212,16 @@ export const AttachV1EventFrameSchema = Type.Object({
 });
 export type AttachV1EventFrame = Static<typeof AttachV1EventFrameSchema>;
 
+export const AttachV1DiscardReasonSchema = Type.Union([
+  Type.Literal("capability_not_negotiated"),
+  Type.Literal("unauthorized_target"),
+]);
+export type AttachV1DiscardReason = Static<typeof AttachV1DiscardReasonSchema>;
+
 export const AttachV1AckSchema = Type.Object({
   kind: Type.Literal("ack"), channel: Type.Union([Type.Literal("event"), Type.Literal("command")]),
   sequence: Type.Integer({ minimum: 1 }), id: Id, duplicate: Type.Optional(Type.Boolean()),
+  discarded: Type.Optional(Type.Literal(true)), reason: Type.Optional(AttachV1DiscardReasonSchema),
 });
 export type AttachV1Ack = Static<typeof AttachV1AckSchema>;
 

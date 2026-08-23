@@ -50,6 +50,14 @@ recreated empty spool to the gateway's durable stream, but MUST refuse an event 
 would skip locally pending work. This makes spool replacement recoverable without replaying an
 already-ACKed command or creating a permanent gap loop.
 
+The gateway's spool watchdog handles a well-formed next-sequence event that is permanently unusable
+because its capability was not negotiated or its target is no longer authorized. In one transaction
+the gateway journals the event as `discarded`, records a bounded reason, advances the event cursor,
+and returns an event ACK with `discarded: true`. The plugin treats that ACK like any other durable
+ACK, removes the local spool entry, and continues on the same connection. Discarded events are never
+projected and do not count as actionable projection dead letters. Sequence conflicts still fail
+closed, while transient projection failures retain the retry and ordered dead-letter behavior below.
+
 Sequences are contiguous. A receiver that observes a future sequence sends `gap` and applies
 nothing after the missing point. A sender either replays from `requestedAfter` or, after configured
 retention makes that impossible, reports `earliestAvailable`/`latestAvailable`; an operator must

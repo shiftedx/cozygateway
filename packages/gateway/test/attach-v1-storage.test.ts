@@ -244,7 +244,7 @@ describe("attach-v1 durable transport storage", () => {
     storage.close();
   });
 
-  it("rejects an explicit scheduled target if it is no longer the selected session at admission", () => {
+  it("quarantines an explicit scheduled target that is no longer selected and advances the spool", () => {
     const storage = openStorage(":memory:");
     const historicalSessionId = storage.nativeBotChat("sage", 1).sessionId;
     const selectedSessionId = storage.resetNativeBotChat("sage", 2);
@@ -259,8 +259,38 @@ describe("attach-v1 durable transport storage", () => {
     expect(selectedSessionId).not.toBe(historicalSessionId);
     // This is the admission-time precondition, deliberately not a timing/sleep test. The selected
     // session changed after an earlier authorization check but before this durable transaction.
-    expect(storage.acceptAttachEvent("sage", frame, 3).status).toBe("rejected_target");
+    expect(storage.acceptAttachEvent("sage", frame, 3)).toEqual({
+      status: "discarded", acknowledgedSequence: 1, reason: "unauthorized_target",
+    });
+    expect(storage.attachEventCursor("sage")).toBe(1);
+    expect(storage.attachProjectionFailure("sage", frame.eventId)).toEqual({
+      attempts: 0, error: "unauthorized_target", deadLetteredAt: 3,
+    });
+    expect(storage.releaseAttachProjectionDeadLetter("sage", frame.eventId)).toBe(false);
     expect(storage.attachScheduledDelivery("sage", frame.event.deliveryId)).toBeUndefined();
+    storage.close();
+  });
+
+  it("durably quarantines a permanently invalid next event without weakening sequence checks", () => {
+    const storage = openStorage(":memory:");
+    const frame = {
+      kind: "event" as const, sequence: 1, eventId: "unsupported-approval",
+      event: {
+        kind: "approval" as const, threadId: "thread", turnId: "turn",
+        approvalId: "approval", callId: "call", name: "shell", status: "pending" as const,
+      },
+    };
+    expect(storage.acceptAttachEvent("sage", frame, 10, "capability_not_negotiated")).toEqual({
+      status: "discarded", acknowledgedSequence: 1, reason: "capability_not_negotiated",
+    });
+    expect(storage.acceptAttachEvent("sage", frame, 11, "capability_not_negotiated")).toEqual({
+      status: "duplicate", acknowledgedSequence: 1,
+    });
+    expect(storage.acceptAttachEvent("sage", { ...frame, sequence: 3, eventId: "gap" }, 12)).toEqual({
+      status: "gap", expectedSequence: 2, receivedSequence: 3,
+    });
+    // Quarantine is complete recovery, not an actionable projection dead letter.
+    expect(storage.attachHealth().deadLetters).toBe(0);
     storage.close();
   });
 

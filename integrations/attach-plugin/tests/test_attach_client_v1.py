@@ -210,6 +210,21 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client._dispatch_inbound(json.dumps({"kind": "ack", "channel": "event", "sequence": 1, "id": first["eventId"]}))
         self.assertEqual(self.spool.pending_events(10, 100000), [])
 
+    async def test_quarantine_ack_advances_spool_and_warns_without_payload(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["draft"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        await self.client.send_draft("retired-thread", "turn", [{"type": "paragraph", "text": "private payload"}])
+        event = self.socket.sent[-1]
+        with self.assertLogs("cozygateway.attach_client_v1", level="WARNING") as logs:
+            await self.client._dispatch_inbound(json.dumps({
+                "kind": "ack", "channel": "event", "sequence": 1, "id": event["eventId"],
+                "discarded": True, "reason": "unauthorized_target",
+            }))
+        self.assertEqual(self.spool.pending_events(10, 100000), [])
+        self.assertEqual(self.spool.event_cursor, 1)
+        self.assertIn("unauthorized_target", logs.output[0])
+        self.assertNotIn("private payload", logs.output[0])
+
     async def test_command_is_persisted_before_ack_and_dispatched_once(self):
         await self.client.connect()
         frame = {"kind": "command", "sequence": 1, "commandId": "c1", "command": {"kind": "turn", "threadId": "t", "turnId": "u", "messageId": "m", "text": "hi"}}
