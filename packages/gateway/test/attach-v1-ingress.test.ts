@@ -65,7 +65,7 @@ describe("attach-v1 ingress", () => {
     limits?: { maxInFlightEvents: number; maxInFlightBytes: number },
     capabilities: string[] = ["draft"],
     resume = { eventSequence: 0, commandSequence: 0 },
-    peer: { token?: string; instanceId?: string; heartbeatAckLimit?: number; version?: number } = {},
+    peer: { token?: string; instanceId?: string; heartbeatAckLimit?: number; version?: number; commands?: Array<{ name: string; description: string; argsHint?: string; category?: string }> } = {},
   ): Promise<{ ws: WebSocket; frames: AttachV1ServerFrame[] }> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: `Bearer ${peer.token ?? "secret"}` } });
     const frames: AttachV1ServerFrame[] = [];
@@ -79,10 +79,27 @@ describe("attach-v1 ingress", () => {
       }
     });
     await once(ws, "open");
-    ws.send(JSON.stringify({ kind: "hello", version: peer.version ?? 1, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }) }));
+    ws.send(JSON.stringify({ kind: "hello", version: peer.version ?? 1, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }), ...(peer.commands === undefined ? {} : { commands: peer.commands }) }));
     await until(() => frames.some((frame) => frame.kind === "hello_ack"));
     return { ws, frames };
   }
+
+  it("keeps the command catalog across a drop and lets a new authenticated hello clear it", async () => {
+    const commands = [
+      { name: "/status", description: "Show session status", category: "Session" },
+      { name: "/queue", description: "Queue the next prompt", argsHint: "<prompt>" },
+    ];
+    const peer = await dial(undefined, ["draft"], undefined, { commands });
+    expect(ingress.commandCatalog("sage")).toEqual(commands);
+
+    peer.ws.close();
+    await once(peer.ws, "close");
+    expect(ingress.commandCatalog("sage")).toEqual(commands);
+
+    const replacement = await dial(undefined, ["draft"], undefined, { commands: [] });
+    expect(ingress.commandCatalog("sage")).toEqual([]);
+    replacement.ws.close();
+  });
 
   it("requires hello, negotiates v1, and replays an unacked durable command", async () => {
     expect(ingress.sendTurn("sage", { kind: "turn", threadId: "t", turnId: "u", text: "hello" })).toBe(true);

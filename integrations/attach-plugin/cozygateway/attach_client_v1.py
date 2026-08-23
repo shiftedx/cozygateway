@@ -12,7 +12,7 @@ import re
 import ssl
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -78,6 +78,7 @@ class AttachV1ClientConfig:
     connect_factory: Optional[Callable[..., Any]] = None
     max_in_flight_events: int = 64
     max_in_flight_bytes: int = 4 * 1024 * 1024
+    commands: List[Dict[str, str]] = field(default_factory=list)
 
 
 class AttachV1Client:
@@ -132,14 +133,18 @@ class AttachV1Client:
         headers = {"Authorization": f"Bearer {self._config.token}"}
         factory = self._config.connect_factory or _default_connect
         self._ws = await factory(self._ws_url, headers, self._ssl_context())
-        await self._send({
+        hello: Dict[str, Any] = {
             "kind": "hello",
             "version": version,
             "instanceId": self._spool.instance_id,
             "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", *( ["mobile_location"] if version >= 2 else [] )],
             "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
             "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
-        })
+            # Present even when empty so a newly authenticated profile can clear a catalog cached
+            # from its previous plugin process. Older gateways ignore the open hello property.
+            "commands": self._config.commands[:512],
+        }
+        await self._send(hello)
 
     async def request_device_status(self, thread_id: str, turn_id: str) -> MobileDeviceStatusResult:
         """Request one ephemeral status result for this live turn, never via the spool."""

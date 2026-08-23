@@ -23,6 +23,7 @@ import {
   type AttachV1MobileRequest,
   type AttachV1MobileResultInput,
   type AttachV1ServerFrame,
+  type AttachV1SlashCommand,
 } from "./protocol-v1.ts";
 import { resolveAttachBearer } from "./token-auth.ts";
 import { emitTrace, traceId, type TraceLog } from "../../trace.ts";
@@ -65,6 +66,9 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #storage: Storage;
   readonly #events: AttachV1Events;
   readonly #current = new Map<string, Connection>();
+  /** Last authenticated catalog per profile. It deliberately survives a socket drop: command
+   * discovery remains useful while the phone is offline, just as Telegram keeps its bot menu. */
+  readonly #commandCatalogs = new Map<string, readonly AttachV1SlashCommand[]>();
   readonly #negotiated = new Set<string>();
   readonly #wss: WebSocketServer;
   readonly #heartbeatIntervalMs: number;
@@ -167,6 +171,9 @@ export class AttachV1Ingress implements TurnEndpoint {
         connection.sendCursor = connection.commandCursor;
         const offered = new Set(frame.capabilities);
         connection.capabilities = new Set(this.#allowed(agentId).filter((capability) => offered.has(capability)));
+        if (frame.commands !== undefined) {
+          this.#commandCatalogs.set(agentId, [...frame.commands]);
+        }
         connection.maxInFlightEvents = Math.min(frame.limits?.maxInFlightEvents ?? ATTACH_V1_MAX_IN_FLIGHT_EVENTS, ATTACH_V1_MAX_IN_FLIGHT_EVENTS);
         connection.maxInFlightBytes = Math.min(frame.limits?.maxInFlightBytes ?? ATTACH_V1_MAX_IN_FLIGHT_BYTES, ATTACH_V1_MAX_IN_FLIGHT_BYTES);
         this.#current.set(agentId, connection);
@@ -401,6 +408,10 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   negotiatedCapabilities(agentId: string): ReadonlySet<AttachV1Capability> {
     return this.#current.get(agentId)?.capabilities ?? new Set();
+  }
+
+  commandCatalog(agentId: string): readonly AttachV1SlashCommand[] {
+    return this.#commandCatalogs.get(agentId) ?? [];
   }
 
   #allowed(agentId: string): AttachV1Capability[] {

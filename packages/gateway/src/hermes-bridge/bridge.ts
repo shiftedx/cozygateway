@@ -1,4 +1,5 @@
 import type {
+  BotAttachmentHistoryItem,
   BotCatalog,
   BotCreateRequest,
   BotChatMessage,
@@ -16,6 +17,7 @@ import type {
   BotRoutineCreateRequest,
   BotRoutinePatch,
   BotSummary,
+  BotSlashCommand,
   BotTurnToolSteps,
   BridgeLiveness,
   ServerFrame,
@@ -219,6 +221,15 @@ export interface BotControlSurface {
   ): BotGroupMessage;
 }
 export interface BotsSurface extends BotControlSurface {
+  commands(name: string): readonly BotSlashCommand[];
+  attachmentHistory(input: {
+    query?: string;
+    kind?: "image" | "video" | "audio" | "file";
+    bot?: string;
+    since?: number;
+    offset: number;
+    limit: number;
+  }): { items: BotAttachmentHistoryItem[]; nextOffset: number | null };
   canonicalChat(name: string): Promise<CanonicalChatResult>;
   newSession(name: string): Promise<BotNewSessionResult>;
   resetChat(name: string): Promise<ChatResetResult>;

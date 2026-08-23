@@ -151,6 +151,8 @@ export class NativeBotDataPlane {
   surface(): BotsSurface {
     const overrides: Partial<BotsSurface> = {
       roster: () => this.#roster(),
+      commands: (name) => this.#commands(name),
+      attachmentHistory: (input) => this.#attachmentHistory(input),
       canonicalChat: (name) => this.#canonical(name),
       newSession: (name) => this.#newSession(name),
       sessions: (name, limit) => this.#sessions(name, limit),
@@ -348,6 +350,32 @@ export class NativeBotDataPlane {
     return {
       sessionId: chat.sessionId,
       adoption: chat.created ? ("created" as const) : ("pin" as const),
+    };
+  }
+
+  #commands(name: string) {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    return this.#ingress.commandCatalog(bot);
+  }
+
+  #attachmentHistory(input: {
+    query?: string;
+    kind?: "image" | "video" | "audio" | "file";
+    bot?: string;
+    since?: number;
+    offset: number;
+    limit: number;
+  }) {
+    const items = this.#storage.nativeBotAttachmentHistory({
+      ...input,
+      bots: [...this.#native],
+      limit: input.limit + 1,
+    });
+    const hasMore = items.length > input.limit;
+    return {
+      items: hasMore ? items.slice(0, input.limit) : items,
+      nextOffset: hasMore ? input.offset + input.limit : null,
     };
   }
 

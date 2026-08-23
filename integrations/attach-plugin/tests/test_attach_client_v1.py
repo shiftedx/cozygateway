@@ -65,6 +65,10 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     async def test_hello_carries_durable_identity_and_resume_cursors(self):
+        self.client._config.commands = [
+            {"name": "/status", "description": "Show session status", "category": "Session"},
+            {"name": "/queue", "description": "Queue the next prompt", "argsHint": "<prompt>"},
+        ]
         await self.client.connect()
         self.assertEqual(self.socket.sent[0]["kind"], "hello")
         self.assertEqual(self.socket.sent[0]["version"], 2)
@@ -72,6 +76,11 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.socket.sent[0]["resume"], {"eventSequence": 0, "commandSequence": 0})
         self.assertIn("mobile_node", self.socket.sent[0]["capabilities"])
         self.assertIn("mobile_location", self.socket.sent[0]["capabilities"])
+        self.assertEqual(self.socket.sent[0]["commands"], self.client._config.commands)
+
+    async def test_hello_carries_an_explicit_empty_catalog_to_clear_stale_discovery(self):
+        await self.client.connect()
+        self.assertEqual(self.socket.sent[0]["commands"], [])
 
     async def test_hello_ack_recovers_a_recreated_empty_spool_from_server_cursors(self):
         await self.client.connect()

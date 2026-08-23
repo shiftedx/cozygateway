@@ -26,6 +26,21 @@ export const AttachV1LimitsSchema = Type.Object({
   maxInFlightBytes: Type.Integer({ minimum: 1024, maximum: 64 * 1024 * 1024 }),
 });
 
+/** One profile-local command the attached Hermes process can execute on its messaging surface.
+ * The leading slash is kept on the wire so clients never have to guess whether a catalog entry is
+ * display text or an invocation. */
+export const AttachV1SlashCommandSchema = Type.Object({
+  name: Type.String({ pattern: "^/[A-Za-z0-9_-]+$", minLength: 2, maxLength: 129 }),
+  description: Type.String({ minLength: 1, maxLength: 200 }),
+  argsHint: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  category: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+});
+export type AttachV1SlashCommand = Static<typeof AttachV1SlashCommandSchema>;
+
+const AttachV1CommandCatalogSchema = Type.Array(AttachV1SlashCommandSchema, {
+  maxItems: 512,
+});
+
 /** The frozen old-server hello. It deliberately cannot parse v2's location capability. */
 export const AttachV1HelloV1Schema = Type.Object({
   kind: Type.Literal("hello"),
@@ -34,6 +49,7 @@ export const AttachV1HelloV1Schema = Type.Object({
   capabilities: Type.Array(AttachV1BaseCapabilitySchema, { uniqueItems: true }),
   resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
   limits: Type.Optional(AttachV1LimitsSchema),
+  commands: Type.Optional(AttachV1CommandCatalogSchema),
 });
 const AttachV1HelloV2Schema = Type.Object({
   kind: Type.Literal("hello"),
@@ -42,6 +58,7 @@ const AttachV1HelloV2Schema = Type.Object({
   capabilities: Type.Array(AttachV1CapabilitySchema, { uniqueItems: true }),
   resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
   limits: Type.Optional(AttachV1LimitsSchema),
+  commands: Type.Optional(AttachV1CommandCatalogSchema),
 });
 export const AttachV1HelloSchema = Type.Union([AttachV1HelloV1Schema, AttachV1HelloV2Schema]);
 export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;

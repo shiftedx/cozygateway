@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 24. This extension is independent of the frozen core
+Status: v1 extension, capability version 26. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 23 }
+"capabilities": { "com.cozylabs.bots": 26 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -62,6 +62,9 @@ extension omits the capability and does not register `/bots` routes.
 | 21 | Redacted tool-step details. |
 | 22 | Durable native clarification events and resolution. |
 | 23 | Exact native turn status/cause and durable queued-at metadata. |
+| 24 | Common document attachment sends and file downloads. |
+| 25 | Profile-local discovery of Hermes gateway-safe, plugin, and installed skill commands. |
+| 26 | Searchable aggregate history of agent-sent attachments across native sessions. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -86,10 +89,41 @@ a second, hand-copied schema.
   execute.
 - `BotInboxThread` and `BotInboxMessagesResponse` are the read-only Hermes A2A projection.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
+- `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its
+  slash-prefixed `name` is the exact invocation; `description`, optional `argsHint`, and optional
+  `category` are presentation metadata. `BotSlashCommandCatalog` is the bounded ordered list.
+- `BotAttachmentHistoryItem` identifies one assistant attachment in a durable native transcript,
+  including its bot, session, message caption, timestamp, and ordinary opaque attachment block.
+  `BotAttachmentHistory` is a newest-first bounded page with an optional next offset.
 
 Only profiles configured in `hermes.profiles` are exposed as CozyChat bots. Profile lifecycle
 belongs to Hermes: create or delete the profile there, then rerun the CozyGateway installer (its
 default `--profiles all` selection reconciles plugin, token, service, and gateway configuration).
+
+### Slash commands
+
+`GET /bots/:name/commands` returns the last catalog advertised by that profile's authenticated
+attach plugin. It contains every Hermes command valid on a messaging gateway: enabled built-ins,
+plugin commands, and installed skill commands. Client-local CLI/TUI commands are intentionally not
+advertised because they cannot execute through Bot Mode.
+
+Clients MUST require capability `>= 25` before calling the route. Selecting an item should insert
+its canonical `name` into the ordinary composer so the user can edit arguments. Sending a command
+uses `POST /bots/:name/chat/messages` unchanged; CozyGateway and clients do not duplicate Hermes
+command parsing or execution. The most recently authenticated catalog remains readable while the
+profile is temporarily disconnected, and an empty catalog is valid.
+
+### Attachment history
+
+`GET /bots/attachments` returns only attachments sent by configured agents in durable native Bot
+Mode sessions. It accepts optional `q`, `kind` (`image`, `video`, `audio`, or `file`), `bot`,
+millisecond `since`, `offset`, and `limit` query parameters. Search is case-insensitive across the
+agent name, message caption, filename, and MIME type. Results are newest first; `limit` is bounded
+to 100 and `nextOffset` is `null` when the page is complete.
+
+Clients MUST require capability `>= 26`. This route indexes metadata only. Attachment bytes remain
+behind the existing authenticated `GET /bots/:name/chat/attachments/:fileId` route, so clients can
+preview, save, or share a result without the gateway duplicating media or exposing a path.
 
 ### Canonical native chat
 

@@ -90,6 +90,8 @@ export const SESSION_LIST_LIMIT = 200;
  *  and an unbounded query string. The NUMBER of cache entries is bounded separately, in the bridge
  *  (`CATALOG_CACHE_MAX`): a length cap bounds the key, never the key space. */
 export const CATALOG_QUERY_MAX = 200;
+export const ATTACHMENT_HISTORY_QUERY_MAX = 200;
+export const ATTACHMENT_HISTORY_LIMIT_MAX = 100;
 
 /** Hermes' JSON-RPC code for "no profile by that name". Mapped to a 404 rather than the blanket 502
  *  every other rejection gets, so the TOCTOU window between a roster-cache hit and the call behind
@@ -681,6 +683,55 @@ export function registerBotRoutes(
         sessionId: result.sessionId,
         adoption: result.adoption,
       });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.get("/bots/:name/commands", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json({
+        name: resolved.name,
+        commands: [...chat.commands(resolved.name)],
+      });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.get("/bots/attachments", requireDevice, (c) => {
+    const rawQuery = (c.req.query("q") ?? "").trim();
+    if (rawQuery.length > ATTACHMENT_HISTORY_QUERY_MAX) {
+      return c.json(errorBody("invalid_request", "attachment search is too long"), 400);
+    }
+    const rawKind = c.req.query("kind");
+    const kind = rawKind === undefined || rawKind === "all" ? undefined : rawKind;
+    if (kind !== undefined && !["image", "video", "audio", "file"].includes(kind)) {
+      return c.json(errorBody("invalid_request", "unknown attachment kind"), 400);
+    }
+    const rawOffset = c.req.query("offset") ?? "0";
+    const rawLimit = c.req.query("limit") ?? "50";
+    const rawSince = c.req.query("since");
+    const offset = Number(rawOffset);
+    const limit = Number(rawLimit);
+    const since = rawSince === undefined ? undefined : Number(rawSince);
+    if (!Number.isSafeInteger(offset) || offset < 0 ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > ATTACHMENT_HISTORY_LIMIT_MAX ||
+        (since !== undefined && (!Number.isSafeInteger(since) || since < 0))) {
+      return c.json(errorBody("invalid_request", "invalid attachment history pagination or date"), 400);
+    }
+    const requestedBot = c.req.query("bot")?.trim().toLowerCase();
+    try {
+      return c.json(chat.attachmentHistory({
+        ...(rawQuery === "" ? {} : { query: rawQuery }),
+        ...(kind === undefined ? {} : { kind: kind as "image" | "video" | "audio" | "file" }),
+        ...(requestedBot ? { bot: requestedBot } : {}),
+        ...(since === undefined ? {} : { since }),
+        offset,
+        limit,
+      }));
     } catch (err) {
       return failure(c, err);
     }

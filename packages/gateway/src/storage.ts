@@ -343,6 +343,15 @@ export interface BotRoutineOverrides {
   effort?: string | null;
 }
 
+export interface NativeBotAttachmentHistoryItem {
+  bot: string;
+  sessionId: string;
+  messageId: string;
+  caption: string;
+  at: number | null;
+  attachment: AttachmentBlock;
+}
+
 /** A group room as it sits on disk. `epoch` and `needsYou` are live protocol state, not metadata:
  *  the epoch supersedes in-flight rounds and `needsYou` is the escalation badge. */
 export interface BotGroupRow {
@@ -1832,6 +1841,63 @@ export class Storage {
       )
       .all(bot, sessionId) as unknown as Array<{ id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null }>;
     return rows.map(nativeBotMessage);
+  }
+
+  /** Agent-sent artifacts across configured profiles and every durable session. Filtering stays in
+   * SQLite so a phone asking for one page never makes the gateway hydrate an unbounded transcript. */
+  nativeBotAttachmentHistory(input: {
+    bots: readonly string[];
+    query?: string;
+    kind?: "image" | "video" | "audio" | "file";
+    bot?: string;
+    since?: number;
+    offset: number;
+    limit: number;
+  }): NativeBotAttachmentHistoryItem[] {
+    if (input.bots.length === 0) return [];
+    const botPlaceholders = input.bots.map(() => "?").join(", ");
+    const kind = `COALESCE(json_extract(artifact.value, '$.mediaKind'), CASE
+      WHEN lower(json_extract(artifact.value, '$.mimeType')) LIKE 'image/%' THEN 'image'
+      WHEN lower(json_extract(artifact.value, '$.mimeType')) LIKE 'video/%' THEN 'video'
+      WHEN lower(json_extract(artifact.value, '$.mimeType')) LIKE 'audio/%' THEN 'audio'
+      ELSE 'file' END)`;
+    const clauses = [
+      "message.role = 'assistant'",
+      "message.attachments_json IS NOT NULL",
+      `message.bot IN (${botPlaceholders})`,
+    ];
+    const args: Array<string | number> = [...input.bots];
+    if (input.bot !== undefined) { clauses.push("message.bot = ?"); args.push(input.bot); }
+    if (input.kind !== undefined) { clauses.push(`${kind} = ?`); args.push(input.kind); }
+    if (input.since !== undefined) { clauses.push("COALESCE(message.at, 0) >= ?"); args.push(input.since); }
+    const query = input.query?.trim().toLowerCase();
+    if (query) {
+      clauses.push(`instr(lower(message.bot || ' ' || message.text || ' ' ||
+        json_extract(artifact.value, '$.name') || ' ' ||
+        json_extract(artifact.value, '$.mimeType')), ?) > 0`);
+      args.push(query);
+    }
+    const rows = this.#db.prepare(
+      `SELECT message.bot, message.session_id AS sessionId,
+              message.message_id AS messageId, message.text AS caption, message.at,
+              artifact.value AS attachmentJson
+       FROM bot_native_messages AS message, json_each(message.attachments_json) AS artifact
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY COALESCE(message.at, 0) DESC, message.message_id DESC,
+                json_extract(artifact.value, '$.fileId') DESC
+       LIMIT ? OFFSET ?`,
+    ).all(...args, input.limit, input.offset) as unknown as Array<{
+      bot: string; sessionId: string; messageId: string; caption: string;
+      at: number | null; attachmentJson: string;
+    }>;
+    return rows.map((row) => ({
+      bot: row.bot,
+      sessionId: row.sessionId,
+      messageId: row.messageId,
+      caption: row.caption,
+      at: row.at,
+      attachment: JSON.parse(row.attachmentJson) as AttachmentBlock,
+    }));
   }
 
   nativeBotMessage(bot: string, messageId: string): BotChatMessage | undefined {

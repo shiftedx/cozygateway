@@ -18,7 +18,10 @@ chat sends, live turns, and groups; CozyGateway MUST NOT submit those chats thro
 - The plugin sends `hello` first. Any other first frame closes the socket. Version 1 is selected by
   the endpoint plus `hello.version: 1`; no unversioned attach endpoint exists.
 - `hello` carries a stable plugin `instanceId`, supported capabilities, event/command resume
-  cursors, and bounded receive limits. `hello_ack` returns the authenticated `agentId`, negotiated
+  cursors, bounded receive limits, and may carry a bounded profile-local slash-command catalog.
+  Each command has its exact slash-prefixed invocation plus presentation metadata; the catalog is
+  authenticated profile state, not a negotiated attach capability, so old peers ignore it.
+  `hello_ack` returns the authenticated `agentId`, negotiated
   limits/capabilities, authoritative cursors, and heartbeat interval. Its capabilities are the
   intersection of the plugin offer and that identity's server-side rollout gates; neither peer
   sends a feature whose capability was not negotiated.

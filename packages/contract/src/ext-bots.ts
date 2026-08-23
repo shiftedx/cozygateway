@@ -921,6 +921,40 @@ export const BotGroupSendRequestSchema = Type.Object({
 });
 export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
 
+/** One command the selected Hermes profile accepts through a messaging surface. The catalog is
+ * profile-owned and comes from Hermes' central registry, plugins, and installed skills. */
+export const BotSlashCommandSchema = Type.Object({
+  name: Type.String({ pattern: "^/[A-Za-z0-9_-]+$", minLength: 2, maxLength: 129 }),
+  description: Type.String({ minLength: 1, maxLength: 200 }),
+  argsHint: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  category: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+});
+export type BotSlashCommand = Static<typeof BotSlashCommandSchema>;
+
+export const BotSlashCommandCatalogSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 256 }),
+  commands: Type.Array(BotSlashCommandSchema, { maxItems: 512 }),
+});
+export type BotSlashCommandCatalog = Static<typeof BotSlashCommandCatalogSchema>;
+
+/** One agent-sent artifact projected from every durable native Bot Mode session. The attachment
+ * remains gateway-scoped and downloads through the existing authenticated per-bot route. */
+export const BotAttachmentHistoryItemSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  messageId: Type.String({ minLength: 1 }),
+  caption: Type.String(),
+  at: Type.Union([Type.Integer(), Type.Null()]),
+  attachment: AttachmentBlockSchema,
+});
+export type BotAttachmentHistoryItem = Static<typeof BotAttachmentHistoryItemSchema>;
+
+export const BotAttachmentHistorySchema = Type.Object({
+  items: Type.Array(BotAttachmentHistoryItemSchema, { maxItems: 100 }),
+  nextOffset: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+});
+export type BotAttachmentHistory = Static<typeof BotAttachmentHistorySchema>;
+
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
  *  configured.
  *
@@ -1029,6 +1063,13 @@ export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
  *    idempotent across gateway/plugin restart.
  *  - `23`: exact native turn status/cause and durable queued-at recovery metadata.
  *  - `24`: document attachments. `POST /bots/:name/chat/attachments` accepts one validated
- *    common document, and attachment `mediaKind: "file"` tells clients to offer download/share. */
+ *    common document, and attachment `mediaKind: "file"` tells clients to offer download/share.
+ *  - `25`: profile-local slash-command discovery. `GET /bots/:name/commands` returns the canonical
+ *    gateway-safe commands, plugin commands, and installed skill commands advertised by that
+ *    profile's authenticated attach plugin. The invocation is sent unchanged through the ordinary
+ *    message route; no command execution logic is duplicated in CozyGateway or a client.
+ *  - `26`: aggregate agent-sent attachment history. `GET /bots/attachments` searches and filters
+ *    artifacts across configured profiles and every durable native session without duplicating
+ *    their bytes or weakening the existing authenticated download route. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-export const BOTS_CAPABILITY_VERSION = 24;
+export const BOTS_CAPABILITY_VERSION = 26;

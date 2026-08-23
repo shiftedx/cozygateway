@@ -32,6 +32,7 @@ import math
 import mimetypes
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -100,6 +101,67 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+_COMMAND_NAME = re.compile(r"^/[A-Za-z0-9_-]{1,128}$")
+
+
+def hermes_gateway_commands() -> List[Dict[str, str]]:
+    """Return the commands this Hermes profile exposes to messaging clients.
+
+    Hermes owns command semantics. CozyGateway only carries this structured projection in the
+    authenticated attach hello, so built-ins, plugins, config gates, and installed skill commands
+    stay aligned with the same registry Telegram and Discord use.
+    """
+    catalog: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def append(name: str, description: str, args_hint: str = "", category: str = "") -> None:
+        invocation = name if name.startswith("/") else f"/{name}"
+        if not _COMMAND_NAME.fullmatch(invocation) or invocation.lower() in seen:
+            return
+        clean_description = " ".join(str(description).split()).strip() or f"Run {invocation}"
+        entry = {
+            "name": invocation,
+            "description": clean_description[:200],
+        }
+        clean_hint = " ".join(str(args_hint).split()).strip()
+        clean_category = " ".join(str(category).split()).strip()
+        if clean_hint:
+            entry["argsHint"] = clean_hint[:160]
+        if clean_category:
+            entry["category"] = clean_category[:80]
+        catalog.append(entry)
+        seen.add(invocation.lower())
+
+    try:
+        from hermes_cli.commands import (
+            COMMAND_REGISTRY,
+            _is_gateway_available,
+            _iter_plugin_command_entries,
+            _resolve_config_gates,
+        )
+
+        overrides = _resolve_config_gates()
+        for command in COMMAND_REGISTRY:
+            if _is_gateway_available(command, overrides):
+                append(command.name, command.description, command.args_hint, command.category)
+        for name, description, args_hint in _iter_plugin_command_entries():
+            append(name, description, args_hint, "Plugins")
+    except Exception:
+        logger.debug("attach: Hermes command registry unavailable", exc_info=True)
+
+    try:
+        from agent.skill_commands import get_skill_commands
+
+        for name, info in sorted((get_skill_commands() or {}).items()):
+            if not isinstance(info, dict):
+                continue
+            append(str(name), str(info.get("description") or "Skill"), category="Skills")
+    except Exception:
+        logger.debug("attach: Hermes skill commands unavailable", exc_info=True)
+
+    return catalog[:512]
 
 
 class AttachAdapter:
@@ -290,6 +352,7 @@ class AttachAdapter:
                 on_interrupt=self._on_interrupt,
                 on_approval=self._dispatch_approval_command,
                 on_clarify=self._dispatch_clarify_command,
+                commands=hermes_gateway_commands(),
             )
         )
         try:
