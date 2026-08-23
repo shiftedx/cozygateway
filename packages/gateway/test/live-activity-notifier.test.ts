@@ -7,7 +7,7 @@ import { openStorage } from "../src/storage.ts";
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("live activity notifier", () => {
-  it("uses authoritative state frames and makes ActivityKit the sole terminal alert", async () => {
+  it("keeps one ActivityKit conversation card across consecutive bot replies", async () => {
     const storage = openStorage(":memory:");
     storage.createDevice({ id: "device", name: "phone", tokenHash: "hash", createdAt: 1 });
     storage.saveLiveActivityRegistration({
@@ -43,11 +43,19 @@ describe("live activity notifier", () => {
       running: false, inflight: false, updatedAt: 3 } as ServerFrame);
     await tick();
     expect(bodies[1]).toMatchObject({ liveActivity: {
-      event: "end", priority: 10,
+      event: "update", priority: 10,
       alert: { title: "CozyChat", body: "Your bot’s reply is ready", sound: "default" },
       contentState: { phase: "completed", eventSequence: 2, elapsedSeconds: 9 },
     } });
-    expect(storage.liveActivityRegistrations()).toHaveLength(0);
+    expect(storage.liveActivityRegistrations()).toHaveLength(1);
+
+    notifier.handleFrame({ type: "bot_chat_state", bot: "sage", sessionId: "s", phase: "polling",
+      running: true, inflight: true, updatedAt: 4 } as ServerFrame);
+    await tick();
+    expect(bodies[2]).toMatchObject({ pushId: "opaque", liveActivity: {
+      event: "update", priority: 5, contentState: { phase: "thinking", eventSequence: 3 },
+    } });
+    expect(storage.liveActivityRegistrations()).toHaveLength(1);
     storage.close();
   });
 

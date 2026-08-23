@@ -41,6 +41,7 @@ export class LiveActivityNotifier {
   readonly #lastToolUpdate = new Map<string, number>();
   readonly #claimedActivities = new Set<string>();
   readonly #terminalCoverage = new Map<string, ReadonlySet<string>>();
+  readonly #settledCompletions = new Set<string>();
 
   constructor(deps: LiveActivityNotifierDeps) {
     this.#storage = deps.storage;
@@ -56,6 +57,7 @@ export class LiveActivityNotifier {
     switch (frame.type) {
       case "bot_chat_state":
         if (frame.phase === "polling") {
+          this.#settledCompletions.delete(this.#completionKey(frame.bot, frame.sessionId));
           this.#publish(frame.bot, { phase: "thinking", toolCallCount: 0, shortStatus: "Thinking" });
         } else if (frame.phase === "timeout" || frame.phase === "failed") {
           this.#end(frame.bot, frame.sessionId, false);
@@ -93,6 +95,7 @@ export class LiveActivityNotifier {
       this.#terminalCoverage.delete(completionKey);
       return terminal;
     }
+    if (this.#settledCompletions.has(completionKey)) return new Set();
 
     const rows = this.#storage.liveActivityRegistrations(event.bot)
       .filter((row) => row.conversationId === event.chatSessionId);
@@ -128,6 +131,7 @@ export class LiveActivityNotifier {
   }
 
   #end(bot: string, sessionId: string, succeeded: boolean): void {
+    this.#settledCompletions.add(this.#completionKey(bot, sessionId));
     const rows = this.#storage.liveActivityRegistrations(bot)
       .filter((row) => row.conversationId === sessionId);
     const uncoveredDevices = new Set<string>();
@@ -167,11 +171,11 @@ export class LiveActivityNotifier {
     const eventSequence = this.#storage.advanceLiveActivity(row.deviceId, row.activityId, timestamp);
     const liveActivity = {
       timestamp,
-      event: terminal ? "end" as const : "update" as const,
+      // The activity belongs to the conversation, not this individual response. Completion is an
+      // alerting update so the next response can reuse the same Lock Screen / Dynamic Island card.
+      event: "update" as const,
       contentState: { ...projection, eventSequence },
-      ...(terminal ? { dismissalDate: timestamp + (projection.phase === "completed" ? 15 * 60 : 0) } : {
-        staleDate: timestamp + 120,
-      }),
+      staleDate: timestamp + (terminal ? 8 * 60 * 60 : 120),
       ...(terminal ? {
         alert: {
           title: "CozyChat",
@@ -192,18 +196,12 @@ export class LiveActivityNotifier {
         device: traceId(row.deviceId),
         result: response.ok ? "ok" : response.status === 404 ? "not_found" : "http_error",
       });
-      if (response.status === 404 || terminal) {
+      if (response.status === 404) {
         this.#storage.deleteLiveActivityRegistration(row.deviceId, row.activityId);
         this.#lastProjection.delete(key);
         this.#lastToolUpdate.delete(key);
       }
       if (!response.ok && response.status !== 404) throw new Error(`relay returned HTTP ${response.status}`);
-      if (terminal) {
-        await this.#fetch(
-          `${this.#relayBaseUrl!.replace(/\/+$/, "")}/register/${encodeURIComponent(row.pushId)}`,
-          { method: "DELETE", signal: AbortSignal.timeout(LIVE_ACTIVITY_TIMEOUT_MS) },
-        ).catch(() => undefined);
-      }
     }).catch((error: unknown) => {
       emitTrace(this.#trace, "relay_result", {
         channel: "live_activity",
