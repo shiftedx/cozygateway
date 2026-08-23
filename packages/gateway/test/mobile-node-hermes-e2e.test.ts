@@ -16,7 +16,15 @@ const PLUGIN_ROOT = fileURLToPath(new URL("../../../integrations/attach-plugin",
 const HARNESS = join(PLUGIN_ROOT, "tests/live_mobile_node_harness.py");
 const PINNED_HERMES = pinnedHermes();
 
+it.runIf(PINNED_HERMES !== undefined)("runs the real Hermes status tool through the live origin-bound mobile-node path (requires HERMES_AGENT_ROOT)", async () => {
+  await runMobileToolE2E("status");
+}, 30_000);
+
 it.runIf(PINNED_HERMES !== undefined)("runs the real Hermes location tool through the live origin-bound mobile-node path (requires HERMES_AGENT_ROOT)", async () => {
+  await runMobileToolE2E("location");
+}, 30_000);
+
+async function runMobileToolE2E(tool: "status" | "location"): Promise<void> {
   process.env["MOBILE_HERMES_DASHBOARD_TOKEN"] = "dashboard-secret";
   process.env["MOBILE_HERMES_SAGE_TOKEN"] = "attach-secret";
   let gateway: RunningGateway | undefined;
@@ -45,7 +53,7 @@ it.runIf(PINNED_HERMES !== undefined)("runs the real Hermes location tool throug
     appB.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true }));
     await pause();
 
-    harness = startHarness(gateway.url, PINNED_HERMES!, "location");
+    harness = startHarness(gateway.url, PINNED_HERMES!, tool);
     await harness.until((event) => event.e2e === "ready");
     await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "sage"));
     const sent = await fetch(`${gateway.url}/bots/sage/chat/messages`, {
@@ -56,15 +64,20 @@ it.runIf(PINNED_HERMES !== undefined)("runs the real Hermes location tool throug
 
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request"));
     const request = appA.frames.find((frame) => frame.type === "mobile_node_request")!;
-    expect(request).toMatchObject({ command: "location.current", purpose: "Find nearby coffee" });
+    expect(request).toMatchObject(tool === "location"
+      ? { command: "location.current", purpose: "Find nearby coffee" }
+      : { command: "device.status" });
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request")).toBe(false);
     appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, status: "denied" }));
     await pause();
     expect(harness.events.some((event) => event.e2e === "result")).toBe(false);
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, status: "ok", result: { latitude: 41.88, longitude: -87.63 } }));
+    const mobileResult = tool === "location"
+      ? { latitude: 41.88, longitude: -87.63 }
+      : { foreground: true };
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, status: "ok", result: mobileResult }));
 
     const result = await harness.until((event) => event.e2e === "result");
-    expect(result).toMatchObject({ threadId: request.threadId, turnId: request.turnId, result: { status: "ok", result: { latitude: 41.88, longitude: -87.63 } } });
+    expect(result).toMatchObject({ threadId: request.threadId, turnId: request.turnId, result: { status: "ok", result: mobileResult } });
     await harness.exited();
   } finally {
     await harness?.close();
@@ -74,7 +87,7 @@ it.runIf(PINNED_HERMES !== undefined)("runs the real Hermes location tool throug
     delete process.env["MOBILE_HERMES_DASHBOARD_TOKEN"];
     delete process.env["MOBILE_HERMES_SAGE_TOKEN"];
   }
-}, 30_000);
+}
 
 function startHarness(gatewayUrl: string, hermes: HermesRuntime, tool: "status" | "location"): Harness {
   const home = mkdtempSync(join(tmpdir(), "cozy-mobile-hermes-"));
