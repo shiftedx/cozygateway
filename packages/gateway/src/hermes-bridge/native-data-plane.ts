@@ -186,7 +186,19 @@ export class NativeBotDataPlane {
   }
 
   #pendingApprovals(): BotPendingApproval[] {
-    return this.#storage.pendingNativeApprovals(100);
+    // A cold restart schedules already-due expiry timers with a zero delay. That is still one
+    // event-loop turn too late for a user who opens the inbox or taps a push immediately, so settle
+    // those durable rows synchronously before projecting the snapshot.
+    for (const due of this.#storage.dueNativeApprovalIds([...this.#native], this.#now())) {
+      const expired = this.#storage.expireNativeApprovalIfDue(due.bot, due.interactionId, this.#now());
+      if (expired === undefined) continue;
+      this.#clearInteractionTimer("approval", due.bot, due.interactionId);
+      this.#emitApprovalResolved(due.bot, expired.sessionId, expired.turnId, due.interactionId, "expired");
+      this.#state(due.bot, expired.sessionId, "polling", true);
+    }
+    // Storage also receives the configured set: a durable row from a removed/reconfigured profile
+    // is intentionally invisible because its existing action route correctly rejects that bot.
+    return this.#storage.pendingNativeApprovals([...this.#native], 100);
   }
 
   /** Expose only attach-configured identities. Hermes may host other profiles, but this gateway
@@ -679,6 +691,14 @@ export class NativeBotDataPlane {
   ): Promise<BotApprovalResolveOutcome> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return "unknown";
+    const now = this.#now();
+    const expired = this.#storage.expireNativeApprovalIfDue(bot, approvalId, now);
+    if (expired !== undefined) {
+      this.#clearInteractionTimer("approval", bot, approvalId);
+      this.#emitApprovalResolved(bot, expired.sessionId, expired.turnId, approvalId, "expired");
+      this.#state(bot, expired.sessionId, "polling", true);
+      return "expired";
+    }
     const binding = this.#storage.nativeInteraction(
       bot,
       "approval",

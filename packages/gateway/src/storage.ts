@@ -2003,7 +2003,7 @@ export class Storage {
    * record's creation time: records are inserted pending once and only transition to a terminal
    * status afterwards, at which point this query excludes them. Keep the payload JSON in SQLite;
    * this read selects only the already-safe rule display name and can never surface tool args. */
-  pendingNativeApprovals(limit: number): Array<{
+  pendingNativeApprovals(bots: readonly string[], limit: number): Array<{
     bot: string;
     sessionId: string;
     turnId: string;
@@ -2011,6 +2011,8 @@ export class Storage {
     ruleName: string;
     createdAt: number;
   }> {
+    if (bots.length === 0) return [];
+    const placeholders = bots.map(() => "?").join(", ");
     return this.#db
       .prepare(
         `SELECT bot, session_id AS sessionId, turn_id AS turnId,
@@ -2018,11 +2020,11 @@ export class Storage {
                 json_extract(payload_json, '$.name') AS ruleName,
                 updated_at AS createdAt
          FROM bot_native_interactions
-         WHERE kind = 'approval' AND status = 'pending'
+         WHERE kind = 'approval' AND status = 'pending' AND bot IN (${placeholders})
          ORDER BY updated_at, interaction_id
          LIMIT ?`,
       )
-      .all(limit) as unknown as Array<{
+      .all(...bots, limit) as unknown as Array<{
         bot: string;
         sessionId: string;
         turnId: string;
@@ -2030,6 +2032,47 @@ export class Storage {
         ruleName: string;
         createdAt: number;
       }>;
+  }
+
+  /** Atomically transition one stale approval before a user can act on it. The conditional update
+   * is authoritative, so a timer or another device winning the race cannot expire a settled row. */
+  expireNativeApprovalIfDue(
+    bot: string,
+    interactionId: string,
+    now: number,
+  ): { sessionId: string; turnId: string } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT session_id AS sessionId, turn_id AS turnId
+         FROM bot_native_interactions
+         WHERE bot = ? AND kind = 'approval' AND interaction_id = ?
+           AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
+      )
+      .get(bot, interactionId, now) as { sessionId: string; turnId: string } | undefined;
+    if (row === undefined) return undefined;
+    const changed = this.#db
+      .prepare(
+        `UPDATE bot_native_interactions SET status = 'expired', updated_at = ?
+         WHERE bot = ? AND kind = 'approval' AND interaction_id = ?
+           AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
+      )
+      .run(now, bot, interactionId, now).changes === 1;
+    return changed ? row : undefined;
+  }
+
+  /** Due active-profile approval ids. Callers settle each through the conditional method above,
+   * retaining exactly-one terminal event semantics while completing the check synchronously. */
+  dueNativeApprovalIds(bots: readonly string[], now: number): Array<{ bot: string; interactionId: string }> {
+    if (bots.length === 0) return [];
+    const placeholders = bots.map(() => "?").join(", ");
+    return this.#db
+      .prepare(
+        `SELECT bot, interaction_id AS interactionId FROM bot_native_interactions
+         WHERE kind = 'approval' AND status = 'pending' AND expires_at IS NOT NULL
+           AND expires_at <= ? AND bot IN (${placeholders})
+         ORDER BY expires_at, interaction_id`,
+      )
+      .all(now, ...bots) as unknown as Array<{ bot: string; interactionId: string }>;
   }
 
   close(): void {

@@ -776,7 +776,9 @@ describe("attach-v1 native Bot Mode plane", () => {
     const frames: ServerFrame[] = [];
     const ingress = { sendClarifyResolution: vi.fn(() => true), sendApprovalResolution: vi.fn(() => true) } as unknown as AttachV1Ingress;
     const recovered = new NativeBotDataPlane({ control, storage, ingress, nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => 20 });
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // No sleep: a user can tap the approval push in the first event-loop turn after restart.
+    // Resolution itself must synchronously recognize the already-past durable deadline.
+    expect(await recovered.surface().resolveApproval("sage", "approve-1", "approve", "device-1")).toBe("expired");
     expect(storage.nativeInteraction("sage", "approval", "approve-1")?.status).toBe("expired");
     expect(recovered.surface().pendingApprovals()).toEqual([]);
     expect(frames).toContainEqual(expect.objectContaining({ type: "bot_approval_resolved", toolCallId: "approve-1", outcome: "expired" }));
@@ -789,6 +791,43 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(storage.nativeInteraction("sage", "clarify", "clarify-1")).toMatchObject({ status: "selected", selectedOptionId: "b" });
     expect(frames).toContainEqual(expect.objectContaining({ type: "bot_clarify_resolved", clarifyId: "clarify-1", outcome: "selected", selectedOptionId: "b" }));
     recovered.close();
+    storage.close();
+  });
+
+  it("keeps removed profiles out of the approval inbox and expires stale active rows before listing", async () => {
+    const storage = openStorage(":memory:");
+    for (const input of [
+      { bot: "sage", interactionId: "expired-list", expiresAt: 10 },
+      { bot: "sage", interactionId: "live", expiresAt: 30 },
+      { bot: "removed", interactionId: "orphan", expiresAt: undefined },
+    ]) {
+      storage.recordNativeInteraction({
+        bot: input.bot, kind: "approval", interactionId: input.interactionId,
+        sessionId: `session-${input.bot}`, turnId: `turn-${input.interactionId}`,
+        payload: { name: "workspace.write" }, status: "pending",
+        ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+        updatedAt: 1,
+      });
+    }
+    const frames: ServerFrame[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => 20,
+    });
+
+    // No sleep: this is the same immediate read a cold push-launch takes.
+    expect(plane.surface().pendingApprovals()).toEqual([{
+      bot: "sage", sessionId: "session-sage", turnId: "turn-live", toolCallId: "live",
+      ruleName: "workspace.write", createdAt: 1,
+    }]);
+    expect(storage.nativeInteraction("sage", "approval", "expired-list")?.status).toBe("expired");
+    expect(frames).toContainEqual(expect.objectContaining({
+      type: "bot_approval_resolved", toolCallId: "expired-list", outcome: "expired",
+    }));
+    expect(storage.nativeInteraction("removed", "approval", "orphan")?.status).toBe("pending");
+    expect(await plane.surface().resolveApproval("removed", "orphan", "approve", "device-1")).toBe("unknown");
+
+    plane.close();
     storage.close();
   });
 
