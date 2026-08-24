@@ -468,9 +468,10 @@ class AttachV1Client:
     async def rollback_uploaded_media(self, media_ids: List[str]) -> None:
         """Durably abandon an atomic occurrence's uploaded media.
 
-        Local descriptor rows disappear before HTTP cleanup is attempted, and failed cleanup stays
-        in the spool for the next reconnect. The return value is the still-pending remote cleanup
-        ids. Callers surface the original media failure and never call the occurrence sent.
+        Local descriptor payloads are withdrawn before HTTP cleanup is attempted; their numbered
+        rows survive as inert placeholders so the event sequence stays contiguous. Failed cleanup
+        stays in the spool for the next reconnect. Callers surface the original media failure and
+        never call the occurrence sent.
         """
         async with self._flow_lock:
             sequences = self._spool.begin_media_cleanup(media_ids)
@@ -779,6 +780,16 @@ class AttachV1Client:
             })
             await self._drain_events()
         elif kind == "gap" and frame.get("channel") == "event":
+            # A gap the spool cannot fill is a durable hole, not a transient one: replaying alone
+            # would hand back the row AFTER the hole, be gapped again, and livelock silently while
+            # heartbeats keep the connection looking online. Heal first, then replay.
+            requested_after = frame.get("requestedAfter")
+            if isinstance(requested_after, int) and requested_after >= 0:
+                for sequence in self._spool.heal_event_gap(requested_after):
+                    logger.warning(
+                        "attach-v1: healed durable event sequence hole at %d with an inert placeholder",
+                        sequence,
+                    )
             await self.replay()
 
     async def _dispatch_command(self, frame: Dict[str, Any], replay: bool) -> None:

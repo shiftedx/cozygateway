@@ -504,7 +504,12 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.client, "_delete_media_sync") as delete:
             await self.client.rollback_uploaded_media(["atomic-first"])
         delete.assert_called_once_with("atomic-first")
-        self.assertEqual(self.spool.pending_events(10, 100_000), [])
+        # The descriptor payload is gone but its sequence is not: the row now carries the inert
+        # placeholder, because deleting it would wedge every event numbered after it.
+        pending = self.spool.pending_events(10, 100_000)
+        self.assertEqual([item["sequence"] for item in pending], [frame["sequence"]])
+        self.assertEqual(pending[0]["event"], {"kind": "presence", "state": "online"})
+        self.assertEqual(pending[0]["eventId"], frame["eventId"])
         self.assertEqual(self.spool.pending_media_cleanups(), [])
         self.assertNotIn(frame["sequence"], self.client._sent_events)
         self.assertEqual(self.client._sent_event_bytes, 0)

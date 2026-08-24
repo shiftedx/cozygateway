@@ -56,6 +56,15 @@ class ResumeConflict(RuntimeError):
 
 _TELEMETRY_MAX_EVENT_AGE_MS = 7 * 24 * 60 * 60 * 1_000
 
+# The one event the gateway admits with no negotiated capability and applies to nothing: it needs
+# no thread, seals no turn, and its projection is a bare `return true`. That makes it the frame a
+# sequence number can wear when the number must survive but its payload must not.
+_INERT_EVENT: Dict[str, Any] = {"kind": "presence", "state": "online"}
+
+# A hole in someone else's spool is not this plugin's to paper over indefinitely. Healing is
+# capped so a badly wrong cursor cannot make the plugin mint an unbounded run of frames.
+MAX_HEALED_SEQUENCE_HOLES = 64
+
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -75,6 +84,11 @@ CREATE TABLE IF NOT EXISTS event_outbox (
   created_at INTEGER NOT NULL,
   acked INTEGER NOT NULL DEFAULT 0 CHECK (acked IN (0, 1))
 ) STRICT;
+-- The outbox keeps every row it ever numbered, so the unacked tail is a vanishing fraction of the
+-- table. `acked` is the LAST column, so without this partial index SQLite must decode every
+-- `frame_json` in the file just to learn a row is already answered for: a 73 MB read per send tick
+-- that blocks the event loop. The index is over the unacked rows alone.
+CREATE INDEX IF NOT EXISTS event_outbox_unacked ON event_outbox (sequence) WHERE acked = 0;
 CREATE TABLE IF NOT EXISTS command_inbox (
   sequence INTEGER PRIMARY KEY,
   command_id TEXT NOT NULL UNIQUE,
@@ -274,23 +288,33 @@ class AttachSpool:
             used += size
         return result
 
-    def begin_media_cleanup(self, media_ids: List[str]) -> List[int]:
-        """Drop local descriptor events for an abandoned atomic media occurrence.
+    def _inert_frame(self, sequence: int, event_id: str) -> tuple[str, int]:
+        """Encode the same-sequence placeholder that stands in for a withdrawn or absent frame."""
+        frame = {"kind": "event", "sequence": sequence, "eventId": event_id, "event": dict(_INERT_EVENT)}
+        encoded = json.dumps(frame, separators=(",", ":"))
+        return encoded, len(encoded.encode("utf-8"))
 
-        Upload bytes live outside the journal, but their descriptor events are ordinary durable
-        rows. Removing both unsent and already-ACKed descriptors is safe: ``event_cursor`` remains
-        monotonic and no terminal event can be a media descriptor. Callers delete the corresponding
-        remote bytes after this local rollback; a later scheduled/commit event must never reference
-        these ids.
+    def begin_media_cleanup(self, media_ids: List[str]) -> List[int]:
+        """Withdraw the descriptor payload of an abandoned atomic media occurrence.
+
+        Upload bytes live outside the journal, but their descriptor events are ordinary numbered
+        rows, and a numbered row is a promise: the gateway admits events only in strictly
+        contiguous order, so a deleted row is a permanent hole that no replay can ever step over.
+        The payload is therefore replaced in place by an inert placeholder carrying the same
+        sequence, the same event id and honest byte accounting. An already-ACKed row re-sends as an
+        exact duplicate and is ignored; an unsent one costs one meaningless frame. Callers delete
+        the corresponding remote bytes after this local withdrawal; a later scheduled/commit event
+        must never reference these ids.
         """
         targets = {media_id for media_id in media_ids if isinstance(media_id, str) and media_id}
         if not targets:
             return []
         rows = self._db.execute(
-            "SELECT sequence, frame_json FROM event_outbox ORDER BY sequence"
+            "SELECT sequence, event_id, frame_json FROM event_outbox ORDER BY sequence"
         ).fetchall()
+        withdrawn: List[tuple[str, int, int]] = []
         sequences: List[int] = []
-        for sequence, encoded in rows:
+        for sequence, event_id, encoded in rows:
             try:
                 event = json.loads(str(encoded)).get("event")
                 descriptor = event.get("media") if isinstance(event, dict) else None
@@ -298,18 +322,56 @@ class AttachSpool:
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
             if isinstance(event, dict) and event.get("kind") == "media" and media_id in targets:
+                replacement, byte_count = self._inert_frame(int(sequence), str(event_id))
+                withdrawn.append((replacement, byte_count, int(sequence)))
                 sequences.append(int(sequence))
         with self._db:
-            if sequences:
+            if withdrawn:
                 self._db.executemany(
-                    "DELETE FROM event_outbox WHERE sequence = ?",
-                    ((sequence,) for sequence in sequences),
+                    "UPDATE event_outbox SET frame_json = ?, byte_count = ? WHERE sequence = ?",
+                    withdrawn,
                 )
             self._db.executemany(
                 "INSERT OR IGNORE INTO media_cleanup (media_id) VALUES (?)",
                 ((media_id,) for media_id in targets),
             )
         return sequences
+
+    def heal_event_gap(self, requested_after: int, limit: int = MAX_HEALED_SEQUENCE_HOLES) -> List[int]:
+        """Mint inert placeholders for numbered rows this spool no longer has.
+
+        A gap frame asks for ``requested_after + 1``. If that row is simply absent, replaying only
+        hands the gateway the row after the hole, it gaps again, and the stream livelocks while
+        heartbeats keep the connection looking healthy. Filling the hole with a frame the gateway
+        accepts and ignores is the only move that lets the numbering continue. Only sequences this
+        spool already issued are healed, so healing can never invent future work.
+        """
+        with self._db:
+            next_sequence = int(
+                self._db.execute("SELECT next_event_sequence FROM state WHERE id = 1").fetchone()[0]
+            )
+            start = max(1, requested_after + 1)
+            last = min(next_sequence - 1, start + max(0, limit) - 1)
+            if start > last:
+                return []
+            present = {
+                int(row[0]) for row in self._db.execute(
+                    "SELECT sequence FROM event_outbox WHERE sequence BETWEEN ? AND ?", (start, last)
+                )
+            }
+            healed: List[int] = []
+            for sequence in range(start, last + 1):
+                if sequence in present:
+                    continue
+                event_id = str(uuid.uuid4())
+                encoded, byte_count = self._inert_frame(sequence, event_id)
+                self._db.execute(
+                    "INSERT INTO event_outbox (sequence, event_id, frame_json, byte_count, created_at, acked)"
+                    " VALUES (?, ?, ?, ?, ?, 0)",
+                    (sequence, event_id, encoded, byte_count, self._now_ms()),
+                )
+                healed.append(sequence)
+        return healed
 
     def pending_media_cleanups(self) -> List[str]:
         return [str(row[0]) for row in self._db.execute(
