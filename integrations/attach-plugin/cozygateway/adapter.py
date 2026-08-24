@@ -38,6 +38,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
+from urllib.error import HTTPError
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .attach_client import (
@@ -216,6 +217,9 @@ class AttachAdapter:
     # -- construction ---------------------------------------------------------
     def _attach_init(self, config: Any) -> None:
         extra = getattr(config, "extra", {}) or {}
+        # Retained so a proactive media send can fall back to the durable one-shot
+        # journal when this adapter's own socket is not writable.
+        self._pconfig: Any = config
         self.gateway_url: str = (
             os.getenv("COZYGATEWAY_URL") or extra.get("gateway_url", "")
         ).rstrip("/")
@@ -1102,10 +1106,19 @@ class AttachAdapter:
                     return SendResult(success=False, error=str(exc))
             return SendResult(success=True)
         if not turn_id:
+            # Hermes' cron "live adapter delivery" calls this surface with no in-flight
+            # turn and a placeholder chat id. A thread-scoped scheduled event is only
+            # accepted for the gateway's CURRENT native session, so an unpinned target
+            # must ride the session-independent canonical-home form instead; otherwise
+            # the placeholder (or a stale thread) is quarantined as unauthorized_target.
             metadata_thread = metadata.get("thread_id") if isinstance(metadata, dict) else None
-            target_thread = str(metadata_thread or chat_id).strip()
+            pinned_thread = str(metadata_thread or "").strip()
+            canonical_home = not pinned_thread
+            target_thread = pinned_thread or str(chat_id or "").strip()
             blocks = normalize_text_to_blocks(content)
-            if not isinstance(client, AttachV1Client) or not target_thread or not blocks:
+            if not isinstance(client, AttachV1Client) or not blocks:
+                return SendResult(success=False, error="no in-flight turn")
+            if not canonical_home and not target_thread:
                 return SendResult(success=False, error="no in-flight turn")
             delivery_key = ""
             try:
@@ -1127,7 +1140,11 @@ class AttachAdapter:
                 delivery_id.encode("utf-8")
             ).hexdigest()[:32]
             frame = await client.send_scheduled(
-                target_thread, delivery_id, message_id, blocks
+                target_thread or None,
+                delivery_id,
+                message_id,
+                blocks,
+                canonical_home=canonical_home,
             )
             if frame is None:
                 return SendResult(success=False, error="scheduled delivery unavailable")
@@ -1166,7 +1183,7 @@ class AttachAdapter:
                     except Exception as exc:  # noqa: BLE001 - text and other media still commit
                         logger.warning(
                             "attach: one reply media upload failed (%s); committing the remaining reply",
-                            exc,
+                            _proactive_media_error(raw_path, exc),
                         )
             had_content = self._content_seen.get(turn_id, False)
             if blocks or chips or media_ids:
@@ -1284,6 +1301,80 @@ class AttachAdapter:
         if self._active_turn.get(chat_id) == turn_id:
             self._active_turn.pop(chat_id, None)
 
+    async def _proactive_media_send(
+        self,
+        chat_id: str,
+        path: str,
+        caption: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Deliver one standalone file that no in-flight turn owns.
+
+        Hermes calls the per-media surfaces outside a turn too (a scheduled report, a
+        resend of an earlier attachment). The base adapter has no attach transport and
+        reports "native ... send unavailable", so route through the same proactive
+        upload/commit machinery the tool path uses. Without a caller-pinned thread the
+        delivery is session independent (canonical home), because a thread-scoped
+        scheduled event is only accepted for the gateway's current native session.
+        """
+        from gateway.platforms.base import SendResult  # harness-defined identifier
+
+        metadata_thread = metadata.get("thread_id") if isinstance(metadata, dict) else None
+        pinned_thread = str(metadata_thread or "").strip()
+        canonical_home = not pinned_thread
+        target_thread = pinned_thread or str(chat_id or "").strip()
+        if not canonical_home and not target_thread:
+            return SendResult(success=False, error="no delivery target")
+        text = caption or ""
+        # Idempotent per file plus occurrence, exactly as the send_message tool path is:
+        # a retry of the same occurrence must not double-post the attachment.
+        delivery_key = "media:" + hashlib.sha256(
+            "\0".join(
+                [
+                    _occurrence_key(),
+                    PLATFORM_NAME,
+                    target_thread,
+                    "canonical_home" if canonical_home else "thread",
+                    self._media_key(path),
+                    text,
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+        if self._ready.is_set() and isinstance(self._client, AttachV1Client):
+            result = await self.send_proactive(
+                target_thread,
+                text,
+                [path],
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+            )
+        else:
+            result = await enqueue_proactive_delivery(
+                getattr(self, "_pconfig", None),
+                thread_id=target_thread,
+                delivery_key=delivery_key,
+                message=text,
+                media_files=[path],
+                canonical_home=canonical_home,
+            )
+        state = result.get("state")
+        if state == "projected":
+            self._remember_absorbed_media(path)
+            return SendResult(success=True, message_id=result.get("messageId"))
+        if state == "suppressed":
+            return SendResult(success=True)
+        if state == "blocked":
+            error = "scheduled media delivery blocked"
+        elif state == "failed":
+            error = str(result.get("error") or "scheduled media delivery failed")
+        else:
+            error = "scheduled media delivery journaled; projection not yet confirmed"
+        media_errors = result.get("media_errors") or []
+        if media_errors:
+            detail = "; ".join(str(entry) for entry in media_errors)[:512]
+            error = f"{error} ({detail})"
+        return SendResult(success=False, error=error)
+
     async def send_video(
         self,
         chat_id: str,
@@ -1293,7 +1384,7 @@ class AttachAdapter:
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Acknowledge video already committed atomically by ``send``."""
+        """Acknowledge video already committed atomically by ``send``, else deliver it."""
         if self._consume_absorbed_media(video_path):
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
@@ -1304,9 +1395,7 @@ class AttachAdapter:
             if getattr(result, "success", False):
                 self._consume_absorbed_media(video_path)
             return result
-        return await super().send_video(  # type: ignore[misc]
-            chat_id, video_path, caption, reply_to, metadata, **kwargs
-        )
+        return await self._proactive_media_send(chat_id, video_path, caption, metadata)
 
     async def send_document(
         self,
@@ -1318,7 +1407,7 @@ class AttachAdapter:
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Acknowledge a document already committed atomically by ``send``."""
+        """Acknowledge a document already committed atomically by ``send``, else deliver it."""
         if self._consume_absorbed_media(file_path):
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
@@ -1329,9 +1418,7 @@ class AttachAdapter:
             if getattr(result, "success", False):
                 self._consume_absorbed_media(file_path)
             return result
-        return await super().send_document(  # type: ignore[misc]
-            chat_id, file_path, caption, file_name, reply_to, metadata, **kwargs
-        )
+        return await self._proactive_media_send(chat_id, file_path, caption, metadata)
 
     async def send_voice(
         self,
@@ -1342,7 +1429,7 @@ class AttachAdapter:
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Acknowledge audio already committed atomically by ``send``."""
+        """Acknowledge audio already committed atomically by ``send``, else deliver it."""
         if self._consume_absorbed_media(audio_path):
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
@@ -1353,9 +1440,7 @@ class AttachAdapter:
             if getattr(result, "success", False):
                 self._consume_absorbed_media(audio_path)
             return result
-        return await super().send_voice(  # type: ignore[misc]
-            chat_id, audio_path, caption, reply_to, metadata, **kwargs
-        )
+        return await self._proactive_media_send(chat_id, audio_path, caption, metadata)
 
     async def send_image_file(
         self,
@@ -1366,7 +1451,7 @@ class AttachAdapter:
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Acknowledge a local image already committed atomically by ``send``."""
+        """Acknowledge a local image already committed atomically by ``send``, else deliver it."""
         if self._consume_absorbed_media(image_path):
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
@@ -1377,9 +1462,7 @@ class AttachAdapter:
             if getattr(result, "success", False):
                 self._consume_absorbed_media(image_path)
             return result
-        return await super().send_image_file(  # type: ignore[misc]
-            chat_id, image_path, caption, reply_to, metadata, **kwargs
-        )
+        return await self._proactive_media_send(chat_id, image_path, caption, metadata)
 
     # -- no-op surfaces the protocol does not model ---------------------------
     async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
@@ -1744,6 +1827,31 @@ def _resident_adapter() -> Optional[AttachAdapter]:
         )
 
 
+def _occurrence_key(args: Optional[Dict[str, Any]] = None) -> str:
+    """The caller-owned occurrence id a delivery key is derived from.
+
+    Stable across retries of one occurrence and distinct between occurrences: the active
+    tool call first, then the caller's own idempotency fields, then the harness session
+    identifiers. An empty result is honest; callers still mix in their own material.
+    """
+    key = str(_CURRENT_TOOL_OCCURRENCE.get() or "").strip()
+    if not key and isinstance(args, dict):
+        key = str(args.get("tool_call_id") or args.get("idempotency_key") or "").strip()
+    if not key:
+        try:
+            from gateway.session_context import get_session_env  # harness-defined identifier
+
+            key = str(
+                get_session_env("HERMES_SESSION_MESSAGE_ID")
+                or get_session_env("HERMES_SESSION_ID")
+                or get_session_env("HERMES_SESSION_KEY")
+                or ""
+            ).strip()
+        except Exception:
+            pass
+    return key
+
+
 async def _send_message_handler(
     args: Dict[str, Any], chat_id: str, platform_name: str, pconfig: Any
 ) -> Dict[str, Any]:
@@ -1757,21 +1865,7 @@ async def _send_message_handler(
     target = str(args.get("target") or "").strip().lower()
     canonical_home = target == platform_name
     key_material = "\0".join([platform_name, chat_id, cleaned, *media_files])
-    occurrence_key = _CURRENT_TOOL_OCCURRENCE.get() or str(
-        args.get("tool_call_id") or args.get("idempotency_key") or ""
-    ).strip()
-    try:
-        from gateway.session_context import get_session_env  # harness-defined identifier
-
-        if not occurrence_key:
-            occurrence_key = str(
-                get_session_env("HERMES_SESSION_MESSAGE_ID")
-                or get_session_env("HERMES_SESSION_ID")
-                or get_session_env("HERMES_SESSION_KEY")
-                or ""
-            ).strip()
-    except Exception:
-        pass
+    occurrence_key = _occurrence_key(args)
     delivery_key = "tool:" + hashlib.sha256(
         f"{occurrence_key}\0{key_material}".encode("utf-8")
     ).hexdigest()
@@ -1838,7 +1932,21 @@ def _apply_projection(
 
 
 def _proactive_media_error(path: str, exc: Exception) -> str:
+    """One bounded, human-readable upload failure line. Never carries payload bytes.
+
+    An HTTP rejection (notably ``415`` for a type the gateway does not accept) also
+    names the file's detected MIME and family, because "io_error" on its own left
+    production guessing which attachment the gateway refused and why.
+    """
     name = os.path.basename(path)[:128] or "attachment"
+    if isinstance(exc, HTTPError):
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        family = AttachAdapter._media_family(path)
+        phrase = str(getattr(exc, "reason", "") or "")[:64].strip()
+        detail = f"http_{exc.code}"
+        if phrase:
+            detail = f"{detail} {phrase}"
+        return f"{name} ({mime}, family={family}): {detail}"
     if isinstance(exc, FileNotFoundError):
         reason = "not_found"
     elif isinstance(exc, PermissionError):
