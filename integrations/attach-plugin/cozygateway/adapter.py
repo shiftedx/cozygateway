@@ -1064,6 +1064,19 @@ class AttachAdapter:
         chips = tracker.chips() if tracker else []
         return chips or None
 
+    def _caller_active_turn(self, chat_id: str) -> Optional[str]:
+        """The in-flight turn on ``chat_id`` -- only when the caller belongs to it.
+
+        A scheduled/proactive send (a cron report, any caller with no turn
+        affiliation) must never ride an in-flight turn it does not own; it takes the
+        session-independent scheduled path exactly as it would with no turn active.
+        See ``_caller_owns_active_turn``.
+        """
+        turn_id = self._active_turn.get(chat_id)
+        if turn_id and not _caller_owns_active_turn(turn_id):
+            return None
+        return turn_id
+
     # -- terminal reply -------------------------------------------------------
     async def send(
         self,
@@ -1081,8 +1094,8 @@ class AttachAdapter:
         from gateway.platforms.base import SendResult  # harness-defined identifier
 
         client = self._client
-        active_turn = self._active_turn.get(chat_id)
-        turn_id = reply_to or self._active_turn.get(chat_id)
+        active_turn = self._caller_active_turn(chat_id)
+        turn_id = reply_to or active_turn
         if client is None:
             return SendResult(success=False, error="attach not connected")
         if isinstance(metadata, dict) and metadata.get("_interim_send") and active_turn:
@@ -1389,7 +1402,7 @@ class AttachAdapter:
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
             return SendResult(success=True)
-        turn_id = self._active_turn.get(chat_id)
+        turn_id = self._caller_active_turn(chat_id)
         if turn_id and video_path in self._turn_media.get(turn_id, []):
             result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
             if getattr(result, "success", False):
@@ -1412,7 +1425,7 @@ class AttachAdapter:
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
             return SendResult(success=True)
-        turn_id = self._active_turn.get(chat_id)
+        turn_id = self._caller_active_turn(chat_id)
         if turn_id and file_path in self._turn_media.get(turn_id, []):
             result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
             if getattr(result, "success", False):
@@ -1434,7 +1447,7 @@ class AttachAdapter:
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
             return SendResult(success=True)
-        turn_id = self._active_turn.get(chat_id)
+        turn_id = self._caller_active_turn(chat_id)
         if turn_id and audio_path in self._turn_media.get(turn_id, []):
             result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
             if getattr(result, "success", False):
@@ -1456,7 +1469,7 @@ class AttachAdapter:
             from gateway.platforms.base import SendResult  # harness-defined identifier
 
             return SendResult(success=True)
-        turn_id = self._active_turn.get(chat_id)
+        turn_id = self._caller_active_turn(chat_id)
         if turn_id and image_path in self._turn_media.get(turn_id, []):
             result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
             if getattr(result, "success", False):
@@ -1537,6 +1550,38 @@ def _current_turn_message_and_cron() -> Tuple[Optional[str], bool, Optional[str]
         _truthy(get_session_env("HERMES_CRON_SESSION")),
         get_session_env("HERMES_SESSION_PROFILE") or None,
     )
+
+
+def _caller_owns_active_turn(turn_id: str) -> bool:
+    """True when the CALLER's own session is the session that owns ``turn_id``.
+
+    ``send`` is a shared platform surface. A live turn's terminal reply arrives on
+    it from inside that turn's own session, but Hermes also delivers a cron/routine
+    report through the very same surface with no turn affiliation at all, from a
+    session whose context is a cron run. ``_active_turn`` is keyed by chat id alone,
+    so without this check a scheduled delivery that lands on a chat with an
+    unrelated turn in flight is absorbed by that turn: its text replaces the live
+    draft, ``done`` seals it, ``_cleanup_turn`` steals the turn from its real owner,
+    and ``send`` returns success -- so no ``scheduled`` frame is ever journaled and
+    the scheduler records a delivery that never happened.
+
+    The harness binds the turn's message id (``HERMES_SESSION_MESSAGE_ID``) into the
+    task-local session context of the turn that is running, and marks a cron run with
+    ``HERMES_CRON_SESSION``; a cron session has no message id. A steer injects
+    ``<turn_id>:steer`` as the message id while the original turn keeps streaming, so
+    the prefix form counts as the same turn. When the harness context is unavailable
+    (a standalone import, a test without the harness stubs) the historic behaviour is
+    preserved: the active turn is adopted.
+    """
+    try:
+        message_id, cron, _profile = _current_turn_message_and_cron()
+    except Exception:  # noqa: BLE001 - no harness context to judge affiliation by
+        return True
+    if cron:
+        return False
+    if not message_id:
+        return True
+    return message_id == turn_id or message_id.startswith(f"{turn_id}:")
 
 
 def _mobile_tool_result(status: str, result: Optional[Dict[str, Any]] = None) -> str:
