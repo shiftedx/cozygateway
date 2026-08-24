@@ -31,11 +31,14 @@ export interface PushDeliveryOptions {
     timestamp: number;
     event: "update" | "end";
     contentState: {
-      phase: "queued" | "thinking" | "usingTools" | "writing" | "completed" | "failed";
+      phase:
+        | "queued" | "thinking" | "usingTools" | "writing" | "waitingOnApproval"
+        | "completed" | "failed";
       toolCallCount: number;
       shortStatus: string;
       eventSequence: number;
       elapsedSeconds?: number;
+      approvalID?: string;
     };
     staleDate?: number;
     dismissalDate?: number;

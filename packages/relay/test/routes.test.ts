@@ -280,6 +280,29 @@ describe("POST /notify", () => {
     }]);
   });
 
+  it("carries the waiting-on-approval phase and its approval id to the transport", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const liveActivity = {
+      timestamp: 10, event: "update", priority: 5, staleDate: 1810,
+      contentState: {
+        phase: "waitingOnApproval", toolCallCount: 1, shortStatus: "Waiting on your approval",
+        eventSequence: 3, approvalID: "call-1",
+      },
+    };
+    expect((await notify(app, { pushId, liveActivity })).status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries).toEqual([{
+      token: "https://x.example/hook", ciphertext: "", options: { liveActivity },
+    }]);
+
+    // Producer input that lands verbatim in an APNs payload stays bounded.
+    expect((await notify(app, { pushId, liveActivity: {
+      ...liveActivity,
+      contentState: { ...liveActivity.contentState, approvalID: "x".repeat(201) },
+    } })).status).toBe(400);
+  });
+
   it("delivers ciphertext through the transport and 202s", async () => {
     const { app, deliveries } = harness();
     const pushId = await registeredPushId(app);

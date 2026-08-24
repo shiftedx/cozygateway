@@ -57,12 +57,17 @@ export const NotifyRequestSchema = Type.Object(
       contentState: Type.Object({
         phase: Type.Union([
           Type.Literal("queued"), Type.Literal("thinking"), Type.Literal("usingTools"),
-          Type.Literal("writing"), Type.Literal("completed"), Type.Literal("failed"),
+          Type.Literal("writing"), Type.Literal("waitingOnApproval"),
+          Type.Literal("completed"), Type.Literal("failed"),
         ]),
         toolCallCount: Type.Integer({ minimum: 0, maximum: 10_000 }),
         shortStatus: Type.String({ minLength: 1, maxLength: 80 }),
         eventSequence: Type.Integer({ minimum: 0 }),
         elapsedSeconds: Type.Optional(Type.Integer({ minimum: 0, maximum: 604_800 })),
+        /** The approval a `waitingOnApproval` card is blocked on, so the Live Activity's Approve
+         * and Deny buttons have something to resolve. Bounded here rather than waved through: it
+         * is producer input that ends up verbatim in an APNs payload. */
+        approvalID: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
       }),
       staleDate: Type.Optional(Type.Integer()),
       dismissalDate: Type.Optional(Type.Integer()),

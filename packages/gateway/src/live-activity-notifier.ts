@@ -8,13 +8,23 @@ export const LIVE_ACTIVITY_TOOL_COALESCE_MS = 15_000;
 const LIVE_ACTIVITY_TIMEOUT_MS = 10_000;
 const COMPLETION_COVERAGE_MS = 60_000;
 
-type Phase = "thinking" | "usingTools" | "writing" | "completed" | "failed";
+type Phase =
+  | "thinking"
+  | "usingTools"
+  | "writing"
+  | "waitingOnApproval"
+  | "completed"
+  | "failed";
 
 interface Projection {
   phase: Phase;
   toolCallCount: number;
   shortStatus: string;
   elapsedSeconds?: number;
+  /** The pending approval this card is blocked on, so the Live Activity can offer Approve and Deny
+   * against `POST /bots/:name/approvals/:toolCallId/{approve,deny}`. An opaque id, never a tool
+   * name or its arguments. */
+  approvalID?: string;
 }
 
 export interface LiveActivityNotifierDeps {
@@ -42,6 +52,11 @@ export class LiveActivityNotifier {
   readonly #claimedActivities = new Set<string>();
   readonly #terminalCoverage = new Map<string, ReadonlySet<string>>();
   readonly #settledCompletions = new Set<string>();
+  /** Per activity, the projection to restore once the run stops being blocked. */
+  readonly #preApproval = new Map<string, Projection>();
+  /** Per bot, the approvals still awaiting a decision, oldest first. A turn can raise several at
+   * once, so resolving one must not clear the card while the others still block the run. */
+  readonly #pendingApprovals = new Map<string, string[]>();
 
   constructor(deps: LiveActivityNotifierDeps) {
     this.#storage = deps.storage;
@@ -69,6 +84,28 @@ export class LiveActivityNotifier {
         if (frame.room !== undefined) return;
         this.#publishTools(frame.bot, frame.steps.length);
         return;
+      case "bot_approval_pending": {
+        if (frame.room !== undefined) return;
+        const pending = this.#pendingApprovals.get(frame.bot) ?? [];
+        if (!pending.includes(frame.toolCallId)) pending.push(frame.toolCallId);
+        this.#pendingApprovals.set(frame.bot, pending);
+        this.#publishApproval(frame.bot, pending[0] ?? frame.toolCallId);
+        return;
+      }
+      case "bot_approval_resolved": {
+        if (frame.room !== undefined) return;
+        const rest = (this.#pendingApprovals.get(frame.bot) ?? [])
+          .filter((id) => id !== frame.toolCallId);
+        const next = rest[0];
+        if (next === undefined) {
+          this.#pendingApprovals.delete(frame.bot);
+          this.#resumeFromApproval(frame.bot);
+        } else {
+          this.#pendingApprovals.set(frame.bot, rest);
+          this.#publishApproval(frame.bot, next);
+        }
+        return;
+      }
       case "bot_chat_delta":
         if (frame.room !== undefined || frame.text.length === 0) return;
         this.#publish(frame.bot, {
@@ -119,6 +156,37 @@ export class LiveActivityNotifier {
     }
   }
 
+  /** A run blocked on an approval is stopped, not working, and the card said "Thinking" before
+   * this. Carrying the approval id is what lets the Live Activity answer it in place. */
+  #publishApproval(bot: string, approvalID: string): void {
+    for (const row of this.#storage.liveActivityRegistrations(bot)) {
+      const key = this.#key(row);
+      const previous = this.#lastProjection.get(key);
+      if (previous !== undefined && previous.phase !== "waitingOnApproval") {
+        this.#preApproval.set(key, previous);
+      }
+    }
+    // `toolCallCount: 0` so #publish carries the count the run already reported forward.
+    this.#publish(bot, {
+      phase: "waitingOnApproval",
+      toolCallCount: 0,
+      shortStatus: "Waiting on your approval",
+      approvalID,
+    });
+  }
+
+  /** Every resolution path lands here through `bot_approval_resolved`, expiry included, so the card
+   * leaves the blocked state even when nobody answered on this device. */
+  #resumeFromApproval(bot: string): void {
+    for (const row of this.#storage.liveActivityRegistrations(bot)) {
+      const key = this.#key(row);
+      if (this.#lastProjection.get(key)?.phase !== "waitingOnApproval") continue;
+      const resumed = this.#preApproval.get(key);
+      this.#preApproval.delete(key);
+      this.#send(row, resumed ?? { phase: "thinking", toolCallCount: 0, shortStatus: "Thinking" }, false);
+    }
+  }
+
   #publish(bot: string, projection: Projection): void {
     for (const row of this.#storage.liveActivityRegistrations(bot)) {
       const previous = this.#lastProjection.get(this.#key(row));
@@ -132,11 +200,13 @@ export class LiveActivityNotifier {
 
   #end(bot: string, sessionId: string, succeeded: boolean): void {
     this.#settledCompletions.add(this.#completionKey(bot, sessionId));
+    this.#pendingApprovals.delete(bot);
     const rows = this.#storage.liveActivityRegistrations(bot)
       .filter((row) => row.conversationId === sessionId);
     const uncoveredDevices = new Set<string>();
     for (const row of rows) {
       const key = this.#key(row);
+      this.#preApproval.delete(key);
       if (!this.#claimedActivities.delete(key)) uncoveredDevices.add(row.deviceId);
       this.#send(row, {
         phase: succeeded ? "completed" : "failed",
@@ -175,7 +245,10 @@ export class LiveActivityNotifier {
       // alerting update so the next response can reuse the same Lock Screen / Dynamic Island card.
       event: "update" as const,
       contentState: { ...projection, eventSequence },
-      staleDate: timestamp + (terminal ? 8 * 60 * 60 : 120),
+      // A blocked run waits on a person, so the 2 minute working-card window would grey the card
+      // out with the buttons still on screen. Approvals expire well inside this window.
+      staleDate: timestamp
+        + (terminal ? 8 * 60 * 60 : projection.phase === "waitingOnApproval" ? 30 * 60 : 120),
       ...(terminal ? {
         alert: {
           title: "CozyChat",
@@ -200,6 +273,7 @@ export class LiveActivityNotifier {
         this.#storage.deleteLiveActivityRegistration(row.deviceId, row.activityId);
         this.#lastProjection.delete(key);
         this.#lastToolUpdate.delete(key);
+        this.#preApproval.delete(key);
       }
       if (!response.ok && response.status !== 404) throw new Error(`relay returned HTTP ${response.status}`);
     }).catch((error: unknown) => {
