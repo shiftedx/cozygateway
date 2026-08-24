@@ -47,7 +47,7 @@ class AttachPeer {
     await once(socket, "open");
     socket.send(JSON.stringify({
       kind: "hello",
-      version: 1,
+      version: 2,
       instanceId: `conformance-${this.#kind}`,
       capabilities: ["draft", "approvals"],
       resume: { eventSequence: 0, commandSequence: 0 },
