@@ -52,13 +52,17 @@ MobileStatus = Literal[
 ]
 MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
-# How long to wait for hello_ack before concluding the server cannot parse a v2 hello and retrying
-# as v1. The gateway gives a peer 5 seconds to say hello; this is the matching budget in the other
-# direction. Anything shorter turns an ordinary slow handshake into a permanent capability
-# downgrade that lasts as long as the connection does.
+# How long to wait for hello_ack before concluding the handshake stalled and re-dialing with the
+# same hello. The gateway gives a peer 5 seconds to say hello; this is the matching budget in the
+# other direction.
 HELLO_ACK_TIMEOUT_SECONDS = 5
-# Deprecated alias: this budget was never about mobile status, it has always gated hello_ack.
-MOBILE_HELLO_ACK_TIMEOUT_SECONDS = HELLO_ACK_TIMEOUT_SECONDS
+# The single hello shape. One version, one capability set, no negotiated subset: a gateway that
+# cannot accept this refuses the socket, which is the only honest outcome for a capability loss.
+HELLO_VERSION = 2
+HELLO_CAPABILITIES = (
+    "draft", "media", "tools", "approvals", "clarify", "scheduled",
+    "mobile_node", "mobile_location", "memory_management",
+)
 ATTACH_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 ATTACH_AUDIO_VIDEO_MAX_BYTES = 40 * 1024 * 1024
 ATTACH_FILE_MAX_BYTES = 20 * 1024 * 1024
@@ -121,8 +125,8 @@ class AttachV1Client:
         self._sent_event_bytes = 0
         self._latest_blocks: Dict[str, List[Dict[str, Any]]] = {}
         self._latest_tools: Dict[str, Dict[str, tuple[str, str, Optional[str]]]] = {}
-        self._hello_version = 2
-        self._hello_fallback_used = False
+        # One re-dial per connect, so a stalled handshake gets a second chance without spinning.
+        self._hello_retried = False
         # Mobile requests are intentionally outside the durable spool: a phone action
         # must not replay after a reconnect or plugin restart.
         self._mobile_requests: Dict[str, tuple[str, asyncio.Future[MobileDeviceStatusResult]]] = {}
@@ -152,10 +156,9 @@ class AttachV1Client:
         self._capabilities.clear()
         self._sent_events.clear()
         self._sent_event_bytes = 0
-        self._hello_version = 2
-        self._hello_fallback_used = False
+        self._hello_retried = False
         try:
-            await self._open(self._hello_version)
+            await self._open()
         except Exception as exc:
             if _http_status(exc) == 401:
                 raise AttachAuthError("attach-v1 rejected (HTTP 401)") from exc
@@ -169,25 +172,24 @@ class AttachV1Client:
         for frame in self._spool.pending_commands():
             await self._dispatch_command(frame, replay=True)
 
-    async def _open(self, version: int) -> None:
+    async def _open(self) -> None:
+        """Dial and send the one hello. There is no reduced shape and no downgrade path: if the
+        gateway cannot accept this hello it closes the socket and the failure is visible."""
         headers = {"Authorization": f"Bearer {self._current_token()}"}
         factory = self._config.connect_factory or _default_connect
         self._ws = await factory(self._ws_url, headers, self._ssl_context())
         hello: Dict[str, Any] = {
             "kind": "hello",
-            "version": version,
+            "version": HELLO_VERSION,
             "instanceId": self._spool.instance_id,
-            "capabilities": ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", *( ["mobile_location", "memory_management"] if version >= 2 else [] )],
+            "capabilities": list(HELLO_CAPABILITIES),
             "resume": {"eventSequence": self._spool.event_cursor, "commandSequence": self._spool.command_cursor},
             "limits": {"maxInFlightEvents": self._max_events, "maxInFlightBytes": self._max_bytes},
             # Present even when empty so a newly authenticated profile can clear a catalog cached
-            # from its previous plugin process. Older gateways ignore the open hello property.
+            # from its previous plugin process.
             "commands": self._config.commands[:512],
+            "telemetry": self._spool.health_snapshot(),
         }
-        # v1's hello is a frozen closed schema. Never strand a fallback reconnect by sending a
-        # v2-only aggregate field to an older gateway.
-        if version >= 2:
-            hello["telemetry"] = self._spool.health_snapshot()
         await self._send(hello)
 
     async def request_device_status(self, thread_id: str, turn_id: str) -> MobileDeviceStatusResult:
@@ -559,17 +561,27 @@ class AttachV1Client:
                         None if self._negotiated else HELLO_ACK_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
-                    if not await self._fallback_to_v1(
+                    if not await self._retry_hello(
                         socket, f"no hello_ack within {HELLO_ACK_TIMEOUT_SECONDS}s"
                     ):
                         return
                     continue
                 except StopAsyncIteration:
-                    if await self._fallback_to_v1(socket, "socket ended before hello_ack"):
+                    if await self._retry_hello(socket, "socket ended before hello_ack"):
                         continue
                     return
                 except ConnectionClosed as exc:
-                    if await self._fallback_to_v1(
+                    # A policy close before hello_ack is the gateway refusing this hello on
+                    # purpose. Re-dialing the same shape cannot change that answer, so say what
+                    # the gateway said and let it surface instead of retrying into a loop.
+                    if _close_code(exc) == POLICY_CLOSE_CODE:
+                        logger.error(
+                            "attach-v1: gateway refused the hello (%s). "
+                            "The plugin and gateway do not agree on the attach contract",
+                            _close_reason(exc).strip() or "no reason given",
+                        )
+                        raise
+                    if await self._retry_hello(
                         socket, f"socket closed before hello_ack (code {_close_code(exc)})"
                     ):
                         continue
@@ -587,28 +599,23 @@ class AttachV1Client:
             self._capabilities.clear()
             self._settle_mobile_requests("device_unavailable")
 
-    async def _fallback_to_v1(self, socket: Any, reason: str = "hello v2 failed") -> bool:
-        """Reconnect once with the frozen v1 hello after v2 fails before its ack.
+    async def _retry_hello(self, socket: Any, reason: str = "hello failed") -> bool:
+        """Re-dial once with the SAME hello after the handshake stalls before its ack.
 
-        The downgrade is permanent for the life of this connection and silently removes the v2-only
-        capabilities (``mobile_location`` and ``memory_management``), so it is a warning, not a
-        detail: a bot whose memory surface is dead for hours usually has this line behind it.
+        There is exactly one hello shape, so a retry can never cost this connection a capability.
+        A gateway that refuses the hello on policy grounds is a contract skew, not a slow
+        handshake: it is logged as an error and left to the caller rather than retried into a loop.
         """
-        if self._negotiated or self._hello_version != 2 or self._hello_fallback_used:
+        if self._negotiated or self._hello_retried:
             return False
-        self._hello_fallback_used = True
-        self._hello_version = 1
+        self._hello_retried = True
         self._capabilities.clear()
-        logger.warning(
-            "attach-v1: %s; retrying handshake as hello v1. "
-            "mobile_location and memory_management stay OFF until this connection is replaced",
-            reason,
-        )
+        logger.warning("attach-v1: %s; re-dialing with the same hello", reason)
         try:
             await socket.close()
-            await self._open(1)
+            await self._open()
         except Exception as exc:  # noqa: BLE001 - the caller re-dials from scratch
-            logger.warning("attach-v1: hello v1 retry could not be dialed (%s)", exc)
+            logger.warning("attach-v1: hello retry could not be dialed (%s)", exc)
             return False
         return True
 
@@ -634,8 +641,17 @@ class AttachV1Client:
             # otherwise invisible from the Hermes side, so record it once at handshake time.
             logger.info(
                 "attach-v1: negotiated hello v%s with capabilities [%s]",
-                self._hello_version, ", ".join(sorted(self._capabilities)),
+                HELLO_VERSION, ", ".join(sorted(self._capabilities)),
             )
+            # The gateway intersects what it offers with what it allows. A missing capability is
+            # a silent surface outage on the Hermes side, so it has to be visible at handshake
+            # time rather than inferred from a 503 hours later.
+            missing = sorted(set(HELLO_CAPABILITIES) - self._capabilities)
+            if missing:
+                logger.warning(
+                    "attach-v1: gateway did not negotiate [%s]; those surfaces stay OFF for this connection",
+                    ", ".join(missing),
+                )
             limits = frame.get("limits")
             if isinstance(limits, dict):
                 self._max_events = min(self._max_events, int(limits.get("maxInFlightEvents", self._max_events)))
@@ -679,10 +695,10 @@ class AttachV1Client:
             elif status == "gap":
                 await self._send({"kind": "gap", "channel": "command", "requestedAfter": self._spool.command_cursor, "earliestAvailable": self._spool.command_cursor + 1, "latestAvailable": frame["sequence"]})
         elif kind == "heartbeat":
-            heartbeat = {"kind": "heartbeat", "sentAt": frame.get("sentAt", 0)}
-            if self._hello_version >= 2:
-                heartbeat["telemetry"] = self._spool.health_snapshot()
-            await self._send(heartbeat)
+            await self._send({
+                "kind": "heartbeat", "sentAt": frame.get("sentAt", 0),
+                "telemetry": self._spool.health_snapshot(),
+            })
             await self._drain_events()
         elif kind == "gap" and frame.get("channel") == "event":
             await self.replay()

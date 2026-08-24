@@ -16,22 +16,21 @@ chat sends, live turns, and groups; CozyGateway MUST NOT submit those chats thro
 - WebSocket: `GET /attach/v1`, authenticated with `Authorization: Bearer <token>` during upgrade.
 - Media bytes: `POST`, `GET`, and atomic-rollback `DELETE /attach/v1/media/:mediaId`, with the
   same bearer token.
-- The plugin sends `hello` first. Any other first frame closes the socket. Version 1 is selected by
-  the endpoint plus `hello.version: 1`; no unversioned attach endpoint exists.
+- The plugin sends `hello` first. Any other first frame closes the socket. There is exactly one
+  hello shape, carrying `version: 2`; no unversioned attach endpoint exists.
 - `hello` carries a stable plugin `instanceId`, supported capabilities, event/command resume
-  cursors, bounded receive limits, and may carry a bounded profile-local slash-command catalog.
-  Each command has its exact slash-prefixed invocation plus presentation metadata; the catalog is
-  authenticated profile state, not a negotiated attach capability, so old peers ignore it.
-  `hello_ack` returns the authenticated `agentId`, negotiated
-  limits/capabilities, authoritative cursors, and heartbeat interval. Its capabilities are the
-  intersection of the plugin offer and that identity's server-side rollout gates; neither peer
-  sends a feature whose capability was not negotiated.
-- The endpoint remains `/attach/v1`; `hello.version` selects this capability grammar. A v2-aware
-  plugin first sends `hello.version: 2`, which is the only hello version that may
-  offer `mobile_location`. A new gateway accepts and acknowledges both v1 and v2. To remain
-  compatible with a closed old v1 server, the plugin uses a bounded pre-ack timeout, closes that
-  attempt, then reconnects once with `hello.version: 1` and the old capability list. The v1
-  fallback is status-only: no location request is sent or replayed while it is selected.
+  cursors, bounded receive limits, a spool telemetry snapshot, and may carry a bounded
+  profile-local slash-command catalog. Each command has its exact slash-prefixed invocation plus
+  presentation metadata; the catalog is authenticated profile state, not a negotiated attach
+  capability. `hello_ack` returns the authenticated `agentId`, negotiated limits/capabilities,
+  authoritative cursors, and heartbeat interval. Its capabilities are the intersection of the
+  plugin offer and that identity's server-side rollout gates; neither peer sends a feature whose
+  capability was not negotiated.
+- The endpoint path remains `/attach/v1`. `hello.version` is a fixed literal, not a negotiation
+  knob: a hello carrying any other version is closed with `1008` and a logged reason naming the
+  version it sent. There is no downgrade ladder and no reduced capability set, so a contract skew
+  between the two peers is a loud connection failure rather than a surface that quietly goes dead.
+  A handshake that stalls before its `hello_ack` is re-dialed once with the identical hello.
 - A newer authenticated connection supersedes the older connection for that identity.
 
 ## Delivery and replay

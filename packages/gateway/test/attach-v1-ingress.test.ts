@@ -74,7 +74,7 @@ describe("attach-v1 ingress", () => {
     limits?: { maxInFlightEvents: number; maxInFlightBytes: number },
     capabilities: string[] = ["draft"],
     resume = { eventSequence: 0, commandSequence: 0 },
-    peer: { token?: string; instanceId?: string; heartbeatAckLimit?: number; version?: number; commands?: Array<{ name: string; description: string; argsHint?: string; category?: string }> } = {},
+    peer: { token?: string; instanceId?: string; heartbeatAckLimit?: number; commands?: Array<{ name: string; description: string; argsHint?: string; category?: string }> } = {},
   ): Promise<{ ws: WebSocket; frames: AttachV1ServerFrame[] }> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: `Bearer ${peer.token ?? "secret"}` } });
     const frames: AttachV1ServerFrame[] = [];
@@ -88,7 +88,7 @@ describe("attach-v1 ingress", () => {
       }
     });
     await once(ws, "open");
-    ws.send(JSON.stringify({ kind: "hello", version: peer.version ?? 1, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }), ...(peer.commands === undefined ? {} : { commands: peer.commands }) }));
+    ws.send(JSON.stringify({ kind: "hello", version: 2, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }), ...(peer.commands === undefined ? {} : { commands: peer.commands }) }));
     await until(() => frames.some((frame) => frame.kind === "hello_ack"));
     return { ws, frames };
   }
@@ -141,7 +141,7 @@ describe("attach-v1 ingress", () => {
   });
 
   it("routes memory requests and results live without writing raw content to storage", async () => {
-    const peer = await dial(undefined, ["memory_management"], undefined, { version: 2 });
+    const peer = await dial(undefined, ["memory_management"]);
     expect(ingress.sendMemoryRequest("sage", {
       kind: "memory_request", requestId: "memory-1", operation: "update",
       input: { sourceId: "vault:0", itemId: "note:Cleo.md", content: "private-memory", expectedRevision: "r1" },
@@ -170,7 +170,7 @@ describe("attach-v1 ingress", () => {
     await once(oldPeer.ws, "close");
     expect(mobileRequests.some((frame) => frame.requestId === "location-old")).toBe(false);
 
-    const newPeer = await dial(undefined, ["mobile_node", "mobile_location"], undefined, { version: 2 });
+    const newPeer = await dial(undefined, ["mobile_node", "mobile_location"]);
     expect(newPeer.frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["mobile_node", "mobile_location"] });
     newPeer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "location-new", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee" }));
     await until(() => mobileRequests.some((frame) => frame.requestId === "location-new"));
@@ -442,10 +442,10 @@ describe("attach-v1 ingress", () => {
 
   // Regression: the hello a real Hermes profile sends in production. Every field here is what the
   // attach plugin actually puts on the wire (all nine capabilities, a spool telemetry snapshot, a
-  // full command catalog, cursors from a long-lived stream). A v2 hello that fails validation is
-  // dropped, and the peer's own hello-ack budget then downgrades it to v1 for the life of the
-  // connection, taking the whole memory surface with it and logging nothing. Keep this parseable.
-  it("negotiates memory_management from the full production-shaped v2 hello", async () => {
+  // full command catalog, cursors from a long-lived stream). A hello that fails validation now
+  // closes the socket out loud, so an unparseable production shape takes the profile offline
+  // instead of quietly costing it the memory surface for hours. Keep this parseable.
+  it("negotiates memory_management from the full production-shaped hello", async () => {
     const commands = Array.from({ length: 512 }, (_, index) => ({
       name: `/command_${index}`, description: "x".repeat(200), argsHint: "y".repeat(160), category: "z".repeat(80),
     }));
@@ -472,8 +472,29 @@ describe("attach-v1 ingress", () => {
     ws.close();
   });
 
+  // Regression: the gateway used to answer an older hello with a silently reduced capability set,
+  // so a peer built against the previous shape looked attached and healthy while its memory and
+  // location surfaces were dead. There is one hello now, and anything else is refused by name.
+  it("refuses an older hello version out loud instead of negotiating a reduced set", async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: "Bearer secret" } });
+    const frames: AttachV1ServerFrame[] = [];
+    ws.on("message", (data) => frames.push(JSON.parse(String(data)) as AttachV1ServerFrame));
+    await once(ws, "open");
+    ws.send(JSON.stringify({
+      kind: "hello", version: 1, instanceId: "legacy-plugin",
+      capabilities: ["draft", "mobile_node"], resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    const [code, reason] = (await once(ws, "close")) as [number, Buffer];
+    expect(code).toBe(1008);
+    expect(String(reason)).toBe("attach-v1 invalid hello frame");
+    expect(frames.some((frame) => frame.kind === "hello_ack")).toBe(false);
+    expect(logs.some((line) => line.includes("refused hello frame") && line.includes("unsupported hello version 1"))).toBe(true);
+    expect(traces.some((line) => JSON.parse(line).event === "attach_frame_refused")).toBe(true);
+    expect(ingress.isAttached("sage")).toBe(false);
+  });
+
   it("separates the three ways the memory lane can be closed", async () => {
-    const peer = await dial(undefined, ["draft"], undefined, { version: 2 });
+    const peer = await dial(undefined, ["draft"]);
     expect(logs.some((line) => line.includes("negotiated hello v2") && !line.includes("memory_management"))).toBe(true);
     expect(ingress.sendMemoryRequest("sage", { kind: "memory_request", requestId: "m1", operation: "overview", input: {} })).toBe("capability_not_negotiated");
     peer.ws.close();
@@ -485,7 +506,7 @@ describe("attach-v1 ingress", () => {
   // Regression: a frame the schema rejects used to be dropped without a word, so a contract skew
   // between the gateway and its plugin presented as a request that simply never got its reply.
   it("closes loudly on a schema-invalid frame instead of dropping it in silence", async () => {
-    const peer = await dial(undefined, ["memory_management"], undefined, { version: 2 });
+    const peer = await dial(undefined, ["memory_management"]);
     peer.ws.send(JSON.stringify({
       kind: "memory_result", requestId: "m1", status: "ok", result: { sources: [{ id: "vault" }] },
     }));

@@ -85,7 +85,7 @@ beforeEach(async () => {
       messageId: `answer:${frame.command.messageId}`, blocks: [{ type: "paragraph", text: `Echo: ${frame.command.text}` }],
     } }));
   });
-  plugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "push-e2e", capabilities: ["draft"], resume: { eventSequence: 0, commandSequence: 0 } }));
+  plugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "push-e2e", capabilities: ["draft"], resume: { eventSequence: 0, commandSequence: 0 } }));
 });
 
 afterEach(async () => {
