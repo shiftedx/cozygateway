@@ -4,6 +4,7 @@ import types
 import unittest
 import sys
 from unittest.mock import AsyncMock, patch
+from urllib.error import HTTPError
 
 # The scheduled sender tests exercise durable framing without requiring the optional production
 # websocket package in the stdlib-only plugin test environment.
@@ -35,6 +36,21 @@ class _SendResult:
         self.success = success
         self.message_id = message_id
         self.error = error
+
+
+def _send_result_modules():
+    """A minimal harness stub for the surfaces that import ``SendResult`` lazily."""
+    gateway = types.ModuleType("gateway")
+    platforms = types.ModuleType("gateway.platforms")
+    base = types.ModuleType("gateway.platforms.base")
+    base.SendResult = _SendResult
+    gateway.platforms = platforms
+    platforms.base = base
+    return {
+        "gateway": gateway,
+        "gateway.platforms": platforms,
+        "gateway.platforms.base": base,
+    }
 
 
 class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -253,9 +269,44 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("projection not yet confirmed", first.error)
             events = self._events(path)
             self.assertEqual([event["kind"] for event in events], ["scheduled", "scheduled"])
-            self.assertEqual([event["threadId"] for event in events], ["thread", "thread"])
+            # No caller-pinned thread: the delivery must be session independent, or the
+            # gateway quarantines the cron placeholder chat id as unauthorized_target.
+            self.assertEqual(
+                [event["target"] for event in events],
+                [{"kind": "canonical_home"}, {"kind": "canonical_home"}],
+            )
+            self.assertNotIn("threadId", events[0])
             self.assertEqual(events[0]["deliveryId"], events[1]["deliveryId"])
             self.assertEqual(events[0]["messageId"], events[1]["messageId"])
+
+    async def test_no_turn_send_with_a_pinned_metadata_thread_keeps_the_thread_form(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            config = self._config(path)
+            adapter = AttachAdapter()
+            adapter._attach_init(config)
+            adapter._spool = AttachSpool(path)
+            adapter._client = AttachV1Client(AttachV1ClientConfig(
+                gateway_url="http://gateway.example",
+                token="secret",
+                spool=adapter._spool,
+            ))
+
+            with patch.dict(sys.modules, _send_result_modules()):
+                try:
+                    result = await adapter.send(
+                        "placeholder",
+                        "Pinned answer",
+                        metadata={"thread_id": "thread-42"},
+                    )
+                finally:
+                    adapter._spool.close()
+
+            self.assertFalse(result.success)
+            events = self._events(path)
+            self.assertEqual([event["kind"] for event in events], ["scheduled"])
+            self.assertEqual(events[0]["threadId"], "thread-42")
+            self.assertNotIn("target", events[0])
 
     async def test_upstream_hermes_abi_reports_journaled_delivery_as_pending_error(self):
         with patch(
@@ -491,6 +542,37 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             events = self._events(path)
             self.assertEqual([event["kind"] for event in events], ["media", "scheduled"])
             self.assertEqual(len(events[1]["mediaIds"]), 1)
+
+    async def test_http_415_upload_failure_names_the_file_its_mime_and_the_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            archive = os.path.join(directory, "logo-package.zip")
+            with open(archive, "wb") as handle:
+                handle.write(b"PK\x03\x04")
+
+            refusal = HTTPError(
+                "http://gateway.example/attach/v1/media/x",
+                415,
+                "Unsupported Media Type",
+                {},
+                None,
+            )
+            self.addCleanup(refusal.close)
+
+            def upload(*_args, **_kwargs):
+                raise refusal
+
+            with patch.object(AttachV1Client, "_upload_media_sync", side_effect=upload):
+                result = await enqueue_proactive_delivery(
+                    self._config(path), thread_id="home", delivery_key="routine:415",
+                    message="the logo package", media_files=[archive],
+                )
+            self.assertEqual(result["state"], "failed")
+            self.assertEqual(result["error"], "media_upload_failed")
+            self.assertEqual(
+                result["media_errors"],
+                ["logo-package.zip (application/zip, family=file): http_415 Unsupported Media Type"],
+            )
 
     async def test_atomic_media_failure_rolls_back_earlier_uploaded_media(self):
         with tempfile.TemporaryDirectory() as directory:

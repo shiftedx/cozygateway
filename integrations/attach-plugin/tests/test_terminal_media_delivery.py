@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import AsyncMock
 
 from cozygateway.adapter import AttachAdapter
 from cozygateway.attach_client_v1 import AttachV1Client
@@ -115,6 +116,97 @@ class TerminalMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(client.drafts, [("thread", "turn", [])])
         self.assertEqual(len(client.commits[0][2]), 1)
+
+    async def test_standalone_image_with_no_turn_rides_the_canonical_home_proactive_path(self):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            handle.write(b"\x89PNG\r\n\x1a\n")
+            image = handle.name
+        self.addCleanup(lambda: os.path.exists(image) and os.unlink(image))
+
+        adapter = self._adapter(image)
+        adapter._client = _Client()
+        adapter._ready.set()
+        adapter.send_proactive = AsyncMock(
+            return_value={"state": "projected", "messageId": "scheduled-abc"}
+        )
+
+        result = await adapter.send_image_file("thread", image, "here it is")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "scheduled-abc")
+        adapter.send_proactive.assert_awaited_once()
+        args, kwargs = adapter.send_proactive.await_args
+        self.assertEqual(args[0], "thread")
+        self.assertEqual(args[1], "here it is")
+        self.assertEqual(args[2], [image])
+        self.assertTrue(kwargs["canonical_home"])
+        self.assertTrue(kwargs["delivery_key"].startswith("media:"))
+
+    async def test_standalone_document_with_a_pinned_thread_stays_thread_scoped(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
+            handle.write(b"%PDF-1.4")
+            document = handle.name
+        self.addCleanup(lambda: os.path.exists(document) and os.unlink(document))
+
+        adapter = self._adapter(document)
+        adapter._client = _Client()
+        adapter._ready.set()
+        adapter.send_proactive = AsyncMock(
+            return_value={"state": "projected", "messageId": "scheduled-def"}
+        )
+
+        result = await adapter.send_document(
+            "placeholder", document, metadata={"thread_id": "thread-42"}
+        )
+
+        self.assertTrue(result.success)
+        _args, kwargs = adapter.send_proactive.await_args
+        self.assertFalse(kwargs["canonical_home"])
+        self.assertEqual(adapter.send_proactive.await_args[0][0], "thread-42")
+
+    async def test_standalone_media_delivery_key_is_stable_per_file_and_occurrence(self):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            handle.write(b"\x89PNG\r\n\x1a\n")
+            image = handle.name
+        self.addCleanup(lambda: os.path.exists(image) and os.unlink(image))
+
+        adapter = self._adapter(image)
+        adapter._client = _Client()
+        adapter._ready.set()
+        adapter.send_proactive = AsyncMock(
+            return_value={"state": "journaled", "messageId": "scheduled-ghi"}
+        )
+
+        await adapter.send_image_file("thread", image, "caption")
+        await adapter.send_image_file("thread", image, "caption")
+        keys = [call.kwargs["delivery_key"] for call in adapter.send_proactive.await_args_list]
+        self.assertEqual(keys[0], keys[1])
+
+    async def test_standalone_media_surfaces_the_upload_failure_instead_of_claiming_success(self):
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as handle:
+            handle.write(b"PK\x03\x04")
+            archive = handle.name
+        self.addCleanup(lambda: os.path.exists(archive) and os.unlink(archive))
+
+        adapter = self._adapter(archive)
+        adapter._client = _Client()
+        adapter._ready.set()
+        adapter.send_proactive = AsyncMock(
+            return_value={
+                "state": "failed",
+                "error": "media_upload_failed",
+                "media_errors": [
+                    f"{os.path.basename(archive)} (application/zip, family=file): http_415 Unsupported Media Type"
+                ],
+            }
+        )
+
+        result = await adapter.send_document("thread", archive)
+
+        self.assertFalse(result.success)
+        self.assertIn("media_upload_failed", result.error)
+        self.assertIn("http_415", result.error)
+        self.assertIn("application/zip", result.error)
 
 
 if __name__ == "__main__":
