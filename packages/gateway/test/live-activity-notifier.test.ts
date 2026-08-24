@@ -59,6 +59,69 @@ describe("live activity notifier", () => {
     storage.close();
   });
 
+  it("blocks the card on a pending approval and resumes the prior phase when it resolves", async () => {
+    const storage = openStorage(":memory:");
+    storage.createDevice({ id: "device", name: "phone", tokenHash: "hash", createdAt: 1 });
+    storage.saveLiveActivityRegistration({
+      deviceId: "device", activityId: "activity", runId: "run", conversationId: "s",
+      bot: "sage", pushId: "opaque", createdAt: 1,
+    });
+    const bodies: any[] = [];
+    const notifier = new LiveActivityNotifier({
+      storage, relayBaseUrl: "https://relay.test", now: () => 10_000, toolCoalesceMs: 0,
+      fetchImpl: async (_input, init) => {
+        if (init?.method === "POST") bodies.push(JSON.parse(String(init.body)));
+        return new Response(null, { status: 202 });
+      },
+    });
+
+    notifier.handleFrame({ type: "bot_tool_activity", bot: "sage", sessionId: "s", turnId: "t",
+      steps: [{ id: "c1", name: "shell", state: "running" }], updatedAt: 2 } as unknown as ServerFrame);
+    await tick();
+    expect(bodies.at(-1).liveActivity.contentState).toMatchObject({ phase: "usingTools", toolCallCount: 1 });
+
+    // A group-room approval belongs to the room surface, never to this 1:1 conversation card.
+    notifier.handleFrame({ type: "bot_approval_pending", bot: "sage", sessionId: "s", turnId: "t",
+      toolCallId: "call-room", name: "shell", updatedAt: 3, room: "lounge" } as unknown as ServerFrame);
+    await tick();
+    expect(bodies).toHaveLength(1);
+
+    notifier.handleFrame({ type: "bot_approval_pending", bot: "sage", sessionId: "s", turnId: "t",
+      toolCallId: "call-1", name: "shell", updatedAt: 3 } as unknown as ServerFrame);
+    await tick();
+    expect(bodies.at(-1).liveActivity).toMatchObject({
+      priority: 5,
+      contentState: {
+        phase: "waitingOnApproval", approvalID: "call-1", toolCallCount: 1,
+        shortStatus: "Waiting on your approval",
+      },
+    });
+    // The blocked card waits on a person, so it must not go stale on the working-card window.
+    expect(bodies.at(-1).liveActivity.staleDate)
+      .toBe(bodies.at(-1).liveActivity.timestamp + 30 * 60);
+    expect(JSON.stringify(bodies.at(-1))).not.toContain("shell");
+
+    // A second approval on the same turn keeps the card blocked when the first one resolves.
+    notifier.handleFrame({ type: "bot_approval_pending", bot: "sage", sessionId: "s", turnId: "t",
+      toolCallId: "call-2", name: "shell", updatedAt: 4 } as unknown as ServerFrame);
+    notifier.handleFrame({ type: "bot_approval_resolved", bot: "sage", sessionId: "s", turnId: "t",
+      toolCallId: "call-1", outcome: "approved", updatedAt: 5 } as unknown as ServerFrame);
+    await tick();
+    expect(bodies.at(-1).liveActivity.contentState).toMatchObject({
+      phase: "waitingOnApproval", approvalID: "call-2",
+    });
+
+    // Expiry is a resolution too, and it must unblock the card without anyone answering here.
+    notifier.handleFrame({ type: "bot_approval_resolved", bot: "sage", sessionId: "s", turnId: "t",
+      toolCallId: "call-2", outcome: "expired", updatedAt: 6 } as unknown as ServerFrame);
+    await tick();
+    expect(bodies.at(-1).liveActivity.contentState).toMatchObject({
+      phase: "usingTools", toolCallCount: 1,
+    });
+    expect(bodies.at(-1).liveActivity.contentState.approvalID).toBeUndefined();
+    storage.close();
+  });
+
   it("covers exactly one ordinary chat push before or after the terminal frame", async () => {
     for (const chatFirst of [true, false]) {
       const storage = openStorage(":memory:");
