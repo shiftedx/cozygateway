@@ -286,6 +286,16 @@ class AttachAdapter:
         # bare create_task result, so hold each here until it finishes.
         self._background_tasks: Set[asyncio.Task] = set()
         self._memory_manager = MemoryManager(extra, os.getenv("HERMES_HOME"))
+        # A memory request reads real files and provider SQL, so it runs on a worker
+        # thread and exactly one runs at a time. A second request arriving while one
+        # is in flight is refused immediately: queueing them would let a search
+        # keystroke stream build an unbounded backlog of full-vault scans.
+        self._memory_busy: Optional[str] = None
+        # Completed mutations by request id, so a replay of a request the gateway
+        # already gave up waiting for returns the first outcome instead of applying
+        # the write a second time. Bounded oldest-first.
+        self._memory_results: OrderedDict[str, Tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]] = OrderedDict()
+        self._memory_results_max = 64
 
     def _spawn_background(self, loop: asyncio.AbstractEventLoop, coro: Any) -> None:
         task = loop.create_task(coro)
@@ -396,7 +406,7 @@ class AttachAdapter:
                 on_interrupt=self._on_interrupt,
                 on_approval=self._dispatch_approval_command,
                 on_clarify=self._dispatch_clarify_command,
-                on_memory=self._handle_memory_command,
+                on_memory=self._on_memory_command,
                 on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
             )
@@ -771,22 +781,76 @@ class AttachAdapter:
             return
         self._spawn_background(loop, self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id))
 
+    #: Operations that change memory, and so must not be applied twice for one request id.
+    _MEMORY_MUTATIONS = ("create", "update", "delete")
+
+    def _on_memory_command(self, command: Dict[str, Any]) -> None:
+        """Hand the request to a background task so the receive loop keeps reading.
+
+        The client awaits this callback inline, so serving the request here would
+        hold up every other frame on the socket for the duration of a vault scan.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_memory_command(command))
+
+    def _remember_memory_result(
+        self, request_id: str, status: str, result: Optional[Dict[str, Any]] = None,
+        message: Optional[str] = None, current: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._memory_results[request_id] = (status, result, message, current)
+        self._memory_results.move_to_end(request_id)
+        while len(self._memory_results) > self._memory_results_max:
+            self._memory_results.popitem(last=False)
+
     async def _handle_memory_command(self, command: Dict[str, Any]) -> None:
-        """Serve an ephemeral request while the authenticated attach socket is live."""
+        """Serve an ephemeral request while the authenticated attach socket is live.
+
+        The work itself runs on a worker thread: a full-vault scan is filesystem
+        work measured in seconds, and doing it inline would stall this profile's
+        heartbeats and turn traffic behind one search keystroke.
+        """
         request_id, operation, input = command.get("requestId"), command.get("operation"), command.get("input")
         client = self._client
         if not isinstance(request_id, str) or not isinstance(operation, str) or not isinstance(input, dict) or not isinstance(client, AttachV1Client):
             return
+        mutation = operation in self._MEMORY_MUTATIONS
+        replayed = self._memory_results.get(request_id) if mutation else None
+        if replayed is not None:
+            status, result, message, current = replayed
+            await client.send_memory_result(request_id, status, result=result, message=message, current=current)
+            return
+        if self._memory_busy is not None and self._memory_busy != request_id:
+            await client.send_memory_result(
+                request_id, "unavailable",
+                message="memory is busy with another request; try again in a moment",
+            )
+            return
+        self._memory_busy = request_id
         try:
-            result = self._memory_manager.execute(operation, input)
-            await client.send_memory_result(request_id, "ok", result=result)
-        except MemoryConflict as error:
-            await client.send_memory_result(request_id, "conflict", message=str(error), current=error.current)
-        except MemoryError as error:
-            await client.send_memory_result(request_id, error.status, message=str(error))
-        except Exception:
-            logger.debug("attach: memory management failed", exc_info=True)
-            await client.send_memory_result(request_id, "unavailable", message="memory source is unavailable")
+            try:
+                result = await asyncio.to_thread(self._memory_manager.execute, operation, input)
+                if mutation: self._remember_memory_result(request_id, "ok", result=result)
+                await client.send_memory_result(request_id, "ok", result=result)
+            except MemoryConflict as error:
+                if mutation: self._remember_memory_result(request_id, "conflict", message=str(error), current=error.current)
+                await client.send_memory_result(request_id, "conflict", message=str(error), current=error.current)
+            except MemoryError as error:
+                if mutation: self._remember_memory_result(request_id, error.status, message=str(error))
+                await client.send_memory_result(request_id, error.status, message=str(error))
+            except Exception as error:
+                # Named by exception class, never with exc_info: a UnicodeDecodeError
+                # carries the offending file bytes in its args. A generic "source
+                # unavailable" here is what hid a TypeError for a whole adapter.
+                logger.debug("attach: memory management failed (%s: %s)", operation, type(error).__name__)
+                await client.send_memory_result(
+                    request_id, "unavailable",
+                    message=f"the memory request could not be completed ({type(error).__name__})",
+                )
+        finally:
+            if self._memory_busy == request_id: self._memory_busy = None
 
     async def _dispatch_clarify_command(self, command: Dict[str, Any]) -> None:
         thread_id = command.get("threadId")

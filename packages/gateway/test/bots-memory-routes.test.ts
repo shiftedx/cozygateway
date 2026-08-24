@@ -3,16 +3,16 @@ import type { MiddlewareHandler } from "hono";
 import { describe, expect, it, vi } from "vitest";
 
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
-import { AttachMemorySurface, MemoryConflict, type MemorySurface } from "../src/hermes-bridge/memory.ts";
+import { AttachMemorySurface, MEMORY_KINDS, MemoryConflict, createMemoryRateLimiter, type MemoryRateLimiter, type MemorySurface } from "../src/hermes-bridge/memory.ts";
 import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 
 type Env = { Variables: { deviceId: string } };
 const item = { id: "fact:1", sourceId: "holographic", kind: "fact" as const, title: "Cleo", snippet: "Cleo likes concise reports", createdAt: 1, updatedAt: 2, timestampKind: "created" as const, revision: "r1", category: "user_pref", tags: ["cleo"], trustScore: 0.9 };
 
-function appFor(memory: Partial<MemorySurface>) {
+function appFor(memory: Partial<MemorySurface>, memoryOptions: { rateLimiter?: MemoryRateLimiter; now?: () => number } = {}) {
   const app = new Hono<Env>();
   const requireDevice: MiddlewareHandler<Env> = async (c, next) => { c.set("deviceId", "device"); await next(); };
-  registerBotRoutes(app, requireDevice, {} as BotsSurface, {}, {}, memory as MemorySurface);
+  registerBotRoutes(app, requireDevice, {} as BotsSurface, {}, {}, memory as MemorySurface, memoryOptions);
   return app;
 }
 
@@ -35,6 +35,29 @@ describe("capability-30 bot memory routes", () => {
     const conflict = await app.request("/bots/cleo/memory/sources/holographic/items/fact:1", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ content: "new", expectedRevision: "r0" }) });
     expect(conflict.status).toBe(409);
     expect(await conflict.json()).toEqual({ error: { code: "conflict", message: "memory item changed; refresh and try again" }, current: item });
+  });
+
+  it("accepts every kind the contract publishes, including the curated profile store", async () => {
+    expect(MEMORY_KINDS).toContain("profile");
+    const items = vi.fn(async () => ({ items: [], sources: [] }));
+    const app = appFor({ items });
+    for (const kind of MEMORY_KINDS) {
+      expect((await app.request(`/bots/cleo/memory/items?kind=${kind}`)).status).toBe(200);
+    }
+    // The store-side name for the About-me target is deliberately not on the wire.
+    expect((await app.request("/bots/cleo/memory/items?kind=user")).status).toBe(400);
+  });
+
+  it("spends a per-device budget so a memory loop is stopped at the gateway", async () => {
+    const items = vi.fn(async () => ({ items: [], sources: [] }));
+    const app = appFor({ items, overview: async () => ({ sources: [] }) }, { rateLimiter: createMemoryRateLimiter({ capacity: 2, refillMs: 10_000 }), now: () => 1_000 });
+    expect((await app.request("/bots/cleo/memory/items")).status).toBe(200);
+    expect((await app.request("/bots/cleo/memory")).status).toBe(200);
+    const limited = await app.request("/bots/cleo/memory/items");
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("10");
+    expect(await limited.json()).toMatchObject({ error: { code: "rate_limited" } });
+    expect(items).toHaveBeenCalledTimes(1);
   });
 
   it("correlates an ephemeral attach reply without accepting a late duplicate", async () => {

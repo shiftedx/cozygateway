@@ -1,21 +1,39 @@
 import { randomUUID } from "node:crypto";
 
+import { BotMemoryKindSchema } from "cozygateway-contract";
 import type {
   BotMemoryDeleteResponse,
   BotMemoryGraphResponse,
   BotMemoryItem,
   BotMemoryItemsResponse,
+  BotMemoryKind,
   BotMemoryOverviewResponse,
   BotMemoryWriteResponse,
 } from "cozygateway-contract";
 
 import { BackendUnavailable } from "../errors.ts";
+import { createPhotoRateLimiter, type PhotoRateLimiter } from "./photos.ts";
 import type { AttachV1MemoryRequest, AttachV1MemoryResult } from "../adapters/attach/protocol-v1.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
 
 export type MemoryOperation = AttachV1MemoryRequest["operation"];
 export type MemoryInput = AttachV1MemoryRequest["input"];
 export type MemoryResult = BotMemoryOverviewResponse | BotMemoryItemsResponse | BotMemoryGraphResponse | BotMemoryItem | BotMemoryWriteResponse | BotMemoryDeleteResponse;
+
+/** The kind filter's allow-list, read off the contract union rather than restated,
+ *  so a kind added to the wire cannot be rejected here by an out-of-date copy. */
+export const MEMORY_KINDS: readonly BotMemoryKind[] = BotMemoryKindSchema.anyOf.map((member) => member.const as BotMemoryKind);
+
+/** Per-device budget for the memory lane. Each request costs the attached plugin a
+ *  filesystem or provider scan it serves one at a time, so a browsing client gets a
+ *  generous burst and a fast refill while a loop gets stopped at the gateway rather
+ *  than at the profile. The bucket is the photo lane's, with memory's own numbers. */
+export const MEMORY_RATE_CAPACITY = 30;
+export const MEMORY_RATE_REFILL_MS = 1_000;
+export type MemoryRateLimiter = PhotoRateLimiter;
+export function createMemoryRateLimiter(opts: { capacity?: number; refillMs?: number } = {}): MemoryRateLimiter {
+  return createPhotoRateLimiter({ capacity: opts.capacity ?? MEMORY_RATE_CAPACITY, refillMs: opts.refillMs ?? MEMORY_RATE_REFILL_MS });
+}
 
 export class MemoryConflict extends Error {
   readonly current: BotMemoryItem | undefined;

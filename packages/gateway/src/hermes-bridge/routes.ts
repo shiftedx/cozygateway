@@ -19,7 +19,8 @@ import {
   ContractViolation,
   assertValid,
 } from "cozygateway-contract";
-import { MemoryConflict, MemoryInvalidRequest, MemoryNotFound, type MemorySurface } from "./memory.ts";
+import { MEMORY_KINDS, MemoryConflict, MemoryInvalidRequest, MemoryNotFound, createMemoryRateLimiter, type MemoryRateLimiter, type MemorySurface } from "./memory.ts";
+import type { BotMemoryKind } from "cozygateway-contract";
 
 import { BackendUnavailable } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
@@ -350,6 +351,11 @@ export function registerBotRoutes(
     now?: () => number;
   } = {},
   memory?: MemorySurface,
+  memoryOptions: {
+    /** Per-device token bucket for the memory lane. Injected so a test can cap at one. */
+    rateLimiter?: MemoryRateLimiter;
+    now?: () => number;
+  } = {},
 ): void {
   const chat = bots as BotsSurface;
   // One limiter per registered app, created here rather than at module scope so two gateways in one
@@ -358,6 +364,21 @@ export function registerBotRoutes(
     photoOptions.limiter ?? createMediaLimiter(PHOTO_MAX_CONCURRENT);
   const photoRate = photoOptions.rateLimiter ?? createPhotoRateLimiter();
   const photoNow = photoOptions.now ?? (() => Date.now());
+  const memoryRate = memoryOptions.rateLimiter ?? createMemoryRateLimiter();
+  const memoryNow = memoryOptions.now ?? (() => Date.now());
+  /** Spends this device's memory budget, answering `429` when it is empty. Every
+   *  memory route pays, reads included: the cost being bounded is the attached
+   *  plugin's single-in-flight scan, which a read occupies exactly as a write does. */
+  const memoryTicket = (c: Context<Env>) => {
+    const ticket = memoryRate.take(c.get("deviceId"), memoryNow());
+    if (ticket.ok) return undefined;
+    const seconds = Math.max(1, Math.ceil(ticket.retryAfterMs / 1000));
+    return c.json(
+      { ...extensionErrorBody("rate_limited", "this device has made too many memory requests; wait and try again"), retryAfterMs: ticket.retryAfterMs },
+      429,
+      { "retry-after": String(seconds) },
+    );
+  };
   const memoryFailure = (c: Context<Env>, error: unknown) => {
     if (error instanceof MemoryConflict)
       return c.json({ ...extensionErrorBody("conflict", error.message), ...(error.current === undefined ? {} : { current: error.current }) }, 409);
@@ -378,8 +399,8 @@ export function registerBotRoutes(
     const since = timestamp("since"); const until = timestamp("until");
     const q = c.req.query("q"); const sourceId = c.req.query("source"); const kind = c.req.query("kind");
     if ((q !== undefined && q.length > 512) || (sourceId !== undefined && sourceId.length > 120)) throw new MemoryInvalidRequest("memory query is too long");
-    if (kind !== undefined && !["memory", "fact", "note"].includes(kind)) throw new MemoryInvalidRequest("unknown memory kind");
-    return { ...(q === undefined ? {} : { q }), ...(sourceId === undefined ? {} : { sourceId }), ...(kind === undefined ? {} : { kind: kind as "memory" | "fact" | "note" }), ...(parsed === undefined ? {} : { limit: parsed }), ...(since === undefined ? {} : { since }), ...(until === undefined ? {} : { until }) };
+    if (kind !== undefined && !MEMORY_KINDS.includes(kind as BotMemoryKind)) throw new MemoryInvalidRequest("unknown memory kind");
+    return { ...(q === undefined ? {} : { q }), ...(sourceId === undefined ? {} : { sourceId }), ...(kind === undefined ? {} : { kind: kind as BotMemoryKind }), ...(parsed === undefined ? {} : { limit: parsed }), ...(since === undefined ? {} : { since }), ...(until === undefined ? {} : { until }) };
   };
   // Cache-first: the snapshot answers immediately, even on a cold link, and a refresh runs in the
   // background so the next read (or the /ws bot_roster frame) carries fresh state.
@@ -396,30 +417,37 @@ export function registerBotRoutes(
   if (memory !== undefined) {
     app.get("/bots/:name/memory", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { return c.json(await memory.overview(resolved.name)); } catch (error) { return memoryFailure(c, error); }
     });
     app.get("/bots/:name/memory/items", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { return c.json(await memory.items(resolved.name, memoryQuery(c))); } catch (error) { return memoryFailure(c, error); }
     });
     app.get("/bots/:name/memory/graph", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { return c.json(await memory.graph(resolved.name, memoryQuery(c, 200))); } catch (error) { return memoryFailure(c, error); }
     });
     app.get("/bots/:name/memory/sources/:source/items/:id", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { return c.json(await memory.item(resolved.name, c.req.param("source"), c.req.param("id"))); } catch (error) { return memoryFailure(c, error); }
     });
     app.post("/bots/:name/memory/sources/:source/items", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { const source = c.req.param("source"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); const result = await memory.create(resolved.name, source, body); memory.audit(c.get("deviceId"), resolved.name, "create", source, result.item.id); return c.json(result, 201); } catch (error) { return memoryFailure(c, error); }
     });
     app.patch("/bots/:name/memory/sources/:source/items/:id", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { const source = c.req.param("source"); const id = c.req.param("id"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); if (body.expectedRevision === undefined) throw new MemoryInvalidRequest("expectedRevision is required"); const result = await memory.update(resolved.name, source, id, body); memory.audit(c.get("deviceId"), resolved.name, "update", source, result.item.id); return c.json(result); } catch (error) { return memoryFailure(c, error); }
     });
     app.delete("/bots/:name/memory/sources/:source/items/:id", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { const source = c.req.param("source"); const id = c.req.param("id"); const body = assertValid(BotMemoryDeleteRequestSchema, await c.req.json()); const result = await memory.remove(resolved.name, source, id, body); memory.audit(c.get("deviceId"), resolved.name, "delete", source, id); return c.json(result); } catch (error) { return memoryFailure(c, error); }
     });
   }
