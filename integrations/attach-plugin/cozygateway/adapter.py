@@ -1920,14 +1920,51 @@ def _proactive_identity(delivery_key: str) -> Tuple[str, str]:
 def _apply_projection(
     result: Dict[str, Any], receipt: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    if receipt is None or receipt.get("state") not in {"projected", "blocked"}:
+    if receipt is None:
         return result
-    result["state"] = receipt["state"]
-    result["accepted_pending"] = False
-    if receipt["state"] == "projected":
-        result["projectedAt"] = receipt.get("projectedAt")
-    else:
-        result["attempts"] = receipt.get("attempts")
+    if receipt.get("state") in {"projected", "blocked"}:
+        result["state"] = receipt["state"]
+        result["accepted_pending"] = False
+        if receipt["state"] == "projected":
+            result["projectedAt"] = receipt.get("projectedAt")
+        else:
+            result["attempts"] = receipt.get("attempts")
+    return _merge_receipt_extensions(result, receipt)
+
+
+def _merge_receipt_extensions(
+    result: Dict[str, Any], receipt: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Surface the additive receipt fields when the gateway sends them.
+
+    "projected" remains the cron-ABI success. These fields only ever add detail, so a gateway that
+    predates durable receipts (and omits them) leaves the result exactly as it was.
+    """
+    displayed_at = receipt.get("displayedAt")
+    if isinstance(displayed_at, int) and not isinstance(displayed_at, bool):
+        result["displayedAt"] = displayed_at
+    terminal = receipt.get("terminal")
+    if isinstance(terminal, dict) and isinstance(terminal.get("state"), str):
+        result["terminal"] = dict(terminal)
+    return result
+
+
+def delivery_state(pconfig: Any, delivery_key: str) -> Dict[str, Any]:
+    """Read the locally persisted terminal state of one scheduled delivery occurrence.
+
+    ``delivery_key`` is the same key the scheduled send used (the Hermes session id, or the
+    caller-supplied key), so ops and Cleo can ask "did that 3:03 AM report ever land?" without a
+    live socket. Returns ``{"state": "unknown", ...}`` when no receipt has arrived yet.
+    """
+    delivery_id, message_id = _proactive_identity(delivery_key)
+    spool = AttachSpool(_proactive_spool_path(pconfig, None))
+    try:
+        row = spool.delivery_receipt_row(delivery_id)
+    finally:
+        spool.close()
+    result: Dict[str, Any] = dict(row) if row is not None else {"state": "unknown"}
+    result["deliveryId"] = delivery_id
+    result["messageId"] = message_id
     return result
 
 
