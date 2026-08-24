@@ -178,7 +178,9 @@ caption/alt text, and expiry. Bytes use the authenticated HTTP side channel; bas
 Hermes host paths are forbidden.
 
 Uploads are immutable and scoped to the authenticated identity. The gateway verifies maximum size,
-sniffed family/MIME, declared size, and SHA-256 before commit. Downloads support byte ranges and
+sniffed family/MIME, declared size, and SHA-256 before commit. The accepted MIME set and the refusal
+statuses are documented once, in contract/ext-bots-v1.md under "Canonical media allowlist" and
+"Media rejection shapes"; the plugin policy table mirrors that list. Downloads support byte ranges and
 expiry. A failed media item does not invalidate text or other valid media in the same committed
 message; missing items are omitted from the app attachment list.
 

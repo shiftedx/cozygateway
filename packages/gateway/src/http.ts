@@ -37,6 +37,7 @@ import type {
   MediaLookup,
 } from "./hermes-bridge/media.ts";
 import {
+  PhotoRefused,
   readCappedBody,
   sniffImageType,
   type PhotoRateLimiter,
@@ -148,6 +149,15 @@ export interface AppDeps {
 
 export function errorBody(code: ErrorCode, message: string): ErrorBody {
   return { error: { code, message } };
+}
+
+/** A 415 that does not say what arrived is a 415 the producer has to guess about, so the received
+ *  `Content-Type` is echoed. It is an attacker-controlled header, so only MIME token characters
+ *  survive and the result is truncated: nothing here can carry markup, a newline, or a slice of the
+ *  uploaded payload back out in the response body. */
+function sanitizedContentType(value: string): string {
+  const cleaned = value.replace(/[^A-Za-z0-9!#$&^_.+/-]/g, "").slice(0, 80);
+  return cleaned.length === 0 ? "(absent)" : cleaned;
 }
 
 type Env = { Variables: { deviceId: string } };
@@ -697,45 +707,55 @@ export function createApp(deps: AppDeps): Hono<Env> {
           400,
         );
       }
-      const mimeType = (c.req.header("content-type") ?? "")
-        .split(";")[0]!
-        .trim()
-        .toLowerCase();
+      const receivedType = c.req.header("content-type") ?? "";
+      const received = sanitizedContentType(receivedType);
+      const mimeType = receivedType.split(";")[0]!.trim().toLowerCase();
+      // The allowlist is documented MIME by MIME in contract/ext-bots-v1.md; the plugin policy
+      // table mirrors that document, and this map is the runtime copy of it.
       const acceptedType = ASSISTANT_MEDIA_TYPES.get(mimeType);
       if (acceptedType === undefined)
         return c.json(
           {
-            ...errorBody("invalid_request", "disallowed media type"),
+            ...errorBody("invalid_request", `media type ${received} is not on the gateway allowlist`),
             reason: "content_type",
+            receivedContentType: received,
           },
           415,
         );
-      const declared = Number(c.req.header("content-length") ?? "");
-      if (Number.isFinite(declared) && declared > acceptedType.maxBytes) {
-        return c.json(
+      /** 413 names the cap for the DECLARED type, not the largest cap in the table, so a producer
+       *  can act on the number instead of guessing which limit it hit. */
+      const overCap = () =>
+        c.json(
           {
-            ...errorBody("invalid_request", "media is over the size cap"),
+            ...errorBody(
+              "invalid_request",
+              `media is over the ${acceptedType.maxBytes} byte cap for ${mimeType}`,
+            ),
             reason: "too_large",
+            limitBytes: acceptedType.maxBytes,
           },
           413,
         );
-      }
+      const declared = Number(c.req.header("content-length") ?? "");
+      if (Number.isFinite(declared) && declared > acceptedType.maxBytes) return overCap();
       let bytes: Uint8Array;
       try {
         bytes = await readCappedBody(c.req.raw.body, acceptedType.maxBytes);
         acceptAssistantMediaBytes(mimeType, bytes, sniffImageType);
       } catch (err) {
-        const tooLarge =
-          err instanceof Error && /large|size|cap|ran past/i.test(err.message);
+        // Every branch answers with gateway-authored prose. No error string from a layer that
+        // touched the payload reaches the body, so no uploaded byte can be reflected.
+        const reason = err instanceof PhotoRefused ? err.reason : "content_type";
+        if (reason === "too_large") return overCap();
+        if (reason === "empty")
+          return c.json({ ...errorBody("invalid_request", "media carried no bytes"), reason }, 400);
         return c.json(
           {
-            ...errorBody(
-              "invalid_request",
-              err instanceof Error ? err.message : "invalid media",
-            ),
-            reason: tooLarge ? "too_large" : "content_type",
+            ...errorBody("invalid_request", `media bytes did not match the declared type ${mimeType}`),
+            reason,
+            receivedContentType: received,
           },
-          tooLarge ? 413 : 415,
+          415,
         );
       }
       const sha256 = createHash("sha256").update(bytes).digest("hex");
