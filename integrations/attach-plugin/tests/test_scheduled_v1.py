@@ -53,6 +53,52 @@ def _send_result_modules():
     }
 
 
+# A faithful stand-in for hermes' ``tools/send_message_tool.py::_send_to_platform``:
+# the cron/scheduler lane calls it with the report in the positional ``message``
+# argument and NO ``args``, then hands the registered plugin handler an empty request
+# and returns whatever the handler returns (there is no standalone fallback).
+_UPSTREAM_SEND_SOURCE = """
+import inspect
+
+
+async def _send_to_platform(
+    handler, pconfig, chat_id, message, thread_id=None, media_files=None, args=None
+):
+    for chunk in [message]:
+        result = handler(args or {}, chat_id, "cozygateway", pconfig)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+"""
+
+
+def _base_adapter_modules():
+    """Harness stubs so the tool-lane body is reachable (it is what used to run)."""
+    class BasePlatformAdapter:
+        extract_media = staticmethod(lambda message: ([], message))
+        filter_media_delivery_paths = staticmethod(lambda media: media)
+
+    gateway = types.ModuleType("gateway")
+    platforms = types.ModuleType("gateway.platforms")
+    base = types.ModuleType("gateway.platforms.base")
+    base.BasePlatformAdapter = BasePlatformAdapter
+    base.SendResult = _SendResult
+    gateway.platforms = platforms
+    platforms.base = base
+    return {
+        "gateway": gateway,
+        "gateway.platforms": platforms,
+        "gateway.platforms.base": base,
+    }
+
+
+def _upstream_send_to_platform():
+    """Build the caller in a module actually named ``tools.send_message_tool``."""
+    module = types.ModuleType("tools.send_message_tool")
+    exec(compile(_UPSTREAM_SEND_SOURCE, "tools/send_message_tool.py", "exec"), module.__dict__)
+    return module._send_to_platform
+
+
 class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
     _CONNECTION_ENV_KEYS = (
         "COZYGATEWAY_URL",
@@ -427,6 +473,101 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([event["kind"] for event in events], ["scheduled"])
             self.assertEqual(events[0]["threadId"], "thread-42")
             self.assertNotIn("target", events[0])
+
+    async def test_cron_lane_without_tool_args_journals_the_report_instead_of_reporting_silence(self):
+        # The live defect: cron delivers through _send_to_platform with args=None, the
+        # registered handler shadows standalone_sender_fn, and an empty request looked
+        # like silence -- success, no frame, no error, nothing delivered.
+        send_to_platform = _upstream_send_to_platform()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, _base_adapter_modules()
+        ):
+            path = os.path.join(directory, "spool.sqlite")
+            result = await send_to_platform(
+                _send_message_handler,
+                self._config(path),
+                "thread",
+                "## Automation health: 19/19 passing",
+                thread_id=None,
+                media_files=[],
+            )
+            events = self._events(path)
+
+        self.assertNotIn("success", result)
+        self.assertEqual(result["state"], "journaled")
+        self.assertEqual([event["kind"] for event in events], ["scheduled"])
+        self.assertEqual(events[0]["target"], {"kind": "canonical_home"})
+        self.assertEqual(
+            events[0]["blocks"],
+            [{"type": "heading", "level": 2, "text": "Automation health: 19/19 passing"}],
+        )
+
+    async def test_cron_lane_media_pairs_ride_the_scheduled_delivery(self):
+        send_to_platform = _upstream_send_to_platform()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, _base_adapter_modules()
+        ):
+            path = os.path.join(directory, "spool.sqlite")
+            png = os.path.join(directory, "report.png")
+            with open(png, "wb") as handle:
+                handle.write(b"\x89PNG\r\n\x1a\n")
+
+            def upload(media_id, _path, mime, digest, data, _expires_at):
+                return {
+                    "mediaId": media_id, "mimeType": mime, "byteCount": len(data),
+                    "sha256": digest, "filename": "report.png", "family": "image",
+                }
+
+            with patch.object(AttachV1Client, "_upload_media_sync", side_effect=upload):
+                result = await send_to_platform(
+                    _send_message_handler,
+                    self._config(path),
+                    "thread",
+                    "daily report",
+                    # cron forwards BasePlatformAdapter.extract_media output verbatim.
+                    media_files=[(png, False)],
+                )
+            events = self._events(path)
+
+        self.assertEqual(result["state"], "journaled")
+        self.assertEqual([event["kind"] for event in events], ["media", "scheduled"])
+        self.assertEqual(events[1]["mediaIds"], [events[0]["media"]["mediaId"]])
+
+    async def test_payloadless_send_is_a_loud_error_not_a_phantom_delivery(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, _base_adapter_modules()
+        ):
+            path = os.path.join(directory, "spool.sqlite")
+            result = await _send_message_handler(
+                {}, "thread", "cozygateway", self._config(path),
+            )
+            self.assertFalse(os.path.exists(path))
+
+        self.assertNotIn("success", result)
+        self.assertIn("no message payload", result["error"])
+
+    async def test_media_pairs_are_not_dropped_by_the_standalone_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            png = os.path.join(directory, "report.png")
+            with open(png, "wb") as handle:
+                handle.write(b"\x89PNG\r\n\x1a\n")
+
+            def upload(media_id, _path, mime, digest, data, _expires_at):
+                return {
+                    "mediaId": media_id, "mimeType": mime, "byteCount": len(data),
+                    "sha256": digest, "filename": "report.png", "family": "image",
+                }
+
+            with patch.object(AttachV1Client, "_upload_media_sync", side_effect=upload):
+                result = await _standalone_send(
+                    self._config(path), "home", "daily report",
+                    thread_id="home", media_files=[(png, False)],
+                )
+            events = self._events(path)
+
+        self.assertEqual(result["state"], "journaled")
+        self.assertEqual([event["kind"] for event in events], ["media", "scheduled"])
 
     async def test_upstream_hermes_abi_reports_journaled_delivery_as_pending_error(self):
         with patch(

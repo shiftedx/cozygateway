@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -1897,20 +1898,123 @@ def _occurrence_key(args: Optional[Dict[str, Any]] = None) -> str:
     return key
 
 
+
+# The upstream module that owns every Hermes platform send. A plugin
+# ``send_message_handler`` is invoked from here on BOTH lanes (see
+# ``_upstream_send_payload``), but only the tool lane fills ``args``.
+_UPSTREAM_SEND_MODULE = "tools.send_message_tool"
+
+
+def _normalized_media_paths(media_files: Any) -> List[str]:
+    """Accept both media shapes Hermes hands a platform plugin.
+
+    The in-plugin callers pass plain paths. The upstream ``standalone_sender_fn``
+    contract (and cron's ``_deliver_result``, which forwards
+    ``BasePlatformAdapter.extract_media`` output verbatim) passes ``(path, is_voice)``
+    pairs instead. Only the string form used to survive, so every attachment on a
+    scheduled report was dropped before the upload loop ever saw it.
+    """
+    paths: List[str] = []
+    for entry in media_files or []:
+        if isinstance(entry, (tuple, list)):
+            entry = entry[0] if entry else None
+        if isinstance(entry, str) and entry:
+            paths.append(entry)
+    return paths
+
+
+def _upstream_send_payload() -> Optional[Dict[str, Any]]:
+    """Recover the outbound payload Hermes does not hand a plugin send handler.
+
+    ``tools/send_message_tool.py::_send_to_platform`` routes EVERY non-builtin platform
+    through ``entry.send_message_handler`` and returns whatever it returns, with no
+    fallback to ``standalone_sender_fn``. It fills ``args`` only on the ``send_message``
+    TOOL lane; cron's ``_deliver_result`` calls the same function with ``args=None`` and
+    the report in the positional ``message`` parameter. A registered handler therefore
+    shadows this plugin's standalone cron sender and is handed an EMPTY request: the
+    report is journaled nowhere, and "no text and no media" reads as silence, which the
+    scheduler records as a delivered run with no error (hermes 0.20.5).
+
+    Read the payload the caller already holds instead of inventing an empty one. The
+    recovery is deliberately narrow: only a frame belonging to the upstream sender
+    module is trusted, and any other caller yields ``None`` so the handler fails loudly
+    rather than delivering nothing quietly.
+    """
+    frame = inspect.currentframe()
+    try:
+        for _ in range(6):
+            frame = frame.f_back if frame is not None else None
+            if frame is None:
+                return None
+            if frame.f_globals.get("__name__") != _UPSTREAM_SEND_MODULE:
+                continue
+            local_vars = frame.f_locals
+            for key in ("chunk", "message"):
+                text = local_vars.get(key)
+                if isinstance(text, str) and text.strip():
+                    return {
+                        "message": text,
+                        "media_files": local_vars.get("media_files"),
+                        "thread_id": local_vars.get("thread_id"),
+                    }
+            return None
+        return None
+    finally:
+        del frame
+
+
+async def _scheduler_lane_send(chat_id: str, pconfig: Any) -> Dict[str, Any]:
+    """Serve a send that carries no tool request: cron, routines, any upstream caller.
+
+    This is the lane ``standalone_sender_fn`` would own if the registered handler did not
+    shadow it, so it delivers through exactly that sender.
+    """
+    payload = _upstream_send_payload()
+    if payload is None:
+        logger.warning(
+            "attach: send_message handler invoked with no message payload and no "
+            "recoverable upstream text; refusing to report a delivery",
+        )
+        return {
+            "error": (
+                "cozygateway received a send with no message payload: the caller passed "
+                "no send_message args and no recoverable text, so nothing was delivered"
+            ),
+        }
+    return _hermes_delivery_result(
+        await _standalone_send(
+            pconfig,
+            chat_id,
+            payload["message"],
+            thread_id=payload.get("thread_id"),
+            media_files=payload.get("media_files"),
+        )
+    )
+
+
 async def _send_message_handler(
     args: Dict[str, Any], chat_id: str, platform_name: str, pconfig: Any
 ) -> Dict[str, Any]:
-    """Own Hermes ``send_message`` so Cozy media is never dropped as unsupported."""
+    """Own Hermes ``send_message`` so Cozy media is never dropped as unsupported.
+
+    Upstream routes every plugin-platform send through this one hook, tool call or not.
+    A request with no ``message`` key is not a tool call: it is the cron/scheduler lane
+    this handler shadows, and it is served by the standalone sender instead.
+    """
+    request = args or {}
+    if "message" not in request:
+        return await _scheduler_lane_send(chat_id, pconfig)
+
     from gateway.platforms.base import BasePlatformAdapter  # harness-defined identifier
 
-    raw_message = str(args.get("message") or "")
+    raw_message = str(request.get("message") or "")
     extracted, cleaned = BasePlatformAdapter.extract_media(raw_message)
     filtered = BasePlatformAdapter.filter_media_delivery_paths(extracted)
     media_files = [str(path) for path, _is_voice in filtered]
-    target = str(args.get("target") or "").strip().lower()
+    target = str(request.get("target") or "").strip().lower()
     canonical_home = target == platform_name
     key_material = "\0".join([platform_name, chat_id, cleaned, *media_files])
-    occurrence_key = _occurrence_key(args)
+    occurrence_key = _occurrence_key(request)
     delivery_key = "tool:" + hashlib.sha256(
         f"{occurrence_key}\0{key_material}".encode("utf-8")
     ).hexdigest()
@@ -2173,7 +2277,7 @@ async def enqueue_proactive_delivery(
         return _proactive_failure("target_required")
     if not key:
         return _proactive_failure("delivery_key_required")
-    paths = [path for path in media_files or [] if isinstance(path, str) and path]
+    paths = _normalized_media_paths(media_files)
     if media_policy not in {"atomic", "allow_partial_media"}:
         return _proactive_failure("invalid_media_policy")
     delivery_id, message_id = _proactive_identity(key)
