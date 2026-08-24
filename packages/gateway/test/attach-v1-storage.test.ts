@@ -323,6 +323,8 @@ describe("attach-v1 durable transport storage", () => {
       deliveryId: "receipt-daily", messageId: "receipt-message",
       target: { kind: "thread", threadId: "home" }, state: "blocked", admittedAt: 10,
       attempts: 1, deadLetteredAt: 11,
+      // Capability 31: `state` stays the pipeline position, `terminal` says the occurrence is dead.
+      terminal: { state: "failed", stage: "projection", reason: "declined", at: 11 },
     });
     expect(storage.releaseAttachProjectionDeadLetter("sage", frame.eventId)).toBe(true);
     storage.markAttachEventApplied("sage", frame.eventId, 12);

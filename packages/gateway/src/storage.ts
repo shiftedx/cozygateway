@@ -301,8 +301,19 @@ CREATE TABLE IF NOT EXISTS bot_native_messages (
   at INTEGER,
   client_id TEXT,
   attachments_json TEXT,
+  marker TEXT,
   PRIMARY KEY (bot, session_id, seq),
   UNIQUE (bot, message_id)
+) STRICT, WITHOUT ROWID;
+-- Proof a HUMAN saw a row, which no other durable record in this gateway carries: a transcript row
+-- proves only that the gateway holds the message, and push is fire-and-forget. First write wins and
+-- rows are never deleted, so a receipt outlives the session selection that produced it.
+CREATE TABLE IF NOT EXISTS bot_message_receipts (
+  bot TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  displayed_at INTEGER NOT NULL,
+  device_id TEXT NOT NULL,
+  PRIMARY KEY (bot, message_id)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS bot_native_interactions (
   bot TEXT NOT NULL,
@@ -444,6 +455,16 @@ export interface AttachScheduledDeliveryReceipt {
   projectedAt?: number;
   attempts?: number;
   deadLetteredAt?: number;
+  /** Capability 31. When a paired device reported the projected row on screen. */
+  displayedAt?: number;
+  /** The one terminal fact about this occurrence, once it has one. `state` above stays the
+   * projection-pipeline position it has always been, so an existing reader is untouched. */
+  terminal?: {
+    state: "displayed" | "failed";
+    stage?: "authorization" | "projection";
+    reason?: string;
+    at: number;
+  };
 }
 
 interface BotGroupDbRow {
@@ -1846,6 +1867,56 @@ export class Storage {
       .get(agentId, deliveryId) as { threadId: string; messageId: string; projectedAt: number | null } | undefined;
   }
 
+  /** Records that a device put these bot rows on screen. First write wins: a later report for an
+   * id that already has a receipt changes nothing, and an id naming no durable row is ignored
+   * rather than refused, so a device replaying an offline queue never gets stuck on a batch it
+   * cannot repair.
+   *
+   * The scheduled-delivery join belongs here, in the same transaction as the write, so a caller
+   * cannot see a receipt without also seeing the delivery binding it just closed. Emitting the
+   * attach command is deliberately NOT this layer's job. */
+  recordBotMessageDisplayed(
+    bot: string,
+    messageIds: readonly string[],
+    deviceId: string,
+    at: number,
+  ): { recorded: number; deliveries: Array<{ deliveryId: string; messageId: string }> } {
+    const insert = this.#db.prepare(
+      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id)
+       SELECT ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM bot_native_messages WHERE bot = ? AND message_id = ?)`,
+    );
+    const binding = this.#db.prepare(
+      `SELECT delivery_id AS deliveryId FROM attach_scheduled_deliveries
+       WHERE agent_id = ? AND message_id = ?`,
+    );
+    const deliveries: Array<{ deliveryId: string; messageId: string }> = [];
+    let recorded = 0;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const messageId of new Set(messageIds)) {
+        if (insert.run(bot, messageId, at, deviceId, bot, messageId).changes !== 1) continue;
+        recorded += 1;
+        const bound = binding.get(bot, messageId) as { deliveryId: string } | undefined;
+        if (bound !== undefined) deliveries.push({ deliveryId: bound.deliveryId, messageId });
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    return { recorded, deliveries };
+  }
+
+  botMessageReceipt(bot: string, messageId: string): { displayedAt: number; deviceId: string } | undefined {
+    return this.#db
+      .prepare(
+        `SELECT displayed_at AS displayedAt, device_id AS deviceId
+         FROM bot_message_receipts WHERE bot = ? AND message_id = ?`,
+      )
+      .get(bot, messageId) as { displayedAt: number; deviceId: string } | undefined;
+  }
+
   /** Read the admitted event's existing durable records; it intentionally performs no projection
    * or mutation, so an agent can distinguish pending admission from a visible transcript row. */
   attachScheduledDeliveryReceipt(agentId: string, deliveryId: string): AttachScheduledDeliveryReceipt | undefined {
@@ -1854,38 +1925,58 @@ export class Storage {
         `SELECT delivery.thread_id AS threadId, delivery.message_id AS messageId,
                 inbox.frame_json AS frameJson, inbox.received_at AS admittedAt,
                 inbox.applied_at AS projectedAt, inbox.projection_attempts AS attempts,
-                inbox.dead_lettered_at AS deadLetteredAt
+                inbox.dead_lettered_at AS deadLetteredAt, inbox.disposition AS disposition,
+                inbox.projection_error AS projectionError,
+                receipt.displayed_at AS displayedAt
          FROM attach_scheduled_deliveries AS delivery
          JOIN attach_event_inbox AS inbox
            ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+         LEFT JOIN bot_message_receipts AS receipt
+           ON receipt.bot = delivery.agent_id AND receipt.message_id = delivery.message_id
          WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
       )
       .get(agentId, deliveryId) as {
         threadId: string; messageId: string; frameJson: string; admittedAt: number;
         projectedAt: number | null; attempts: number; deadLetteredAt: number | null;
+        disposition: string; projectionError: string | null; displayedAt: number | null;
       } | undefined;
     if (row === undefined) return undefined;
     const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
     const semanticHome = frame.event.kind === "scheduled" && "target" in frame.event;
+    const target = semanticHome
+      ? { kind: "canonical_home" as const, sessionId: row.threadId }
+      : { kind: "thread" as const, threadId: row.threadId };
+    // One terminal fact, and displayed outranks failed: a row a human read is delivered no matter
+    // what the pipeline had to survive to put it there.
+    const reason = row.projectionError === null ? undefined : row.projectionError.slice(0, 256);
+    const terminal: AttachScheduledDeliveryReceipt["terminal"] =
+      row.displayedAt !== null
+        ? { state: "displayed", at: row.displayedAt }
+        : row.disposition === "discarded"
+          ? { state: "failed", stage: "authorization", ...(reason === undefined ? {} : { reason }), at: row.admittedAt }
+          : row.deadLetteredAt !== null
+            ? { state: "failed", stage: "projection", ...(reason === undefined ? {} : { reason }), at: row.deadLetteredAt }
+            : undefined;
+    const extras = {
+      ...(row.displayedAt === null ? {} : { displayedAt: row.displayedAt }),
+      ...(terminal === undefined ? {} : { terminal }),
+    };
     if (row.projectedAt !== null) {
       return {
-        deliveryId, messageId: row.messageId,
-        target: semanticHome ? { kind: "canonical_home", sessionId: row.threadId } : { kind: "thread", threadId: row.threadId },
-        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt,
+        deliveryId, messageId: row.messageId, target,
+        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt, ...extras,
       };
     }
     if (row.deadLetteredAt !== null) {
       return {
-        deliveryId, messageId: row.messageId,
-        target: semanticHome ? { kind: "canonical_home", sessionId: row.threadId } : { kind: "thread", threadId: row.threadId },
+        deliveryId, messageId: row.messageId, target,
         state: "blocked", admittedAt: row.admittedAt, attempts: row.attempts,
-        deadLetteredAt: row.deadLetteredAt,
+        deadLetteredAt: row.deadLetteredAt, ...extras,
       };
     }
     return {
-      deliveryId, messageId: row.messageId,
-      target: semanticHome ? { kind: "canonical_home", sessionId: row.threadId } : { kind: "thread", threadId: row.threadId },
-      state: "admitted", admittedAt: row.admittedAt,
+      deliveryId, messageId: row.messageId, target,
+      state: "admitted", admittedAt: row.admittedAt, ...extras,
     };
   }
 
@@ -2095,13 +2186,15 @@ export class Storage {
     at: number;
     clientId?: string;
     attachments?: AttachmentBlock[];
+    /** Capability 31: labels a gateway-authored row that is not conversation. */
+    marker?: string;
   }): BotChatMessage {
     const prior = this.#db
       .prepare(
-        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker
          FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
       )
-      .get(input.bot, input.messageId) as { id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null } | undefined;
+      .get(input.bot, input.messageId) as NativeBotMessageDbRow | undefined;
     if (prior !== undefined) return nativeBotMessage(prior);
     const next = this.#db
       .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM bot_native_messages WHERE bot = ? AND session_id = ?")
@@ -2109,8 +2202,8 @@ export class Storage {
     this.#db
       .prepare(
         `INSERT INTO bot_native_messages
-           (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json, marker)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.bot,
@@ -2122,6 +2215,7 @@ export class Storage {
         input.at,
         input.clientId ?? null,
         input.attachments === undefined ? null : JSON.stringify(input.attachments),
+        input.marker ?? null,
       );
     this.#db
       .prepare("UPDATE bot_native_sessions SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
@@ -2129,16 +2223,16 @@ export class Storage {
     this.#db
       .prepare("UPDATE bot_native_chats SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
       .run(input.at, input.bot, input.sessionId);
-    return { id: input.messageId, role: input.role, text: input.text, at: input.at, ...(input.clientId === undefined ? {} : { clientId: input.clientId }), ...(input.attachments === undefined ? {} : { attachments: input.attachments }) };
+    return { id: input.messageId, role: input.role, text: input.text, at: input.at, ...(input.clientId === undefined ? {} : { clientId: input.clientId }), ...(input.attachments === undefined ? {} : { attachments: input.attachments }), ...(input.marker === undefined ? {} : { marker: input.marker }) };
   }
 
   nativeBotMessages(bot: string, sessionId: string): BotChatMessage[] {
     const rows = this.#db
       .prepare(
-        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker
          FROM bot_native_messages WHERE bot = ? AND session_id = ? ORDER BY seq`,
       )
-      .all(bot, sessionId) as unknown as Array<{ id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null }>;
+      .all(bot, sessionId) as unknown as NativeBotMessageDbRow[];
     return rows.map(nativeBotMessage);
   }
 
@@ -2202,10 +2296,10 @@ export class Storage {
   nativeBotMessage(bot: string, messageId: string): BotChatMessage | undefined {
     const row = this.#db
       .prepare(
-        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker
          FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
       )
-      .get(bot, messageId) as { id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null } | undefined;
+      .get(bot, messageId) as NativeBotMessageDbRow | undefined;
     return row === undefined ? undefined : nativeBotMessage(row);
   }
 
@@ -2607,7 +2701,17 @@ export class Storage {
   }
 }
 
-function nativeBotMessage(row: { id: string; role: string; text: string; at: number | null; clientId: string | null; attachmentsJson: string | null }): BotChatMessage {
+interface NativeBotMessageDbRow {
+  id: string;
+  role: string;
+  text: string;
+  at: number | null;
+  clientId: string | null;
+  attachmentsJson: string | null;
+  marker: string | null;
+}
+
+function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
   return {
     id: row.id,
     role: row.role,
@@ -2615,6 +2719,7 @@ function nativeBotMessage(row: { id: string; role: string; text: string; at: num
     at: row.at,
     ...(row.clientId === null ? {} : { clientId: row.clientId }),
     ...(row.attachmentsJson === null ? {} : { attachments: JSON.parse(row.attachmentsJson) as AttachmentBlock[] }),
+    ...(row.marker === null ? {} : { marker: row.marker }),
   };
 }
 
@@ -2637,6 +2742,13 @@ export function openStorage(dbPath: string): Storage {
     if (!interactionColumns.some((column) => column.name === name))
       db.exec(`ALTER TABLE bot_native_interactions ADD COLUMN ${name} ${definition}`);
   }
+  // Capability 31 marks gateway-authored non-conversation rows (`delivery.failed`). Existing rows
+  // stay unmarked, which is exactly what they are.
+  const messageColumns = db
+    .prepare("SELECT name FROM pragma_table_info('bot_native_messages')")
+    .all() as Array<{ name: string }>;
+  if (!messageColumns.some((column) => column.name === "marker"))
+    db.exec("ALTER TABLE bot_native_messages ADD COLUMN marker TEXT");
   const streamColumns = db
     .prepare("SELECT name FROM pragma_table_info('attach_streams')")
     .all() as Array<{ name: string }>;

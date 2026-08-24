@@ -18,6 +18,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("mobile_node"),
   Type.Literal("mobile_location"),
   Type.Literal("memory_management"),
+  Type.Literal("delivery_receipts"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -105,6 +106,22 @@ export const AttachV1MemoryRequestSchema = Type.Object({
   }, { additionalProperties: false }),
 }, { additionalProperties: false });
 export type AttachV1MemoryRequest = Static<typeof AttachV1MemoryRequestSchema>;
+/** Gateway-observed truth about ONE scheduled delivery occurrence, sent back to the plugin that
+ * produced it so its own spool stops guessing. `displayed` means a paired device reported the row
+ * on screen; `failed` means the occurrence is terminal in the gateway and will never be projected,
+ * with `stage` saying where it died (`authorization` at inbox admission, `projection` at the
+ * dead-letter barrier) and `reason` carrying the bounded gateway-side text.
+ *
+ * States never regress: the gateway emits at most one command per (delivery, state), keyed
+ * `rcpt:<deliveryId>:<state>`, and a plugin that receives both keeps the first terminal one. */
+const DeliveryReceiptCommand = Type.Object({
+  kind: Type.Literal("delivery_receipt"), deliveryId: Id, messageId: Id,
+  state: Type.Union([Type.Literal("displayed"), Type.Literal("failed")]),
+  at: Type.Integer({ minimum: 0 }),
+  stage: Type.Optional(Type.Union([Type.Literal("authorization"), Type.Literal("projection")])),
+  reason: Type.Optional(Type.String({ maxLength: 256 })),
+});
+
 /** Capability-free transport tombstone. It advances the durable command sequence without
  * invoking a Hermes action when a command queued while disconnected is no longer supported by
  * the plugin that reconnects. */
@@ -113,13 +130,14 @@ const DiscardCommand = Type.Object({
   originalKind: Type.Union([
     Type.Literal("turn"), Type.Literal("steer"), Type.Literal("interrupt"),
     Type.Literal("resolve_approval"), Type.Literal("resolve_clarify"),
+    Type.Literal("delivery_receipt"),
   ]),
   reason: Type.String({ minLength: 1, maxLength: 512 }),
 });
 
 export const AttachV1CommandSchema = Type.Union([
   TurnCommand, SteerCommand, InterruptCommand, ResolveApprovalCommand, ResolveClarifyCommand,
-  DiscardCommand,
+  DeliveryReceiptCommand, DiscardCommand,
 ]);
 export type AttachV1Command = Static<typeof AttachV1CommandSchema>;
 

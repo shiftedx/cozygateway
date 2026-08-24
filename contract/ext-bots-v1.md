@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 28 }
+"capabilities": { "com.cozylabs.bots": 31 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -67,6 +67,9 @@ extension omits the capability and does not register `/bots` routes.
 | 26 | Searchable aggregate history of agent-sent attachments across native sessions. |
 | 27 | Bounded current-state inbox for pending native approvals. |
 | 28 | Requested-vs-confirmed native approval and clarification settlement. |
+| 29 | Bounded pending clarifications and confirmed terminal settlement receipts on the recovery route. |
+| 30 | Profile-local memory read and conditional write routes. |
+| 31 | Durable delivery receipts: the displayed report, `BotChatMessage.marker`, and role `system`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -81,8 +84,13 @@ a second, hand-copied schema.
   remains Hermes control-plane data.
 - `BotChatMessage` is a durable native transcript row. `id` is the gateway/attach event message
   id, `at` is gateway-clock milliseconds (or `null` when unavailable), and `clientId` is an
-  optional sender echo. Roles are `user` or `assistant` in the projection. Attachments are
-  gateway-scoped opaque `fileId` values, never paths or URLs.
+  optional sender echo. Attachments are gateway-scoped opaque `fileId` values, never paths or URLs.
+  Roles are `user` or `assistant` in the conversational projection, plus, from capability 31,
+  `system` on gateway-authored rows that are not conversation. Roles are NOT an enum on this wire:
+  a client renders an unfamiliar role rather than dropping the row.
+  From capability 31 a row may also carry `marker`, a bounded label naming what a gateway-authored
+  row IS. The only v1 value is `delivery.failed`. A client that does not know a marker renders the
+  ordinary row it already renders.
 - `BotSessionSummary` is a durable native Bot Mode session. Current native Bot Mode sessions have
   `kind: "conversation"`; `startedAt` and `lastActiveAt` are milliseconds. They are not Hermes
   Dashboard session records.
@@ -193,6 +201,27 @@ row. Once any row exists, the field is absent.
 are the fresher source for a composing UI. `POST /bots/:name/chat/stop` sends attach-v1 interrupt
 for that active native turn; follow-up text uses native attach-v1 steering, never Dashboard chat.
 
+### Delivery receipts (capability 31)
+
+`POST /bots/:name/chat/messages/displayed` carries 1 to 64 wire ids of transcript rows this device
+actually put on screen, and answers `202 { "recorded": n }` with the number that became a NEW
+receipt. It is the only signal in this contract that a HUMAN received a message: a durable
+transcript row proves only that the gateway holds it, and push is fire-and-forget by construction.
+
+Receipts are first-write-wins and never deleted. Ids that already have a receipt, and ids naming no
+durable row for that bot, are both ignored and both count zero, so `recorded` is not an error
+signal and a client MUST NOT retry a low count. Repeating a request is therefore free, which is
+what makes a durable offline client queue safe to flush blindly on reconnect.
+
+A client MUST gate the route on `com.cozylabs.bots >= 31` and MUST NOT send provisional
+(client-side, not yet committed) ids. A version 30 gateway answers `404`, which means "this gateway
+does not collect receipts", never "the message was lost".
+
+When a receipt lands on a row that was a scheduled delivery, the gateway tells the plugin that
+produced it over attach-v1 (`contract/attach-v1.md`, `delivery_receipt`). When a scheduled delivery
+instead fails terminally, the gateway appends one `role: "system"`, `marker: "delivery.failed"` row
+to that bot's current canonical chat: a quiet status row, not a bubble, and it raises no push.
+
 ### Attachments and media
 
 Photo bytes are validated and stored by the gateway before the associated attach-v1 command is
@@ -225,6 +254,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/:name/chat` | — | `{ name, sessionId, adoption: "created" \| "pin" }` | Resolves the selected native chat. |
 | `GET /bots/:name/chat/messages` | — | `{ name, sessionId, adoption, messages, running, inflight, updatedAt, suggestion?, toolSteps? }` | Reads native transcript and native tool history. |
 | `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Admits a native turn or steer, then appends locally. |
+| `POST /bots/:name/chat/messages/displayed` | `BotChatDisplayedRequest` | `202 BotChatDisplayedResponse` | Capability 31. Records that this device displayed those rows. |
 | `POST /bots/:name/chat/photos` | multipart `file`, `BotChatPhotoFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated image plus optional caption. |
 | `POST /bots/:name/chat/attachments` | multipart `file`, `BotChatAttachmentFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated PDF, text, RTF, Office, or OpenDocument file plus optional caption. |
 | `POST /bots/:name/chat/stop` | — | `BotChatStopResponse` | Interrupts the current native turn; returns 409 when idle. |

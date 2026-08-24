@@ -6,6 +6,7 @@ import {
   BotCreateRequestSchema,
   BotChatAttachmentFieldsSchema,
   BotClarifyResolveRequestSchema,
+  BotChatDisplayedRequestSchema,
   BotChatSendRequestSchema,
   BotFocusRequestSchema,
   BotGroupCreateRequestSchema,
@@ -897,6 +898,44 @@ export function registerBotRoutes(
         { name, sessionId: sent.sessionId, message: sent.message },
         202,
       );
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // Capability 31. The device reporting what it actually PUT ON SCREEN, which is the only proof of
+  // human delivery this system has: a durable transcript row proves the gateway holds a message and
+  // a push proves nothing at all.
+  //
+  // 202, not 200: recording the receipt is synchronous, but what the report SETS IN MOTION (telling
+  // the plugin that produced a scheduled delivery that a human read it) rides the durable attach
+  // outbox and is not finished when this answers.
+  //
+  // `recorded` counts new receipts only. A client MUST NOT read a low count as a failure and retry:
+  // already-recorded ids and ids naming no durable row both count zero, and both are correct.
+  app.post("/bots/:name/chat/messages/displayed", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotChatDisplayedRequestSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      const recorded = chat.recordDisplayed(
+        resolved.name,
+        parsed.messageIds,
+        c.get("deviceId"),
+      );
+      return c.json(recorded, 202);
     } catch (err) {
       return failure(c, err);
     }

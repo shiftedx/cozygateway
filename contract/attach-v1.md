@@ -130,6 +130,47 @@ The route does not claim `notified`: gateway push is intentionally fire-and-forg
 is not proof that a device or a human received it. A plugin must report a local enqueue as `journaled`
 or `accepted_pending`, not delivered, until this route reports `projected`.
 
+A receipt additionally carries two optional fields, both added with the `delivery_receipts`
+capability and both absent until the fact they describe exists:
+
+- `displayedAt`: when a paired device reported the projected row on screen.
+- `terminal`: the one terminal fact about this occurrence, as
+  `{ "state": "displayed" | "failed", "stage"?, "reason"?, "at" }`. `state` above is unchanged and
+  still describes the projection pipeline; `terminal` describes the OCCURRENCE. `displayed`
+  outranks `failed`, states never regress, and `stage` is `authorization` (quarantined at inbox
+  admission) or `projection` (dead-lettered after retries).
+
+### `delivery_receipt` command
+
+Negotiating `delivery_receipts` asks the gateway to push those same facts back down the ordinary
+durable command channel rather than making the plugin poll:
+
+```json
+{ "kind": "delivery_receipt", "deliveryId": "...", "messageId": "...",
+  "state": "displayed", "at": 0, "stage": "projection", "reason": "..." }
+```
+
+`stage` and `reason` are present only for `state: "failed"`, and `reason` is bounded at 256
+characters. The gateway emits at most one command per occurrence and state, keyed
+`rcpt:<deliveryId>:<state>`, so a redelivery after reconnect is the same `commandId` and a plugin
+that has already applied it acks it again and does nothing. A plugin keeps the FIRST terminal
+state it sees.
+
+Three things raise a receipt: a device reporting a scheduled delivery's row displayed; a scheduled
+event quarantined at admission (`failed` / `authorization`, carrying the discard reason); and a
+scheduled event dead-lettered after projection retries (`failed` / `projection`, carrying the
+truncated projection error). Failures before gateway admission stay plugin-local: the gateway
+cannot report an event it never saw.
+
+A plugin that never negotiates `delivery_receipts` is unaffected. A receipt is never queued for a
+connected plugin that did not negotiate it, and one queued while that plugin was away is converted
+to the ordinary `discard` tombstone on reconnect, exactly like any other unsupported command, so
+the command sequence advances and nothing stalls.
+
+A terminal FAILURE is also surfaced to the human: the gateway appends one marked row
+(`marker: "delivery.failed"`, role `system`, ext-bots-v1 capability 31) to that bot's current
+canonical chat, so a cron report that never arrived is visible instead of silently absent.
+
 ## Media
 
 WebSocket frames carry only `mediaId`, MIME, byte count, SHA-256, safe filename, family, optional

@@ -289,6 +289,13 @@ export interface BotsSurface extends BotControlSurface {
     optionId: string,
     deviceId: string,
   ): Promise<BotClarifyResolveOutcome>;
+  /** Capability 31. Records that this device displayed these wire ids; returns how many became a
+   * NEW receipt. Idempotent, first-write-wins, and unknown ids are ignored. */
+  recordDisplayed(
+    name: string,
+    messageIds: readonly string[],
+    deviceId: string,
+  ): { recorded: number };
 }
 
 export interface HermesBridgeOptions {
