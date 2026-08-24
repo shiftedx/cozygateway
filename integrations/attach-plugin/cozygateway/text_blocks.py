@@ -62,6 +62,31 @@ def normalize_text_to_blocks(text: str) -> List[RichBlock]:
     return blocks
 
 
+def block_split_index(text: str, line_index: int) -> Optional[int]:
+    """How many blocks precede ``line_index`` when ``text`` is cut there, or ``None``.
+
+    "Precede" is only well defined when cutting at that line leaves the block
+    structure of ``text`` untouched: cutting inside a paragraph, a fenced code body,
+    a table or a list would invent a boundary the reader never wrote, and an
+    attachment placed at an invented boundary lands somewhere nobody asked for. So
+    this normalizes the head, the tail and the whole with the SAME normalizer and
+    only answers when head + tail is byte-identical on the wire to the whole; every
+    other case answers ``None``, which the callers read as "no position" and fall
+    back to legacy above-stack placement.
+    """
+    if line_index < 0:
+        return None
+    lines = re.sub(r"\r\n?", "\n", text).split("\n")
+    if line_index > len(lines):
+        return None
+    head = normalize_text_to_blocks("\n".join(lines[:line_index]))
+    tail = normalize_text_to_blocks("\n".join(lines[line_index:]))
+    whole = normalize_text_to_blocks(text)
+    if head + tail != whole:
+        return None
+    return len(head)
+
+
 def _normalize_lines(lines: List[str]) -> Tuple[List[RichBlock], List[int]]:
     """Core dispatch loop over an already-split, already ``\\n``-normalized ``lines``.
 

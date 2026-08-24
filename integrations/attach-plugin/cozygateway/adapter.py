@@ -65,7 +65,11 @@ from .media_descriptor import (
     MediaProbeError,
     probe as probe_media,
 )
-from .text_blocks import IncrementalNormalizer, normalize_text_to_blocks
+from .text_blocks import (
+    IncrementalNormalizer,
+    block_split_index,
+    normalize_text_to_blocks,
+)
 from .tool_chips import ToolChipTracker
 from .memory import MemoryConflict, MemoryError, MemoryManager
 
@@ -263,6 +267,10 @@ class MediaBatch:
 
     uploaded: List[Dict[str, Any]] = field(default_factory=list)
     failed: List[Dict[str, Any]] = field(default_factory=list)
+    # Inline block positions for the ACCEPTED attachments, index-for-index with
+    # ``media_ids``. ``None`` means the caller had none, which is legacy above-stack
+    # placement.
+    media_positions: Optional[List[int]] = None
 
     @property
     def media_ids(self) -> List[str]:
@@ -357,6 +365,51 @@ def _media_failure(
     }
 
 
+def _media_positions_for_draft(
+    draft: str, cleaned: str, paths: List[str]
+) -> Optional[List[int]]:
+    """Where each path's marker line sat in the block flow of the delivered text.
+
+    A ``position`` is the index in the message's normalized block array BEFORE which
+    the attachment renders, so an image written under its heading renders under that
+    heading instead of on a stack above the whole reply.
+
+    The draft still carries the ``MEDIA:``/local-file marker lines (Hermes strips them
+    only after the message handler returns), so the marker line IS the author's chosen
+    spot. This locates each path's line in the draft, removes every marker line, checks
+    that what remains normalizes to exactly the blocks the delivered ``cleaned`` text
+    normalizes to, and then asks the shared normalizer how many blocks precede each cut.
+
+    Answers ``None`` -- for ALL paths, never a partial array -- whenever any of that is
+    not certain: a path named on more than one line, a marker inside a paragraph or a
+    code fence, or a draft whose leftovers no longer match what Hermes delivered. The
+    caller then omits positions entirely and the reader gets today's above-stack
+    rendering, which is the whole point: an uncertain index must degrade to a picture in
+    the wrong place, never to a lost picture.
+    """
+    if not paths:
+        return None
+    lines = re.sub(r"\r\n?", "\n", draft).split("\n")
+    marker_line: Dict[str, int] = {}
+    for path in paths:
+        hits = [index for index, line in enumerate(lines) if path in line]
+        if len(hits) != 1:
+            return None
+        marker_line[path] = hits[0]
+    markers = set(marker_line.values())
+    stripped = "\n".join(line for index, line in enumerate(lines) if index not in markers)
+    if normalize_text_to_blocks(stripped) != normalize_text_to_blocks(cleaned):
+        return None
+    positions: List[int] = []
+    for path in paths:
+        preceding = sum(1 for index in range(marker_line[path]) if index not in markers)
+        position = block_split_index(stripped, preceding)
+        if position is None:
+            return None
+        positions.append(position)
+    return positions
+
+
 @dataclass
 class _PreparedMedia:
     """One attachment after probing: either a refusal, or bytes ready for the wire."""
@@ -429,8 +482,18 @@ class MediaUploadService:
             self._mark(media_id, "blocked", detail=detail[:512])
 
     # -- upload --------------------------------------------------------------
-    async def upload(self, paths: List[str]) -> MediaBatch:
+    async def upload(
+        self, paths: List[str], positions: Optional[List[int]] = None
+    ) -> MediaBatch:
+        """Upload ``paths``; ``positions`` (when given) is aligned index-for-index.
+
+        Positions ride alongside the slots, they never reorder them: an attachment the
+        gateway refuses drops its position with it, and the ones that survive keep the
+        block index the author wrote them at.
+        """
         batch = MediaBatch()
+        if positions is not None and len(positions) != len(paths):
+            positions = None
         if not paths:
             return batch
         if not _client_supports(self._client, "media"):
@@ -471,8 +534,17 @@ class MediaUploadService:
 
         # gather preserves argument order, so a media id keeps the slot its index gave it
         # however the uploads interleave.
-        for ok, record in await asyncio.gather(*(send(item) for item in prepared)):
-            (batch.uploaded if ok else batch.failed).append(record)
+        accepted_positions: List[int] = []
+        results = await asyncio.gather(*(send(item) for item in prepared))
+        for item, (ok, record) in zip(prepared, results):
+            if ok:
+                batch.uploaded.append(record)
+                if positions is not None:
+                    accepted_positions.append(positions[item.index])
+            else:
+                batch.failed.append(record)
+        if positions is not None:
+            batch.media_positions = accepted_positions
         return batch
 
     async def _prepare(self, index: int, path: str) -> "_PreparedMedia":
@@ -726,6 +798,10 @@ class AttachAdapter:
         # message handler returns. Attach-v1 must know those paths before its
         # terminal send seals the turn, so retain them at that boundary.
         self._turn_media: Dict[str, List[str]] = {}
+        # Where each of those paths sat in the reply's block flow, when the draft
+        # said so unambiguously: ``{turnId: (cleanedBlocks, {path: position})}``.
+        # Absent (or dropped at send time) means legacy above-stack placement.
+        self._turn_media_positions: Dict[str, Tuple[List[Any], Dict[str, int]]] = {}
         # Hermes subsequently runs its conventional per-platform media phase.
         # Remember successful atomic uploads so those calls can be acknowledged
         # without a duplicate upload or a misleading fallback warning.
@@ -784,9 +860,15 @@ class AttachAdapter:
         self._message_handler = wrapped  # harness-defined callback slot
 
     def _stage_response_media(self, turn_id: str, response: str) -> None:
-        """Mirror Hermes' safe extraction without altering its delivery input."""
+        """Mirror Hermes' safe extraction without altering its delivery input.
+
+        The draft still holds the marker lines here, so this is also the ONE moment
+        that can see where the author put each attachment. The block index is captured
+        alongside the path; the terminal send puts it on the wire only if the delivered
+        text still agrees with this snapshot.
+        """
         try:
-            media, _cleaned = self.extract_media(response)  # type: ignore[attr-defined]
+            media, cleaned = self.extract_media(response)  # type: ignore[attr-defined]
             explicit = [
                 path
                 for path, _is_voice in self.filter_media_delivery_paths(media)  # type: ignore[attr-defined]
@@ -795,8 +877,53 @@ class AttachAdapter:
             logger.debug("attach: terminal media staging failed", exc_info=True)
             return
         paths = list(dict.fromkeys(str(path) for path in explicit if path))
-        if paths:
-            self._turn_media[turn_id] = paths[:16]
+        if not paths:
+            return
+        staged = paths[:16]
+        self._turn_media[turn_id] = staged
+        self._turn_media_positions.pop(turn_id, None)
+        try:
+            positions = _media_positions_for_draft(response, str(cleaned or ""), staged)
+        except Exception:  # noqa: BLE001 - placement is a nicety; the picture is not
+            logger.debug("attach: inline media positions unavailable", exc_info=True)
+            return
+        if positions is None:
+            return
+        self._turn_media_positions[turn_id] = (
+            normalize_text_to_blocks(str(cleaned or "")),
+            dict(zip(staged, positions)),
+        )
+
+    def _staged_positions(self, turn_id: str, paths: List[str]) -> Optional[List[int]]:
+        """The staged block positions for exactly ``paths``, or ``None``.
+
+        All or nothing: a turn whose attachments arrived from more than one place (a
+        staged draft marker plus a path handed in by metadata) has no single authored
+        order to honor, so the whole delivery falls back to legacy placement rather
+        than positioning some attachments and stacking the rest.
+        """
+        staged = self._turn_media_positions.get(turn_id)
+        if staged is None:
+            return None
+        _blocks, positions = staged
+        if any(path not in positions for path in paths):
+            return None
+        return [positions[path] for path in paths]
+
+    def _positions_still_true(self, turn_id: str, blocks: List[Any]) -> bool:
+        """Whether the sealed blocks are still the draft the positions were measured on.
+
+        The measured blocks must remain a PREFIX of what is being sealed, which lets the
+        one legitimate late edit through (the "I could not attach ..." sentence appended
+        after a refused upload) while rejecting any rewrite that would move the indices.
+        A holding prefix also keeps every position in range, since each one was counted
+        inside those measured blocks.
+        """
+        staged = self._turn_media_positions.get(turn_id)
+        if staged is None:
+            return False
+        measured, _positions = staged
+        return list(blocks[: len(measured)]) == list(measured)
 
     @staticmethod
     def _media_family(path: str) -> str:
@@ -1632,6 +1759,7 @@ class AttachAdapter:
             )
             chips = self._chips(turn_id)
             media_ids: List[str] = []
+            media_positions: Optional[List[int]] = None
             uploaded_paths: List[str] = []
             media_result: Optional[Dict[str, Any]] = None
             service: Optional[MediaUploadService] = None
@@ -1648,8 +1776,12 @@ class AttachAdapter:
                     destination=MediaDestination("active_turn", chat_id),
                     spool=self._spool,
                 )
-                batch = await service.upload(paths[:16])
+                sendable = paths[:16]
+                batch = await service.upload(
+                    sendable, self._staged_positions(turn_id, sendable)
+                )
                 media_ids = batch.media_ids
+                media_positions = batch.media_positions
                 uploaded_paths = [str(entry["source"]) for entry in batch.uploaded]
                 if batch.failed:
                     # The text still commits, but it says so. Committing a reply that
@@ -1666,19 +1798,27 @@ class AttachAdapter:
                     )
                     media_result = batch.partial_result(turn_id)
             blocks = self._normalize(turn_id, final_text)
+            if media_positions is not None and not self._positions_still_true(turn_id, blocks):
+                # The delivered text is not the draft the positions were measured
+                # against. Ship the attachments the way they have always shipped.
+                media_positions = None
             had_content = self._content_seen.get(turn_id, False)
             if blocks or chips or media_ids:
                 # Full replace with the final view, then seal it.
                 await client.send_draft(chat_id, turn_id, blocks, tool_calls=chips)
                 if isinstance(client, AttachV1Client):
-                    await client.send_done(chat_id, turn_id, media_ids=media_ids)
+                    await client.send_done(
+                        chat_id, turn_id, media_ids=media_ids, media_positions=media_positions
+                    )
                 else:
                     await client.send_done(chat_id, turn_id)
             elif had_content:
                 # Nothing new to draw, but earlier drafts carried content: seal the
                 # latest good draft. Do not send an empty draft (it would wipe it).
                 if isinstance(client, AttachV1Client):
-                    await client.send_done(chat_id, turn_id, media_ids=media_ids)
+                    await client.send_done(
+                        chat_id, turn_id, media_ids=media_ids, media_positions=media_positions
+                    )
                 else:
                     await client.send_done(chat_id, turn_id)
             else:
@@ -1722,8 +1862,13 @@ class AttachAdapter:
         *,
         canonical_home: bool,
         delivery_key: str,
+        media_positions: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
-        """Commit one tool-originated delivery through the resident writable socket."""
+        """Commit one tool-originated delivery through the resident writable socket.
+
+        ``media_positions``, when given, is aligned index-for-index with ``media_files``
+        and says which block each attachment renders before.
+        """
         client = self._client
         if not isinstance(client, AttachV1Client) or not self._ready.is_set():
             return _proactive_failure("attach_not_writable")
@@ -1738,7 +1883,11 @@ class AttachAdapter:
             ),
             spool=self._spool,
         )
-        batch = await service.upload(list(media_files[:16]))
+        sendable = list(media_files[:16])
+        batch = await service.upload(
+            sendable,
+            list(media_positions[:16]) if media_positions is not None else None,
+        )
         media_ids = batch.media_ids
         if batch.failed:
             await client.rollback_uploaded_media(media_ids)
@@ -1756,6 +1905,7 @@ class AttachAdapter:
             blocks,
             media_ids,
             canonical_home=canonical_home,
+            media_positions=batch.media_positions,
         )
         if frame is None:
             return _proactive_failure("scheduled_delivery_unavailable", delivery_id, message_id)
@@ -1789,6 +1939,7 @@ class AttachAdapter:
         """Drop a turn's per-turn state once it commits, fails, or is dropped."""
         self._turn_text.pop(turn_id, None)
         self._turn_media.pop(turn_id, None)
+        self._turn_media_positions.pop(turn_id, None)
         self._tool_chips.pop(turn_id, None)
         self._normalizers.pop(turn_id, None)
         self._content_seen.pop(turn_id, None)
@@ -2566,6 +2717,9 @@ async def _send_message_handler(
     extracted, cleaned = BasePlatformAdapter.extract_media(raw_message)
     filtered = BasePlatformAdapter.filter_media_delivery_paths(extracted)
     media_files = [str(path) for path, _is_voice in filtered]
+    # The tool's raw message still holds the marker lines, so this lane can place its
+    # attachments in the block flow exactly the way the terminal reply lane does.
+    media_positions = _media_positions_for_draft(raw_message, cleaned, media_files)
     target = str(request.get("target") or "").strip().lower()
     canonical_home = target == platform_name
     key_material = "\0".join([platform_name, chat_id, cleaned, *media_files])
@@ -2582,6 +2736,7 @@ async def _send_message_handler(
                 media_files,
                 canonical_home=canonical_home,
                 delivery_key=delivery_key,
+                media_positions=media_positions,
             )
         )
     return _hermes_delivery_result(
@@ -2591,6 +2746,7 @@ async def _send_message_handler(
             delivery_key=delivery_key,
             message=cleaned,
             media_files=media_files,
+            media_positions=media_positions,
             canonical_home=canonical_home,
         )
     )
@@ -2875,6 +3031,7 @@ async def enqueue_proactive_delivery(
     delivery_key: str,
     message: str,
     media_files: Optional[List[str]] = None,
+    media_positions: Optional[List[int]] = None,
     media_policy: str = "atomic",
     spool_path: Optional[str] = None,
     canonical_home: bool = False,
@@ -2927,9 +3084,17 @@ async def enqueue_proactive_delivery(
             ),
             spool=spool,
         )
+        positions: Optional[List[int]] = None
         if paths:
-            batch = await service.upload(paths[:16])
+            sendable = paths[:16]
+            aligned = (
+                list(media_positions[: len(sendable)])
+                if media_positions is not None and len(media_positions) == len(paths)
+                else None
+            )
+            batch = await service.upload(sendable, aligned)
             media_ids = batch.media_ids
+            positions = batch.media_positions
             media_errors = batch.error_lines
             if media_errors and media_policy == "atomic":
                 # A later upload failure abandons the entire occurrence. Roll
@@ -2952,6 +3117,7 @@ async def enqueue_proactive_delivery(
             blocks,
             media_ids,
             canonical_home=canonical_home,
+            media_positions=positions,
         )
         if frame is None:
             return _proactive_failure("scheduled_not_supported", delivery_id, message_id, media_errors)

@@ -31,8 +31,8 @@ class _Client(AttachV1Client):
     async def send_draft(self, thread_id, turn_id, blocks, tool_calls=None):
         self.drafts.append((thread_id, turn_id, blocks))
 
-    async def send_done(self, thread_id, turn_id, media_ids=None):
-        self.commits.append((thread_id, turn_id, media_ids or []))
+    async def send_done(self, thread_id, turn_id, media_ids=None, media_positions=None):
+        self.commits.append((thread_id, turn_id, media_ids or [], media_positions))
 
 
 class TerminalMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):

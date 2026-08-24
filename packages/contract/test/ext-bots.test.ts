@@ -478,8 +478,9 @@ describe("capability advertisement", () => {
     // 28 distinguishes a durable resolution request from Hermes terminal confirmation;
     // 29 adds clarification recovery and terminal settlement receipts; 30 adds
     // attached-profile Memory management; 31 adds durable delivery receipts (the displayed
-    // report, `BotChatMessage.marker`, and role `system` on gateway-authored marker rows).
-    expect(BOTS_CAPABILITY_VERSION).toBe(31);
+    // report, `BotChatMessage.marker`, and role `system` on gateway-authored marker rows);
+    // 32 adds inline media ordering (`BotChatMessage.attachments[].position`).
+    expect(BOTS_CAPABILITY_VERSION).toBe(32);
   });
 
   it("accepts capability-23 native turn status without changing legacy state fields", () => {
@@ -530,6 +531,23 @@ describe("capability advertisement", () => {
         ],
       }),
     ).toBe(true);
+  });
+
+  it("accepts a capability-32 inline position on an attachment, and only a bounded one", () => {
+    const row = (attachment: Record<string, unknown>) => ({
+      id: "assistant-2", role: "assistant", text: "Sales are up.", at: 1_800_000_000_000,
+      attachments: [{
+        type: "attachment", fileId: "0123456789abcdef0123456789abcdef",
+        name: "chart.png", mimeType: "image/png", size: 9, ...attachment,
+      }],
+    });
+    // 0 is above everything, and a mixed message (one positioned, one not) is legal.
+    expect(check(BotChatMessageSchema, row({ position: 0 }))).toBe(true);
+    expect(check(BotChatMessageSchema, row({ position: 3 }))).toBe(true);
+    expect(check(BotChatMessageSchema, row({}))).toBe(true);
+    expect(check(BotChatMessageSchema, row({ position: -1 }))).toBe(false);
+    expect(check(BotChatMessageSchema, row({ position: 1.5 }))).toBe(false);
+    expect(check(BotChatMessageSchema, row({ position: "1" }))).toBe(false);
   });
 
   it("accepts capability-16 session list and adoption responses", () => {

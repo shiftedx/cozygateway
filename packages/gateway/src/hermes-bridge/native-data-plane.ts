@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import type {
   AttachmentBlock,
+  BotChatAttachment,
   BotApprovalPendingFrame,
   BotApprovalResolutionRequestedFrame,
   BotApprovalResolvedFrame,
@@ -331,6 +332,7 @@ export class NativeBotDataPlane {
         event.messageId,
         event.blocks,
         event.mediaIds,
+        event.mediaPositions,
       );
     }
     if (!("threadId" in event)) return false;
@@ -355,7 +357,7 @@ export class NativeBotDataPlane {
           delivery.acknowledgedAt !== null
         ) {
           const committed = this.#commit(
-            key, sessionId, event.messageId, event.blocks, event.mediaIds,
+            key, sessionId, event.messageId, event.blocks, event.mediaIds, event.mediaPositions,
           );
           if (committed) {
             this.#storage.recordNativeBotTerminal({
@@ -400,6 +402,7 @@ export class NativeBotDataPlane {
         event.messageId,
         event.blocks,
         event.mediaIds,
+        event.mediaPositions,
       );
     }
     if (
@@ -969,14 +972,20 @@ export class NativeBotDataPlane {
     messageId: string,
     blocks: readonly RichBlock[],
     mediaIds?: string[],
+    mediaPositions?: number[],
   ): boolean {
     const now = this.#now();
     if (this.#storage.nativeBotMessage(bot, messageId) !== undefined)
       return true;
-    const attachments = mediaIds?.flatMap((mediaId): AttachmentBlock[] => {
+    // Positions are all or nothing: a length that does not match the ids is a sender that
+    // counted something else, and half a placement is worse than none. The transcript then
+    // carries the attachments the way it always has, above the message.
+    const positions = mediaPositions?.length === mediaIds?.length ? mediaPositions : undefined;
+    const attachments = mediaIds?.flatMap((mediaId, index): BotChatAttachment[] => {
       const info = this.#storage.attachMediaInfo(bot, mediaId, now);
       if (info === undefined) return [];
       const family = info.descriptor.family;
+      const position = positions?.[index];
       return [
         {
           type: "attachment",
@@ -987,6 +996,7 @@ export class NativeBotDataPlane {
           ...(family === "image" || family === "audio" || family === "video" || family === "file"
             ? { mediaKind: family }
             : {}),
+          ...(position === undefined ? {} : { position }),
         },
       ];
     });
