@@ -13,6 +13,7 @@ import type {
 
 import { BackendUnavailable } from "../errors.ts";
 import { createPhotoRateLimiter, type PhotoRateLimiter } from "./photos.ts";
+import type { MemorySendOutcome } from "../adapters/attach/ingress-v1.ts";
 import type { AttachV1MemoryRequest, AttachV1MemoryResult } from "../adapters/attach/protocol-v1.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
 
@@ -55,15 +56,24 @@ export interface MemorySurface {
 
 interface Pending { agentId: string; resolve: (value: MemoryResult) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout>; }
 
+/** The operator-facing reading of each refusal. A plugin that connected but negotiated an older
+ *  hello reads identically to an offline one from the phone, so the message has to separate them:
+ *  one needs the bot brought online, the other needs its plugin restarted. */
+const MEMORY_UNAVAILABLE: Record<Exclude<MemorySendOutcome, "sent">, string> = {
+  unknown_bot: "this bot has no attach profile on this gateway",
+  not_attached: "this bot's plugin is not attached right now",
+  capability_not_negotiated: "this bot's attached plugin negotiated without memory_management; restart the Hermes profile so it picks up the current plugin",
+};
+
 /** Correlates the bounded live attach-v1 management lane. It retains only a
  * waiter, never memory content. Disconnected plugins fail immediately so a
  * timed-out mutation cannot execute later after reconnect. */
 export class AttachMemorySurface implements MemorySurface {
   readonly #pending = new Map<string, Pending>();
-  readonly #endpoint: { sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): boolean };
+  readonly #endpoint: { sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome };
   readonly #timeoutMs: number;
   readonly #trace: TraceLog | undefined;
-  constructor(endpoint: { sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): boolean }, timeoutMs = 12_000, trace?: TraceLog) { this.#endpoint = endpoint; this.#timeoutMs = timeoutMs; this.#trace = trace; }
+  constructor(endpoint: { sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome }, timeoutMs = 12_000, trace?: TraceLog) { this.#endpoint = endpoint; this.#timeoutMs = timeoutMs; this.#trace = trace; }
 
   #request(agentId: string, operation: MemoryOperation, input: MemoryInput): Promise<MemoryResult> {
     const requestId = randomUUID();
@@ -73,9 +83,11 @@ export class AttachMemorySurface implements MemorySurface {
       }, this.#timeoutMs);
       timer.unref();
       this.#pending.set(requestId, { agentId, resolve, reject, timer });
-      if (!this.#endpoint.sendMemoryRequest(agentId, { kind: "memory_request", requestId, operation, input })) {
+      const outcome = this.#endpoint.sendMemoryRequest(agentId, { kind: "memory_request", requestId, operation, input });
+      if (outcome !== "sent") {
         clearTimeout(timer); this.#pending.delete(requestId);
-        reject(new BackendUnavailable("memory management is unavailable for this bot"));
+        emitTrace(this.#trace, "bot_memory_unavailable", { profile: traceId(agentId), operation, reason: outcome });
+        reject(new BackendUnavailable(`memory management is unavailable for this bot: ${MEMORY_UNAVAILABLE[outcome]}`));
       }
     });
   }

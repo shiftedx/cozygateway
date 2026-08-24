@@ -60,9 +60,30 @@ describe("capability-30 bot memory routes", () => {
     expect(items).toHaveBeenCalledTimes(1);
   });
 
+  // Regression: the production failure. Every memory route answered 503 "memory management is
+  // unavailable for this bot" while chat, media and tools were live, because the attached plugin
+  // had negotiated a hello that never offered `memory_management`. One sentence for three
+  // unrelated conditions is what made a stale plugin indistinguishable from an offline bot, so
+  // the reason has to reach the operator.
+  it("says WHY the memory lane is closed instead of one sentence for three conditions", async () => {
+    const cases = [
+      ["capability_not_negotiated", "negotiated without memory_management"],
+      ["not_attached", "not attached right now"],
+      ["unknown_bot", "no attach profile on this gateway"],
+    ] as const;
+    for (const [outcome, expected] of cases) {
+      const memory = new AttachMemorySurface({ sendMemoryRequest: () => outcome });
+      const response = await appFor(memory).request("/bots/cleo/memory");
+      expect(response.status).toBe(503);
+      const body = (await response.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe("backend_unavailable");
+      expect(body.error.message).toContain(expected);
+    }
+  });
+
   it("correlates an ephemeral attach reply without accepting a late duplicate", async () => {
     const sent: Array<{ requestId: string }> = [];
-    const memory = new AttachMemorySurface({ sendMemoryRequest: (_agent, command) => { sent.push(command); return true; } });
+    const memory = new AttachMemorySurface({ sendMemoryRequest: (_agent, command) => { sent.push(command); return "sent" as const; } });
     const pending = memory.overview("cleo");
     expect(sent).toHaveLength(1);
     const frame = { kind: "memory_result" as const, requestId: sent[0]!.requestId, status: "ok" as const, result: { sources: [] } };

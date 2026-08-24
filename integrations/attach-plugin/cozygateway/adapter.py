@@ -48,7 +48,7 @@ from .attach_client import (
     TurnFrame,
 )
 from .attach_client_v1 import (
-    MOBILE_HELLO_ACK_TIMEOUT_SECONDS,
+    HELLO_ACK_TIMEOUT_SECONDS,
     MOBILE_STATUS_VALUES,
     AttachV1Client,
     AttachV1ClientConfig,
@@ -434,7 +434,7 @@ class AttachAdapter:
         try:
             await asyncio.wait_for(
                 self._ready.wait(),
-                2 * MOBILE_HELLO_ACK_TIMEOUT_SECONDS + 0.5,
+                2 * HELLO_ACK_TIMEOUT_SECONDS + 0.5,
             )
         except asyncio.TimeoutError:
             await self.disconnect()

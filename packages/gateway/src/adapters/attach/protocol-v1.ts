@@ -64,7 +64,7 @@ export const AttachV1HelloV1Schema = Type.Object({
   limits: Type.Optional(AttachV1LimitsSchema),
   commands: Type.Optional(AttachV1CommandCatalogSchema),
 }, { additionalProperties: false });
-const AttachV1HelloV2Schema = Type.Object({
+export const AttachV1HelloV2Schema = Type.Object({
   kind: Type.Literal("hello"),
   version: Type.Literal(2),
   instanceId: Id,

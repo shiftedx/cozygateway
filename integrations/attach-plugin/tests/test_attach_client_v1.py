@@ -205,7 +205,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             "resume": {"eventSequence": 0, "commandSequence": 0},
             "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}, "heartbeatIntervalMs": 15000,
         }))
-        with patch("cozygateway.attach_client_v1.MOBILE_HELLO_ACK_TIMEOUT_SECONDS", 0.001):
+        with patch("cozygateway.attach_client_v1.HELLO_ACK_TIMEOUT_SECONDS", 0.001):
             await client.connect()
             watcher = __import__("asyncio").create_task(client.watch())
             for _ in range(20):
@@ -253,6 +253,58 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first.sent[0]["version"], second.sent[0]["version"]), (2, 1))
         await client.close()
         await watcher
+
+    async def test_hello_fallback_is_logged_with_its_reason(self):
+        """Regression: the downgrade was silent.
+
+        Falling back to v1 permanently removes ``mobile_location`` and ``memory_management`` for
+        the life of the connection. Every surface built on them then fails with an "unavailable"
+        that names no cause, and nothing in either log says a downgrade happened. The warning IS
+        the fix for that: it is the only place the cause is recorded.
+        """
+        first, second = FakeSocket(), FakeSocket()
+        sockets = iter([first, second])
+
+        async def old_server_factory(_url, _headers, _ssl):
+            return next(sockets)
+
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url="http://gateway.example", token="secret", spool=self.spool,
+            connect_factory=old_server_factory,
+        ))
+        await first.inbound.put(ConnectionClosedError(Close(1008, "attach-v1 invalid hello frame"), None, None))
+        await second.inbound.put(json.dumps({
+            "kind": "hello_ack", "version": 1, "capabilities": ["mobile_node"],
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+        await client.connect()
+        with self.assertLogs("cozygateway.attach_client_v1", level="INFO") as captured:
+            watcher = __import__("asyncio").create_task(client.watch())
+            for _ in range(50):
+                if client._negotiated:
+                    break
+                await __import__("asyncio").sleep(0.001)
+            self.assertTrue(client._negotiated)
+        warnings = [line for line in captured.output if line.startswith("WARNING")]
+        self.assertTrue(any("retrying handshake as hello v1" in line for line in warnings), captured.output)
+        self.assertTrue(any("closed before hello_ack" in line for line in warnings), captured.output)
+        self.assertTrue(any("memory_management stay OFF" in line for line in warnings), captured.output)
+        # The negotiated set is recorded too, so "which capabilities does this bot actually have"
+        # is answerable from the Hermes log alone.
+        self.assertTrue(any("negotiated hello v1" in line for line in captured.output), captured.output)
+        await client.close()
+        await watcher
+
+    def test_hello_ack_budget_is_not_a_one_second_race(self):
+        """Regression: the budget was 1s and named for mobile status.
+
+        A handshake that loses that race downgrades to v1 silently and permanently, so the budget
+        has to be the gateway's own hello window, not a value tight enough for an ordinary slow
+        boot to trip.
+        """
+        from cozygateway.attach_client_v1 import HELLO_ACK_TIMEOUT_SECONDS
+
+        self.assertGreaterEqual(HELLO_ACK_TIMEOUT_SECONDS, 5)
 
     async def test_pre_ack_connection_closed_error_falls_back_to_v1(self):
         first, second = FakeSocket(), FakeSocket()
