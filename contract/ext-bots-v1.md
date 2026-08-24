@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 31 }
+"capabilities": { "com.cozylabs.bots": 32 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -70,6 +70,7 @@ extension omits the capability and does not register `/bots` routes.
 | 29 | Bounded pending clarifications and confirmed terminal settlement receipts on the recovery route. |
 | 30 | Profile-local memory read and conditional write routes. |
 | 31 | Durable delivery receipts: the displayed report, `BotChatMessage.marker`, and role `system`. |
+| 32 | Inline media ordering: `BotChatMessage.attachments[].position`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -91,6 +92,7 @@ a second, hand-copied schema.
   From capability 31 a row may also carry `marker`, a bounded label naming what a gateway-authored
   row IS. The only v1 value is `delivery.failed`. A client that does not know a marker renders the
   ordinary row it already renders.
+  From capability 32 an attachment entry may also carry `position`; see "Inline media ordering".
 - `BotSessionSummary` is a durable native Bot Mode session. Current native Bot Mode sessions have
   `kind: "conversation"`; `startedAt` and `lastActiveAt` are milliseconds. They are not Hermes
   Dashboard session records.
@@ -232,6 +234,34 @@ Capability 24 additionally admits one 20 MiB document per turn: PDF; UTF-8 plain
 CSV, JSON, or RTF; legacy Office; OOXML; and OpenDocument files. The gateway checks the declared
 allow-listed MIME against lightweight format bytes, stores the sanitized filename as metadata, and
 serves every attachment with `Content-Disposition: attachment` and `nosniff`.
+
+### Inline media ordering (capability 32)
+
+An attachment entry on `BotChatMessage.attachments` may carry an optional `position`: the index in
+that message's normalized block array BEFORE which the attachment renders. `0` renders it above
+every block, `blocks.length` renders it below every block, and any value between renders it between
+those two blocks. The point is that an image the agent wrote under a heading renders under that
+heading rather than on a stack above the whole reply.
+
+The rules, which both sides implement verbatim:
+
+- Absent `position` is the legacy shape and means above-stack. Every row written before 32 has it,
+  and any sender that cannot say where an attachment belongs keeps sending it. It is not an error
+  and it is not a downgrade.
+- A reader MUST clamp an out-of-range value into `0...blocks.length` rather than dropping the
+  attachment. A sender that counts blocks differently than the reader degrades to a picture in a
+  slightly wrong place; it never degrades to a lost picture.
+- A message MAY mix the two. Positioned attachments render in flow at their index, unpositioned
+  ones render above the message, and both are correct in the same bubble.
+- Rendering is data driven, not version gated: a client renders in flow whenever positions are
+  present. The EMITTING side is what gates on `>= 32`.
+
+On the plugin side (`contract/attach-v1.md`), the `commit` and `scheduled` events carry an optional
+`mediaPositions` array aligned index-for-index with `mediaIds`, and the gateway threads
+`mediaPositions[i]` onto the attachment it builds from `mediaIds[i]`. That array is all or nothing:
+when present it MUST have exactly the length of `mediaIds`, because a partial array would silently
+claim index `0` for every attachment it omitted. A plugin that is not certain where its attachments
+belong omits the field entirely. Message `text` is unaffected: `position` is the only new data.
 
 ### Canonical media allowlist
 

@@ -184,6 +184,16 @@ statuses are documented once, in contract/ext-bots-v1.md under "Canonical media 
 expiry. A failed media item does not invalidate text or other valid media in the same committed
 message; missing items are omitted from the app attachment list.
 
+A `commit` or `scheduled` event carrying `mediaIds` MAY also carry `mediaPositions`, an array of
+block indices aligned index-for-index with `mediaIds`: entry `i` is the index in that message's
+normalized block array BEFORE which media `i` renders. When present it MUST have exactly the length
+of `mediaIds`; a partial array is not a shape this protocol has, because it would silently claim
+index `0` for every attachment it omitted. A plugin that is not certain where its attachments
+belong omits the field, and the gateway then builds the unpositioned attachments it always built.
+The gateway threads `mediaPositions[i]` onto the attachment built from `mediaIds[i]`; the reader
+clamps an out-of-range index rather than dropping the attachment. The rendering rules live once, in
+contract/ext-bots-v1.md under "Inline media ordering".
+
 An atomic producer that abandons an occurrence removes its local descriptor events first and then
 uses authenticated `DELETE` for each uploaded id. `204` is idempotent, including when a prior
 cleanup already removed the id. The gateway refuses to remove a media item already referenced by a

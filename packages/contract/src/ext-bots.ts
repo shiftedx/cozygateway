@@ -134,13 +134,33 @@ export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
  *  `clientId` echoes an optional sender id so an optimistic row can be replaced. `attachments`
  *  holds immutable gateway-scoped blocks for sent or received media. Their `fileId` is opaque and
  *  resolves only through `GET /bots/:name/chat/attachments/:fileId`; it is never a URL or path. */
+/** One attachment on a durable message: the gateway-owned block, plus WHERE in the message it
+ *  renders (capability 32).
+ *
+ *  `position` is the index in this message's normalized block array BEFORE which the attachment
+ *  renders: `0` puts it above everything, `blocks.length` puts it below everything, and any value
+ *  in between puts it between those two blocks. It exists so an image written under its heading
+ *  renders under that heading instead of on a stack above the whole reply.
+ *
+ *  Absent `position` is the legacy shape and means above-stack, which is what every message
+ *  written before 32 carries and what any sender that cannot say where an attachment belongs keeps
+ *  sending. A reader MUST clamp an out-of-range value into `0...blocks.length` rather than dropping
+ *  the attachment: a sender that counts blocks differently degrades to a picture in a slightly
+ *  wrong place, never to a lost picture. A message MAY mix the two: positioned attachments render
+ *  in flow, unpositioned ones render above, and both are correct. */
+export const BotChatAttachmentSchema = Type.Composite([
+  AttachmentBlockSchema,
+  Type.Object({ position: Type.Optional(Type.Integer({ minimum: 0, maximum: 4096 })) }),
+]);
+export type BotChatAttachment = Static<typeof BotChatAttachmentSchema>;
+
 export const BotChatMessageSchema = Type.Object({
   id: Type.String(),
   role: Type.String(),
   text: Type.String(),
   at: Type.Union([Type.Integer(), Type.Null()]),
   clientId: Type.Optional(Type.String()),
-  attachments: Type.Optional(Type.Array(AttachmentBlockSchema)),
+  attachments: Type.Optional(Type.Array(BotChatAttachmentSchema)),
   /** Capability 31. Present only on gateway-authored rows that are not conversation: a client MAY
    *  render a marked row as a status chip rather than a bubble, and a client that does not know the
    *  marker renders the ordinary row it already renders. The only v1 value is `delivery.failed`,
@@ -1213,7 +1233,15 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *      current canonical chat when a scheduled delivery terminally fails, so a cron report that
  *      never arrived is visible to the user instead of silently absent.
  *    What 31 does NOT add: any push, any per-attachment receipt, and any retroactive receipt for
- *    rows that were already on screen before the client learned to report them. */
+ *    rows that were already on screen before the client learned to report them.
+ *  - `32`: INLINE MEDIA ORDERING. `BotChatMessage.attachments` entries gain an optional
+ *    `position`, the block index BEFORE which that attachment renders (see
+ *    `BotChatAttachmentSchema` and `contract/ext-bots-v1.md`). Purely additive in both
+ *    directions: a client below 32 ignores the field and keeps its above-stack stack, and a
+ *    gateway below 32 simply never sends one. Rendering is data driven, not version gated: a
+ *    client renders in flow whenever positions are present. The emitting side is what gates on
+ *    `>= 32`. An out-of-range value clamps into `0...blocks.length`; it never drops the
+ *    attachment. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
 /** Capability 30: a bounded, source-labelled projection of memory owned by the
  * attached Hermes profile.  `attributes` deliberately does not exist: every
@@ -1269,4 +1297,4 @@ export type BotMemoryWriteResponse = Static<typeof BotMemoryWriteResponseSchema>
 export const BotMemoryDeleteResponseSchema = Type.Object({ id: Type.String({ minLength: 1, maxLength: 512 }), revision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
 export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchema>;
 
-export const BOTS_CAPABILITY_VERSION = 31;
+export const BOTS_CAPABILITY_VERSION = 32;

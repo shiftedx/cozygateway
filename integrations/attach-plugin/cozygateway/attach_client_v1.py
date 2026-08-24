@@ -317,7 +317,13 @@ class AttachV1Client:
             if await self._queue_event(event) is not None:
                 tool_states[chip.id] = state
 
-    async def send_done(self, thread_id: str, turn_id: str, media_ids: Optional[List[str]] = None) -> None:
+    async def send_done(
+        self,
+        thread_id: str,
+        turn_id: str,
+        media_ids: Optional[List[str]] = None,
+        media_positions: Optional[List[int]] = None,
+    ) -> None:
         blocks = self._latest_blocks.pop(turn_id, [])
         self._latest_tools.pop(turn_id, None)
         event: Dict[str, Any] = {
@@ -326,6 +332,7 @@ class AttachV1Client:
         }
         if media_ids:
             event["mediaIds"] = list(media_ids[:16])
+            _set_media_positions(event, media_positions)
         await self._queue_event(event)
 
     async def send_failed(self, thread_id: str, turn_id: str, message: str) -> None:
@@ -350,6 +357,7 @@ class AttachV1Client:
         blocks: List[RichBlock],
         media_ids: Optional[List[str]] = None,
         canonical_home: bool = False,
+        media_positions: Optional[List[int]] = None,
     ) -> Optional[Dict[str, Any]]:
         event: Dict[str, Any] = {
             "kind": "scheduled", "deliveryId": delivery_id,
@@ -363,6 +371,7 @@ class AttachV1Client:
             return None
         if media_ids:
             event["mediaIds"] = list(media_ids[:16])
+            _set_media_positions(event, media_positions)
         return await self._queue_event(event)
 
     async def send_approval(self, thread_id: str, turn_id: str, approval_id: str, call_id: str, name: str, status: str) -> None:
@@ -997,6 +1006,35 @@ def _media_byte_limit(mime: str) -> int:
     if mime.startswith("audio/") or mime.startswith("video/"):
         return ATTACH_AUDIO_VIDEO_MAX_BYTES
     return ATTACH_FILE_MAX_BYTES
+
+
+# The gateway's bound on one inline position (protocol-v1 `mediaPositions`). A reply
+# with more blocks than this is far past anything a person reads in one bubble, and a
+# position beyond the array is clamped by the reader anyway.
+MEDIA_POSITION_MAX = 4096
+
+
+def _set_media_positions(
+    event: Dict[str, Any], media_positions: Optional[List[int]]
+) -> None:
+    """Attach inline positions to an event, or leave it legacy.
+
+    The wire allows all positions or none: a partial array would silently tell the
+    reader that the attachments without one belong at index 0. Anything that is not a
+    clean, in-range int for EVERY id drops the whole array, and the attachments then
+    render above the message exactly as they always have.
+    """
+    ids = event.get("mediaIds") or []
+    if not media_positions or len(media_positions) != len(ids):
+        return
+    positions: List[int] = []
+    for value in media_positions:
+        if not isinstance(value, int) or isinstance(value, bool):
+            return
+        if value < 0 or value > MEDIA_POSITION_MAX:
+            return
+        positions.append(value)
+    event["mediaPositions"] = positions
 
 
 def _event_capabilities(event: Dict[str, Any]) -> List[str]:

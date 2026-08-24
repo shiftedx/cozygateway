@@ -151,9 +151,15 @@ const DraftEvent = Type.Object({
   kind: Type.Literal("draft"), threadId: Id, turnId: Id, blocks: Type.Array(RichBlockSchema),
   replace: Type.Optional(Type.Boolean()),
 });
+/** `mediaPositions`, when present, is aligned index-for-index with `mediaIds` and MUST have the
+ * same length: entry `i` is the block index BEFORE which media `i` renders (capability 32). It is
+ * all or nothing, because a partial array would silently claim index 0 for every attachment it
+ * omits. A plugin that cannot say where an attachment belongs omits the field, and the gateway
+ * then builds today's unpositioned attachments. */
 const CommitEvent = Type.Object({
   kind: Type.Literal("commit"), threadId: Id, turnId: Id, messageId: Id,
   blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
 });
 const FailedEvent = Type.Object({
   kind: Type.Literal("failed"), threadId: Id, turnId: Id, messageId: Id,
@@ -182,6 +188,7 @@ const ClarifyEvent = Type.Object({
 const ScheduledEvent = Type.Object({
   kind: Type.Literal("scheduled"), threadId: Id, deliveryId: Id, messageId: Id,
   blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
 });
 /** The attach bearer already identifies the Hermes profile, so a semantic home target never
  * carries a second caller-controlled profile field. Gateway admission binds it once to the
@@ -190,6 +197,7 @@ const ScheduledCanonicalHomeEvent = Type.Object({
   kind: Type.Literal("scheduled"), target: Type.Object({ kind: Type.Literal("canonical_home") }),
   deliveryId: Id, messageId: Id,
   blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
 });
 const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1MediaDescriptorSchema });
 const PresenceEvent = Type.Object({

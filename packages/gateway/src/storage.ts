@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 
 import type {
   AttachmentBlock,
+  BotChatAttachment,
   BotChatMessage,
   BotInteractionSettlement,
   BotPendingClarification,
@@ -2185,7 +2186,8 @@ export class Storage {
     text: string;
     at: number;
     clientId?: string;
-    attachments?: AttachmentBlock[];
+    /** Capability 32: an entry MAY carry a `position` saying where in the block flow it renders. */
+    attachments?: BotChatAttachment[];
     /** Capability 31: labels a gateway-authored row that is not conversation. */
     marker?: string;
   }): BotChatMessage {
@@ -2718,7 +2720,7 @@ function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
     text: row.text,
     at: row.at,
     ...(row.clientId === null ? {} : { clientId: row.clientId }),
-    ...(row.attachmentsJson === null ? {} : { attachments: JSON.parse(row.attachmentsJson) as AttachmentBlock[] }),
+    ...(row.attachmentsJson === null ? {} : { attachments: JSON.parse(row.attachmentsJson) as BotChatAttachment[] }),
     ...(row.marker === null ? {} : { marker: row.marker }),
   };
 }
