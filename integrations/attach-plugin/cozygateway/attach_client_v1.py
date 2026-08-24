@@ -65,6 +65,15 @@ HELLO_CAPABILITIES = (
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
+
+# What one delivery receipt means for each of that delivery's attachments. "projected"
+# only ever arrives on the HTTP receipt read; the socket command carries the terminals.
+_MEDIA_STATE_FOR_RECEIPT = {
+    "projected": "projected",
+    "displayed": "displayed",
+    "blocked": "blocked",
+    "failed": "blocked",
+}
 RECEIPT_STAGES = frozenset({"authorization", "projection"})
 RECEIPT_REASON_MAX_CHARS = 256
 # Matches the gateway's shared Id schema, so a legal deliveryId is never dropped locally.
@@ -423,9 +432,21 @@ class AttachV1Client:
             return None
         return event
 
-    async def upload_media(self, media_id: str, path: str, family: str, expires_at: Optional[int] = None) -> Dict[str, Any]:
-        """Upload bytes through the authenticated HTTP side channel; WS carries only metadata."""
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    async def upload_media(
+        self,
+        media_id: str,
+        path: str,
+        family: str,
+        expires_at: Optional[int] = None,
+        mime: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Upload bytes through the authenticated HTTP side channel; WS carries only metadata.
+
+        ``mime`` is the type the bytes were PROVEN to be (see media_descriptor.probe).
+        Callers that have not probed fall back to the extension guess, which is what the
+        gateway allowlist and the client renderer then have to disagree about.
+        """
+        mime = mime or mimetypes.guess_type(path)[0] or "application/octet-stream"
         limit = _media_byte_limit(mime)
         if os.stat(path).st_size > limit:
             raise ValueError("media exceeds size cap")
@@ -461,7 +482,31 @@ class AttachV1Client:
         return await asyncio.to_thread(self._download_media_sync, media_id, max_bytes)
 
     async def delivery_receipt(self, delivery_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
-        return await asyncio.to_thread(self._delivery_receipt_sync, delivery_id, timeout_seconds)
+        receipt = await asyncio.to_thread(self._delivery_receipt_sync, delivery_id, timeout_seconds)
+        if receipt is not None:
+            self._upgrade_media_rows(delivery_id, str(receipt.get("state") or ""))
+        return receipt
+
+    def _upgrade_media_rows(self, delivery_id: str, receipt_state: str) -> None:
+        """Carry one delivery receipt down onto its attachments' durable rows.
+
+        A receipt is the only authority that may move media past ``journaled``, and it
+        arrives on two channels: the ``delivery_receipt`` command and this HTTP read.
+        Both land here so a late or duplicated receipt is applied exactly once: the
+        spool's own monotonic guard drops a repeat as "duplicate" and refuses to walk a
+        settled row backwards.
+        """
+        state = _MEDIA_STATE_FOR_RECEIPT.get(receipt_state)
+        if state is None:
+            return
+        spool = getattr(self, "_spool", None)
+        if spool is None:
+            return
+        try:
+            for row in spool.media_rows(delivery_id):
+                spool.media_mark(delivery_id, str(row["mediaId"]), state)
+        except Exception:  # noqa: BLE001 - a receipt must never break the read that carried it
+            logger.debug("attach-v1: media lifecycle upgrade failed", exc_info=True)
 
     def _delivery_receipt_sync(self, delivery_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
         parsed = urlparse(self._config.gateway_url)
@@ -766,6 +811,7 @@ class AttachV1Client:
             stage=str(stage) if isinstance(stage, str) else None,
             reason=reason[:RECEIPT_REASON_MAX_CHARS] if isinstance(reason, str) else None,
         )
+        self._upgrade_media_rows(delivery_id, str(state))
         logger.info(
             "attach-v1: delivery receipt %s state=%s stage=%s (%s)",
             delivery_id, state, stage or "-", outcome,

@@ -916,9 +916,9 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_415_upload_failure_names_the_file_its_mime_and_the_status(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "spool.sqlite")
-            archive = os.path.join(directory, "logo-package.zip")
+            archive = os.path.join(directory, "logo-package.mp4")
             with open(archive, "wb") as handle:
-                handle.write(b"PK\x03\x04")
+                handle.write(b"not really a container")
 
             refusal = HTTPError(
                 "http://gateway.example/attach/v1/media/x",
@@ -941,7 +941,7 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["error"], "media_upload_failed")
             self.assertEqual(
                 result["media_errors"],
-                ["logo-package.zip (application/zip, family=file): http_415 Unsupported Media Type"],
+                ["logo-package.mp4 (video/mp4, family=video): http_415 Unsupported Media Type"],
             )
 
     async def test_atomic_media_failure_rolls_back_earlier_uploaded_media(self):
@@ -1012,7 +1012,13 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     "sha256": digest, "filename": "report.png", "family": "image",
                 }
 
-            with patch.object(AttachV1Client, "_upload_media_sync", side_effect=upload):
+            uploaded = []
+
+            def counting_upload(media_id, upload_path, mime, digest, data, expires_at):
+                uploaded.append(media_id)
+                return upload(media_id, upload_path, mime, digest, data, expires_at)
+
+            with patch.object(AttachV1Client, "_upload_media_sync", side_effect=counting_upload):
                 first = await _standalone_send(self._config(path), "home", "daily report", thread_id="home", media_files=[png])
                 second = await _standalone_send(self._config(path), "home", "daily report", thread_id="home", media_files=[png])
             self.assertEqual(first["state"], "journaled")
@@ -1020,10 +1026,13 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first["deliveryId"], second["deliveryId"])
             self.assertEqual(first["messageId"], second["messageId"])
             events = self._events(path)
-            self.assertEqual([event["kind"] for event in events], ["media", "scheduled", "media", "scheduled"])
-            self.assertEqual(events[0]["media"]["mediaId"], events[2]["media"]["mediaId"])
-            self.assertEqual(events[1]["messageId"], events[3]["messageId"])
-            self.assertEqual(events[1]["mediaIds"], events[3]["mediaIds"])
+            # The retry reuses the claimed media id instead of uploading a second copy,
+            # so only the scheduled frame repeats.
+            self.assertEqual([event["kind"] for event in events], ["media", "scheduled", "scheduled"])
+            self.assertEqual(len(uploaded), 1)
+            self.assertEqual(events[1]["messageId"], events[2]["messageId"])
+            self.assertEqual(events[1]["mediaIds"], events[2]["mediaIds"])
+            self.assertEqual(events[1]["mediaIds"], [events[0]["media"]["mediaId"]])
 
     async def test_scheduled_media_ids_are_fetchable_by_the_device_route(self):
         # A scheduled attachment is stored and retained exactly like a live-turn one, but the

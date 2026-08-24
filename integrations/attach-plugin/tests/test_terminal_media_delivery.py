@@ -24,7 +24,7 @@ class _Client(AttachV1Client):
         self.drafts = []
         self.commits = []
 
-    async def upload_media(self, media_id, path, family):
+    async def upload_media(self, media_id, path, family, expires_at=None, mime=None):
         self.uploads.append((media_id, path, family))
         return {"id": media_id}
 
