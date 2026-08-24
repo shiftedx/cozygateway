@@ -358,6 +358,7 @@ export class NativeBotDataPlane {
         ) {
           const committed = this.#commit(
             key, sessionId, event.messageId, event.blocks, event.mediaIds, event.mediaPositions,
+            event.turnId,
           );
           if (committed) {
             this.#storage.recordNativeBotTerminal({
@@ -403,6 +404,7 @@ export class NativeBotDataPlane {
         event.blocks,
         event.mediaIds,
         event.mediaPositions,
+        event.turnId,
       );
     }
     if (
@@ -973,6 +975,7 @@ export class NativeBotDataPlane {
     blocks: readonly RichBlock[],
     mediaIds?: string[],
     mediaPositions?: number[],
+    turnId?: string,
   ): boolean {
     const now = this.#now();
     if (this.#storage.nativeBotMessage(bot, messageId) !== undefined)
@@ -1012,6 +1015,13 @@ export class NativeBotDataPlane {
         ? {}
         : { attachments }),
     });
+    // A turn reply that carried media is the only delivery whose lifecycle had no gateway-side
+    // name. Record the plugin's own key for it now, while the turn id is still in hand, so the
+    // displayed ack that arrives minutes later can close those media rows instead of leaving the
+    // agent to say "I cannot confirm CozyChat displayed the attachment" about a picture the
+    // owner is already looking at.
+    if (turnId !== undefined && attachments !== undefined && attachments.length > 0)
+      this.#storage.bindTurnMediaDelivery(bot, messageId, `turn:${turnId}`);
     this.#broadcast({
       type: "bot_chat",
       bot,

@@ -316,6 +316,17 @@ CREATE TABLE IF NOT EXISTS bot_message_receipts (
   device_id TEXT NOT NULL,
   PRIMARY KEY (bot, message_id)
 ) STRICT, WITHOUT ROWID;
+-- Binds one committed TURN reply that carried attachments to the delivery id its plugin already
+-- keyed the media lifecycle under (turn:<turnId>). Scheduled deliveries have
+-- attach_scheduled_deliveries for this; a turn had nothing, which is why turn media could never
+-- move past 'journaled' no matter how many phones displayed it. First write wins, and the row
+-- outlives the session selection so a receipt arriving days later still finds its delivery.
+CREATE TABLE IF NOT EXISTS bot_turn_media_deliveries (
+  bot TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  delivery_id TEXT NOT NULL,
+  PRIMARY KEY (bot, message_id)
+) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS bot_native_interactions (
   bot TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('approval', 'clarify')),
@@ -1868,14 +1879,28 @@ export class Storage {
       .get(agentId, deliveryId) as { threadId: string; messageId: string; projectedAt: number | null } | undefined;
   }
 
+  /** Binds a committed turn reply's message to the delivery id its plugin keyed the attachments
+   * under. Only called for a reply that actually carries attachments: a text-only turn has no
+   * media lifecycle to close, so binding it would only put a receipt on the wire that nothing
+   * reads. First write wins, matching the receipt itself. */
+  bindTurnMediaDelivery(bot: string, messageId: string, deliveryId: string): void {
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO bot_turn_media_deliveries (bot, message_id, delivery_id)
+         VALUES (?, ?, ?)`,
+      )
+      .run(bot, messageId, deliveryId);
+  }
+
   /** Records that a device put these bot rows on screen. First write wins: a later report for an
    * id that already has a receipt changes nothing, and an id naming no durable row is ignored
    * rather than refused, so a device replaying an offline queue never gets stuck on a batch it
    * cannot repair.
    *
-   * The scheduled-delivery join belongs here, in the same transaction as the write, so a caller
-   * cannot see a receipt without also seeing the delivery binding it just closed. Emitting the
-   * attach command is deliberately NOT this layer's job. */
+   * The delivery join belongs here, in the same transaction as the write, so a caller cannot see
+   * a receipt without also seeing the delivery binding it just closed. Both kinds of delivery are
+   * joined: a scheduled occurrence, and a turn reply that carried media. Emitting the attach
+   * command is deliberately NOT this layer's job. */
   recordBotMessageDisplayed(
     bot: string,
     messageIds: readonly string[],
@@ -1891,6 +1916,10 @@ export class Storage {
       `SELECT delivery_id AS deliveryId FROM attach_scheduled_deliveries
        WHERE agent_id = ? AND message_id = ?`,
     );
+    const turnBinding = this.#db.prepare(
+      `SELECT delivery_id AS deliveryId FROM bot_turn_media_deliveries
+       WHERE bot = ? AND message_id = ?`,
+    );
     const deliveries: Array<{ deliveryId: string; messageId: string }> = [];
     let recorded = 0;
     this.#db.exec("BEGIN IMMEDIATE");
@@ -1898,7 +1927,8 @@ export class Storage {
       for (const messageId of new Set(messageIds)) {
         if (insert.run(bot, messageId, at, deviceId, bot, messageId).changes !== 1) continue;
         recorded += 1;
-        const bound = binding.get(bot, messageId) as { deliveryId: string } | undefined;
+        const bound = (binding.get(bot, messageId) ?? turnBinding.get(bot, messageId)) as
+          { deliveryId: string } | undefined;
         if (bound !== undefined) deliveries.push({ deliveryId: bound.deliveryId, messageId });
       }
       this.#db.exec("COMMIT");
