@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
+import type { TSchema } from "@sinclair/typebox";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
-import { check, type AttachHealthSummary } from "cozygateway-contract";
+import { check, ContractViolation, assertValid, type AttachHealthSummary } from "cozygateway-contract";
 import { WebSocket, WebSocketServer } from "ws";
 
 import type { NativeInteractionResolutionRequest, Storage } from "../../storage.ts";
@@ -13,7 +14,16 @@ import type {
   TurnEndpoint,
 } from "./adapter.ts";
 import {
+  AttachV1AckSchema,
   AttachV1ClientFrameSchema,
+  AttachV1EventFrameSchema,
+  AttachV1GapSchema,
+  AttachV1HeartbeatSchema,
+  AttachV1HelloV1Schema,
+  AttachV1HelloV2Schema,
+  AttachV1MemoryResultSchema,
+  AttachV1MobileCancelSchema,
+  AttachV1MobileRequestSchema,
   type AttachV1Capability,
   type AttachV1ClientFrame,
   type AttachV1Command,
@@ -37,6 +47,9 @@ export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
 export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management"] as const satisfies readonly AttachV1Capability[];
+
+/** Why a memory request did or did not reach the attached plugin. */
+export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
 
 export interface AttachV1Events {
   /** True only after the event was durably projected into its owning app/transcript state. */
@@ -87,6 +100,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #projectionMaxAttempts: number;
   readonly #projectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #trace: TraceLog | undefined;
+  readonly #log: (line: string) => void;
   #lastHeartbeatAt: number | null = null;
 
   constructor(deps: {
@@ -100,6 +114,9 @@ export class AttachV1Ingress implements TurnEndpoint {
     projectionRetryMs?: number;
     projectionMaxAttempts?: number;
     trace?: TraceLog;
+    /** Operator-visible channel for refusals. Tracing is optional and often off; a peer that is
+     *  being refused must still say so somewhere an operator reads by default. */
+    log?: (line: string) => void;
   }) {
     this.#tokens = deps.tokens;
     this.#storage = deps.storage;
@@ -111,6 +128,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#projectionRetryMs = deps.projectionRetryMs ?? 250;
     this.#projectionMaxAttempts = deps.projectionMaxAttempts ?? 8;
     this.#trace = deps.trace;
+    this.#log = deps.log ?? ((line) => console.warn(line));
     this.#wss = new WebSocketServer({ noServer: true });
     this.#wss.on("error", () => {});
     this.#wss.on("connection", (socket, req) => this.#onConnection(socket, req));
@@ -153,8 +171,17 @@ export class AttachV1Ingress implements TurnEndpoint {
       connection.lastSeenAt = receivedAt;
       connection.heartbeatDegraded = false;
       let decoded: unknown;
-      try { decoded = JSON.parse(String(data)); } catch { return; }
-      if (!check(AttachV1ClientFrameSchema, decoded)) return;
+      try { decoded = JSON.parse(String(data)); } catch {
+        this.#refuse(agentId, socket, "unparseable", "frame is not JSON");
+        return;
+      }
+      if (!check(AttachV1ClientFrameSchema, decoded)) {
+        // A dropped frame used to be invisible on both ends: the peer waits forever for a reply
+        // that will never come, and no log says why. Name the offending field and close, so a
+        // contract skew is a loud, bounded refusal instead of a hang.
+        this.#refuse(agentId, socket, frameKind(decoded), schemaReason(decoded));
+        return;
+      }
       const frame = decoded as AttachV1ClientFrame;
       if (!connection.hello) {
         if (frame.kind !== "hello") {
@@ -184,7 +211,16 @@ export class AttachV1Ingress implements TurnEndpoint {
         connection.maxInFlightEvents = Math.min(frame.limits?.maxInFlightEvents ?? ATTACH_V1_MAX_IN_FLIGHT_EVENTS, ATTACH_V1_MAX_IN_FLIGHT_EVENTS);
         connection.maxInFlightBytes = Math.min(frame.limits?.maxInFlightBytes ?? ATTACH_V1_MAX_IN_FLIGHT_BYTES, ATTACH_V1_MAX_IN_FLIGHT_BYTES);
         this.#current.set(agentId, connection);
-        this.#traceAttach("attach_hello", agentId, { commandCursor: connection.commandCursor, eventCursor: this.#storage.attachEventCursor(agentId) });
+        this.#traceAttach("attach_hello", agentId, {
+          commandCursor: connection.commandCursor,
+          eventCursor: this.#storage.attachEventCursor(agentId),
+          helloVersion: frame.version,
+          capabilities: [...connection.capabilities].join(","),
+        });
+        // What a peer negotiated decides which surfaces work for the rest of the connection's
+        // life, and nothing else on the gateway reports it. A plugin that quietly handshakes as
+        // an older version leaves this one line as the evidence.
+        this.#log(`attach-v1: profile "${agentId}" negotiated hello v${frame.version} with capabilities [${[...connection.capabilities].join(", ")}]`);
         const common = {
           kind: "hello_ack" as const, agentId,
           resume: { eventSequence: this.#storage.attachEventCursor(agentId), commandSequence: this.#storage.attachCommandCursor(agentId) },
@@ -429,12 +465,18 @@ export class AttachV1Ingress implements TurnEndpoint {
     return this.#enqueue(agentId, { kind: "resolve_clarify", ...input }, commandId);
   }
 
-  /** Raw memory is a live request/reply lane and is never written to Gateway storage. */
-  sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): boolean {
-    if (![...this.#tokens.values()].includes(agentId)) return false;
+  /** Raw memory is a live request/reply lane and is never written to Gateway storage.
+   *
+   *  The three ways this lane can be closed are operationally different -- an unconfigured bot, a
+   *  disconnected plugin, and a plugin that connected but never offered `memory_management` all
+   *  need different fixes -- so the caller gets the reason rather than a bare `false`. Collapsing
+   *  them into one 503 is what made a stale plugin indistinguishable from an offline one. */
+  sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome {
+    if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
-    if (connection?.hello !== true || !connection.capabilities.has("memory_management")) return false;
-    return this.#send(connection, input);
+    if (connection?.hello !== true) return "not_attached";
+    if (!connection.capabilities.has("memory_management")) return "capability_not_negotiated";
+    return this.#send(connection, input) ? "sent" : "not_attached";
   }
 
   requestNativeClarifyResolution(
@@ -574,6 +616,15 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#traceAttach("attach_presence", agentId, { state });
   }
 
+  /** Refuses one frame out loud. The reason is derived from the schema, never from payload
+   *  content, so nothing a peer sent can be echoed into a log line. */
+  #refuse(agentId: string, socket: WebSocket, kind: string, reason: string): void {
+    const bounded = reason.slice(0, 160);
+    this.#log(`attach-v1: refused ${kind} frame from profile "${agentId}": ${bounded}`);
+    this.#traceAttach("attach_frame_refused", agentId, { frameKind: kind, reason: bounded });
+    socket.close(1008, `attach-v1 invalid ${kind} frame`.slice(0, 120));
+  }
+
   #traceAttach(event: string, agentId: string, fields: Record<string, number | string> = {}): void {
     if (this.#trace === undefined) return;
     try {
@@ -592,6 +643,43 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#current.clear();
     this.#wss.close();
   }
+}
+
+/** The peer's claimed frame kind, constrained to the known set. An unknown or absent kind is
+ *  reported as "unknown" rather than echoed, so the log line stays bounded and content-free. */
+const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result"]);
+function frameKind(decoded: unknown): string {
+  const kind = typeof decoded === "object" && decoded !== null ? (decoded as { kind?: unknown }).kind : undefined;
+  return typeof kind === "string" && KNOWN_FRAME_KINDS.has(kind) ? kind : "unknown";
+}
+
+/** The one member schema a frame CLAIMED to be, so the violation names a field instead of the
+ *  whole union. Validating a bad frame against the union only ever answers "expected union value"
+ *  at the root, which is exactly as useless as the silent drop it replaced. */
+const KIND_SCHEMAS: Record<string, TSchema> = {
+  event: AttachV1EventFrameSchema,
+  ack: AttachV1AckSchema,
+  gap: AttachV1GapSchema,
+  heartbeat: AttachV1HeartbeatSchema,
+  mobile_request: AttachV1MobileRequestSchema,
+  mobile_cancel: AttachV1MobileCancelSchema,
+  memory_result: AttachV1MemoryResultSchema,
+};
+
+/** The first schema violation, as "<message> at <json pointer>". TypeBox's message text and the
+ *  pointer are both schema-derived, so no payload value reaches the log. */
+function schemaReason(decoded: unknown): string {
+  const kind = frameKind(decoded);
+  const version = typeof decoded === "object" && decoded !== null ? (decoded as { version?: unknown }).version : undefined;
+  const schema = kind === "hello"
+    ? (version === 1 ? AttachV1HelloV1Schema : AttachV1HelloV2Schema)
+    : KIND_SCHEMAS[kind] ?? AttachV1ClientFrameSchema;
+  try {
+    assertValid(schema, decoded);
+  } catch (err) {
+    if (err instanceof ContractViolation) return err.message;
+  }
+  return "failed schema validation";
 }
 
 function isLocationResult(value: unknown): value is { latitude: number; longitude: number } {

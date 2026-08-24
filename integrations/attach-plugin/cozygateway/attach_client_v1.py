@@ -52,7 +52,13 @@ MobileStatus = Literal[
 ]
 MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
-MOBILE_HELLO_ACK_TIMEOUT_SECONDS = 1
+# How long to wait for hello_ack before concluding the server cannot parse a v2 hello and retrying
+# as v1. The gateway gives a peer 5 seconds to say hello; this is the matching budget in the other
+# direction. Anything shorter turns an ordinary slow handshake into a permanent capability
+# downgrade that lasts as long as the connection does.
+HELLO_ACK_TIMEOUT_SECONDS = 5
+# Deprecated alias: this budget was never about mobile status, it has always gated hello_ack.
+MOBILE_HELLO_ACK_TIMEOUT_SECONDS = HELLO_ACK_TIMEOUT_SECONDS
 ATTACH_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 ATTACH_AUDIO_VIDEO_MAX_BYTES = 40 * 1024 * 1024
 ATTACH_FILE_MAX_BYTES = 20 * 1024 * 1024
@@ -550,18 +556,22 @@ class AttachV1Client:
                 try:
                     raw = await asyncio.wait_for(
                         anext(iterator),
-                        None if self._negotiated else MOBILE_HELLO_ACK_TIMEOUT_SECONDS,
+                        None if self._negotiated else HELLO_ACK_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
-                    if not await self._fallback_to_v1(socket):
+                    if not await self._fallback_to_v1(
+                        socket, f"no hello_ack within {HELLO_ACK_TIMEOUT_SECONDS}s"
+                    ):
                         return
                     continue
                 except StopAsyncIteration:
-                    if await self._fallback_to_v1(socket):
+                    if await self._fallback_to_v1(socket, "socket ended before hello_ack"):
                         continue
                     return
-                except ConnectionClosed:
-                    if await self._fallback_to_v1(socket):
+                except ConnectionClosed as exc:
+                    if await self._fallback_to_v1(
+                        socket, f"socket closed before hello_ack (code {_close_code(exc)})"
+                    ):
                         continue
                     raise
                 await self._dispatch_inbound(raw)
@@ -577,17 +587,28 @@ class AttachV1Client:
             self._capabilities.clear()
             self._settle_mobile_requests("device_unavailable")
 
-    async def _fallback_to_v1(self, socket: Any) -> bool:
-        """Reconnect once with the frozen v1 hello after v2 fails before its ack."""
+    async def _fallback_to_v1(self, socket: Any, reason: str = "hello v2 failed") -> bool:
+        """Reconnect once with the frozen v1 hello after v2 fails before its ack.
+
+        The downgrade is permanent for the life of this connection and silently removes the v2-only
+        capabilities (``mobile_location`` and ``memory_management``), so it is a warning, not a
+        detail: a bot whose memory surface is dead for hours usually has this line behind it.
+        """
         if self._negotiated or self._hello_version != 2 or self._hello_fallback_used:
             return False
         self._hello_fallback_used = True
         self._hello_version = 1
         self._capabilities.clear()
+        logger.warning(
+            "attach-v1: %s; retrying handshake as hello v1. "
+            "mobile_location and memory_management stay OFF until this connection is replaced",
+            reason,
+        )
         try:
             await socket.close()
             await self._open(1)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - the caller re-dials from scratch
+            logger.warning("attach-v1: hello v1 retry could not be dialed (%s)", exc)
             return False
         return True
 
@@ -609,6 +630,12 @@ class AttachV1Client:
             offered = frame.get("capabilities")
             self._capabilities = {str(item) for item in offered} if isinstance(offered, list) else set()
             self._negotiated = True
+            # The negotiated set decides which surfaces work for the life of this connection and is
+            # otherwise invisible from the Hermes side, so record it once at handshake time.
+            logger.info(
+                "attach-v1: negotiated hello v%s with capabilities [%s]",
+                self._hello_version, ", ".join(sorted(self._capabilities)),
+            )
             limits = frame.get("limits")
             if isinstance(limits, dict):
                 self._max_events = min(self._max_events, int(limits.get("maxInFlightEvents", self._max_events)))

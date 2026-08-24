@@ -22,6 +22,7 @@ describe("attach-v1 ingress", () => {
   let mobileCancels: string[];
   let acceptsTarget: boolean;
   let memoryResults: AttachV1MemoryResult[];
+  let logs: string[];
 
   beforeEach(async () => {
     storage = openStorage(":memory:");
@@ -34,6 +35,7 @@ describe("attach-v1 ingress", () => {
     mobileCancels = [];
     acceptsTarget = true;
     memoryResults = [];
+    logs = [];
     ingress = new AttachV1Ingress({
       tokens: new Map([
         ["secret", "sage"],
@@ -53,6 +55,7 @@ describe("attach-v1 ingress", () => {
       projectionRetryMs: 10,
       projectionMaxAttempts: 3,
       trace: (line) => traces.push(line),
+      log: (line) => logs.push(line),
     });
     server = createServer();
     server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
@@ -142,7 +145,7 @@ describe("attach-v1 ingress", () => {
     expect(ingress.sendMemoryRequest("sage", {
       kind: "memory_request", requestId: "memory-1", operation: "update",
       input: { sourceId: "vault:0", itemId: "note:Cleo.md", content: "private-memory", expectedRevision: "r1" },
-    })).toBe(true);
+    })).toBe("sent");
     await until(() => peer.frames.some((frame) => frame.kind === "memory_request"));
     peer.ws.send(JSON.stringify({
       kind: "memory_result", requestId: "memory-1", status: "ok",
@@ -435,6 +438,70 @@ describe("attach-v1 ingress", () => {
     expect(heartbeatCounts.reduce((total, count) => total + count, 0)).toBe(18);
     expect(pendingReads).toHaveBeenCalledTimes(readsAfterHello);
     peers.forEach(({ ws }) => ws.close());
+  });
+
+  // Regression: the hello a real Hermes profile sends in production. Every field here is what the
+  // attach plugin actually puts on the wire (all nine capabilities, a spool telemetry snapshot, a
+  // full command catalog, cursors from a long-lived stream). A v2 hello that fails validation is
+  // dropped, and the peer's own hello-ack budget then downgrades it to v1 for the life of the
+  // connection, taking the whole memory surface with it and logging nothing. Keep this parseable.
+  it("negotiates memory_management from the full production-shaped v2 hello", async () => {
+    const commands = Array.from({ length: 512 }, (_, index) => ({
+      name: `/command_${index}`, description: "x".repeat(200), argsHint: "y".repeat(160), category: "z".repeat(80),
+    }));
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: "Bearer secret" } });
+    const frames: AttachV1ServerFrame[] = [];
+    ws.on("message", (data) => frames.push(JSON.parse(String(data)) as AttachV1ServerFrame));
+    await once(ws, "open");
+    ws.send(JSON.stringify({
+      kind: "hello", version: 2, instanceId: "b3f2c1d0-1111-2222-3333-444455556666",
+      capabilities: ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management"],
+      resume: { eventSequence: 0, commandSequence: 0 },
+      limits: { maxInFlightEvents: 64, maxInFlightBytes: 4 * 1024 * 1024 },
+      commands,
+      telemetry: { eventOutboxDepth: 12, oldestEventAgeMs: 7 * 24 * 60 * 60 * 1000, eventAckCursor: 106738, commandInboxDepth: 3 },
+    }));
+    await until(() => frames.some((frame) => frame.kind === "hello_ack"));
+    const ack = frames.find((frame) => frame.kind === "hello_ack") as unknown as { version: number; capabilities: string[] };
+    expect(ack.version).toBe(2);
+    expect(ack.capabilities).toContain("memory_management");
+    expect(ingress.sendMemoryRequest("sage", { kind: "memory_request", requestId: "m1", operation: "overview", input: {} })).toBe("sent");
+    // The negotiated set is the only thing that decides whether the memory lane exists at all, so
+    // it has to be readable from a log instead of inferred from a 503 hours later.
+    expect(logs.some((line) => line.includes("negotiated hello v2") && line.includes("memory_management"))).toBe(true);
+    ws.close();
+  });
+
+  it("separates the three ways the memory lane can be closed", async () => {
+    const peer = await dial(undefined, ["draft"], undefined, { version: 2 });
+    expect(logs.some((line) => line.includes("negotiated hello v2") && !line.includes("memory_management"))).toBe(true);
+    expect(ingress.sendMemoryRequest("sage", { kind: "memory_request", requestId: "m1", operation: "overview", input: {} })).toBe("capability_not_negotiated");
+    peer.ws.close();
+    await until(() => !ingress.isAttached("sage"));
+    expect(ingress.sendMemoryRequest("sage", { kind: "memory_request", requestId: "m2", operation: "overview", input: {} })).toBe("not_attached");
+    expect(ingress.sendMemoryRequest("nobody", { kind: "memory_request", requestId: "m3", operation: "overview", input: {} })).toBe("unknown_bot");
+  });
+
+  // Regression: a frame the schema rejects used to be dropped without a word, so a contract skew
+  // between the gateway and its plugin presented as a request that simply never got its reply.
+  it("closes loudly on a schema-invalid frame instead of dropping it in silence", async () => {
+    const peer = await dial(undefined, ["memory_management"], undefined, { version: 2 });
+    peer.ws.send(JSON.stringify({
+      kind: "memory_result", requestId: "m1", status: "ok", result: { sources: [{ id: "vault" }] },
+    }));
+    const [code, reason] = (await once(peer.ws, "close")) as [number, Buffer];
+    expect(code).toBe(1008);
+    expect(String(reason)).toBe("attach-v1 invalid memory_result frame");
+    expect(logs.some((line) => line.includes("refused memory_result frame") && line.includes("/result"))).toBe(true);
+    expect(traces.some((line) => JSON.parse(line).event === "attach_frame_refused")).toBe(true);
+  });
+
+  it("closes loudly on a frame that is not JSON at all", async () => {
+    const peer = await dial(undefined, ["draft"]);
+    peer.ws.send("not json");
+    const [code] = (await once(peer.ws, "close")) as [number];
+    expect(code).toBe(1008);
+    expect(logs.some((line) => line.includes("refused unparseable frame"))).toBe(true);
   });
 });
 
