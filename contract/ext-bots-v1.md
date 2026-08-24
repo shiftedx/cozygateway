@@ -233,6 +233,68 @@ CSV, JSON, or RTF; legacy Office; OOXML; and OpenDocument files. The gateway che
 allow-listed MIME against lightweight format bytes, stores the sanitized filename as metadata, and
 serves every attachment with `Content-Disposition: attachment` and `nosniff`.
 
+### Canonical media allowlist
+
+This table is the single reference for outbound media admission. The gateway upload route
+(`POST /attach/v1/media/:mediaId`) accepts exactly these MIME types, and the attach plugin's
+compatibility policy mirrors this table rather than keeping a second opinion. A type absent here is
+refused at the gateway, so a plugin that offers one is guaranteed a 415.
+
+| MIME | Extension | Family | Cap | Baseline |
+| --- | --- | --- | --- | --- |
+| `image/png` | png | image | 8 MiB | yes |
+| `image/jpeg` | jpg | image | 8 MiB | yes |
+| `image/webp` | webp | image | 8 MiB | yes |
+| `image/gif` | gif | image | 8 MiB | yes |
+| `video/mp4` | mp4 | video | 40 MiB | yes, H.264 video with AAC-LC audio |
+| `video/quicktime` | mov | video | 40 MiB | beyond baseline, accepted for existing device uploads |
+| `audio/mp4` | m4a | audio | 40 MiB | yes, AAC |
+| `audio/mpeg` | mp3 | audio | 40 MiB | yes |
+| `audio/wav`, `audio/x-wav` | wav | audio | 40 MiB | yes |
+| `application/pdf` | pdf | file | 20 MiB | yes |
+| `text/plain`, `text/markdown`, `text/csv`, `application/json`, `application/rtf`, `text/rtf` | txt, md, csv, json, rtf | file | 20 MiB | explicit document allowlist |
+| `application/msword`, `application/vnd.ms-excel`, `application/vnd.ms-powerpoint` | doc, xls, ppt | file | 20 MiB | explicit document allowlist |
+| OOXML `.docx`, `.xlsx`, `.pptx` | docx, xlsx, pptx | file | 20 MiB | explicit document allowlist |
+| OpenDocument `.odt`, `.ods`, `.odp` | odt, ods, odp | file | 20 MiB | explicit document allowlist |
+
+The container MIME is what the gateway checks. Codec-level facts for MP4 (H.264 plus AAC-LC,
+`yuv420p`, fast-start) are a plugin-side probe: this layer sees a container, not a stream.
+
+`image/svg+xml`, bare `application/zip`, `text/html`, and every other type are excluded on purpose.
+SVG and HTML carry script and external references; a generic archive is not a renderable
+attachment. Excluded means refused at upload, never silently transcoded.
+
+Declared type is a claim, so every accepted type is additionally checked against format magic bytes
+before commit. Bytes that contradict an allowed declaration are refused exactly like a disallowed
+type.
+
+### Media rejection shapes
+
+`POST /attach/v1/media/:mediaId` answers a refusal with core `ErrorBody` plus a machine-readable
+`reason`, and never echoes any uploaded byte:
+
+| Status | `reason` | Extra fields | Cause |
+| --- | --- | --- | --- |
+| `400` | `empty` | none | zero-byte upload |
+| `413` | `too_large` | `limitBytes` | declared `Content-Length` or delivered bytes over that type's cap |
+| `415` | `content_type` | `receivedContentType` | type not on the allowlist, or bytes that do not match the declared type |
+| `422` | `digest` | none | `X-Attach-SHA256` missing or not matching the delivered bytes |
+| `409` | none | none | media id already exists with different bytes, or a delete target is referenced |
+
+`limitBytes` is the cap for the declared type, not the largest cap in the table. `receivedContentType`
+is the request header reduced to MIME token characters and truncated, so it names what arrived
+without reflecting attacker-chosen text. Error prose is gateway-authored in every branch; no message
+from a layer that touched the payload is passed through.
+
+This route is not rate limited today, so it never answers `429`. If that changes, the shape is the
+one already used by `POST /bots/:name/chat/attachments`: status `429`, extension code `rate_limited`,
+a `retryAfterMs` field, and a whole-second `Retry-After` header. A producer should treat `429` with
+`Retry-After` as retryable whether or not this route emits it yet.
+
+Every type this route accepts is downloadable through `GET /attach/v1/media/:mediaId`, which serves
+the stored MIME with `nosniff`, `Content-Disposition: attachment`, and byte-range support. There is
+no accept-but-never-serve type.
+
 `GET /bots/:name/media?src=` is a separate HTTPS media proxy for a public source URL in bot output;
 it is not a native attachment transport and it refuses unsafe/non-HTTPS sources.
 

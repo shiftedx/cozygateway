@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { FILE_MAX_BYTES, FILE_TYPES, acceptFileBytes } from "./documents.ts";
+import { PhotoRefused } from "./photos.ts";
 
 /** Capability 15 limits one settled assistant row to three media attempts. A fourth directive stays
  *  visible as text, even when one of the first three fails. */
@@ -16,6 +17,8 @@ export type AssistantMediaKind = "image" | "video" | "audio" | "file";
 const fileMediaTypes: [string, { ext: string; kind: AssistantMediaKind; maxBytes: number }][] =
   [...FILE_TYPES].map(([mime, ext]) => [mime, { ext, kind: "file", maxBytes: FILE_MAX_BYTES }]);
 
+/** The canonical upload allowlist. It is documented MIME by MIME in contract/ext-bots-v1.md, which
+ *  the attach plugin's compatibility policy mirrors; the two must not drift. */
 export const ASSISTANT_MEDIA_TYPES = new Map<string, { ext: string; kind: AssistantMediaKind; maxBytes: number }>([
   ["image/png", { ext: "png", kind: "image", maxBytes: ASSISTANT_IMAGE_MAX_BYTES }],
   ["image/jpeg", { ext: "jpg", kind: "image", maxBytes: ASSISTANT_IMAGE_MAX_BYTES }],
@@ -141,12 +144,11 @@ export function acceptAssistantMediaBytes(
 ): DecodedAssistantMedia {
   const normalized = declared.toLowerCase();
   const accepted = ASSISTANT_MEDIA_TYPES.get(normalized);
-  if (accepted === undefined) throw new Error("hermes returned a disallowed media type");
-  if (bytes.byteLength === 0 || bytes.byteLength > accepted.maxBytes) {
-    throw new Error("hermes returned empty or oversized media");
-  }
+  if (accepted === undefined) throw new PhotoRefused("content_type", "hermes returned a disallowed media type");
+  if (bytes.byteLength === 0) throw new PhotoRefused("empty", "hermes returned empty media");
+  if (bytes.byteLength > accepted.maxBytes) throw new PhotoRefused("too_large", "hermes returned oversized media");
   if (!bytesMatchMediaType(normalized, bytes, sniff)) {
-    throw new Error("hermes media bytes did not match the declared allowed type");
+    throw new PhotoRefused("content_type", "hermes media bytes did not match the declared allowed type");
   }
   return { bytes, mime: normalized, ext: accepted.ext, kind: accepted.kind };
 }
