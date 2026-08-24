@@ -311,6 +311,23 @@ export function isPhotoFileId(value: string): boolean {
   return FILE_ID_RE.test(value);
 }
 
+/** The shape of every id the attach media store will accept on upload
+ *  (`POST /attach/v1/media`, packages/gateway/src/http.ts). A device fetches an attachment by
+ *  the id that is written into the message's `attachments_json`, so this route must be able to
+ *  serve ANY id the store was willing to hold -- a stricter check here means the gateway keeps
+ *  bytes it then refuses to hand back, and a delivered attachment reads as "no longer
+ *  available" forever even though nothing expired and nothing was deleted. That is exactly what
+ *  a `scheduled_media_<hex>` id did against `isPhotoFileId`'s bare-32-hex shape.
+ *
+ *  The safety property that mattered is unchanged: the id lands in a URL path, so it stays a
+ *  bounded run of `A-Za-z0-9_-` with no dot, slash, or separator of any kind. Nothing
+ *  path-shaped reaches a lookup. */
+const ATTACH_MEDIA_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function isFetchableAttachmentId(value: string): boolean {
+  return ATTACH_MEDIA_ID_RE.test(value);
+}
+
 /** The name that rides the `attachment` block. Generated, never the client's: a filename is the one
  *  field of an upload that is pure attacker-controlled text with a long history of being interpreted
  *  (path traversal, extension confusion, markup in whatever renders it), and nothing in this feature

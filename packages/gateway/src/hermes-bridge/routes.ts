@@ -64,7 +64,7 @@ import {
   PhotoRefused,
   acceptPhoto,
   createPhotoRateLimiter,
-  isPhotoFileId,
+  isFetchableAttachmentId,
   readCappedBody,
   redactHostPaths,
   type PhotoRateLimiter,
@@ -1247,7 +1247,7 @@ export function registerBotRoutes(
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
     const fileId = c.req.param("fileId") ?? "";
-    if (!isPhotoFileId(fileId)) {
+    if (!isFetchableAttachmentId(fileId)) {
       return c.json(
         errorBody("invalid_request", "fileId is not a gateway attachment id"),
         400,

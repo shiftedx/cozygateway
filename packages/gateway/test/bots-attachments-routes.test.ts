@@ -91,4 +91,27 @@ describe("capability-24 bot attachment routes", () => {
     expect(response.headers.get("content-disposition")).toContain('filename="report.pdf"');
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
   });
+
+  // A scheduled/proactive delivery's attachment is stored and retained like any other, but its
+  // id was rejected by the fetch route's shape check before any lookup ran: the photo rendered
+  // once from the delivery and then read as "no longer available" forever. The route must serve
+  // every id the attach media store was willing to accept on upload.
+  it("serves an attachment whose id the media store accepted, prefix and all", async () => {
+    const { app } = fixture();
+    const scheduledId = `scheduled_media_${"b".repeat(32)}`;
+    const response = await app.request(`/bots/sage/chat/attachments/${scheduledId}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-disposition")).toContain('filename="report.pdf"');
+  });
+
+  it.each(["../secret", "a/b", "with.dot", "", "x".repeat(129)])(
+    "still refuses a path-shaped or oversized id before any lookup (%s)",
+    async (bad) => {
+      const { app } = fixture();
+      const response = await app.request(
+        `/bots/sage/chat/attachments/${encodeURIComponent(bad)}`,
+      );
+      expect(response.status).not.toBe(200);
+    },
+  );
 });
