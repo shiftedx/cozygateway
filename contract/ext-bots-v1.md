@@ -263,6 +263,12 @@ Dashboard file routes. `MemoryItem.timestampKind` is `created` for provider/nati
 by the plugin-side sidecar, and `unknown` otherwise. Absolute vault roots never cross this boundary.
 Memory content never rides a websocket frame, push, heartbeat, telemetry, or trace record.
 
+`MemoryItem.kind` is one of `memory`, `profile`, `fact`, `note`: `profile` is the curated About-me
+store, which the plugin's own store calls `user`; that store-side name is not a wire value. Every
+memory route spends a per-device token budget and answers `429 rate_limited` with `retryAfterMs`
+when it is empty, reads included: the attached plugin serves one memory request at a time, and a
+second request arriving while one is in flight is answered `unavailable` rather than queued.
+
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
 that exists but is not configured as a native identity must not fall through to Dashboard chat.
 

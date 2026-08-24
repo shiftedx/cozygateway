@@ -1178,8 +1178,10 @@ export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
  * exists only where a client actually branches on it: the mutation verbs, the
  * curated capacity meter and its next-session note, and `relationships`, which
  * gates the graph destination. */
+/** `profile` is the curated About-me store. Hermes' own store calls that target
+ *  `user`; the wire keeps the reader-facing name, and `user` is not a member. */
 export const BotMemoryKindSchema = Type.Union([
-  Type.Literal("memory"), Type.Literal("fact"), Type.Literal("note"),
+  Type.Literal("memory"), Type.Literal("profile"), Type.Literal("fact"), Type.Literal("note"),
 ]);
 export type BotMemoryKind = Static<typeof BotMemoryKindSchema>;
 export const BotMemoryTimestampKindSchema = Type.Union([
