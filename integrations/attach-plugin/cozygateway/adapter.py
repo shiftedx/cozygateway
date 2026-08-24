@@ -229,6 +229,11 @@ MEDIA_RETRY_AFTER_CAP_SECONDS = 2.0
 # this occurrence, so a replay reuses the id instead of uploading a second copy.
 MEDIA_ALREADY_UPLOADED_STATES = frozenset({"uploaded", "journaled", "projected", "displayed"})
 
+# The delivery id a reply made inside a live conversation journals its attachments under. It is
+# derived from the turn rather than assigned, so the gateway can rebuild the same id from the
+# commit it already saw and address a receipt back at these rows.
+TURN_DELIVERY_PREFIX = "turn:"
+
 # Attachments of one reply upload in parallel, because each one spends nearly all of
 # its time waiting on a socket. Three at a time is where a multi-attachment reply
 # stops being the slowest thing in the turn without turning one person's send into a
@@ -1772,7 +1777,7 @@ class AttachAdapter:
                 paths = list(dict.fromkeys(path for path in raw_media if isinstance(path, str) and path))
                 service = MediaUploadService(
                     client,
-                    delivery_id="turn:" + turn_id,
+                    delivery_id=TURN_DELIVERY_PREFIX + turn_id,
                     destination=MediaDestination("active_turn", chat_id),
                     spool=self._spool,
                 )
@@ -1826,6 +1831,11 @@ class AttachAdapter:
                 await client.send_failed(chat_id, turn_id, "empty reply")
                 return SendResult(success=True)
             if service is not None and media_ids:
+                # A turn walks journaled -> displayed with nothing in between. `projected` is a
+                # state the wire has no receipt for on this path: the gateway commits a turn from
+                # the same frame that seals it, so there is no separate projection signal to
+                # report. The next honest fact about these attachments is a phone saying it drew
+                # them, which arrives as a delivery_receipt keyed by this same delivery id.
                 service.mark_journaled(media_ids)
             for uploaded_path in uploaded_paths:
                 self._remember_absorbed_media(uploaded_path)
@@ -2866,21 +2876,33 @@ def _merge_receipt_extensions(
 
 
 def delivery_state(pconfig: Any, delivery_key: str) -> Dict[str, Any]:
-    """Read the locally persisted terminal state of one scheduled delivery occurrence.
+    """Read the locally persisted terminal state of one delivery occurrence.
 
-    ``delivery_key`` is the same key the scheduled send used (the Hermes session id, or the
-    caller-supplied key), so ops and Cleo can ask "did that 3:03 AM report ever land?" without a
-    live socket. Returns ``{"state": "unknown", ...}`` when no receipt has arrived yet.
+    ``delivery_key`` is the same key the send used (the Hermes session id, or the caller-supplied
+    key), so ops and Cleo can ask "did that 3:03 AM report ever land?" without a live socket. A key
+    already carrying the ``turn:`` prefix names a REPLY made in a live conversation, whose media is
+    journaled under that same id; it is answerable the moment the phone reports the row on screen,
+    which is the question an agent actually gets asked ("did you see the picture?").
+
+    Returns ``{"state": "unknown", ...}`` when no receipt has arrived yet. ``media`` is present only
+    when the occurrence carried attachments, so the scheduled reading is unchanged for text.
     """
-    delivery_id, message_id = _proactive_identity(delivery_key)
+    if delivery_key.startswith(TURN_DELIVERY_PREFIX):
+        delivery_id = delivery_key
+        message_id = delivery_key[len(TURN_DELIVERY_PREFIX):]
+    else:
+        delivery_id, message_id = _proactive_identity(delivery_key)
     spool = AttachSpool(_proactive_spool_path(pconfig, None))
     try:
         row = spool.delivery_receipt_row(delivery_id)
+        media = spool.media_rows(delivery_id)
     finally:
         spool.close()
     result: Dict[str, Any] = dict(row) if row is not None else {"state": "unknown"}
     result["deliveryId"] = delivery_id
     result["messageId"] = message_id
+    if media:
+        result["media"] = media
     return result
 
 
