@@ -150,7 +150,8 @@ class AttachV1FederatedHealthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(spool.health_snapshot()["oldestEventAgeMs"], 7 * 24 * 60 * 60 * 1_000)
             spool.close()
 
-    async def test_v1_fallback_omits_v2_telemetry(self):
+    async def test_telemetry_rides_every_hello_and_heartbeat(self):
+        """There is no reduced hello, so telemetry is never conditional on a negotiated version."""
         with tempfile.TemporaryDirectory() as directory:
             spool = AttachSpool(os.path.join(directory, "spool.sqlite"))
             socket = FakeSocket()
@@ -162,10 +163,9 @@ class AttachV1FederatedHealthTests(unittest.IsolatedAsyncioTestCase):
                 gateway_url="http://gateway.example", token="secret", spool=spool,
                 connect_factory=connect_factory,
             ))
-            await client._open(1)
-            self.assertEqual(socket.sent[0]["version"], 1)
-            self.assertNotIn("telemetry", socket.sent[0])
-            client._hello_version = 1
+            await client._open()
+            self.assertEqual(socket.sent[0]["version"], 2)
+            self.assertIn("telemetry", socket.sent[0])
             await client._dispatch_inbound(json.dumps({"kind": "heartbeat", "sentAt": 1}))
-            self.assertNotIn("telemetry", socket.sent[-1])
+            self.assertIn("telemetry", socket.sent[-1])
             spool.close()

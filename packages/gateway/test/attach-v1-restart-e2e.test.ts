@@ -37,7 +37,7 @@ it("attach-v1 completes exactly once after a gateway restart mid-reply", async (
     sockets.push(firstPlugin);
     firstPlugin.on("message", (data) => firstPluginFrames.push(JSON.parse(String(data))));
     await once(firstPlugin, "open");
-    firstPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "plugin", capabilities: ["draft"], resume: { eventSequence: 0, commandSequence: 0 } }));
+    firstPlugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "plugin", capabilities: ["draft"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => firstPluginFrames.some((frame) => frame.kind === "hello_ack"));
 
     await fetch(`${gateway.url}/threads/${threadId}/messages`, { method: "POST", headers: auth(deviceToken), body: JSON.stringify({ blocks: [{ type: "paragraph", text: "hello" }] }) });
@@ -62,7 +62,7 @@ it("attach-v1 completes exactly once after a gateway restart mid-reply", async (
     sockets.push(secondPlugin);
     secondPlugin.on("message", (data) => secondPluginFrames.push(JSON.parse(String(data))));
     await once(secondPlugin, "open");
-    secondPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "plugin", capabilities: ["draft"], resume: { eventSequence: 1, commandSequence: 1 } }));
+    secondPlugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "plugin", capabilities: ["draft"], resume: { eventSequence: 1, commandSequence: 1 } }));
     await until(() => secondPluginFrames.some((frame) => frame.kind === "hello_ack"));
     secondPlugin.send(JSON.stringify({ kind: "event", sequence: 2, eventId: "commit-1", event: { kind: "commit", threadId, turnId: command.command.turnId, messageId: "assistant-1", blocks: [{ type: "paragraph", text: "finished" }] } }));
     await until(() => secondPluginFrames.some((frame) => frame.kind === "ack" && frame.sequence === 2));

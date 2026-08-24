@@ -68,7 +68,7 @@ it("replays Cleo's complete long-session shape without starving health or losing
     plugin.on("message", (data) => pluginFrames.push(JSON.parse(String(data)) as AttachV1ServerFrame));
     await once(plugin, "open");
     plugin.send(JSON.stringify({
-      kind: "hello", version: 1, instanceId: "captured-session-replay",
+      kind: "hello", version: 2, instanceId: "captured-session-replay",
       capabilities: ["draft", "tools", "approvals"],
       limits: { maxInFlightEvents: MAX_IN_FLIGHT_EVENTS, maxInFlightBytes: MAX_IN_FLIGHT_BYTES },
       resume: { eventSequence: 0, commandSequence: 0 },

@@ -6,7 +6,9 @@ import { RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, Bot
 const Id = Type.String({ minLength: 1, maxLength: 256 });
 const Sequence = Type.Integer({ minimum: 0 });
 
-const AttachV1BaseCapabilitySchema = Type.Union([
+/** The one capability set. There is no reduced legacy subset: a peer either speaks the current
+ * contract or it is refused at hello. */
+export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("draft"),
   Type.Literal("media"),
   Type.Literal("tools"),
@@ -14,9 +16,6 @@ const AttachV1BaseCapabilitySchema = Type.Union([
   Type.Literal("clarify"),
   Type.Literal("scheduled"),
   Type.Literal("mobile_node"),
-]);
-export const AttachV1CapabilitySchema = Type.Union([
-  AttachV1BaseCapabilitySchema,
   Type.Literal("mobile_location"),
   Type.Literal("memory_management"),
 ]);
@@ -54,17 +53,9 @@ export const AttachV1TelemetrySchema = Type.Object({
 }, { additionalProperties: false });
 export type AttachV1Telemetry = Static<typeof AttachV1TelemetrySchema>;
 
-/** The frozen old-server hello. It deliberately cannot parse v2's location capability. */
-export const AttachV1HelloV1Schema = Type.Object({
-  kind: Type.Literal("hello"),
-  version: Type.Literal(1),
-  instanceId: Id,
-  capabilities: Type.Array(AttachV1BaseCapabilitySchema, { uniqueItems: true }),
-  resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
-  limits: Type.Optional(AttachV1LimitsSchema),
-  commands: Type.Optional(AttachV1CommandCatalogSchema),
-}, { additionalProperties: false });
-export const AttachV1HelloV2Schema = Type.Object({
+/** The one hello. `version` stays a literal on the wire so a peer built against an older shape is
+ * rejected out loud at the handshake instead of negotiating a quietly reduced capability set. */
+export const AttachV1HelloSchema = Type.Object({
   kind: Type.Literal("hello"),
   version: Type.Literal(2),
   instanceId: Id,
@@ -74,7 +65,6 @@ export const AttachV1HelloV2Schema = Type.Object({
   commands: Type.Optional(AttachV1CommandCatalogSchema),
   telemetry: Type.Optional(AttachV1TelemetrySchema),
 });
-export const AttachV1HelloSchema = Type.Union([AttachV1HelloV1Schema, AttachV1HelloV2Schema]);
 export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;
 
 export const AttachV1MediaDescriptorSchema = Type.Object({
@@ -253,13 +243,6 @@ export const AttachV1GapSchema = Type.Object({
 });
 
 export const AttachV1HelloAckSchema = Type.Object({
-  kind: Type.Literal("hello_ack"), version: Type.Literal(1), agentId: Id,
-  capabilities: Type.Array(AttachV1BaseCapabilitySchema),
-  resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
-  limits: AttachV1LimitsSchema,
-  heartbeatIntervalMs: Type.Integer({ minimum: 1000 }),
-});
-const AttachV1HelloAckV2Schema = Type.Object({
   kind: Type.Literal("hello_ack"), version: Type.Literal(2), agentId: Id,
   capabilities: Type.Array(AttachV1CapabilitySchema),
   resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
@@ -278,5 +261,5 @@ export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1MemoryResultSchema,
 ]);
 export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
-export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1HelloAckV2Schema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema]);
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema]);
 export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;

@@ -7,7 +7,9 @@ from unittest.mock import mock_open, patch
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
+from cozygateway.attach_client_v1 import (
+    AttachV1Client, AttachV1ClientConfig, HELLO_CAPABILITIES, HELLO_VERSION,
+)
 from cozygateway.attach_client import ToolChip
 from cozygateway.attach_spool import AttachSpool
 
@@ -189,58 +191,67 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.send_draft("t", "u", [])
         self.assertEqual(self.socket.sent[-1]["sequence"], 2245)
 
-    async def test_closed_v1_server_handshake_falls_back_without_sending_location(self):
+    async def test_stalled_handshake_retries_the_same_hello_and_never_downgrades(self):
+        """Regression: a stalled hello_ack used to downgrade the connection to a smaller hello.
+
+        The downgrade removed ``mobile_location`` and ``memory_management`` for the life of the
+        connection and said nothing, so every surface built on them failed with an "unavailable"
+        that named no cause. There is one hello now: a retry re-sends the identical shape, and
+        the reason is a warning so the stall itself is still visible.
+        """
         first, second = FakeSocket(), FakeSocket()
         sockets = iter([first, second])
 
-        async def old_server_factory(_url, _headers, _ssl):
+        async def slow_server_factory(_url, _headers, _ssl):
             return next(sockets)
 
         client = AttachV1Client(AttachV1ClientConfig(
             gateway_url="http://gateway.example", token="secret", spool=self.spool,
-            connect_factory=old_server_factory,
+            connect_factory=slow_server_factory,
         ))
         await second.inbound.put(json.dumps({
-            "kind": "hello_ack", "version": 1, "agentId": "sage", "capabilities": ["mobile_node"],
+            "kind": "hello_ack", "version": 2, "agentId": "sage",
+            "capabilities": list(HELLO_CAPABILITIES),
             "resume": {"eventSequence": 0, "commandSequence": 0},
             "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}, "heartbeatIntervalMs": 15000,
         }))
         with patch("cozygateway.attach_client_v1.HELLO_ACK_TIMEOUT_SECONDS", 0.001):
             await client.connect()
-            watcher = __import__("asyncio").create_task(client.watch())
-            for _ in range(20):
-                if client._negotiated:
-                    break
-                await __import__("asyncio").sleep(0.001)
-            self.assertTrue(client._negotiated)
-            self.assertEqual(first.sent[0]["version"], 2)
-            self.assertIn("mobile_location", first.sent[0]["capabilities"])
-            self.assertEqual(second.sent[0]["version"], 1)
-            self.assertNotIn("mobile_location", second.sent[0]["capabilities"])
-            self.assertEqual(await client.request_location("thread", "turn", "Find coffee"), {"status": "device_unavailable"})
-            request = __import__("asyncio").create_task(client.request_device_status("thread", "turn"))
-            await __import__("asyncio").sleep(0)
-            status = second.sent[-1]
-            self.assertEqual(status["command"], "device.status")
-            await second.inbound.put(json.dumps({"kind": "mobile_result", "requestId": status["requestId"], "status": "ok", "result": {"foreground": True}}))
-            self.assertEqual(await request, {"status": "ok", "result": {"foreground": True}})
+            with self.assertLogs("cozygateway.attach_client_v1", level="INFO") as captured:
+                watcher = __import__("asyncio").create_task(client.watch())
+                for _ in range(50):
+                    if client._negotiated:
+                        break
+                    await __import__("asyncio").sleep(0.001)
+                self.assertTrue(client._negotiated)
+            # Identical shape both times. No capability is traded away for a second chance.
+            self.assertEqual(first.sent[0], second.sent[0])
+            self.assertEqual(second.sent[0]["version"], 2)
+            self.assertIn("mobile_location", second.sent[0]["capabilities"])
+            self.assertIn("memory_management", second.sent[0]["capabilities"])
+            warnings = [line for line in captured.output if line.startswith("WARNING")]
+            self.assertTrue(any("re-dialing with the same hello" in line for line in warnings), captured.output)
+            self.assertTrue(any("no hello_ack within" in line for line in warnings), captured.output)
+            # The negotiated set is recorded too, so "which capabilities does this bot actually
+            # have" is answerable from the Hermes log alone.
+            self.assertTrue(any("negotiated hello v2" in line for line in captured.output), captured.output)
             await client.close()
             await watcher
 
-    async def test_pre_ack_close_falls_back_to_v1(self):
+    async def test_pre_ack_socket_end_retries_the_same_hello(self):
         first, second = FakeSocket(), FakeSocket()
         sockets = iter([first, second])
 
-        async def old_server_factory(_url, _headers, _ssl):
+        async def flaky_server_factory(_url, _headers, _ssl):
             return next(sockets)
 
         client = AttachV1Client(AttachV1ClientConfig(
             gateway_url="http://gateway.example", token="secret", spool=self.spool,
-            connect_factory=old_server_factory,
+            connect_factory=flaky_server_factory,
         ))
         await first.close()
         await second.inbound.put(json.dumps({
-            "kind": "hello_ack", "version": 1, "capabilities": ["mobile_node"],
+            "kind": "hello_ack", "version": 2, "capabilities": list(HELLO_CAPABILITIES),
             "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
         }))
         await client.connect()
@@ -250,88 +261,70 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
                 break
             await __import__("asyncio").sleep(0.001)
         self.assertTrue(client._negotiated)
-        self.assertEqual((first.sent[0]["version"], second.sent[0]["version"]), (2, 1))
+        self.assertEqual(first.sent[0], second.sent[0])
         await client.close()
         await watcher
 
-    async def test_hello_fallback_is_logged_with_its_reason(self):
-        """Regression: the downgrade was silent.
+    async def test_refused_hello_is_reported_not_retried_into_a_smaller_one(self):
+        """A 1008 before hello_ack is the gateway rejecting this contract on purpose.
 
-        Falling back to v1 permanently removes ``mobile_location`` and ``memory_management`` for
-        the life of the connection. Every surface built on them then fails with an "unavailable"
-        that names no cause, and nothing in either log says a downgrade happened. The warning IS
-        the fix for that: it is the only place the cause is recorded.
+        Re-dialing the same shape cannot change that answer, and there is no smaller shape to try,
+        so the refusal is logged with the gateway's own reason and left to surface.
         """
         first, second = FakeSocket(), FakeSocket()
         sockets = iter([first, second])
 
-        async def old_server_factory(_url, _headers, _ssl):
+        async def refusing_server_factory(_url, _headers, _ssl):
             return next(sockets)
 
         client = AttachV1Client(AttachV1ClientConfig(
             gateway_url="http://gateway.example", token="secret", spool=self.spool,
-            connect_factory=old_server_factory,
+            connect_factory=refusing_server_factory,
         ))
         await first.inbound.put(ConnectionClosedError(Close(1008, "attach-v1 invalid hello frame"), None, None))
-        await second.inbound.put(json.dumps({
-            "kind": "hello_ack", "version": 1, "capabilities": ["mobile_node"],
-            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
-        }))
         await client.connect()
         with self.assertLogs("cozygateway.attach_client_v1", level="INFO") as captured:
-            watcher = __import__("asyncio").create_task(client.watch())
-            for _ in range(50):
-                if client._negotiated:
-                    break
-                await __import__("asyncio").sleep(0.001)
-            self.assertTrue(client._negotiated)
-        warnings = [line for line in captured.output if line.startswith("WARNING")]
-        self.assertTrue(any("retrying handshake as hello v1" in line for line in warnings), captured.output)
-        self.assertTrue(any("closed before hello_ack" in line for line in warnings), captured.output)
-        self.assertTrue(any("memory_management stay OFF" in line for line in warnings), captured.output)
-        # The negotiated set is recorded too, so "which capabilities does this bot actually have"
-        # is answerable from the Hermes log alone.
-        self.assertTrue(any("negotiated hello v1" in line for line in captured.output), captured.output)
+            await client.watch()
+        self.assertTrue(any(
+            line.startswith("ERROR") and "gateway refused the hello" in line and "attach-v1 invalid hello frame" in line
+            for line in captured.output
+        ), captured.output)
+        self.assertFalse(client._negotiated)
+        self.assertEqual(second.sent, [])
         await client.close()
-        await watcher
+
+    async def test_capability_gap_in_the_ack_is_warned_about_at_handshake_time(self):
+        """Regression: the stale-code incident that started all of this.
+
+        The plugin asked for all nine capabilities and the gateway acked a smaller set. Nothing
+        recorded the gap, so the memory surface was dead for hours before anyone could name why.
+        """
+        await self.client.connect()
+        with self.assertLogs("cozygateway.attach_client_v1", level="INFO") as captured:
+            await self.client._dispatch_inbound(json.dumps({
+                "kind": "hello_ack", "version": 2, "capabilities": ["draft", "media"],
+                "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+            }))
+        warnings = [line for line in captured.output if line.startswith("WARNING")]
+        self.assertTrue(any("memory_management" in line and "stay OFF" in line for line in warnings), captured.output)
+
+    def test_hello_is_one_shape_with_every_capability(self):
+        self.assertEqual(HELLO_VERSION, 2)
+        self.assertEqual(set(HELLO_CAPABILITIES), {
+            "draft", "media", "tools", "approvals", "clarify", "scheduled",
+            "mobile_node", "mobile_location", "memory_management",
+        })
 
     def test_hello_ack_budget_is_not_a_one_second_race(self):
         """Regression: the budget was 1s and named for mobile status.
 
-        A handshake that loses that race downgrades to v1 silently and permanently, so the budget
-        has to be the gateway's own hello window, not a value tight enough for an ordinary slow
-        boot to trip.
+        A handshake that lost that race used to be downgraded silently and permanently, so the
+        budget has to be the gateway's own hello window, not a value tight enough for an ordinary
+        slow boot to trip.
         """
         from cozygateway.attach_client_v1 import HELLO_ACK_TIMEOUT_SECONDS
 
         self.assertGreaterEqual(HELLO_ACK_TIMEOUT_SECONDS, 5)
-
-    async def test_pre_ack_connection_closed_error_falls_back_to_v1(self):
-        first, second = FakeSocket(), FakeSocket()
-        sockets = iter([first, second])
-
-        async def old_server_factory(_url, _headers, _ssl):
-            return next(sockets)
-
-        client = AttachV1Client(AttachV1ClientConfig(
-            gateway_url="http://gateway.example", token="secret", spool=self.spool,
-            connect_factory=old_server_factory,
-        ))
-        await first.inbound.put(ConnectionClosedError(Close(1008, "unknown hello field"), None, None))
-        await second.inbound.put(json.dumps({
-            "kind": "hello_ack", "version": 1, "capabilities": ["mobile_node"],
-            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
-        }))
-        await client.connect()
-        watcher = __import__("asyncio").create_task(client.watch())
-        for _ in range(20):
-            if client._negotiated:
-                break
-            await __import__("asyncio").sleep(0.001)
-        self.assertTrue(client._negotiated)
-        self.assertEqual((first.sent[0]["version"], second.sent[0]["version"]), (2, 1))
-        await client.close()
-        await watcher
 
     async def test_non_auth_policy_close_does_not_masquerade_as_token_rejection(self):
         await self.client.connect()

@@ -48,7 +48,7 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     sockets.push(plugin);
     plugin.on("message", (data) => pluginFrames.push(JSON.parse(String(data))));
     await once(plugin, "open");
-    plugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 0, commandSequence: 0 } }));
+    plugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "hermes-sage", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
     expect(pluginFrames.find((frame) => frame.kind === "hello_ack")?.capabilities).not.toContain("media");
 
@@ -136,7 +136,7 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     sockets.push(selectedPlugin);
     selectedPlugin.on("message", (data) => selectedPluginFrames.push(JSON.parse(String(data))));
     await once(selectedPlugin, "open");
-    selectedPlugin.send(JSON.stringify({ kind: "hello", version: 1, instanceId: "hermes-sage-selected", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 7, commandSequence: 0 } }));
+    selectedPlugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "hermes-sage-selected", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 7, commandSequence: 0 } }));
     await until(() => selectedPluginFrames.some((frame) => frame.kind === "hello_ack"));
     selectedPlugin.send(JSON.stringify({ kind: "event", sequence: 8, eventId: "scheduled-selected", event: { kind: "scheduled", threadId: selectedSessionId, deliveryId: "selected-delivery", messageId: "selected-message", blocks: [{ type: "paragraph", text: "selected daily" }] } }));
     await until(() => selectedPluginFrames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 8));
@@ -177,7 +177,7 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     downgradedPlugin.on("message", (data) => downgradedFrames.push(JSON.parse(String(data))));
     await once(downgradedPlugin, "open");
     downgradedPlugin.send(JSON.stringify({
-      kind: "hello", version: 1, instanceId: "hermes-sage-no-clarify", capabilities: ["draft", "scheduled"],
+      kind: "hello", version: 2, instanceId: "hermes-sage-no-clarify", capabilities: ["draft", "scheduled"],
       resume: { eventSequence: 9, commandSequence: 0 },
     }));
     await until(() => downgradedFrames.some((frame) => frame.kind === "command" && frame.command.kind === "discard" && frame.command.originalKind === "resolve_clarify"));

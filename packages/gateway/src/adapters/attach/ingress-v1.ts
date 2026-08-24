@@ -19,8 +19,7 @@ import {
   AttachV1EventFrameSchema,
   AttachV1GapSchema,
   AttachV1HeartbeatSchema,
-  AttachV1HelloV1Schema,
-  AttachV1HelloV2Schema,
+  AttachV1HelloSchema,
   AttachV1MemoryResultSchema,
   AttachV1MobileCancelSchema,
   AttachV1MobileRequestSchema,
@@ -175,6 +174,13 @@ export class AttachV1Ingress implements TurnEndpoint {
         this.#refuse(agentId, socket, "unparseable", "frame is not JSON");
         return;
       }
+      // There is one hello shape. A peer built against an older one used to negotiate a reduced
+      // capability set and look healthy for hours; name the version it sent and close instead.
+      const helloVersion = helloVersionOf(decoded);
+      if (helloVersion !== undefined) {
+        this.#refuse(agentId, socket, "hello", `unsupported hello version ${helloVersion}, this gateway speaks hello version 2 only`);
+        return;
+      }
       if (!check(AttachV1ClientFrameSchema, decoded)) {
         // A dropped frame used to be invisible on both ends: the peer waits forever for a reply
         // that will never come, and no log says why. Name the offending field and close, so a
@@ -221,20 +227,13 @@ export class AttachV1Ingress implements TurnEndpoint {
         // life, and nothing else on the gateway reports it. A plugin that quietly handshakes as
         // an older version leaves this one line as the evidence.
         this.#log(`attach-v1: profile "${agentId}" negotiated hello v${frame.version} with capabilities [${[...connection.capabilities].join(", ")}]`);
-        const common = {
-          kind: "hello_ack" as const, agentId,
+        this.#send(connection, {
+          kind: "hello_ack", version: 2, agentId,
+          capabilities: [...connection.capabilities],
           resume: { eventSequence: this.#storage.attachEventCursor(agentId), commandSequence: this.#storage.attachCommandCursor(agentId) },
           limits: { maxInFlightEvents: connection.maxInFlightEvents, maxInFlightBytes: connection.maxInFlightBytes },
           heartbeatIntervalMs: this.#heartbeatIntervalMs,
-        };
-        if (frame.version === 1) {
-          this.#send(connection, {
-            ...common, version: 1,
-            capabilities: [...connection.capabilities].filter((capability): capability is Exclude<AttachV1Capability, "mobile_location" | "memory_management"> => capability !== "mobile_location" && capability !== "memory_management"),
-          });
-        } else {
-          this.#send(connection, { ...common, version: 2, capabilities: [...connection.capabilities] });
-        }
+        });
         this.#presence(agentId, "online");
         this.#refreshDegraded(agentId, connection);
         this.#flush(agentId, connection.commandCursor);
@@ -657,6 +656,7 @@ function frameKind(decoded: unknown): string {
  *  whole union. Validating a bad frame against the union only ever answers "expected union value"
  *  at the root, which is exactly as useless as the silent drop it replaced. */
 const KIND_SCHEMAS: Record<string, TSchema> = {
+  hello: AttachV1HelloSchema,
   event: AttachV1EventFrameSchema,
   ack: AttachV1AckSchema,
   gap: AttachV1GapSchema,
@@ -669,17 +669,25 @@ const KIND_SCHEMAS: Record<string, TSchema> = {
 /** The first schema violation, as "<message> at <json pointer>". TypeBox's message text and the
  *  pointer are both schema-derived, so no payload value reaches the log. */
 function schemaReason(decoded: unknown): string {
-  const kind = frameKind(decoded);
-  const version = typeof decoded === "object" && decoded !== null ? (decoded as { version?: unknown }).version : undefined;
-  const schema = kind === "hello"
-    ? (version === 1 ? AttachV1HelloV1Schema : AttachV1HelloV2Schema)
-    : KIND_SCHEMAS[kind] ?? AttachV1ClientFrameSchema;
+  const schema = KIND_SCHEMAS[frameKind(decoded)] ?? AttachV1ClientFrameSchema;
   try {
     assertValid(schema, decoded);
   } catch (err) {
     if (err instanceof ContractViolation) return err.message;
   }
   return "failed schema validation";
+}
+
+/** The version a hello frame claimed, when it is anything other than the one supported version.
+ *  `undefined` means "not a mis-versioned hello", so an ordinary frame takes the normal path. The
+ *  value is rendered bounded and only when it is a finite number, so no payload prose reaches a log. */
+function helloVersionOf(decoded: unknown): string | undefined {
+  if (typeof decoded !== "object" || decoded === null) return undefined;
+  const record = decoded as { kind?: unknown; version?: unknown };
+  if (record.kind !== "hello" || record.version === 2) return undefined;
+  return typeof record.version === "number" && Number.isFinite(record.version)
+    ? String(record.version).slice(0, 16)
+    : "unknown";
 }
 
 function isLocationResult(value: unknown): value is { latitude: number; longitude: number } {

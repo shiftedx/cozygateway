@@ -5,12 +5,11 @@ import {
   AttachV1ClientFrameSchema,
   AttachV1EventFrameSchema,
   AttachV1HelloSchema,
-  AttachV1HelloV1Schema,
   AttachV1ServerFrameSchema,
 } from "../src/adapters/attach/protocol-v1.ts";
 
 describe("attach-v1 protocol", () => {
-  it("negotiates version, capabilities, cursor and backpressure limits", () => {
+  it("negotiates capabilities, cursor and backpressure limits with one hello shape", () => {
     expect(check(AttachV1HelloSchema, {
       kind: "hello",
       version: 2,
@@ -23,11 +22,10 @@ describe("attach-v1 protocol", () => {
         { name: "/queue", description: "Queue the next prompt", argsHint: "<prompt>" },
       ],
     })).toBe(true);
-    expect(check(AttachV1HelloV1Schema, {
+    // There is no second hello shape to fall back to. A peer that still speaks version 1 fails
+    // the schema outright rather than negotiating a quietly reduced capability set.
+    expect(check(AttachV1HelloSchema, {
       kind: "hello", version: 1, instanceId: "plugin-1", capabilities: ["draft", "mobile_node"],
-    })).toBe(true);
-    expect(check(AttachV1HelloV1Schema, {
-      kind: "hello", version: 2, instanceId: "plugin-1", capabilities: ["mobile_node", "mobile_location"],
     })).toBe(false);
     expect(check(AttachV1HelloSchema, {
       kind: "hello", version: 2, instanceId: "plugin-1", capabilities: ["draft"],
@@ -39,10 +37,6 @@ describe("attach-v1 protocol", () => {
       kind: "hello", version: 2, instanceId: "fresh-plugin", capabilities: ["draft"],
       telemetry: { eventOutboxDepth: 0, oldestEventAgeMs: null, eventAckCursor: 0, commandInboxDepth: 0 },
     })).toBe(true);
-    expect(check(AttachV1HelloV1Schema, {
-      kind: "hello", version: 1, instanceId: "plugin-1", capabilities: ["draft"],
-      telemetry: { eventOutboxDepth: 3, oldestEventAgeMs: 4, eventAckCursor: 5, commandInboxDepth: 7 },
-    })).toBe(false);
     expect(check(AttachV1HelloSchema, { kind: "hello", version: 0, instanceId: "x", capabilities: [] })).toBe(false);
     expect(check(AttachV1HelloSchema, {
       kind: "hello", version: 2, instanceId: "x", capabilities: [],
