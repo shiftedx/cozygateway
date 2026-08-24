@@ -141,6 +141,11 @@ export const BotChatMessageSchema = Type.Object({
   at: Type.Union([Type.Integer(), Type.Null()]),
   clientId: Type.Optional(Type.String()),
   attachments: Type.Optional(Type.Array(AttachmentBlockSchema)),
+  /** Capability 31. Present only on gateway-authored rows that are not conversation: a client MAY
+   *  render a marked row as a status chip rather than a bubble, and a client that does not know the
+   *  marker renders the ordinary row it already renders. The only v1 value is `delivery.failed`,
+   *  which the gateway writes with role `system` when a scheduled delivery terminally fails. */
+  marker: Type.Optional(Type.String({ maxLength: 64 })),
 });
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;
 
@@ -494,6 +499,27 @@ export const BotChatSendRequestSchema = Type.Object({
   clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
 export type BotChatSendRequest = Static<typeof BotChatSendRequestSchema>;
+
+/** `POST /bots/:name/chat/messages/displayed` body (capability 31). The ids are wire ids of rows the
+ *  device actually PUT ON SCREEN, which is the one fact a gateway cannot observe for itself: a
+ *  durable transcript row proves delivery to the gateway, and a push proves nothing at all.
+ *
+ *  Bounded at 64 per request because the app coalesces a scroll burst into one call, not because a
+ *  session is short: a client with more to report sends more requests. Unknown ids are ignored
+ *  rather than refused, so a device replaying its offline queue after a chat reset is never stuck
+ *  retrying a batch it cannot repair. */
+export const BotChatDisplayedRequestSchema = Type.Object({
+  messageIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 64 }),
+});
+export type BotChatDisplayedRequest = Static<typeof BotChatDisplayedRequestSchema>;
+
+/** `202` body for the same route. `recorded` counts the ids that became a NEW receipt: ids already
+ *  displayed and ids naming no durable row both count zero, so a client cannot read it as an error
+ *  signal and MUST NOT retry on a low count. The route is idempotent and first-write-wins. */
+export const BotChatDisplayedResponseSchema = Type.Object({
+  recorded: Type.Integer({ minimum: 0 }),
+});
+export type BotChatDisplayedResponse = Static<typeof BotChatDisplayedResponseSchema>;
 
 /** The non-file parts of the `POST /bots/:name/chat/photos` multipart body (capability 9). The
  *  `file` part is not modelled here on purpose: it is bytes, and what makes it acceptable is the
@@ -1170,7 +1196,24 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    event. `bot_*_resolution_requested` disables duplicate actions across paired devices.
  *  - `29`: `GET /bots/approvals?state=pending` additionally returns bounded pending
  *    clarifications and confirmed terminal settlement receipts so a reconnect can settle an
- *    optimistic action without guessing from the action POST. */
+ *    optimistic action without guessing from the action POST.
+ *  - `31`: DURABLE DELIVERY RECEIPTS. Three additive pieces, and a client gates each on `>= 31`:
+ *    - `POST /bots/:name/chat/messages/displayed` reports the wire ids of rows the device actually
+ *      put on screen. It is the only signal in this contract that a HUMAN saw a message: a durable
+ *      transcript row proves the gateway holds it, and `contract/push-v0.md` push is fire-and-forget
+ *      by construction. A client MUST require `>= 31` before sending it; a version 30 gateway
+ *      answers `404`, and a client MUST treat that as "this gateway does not collect receipts"
+ *      rather than as a lost message.
+ *    - `BotChatMessage.marker`, an optional bounded label on gateway-authored rows that are not
+ *      conversation. A client below 31 ignores it and renders the ordinary row, which is exactly
+ *      where it was before.
+ *    - role `system` on a `BotChatMessage`. Roles were never an enum on this wire (section 3), so
+ *      this adds no new rule: a client MUST render an unknown role rather than dropping the row.
+ *      The one v1 emitter is the `delivery.failed` marker row the gateway appends to a bot's
+ *      current canonical chat when a scheduled delivery terminally fails, so a cron report that
+ *      never arrived is visible to the user instead of silently absent.
+ *    What 31 does NOT add: any push, any per-attachment receipt, and any retroactive receipt for
+ *    rows that were already on screen before the client learned to report them. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
 /** Capability 30: a bounded, source-labelled projection of memory owned by the
  * attached Hermes profile.  `attributes` deliberately does not exist: every
@@ -1226,4 +1269,4 @@ export type BotMemoryWriteResponse = Static<typeof BotMemoryWriteResponseSchema>
 export const BotMemoryDeleteResponseSchema = Type.Object({ id: Type.String({ minLength: 1, maxLength: 512 }), revision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
 export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchema>;
 
-export const BOTS_CAPABILITY_VERSION = 30;
+export const BOTS_CAPABILITY_VERSION = 31;

@@ -246,6 +246,9 @@ export async function startGateway(
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
       onMemoryResult: (agentId, frame) => { memorySurface?.handle(agentId, frame); },
+      // The plugin-facing receipt is the ingress' own business; this is the half the USER sees.
+      onScheduledDeliveryFailed: (agentId, failure) =>
+        nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
       onPresence: (agentId, state) => {
         hub.broadcast({
           type: "presence",

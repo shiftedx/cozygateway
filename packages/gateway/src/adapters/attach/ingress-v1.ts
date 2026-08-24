@@ -45,7 +45,7 @@ export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management", "delivery_receipts"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -59,6 +59,19 @@ export interface AttachV1Events {
   onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;
   onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
   onMemoryResult?(agentId: string, frame: AttachV1MemoryResult): void;
+  /** A scheduled delivery that will never reach a transcript. The ingress emits the plugin-facing
+   * receipt itself; this is the app-facing half, raised so the layer that owns a bot's canonical
+   * chat can say so to the user instead of leaving a cron report silently missing. */
+  onScheduledDeliveryFailed?(
+    agentId: string,
+    failure: {
+      deliveryId: string;
+      messageId: string;
+      stage: "authorization" | "projection";
+      reason: string;
+      at: number;
+    },
+  ): void;
 }
 
 interface Connection {
@@ -315,6 +328,14 @@ export class AttachV1Ingress implements TurnEndpoint {
       if (admission.status === "accepted") {
         this.#projectPending(agentId);
       }
+      if (admission.status === "discarded" && frame.event.kind === "scheduled") {
+        this.#deliveryFailed(agentId, {
+          deliveryId: frame.event.deliveryId,
+          messageId: frame.event.messageId,
+          stage: "authorization",
+          reason: admission.reason,
+        });
+      }
       this.#traceAttach("attach_event", agentId, { eventCursor: admission.acknowledgedSequence, outcome: admission.status });
       this.#send(connection, {
         kind: "ack", channel: "event", sequence: admission.acknowledgedSequence,
@@ -508,6 +529,45 @@ export class AttachV1Ingress implements TurnEndpoint {
     return this.#send(connection, { kind: "mobile_result", ...frame });
   }
 
+  /** Durably queues one delivery receipt. `false` means the receipt was not queued at all, which
+   * is deliberate and never fatal: a receipt is gateway-to-plugin bookkeeping, so a plugin that
+   * never negotiated `delivery_receipts` simply does not hear about it rather than having its
+   * outbox filled with commands it would only discard. A receipt queued while the plugin is away
+   * follows the ordinary durable path and, if that plugin comes back without the capability, the
+   * existing tombstone converts it to a `discard`. */
+  sendDeliveryReceipt(
+    agentId: string,
+    input: {
+      deliveryId: string;
+      messageId: string;
+      state: "displayed" | "failed";
+      at?: number;
+      stage?: "authorization" | "projection";
+      reason?: string;
+    },
+  ): boolean {
+    const { at, stage, reason, ...rest } = input;
+    return this.#enqueue(
+      agentId,
+      {
+        kind: "delivery_receipt", ...rest, at: at ?? this.#now(),
+        ...(stage === undefined ? {} : { stage }),
+        ...(reason === undefined ? {} : { reason: reason.slice(0, 256) }),
+      },
+      `rcpt:${input.deliveryId}:${input.state}`,
+    );
+  }
+
+  #deliveryFailed(
+    agentId: string,
+    failure: { deliveryId: string; messageId: string; stage: "authorization" | "projection"; reason: string },
+  ): void {
+    const at = this.#now();
+    const reason = failure.reason.slice(0, 256);
+    this.sendDeliveryReceipt(agentId, { ...failure, reason, state: "failed", at });
+    this.#events.onScheduledDeliveryFailed?.(agentId, { ...failure, reason, at });
+  }
+
   replayUnapplied(agentId: string): void {
     this.#projectPending(agentId);
   }
@@ -581,6 +641,14 @@ export class AttachV1Ingress implements TurnEndpoint {
       }
       const failure = this.#storage.recordAttachProjectionFailure(agentId, frame.eventId, error, this.#now(), this.#projectionMaxAttempts);
       if (failure.deadLettered) {
+        if (frame.event.kind === "scheduled") {
+          this.#deliveryFailed(agentId, {
+            deliveryId: frame.event.deliveryId,
+            messageId: frame.event.messageId,
+            stage: "projection",
+            reason: error,
+          });
+        }
         this.#presence(agentId, "degraded");
         this.#traceAttach("attach_projection", agentId, { outcome: "dead_letter" });
         return;
@@ -709,6 +777,7 @@ function eventCapabilities(frame: AttachV1EventFrame): AttachV1Capability[] {
 
 function commandCapabilities(command: AttachV1Command): AttachV1Capability[] {
   if (command.kind === "discard") return [];
+  if (command.kind === "delivery_receipt") return ["delivery_receipts"];
   if (command.kind === "resolve_approval") return ["approvals"];
   if (command.kind === "resolve_clarify") return ["clarify"];
   if (command.kind === "turn" && (command.mediaIds?.length ?? 0) > 0) return ["draft", "media"];

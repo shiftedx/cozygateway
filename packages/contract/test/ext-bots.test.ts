@@ -5,6 +5,8 @@ import {
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotChatDeltaFrameSchema,
+  BotChatDisplayedRequestSchema,
+  BotChatDisplayedResponseSchema,
   BotChatStateFrameSchema,
   BotChatMessageSchema,
   BotChatResetFrameSchema,
@@ -475,8 +477,9 @@ describe("capability advertisement", () => {
     // 25 adds slash commands; 26 adds attachment history; 27 adds pending approval recovery;
     // 28 distinguishes a durable resolution request from Hermes terminal confirmation;
     // 29 adds clarification recovery and terminal settlement receipts; 30 adds
-    // attached-profile Memory management.
-    expect(BOTS_CAPABILITY_VERSION).toBe(30);
+    // attached-profile Memory management; 31 adds durable delivery receipts (the displayed
+    // report, `BotChatMessage.marker`, and role `system` on gateway-authored marker rows).
+    expect(BOTS_CAPABILITY_VERSION).toBe(31);
   });
 
   it("accepts capability-23 native turn status without changing legacy state fields", () => {
@@ -589,5 +592,31 @@ describe("capability advertisement", () => {
     };
     expect(check(BotInboxActivityFrameSchema, activity)).toBe(true);
     expect(check(ServerFrameSchema, activity)).toBe(true);
+  });
+
+  it("bounds the capability-31 displayed report and keeps its response a plain count", () => {
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1", "m2"] })).toBe(true);
+    // Empty is not a report, it is a wasted round trip; 64 is the coalesced-scroll batch bound.
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: [] })).toBe(false);
+    expect(check(BotChatDisplayedRequestSchema, {
+      messageIds: Array.from({ length: 65 }, (_, index) => `m${index}`),
+    })).toBe(false);
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["x".repeat(129)] })).toBe(false);
+    expect(check(BotChatDisplayedResponseSchema, { recorded: 0 })).toBe(true);
+    expect(check(BotChatDisplayedResponseSchema, { recorded: -1 })).toBe(false);
+  });
+
+  it("carries a capability-31 marker on a gateway-authored system row without changing older rows", () => {
+    expect(check(BotChatMessageSchema, {
+      id: "delivery-failed:cron-1", role: "system", text: "could not be delivered",
+      at: 1_800_000_000_000, marker: "delivery.failed",
+    })).toBe(true);
+    // Additive: a row without the field is exactly the row every pre-31 gateway already sent.
+    expect(check(BotChatMessageSchema, {
+      id: "m1", role: "assistant", text: "hi", at: null,
+    })).toBe(true);
+    expect(check(BotChatMessageSchema, {
+      id: "m1", role: "assistant", text: "hi", at: null, marker: "x".repeat(65),
+    })).toBe(false);
   });
 });

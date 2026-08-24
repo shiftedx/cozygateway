@@ -190,6 +190,8 @@ export class NativeBotDataPlane {
       chatAttachmentInfo: (name, fileId) => this.#attachmentInfo(name, fileId),
       chatAttachmentSlice: (name, fileId, offset, length) =>
         this.#attachmentSlice(name, fileId, offset, length),
+      recordDisplayed: (name, messageIds, deviceId) =>
+        this.#recordDisplayed(name, messageIds, deviceId),
     };
     return new Proxy(this.#control, {
       get: (target, property) => {
@@ -904,6 +906,61 @@ export class NativeBotDataPlane {
     });
     this.#draftSeq.delete(turnId);
     this.#state(bot, sessionId, terminal.phase, false, terminal);
+  }
+
+  /** Capability 31. Turns a device's "I put these on screen" report into durable receipts, and
+   * closes the loop for any of them that were a scheduled delivery: the plugin that produced a
+   * cron report learns that a human read it, which is the one thing neither its own spool nor the
+   * gateway's transcript could tell it. */
+  #recordDisplayed(
+    name: string,
+    messageIds: readonly string[],
+    deviceId: string,
+  ): { recorded: number } {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const at = this.#now();
+    const result = this.#storage.recordBotMessageDisplayed(bot, messageIds, deviceId, at);
+    for (const delivery of result.deliveries) {
+      this.#ingress.sendDeliveryReceipt(bot, {
+        deliveryId: delivery.deliveryId,
+        messageId: delivery.messageId,
+        state: "displayed",
+        at,
+      });
+    }
+    return { recorded: result.recorded };
+  }
+
+  /** A scheduled delivery that terminally failed is the one gateway-side event a user can neither
+   * see nor infer: nothing arrives, and nothing says why. This appends one quiet marked row to the
+   * bot's CURRENT canonical chat, which is where the delivery would have landed had it survived.
+   *
+   * The row is keyed by delivery id, so a retried failure never duplicates it, and it raises no
+   * push: a report that failed to arrive should not wake a phone at 3am to say so. */
+  recordScheduledDeliveryFailure(
+    bot: string,
+    failure: { deliveryId: string; stage: "authorization" | "projection"; reason: string; at: number },
+  ): void {
+    const key = normalize(bot);
+    if (!this.handles(key)) return;
+    const chat = this.#storage.nativeBotChat(key, failure.at);
+    const message = this.#storage.appendNativeBotMessage({
+      bot: key,
+      sessionId: chat.sessionId,
+      messageId: `delivery-failed:${failure.deliveryId}`,
+      role: "system",
+      marker: DELIVERY_FAILED_MARKER,
+      text: deliveryFailureText(key, failure.at, failure.reason),
+      at: failure.at,
+    });
+    this.#broadcast({
+      type: "bot_chat",
+      bot: key,
+      sessionId: chat.sessionId,
+      messages: [message],
+      updatedAt: failure.at,
+    });
   }
 
   #commit(
@@ -1686,6 +1743,17 @@ export class NativeBotDataPlane {
   ): void {
     this.#broadcast(this.#stateFrame(bot, sessionId, phase, running, terminal));
   }
+}
+
+/** Capability 31's only marker value. */
+export const DELIVERY_FAILED_MARKER = "delivery.failed";
+
+/** One human sentence, in the gateway's own local time, because that is the clock the bot's
+ * routines are scheduled against and the one the user set them on. */
+export function deliveryFailureText(bot: string, at: number, reason: string): string {
+  const name = bot.charAt(0).toUpperCase() + bot.slice(1);
+  const time = new Date(at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  return `${name} tried to deliver a scheduled message at ${time} and it could not be delivered: ${reason.slice(0, 256)}.`;
 }
 
 function normalize(value: string): string {

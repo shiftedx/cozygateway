@@ -132,6 +132,12 @@ describe("attach-v1 delivery receipts", () => {
         admittedAt: 1_000,
         attempts: 1,
         deadLetteredAt: 1_100,
+        terminal: {
+          state: "failed",
+          stage: "projection",
+          reason: "projection declined event",
+          at: 1_100,
+        },
       });
     } finally {
       storage.close();
