@@ -18,7 +18,9 @@ import hashlib
 import mimetypes
 import os
 import struct
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -30,6 +32,7 @@ __all__ = [
     "evaluate_compatibility",
     "detect_mime",
     "probe",
+    "clear_descriptor_cache",
 ]
 
 # Bounds. A malformed or hostile file must never turn a probe into a long walk.
@@ -37,6 +40,39 @@ SNIFF_BYTES = 4096
 MAX_ELEMENTS = 4096
 MAX_DEPTH = 8
 HASH_CHUNK = 1024 * 1024
+
+# A probe reads the whole file to hash it, so re-probing the same unchanged bytes is
+# the most expensive repeat in the send path (a resend, a retry, or the same asset
+# attached to several messages). File identity is (device, inode, size, mtime); when
+# all four match, the bytes are the bytes. The sha is not re-read to confirm that:
+# it is verified against the bytes actually streamed to the gateway, which the upload
+# reads anyway, so a stale entry cannot become a wrong attachment.
+DESCRIPTOR_CACHE_MAX = 64
+_descriptor_cache: "OrderedDict[Tuple[Any, ...], MediaDescriptor]" = OrderedDict()
+_descriptor_cache_lock = threading.Lock()
+
+
+def clear_descriptor_cache() -> None:
+    """Drop every cached descriptor. Tests and a changed policy start from nothing."""
+
+    with _descriptor_cache_lock:
+        _descriptor_cache.clear()
+
+
+def _cache_get(key: Tuple[Any, ...]) -> Optional["MediaDescriptor"]:
+    with _descriptor_cache_lock:
+        descriptor = _descriptor_cache.get(key)
+        if descriptor is not None:
+            _descriptor_cache.move_to_end(key)
+        return descriptor
+
+
+def _cache_put(key: Tuple[Any, ...], descriptor: "MediaDescriptor") -> None:
+    with _descriptor_cache_lock:
+        _descriptor_cache[key] = descriptor
+        _descriptor_cache.move_to_end(key)
+        while len(_descriptor_cache) > DESCRIPTOR_CACHE_MAX:
+            _descriptor_cache.popitem(last=False)
 
 
 class MediaProbeError(Exception):
@@ -514,6 +550,7 @@ def probe(
     *,
     stability_wait_s: float = 0.0,
     allowed_roots: Optional[Iterable[str]] = None,
+    use_cache: bool = True,
 ) -> MediaDescriptor:
     """Verify a file is ready to upload and describe what it actually is.
 
@@ -521,9 +558,18 @@ def probe(
     escapes ``allowed_roots`` through a symlink, is not a regular file, is
     unreadable, is empty, or is still growing (size sampled twice when
     ``stability_wait_s`` is positive).
+
+    Readiness is always re-checked. ``use_cache`` only decides whether the read
+    that hashes and sniffs the bytes is skipped for a file whose identity has not
+    moved (see DESCRIPTOR_CACHE_MAX).
     """
 
     expanded, realpath, size_bytes = _check_readiness(path, allowed_roots, stability_wait_s)
+    key = _identity(expanded, realpath, size_bytes)
+    if use_cache and key is not None:
+        cached = _cache_get(key)
+        if cached is not None:
+            return cached
     head, sha256 = _read_head_and_hash(realpath, expanded)
     declared, detected = _declared_mime(expanded), detect_mime(head)
 
@@ -556,7 +602,7 @@ def probe(
         audio_codec=facts.get("audio_codec"),
         codecs_known=codecs_known,
     )
-    return MediaDescriptor(
+    descriptor = MediaDescriptor(
         path=expanded,
         realpath=realpath,
         size_bytes=size_bytes,
@@ -575,3 +621,20 @@ def probe(
         compatibility=compatibility,
         incompatibility_reason=reason,
     )
+    if use_cache and key is not None:
+        _cache_put(key, descriptor)
+    return descriptor
+
+
+def _identity(expanded: str, realpath: str, size_bytes: int) -> Optional[Tuple[Any, ...]]:
+    """(path, device, inode, size, mtime) for a file, or None if it cannot be read.
+
+    A rewritten file changes size or mtime, and a replaced file changes inode, so a
+    hit means these exact bytes were already described.
+    """
+
+    try:
+        status = os.stat(realpath)
+    except OSError:
+        return None
+    return (expanded, realpath, status.st_dev, status.st_ino, size_bytes, status.st_mtime_ns)

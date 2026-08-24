@@ -11,9 +11,11 @@ import time
 import unittest
 
 from cozygateway.media_descriptor import (
+    DESCRIPTOR_CACHE_MAX,
     MEDIA_COMPATIBILITY_POLICY,
     SUPPORTED_MIME_TYPES,
     MediaProbeError,
+    clear_descriptor_cache,
     detect_mime,
     evaluate_compatibility,
     probe,
@@ -459,6 +461,66 @@ class ContainerParseTests(MediaDescriptorTestCase):
     def test_malformed_ebml_does_not_crash(self):
         descriptor = probe(self.write("bad.webm", b"\x1a\x45\xdf\xa3" + b"\x00" * 64 + b"webm"))
         self.assertIn(descriptor.compatibility, ("unsupported", "unknown"))
+
+
+class DescriptorCacheTests(MediaDescriptorTestCase):
+    """The cache may skip a read. It may never answer for bytes that have moved."""
+
+    def setUp(self):
+        super().setUp()
+        clear_descriptor_cache()
+        self.addCleanup(clear_descriptor_cache)
+
+    def stamp(self, path, seconds):
+        """Pin mtime, so the test does not depend on the filesystem's clock resolution."""
+        os.utime(path, ns=(seconds * 1_000_000_000, seconds * 1_000_000_000))
+
+    def test_an_unchanged_file_is_described_once(self):
+        path = self.write("shot.png", png_bytes())
+        self.stamp(path, 1_700_000_000)
+        first = probe(path)
+        self.assertIs(probe(path), first)
+
+    def test_disabling_the_cache_re_reads_the_bytes(self):
+        path = self.write("shot.png", png_bytes())
+        self.stamp(path, 1_700_000_000)
+        first = probe(path)
+        again = probe(path, use_cache=False)
+        self.assertIsNot(again, first)
+        self.assertEqual(again.sha256, first.sha256)
+
+    def test_rewritten_bytes_at_the_same_path_are_described_again(self):
+        path = self.write("shot.png", png_bytes())
+        self.stamp(path, 1_700_000_000)
+        first = probe(path)
+
+        # Same name, same size, new bytes: only the inode and mtime say so.
+        os.unlink(path)
+        self.write("shot.png", png_bytes(width=2))
+        self.stamp(path, 1_700_000_100)
+        second = probe(path)
+        self.assertIsNot(second, first)
+        self.assertNotEqual(second.sha256, first.sha256)
+
+    def test_a_deleted_file_is_reported_missing_rather_than_served_from_cache(self):
+        path = self.write("shot.png", png_bytes())
+        probe(path)
+        os.unlink(path)
+        with self.assertRaises(MediaProbeError) as caught:
+            probe(path)
+        self.assertEqual(caught.exception.code, "missing")
+
+    def test_the_cache_is_bounded_and_evicts_the_oldest(self):
+        paths = []
+        for index in range(DESCRIPTOR_CACHE_MAX + 1):
+            path = self.write("shot%d.png" % index, png_bytes(width=1, height=index + 1))
+            self.stamp(path, 1_700_000_000)
+            paths.append(path)
+        first = probe(paths[0])
+        for path in paths[1:]:
+            probe(path)
+        self.assertIsNot(probe(paths[0]), first)
+        self.assertIs(probe(paths[-1]), probe(paths[-1]))
 
 
 class PolicyTableTests(unittest.TestCase):
