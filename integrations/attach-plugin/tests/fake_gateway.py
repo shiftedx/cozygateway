@@ -45,6 +45,7 @@ import socket
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional
@@ -106,9 +107,13 @@ class HttpResponse:
     delay_s: float = 0.0
 
 
-def upload_ok(*, status: int = 201) -> HttpResponse:
-    """Accept the upload and answer with the descriptor the real gateway would build."""
-    return HttpResponse(label="ok", behaviour="descriptor", status=status)
+def upload_ok(*, status: int = 201, delay_s: float = 0.0) -> HttpResponse:
+    """Accept the upload and answer with the descriptor the real gateway would build.
+
+    ``delay_s`` holds the request open after the body arrives, which is how overlapping
+    uploads are made observable to :attr:`FakeGateway.peak_upload_concurrency`.
+    """
+    return HttpResponse(label="ok", behaviour="descriptor", status=status, delay_s=delay_s)
 
 
 def upload_forbidden(*, message: str = "attach media is not authorized") -> HttpResponse:
@@ -365,6 +370,8 @@ class FakeGateway:
         self._receipt_requests: List[str] = []
         self._frames: List[Dict[str, Any]] = []
 
+        self._upload_in_flight = 0
+        self._peak_upload_concurrency = 0
         self._upload_script = _ScriptQueue(default=upload_ok())
         self._receipt_scripts: Dict[str, _ScriptQueue] = {}
 
@@ -621,6 +628,24 @@ class FakeGateway:
     # -- HTTP handlers -------------------------------------------------------------
 
     def _handle_upload(self, handler: _MediaHandler, media_id: str) -> None:
+        with self._in_flight_upload():
+            self._upload(handler, media_id)
+
+    @contextmanager
+    def _in_flight_upload(self):
+        """Count concurrent uploads, so a bounded producer can be proven bounded."""
+        with self._lock:
+            self._upload_in_flight += 1
+            self._peak_upload_concurrency = max(
+                self._peak_upload_concurrency, self._upload_in_flight,
+            )
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._upload_in_flight -= 1
+
+    def _upload(self, handler: _MediaHandler, media_id: str) -> None:
         response = self._upload_script.take()
         content_type = (handler.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         record = UploadRecord(
@@ -690,6 +715,12 @@ class FakeGateway:
     def uploads(self) -> List[UploadRecord]:
         with self._lock:
             return list(self._uploads)
+
+    @property
+    def peak_upload_concurrency(self) -> int:
+        """The most uploads this gateway ever had open at once."""
+        with self._lock:
+            return self._peak_upload_concurrency
 
     @property
     def upload_media_ids(self) -> List[str]:

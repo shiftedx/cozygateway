@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -9,6 +10,7 @@ from websockets.frames import Close
 
 from cozygateway.attach_client_v1 import (
     AttachV1Client, AttachV1ClientConfig, HELLO_CAPABILITIES, HELLO_VERSION,
+    _HashingReader,
 )
 from cozygateway.attach_client import ToolChip
 from cozygateway.attach_spool import AttachSpool
@@ -61,6 +63,13 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             on_turn=self.turns.append, connect_factory=connect_factory,
             on_clarify=self.clarifications.append,
         ))
+
+    def _movie(self, payload):
+        """A real file on disk: the upload path streams from it rather than a buffer."""
+        path = os.path.join(self.tmp.name, "movie.mp4")
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        return path
 
     async def asyncTearDown(self):
         await self.client.close()
@@ -444,8 +453,9 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             captured.append(request)
             return FakeHTTPResponse()
 
+        movie = self._movie(b"video")
         with patch("cozygateway.attach_client_v1.urlopen", side_effect=open_request):
-            self.client._upload_media_sync("m", "/tmp/movie.mp4", "video/mp4", "a" * 64, b"video", None)
+            self.client._upload_media_sync("m", movie, "video/mp4", 5, "a" * 64, None)
 
         self.assertEqual(captured[0].get_header("User-agent"), "CozyGateway-Attach/1.0")
 
@@ -468,7 +478,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("cozygateway.attach_client_v1.urlopen", side_effect=open_request):
             self.client._upload_media_sync(
-                "m", "/tmp/movie.mp4", "video/mp4", "a" * 64, b"video", None
+                "m", self._movie(b"video"), "video/mp4", 5, "a" * 64, None
             )
             self.client._delivery_receipt_sync("delivery", 0.1)
 
@@ -506,22 +516,18 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         delete.assert_called_once_with("cleanup-after-crash")
         self.assertEqual(self.spool.pending_media_cleanups(), [])
 
-    async def test_media_upload_reads_at_most_one_byte_past_the_protocol_cap(self):
-        __import__("mimetypes").guess_type("/tmp/report.png")
-        reads = []
+    def test_media_upload_streams_no_more_than_the_declared_byte_count(self):
+        """A file that grew after it was measured cannot outrun its Content-Length.
 
-        class File:
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
-            def read(self, limit):
-                reads.append(limit)
-                return b"x" * limit
-
-        with patch("cozygateway.attach_client_v1.os.stat", return_value=type("Stat", (), {"st_size": 1})()), \
-             patch("builtins.open", return_value=File()):
-            with self.assertRaisesRegex(ValueError, "size cap"):
-                await self.client.upload_media("m", "/private/report.png", "image")
-        self.assertEqual(reads, [8 * 1024 * 1024 + 1])
+        The declared length is what the cap was checked against and what frames the
+        request, so the body reader stops there however many bytes are on disk.
+        """
+        movie = self._movie(b"x" * 4096)
+        with open(movie, "rb") as handle:
+            body = _HashingReader(handle, 5)
+            streamed = b"".join(iter(lambda: body.read(4096), b""))
+        self.assertEqual(streamed, b"xxxxx")
+        self.assertEqual(body.hexdigest(), hashlib.sha256(b"xxxxx").hexdigest())
 
     async def test_media_download_defaults_to_the_gateway_audio_video_cap(self):
         with patch.object(self.client, "_download_media_sync", return_value=(b"movie", "movie.mp4", "video/mp4")) as download:

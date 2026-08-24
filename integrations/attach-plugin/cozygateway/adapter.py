@@ -55,6 +55,7 @@ from .attach_client_v1 import (
     AttachV1Client,
     AttachV1ClientConfig,
     _is_location,
+    _media_byte_limit,
     normalize_location_purpose,
 )
 from .attach_spool import AttachSpool
@@ -224,6 +225,20 @@ MEDIA_RETRY_AFTER_CAP_SECONDS = 2.0
 # this occurrence, so a replay reuses the id instead of uploading a second copy.
 MEDIA_ALREADY_UPLOADED_STATES = frozenset({"uploaded", "journaled", "projected", "displayed"})
 
+# Attachments of one reply upload in parallel, because each one spends nearly all of
+# its time waiting on a socket. Three at a time is where a multi-attachment reply
+# stops being the slowest thing in the turn without turning one person's send into a
+# burst the gateway has to absorb.
+MEDIA_UPLOAD_CONCURRENCY = 3
+
+# The per-file caps are the gateway's own (contract/ext-bots-v1.md, "Canonical media
+# allowlist"), read through the client so the two cannot drift. The contract sets no
+# aggregate, so this is the plugin's guard on one occurrence: 16 attachments at the
+# video cap would be 640 MiB moved for a single message.
+# ponytail: a fixed number, not a policy engine. If the gateway ever publishes an
+# aggregate cap, delete this constant and read that one.
+MEDIA_AGGREGATE_MAX_BYTES = 64 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class MediaDestination:
@@ -342,6 +357,17 @@ def _media_failure(
     }
 
 
+@dataclass
+class _PreparedMedia:
+    """One attachment after probing: either a refusal, or bytes ready for the wire."""
+
+    index: int
+    path: str
+    descriptor: Optional[MediaDescriptor] = None
+    media_id: Optional[str] = None
+    failure: Optional[Dict[str, Any]] = None
+
+
 class MediaUploadService:
     """Local paths to gateway media ids: one implementation, four callers.
 
@@ -421,12 +447,36 @@ class MediaUploadService:
                     ))
                 )
             return batch
-        for index, path in enumerate(paths):
-            ok, record = await self._one(index, path)
+        limiter = asyncio.Semaphore(MEDIA_UPLOAD_CONCURRENCY)
+
+        async def prepare(index: int, path: str) -> "_PreparedMedia":
+            async with limiter:
+                return await self._prepare(index, path)
+
+        # Probe every path first. The sizes decide whether the occurrence is sendable at
+        # all, and no byte goes on the wire until they do (spec finding 8).
+        prepared = list(await asyncio.gather(
+            *(prepare(index, path) for index, path in enumerate(paths))
+        ))
+        refusal = self._aggregate_refusal(prepared)
+        if refusal is not None:
+            batch.failed.extend(refusal)
+            return batch
+
+        async def send(item: "_PreparedMedia") -> Tuple[bool, Dict[str, Any]]:
+            if item.failure is not None:
+                return False, item.failure
+            async with limiter:
+                return await self._send(item)
+
+        # gather preserves argument order, so a media id keeps the slot its index gave it
+        # however the uploads interleave.
+        for ok, record in await asyncio.gather(*(send(item) for item in prepared)):
             (batch.uploaded if ok else batch.failed).append(record)
         return batch
 
-    async def _one(self, index: int, path: str) -> Tuple[bool, Dict[str, Any]]:
+    async def _prepare(self, index: int, path: str) -> "_PreparedMedia":
+        """Probe one path and answer every question that does not need the network."""
         name = os.path.basename(path)[:128] or "attachment"
         try:
             descriptor = await asyncio.to_thread(
@@ -434,26 +484,87 @@ class MediaUploadService:
             )
         except MediaProbeError as err:
             logger.warning("attach: %s is not ready to upload: %s", name, err)
-            return False, _media_failure(path, None, err.code, "%s: %s" % (name, err.code))
+            return _PreparedMedia(index, path, failure=_media_failure(
+                path, None, err.code, "%s: %s" % (name, err.code)))
         except Exception as exc:  # noqa: BLE001 - a probe fault is that file's failure
-            return False, _media_failure(path, None, None, _proactive_media_error(path, exc))
+            return _PreparedMedia(index, path, failure=_media_failure(
+                path, None, None, _proactive_media_error(path, exc)))
 
         media_id = _proactive_media_id(self._delivery_id, index, descriptor.sha256)
         reason = _policy_block_reason(descriptor)
         if reason is not None:
             # No network request: the bytes already answered the question (finding 8).
-            self._mark(
-                media_id, "blocked", detail=reason,
-                sha256=descriptor.sha256, path_meta=descriptor.filename,
-            )
-            logger.warning("attach: refusing %s (%s) locally: %s", name, descriptor.mime, reason)
-            return False, _media_failure(
-                path, descriptor, "unsupported_media_type",
-                "%s (%s, family=%s): unsupported_media_type" % (name, descriptor.mime, descriptor.family),
-                media_id,
-            )
+            return _PreparedMedia(index, path, descriptor, failure=self._blocked(
+                media_id, path, descriptor, "unsupported_media_type",
+                "%s (%s, family=%s): unsupported_media_type"
+                % (name, descriptor.mime, descriptor.family),
+                reason,
+            ))
 
-        media_id = self._claim(index, descriptor, media_id)
+        limit = _media_byte_limit(descriptor.mime)
+        if descriptor.size_bytes > limit:
+            detail = "%s is %d bytes, over the %d byte cap for %s" % (
+                name, descriptor.size_bytes, limit, descriptor.mime,
+            )
+            return _PreparedMedia(index, path, descriptor, failure=self._blocked(
+                media_id, path, descriptor, "too_large",
+                "%s: too_large (%s)" % (name, detail), detail,
+            ))
+        return _PreparedMedia(index, path, descriptor, media_id)
+
+    def _aggregate_refusal(self, prepared: List["_PreparedMedia"]) -> Optional[List[Dict[str, Any]]]:
+        """Refuse the whole occurrence when its attachments together are too much.
+
+        Individually legal files can still add up to more than one message should move,
+        and half a message is not a useful outcome, so this is all or nothing.
+        """
+        total = sum(
+            item.descriptor.size_bytes for item in prepared
+            if item.failure is None and item.descriptor is not None
+        )
+        if total <= MEDIA_AGGREGATE_MAX_BYTES:
+            return None
+        detail = "%d attachments total %d bytes, over the %d byte cap for one message" % (
+            len(prepared), total, MEDIA_AGGREGATE_MAX_BYTES,
+        )
+        logger.warning("attach: refusing delivery %s locally: %s", self._delivery_id, detail)
+        failures = []
+        for item in prepared:
+            if item.failure is not None:
+                failures.append(item.failure)
+                continue
+            name = os.path.basename(item.path)[:128] or "attachment"
+            failures.append(self._blocked(
+                item.media_id or "", item.path, item.descriptor, "too_large",
+                "%s: too_large (%s)" % (name, detail), detail,
+            ))
+        return failures
+
+    def _blocked(
+        self,
+        media_id: str,
+        path: str,
+        descriptor: Optional[MediaDescriptor],
+        status: str,
+        error: str,
+        detail: str,
+    ) -> Dict[str, Any]:
+        """One attachment refused before any network request, recorded durably."""
+        if media_id:
+            self._mark(
+                media_id, "blocked", detail=detail,
+                sha256=descriptor.sha256 if descriptor is not None else None,
+                path_meta=descriptor.filename if descriptor is not None else None,
+            )
+        logger.warning("attach: refusing %s locally: %s", os.path.basename(path)[:128], detail)
+        return _media_failure(path, descriptor, status, error, media_id or None)
+
+    async def _send(self, item: "_PreparedMedia") -> Tuple[bool, Dict[str, Any]]:
+        """Claim the slot, then put one prepared file on the wire."""
+        path, descriptor = item.path, item.descriptor
+        assert descriptor is not None and item.media_id is not None
+        name = os.path.basename(path)[:128] or "attachment"
+        media_id = self._claim(item.index, descriptor, item.media_id)
         if self._row_state(media_id) in MEDIA_ALREADY_UPLOADED_STATES:
             return True, self._accepted(media_id, path, descriptor, reused=True)
         self._mark(
@@ -467,7 +578,8 @@ class MediaUploadService:
         for attempt in (0, 1):
             try:
                 await self._client.upload_media(
-                    media_id, descriptor.path, descriptor.family, mime=descriptor.mime,
+                    media_id, descriptor.path, descriptor.family,
+                    mime=descriptor.mime, sha256=descriptor.sha256,
                 )
             except HTTPError as exc:
                 if exc.code == 429 and attempt == 0:

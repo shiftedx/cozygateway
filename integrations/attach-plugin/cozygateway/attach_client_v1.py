@@ -439,23 +439,29 @@ class AttachV1Client:
         family: str,
         expires_at: Optional[int] = None,
         mime: Optional[str] = None,
+        sha256: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Upload bytes through the authenticated HTTP side channel; WS carries only metadata.
 
         ``mime`` is the type the bytes were PROVEN to be (see media_descriptor.probe).
         Callers that have not probed fall back to the extension guess, which is what the
         gateway allowlist and the client renderer then have to disagree about.
+
+        ``sha256`` is the digest the probe already computed. Passing it means the file is
+        read once for the whole send instead of twice, and the digest of the bytes that
+        actually go on the wire is checked against it, so a file rewritten between the
+        probe and the upload fails here rather than becoming a wrong attachment. Nothing
+        is buffered: the body streams from disk on a worker thread, which is also what
+        keeps a 40 MiB video off the event loop that carries heartbeats and tool events.
         """
         mime = mime or mimetypes.guess_type(path)[0] or "application/octet-stream"
         limit = _media_byte_limit(mime)
-        if os.stat(path).st_size > limit:
+        size_bytes = os.stat(path).st_size
+        if size_bytes > limit:
             raise ValueError("media exceeds size cap")
-        with open(path, "rb") as handle:
-            data = handle.read(limit + 1)
-        if len(data) > limit:
-            raise ValueError("media exceeds size cap")
-        digest = hashlib.sha256(data).hexdigest()
-        descriptor = await asyncio.to_thread(self._upload_media_sync, media_id, path, mime, digest, data, expires_at)
+        descriptor = await asyncio.to_thread(
+            self._upload_media_sync, media_id, path, mime, size_bytes, sha256, expires_at,
+        )
         await self._queue_event({"kind": "media", "media": descriptor})
         return descriptor
 
@@ -548,7 +554,15 @@ class AttachV1Client:
                 filename = unquote(disposition.split(marker, 1)[1].split(";", 1)[0].strip()) or filename
             return data, filename, mime
 
-    def _upload_media_sync(self, media_id: str, path: str, mime: str, digest: str, data: bytes, expires_at: Optional[int]) -> Dict[str, Any]:
+    def _upload_media_sync(
+        self,
+        media_id: str,
+        path: str,
+        mime: str,
+        size_bytes: int,
+        digest: Optional[str],
+        expires_at: Optional[int],
+    ) -> Dict[str, Any]:
         parsed = urlparse(self._config.gateway_url)
         origin = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}"
         headers = {
@@ -559,15 +573,28 @@ class AttachV1Client:
             # non-browser protocol client explicitly so the authenticated media
             # side channel follows the same public route as the WebSocket.
             "User-Agent": "CozyGateway-Attach/1.0",
-            "X-Attach-Sha256": digest,
             "X-Attach-Filename": os.path.basename(path),
         }
         if expires_at is not None:
             headers["X-Attach-Expires-At"] = str(expires_at)
-        request = Request(f"{origin}/attach/v1/media/{quote(media_id, safe='')}", data=data, headers=headers, method="POST")
-        context = self._ssl_context() if origin.startswith("https://") else None
-        with urlopen(request, context=context, timeout=60) as response:
-            return dict(json.loads(response.read())["media"])
+        with open(path, "rb") as handle:
+            if digest is None:
+                digest = _file_digest(handle)
+            headers["X-Attach-Sha256"] = digest
+            headers["Content-Length"] = str(size_bytes)
+            body = _HashingReader(handle, size_bytes)
+            request = Request(
+                f"{origin}/attach/v1/media/{quote(media_id, safe='')}",
+                data=body, headers=headers, method="POST",
+            )
+            context = self._ssl_context() if origin.startswith("https://") else None
+            with urlopen(request, context=context, timeout=60) as response:
+                descriptor = dict(json.loads(response.read())["media"])
+        if body.complete and body.hexdigest() != digest:
+            # The bytes on the wire are not the bytes that were probed, so the delivery is
+            # abandoned before it is journaled and the caller rolls the upload back.
+            raise ValueError("media changed on disk during upload")
+        return descriptor
 
     def _delete_media_sync(self, media_id: str) -> None:
         parsed = urlparse(self._config.gateway_url)
@@ -901,6 +928,56 @@ def normalize_location_purpose(value: Any) -> Optional[str]:
         return None
     purpose = " ".join(value.strip().split())
     return purpose if purpose and len(purpose.encode("utf-8")) <= 160 else None
+
+
+class _HashingReader:
+    """A read-only view of an open file that digests what it hands out.
+
+    http.client pulls the request body through ``read(n)``, so this is where the bytes
+    that reach the socket can be hashed without a second pass over the file. It also
+    never hands out more than ``limit``: the request declared that many bytes, and a
+    file that grew since it was measured must not desynchronize the framing or slip
+    past the size cap that number came from.
+    """
+
+    # http.client asks for 8 KiB at a time. Answering with more is allowed and is what
+    # keeps a 32 MiB attachment from becoming four thousand read/send round trips.
+    BLOCK = 1024 * 1024
+
+    def __init__(self, handle: Any, limit: int) -> None:
+        self._handle = handle
+        self._remaining = limit
+        self._digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        want = self._remaining if size is None or size < 0 else min(
+            max(size, self.BLOCK), self._remaining,
+        )
+        chunk = self._handle.read(want)
+        self._remaining -= len(chunk)
+        self._digest.update(chunk)
+        return chunk
+
+    @property
+    def complete(self) -> bool:
+        """Whether the whole declared body was handed out. A short read means the
+        transport never sent it, and the response already says why."""
+        return self._remaining <= 0
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+def _file_digest(handle: Any) -> str:
+    """sha256 of an open file, leaving it rewound. Only for callers that did not probe."""
+
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    handle.seek(0)
+    return digest.hexdigest()
 
 
 def _media_byte_limit(mime: str) -> int:
