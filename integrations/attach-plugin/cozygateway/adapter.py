@@ -36,9 +36,9 @@ import random
 import re
 import threading
 import time
-import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from urllib.error import HTTPError
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -58,6 +58,12 @@ from .attach_client_v1 import (
     normalize_location_purpose,
 )
 from .attach_spool import AttachSpool
+from .media_descriptor import (
+    MEDIA_COMPATIBILITY_POLICY,
+    MediaDescriptor,
+    MediaProbeError,
+    probe as probe_media,
+)
 from .text_blocks import IncrementalNormalizer, normalize_text_to_blocks
 from .tool_chips import ToolChipTracker
 from .memory import MemoryConflict, MemoryError, MemoryManager
@@ -196,6 +202,337 @@ def hermes_gateway_commands() -> List[Dict[str, str]]:
         logger.debug("attach: Hermes skill commands unavailable", exc_info=True)
 
     return catalog[:512]
+
+
+# ---------------------------------------------------------------------------
+# The one media upload path
+# ---------------------------------------------------------------------------
+
+# A file the agent generated moments ago may still be flushing when its path is
+# named, so the probe samples its size twice this far apart before trusting the
+# bytes (spec finding 8). The probe runs on a worker thread, so the wait never
+# stalls the event loop.
+MEDIA_STABILITY_WAIT_SECONDS = _env_float("COZYGATEWAY_MEDIA_STABILITY_WAIT", 0.1)
+
+# 429 is the one upload status worth re-attempting inside a single send: the
+# gateway said exactly how long to wait and the bytes are already in hand. 5xx
+# and dropped sockets stay failures here, because the durable delivery journal
+# already owns those retries and a second one would only double the latency.
+MEDIA_RETRY_AFTER_CAP_SECONDS = 2.0
+
+# Lifecycle states that prove these exact bytes already reached the gateway for
+# this occurrence, so a replay reuses the id instead of uploading a second copy.
+MEDIA_ALREADY_UPLOADED_STATES = frozenset({"uploaded", "journaled", "projected", "displayed"})
+
+
+@dataclass(frozen=True)
+class MediaDestination:
+    """Where one delivery is going, in the single shape every path agrees on.
+
+    Spec finding 6: response delivery, standalone media, ``send_message`` and cron
+    must not each infer the target differently. ``key`` is what content idempotency
+    is scoped by, so the same bytes going somewhere else is a separate claim.
+    """
+
+    kind: str
+    thread_id: str = ""
+
+    @property
+    def key(self) -> str:
+        return self.kind if self.kind == "canonical_home" else "%s:%s" % (self.kind, self.thread_id)
+
+
+@dataclass
+class MediaBatch:
+    """What one delivery's attachments actually became. Never a delivery claim."""
+
+    uploaded: List[Dict[str, Any]] = field(default_factory=list)
+    failed: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def media_ids(self) -> List[str]:
+        return [entry["mediaId"] for entry in self.uploaded]
+
+    @property
+    def error_lines(self) -> List[str]:
+        """The bounded human-readable failure lines the durable result ABI carries."""
+        return [str(entry["error"]) for entry in self.failed]
+
+    def failure_sentence(self) -> str:
+        """One plain sentence naming what the person will NOT see (spec finding 2)."""
+        names = [str(entry["path"]) for entry in self.failed]
+        if not names:
+            return ""
+        if len(names) == 1:
+            listed = names[0]
+        elif len(names) == 2:
+            listed = " and ".join(names)
+        else:
+            listed = ", ".join(names[:-1]) + ", and " + names[-1]
+        return "I could not attach %s." % listed
+
+    def partial_result(self, message_id: Optional[str]) -> Dict[str, Any]:
+        return {
+            "state": "partial",
+            "messageId": message_id,
+            "uploaded": [dict(entry) for entry in self.uploaded],
+            "failed": [dict(entry) for entry in self.failed],
+        }
+
+
+def _client_supports(client: Any, capability: str) -> bool:
+    """Whether the gateway advertised ``capability`` on this connection.
+
+    An empty/absent set means the client has not handshaken (or predates capability
+    advertisement); that is not evidence of refusal, so it reads as permitted.
+    """
+    capabilities = getattr(client, "_capabilities", None)
+    return capability in capabilities if capabilities else True
+
+
+def _policy_block_reason(descriptor: MediaDescriptor) -> Optional[str]:
+    """Refuse locally only what the bytes PROVE the client cannot render.
+
+    Spec finding 9 wants an explicit compatibility policy; findings 1 and 8 want the
+    refusal to happen before a network request. But an inconclusive probe is not
+    evidence: when the bytes do not identify a type and the extension claims one the
+    policy supports, this fails OPEN and lets the upload run. The gateway verifies
+    magic numbers as the backstop and answers 415, which is a truthful rejection from
+    the authority rather than a guess from a sniffer.
+    """
+    if descriptor.compatibility != "unsupported":
+        return None
+    if descriptor.detected_mime == "application/octet-stream":
+        rule = MEDIA_COMPATIBILITY_POLICY.get(descriptor.declared_mime)
+        if rule is not None and rule["status"] == "supported":
+            return None
+    return descriptor.incompatibility_reason or (
+        "%s is not an allowed attachment type." % descriptor.mime
+    )
+
+
+def _retry_after_seconds(exc: HTTPError) -> float:
+    try:
+        value = float((exc.headers or {}).get("Retry-After", "") or 0)
+    except (AttributeError, TypeError, ValueError):
+        value = 0.0
+    return min(max(value, 0.05), MEDIA_RETRY_AFTER_CAP_SECONDS)
+
+
+def _media_failure(
+    path: str,
+    descriptor: Optional[MediaDescriptor],
+    status: Optional[Any],
+    error: str,
+    media_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One refused attachment, in the shape a partial result reports (finding 2).
+
+    ``path`` is the basename only: a failure line travels into agent output and logs,
+    and the directory a file sits in is nobody else's business.
+    """
+    return {
+        "path": os.path.basename(path)[:128] or "attachment",
+        "mime": descriptor.mime if descriptor is not None else (
+            mimetypes.guess_type(path)[0] or "application/octet-stream"
+        ),
+        "status": status,
+        "error": error,
+        "mediaId": media_id,
+    }
+
+
+class MediaUploadService:
+    """Local paths to gateway media ids: one implementation, four callers.
+
+    The active-turn terminal send, the proactive tool send, the standalone/resend
+    surfaces and the cron lane all call :meth:`upload`, so probing, the compatibility
+    gate, content idempotency, the exact upload MIME and the durable lifecycle marks
+    happen once and identically (spec P1, "unified delivery path").
+
+    Nothing here claims delivery. The batch says what the gateway accepted and what it
+    refused; the caller journals. A row only moves past ``journaled`` when a receipt
+    says so, so "uploaded" and "journaled" can never be read as "the person saw it".
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        delivery_id: str,
+        destination: MediaDestination,
+        spool: Optional[AttachSpool] = None,
+    ) -> None:
+        self._client = client
+        self._delivery_id = delivery_id
+        self._destination = destination
+        self._spool = spool if spool is not None else getattr(client, "_spool", None)
+
+    # -- durable lifecycle ---------------------------------------------------
+    def _mark(self, media_id: str, state: str, **fields: Any) -> str:
+        """Record one lifecycle transition. A spool-less caller still delivers."""
+        spool = self._spool
+        if spool is None:
+            return "unavailable"
+        try:
+            return spool.media_mark(self._delivery_id, media_id, state, **fields)
+        except Exception:  # noqa: BLE001 - observability must never fail a delivery
+            logger.debug("attach: media lifecycle mark failed", exc_info=True)
+            return "unavailable"
+
+    def _row_state(self, media_id: str) -> Optional[str]:
+        spool = self._spool
+        if spool is None:
+            return None
+        try:
+            for row in spool.media_rows(self._delivery_id):
+                if row["mediaId"] == media_id:
+                    return str(row["state"])
+        except Exception:  # noqa: BLE001 - an unreadable row only costs a re-upload
+            logger.debug("attach: media lifecycle read failed", exc_info=True)
+        return None
+
+    def mark_journaled(self, media_ids: List[str]) -> None:
+        """The commit carrying these ids was accepted by the durable event journal."""
+        for media_id in media_ids:
+            self._mark(media_id, "journaled")
+
+    def mark_blocked(self, media_ids: List[str], detail: str) -> None:
+        """The occurrence was abandoned before it was journaled (atomic rollback)."""
+        for media_id in media_ids:
+            self._mark(media_id, "blocked", detail=detail[:512])
+
+    # -- upload --------------------------------------------------------------
+    async def upload(self, paths: List[str]) -> MediaBatch:
+        batch = MediaBatch()
+        if not paths:
+            return batch
+        if not _client_supports(self._client, "media"):
+            # The one cheap authorization check this API offers: the hello ack says
+            # whether this connection may carry media at all, and it costs nothing.
+            # ponytail: attach-v1 has no destination-authorization endpoint (only
+            # POST/GET/DELETE media and GET deliveries), so "may this target receive
+            # this?" is still only answered when the delivery is journaled. Inventing
+            # a preflight route belongs to the gateway lane, not here.
+            for path in paths:
+                batch.failed.append(
+                    _media_failure(path, None, "media_unavailable", "%s: media_unavailable" % (
+                        os.path.basename(path)[:128] or "attachment",
+                    ))
+                )
+            return batch
+        for index, path in enumerate(paths):
+            ok, record = await self._one(index, path)
+            (batch.uploaded if ok else batch.failed).append(record)
+        return batch
+
+    async def _one(self, index: int, path: str) -> Tuple[bool, Dict[str, Any]]:
+        name = os.path.basename(path)[:128] or "attachment"
+        try:
+            descriptor = await asyncio.to_thread(
+                probe_media, path, stability_wait_s=MEDIA_STABILITY_WAIT_SECONDS
+            )
+        except MediaProbeError as err:
+            logger.warning("attach: %s is not ready to upload: %s", name, err)
+            return False, _media_failure(path, None, err.code, "%s: %s" % (name, err.code))
+        except Exception as exc:  # noqa: BLE001 - a probe fault is that file's failure
+            return False, _media_failure(path, None, None, _proactive_media_error(path, exc))
+
+        media_id = _proactive_media_id(self._delivery_id, index, descriptor.sha256)
+        reason = _policy_block_reason(descriptor)
+        if reason is not None:
+            # No network request: the bytes already answered the question (finding 8).
+            self._mark(
+                media_id, "blocked", detail=reason,
+                sha256=descriptor.sha256, path_meta=descriptor.filename,
+            )
+            logger.warning("attach: refusing %s (%s) locally: %s", name, descriptor.mime, reason)
+            return False, _media_failure(
+                path, descriptor, "unsupported_media_type",
+                "%s (%s, family=%s): unsupported_media_type" % (name, descriptor.mime, descriptor.family),
+                media_id,
+            )
+
+        media_id = self._claim(index, descriptor, media_id)
+        if self._row_state(media_id) in MEDIA_ALREADY_UPLOADED_STATES:
+            return True, self._accepted(media_id, path, descriptor, reused=True)
+        self._mark(
+            media_id, "prepared", sha256=descriptor.sha256, path_meta=descriptor.filename,
+        )
+        if descriptor.mime_mismatch:
+            logger.info(
+                "attach: %s is named %s but its bytes are %s; uploading as the bytes",
+                name, descriptor.declared_mime, descriptor.detected_mime,
+            )
+        for attempt in (0, 1):
+            try:
+                await self._client.upload_media(
+                    media_id, descriptor.path, descriptor.family, mime=descriptor.mime,
+                )
+            except HTTPError as exc:
+                if exc.code == 429 and attempt == 0:
+                    await asyncio.sleep(_retry_after_seconds(exc))
+                    continue
+                return False, self._refused(media_id, path, descriptor, exc, exc.code)
+            except Exception as exc:  # noqa: BLE001 - one file, not the whole send
+                return False, self._refused(media_id, path, descriptor, exc, None)
+            self._mark(media_id, "uploaded")
+            return True, self._accepted(media_id, path, descriptor, reused=False)
+        # Unreachable: the loop above either returns or retries exactly once.
+        return False, _media_failure(path, descriptor, None, "%s: upload_failed" % name, media_id)
+
+    def _claim(self, index: int, descriptor: MediaDescriptor, media_id: str) -> str:
+        """Persisted idempotency: (occurrence slot, content hash, destination).
+
+        The slot index is part of the occurrence key on purpose. Identity is the bytes,
+        so a rewritten file is a genuinely new claim and a retry of the same send is not;
+        but two attachments that happen to hold identical bytes in ONE message are two
+        attachments, and collapsing them would silently drop one from the person's view.
+        """
+        spool = self._spool
+        if spool is None:
+            return media_id
+        try:
+            claim = spool.media_dedupe_claim(
+                "%s#%d" % (self._delivery_id, index),
+                descriptor.sha256,
+                self._destination.key,
+                media_id,
+            )
+        except Exception:  # noqa: BLE001 - a failed claim costs one duplicate upload
+            logger.debug("attach: media dedupe claim failed", exc_info=True)
+            return media_id
+        return str(claim.get("media_id") or media_id)
+
+    def _accepted(
+        self, media_id: str, path: str, descriptor: MediaDescriptor, *, reused: bool
+    ) -> Dict[str, Any]:
+        return {
+            "mediaId": media_id,
+            "path": descriptor.filename,
+            "mime": descriptor.mime,
+            "family": descriptor.family,
+            "bytes": descriptor.size_bytes,
+            "sha256": descriptor.sha256,
+            "reused": reused,
+            "source": path,
+        }
+
+    def _refused(
+        self,
+        media_id: str,
+        path: str,
+        descriptor: MediaDescriptor,
+        exc: Exception,
+        status: Optional[int],
+    ) -> Dict[str, Any]:
+        detail = _proactive_media_error(descriptor.path, exc, descriptor)
+        self._mark(media_id, "upload_failed", detail=detail)
+        logger.warning(
+            "attach: upload refused for delivery %s media %s: %s",
+            self._delivery_id, media_id, detail,
+        )
+        return _media_failure(path, descriptor, status, detail, media_id)
 
 
 class AttachAdapter:
@@ -1162,10 +1499,14 @@ class AttachAdapter:
             )
             if frame is None:
                 return SendResult(success=False, error="scheduled delivery unavailable")
-            receipt = await _proactive_projection(client, delivery_id, 2.0)
-            if receipt is not None and receipt.get("state") == "projected":
+            # Journaled and durable. Projection is asynchronous (spec finding 4): a
+            # receipt arriving later upgrades the durable row, and ``delivery_state``
+            # answers "did it land". Blocking the caller here only ever taught a slow
+            # projection to look like a failure.
+            receipt = _durable_receipt(self._spool, delivery_id)
+            if receipt == "projected":
                 return SendResult(success=True, message_id=message_id)
-            if receipt is not None and receipt.get("state") == "blocked":
+            if receipt == "blocked":
                 return SendResult(success=False, error="scheduled delivery blocked")
             return SendResult(
                 success=False,
@@ -1177,10 +1518,11 @@ class AttachAdapter:
             final_text = content if (content and content.strip()) else self._turn_text.get(
                 turn_id, ""
             )
-            blocks = self._normalize(turn_id, final_text)
             chips = self._chips(turn_id)
             media_ids: List[str] = []
             uploaded_paths: List[str] = []
+            media_result: Optional[Dict[str, Any]] = None
+            service: Optional[MediaUploadService] = None
             raw_media: List[Any] = list(self._turn_media.get(turn_id, []))
             if isinstance(metadata, dict):
                 metadata_media = metadata.get("media_files") or metadata.get("media") or []
@@ -1188,17 +1530,30 @@ class AttachAdapter:
                     raw_media.extend(metadata_media)
             if isinstance(client, AttachV1Client):
                 paths = list(dict.fromkeys(path for path in raw_media if isinstance(path, str) and path))
-                for raw_path in paths[:16]:
-                    media_id = uuid.uuid4().hex
-                    try:
-                        await client.upload_media(media_id, raw_path, self._media_family(raw_path))
-                        media_ids.append(media_id)
-                        uploaded_paths.append(raw_path)
-                    except Exception as exc:  # noqa: BLE001 - text and other media still commit
+                service = MediaUploadService(
+                    client,
+                    delivery_id="turn:" + turn_id,
+                    destination=MediaDestination("active_turn", chat_id),
+                    spool=self._spool,
+                )
+                batch = await service.upload(paths[:16])
+                media_ids = batch.media_ids
+                uploaded_paths = [str(entry["source"]) for entry in batch.uploaded]
+                if batch.failed:
+                    # The text still commits, but it says so. Committing a reply that
+                    # silently lost its central artifact is the failure mode spec
+                    # finding 2 was written about.
+                    for line in batch.error_lines:
                         logger.warning(
                             "attach: one reply media upload failed (%s); committing the remaining reply",
-                            _proactive_media_error(raw_path, exc),
+                            line,
                         )
+                    sentence = batch.failure_sentence()
+                    final_text = "\n\n".join(
+                        part for part in (final_text.strip(), sentence) if part
+                    )
+                    media_result = batch.partial_result(turn_id)
+            blocks = self._normalize(turn_id, final_text)
             had_content = self._content_seen.get(turn_id, False)
             if blocks or chips or media_ids:
                 # Full replace with the final view, then seal it.
@@ -1218,6 +1573,8 @@ class AttachAdapter:
                 # No content ever materialized for this turn.
                 await client.send_failed(chat_id, turn_id, "empty reply")
                 return SendResult(success=True)
+            if service is not None and media_ids:
+                service.mark_journaled(media_ids)
             for uploaded_path in uploaded_paths:
                 self._remember_absorbed_media(uploaded_path)
         except (AttachAuthError, AttachSupersededError) as exc:
@@ -1227,7 +1584,10 @@ class AttachAdapter:
             return SendResult(success=False, error=str(exc))
         finally:
             self._cleanup_turn(chat_id, turn_id)
-        return SendResult(success=True, message_id=turn_id)
+        result = SendResult(success=True, message_id=turn_id)
+        if media_result is not None:
+            _attach_media_result(result, media_result)
+        return result
 
     async def send_or_update_status(
         self,
@@ -1258,19 +1618,21 @@ class AttachAdapter:
         delivery_id, message_id = _proactive_identity(delivery_key)
         if len(media_files) > 16:
             return _proactive_failure("media_count_exceeded", delivery_id, message_id)
-        media_ids: List[str] = []
-        media_errors: List[str] = []
-        for index, path in enumerate(media_files[:16]):
-            media_id = _proactive_media_id(delivery_id, index)
-            try:
-                await client.upload_media(media_id, path, self._media_family(path))
-                media_ids.append(media_id)
-            except Exception as exc:  # noqa: BLE001 - the atomic policy reports every failure
-                media_errors.append(_proactive_media_error(path, exc))
-        if media_errors:
+        service = MediaUploadService(
+            client,
+            delivery_id=delivery_id,
+            destination=MediaDestination(
+                "canonical_home" if canonical_home else "thread", chat_id
+            ),
+            spool=self._spool,
+        )
+        batch = await service.upload(list(media_files[:16]))
+        media_ids = batch.media_ids
+        if batch.failed:
             await client.rollback_uploaded_media(media_ids)
+            service.mark_blocked(media_ids, "atomic occurrence abandoned before journal")
             return _proactive_failure(
-                "media_upload_failed", delivery_id, message_id, media_errors
+                "media_upload_failed", delivery_id, message_id, batch.error_lines
             )
         blocks = normalize_text_to_blocks(message)
         if not blocks and not media_ids:
@@ -1285,6 +1647,7 @@ class AttachAdapter:
         )
         if frame is None:
             return _proactive_failure("scheduled_delivery_unavailable", delivery_id, message_id)
+        service.mark_journaled(media_ids)
         result: Dict[str, Any] = {
             "state": "journaled",
             "accepted_pending": True,
@@ -1292,8 +1655,13 @@ class AttachAdapter:
             "messageId": message_id,
             "eventId": frame["eventId"],
         }
-        receipt = await _proactive_projection(client, delivery_id, 2.0)
-        return _apply_projection(result, receipt)
+        # Projection is asynchronous and durable (spec finding 4). The delivery is
+        # accepted and pending; the receipts machinery upgrades the rows when the
+        # gateway answers, and a timeout is never reinterpreted as a failure.
+        if _durable_receipt(self._spool, delivery_id) == "projected":
+            result["state"] = "projected"
+            result["accepted_pending"] = False
+        return result
 
     async def _safe_failed(self, chat_id: str, turn_id: str, message: str) -> None:
         """Emit a ``failed`` frame, swallowing any error (best-effort teardown)."""
@@ -1372,18 +1740,27 @@ class AttachAdapter:
                 canonical_home=canonical_home,
             )
         state = result.get("state")
-        if state == "projected":
+        media_errors = result.get("media_errors") or []
+        if state in {"projected", "displayed"}:
             self._remember_absorbed_media(path)
             return SendResult(success=True, message_id=result.get("messageId"))
         if state == "suppressed":
             return SendResult(success=True)
+        if result.get("accepted_pending") and not media_errors:
+            # Durably journaled with every attachment uploaded. This is Hermes' own
+            # media surface, where a False result makes it emit "native ... send
+            # unavailable" and try again; that would fire on every healthy delivery
+            # now that projection is asynchronous. The truthful lifecycle lives in the
+            # media_lifecycle rows and delivery_state(), which stay at "journaled"
+            # until a receipt says otherwise: this is an acceptance, not a receipt.
+            self._remember_absorbed_media(path)
+            return SendResult(success=True, message_id=result.get("messageId"))
         if state == "blocked":
             error = "scheduled media delivery blocked"
         elif state == "failed":
             error = str(result.get("error") or "scheduled media delivery failed")
         else:
             error = "scheduled media delivery journaled; projection not yet confirmed"
-        media_errors = result.get("media_errors") or []
         if media_errors:
             detail = "; ".join(str(entry) for entry in media_errors)[:512]
             error = f"{error} ({detail})"
@@ -2118,7 +2495,7 @@ def _proactive_spool_path(pconfig: Any, spool_path: Optional[str]) -> str:
     )
 
 
-def _proactive_media_id(delivery_id: str, index: int) -> str:
+def _proactive_media_id(delivery_id: str, index: int, sha256: Optional[str] = None) -> str:
     """Mint a scheduled attachment id in the ONE shape the device can fetch back.
 
     The bytes of a scheduled attachment are stored and retained exactly like a live-turn
@@ -2130,14 +2507,54 @@ def _proactive_media_id(delivery_id: str, index: int) -> str:
     from the delivery and then read as "no longer available" on every later visit --
     a fetch rejection, never an expiry or a rollback.
 
-    A live-turn attachment uses ``uuid.uuid4().hex`` (32 hex, adapter.py:1192). This id is
-    the deterministic counterpart of that shape: the same digest as before, minus the
-    prefix, so it stays stable across retries of one occurrence (retries must reuse the
-    id, not upload a second copy) while being servable for as long as the message lives.
+    A live-turn attachment once used ``uuid.uuid4().hex`` (32 hex). This id is the
+    deterministic counterpart of that shape, and every path now mints ids here: the same
+    digest as before, minus the prefix, so it stays stable across retries of one
+    occurrence (retries must reuse the id, not upload a second copy) while being servable
+    for as long as the message lives.
+
+    ``sha256`` makes the id content addressed. Retrying an occurrence reuses the id, but
+    a file rewritten in place between attempts is different bytes and so gets a different
+    id: one id must never point at two different payloads.
     """
-    return hashlib.sha256(
-        f"{delivery_id}\0{index}".encode("utf-8")
-    ).hexdigest()[:32]
+    material = f"{delivery_id}\0{index}" if sha256 is None else f"{delivery_id}\0{index}\0{sha256}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def _durable_receipt(spool: Optional[AttachSpool], delivery_id: str) -> Optional[str]:
+    """The projection state a receipt has ALREADY established, without waiting for one.
+
+    Replaces the two-second projection stall (spec finding 4): a receipt that arrived
+    while the upload was in flight still counts, and one that has not arrived leaves the
+    delivery pending rather than failed.
+    """
+    if spool is None:
+        return None
+    try:
+        row = spool.delivery_receipt_row(delivery_id)
+    except Exception:  # noqa: BLE001 - an unreadable receipt is simply not one
+        logger.debug("attach: durable receipt read failed", exc_info=True)
+        return None
+    if not row:
+        return None
+    state = str(row.get("state") or "")
+    if state == "displayed":
+        return "projected"
+    if state == "failed" and row.get("stage") == "authorization":
+        return "blocked"
+    return state or None
+
+
+def _attach_media_result(result: Any, payload: Dict[str, Any]) -> None:
+    """Carry the structured media outcome on the harness' SendResult when it allows it.
+
+    Hermes owns that class, so a slotted or frozen build simply does not carry the
+    detail; the committed reply text and the durable rows already do.
+    """
+    try:
+        setattr(result, "media_result", payload)
+    except Exception:  # noqa: BLE001 - decoration is never worth failing a send for
+        logger.debug("attach: could not decorate SendResult with the media result", exc_info=True)
 
 
 def _proactive_identity(delivery_key: str) -> Tuple[str, str]:
@@ -2199,7 +2616,9 @@ def delivery_state(pconfig: Any, delivery_key: str) -> Dict[str, Any]:
     return result
 
 
-def _proactive_media_error(path: str, exc: Exception) -> str:
+def _proactive_media_error(
+    path: str, exc: Exception, descriptor: Optional[MediaDescriptor] = None
+) -> str:
     """One bounded, human-readable upload failure line. Never carries payload bytes.
 
     An HTTP rejection (notably ``415`` for a type the gateway does not accept) also
@@ -2208,8 +2627,10 @@ def _proactive_media_error(path: str, exc: Exception) -> str:
     """
     name = os.path.basename(path)[:128] or "attachment"
     if isinstance(exc, HTTPError):
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        family = AttachAdapter._media_family(path)
+        mime = descriptor.mime if descriptor is not None else (
+            mimetypes.guess_type(path)[0] or "application/octet-stream"
+        )
+        family = descriptor.family if descriptor is not None else AttachAdapter._media_family(path)
         phrase = str(getattr(exc, "reason", "") or "")[:64].strip()
         detail = f"http_{exc.code}"
         if phrase:
@@ -2386,14 +2807,18 @@ async def enqueue_proactive_delivery(
             spool=spool,
             ca_file=os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None,
         ))
+        service = MediaUploadService(
+            client,
+            delivery_id=delivery_id,
+            destination=MediaDestination(
+                "canonical_home" if canonical_home else "thread", target_thread
+            ),
+            spool=spool,
+        )
         if paths:
-            for index, path in enumerate(paths[:16]):
-                media_id = _proactive_media_id(delivery_id, index)
-                try:
-                    await client.upload_media(media_id, path, AttachAdapter._media_family(path))
-                    media_ids.append(media_id)
-                except Exception as exc:  # noqa: BLE001 - policy below determines whether text may continue
-                    media_errors.append(_proactive_media_error(path, exc))
+            batch = await service.upload(paths[:16])
+            media_ids = batch.media_ids
+            media_errors = batch.error_lines
             if media_errors and media_policy == "atomic":
                 # A later upload failure abandons the entire occurrence. Roll
                 # back every earlier successful upload before reporting the
@@ -2403,6 +2828,7 @@ async def enqueue_proactive_delivery(
                     await client.rollback_uploaded_media(media_ids)
                 except Exception:  # noqa: BLE001 - preserve the media failure as the public result
                     logger.warning("attach: atomic scheduled-media rollback failed", exc_info=True)
+                service.mark_blocked(media_ids, "atomic occurrence abandoned before journal")
                 return _proactive_failure("media_upload_failed", delivery_id, message_id, media_errors)
         blocks = normalize_text_to_blocks(text)
         if not blocks and not media_ids:
@@ -2417,6 +2843,7 @@ async def enqueue_proactive_delivery(
         )
         if frame is None:
             return _proactive_failure("scheduled_not_supported", delivery_id, message_id, media_errors)
+        service.mark_journaled(media_ids)
         result: Dict[str, Any] = {
             "state": "journaled_partial" if media_errors else "journaled",
             "accepted_pending": True,
