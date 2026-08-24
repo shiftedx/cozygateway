@@ -29,6 +29,23 @@ logger = logging.getLogger(__name__)
 TERMINAL_RECEIPT_STATES = frozenset({"displayed", "failed"})
 
 
+# The media lifecycle a single attachment walks for one delivery occurrence. Ranks are the only
+# forward direction: a mark may advance or repeat a stage, never rewind it.
+MEDIA_LIFECYCLE_STAGES: Dict[str, int] = {
+    "prepared": 0,
+    "uploaded": 1,
+    "journaled": 2,
+    "projected": 3,
+    "displayed": 4,
+}
+
+# Once a media occurrence reaches one of these it is answered for good. "displayed" is the only
+# terminal that also sits on the progression ladder, so a projected row may still upgrade to it.
+TERMINAL_MEDIA_STATES = frozenset({"displayed", "blocked", "expired", "upload_failed"})
+
+MEDIA_LIFECYCLE_STATES = frozenset(MEDIA_LIFECYCLE_STAGES) | TERMINAL_MEDIA_STATES
+
+
 class TerminalSealed(RuntimeError):
     """Raised when an event attempts to mutate a turn after its terminal event."""
 
@@ -71,6 +88,24 @@ CREATE TABLE IF NOT EXISTS turn_terminals (
 ) STRICT;
 CREATE TABLE IF NOT EXISTS media_cleanup (
   media_id TEXT PRIMARY KEY
+) STRICT;
+CREATE TABLE IF NOT EXISTS media_lifecycle (
+  delivery_id TEXT NOT NULL,
+  media_id TEXT NOT NULL,
+  sha256 TEXT,
+  path_meta TEXT,
+  state TEXT NOT NULL,
+  detail TEXT,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (delivery_id, media_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS media_occurrences (
+  occurrence_key TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  destination TEXT NOT NULL,
+  media_id TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (occurrence_key, sha256, destination)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS delivery_receipts (
   delivery_id TEXT PRIMARY KEY,
@@ -375,6 +410,115 @@ class AttachSpool:
         if reason is not None:
             result["reason"] = str(reason)
         return result
+
+    def media_mark(
+        self,
+        delivery_id: str,
+        media_id: str,
+        state: str,
+        detail: Optional[str] = None,
+        sha256: Optional[str] = None,
+        path_meta: Optional[str] = None,
+    ) -> str:
+        """Advance one attachment's durable lifecycle state. Progress only, terminals forever.
+
+        The row is the answer to "did this media actually reach the person", so a late or
+        duplicated receipt must never turn a settled answer back into an optimistic one. A
+        rejected mark is logged at INFO rather than swallowed, because a regression attempt is a
+        real signal about the sender, not noise.
+        """
+        if not isinstance(delivery_id, str) or not delivery_id:
+            return "invalid"
+        if not isinstance(media_id, str) or not media_id:
+            return "invalid"
+        if state not in MEDIA_LIFECYCLE_STATES:
+            return "invalid"
+        prior = self._db.execute(
+            "SELECT state FROM media_lifecycle WHERE delivery_id = ? AND media_id = ?",
+            (delivery_id, media_id),
+        ).fetchone()
+        if prior is not None:
+            prior_state = str(prior[0])
+            if prior_state == state:
+                return "duplicate"
+            if prior_state in TERMINAL_MEDIA_STATES:
+                logger.info(
+                    "attach-v1: media %s of delivery %s already terminal as %s; dropping %s mark",
+                    media_id, delivery_id, prior_state, state,
+                )
+                return "conflict"
+            if state not in TERMINAL_MEDIA_STATES:
+                if MEDIA_LIFECYCLE_STAGES[state] < MEDIA_LIFECYCLE_STAGES[prior_state]:
+                    logger.info(
+                        "attach-v1: media %s of delivery %s is at %s; dropping regressive %s mark",
+                        media_id, delivery_id, prior_state, state,
+                    )
+                    return "conflict"
+        with self._db:
+            self._db.execute(
+                "INSERT INTO media_lifecycle (delivery_id, media_id, sha256, path_meta, state, detail, updated_at_ms)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(delivery_id, media_id) DO UPDATE SET"
+                " state = excluded.state, detail = excluded.detail, updated_at_ms = excluded.updated_at_ms,"
+                " sha256 = COALESCE(excluded.sha256, media_lifecycle.sha256),"
+                " path_meta = COALESCE(excluded.path_meta, media_lifecycle.path_meta)",
+                (delivery_id, media_id, sha256, path_meta, state, detail, self._now_ms()),
+            )
+        return "recorded"
+
+    def media_rows(self, delivery_id: str) -> List[Dict[str, Any]]:
+        """Return every attachment row for one delivery occurrence, oldest media id first."""
+        rows = self._db.execute(
+            "SELECT media_id, sha256, path_meta, state, detail, updated_at_ms"
+            " FROM media_lifecycle WHERE delivery_id = ? ORDER BY media_id",
+            (delivery_id,),
+        ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for media_id, sha256, path_meta, state, detail, updated_at_ms in rows:
+            result.append({
+                "mediaId": str(media_id),
+                "sha256": None if sha256 is None else str(sha256),
+                "pathMeta": None if path_meta is None else str(path_meta),
+                "state": str(state),
+                "detail": None if detail is None else str(detail),
+                "updatedAt": int(updated_at_ms),
+            })
+        return result
+
+    def media_dedupe_claim(
+        self,
+        occurrence_key: str,
+        sha256: str,
+        destination: str,
+        media_id: str,
+    ) -> Dict[str, Any]:
+        """Claim (occurrence, content hash, destination) for ``media_id``, or return the winner.
+
+        Identity is the bytes, not the path: rewriting a file in place yields a new hash and so a
+        genuinely new claim, while a retried or restarted send of the same bytes to the same
+        destination reuses the already uploaded media id. The claim is a single conditional insert
+        so two processes racing on the same spool cannot both believe they won.
+        """
+        if not isinstance(occurrence_key, str) or not occurrence_key:
+            raise ValueError("media_dedupe_claim requires a non-empty occurrence key")
+        if not isinstance(sha256, str) or not sha256:
+            raise ValueError("media_dedupe_claim requires a non-empty content hash")
+        if not isinstance(destination, str) or not destination:
+            raise ValueError("media_dedupe_claim requires a non-empty destination")
+        if not isinstance(media_id, str) or not media_id:
+            raise ValueError("media_dedupe_claim requires a non-empty media id")
+        with self._db:
+            claimed = self._db.execute(
+                "INSERT INTO media_occurrences (occurrence_key, sha256, destination, media_id, created_at_ms)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(occurrence_key, sha256, destination) DO NOTHING",
+                (occurrence_key, sha256, destination, media_id, self._now_ms()),
+            ).rowcount == 1
+            winner = self._db.execute(
+                "SELECT media_id FROM media_occurrences"
+                " WHERE occurrence_key = ? AND sha256 = ? AND destination = ?",
+                (occurrence_key, sha256, destination),
+            ).fetchone()
+        return {"claimed": claimed, "media_id": str(winner[0])}
 
     def accept_command(self, frame: Dict[str, Any]) -> str:
         sequence = frame.get("sequence")
