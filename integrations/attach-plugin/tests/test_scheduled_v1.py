@@ -279,6 +279,126 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[0]["deliveryId"], events[1]["deliveryId"])
             self.assertEqual(events[0]["messageId"], events[1]["messageId"])
 
+    @staticmethod
+    def _session_context_modules(message_id="", cron=""):
+        """Stub the harness session context a turn/cron send is judged by."""
+        gateway = types.ModuleType("gateway")
+        platforms = types.ModuleType("gateway.platforms")
+        base = types.ModuleType("gateway.platforms.base")
+        base.SendResult = _SendResult
+        gateway.platforms = platforms
+        platforms.base = base
+        context = types.ModuleType("gateway.session_context")
+        values = {
+            "HERMES_SESSION_MESSAGE_ID": message_id,
+            "HERMES_CRON_SESSION": cron,
+        }
+        context.get_session_env = lambda key, default="": values.get(key, "")
+        gateway.session_context = context
+        return {
+            "gateway": gateway,
+            "gateway.platforms": platforms,
+            "gateway.platforms.base": base,
+            "gateway.session_context": context,
+        }
+
+    def _live_adapter(self, path):
+        adapter = AttachAdapter()
+        adapter._attach_init(self._config(path))
+        adapter._spool = AttachSpool(path)
+        adapter._client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url="http://gateway.example",
+            token="secret",
+            spool=adapter._spool,
+        ))
+        return adapter
+
+    async def test_cron_send_never_attaches_to_an_unrelated_live_turn(self):
+        """A cron delivery arriving mid-turn must ride the scheduled path.
+
+        Regression for the live incident: the report was absorbed into whatever turn
+        happened to be in flight on that chat, ``send`` returned success, and no
+        ``scheduled`` frame was ever journaled.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            adapter = self._live_adapter(path)
+            adapter._active_turn["thread"] = "turn-live"
+            adapter._turn_text["turn-live"] = "the user's own in-flight answer"
+
+            with patch.dict(sys.modules, self._session_context_modules(cron="1")):
+                try:
+                    result = await adapter.send("thread", "Cronjob Response: daily brief")
+                finally:
+                    adapter._spool.close()
+
+            events = self._events(path)
+            self.assertEqual([event["kind"] for event in events], ["scheduled"])
+            self.assertEqual(events[0]["target"], {"kind": "canonical_home"})
+            self.assertNotIn("turnId", events[0])
+            # The live turn is untouched: not sealed, not cleaned up, not stolen.
+            self.assertEqual(adapter._active_turn.get("thread"), "turn-live")
+            self.assertEqual(adapter._turn_text.get("turn-live"), "the user's own in-flight answer")
+            self.assertFalse(result.success)
+            self.assertIn("projection not yet confirmed", result.error)
+
+    async def test_the_turns_own_terminal_reply_still_takes_the_turn_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            adapter = self._live_adapter(path)
+            adapter._active_turn["thread"] = "turn-live"
+
+            with patch.dict(
+                sys.modules, self._session_context_modules(message_id="turn-live")
+            ):
+                try:
+                    result = await adapter.send("thread", "the turn's own answer")
+                finally:
+                    adapter._spool.close()
+
+            events = self._events(path)
+            self.assertEqual([event["kind"] for event in events], ["draft", "commit"])
+            self.assertTrue(all(event["turnId"] == "turn-live" for event in events))
+            self.assertTrue(result.success)
+            self.assertEqual(result.message_id, "turn-live")
+
+    async def test_a_steer_message_id_still_owns_the_original_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            adapter = self._live_adapter(path)
+            adapter._active_turn["thread"] = "turn-live"
+
+            with patch.dict(
+                sys.modules, self._session_context_modules(message_id="turn-live:steer")
+            ):
+                try:
+                    result = await adapter.send("thread", "the steered answer")
+                finally:
+                    adapter._spool.close()
+
+            self.assertEqual(
+                [event["kind"] for event in self._events(path)], ["draft", "commit"]
+            )
+            self.assertTrue(result.success)
+
+    async def test_cron_interim_notice_never_draws_into_an_unrelated_live_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            adapter = self._live_adapter(path)
+            adapter._active_turn["thread"] = "turn-live"
+
+            with patch.dict(sys.modules, self._session_context_modules(cron="1")):
+                try:
+                    await adapter.send_or_update_status(
+                        "thread", "status", "cron status notice",
+                    )
+                finally:
+                    adapter._spool.close()
+
+            events = self._events(path)
+            self.assertEqual([event["kind"] for event in events], ["scheduled"])
+            self.assertTrue(all("turnId" not in event for event in events))
+
     async def test_no_turn_send_with_a_pinned_metadata_thread_keeps_the_thread_form(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "spool.sqlite")
