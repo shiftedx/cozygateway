@@ -979,7 +979,9 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             rollback_call.assert_awaited_once()
             rolled_back_ids = rollback_call.await_args.args[1]
             self.assertEqual(len(rolled_back_ids), 1)
-            self.assertEqual(self._events(path), [])
+            # The withdrawn descriptor keeps its sequence and wears the inert placeholder, so the
+            # abandoned occurrence contributes no media and no scheduled event to the stream.
+            self.assertEqual(self._events(path), [{"kind": "presence", "state": "online"}])
             spool = AttachSpool(path)
             try:
                 self.assertEqual(spool.pending_media_cleanups(), rolled_back_ids)

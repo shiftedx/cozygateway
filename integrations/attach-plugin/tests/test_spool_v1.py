@@ -65,7 +65,7 @@ class AttachSpoolTests(unittest.TestCase):
         self.assertEqual([f["sequence"] for f in spool.pending_events(10, 100000)], [1])
         spool.close()
 
-    def test_atomic_media_rollback_removes_only_the_target_media_events(self):
+    def test_atomic_media_rollback_neuters_only_the_target_media_events(self):
         spool = AttachSpool(self.path)
         first = spool.enqueue_event({
             "kind": "media", "media": {"mediaId": "uploaded-first"},
@@ -73,15 +73,56 @@ class AttachSpoolTests(unittest.TestCase):
         retained = spool.enqueue_event({
             "kind": "media", "media": {"mediaId": "keep-me"},
         })
-        removed = spool.begin_media_cleanup(["uploaded-first"])
-        self.assertEqual(removed, [first["sequence"]])
+        withdrawn = spool.begin_media_cleanup(["uploaded-first"])
+        self.assertEqual(withdrawn, [first["sequence"]])
         self.assertEqual(spool.pending_media_cleanups(), ["uploaded-first"])
         spool.mark_media_cleanup_complete("uploaded-first")
         self.assertEqual(spool.pending_media_cleanups(), [])
+        # The row survives, so the sequence stays contiguous; only its payload is withdrawn.
+        frames = spool.pending_events(10, 100000)
         self.assertEqual(
-            [frame["sequence"] for frame in spool.pending_events(10, 100000)],
-            [retained["sequence"]],
+            [frame["sequence"] for frame in frames],
+            [first["sequence"], retained["sequence"]],
         )
+        self.assertEqual(frames[0]["event"], {"kind": "presence", "state": "online"})
+        self.assertEqual(frames[1]["event"]["media"]["mediaId"], "keep-me")
+        spool.close()
+
+    def test_reading_the_pending_tail_never_scans_the_acked_history(self):
+        """The read that runs on the event loop must not grow with the outbox.
+
+        ``acked`` is the last column of the row, so an unindexed ``WHERE acked = 0`` makes SQLite
+        decode every ``frame_json`` in the file: on a 103k-row spool that is tens of MB of JSON
+        per send tick, which is how a Discord shard heartbeat ends up blocked for ten seconds.
+        The partial index over the unacked tail is the whole fix, and the query plan is the only
+        honest assertion about it.
+        """
+        spool = AttachSpool(self.path)
+        for index in range(50):
+            frame = spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": f"u{index}", "blocks": []})
+            if index < 40:
+                spool.ack_event(frame["sequence"], frame["eventId"])
+        plan = " ".join(
+            str(row[-1]) for row in spool._db.execute(
+                "EXPLAIN QUERY PLAN SELECT frame_json, byte_count FROM event_outbox"
+                " WHERE acked = 0 ORDER BY sequence LIMIT 8"
+            )
+        )
+        self.assertIn("event_outbox_unacked", plan, plan)
+        self.assertNotIn("SCAN event_outbox\n", plan + "\n")
+        self.assertEqual([frame["sequence"] for frame in spool.pending_events(8, 1_000_000)], list(range(41, 49)))
+        spool.close()
+
+    def test_an_existing_spool_gains_the_unacked_index_on_open(self):
+        """A wedged spool is repaired by opening it, not by a migration someone must remember."""
+        spool = AttachSpool(self.path)
+        with spool._db:
+            spool._db.execute("DROP INDEX event_outbox_unacked")
+        spool.close()
+
+        spool = AttachSpool(self.path)
+        indexes = {str(row[1]) for row in spool._db.execute("PRAGMA index_list(event_outbox)")}
+        self.assertIn("event_outbox_unacked", indexes)
         spool.close()
 
 

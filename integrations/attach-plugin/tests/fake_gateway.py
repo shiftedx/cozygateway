@@ -354,12 +354,16 @@ class FakeGateway:
         capabilities: Optional[List[str]] = None,
         auto_hello_ack: bool = True,
         auto_ack_events: bool = True,
+        enforce_event_sequence: bool = False,
         host: str = "127.0.0.1",
     ) -> None:
         self.token = token
         self.capabilities = list(DEFAULT_CAPABILITIES if capabilities is None else capabilities)
         self.auto_hello_ack = auto_hello_ack
         self.auto_ack_events = auto_ack_events
+        # Off by default so existing tests keep scripting sequences freely. Turned on, this is the
+        # real gateway's admission rule: strictly contiguous or a gap reply, never a skip.
+        self.enforce_event_sequence = enforce_event_sequence
         self._host = host
 
         # Assertion surface. The HTTP threads and the event loop both append, so every
@@ -369,6 +373,7 @@ class FakeGateway:
         self._deletes: List[str] = []
         self._receipt_requests: List[str] = []
         self._frames: List[Dict[str, Any]] = []
+        self._gaps_sent: List[int] = []
 
         self._upload_in_flight = 0
         self._peak_upload_concurrency = 0
@@ -377,6 +382,8 @@ class FakeGateway:
 
         self._connections: List[Any] = []
         self._command_sequence = 0
+        self._event_cursor = 0
+        self._admitted_event_ids: set[str] = set()
         self._scheduled: List[asyncio.Task] = []
 
         self._http: Optional[_QuietHTTPServer] = None
@@ -527,6 +534,8 @@ class FakeGateway:
             self._frames.append(frame)
         if frame.get("kind") == "hello" and self.auto_hello_ack:
             await self.send_hello_ack(connection=connection)
+        elif frame.get("kind") == "event" and self.enforce_event_sequence:
+            await self._admit_event(frame, connection)
         elif frame.get("kind") == "event" and self.auto_ack_events:
             await self.ack_event(frame, connection)
 
@@ -553,6 +562,37 @@ class FakeGateway:
             "resume": dict(resume or {"eventSequence": 0, "commandSequence": 0}),
             "limits": dict(DEFAULT_LIMITS),
         }, connection)
+
+    async def _admit_event(self, frame: Dict[str, Any], connection: Optional[Any] = None) -> bool:
+        """Admit one event the way the gateway does: contiguous or gapped, duplicates tolerated."""
+        sequence, event_id = frame.get("sequence"), frame.get("eventId")
+        if not isinstance(sequence, int) or not isinstance(event_id, str):
+            return False
+        if event_id in self._admitted_event_ids:
+            return await self._send(
+                {"kind": "ack", "channel": "event", "sequence": sequence, "id": event_id, "duplicate": True},
+                connection,
+            )
+        if sequence != self._event_cursor + 1:
+            self._record(self._gaps_sent, sequence)
+            return await self._send({
+                "kind": "gap", "channel": "event", "requestedAfter": self._event_cursor,
+                "earliestAvailable": self._event_cursor + 1, "latestAvailable": self._event_cursor,
+            }, connection)
+        self._event_cursor = sequence
+        self._admitted_event_ids.add(event_id)
+        return await self.ack_event(frame, connection)
+
+    @property
+    def admitted_event_cursor(self) -> int:
+        """The highest strictly contiguous event sequence this gateway has admitted."""
+        return self._event_cursor
+
+    @property
+    def gaps_sent(self) -> List[int]:
+        """The event sequence that triggered each gap reply, in order."""
+        with self._lock:
+            return list(self._gaps_sent)
 
     async def ack_event(self, frame: Dict[str, Any], connection: Optional[Any] = None) -> bool:
         sequence, event_id = frame.get("sequence"), frame.get("eventId")
