@@ -1899,10 +1899,24 @@ def _occurrence_key(args: Optional[Dict[str, Any]] = None) -> str:
 
 
 
-# The upstream module that owns every Hermes platform send. A plugin
-# ``send_message_handler`` is invoked from here on BOTH lanes (see
+# The upstream frame that owns every Hermes platform send. A plugin
+# ``send_message_handler`` is invoked from there on BOTH lanes (see
 # ``_upstream_send_payload``), but only the tool lane fills ``args``.
+#
+# Both halves matter. The module alone is not enough: ``tools.send_message_tool``
+# also owns ``_handle_send``, ``_send_via_adapter`` and ``_registry_standalone_send``,
+# and each of those holds a DIFFERENT ``message``/``media_files`` binding (or none at
+# all). ``_send_to_platform`` is the one function that provably holds the complete
+# outbound request -- it is the ``def`` that takes ``message`` and ``media_files`` as
+# parameters and calls the handler itself.
 _UPSTREAM_SEND_MODULE = "tools.send_message_tool"
+_UPSTREAM_SEND_FUNCTION = "_send_to_platform"
+
+# How far above the handler the upstream sender can sit. The handler is reached
+# through ``_send_message_handler`` -> ``_scheduler_lane_send`` -> here, so the
+# sender is normally three frames up; the margin absorbs any future in-plugin or
+# upstream wrapper without letting the search wander into unrelated callers.
+_UPSTREAM_SEND_MAX_DEPTH = 8
 
 
 def _normalized_media_paths(media_files: Any) -> List[str]:
@@ -1926,30 +1940,43 @@ def _normalized_media_paths(media_files: Any) -> List[str]:
 def _upstream_send_payload() -> Optional[Dict[str, Any]]:
     """Recover the outbound payload Hermes does not hand a plugin send handler.
 
-    ``tools/send_message_tool.py::_send_to_platform`` routes EVERY non-builtin platform
-    through ``entry.send_message_handler`` and returns whatever it returns, with no
-    fallback to ``standalone_sender_fn``. It fills ``args`` only on the ``send_message``
-    TOOL lane; cron's ``_deliver_result`` calls the same function with ``args=None`` and
-    the report in the positional ``message`` parameter. A registered handler therefore
-    shadows this plugin's standalone cron sender and is handed an EMPTY request: the
-    report is journaled nowhere, and "no text and no media" reads as silence, which the
-    scheduler records as a delivered run with no error (hermes 0.20.5).
+    ``tools/send_message_tool.py::_send_to_platform`` (the ``def`` at :925) routes EVERY
+    non-builtin platform through ``entry.send_message_handler`` and returns whatever it
+    returns, with no fallback to ``standalone_sender_fn``. It fills ``args`` only on the
+    ``send_message`` TOOL lane; cron's ``_deliver_result`` calls the same function with
+    ``args=None`` and the report in the positional ``message`` parameter. A registered
+    handler therefore shadows this plugin's standalone cron sender and is handed an EMPTY
+    request: the report is journaled nowhere, and "no text and no media" reads as silence,
+    which the scheduler records as a delivered run with no error (hermes 0.20.5).
 
     Read the payload the caller already holds instead of inventing an empty one. The
-    recovery is deliberately narrow: only a frame belonging to the upstream sender
-    module is trusted, and any other caller yields ``None`` so the handler fails loudly
-    rather than delivering nothing quietly.
+    recovery is deliberately narrow: only the ``_send_to_platform`` frame is trusted, and
+    any other caller yields ``None`` so the handler fails loudly rather than delivering
+    nothing quietly.
+
+    Two details of that frame decide what a scheduled report actually carries:
+
+    * ``message`` is the WHOLE outbound text; ``chunk`` is only the current slice of the
+      platform-limit loop. Upstream ``return``s inside that loop on the handler lane
+      (send_message_tool.py:1289-1297), so recovering ``chunk`` delivers slice one and
+      silently drops the rest. Recovering ``message`` delivers the report intact and
+      keeps the derived delivery key identical on every invocation, so media rides
+      exactly one durable occurrence even if a future upstream drops that early return.
+    * ``media_files`` is read from the SAME frame as the text, so the attachments always
+      belong to the message they were extracted from.
     """
     frame = inspect.currentframe()
     try:
-        for _ in range(6):
+        for _ in range(_UPSTREAM_SEND_MAX_DEPTH):
             frame = frame.f_back if frame is not None else None
             if frame is None:
                 return None
             if frame.f_globals.get("__name__") != _UPSTREAM_SEND_MODULE:
                 continue
+            if frame.f_code.co_name != _UPSTREAM_SEND_FUNCTION:
+                continue
             local_vars = frame.f_locals
-            for key in ("chunk", "message"):
+            for key in ("message", "chunk"):
                 text = local_vars.get(key)
                 if isinstance(text, str) and text.strip():
                     return {
@@ -2053,7 +2080,23 @@ def _proactive_spool_path(pconfig: Any, spool_path: Optional[str]) -> str:
 
 
 def _proactive_media_id(delivery_id: str, index: int) -> str:
-    return "scheduled_media_" + hashlib.sha256(
+    """Mint a scheduled attachment id in the ONE shape the device can fetch back.
+
+    The bytes of a scheduled attachment are stored and retained exactly like a live-turn
+    attachment's, but the device-facing fetch route validates the id before it looks
+    anything up (``isPhotoFileId`` / ``FILE_ID_RE`` = 32 lowercase hex,
+    packages/gateway/src/hermes-bridge/photos.ts:308-312, used at
+    packages/gateway/src/hermes-bridge/routes.ts:1250). A ``scheduled_media_``-prefixed
+    id passes the permissive upload validator but fails that one, so the photo rendered
+    from the delivery and then read as "no longer available" on every later visit --
+    a fetch rejection, never an expiry or a rollback.
+
+    A live-turn attachment uses ``uuid.uuid4().hex`` (32 hex, adapter.py:1192). This id is
+    the deterministic counterpart of that shape: the same digest as before, minus the
+    prefix, so it stays stable across retries of one occurrence (retries must reuse the
+    id, not upload a second copy) while being servable for as long as the message lives.
+    """
+    return hashlib.sha256(
         f"{delivery_id}\0{index}".encode("utf-8")
     ).hexdigest()[:32]
 

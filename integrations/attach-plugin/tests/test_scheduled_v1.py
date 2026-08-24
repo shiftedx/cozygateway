@@ -92,11 +92,59 @@ def _base_adapter_modules():
     }
 
 
-def _upstream_send_to_platform():
+# Upstream chunks a long message on the platform's own limit and then, on the handler
+# lane, ``return``s inside that loop after the FIRST slice (send_message_tool.py:1289-1297).
+# So a recovery that reads ``chunk`` delivers slice one and drops the rest of the report,
+# attachments included -- the loop only ever runs once.
+_UPSTREAM_CHUNKED_SEND_SOURCE = """
+import inspect
+
+
+async def _send_to_platform(
+    handler, pconfig, chat_id, message, thread_id=None, media_files=None, args=None
+):
+    chunks = [message[: len(message) // 2], message[len(message) // 2 :]]
+    for chunk in chunks:
+        result = handler(args or {}, chat_id, "cozygateway", pconfig)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+"""
+
+# A DIFFERENT function in the same upstream module. ``_handle_send``,
+# ``_send_via_adapter`` and ``_registry_standalone_send`` all live in
+# ``tools.send_message_tool`` and all hold a ``message`` local, but none of them holds
+# the request ``_send_to_platform`` was given. Trusting the module alone lets a
+# neighbouring frame's text be delivered as though it were the report.
+_UPSTREAM_NEIGHBOUR_SEND_SOURCE = """
+import inspect
+
+
+async def _registry_standalone_send(handler, pconfig, chat_id, message, args=None):
+    result = handler(args or {}, chat_id, "cozygateway", pconfig)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+"""
+
+
+def _upstream_module(source):
     """Build the caller in a module actually named ``tools.send_message_tool``."""
     module = types.ModuleType("tools.send_message_tool")
-    exec(compile(_UPSTREAM_SEND_SOURCE, "tools/send_message_tool.py", "exec"), module.__dict__)
-    return module._send_to_platform
+    exec(compile(source, "tools/send_message_tool.py", "exec"), module.__dict__)
+    return module
+
+
+def _upstream_send_to_platform():
+    return _upstream_module(_UPSTREAM_SEND_SOURCE)._send_to_platform
+
+
+def _upstream_chunked_send_to_platform():
+    return _upstream_module(_UPSTREAM_CHUNKED_SEND_SOURCE)._send_to_platform
+
+
+def _upstream_neighbouring_sender():
+    return _upstream_module(_UPSTREAM_NEIGHBOUR_SEND_SOURCE)._registry_standalone_send
 
 
 class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -533,6 +581,67 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["kind"] for event in events], ["media", "scheduled"])
         self.assertEqual(events[1]["mediaIds"], [events[0]["media"]["mediaId"]])
 
+    async def test_cron_lane_recovers_the_whole_report_not_the_first_chunk(self):
+        # Upstream returns after the first chunk on the handler lane, so recovering
+        # ``chunk`` delivers half a report and loses the attachment that upstream
+        # attaches to the LAST chunk. The whole ``message`` is the only correct payload.
+        send_to_platform = _upstream_chunked_send_to_platform()
+        report = "## Automation health\n\nfirst half of the report. second half of the report."
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, _base_adapter_modules()
+        ):
+            path = os.path.join(directory, "spool.sqlite")
+            png = os.path.join(directory, "report.png")
+            with open(png, "wb") as handle:
+                handle.write(b"\x89PNG\r\n\x1a\n")
+
+            def upload(media_id, _path, mime, digest, data, _expires_at):
+                return {
+                    "mediaId": media_id, "mimeType": mime, "byteCount": len(data),
+                    "sha256": digest, "filename": "report.png", "family": "image",
+                }
+
+            with patch.object(AttachV1Client, "_upload_media_sync", side_effect=upload):
+                result = await send_to_platform(
+                    _send_message_handler,
+                    self._config(path),
+                    "thread",
+                    report,
+                    media_files=[(png, False)],
+                )
+            events = self._events(path)
+
+        self.assertEqual(result["state"], "journaled")
+        self.assertEqual([event["kind"] for event in events], ["media", "scheduled"])
+        # The attachment rides the scheduled frame exactly once...
+        self.assertEqual(events[1]["mediaIds"], [events[0]["media"]["mediaId"]])
+        # ...and the text is the entire report, not the first slice of it.
+        delivered = "".join(
+            block.get("text", "") for block in events[1]["blocks"]
+        )
+        self.assertIn("first half of the report.", delivered)
+        self.assertIn("second half of the report.", delivered)
+
+    async def test_a_neighbouring_upstream_frame_is_never_mistaken_for_the_sender(self):
+        # Only ``_send_to_platform`` provably holds the request. Any other function in
+        # ``tools.send_message_tool`` must fail loudly rather than deliver a payload that
+        # was never addressed to this platform.
+        neighbour = _upstream_neighbouring_sender()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, _base_adapter_modules()
+        ):
+            path = os.path.join(directory, "spool.sqlite")
+            result = await neighbour(
+                _send_message_handler,
+                self._config(path),
+                "thread",
+                "text belonging to some other send",
+            )
+            self.assertFalse(os.path.exists(path))
+
+        self.assertNotIn("success", result)
+        self.assertIn("no message payload", result["error"])
+
     async def test_payloadless_send_is_a_loud_error_not_a_phantom_delivery(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             sys.modules, _base_adapter_modules()
@@ -915,6 +1024,38 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[0]["media"]["mediaId"], events[2]["media"]["mediaId"])
             self.assertEqual(events[1]["messageId"], events[3]["messageId"])
             self.assertEqual(events[1]["mediaIds"], events[3]["mediaIds"])
+
+    async def test_scheduled_media_ids_are_fetchable_by_the_device_route(self):
+        # A scheduled attachment is stored and retained exactly like a live-turn one, but the
+        # device fetches it by id and the fetch route validates the id BEFORE any lookup
+        # (isPhotoFileId, 32 lowercase hex). A prefixed id therefore uploaded fine, rendered
+        # once from the delivery, and then read as "no longer available" on every later visit.
+        # Scheduled ids must carry the same shape a live-turn uuid4().hex id does.
+        import re
+
+        live_turn_shape = re.compile(r"^[0-9a-f]{32}$")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "spool.sqlite")
+            png = os.path.join(directory, "report.png")
+            with open(png, "wb") as handle:
+                handle.write(b"\x89PNG\r\n\x1a\n")
+
+            def upload(media_id, _path, mime, digest, data, _expires_at):
+                return {
+                    "mediaId": media_id, "mimeType": mime, "byteCount": len(data),
+                    "sha256": digest, "filename": "report.png", "family": "image",
+                }
+
+            with patch.object(AttachV1Client, "_upload_media_sync", side_effect=upload):
+                await _standalone_send(
+                    self._config(path), "home", "daily report",
+                    thread_id="home", media_files=[(png, False)],
+                )
+            events = self._events(path)
+
+        media_id = events[0]["media"]["mediaId"]
+        self.assertRegex(media_id, live_turn_shape)
+        self.assertEqual(events[1]["mediaIds"], [media_id])
 
     async def test_projection_receipt_is_the_only_path_that_reports_projected(self):
         with tempfile.TemporaryDirectory() as directory:
