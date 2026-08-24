@@ -61,8 +61,12 @@ HELLO_ACK_TIMEOUT_SECONDS = 5
 HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
-    "mobile_node", "mobile_location", "memory_management",
+    "mobile_node", "mobile_location", "memory_management", "delivery_receipts",
 )
+# Terminal states a delivery_receipt command may carry, and the stages a failure may name.
+RECEIPT_STATES = frozenset({"displayed", "failed"})
+RECEIPT_STAGES = frozenset({"authorization", "projection"})
+RECEIPT_REASON_MAX_CHARS = 256
 ATTACH_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 ATTACH_AUDIO_VIDEO_MAX_BYTES = 40 * 1024 * 1024
 ATTACH_FILE_MAX_BYTES = 20 * 1024 * 1024
@@ -719,6 +723,12 @@ class AttachV1Client:
             handler, parsed = self._config.on_approval, command
         elif command.get("kind") == "resolve_clarify" and self._config.on_clarify is not None:
             handler, parsed = self._config.on_clarify, command
+        elif command.get("kind") == "delivery_receipt":
+            # Receipts have no handler callback: the durable record IS the effect. The ACK has
+            # already been sent by the command-inbox machinery above.
+            self._record_delivery_receipt(command)
+            self._spool.mark_command_processed(str(frame.get("commandId", "")))
+            return
         if handler is not None and parsed is not None:
             try:
                 outcome = handler(parsed)
@@ -727,6 +737,37 @@ class AttachV1Client:
             except Exception:
                 return
         self._spool.mark_command_processed(str(frame.get("commandId", "")))
+
+    def _record_delivery_receipt(self, command: Dict[str, Any]) -> None:
+        """Validate and persist one delivery_receipt command, then log a single INFO line."""
+        delivery_id = command.get("deliveryId")
+        state = command.get("state")
+        at = command.get("at")
+        stage = command.get("stage")
+        reason = command.get("reason")
+        if not isinstance(delivery_id, str) or not delivery_id or len(delivery_id) > 128:
+            logger.warning("attach-v1: dropping delivery_receipt with an unusable deliveryId")
+            return
+        if state not in RECEIPT_STATES or not isinstance(at, int) or isinstance(at, bool) or at < 0:
+            logger.warning("attach-v1: dropping malformed delivery_receipt for %s", delivery_id)
+            return
+        if stage is not None and stage not in RECEIPT_STAGES:
+            logger.warning("attach-v1: dropping delivery_receipt for %s with unknown stage", delivery_id)
+            return
+        if reason is not None and not isinstance(reason, str):
+            logger.warning("attach-v1: dropping delivery_receipt for %s with a non-string reason", delivery_id)
+            return
+        outcome = self._spool.record_delivery_receipt(
+            delivery_id,
+            str(state),
+            at,
+            stage=str(stage) if isinstance(stage, str) else None,
+            reason=reason[:RECEIPT_REASON_MAX_CHARS] if isinstance(reason, str) else None,
+        )
+        logger.info(
+            "attach-v1: delivery receipt %s state=%s stage=%s (%s)",
+            delivery_id, state, stage or "-", outcome,
+        )
 
     async def _close_socket(self, ws: Any) -> None:
         try:

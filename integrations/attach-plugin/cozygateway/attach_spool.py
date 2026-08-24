@@ -8,6 +8,7 @@ ACK. That is the plugin half of attach-v1's at-least-once contract.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -19,6 +20,13 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - the native Hermes host is POSIX
     fcntl = None
+
+
+logger = logging.getLogger(__name__)
+
+# A delivery occurrence reaches exactly one of these once, and never leaves it. Everything else
+# ("pending", "journaled", "projected") is a stage on the way there and may still be upgraded.
+TERMINAL_RECEIPT_STATES = frozenset({"displayed", "failed"})
 
 
 class TerminalSealed(RuntimeError):
@@ -63,6 +71,13 @@ CREATE TABLE IF NOT EXISTS turn_terminals (
 ) STRICT;
 CREATE TABLE IF NOT EXISTS media_cleanup (
   media_id TEXT PRIMARY KEY
+) STRICT;
+CREATE TABLE IF NOT EXISTS delivery_receipts (
+  delivery_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  stage TEXT,
+  reason TEXT,
+  at_ms INTEGER NOT NULL
 ) STRICT;
 """
 
@@ -306,6 +321,60 @@ class AttachSpool:
             "eventAckCursor": int(event_cursor),
             "commandInboxDepth": int(command_inbox_depth),
         }
+
+    def record_delivery_receipt(
+        self,
+        delivery_id: str,
+        state: str,
+        at_ms: int,
+        stage: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> str:
+        """Upsert one delivery receipt. The first terminal state wins, forever.
+
+        A "displayed" receipt may still upgrade a non-terminal row (the projected era), but a
+        terminal row is never rewritten: neither displayed over failed nor failed over displayed.
+        A conflicting terminal is dropped and logged rather than silently swallowed.
+        """
+        if not isinstance(delivery_id, str) or not delivery_id or not isinstance(state, str) or not state:
+            return "invalid"
+        prior = self._db.execute(
+            "SELECT state FROM delivery_receipts WHERE delivery_id = ?", (delivery_id,)
+        ).fetchone()
+        if prior is not None:
+            prior_state = str(prior[0])
+            if prior_state in TERMINAL_RECEIPT_STATES:
+                if prior_state == state:
+                    return "duplicate"
+                logger.info(
+                    "attach-v1: delivery %s already terminal as %s; dropping conflicting %s receipt",
+                    delivery_id, prior_state, state,
+                )
+                return "conflict"
+        with self._db:
+            self._db.execute(
+                "INSERT INTO delivery_receipts (delivery_id, state, stage, reason, at_ms) VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(delivery_id) DO UPDATE SET state = excluded.state, stage = excluded.stage,"
+                " reason = excluded.reason, at_ms = excluded.at_ms",
+                (delivery_id, state, stage, reason, int(at_ms)),
+            )
+        return "recorded"
+
+    def delivery_receipt_row(self, delivery_id: str) -> Optional[Dict[str, Any]]:
+        """Return the locally persisted receipt for a delivery occurrence, or ``None``."""
+        row = self._db.execute(
+            "SELECT state, stage, reason, at_ms FROM delivery_receipts WHERE delivery_id = ?",
+            (delivery_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        state, stage, reason, at_ms = row
+        result: Dict[str, Any] = {"state": str(state), "at": int(at_ms)}
+        if stage is not None:
+            result["stage"] = str(stage)
+        if reason is not None:
+            result["reason"] = str(reason)
+        return result
 
     def accept_command(self, frame: Dict[str, Any]) -> str:
         sequence = frame.get("sequence")
