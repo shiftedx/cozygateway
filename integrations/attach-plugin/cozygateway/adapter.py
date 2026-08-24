@@ -1718,11 +1718,50 @@ def _post_tool_call(**kwargs: Any) -> None:
             _CURRENT_TOOL_OCCURRENCE.set(None)
 
 
+#: The Hermes approval surfaces whose prompt this platform actually answers.
+#:
+#: Both of these route through ``tools/approval.py::_await_gateway_decision``: the
+#: request is parked on the session's approval queue, the platform is told about it
+#: through ``notify_cb``, and the agent blocks on that queue entry until the
+#: canonical approval timeout elapses. A ``/approve`` or ``/deny`` injected by
+#: ``_handle_approval_command`` resolves exactly that entry, so a card drawn for one
+#: of these is a card a tap can settle.
+ANSWERABLE_APPROVAL_SURFACES = frozenset({"gateway", "mcp-elicitation"})
+
+
+def _is_answerable_approval(kwargs: Dict[str, Any]) -> bool:
+    """True when THIS platform's approve/deny is the thing being waited on.
+
+    Hermes fires ``pre_approval_request`` / ``post_approval_response`` for every
+    approval surface, and most of them are decided somewhere no phone can reach:
+
+    * ``surface="smart"`` -- ``approvals.mode: smart`` asks an auxiliary LLM
+      guardian first. The pre hook fires, the aux model answers a second or two
+      later, and the post hook fires with ``choice="smart_approve"`` /
+      ``"smart_deny"``. A human was never in that loop.
+    * ``surface="cli"`` -- an interactive prompt on the operator's own terminal.
+    * ``surface="transport:<name>"`` -- a registered approval transport plugin has
+      replaced every built-in prompt surface, including this one.
+    * ``coalesced=True`` -- a FOLLOWER of an identical concurrent approval. It only
+      adopts whatever the leader is answered with; it has no prompt of its own.
+
+    Forwarding those is what made an Approve/Deny card appear and vanish before the
+    user could act: the card was a read-out of somebody else's decision, drawn with
+    buttons, and terminated the moment that decision landed. Only the surfaces this
+    platform is the decider for become cards.
+    """
+    if kwargs.get("coalesced"):
+        return False
+    return str(kwargs.get("surface") or "").strip() in ANSWERABLE_APPROVAL_SURFACES
+
+
 def _dispatch_approval_hook(phase: str, kwargs: Dict[str, Any]) -> None:
     """Observer-only Hermes approval hook → attach-v1 lifecycle event."""
     try:
         platform, chat_id = _current_turn_platform_and_chat()
         if platform != PLATFORM_NAME or not chat_id:
+            return
+        if not _is_answerable_approval(kwargs):
             return
         approval_id = _tool_call_id(kwargs)
         if approval_id is None:
