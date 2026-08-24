@@ -13,6 +13,7 @@ import os
 import re
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -24,13 +25,21 @@ _WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
 
 
 def _now() -> int: return int(time.time() * 1000)
+def _millis(value: Any) -> Optional[int]:
+    """Parse one ISO-8601 stamp (a naive value is read as UTC) into epoch millis."""
+    if not value: return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except Exception: return None
 def _hash(value: str) -> str: return hashlib.sha256(value.encode("utf-8")).hexdigest()
 def _revision(*parts: str) -> str: return _hash("\0".join(parts))
 def _snippet(value: str) -> str: return " ".join(value.split())[:1_000]
 def _title(value: str, fallback: str = "Memory") -> str: return next((line.strip("# ").strip() for line in value.splitlines() if line.strip()), fallback)[:512]
 
 def _caps(**yes: bool) -> Dict[str, bool]:
-    keys = ("search", "browse", "create", "edit", "delete", "relationships", "backlinks", "categories", "tags", "trust", "capacity", "effectiveNextSession")
+    keys = ("create", "edit", "delete", "relationships", "capacity", "effectiveNextSession")
     return {key: bool(yes.get(key, False)) for key in keys}
 
 
@@ -89,9 +98,9 @@ class CuratedAdapter:
             for source, target, label in (("curated-memory", "memory", "Curated notes"), ("curated-user", "user", "About me")):
                 entries = store.memory_entries if target == "memory" else store.user_entries
                 limit = store.memory_char_limit if target == "memory" else store.user_char_limit
-                rows.append({"id": source, "displayName": label, "kind": target, "status": "available" if store.target_enabled(target) else "unavailable", "capabilities": _caps(search=True, browse=True, create=store.target_enabled(target), edit=store.target_enabled(target), delete=store.target_enabled(target), capacity=True, effectiveNextSession=True), "counts": {"items": len(entries)}, "capacity": {"used": len("\n§\n".join(entries)), "limit": limit}, "effectiveNextSession": True})
+                rows.append({"id": source, "displayName": label, "kind": target, "status": "available" if store.target_enabled(target) else "unavailable", "capabilities": _caps(create=store.target_enabled(target), edit=store.target_enabled(target), delete=store.target_enabled(target), capacity=True, effectiveNextSession=True), "capacity": {"used": len("\n§\n".join(entries)), "limit": limit}, "effectiveNextSession": True})
             return rows
-        except Exception: return [{"id": "curated-memory", "displayName": "Curated notes", "kind": "memory", "status": "unavailable", "detail": "Curated memory is unavailable", "capabilities": _caps(), "counts": {"items": 0}}]
+        except Exception: return [{"id": "curated-memory", "displayName": "Curated notes", "kind": "memory", "status": "unavailable", "detail": "Curated memory is unavailable", "capabilities": _caps()}]
     def _items(self, source: str, content: bool = False) -> List[Dict[str, Any]]:
         target, store = self._target(source), self._store(); entries = store.memory_entries if target == "memory" else store.user_entries
         path = store._path_for(target); file_rev = _hash(path.read_text("utf-8")) if path.exists() else _hash("")
@@ -136,35 +145,26 @@ class HolographicAdapter:
         return provider, provider._store
     def describe(self) -> Dict[str, Any]:
         try:
-            _, store = self._provider(); count = int(store._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]); entities = int(store._conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0])
-            return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "available", "capabilities": _caps(search=True, browse=True, create=True, edit=True, delete=True, relationships=True, categories=True, tags=True, trust=True), "counts": {"items": count, "entities": entities}}
-        except MemoryNotFound: return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "unavailable", "detail": "Holographic is not the active provider", "capabilities": _caps(), "counts": {"items": 0}}
-        except Exception: return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "degraded", "detail": "Holographic configuration needs review", "capabilities": _caps(), "counts": {"items": 0}}
-    @staticmethod
-    def _millis(value: Any) -> Optional[int]:
-        if not value: return None
-        try:
-            from datetime import datetime, timezone
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=timezone.utc)
-            return int(parsed.timestamp() * 1000)
-        except Exception: return None
-    def _item(self, store: Any, row: Dict[str, Any], full: bool = False) -> Dict[str, Any]:
-        fact_id = int(row["fact_id"]); entities = [str(r[0]) for r in store._conn.execute("SELECT e.name FROM entities e JOIN fact_entities fe ON fe.entity_id=e.entity_id WHERE fe.fact_id=? ORDER BY e.name", (fact_id,)).fetchall()]
-        content = str(row["content"]); created, updated = self._millis(row.get("created_at")), self._millis(row.get("updated_at"))
+            self._provider()
+            return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "available", "capabilities": _caps(create=True, edit=True, delete=True, relationships=True)}
+        except MemoryNotFound: return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "unavailable", "detail": "Holographic is not the active provider", "capabilities": _caps()}
+        except Exception: return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "degraded", "detail": "Holographic configuration needs review", "capabilities": _caps()}
+    def _item(self, row: Dict[str, Any], full: bool = False) -> Dict[str, Any]:
+        fact_id = int(row["fact_id"])
+        content = str(row["content"]); created, updated = _millis(row.get("created_at")), _millis(row.get("updated_at"))
         tags = [tag.strip() for tag in str(row.get("tags") or "").split(",") if tag.strip()]
         category = str(row.get("category") or "general")[:120]
         bounded_tags = [tag[:120] for tag in tags[:64]]
-        return {"id": f"fact:{fact_id}", "sourceId": self.source, "kind": "fact", "title": _title(content, "Fact"), "snippet": _snippet(content), **({"content": content[:_MAX_TEXT]} if full else {}), **({"createdAt": created} if created is not None else {}), **({"updatedAt": updated} if updated is not None else {}), "timestampKind": "created", "revision": _revision(str(row.get("updated_at") or ""), content, category, "\0".join(bounded_tags)), "category": category, "tags": bounded_tags, "trustScore": float(row.get("trust_score") or 0), "retrievalCount": int(row.get("retrieval_count") or 0), "helpfulCount": int(row.get("helpful_count") or 0), "entities": [entity[:200] for entity in entities[:64]]}
+        return {"id": f"fact:{fact_id}", "sourceId": self.source, "kind": "fact", "title": _title(content, "Fact"), "snippet": _snippet(content), **({"content": content[:_MAX_TEXT]} if full else {}), **({"createdAt": created} if created is not None else {}), **({"updatedAt": updated} if updated is not None else {}), "timestampKind": "created", "revision": _revision(str(row.get("updated_at") or ""), content, category, "\0".join(bounded_tags)), "category": category, "tags": bounded_tags, "trustScore": float(row.get("trust_score") or 0)}
     def _row(self, store: Any, item_id: str) -> Dict[str, Any]:
         if not item_id.startswith("fact:") or not item_id[5:].isdigit(): raise MemoryNotFound("memory item not found")
-        row = store._conn.execute("SELECT fact_id,content,category,tags,trust_score,retrieval_count,helpful_count,created_at,updated_at FROM facts WHERE fact_id=?", (int(item_id[5:]),)).fetchone()
+        row = store._conn.execute("SELECT fact_id,content,category,tags,trust_score,created_at,updated_at FROM facts WHERE fact_id=?", (int(item_id[5:]),)).fetchone()
         if row is None: raise MemoryNotFound("memory item not found")
         return dict(row)
     def items(self, q: str = "", limit: int = _MAX_ITEMS, **_: Any) -> List[Dict[str, Any]]:
-        _, store = self._provider(); bounded = min(max(limit, 1), _MAX_SOURCE_SCAN); rows = store.search_facts(q, limit=bounded) if q.strip() else store.list_facts(limit=bounded); return [self._item(store, row) for row in rows]
+        _, store = self._provider(); bounded = min(max(limit, 1), _MAX_SOURCE_SCAN); rows = store.search_facts(q, limit=bounded) if q.strip() else store.list_facts(limit=bounded); return [self._item(row) for row in rows]
     def get(self, item_id: str) -> Dict[str, Any]:
-        _, store = self._provider(); return self._item(store, self._row(store, item_id), True)
+        _, store = self._provider(); return self._item(self._row(store, item_id), True)
     def create(self, input: Dict[str, Any]) -> Dict[str, Any]:
         _, store = self._provider(); fact_id = store.add_fact(input["content"], category=input.get("category", "general"), tags=",".join(input.get("tags", []))); return {"item": self.get(f"fact:{fact_id}")}
     def update(self, item_id: str, input: Dict[str, Any]) -> Dict[str, Any]:
@@ -191,15 +191,14 @@ class HolographicAdapter:
 class VaultAdapter:
     def __init__(self, display_name: str, root: str, index: int): self.source, self.display_name, self.root = f"vault:{index}", display_name, Path(root).expanduser().resolve()
     def describe(self) -> Dict[str, Any]:
-        try: count = len(list(self._paths()))
-        except Exception: return {"id": self.source, "displayName": self.display_name, "kind": "vault", "status": "unavailable", "detail": "Vault root is unavailable", "capabilities": _caps(), "counts": {"items": 0}}
-        return {"id": self.source, "displayName": self.display_name, "kind": "vault", "status": "available", "capabilities": _caps(search=True, browse=True, create=True, edit=True, delete=True, relationships=True, backlinks=True, tags=True), "counts": {"items": count}}
+        if not self.root.is_dir(): return {"id": self.source, "displayName": self.display_name, "kind": "vault", "status": "unavailable", "detail": "Vault root is unavailable", "capabilities": _caps()}
+        return {"id": self.source, "displayName": self.display_name, "kind": "vault", "status": "available", "capabilities": _caps(create=True, edit=True, delete=True, relationships=True)}
     def _paths(self) -> Iterable[Path]:
         if not self.root.is_dir(): raise MemoryNotFound("vault root is unavailable")
         for path in self.root.rglob("*.md"):
             if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(self.root):
                 relative = path.relative_to(self.root).as_posix()
-                if len(relative) <= 507 and len(relative) <= 1_024: yield path
+                if len(relative) <= 507: yield path
     def _path(self, item_id: str) -> Path:
         if not item_id.startswith("note:"): raise MemoryNotFound("memory item not found")
         unresolved = self.root / item_id[5:]
@@ -216,14 +215,7 @@ class VaultAdapter:
     @staticmethod
     def _frontmatter_date(front: str) -> Optional[int]:
         match = re.search(r"(?:^|\n)date:\s*['\"]?([^\n'\"]+)", front)
-        if match is None: return None
-        try:
-            from datetime import datetime, timezone
-            value = match.group(1).strip()
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=timezone.utc)
-            return int(parsed.timestamp() * 1000)
-        except Exception: return None
+        return None if match is None else _millis(match.group(1).strip())
     def _backlinks(self, path: Path, title: str) -> List[str]:
         target_names = {title.lower(), path.stem.lower(), path.relative_to(self.root).with_suffix("").as_posix().lower()}
         found: List[str] = []
@@ -312,7 +304,7 @@ class MemoryManager:
         try:
             from hermes_cli.config import load_config_readonly
             provider = str((load_config_readonly().get("memory", {}) or {}).get("provider", "")).strip()
-            if provider and provider.lower() != "holographic": rows.append({"id": f"provider:{provider}", "displayName": provider, "kind": "provider", "status": "unsupported", "detail": "No Cozy memory adapter is installed for this provider", "capabilities": _caps(), "counts": {"items": 0}})
+            if provider and provider.lower() != "holographic": rows.append({"id": f"provider:{provider}", "displayName": provider, "kind": "provider", "status": "unsupported", "detail": "No Cozy memory adapter is installed for this provider", "capabilities": _caps()})
         except Exception: pass
         return rows
     def _adapter(self, source: str):
@@ -333,17 +325,8 @@ class MemoryManager:
             kind, since, until = input.get("kind"), input.get("since"), input.get("until")
             items = [item for item in items if (not kind or item["kind"] == kind) and (not isinstance(since, int) or item.get("createdAt", -1) >= since) and (not isinstance(until, int) or item.get("createdAt", until + 1) <= until)]
             items.sort(key=lambda item: (int(item.get("updatedAt", 0)), item["id"]), reverse=True)
-            cursor = input.get("cursor")
-            if isinstance(cursor, str) and ":" in cursor:
-                stamp, item_id = cursor.split(":", 1)
-                try: marker = (int(stamp), item_id)
-                except ValueError: raise MemoryInvalid("invalid memory cursor")
-                items = [item for item in items if (int(item.get("updatedAt", 0)), item["id"]) < marker]
             limit = min(_MAX_ITEMS, max(1, int(input.get("limit", _MAX_ITEMS))))
-            page = items[:limit]
-            result: Dict[str, Any] = {"items": page, "sources": statuses}
-            if len(items) > limit and page: result["nextCursor"] = f"{int(page[-1].get('updatedAt', 0))}:{page[-1]['id']}"
-            return result
+            return {"items": items[:limit], "sources": statuses}
         if operation == "graph":
             if isinstance(source, str) and source:
                 return self._adapter(source).graph(**input)

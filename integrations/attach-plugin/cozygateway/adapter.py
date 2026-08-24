@@ -396,7 +396,7 @@ class AttachAdapter:
                 on_interrupt=self._on_interrupt,
                 on_approval=self._dispatch_approval_command,
                 on_clarify=self._dispatch_clarify_command,
-                on_memory=self._dispatch_memory_command,
+                on_memory=self._handle_memory_command,
                 on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
             )
@@ -771,11 +771,8 @@ class AttachAdapter:
             return
         self._spawn_background(loop, self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id))
 
-    async def _dispatch_memory_command(self, command: Dict[str, Any]) -> None:
-        """Serve an ephemeral request while the authenticated attach socket is live."""
-        await self._handle_memory_command(command)
-
     async def _handle_memory_command(self, command: Dict[str, Any]) -> None:
+        """Serve an ephemeral request while the authenticated attach socket is live."""
         request_id, operation, input = command.get("requestId"), command.get("operation"), command.get("input")
         client = self._client
         if not isinstance(request_id, str) or not isinstance(operation, str) or not isinstance(input, dict) or not isinstance(client, AttachV1Client):
