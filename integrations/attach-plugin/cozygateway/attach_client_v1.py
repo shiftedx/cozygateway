@@ -67,6 +67,8 @@ HELLO_CAPABILITIES = (
 RECEIPT_STATES = frozenset({"displayed", "failed"})
 RECEIPT_STAGES = frozenset({"authorization", "projection"})
 RECEIPT_REASON_MAX_CHARS = 256
+# Matches the gateway's shared Id schema, so a legal deliveryId is never dropped locally.
+RECEIPT_ID_MAX_CHARS = 256
 ATTACH_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 ATTACH_AUDIO_VIDEO_MAX_BYTES = 40 * 1024 * 1024
 ATTACH_FILE_MAX_BYTES = 20 * 1024 * 1024
@@ -745,7 +747,7 @@ class AttachV1Client:
         at = command.get("at")
         stage = command.get("stage")
         reason = command.get("reason")
-        if not isinstance(delivery_id, str) or not delivery_id or len(delivery_id) > 128:
+        if not isinstance(delivery_id, str) or not delivery_id or len(delivery_id) > RECEIPT_ID_MAX_CHARS:
             logger.warning("attach-v1: dropping delivery_receipt with an unusable deliveryId")
             return
         if state not in RECEIPT_STATES or not isinstance(at, int) or isinstance(at, bool) or at < 0:
