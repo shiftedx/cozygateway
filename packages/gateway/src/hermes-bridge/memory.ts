@@ -32,7 +32,7 @@ export interface MemorySurface {
   update(name: string, sourceId: string, itemId: string, input: MemoryInput): Promise<BotMemoryWriteResponse>;
   remove(name: string, sourceId: string, itemId: string, input: MemoryInput): Promise<BotMemoryDeleteResponse>;
   graph(name: string, input: MemoryInput): Promise<BotMemoryGraphResponse>;
-  audit?(actorId: string, name: string, action: "create" | "update" | "delete", sourceId: string, itemId: string): void;
+  audit(actorId: string, name: string, action: "create" | "update" | "delete", sourceId: string, itemId: string): void;
 }
 
 interface Pending { agentId: string; resolve: (value: MemoryResult) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout>; }

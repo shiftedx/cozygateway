@@ -375,10 +375,11 @@ export function registerBotRoutes(
       const value = Number(text); if (!Number.isSafeInteger(value) || value < 0) throw new MemoryInvalidRequest(`${name} must be a non-negative millisecond timestamp`);
       return value;
     };
-    const q = c.req.query("q"); const sourceId = c.req.query("source"); const kind = c.req.query("kind"); const cursor = c.req.query("cursor");
-    if ((q !== undefined && q.length > 512) || (sourceId !== undefined && sourceId.length > 120) || (cursor !== undefined && cursor.length > 512)) throw new MemoryInvalidRequest("memory query is too long");
-    if (kind !== undefined && !["memory", "profile", "fact", "note"].includes(kind)) throw new MemoryInvalidRequest("unknown memory kind");
-    return { ...(q === undefined ? {} : { q }), ...(sourceId === undefined ? {} : { sourceId }), ...(kind === undefined ? {} : { kind: kind as "memory" | "profile" | "fact" | "note" }), ...(cursor === undefined ? {} : { cursor }), ...(parsed === undefined ? {} : { limit: parsed }), ...(timestamp("since") === undefined ? {} : { since: timestamp("since")! }), ...(timestamp("until") === undefined ? {} : { until: timestamp("until")! }) };
+    const since = timestamp("since"); const until = timestamp("until");
+    const q = c.req.query("q"); const sourceId = c.req.query("source"); const kind = c.req.query("kind");
+    if ((q !== undefined && q.length > 512) || (sourceId !== undefined && sourceId.length > 120)) throw new MemoryInvalidRequest("memory query is too long");
+    if (kind !== undefined && !["memory", "fact", "note"].includes(kind)) throw new MemoryInvalidRequest("unknown memory kind");
+    return { ...(q === undefined ? {} : { q }), ...(sourceId === undefined ? {} : { sourceId }), ...(kind === undefined ? {} : { kind: kind as "memory" | "fact" | "note" }), ...(parsed === undefined ? {} : { limit: parsed }), ...(since === undefined ? {} : { since }), ...(until === undefined ? {} : { until }) };
   };
   // Cache-first: the snapshot answers immediately, even on a cold link, and a refresh runs in the
   // background so the next read (or the /ws bot_roster frame) carries fresh state.
@@ -411,15 +412,15 @@ export function registerBotRoutes(
     });
     app.post("/bots/:name/memory/sources/:source/items", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
-      try { const source = c.req.param("source"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); const result = await memory.create(resolved.name, source, body); memory.audit?.(c.get("deviceId"), resolved.name, "create", source, result.item.id); return c.json(result, 201); } catch (error) { return memoryFailure(c, error); }
+      try { const source = c.req.param("source"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); const result = await memory.create(resolved.name, source, body); memory.audit(c.get("deviceId"), resolved.name, "create", source, result.item.id); return c.json(result, 201); } catch (error) { return memoryFailure(c, error); }
     });
     app.patch("/bots/:name/memory/sources/:source/items/:id", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
-      try { const source = c.req.param("source"); const id = c.req.param("id"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); if (body.expectedRevision === undefined) throw new MemoryInvalidRequest("expectedRevision is required"); const result = await memory.update(resolved.name, source, id, body); memory.audit?.(c.get("deviceId"), resolved.name, "update", source, result.item.id); return c.json(result); } catch (error) { return memoryFailure(c, error); }
+      try { const source = c.req.param("source"); const id = c.req.param("id"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); if (body.expectedRevision === undefined) throw new MemoryInvalidRequest("expectedRevision is required"); const result = await memory.update(resolved.name, source, id, body); memory.audit(c.get("deviceId"), resolved.name, "update", source, result.item.id); return c.json(result); } catch (error) { return memoryFailure(c, error); }
     });
     app.delete("/bots/:name/memory/sources/:source/items/:id", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
-      try { const source = c.req.param("source"); const id = c.req.param("id"); const body = assertValid(BotMemoryDeleteRequestSchema, await c.req.json()); const result = await memory.remove(resolved.name, source, id, body); memory.audit?.(c.get("deviceId"), resolved.name, "delete", source, id); return c.json(result); } catch (error) { return memoryFailure(c, error); }
+      try { const source = c.req.param("source"); const id = c.req.param("id"); const body = assertValid(BotMemoryDeleteRequestSchema, await c.req.json()); const result = await memory.remove(resolved.name, source, id, body); memory.audit(c.get("deviceId"), resolved.name, "delete", source, id); return c.json(result); } catch (error) { return memoryFailure(c, error); }
     });
   }
 

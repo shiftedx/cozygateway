@@ -7,7 +7,7 @@ import { AttachMemorySurface, MemoryConflict, type MemorySurface } from "../src/
 import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 
 type Env = { Variables: { deviceId: string } };
-const item = { id: "fact:1", sourceId: "holographic", kind: "fact" as const, title: "Cleo", snippet: "Cleo likes concise reports", createdAt: 1, updatedAt: 2, timestampKind: "created" as const, revision: "r1", category: "user_pref", tags: ["cleo"], trustScore: 0.9, retrievalCount: 3, helpfulCount: 1, entities: ["Cleo"] };
+const item = { id: "fact:1", sourceId: "holographic", kind: "fact" as const, title: "Cleo", snippet: "Cleo likes concise reports", createdAt: 1, updatedAt: 2, timestampKind: "created" as const, revision: "r1", category: "user_pref", tags: ["cleo"], trustScore: 0.9 };
 
 function appFor(memory: Partial<MemorySurface>) {
   const app = new Hono<Env>();
