@@ -155,11 +155,18 @@ const DraftEvent = Type.Object({
  * same length: entry `i` is the block index BEFORE which media `i` renders (capability 32). It is
  * all or nothing, because a partial array would silently claim index 0 for every attachment it
  * omits. A plugin that cannot say where an attachment belongs omits the field, and the gateway
- * then builds today's unpositioned attachments. */
+ * then builds today's unpositioned attachments.
+ *
+ * `continues` is the plugin saying "this reply is a message, not the end of the turn". A Hermes
+ * agent loop may deliver several replies before it is done, and the gateway cannot tell them apart
+ * from the frame alone: every reply is a commit. The plugin can, because Hermes marks its own final
+ * turn delivery (the per-turn reply anchor, and its `notify` marker). An omitted or false field is
+ * the historic terminal commit, so an older plugin and an older gateway both keep today's meaning. */
 const CommitEvent = Type.Object({
   kind: Type.Literal("commit"), threadId: Id, turnId: Id, messageId: Id,
   blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
   mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
+  continues: Type.Optional(Type.Boolean()),
 });
 const FailedEvent = Type.Object({
   kind: Type.Literal("failed"), threadId: Id, turnId: Id, messageId: Id,

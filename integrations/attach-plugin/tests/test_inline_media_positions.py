@@ -42,7 +42,7 @@ class _Client(AttachV1Client):
     async def send_draft(self, thread_id, turn_id, blocks, tool_calls=None):
         self.drafts.append((thread_id, turn_id, blocks))
 
-    async def send_done(self, thread_id, turn_id, media_ids=None, media_positions=None):
+    async def send_done(self, thread_id, turn_id, media_ids=None, media_positions=None, continues=False):
         self.commits.append((thread_id, turn_id, media_ids or [], media_positions))
 
 

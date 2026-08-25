@@ -1667,17 +1667,27 @@ class AttachAdapter:
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """Deliver the turn's terminal reply: a final full draft, then ``done``.
+        """Deliver one reply of a turn: a full draft, then ``done``.
 
-        The gateway seals the latest draft as the durable reply. An empty reply with
-        no prior visible content sends ``failed`` instead. Any exception on the path
-        sends a best-effort ``failed``; per-turn state is dropped in ``finally``.
+        The gateway commits the latest draft as a durable message. That commit also SEALS the
+        turn, unless this is a reply the agent produced part-way through its run, in which case
+        it is marked ``continues`` and the turn keeps running (see ``_hermes_final_delivery``).
+        An empty terminal reply with no prior visible content sends ``failed`` instead. Any
+        exception on the path sends a best-effort ``failed``; per-message state is dropped in
+        ``finally``, so the next reply of the same turn starts from a clean draft.
         """
         from gateway.platforms.base import SendResult  # harness-defined identifier
 
         client = self._client
         active_turn = self._caller_active_turn(chat_id)
         turn_id = reply_to or active_turn
+        # An interim reply commits its message and leaves the turn running. See
+        # ``_hermes_final_delivery`` for how the two are told apart.
+        continues = bool(
+            active_turn
+            and turn_id == active_turn
+            and not _hermes_final_delivery(reply_to, active_turn, metadata)
+        )
         if client is None:
             return SendResult(success=False, error="attach not connected")
         if isinstance(metadata, dict) and metadata.get("_interim_send") and active_turn:
@@ -1772,6 +1782,7 @@ class AttachAdapter:
                     },
                 )
             return result
+        keep_active = continues
         try:
             # The authoritative terminal text, or the last streamed buffer when the
             # terminal content is empty or whitespace (a draft-only turn).
@@ -1825,23 +1836,32 @@ class AttachAdapter:
                 media_positions = None
             had_content = self._content_seen.get(turn_id, False)
             if blocks or chips or media_ids:
-                # Full replace with the final view, then seal it.
+                # Full replace with the reply's view, then commit it. The commit seals the turn
+                # unless this is an interim reply, which only projects its message.
                 await client.send_draft(chat_id, turn_id, blocks, tool_calls=chips)
                 if isinstance(client, AttachV1Client):
                     await client.send_done(
-                        chat_id, turn_id, media_ids=media_ids, media_positions=media_positions
+                        chat_id, turn_id, media_ids=media_ids,
+                        media_positions=media_positions, continues=continues,
                     )
                 else:
+                    # attach-v0 has no additive field to say "keep the turn open", so it keeps
+                    # its historic terminal meaning rather than being quietly misreported.
                     await client.send_done(chat_id, turn_id)
             elif had_content:
-                # Nothing new to draw, but earlier drafts carried content: seal the
+                # Nothing new to draw, but earlier drafts carried content: commit the
                 # latest good draft. Do not send an empty draft (it would wipe it).
                 if isinstance(client, AttachV1Client):
                     await client.send_done(
-                        chat_id, turn_id, media_ids=media_ids, media_positions=media_positions
+                        chat_id, turn_id, media_ids=media_ids,
+                        media_positions=media_positions, continues=continues,
                     )
                 else:
                     await client.send_done(chat_id, turn_id)
+            elif continues:
+                # An interim reply with nothing in it is a no-op, not a failed turn: the agent
+                # is still working and owns the terminal outcome.
+                return SendResult(success=True)
             else:
                 # No content ever materialized for this turn.
                 await client.send_failed(chat_id, turn_id, "empty reply")
@@ -1858,10 +1878,12 @@ class AttachAdapter:
         except (AttachAuthError, AttachSupersededError) as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as exc:  # noqa: BLE001 - best-effort failed on the way out
+            # `failed` seals the turn, interim or not, so the anchor goes with it.
+            keep_active = False
             await self._safe_failed(chat_id, turn_id, "turn error")
             return SendResult(success=False, error=str(exc))
         finally:
-            self._cleanup_turn(chat_id, turn_id)
+            self._cleanup_turn(chat_id, turn_id, keep_active=keep_active)
         result = SendResult(success=True, message_id=turn_id)
         if media_result is not None:
             _decorate_send_result(result, "media_result", media_result)
@@ -1968,15 +1990,21 @@ class AttachAdapter:
         except Exception:  # noqa: BLE001 - already failing; nothing more to do
             logger.debug("attach: failed frame emit failed", exc_info=True)
 
-    def _cleanup_turn(self, chat_id: str, turn_id: str) -> None:
-        """Drop a turn's per-turn state once it commits, fails, or is dropped."""
+    def _cleanup_turn(self, chat_id: str, turn_id: str, keep_active: bool = False) -> None:
+        """Drop the per-MESSAGE state a reply leaves behind, and by default the turn with it.
+
+        ``keep_active`` is for an interim reply: its message is complete, so the draft buffer,
+        chips and staged media go, but the turn is still running and the thread's reply anchor
+        must survive. Without it the drafts and tool chips the agent produces for the REST of the
+        run find no active turn and are dropped on the floor.
+        """
         self._turn_text.pop(turn_id, None)
         self._turn_media.pop(turn_id, None)
         self._turn_media_positions.pop(turn_id, None)
         self._tool_chips.pop(turn_id, None)
         self._normalizers.pop(turn_id, None)
         self._content_seen.pop(turn_id, None)
-        if self._active_turn.get(chat_id) == turn_id:
+        if not keep_active and self._active_turn.get(chat_id) == turn_id:
             self._active_turn.pop(chat_id, None)
 
     async def _proactive_media_send(
@@ -2226,6 +2254,36 @@ def _current_turn_message_and_cron() -> Tuple[Optional[str], bool, Optional[str]
         _truthy(get_session_env("HERMES_CRON_SESSION")),
         get_session_env("HERMES_SESSION_PROFILE") or None,
     )
+
+
+def _hermes_final_delivery(
+    reply_to: Optional[str],
+    active_turn: str,
+    metadata: Optional[Dict[str, Any]],
+) -> bool:
+    """True when this ``send`` is Hermes's OWN terminal delivery for ``active_turn``.
+
+    A Hermes agent loop can reply several times before it is finished: ``send_message`` to the
+    current chat during iteration 5 of 90 arrives on this same surface as the answer that ends
+    the turn. The frame is identical, so the gateway cannot tell them apart -- it used to seal
+    the turn on the first one, discard every later tool event and draft, and force-terminalize
+    the still-running tool steps ("1 did not finish"). This adapter can tell them apart, because
+    Hermes stamps its terminal delivery twice over and nothing else carries either mark:
+
+    * ``reply_to`` is the turn's own reply anchor. ``_handle_turn`` injects the turn with
+      ``message_id=turn_id``, and Hermes replies to that anchor
+      (``_reply_anchor_for_event`` -> ``event.message_id``) only for the final response.
+    * ``metadata["notify"]`` is Hermes's "this is user-visible final content" marker
+      (``_mark_notify_metadata``), applied to every terminal reply and to nothing else.
+
+    A mid-run ``send_message`` carries neither: the tool builds its own metadata
+    (``thread_id`` at most) and passes no ``reply_to``. Both marks are checked because either one
+    alone would be a single point of failure, and the cost of a false negative is only that the
+    turn waits for its configured timeout instead of sealing at once.
+    """
+    if reply_to and reply_to == active_turn:
+        return True
+    return isinstance(metadata, dict) and metadata.get("notify") is True
 
 
 def _caller_owns_active_turn(turn_id: str) -> bool:

@@ -77,9 +77,20 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `app
 `scheduled`, `media`, and `presence`.
 
 - A draft is full-replace decoration and may be dropped by clients.
-- Exactly one of `commit`, `failed`, `cancelled`, or `interrupted` seals a turn. Replays are
-  idempotent. A later terminal or late draft is durably acknowledged but cannot change the sealed
-  result.
+- A `commit` projects one durable message. It also SEALS the turn unless it carries
+  `continues: true`, which says the message is a reply the agent produced part-way through a run
+  that is still going. An interim commit is projected exactly like any other message; the turn's
+  state stays running, its tool steps keep their own lifecycle, and later `tool` and `draft` events
+  for the same `turnId` are still applied. The field is additive and optional in both directions:
+  a plugin that never sends it, and a gateway that does not read it, behave exactly as before.
+  A turn carrying interim commits is sealed by the first `commit` without `continues`, by
+  `failed`/`cancelled`/`interrupted`, or by the gateway's configured turn timeout.
+- Only the plugin can mark `continues`. Every reply of a turn is the same frame on the wire, so the
+  gateway has nothing to judge it by; the plugin sits next to Hermes, which marks its own final
+  delivery for a turn and marks nothing else that way.
+- Exactly one of `commit` (without `continues`), `failed`, `cancelled`, or `interrupted` seals a
+  turn. Replays are idempotent. A later terminal or late draft is durably acknowledged but cannot
+  change the sealed result.
 - Tool calls use a stable `callId` with `running` → `ok|error` terminal transitions.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.

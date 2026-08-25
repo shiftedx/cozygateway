@@ -82,8 +82,8 @@ The TypeBox schemas are normative. The names below identify complete shapes rath
 a second, hand-copied schema.
 
 - `BotSummary` is one control-plane roster row. Its `chatSessionId`, `preview`, and
-  `lastActiveAt` are overlaid from the configured bot's gateway-owned native chat. Profile metadata
-  remains Hermes control-plane data.
+  `lastActiveAt` are overlaid from the configured bot's gateway-owned native chat, on every surface
+  that serves a roster row. Profile metadata remains Hermes control-plane data.
 - `BotChatMessage` is a durable native transcript row. `id` is the gateway/attach event message
   id, `at` is gateway-clock milliseconds (or `null` when unavailable), and `clientId` is an
   optional sender echo. Attachments are gateway-scoped opaque `fileId` values, never paths or URLs.
@@ -419,7 +419,10 @@ that exists but is not configured as a native identity must not fall through to 
 All frames travel on the existing authenticated `/ws` and are members of the closed core
 `ServerFrame` union. `updatedAt`, message timestamps, and tool timestamps are milliseconds.
 
-- `bot_roster`: complete `BotSummary[]` control-plane roster snapshot.
+- `bot_roster`: complete `BotSummary[]` control-plane roster snapshot. It is the same overlay
+  `GET /bots` returns, rows and fields alike: `chatSessionId` carries the bot's real native chat
+  session, so a client can join a `bot_chat_delta`, `bot_chat_state`, or `bot_tool_activity` frame
+  to the roster row it belongs to.
 - `bot_presence`: complete active profile-name set.
 - `bot_chat`: native transcript delta. `messages` contains only newly committed rows.
 - `bot_chat_state`: current native-turn phase: `polling`, `complete`, `timeout`, or `failed`.
