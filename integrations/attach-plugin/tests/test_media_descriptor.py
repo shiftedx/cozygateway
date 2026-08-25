@@ -344,12 +344,13 @@ class DetectionTests(MediaDescriptorTestCase):
         self.assertEqual(descriptor.compatibility, "unsupported")
         self.assertIn("not an allowed attachment type", descriptor.incompatibility_reason)
 
-    def test_bare_zip_is_unsupported_with_a_reason(self):
+    def test_bare_zip_is_supported_as_a_file(self):
         descriptor = probe(self.write("bundle.zip", bare_zip_bytes()))
         self.assertEqual(descriptor.detected_mime, "application/zip")
+        self.assertEqual(descriptor.mime, "application/zip")
         self.assertEqual(descriptor.family, "file")
-        self.assertEqual(descriptor.compatibility, "unsupported")
-        self.assertIn("ZIP archives", descriptor.incompatibility_reason)
+        self.assertEqual(descriptor.compatibility, "supported")
+        self.assertIsNone(descriptor.incompatibility_reason)
 
     def test_ooxml_zip_is_detected_as_its_own_type(self):
         descriptor = probe(self.write("report.docx", ooxml_zip_bytes()))
@@ -357,6 +358,14 @@ class DetectionTests(MediaDescriptorTestCase):
         self.assertNotEqual(descriptor.detected_mime, "application/zip")
         self.assertEqual(descriptor.compatibility, "unsupported")
         self.assertIn("Export to PDF", descriptor.incompatibility_reason)
+
+    def test_ooxml_package_never_rides_the_zip_allowance(self):
+        """Both start with PK. Only the bare archive is a deliverable file."""
+
+        self.assertEqual(detect_mime(ooxml_zip_bytes()), "application/vnd.openxmlformats-officedocument")
+        self.assertEqual(detect_mime(bare_zip_bytes()), "application/zip")
+        self.assertEqual(evaluate_compatibility("application/zip")[0], "supported")
+        self.assertEqual(evaluate_compatibility("application/vnd.openxmlformats-officedocument")[0], "unsupported")
 
     def test_detect_mime_on_short_and_empty_buffers_does_not_crash(self):
         for payload in (b"", b"\x89", b"RIFF", b"PK\x03\x04", b"\x00" * 3):
@@ -547,6 +556,7 @@ class PolicyTableTests(unittest.TestCase):
                 "audio/mpeg",
                 "audio/wav",
                 "application/pdf",
+                "application/zip",
             },
         )
 

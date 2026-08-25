@@ -42,6 +42,7 @@ const SAMPLES = new Map<string, Uint8Array>([
   ["application/vnd.oasis.opendocument.text", zip],
   ["application/vnd.oasis.opendocument.spreadsheet", zip],
   ["application/vnd.oasis.opendocument.presentation", zip],
+  ["application/zip", zip],
 ]);
 
 describe("attach-v1 media policy: allowlist and rejection shapes", () => {
@@ -98,9 +99,15 @@ describe("attach-v1 media policy: allowlist and rejection shapes", () => {
     ]) {
       expect(ASSISTANT_MEDIA_TYPES.has(baseline)).toBe(true);
     }
-    for (const excluded of ["image/svg+xml", "application/zip", "text/html"]) {
+    for (const excluded of ["image/svg+xml", "text/html"]) {
       expect(ASSISTANT_MEDIA_TYPES.has(excluded)).toBe(false);
     }
+    // A ZIP is delivered as a generic file: same 20 MiB document cap, `file` kind, no inline render.
+    expect(ASSISTANT_MEDIA_TYPES.get("application/zip")).toMatchObject({
+      ext: "zip",
+      kind: "file",
+      maxBytes: ASSISTANT_MEDIA_TYPES.get("application/pdf")!.maxBytes,
+    });
 
     let index = 0;
     for (const [mime, sample] of SAMPLES) {
@@ -169,6 +176,19 @@ describe("attach-v1 media policy: allowlist and rejection shapes", () => {
     const body = await refused.json();
     expect(body).toMatchObject({ reason: "too_large", limitBytes: limit });
     expect(body.error.message).toContain(String(limit));
+  });
+
+  it("answers 413 with the document cap for a ZIP past it, and 415 for zip bytes under another type", async () => {
+    const limit = ASSISTANT_MEDIA_TYPES.get("application/zip")!.maxBytes;
+    const oversized = new Uint8Array(limit + 1);
+    oversized.set(zip);
+    const refused = await upload("zip_big", "application/zip", oversized, "big.zip");
+    expect(refused.status).toBe(413);
+    expect(await refused.json()).toMatchObject({ reason: "too_large", limitBytes: limit });
+
+    const notAZip = await upload("zip_bad", "application/zip", text("PLAIN-TEXT-SECRETPAYLOAD"), "x.zip");
+    expect(notAZip.status).toBe(415);
+    expect(JSON.stringify(await notAZip.json())).not.toContain("SECRETPAYLOAD");
   });
 
   it("names the declared type's own cap, not the largest cap in the table", async () => {
