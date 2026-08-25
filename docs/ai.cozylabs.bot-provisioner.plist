@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bot auto-provisioner (issue #183).
+
+  Sweeps every 30 seconds for Hermes profiles that opted into the CozyGateway
+  attach surface but are not yet wired for it, and provisions them. See
+  docs/attach-v1-operations.md, section "Automatic bot provisioning".
+
+  TEMPLATE. Replace every REPLACE_ME_REPO with the absolute path to the
+  cozygateway checkout on this Mac before installing, then:
+
+    sed "s#REPLACE_ME_REPO#$PWD#g" docs/ai.cozylabs.bot-provisioner.plist \
+      > ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist
+    launchctl bootstrap "gui/$(id -u)" \
+      ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist
+
+  To stop it:
+
+    launchctl bootout "gui/$(id -u)/ai.cozylabs.bot-provisioner"
+
+  This agent shells out to ssh with key auth and to launchctl, so it has to run
+  in the Aqua session as the logged-in user. A LaunchDaemon would have neither
+  the ssh key nor the per-user launchd domain the per-profile gateway services
+  live in.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.cozylabs.bot-provisioner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPLACE_ME_REPO/scripts/bot-provisioner-watch.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPLACE_ME_REPO</string>
+
+    <!-- The sweep is cheap when there is nothing to do: a readdir, a YAML parse
+         per profile, and a launchctl print. It only reaches the network once a
+         profile actually needs provisioning. -->
+    <key>StartInterval</key>
+    <integer>30</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Explicitly NOT KeepAlive: this is a periodic one-shot, and KeepAlive
+         would have launchd restart it the instant each sweep exits. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+
+    <!-- A sweep waits up to 90s for the attach hello, so a slow one can still
+         be running when the next tick fires. The script's own lock makes that
+         a logged no-op rather than two provisioners racing the same profile. -->
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- The script keeps its own timestamped log; these two catch anything that
+         escapes it, such as a bash syntax error before logging is set up. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/cozylabs-bot-provisioner.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/cozylabs-bot-provisioner.err.log</string>
+</dict>
+</plist>

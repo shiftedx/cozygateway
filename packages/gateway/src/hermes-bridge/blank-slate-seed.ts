@@ -28,6 +28,22 @@ export const BLANK_SLATE_PLATFORMS = ["cozygateway", "cli"] as const;
  *  decided without them ever seeing it. */
 export const BLANK_SLATE_APPROVAL_MODE = "manual";
 
+/** The Hermes plugin that makes a bot reachable at all.
+ *
+ *  A profile is only chattable from the phone once its own gateway process loads this plugin: the
+ *  plugin is what opens the attach stream the gateway's `NativeBotDataPlane` reads and writes. A
+ *  profile created without it is a roster row nobody can talk to, which is exactly what issue #183
+ *  was. `allow_tool_override: false` mirrors the six hand-provisioned profiles: the attach plugin
+ *  does not get to widen the toolset floor the seed just wrote. */
+export const ATTACH_PLUGIN_NAME = "cozygateway";
+
+/** The plugin stanza a fresh profile needs, in the shape the working profiles carry it. */
+export const ATTACH_PLUGIN_SEED = {
+  enabled: [ATTACH_PLUGIN_NAME],
+  disabled: [] as string[],
+  entries: { [ATTACH_PLUGIN_NAME]: { allow_tool_override: false } },
+} as const;
+
 /** The complete blank-slate seed, exported as one value so the creation test asserts the whole
  *  shape rather than a hand-picked subset.
  *
@@ -55,6 +71,7 @@ export const BLANK_SLATE_SEED = {
     BLANK_SLATE_PLATFORMS.map((platform) => [platform, [...BLANK_SLATE_TOOLSETS]]),
   ),
   approvals: { mode: BLANK_SLATE_APPROVAL_MODE },
+  plugins: ATTACH_PLUGIN_SEED,
 } as const;
 
 /** What the creating user explicitly asked this bot to start with, on top of the floor. Absent
@@ -102,6 +119,34 @@ export interface BlankSlatePlan {
   unknownMcpServers: string[];
 }
 
+/** The `plugins` patch a profile needs, or undefined when it is already bound.
+ *
+ *  Every field is merged rather than replaced, because a `plugins` stanza that already exists
+ *  belongs to whoever wrote it. `enabled` in particular is an ARRAY, and the deep merge on the
+ *  other side replaces arrays wholesale, so the union has to be computed here or seeding this
+ *  plugin would silently unload every other one the profile had.
+ *
+ *  A name sitting in `disabled` is dropped from it in the same write: Hermes reads both lists and
+ *  leaving `cozygateway` in each would be an instruction that contradicts itself. That is the one
+ *  place this seed overrules an existing decision, and it does so only for its own plugin. */
+function planAttachPlugin(plugins: Record<string, unknown>): Record<string, unknown> | undefined {
+  const enabled = Array.isArray(plugins["enabled"]) ? (plugins["enabled"] as unknown[]) : [];
+  const disabled = Array.isArray(plugins["disabled"]) ? (plugins["disabled"] as unknown[]) : [];
+  const entries = asRecord(plugins["entries"]) ?? {};
+
+  const isEnabled = enabled.includes(ATTACH_PLUGIN_NAME);
+  const isDisabled = disabled.includes(ATTACH_PLUGIN_NAME);
+  const hasEntry = entries[ATTACH_PLUGIN_NAME] !== undefined;
+  if (isEnabled && !isDisabled && hasEntry) return undefined;
+
+  const patch: Record<string, unknown> = {};
+  if (!isEnabled) patch["enabled"] = [...enabled, ATTACH_PLUGIN_NAME];
+  if (isDisabled) patch["disabled"] = disabled.filter((name) => name !== ATTACH_PLUGIN_NAME);
+  else if (plugins["disabled"] === undefined) patch["disabled"] = [];
+  if (!hasEntry) patch["entries"] = { [ATTACH_PLUGIN_NAME]: { allow_tool_override: false } };
+  return patch;
+}
+
 /** Works out the subset of the seed a profile does not already carry.
  *
  *  A key that is already present is somebody's decision -- Hermes', or a user who has since raised
@@ -120,6 +165,12 @@ export function planBlankSlateSeed(input: {
 }): BlankSlatePlan {
   const config = asRecord(input.current) ?? {};
   const patch: Record<string, unknown> = {};
+
+  // The plugin binding first, and NOT behind `blankSlate`. That flag is toolset policy: an
+  // operator turning it off is asking for hermes' broad defaults, not for an unreachable bot.
+  // Reachability is not a default anyone gets to opt out of by accident.
+  const pluginPatch = planAttachPlugin(asRecord(config["plugins"]) ?? {});
+  if (pluginPatch !== undefined) patch["plugins"] = pluginPatch;
 
   const requestedToolsets = cleanNames(input.selection?.toolsets);
   const known = input.reportedToolsets;
