@@ -207,7 +207,7 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[1:3], ("native caption", ["/tmp/photo.jpg"]))
         self.assertTrue(kwargs["canonical_home"])
 
-    async def test_send_message_handler_never_calls_journal_admission_success(self):
+    async def test_send_message_handler_reports_journaled_admission_as_accepted(self):
         resident = types.SimpleNamespace(
             _ready=__import__("asyncio").Event(),
             send_proactive=AsyncMock(
@@ -254,9 +254,12 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
             _post_tool_call(tool_name="send_message", tool_call_id="call-2")
 
+        # Durably journaled is an acceptance, not a failure: an error here made hermes
+        # core post a duplicate plain-text copy of the same report.
         self.assertEqual(result["state"], "journaled")
-        self.assertIn("projection is not yet confirmed", result["error"])
-        self.assertNotIn("success", result)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["pending"])
+        self.assertNotIn("error", result)
         first_key = resident.send_proactive.await_args_list[0].kwargs["delivery_key"]
         retry_key = resident.send_proactive.await_args_list[1].kwargs["delivery_key"]
         distinct_key = resident.send_proactive.await_args_list[2].kwargs["delivery_key"]
@@ -358,9 +361,9 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     adapter._spool.close()
 
-            self.assertFalse(first.success)
-            self.assertFalse(retry.success)
-            self.assertIn("projection not yet confirmed", first.error)
+            self.assertTrue(first.success)
+            self.assertTrue(retry.success)
+            self.assertTrue(first.delivery_lifecycle["accepted_pending"])
             events = self._events(path)
             self.assertEqual([event["kind"] for event in events], ["scheduled", "scheduled"])
             # No caller-pinned thread: the delivery must be session independent, or the
@@ -433,8 +436,8 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             # The live turn is untouched: not sealed, not cleaned up, not stolen.
             self.assertEqual(adapter._active_turn.get("thread"), "turn-live")
             self.assertEqual(adapter._turn_text.get("turn-live"), "the user's own in-flight answer")
-            self.assertFalse(result.success)
-            self.assertIn("projection not yet confirmed", result.error)
+            self.assertTrue(result.success)
+            self.assertTrue(result.delivery_lifecycle["accepted_pending"])
 
     async def test_the_turns_own_terminal_reply_still_takes_the_turn_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -516,7 +519,8 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     adapter._spool.close()
 
-            self.assertFalse(result.success)
+            self.assertTrue(result.success)
+            self.assertTrue(result.delivery_lifecycle["accepted_pending"])
             events = self._events(path)
             self.assertEqual([event["kind"] for event in events], ["scheduled"])
             self.assertEqual(events[0]["threadId"], "thread-42")
@@ -541,7 +545,8 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
             events = self._events(path)
 
-        self.assertNotIn("success", result)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["pending"])
         self.assertEqual(result["state"], "journaled")
         self.assertEqual([event["kind"] for event in events], ["scheduled"])
         self.assertEqual(events[0]["target"], {"kind": "canonical_home"})
@@ -678,7 +683,7 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "journaled")
         self.assertEqual([event["kind"] for event in events], ["media", "scheduled"])
 
-    async def test_upstream_hermes_abi_reports_journaled_delivery_as_pending_error(self):
+    async def test_upstream_hermes_abi_reports_journaled_delivery_as_accepted(self):
         with patch(
             "cozygateway.adapter._standalone_send",
             AsyncMock(return_value={"state": "journaled", "accepted_pending": True}),
@@ -687,8 +692,9 @@ class ScheduledDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 types.SimpleNamespace(extra={}), "home", "daily note"
             )
         self.assertEqual(result["state"], "journaled")
-        self.assertIn("projection is not yet confirmed", result["error"])
-        self.assertNotIn("success", result)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["pending"])
+        self.assertNotIn("error", result)
 
     async def test_upstream_hermes_abi_reports_only_projected_as_success(self):
         with patch(
