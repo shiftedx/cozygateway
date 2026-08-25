@@ -352,6 +352,30 @@ class AttachV1Client:
             "messageId": str(uuid.uuid4()), "message": message[:4096],
         })
 
+    async def send_cancelled(self, thread_id: str, turn_id: str) -> None:
+        """Seal a turn that ended with nothing to say.
+
+        The one terminal that neither projects a message nor reports an error: a turn the
+        harness consumed without producing user-visible output (a slash command whose notice
+        is empty) is over, and saying so is the difference between a sealed turn and a phone
+        that shows "thinking" forever.
+        """
+        self._latest_blocks.pop(turn_id, None)
+        self._latest_tools.pop(turn_id, None)
+        await self._queue_event({
+            "kind": "cancelled", "threadId": thread_id, "turnId": turn_id,
+            "messageId": str(uuid.uuid4()),
+        })
+
+    async def send_interrupted(self, thread_id: str, turn_id: str) -> None:
+        """Seal a turn the operator stopped. Idempotent: a later terminal cannot win."""
+        self._latest_blocks.pop(turn_id, None)
+        self._latest_tools.pop(turn_id, None)
+        await self._queue_event({
+            "kind": "interrupted", "threadId": thread_id, "turnId": turn_id,
+            "messageId": str(uuid.uuid4()),
+        })
+
     async def send_tool(self, thread_id: str, turn_id: str, call_id: str, name: str, status: str, detail: Optional[str] = None) -> None:
         event: Dict[str, Any] = {"kind": "tool", "threadId": thread_id, "turnId": turn_id, "callId": call_id, "name": name[:128], "status": status}
         if detail:

@@ -151,6 +151,49 @@ _ONE_SHOT_CLEANUP_SECONDS = 0.25
 _ONE_SHOT_CLEANUP_TASKS: Set[asyncio.Task] = set()
 
 
+def consumed_as_command(event: Any) -> Optional[str]:
+    """The canonical Hermes command this inbound message will be CONSUMED as, or ``None``.
+
+    A message whose text is a Hermes slash command never reaches the agent loop: Hermes
+    dispatches it from the command registry and returns the notice, so no agent turn runs and
+    no streaming draft is ever produced. The gateway, meanwhile, opened a durable turn for it.
+    Everything that seals such a turn hangs off knowing it IS one, so the reading is taken from
+    Hermes' own registry rather than from a leading slash: an unknown ``/word`` is ordinary text
+    that the agent answers, and sealing that turn early would cut off a real reply.
+
+    Fails CLOSED. With no registry on the path (a standalone import, a test without the harness
+    stubs) there is no agent either, so guessing buys nothing and mis-reading costs a live turn.
+    """
+    text = str(getattr(event, "text", "") or "").strip()
+    if not text.startswith("/"):
+        return None
+    try:
+        name = event.get_command()
+    except Exception:  # noqa: BLE001 - a foreign event shape is simply not a command
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    try:
+        from hermes_cli.commands import (  # harness-defined identifiers
+            is_gateway_known_command,
+            resolve_command,
+        )
+    except Exception:  # noqa: BLE001 - no registry, no command dispatch to seal after
+        logger.debug("attach: Hermes command registry unavailable", exc_info=True)
+        return None
+    try:
+        definition = resolve_command(name)
+        canonical = getattr(definition, "name", None) or name
+        if not is_gateway_known_command(canonical):
+            # A config-defined quick command resolves inside Hermes and is invisible here; the
+            # gateway's stale-turn reaper is the belt for that narrow case.
+            return None
+    except Exception:  # noqa: BLE001 - a registry fault must not change turn handling
+        logger.debug("attach: Hermes command resolution failed", exc_info=True)
+        return None
+    return str(canonical)
+
+
 def hermes_gateway_commands() -> List[Dict[str, str]]:
     """Return the commands this Hermes profile exposes to messaging clients.
 
@@ -770,6 +813,13 @@ class AttachAdapter:
         # Injectable so tests are deterministic.
         self._reconnect_sleep = asyncio.sleep
         self._reconnect_jitter = random.random
+        # How long an acked interrupt waits for Hermes' own terminal before sealing the turn
+        # itself. Long enough for a live run's stop notice, short enough that a phone showing
+        # "thinking" over a dead turn recovers while the operator is still looking at it.
+        self._interrupt_seal_grace: float = _env_float(
+            "COZYGATEWAY_INTERRUPT_SEAL_GRACE_SECONDS", 5.0
+        )
+        self._interrupt_sleep = asyncio.sleep
         # Per-thread active turn id: set on inject, read by the draft / terminal
         # surfaces, dropped when the turn ends.
         self._active_turn: Dict[str, str] = {}
@@ -852,17 +902,80 @@ class AttachAdapter:
         return normalizer.update(text)
 
     def set_message_handler(self, handler: Any) -> None:
-        """Stage safe local reply media while preserving Hermes' response."""
+        """Stage safe local reply media, and seal a turn Hermes consumed as a command.
+
+        This wrapper is the ONE seam that sees both halves of a command dispatch: the message
+        going in, and whatever Hermes made of it coming out. See ``_seal_consumed_command`` for
+        why the second half has to be watched at all.
+        """
 
         async def wrapped(event: Any) -> Any:
-            response = await handler(event)
             chat_id = getattr(getattr(event, "source", None), "chat_id", None)
-            turn_id = self._active_turn.get(chat_id) if isinstance(chat_id, str) else None
+            chat_id = chat_id if isinstance(chat_id, str) else None
+            active = self._active_turn.get(chat_id) if chat_id else None
+            command = consumed_as_command(event) if active else None
+            # Only the message that OPENED the turn can seal it: a steer injects
+            # "<turnId>:steer" and an interrupt injects no anchor at all, and neither one owns
+            # the turn's outcome.
+            command_turn = active if command and getattr(event, "message_id", None) == active else None
+            try:
+                response = await handler(event)
+            except BaseException:
+                if command_turn:
+                    await self._seal_consumed_command(chat_id, command_turn, command, failed=True)
+                raise
+            turn_id = self._active_turn.get(chat_id) if chat_id else None
             if turn_id and isinstance(response, str):
                 self._stage_response_media(turn_id, response)
+            if command_turn:
+                await self._seal_consumed_command(chat_id, command_turn, command, response=response)
             return response
 
         self._message_handler = wrapped  # harness-defined callback slot
+
+    async def _seal_consumed_command(
+        self,
+        chat_id: str,
+        turn_id: str,
+        command: str,
+        response: Any = None,
+        failed: bool = False,
+    ) -> None:
+        """Seal the turn a Hermes command consumed, when nothing else will.
+
+        A command notice that HAS text already seals its turn on the ordinary reply path: Hermes
+        delivers it through ``send`` with the turn's own reply anchor and its ``notify`` marker,
+        which reads as the terminal delivery (see ``_hermes_final_delivery``) and commits.
+
+        The hole is a command that produces no text -- ``/start`` returns "", a handler returns
+        ``None``, a handler raises -- and the ones that hang. Nothing is ever sent, so the durable
+        turn the gateway opened for that message stays open: the app shows "thinking" until an
+        operator repairs the row by hand (issue #190). A command dispatch is over when the handler
+        returns, so this is the moment the floor terminal is honest.
+
+        The floor is deliberately not an empty ``commit``: that would append a blank assistant
+        bubble to the transcript. A raised handler seals ``failed`` (something went wrong and the
+        user should see that); a silent one seals ``cancelled``, which ends the turn without
+        inventing a message. A hang produces no return at all and is the gateway reaper's job.
+        """
+        text = getattr(response, "text", response)  # unwrap Hermes' EphemeralReply
+        if not failed and isinstance(text, str) and text.strip():
+            return  # Hermes' own notify delivery seals this one.
+        client = self._client
+        if self._active_turn.get(chat_id) != turn_id or client is None:
+            return
+        logger.info("attach: sealing turn %s consumed as /%s with no reply", turn_id, command)
+        try:
+            if failed:
+                await client.send_failed(chat_id, turn_id, f"/{command} failed")
+            else:
+                await client.send_cancelled(chat_id, turn_id)
+        except Exception:  # noqa: BLE001 - a seal that cannot be sent must not crash dispatch
+            # The local anchor stays: the turn is still open on the wire, so the reaper (and any
+            # later frame for it) must still find it here.
+            logger.debug("attach: command turn seal failed", exc_info=True)
+            return
+        self._cleanup_turn(chat_id, turn_id)
 
     def _stage_response_media(self, turn_id: str, response: str) -> None:
         """Mirror Hermes' safe extraction without altering its delivery input.
@@ -1304,9 +1417,17 @@ class AttachAdapter:
         steer text, so it needs no extra harness import and this module stays importable
         without the harness on the path.
 
-        The gateway independently records ``turn.interrupted`` on its side, so this only needs
-        to stop the live run. A failed inject must never crash the drain loop, so it degrades to
-        a best-effort no-op (debug-log-and-return).
+        A live run stops and Hermes delivers its own stop notice, which seals the turn on the
+        ordinary reply path. When there is no live Hermes work for the turn -- it was consumed as
+        a command, or the run died -- the inject is a clean no-op and NOTHING seals: the interrupt
+        is acked on the wire and the phone keeps showing "thinking" (issue #190, three acked
+        interrupts, no terminal). So the seal is guaranteed here instead: after a short grace for
+        Hermes' own terminal, a turn still open is sealed ``interrupted``. The grace is what keeps
+        the live path's notice text: whoever seals first wins, and Hermes wins when it is alive.
+
+        A failed inject must never crash the drain loop, so it degrades to a best-effort no-op
+        (debug-log-and-return) -- and still seals, because an interrupt the operator asked for
+        must terminalize either way.
         """
         from gateway.platforms.base import MessageEvent  # harness-defined identifier
 
@@ -1321,6 +1442,22 @@ class AttachAdapter:
             await self.handle_message(event)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - an interrupt must never crash the drain loop
             logger.debug("attach: interrupt injection raised", exc_info=True)
+        await self._seal_interrupted(frame.thread_id, frame.turn_id)
+
+    async def _seal_interrupted(self, thread_id: str, turn_id: str) -> None:
+        """Emit the ``interrupted`` terminal for ``turn_id`` unless something else sealed it."""
+        if self._interrupt_seal_grace > 0:
+            await self._interrupt_sleep(self._interrupt_seal_grace)
+        client = self._client
+        if self._active_turn.get(thread_id) != turn_id or client is None:
+            return  # Hermes sealed it (with its own notice text, which is the better terminal).
+        logger.info("attach: interrupt sealing turn %s; no Hermes terminal arrived", turn_id)
+        try:
+            await client.send_interrupted(thread_id, turn_id)
+        except Exception:  # noqa: BLE001 - the drain loop outlives one failed frame
+            logger.debug("attach: interrupted frame emit failed", exc_info=True)
+            return
+        self._cleanup_turn(thread_id, turn_id)
 
     def _on_approval_command(self, command: Dict[str, Any]) -> None:
         """Resolve a durable v1 approval through Hermes' native slash-command seam."""

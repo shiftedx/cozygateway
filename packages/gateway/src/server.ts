@@ -49,6 +49,12 @@ export const GATEWAY_VERSION = "0.2.8";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
+/** Seconds from the config file in the units the data plane takes. An omitted knob stays omitted,
+ *  so the plane keeps ownership of its own defaults instead of having them restated here. */
+function millis(seconds: number | undefined): number | undefined {
+  return seconds === undefined ? undefined : seconds * 1000;
+}
+
 function allowedAttachMedia(config: GatewayConfig, agentId: string): boolean {
   return Object.keys(config.hermes.profiles).some(
     (profile) => profile.trim().toLowerCase() === agentId,
@@ -329,6 +335,9 @@ export async function startGateway(
     nativeBots: nativeBotEntries.map(([bot]) => bot),
     chatSuggestion: hermesOptions.chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
+    staleTurnSweepMs: millis(config.staleTurnSweepSeconds),
+    staleTurnInterruptGraceMs: millis(config.staleTurnInterruptGraceSeconds),
+    staleTurnCeilingMs: millis(config.staleTurnCeilingSeconds),
     broadcast: (frame) => {
       hub.broadcast(frame);
       raiseLiveActivityFrame(frame);

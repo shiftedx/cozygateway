@@ -72,6 +72,12 @@ export interface NativeBotDataPlaneOptions {
   now?: () => number;
   /** Existing gateway wall-clock bound; durable attach queueing lasts until this deadline. */
   turnTimeoutMs?: number;
+  /** How often the stale-turn sweep runs. 0 disables the sweep entirely. */
+  staleTurnSweepMs?: number | undefined;
+  /** Silence after an ACKED interrupt before the gateway seals the turn itself. */
+  staleTurnInterruptGraceMs?: number | undefined;
+  /** Hard ceiling of TOTAL silence (no frames of any kind) before a turn is reaped. */
+  staleTurnCeilingMs?: number | undefined;
   log?: (message: string) => void;
   trace?: TraceLog;
   mobileNode?: MobileNodeBroker;
@@ -133,6 +139,15 @@ export class NativeBotDataPlane {
   >();
   readonly #turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #liveTurnBatches = new Map<string, LiveTurnBatch>();
+  readonly #staleTurnSweepMs: number;
+  readonly #staleTurnInterruptGraceMs: number;
+  readonly #staleTurnCeilingMs: number;
+  /** Last moment this turn produced ANY frame. Seeded from the durable queuedAt, so a restart
+   *  does not hand a turn that was already silent for an hour a fresh hour of silence. */
+  readonly #turnActivity = new Map<string, number>();
+  /** When an interrupt for this turn was accepted by the plugin. */
+  readonly #interruptAcked = new Map<string, number>();
+  #staleTurnSweep: ReturnType<typeof setInterval> | undefined;
 
   constructor(opts: NativeBotDataPlaneOptions) {
     this.#control = opts.control;
@@ -145,6 +160,9 @@ export class NativeBotDataPlane {
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
     this.#turnTimeoutMs = opts.turnTimeoutMs ?? 0;
+    this.#staleTurnSweepMs = opts.staleTurnSweepMs ?? 60_000;
+    this.#staleTurnInterruptGraceMs = opts.staleTurnInterruptGraceMs ?? 120_000;
+    this.#staleTurnCeilingMs = opts.staleTurnCeilingMs ?? 1_800_000;
     this.#log =
       opts.log ??
       ((message) => void process.stderr.write(`[native-bot] ${message}\n`));
@@ -156,8 +174,10 @@ export class NativeBotDataPlane {
     for (const bot of this.#native) {
       const chat = this.#storage.nativeBotChat(bot, this.#now());
       this.#restoreToolFrames(bot);
-      if (chat.activeTurnId !== undefined)
+      if (chat.activeTurnId !== undefined) {
         this.#scheduleTurnTimeout(bot, chat.sessionId, chat.activeTurnId);
+        this.#seedTurnActivity(bot, chat.sessionId, chat.activeTurnId);
+      }
     }
     for (const pending of this.#storage.pendingNativeInteractions()) {
       if (this.#native.has(pending.bot))
@@ -312,6 +332,10 @@ export class NativeBotDataPlane {
   }
 
   close(): void {
+    if (this.#staleTurnSweep !== undefined) clearInterval(this.#staleTurnSweep);
+    this.#staleTurnSweep = undefined;
+    this.#turnActivity.clear();
+    this.#interruptAcked.clear();
     for (const timer of this.#interactionTimers.values()) clearTimeout(timer);
     this.#interactionTimers.clear();
     for (const timer of this.#turnTimers.values()) clearTimeout(timer);
@@ -381,6 +405,10 @@ export class NativeBotDataPlane {
         return true;
       }
       if (command === undefined || command.threadId !== sessionId) return false;
+      // Any frame at all is proof the turn is alive. A long tool run keeps producing them (tool
+      // steps, drafts, and since #189 interim commits), which is exactly what makes total silence
+      // a safe staleness signal rather than a race against slow work.
+      this.#turnActivity.set(this.#nativeTurnKey(key, sessionId, event.turnId), this.#now());
     }
     if (event.kind === "draft") {
       const seq = (this.#draftSeq.get(event.turnId) ?? 0) + 1;
@@ -605,6 +633,7 @@ export class NativeBotDataPlane {
       this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
       if (opts?.deviceId !== undefined) this.#turnOrigins.set(this.#nativeTurnKey(bot, chat.sessionId, turnId), opts.deviceId);
       this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
+      this.#seedTurnActivity(bot, chat.sessionId, turnId);
     }
     this.#broadcastMessage(bot, chat.sessionId, message, now);
     if (chat.activeTurnId === undefined)
@@ -626,6 +655,13 @@ export class NativeBotDataPlane {
         `native attach-v1 profile "${bot}" cannot queue an interrupt`,
       );
     }
+    // An ack means the interrupt reached the plugin, NOT that the turn ended. When the plugin has
+    // no live Hermes work to stop, nothing seals; the sweep below reads this together with total
+    // silence and terminalizes the turn itself (issue #190).
+    this.#interruptAcked.set(
+      this.#nativeTurnKey(bot, chat.sessionId, chat.activeTurnId),
+      this.#now(),
+    );
     return "stopped";
   }
 
@@ -907,6 +943,9 @@ export class NativeBotDataPlane {
       status: terminal.status, reason: terminal.cause ?? terminal.phase,
     });
     this.#tracedTurnStates.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#turnActivity.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#interruptAcked.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#stopStaleTurnSweepWhenIdle();
     this.#expireTurnInteractions(bot, sessionId, turnId);
     this.#sealTools(
       bot,
@@ -1275,6 +1314,83 @@ export class NativeBotDataPlane {
       phase: "timeout",
       status: "timed_out",
     });
+  }
+
+  #seedTurnActivity(bot: string, sessionId: string, turnId: string): void {
+    const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    if (!this.#turnActivity.has(key)) {
+      const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
+      this.#turnActivity.set(key, delivery?.queuedAt ?? this.#now());
+    }
+    this.#startStaleTurnSweep();
+  }
+
+  /** The sweep runs only while a turn is open, so an idle gateway holds no timer at all. */
+  #startStaleTurnSweep(): void {
+    if (this.#staleTurnSweep !== undefined) return;
+    if (this.#staleTurnSweepMs <= 0) return;
+    if (this.#staleTurnInterruptGraceMs <= 0 && this.#staleTurnCeilingMs <= 0) return;
+    const timer = setInterval(() => this.#sweepStaleTurns(), this.#staleTurnSweepMs);
+    if (typeof timer.unref === "function") timer.unref();
+    this.#staleTurnSweep = timer;
+  }
+
+  #stopStaleTurnSweepWhenIdle(): void {
+    if (this.#staleTurnSweep === undefined || this.#turnActivity.size > 0) return;
+    clearInterval(this.#staleTurnSweep);
+    this.#staleTurnSweep = undefined;
+  }
+
+  /** Seal turns that can no longer seal themselves.
+   *
+   *  A turn is durable, so a turn nothing will ever terminalize is a phone that shows "thinking"
+   *  forever -- across app restarts and container restarts alike, until an operator writes a
+   *  terminal row by hand (issue #190). Two readings end one:
+   *
+   *  - an ACKED interrupt plus silence: the operator asked for a stop, the plugin took the
+   *    command, and no terminal followed. That turn is over whether or not anything was running.
+   *  - total silence past the hard ceiling: no draft, no tool step, no interim commit, nothing.
+   *
+   *  Silence is the whole signal, and it is only trustworthy because live work is noisy: a tool
+   *  run emits `running`/`ok` steps, a streaming reply emits drafts, and a long agent loop emits
+   *  interim commits. A legitimately long run is therefore never stale, and only a turn that has
+   *  gone truly dark is reaped. */
+  #sweepStaleTurns(): void {
+    const now = this.#now();
+    const live = new Set<string>();
+    for (const bot of this.#native) {
+      const chat = this.#storage.nativeBotChat(bot, now);
+      const turnId = chat.activeTurnId;
+      if (turnId === undefined) continue;
+      const key = this.#nativeTurnKey(bot, chat.sessionId, turnId);
+      live.add(key);
+      this.#seedTurnActivity(bot, chat.sessionId, turnId);
+      const silentFor = now - (this.#turnActivity.get(key) ?? now);
+      const acked = this.#interruptAcked.get(key);
+      if (
+        acked !== undefined &&
+        this.#staleTurnInterruptGraceMs > 0 &&
+        silentFor >= this.#staleTurnInterruptGraceMs &&
+        now - acked >= this.#staleTurnInterruptGraceMs
+      ) {
+        this.#log(
+          `reaping interrupted turn ${turnId} for ${bot}: silent for ${silentFor}ms after an acked interrupt`,
+        );
+        this.#finish(bot, chat.sessionId, turnId, { phase: "failed", status: "interrupted" });
+        continue;
+      }
+      if (this.#staleTurnCeilingMs > 0 && silentFor >= this.#staleTurnCeilingMs) {
+        this.#log(
+          `reaping silent turn ${turnId} for ${bot}: no events for ${silentFor}ms`,
+        );
+        this.#finish(bot, chat.sessionId, turnId, { phase: "timeout", status: "timed_out" });
+      }
+    }
+    // A turn can also leave through /new, which discards it without a terminal. Anything no
+    // longer the active turn is bookkeeping this sweep should not carry (or watch) any further.
+    for (const map of [this.#turnActivity, this.#interruptAcked])
+      for (const key of map.keys()) if (!live.has(key)) map.delete(key);
+    this.#stopStaleTurnSweepWhenIdle();
   }
 
   #clearTurnTimeout(bot: string, sessionId: string, turnId: string): void {

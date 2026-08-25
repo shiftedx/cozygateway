@@ -91,6 +91,19 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `app
 - Exactly one of `commit` (without `continues`), `failed`, `cancelled`, or `interrupted` seals a
   turn. Replays are idempotent. A later terminal or late draft is durably acknowledged but cannot
   change the sealed result.
+- Every turn seals. A turn is durable, so an unsealed one reads as "thinking" on every device
+  forever. Three obligations follow, and none of them adds a frame kind or a field:
+  - A turn whose message the plugin's harness consumes as a slash command runs no agent turn and
+    may produce no reply at all. The plugin seals it anyway: `commit` when the command has notice
+    text, `cancelled` when it has none, `failed` when the command raised.
+  - An `interrupt` command ALWAYS produces a terminal. When the plugin has live work to stop, its
+    harness's own terminal seals the turn; when it does not, the plugin emits `interrupted` itself
+    after a bounded grace, rather than acking the interrupt and leaving the turn open.
+  - The gateway keeps a server-side floor for the cases no plugin can report, a plugin that hangs
+    mid-command included: an active turn that has produced NO event for a bounded window seals
+    `interrupted` when an interrupt was acked for it, or `timed_out` past a hard ceiling. Silence
+    is the whole signal and live work is never silent (tool steps, drafts, interim commits), so a
+    legitimately long run is never reaped. Both bounds are operator-configurable.
 - Tool calls use a stable `callId` with `running` → `ok|error` terminal transitions.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.

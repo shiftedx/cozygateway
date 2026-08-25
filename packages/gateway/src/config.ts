@@ -96,6 +96,15 @@ const GatewayConfigSchema = Type.Object({
    *  compacting context. A positive value interrupts through the same path as a manual stop.
    *  Config-file only; not env-driven (see applyEnvOverrides). */
   turnTimeoutSeconds: Type.Integer({ minimum: 0, default: 0 }),
+  /** Stale-turn reaper. A native Bot Mode turn is durable, so a turn nothing ever terminalizes
+   *  shows as "thinking" on every device until an operator repairs the row by hand. These bound
+   *  that: the sweep interval, the silence allowed after an ACKED interrupt, and the hard ceiling
+   *  of total silence (no drafts, no tool steps, no interim commits -- a working turn is never
+   *  silent). 0 disables the sweep or either reading; omitted leaves the data plane's own
+   *  defaults in force. Config-file only. */
+  staleTurnSweepSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+  staleTurnInterruptGraceSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+  staleTurnCeilingSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
   /** Capability id -> integer version, surfaced verbatim as GatewayInfo.capabilities (contract
    *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
    *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
