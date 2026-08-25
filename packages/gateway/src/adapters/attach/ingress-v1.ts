@@ -640,7 +640,14 @@ export class AttachV1Ingress implements TurnEndpoint {
         continue;
       }
       const failure = this.#storage.recordAttachProjectionFailure(agentId, frame.eventId, error, this.#now(), this.#projectionMaxAttempts);
+      // A projection failure used to be invisible until the post-mortem DB read. Say it on the
+      // operator channel at the first attempt and at the dead letter (issue #193): the dead
+      // letter blocks every later event for this identity, which is exactly the kind of fact an
+      // operator must not learn from a silent phone.
+      if (failure.attempts === 1)
+        this.#log(`attach-v1: projecting event ${frame.sequence} for profile "${agentId}" failed (${error}); retrying`);
       if (failure.deadLettered) {
+        this.#log(`attach-v1: event ${frame.sequence} for profile "${agentId}" dead-lettered after ${failure.attempts} projection attempts (${error}); later events for this profile are blocked until it is released`);
         if (frame.event.kind === "scheduled") {
           this.#deliveryFailed(agentId, {
             deliveryId: frame.event.deliveryId,

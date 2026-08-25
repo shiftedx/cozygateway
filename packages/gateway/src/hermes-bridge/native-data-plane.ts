@@ -380,24 +380,34 @@ export class NativeBotDataPlane {
       const terminal = this.#storage.nativeBotTurnTerminal(key, sessionId, event.turnId);
       if (terminal !== undefined) {
         const delivery = this.#storage.nativeBotTurnDelivery(key, event.turnId);
-        // An acknowledged Hermes turn may finish after the local response deadline. Its durable
-        // answer is still authoritative; only an unacknowledged/cancelled turn stays timed out.
+        // An acknowledged Hermes turn may finish after something else sealed it: the local
+        // response deadline, the stale-turn reaper, or the plugin's own interrupt seal. The
+        // durable reply is still authoritative -- it is the one thing the user was waiting for,
+        // and this used to honor it only past a `timed_out` seal, so a commit landing after any
+        // other provisional terminal was acknowledged and silently dropped (issue #193). The
+        // projection is idempotent by messageId, so an at-least-once retry is safe.
+        // The one exception is an explicit user cancel (`cause: "cancelled"`): the user said
+        // stop and the plugin witnessed it, so a late reply stays suppressed. Every other seal
+        // is a provisional gateway guess that the durable reply outranks.
         if (
           event.kind === "commit" &&
-          terminal.status === "timed_out" &&
           command?.threadId === sessionId &&
           delivery !== undefined &&
-          delivery.acknowledgedAt !== null
+          delivery.acknowledgedAt !== null &&
+          terminal.cause !== "cancelled"
         ) {
           const committed = this.#commit(
             key, sessionId, event.messageId, event.blocks, event.mediaIds, event.mediaPositions,
             event.turnId,
           );
-          if (committed) {
+          if (committed && event.continues !== true && terminal.status !== "completed") {
             this.#storage.recordNativeBotTerminal({
               bot: key, sessionId, turnId: event.turnId,
               status: "completed", completedAt: this.#now(),
             });
+            // The provisional seal may have left the durable pointer standing (a crash between
+            // journal and apply does exactly that); settle it with the same guarded clear.
+            this.#storage.clearNativeBotTurn(key, sessionId, event.turnId, this.#now());
             this.#state(key, sessionId, "complete", false, { status: "completed" });
           }
           return committed;
@@ -437,10 +447,12 @@ export class NativeBotDataPlane {
       // and drafts the agent keeps producing still reach the app.
       if (event.continues === true)
         return this.#commitInterim(key, sessionId, event);
-      this.#finish(key, sessionId, event.turnId, {
-        phase: "complete",
-        status: "completed",
-      });
+      // Project the reply DURABLY before sealing the turn. Both halves are idempotent, but only
+      // this order is crash-safe: a death between them leaves the message on record and the
+      // turn open, and the next assembly's replay re-runs both. The old order could die having
+      // sealed the turn without ever projecting the reply -- the ghost issue #193 repaired by
+      // hand in production. The seal callback keeps the WIRE order clients pin: live activity
+      // flushes, the terminal frames go out, and the answer lands last.
       return this.#commit(
         key,
         sessionId,
@@ -449,6 +461,11 @@ export class NativeBotDataPlane {
         event.mediaIds,
         event.mediaPositions,
         event.turnId,
+        () =>
+          this.#finish(key, sessionId, event.turnId, {
+            phase: "complete",
+            status: "completed",
+          }),
       );
     }
     if (
@@ -1058,6 +1075,9 @@ export class NativeBotDataPlane {
     });
   }
 
+  /** `seal` runs after the durable message append and before the wire announcement. It is how a
+   *  final commit keeps the crash-safe durable order (reply row first, then the terminal seal)
+   *  without changing the wire order clients pin (activity, terminal state, then the answer). */
   #commit(
     bot: string,
     sessionId: string,
@@ -1066,10 +1086,14 @@ export class NativeBotDataPlane {
     mediaIds?: string[],
     mediaPositions?: number[],
     turnId?: string,
+    seal?: () => void,
   ): boolean {
     const now = this.#now();
-    if (this.#storage.nativeBotMessage(bot, messageId) !== undefined)
+    if (this.#storage.nativeBotMessage(bot, messageId) !== undefined) {
+      // Already projected (an at-least-once retry, or a crash after the append): still seal.
+      seal?.();
       return true;
+    }
     // Positions are all or nothing: a length that does not match the ids is a sender that
     // counted something else, and half a placement is worse than none. The transcript then
     // carries the attachments the way it always has, above the message.
@@ -1112,6 +1136,7 @@ export class NativeBotDataPlane {
     // owner is already looking at.
     if (turnId !== undefined && attachments !== undefined && attachments.length > 0)
       this.#storage.bindTurnMediaDelivery(bot, messageId, `turn:${turnId}`);
+    seal?.();
     this.#broadcast({
       type: "bot_chat",
       bot,
@@ -1495,8 +1520,13 @@ export class NativeBotDataPlane {
     if (
       binding !== undefined &&
       (binding.sessionId !== sessionId || binding.turnId !== event.turnId)
-    )
-      return false;
+    ) {
+      // Another (session, turn) durably owns this approval id, so no retry can ever apply this
+      // frame -- and a decline would dead-letter it and block every later event for the agent
+      // behind it (issue #193). A permanently stale frame is acknowledged out loud instead.
+      this.#log(`dropping approval event for "${bot}": approval id is bound to another turn`);
+      return true;
+    }
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "approval",
@@ -1509,7 +1539,10 @@ export class NativeBotDataPlane {
       updatedAt: this.#now(),
     });
     if (change === "duplicate") return true;
-    if (change === "conflict") return false;
+    if (change === "conflict") {
+      this.#log(`dropping approval event for "${bot}": approval id is bound to another turn`);
+      return true;
+    }
     if (outcome === undefined) {
       const wire: BotApprovalPendingFrame = {
         type: "bot_approval_pending",
@@ -1576,8 +1609,11 @@ export class NativeBotDataPlane {
     if (
       binding !== undefined &&
       (binding.sessionId !== sessionId || binding.turnId !== event.turnId)
-    )
-      return false;
+    ) {
+      // Permanently mis-bound (see the approval arm): acknowledge instead of dead-lettering.
+      this.#log(`dropping clarify event for "${bot}": clarify id is bound to another turn`);
+      return true;
+    }
     const options = binding === undefined
       ? event.options
       : (binding.payload as ClarifyPayload).options;
@@ -1585,8 +1621,11 @@ export class NativeBotDataPlane {
       outcome === "selected" &&
       event.selectedOptionId !== undefined &&
       !options.some((option) => option.id === event.selectedOptionId)
-    )
-      return false;
+    ) {
+      // The durable option list can never grow this id; no retry can apply the frame.
+      this.#log(`dropping clarify event for "${bot}": selected option is not in the durable option list`);
+      return true;
+    }
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "clarify",
@@ -1602,7 +1641,10 @@ export class NativeBotDataPlane {
       updatedAt: this.#now(),
     });
     if (change === "duplicate") return true;
-    if (change === "conflict") return false;
+    if (change === "conflict") {
+      this.#log(`dropping clarify event for "${bot}": clarify id is bound to another turn`);
+      return true;
+    }
     if (outcome === undefined) {
       const pending: BotClarifyPendingFrame = {
         type: "bot_clarify_pending",
