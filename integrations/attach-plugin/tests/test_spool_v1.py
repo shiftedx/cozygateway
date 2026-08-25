@@ -29,6 +29,20 @@ class AttachSpoolTests(unittest.TestCase):
             spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})
         spool.close()
 
+    def test_delegation_events_bypass_the_turn_terminal_seal(self):
+        # An async delegate_task batch outlives its turn: a child's finish leg after the
+        # terminal must still travel, while every other kind stays sealed.
+        spool = AttachSpool(self.path)
+        spool.enqueue_event({"kind": "commit", "threadId": "t", "turnId": "u", "messageId": "m", "blocks": []})
+        with self.assertRaises(TerminalSealed):
+            spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})
+        frame = spool.enqueue_event({
+            "kind": "delegation", "threadId": "t", "turnId": "u", "batchId": "b",
+            "childId": "c", "index": 0, "count": 1, "status": "succeeded", "lastActiveAt": 5,
+        })
+        self.assertEqual(frame["event"]["kind"], "delegation")
+        spool.close()
+
     def test_command_is_persisted_before_ack_and_deduped(self):
         spool = AttachSpool(self.path)
         frame = {"kind": "command", "sequence": 1, "commandId": "c1", "command": {"kind": "turn", "threadId": "t", "turnId": "u", "messageId": "m", "text": "hi"}}

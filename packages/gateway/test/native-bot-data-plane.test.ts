@@ -1265,4 +1265,231 @@ describe("attach-v1 native Bot Mode plane", () => {
     plane.close();
     storage.close();
   });
+
+  it("projects a delegation batch out of order, isolates one child failure, and restores on reopen", async () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        storage.enqueueAttachCommand(bot, `turn:${String(input.turnId)}`, { kind: "turn", ...input } as never, 1);
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => now++,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "rewrite the skills");
+    const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+    // Below capability 34 nothing changes: without delegation events history has no field.
+    expect(await plane.surface().chatHistory("sage")).not.toHaveProperty("delegations");
+
+    const child = (eventId: string, sequence: number, body: Record<string, unknown>) => ({
+      kind: "event" as const, sequence, eventId,
+      event: {
+        kind: "delegation", threadId: sent.sessionId, turnId,
+        batchId: "call-1", count: 3, lastActiveAt: 5, ...body,
+      } as never,
+    });
+    // Siblings update independently and OUT OF ORDER, and identical concurrent tool names
+    // cannot collide: identity is (batchId, childId), tool names are display metadata.
+    expect(plane.handle("sage", child("b-run", 1, { childId: "sa-1", index: 1, status: "running", label: "Rewrite B", currentTool: "write_file" }))).toBe(true);
+    expect(plane.handle("sage", child("a-run", 2, { childId: "sa-0", index: 0, status: "running", label: "Rewrite A", currentTool: "write_file" }))).toBe(true);
+    expect(plane.handle("sage", child("c-run", 3, { childId: "sa-2", index: 2, status: "running", label: "Rewrite C" }))).toBe(true);
+    expect(plane.handle("sage", child("b-done", 4, { childId: "sa-1", index: 1, status: "succeeded", toolCount: 7 }))).toBe(true);
+    // One child failing must not touch its siblings.
+    expect(plane.handle("sage", child("a-fail", 5, { childId: "sa-0", index: 0, status: "failed" }))).toBe(true);
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 6, eventId: "commit", event: {
+        kind: "commit", threadId: sent.sessionId, turnId, messageId: "answer",
+        blocks: [{ type: "paragraph", text: "dispatched" }],
+      } as never,
+    })).toBe(true);
+    // The batch outlives its turn (async dispatch): sa-2's finish leg lands AFTER the seal
+    // and still settles its card instead of being dropped.
+    expect(plane.handle("sage", child("c-done", 7, { childId: "sa-2", index: 2, status: "succeeded" }))).toBe(true);
+
+    const last = frames
+      .filter((frame): frame is Extract<ServerFrame, { type: "bot_delegation_activity" }> => frame.type === "bot_delegation_activity")
+      .at(-1)!;
+    expect(last).toMatchObject({
+      bot: "sage", turnId, batchId: "call-1", count: 3, done: true,
+      children: [
+        { childId: "sa-0", index: 0, status: "failed", label: "Rewrite A" },
+        { childId: "sa-1", index: 1, status: "succeeded", toolCount: 7, label: "Rewrite B" },
+        { childId: "sa-2", index: 2, status: "succeeded", label: "Rewrite C" },
+      ],
+    });
+    // Privacy: only bounded display fields cross the wire -- no args, results, reasoning,
+    // summaries, prompts, or paths.
+    const allowed = new Set(["apiCalls", "childId", "currentTool", "endedAt", "index", "label", "lastActiveAt", "startedAt", "status", "toolCount"]);
+    for (const entry of last.children) {
+      for (const field of Object.keys(entry)) expect(allowed.has(field), field).toBe(true);
+    }
+
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({
+      running: false,
+      delegations: [{ turnId, batchId: "call-1", count: 3, children: [
+        { childId: "sa-0", status: "failed" },
+        { childId: "sa-1", status: "succeeded" },
+        { childId: "sa-2", status: "succeeded" },
+      ] }],
+    });
+
+    // A fresh plane over the same storage restores the batch for reconnecting clients.
+    plane.close();
+    const reopened = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: () => undefined, now: () => now++,
+    });
+    expect(await reopened.surface().chatHistory("sage")).toMatchObject({
+      delegations: [{ batchId: "call-1", children: [
+        { childId: "sa-0", status: "failed" },
+        { childId: "sa-1", toolCount: 7 },
+        { childId: "sa-2", status: "succeeded" },
+      ] }],
+    });
+    reopened.close();
+    storage.close();
+  });
+
+  it("treats a replayed delegation state as a projected no-op and never resurrects a settled child", () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => 100,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+    const running = {
+      kind: "delegation", threadId: chat.sessionId, turnId: "turn",
+      batchId: "b", childId: "sa-0", index: 0, count: 1, status: "running", lastActiveAt: 5,
+    } as never;
+
+    expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "first", event: running })).toBe(true);
+    expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "repeat", event: running })).toBe(true);
+    expect(plane.handle("sage", { kind: "event", sequence: 3, eventId: "finish", event: {
+      kind: "delegation", threadId: chat.sessionId, turnId: "turn",
+      batchId: "b", childId: "sa-0", index: 0, count: 1, status: "succeeded", lastActiveAt: 6,
+    } as never })).toBe(true);
+    // A live leg replayed AFTER the child settled is acknowledged, never a resurrection.
+    expect(plane.handle("sage", { kind: "event", sequence: 4, eventId: "stale-run", event: running })).toBe(true);
+
+    expect(storage.botChatDelegations(chat.sessionId, 0)).toHaveLength(1);
+    expect(storage.botChatDelegations(chat.sessionId, 0)[0]).toMatchObject({ status: "succeeded" });
+    plane.close();
+    storage.close();
+  });
+
+  it("an interrupted turn settles its live children interrupted, leaving no spinner", async () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        storage.enqueueAttachCommand(bot, `turn:${String(input.turnId)}`, { kind: "turn", ...input } as never, 1);
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => now++,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "delegate");
+    const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+    expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "run", event: {
+      kind: "delegation", threadId: sent.sessionId, turnId,
+      batchId: "b", childId: "sa-0", index: 0, count: 1, status: "running", lastActiveAt: 5,
+    } as never })).toBe(true);
+    expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "stop", event: {
+      kind: "interrupted", threadId: sent.sessionId, turnId,
+    } as never })).toBe(true);
+
+    expect(frames.filter((frame) => frame.type === "bot_delegation_activity").at(-1)).toMatchObject({
+      turnId, batchId: "b", done: true, children: [{ childId: "sa-0", status: "interrupted" }],
+    });
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({
+      delegations: [{ turnId, children: [{ childId: "sa-0", status: "interrupted" }] }],
+    });
+    plane.close();
+    storage.close();
+  });
+
+  it("a new turn settles a prior turn's unproven children unknown, never failed", async () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        storage.enqueueAttachCommand(bot, `turn:${String(input.turnId)}`, { kind: "turn", ...input } as never, 1);
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => now++,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "delegate");
+    const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+    expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "run", event: {
+      kind: "delegation", threadId: sent.sessionId, turnId,
+      batchId: "b", childId: "sa-0", index: 0, count: 1, status: "running", lastActiveAt: 5,
+    } as never })).toBe(true);
+    // A COMPLETED turn keeps live children live: the async batch legitimately continues.
+    expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "commit", event: {
+      kind: "commit", threadId: sent.sessionId, turnId, messageId: "answer",
+      blocks: [{ type: "paragraph", text: "dispatched" }],
+    } as never })).toBe(true);
+    expect(storage.botChatDelegations(sent.sessionId, 0)[0]).toMatchObject({ status: "running" });
+
+    // Whatever finish leg was coming may never come once a NEW turn starts over the same
+    // chat: the unproven child settles `unknown` -- never `failed`.
+    await plane.surface().sendChatMessage("sage", "next question");
+    expect(storage.botChatDelegations(sent.sessionId, 0)[0]).toMatchObject({ status: "unknown" });
+    expect(frames.filter((frame) => frame.type === "bot_delegation_activity").at(-1)).toMatchObject({
+      turnId, batchId: "b", children: [{ childId: "sa-0", status: "unknown" }],
+    });
+    plane.close();
+    storage.close();
+  });
+
+  it("a gateway restart leaves in-flight children unknown, never failed", async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "delegation-restart-")), "gateway.sqlite");
+    const storage = openStorage(dbPath);
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        storage.enqueueAttachCommand(bot, `turn:${String(input.turnId)}`, { kind: "turn", ...input } as never, 1);
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: () => undefined, now: () => now++,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "delegate");
+    const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+    expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "run", event: {
+      kind: "delegation", threadId: sent.sessionId, turnId,
+      batchId: "b", childId: "sa-0", index: 0, count: 1, status: "running", lastActiveAt: 5,
+    } as never })).toBe(true);
+    expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "commit", event: {
+      kind: "commit", threadId: sent.sessionId, turnId, messageId: "answer",
+      blocks: [{ type: "paragraph", text: "dispatched" }],
+    } as never })).toBe(true);
+    plane.close();
+    storage.close();
+
+    // Boot-time reconciliation: Hermes cannot prove what an in-flight child did across a
+    // restart, so the surviving row is `unknown` -- and a late finish leg replayed through
+    // the spool is still free to overwrite it with the real outcome.
+    const reopened = openStorage(dbPath);
+    expect(reopened.botChatDelegations(sent.sessionId, 0)[0]).toMatchObject({ status: "unknown" });
+    reopened.close();
+  });
 });

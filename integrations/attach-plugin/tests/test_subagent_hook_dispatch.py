@@ -1,0 +1,198 @@
+"""Unit tests for the delegation lifecycle hook dispatch behind live batch cards.
+
+Run with:
+    cd integrations/attach-plugin && python3 -m unittest discover -s tests -v
+
+Same harness-free pattern as ``test_tool_hook_dispatch_call_id.py``: the session
+context lookup is monkeypatched and a recording fake stands in for the adapter,
+so these tests observe exactly what ``_dispatch_delegation_hook`` forwards --
+batch identity, spawn-order indices, the closed status vocabulary, and the
+bounded display fields (a truncated goal label, a tool count; nothing else).
+"""
+
+import unittest
+
+import cozygateway.adapter as adapter_module
+
+
+class _RecordingAdapter:
+    def __init__(self):
+        self.events = []
+
+    def observe_delegation_event(self, chat_id, payload):
+        self.events.append((chat_id, payload))
+
+
+def _reset_registry():
+    with adapter_module._DELEGATION_BATCHES_LOCK:
+        adapter_module._DELEGATION_BATCHES.clear()
+        adapter_module._DELEGATION_PARENT_LATEST.clear()
+
+
+class DelegationHookDispatchTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_lookup = adapter_module._current_turn_platform_and_chat
+        adapter_module._current_turn_platform_and_chat = lambda: (
+            adapter_module.PLATFORM_NAME,
+            "chat-1",
+        )
+        self.adapter = _RecordingAdapter()
+        adapter_module._register_active_adapter(self.adapter)
+        adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+        _reset_registry()
+
+    def tearDown(self):
+        adapter_module._current_turn_platform_and_chat = self._orig_lookup
+        adapter_module._unregister_active_adapter(self.adapter)
+        adapter_module._CURRENT_DELEGATION_CALL.set(None)
+        _reset_registry()
+
+    def test_start_leg_forwards_batch_identity_and_running_status(self):
+        adapter_module._subagent_start(
+            parent_session_id="parent",
+            child_session_id="child-1",
+            child_role="leaf",
+            child_goal="Summarize the report",
+        )
+        self.assertEqual(len(self.adapter.events), 1)
+        chat_id, payload = self.adapter.events[0]
+        self.assertEqual(chat_id, "chat-1")
+        self.assertEqual(payload["batch_id"], "call-7")
+        self.assertEqual(payload["child_id"], "child-1")
+        self.assertEqual(payload["index"], 0)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["label"], "Summarize the report")
+        self.assertGreater(payload["last_active_at"], 0)
+
+    def test_siblings_get_spawn_order_indices_and_growing_count(self):
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="a"
+        )
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-2", child_goal="b"
+        )
+        (_, first), (_, second) = self.adapter.events
+        self.assertEqual((first["index"], first["count"]), (0, 1))
+        self.assertEqual((second["index"], second["count"]), (1, 2))
+        self.assertEqual(first["batch_id"], second["batch_id"])
+
+    def test_context_free_finish_leg_routes_via_retained_parent_association(self):
+        # The spawn leg runs with full session context (the copied parent tool context)...
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="g"
+        )
+        # ...but an async batch's consolidation thread may carry none at all.
+        adapter_module._current_turn_platform_and_chat = lambda: (None, None)
+        adapter_module._CURRENT_DELEGATION_CALL.set(None)
+        adapter_module._subagent_stop(
+            parent_session_id="parent",
+            child_session_id="child-1",
+            child_status="completed",
+            tool_call_history=[{"tool_name": "write_file"}, {"tool_name": "search"}],
+        )
+        chat_id, payload = self.adapter.events[-1]
+        self.assertEqual(chat_id, "chat-1")
+        self.assertEqual(payload["batch_id"], "call-7")
+        self.assertEqual(payload["child_id"], "child-1")
+        self.assertEqual(payload["index"], 0)
+        self.assertEqual(payload["status"], "succeeded")
+        self.assertEqual(payload["tool_count"], 2)
+
+    def test_terminal_status_mapping_is_closed_and_honest(self):
+        for raw, wire in (
+            ("completed", "succeeded"),
+            ("failed", "failed"),
+            ("error", "failed"),
+            ("interrupted", "interrupted"),
+            ("cancelled", "interrupted"),
+            # An unprovable outcome is `unknown`, never `failed`.
+            ("exploded", "unknown"),
+            (None, "unknown"),
+        ):
+            self.adapter.events.clear()
+            adapter_module._subagent_stop(
+                parent_session_id="parent",
+                child_session_id="child-1",
+                child_status=raw,
+                tool_call_history=[],
+            )
+            self.assertEqual(self.adapter.events[0][1]["status"], wire, raw)
+
+    def test_forbidden_fields_never_leave_the_dispatch(self):
+        adapter_module._subagent_start(
+            parent_session_id="parent",
+            child_session_id="child-1",
+            child_goal="g",
+            child_role="leaf",
+        )
+        adapter_module._subagent_stop(
+            parent_session_id="parent",
+            child_session_id="child-1",
+            child_status="completed",
+            child_summary="a whole child transcript summary",
+            tool_call_history=[{"tool_name": "write_file", "args": {"path": "/secret"}}],
+            duration_ms=1234,
+        )
+        allowed = {
+            "batch_id", "child_id", "index", "count", "status",
+            "label", "tool_count", "last_active_at",
+        }
+        for _chat, payload in self.adapter.events:
+            self.assertLessEqual(set(payload), allowed, payload)
+
+    def test_goal_label_is_truncated_to_wire_bound(self):
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="x" * 500
+        )
+        self.assertEqual(len(self.adapter.events[0][1]["label"]), 200)
+
+    def test_missing_child_session_id_drops_the_event(self):
+        adapter_module._subagent_start(child_session_id=None, child_goal="g")
+        adapter_module._subagent_stop(child_session_id="  ", child_status="completed")
+        self.assertEqual(self.adapter.events, [])
+
+    def test_other_platform_turns_are_ignored(self):
+        adapter_module._current_turn_platform_and_chat = lambda: ("cli", "chat-1")
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="g"
+        )
+        self.assertEqual(self.adapter.events, [])
+
+    def test_unassociated_context_free_leg_is_not_routable(self):
+        adapter_module._current_turn_platform_and_chat = lambda: (None, None)
+        adapter_module._CURRENT_DELEGATION_CALL.set(None)
+        adapter_module._subagent_stop(
+            parent_session_id="stranger", child_session_id="child-1", child_status="completed"
+        )
+        self.assertEqual(self.adapter.events, [])
+
+    def test_pre_and_post_tool_call_manage_the_batch_call_id(self):
+        adapter_module._CURRENT_DELEGATION_CALL.set(None)
+        adapter_module._pre_tool_call(tool_name="delegate_task", tool_call_id="call-9")
+        self.assertEqual(adapter_module._CURRENT_DELEGATION_CALL.get(), "call-9")
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="g"
+        )
+        self.assertEqual(self.adapter.events[0][1]["batch_id"], "call-9")
+        adapter_module._post_tool_call(tool_name="delegate_task", tool_call_id="call-9")
+        self.assertIsNone(adapter_module._CURRENT_DELEGATION_CALL.get())
+
+    def test_overlapping_batches_keep_identity_by_call_id(self):
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="a"
+        )
+        adapter_module._CURRENT_DELEGATION_CALL.set("call-8")
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-9", child_goal="b"
+        )
+        # The first batch's finish leg still lands on ITS batch, not the newest one.
+        adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+        adapter_module._subagent_stop(
+            parent_session_id="parent", child_session_id="child-1",
+            child_status="completed", tool_call_history=[],
+        )
+        stop_payload = self.adapter.events[-1][1]
+        self.assertEqual(stop_payload["batch_id"], "call-7")
+        self.assertEqual(stop_payload["index"], 0)
+        self.assertEqual(self.adapter.events[1][1]["batch_id"], "call-8")

@@ -45,7 +45,7 @@ export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management", "delivery_receipts"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management", "delivery_receipts", "delegation"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -645,7 +645,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       // dead-lettered and head-of-line blocked their bots for hours (issue #193), a price no
       // draft is worth. Durable facts (commits, terminals, scheduled deliveries, interactions)
       // keep the dead letter, because silently skipping one of those would lose user data.
-      const ephemeral = frame.event.kind === "draft" || frame.event.kind === "tool";
+      const ephemeral = frame.event.kind === "draft" || frame.event.kind === "tool" || frame.event.kind === "delegation";
       const failure = this.#storage.recordAttachProjectionFailure(agentId, frame.eventId, error, this.#now(), ephemeral ? Number.MAX_SAFE_INTEGER : this.#projectionMaxAttempts);
       // A projection failure used to be invisible until the post-mortem DB read. Say it on the
       // operator channel at the first attempt and at the dead letter (issue #193): the dead
@@ -785,6 +785,7 @@ function eventCapabilities(frame: AttachV1EventFrame): AttachV1Capability[] {
   switch (frame.event.kind) {
     case "media": return ["media"];
     case "tool": return ["tools"];
+    case "delegation": return ["delegation"];
     case "approval": return ["approvals"];
     case "clarify": return ["clarify"];
     case "scheduled": return ["scheduled", ...(frame.event.mediaIds?.length ? ["media" as const] : [])];

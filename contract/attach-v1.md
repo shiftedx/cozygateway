@@ -73,8 +73,8 @@ reconnecting plugin no longer negotiates its capability; it advances sequence/de
 MUST invoke no Hermes action. Stable
 agent/thread/turn/message/approval/clarify ids are preserved end to end.
 
-Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `approval`, `clarify`,
-`scheduled`, `media`, and `presence`.
+Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `delegation`,
+`approval`, `clarify`, `scheduled`, `media`, and `presence`.
 
 - A draft is full-replace decoration and may be dropped by clients.
 - A `commit` projects one durable message. It also SEALS the turn unless it carries
@@ -105,6 +105,14 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `app
     is the whole signal and live work is never silent (tool steps, drafts, interim commits), so a
     legitimately long run is never reaped. Both bounds are operator-configurable.
 - Tool calls use a stable `callId` with `running` → `ok|error` terminal transitions.
+- `delegation` (capability `delegation`) is the child lifecycle behind live delegation batch
+  cards: one event is one child update carrying (batchId, childId, index, count), a bounded
+  label, a closed status vocabulary, and at most a tool NAME -- never args, results, reasoning,
+  or child summaries. Identity is (batchId, childId); `childId` is the Hermes child session id,
+  present on both lifecycle legs, so it is the upsert key. A batch may outlive its turn (async
+  dispatch), so events legitimately arrive after the turn sealed. Like `draft` and `tool` it is
+  EPHEMERAL rendering state: an undeliverable one is skipped after bounded retries and must
+  never dead-letter the stream.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.
 - `scheduled` is an unanchored durable delivery with a caller-owned occurrence key. Its target is either

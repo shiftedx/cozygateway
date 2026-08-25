@@ -23,6 +23,7 @@ import type {
   BotSummary,
   BotSlashCommand,
   BotTurnToolSteps,
+  BotTurnDelegations,
   BridgeLiveness,
   ServerFrame,
 } from "cozygateway-contract";
@@ -163,6 +164,8 @@ export interface BotChatHistory {
   cause?: BotChatStateCause;
   queuedAt?: number;
   toolSteps?: BotTurnToolSteps[];
+  /** Capability 34 delegation batches (subagent visibility) for turns of this session. */
+  delegations?: BotTurnDelegations[];
   updatedAt: number;
   suggestion?: string;
 }

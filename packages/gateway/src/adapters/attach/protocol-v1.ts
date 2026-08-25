@@ -19,6 +19,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("mobile_location"),
   Type.Literal("memory_management"),
   Type.Literal("delivery_receipts"),
+  Type.Literal("delegation"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -179,6 +180,39 @@ const ToolEvent = Type.Object({
   status: Type.Union([Type.Literal("running"), Type.Literal("ok"), Type.Literal("error")]),
   detail: Type.Optional(Type.String({ maxLength: 1024 })),
 });
+/** Closed status vocabulary for one delegated child. `queued|starting|running|stalling` are
+ * live; the rest are settled. `unknown` is the honest settle for work whose outcome cannot be
+ * proven (a restart with the child in flight) -- never rendered as failure. */
+const DelegationStatus = Type.Union([
+  Type.Literal("queued"), Type.Literal("starting"), Type.Literal("running"),
+  Type.Literal("stalling"), Type.Literal("succeeded"), Type.Literal("failed"),
+  Type.Literal("interrupted"), Type.Literal("stalled"), Type.Literal("unknown"),
+]);
+/** EPHEMERAL delegation lifecycle behind the turn's live batch card. One event is one child
+ * update; identity is (batchId, childId), never the tool name, so identical concurrent tools
+ * cannot collide. `batchId` is the parent's own `delegate_task` tool-call id until Hermes
+ * exposes its real delegation id in the lifecycle hooks (a compatibility fallback clients
+ * treat as opaque). `childId` is the Hermes child session id: the one identifier present on
+ * both the spawn and finish legs. Only bounded display metadata crosses this wire -- a
+ * truncated label and a tool NAME; never args, results, reasoning, prompts, paths, or child
+ * summaries. Like `tool`, the event is rendering state: the gateway must never let an
+ * undeliverable one dead-letter the stream (issue #193/#194). */
+const DelegationEvent = Type.Object({
+  kind: Type.Literal("delegation"), threadId: Id, turnId: Id, batchId: Id, childId: Id,
+  /** Position within the batch, from 0, stable for the child's lifetime. */
+  index: Type.Integer({ minimum: 0 }),
+  /** Children known to the batch so far; grows monotonically (exact once Hermes reports
+   * `task_count`). */
+  count: Type.Integer({ minimum: 1 }),
+  label: Type.Optional(Type.String({ maxLength: 200 })),
+  status: DelegationStatus,
+  /** Tool NAME only. */
+  currentTool: Type.Optional(Type.String({ maxLength: 128 })),
+  apiCalls: Type.Optional(Type.Integer({ minimum: 0 })),
+  toolCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** MILLISECONDS, plugin clock: when the child last showed observable activity. */
+  lastActiveAt: Type.Integer({ minimum: 0 }),
+});
 const ApprovalEvent = Type.Object({
   kind: Type.Literal("approval"), threadId: Id, turnId: Id, approvalId: Id, callId: Id,
   name: Type.String({ minLength: 1, maxLength: 128 }),
@@ -242,7 +276,7 @@ export type AttachV1MobileResultInput =
 
 /** Deliberately closed: no thinking/reasoning/chain-of-thought event exists. */
 export const AttachV1EventSchema = Type.Union([
-  DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent,
+  DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent, DelegationEvent,
   ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, PresenceEvent,
 ]);
 export type AttachV1Event = Static<typeof AttachV1EventSchema>;

@@ -24,6 +24,7 @@ import {
   BotRosterFrameSchema,
   BotRoutinesFrameSchema,
   BotToolActivityFrameSchema,
+  BotDelegationActivityFrameSchema,
 } from "./ext-bots.ts";
 import {
   ApprovalArgSummarySchema,
@@ -198,6 +199,7 @@ export const ServerFrameSchema = Type.Union([
   BotClarifyResolutionRequestedFrameSchema,
   BotClarifyResolvedFrameSchema,
   BotToolActivityFrameSchema,
+  BotDelegationActivityFrameSchema,
   BotInboxActivityFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

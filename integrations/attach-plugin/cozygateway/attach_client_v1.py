@@ -62,6 +62,7 @@ HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "memory_management", "delivery_receipts",
+    "delegation",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
@@ -406,6 +407,44 @@ class AttachV1Client:
             event["mediaIds"] = list(media_ids[:16])
             _set_media_positions(event, media_positions)
         return await self._queue_event(event)
+
+    async def send_delegation(
+        self,
+        thread_id: str,
+        turn_id: str,
+        batch_id: str,
+        child_id: str,
+        *,
+        index: int,
+        count: int,
+        status: str,
+        label: Optional[str] = None,
+        current_tool: Optional[str] = None,
+        api_calls: Optional[int] = None,
+        tool_count: Optional[int] = None,
+        last_active_at: Optional[int] = None,
+    ) -> None:
+        """Queue one ephemeral delegation lifecycle event (capability ``delegation``).
+
+        Bounds mirror the wire schema; a gateway that never negotiated the capability
+        makes ``_queue_event`` drop the event silently.
+        """
+        event: Dict[str, Any] = {
+            "kind": "delegation", "threadId": thread_id, "turnId": turn_id,
+            "batchId": batch_id[:256], "childId": child_id[:256],
+            "index": max(0, int(index)), "count": max(1, int(count)),
+            "status": status,
+            "lastActiveAt": max(0, int(last_active_at or 0)),
+        }
+        if label:
+            event["label"] = label[:200]
+        if current_tool:
+            event["currentTool"] = current_tool[:128]
+        if api_calls is not None:
+            event["apiCalls"] = max(0, int(api_calls))
+        if tool_count is not None:
+            event["toolCount"] = max(0, int(tool_count))
+        await self._queue_event(event)
 
     async def send_approval(self, thread_id: str, turn_id: str, approval_id: str, call_id: str, name: str, status: str) -> None:
         await self._queue_event({
@@ -1076,6 +1115,8 @@ def _event_capabilities(event: Dict[str, Any]) -> List[str]:
         return ["media"]
     if kind == "tool":
         return ["tools"]
+    if kind == "delegation":
+        return ["delegation"]
     if kind == "approval":
         return ["approvals"]
     if kind == "clarify":
