@@ -46,14 +46,38 @@ export const BotSummarySchema = Type.Object({
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
-/** The minimum needed to create a Hermes profile. Its soul, model, tools, and MCP defaults come
- * from Hermes itself and can be selectively overridden through the profile routes afterwards. */
+/** The minimum needed to create a Hermes profile, plus what the creating user chose to hand it on
+ * day one. Its soul and model still come from Hermes and the profile routes afterwards.
+ *
+ * `toolsets` and `mcpServers` are ADDITIVE and OPTIONAL (capability 33). A gateway that seeds
+ * blank-slate bots starts a bot on the `file` + `terminal` floor; these two fields name what to
+ * grant ON TOP of it at creation, so a power user does not have to earn back the tools they
+ * already know they want. Both are advisory lists, not assertions: a name the backend does not
+ * report is SKIPPED and named back in `BotCreateResponse.warnings`, never invented and never a
+ * reason to fail the create. An empty array is the same as omitting the field.
+ *
+ * The fields are additive on the wire too. `BotCreateRequestSchema` is not
+ * `additionalProperties: false`, so a gateway below 33 accepts a request carrying them and
+ * silently ignores them; the bot is still created, just without the selection. A client that must
+ * not silently drop the user's picks gates its picker on `com.cozylabs.bots >= 33`. */
 export const BotCreateRequestSchema = Type.Object({
   name: Type.String({ minLength: 1, maxLength: 64 }),
   title: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
   description: Type.Optional(Type.String({ maxLength: 2_000 })),
+  toolsets: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })),
+  mcpServers: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })),
 });
 export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
+
+/** The `POST /bots` reply. `warnings` is present only when there is something to say, and its
+ * lines are display-safe operator English about the create that just SUCCEEDED: a selected name
+ * that was skipped, or a seed that could not be written. It is never an error channel; a failed
+ * create answers `ErrorBody` with a status instead. A client below 33 ignores the field. */
+export const BotCreateResponseSchema = Type.Object({
+  bot: BotSummarySchema,
+  warnings: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 400 }), { maxItems: 16 })),
+});
+export type BotCreateResponse = Static<typeof BotCreateResponseSchema>;
 
 /** Gateway-owned attach-v1 Bot Mode sessions are conversations. */
 export const BotSessionKindSchema = Type.Literal("conversation");
@@ -1297,4 +1321,11 @@ export type BotMemoryWriteResponse = Static<typeof BotMemoryWriteResponseSchema>
 export const BotMemoryDeleteResponseSchema = Type.Object({ id: Type.String({ minLength: 1, maxLength: 512 }), revision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
 export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchema>;
 
-export const BOTS_CAPABILITY_VERSION = 32;
+/** Capability 33: create-time tool selection. `POST /bots` accepts optional `toolsets` and
+ *  `mcpServers` alongside the name, and answers `BotCreateResponse`, whose optional `warnings`
+ *  name any selection the backend did not report and could not grant. A gateway that seeds
+ *  blank-slate bots applies the selection ON TOP of the `file` + `terminal` floor. Both request
+ *  fields are optional and additive, so a client below 33 is untouched and a gateway below 33
+ *  ignores them; a picker UI gates on `>= 33` so the user is never shown a choice that will be
+ *  dropped in silence. */
+export const BOTS_CAPABILITY_VERSION = 33;

@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 32 }
+"capabilities": { "com.cozylabs.bots": 33 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -71,6 +71,7 @@ extension omits the capability and does not register `/bots` routes.
 | 30 | Profile-local memory read and conditional write routes. |
 | 31 | Durable delivery receipts: the displayed report, `BotChatMessage.marker`, and role `system`. |
 | 32 | Inline media ordering: `BotChatMessage.attachments[].position`. |
+| 33 | Create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots`, and `BotCreateResponse.warnings`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -121,6 +122,17 @@ a second, hand-copied schema.
 Only profiles configured in `hermes.profiles` are exposed as CozyChat bots. Profile lifecycle
 belongs to Hermes: create or delete the profile there, then rerun the CozyGateway installer (its
 default `--profiles all` selection reconciles plugin, token, service, and gateway configuration).
+
+`POST /bots` creates the Hermes profile and then SEEDS it as a blank slate: the `file` + `terminal`
+toolset floor on the `cozygateway` and `cli` platforms, `approvals.mode: manual`, and inherited MCP
+servers quieted. A fresh profile that is seeded with nothing does not get a small toolset, it
+inherits Hermes' broad per-platform default, so the floor has to be written down to exist. The
+capability-33 `toolsets` and `mcpServers` fields name what to grant ON TOP of that floor;
+`file` and `terminal` are always included, and a name the backend does not report is skipped and
+listed in `BotCreateResponse.warnings` rather than failing the create. The seed only ever writes
+keys the profile does not already carry, and a seed that fails leaves the created bot in place with
+a warning. Operators turn the whole behaviour off with `hermes.seedBlankSlateBots: false`; an
+explicit selection is still honoured when they do. See `docs/attach-v1-operations.md`.
 
 ### Slash commands
 
@@ -337,6 +349,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | Route | Request | Success response | Notes |
 | --- | --- | --- | --- |
 | `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots. |
+| `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate. `409` extension code `conflict` when the name is taken. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
 | `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. |

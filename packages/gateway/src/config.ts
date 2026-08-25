@@ -40,6 +40,12 @@ const HermesBridgeConfigSchema = Type.Object({
    *  used by the routine and profile-control surfaces. Optional because Hermes does not expose the
    *  profile a gateway process was launched under. */
   profile: Type.Optional(Type.String({ minLength: 1 })),
+  /** Whether `POST /bots` seeds a newly created profile as a BLANK SLATE: the `file` + `terminal`
+   *  toolset floor on the `cozygateway` and `cli` platforms, and `approvals.mode: manual` so the
+   *  bot has to ask before it earns anything else. Default true. Set false to leave created
+   *  profiles on Hermes' broad per-platform defaults. Only ever seeds keys the profile does not
+   *  already have, so it cannot walk back a bot the user has since armed. */
+  seedBlankSlateBots: Type.Optional(Type.Boolean()),
   /** The opener an EMPTY bot chat offers a client (capability 11, issue #59). Defaults to the line
    *  this gateway used to submit by itself, "Hey, tell me about yourself!".
    *

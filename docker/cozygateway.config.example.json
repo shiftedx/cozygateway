@@ -9,6 +9,7 @@
     "username": "cozybridge",
     "passwordEnv": "COZYGATEWAY_HERMES_PASSWORD",
     "baseUrl": "http://host.docker.internal:9119",
+    "seedBlankSlateBots": true,
     "profiles": {
       "sage": {
         "name": "Sage",

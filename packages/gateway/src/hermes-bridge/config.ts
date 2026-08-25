@@ -11,6 +11,10 @@ export interface ParsedHermesOptions {
   hiddenProfiles: string[];
   /** The profile the bridge's own Hermes link runs on, normalized, or undefined when unset. */
   bridgeProfile: string | undefined;
+  /** Whether `POST /bots` seeds a newly created profile as a blank slate. Always a boolean, already
+   *  defaulted to true: an operator has to say `false` in the config file to get the old broad
+   *  Hermes defaults back. */
+  seedBlankSlateBots: boolean;
   /** The opener an empty bot chat offers (capability 11). Always a string, already defaulted: the
    *  empty string is the operator's "offer nothing", and the bridge reads it as such. */
   chatSuggestion: string;
@@ -95,6 +99,7 @@ export function parseHermesOptions(
   // `??`, not `||`: an operator who wrote "" meant it, and collapsing that onto the default would
   // make the one setting that turns the suggestion off silently do nothing.
   const chatSuggestion = config.chatSuggestion ?? DEFAULT_CHAT_SUGGESTION;
+  const seedBlankSlateBots = config.seedBlankSlateBots ?? true;
 
   if (mode === "password") {
     const username = config.username;
@@ -124,6 +129,7 @@ export function parseHermesOptions(
       },
       hiddenProfiles,
       bridgeProfile,
+      seedBlankSlateBots,
       chatSuggestion,
     };
   }
@@ -146,6 +152,7 @@ export function parseHermesOptions(
     auth: { mode: "token", token, param: config.authParam ?? "token" },
     hiddenProfiles,
     bridgeProfile,
+    seedBlankSlateBots,
     chatSuggestion,
   };
 }

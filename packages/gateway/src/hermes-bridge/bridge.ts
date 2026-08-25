@@ -2,6 +2,7 @@ import type {
   BotAttachmentHistoryItem,
   BotCatalog,
   BotCreateRequest,
+  BotCreateResponse,
   BotChatMessage,
   BotChatStateCause,
   BotChatStatus,
@@ -74,6 +75,7 @@ import {
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
+import { seedBlankSlateProfile, type BlankSlateSelection } from "./blank-slate-seed.ts";
 
 export const ROSTER_POLL_MS = 5_000;
 export const ROUTINES_POLL_MS = 20_000;
@@ -186,7 +188,7 @@ export class BotSessionConflict extends Error {
 
 export interface BotControlSurface {
   roster(): BotRosterView;
-  createBot(input: BotCreateRequest): Promise<{ bot: BotSummary }>;
+  createBot(input: BotCreateRequest): Promise<BotCreateResponse>;
   health(): BridgeLiveness;
   refreshSoon(reason: string): void;
   inbox(name: string): Promise<BotInboxView>;
@@ -305,6 +307,10 @@ export interface HermesBridgeOptions {
   now: () => number;
   hiddenProfiles?: Iterable<string>;
   bridgeProfile?: string;
+  /** Whether a newly created bot is seeded as a blank slate (file + terminal, manual approvals).
+   *  Default true. Turning it off leaves a created profile on Hermes' broad platform defaults,
+   *  which is the pre-blank-slate behaviour. */
+  seedBlankSlateBots?: boolean;
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
@@ -327,6 +333,7 @@ export class HermesBridge implements BotControlSurface {
   readonly #now: () => number;
   readonly #hidden: ReadonlySet<string>;
   readonly #bridgeProfile: string | undefined;
+  readonly #seedBlankSlateBots: boolean;
   readonly #log: (line: string) => void;
   readonly #groups: GroupRooms;
   readonly #catalog = new Map<string, CachedCatalog>();
@@ -355,6 +362,7 @@ export class HermesBridge implements BotControlSurface {
     );
     const profile = opts.bridgeProfile?.trim().toLowerCase();
     this.#bridgeProfile = profile || undefined;
+    this.#seedBlankSlateBots = opts.seedBlankSlateBots ?? true;
     this.#catalogTtlMs = opts.catalogTtlMs ?? CATALOG_TTL_MS;
     this.#catalogDegradedTtlMs =
       opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
@@ -447,7 +455,7 @@ export class HermesBridge implements BotControlSurface {
       hermesState,
     };
   }
-  async createBot(input: BotCreateRequest): Promise<{ bot: BotSummary }> {
+  async createBot(input: BotCreateRequest): Promise<BotCreateResponse> {
     const name = validateNewBotName(input.name);
     try {
       await this.#client.request("profiles.create", {
@@ -463,6 +471,45 @@ export class HermesBridge implements BotControlSurface {
         throw new BotNameTaken(name);
       }
       throw error;
+    }
+
+    // The profile exists from here on. Everything below is best-effort decoration of a create that
+    // already succeeded: a failure is logged loudly and reported in `warnings`, never turned into a
+    // retry that can only collide with itself or into a 500 over a bot that now exists.
+    const warnings: string[] = [];
+    const selection: BlankSlateSelection = {
+      ...(input.toolsets === undefined ? {} : { toolsets: input.toolsets }),
+      ...(input.mcpServers === undefined ? {} : { mcpServers: input.mcpServers }),
+    };
+    const hasSelection =
+      selection.toolsets !== undefined || selection.mcpServers !== undefined;
+    if (this.#seedBlankSlateBots || hasSelection) {
+      try {
+        const seed = await seedBlankSlateProfile(this.#client, name, {
+          blankSlate: this.#seedBlankSlateBots,
+          selection,
+        });
+        this.#log(
+          `bot ${name} seed: ${seed.wrote ? "written" : "already present"}` +
+            `, blankSlate=${this.#seedBlankSlateBots}`,
+        );
+        if (seed.unknownToolsets.length > 0) {
+          warnings.push(
+            `hermes does not report these toolsets, so they were skipped: ${seed.unknownToolsets.join(", ")}`,
+          );
+        }
+        if (seed.unknownMcpServers.length > 0) {
+          warnings.push(
+            `this bot's config defines no such MCP server, so they were skipped: ${seed.unknownMcpServers.join(", ")}`,
+          );
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.#log(`bot ${name} seed FAILED, it starts on hermes platform defaults: ${detail}`);
+        warnings.push(
+          "the starting tool set could not be written, so this bot starts on Hermes' own defaults",
+        );
+      }
     }
 
     const title = input.title?.trim();
@@ -483,7 +530,7 @@ export class HermesBridge implements BotControlSurface {
     await this.refresh(`bot ${name} created`);
     const bot = this.#storage.botRoster().bots.find((row) => row.name === name);
     if (bot === undefined) throw new BotNotFound(name);
-    return { bot };
+    return { bot, ...(warnings.length === 0 ? {} : { warnings }) };
   }
   health(): BridgeLiveness {
     const liveness = this.#client.liveness();

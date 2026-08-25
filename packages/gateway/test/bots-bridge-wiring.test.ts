@@ -42,6 +42,9 @@ describe("hermes bridge options", () => {
       url: "ws://h/api/ws",
       auth: { mode: "token", token: "s3cret", param: "token" },
       hiddenProfiles: [],
+      // Defaulted ON: a gateway that seeds nothing is a gateway whose new bots inherit Hermes'
+      // broad platform defaults, which is the thing the blank slate exists to stop.
+      seedBlankSlateBots: true,
       // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
       // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
       chatSuggestion: DEFAULT_CHAT_SUGGESTION,
@@ -73,10 +76,21 @@ describe("hermes bridge options", () => {
         provider: "basic",
       },
       hiddenProfiles: [],
+      // Defaulted ON: a gateway that seeds nothing is a gateway whose new bots inherit Hermes'
+      // broad platform defaults, which is the thing the blank slate exists to stop.
+      seedBlankSlateBots: true,
       // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
       // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
       chatSuggestion: DEFAULT_CHAT_SUGGESTION,
     });
+  });
+
+  it("takes the operator's seedBlankSlateBots opt-out literally, and only a literal false", () => {
+    const base = { url: "ws://h/api/ws", tokenEnv: "T", profiles: {} } as const;
+    const env = { T: "s3cret" };
+    expect(parseHermesOptions({ ...base, seedBlankSlateBots: false }, env).seedBlankSlateBots).toBe(false);
+    expect(parseHermesOptions({ ...base, seedBlankSlateBots: true }, env).seedBlankSlateBots).toBe(true);
+    expect(parseHermesOptions(base, env).seedBlankSlateBots).toBe(true);
   });
 
   it("normalizes the roster hide list: trimmed, lowercased, blanks dropped, duplicates collapsed", () => {
