@@ -59,6 +59,11 @@ the device receipt landed; nothing was simulated.
 | 11 | Socket interruption during upload | `scheduled:d718b438`, `scheduled:c889272b` | `scheduled-b050dd51`, `scheduled-85dc0c28` | `7641e156`, `b3d31bfe` (video/mp4, 30.6 MB) | uploaded | projected | displayed | PASS |
 | 12 | Receipt reconciliation across the three layers | all rows above | | | agree | agree | agree | PASS |
 
+Tests 9 and 10 record the policy as it stood on the run date. `application/zip` has since been
+admitted as a FILE attachment (delivered and shareable, never rendered inline) under the 20 MiB
+document cap; see the canonical media allowlist in `contract/ext-bots-v1.md`. The rows are left
+as recorded because they are evidence of a run, not a live statement of policy.
+
 Test 4 resent identical bytes under a new occurrence and correctly got a new media id: identity is
 (occurrence, content hash, destination), so a genuine resend is not suppressed. Test 9 never made a
 network request; the bytes answered the question and the reason names the fix. Test 10 refused the

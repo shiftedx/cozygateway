@@ -118,6 +118,9 @@ MEDIA_COMPATIBILITY_POLICY: Dict[str, Dict[str, Any]] = {
     "audio/mpeg": _rule("audio", "supported"),
     "audio/wav": _rule("audio", "supported"),
     "application/pdf": _rule("file", "supported"),
+    # A bare archive is delivered as a generic file: no inline render, download and share only.
+    # OOXML packages are a different mime (see detect_mime) and stay off this list.
+    "application/zip": _rule("file", "supported"),
     "image/heic": _rule(
         "image", "unsupported", "HEIC images are not rendered by the client. Convert to PNG or JPEG before sending."
     ),
@@ -146,11 +149,6 @@ MEDIA_COMPATIBILITY_POLICY: Dict[str, Dict[str, Any]] = {
     ),
     "audio/ogg": _rule(
         "audio", "unsupported", "Ogg audio is not supported by the client. Convert to M4A/AAC, MP3, or WAV."
-    ),
-    "application/zip": _rule(
-        "file",
-        "unsupported",
-        "ZIP archives are not an allowed attachment type. Send the files inside it individually.",
     ),
     "application/vnd.openxmlformats-officedocument": _rule(
         "file", "unsupported", "Office documents are not an allowed attachment type. Export to PDF before sending."

@@ -305,13 +305,20 @@ refused at the gateway, so a plugin that offers one is guaranteed a 415.
 | `application/msword`, `application/vnd.ms-excel`, `application/vnd.ms-powerpoint` | doc, xls, ppt | file | 20 MiB | explicit document allowlist |
 | OOXML `.docx`, `.xlsx`, `.pptx` | docx, xlsx, pptx | file | 20 MiB | explicit document allowlist |
 | OpenDocument `.odt`, `.ods`, `.odp` | odt, ods, odp | file | 20 MiB | explicit document allowlist |
+| `application/zip` | zip | file | 20 MiB | explicit file allowlist, delivered and shareable, never rendered inline |
 
 The container MIME is what the gateway checks. Codec-level facts for MP4 (H.264 plus AAC-LC,
 `yuv420p`, fast-start) are a plugin-side probe: this layer sees a container, not a stream.
 
-`image/svg+xml`, bare `application/zip`, `text/html`, and every other type are excluded on purpose.
-SVG and HTML carry script and external references; a generic archive is not a renderable
-attachment. Excluded means refused at upload, never silently transcoded.
+`image/svg+xml`, `text/html`, and every other type are excluded on purpose. SVG and HTML carry
+script and external references. Excluded means refused at upload, never silently transcoded.
+
+`application/zip` is admitted as a FILE attachment, not a renderable one: it is delivered, stored,
+and offered for download or share under the existing `mediaKind: "file"` shape from capability 24,
+and no client is asked to render or expand it. It shares the 20 MiB document cap, the largest cap
+any `file` type carries. The OOXML and OpenDocument packages above are ZIP containers on the wire,
+so the DECLARED type is what separates them from a bare archive; the plugin-side probe tells them
+apart by the uncompressed `[Content_Types].xml` entry an Office package stores first.
 
 Declared type is a claim, so every accepted type is additionally checked against format magic bytes
 before commit. Bytes that contradict an allowed declaration are refused exactly like a disallowed

@@ -16,10 +16,15 @@ export const FILE_TYPES = new Map<string, string>([
   ["application/vnd.oasis.opendocument.text", "odt"],
   ["application/vnd.oasis.opendocument.spreadsheet", "ods"],
   ["application/vnd.oasis.opendocument.presentation", "odp"],
+  ["application/zip", "zip"],
 ]);
 
 const OLE_TYPES = new Set(["application/msword", "application/vnd.ms-excel", "application/vnd.ms-powerpoint"]);
+/** Every member is a ZIP on the wire, so the magic check is the same for all of them. The declared
+ * type is what separates a bare archive from an OOXML or OpenDocument package; the plugin-side
+ * probe tells them apart by the package's uncompressed "[Content_Types].xml" entry. */
 const ZIP_TYPES = new Set([
+  "application/zip",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
