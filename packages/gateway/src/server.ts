@@ -17,7 +17,7 @@ import {
   ATTACH_V1_CAPABILITIES,
   AttachV1Ingress,
 } from "./adapters/attach/ingress-v1.ts";
-import type { AttachV1Capability } from "./adapters/attach/protocol-v1.ts";
+import type { AttachV1Capability, AttachV1EventFrame } from "./adapters/attach/protocol-v1.ts";
 import { AttachNativeSink } from "./adapters/attach/native-sink.ts";
 import {
   AttachRouter,
@@ -53,6 +53,52 @@ export const PUSH_PROXY_CAPABILITY_VERSION = 1;
  *  so the plane keeps ownership of its own defaults instead of having them restated here. */
 function millis(seconds: number | undefined): number | undefined {
   return seconds === undefined ? undefined : seconds * 1000;
+}
+
+/** Last stop of the attach apply chain. An event no projection claims is either transiently
+ *  unappliable (declining is right: the ingress retries it and eventually dead-letters) or
+ *  PERMANENTLY orphaned: the durable binding it was authorized against -- its turn command or
+ *  its scheduled delivery target -- is gone or points elsewhere, so no retry can ever apply it.
+ *  Declining those bricked whole agents in production (issue #193): one orphan dead-letters,
+ *  and every later journaled event for that identity is acknowledged on the wire yet never
+ *  applied. An orphan is a fact about the past, not future work: acknowledge it out loud and
+ *  let the stream move. */
+function acknowledgeOrphanedAttachEvent(
+  storage: Storage,
+  agentId: string,
+  frame: AttachV1EventFrame,
+): boolean {
+  const event = frame.event;
+  const acknowledge = (reason: string): true => {
+    console.warn(
+      `attach-v1: acknowledged orphaned ${event.kind} event for profile "${agentId}": ${reason}`,
+    );
+    return true;
+  };
+  if (event.kind === "scheduled") {
+    const delivery = storage.attachScheduledDelivery(agentId, event.deliveryId);
+    if (delivery === undefined || delivery.messageId !== event.messageId)
+      return acknowledge("no durable delivery binding");
+    if (
+      storage.threadById(delivery.threadId) === undefined &&
+      !storage.nativeBotHasSession(agentId, delivery.threadId)
+    )
+      return acknowledge("the delivery target no longer exists");
+    return false;
+  }
+  if ("turnId" in event) {
+    const command = storage.attachTurnCommand(agentId, event.turnId);
+    if (command === undefined) return acknowledge("no durable turn command");
+    if ("threadId" in event && command.threadId !== event.threadId)
+      return acknowledge("the turn command is bound to another thread");
+    if (
+      "threadId" in event &&
+      storage.threadById(event.threadId) === undefined &&
+      !storage.nativeBotHasSession(agentId, event.threadId)
+    )
+      return acknowledge("the turn's thread no longer exists");
+  }
+  return false;
 }
 
 function allowedAttachMedia(config: GatewayConfig, agentId: string): boolean {
@@ -249,7 +295,8 @@ export async function startGateway(
         if (nativeBotPlane?.handle(agentId, frame)) return true;
         if (frame.event.kind === "media" || frame.event.kind === "presence")
           return true;
-        return nativeSink?.handle(agentId, frame) ?? false;
+        if (nativeSink?.handle(agentId, frame) === true) return true;
+        return acknowledgeOrphanedAttachEvent(storage, agentId, frame);
       },
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
@@ -402,6 +449,9 @@ export async function startGateway(
     config,
     gatewayInfo,
     attachHealth: () => attachV1Ingress.health(),
+    attachDeadLetters: () => storage.attachProjectionDeadLetters(),
+    releaseAttachDeadLetter: (agentId, eventId) =>
+      attachV1Ingress.releaseProjectionDeadLetter(agentId, eventId),
     bots: botsSurface,
     memory: memorySurface,
     attachTokens,

@@ -1076,7 +1076,10 @@ describe("attach-v1 native Bot Mode plane", () => {
         kind: "approval", threadId: secondSessionId, turnId: "turn-second",
         approvalId: "approval-1", callId: "call-second", name: "workspace.write", status: "approved",
       },
-    })).toBe(false);
+    // Acknowledged (true) rather than declined: the frame is PERMANENTLY mis-bound, and a
+    // decline would dead-letter it and block every later event for the agent (issue #193).
+    // Rejection now means "no durable state changes, no resolved frame", asserted below.
+    })).toBe(true);
     expect(storage.nativeInteraction("sage", "approval", "approval-1")).toMatchObject({
       sessionId: first.sessionId, turnId: "turn-first", status: "pending",
     });
@@ -1117,7 +1120,10 @@ describe("attach-v1 native Bot Mode plane", () => {
         clarifyId: "clarify-1", prompt: "Choose", options: [{ id: "a", label: "A" }],
         status: "resolved", selectedOptionId: "not-an-offered-option",
       },
-    })).toBe(false);
+    // Acknowledged (true) rather than declined: the durable option list can never grow this id,
+    // so a decline could only dead-letter the agent's inbox (issue #193). Rejection now means
+    // "no durable state changes, no resolved frame", asserted below.
+    })).toBe(true);
     expect(storage.nativeInteraction("sage", "clarify", "clarify-1")).toMatchObject({
       status: "pending", selectedOptionId: null,
     });

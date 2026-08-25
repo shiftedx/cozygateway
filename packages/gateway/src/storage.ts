@@ -1758,6 +1758,27 @@ export class Storage {
     return rows.map((row) => JSON.parse(row.frameJson) as AttachV1EventFrame);
   }
 
+  /** Operator surface (issue #193): the projection dead letters currently blocking streams. */
+  attachProjectionDeadLetters(): Array<{
+    agentId: string; sequence: number; eventId: string; kind: string;
+    attempts: number; error: string | null; deadLetteredAt: number; receivedAt: number;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT agent_id AS agentId, sequence, event_id AS eventId,
+                json_extract(frame_json, '$.event.kind') AS kind,
+                projection_attempts AS attempts, projection_error AS error,
+                dead_lettered_at AS deadLetteredAt, received_at AS receivedAt
+         FROM attach_event_inbox
+         WHERE disposition = 'accepted' AND dead_lettered_at IS NOT NULL AND applied_at IS NULL
+         ORDER BY agent_id, sequence`,
+      )
+      .all() as unknown as Array<{
+        agentId: string; sequence: number; eventId: string; kind: string;
+        attempts: number; error: string | null; deadLetteredAt: number; receivedAt: number;
+      }>;
+  }
+
   attachTurnCommand(agentId: string, turnId: string): { threadId: string; messageId: string } | undefined {
     const rows = this.#db
       .prepare(
@@ -1816,7 +1837,7 @@ export class Storage {
            status = excluded.status,
            cause = excluded.cause,
            completed_at = excluded.completed_at
-         WHERE bot_native_turn_terminals.status = 'timed_out'
+         WHERE bot_native_turn_terminals.status != 'completed'
            AND excluded.status = 'completed'`,
       )
       .run(
@@ -2821,5 +2842,20 @@ export function openStorage(dbPath: string): Storage {
     )
   `).run(Date.now());
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL");
+  // Issue #193: `applied_at` is the assembly-time replay watermark -- every accepted inbox row
+  // still NULL at boot is re-applied through the normal projection path. Rows from before this
+  // build predate that contract: some were applied by builds whose bookkeeping then failed or
+  // dead-lettered, and replaying weeks of stale conversation into live chats on the first boot
+  // of this build would be a worse failure than the (already hand-repaired) ghosts it might
+  // heal. The honest watermark is therefore "replay begins with events journaled after this
+  // migration": every pre-existing unapplied row is stamped applied at its own received_at, so
+  // the first boot replays nothing historical.
+  const { user_version: schemaVersion } = db
+    .prepare("PRAGMA user_version")
+    .get() as { user_version: number };
+  if (schemaVersion < 1) {
+    db.exec("UPDATE attach_event_inbox SET applied_at = received_at WHERE applied_at IS NULL");
+    db.exec("PRAGMA user_version = 1");
+  }
   return new Storage(db);
 }
