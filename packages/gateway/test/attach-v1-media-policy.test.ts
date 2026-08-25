@@ -42,6 +42,7 @@ const SAMPLES = new Map<string, Uint8Array>([
   ["application/vnd.oasis.opendocument.text", zip],
   ["application/vnd.oasis.opendocument.spreadsheet", zip],
   ["application/vnd.oasis.opendocument.presentation", zip],
+  ["application/zip", zip],
 ]);
 
 describe("attach-v1 media policy: allowlist and rejection shapes", () => {
@@ -98,7 +99,7 @@ describe("attach-v1 media policy: allowlist and rejection shapes", () => {
     ]) {
       expect(ASSISTANT_MEDIA_TYPES.has(baseline)).toBe(true);
     }
-    for (const excluded of ["image/svg+xml", "application/zip", "text/html"]) {
+    for (const excluded of ["image/svg+xml", "text/html"]) {
       expect(ASSISTANT_MEDIA_TYPES.has(excluded)).toBe(false);
     }
 
@@ -122,6 +123,27 @@ describe("attach-v1 media policy: allowlist and rejection shapes", () => {
       expect(served.headers.get("content-disposition")).toContain("attachment");
       expect(new Uint8Array(await served.arrayBuffer())).toEqual(sample);
     }
+  });
+
+  it("carries a bare zip as a file attachment under the document cap", async () => {
+    const accepted = ASSISTANT_MEDIA_TYPES.get("application/zip")!;
+    expect(accepted).toMatchObject({ ext: "zip", kind: "file" });
+    expect(accepted.maxBytes).toBe(ASSISTANT_MEDIA_TYPES.get("application/pdf")!.maxBytes);
+
+    const response = await upload("zip_1", "application/zip", zip, "bundle.zip");
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({
+      media: { mediaId: "zip_1", mimeType: "application/zip", family: "file" },
+    });
+  });
+
+  it("answers 413 with the document cap when a zip runs past it", async () => {
+    const limit = ASSISTANT_MEDIA_TYPES.get("application/zip")!.maxBytes;
+    const oversized = new Uint8Array(limit + 1);
+    oversized.set(zip);
+    const refused = await upload("zip_big", "application/zip", oversized, "big.zip");
+    expect(refused.status).toBe(413);
+    expect(await refused.json()).toMatchObject({ reason: "too_large", limitBytes: limit });
   });
 
   it("refuses a type off the allowlist with 415 naming the received content type", async () => {

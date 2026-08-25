@@ -183,8 +183,8 @@ class TerminalMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(keys[0], keys[1])
 
     async def test_standalone_media_surfaces_the_upload_failure_instead_of_claiming_success(self):
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as handle:
-            handle.write(b"PK\x03\x04")
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as handle:
+            handle.write(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>")
             archive = handle.name
         self.addCleanup(lambda: os.path.exists(archive) and os.unlink(archive))
 
@@ -196,7 +196,7 @@ class TerminalMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "state": "failed",
                 "error": "media_upload_failed",
                 "media_errors": [
-                    f"{os.path.basename(archive)} (application/zip, family=file): http_415 Unsupported Media Type"
+                    f"{os.path.basename(archive)} (image/svg+xml, family=image): http_415 Unsupported Media Type"
                 ],
             }
         )
@@ -206,7 +206,7 @@ class TerminalMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertIn("media_upload_failed", result.error)
         self.assertIn("http_415", result.error)
-        self.assertIn("application/zip", result.error)
+        self.assertIn("image/svg+xml", result.error)
 
 
 if __name__ == "__main__":

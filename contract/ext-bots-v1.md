@@ -305,13 +305,19 @@ refused at the gateway, so a plugin that offers one is guaranteed a 415.
 | `application/msword`, `application/vnd.ms-excel`, `application/vnd.ms-powerpoint` | doc, xls, ppt | file | 20 MiB | explicit document allowlist |
 | OOXML `.docx`, `.xlsx`, `.pptx` | docx, xlsx, pptx | file | 20 MiB | explicit document allowlist |
 | OpenDocument `.odt`, `.ods`, `.odp` | odt, ods, odp | file | 20 MiB | explicit document allowlist |
+| `application/zip` | zip | file | 20 MiB | explicit document allowlist |
 
 The container MIME is what the gateway checks. Codec-level facts for MP4 (H.264 plus AAC-LC,
 `yuv420p`, fast-start) are a plugin-side probe: this layer sees a container, not a stream.
 
-`image/svg+xml`, bare `application/zip`, `text/html`, and every other type are excluded on purpose.
-SVG and HTML carry script and external references; a generic archive is not a renderable
-attachment. Excluded means refused at upload, never silently transcoded.
+`image/svg+xml`, `text/html`, and every other type are excluded on purpose. SVG and HTML carry
+script and external references. Excluded means refused at upload, never silently transcoded.
+
+A ZIP is admitted as a file attachment, not as renderable media. It is delivered and stored like
+any other `mediaKind: "file"` artifact, previewed through the client's QuickLook document path, and
+saved or shared to Files. Nothing about it renders inline in a bubble. An OOXML package is still
+matched by its specific `.docx` / `.xlsx` / `.pptx` MIME, so a real Office document keeps its own
+type rather than collapsing into the generic archive row.
 
 Declared type is a claim, so every accepted type is additionally checked against format magic bytes
 before commit. Bytes that contradict an allowed declaration are refused exactly like a disallowed

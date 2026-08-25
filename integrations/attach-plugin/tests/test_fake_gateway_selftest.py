@@ -138,9 +138,9 @@ class FakeGatewaySelfTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["limitBytes"], 8 * 1024 * 1024)
 
     async def test_415_names_the_rejected_mime_in_the_body(self):
-        error = await self._failing_upload(upload_unsupported_mime("application/zip"))
+        error = await self._failing_upload(upload_unsupported_mime("image/svg+xml"))
         body = json.loads(error.read())
-        self.assertEqual((error.code, body["mimeType"]), (415, "application/zip"))
+        self.assertEqual((error.code, body["mimeType"]), (415, "image/svg+xml"))
 
     async def test_429_carries_retry_after(self):
         error = await self._failing_upload(upload_rate_limited(retry_after=7))

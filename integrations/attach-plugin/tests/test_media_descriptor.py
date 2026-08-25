@@ -344,12 +344,12 @@ class DetectionTests(MediaDescriptorTestCase):
         self.assertEqual(descriptor.compatibility, "unsupported")
         self.assertIn("not an allowed attachment type", descriptor.incompatibility_reason)
 
-    def test_bare_zip_is_unsupported_with_a_reason(self):
+    def test_bare_zip_is_an_allowed_file_attachment(self):
         descriptor = probe(self.write("bundle.zip", bare_zip_bytes()))
         self.assertEqual(descriptor.detected_mime, "application/zip")
         self.assertEqual(descriptor.family, "file")
-        self.assertEqual(descriptor.compatibility, "unsupported")
-        self.assertIn("ZIP archives", descriptor.incompatibility_reason)
+        self.assertEqual(descriptor.compatibility, "supported")
+        self.assertIsNone(descriptor.incompatibility_reason)
 
     def test_ooxml_zip_is_detected_as_its_own_type(self):
         descriptor = probe(self.write("report.docx", ooxml_zip_bytes()))
@@ -547,6 +547,7 @@ class PolicyTableTests(unittest.TestCase):
                 "audio/mpeg",
                 "audio/wav",
                 "application/pdf",
+                "application/zip",
             },
         )
 

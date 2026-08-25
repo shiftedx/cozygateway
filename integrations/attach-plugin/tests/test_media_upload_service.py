@@ -73,7 +73,8 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.png_two = self._write("second.png", PNG_1X1 + b"\x00" * 16)
         self.archive = os.path.join(self.tmp.name, "logs.zip")
         with zipfile.ZipFile(self.archive, "w") as bundle:
-            bundle.writestr("note.txt", "a real archive, refused by policy")
+            bundle.writestr("note.txt", "a real archive, carried as a file attachment")
+        self.page = self._write("report.html", b"<!doctype html><html><body>hi</body></html>")
         # Bytes that identify nothing, named as something the policy supports: the
         # fail-open case, where the gateway is the authority on the type.
         self.opaque = self._write("clip.mp4", b"not really a container at all")
@@ -250,14 +251,22 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.gateway.events_of_kind("scheduled"), [])
 
     async def test_bytes_that_prove_an_unsupported_type_fail_before_any_network_call(self):
-        result = await self._proactive([self.archive])
+        result = await self._proactive([self.page])
 
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["media_errors"], [
-            "logs.zip (application/zip, family=file): unsupported_media_type",
+            "report.html (text/html, family=file): unsupported_media_type",
         ])
         self.assertEqual(self.gateway.uploads, [])
         self.assertEqual(list(self._rows(result["deliveryId"]).values()), ["blocked"])
+
+    async def test_a_zip_uploads_as_a_file_attachment(self):
+        result = await self._proactive([self.archive])
+
+        self.assertEqual(result["state"], "journaled")
+        self.assertEqual(self.gateway.upload_content_types, ["application/zip"])
+        self.assertEqual(self.gateway.uploads[0].filename, "logs.zip")
+        self.assertEqual(list(self._rows(result["deliveryId"]).values()), ["journaled"])
 
     async def test_an_unidentifiable_file_fails_open_and_the_gateway_415_decides(self):
         self.gateway.script_upload(upload_unsupported_mime("video/mp4"))

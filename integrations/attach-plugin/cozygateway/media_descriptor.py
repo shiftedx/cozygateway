@@ -147,11 +147,7 @@ MEDIA_COMPATIBILITY_POLICY: Dict[str, Dict[str, Any]] = {
     "audio/ogg": _rule(
         "audio", "unsupported", "Ogg audio is not supported by the client. Convert to M4A/AAC, MP3, or WAV."
     ),
-    "application/zip": _rule(
-        "file",
-        "unsupported",
-        "ZIP archives are not an allowed attachment type. Send the files inside it individually.",
-    ),
+    "application/zip": _rule("file", "supported"),
     "application/vnd.openxmlformats-officedocument": _rule(
         "file", "unsupported", "Office documents are not an allowed attachment type. Export to PDF before sending."
     ),

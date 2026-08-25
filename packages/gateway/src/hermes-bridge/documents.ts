@@ -16,6 +16,7 @@ export const FILE_TYPES = new Map<string, string>([
   ["application/vnd.oasis.opendocument.text", "odt"],
   ["application/vnd.oasis.opendocument.spreadsheet", "ods"],
   ["application/vnd.oasis.opendocument.presentation", "odp"],
+  ["application/zip", "zip"],
 ]);
 
 const OLE_TYPES = new Set(["application/msword", "application/vnd.ms-excel", "application/vnd.ms-powerpoint"]);
@@ -24,6 +25,7 @@ const ZIP_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   "application/vnd.oasis.opendocument.text", "application/vnd.oasis.opendocument.spreadsheet", "application/vnd.oasis.opendocument.presentation",
+  "application/zip",
 ]);
 const TEXT_TYPES = new Set(["text/plain", "text/markdown", "text/csv", "application/json", "application/rtf", "text/rtf"]);
 
