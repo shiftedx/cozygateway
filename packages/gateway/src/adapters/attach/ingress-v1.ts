@@ -639,13 +639,25 @@ export class AttachV1Ingress implements TurnEndpoint {
         this.#traceAttach("attach_projection", agentId, { outcome: "applied" });
         continue;
       }
-      const failure = this.#storage.recordAttachProjectionFailure(agentId, frame.eventId, error, this.#now(), this.#projectionMaxAttempts);
+      // A draft or tool frame is ephemeral rendering state: superseded in seconds and worthless
+      // once its turn ends. It gets the same bounded retries, but exhaustion SKIPS it (stamped
+      // applied, said out loud) instead of dead-lettering: in production two declined drafts
+      // dead-lettered and head-of-line blocked their bots for hours (issue #193), a price no
+      // draft is worth. Durable facts (commits, terminals, scheduled deliveries, interactions)
+      // keep the dead letter, because silently skipping one of those would lose user data.
+      const ephemeral = frame.event.kind === "draft" || frame.event.kind === "tool";
+      const failure = this.#storage.recordAttachProjectionFailure(agentId, frame.eventId, error, this.#now(), ephemeral ? Number.MAX_SAFE_INTEGER : this.#projectionMaxAttempts);
       // A projection failure used to be invisible until the post-mortem DB read. Say it on the
       // operator channel at the first attempt and at the dead letter (issue #193): the dead
       // letter blocks every later event for this identity, which is exactly the kind of fact an
       // operator must not learn from a silent phone.
       if (failure.attempts === 1)
-        this.#log(`attach-v1: projecting event ${frame.sequence} for profile "${agentId}" failed (${error}); retrying`);
+        this.#log(`attach-v1: projecting ${frame.event.kind} event ${frame.sequence} for profile "${agentId}" failed (${error}); retrying`);
+      if (ephemeral && failure.attempts >= this.#projectionMaxAttempts) {
+        this.#storage.markAttachEventApplied(agentId, frame.eventId, this.#now());
+        this.#log(`attach-v1: skipped undeliverable ${frame.event.kind} event ${frame.sequence} for profile "${agentId}" after ${failure.attempts} attempts (${error}); ephemeral events never dead-letter the stream`);
+        continue;
+      }
       if (failure.deadLettered) {
         this.#log(`attach-v1: event ${frame.sequence} for profile "${agentId}" dead-lettered after ${failure.attempts} projection attempts (${error}); later events for this profile are blocked until it is released`);
         if (frame.event.kind === "scheduled") {

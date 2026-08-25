@@ -449,6 +449,9 @@ export async function startGateway(
     config,
     gatewayInfo,
     attachHealth: () => attachV1Ingress.health(),
+    attachDeadLetters: () => storage.attachProjectionDeadLetters(),
+    releaseAttachDeadLetter: (agentId, eventId) =>
+      attachV1Ingress.releaseProjectionDeadLetter(agentId, eventId),
     bots: botsSurface,
     memory: memorySurface,
     attachTokens,

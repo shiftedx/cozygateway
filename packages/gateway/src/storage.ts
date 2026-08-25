@@ -1758,6 +1758,27 @@ export class Storage {
     return rows.map((row) => JSON.parse(row.frameJson) as AttachV1EventFrame);
   }
 
+  /** Operator surface (issue #193): the projection dead letters currently blocking streams. */
+  attachProjectionDeadLetters(): Array<{
+    agentId: string; sequence: number; eventId: string; kind: string;
+    attempts: number; error: string | null; deadLetteredAt: number; receivedAt: number;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT agent_id AS agentId, sequence, event_id AS eventId,
+                json_extract(frame_json, '$.event.kind') AS kind,
+                projection_attempts AS attempts, projection_error AS error,
+                dead_lettered_at AS deadLetteredAt, received_at AS receivedAt
+         FROM attach_event_inbox
+         WHERE disposition = 'accepted' AND dead_lettered_at IS NOT NULL AND applied_at IS NULL
+         ORDER BY agent_id, sequence`,
+      )
+      .all() as unknown as Array<{
+        agentId: string; sequence: number; eventId: string; kind: string;
+        attempts: number; error: string | null; deadLetteredAt: number; receivedAt: number;
+      }>;
+  }
+
   attachTurnCommand(agentId: string, turnId: string): { threadId: string; messageId: string } | undefined {
     const rows = this.#db
       .prepare(

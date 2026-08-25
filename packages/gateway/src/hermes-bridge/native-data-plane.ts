@@ -414,7 +414,14 @@ export class NativeBotDataPlane {
         }
         return true;
       }
-      if (command === undefined || command.threadId !== sessionId) return false;
+      if (command === undefined || command.threadId !== sessionId) {
+        // This is a known native session, so no other projection will claim the event; the
+        // declined guard is the whole diagnosis and must not die silent (issue #193).
+        this.#log(
+          `native ${event.kind} event for "${key}" declined: ${command === undefined ? "no durable turn command" : "turn command bound to another thread"} (turn ${event.turnId})`,
+        );
+        return false;
+      }
       // Any frame at all is proof the turn is alive. A long tool run keeps producing them (tool
       // steps, drafts, and since #189 interim commits), which is exactly what makes total silence
       // a safe staleness signal rather than a race against slow work.

@@ -122,6 +122,14 @@ export interface AppDeps {
   gatewayInfo: GatewayInfo;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
+  /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
+   *  every later event for its agent, so it must be listable and releasable without DB surgery. */
+  attachDeadLetters?: () => Array<{
+    agentId: string; sequence: number; eventId: string; kind: string;
+    attempts: number; error: string | null; deadLetteredAt: number; receivedAt: number;
+  }>;
+  /** Releases the FIRST dead letter for an agent and immediately retries projection. */
+  releaseAttachDeadLetter?: (agentId: string, eventId: string) => boolean;
   presenceOf: (agentId: string) => PresenceState;
   submitUserMessage: (threadId: string, blocks: RichBlock[]) => Message;
   interruptThread: (threadId: string) => "interrupting" | "idle";
@@ -304,6 +312,24 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   app.get("/devices", requireDevice, (c) => c.json(deps.storage.listDevices()));
+
+  // Issue #193's operator surface. A projection dead letter head-of-line blocks its agent's
+  // whole event stream; before these routes the only remedies were DB surgery or a redeploy.
+  app.get("/attach/deadletters", requireDevice, (c) =>
+    c.json({ deadLetters: deps.attachDeadLetters?.() ?? [] }));
+
+  app.post("/attach/deadletters/release", requireDevice, async (c) => {
+    const body = (await c.req.json().catch(() => undefined)) as
+      | { agentId?: unknown; eventId?: unknown }
+      | undefined;
+    if (body === undefined || typeof body.agentId !== "string" || typeof body.eventId !== "string")
+      return c.json(errorBody("invalid_request", "agentId and eventId are required"), 400);
+    if (deps.releaseAttachDeadLetter === undefined)
+      return c.json(errorBody("not_found", "attach is not configured"), 404);
+    if (!deps.releaseAttachDeadLetter(body.agentId, body.eventId))
+      return c.json(errorBody("not_found", "not the first dead letter for that agent"), 404);
+    return c.json({ released: true });
+  });
 
   app.delete("/devices/:id", requireDevice, (c) => {
     const id = c.req.param("id");
