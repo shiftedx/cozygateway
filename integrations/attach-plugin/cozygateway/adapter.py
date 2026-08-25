@@ -1748,14 +1748,30 @@ class AttachAdapter:
             # answers "did it land". Blocking the caller here only ever taught a slow
             # projection to look like a failure.
             receipt = _durable_receipt(self._spool, delivery_id)
-            if receipt == "projected":
-                return SendResult(success=True, message_id=message_id)
             if receipt == "blocked":
                 return SendResult(success=False, error="scheduled delivery blocked")
-            return SendResult(
-                success=False,
-                error="scheduled delivery journaled; projection not yet confirmed",
-            )
+            if receipt == "failed":
+                return SendResult(success=False, error="scheduled delivery failed")
+            result = SendResult(success=True, message_id=message_id)
+            if receipt != "projected":
+                # Accepted-pending, exactly as the proactive-media path reports it.
+                # Hermes core reads any non-network false result as a FORMATTING
+                # failure and posts a second plain-text copy of the same reply, so a
+                # durable acceptance returned as false duplicated a message that was
+                # about to be displayed (incident 2026-08-24). Acceptance is what this
+                # surface can honestly report; the lifecycle stays in the spool rows
+                # and ``delivery_state``, which only move on a receipt.
+                _decorate_send_result(
+                    result,
+                    "delivery_lifecycle",
+                    {
+                        "state": "journaled",
+                        "accepted_pending": True,
+                        "deliveryId": delivery_id,
+                        "messageId": message_id,
+                    },
+                )
+            return result
         try:
             # The authoritative terminal text, or the last streamed buffer when the
             # terminal content is empty or whitespace (a draft-only turn).
@@ -1848,7 +1864,7 @@ class AttachAdapter:
             self._cleanup_turn(chat_id, turn_id)
         result = SendResult(success=True, message_id=turn_id)
         if media_result is not None:
-            _attach_media_result(result, media_result)
+            _decorate_send_result(result, "media_result", media_result)
         return result
 
     async def send_or_update_status(
@@ -1930,8 +1946,15 @@ class AttachAdapter:
         # Projection is asynchronous and durable (spec finding 4). The delivery is
         # accepted and pending; the receipts machinery upgrades the rows when the
         # gateway answers, and a timeout is never reinterpreted as a failure.
-        if _durable_receipt(self._spool, delivery_id) == "projected":
+        receipt = _durable_receipt(self._spool, delivery_id)
+        if receipt == "projected":
             result["state"] = "projected"
+            result["accepted_pending"] = False
+        elif receipt in {"blocked", "failed"}:
+            # A terminal rejection that already landed is not an acceptance. Say so
+            # here, or the caller reads "journaled" and reports a success the person
+            # will never see.
+            result["state"] = receipt
             result["accepted_pending"] = False
         return result
 
@@ -2027,7 +2050,9 @@ class AttachAdapter:
             # media_lifecycle rows and delivery_state(), which stay at "journaled"
             # until a receipt says otherwise: this is an acceptance, not a receipt.
             self._remember_absorbed_media(path)
-            return SendResult(success=True, message_id=result.get("messageId"))
+            pending = SendResult(success=True, message_id=result.get("messageId"))
+            _decorate_send_result(pending, "delivery_lifecycle", dict(result))
+            return pending
         if state == "blocked":
             error = "scheduled media delivery blocked"
         elif state == "failed":
@@ -2529,7 +2554,15 @@ async def _hermes_standalone_send(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
 
 def _hermes_delivery_result(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Make upstream Hermes treat only confirmed projection as delivery success."""
+    """Translate a durable Cozy delivery state into upstream Hermes' success/error ABI.
+
+    Confirmed projection and durable acceptance both report success. Reporting an
+    accepted-pending occurrence as an error taught every caller that a healthy delivery
+    had failed: hermes core retried it as a formatting failure and duplicated the
+    message, and the scheduler kept the projection-timeout string as the run's delivery
+    error long after the occurrence reached ``displayed`` (incident 2026-08-24). Only a
+    rejection is an error now; ``delivery_state()`` still answers "did it land".
+    """
     state = result.get("state")
     if state == "projected":
         return {**result, "success": True}
@@ -2540,10 +2573,14 @@ def _hermes_delivery_result(result: Dict[str, Any]) -> Dict[str, Any]:
     if state == "blocked":
         return {**result, "error": "delivery was blocked before projection"}
     if state == "journaled_partial":
+        # Journaled, but an attachment was lost on the way. A partial occurrence is
+        # still a failure of the delivery the caller asked for.
         return {
             **result,
             "error": "delivery is partially journaled and projection is not yet confirmed",
         }
+    if state == "journaled" and result.get("accepted_pending"):
+        return {**result, "success": True, "pending": True}
     return {
         **result,
         "error": "delivery is durable but projection is not yet confirmed",
@@ -2823,16 +2860,19 @@ def _durable_receipt(spool: Optional[AttachSpool], delivery_id: str) -> Optional
     return state or None
 
 
-def _attach_media_result(result: Any, payload: Dict[str, Any]) -> None:
-    """Carry the structured media outcome on the harness' SendResult when it allows it.
+def _decorate_send_result(result: Any, field: str, payload: Dict[str, Any]) -> None:
+    """Carry structured detail on the harness' SendResult when it allows it.
 
-    Hermes owns that class, so a slotted or frozen build simply does not carry the
-    detail; the committed reply text and the durable rows already do.
+    ``media_result`` is the media outcome; ``delivery_lifecycle`` is the accepted-pending
+    state a durable send has no upstream field for (``SendResult`` models success and
+    error only). Hermes owns that class, so a slotted or frozen build simply does not
+    carry either one: the committed reply text, the durable spool rows and
+    ``delivery_state()`` remain the authority.
     """
     try:
-        setattr(result, "media_result", payload)
+        setattr(result, field, payload)
     except Exception:  # noqa: BLE001 - decoration is never worth failing a send for
-        logger.debug("attach: could not decorate SendResult with the media result", exc_info=True)
+        logger.debug("attach: could not decorate SendResult with %s", field, exc_info=True)
 
 
 def _proactive_identity(delivery_key: str) -> Tuple[str, str]:
