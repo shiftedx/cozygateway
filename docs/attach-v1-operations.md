@@ -163,3 +163,89 @@ backup with the same manifest `name:` can silently shadow the real plugin
 across every restart. Keep backups outside `plugins/`. The script's header
 comment documents the quiescence heuristic (spool sequence quiet-window
 polling) and its known false-quiet / false-busy limits in detail.
+
+## Automatic bot provisioning
+
+`POST /bots` creates a Hermes profile and a roster row. Neither makes the bot
+reachable. Chat rides a native attach binding with three halves, and until all
+three exist the new bot is a name in a list nobody can talk to (issue #183):
+
+1. **The gateway must know the profile.** `NativeBotDataPlane`'s native-bot set
+   is built at BOOT from `hermes.profiles` in the mounted config, and each entry
+   names a `tokenEnv` whose variable has to exist in the box's `.env`.
+2. **The Mac must have the plugin.** `~/.hermes/profiles/<p>/plugins/cozygateway`
+   has to hold the attach plugin, and the profile's own `.env` has to carry that
+   profile's `COZYGATEWAY_TOKEN`, `COZYGATEWAY_URL` and a `COZYGATEWAY_SPOOL_PATH`
+   pointing inside that profile.
+3. **The profile needs its own gateway process.** `ai.hermes.gateway-<p>` is what
+   dials the attach stream. No process, no stream.
+
+The gateway seed writes the profile's half of (2) at create time: every new
+profile gets `plugins.enabled: [cozygateway]` (see
+`packages/gateway/src/hermes-bridge/blank-slate-seed.ts`). That stanza is the
+profile saying it wants the phone surface. The rest is Mac-side and box-side
+work, which is what these two scripts do.
+
+### One profile, by hand
+
+```bash
+scripts/provision-bot.sh -n provcheck   # see the plan, change nothing
+scripts/provision-bot.sh provcheck      # do it
+```
+
+It is idempotent: every step checks real state first, so a re-run is a no-op and
+a run that died halfway is repaired by the next one. It ends by waiting for the
+box log to show an attach hello for the profile, so a green exit means the bot
+really is connected, not merely configured.
+
+### The watcher
+
+`scripts/bot-provisioner-watch.sh` is one sweep: it provisions every profile
+that has opted in but is not yet wired, and leaves everything else alone.
+`docs/ai.cozylabs.bot-provisioner.plist` runs that sweep every 30 seconds, so a
+bot created from the phone becomes chattable without anyone at a terminal.
+
+The plist is a template and is NOT installed by default. To enable it:
+
+```bash
+sed "s#REPLACE_ME_REPO#$PWD#g" docs/ai.cozylabs.bot-provisioner.plist \
+  > ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist \
+  && launchctl bootstrap "gui/$(id -u)" \
+       ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist
+```
+
+To stop it: `launchctl bootout "gui/$(id -u)/ai.cozylabs.bot-provisioner"`.
+The log is `~/Library/Logs/cozylabs-bot-provisioner.log`.
+
+### What a fresh profile inherits, and why it has to be undone
+
+A new Hermes profile arrives holding a COPY of the launch profile's `.env`. That
+copy is the source of three traps the provisioner exists to defuse, all three
+observed live while building it:
+
+- **An attach token it did not mint.** Every bot created this way inherits the
+  same one and would attach as the same identity. So the presence of a
+  `COZYGATEWAY_TOKEN` proves nothing, and the box is treated as the authority:
+  a profile the box already names keeps its token, and a profile it does not
+  gets a freshly minted one.
+- **A spool path pointing at the GLOBAL spool.** Two profiles that both kept it
+  would read and acknowledge each other's events out of one file. It is
+  rewritten to the profile's own path.
+- **The launch profile's `DISCORD_BOT_TOKEN`.** Only one gateway may hold a
+  Discord session. Two that claim it take it from each other with `--replace`
+  handoffs that SIGTERM the loser, whose launchd job restarts it and takes it
+  back, and every takeover tears down the attach adapter with it. Live, a new
+  bot ping-ponged with `cleo` every ~30 seconds and both were unusable. Single
+  holder credentials are blanked on first provisioning only.
+
+### Gotchas
+
+- **`hermes gateway install` is a no-op when the plist already exists**, so a
+  profile whose service was booted out gets a cheerful "installed" and stays
+  dead. The provisioner asserts the load with `launchctl print` and bootstraps
+  the plist itself rather than trusting the installer's exit code.
+- **Backups never go inside `plugins/`.** Hermes loads any directory there with
+  a matching `plugin.yaml` name by scan-order luck, so a backup can silently win
+  over the real plugin. The provisioner refuses to run when it finds one.
+- **`docker compose up -d gateway`, not `--build`.** Only the env and the mounted
+  config changed; a recreate re-reads both, and a rebuild is a deploy.

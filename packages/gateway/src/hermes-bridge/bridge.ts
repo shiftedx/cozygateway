@@ -481,35 +481,34 @@ export class HermesBridge implements BotControlSurface {
       ...(input.toolsets === undefined ? {} : { toolsets: input.toolsets }),
       ...(input.mcpServers === undefined ? {} : { mcpServers: input.mcpServers }),
     };
-    const hasSelection =
-      selection.toolsets !== undefined || selection.mcpServers !== undefined;
-    if (this.#seedBlankSlateBots || hasSelection) {
-      try {
-        const seed = await seedBlankSlateProfile(this.#client, name, {
-          blankSlate: this.#seedBlankSlateBots,
-          selection,
-        });
-        this.#log(
-          `bot ${name} seed: ${seed.wrote ? "written" : "already present"}` +
-            `, blankSlate=${this.#seedBlankSlateBots}`,
-        );
-        if (seed.unknownToolsets.length > 0) {
-          warnings.push(
-            `hermes does not report these toolsets, so they were skipped: ${seed.unknownToolsets.join(", ")}`,
-          );
-        }
-        if (seed.unknownMcpServers.length > 0) {
-          warnings.push(
-            `this bot's config defines no such MCP server, so they were skipped: ${seed.unknownMcpServers.join(", ")}`,
-          );
-        }
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        this.#log(`bot ${name} seed FAILED, it starts on hermes platform defaults: ${detail}`);
+    // Unconditional, where this used to be gated on the flag or a selection. The seed now also
+    // writes the attach-plugin binding, and a bot without that binding is one nobody can talk to
+    // (issue #183), so there is no configuration under which skipping this pass is correct.
+    try {
+      const seed = await seedBlankSlateProfile(this.#client, name, {
+        blankSlate: this.#seedBlankSlateBots,
+        selection,
+      });
+      this.#log(
+        `bot ${name} seed: ${seed.wrote ? "written" : "already present"}` +
+          `, blankSlate=${this.#seedBlankSlateBots}`,
+      );
+      if (seed.unknownToolsets.length > 0) {
         warnings.push(
-          "the starting tool set could not be written, so this bot starts on Hermes' own defaults",
+          `hermes does not report these toolsets, so they were skipped: ${seed.unknownToolsets.join(", ")}`,
         );
       }
+      if (seed.unknownMcpServers.length > 0) {
+        warnings.push(
+          `this bot's config defines no such MCP server, so they were skipped: ${seed.unknownMcpServers.join(", ")}`,
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#log(`bot ${name} seed FAILED, it starts on hermes platform defaults: ${detail}`);
+      warnings.push(
+        "the starting tool set could not be written, so this bot starts on Hermes' own defaults",
+      );
     }
 
     const title = input.title?.trim();

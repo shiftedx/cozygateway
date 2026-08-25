@@ -189,6 +189,13 @@ describe("POST /bots seeds a blank slate", () => {
           cli: ["file", "terminal"],
         },
         approvals: { mode: "manual" },
+        // Without this the bot is a roster row nobody can reach: the profile's own gateway
+        // process only opens the attach stream when it loads this plugin (issue #183).
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+        },
       },
     });
     // The whole seed, asserted as one value rather than a hand-picked subset.
@@ -282,6 +289,11 @@ describe("idempotency", () => {
       profileConfig: {
         platform_toolsets: { cozygateway: ["file", "terminal", "web"], cli: ["file"] },
         approvals: { mode: "smart" },
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+        },
       },
     });
 
@@ -292,13 +304,64 @@ describe("idempotency", () => {
 
   it("seeds only the half that is missing", () => {
     const plan = planBlankSlateSeed({
-      current: { platform_toolsets: { cozygateway: ["web"] } },
+      current: {
+        platform_toolsets: { cozygateway: ["web"] },
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+        },
+      },
       blankSlate: true,
     });
     expect(plan.config).toEqual({
       platform_toolsets: { cli: ["file", "terminal"] },
       approvals: { mode: "manual" },
     });
+  });
+});
+
+describe("the attach-plugin binding", () => {
+  it("unions the enabled list rather than replacing it, because the merge replaces arrays", () => {
+    const plan = planBlankSlateSeed({
+      current: { plugins: { enabled: ["house-lights"] } },
+      blankSlate: true,
+    });
+    // Writing ["cozygateway"] here would unload house-lights on the next profile load.
+    expect(plan.config?.["plugins"]).toEqual({
+      enabled: ["house-lights", "cozygateway"],
+      disabled: [],
+      entries: { cozygateway: { allow_tool_override: false } },
+    });
+  });
+
+  it("lifts its own name out of disabled, which would otherwise contradict enabled", () => {
+    const plan = planBlankSlateSeed({
+      current: { plugins: { enabled: [], disabled: ["cozygateway", "house-lights"] } },
+      blankSlate: true,
+    });
+    expect(plan.config?.["plugins"]).toEqual({
+      enabled: ["cozygateway"],
+      // house-lights stays disabled: this seed only ever overrules the decision about itself.
+      disabled: ["house-lights"],
+      entries: { cozygateway: { allow_tool_override: false } },
+    });
+  });
+
+  it("leaves an entry the user has already tuned exactly as it is", () => {
+    const plan = planBlankSlateSeed({
+      current: {
+        platform_toolsets: { cozygateway: ["web"], cli: ["web"] },
+        approvals: { mode: "smart" },
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: true } },
+        },
+      },
+      blankSlate: true,
+    });
+    expect(plan.config).toBeUndefined();
   });
 });
 
@@ -316,11 +379,21 @@ describe("the seed is best-effort", () => {
 });
 
 describe("seedBlankSlateBots: false", () => {
-  it("writes nothing at all, leaving hermes' broad platform defaults in place", async () => {
+  it("writes the plugin binding and nothing else, leaving hermes' broad defaults in place", async () => {
     const { authed, dashboard } = await setup({ seedBlankSlateBots: false });
     expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
-    // Not even the read: with the flag off and nothing selected there is nothing to decide.
-    expect(dashboard).toEqual([]);
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    // The flag is toolset policy, so the floor, the approval mode and the MCP quieting all stop.
+    expect(body.config["platform_toolsets"]).toBeUndefined();
+    expect(body.config["approvals"]).toBeUndefined();
+    expect(body.config["mcp_servers"]).toBeUndefined();
+    // Reachability is not toolset policy. An operator asking for hermes' broad defaults is not
+    // asking for a bot nobody can talk to, so the binding is written whatever the flag says.
+    expect(body.config["plugins"]).toEqual({
+      enabled: ["cozygateway"],
+      disabled: [],
+      entries: { cozygateway: { allow_tool_override: false } },
+    });
   });
 
   it("still honours an explicit selection, because that is the user speaking, not a default", async () => {
@@ -338,5 +411,10 @@ describe("seedBlankSlateBots: false", () => {
     // because quieting the rest is the blank slate's job and the blank slate is off.
     expect(body.config["mcp_servers"]).toEqual({ github: { enabled: true } });
     expect(body.config["approvals"]).toBeUndefined();
+    expect(body.config["plugins"]).toEqual({
+      enabled: ["cozygateway"],
+      disabled: [],
+      entries: { cozygateway: { allow_tool_override: false } },
+    });
   });
 });
