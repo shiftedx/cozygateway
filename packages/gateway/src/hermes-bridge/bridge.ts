@@ -360,6 +360,7 @@ export class HermesBridge implements BotControlSurface {
   #closed = false;
   #lastRoster = "";
   #lastActive = "";
+  #rosterOverlay: ((bots: readonly BotSummary[]) => BotSummary[]) | undefined;
   constructor(opts: HermesBridgeOptions) {
     this.#client = opts.client;
     this.#storage = opts.storage;
@@ -606,7 +607,20 @@ export class HermesBridge implements BotControlSurface {
     this.#refreshing = run;
     return run;
   }
-  #publish(bots: BotSummary[], updatedAt: number): void {
+  /** The native data plane is assembled after this bridge and owns the local conversation
+   * identity, so it hands its overlay back here. Without it the `bot_roster` frame is built from
+   * `profiles.list` alone and disagrees with `GET /bots` about the same rows. */
+  setRosterOverlay(overlay: (bots: readonly BotSummary[]) => BotSummary[]): void {
+    this.#rosterOverlay = overlay;
+    // A frame published before the overlay existed carried the un-overlaid rows. Drop the
+    // dedupe memory so the corrected roster goes out on the next refresh rather than being
+    // suppressed as unchanged.
+    this.#lastRoster = "";
+    this.#lastActive = "";
+  }
+  #publish(rawBots: BotSummary[], updatedAt: number): void {
+    const bots =
+      this.#rosterOverlay === undefined ? rawBots : this.#rosterOverlay(rawBots);
     const json = JSON.stringify(bots);
     if (json !== this.#lastRoster) {
       this.#lastRoster = json;

@@ -359,7 +359,11 @@ export async function startGateway(
     trace: traceLog,
     mobileNode,
   });
-  botsSurface = nativeBotPlane.surface();
+  const nativePlane = nativeBotPlane;
+  botsSurface = nativePlane.surface();
+  // Same rows, same overlay, both surfaces: the `bot_roster` frame and `GET /bots` are now built
+  // by one function, so a WS row carries the chat session id its REST twin carries.
+  bridge.setRosterOverlay((bots) => nativePlane.rosterBots(bots));
   nativeSink = new AttachNativeSink({
     storage,
     broadcast: (frame) => {

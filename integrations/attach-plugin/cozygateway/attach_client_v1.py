@@ -323,13 +323,22 @@ class AttachV1Client:
         turn_id: str,
         media_ids: Optional[List[str]] = None,
         media_positions: Optional[List[int]] = None,
+        continues: bool = False,
     ) -> None:
+        """Commit the latest draft as a durable message.
+
+        ``continues`` marks a reply the agent produced part-way through a run: the message is
+        real, the turn is not over. The field is additive and only sent when true, so a gateway
+        that predates it decodes exactly the frame it has always decoded.
+        """
         blocks = self._latest_blocks.pop(turn_id, [])
         self._latest_tools.pop(turn_id, None)
         event: Dict[str, Any] = {
             "kind": "commit", "threadId": thread_id, "turnId": turn_id,
             "messageId": str(uuid.uuid4()), "blocks": blocks,
         }
+        if continues:
+            event["continues"] = True
         if media_ids:
             event["mediaIds"] = list(media_ids[:16])
             _set_media_positions(event, media_positions)

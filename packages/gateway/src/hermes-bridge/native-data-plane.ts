@@ -231,10 +231,15 @@ export class NativeBotDataPlane {
 
   /** Expose only attach-configured identities. Hermes may host other profiles, but this gateway
    * has no token, plugin, or durable chat transport for them until the installer reconciles them.
-   * Overlay the native transcript on their dashboard-owned metadata. */
-  #roster() {
-    const view = this.#control.roster();
-    const bots = view.bots
+   * Overlay the native transcript on their dashboard-owned metadata.
+   *
+   * Public because the `bot_roster` frame has to be the same rows `GET /bots` returns. The control
+   * plane builds a roster from `profiles.list` alone, which knows no local conversation identity,
+   * so a frame published straight from it carried `chatSessionId: null` while the REST route
+   * carried the real id: a client could not join a `bot_chat_delta` to the roster row it belongs
+   * to. One function, both surfaces, no drift. */
+  rosterBots(bots: readonly BotSummary[]): BotSummary[] {
+    return bots
       .filter((summary) => this.#native.has(normalize(summary.name)))
       .map((summary): BotSummary => {
         const bot = normalize(summary.name);
@@ -253,7 +258,11 @@ export class NativeBotDataPlane {
               : { kind: "plain", text: latest.text.trim() },
         };
       });
-    return { ...view, bots };
+  }
+
+  #roster() {
+    const view = this.#control.roster();
+    return { ...view, bots: this.rosterBots(view.bots) };
   }
 
   handles(bot: string): boolean {
@@ -393,6 +402,13 @@ export class NativeBotDataPlane {
       return true;
     }
     if (event.kind === "commit") {
+      // A Hermes agent loop legitimately replies more than once: an interim reply mid-run is the
+      // same `commit` frame as the last one, so the gateway cannot tell them apart on its own and
+      // used to end the turn on the first. The plugin can tell them apart, and says so. An interim
+      // commit projects its message like any other and leaves the TURN running, so the tool events
+      // and drafts the agent keeps producing still reach the app.
+      if (event.continues === true)
+        return this.#commitInterim(key, sessionId, event);
       this.#finish(key, sessionId, event.turnId, {
         phase: "complete",
         status: "completed",
@@ -917,6 +933,41 @@ export class NativeBotDataPlane {
    * closes the loop for any of them that were a scheduled delivery: the plugin that produced a
    * cron report learns that a human read it, which is the one thing neither its own spool nor the
    * gateway's transcript could tell it. */
+  /** Projects one reply of a still-running turn. Everything `#finish` does is deliberately absent:
+   * no terminal record, no `#sealTools` (nothing has stopped running), no cleared active turn. The
+   * live draft that carried this reply is emptied without `done`, because the reply now exists as a
+   * transcript row and the turn is still going. */
+  #commitInterim(
+    bot: string,
+    sessionId: string,
+    event: Extract<AttachV1EventFrame["event"], { kind: "commit" }>,
+  ): boolean {
+    this.#flushLiveTurn(this.#nativeTurnKey(bot, sessionId, event.turnId));
+    const committed = this.#commit(
+      bot,
+      sessionId,
+      event.messageId,
+      event.blocks,
+      event.mediaIds,
+      event.mediaPositions,
+      event.turnId,
+    );
+    if (!committed) return false;
+    const seq = (this.#draftSeq.get(event.turnId) ?? 0) + 1;
+    this.#draftSeq.set(event.turnId, seq);
+    this.#broadcast({
+      type: "bot_chat_delta",
+      bot,
+      sessionId,
+      turnId: event.turnId,
+      text: "",
+      seq,
+      updatedAt: this.#now(),
+    });
+    this.#state(bot, sessionId, "polling", true);
+    return true;
+  }
+
   #recordDisplayed(
     name: string,
     messageIds: readonly string[],
