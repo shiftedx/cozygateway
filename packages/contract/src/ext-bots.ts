@@ -410,6 +410,78 @@ export const BotTurnToolStepsSchema = Type.Object({
 });
 export type BotTurnToolSteps = Static<typeof BotTurnToolStepsSchema>;
 
+/** Closed status vocabulary for one delegated child. Capability 34 (subagent visibility).
+ *  `queued|starting|running|stalling` are live; the rest are settled. `unknown` is the honest
+ *  settle for work whose outcome cannot be proven (a restart with the child in flight) and is
+ *  never rendered as failure. `stalling`/`stalled` mark long-quiet work; clients may also derive
+ *  quietness from `lastActiveAt` ("quiet for 2m", not failed). */
+export const BotDelegationChildStatusSchema = Type.Union([
+  Type.Literal("queued"), Type.Literal("starting"), Type.Literal("running"),
+  Type.Literal("stalling"), Type.Literal("succeeded"), Type.Literal("failed"),
+  Type.Literal("interrupted"), Type.Literal("stalled"), Type.Literal("unknown"),
+]);
+export type BotDelegationChildStatus = Static<typeof BotDelegationChildStatusSchema>;
+
+/** One delegated child of a native turn's `delegate_task` batch. Capability 34.
+ *
+ *  Identity is (batchId, childId) -- `childId` is the Hermes child session id, the one
+ *  identifier present on both the spawn and finish legs of the lifecycle, so it is the upsert
+ *  key exactly as `stepId` keys a tool step; tool names are display metadata only and can never
+ *  collide. Only bounded display text crosses this wire: a truncated task label and a tool
+ *  NAME -- never args, results, reasoning, prompts, local paths, or child summaries. */
+export const BotDelegationChildSchema = Type.Object({
+  childId: Type.String(),
+  /** Position within the batch, from 0, pinned when the gateway FIRST sees the child. */
+  index: Type.Integer(),
+  label: Type.Optional(Type.String()),
+  status: BotDelegationChildStatusSchema,
+  /** Tool NAME only. */
+  currentTool: Type.Optional(Type.String()),
+  apiCalls: Type.Optional(Type.Integer()),
+  toolCount: Type.Optional(Type.Integer()),
+  /** MILLISECONDS, plugin clock. When the child last showed observable activity. */
+  lastActiveAt: Type.Integer(),
+  /** MILLISECONDS, gateway clock. When the gateway first saw the child. */
+  startedAt: Type.Integer(),
+  /** MILLISECONDS. Absent while the child is live. */
+  endedAt: Type.Optional(Type.Integer()),
+});
+export type BotDelegationChild = Static<typeof BotDelegationChildSchema>;
+
+/** What one turn's `delegate_task` batch is doing, as a full-replace snapshot. Capability 34.
+ *  Same wire discipline as `bot_tool_activity`: every frame is independently sufficient, frame
+ *  `seq` is monotonic within one (turnId, batchId), `done` marks the batch fully settled, and
+ *  the frame is NOT pushed, ever. `batchId` also keys the client's reconciliation of the live
+ *  card with Hermes's synthetic "[ASYNC DELEGATION BATCH COMPLETE ...]" transcript row. A batch
+ *  may outlive its turn (async dispatch): frames legitimately arrive after the turn sealed. */
+export const BotDelegationActivityFrameSchema = Type.Object({
+  type: Type.Literal("bot_delegation_activity"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  batchId: Type.String(),
+  /** Children known to the batch so far; grows monotonically. */
+  count: Type.Integer(),
+  children: Type.Array(BotDelegationChildSchema),
+  /** Monotonic within one (turnId, batchId), starting at 1. */
+  seq: Type.Integer(),
+  updatedAt: Type.Integer(),
+  done: Type.Optional(Type.Boolean()),
+});
+export type BotDelegationActivityFrame = Static<typeof BotDelegationActivityFrameSchema>;
+
+/** One past turn's delegation batch, persisted like `BotTurnToolSteps` and for the same
+ *  reason: a batch belongs to a TURN, and `startedAt` is the honest chronological join. */
+export const BotTurnDelegationsSchema = Type.Object({
+  turnId: Type.String(),
+  batchId: Type.String(),
+  count: Type.Integer(),
+  startedAt: Type.Integer(),
+  endedAt: Type.Optional(Type.Integer()),
+  children: Type.Array(BotDelegationChildSchema),
+});
+export type BotTurnDelegations = Static<typeof BotTurnDelegationsSchema>;
+
 export const BotApprovalPendingFrameSchema = Type.Object({
   type: Type.Literal("bot_approval_pending"),
   bot: Type.String(),
@@ -1328,4 +1400,14 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  *  fields are optional and additive, so a client below 33 is untouched and a gateway below 33
  *  ignores them; a picker UI gates on `>= 33` so the user is never shown a choice that will be
  *  dropped in silence. */
-export const BOTS_CAPABILITY_VERSION = 33;
+/** Capability 34: SUBAGENT VISIBILITY. When a bot delegates work to subagents mid-turn (Hermes
+ *  `delegate_task`), the batch lifecycle reaches clients as `bot_delegation_activity`
+ *  full-replace snapshots, plus a `delegations` array on `GET /bots/:name/chat/messages` so an
+ *  active batch survives reopen and reconnect. Additive exactly as capability 12 was: a client
+ *  below 34 ignores an unknown frame type and an optional response field and keeps today's
+ *  behavior (the outer delegate_task chip plus the terminal completion card); a client that
+ *  renders live batch cards gates on `>= 34`, because an older gateway never sends either.
+ *  Children carry only bounded display metadata (a truncated task label, a tool name); raw
+ *  child transcripts, summaries, args, and results never cross this wire, a restart with a
+ *  child in flight settles it `unknown` -- never `failed` -- and nothing here is pushed. */
+export const BOTS_CAPABILITY_VERSION = 34;

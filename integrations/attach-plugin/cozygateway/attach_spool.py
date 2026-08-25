@@ -249,7 +249,10 @@ class AttachSpool:
 
     def enqueue_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         turn_id = event.get("turnId")
-        if isinstance(turn_id, str) and turn_id:
+        # A `delegation` event is exempt from the terminal seal: an async delegate_task batch
+        # legitimately outlives its turn, and a child's finish leg after the seal must still
+        # settle its card (the gateway projects post-seal delegation legs explicitly).
+        if isinstance(turn_id, str) and turn_id and event.get("kind") != "delegation":
             sealed = self._db.execute("SELECT 1 FROM turn_terminals WHERE turn_id = ?", (turn_id,)).fetchone()
             if sealed is not None:
                 raise TerminalSealed(f"turn {turn_id!r} already has a terminal event")

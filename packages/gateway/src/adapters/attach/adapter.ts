@@ -260,6 +260,10 @@ export function createAttachAdapter(deps: {
           // Clarification is a distinct v1 interaction and has no frozen core-thread frame yet.
           // It remains durably journaled and is projected by the Bot Mode native sink.
           return true;
+        case "delegation":
+          // Delegation batch cards are a Bot Mode surface (capability 34): the native sink
+          // projects them and the frozen core-thread contract carries no equivalent frame.
+          return true;
       }
     },
 

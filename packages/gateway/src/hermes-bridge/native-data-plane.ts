@@ -18,6 +18,9 @@ import type {
   BotToolActivityFrame,
   BotToolStep,
   BotTurnToolSteps,
+  BotDelegationActivityFrame,
+  BotDelegationChild,
+  BotTurnDelegations,
   BotSummary,
   BotPendingClarification,
   BotPendingApproval,
@@ -96,11 +99,31 @@ interface ToolFrameState {
   steps: Map<string, BotToolStep>;
 }
 
-type LiveTurnFrame = BotChatDeltaFrame | BotToolActivityFrame | BotChatStateFrame;
+interface DelegationFrameState {
+  seq: number;
+  count: number;
+  children: Map<string, BotDelegationChild>;
+}
+
+/** Delegation statuses that will never change on their own again (a settled child may still be
+ * overwritten by a REAL finish leg upgrading an `unknown`, but never regresses to live). */
+const DELEGATION_SETTLED = new Set<BotDelegationChild["status"]>([
+  "succeeded", "failed", "interrupted", "stalled", "unknown",
+]);
+
+type LiveTurnFrame = BotChatDeltaFrame | BotToolActivityFrame | BotDelegationActivityFrame | BotChatStateFrame;
 
 interface LiveTurnBatch {
   timer: ReturnType<typeof setTimeout>;
-  frames: Map<LiveTurnFrame["type"], LiveTurnFrame>;
+  frames: Map<string, LiveTurnFrame>;
+}
+
+/** Coalescing slot for a live-turn frame: latest-wins per type, except delegation snapshots,
+ * which are latest-wins per (type, batch). */
+function liveTurnFrameKey(frame: LiveTurnFrame): string {
+  return frame.type === "bot_delegation_activity"
+    ? `${frame.type}:${frame.batchId}`
+    : frame.type;
 }
 
 const LIVE_TURN_FLUSH_MS = 100;
@@ -131,6 +154,7 @@ export class NativeBotDataPlane {
   readonly #turnOrigins = new Map<string, string>();
   readonly #draftSeq = new Map<string, number>();
   readonly #toolFrames = new Map<string, ToolFrameState>();
+  readonly #delegationFrames = new Map<string, Map<string, DelegationFrameState>>();
   readonly #tracedTurnStates = new Map<string, string>();
   readonly #attachPresence = new Map<string, "online" | "degraded" | "absent">();
   readonly #interactionTimers = new Map<
@@ -174,6 +198,7 @@ export class NativeBotDataPlane {
     for (const bot of this.#native) {
       const chat = this.#storage.nativeBotChat(bot, this.#now());
       this.#restoreToolFrames(bot);
+      this.#restoreDelegationFrames(bot);
       if (chat.activeTurnId !== undefined) {
         this.#scheduleTurnTimeout(bot, chat.sessionId, chat.activeTurnId);
         this.#seedTurnActivity(bot, chat.sessionId, chat.activeTurnId);
@@ -379,6 +404,11 @@ export class NativeBotDataPlane {
       const command = this.#storage.attachTurnCommand(key, event.turnId);
       const terminal = this.#storage.nativeBotTurnTerminal(key, sessionId, event.turnId);
       if (terminal !== undefined) {
+        // A delegation batch legitimately outlives its turn (async delegate_task): a child's
+        // finish leg lands after the seal and must still settle its card. Ephemeral, so the
+        // at-least-once replay of an already-settled state is acknowledged inside #delegation.
+        if (event.kind === "delegation")
+          return this.#delegation(key, sessionId, event, false);
         const delivery = this.#storage.nativeBotTurnDelivery(key, event.turnId);
         // An acknowledged Hermes turn may finish after something else sealed it: the local
         // response deadline, the stale-turn reaper, or the plugin's own interrupt seal. The
@@ -488,6 +518,7 @@ export class NativeBotDataPlane {
       return true;
     }
     if (event.kind === "tool") return this.#tool(key, sessionId, event);
+    if (event.kind === "delegation") return this.#delegation(key, sessionId, event, true);
     if (event.kind === "approval") return this.#approval(key, sessionId, event);
     if (event.kind === "clarify") return this.#clarify(key, sessionId, event);
     return false;
@@ -611,6 +642,7 @@ export class NativeBotDataPlane {
       inflight: chat.activeTurnId !== undefined,
       ...(state === undefined ? {} : state),
       ...this.#historyToolSteps(chat.sessionId),
+      ...this.#historyDelegations(chat.sessionId),
       updatedAt: this.#now(),
       ...(messages.length === 0 && this.#chatSuggestion !== ""
         ? { suggestion: this.#chatSuggestion }
@@ -658,6 +690,7 @@ export class NativeBotDataPlane {
       if (opts?.deviceId !== undefined) this.#turnOrigins.set(this.#nativeTurnKey(bot, chat.sessionId, turnId), opts.deviceId);
       this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
       this.#seedTurnActivity(bot, chat.sessionId, turnId);
+      this.#sweepStaleDelegations(bot, chat.sessionId, turnId);
     }
     this.#broadcastMessage(bot, chat.sessionId, message, now);
     if (chat.activeTurnId === undefined)
@@ -977,6 +1010,7 @@ export class NativeBotDataPlane {
       turnId,
       terminal.status === "completed" ? "ok" : "error",
     );
+    this.#sealDelegations(bot, sessionId, turnId, terminal.status === "completed");
     const seq = (this.#draftSeq.get(turnId) ?? 0) + 1;
     this.#broadcast({
       type: "bot_chat_delta",
@@ -1257,6 +1291,248 @@ export class NativeBotDataPlane {
       return { ...turn, ...(endedAt === undefined ? {} : { endedAt }) };
     });
     return toolSteps.length === 0 ? {} : { toolSteps };
+  }
+
+  #delegation(
+    bot: string,
+    sessionId: string,
+    event: Extract<AttachV1EventFrame["event"], { kind: "delegation" }>,
+    live: boolean,
+  ): boolean {
+    const key = this.#nativeTurnKey(bot, sessionId, event.turnId);
+    const batches = this.#delegationFrames.get(key) ?? new Map<string, DelegationFrameState>();
+    const current = batches.get(event.batchId) ?? {
+      seq: 0,
+      count: 0,
+      children: new Map<string, BotDelegationChild>(),
+    };
+    const prior = current.children.get(event.childId);
+    // Attach-v1 is at-least-once: a replayed child state is acknowledged without another
+    // SQLite write or rebroadcast, exactly as a replayed tool event is.
+    if (
+      prior !== undefined &&
+      prior.status === event.status &&
+      prior.currentTool === event.currentTool &&
+      prior.toolCount === event.toolCount &&
+      prior.lastActiveAt === event.lastActiveAt
+    ) return true;
+    // A live leg replayed AFTER the child settled must not resurrect it.
+    if (
+      prior !== undefined &&
+      DELEGATION_SETTLED.has(prior.status) &&
+      !DELEGATION_SETTLED.has(event.status)
+    ) return true;
+    const now = this.#now();
+    const label = event.label ?? prior?.label;
+    const apiCalls = event.apiCalls ?? prior?.apiCalls;
+    const toolCount = event.toolCount ?? prior?.toolCount;
+    const child: BotDelegationChild = {
+      childId: event.childId,
+      index: prior?.index ?? event.index,
+      status: event.status,
+      lastActiveAt: event.lastActiveAt,
+      startedAt: prior?.startedAt ?? now,
+      ...(DELEGATION_SETTLED.has(event.status) ? { endedAt: now } : {}),
+      ...(label === undefined ? {} : { label }),
+      ...(event.currentTool === undefined ? {} : { currentTool: event.currentTool }),
+      ...(apiCalls === undefined ? {} : { apiCalls }),
+      ...(toolCount === undefined ? {} : { toolCount }),
+    };
+    current.children.set(event.childId, child);
+    current.count = Math.max(current.count, event.count, current.children.size);
+    current.seq += 1;
+    batches.set(event.batchId, current);
+    this.#delegationFrames.set(key, batches);
+    this.#storage.upsertBotChatDelegation({
+      bot,
+      sessionId,
+      turnId: event.turnId,
+      batchId: event.batchId,
+      childId: child.childId,
+      index: child.index,
+      count: current.count,
+      status: child.status,
+      lastActiveAt: child.lastActiveAt,
+      startedAt: child.startedAt,
+      endedAt: child.endedAt,
+      label: child.label,
+      currentTool: child.currentTool,
+      apiCalls: child.apiCalls,
+      toolCount: child.toolCount,
+    });
+    const wire = this.#delegationWire(bot, sessionId, event.turnId, event.batchId, current, now);
+    // Post-seal legs broadcast directly: the sealed turn is not "polling" and has no live batch.
+    if (live) {
+      this.#coalesceLiveTurn(key, wire, this.#stateFrame(bot, sessionId, "polling", true));
+    } else {
+      this.#broadcast(wire);
+    }
+    return true;
+  }
+
+  #delegationWire(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    batchId: string,
+    state: DelegationFrameState,
+    updatedAt: number,
+  ): BotDelegationActivityFrame {
+    const children = [...state.children.values()].sort((a, b) => a.index - b.index);
+    const done =
+      children.length >= state.count &&
+      children.every((child) => DELEGATION_SETTLED.has(child.status));
+    return {
+      type: "bot_delegation_activity",
+      bot,
+      sessionId,
+      turnId,
+      batchId,
+      count: state.count,
+      children,
+      seq: state.seq,
+      updatedAt,
+      ...(done ? { done: true } : {}),
+    };
+  }
+
+  /** Reconnect recovery for delegation batches, exactly as `#historyToolSteps` is for steps. */
+  #historyDelegations(sessionId: string): { delegations?: BotTurnDelegations[] } {
+    const batches = new Map<string, BotTurnDelegations>();
+    for (const row of this.#storage.botChatDelegations(sessionId, 0)) {
+      const groupKey = `${row.turnId}\u0000${row.batchId}`;
+      const batch = batches.get(groupKey) ?? {
+        turnId: row.turnId,
+        batchId: row.batchId,
+        count: 0,
+        startedAt: row.startedAt,
+        children: [],
+      };
+      batch.count = Math.max(batch.count, row.count);
+      batch.startedAt = Math.min(batch.startedAt, row.startedAt);
+      batch.children.push(this.#delegationChildFromRow(row));
+      batches.set(groupKey, batch);
+    }
+    const delegations = [...batches.values()].map((batch) => {
+      batch.children.sort((a, b) => a.index - b.index);
+      const endedAt = batch.children.reduce<number | undefined>(
+        (latest, child) =>
+          child.endedAt === undefined
+            ? undefined
+            : Math.max(latest ?? child.endedAt, child.endedAt),
+        undefined,
+      );
+      return { ...batch, ...(endedAt === undefined ? {} : { endedAt }) };
+    });
+    return delegations.length === 0 ? {} : { delegations };
+  }
+
+  #delegationChildFromRow(row: {
+    childId: string;
+    index: number;
+    label: string | null;
+    status: string;
+    currentTool: string | null;
+    apiCalls: number | null;
+    toolCount: number | null;
+    lastActiveAt: number;
+    startedAt: number;
+    endedAt: number | null;
+  }): BotDelegationChild {
+    return {
+      childId: row.childId,
+      index: row.index,
+      status: row.status as BotDelegationChild["status"],
+      lastActiveAt: row.lastActiveAt,
+      startedAt: row.startedAt,
+      ...(row.endedAt === null ? {} : { endedAt: row.endedAt }),
+      ...(row.label === null ? {} : { label: row.label }),
+      ...(row.currentTool === null ? {} : { currentTool: row.currentTool }),
+      ...(row.apiCalls === null ? {} : { apiCalls: row.apiCalls }),
+      ...(row.toolCount === null ? {} : { toolCount: row.toolCount }),
+    };
+  }
+
+  #restoreDelegationFrames(bot: string): void {
+    for (const session of this.#storage.nativeBotSessions(bot, 10_000)) {
+      for (const row of this.#storage.botChatDelegations(session.id, 0)) {
+        const key = this.#nativeTurnKey(bot, session.id, row.turnId);
+        const batches =
+          this.#delegationFrames.get(key) ?? new Map<string, DelegationFrameState>();
+        const current = batches.get(row.batchId) ?? {
+          seq: 0,
+          count: 0,
+          children: new Map<string, BotDelegationChild>(),
+        };
+        current.children.set(row.childId, this.#delegationChildFromRow(row));
+        current.count = Math.max(current.count, row.count, current.children.size);
+        batches.set(row.batchId, current);
+        this.#delegationFrames.set(key, batches);
+      }
+    }
+  }
+
+  /** Settles a sealed turn's batches. An interrupted/failed turn takes its live children with
+   *  it (`interrupted`): the user said stop and no spinner may remain. A COMPLETED turn keeps
+   *  live children live -- an async `delegate_task` batch legitimately outlives its turn, and
+   *  its finish legs still project (see the terminal carve-out in `handle`). */
+  #sealDelegations(bot: string, sessionId: string, turnId: string, completed: boolean): void {
+    if (completed) return;
+    const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    this.#settleLiveDelegations(bot, sessionId, turnId, key, "interrupted");
+  }
+
+  /** A still-live child on any PRIOR turn when a new turn starts is work whose finish leg may
+   *  never come (Hermes restarted under it): settle it `unknown`, never `failed`, mirroring the
+   *  boot-time reconciliation in storage. */
+  #sweepStaleDelegations(bot: string, sessionId: string, activeTurnId: string): void {
+    const activeKey = this.#nativeTurnKey(bot, sessionId, activeTurnId);
+    const prefix = this.#nativeTurnKey(bot, sessionId, "");
+    for (const key of this.#delegationFrames.keys()) {
+      if (key === activeKey || !key.startsWith(prefix)) continue;
+      this.#settleLiveDelegations(bot, sessionId, key.slice(prefix.length), key, "unknown");
+    }
+  }
+
+  #settleLiveDelegations(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    key: string,
+    settle: "interrupted" | "unknown",
+  ): void {
+    const batches = this.#delegationFrames.get(key);
+    if (batches === undefined) return;
+    const now = this.#now();
+    for (const [batchId, state] of batches) {
+      let changed = false;
+      for (const [childId, child] of state.children) {
+        if (DELEGATION_SETTLED.has(child.status)) continue;
+        const settled: BotDelegationChild = { ...child, status: settle, endedAt: now };
+        state.children.set(childId, settled);
+        this.#storage.upsertBotChatDelegation({
+          bot,
+          sessionId,
+          turnId,
+          batchId,
+          childId,
+          index: settled.index,
+          count: state.count,
+          status: settled.status,
+          lastActiveAt: settled.lastActiveAt,
+          startedAt: settled.startedAt,
+          endedAt: now,
+          label: settled.label,
+          currentTool: settled.currentTool,
+          apiCalls: settled.apiCalls,
+          toolCount: settled.toolCount,
+        });
+        changed = true;
+      }
+      if (!changed) continue;
+      state.seq += 1;
+      this.#broadcast(this.#delegationWire(bot, sessionId, turnId, batchId, state, now));
+    }
   }
 
   #turnState(
@@ -1893,7 +2169,7 @@ export class NativeBotDataPlane {
   #coalesceLiveTurn(key: string, ...frames: LiveTurnFrame[]): void {
     const current = this.#liveTurnBatches.get(key);
     if (current !== undefined) {
-      for (const frame of frames) current.frames.set(frame.type, frame);
+      for (const frame of frames) current.frames.set(liveTurnFrameKey(frame), frame);
       return;
     }
     const timer = setTimeout(() => this.#tickLiveTurn(key), LIVE_TURN_FLUSH_MS);
@@ -1924,11 +2200,19 @@ export class NativeBotDataPlane {
     this.#broadcastLiveFrames(frames);
   }
 
-  #broadcastLiveFrames(frames: ReadonlyMap<LiveTurnFrame["type"], LiveTurnFrame>): void {
-    for (const type of ["bot_chat_delta", "bot_tool_activity", "bot_chat_state"] as const) {
+  #broadcastLiveFrames(frames: ReadonlyMap<string, LiveTurnFrame>): void {
+    for (const type of ["bot_chat_delta", "bot_tool_activity"] as const) {
       const frame = frames.get(type);
       if (frame !== undefined) this.#broadcast(frame);
     }
+    // Delegation snapshots coalesce per BATCH (see liveTurnFrameKey): one turn can run several
+    // batches, and keeping only the latest frame per type would silently drop a sibling batch's
+    // final state.
+    for (const [key, frame] of frames) {
+      if (key.startsWith("bot_delegation_activity")) this.#broadcast(frame);
+    }
+    const state = frames.get("bot_chat_state");
+    if (state !== undefined) this.#broadcast(state);
   }
 
   #discardLiveTurn(key: string): void {

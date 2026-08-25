@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 33 }
+"capabilities": { "com.cozylabs.bots": 34 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -72,6 +72,7 @@ extension omits the capability and does not register `/bots` routes.
 | 31 | Durable delivery receipts: the displayed report, `BotChatMessage.marker`, and role `system`. |
 | 32 | Inline media ordering: `BotChatMessage.attachments[].position`. |
 | 33 | Create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots`, and `BotCreateResponse.warnings`. |
+| 34 | Subagent visibility: `bot_delegation_activity` batch snapshots and a `delegations` array on chat history. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -445,6 +446,15 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
 - `bot_chat_adopted`: a new/adopt action selected an existing native session. Rebind and reload.
 - `bot_tool_activity`: full-replace steps for a native turn. `BotToolStep.detail` and `errorText`
   are bounded/redacted display text; raw inputs and outputs never cross this contract.
+- `bot_delegation_activity` (capability 34): full-replace children of one native turn's
+  `delegate_task` batch. Identity is (`batchId`, `childId`); `seq` is monotonic within one
+  (`turnId`, `batchId`) and `done` marks the batch fully settled. `label` is bounded display
+  text and `currentTool` is a tool NAME; child args, results, reasoning, summaries, prompts,
+  and paths never cross this contract. A batch may outlive its turn (async dispatch), so frames
+  legitimately arrive after the turn sealed; a restart with a child in flight settles it
+  `unknown` -- never `failed`. Active and past batches also ride chat history as the optional
+  `delegations` array, so reconnect does not erase a live card, and `batchId` keys client
+  reconciliation with the terminal "[ASYNC DELEGATION BATCH COMPLETE ...]" transcript row.
 - `bot_approval_pending`, `bot_approval_resolution_requested`, and `bot_approval_resolved`:
   durable native tool-approval lifecycle. The requested frame means outbox admission only; a
   terminal frame is emitted solely from the later plugin terminal event (or local expiry).

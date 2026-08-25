@@ -132,6 +132,31 @@ CREATE TABLE IF NOT EXISTS bot_chat_tool_steps (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_session
   ON bot_chat_tool_steps (session_id, started_at);
+-- Capability 34 delegation children. Same shape of honesty as bot_chat_tool_steps: a child
+-- belongs to a TURN's batch, keyed by (batch, child) where child_id is the Hermes child session
+-- id that joins the spawn and finish legs of one delegation, and the only text here is the
+-- bounded display text the wire already carries (a truncated task label, a tool name) -- never
+-- a child transcript, summary, or path.
+CREATE TABLE IF NOT EXISTS bot_chat_delegations (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  child_id TEXT NOT NULL,
+  child_index INTEGER NOT NULL,
+  batch_count INTEGER NOT NULL,
+  label TEXT,
+  status TEXT NOT NULL,
+  current_tool TEXT,
+  api_calls INTEGER,
+  tool_count INTEGER,
+  last_active_at INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  PRIMARY KEY (bot, turn_id, batch_id, child_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_chat_delegations_session
+  ON bot_chat_delegations (session_id, started_at);
 -- Capability 18 routine model/effort selections. Hermes' surveyed cron RPC cannot persist or
 -- apply the pair to one run, so these are deliberately gateway-owned inert contract metadata.
 -- JSON preserves the difference between an omitted field and an explicit null (follow profile).
@@ -951,6 +976,108 @@ export class Storage {
   sweepBotChatToolSteps(now: number, ttlMs: number): number {
     return this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE started_at < ?").run(now - ttlMs)
       .changes as number;
+  }
+
+  /** Upserts one delegation child by (bot, turn, batch, child). `child_index` and `started_at`
+   *  are pinned by the FIRST write; a later write owns status/current_tool/last_active_at/
+   *  ended_at, `batch_count` only grows, and `label` keeps its first non-null value (a finish
+   *  leg without a label must not erase the spawn leg's). */
+  upsertBotChatDelegation(child: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    batchId: string;
+    childId: string;
+    index: number;
+    count: number;
+    status: string;
+    lastActiveAt: number;
+    startedAt: number;
+    endedAt: number | undefined;
+    label?: string | undefined;
+    currentTool?: string | undefined;
+    apiCalls?: number | undefined;
+    toolCount?: number | undefined;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_chat_delegations
+           (bot, session_id, turn_id, batch_id, child_id, child_index, batch_count, label,
+            status, current_tool, api_calls, tool_count, last_active_at, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot, turn_id, batch_id, child_id) DO UPDATE SET
+           batch_count = MAX(bot_chat_delegations.batch_count, excluded.batch_count),
+           label = COALESCE(bot_chat_delegations.label, excluded.label),
+           status = excluded.status,
+           current_tool = excluded.current_tool,
+           api_calls = COALESCE(excluded.api_calls, bot_chat_delegations.api_calls),
+           tool_count = COALESCE(excluded.tool_count, bot_chat_delegations.tool_count),
+           last_active_at = excluded.last_active_at,
+           ended_at = COALESCE(excluded.ended_at, bot_chat_delegations.ended_at)`,
+      )
+      .run(
+        child.bot,
+        child.sessionId,
+        child.turnId,
+        child.batchId,
+        child.childId,
+        child.index,
+        child.count,
+        child.label ?? null,
+        child.status,
+        child.currentTool ?? null,
+        child.apiCalls ?? null,
+        child.toolCount ?? null,
+        child.lastActiveAt,
+        child.startedAt,
+        child.endedAt ?? null,
+      );
+  }
+
+  /** Every delegation child recorded for one chat, oldest first and in-batch order within. */
+  botChatDelegations(
+    sessionId: string,
+    notBefore: number,
+  ): Array<{
+    turnId: string;
+    batchId: string;
+    childId: string;
+    index: number;
+    count: number;
+    label: string | null;
+    status: string;
+    currentTool: string | null;
+    apiCalls: number | null;
+    toolCount: number | null;
+    lastActiveAt: number;
+    startedAt: number;
+    endedAt: number | null;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT turn_id AS turnId, batch_id AS batchId, child_id AS childId,
+                child_index AS "index", batch_count AS count, label, status,
+                current_tool AS currentTool, api_calls AS apiCalls, tool_count AS toolCount,
+                last_active_at AS lastActiveAt, started_at AS startedAt, ended_at AS endedAt
+         FROM bot_chat_delegations
+         WHERE session_id = ? AND started_at >= ?
+         ORDER BY started_at, child_index, child_id`,
+      )
+      .all(sessionId, notBefore) as unknown as Array<{
+      turnId: string;
+      batchId: string;
+      childId: string;
+      index: number;
+      count: number;
+      label: string | null;
+      status: string;
+      currentTool: string | null;
+      apiCalls: number | null;
+      toolCount: number | null;
+      lastActiveAt: number;
+      startedAt: number;
+      endedAt: number | null;
+    }>;
   }
 
   botRoutineOverrides(bot: string, routineId: string): BotRoutineOverrides | undefined {
@@ -2839,6 +2966,21 @@ export function openStorage(dbPath: string): Storage {
       WHERE chat.bot = bot_chat_tool_steps.bot
         AND chat.session_id = bot_chat_tool_steps.session_id
         AND chat.active_turn_id = bot_chat_tool_steps.turn_id
+    )
+  `).run(Date.now());
+  // Restart truth for delegation children: only the selected active turn can still receive a
+  // finish leg after restart, so every other still-live child settles as `unknown` -- NEVER
+  // `failed`. Hermes explicitly cannot prove what external side effects an in-flight child had,
+  // and a late finish leg replayed through the spool is still free to overwrite `unknown` with
+  // the real outcome.
+  db.prepare(`
+    UPDATE bot_chat_delegations
+    SET status = 'unknown', ended_at = ?
+    WHERE status IN ('queued', 'starting', 'running', 'stalling') AND NOT EXISTS (
+      SELECT 1 FROM bot_native_chats AS chat
+      WHERE chat.bot = bot_chat_delegations.bot
+        AND chat.session_id = bot_chat_delegations.session_id
+        AND chat.active_turn_id = bot_chat_delegations.turn_id
     )
   `).run(Date.now());
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL");

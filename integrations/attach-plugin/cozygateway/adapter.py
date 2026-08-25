@@ -823,6 +823,12 @@ class AttachAdapter:
         # Per-thread active turn id: set on inject, read by the draft / terminal
         # surfaces, dropped when the turn ends.
         self._active_turn: Dict[str, str] = {}
+        # Delegation batch id -> the turn that dispatched it, pinned at the batch's first
+        # event and bounded oldest-first. An async ``delegate_task`` batch outlives its turn,
+        # and a late finish leg must land on the ORIGINAL turn id (the gateway's post-seal
+        # projection carve-out expects it), not whatever turn is active by then.
+        self._delegation_turns: "OrderedDict[str, str]" = OrderedDict()
+        self._delegation_turns_max = 64
         # (threadId, turnId) already seen or in flight: a repeat is dropped, but
         # only within a bounded retention window -- see below.
         #
@@ -1778,6 +1784,61 @@ class AttachAdapter:
         except Exception:  # noqa: BLE001 - a chip is presentation-only
             logger.debug("attach: tool-chip draft failed", exc_info=True)
 
+    # -- delegation-card tap ---------------------------------------------------
+    def observe_delegation_event(self, chat_id: str, payload: Dict[str, Any]) -> None:
+        """Sync entry from an agent/delegation worker thread (subagent lifecycle hooks).
+        Never raises.
+
+        Hops onto the adapter's event loop, exactly as ``observe_tool_event`` does, so the
+        turn pinning and the send happen single-threaded. A missing loop degrades silently.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._apply_delegation_event(chat_id, dict(payload)), loop
+            )
+        except Exception:  # noqa: BLE001 - a dead loop must degrade silently
+            logger.debug("attach: observe_delegation_event schedule failed", exc_info=True)
+
+    async def _apply_delegation_event(self, chat_id: str, payload: Dict[str, Any]) -> None:
+        """Emit one ephemeral ``delegation`` event pinned to the turn that dispatched its batch.
+
+        The batch's turn is pinned at its FIRST event (the chat's active turn at dispatch): an
+        async ``delegate_task`` batch legitimately outlives its turn, so a finish leg arriving
+        after the seal still carries the original turn id and the gateway's post-seal
+        projection settles the right card. The spool exempts ``delegation`` events from the
+        turn's terminal seal for the same reason.
+        """
+        batch_id = str(payload.get("batch_id") or "")
+        child_id = str(payload.get("child_id") or "")
+        client = self._client
+        if not batch_id or not child_id or not isinstance(client, AttachV1Client):
+            return
+        turn_id = self._delegation_turns.get(batch_id) or self._active_turn.get(chat_id)
+        if not turn_id:
+            return
+        if batch_id not in self._delegation_turns:
+            self._delegation_turns[batch_id] = turn_id
+            while len(self._delegation_turns) > self._delegation_turns_max:
+                self._delegation_turns.popitem(last=False)
+        try:
+            await client.send_delegation(
+                chat_id,
+                turn_id,
+                batch_id,
+                child_id,
+                index=int(payload.get("index") or 0),
+                count=int(payload.get("count") or 1),
+                status=str(payload.get("status") or "unknown"),
+                label=payload.get("label"),
+                tool_count=payload.get("tool_count"),
+                last_active_at=payload.get("last_active_at"),
+            )
+        except Exception:  # noqa: BLE001 - a card is presentation-only
+            logger.debug("attach: delegation event emit failed", exc_info=True)
+
     def _chips(self, turn_id: str) -> Optional[List[Any]]:
         tracker = self._tool_chips.get(turn_id)
         chips = tracker.chips() if tracker else []
@@ -2574,8 +2635,15 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
 
 def _pre_tool_call(**kwargs: Any) -> None:
     """``pre_tool_call`` hook: the chip-open leg. Observer only (returns None)."""
-    if str(kwargs.get("tool_name") or "") == "send_message":
+    tool_name = str(kwargs.get("tool_name") or "")
+    if tool_name == "send_message":
         _CURRENT_TOOL_OCCURRENCE.set(_tool_call_id(kwargs))
+    elif tool_name == "delegate_task":
+        # The batch id for this call's delegation cards: the parent's own tool-call id (the
+        # documented fallback until Hermes exposes its real delegation_id to lifecycle hooks).
+        # Task-local, so it rides the ``contextvars.copy_context()`` Hermes hands each child
+        # worker and outlives this hook for the whole batch.
+        _CURRENT_DELEGATION_CALL.set(_tool_call_id(kwargs))
     _dispatch_tool_hook("start", kwargs)
 
 
@@ -2584,8 +2652,167 @@ def _post_tool_call(**kwargs: Any) -> None:
     try:
         _dispatch_tool_hook("complete", kwargs)
     finally:
-        if str(kwargs.get("tool_name") or "") == "send_message":
+        tool_name = str(kwargs.get("tool_name") or "")
+        if tool_name == "send_message":
             _CURRENT_TOOL_OCCURRENCE.set(None)
+        elif tool_name == "delegate_task":
+            _CURRENT_DELEGATION_CALL.set(None)
+
+
+# ---------------------------------------------------------------------------
+# Subagent lifecycle hook wiring (live delegation batch cards).
+#
+# ``delegate_task`` fires ``subagent_start`` / ``subagent_stop`` for every child it spawns.
+# Spawn legs run under a copy of the parent tool thread's context, so the same task-local
+# session context that routes tool chips routes them; an async batch's finish legs can
+# consolidate on a thread with NO session context, so the association made at spawn is
+# retained: a bounded parent-session -> (chat, batch) map. Hermes's hook payloads expose no
+# delegation id or task index (a proposed upstream extension), so the batch id is the parent's
+# own ``delegate_task`` tool-call id captured by ``pre_tool_call``, indices are assigned in
+# spawn order, and the child's session id -- the one identifier present on BOTH legs -- pairs
+# them (the wire ``childId``). Only bounded display text leaves this module: a truncated goal
+# as the label and a tool count; never summaries, args, results, prompts, or paths.
+# ---------------------------------------------------------------------------
+
+#: The parent's live ``delegate_task`` call id, task-local so it propagates into the
+#: ``contextvars.copy_context()`` Hermes hands each child worker.
+_CURRENT_DELEGATION_CALL: ContextVar[Optional[str]] = ContextVar(
+    "cozygateway_delegation_call", default=None
+)
+
+
+@dataclass
+class _DelegationBatch:
+    """Everything a finish leg needs when it arrives with no session context."""
+
+    chat_id: str
+    batch_id: str
+    #: child session id -> stable batch index, in spawn order.
+    indices: Dict[str, int] = field(default_factory=dict)
+
+
+#: batch id -> its batch, bounded oldest-first. Eviction beyond the cap orphans that batch's
+#: remaining finish legs (they drop, and the gateway's stale sweep settles the cards
+#: ``unknown``): a bounded loss, priced against an unbounded registry.
+_DELEGATION_BATCHES: "OrderedDict[str, _DelegationBatch]" = OrderedDict()
+#: parent session id -> its most recent batch id: the context-free finish leg's route in.
+_DELEGATION_PARENT_LATEST: Dict[str, str] = {}
+_DELEGATION_BATCHES_LOCK = threading.Lock()
+_DELEGATION_BATCHES_MAX = 32
+
+#: Hermes child result statuses -> the closed wire vocabulary. ``cancelled`` renders as
+#: ``interrupted`` (the vocabulary is closed and the user asked for the stop). An unrecognized
+#: terminal maps to ``unknown`` -- the honest "cannot prove the outcome" -- NEVER ``failed``.
+_DELEGATION_STATUS_MAP = {
+    "completed": "succeeded",
+    "succeeded": "succeeded",
+    "success": "succeeded",
+    "failed": "failed",
+    "error": "failed",
+    "timeout": "failed",
+    "interrupted": "interrupted",
+    "cancelled": "interrupted",
+}
+
+
+def _delegation_batch_for(
+    parent_key: str, chat_id: Optional[str], call_id: Optional[str]
+) -> Optional[_DelegationBatch]:
+    """The batch one lifecycle leg belongs to, creating it when routable. None = not ours.
+
+    Resolution order: the exact batch for the leg's own ``delegate_task`` call id (keeps
+    (batchId, childId) stable when batches overlap); else the parent's latest batch (the
+    context-free finish leg); else -- with session context proving this platform's turn -- a
+    new batch. Without context and without an association the leg is not routable.
+    """
+    with _DELEGATION_BATCHES_LOCK:
+        if call_id:
+            batch = _DELEGATION_BATCHES.get(call_id)
+            if batch is not None:
+                return batch
+        elif parent_key in _DELEGATION_PARENT_LATEST:
+            batch = _DELEGATION_BATCHES.get(_DELEGATION_PARENT_LATEST[parent_key])
+            if batch is not None:
+                return batch
+        if not chat_id:
+            return None
+        batch_id = call_id or "deleg-{:x}-{:06x}".format(
+            int(time.time() * 1000), random.getrandbits(24)
+        )
+        batch = _DelegationBatch(chat_id=chat_id, batch_id=batch_id)
+        _DELEGATION_BATCHES[batch_id] = batch
+        _DELEGATION_PARENT_LATEST[parent_key] = batch_id
+        while len(_DELEGATION_BATCHES) > _DELEGATION_BATCHES_MAX:
+            evicted_id, _evicted = _DELEGATION_BATCHES.popitem(last=False)
+            for parent, latest in list(_DELEGATION_PARENT_LATEST.items()):
+                if latest == evicted_id:
+                    del _DELEGATION_PARENT_LATEST[parent]
+        return batch
+
+
+def _dispatch_delegation_hook(leg: str, kwargs: Dict[str, Any]) -> None:
+    """Forward one subagent lifecycle hook firing to the active adapters. Never raises."""
+    try:
+        child_raw = kwargs.get("child_session_id")
+        child_id = str(child_raw).strip() if child_raw else ""
+        if not child_id:
+            # Without the shared key the two legs cannot pair; an unkeyed card would render
+            # as a permanent orphan, so the event is dropped whole.
+            return
+        try:
+            platform, chat_id = _current_turn_platform_and_chat()
+        except Exception:  # noqa: BLE001 - consolidation threads may have no harness context
+            platform, chat_id = None, None
+        if platform is not None and platform != PLATFORM_NAME:
+            return
+        parent_key = str(kwargs.get("parent_session_id") or "").strip() or (chat_id or "")
+        if not parent_key:
+            return
+        batch = _delegation_batch_for(
+            parent_key,
+            chat_id if platform == PLATFORM_NAME else None,
+            _CURRENT_DELEGATION_CALL.get(),
+        )
+        if batch is None:
+            return
+        adapters = _active_adapters_snapshot()
+        if not adapters:
+            return
+        with _DELEGATION_BATCHES_LOCK:
+            index = batch.indices.setdefault(child_id, len(batch.indices))
+            count = len(batch.indices)
+        payload: Dict[str, Any] = {
+            "batch_id": batch.batch_id,
+            "child_id": child_id,
+            "index": index,
+            "count": count,
+            "last_active_at": int(time.time() * 1000),
+        }
+        if leg == "start":
+            payload["status"] = "running"
+            label = _preview(kwargs.get("child_goal"))
+            if label:
+                payload["label"] = label
+        else:
+            raw_status = str(kwargs.get("child_status") or "").strip().lower()
+            payload["status"] = _DELEGATION_STATUS_MAP.get(raw_status, "unknown")
+            history = kwargs.get("tool_call_history")
+            if isinstance(history, list):
+                payload["tool_count"] = len(history)
+        for adapter in adapters:
+            adapter.observe_delegation_event(batch.chat_id, payload)
+    except Exception:  # noqa: BLE001 - a card must never crash the agent loop
+        logger.debug("attach: delegation-hook dispatch failed", exc_info=True)
+
+
+def _subagent_start(**kwargs: Any) -> None:
+    """``subagent_start`` hook: a child's spawn leg. Observer only (returns None)."""
+    _dispatch_delegation_hook("start", kwargs)
+
+
+def _subagent_stop(**kwargs: Any) -> None:
+    """``subagent_stop`` hook: a child's finish leg (carries the outcome)."""
+    _dispatch_delegation_hook("stop", kwargs)
 
 
 #: The Hermes approval surfaces whose prompt this platform actually answers.
@@ -3474,5 +3701,7 @@ def register(ctx: Any) -> None:
         ctx.register_hook("post_tool_call", _post_tool_call)
         ctx.register_hook("pre_approval_request", _pre_approval_request)
         ctx.register_hook("post_approval_response", _post_approval_response)
+        ctx.register_hook("subagent_start", _subagent_start)
+        ctx.register_hook("subagent_stop", _subagent_stop)
     except Exception:  # noqa: BLE001 - no chips, never crash
         logger.debug("attach: tool-lifecycle hooks unavailable; chips disabled", exc_info=True)

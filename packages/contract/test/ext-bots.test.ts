@@ -35,6 +35,9 @@ import {
   BotSessionsResponseSchema,
   BotSummarySchema,
   BotToolActivityFrameSchema,
+  BotDelegationChildSchema,
+  BotDelegationActivityFrameSchema,
+  BotTurnDelegationsSchema,
   BotToolStepSchema,
   BotTurnToolStepsSchema,
   ServerFrameSchema,
@@ -485,7 +488,10 @@ describe("capability advertisement", () => {
     // 33 adds create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots` and
     // the optional `warnings` on its reply. Both request fields are additive and a gateway below
     // 33 ignores them silently, so a picker UI gates on this version rather than on hope.
-    expect(BOTS_CAPABILITY_VERSION).toBe(33);
+    // 34 adds subagent visibility: `bot_delegation_activity` full-replace batch snapshots and
+    // the optional `delegations` array on chat history. A client below 34 ignores both and
+    // keeps today's behavior (the outer delegate_task chip plus the terminal completion card).
+    expect(BOTS_CAPABILITY_VERSION).toBe(34);
   });
 
   it("accepts a capability-33 create with tool selections, and keeps them optional", () => {
@@ -662,5 +668,68 @@ describe("capability advertisement", () => {
     expect(check(BotChatMessageSchema, {
       id: "m1", role: "assistant", text: "hi", at: null, marker: "x".repeat(65),
     })).toBe(false);
+  });
+});
+
+describe("delegation activity (capability 34)", () => {
+  const child = { childId: "sa-0", index: 0, status: "running", lastActiveAt: 1_800_000_000_000, startedAt: 1_800_000_000_000 };
+  const frame = {
+    type: "bot_delegation_activity",
+    bot: "scout",
+    sessionId: "sess-1",
+    turnId: "sess-1#1800000000000-1",
+    batchId: "call-1",
+    count: 5,
+    children: [child],
+    seq: 1,
+    updatedAt: 1_800_000_000_000,
+  };
+
+  it("accepts a live child, a settled one, and the frame that carries them", () => {
+    expect(check(BotDelegationChildSchema, child)).toBe(true);
+    expect(check(BotDelegationChildSchema, { ...child, status: "succeeded", endedAt: 1_800_000_001_000, label: "Rewrite the skill", currentTool: "write_file", apiCalls: 4, toolCount: 7 })).toBe(true);
+    expect(check(BotDelegationActivityFrameSchema, frame)).toBe(true);
+    expect(check(BotDelegationActivityFrameSchema, { ...frame, done: true, children: [] })).toBe(true);
+    expect(check(ServerFrameSchema, frame)).toBe(true);
+  });
+
+  it("keeps the status vocabulary closed on the nine agreed words", () => {
+    for (const status of ["queued", "starting", "running", "stalling", "succeeded", "failed", "interrupted", "stalled", "unknown"]) {
+      expect(check(BotDelegationChildSchema, { ...child, status })).toBe(true);
+    }
+    // `unknown` exists precisely so a fourth terminal word is never invented; `cancelled`
+    // renders as `interrupted` upstream and `done`/`completed` never reach this wire.
+    for (const status of ["done", "completed", "cancelled", "pending"]) {
+      expect(check(BotDelegationChildSchema, { ...child, status })).toBe(false);
+    }
+  });
+
+  it("declares only bounded display metadata, never child transcripts or tool payloads", () => {
+    // Same redaction-guard shape pin as BotToolStepSchema: the property SET is the contract.
+    expect(Object.keys(BotDelegationChildSchema.properties).sort()).toEqual([
+      "apiCalls",
+      "childId",
+      "currentTool",
+      "endedAt",
+      "index",
+      "label",
+      "lastActiveAt",
+      "startedAt",
+      "status",
+      "toolCount",
+    ]);
+    for (const leak of ["args", "result", "summary", "goal", "reasoning", "prompt", "transcript", "sessionPath", "model", "provider"]) {
+      expect(BotDelegationChildSchema.properties).not.toHaveProperty(leak);
+    }
+  });
+
+  it("holds ordinals as integers and keeps history batches joinable by turn", () => {
+    expect(check(BotDelegationActivityFrameSchema, { ...frame, seq: 1.5 })).toBe(false);
+    expect(check(BotDelegationActivityFrameSchema, { ...frame, count: undefined })).toBe(false);
+    expect(check(BotDelegationChildSchema, { ...child, index: 0.5 })).toBe(false);
+    expect(check(BotTurnDelegationsSchema, {
+      turnId: frame.turnId, batchId: "call-1", count: 5,
+      startedAt: 1_800_000_000_000, endedAt: 1_800_000_002_000, children: [child],
+    })).toBe(true);
   });
 });
