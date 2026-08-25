@@ -37,8 +37,8 @@ profile gateway status are the relevant operational checks.
 
 ## Blank slate bots
 
-A bot created through `POST /bots` starts as a **blank slate**: two toolsets,
-and permission to ask for the rest. The gateway seeds the profile Hermes just
+A bot created through `POST /bots` starts as a **blank slate**: two toolsets, no
+playbooks, and permission to ask for the rest. The gateway seeds the profile Hermes just
 created, through the same profile-aware Dashboard config surface the model
 routes use (`PUT /api/config?profile=<name>`, which deep-merges):
 
@@ -48,6 +48,8 @@ platform_toolsets:
   cli: [file, terminal]
 approvals:
   mode: manual
+skills:
+  disabled: [<every skill this profile has, minus the floor>]
 ```
 
 **Why write anything at all.** A fresh Hermes profile with no
@@ -96,6 +98,52 @@ is the same key `enabled_mcp_server_names` reads. Note this is NOT the
 which only `profiles.describe` reads, and is reported as runtime-inert for
 exactly that reason.
 
+**Skills.** Skills (playbooks) are gated by a per-profile OFF-list:
+`skills.disabled` in that profile's `config.yaml`, read by
+`agent.skill_utils.get_disabled_skill_names` and by every consumer of
+`tools/skills_tool.py::_find_all_skills`. There is no enabled allowlist anywhere
+behind it, so a profile that names nothing has every installed skill ON. A fresh
+profile arrives with a skills directory copied from the launch profile and no
+`skills` stanza at all, which is why a brand-new bot's New Bot sheet used to
+read "199 on". The floor has to be written down here too.
+
+The catalog the OFF-list is derived from is that profile's own
+`profiles.describe` reply, the same read the app's create sheet enumerates skills
+with (`GET /bots/:name/profile` -> `mapProfileDescribe(...).skills`). Upstream
+builds those rows by walking `<profile>/skills/**/SKILL.md` under that profile's
+`HERMES_HOME`, so the names come out spelled exactly the way the runtime matches
+them: verbatim, case-sensitive. If that read fails, the seed writes **no**
+`skills` key at all rather than a partial guess, logs
+`skills NOT seeded`, and returns a warning saying the bot starts with every
+installed skill on. An empty catalog is treated the same way: upstream drops the
+skills section wholesale on a bad read, so "no skills reported" is not proof a
+profile has none.
+
+Keep specific skills on with `hermes.blankSlateSkillsOn` (a list of skill names,
+default `[]`):
+
+```json
+{ "hermes": { "blankSlateSkillsOn": ["tdd", "brainstorming"] } }
+```
+
+Default empty on purpose. Autonomy rides on the toolset floor, not on playbooks:
+`file` + `terminal` are what let the bot run `hermes skills` and ask for one, and
+a skill is then one approval away through the same earn-a-tool loop, or one tap
+away in the app's searchable skills picker. Unlike toolsets and MCP servers, the
+skills path is runtime-effective end to end:
+`PATCH /bots/:name/profile disabledSkills` -> `profiles.configure
+disabled_skills` -> this same `skills.disabled` key, replace-whole. A name in the
+floor that the profile does not actually have is not invented into either list.
+
+**Ordering, and why a user's choice still wins.** The seed runs inside
+`POST /bots`, before the create response is assembled. The app's create sheet
+then PATCHes the bot it just got back, and that patch is a diff against the
+baseline the sheet loaded: `disabledSkills` is absent unless the user actually
+touched the skills section. So an untouched create keeps the floor the seed
+wrote, and an explicit selection lands on top of it and wins wholesale, because
+`disabled_skills` is replace-whole. There is deliberately no `skills` field on
+`POST /bots`: the PATCH already covers it.
+
 ### Choosing tools at creation time
 
 `POST /bots` accepts two optional additive lists (capability 33):
@@ -125,8 +173,11 @@ Default `true`. With it off, a created profile keeps Hermes' broad platform
 defaults and the gateway writes nothing, not even the config read. An explicit
 `toolsets` / `mcpServers` selection is still honoured with the flag off: that is
 the user saying what this bot should have, and no gateway default overrules it.
-What the flag off does drop is the parts nobody asked for, the approval mode and
-the quieting of inherited MCP servers.
+What the flag off does drop is the parts nobody asked for: the approval mode, the
+quieting of inherited MCP servers, and the skills OFF-list. Skills mirror the
+toolset floor exactly there. With the flag off the bot keeps Hermes' own default,
+which for skills means every installed one on, and `blankSlateSkillsOn` is not
+read at all.
 
 **Idempotency.** The seed reads the profile config first and writes only keys
 that are absent. A retried create, or a second pass over a profile a user has

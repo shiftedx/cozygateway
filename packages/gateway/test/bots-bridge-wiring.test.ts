@@ -45,6 +45,9 @@ describe("hermes bridge options", () => {
       // Defaulted ON: a gateway that seeds nothing is a gateway whose new bots inherit Hermes'
       // broad platform defaults, which is the thing the blank slate exists to stop.
       seedBlankSlateBots: true,
+      // Empty, and that is the floor doing its job: skills are an OFF-list with no allowlist
+      // behind it, so a blank slate names every installed one and keeps none.
+      blankSlateSkillsOn: [],
       // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
       // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
       chatSuggestion: DEFAULT_CHAT_SUGGESTION,
@@ -79,6 +82,9 @@ describe("hermes bridge options", () => {
       // Defaulted ON: a gateway that seeds nothing is a gateway whose new bots inherit Hermes'
       // broad platform defaults, which is the thing the blank slate exists to stop.
       seedBlankSlateBots: true,
+      // Empty, and that is the floor doing its job: skills are an OFF-list with no allowlist
+      // behind it, so a blank slate names every installed one and keeps none.
+      blankSlateSkillsOn: [],
       // Defaulted, not absent: an operator who configures nothing still gets the opener offered as a
       // suggestion, which is the whole of what capability 11 left of the old auto-submitted kickoff.
       chatSuggestion: DEFAULT_CHAT_SUGGESTION,
@@ -91,6 +97,18 @@ describe("hermes bridge options", () => {
     expect(parseHermesOptions({ ...base, seedBlankSlateBots: false }, env).seedBlankSlateBots).toBe(false);
     expect(parseHermesOptions({ ...base, seedBlankSlateBots: true }, env).seedBlankSlateBots).toBe(true);
     expect(parseHermesOptions(base, env).seedBlankSlateBots).toBe(true);
+  });
+
+  it("normalizes the skills floor: trimmed, blanks dropped, duplicates collapsed, case KEPT", () => {
+    const base = { url: "ws://h/api/ws", tokenEnv: "T", profiles: {} } as const;
+    const env = { T: "s3cret" };
+    expect(parseHermesOptions(base, env).blankSlateSkillsOn).toEqual([]);
+    expect(
+      parseHermesOptions({ ...base, blankSlateSkillsOn: [" tdd ", "tdd", "PDF-Forms"] }, env)
+        .blankSlateSkillsOn,
+      // NOT lowercased, unlike the hide list: upstream matches a disabled name against the skills
+      // directory verbatim, so folding case would keep the wrong skill off.
+    ).toEqual(["tdd", "PDF-Forms"]);
   });
 
   it("normalizes the roster hide list: trimmed, lowercased, blanks dropped, duplicates collapsed", () => {

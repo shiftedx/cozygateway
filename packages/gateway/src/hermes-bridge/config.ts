@@ -1,5 +1,6 @@
 import type { HermesBridgeConfig } from "../config.ts";
 import { DEFAULT_AUTH_PROVIDER, type HermesAuth } from "./client.ts";
+import { normalizeNames } from "./profile.ts";
 
 const DEFAULT_CHAT_SUGGESTION = "Hey, tell me about yourself!";
 
@@ -15,6 +16,10 @@ export interface ParsedHermesOptions {
    *  defaulted to true: an operator has to say `false` in the config file to get the old broad
    *  Hermes defaults back. */
   seedBlankSlateBots: boolean;
+  /** Skill names a blank-slate bot keeps ON. Always an array, already trimmed and deduped; empty
+   *  when the operator named none, which is the default and means a bot starts with no playbooks
+   *  at all. */
+  blankSlateSkillsOn: string[];
   /** The opener an empty bot chat offers (capability 11). Always a string, already defaulted: the
    *  empty string is the operator's "offer nothing", and the bridge reads it as such. */
   chatSuggestion: string;
@@ -100,6 +105,12 @@ export function parseHermesOptions(
   // make the one setting that turns the suggestion off silently do nothing.
   const chatSuggestion = config.chatSuggestion ?? DEFAULT_CHAT_SUGGESTION;
   const seedBlankSlateBots = config.seedBlankSlateBots ?? true;
+  // `normalizeNames`, not `parseHiddenProfiles`: skill names are matched against the skills
+  // directory VERBATIM and case-sensitively (`agent.skill_utils._normalize_string_set` only
+  // strips), so folding case the way the hide list does would turn a real name into one that keeps
+  // its skill switched off. Trimming still matters: a stray space must not become a name that
+  // matches nothing and silently leaves that skill in the OFF-list.
+  const blankSlateSkillsOn = normalizeNames(config.blankSlateSkillsOn ?? []);
 
   if (mode === "password") {
     const username = config.username;
@@ -130,6 +141,7 @@ export function parseHermesOptions(
       hiddenProfiles,
       bridgeProfile,
       seedBlankSlateBots,
+      blankSlateSkillsOn,
       chatSuggestion,
     };
   }
@@ -153,6 +165,7 @@ export function parseHermesOptions(
     hiddenProfiles,
     bridgeProfile,
     seedBlankSlateBots,
+    blankSlateSkillsOn,
     chatSuggestion,
   };
 }

@@ -75,7 +75,11 @@ import {
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
-import { seedBlankSlateProfile, type BlankSlateSelection } from "./blank-slate-seed.ts";
+import {
+  BLANK_SLATE_SKILLS_ON,
+  seedBlankSlateProfile,
+  type BlankSlateSelection,
+} from "./blank-slate-seed.ts";
 
 export const ROSTER_POLL_MS = 5_000;
 export const ROUTINES_POLL_MS = 20_000;
@@ -311,6 +315,9 @@ export interface HermesBridgeOptions {
    *  Default true. Turning it off leaves a created profile on Hermes' broad platform defaults,
    *  which is the pre-blank-slate behaviour. */
   seedBlankSlateBots?: boolean;
+  /** Skill names a blank-slate bot keeps ON. Default `[]`: no playbooks until asked. Ignored when
+   *  `seedBlankSlateBots` is false. */
+  blankSlateSkillsOn?: readonly string[];
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
@@ -334,6 +341,7 @@ export class HermesBridge implements BotControlSurface {
   readonly #hidden: ReadonlySet<string>;
   readonly #bridgeProfile: string | undefined;
   readonly #seedBlankSlateBots: boolean;
+  readonly #blankSlateSkillsOn: readonly string[];
   readonly #log: (line: string) => void;
   readonly #groups: GroupRooms;
   readonly #catalog = new Map<string, CachedCatalog>();
@@ -363,6 +371,7 @@ export class HermesBridge implements BotControlSurface {
     const profile = opts.bridgeProfile?.trim().toLowerCase();
     this.#bridgeProfile = profile || undefined;
     this.#seedBlankSlateBots = opts.seedBlankSlateBots ?? true;
+    this.#blankSlateSkillsOn = opts.blankSlateSkillsOn ?? BLANK_SLATE_SKILLS_ON;
     this.#catalogTtlMs = opts.catalogTtlMs ?? CATALOG_TTL_MS;
     this.#catalogDegradedTtlMs =
       opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
@@ -488,11 +497,23 @@ export class HermesBridge implements BotControlSurface {
       const seed = await seedBlankSlateProfile(this.#client, name, {
         blankSlate: this.#seedBlankSlateBots,
         selection,
+        skillsOn: this.#blankSlateSkillsOn,
       });
       this.#log(
         `bot ${name} seed: ${seed.wrote ? "written" : "already present"}` +
           `, blankSlate=${this.#seedBlankSlateBots}`,
       );
+      if (seed.skillCatalogUnavailable) {
+        // Loud, and named as its own failure rather than folded into the generic seed warning:
+        // everything else about this bot came out right, and the one thing that did not is the
+        // one that leaves it holding every installed playbook.
+        this.#log(
+          `bot ${name} skills NOT seeded: its skill catalog could not be read, so every installed skill starts on`,
+        );
+        warnings.push(
+          "this bot's skill list could not be read, so it starts with every installed skill on; turn the ones you do not want off in its settings",
+        );
+      }
       if (seed.unknownToolsets.length > 0) {
         warnings.push(
           `hermes does not report these toolsets, so they were skipped: ${seed.unknownToolsets.join(", ")}`,
