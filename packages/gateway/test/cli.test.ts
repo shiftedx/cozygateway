@@ -62,6 +62,29 @@ describe("cozygateway pair", () => {
     storage.close();
   });
 
+  it("honors --ttl for the App Review audience and keeps the code alive for days", async () => {
+    const { configPath, dbPath } = tempConfig();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(String(line));
+    });
+    const exitCode = await runCli(["pair", "--config", configPath, "--ttl", "20160"]);
+    vi.restoreAllMocks();
+    expect(exitCode).toBe(0);
+    const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as { setupCode: string };
+    const storage = openStorage(dbPath);
+    // Thirteen days out the code still pairs; the default ten-minute code would be long dead.
+    expect(storage.consumeSetupCode(payload.setupCode, Date.now() + 13 * 24 * 60 * 60 * 1000)).toBe("ok");
+    storage.close();
+    expect(lines.some((l) => l.includes("valid for 14 days"))).toBe(true);
+  });
+
+  it("refuses a --ttl outside the bounded window", async () => {
+    const { configPath } = tempConfig();
+    await expect(runCli(["pair", "--config", configPath, "--ttl", "0"])).rejects.toThrow(/--ttl/);
+    await expect(runCli(["pair", "--config", configPath, "--ttl", "999999"])).rejects.toThrow(/--ttl/);
+  });
+
   it("advertises an http gatewayUrl when no TLS is configured", async () => {
     const { configPath } = tempConfig();
     expect((await pairPayload(configPath)).gatewayUrl).toMatch(/^http:\/\//);
