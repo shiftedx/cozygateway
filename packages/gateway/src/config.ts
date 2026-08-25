@@ -46,6 +46,13 @@ const HermesBridgeConfigSchema = Type.Object({
    *  profiles on Hermes' broad per-platform defaults. Only ever seeds keys the profile does not
    *  already have, so it cannot walk back a bot the user has since armed. */
   seedBlankSlateBots: Type.Optional(Type.Boolean()),
+  /** Skill names a blank-slate bot keeps ON. Default `[]`: skills are gated by a per-profile
+   *  `skills.disabled` OFF-list with no enabled allowlist behind it, so a fresh profile with no
+   *  such list has every installed skill on. The seed writes the profile's own skill catalog minus
+   *  this floor. Autonomy comes from the `file` + `terminal` toolsets, not from playbooks, and a
+   *  skill is one approval (or one tap in the app's skills picker) away. Only read when
+   *  `seedBlankSlateBots` is true, and only written onto a profile that carries no OFF-list yet. */
+  blankSlateSkillsOn: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   /** The opener an EMPTY bot chat offers a client (capability 11, issue #59). Defaults to the line
    *  this gateway used to submit by itself, "Hey, tell me about yourself!".
    *

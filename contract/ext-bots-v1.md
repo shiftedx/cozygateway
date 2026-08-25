@@ -124,15 +124,22 @@ belongs to Hermes: create or delete the profile there, then rerun the CozyGatewa
 default `--profiles all` selection reconciles plugin, token, service, and gateway configuration).
 
 `POST /bots` creates the Hermes profile and then SEEDS it as a blank slate: the `file` + `terminal`
-toolset floor on the `cozygateway` and `cli` platforms, `approvals.mode: manual`, and inherited MCP
-servers quieted. A fresh profile that is seeded with nothing does not get a small toolset, it
+toolset floor on the `cozygateway` and `cli` platforms, `approvals.mode: manual`, inherited MCP
+servers quieted, and the profile's whole skill catalog written into its `skills.disabled` OFF-list
+so a new bot starts with no playbooks (skills have no enabled allowlist upstream, so a profile that
+names nothing has every installed skill on). Operators keep named skills on with
+`hermes.blankSlateSkillsOn`, default `[]`. A skill catalog that cannot be read leaves the key
+unwritten and adds a warning rather than guessing at half of it. A fresh profile that is seeded with nothing does not get a small toolset, it
 inherits Hermes' broad per-platform default, so the floor has to be written down to exist. The
 capability-33 `toolsets` and `mcpServers` fields name what to grant ON TOP of that floor;
 `file` and `terminal` are always included, and a name the backend does not report is skipped and
 listed in `BotCreateResponse.warnings` rather than failing the create. The seed only ever writes
 keys the profile does not already carry, and a seed that fails leaves the created bot in place with
 a warning. Operators turn the whole behaviour off with `hermes.seedBlankSlateBots: false`; an
-explicit selection is still honoured when they do. See `docs/attach-v1-operations.md`.
+explicit selection is still honoured when they do, and the skills OFF-list stops exactly as the
+toolset floor does. There is no create-time `skills` field: the app's post-create
+`PATCH /bots/:name/profile disabledSkills` is replace-whole and lands after the seed, so a user's
+explicit skill selection wins wholesale while an untouched create keeps the floor. See `docs/attach-v1-operations.md`.
 
 ### Slash commands
 

@@ -10,6 +10,7 @@ import { createHermesClient, type HermesClient } from "../src/hermes-bridge/clie
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
 import {
   BLANK_SLATE_SEED,
+  BLANK_SLATE_SKILLS_ON,
   planBlankSlateSeed,
 } from "../src/hermes-bridge/blank-slate-seed.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
@@ -71,11 +72,23 @@ function liveProfiles(names: Set<string>) {
 /** The toolsets a fake Hermes reports for a profile, in `profiles.describe` shape. */
 const REPORTED_TOOLSETS = ["file", "terminal", "web", "memory", "cronjob"];
 
+/** The SKILLS a fake Hermes reports for a fresh profile: the catalog it inherited from the launch
+ *  profile, every row `enabled` because it has no `skills.disabled` yet. That is the leak the
+ *  skills half of the seed closes. */
+const REPORTED_SKILLS = ["brainstorming", "pdf-forms", "slack-digest", "tdd", "webapp-testing"];
+
 async function setup(
   opts: {
     /** The config the new profile already carries when the seed reads it. */
     profileConfig?: Record<string, unknown>;
     seedBlankSlateBots?: boolean;
+    /** The skills floor an operator configured, i.e. `hermes.blankSlateSkillsOn`. */
+    blankSlateSkillsOn?: readonly string[];
+    /** The skill rows `profiles.describe` answers with. Defaults to none, which is the shape the
+     *  toolset-era tests were written against. */
+    reportedSkills?: readonly string[];
+    /** When true `profiles.describe` rejects, which is a skill catalog that cannot be read. */
+    describeFails?: boolean;
     dashboardFails?: boolean;
   } = {},
 ): Promise<Harness> {
@@ -91,10 +104,14 @@ async function setup(
         return {};
       },
       "profiles.configure": () => ({ applied: { ui_meta: true } }),
-      "profiles.describe": () => ({
-        name: "x",
-        toolsets: REPORTED_TOOLSETS.map((name) => ({ name, enabled: false })),
-      }),
+      "profiles.describe": () => {
+        if (opts.describeFails === true) throw { code: 4064, message: "profile not found" };
+        return {
+          name: "x",
+          toolsets: REPORTED_TOOLSETS.map((name) => ({ name, enabled: false })),
+          skills: (opts.reportedSkills ?? []).map((name) => ({ name, enabled: true })),
+        };
+      },
     },
     dashboard: (request) => {
       dashboard.push({
@@ -124,6 +141,9 @@ async function setup(
     ...(opts.seedBlankSlateBots === undefined
       ? {}
       : { seedBlankSlateBots: opts.seedBlankSlateBots }),
+    ...(opts.blankSlateSkillsOn === undefined
+      ? {}
+      : { blankSlateSkillsOn: opts.blankSlateSkillsOn }),
   });
   bridges.push(bridge);
 
@@ -225,6 +245,111 @@ describe("POST /bots seeds a blank slate", () => {
     await authed("/bots", post({ name: "night-owl" }));
     const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
     expect(body.config["mcp_servers"]).toEqual({ home_assistant: { enabled: false } });
+  });
+});
+
+/** Skills are the fourth dimension of the blank slate, and the one that used to leak: they are
+ *  gated by a per-profile `skills.disabled` OFF-list with no enabled allowlist anywhere behind it,
+ *  so a fresh profile carrying no such list has every installed skill ON. Kyle's dogfood finding
+ *  was a New Bot sheet reading "199 on". */
+describe("POST /bots seeds the skills OFF-list", () => {
+  it("writes the whole catalog off, because a blank slate has no playbooks until it is asked", async () => {
+    const { authed, dashboard } = await setup({ reportedSkills: REPORTED_SKILLS });
+
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    // Sorted, the way `save_disabled_skills` writes it, so a file this seed wrote and one Hermes'
+    // own skills UI wrote read the same.
+    expect(body.config["skills"]).toEqual({
+      disabled: ["brainstorming", "pdf-forms", "slack-digest", "tdd", "webapp-testing"],
+    });
+    // The default floor is empty on purpose: autonomy is the toolset floor's job.
+    expect(BLANK_SLATE_SKILLS_ON).toEqual([]);
+  });
+
+  it("keeps the configured floor ON by leaving those names out of the OFF-list", async () => {
+    const { authed, dashboard } = await setup({
+      reportedSkills: REPORTED_SKILLS,
+      blankSlateSkillsOn: ["tdd", "brainstorming"],
+    });
+    await authed("/bots", post({ name: "night-owl" }));
+
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    expect(body.config["skills"]).toEqual({
+      disabled: ["pdf-forms", "slack-digest", "webapp-testing"],
+    });
+  });
+
+  it("names a floor entry the profile does not have back at nobody: it is simply not in the list", async () => {
+    const plan = planBlankSlateSeed({
+      current: {},
+      blankSlate: true,
+      skillCatalog: ["tdd"],
+      // `telepathy` is not installed for this profile, so there is nothing to keep on and nothing
+      // to switch off. It is never invented into either list.
+      skillsOn: ["tdd", "telepathy"],
+    });
+    expect(plan.config?.["skills"]).toEqual({ disabled: [] });
+  });
+
+  it("merges only the disabled array, so a skills stanza Hermes wrote survives", async () => {
+    const { authed, dashboard } = await setup({
+      reportedSkills: ["tdd"],
+      profileConfig: { skills: { external_dirs: ["/custom"], template_vars: true } },
+    });
+    await authed("/bots", post({ name: "night-owl" }));
+
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    // The write is a DEEP MERGE: naming only `disabled` is what keeps `external_dirs` alive.
+    expect(body.config["skills"]).toEqual({ disabled: ["tdd"] });
+  });
+
+  it("leaves an OFF-list the profile already carries exactly as it is", async () => {
+    const { authed, dashboard } = await setup({
+      reportedSkills: REPORTED_SKILLS,
+      profileConfig: {
+        platform_toolsets: { cozygateway: ["file", "terminal"], cli: ["file", "terminal"] },
+        approvals: { mode: "manual" },
+        skills: { disabled: ["pdf-forms"] },
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+        },
+      },
+    });
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+    // Every key was already there, including the OFF-list somebody curated. Nothing is written at
+    // all, rather than the user's four kept skills being switched back off.
+    expect(writes(dashboard)).toEqual([]);
+  });
+
+  it("writes nothing when the catalog is empty, rather than an OFF-list that blocks later passes", () => {
+    // `profiles.describe` drops the skills section wholesale on a bad read upstream, and
+    // `mapProfileDescribe` is deliberately tolerant of that, so an empty catalog is not proof a
+    // profile has no skills.
+    const plan = planBlankSlateSeed({ current: {}, blankSlate: true, skillCatalog: [] });
+    expect(plan.config?.["skills"]).toBeUndefined();
+  });
+
+  it("skips the key when the catalog cannot be read, and says so loudly", async () => {
+    const { authed, dashboard, logs } = await setup({ describeFails: true });
+
+    const res = await authed("/bots", post({ name: "night-owl" }));
+    expect(res.status).toBe(201);
+
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    // No partial guess. The rest of the floor is knowable from the config read alone and is still
+    // written, so the bot is reachable and holds two toolsets.
+    expect(body.config["skills"]).toBeUndefined();
+    expect(body.config["platform_toolsets"]).toEqual({
+      cozygateway: ["file", "terminal"],
+      cli: ["file", "terminal"],
+    });
+    expect(logs.join("\n")).toContain("skills NOT seeded");
+    const reply = (await res.json()) as { warnings: string[] };
+    expect(reply.warnings.join(" ")).toContain("every installed skill on");
   });
 });
 
@@ -380,13 +505,19 @@ describe("the seed is best-effort", () => {
 
 describe("seedBlankSlateBots: false", () => {
   it("writes the plugin binding and nothing else, leaving hermes' broad defaults in place", async () => {
-    const { authed, dashboard } = await setup({ seedBlankSlateBots: false });
+    const { authed, dashboard } = await setup({
+      seedBlankSlateBots: false,
+      reportedSkills: REPORTED_SKILLS,
+    });
     expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
     const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
     // The flag is toolset policy, so the floor, the approval mode and the MCP quieting all stop.
     expect(body.config["platform_toolsets"]).toBeUndefined();
     expect(body.config["approvals"]).toBeUndefined();
     expect(body.config["mcp_servers"]).toBeUndefined();
+    // Skills mirror the toolset floor exactly: with the flag off the bot keeps Hermes' own
+    // default, which for skills means every installed one on.
+    expect(body.config["skills"]).toBeUndefined();
     // Reachability is not toolset policy. An operator asking for hermes' broad defaults is not
     // asking for a bot nobody can talk to, so the binding is written whatever the flag says.
     expect(body.config["plugins"]).toEqual({
