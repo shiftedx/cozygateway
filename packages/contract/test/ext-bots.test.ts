@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/index.ts";
 import {
+  BotCreateRequestSchema,
+  BotCreateResponseSchema,
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotChatDeltaFrameSchema,
@@ -479,8 +481,32 @@ describe("capability advertisement", () => {
     // 29 adds clarification recovery and terminal settlement receipts; 30 adds
     // attached-profile Memory management; 31 adds durable delivery receipts (the displayed
     // report, `BotChatMessage.marker`, and role `system` on gateway-authored marker rows);
-    // 32 adds inline media ordering (`BotChatMessage.attachments[].position`).
-    expect(BOTS_CAPABILITY_VERSION).toBe(32);
+    // 32 adds inline media ordering (`BotChatMessage.attachments[].position`);
+    // 33 adds create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots` and
+    // the optional `warnings` on its reply. Both request fields are additive and a gateway below
+    // 33 ignores them silently, so a picker UI gates on this version rather than on hope.
+    expect(BOTS_CAPABILITY_VERSION).toBe(33);
+  });
+
+  it("accepts a capability-33 create with tool selections, and keeps them optional", () => {
+    expect(check(BotCreateRequestSchema, { name: "night-owl" })).toBe(true);
+    expect(
+      check(BotCreateRequestSchema, { name: "night-owl", toolsets: ["web"], mcpServers: ["github"] }),
+    ).toBe(true);
+    // A blank name in a selection is not a name: it would ride through to a resolver as noise.
+    expect(check(BotCreateRequestSchema, { name: "night-owl", toolsets: [""] })).toBe(false);
+    expect(check(BotCreateRequestSchema, { name: "night-owl", toolsets: "web" })).toBe(false);
+  });
+
+  it("keeps warnings optional on the create reply, and bounded when present", () => {
+    const bot = {
+      name: "night-owl", displayName: "Night Owl", handle: "@night-owl", description: null,
+      hasAvatar: false, group: null, pinned: false, active: false, lastActiveAt: null,
+      chatSessionId: null, preview: { kind: "empty", text: "" }, meta: null,
+    };
+    expect(check(BotCreateResponseSchema, { bot })).toBe(true);
+    expect(check(BotCreateResponseSchema, { bot, warnings: ["skipped: telepathy"] })).toBe(true);
+    expect(check(BotCreateResponseSchema, { bot, warnings: [""] })).toBe(false);
   });
 
   it("accepts capability-23 native turn status without changing legacy state fields", () => {

@@ -190,6 +190,7 @@ export async function startGateway(
     ...(hermesOptions.bridgeProfile === undefined
       ? {}
       : { bridgeProfile: hermesOptions.bridgeProfile }),
+    seedBlankSlateBots: hermesOptions.seedBlankSlateBots,
     // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
     // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
     // rather than borrowed from a chat thread, so a client that does not know about rooms yet
