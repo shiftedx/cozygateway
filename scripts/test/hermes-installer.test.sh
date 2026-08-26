@@ -90,6 +90,7 @@ for platform in Darwin Linux Windows; do
   grep -Fq "gateway install --start-now --start-on-login" <<<"$output"
   grep -Fq "gateway start" <<<"$output"
   grep -Fq "gateway restart" <<<"$output"
+  test ! -e "$tmp/gateway-$platform"
 done
 if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 'http://not-a-host' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-invalid-host" >/dev/null 2>&1; then
   echo 'expected URL syntax in --bind-host to fail' >&2
@@ -387,6 +388,7 @@ dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/w
 set -e
 grep -Fq 'COZYGATEWAY_EXPECTED_DASHBOARD_PORT' "$tmp/windows-dashboard-commands"
 grep -Fq 'COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER' "$tmp/windows-dashboard-commands"
+grep -Fq 'GetFullPath($token)' "$repo_root/scripts/agent-install.sh"
 test ! -e "$tmp/windows-dashboard-wrong"
 if grep -Fq 'Dashboard stayed listening after stop' <<<"$dashboard_fallback_output"; then
   echo 'Windows Dashboard fallback did not release the validated listener' >&2
@@ -397,7 +399,9 @@ fi
 # when the listener config is corrupt and Node cannot be resolved.
 printf '{not-json\n' > "$tmp/gateway-windows-fallback/local/cozygateway.config.json"
 sed -i "s|^hermes_bin=.*|hermes_bin=$tmp/missing-hermes|" "$tmp/gateway-windows-fallback/local/install-state"
-HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_UNRELATED_LISTENER=1 COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+curl_count_before_uninstall="$(wc -l < "$tmp/curl.log")"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_UNRELATED_LISTENER=1 COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+test "$(wc -l < "$tmp/curl.log")" = "$curl_count_before_uninstall"
 test ! -e "$tmp/gateway-windows-fallback"
 
 # A listener alone is not sufficient: an existing Dashboard that rejects the

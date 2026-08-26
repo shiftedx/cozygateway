@@ -428,15 +428,18 @@ install_posix_cli() {
   say "OK    the cozygateway command is available in new terminal sessions"
 }
 remove_posix_cli() {
-  local link="$HOME/.local/bin/cozygateway" profile temp
+  local link="$HOME/.local/bin/cozygateway" profile
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$CLI_WRAPPER" ]; then rm -f "$link"; fi
   if [ -f "$link" ] && cmp -s "$link" "$CLI_WRAPPER"; then rm -f "$link"; fi
   for profile in "$HOME/.profile" "$HOME/.zprofile"; do
     [ -f "$profile" ] || continue
-    temp="$(umask 077; mktemp "$profile.cozygateway.XXXXXX")"
-    grep -Fvx "$CLI_PATH_LINE" "$profile" > "$temp" || true
-    cat "$temp" > "$profile"
-    rm -f "$temp"
+    (
+      umask 077
+      temp="$(mktemp "$profile.cozygateway.XXXXXX")"
+      trap 'rm -f "$temp"' EXIT HUP INT TERM
+      grep -Fvx "$CLI_PATH_LINE" "$profile" > "$temp" || true
+      cat "$temp" > "$profile"
+    )
   done
 }
 remove_windows_cli_path() {
@@ -589,6 +592,7 @@ stop_owned_windows_gateway() {
   set -e
   [ "$code" -eq 3 ] && return 1
   [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
+  [ "$check_target_port" = 0 ] && return 0
   for _ in $(seq 1 10); do gateway_ready || return 0; sleep 1; done
   die "the previous CozyGateway process stayed listening on port $PORT"
 }
@@ -713,8 +717,16 @@ stop_stubborn_windows_dashboard() {
     if ($null -eq $connection) { exit 0 }
     $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
     $command = [string]$process.CommandLine
-    $ownsHermes = $command.IndexOf($env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-      $command.IndexOf($env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    $expectedHermes = [IO.Path]::GetFullPath($env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES)
+    $expectedLauncher = [IO.Path]::GetFullPath($env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER)
+    $tokens = @([regex]::Matches($command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
+    $ownsHermes = @($tokens | Where-Object {
+      $token = $_
+      try {
+        $full = [IO.Path]::GetFullPath($token)
+        $full.Equals($expectedHermes, [StringComparison]::OrdinalIgnoreCase) -or $full.Equals($expectedLauncher, [StringComparison]::OrdinalIgnoreCase)
+      } catch { $false }
+    }).Count -gt 0
     if (-not $ownsHermes -or -not $command.Contains(" dashboard ") -or -not $command.Contains("--port " + $port)) { exit 42 }
     Stop-Process -Id $process.ProcessId -Force
   ' >/dev/null 2>&1
@@ -815,7 +827,7 @@ main() {
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
   have "$HERMES_BIN" || die "Hermes must already be installed"; HERMES_RESOLVED="$(resolve_hermes)"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
-  say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; mkdir -p "$LOCAL_DIR"; write_gateway_env
+  say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
