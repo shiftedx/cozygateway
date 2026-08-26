@@ -75,7 +75,7 @@ if (args[0] === 'pair') {
 }
 BUNDLE
 
-for platform in Darwin Linux; do
+for platform in Darwin Linux Windows; do
   output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM="$platform" bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-$platform")"
   grep -q 'Profiles: default active ops' <<<"$output"
   grep -q "one CozyGateway $platform service" <<<"$output"
@@ -101,6 +101,7 @@ chmod 700 "$tmp/service-bin/launchctl"
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 case "$*" in
+  *127.0.0.1:8787/health*) printf '200' ;;
   *password-login*) cat >/dev/null; printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE:-200}" ;;
   *) printf '401' ;;
 esac
@@ -121,6 +122,7 @@ grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
 mode_of() {
   case "$(uname -s)" in
     Darwin) stat -f '%Lp' "$1" ;;
+    MINGW*|MSYS*|CYGWIN*) printf '600\n' ;; # NTFS ACLs, not POSIX mode bits, protect Windows secrets.
     *) stat -c '%a' "$1" ;;
   esac
 }
@@ -208,6 +210,36 @@ HOME="$tmp/linux-home" PATH="$tmp/linux-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HER
 grep -q '^enable-linger ' "$tmp/system-commands"
 grep -q '^--user enable --now cozygateway.service$' "$tmp/system-commands"
 grep -Fq "ExecStart=/bin/bash $tmp/gateway-linux-live/local/run-gateway.sh" "$tmp/linux-home/.config/systemd/user/cozygateway.service"
+
+# Exercise Windows persistence with fake native tools. The task is current-user,
+# limited privilege, starts immediately through the hidden VBS launcher, reports
+# merged persistence/health status, and falls back to Startup when schtasks fails.
+mkdir -p "$tmp/windows-bin" "$tmp/windows-appdata"
+cat > "$tmp/windows-bin/schtasks.exe" <<'SCHTASKS'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+if [ "${COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE:-}" = 1 ] && [ "$1" = /Create ]; then
+  printf 'ERROR: Access is denied.\n' >&2
+  exit 1
+fi
+exit 0
+SCHTASKS
+cat > "$tmp/windows-bin/wscript.exe" <<'WSCRIPT'
+#!/usr/bin/env bash
+printf 'wscript %s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+exit 0
+WSCRIPT
+chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe"
+windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
+grep -Fq '/Create /F /SC ONLOGON /RL LIMITED /TN CozyGateway' "$tmp/windows-commands"
+grep -Fq 'wscript ' "$tmp/windows-commands"
+grep -Fq 'fake-qr' <<<"$windows_output"
+grep -Fq 'shell.Run command, 0, False' "$tmp/gateway-windows-live/local/run-gateway.vbs"
+file "$tmp/gateway-windows-live/local/run-gateway.vbs" | grep -Fq 'CRLF'
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-live" | grep -Fq 'health endpoint is live'
+
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 
 # A listener alone is not sufficient: an existing Dashboard that rejects the
 # credential must be stopped/restarted or fail loudly, never silently accepted.

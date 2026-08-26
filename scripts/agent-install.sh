@@ -17,6 +17,7 @@ PORT="${COZYGATEWAY_PORT:-8787}"
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
 DRY_RUN=0
 UNINSTALL=0
+STATUS=0
 SERVICE_PLATFORM="${COZYGATEWAY_SERVICE_PLATFORM:-}"
 TOKENS=()
 TOKEN_ENVS=()
@@ -43,6 +44,8 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --port PORT             gateway listener port (default 8787)
   --dashboard-port PORT   local Hermes Dashboard control-plane port (default 9119)
   --dry-run               show discovered work without changing anything
+  --service-platform OS   override service platform (Darwin, Linux, Windows)
+  --status                report persistence and live gateway health
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
 
 The gateway and attach plugin both stay on this machine. This installer never
@@ -60,12 +63,36 @@ while [ "$#" -gt 0 ]; do
     --port) need_value "$@"; PORT="$2"; shift ;;
     --dashboard-port) need_value "$@"; DASHBOARD_PORT="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
+    --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
+    --status) STATUS=1 ;;
     --uninstall) UNINSTALL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
   shift
 done
+
+normalize_service_platform() {
+  [ -n "$SERVICE_PLATFORM" ] || SERVICE_PLATFORM="$(uname -s)"
+  case "$SERVICE_PLATFORM" in
+    Darwin|Linux) ;;
+    Windows|MINGW*|MSYS*|CYGWIN*) SERVICE_PLATFORM=Windows ;;
+    *) die "supported service managers are launchd (macOS), systemd --user (Linux), and Scheduled Tasks (Windows)" ;;
+  esac
+}
+is_windows() { [ "$SERVICE_PLATFORM" = Windows ]; }
+to_posix_path() {
+  if is_windows; then have cygpath || die "Git Bash must provide cygpath on Windows"; cygpath -u "$1"; else printf '%s' "$1"; fi
+}
+to_windows_path() {
+  if is_windows; then have cygpath || die "Git Bash must provide cygpath on Windows"; cygpath -w "$1"; else printf '%s' "$1"; fi
+}
+normalize_service_platform
+if is_windows; then
+  GATEWAY_DIR="$(to_posix_path "$GATEWAY_DIR")"
+  [ -z "$BUNDLE_PATH" ] || BUNDLE_PATH="$(to_posix_path "$BUNDLE_PATH")"
+  [ -z "$PLUGIN_ARCHIVE" ] || PLUGIN_ARCHIVE="$(to_posix_path "$PLUGIN_ARCHIVE")"
+fi
 
 case "$PORT" in ''|*[!0-9]*) die "--port must be 1-65535" ;; esac
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be 1-65535"
@@ -79,7 +106,9 @@ canonical_gateway_dir() {
   [ "$base" != . ] && [ "$base" != .. ] || die "--gateway-dir must not resolve to . or .."
   [ -d "$parent" ] && GATEWAY_DIR="$(cd -P "$parent" && pwd)/$base"
   case "$GATEWAY_DIR" in /|"$HOME") die "--gateway-dir must be dedicated CozyGateway state, not $GATEWAY_DIR" ;; esac
-  case "$GATEWAY_DIR" in *[!A-Za-z0-9_./-]*) die "--gateway-dir may contain only letters, digits, _, ., /, and - so launchd/systemd can load it safely" ;; esac
+  if ! is_windows; then
+    case "$GATEWAY_DIR" in *[!A-Za-z0-9_./-]*) die "--gateway-dir may contain only letters, digits, _, ., /, and - so launchd/systemd can load it safely" ;; esac
+  fi
 }
 canonical_gateway_dir
 
@@ -93,6 +122,8 @@ CLI_WRAPPER="$GATEWAY_DIR/bin/cozygateway"
 GW_LOG="$LOCAL_DIR/cozygateway.log"
 SERVICE_LABEL="ai.cozylabs.cozygateway"
 SERVICE_UNIT="cozygateway.service"
+WINDOWS_TASK="CozyGateway"
+WINDOWS_VBS="$LOCAL_DIR/run-gateway.vbs"
 
 node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -dc '0-9'; }
 resolve_node() {
@@ -113,7 +144,11 @@ resolve_hermes() {
 # profile names are shell/file-safe Hermes identifiers. Reject anything that
 # could turn a plugin or spool path into a path traversal before constructing it.
 valid_profile() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || [ "$1" = default ]; }
-hermes_config_path() { "$HERMES_BIN" -p "$1" config path 2>/dev/null; }
+hermes_config_path() {
+  local path
+  path="$("$HERMES_BIN" -p "$1" config path 2>/dev/null)" || return
+  to_posix_path "$path"
+}
 discover_root() {
   local default_config
   default_config="$(hermes_config_path default)" || die "could not ask Hermes for the default profile config path"
@@ -314,7 +349,7 @@ write_state() {
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
-resolve_platform() { [ -n "$SERVICE_PLATFORM" ] || SERVICE_PLATFORM="$(uname -s)"; case "$SERVICE_PLATFORM" in Darwin|Linux) ;; *) die "supported service managers are launchd (macOS) and systemd --user (Linux)" ;; esac; }
+resolve_platform() { normalize_service_platform; }
 write_cli_wrapper() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   write executable gateway CLI at $CLI_WRAPPER"; return; }
   mkdir -p "$GATEWAY_DIR/bin"
@@ -364,10 +399,58 @@ NODE
 WRAPPER
   chmod 700 "$WRAPPER"
 }
+vbs_quote() {
+  local value="$1"
+  case "$value" in *$'\r'*|*$'\n'*) die "refusing a Windows launcher path containing a line break" ;; esac
+  value="${value//\"/\"\"}"
+  printf '"%s"' "$value"
+}
+windows_startup_dir() {
+  local native="${APPDATA:-}"
+  [ -n "$native" ] || native="$(to_windows_path "$HOME")\\AppData\\Roaming"
+  to_posix_path "$native\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
+}
+write_windows_launcher() {
+  local bash_posix bash_native wrapper_native command
+  bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
+  bash_posix="$(to_posix_path "$bash_posix")"
+  [ -f "$bash_posix" ] || die "Git Bash executable is unavailable: $bash_posix"
+  bash_native="$(to_windows_path "$bash_posix")"
+  wrapper_native="$(to_windows_path "$WRAPPER")"
+  command="$(vbs_quote "$bash_native") & \" \" & $(vbs_quote "$wrapper_native")"
+  [ "$DRY_RUN" = 1 ] && { say "DRY   write hidden Windows launcher at $WINDOWS_VBS"; return; }
+  {
+    printf 'Set shell = CreateObject("WScript.Shell")\r\n'
+    printf 'command = %s\r\n' "$command"
+    printf 'shell.Run command, 0, False\r\n'
+  } > "$WINDOWS_VBS"
+  chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
+}
+install_windows_service() {
+  local vbs_native task_command output code startup entry
+  write_windows_launcher
+  [ "$DRY_RUN" = 1 ] && { say "DRY   register current-user Scheduled Task $WINDOWS_TASK with Startup-folder fallback"; return; }
+  vbs_native="$(to_windows_path "$WINDOWS_VBS")"
+  task_command="wscript.exe \"$vbs_native\""
+  set +e
+  output="$(MSYS_NO_PATHCONV=1 schtasks.exe /Create /F /SC ONLOGON /RL LIMITED /TN "$WINDOWS_TASK" /TR "$task_command" 2>&1)"
+  code=$?
+  set -e
+  if [ "$code" -ne 0 ]; then
+    startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
+    mkdir -p "$startup"; cp "$WINDOWS_VBS" "$entry"
+    say "INFO  Scheduled Task unavailable; installed current-user Startup fallback: $entry"
+  else
+    say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
+  fi
+  wscript.exe "$vbs_native"
+}
 install_service() {
   resolve_platform; write_wrapper
   if [ "$DRY_RUN" = 1 ]; then say "DRY   install one CozyGateway $SERVICE_PLATFORM service; it reuses/starts Hermes Dashboard as local control plane"; return; fi
-  if [ "$SERVICE_PLATFORM" = Darwin ]; then
+  if [ "$SERVICE_PLATFORM" = Windows ]; then
+    install_windows_service
+  elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -454,7 +537,16 @@ uninstall() {
   [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || die "Hermes executable from installer state is unavailable: $hermes_bin"
   HERMES_RESOLVED="$hermes_bin"
   resolve_platform
-  if [ "$SERVICE_PLATFORM" = Darwin ]; then
+  if [ "$SERVICE_PLATFORM" = Windows ]; then
+    local startup_entry
+    startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+    if [ "$DRY_RUN" = 1 ]; then
+      say "DRY   delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
+    else
+      MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+      rm -f "$startup_entry"
+    fi
+  elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
     else launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; fi
   else
@@ -476,7 +568,26 @@ uninstall() {
   done
   run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
+status_install() {
+  local persisted=0 live=0 startup_entry code
+  resolve_platform
+  if [ "$SERVICE_PLATFORM" = Windows ]; then
+    startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+    MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" >/dev/null 2>&1 && { say "OK    Scheduled Task registered: $WINDOWS_TASK"; persisted=1; }
+    [ -f "$startup_entry" ] && { say "OK    Startup login item registered: $startup_entry"; persisted=1; }
+  elif [ "$SERVICE_PLATFORM" = Darwin ]; then
+    launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1 && { say "OK    launchd service registered: $SERVICE_LABEL"; persisted=1; }
+  else
+    systemctl --user is-enabled "$SERVICE_UNIT" >/dev/null 2>&1 && { say "OK    systemd user service registered: $SERVICE_UNIT"; persisted=1; }
+  fi
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+  [ "$code" = 200 ] && { say "OK    CozyGateway health endpoint is live"; live=1; }
+  [ "$persisted" = 1 ] || say "FAIL  CozyGateway login persistence is absent"
+  [ "$live" = 1 ] || say "FAIL  CozyGateway health endpoint is not responding"
+  [ "$persisted" = 1 ] && [ "$live" = 1 ]
+}
 main() {
+  if [ "$STATUS" = 1 ]; then status_install; return; fi
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
