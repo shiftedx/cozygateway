@@ -101,7 +101,7 @@ fi
 # service-manager fake separate from Hermes so uninstall can prove it uses the
 # executable persisted in installer state instead of whichever `hermes` PATH
 # happens to contain later.
-mkdir -p "$tmp/service-bin"
+mkdir -p "$tmp/service-bin" "$tmp/darwin-home"
 cat > "$tmp/service-bin/launchctl" <<'LAUNCHCTL'
 #!/usr/bin/env bash
 exit 0
@@ -111,7 +111,7 @@ cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 [ -z "${COZYGATEWAY_TEST_CURL_LOG:-}" ] || printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_CURL_LOG"
 case "$*" in
-  *127.0.0.1:8787/health*|*192.0.2.10:8787/health*)
+  *127.0.0.1:8787/health*|*127.0.0.1:9000/health*|*192.0.2.10:8787/health*)
     if [ -n "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}" ] && [ ! -f "$COZYGATEWAY_TEST_GATEWAY_MARKER" ]; then
       if [[ "$*" == *"-o /dev/null"* ]]; then printf '000'; else printf '{"attach":{"configured":1,"online":0,"deadLetters":0}}'; fi
       exit 0
@@ -129,7 +129,7 @@ case "$*" in
 esac
 CURL
 chmod 700 "$tmp/bin/curl"
-live_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bind-host 192.0.2.10 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+live_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bind-host 192.0.2.10 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 # shellcheck disable=SC2016
 if grep -Fq 'spaces $dollar' <<<"$live_output"; then
   echo 'installer output must not contain credentials' >&2
@@ -172,6 +172,13 @@ grep -q '^service_active=preexisting$' "$tmp/gateway-live/local/install-state"
 grep -Fq "hermes_bin=$tmp/bin/hermes" "$tmp/gateway-live/local/install-state"
 test ! -e "$credential_marker"
 test -x "$tmp/gateway-live/bin/cozygateway"
+if [[ "$(uname -s)" = MINGW* ]]; then
+  cmp -s "$tmp/darwin-home/.local/bin/cozygateway" "$tmp/gateway-live/bin/cozygateway"
+else
+  test "$(readlink "$tmp/darwin-home/.local/bin/cozygateway")" = "$tmp/gateway-live/bin/cozygateway"
+fi
+grep -Fqx 'export PATH="$HOME/.local/bin:$PATH" # CozyGateway CLI' "$tmp/darwin-home/.profile"
+grep -Fqx 'export PATH="$HOME/.local/bin:$PATH" # CozyGateway CLI' "$tmp/darwin-home/.zprofile"
 if grep -Eq 'COZYGATEWAY_(HERMES_PASSWORD|ATTACH_TOKEN)' "$tmp/gateway-live/bin/cozygateway"; then
   echo 'gateway CLI wrapper must not contain secrets' >&2
   exit 1
@@ -239,9 +246,9 @@ config.host = '127.0.0.1';
 config.port = 8999;
 writeFileSync(path, JSON.stringify(config));
 NODE
-preserved_listener_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+preserved_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq 'CozyGateway listens on 127.0.0.1:8999' <<<"$preserved_listener_output"
-overridden_listener_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 0.0.0.0 --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+overridden_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 0.0.0.0 --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq 'CozyGateway listens on 0.0.0.0:9000' <<<"$overridden_listener_output"
 
 # Restore the fixture listener for the live rerun checks below.
@@ -259,7 +266,7 @@ NODE
 default_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 ops_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 install_count_before="$(grep -c '^default:gateway:install$' "$tmp/commands")"
-rerun_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 # Rerunning on an installed gateway still lands on the pairing finale with a minted code.
 grep -Fq 'fake-qr' <<<"$rerun_output"
 grep -Fq '"setupCode":"TEST-CODE"' <<<"$rerun_output"
@@ -273,7 +280,7 @@ test "$(grep -c '^default:gateway:restart$' "$tmp/commands")" = 1
 # pre-existing active service is left untouched.
 # Deliberately remove the fake Hermes directory and omit COZYGATEWAY_HERMES_BIN:
 # uninstall must use the absolute executable captured at install time.
-PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
+HOME="$tmp/darwin-home" PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
 grep -q '^default:gateway:uninstall$' "$tmp/commands"
 grep -q '^ops:gateway:stop$' "$tmp/commands"
 if grep -q '^active:gateway:\(stop\|uninstall\)$' "$tmp/commands"; then
@@ -283,6 +290,9 @@ fi
 test "$(cat "$tmp/hermes/gateway-default.state")" = absent
 test "$(cat "$tmp/hermes/gateway-ops.state")" = stopped
 test "$(cat "$tmp/hermes/gateway-active.state")" = running
+test ! -e "$tmp/darwin-home/.local/bin/cozygateway"
+! grep -Fq '# CozyGateway CLI' "$tmp/darwin-home/.profile"
+! grep -Fq '# CozyGateway CLI' "$tmp/darwin-home/.zprofile"
 
 # Exercise the real Linux unit path with fake systemd tools: lingering is
 # enabled and the generated unit points at the validated wrapper.
@@ -302,6 +312,12 @@ HOME="$tmp/linux-home" PATH="$tmp/linux-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HER
 grep -q '^enable-linger ' "$tmp/system-commands"
 grep -q '^--user enable --now cozygateway.service$' "$tmp/system-commands"
 grep -Fq "ExecStart=/bin/bash $tmp/gateway-linux-live/local/run-gateway.sh" "$tmp/linux-home/.config/systemd/user/cozygateway.service"
+if [[ "$(uname -s)" = MINGW* ]]; then
+  cmp -s "$tmp/linux-home/.local/bin/cozygateway" "$tmp/gateway-linux-live/bin/cozygateway"
+else
+  test "$(readlink "$tmp/linux-home/.local/bin/cozygateway")" = "$tmp/gateway-linux-live/bin/cozygateway"
+fi
+grep -Fqx 'export PATH="$HOME/.local/bin:$PATH" # CozyGateway CLI' "$tmp/linux-home/.profile"
 
 # Exercise Windows persistence with fake native tools. The task is current-user,
 # limited privilege, starts immediately through the hidden VBS launcher, reports
@@ -350,6 +366,13 @@ HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$
 grep -Fq 'powershell -NoProfile -NonInteractive -Command' "$tmp/windows-commands"
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-live" | grep -Fq 'health endpoint is live'
 
+# An explicit port update must stop the process selected by its managed config,
+# even though the replacement port cannot be healthy until the new child starts.
+rm -f "$tmp/windows-gateway-ready"
+windows_stop_count="$(grep -c '^powershell ' "$tmp/windows-commands")"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live" >/dev/null
+test "$(grep -c '^powershell ' "$tmp/windows-commands")" -gt "$windows_stop_count"
+
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 
@@ -367,9 +390,15 @@ if grep -Fq 'Dashboard stayed listening after stop' <<<"$dashboard_fallback_outp
   exit 1
 fi
 
+# Removal is a recovery path: it must work from persisted install state even
+# when the listener config is corrupt and Node cannot be resolved.
+printf '{not-json\n' > "$tmp/gateway-windows-fallback/local/cozygateway.config.json"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+test ! -e "$tmp/gateway-windows-fallback"
+
 # A listener alone is not sufficient: an existing Dashboard that rejects the
 # credential must be stopped/restarted or fail loudly, never silently accepted.
-if wrong_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"; then
+if wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"; then
   echo 'expected wrong Dashboard credential to fail' >&2
   exit 1
 fi

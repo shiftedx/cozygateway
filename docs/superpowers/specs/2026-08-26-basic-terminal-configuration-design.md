@@ -23,13 +23,13 @@ The existing CLI owns the menu, status request, validation, and atomic JSON upda
 
 The installed service runner watches the configuration file. A successful atomic replacement causes it to stop the current gateway child and start a new child with the new listener settings. The supervisor stays alive, so this works with the Windows Startup fallback as well as launchd and systemd. The same configuration operation updates only the installer-owned `COZYGATEWAY_URL` line in every managed Hermes profile and restarts those Hermes gateways so attach follows a changed port.
 
-The Windows installer writes `cozygateway.cmd` beside the existing Git Bash wrapper and adds that bin directory to the current process and the user's PATH idempotently. The command file invokes the verified bundled CLI from the managed local directory, so plain `cozygateway` automatically finds the installed configuration.
+The Windows installer writes `cozygateway.cmd` beside the existing Git Bash wrapper and adds that bin directory to the current process and the user's PATH idempotently. macOS and Linux expose the same managed wrapper through `~/.local/bin` and their login profile. Plain `cozygateway` therefore finds the installed configuration without a global package or extra dependency.
 
 ## Data Safety and Failure Handling
 
 Configuration changes parse and validate the entire existing config before mutation, preserve unknown and unrelated keys, write sibling temporary files, and atomically rename them over the originals. Hermes environment files retain all secret lines byte-for-byte; only the non-secret local gateway URL changes.
 
-The menu reports an offline health endpoint without failing to open. A managed listener change is accepted only after the gateway and Hermes attach return healthy; a failed replacement atomically restores the previous listener and Hermes target.
+The menu reports an offline health endpoint without failing to open. A managed listener change is accepted only after every configured Hermes attach is online with zero dead letters; a failed replacement atomically restores the previous listener and Hermes target. IPv6 URLs are bracketed. TLS changes preserve an existing HTTPS hostname for certificate validation instead of substituting the local bind address.
 
 ## Testing
 

@@ -113,10 +113,24 @@ describe("listener configuration", () => {
     config.port = 9443;
     writeFileSync(path, JSON.stringify(config));
     writeFileSync(join(localDir, "install-state"), `profiles=default\nhermes_root=${hermesRoot}\nhermes_bin=${join(hermesRoot, "hermes")}\n`);
-    writeFileSync(join(hermesRoot, ".env"), "COZYGATEWAY_URL=http://127.0.0.1:8787\nCOZYGATEWAY_TOKEN=secret\n");
+    writeFileSync(join(hermesRoot, ".env"), "COZYGATEWAY_URL=https://gateway.lan:8787\nCOZYGATEWAY_TOKEN=secret\n");
 
     syncManagedListenerTargets(path);
 
-    expect(readFileSync(join(hermesRoot, ".env"), "utf8")).toContain("COZYGATEWAY_URL=https://127.0.0.1:9443");
+    expect(readFileSync(join(hermesRoot, ".env"), "utf8")).toContain("COZYGATEWAY_URL=https://gateway.lan:9443");
+  });
+
+  it("refuses to invent a certificate hostname for a managed TLS target", () => {
+    const path = configFile();
+    const localDir = dirname(path);
+    const hermesRoot = join(localDir, "hermes-tls-missing-name");
+    mkdirSync(hermesRoot, { recursive: true });
+    const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    config.tls = { certFile: "cert.pem", keyFile: "key.pem" };
+    writeFileSync(path, JSON.stringify(config));
+    writeFileSync(join(localDir, "install-state"), `profiles=default\nhermes_root=${hermesRoot}\nhermes_bin=${join(hermesRoot, "hermes")}\n`);
+    writeFileSync(join(hermesRoot, ".env"), "COZYGATEWAY_URL=http://127.0.0.1:8787\nCOZYGATEWAY_TOKEN=secret\n");
+
+    expect(() => syncManagedListenerTargets(path)).toThrow(/existing https.*certificate hostname/i);
   });
 });

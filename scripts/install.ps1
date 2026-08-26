@@ -198,6 +198,19 @@ if ($PSVersionTable.PSVersion.Major -lt 5) { Fail 'Windows PowerShell 5.1 or new
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $script:InstallHome = Resolve-InstallHome $env:COZYGATEWAY_HOME
+$bin = Join-Path $script:InstallHome 'bin'
+$installerPath = Join-Path $bin 'agent-install.sh'
+$isUninstall = $InstallerArguments -contains '--uninstall'
+
+if ($isUninstall) {
+    $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
+    if (-not (Test-Path -LiteralPath $installerPath)) { Fail "no CozyGateway installer was found at $installerPath" }
+    & $bash $installerPath '--service-platform' 'Windows' '--gateway-dir' $script:InstallHome @InstallerArguments
+    if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
+    Set-CozyGatewayCommandPath $bin $false
+    return
+}
+
 $hermes = Resolve-Hermes $env:COZYGATEWAY_HERMES_INSTALL_URL
 Confirm-HermesModel $hermes
 $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
@@ -210,13 +223,11 @@ if ([string]::IsNullOrWhiteSpace($base)) {
     $base = "https://github.com/$repo/releases/download/$tag"
 }
 
-$bin = Join-Path $script:InstallHome 'bin'
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
 $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
-$installerPath = Join-Path $bin 'agent-install.sh'
 Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
 Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
 Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
 Invoke-CozyGatewayInstaller $bash $installerPath $InstallerArguments
-Set-CozyGatewayCommandPath $bin (-not ($InstallerArguments -contains '--uninstall'))
+if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }

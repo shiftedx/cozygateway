@@ -98,12 +98,21 @@ export function syncManagedListenerTargets(configPath: string): ManagedHermesPro
 
   const hermesRoot = nativeManagedPath(rawRoot);
   const executable = nativeManagedPath(rawExecutable);
-  const target = listenerOrigin(host, port, config.tls === undefined ? "http" : "https");
   const updates = profiles.map((profile) => {
     const envPath = profile === "default" ? join(hermesRoot, ".env") : join(hermesRoot, "profiles", profile, ".env");
     const before = readFileSync(envPath, "utf8");
-    if (!/^COZYGATEWAY_URL=.*$/m.test(before)) {
+    const current = /^COZYGATEWAY_URL=(.*)$/m.exec(before)?.[1];
+    if (current === undefined) {
       throw new Error(`Hermes profile ${profile} is missing its installer-managed CozyGateway URL`);
+    }
+    let target = listenerOrigin(host, port, "http");
+    if (config.tls !== undefined) {
+      const url = new URL(current);
+      if (url.protocol !== "https:" || url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+        throw new Error(`Hermes profile ${profile} needs an existing https CozyGateway origin with its certificate hostname before TLS listener changes`);
+      }
+      url.port = String(port);
+      target = url.origin;
     }
     return { profile, envPath, content: before.replace(/^COZYGATEWAY_URL=.*$/m, `COZYGATEWAY_URL=${target}`) };
   });

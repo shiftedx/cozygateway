@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import { execFile as execFileCallback } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { request as httpsRequest } from "node:https";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
+import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { promisify } from "node:util";
 
@@ -37,11 +40,47 @@ function healthOrigin(config: ReturnType<typeof loadConfig>): string {
   return listenerOrigin(config.host ?? "0.0.0.0", config.port, gatewayScheme(config));
 }
 
-async function fetchHealth(configPath: string, timeoutMs: number): Promise<{ attach?: { configured?: number; online?: number } }> {
+type GatewayHealth = { attach?: { configured?: number; online?: number; deadLetters?: number } };
+
+async function fetchHealth(configPath: string, timeoutMs: number): Promise<GatewayHealth> {
   const config = loadConfig(configPath);
-  const response = await fetch(`${healthOrigin(config)}/health`, { signal: AbortSignal.timeout(timeoutMs) });
-  if (!response.ok) throw new Error(`gateway health returned HTTP ${response.status}`);
-  return response.json() as Promise<{ attach?: { configured?: number; online?: number } }>;
+  const url = `${healthOrigin(config)}/health`;
+  if (config.tls === undefined) {
+    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) throw new Error(`gateway health returned HTTP ${response.status}`);
+    return response.json() as Promise<GatewayHealth>;
+  }
+  const ca = [...rootCertificates, readFileSync(config.tls.certFile)];
+  return new Promise((resolve, reject) => {
+    const request = httpsRequest(
+      url,
+      {
+        ca,
+        checkServerIdentity: () => undefined,
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => (body += chunk));
+        response.on("end", () => {
+          if (response.statusCode !== 200) return reject(new Error(`gateway health returned HTTP ${response.statusCode ?? 0}`));
+          try {
+            resolve(JSON.parse(body) as GatewayHealth);
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    request.setTimeout(timeoutMs, () => request.destroy(new Error("gateway health timed out")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+export function isGatewayReady(health: { attach?: { configured?: number; online?: number; deadLetters?: number } }): boolean {
+  const configured = health.attach?.configured ?? 0;
+  return configured > 0 && health.attach?.online === configured && health.attach?.deadLetters === 0;
 }
 
 const defaultRuntime: CliRuntime = {
@@ -53,9 +92,7 @@ const defaultRuntime: CliRuntime = {
     while (Date.now() < deadline) {
       try {
         const health = await fetchHealth(configPath, 1_000);
-        const configured = health.attach?.configured ?? 0;
-        const online = health.attach?.online ?? 0;
-        if (configured > 0 && online === configured) return;
+        if (isGatewayReady(health)) return;
       } catch {
         // The managed supervisor and Hermes profiles may still be restarting.
       }
@@ -91,7 +128,7 @@ function isLoopbackUrl(url: string): boolean {
 }
 
 function pairingUrl(config: ReturnType<typeof loadConfig>, advertised: string | undefined): string {
-  if (advertised === undefined) return `${gatewayScheme(config)}://${pairingHost(config)}:${config.port}`;
+  if (advertised === undefined) return listenerOrigin(pairingHost(config), config.port, gatewayScheme(config));
   const url = new URL(advertised);
   if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username !== "" || url.password !== "") {
     throw new Error("--url must be an http(s) gateway origin without credentials");

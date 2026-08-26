@@ -122,18 +122,37 @@ try {
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
+    $mustNotRunHermesInstaller = Join-Path $temp 'must-not-run-hermes-installer.ps1'
+    Write-Utf8NoBom $mustNotRunHermesInstaller "throw 'uninstall must not install Hermes'`n"
+    Remove-Item -LiteralPath $eventLog -Force
     $uninstall = Invoke-Bootstrap $installer @{
-        'PATH' = "$fakeBin;$env:PATH"
-        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'LOCALAPPDATA' = (Join-Path $temp 'uninstall without prerequisites')
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = (Join-Path $temp 'missing release assets')
         'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
         'COZYGATEWAY_GIT_BASH' = $fakeBash
-        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_HERMES_INSTALL_URL' = $mustNotRunHermesInstaller
         'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$managedBin"
         'COZYGATEWAY_TEST_USER_PATH_LOG' = $uninstallPathLog
     } @('--uninstall')
     Assert-True ($uninstall.ExitCode -eq 0) "bootstrap uninstall failed: $($uninstall.Output)"
     $uninstalledPath = Get-Content -LiteralPath $uninstallPathLog -Raw
     Assert-True (-not ($uninstalledPath -match [regex]::Escape($managedBin))) 'uninstall must remove the managed command directory from the user PATH'
+    Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw) -match 'hermes:model')) 'uninstall must not open Hermes model selection'
+
+    $dryRunPathLog = Join-Path $temp 'dry-run-user-path.txt'
+    $dryRun = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Dry Run Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+        'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $dryRunPathLog
+    }
+    Assert-True ($dryRun.ExitCode -eq 0) "bootstrap dry run failed: $($dryRun.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $dryRunPathLog)) 'dry run must not mutate the user PATH'
 
     $missingRoot = Join-Path $temp 'missing hermes case'
     $missingHermes = Join-Path $missingRoot 'hermes\bin\hermes.cmd'

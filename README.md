@@ -23,6 +23,8 @@ macOS/Linux:
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
+Open a new terminal afterward and type `cozygateway` on every supported host.
+
 No Docker, git, or build tools. It requires an existing Hermes installation and Node 24+. The
 bootstrap verifies versioned release checksums for the gateway bundle, complete Hermes attach-plugin
 archive, and installer payload. It discovers Hermes profile homes through the Hermes CLI, installs
@@ -47,7 +49,8 @@ bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygatewa
 ```
 
 This removes CozyGateway-owned service state, plugin copies, spools, and installer-written env keys;
-Hermes profiles and Hermes services remain.
+Hermes profiles and Hermes services remain. It also removes the installer-owned
+command entry from the user PATH.
 
 ### Existing Hermes install
 

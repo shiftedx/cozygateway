@@ -406,6 +406,39 @@ write_cli_wrapper() {
     chmod 755 "$CLI_WINDOWS" 2>/dev/null || true
   fi
 }
+CLI_PATH_LINE='export PATH="$HOME/.local/bin:$PATH" # CozyGateway CLI'
+install_posix_cli() {
+  local link="$HOME/.local/bin/cozygateway" profile current
+  [ "$DRY_RUN" = 1 ] && { say "DRY   expose the cozygateway command through $link"; return; }
+  mkdir -p "$HOME/.local/bin"
+  if [ -L "$link" ]; then
+    current="$(readlink "$link")"
+    [ "$current" = "$CLI_WRAPPER" ] || die "refusing to replace an unrelated command at $link"
+  elif [ -e "$link" ]; then
+    cmp -s "$link" "$CLI_WRAPPER" || die "refusing to replace an unrelated command at $link"
+  else
+    ln -s "$CLI_WRAPPER" "$link"
+  fi
+  profile="$HOME/.profile"
+  grep -Fqx "$CLI_PATH_LINE" "$profile" 2>/dev/null || printf '%s\n' "$CLI_PATH_LINE" >> "$profile"
+  if [ "$SERVICE_PLATFORM" = Darwin ]; then
+    profile="$HOME/.zprofile"
+    grep -Fqx "$CLI_PATH_LINE" "$profile" 2>/dev/null || printf '%s\n' "$CLI_PATH_LINE" >> "$profile"
+  fi
+  say "OK    the cozygateway command is available in new terminal sessions"
+}
+remove_posix_cli() {
+  local link="$HOME/.local/bin/cozygateway" profile temp
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$CLI_WRAPPER" ]; then rm -f "$link"; fi
+  if [ -f "$link" ] && cmp -s "$link" "$CLI_WRAPPER"; then rm -f "$link"; fi
+  for profile in "$HOME/.profile" "$HOME/.zprofile"; do
+    [ -f "$profile" ] || continue
+    temp="$profile.cozygateway.$$"
+    grep -Fvx "$CLI_PATH_LINE" "$profile" > "$temp" || true
+    cat "$temp" > "$profile"
+    rm -f "$temp"
+  done
+}
 remove_windows_cli_path() {
   local bin_native
   bin_native="$(to_windows_path "$GATEWAY_DIR/bin")"
@@ -525,22 +558,27 @@ write_windows_launcher() {
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
 stop_owned_windows_gateway() {
-  local config_native code expected_port
+  local config_native code
   config_native="$(to_windows_path "$CONFIG_JSON")"
-  expected_port="${PREVIOUS_PORT:-$PORT}"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$expected_port" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$PORT" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
+    $managed = Get-CimInstance Win32_Process | Where-Object {
+      $command = [string]$_.CommandLine
+      $command.Contains("cozygateway.mjs") -and $command.Contains(" serve ") -and $command.Contains($env:COZYGATEWAY_EXPECTED_CONFIG)
+    } | Select-Object -First 1
+    if ($null -ne $managed) {
+      Stop-Process -Id $managed.ProcessId -Force
+      exit 0
+    }
     $connection = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $connection) { exit 0 }
-    $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
-    $command = [string]$process.CommandLine
-    if (-not $command.Contains("cozygateway.mjs") -or -not $command.Contains(" serve ") -or -not $command.Contains($env:COZYGATEWAY_EXPECTED_CONFIG)) { exit 42 }
-    Stop-Process -Id $process.ProcessId -Force
+    if ($null -ne $connection) { exit 42 }
+    exit 3
   ' >/dev/null 2>&1
   code=$?
   set -e
-  [ "$code" -eq 0 ] || die "port $expected_port is owned by a process this installer cannot safely stop"
+  [ "$code" -eq 3 ] && return 1
+  [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
   for _ in $(seq 1 10); do gateway_ready || return 0; sleep 1; done
   die "the previous CozyGateway process stayed listening on port $PORT"
 }
@@ -561,8 +599,7 @@ install_windows_service() {
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
   fi
-  if gateway_ready; then
-    stop_owned_windows_gateway
+  if stop_owned_windows_gateway; then
     say "OK    stopped the previous CozyGateway process for an in-place update"
   fi
   wscript.exe "$vbs_native"
@@ -710,15 +747,15 @@ uninstall() {
     else
       MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
       rm -f "$startup_entry"
-      gateway_ready && stop_owned_windows_gateway
+      stop_owned_windows_gateway || true
     fi
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-    else launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; fi
+    else launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli; fi
   else
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "$HOME/.config/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
-    else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "$HOME/.config/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; fi
+    else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "$HOME/.config/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
   fi
   IFS=',' read -r -a SELECTED <<<"$profiles"; HERMES_ROOT="$root"
   for p in "${SELECTED[@]}"; do
@@ -754,15 +791,15 @@ status_install() {
   [ "$persisted" = 1 ] && [ "$live" = 1 ]
 }
 main() {
-  NODE_RESOLVED="$(resolve_node)"; hydrate_listener_settings; validate_listener_settings
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
+  NODE_RESOLVED="$(resolve_node)"; hydrate_listener_settings; validate_listener_settings
   if [ "$STATUS" = 1 ]; then status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
   have "$HERMES_BIN" || die "Hermes must already be installed"; HERMES_RESOLVED="$(resolve_hermes)"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; mkdir -p "$LOCAL_DIR"; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
-  write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready
+  write_gateway_config; write_cli_wrapper; is_windows || install_posix_cli; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   say "OK    CozyGateway listens on $BIND_HOST:$PORT. Remote exposure is user-managed."
   # The finale: mint a pairing code and print the QR so install -> scan -> chatting needs no

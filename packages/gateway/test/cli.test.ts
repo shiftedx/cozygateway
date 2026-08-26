@@ -4,8 +4,10 @@ import { dirname, join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { runCli } from "../src/cli.ts";
+import { isGatewayReady, runCli } from "../src/cli.ts";
+import { startGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
+import { generateSelfSigned } from "./helpers/self-signed.ts";
 
 function scriptedIo(answers: string[]) {
   return {
@@ -98,6 +100,11 @@ describe("cozygateway pair", () => {
     expect((await pairPayload(configPath)).gatewayUrl).toMatch(/^http:\/\//);
   });
 
+  it("brackets an IPv6 listener in the pairing URL", async () => {
+    const { configPath } = tempConfig({ host: "::1" });
+    expect((await pairPayload(configPath)).gatewayUrl).toBe("http://[::1]:18787");
+  });
+
   it("advertises an https gatewayUrl when the gateway serves TLS", async () => {
     // The pairing payload is what the phone dials. If the gateway terminates TLS and the payload
     // still says http, every scan pairs against a port that is not speaking plaintext.
@@ -180,6 +187,47 @@ describe("cozygateway pair finale", () => {
 });
 
 describe("cozygateway terminal menu", () => {
+  it("requires zero dead letters before a managed listener is ready", () => {
+    expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 1 } })).toBe(false);
+    expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 0 } })).toBe(true);
+  });
+
+  it("reports a local self-signed TLS gateway online", async () => {
+    const pair = generateSelfSigned();
+    const { configPath, dbPath } = tempConfig();
+    process.env.TEST_HERMES_CONTROL_TOKEN = "control-secret";
+    process.env.TEST_ATTACH_TOKEN = "attach-secret";
+    const gateway = await startGateway({
+      name: "tls-status",
+      host: "127.0.0.1",
+      port: 0,
+      dbPath,
+      turnTimeoutSeconds: 30,
+      hermes: {
+        url: "ws://127.0.0.1:1/api/ws",
+        tokenEnv: "TEST_HERMES_CONTROL_TOKEN",
+        profiles: { sage: { tokenEnv: "TEST_ATTACH_TOKEN" } },
+      },
+      tls: { certFile: pair.certFile, keyFile: pair.keyFile },
+    });
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    config.port = Number(new URL(gateway.url).port);
+    config.host = "127.0.0.1";
+    config.tls = { certFile: pair.certFile, keyFile: pair.keyFile };
+    writeFileSync(configPath, JSON.stringify(config));
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+    try {
+      expect(await runCli(["status", "--config", configPath])).toBe(0);
+    } finally {
+      vi.restoreAllMocks();
+      await gateway.close();
+      delete process.env.TEST_HERMES_CONTROL_TOKEN;
+      delete process.env.TEST_ATTACH_TOKEN;
+    }
+    expect(lines.join("\n")).toMatch(/Status:\s+online/);
+  });
+
   it("opens the basic menu when no command is supplied", async () => {
     const { configPath } = tempConfig({ host: "0.0.0.0", port: 18787 });
     const lines: string[] = [];

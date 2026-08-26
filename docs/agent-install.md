@@ -62,6 +62,10 @@ the `{"gatewayUrl":...,"setupCode":...}` payload from contract section 4; the
 URL prefers the machine's LAN address over loopback. Codes expire after 10
 minutes; mint another with `~/.cozygateway/bin/cozygateway pair`, or
 `pair --url https://...` for a remote origin such as a Tailscale hostname.
+IPv6 listener addresses are bracketed in generated URLs. With gateway-native
+TLS, configuration keeps the existing HTTPS hostname so Hermes validates the
+certificate name; private certificate authorities still use
+`COZYGATEWAY_CA_FILE`.
 
 The default listener is `0.0.0.0:8787` for local/LAN use. Network reachability
 outside the machine is deliberately not automated; see `docs/connectivity.md`.
@@ -77,6 +81,7 @@ custom listener unless an explicit installer host or port option replaces it.
 LAN-only bind addresses are used consistently for local Hermes attachment and
 health checks. If a managed listener replacement cannot become ready, the CLI
 restores the previous working listener automatically.
+Readiness requires every configured attach profile online and zero dead letters.
 The non-interactive `cozygateway status`, `cozygateway pair`, and
 `cozygateway configure` commands expose the same focused operations directly.
 
@@ -84,3 +89,8 @@ On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the
 current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
 when policy blocks task registration. Phone-created bot auto-provisioning is not
 part of the Windows installer.
+
+Uninstall is deliberately independent of model selection, downloads, Node, and
+listener-config parsing, so a damaged install remains removable. On macOS and
+Linux the installer also exposes `cozygateway` through `~/.local/bin` in new
+terminal sessions; uninstall removes only its own command entry and profile line.

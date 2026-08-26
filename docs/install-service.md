@@ -13,6 +13,8 @@ a secret. The service starts or reuses the loopback Hermes Dashboard as the
 control/read plane. Each selected Hermes profile gateway is restarted, started,
 or installed as needed so its attach plugin is operational. Hermes keeps
 ownership of those services; uninstall reverses only lifecycle work it caused.
+It also makes `cozygateway` available in new terminal sessions without a global
+package installation.
 
 The gateway listens on `0.0.0.0:8787` by default, allowing local/LAN access.
 Change it with `--bind-host` or `--port` when installing. The attached Hermes
