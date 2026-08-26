@@ -5,12 +5,30 @@ import { applyEnvOverrides, loadConfig } from "./config.ts";
 import { openStorage } from "./storage.ts";
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
+import { primaryLanAddress } from "./lan.ts";
+import { QrCapacityError, encodeQr, renderQrHalfBlocks } from "./qr.ts";
 import { gatewayScheme } from "./tls.ts";
 
 const USAGE = `usage: cozygateway <serve|pair> --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
 
+/** The host a phone should dial. An explicit configured host (loopback included) is advertised
+ *  verbatim: it is where the gateway actually answers. A wildcard or absent host listens on
+ *  every interface, so the payload prefers the machine's LAN address; `127.0.0.1` would send
+ *  every scan at the phone itself. Loopback remains the honest fallback on a machine with no
+ *  external interface at all. */
+function pairingHost(config: ReturnType<typeof loadConfig>): string {
+  const host = config.host;
+  if (host !== undefined && host !== "0.0.0.0" && host !== "::") return host;
+  return primaryLanAddress() ?? "127.0.0.1";
+}
+
+function isLoopbackUrl(url: string): boolean {
+  const hostname = new URL(url).hostname;
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
+}
+
 function pairingUrl(config: ReturnType<typeof loadConfig>, advertised: string | undefined): string {
-  if (advertised === undefined) return `${gatewayScheme(config)}://127.0.0.1:${config.port}`;
+  if (advertised === undefined) return `${gatewayScheme(config)}://${pairingHost(config)}:${config.port}`;
   const url = new URL(advertised);
   if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username !== "" || url.password !== "") {
     throw new Error("--url must be an http(s) gateway origin without credentials");
@@ -78,8 +96,26 @@ export async function runCli(argv: string[]): Promise<number> {
     // plaintext. Derived without opening the cert files, since `pair` binds no listener; a broken
     // pair is `serve`'s to shout about.
     const payload = { gatewayUrl: pairingUrl(config, values.url), setupCode: code };
-    console.log(JSON.stringify(payload));
-    console.log(`Setup code ${code} is valid for ${describeTtl(ttlMs)}. Scan or type it in the app.`);
+    const payloadJson = JSON.stringify(payload);
+    // The QR encodes the payload JSON byte for byte: that raw string is what CozyChat's scanner
+    // decodes. It is sugar on top of the plain text below; the URL and code are the guarantee,
+    // so a payload too large to encode (or any renderer surprise) never fails the mint.
+    try {
+      console.log(renderQrHalfBlocks(encodeQr(payloadJson), { color: process.stdout.isTTY === true }));
+    } catch (err) {
+      if (!(err instanceof QrCapacityError)) throw err;
+      console.log("QR omitted: the pairing payload is too large to encode. Use the URL and code below.");
+    }
+    console.log(payloadJson);
+    console.log(`Gateway URL: ${payload.gatewayUrl}`);
+    console.log(`Setup code:  ${code}`);
+    console.log("Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.");
+    console.log(`Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`);
+    if (isLoopbackUrl(payload.gatewayUrl)) {
+      console.log(
+        "This URL is loopback, so only this machine can reach it. Remote access (Tailscale and friends) is documented at https://cozylabs.ai.",
+      );
+    }
     return 0;
   }
 

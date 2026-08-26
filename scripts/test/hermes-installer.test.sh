@@ -68,7 +68,10 @@ if (args[0] === 'pair') {
   if (!existsSync(config)) process.exit(2);
   const urlAt = args.indexOf('--url');
   const gatewayUrl = urlAt === -1 ? 'http://127.0.0.1:8787' : args[urlAt + 1];
+  process.stdout.write('█▀▀▀▀▀█ fake-qr █▀▀▀▀▀█\n');
   process.stdout.write(JSON.stringify({ gatewayUrl, setupCode: 'TEST-CODE' }) + '\n');
+  process.stdout.write('Gateway URL: ' + gatewayUrl + '\n');
+  process.stdout.write('Setup code:  TEST-CODE\n');
 }
 BUNDLE
 
@@ -77,6 +80,7 @@ for platform in Darwin Linux; do
   grep -q 'Profiles: default active ops' <<<"$output"
   grep -q "one CozyGateway $platform service" <<<"$output"
   grep -q 'Hermes Dashboard as local control plane' <<<"$output"
+  grep -q 'mint pairing code and QR' <<<"$output"
   grep -Fq "$tmp/gateway-$platform/bin/cozygateway pair --url https://gateway.example.com" <<<"$output"
   grep -Fq "gateway install --start-now --start-on-login" <<<"$output"
   grep -Fq "gateway start" <<<"$output"
@@ -108,6 +112,10 @@ if grep -Fq 'spaces $dollar' <<<"$live_output"; then
   echo 'installer output must not contain credentials' >&2
   exit 1
 fi
+# The install finishes on the pairing finale: QR, payload JSON, and the re-mint one-liner.
+grep -Fq 'fake-qr' <<<"$live_output"
+grep -Fq '"setupCode":"TEST-CODE"' <<<"$live_output"
+grep -Fq "mint a fresh QR and code with: $tmp/gateway-live/bin/cozygateway pair" <<<"$live_output"
 grep -q '"profiles"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
 mode_of() {
@@ -157,7 +165,10 @@ fi
 default_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 ops_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 install_count_before="$(grep -c '^default:gateway:install$' "$tmp/commands")"
-PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" >/dev/null
+rerun_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+# Rerunning on an installed gateway still lands on the pairing finale with a minted code.
+grep -Fq 'fake-qr' <<<"$rerun_output"
+grep -Fq '"setupCode":"TEST-CODE"' <<<"$rerun_output"
 test "$default_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 test "$ops_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 test "$install_count_before" = "$(grep -c '^default:gateway:install$' "$tmp/commands")"
