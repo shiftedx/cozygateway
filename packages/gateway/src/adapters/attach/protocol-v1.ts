@@ -213,6 +213,13 @@ const DelegationEvent = Type.Object({
   toolCount: Type.Optional(Type.Integer({ minimum: 0 })),
   /** MILLISECONDS, plugin clock: when the child last showed observable activity. */
   lastActiveAt: Type.Integer({ minimum: 0 }),
+  /** Canonical Hermes delegation id (`deleg_...`) for the WHOLE batch, once the plugin has
+   * learned it from the structured `delegation_id` field of the parent `delegate_task`
+   * result. Batch-level: identical on every child event that carries it, and typically
+   * present only from the finish legs onward (async spawn legs precede the tool result).
+   * It never replaces (batchId, childId) as identity -- it exists so clients can reconcile
+   * the live card with Hermes's "[ASYNC DELEGATION BATCH COMPLETE - <deleg_id>]" row. */
+  aliasId: Type.Optional(Id),
 });
 /** EPHEMERAL rolling reasoning preview behind the turn's thinking shimmer (capability
  * `thinking`). A deliberate, bounded reopening of the closed no-reasoning rule below: reasoning

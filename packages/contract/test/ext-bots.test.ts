@@ -736,6 +736,22 @@ describe("delegation activity (capability 34)", () => {
       startedAt: 1_800_000_000_000, endedAt: 1_800_000_002_000, children: [child],
     })).toBe(true);
   });
+
+  it("carries the canonical Hermes alias as an optional batch-level field only", () => {
+    // `aliasId` is the canonical `deleg_...` id learned from the delegate_task result; it
+    // rides the frame and history batch so clients can reconcile the async completion row
+    // when the exact `batchId` match fails. Additive under capability 34.
+    expect(check(BotDelegationActivityFrameSchema, { ...frame, aliasId: "deleg_c6eb9310" })).toBe(true);
+    expect(check(ServerFrameSchema, { ...frame, aliasId: "deleg_c6eb9310" })).toBe(true);
+    expect(check(BotTurnDelegationsSchema, {
+      turnId: frame.turnId, batchId: "call-1", aliasId: "deleg_c6eb9310", count: 5,
+      startedAt: 1_800_000_000_000, children: [child],
+    })).toBe(true);
+    // Alias-absent frames stay exactly as they were (an older gateway never sends it).
+    expect(check(BotDelegationActivityFrameSchema, frame)).toBe(true);
+    // Batch-level, never child-level: the child property set is the privacy contract.
+    expect(BotDelegationChildSchema.properties).not.toHaveProperty("aliasId");
+  });
 });
 
 describe("thinking preview (capability 35)", () => {

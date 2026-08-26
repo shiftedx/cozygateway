@@ -1842,6 +1842,7 @@ class AttachAdapter:
                 label=payload.get("label"),
                 tool_count=payload.get("tool_count"),
                 last_active_at=payload.get("last_active_at"),
+                alias_id=payload.get("alias_id"),
             )
         except Exception:  # noqa: BLE001 - a card is presentation-only
             logger.debug("attach: delegation event emit failed", exc_info=True)
@@ -2731,6 +2732,13 @@ def _post_tool_call(**kwargs: Any) -> None:
         if tool_name == "send_message":
             _CURRENT_TOOL_OCCURRENCE.set(None)
         elif tool_name == "delegate_task":
+            try:
+                _record_delegation_alias(
+                    _tool_call_id(kwargs),
+                    _delegation_alias_from_result(kwargs.get("result")),
+                )
+            except Exception:  # noqa: BLE001 - an alias must never crash the tool loop
+                logger.debug("attach: delegation alias capture failed", exc_info=True)
             _CURRENT_DELEGATION_CALL.set(None)
 
 
@@ -2762,6 +2770,10 @@ class _DelegationBatch:
 
     chat_id: str
     batch_id: str
+    #: Canonical Hermes delegation id (``deleg_...``) once learned from the parent
+    #: ``delegate_task`` result; batch-level, keep-first, rides subsequent frames as
+    #: ``aliasId`` so clients can reconcile the async completion row.
+    alias_id: Optional[str] = None
     #: child session id -> stable batch index, in spawn order.
     indices: Dict[str, int] = field(default_factory=dict)
 
@@ -2774,6 +2786,71 @@ _DELEGATION_BATCHES: "OrderedDict[str, _DelegationBatch]" = OrderedDict()
 _DELEGATION_PARENT_LATEST: Dict[str, str] = {}
 _DELEGATION_BATCHES_LOCK = threading.Lock()
 _DELEGATION_BATCHES_MAX = 32
+
+#: call id -> alias captured by ``_post_tool_call`` before any lifecycle leg created the
+#: batch. Defensive only: async spawn legs run INSIDE the ``delegate_task`` call, so the
+#: batch normally exists first. Bounded oldest-first, same price policy as the batches map.
+_DELEGATION_PENDING_ALIASES: "OrderedDict[str, str]" = OrderedDict()
+_DELEGATION_PENDING_ALIASES_MAX = 32
+
+#: The shape Hermes mints (``tools/delegation_live_log.py::new_live_delegation_id``:
+#: ``deleg_`` + 8 hex chars); bounded loosely so a longer future id still matches.
+_DELEGATION_ALIAS_RE = re.compile(r"^deleg_[A-Za-z0-9]{4,64}$")
+#: EXPLICIT documented fallback: the live-transcript directory segment
+#: ``.../delegation/live/<deleg_id>/task-<n>.log`` returned in ``live_transcripts``
+#: (``tools/delegation_live_log.py`` names the directory with the batch's delegation id).
+#: A path-segment extraction, never free-text prose parsing.
+_DELEGATION_LIVE_PATH_RE = re.compile(r"/delegation/live/(deleg_[A-Za-z0-9]+)/")
+
+
+def _delegation_alias_from_result(result: Any) -> Optional[str]:
+    """The canonical delegation id from a ``delegate_task`` result, or None.
+
+    Hermes returns the tool result as one JSON object string; the async
+    "dispatched" payload carries a structured top-level ``delegation_id``
+    (``tools/delegate_tool.py``) that matches ``cache/delegation/live/<id>/``.
+    Fallback: the id segment of a ``live_transcripts`` path (see
+    ``_DELEGATION_LIVE_PATH_RE``). An older result shape yields None and the
+    batch simply has no alias -- everything else keeps working.
+    """
+    payload: Any = result
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            payload = json.loads(text)
+        except Exception:  # noqa: BLE001 - an unparseable result means no alias
+            return None
+    if not isinstance(payload, dict):
+        return None
+    alias = payload.get("delegation_id")
+    if isinstance(alias, str) and _DELEGATION_ALIAS_RE.match(alias):
+        return alias
+    transcripts = payload.get("live_transcripts")
+    if isinstance(transcripts, list):
+        for path in transcripts:
+            if not isinstance(path, str):
+                continue
+            match = _DELEGATION_LIVE_PATH_RE.search(path.replace("\\", "/"))
+            if match:
+                return match.group(1)
+    return None
+
+
+def _record_delegation_alias(call_id: Optional[str], alias: Optional[str]) -> None:
+    """Attach ``alias`` to the batch for ``call_id`` (or park it for a late batch)."""
+    if not call_id or not alias:
+        return
+    with _DELEGATION_BATCHES_LOCK:
+        batch = _DELEGATION_BATCHES.get(call_id)
+        if batch is not None:
+            if batch.alias_id is None:
+                batch.alias_id = alias
+            return
+        _DELEGATION_PENDING_ALIASES[call_id] = alias
+        while len(_DELEGATION_PENDING_ALIASES) > _DELEGATION_PENDING_ALIASES_MAX:
+            _DELEGATION_PENDING_ALIASES.popitem(last=False)
 
 #: Hermes child result statuses -> the closed wire vocabulary. ``cancelled`` renders as
 #: ``interrupted`` (the vocabulary is closed and the user asked for the stop). An unrecognized
@@ -2814,7 +2891,11 @@ def _delegation_batch_for(
         batch_id = call_id or "deleg-{:x}-{:06x}".format(
             int(time.time() * 1000), random.getrandbits(24)
         )
-        batch = _DelegationBatch(chat_id=chat_id, batch_id=batch_id)
+        batch = _DelegationBatch(
+            chat_id=chat_id,
+            batch_id=batch_id,
+            alias_id=_DELEGATION_PENDING_ALIASES.pop(batch_id, None),
+        )
         _DELEGATION_BATCHES[batch_id] = batch
         _DELEGATION_PARENT_LATEST[parent_key] = batch_id
         while len(_DELEGATION_BATCHES) > _DELEGATION_BATCHES_MAX:
@@ -2856,6 +2937,7 @@ def _dispatch_delegation_hook(leg: str, kwargs: Dict[str, Any]) -> None:
         with _DELEGATION_BATCHES_LOCK:
             index = batch.indices.setdefault(child_id, len(batch.indices))
             count = len(batch.indices)
+            alias_id = batch.alias_id
         payload: Dict[str, Any] = {
             "batch_id": batch.batch_id,
             "child_id": child_id,
@@ -2863,6 +2945,8 @@ def _dispatch_delegation_hook(leg: str, kwargs: Dict[str, Any]) -> None:
             "count": count,
             "last_active_at": int(time.time() * 1000),
         }
+        if alias_id:
+            payload["alias_id"] = alias_id
         if leg == "start":
             payload["status"] = "running"
             label = _preview(kwargs.get("child_goal"))

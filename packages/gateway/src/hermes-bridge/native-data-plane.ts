@@ -103,6 +103,8 @@ interface ToolFrameState {
 interface DelegationFrameState {
   seq: number;
   count: number;
+  /** Canonical Hermes delegation id (`deleg_...`) once any event carried it; keep-first. */
+  aliasId?: string;
   children: Map<string, BotDelegationChild>;
 }
 
@@ -1346,21 +1348,72 @@ export class NativeBotDataPlane {
       children: new Map<string, BotDelegationChild>(),
     };
     const prior = current.children.get(event.childId);
+    // The batch-level alias (Hermes's canonical `deleg_...` id) rides child events once the
+    // plugin learns it from the parent tool result. Keep-first, and a frame whose only news
+    // is the alias must NOT be dropped as a replay: clients need it to reconcile the batch
+    // with the async completion row.
+    const aliasNew = event.aliasId !== undefined && current.aliasId === undefined;
+    if (aliasNew) current.aliasId = event.aliasId;
     // Attach-v1 is at-least-once: a replayed child state is acknowledged without another
     // SQLite write or rebroadcast, exactly as a replayed tool event is.
     if (
+      !aliasNew &&
       prior !== undefined &&
       prior.status === event.status &&
       prior.currentTool === event.currentTool &&
       prior.toolCount === event.toolCount &&
       prior.lastActiveAt === event.lastActiveAt
-    ) return true;
-    // A live leg replayed AFTER the child settled must not resurrect it.
+    ) {
+      // Cleo diagnostic: an acknowledged TERMINAL event that produces no broadcast is
+      // exactly the shape behind a stuck "working" card -- make it loud in the log.
+      if (DELEGATION_SETTLED.has(event.status))
+        this.#log(
+          `delegation terminal event for "${bot}" acknowledged without broadcast ` +
+            `(batch ${event.batchId}, child ${event.childId}: duplicate settled replay)`,
+        );
+      return true;
+    }
+    // A live leg replayed AFTER the child settled must not resurrect it. A newly learned
+    // alias still lands: persist it and rebroadcast the batch otherwise UNCHANGED.
     if (
       prior !== undefined &&
       DELEGATION_SETTLED.has(prior.status) &&
       !DELEGATION_SETTLED.has(event.status)
-    ) return true;
+    ) {
+      if (aliasNew) {
+        const stampedAt = this.#now();
+        current.seq += 1;
+        batches.set(event.batchId, current);
+        this.#delegationFrames.set(key, batches);
+        this.#storage.upsertBotChatDelegation({
+          bot,
+          sessionId,
+          turnId: event.turnId,
+          batchId: event.batchId,
+          aliasId: current.aliasId,
+          childId: prior.childId,
+          index: prior.index,
+          count: current.count,
+          status: prior.status,
+          lastActiveAt: prior.lastActiveAt,
+          startedAt: prior.startedAt,
+          endedAt: prior.endedAt,
+          label: prior.label,
+          currentTool: prior.currentTool,
+          apiCalls: prior.apiCalls,
+          toolCount: prior.toolCount,
+        });
+        const aliasWire = this.#delegationWire(
+          bot, sessionId, event.turnId, event.batchId, current, stampedAt,
+        );
+        if (live) {
+          this.#coalesceLiveTurn(key, aliasWire, this.#stateFrame(bot, sessionId, "polling", true));
+        } else {
+          this.#broadcast(aliasWire);
+        }
+      }
+      return true;
+    }
     const now = this.#now();
     const label = event.label ?? prior?.label;
     const apiCalls = event.apiCalls ?? prior?.apiCalls;
@@ -1371,7 +1424,7 @@ export class NativeBotDataPlane {
       status: event.status,
       lastActiveAt: event.lastActiveAt,
       startedAt: prior?.startedAt ?? now,
-      ...(DELEGATION_SETTLED.has(event.status) ? { endedAt: now } : {}),
+      ...(DELEGATION_SETTLED.has(event.status) ? { endedAt: prior?.endedAt ?? now } : {}),
       ...(label === undefined ? {} : { label }),
       ...(event.currentTool === undefined ? {} : { currentTool: event.currentTool }),
       ...(apiCalls === undefined ? {} : { apiCalls }),
@@ -1387,6 +1440,7 @@ export class NativeBotDataPlane {
       sessionId,
       turnId: event.turnId,
       batchId: event.batchId,
+      aliasId: current.aliasId,
       childId: child.childId,
       index: child.index,
       count: current.count,
@@ -1427,6 +1481,7 @@ export class NativeBotDataPlane {
       sessionId,
       turnId,
       batchId,
+      ...(state.aliasId === undefined ? {} : { aliasId: state.aliasId }),
       count: state.count,
       children,
       seq: state.seq,
@@ -1447,6 +1502,7 @@ export class NativeBotDataPlane {
         startedAt: row.startedAt,
         children: [],
       };
+      if (batch.aliasId === undefined && row.aliasId !== null) batch.aliasId = row.aliasId;
       batch.count = Math.max(batch.count, row.count);
       batch.startedAt = Math.min(batch.startedAt, row.startedAt);
       batch.children.push(this.#delegationChildFromRow(row));
@@ -1505,6 +1561,7 @@ export class NativeBotDataPlane {
         };
         current.children.set(row.childId, this.#delegationChildFromRow(row));
         current.count = Math.max(current.count, row.count, current.children.size);
+        if (current.aliasId === undefined && row.aliasId !== null) current.aliasId = row.aliasId;
         batches.set(row.batchId, current);
         this.#delegationFrames.set(key, batches);
       }
@@ -1554,6 +1611,7 @@ export class NativeBotDataPlane {
           sessionId,
           turnId,
           batchId,
+          aliasId: state.aliasId,
           childId,
           index: settled.index,
           count: state.count,

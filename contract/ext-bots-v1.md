@@ -456,6 +456,14 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   `unknown` -- never `failed`. Active and past batches also ride chat history as the optional
   `delegations` array, so reconnect does not erase a live card, and `batchId` keys client
   reconciliation with the terminal "[ASYNC DELEGATION BATCH COMPLETE ...]" transcript row.
+  When the attach plugin learns the canonical Hermes delegation id (`deleg_...`) from the
+  structured `delegation_id` field of the parent `delegate_task` result, the snapshot frame
+  and each history batch carry it as an optional batch-level `aliasId`. Identity stays
+  (`batchId`, `childId`); a client whose exact-`batchId` reconciliation of that completion
+  row fails falls back to matching the row's `deleg_...` id against `aliasId`. The alias
+  typically appears from the batch's terminal legs onward (async spawn legs precede the tool
+  result) and may be absent entirely under an older Hermes. Additive under capability 34: a
+  below-capability or alias-unaware client ignores it.
 - `bot_thinking_activity` (capability 35): latest-only sanitized preview of the bot's live
   reasoning for one native turn, shown in the thinking shimmer. `text` is a tail-truncated
   <=280-char display string (schema-enforced); `seq` is monotonic within `turnId` and a

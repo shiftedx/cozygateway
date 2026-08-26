@@ -151,6 +151,21 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_counts_at_ready, [1])
         self.assertEqual(self.socket.sent[-1]["kind"], "event")
 
+    async def test_send_delegation_carries_optional_alias_id(self):
+        await self.client.send_delegation(
+            "thread", "turn", "call_d3R3", "sa-0", index=0, count=1,
+            status="succeeded", last_active_at=6, alias_id="deleg_c6eb9310",
+        )
+        await self.client.send_delegation(
+            "thread", "turn", "call_d3R3", "sa-1", index=1, count=2,
+            status="running", last_active_at=7,
+        )
+        events = [frame["event"] for frame in self.spool.pending_events(10, 100_000)]
+        self.assertEqual(events[0]["aliasId"], "deleg_c6eb9310")
+        self.assertEqual(events[0]["batchId"], "call_d3R3")
+        # Alias-absent events keep the exact historical shape.
+        self.assertNotIn("aliasId", events[1])
+
     async def test_repeated_draft_snapshot_emits_only_tool_lifecycle_changes(self):
         chip = ToolChip(id="call-1", name="search", status="running")
 

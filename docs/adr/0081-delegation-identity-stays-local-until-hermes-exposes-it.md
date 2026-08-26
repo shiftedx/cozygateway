@@ -35,3 +35,18 @@ event, tool_name, status, api_calls, tool_count, last_active_at}`), so platform
 plugins can render live batch cards without consuming the UI-scoped progress
 callback or reading transcripts. When that lands, `batchId` becomes
 `delegation_id` behind the same opaque contract and this ADR is superseded.
+
+## Addendum (2026-08-25): batch-level alias from the tool result
+
+The lifecycle hooks still expose no delegation id, so `batchId` stays the parent
+tool-call id. But the parent `delegate_task` RESULT is a documented structured
+payload: its async "dispatched" shape carries a top-level `delegation_id`
+(`tools/delegate_tool.py`) matching `cache/delegation/live/<id>/`. The plugin now
+captures that field in `post_tool_call` -- with the `live_transcripts` path
+segment `.../delegation/live/<deleg_id>/...` as an explicit documented fallback,
+never prose parsing -- and emits it as an optional batch-level `aliasId` on the
+batch's subsequent delegation events, so clients can reconcile the live card with
+Hermes's `[ASYNC DELEGATION BATCH COMPLETE - <deleg_id>]` completion row.
+Identity is unchanged (`batchId`, `childId`); this is neither the rejected Hermes
+patch nor the rejected prose parsing, and when the upstream ask lands `aliasId`
+becomes redundant.
