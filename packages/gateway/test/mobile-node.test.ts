@@ -24,6 +24,13 @@ function leaseFor(send: ReturnType<typeof vi.fn>, requestId: string): string {
   return frame.lease;
 }
 
+/** The command-specific half of a P1 invocation, named so a literal cannot widen into a union
+ *  carrying optional-undefined members that the discriminated invocation type will not accept. */
+type P1RequestShape =
+  | { command: "camera.capture"; camera: "front" | "rear"; capture: "photo" | "video"; videoDurationSeconds: 10 }
+  | { command: "file.pick"; selection: "photo" | "file" }
+  | { command: "notification.present"; title: string; body: string };
+
 describe("MobileNodeBroker", () => {
   it("settles successful P1 media exactly once and rechecks expiry and foreground during upload", () => {
     vi.useFakeTimers();
@@ -33,7 +40,7 @@ describe("MobileNodeBroker", () => {
       let foreground = true;
       const route = () => ({ status: "available" as const, selectedSocketPresent: true, selectedSocketOpen: true, commandAdvertised: true, connectedSocketCount: 1, foreground });
       const broker = new MobileNodeBroker({ route, send, result, receipt, now: () => now });
-      const requests = [
+      const requests: P1RequestShape[] = [
         { command: "camera.capture" as const, camera: "rear" as const, capture: "photo" as const, videoDurationSeconds: 10 },
         { command: "file.pick" as const, selection: "file" as const },
         { command: "notification.present" as const, title: "Cozy", body: "Approve?" },
@@ -76,9 +83,9 @@ describe("MobileNodeBroker", () => {
     const send = vi.fn(() => true), result = vi.fn();
     const route = () => ({ status: "available" as const, selectedSocketPresent: true, selectedSocketOpen: true, commandAdvertised: true, connectedSocketCount: 1, foreground: true });
     const broker = new MobileNodeBroker({ route, send, result, receipt: () => true, now: () => now });
-    const request = command === "camera.capture"
-      ? { command, camera: "rear" as const, capture: "photo" as const, videoDurationSeconds: 10 }
-      : command === "file.pick" ? { command, selection: "file" as const }
+    const request: P1RequestShape = command === "camera.capture"
+      ? { command, camera: "rear", capture: "photo", videoDurationSeconds: 10 }
+      : command === "file.pick" ? { command, selection: "file" }
       : { command, title: "Cozy", body: "Approve?" };
     const base = { ...request, bot: "sage", threadId: "thread", turnId: "turn", purpose, deviceId: "origin", agentId: "sage", expiresAt: 2_000 };
     broker.invoke({ ...base, requestId: "one" });
