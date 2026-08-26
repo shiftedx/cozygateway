@@ -767,6 +767,27 @@ class MediaUploadService:
         return _media_failure(path, descriptor, status, detail, media_id)
 
 
+def _profile_from_hermes_home() -> str:
+    """The profile this process IS, when nothing configured it.
+
+    Neither `plugins.entries.cozygateway.config.profile` nor `HERMES_PROFILE` is set in a normal
+    per-profile install, so the adapter used to hold an empty profile and stamp nothing on the
+    inbound source. The live-turn gate then read an empty profile and refused every phone-node
+    call with `profile_mismatch` (observed 2026-08-26). A per-profile Hermes runs with
+    `HERMES_HOME=<...>/profiles/<name>`, so the process already knows its own name; deriving it
+    here means a new bot needs no extra configuration to use its phone as a node.
+
+    Returns "" when the home is absent or is not a profile directory (the default profile, a test
+    harness), which leaves the gate exactly as fail-closed as it was.
+    """
+    home = (os.getenv("HERMES_HOME") or "").strip()
+    if not home:
+        return ""
+    path = os.path.normpath(home)
+    parent, name = os.path.split(path)
+    return name if os.path.basename(parent) == "profiles" and name else ""
+
+
 class AttachAdapter:
     """The platform methods, mixed into a concrete adapter subclass by the factory.
 
@@ -795,7 +816,10 @@ class AttachAdapter:
         ).rstrip("/")
         # The attach bearer token. Header-only; never logged, never in a URL.
         self.token: str = os.getenv("COZYGATEWAY_TOKEN") or extra.get("token", "")
-        self._profile: str = str(extra.get("profile") or os.getenv("HERMES_PROFILE") or "").strip()
+        self._profile: str = (
+            str(extra.get("profile") or os.getenv("HERMES_PROFILE") or "").strip()
+            or _profile_from_hermes_home()
+        )
         self.ca_file: Optional[str] = (
             os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None
         )
