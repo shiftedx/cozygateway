@@ -118,3 +118,55 @@ describe("cozygateway pair", () => {
     expect(errors.join("\n")).toContain("usage");
   });
 });
+
+describe("cozygateway pair finale", () => {
+  async function pairLines(configPath: string, extraArgs: string[] = []): Promise<string[]> {
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => lines.push(String(line)));
+    const exitCode = await runCli(["pair", "--config", configPath, ...extraArgs]);
+    vi.restoreAllMocks();
+    expect(exitCode).toBe(0);
+    return lines;
+  }
+
+  it("prints the QR block, the exact payload JSON, and the labeled URL and code", async () => {
+    const { configPath } = tempConfig();
+    const lines = await pairLines(configPath);
+    const payloadLine = lines.find((l) => l.startsWith("{"));
+    expect(payloadLine).toBeDefined();
+    const payload = JSON.parse(payloadLine ?? "{}") as { gatewayUrl: string; setupCode: string };
+    // Byte-shaped like the contract example: gatewayUrl first, setupCode second, nothing else.
+    expect(payloadLine).toBe(`{"gatewayUrl":"${payload.gatewayUrl}","setupCode":"${payload.setupCode}"}`);
+    const qrBlock = lines.find((l) => l.includes("█"));
+    expect(qrBlock).toBeDefined();
+    expect((qrBlock ?? "").split("\n").length).toBeGreaterThan(10);
+    expect(lines).toContain(`Gateway URL: ${payload.gatewayUrl}`);
+    expect(lines).toContain(`Setup code:  ${payload.setupCode}`);
+    expect(lines.some((l) => l.includes("Mint a fresh one with: cozygateway pair"))).toBe(true);
+  });
+
+  it("advertises an explicitly configured loopback host verbatim and says it is loopback", async () => {
+    const { configPath } = tempConfig({ host: "127.0.0.1" });
+    const lines = await pairLines(configPath);
+    const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as { gatewayUrl: string };
+    expect(payload.gatewayUrl).toBe("http://127.0.0.1:18787");
+    expect(lines.some((l) => l.includes("only this machine can reach it"))).toBe(true);
+  });
+
+  it("prefers the machine's LAN address over loopback for a wildcard bind", async () => {
+    const { primaryLanAddress } = await import("../src/lan.ts");
+    const expectedHost = primaryLanAddress() ?? "127.0.0.1";
+    const { configPath } = tempConfig({ host: "0.0.0.0" });
+    const lines = await pairLines(configPath);
+    const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as { gatewayUrl: string };
+    expect(payload.gatewayUrl).toBe(`http://${expectedHost}:18787`);
+  });
+
+  it("keeps the loopback note off an externally reachable URL", async () => {
+    const { configPath } = tempConfig();
+    const lines = await pairLines(configPath, ["--url", "https://gateway.example.com"]);
+    const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as { gatewayUrl: string };
+    expect(payload.gatewayUrl).toBe("https://gateway.example.com");
+    expect(lines.some((l) => l.includes("only this machine can reach it"))).toBe(false);
+  });
+});

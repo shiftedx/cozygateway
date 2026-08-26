@@ -41,5 +41,13 @@ curl -fsSL https://cozylabs.ai/install.sh | bash
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
 
+The install (and every re-run) finishes by minting a pairing code and printing
+a terminal QR plus the gateway URL and setup code in plain text, so a fresh
+device goes install, scan, chatting with no further commands. The QR encodes
+the `{"gatewayUrl":...,"setupCode":...}` payload from contract section 4; the
+URL prefers the machine's LAN address over loopback. Codes expire after 10
+minutes; mint another with `~/.cozygateway/bin/cozygateway pair`, or
+`pair --url https://...` for a remote origin such as a Tailscale hostname.
+
 The default listener is `0.0.0.0:8787` for local/LAN use. Network reachability
 outside the machine is deliberately not automated; see `docs/connectivity.md`.

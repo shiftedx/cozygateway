@@ -484,8 +484,11 @@ main() {
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; mkdir -p "$LOCAL_DIR"; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   write_gateway_config; ensure_hermes_gateways; write_state; write_cli_wrapper; start_dashboard; install_service
-  if [ "$DRY_RUN" = 0 ]; then "$CLI_WRAPPER" pair --config "$CONFIG_JSON"; else say "DRY   mint pairing code with $CLI_WRAPPER pair"; fi
   say "OK    CozyGateway listens on $BIND_HOST:$PORT. Remote exposure is user-managed."
+  # The finale: mint a pairing code and print the QR so install -> scan -> chatting needs no
+  # further commands. A rerun on an installed gateway lands here too, with a fresh code.
+  if [ "$DRY_RUN" = 0 ]; then "$CLI_WRAPPER" pair --config "$CONFIG_JSON"; else say "DRY   mint pairing code and QR with $CLI_WRAPPER pair"; fi
+  say "INFO  codes expire after 10 minutes; mint a fresh QR and code with: $CLI_WRAPPER pair"
   say "INFO  pair a remote URL with: $CLI_WRAPPER pair --url https://gateway.example.com"
 }
 main
