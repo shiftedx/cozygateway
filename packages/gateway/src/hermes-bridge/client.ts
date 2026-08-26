@@ -209,7 +209,7 @@ export interface HermesClient {
   request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   /** Calls the authenticated dashboard REST surface on the same Hermes connection. `path` is
    *  origin-relative and may include a query string. */
-  dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT"; body?: unknown }): Promise<T>;
+  dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown }): Promise<T>;
   /** Reads one Hermes-host file through the authenticated dashboard. */
   readMediaDataUrl(path: string): Promise<string>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
@@ -584,7 +584,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
   async function dashboardJson<T>(
     path: string,
-    init: { method?: "GET" | "POST" | "PUT"; body?: unknown } = {},
+    init: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown } = {},
   ): Promise<T> {
     let relogged = false;
     const send = async (): Promise<Response> => {

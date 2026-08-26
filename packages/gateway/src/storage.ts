@@ -2886,6 +2886,85 @@ export class Storage {
       .run(bot, bot, NATIVE_INTERACTION_SETTLEMENT_LIMIT);
   }
 
+  /** The bot's live native turn, if any, read WITHOUT the create-if-missing side effect of
+   *  `nativeBotChat`. Deletion asks this question about a bot it is about to remove, so writing a
+   *  fresh chat row for it here would be self-defeating. */
+  nativeBotActiveTurn(bot: string): { sessionId: string; turnId: string } | undefined {
+    const row = this.#db
+      .prepare("SELECT session_id AS sessionId, active_turn_id AS turnId FROM bot_native_chats WHERE bot = ?")
+      .get(bot) as unknown as { sessionId: string; turnId: string | null } | undefined;
+    if (row === undefined || row.turnId === null) return undefined;
+    return { sessionId: row.sessionId, turnId: row.turnId };
+  }
+
+  /** Removes every durable row this gateway holds for one bot, in one transaction: the roster
+   *  cache row, the native chat plane (active pointer, sessions, transcript, receipts, turn media
+   *  bindings, interactions, terminals), tool steps and delegations, routine overrides, the attach
+   *  journals (stream cursors, command outbox, event inbox, turn terminals, media blobs, scheduled
+   *  deliveries), the bot's group-turn tombstones, its Live Activity registrations, and its half
+   *  of the core thread surface (messages, threads, the agent row). Group rooms and their
+   *  membership are deliberately NOT touched: a room is a user-owned resource that may name a
+   *  deleted member, and
+   *  the room surface already renders a missing member honestly.
+   *
+   *  Returns the deleted row count per area (zero-row areas omitted), so the delete route reports
+   *  what it actually removed rather than asserting it. Keys are the stable identifiers
+   *  `BotDeleteResponse.purged` carries on the wire. */
+  purgeBot(bot: string): Record<string, number> {
+    const areas: ReadonlyArray<readonly [area: string, table: string, column: string]> = [
+      ["roster", "bot_roster", "name"],
+      ["toolSteps", "bot_chat_tool_steps", "bot"],
+      ["delegations", "bot_chat_delegations", "bot"],
+      ["routineOverrides", "bot_routine_overrides", "bot"],
+      ["chatPointer", "bot_native_chats", "bot"],
+      ["sessions", "bot_native_sessions", "bot"],
+      ["messages", "bot_native_messages", "bot"],
+      ["receipts", "bot_message_receipts", "bot"],
+      ["turnMediaDeliveries", "bot_turn_media_deliveries", "bot"],
+      ["interactions", "bot_native_interactions", "bot"],
+      ["turnTerminals", "bot_native_turn_terminals", "bot"],
+      ["attachStream", "attach_streams", "agent_id"],
+      ["attachCommands", "attach_command_outbox", "agent_id"],
+      ["attachEvents", "attach_event_inbox", "agent_id"],
+      ["attachTurnTerminals", "attach_turn_terminals", "agent_id"],
+      ["attachMedia", "attach_media", "agent_id"],
+      ["scheduledDeliveries", "attach_scheduled_deliveries", "agent_id"],
+      ["groupTurns", "bot_group_turns", "agent_id"],
+      ["liveActivities", "live_activity_registrations", "bot"],
+    ];
+    const purged: Record<string, number> = {};
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const [area, table, column] of areas) {
+        const changes = Number(
+          this.#db.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(bot).changes,
+        );
+        if (changes > 0) purged[area] = changes;
+      }
+      // The core thread surface is a parent/child chain rather than a flat `WHERE bot = ?`, and
+      // `PRAGMA foreign_keys` is ON, so it goes child-first inside this same transaction. The
+      // `agents` row is config-derived and will be rewritten at the next boot if the operator
+      // never runs the deprovision sweep, which is exactly why that sweep is in the residue list.
+      const core: ReadonlyArray<readonly [area: string, sql: string]> = [
+        [
+          "coreMessages",
+          "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE agent_id = ?)",
+        ],
+        ["coreThreads", "DELETE FROM threads WHERE agent_id = ?"],
+        ["agentRow", "DELETE FROM agents WHERE id = ?"],
+      ];
+      for (const [area, sql] of core) {
+        const changes = Number(this.#db.prepare(sql).run(bot).changes);
+        if (changes > 0) purged[area] = changes;
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    return purged;
+  }
+
   close(): void {
     this.#db.close();
   }

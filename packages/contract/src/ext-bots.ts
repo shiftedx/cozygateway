@@ -79,6 +79,24 @@ export const BotCreateResponseSchema = Type.Object({
 });
 export type BotCreateResponse = Static<typeof BotCreateResponseSchema>;
 
+/** The `DELETE /bots/:name` reply (capability 37). `hermesProfile` says what happened on the
+ * Hermes host: `deleted` when the dashboard removed the profile directory on this call, or
+ * `already_absent` when Hermes no longer had it and only gateway state remained. `purged` counts
+ * the durable gateway rows removed, keyed by stable store-area identifiers (they are wire ids,
+ * not presentation strings; an area with zero rows is omitted). `tokenRevoked` reports whether an
+ * attach identity stopped authenticating as part of this call. `residue` lines are display-safe
+ * operator English naming what this gateway cannot remove from where it runs (the box config
+ * entry, the token env line, the host launchd service) and pointing at the deprovision sweep.
+ * None of the residue can authenticate: the token is already dead gateway-side. */
+export const BotDeleteResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  hermesProfile: Type.Union([Type.Literal("deleted"), Type.Literal("already_absent")]),
+  purged: Type.Record(Type.String(), Type.Integer({ minimum: 0 })),
+  tokenRevoked: Type.Boolean(),
+  residue: Type.Array(Type.String({ minLength: 1, maxLength: 400 }), { maxItems: 16 }),
+});
+export type BotDeleteResponse = Static<typeof BotDeleteResponseSchema>;
+
 /** Gateway-owned attach-v1 Bot Mode sessions are conversations. */
 export const BotSessionKindSchema = Type.Literal("conversation");
 export type BotSessionKind = Static<typeof BotSessionKindSchema>;
@@ -1480,4 +1498,10 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  *  dropping the rows. Additive exactly as 33 was: a client below 36 ignores the unknown field
  *  and marker; a client that renders the providers summary or disabled entries gates on
  *  `>= 36`. */
-export const BOTS_CAPABILITY_VERSION = 36;
+/** Capability 37: BOT DELETION. `DELETE /bots/:name` is the inverse of `POST /bots`: the Hermes
+ *  profile directory is removed through the dashboard (config, API keys, memories, sessions,
+ *  skills, cron, the synced plugin and its .env), every durable gateway row the bot owned is
+ *  purged, and the attach identity stops authenticating immediately. A running native turn
+ *  refuses the delete with `409` extension code `conflict` (the body carries `turnId`) unless
+ *  `?force=1`. Additive exactly as 33 was: a client below 37 simply never calls the route. */
+export const BOTS_CAPABILITY_VERSION = 37;

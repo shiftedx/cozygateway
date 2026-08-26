@@ -3,6 +3,7 @@ import type {
   BotCatalog,
   BotCreateRequest,
   BotCreateResponse,
+  BotDeleteResponse,
   BotChatMessage,
   BotChatStateCause,
   BotChatStatus,
@@ -28,6 +29,7 @@ import type {
   ServerFrame,
 } from "cozygateway-contract";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
+import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import {
   HermesRpcError,
@@ -57,7 +59,15 @@ import { parseChatSnapshot } from "./chat-messages.ts";
 import { inboxMessages as projectInboxMessages, inboxThread } from "./inbox.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
-import { BotNameTaken, BotNotFound, validateNewBotName } from "./crud.ts";
+import {
+  BotNameInvalid,
+  BotNameTaken,
+  BotNotFound,
+  BotTurnActive,
+  RESERVED_PROFILE_NAMES,
+  normalizeProfileName,
+  validateNewBotName,
+} from "./crud.ts";
 import {
   CATALOG_CACHE_MAX,
   CATALOG_DEGRADED_TTL_MS,
@@ -196,6 +206,7 @@ export class BotSessionConflict extends Error {
 export interface BotControlSurface {
   roster(): BotRosterView;
   createBot(input: BotCreateRequest): Promise<BotCreateResponse>;
+  deleteBot(name: string, opts?: { force?: boolean }): Promise<BotDeleteResponse>;
   health(): BridgeLiveness;
   refreshSoon(reason: string): void;
   inbox(name: string): Promise<BotInboxView>;
@@ -333,6 +344,10 @@ export interface HermesBridgeOptions {
     text: string;
   }) => void;
   logSink?: (line: string) => void;
+  /** Kills the bot's attach identity the moment `deleteBot` commits: token map entry, live
+   *  socket, adapter, capability grant. Returns whether an identity was actually held. Wired by
+   *  the server, absent in bridge-only tests. */
+  revokeAttachIdentity?: (name: string) => boolean;
 }
 
 /** Dashboard control/read plane. All Bot Mode conversation traffic is attach-v1. */
@@ -351,6 +366,7 @@ export class HermesBridge implements BotControlSurface {
   readonly #catalogInflight = new Map<string, Promise<BotCatalog>>();
   readonly #catalogTtlMs: number;
   readonly #catalogDegradedTtlMs: number;
+  readonly #revokeAttachIdentity: (name: string) => boolean;
   readonly #chains = new Map<string, Promise<unknown>>();
   readonly #routineWatch = new Map<string, number>();
   readonly #lastRoutines = new Map<string, string>();
@@ -379,6 +395,7 @@ export class HermesBridge implements BotControlSurface {
     this.#catalogTtlMs = opts.catalogTtlMs ?? CATALOG_TTL_MS;
     this.#catalogDegradedTtlMs =
       opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
+    this.#revokeAttachIdentity = opts.revokeAttachIdentity ?? (() => false);
     this.#log =
       opts.logSink ??
       ((line) => void process.stderr.write(`[hermes-bridge] ${line}\n`));
@@ -555,6 +572,68 @@ export class HermesBridge implements BotControlSurface {
     const bot = this.#storage.botRoster().bots.find((row) => row.name === name);
     if (bot === undefined) throw new BotNotFound(name);
     return { bot, ...(warnings.length === 0 ? {} : { warnings }) };
+  }
+  /** The inverse of `createBot`, built for "no traces on the Hermes host": the dashboard's
+   *  `DELETE /api/profiles/:name` removes the whole profile directory (config, API keys,
+   *  memories, sessions, skills, cron, the synced attach plugin and its .env with the tokens),
+   *  and only after that does the gateway purge its own projection and revoke the attach
+   *  identity. Hermes being unreachable is therefore a refusal, never a local-only delete: a
+   *  purge that leaves the profile alive on the host is the opposite of what this route
+   *  promises. Hermes answering 404 with local state still present is the recovery half of the
+   *  same promise: the purge and revocation proceed, reported as `already_absent`. */
+  async deleteBot(name: string, opts: { force?: boolean } = {}): Promise<BotDeleteResponse> {
+    const canon = normalizeProfileName(name);
+    if (RESERVED_PROFILE_NAMES.has(canon))
+      throw new BotNameInvalid(`"${canon}" is reserved and cannot be deleted through this route`);
+    const active = this.#storage.nativeBotActiveTurn(canon);
+    if (active !== undefined && opts.force !== true)
+      throw new BotTurnActive(canon, active.turnId);
+    let hermesProfile: BotDeleteResponse["hermesProfile"];
+    try {
+      await this.#client.dashboardJson(`/api/profiles/${encodeURIComponent(canon)}`, {
+        method: "DELETE",
+      });
+      hermesProfile = "deleted";
+    } catch (error) {
+      if (error instanceof HermesRpcError && error.code === 404) {
+        hermesProfile = "already_absent";
+      } else if (error instanceof HermesRpcError) {
+        // 400 is the dashboard's own refusal (the default-profile guard); anything else is the
+        // backend failing. Either way nothing was deleted anywhere, so nothing is purged here.
+        throw new BackendUnavailable(
+          `hermes refused to delete profile "${canon}": ${error.message}`,
+        );
+      } else {
+        throw new BackendUnavailable(
+          `hermes could not be reached to delete profile "${canon}"; nothing was removed`,
+        );
+      }
+    }
+    // Read BEFORE the purge empties the roster cache: this is the "did the gateway know it"
+    // half of the 404 decision.
+    const known = this.#storage.botRoster().bots.some((bot) => bot.name === canon);
+    // The FIRST mutation once the host has committed, deliberately ahead of the purge: from here
+    // on the bot's token authenticates nothing and its socket is closed, so no connection can
+    // race the sweep and write rows back in behind it. It is not moved ahead of the Hermes call
+    // for the mirror-image reason: a refusal above means nothing was deleted anywhere, and a bot
+    // still alive on its host must keep its identity.
+    const tokenRevoked = this.#revokeAttachIdentity(canon);
+    const purged = this.#storage.purgeBot(canon);
+    if (hermesProfile === "already_absent" && !known && Object.keys(purged).length === 0)
+      throw new BotNotFound(canon);
+    await this.refresh(`bot ${canon} deleted`);
+    return {
+      name: canon,
+      hermesProfile,
+      purged,
+      tokenRevoked,
+      residue: [
+        `the box gateway config still maps hermes.profiles.${canon} to its token env var`,
+        `the box .env still carries this bot's attach token line (it can no longer authenticate)`,
+        `the Hermes host may still have the launchd service ai.hermes.gateway-${canon} installed`,
+        `run scripts/deprovision-bot.sh ${canon} to sweep all of these and restart the box gateway`,
+      ],
+    };
   }
   health(): BridgeLiveness {
     const liveness = this.#client.liveness();

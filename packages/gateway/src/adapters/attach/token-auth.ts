@@ -19,3 +19,17 @@ export function resolveAttachBearer(
   }
   return resolved;
 }
+
+/** Removes every token that resolves to `agentId` from the shared map. Both public attach
+ * surfaces (the WebSocket upgrade and HTTP media) authenticate against this one map, so a deleted
+ * bot's identity stops authenticating the moment this returns, before any sweep rewrites the env
+ * line that used to mint it. Returns whether the map held a token for the agent at all. */
+export function revokeAttachTokens(tokens: Map<string, string>, agentId: string): boolean {
+  let revoked = false;
+  for (const [token, holder] of tokens) {
+    if (holder !== agentId) continue;
+    tokens.delete(token);
+    revoked = true;
+  }
+  return revoked;
+}

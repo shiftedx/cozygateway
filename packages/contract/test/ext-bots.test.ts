@@ -4,6 +4,7 @@ import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/
 import {
   BotCreateRequestSchema,
   BotCreateResponseSchema,
+  BotDeleteResponseSchema,
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
   BotChatDeltaFrameSchema,
@@ -524,7 +525,9 @@ describe("capability advertisement", () => {
     // 36 adds full provider visibility on `BotModelConfig`: the optional `providers` summary and
     // the optional `unauthenticated: true` catalog marker. A client below 36 ignores both and
     // keeps rendering the catalog alone.
-    expect(BOTS_CAPABILITY_VERSION).toBe(36);
+    // 37 adds bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Additive in the
+    // simplest possible way, since a client below 37 simply never calls the route.
+    expect(BOTS_CAPABILITY_VERSION).toBe(37);
   });
 
   it("accepts a capability-33 create with tool selections, and keeps them optional", () => {
@@ -546,6 +549,31 @@ describe("capability advertisement", () => {
     expect(check(BotCreateResponseSchema, { bot })).toBe(true);
     expect(check(BotCreateResponseSchema, { bot, warnings: ["skipped: telepathy"] })).toBe(true);
     expect(check(BotCreateResponseSchema, { bot, warnings: [""] })).toBe(false);
+  });
+
+  it("keeps the capability-37 delete reply honest about what it removed", () => {
+    const reply = {
+      name: "night-owl",
+      hermesProfile: "deleted",
+      purged: { roster: 1, sessions: 2 },
+      tokenRevoked: true,
+      residue: ["run scripts/deprovision-bot.sh night-owl"],
+    };
+    expect(check(BotDeleteResponseSchema, reply)).toBe(true);
+    // The recovery half: Hermes no longer had the profile, only gateway state remained.
+    expect(check(BotDeleteResponseSchema, { ...reply, hermesProfile: "already_absent" })).toBe(true);
+    // A bot that owned nothing purges nothing and leaves nothing behind; both stay valid.
+    expect(check(BotDeleteResponseSchema, { ...reply, purged: {}, residue: [] })).toBe(true);
+    // "maybe deleted" is not one of the two answers this route is allowed to give.
+    expect(check(BotDeleteResponseSchema, { ...reply, hermesProfile: "partial" })).toBe(false);
+    // A count is a count: never negative, and never a presentation string.
+    expect(check(BotDeleteResponseSchema, { ...reply, purged: { roster: -1 } })).toBe(false);
+    expect(check(BotDeleteResponseSchema, { ...reply, purged: { roster: "one" } })).toBe(false);
+    // Residue lines are operator English, so an empty line is noise rather than a line.
+    expect(check(BotDeleteResponseSchema, { ...reply, residue: [""] })).toBe(false);
+    // tokenRevoked is a fact the caller acts on, so it is required rather than assumed.
+    const { tokenRevoked: _dropped, ...withoutFlag } = reply;
+    expect(check(BotDeleteResponseSchema, withoutFlag)).toBe(false);
   });
 
   it("accepts capability-23 native turn status without changing legacy state fields", () => {

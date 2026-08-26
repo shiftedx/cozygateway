@@ -721,6 +721,20 @@ export class AttachV1Ingress implements TurnEndpoint {
     }
   }
 
+  /** Ends a deleted bot's live attach lane. The caller removes the token map entry
+   *  (`revokeAttachTokens`); this drops the open socket and the per-profile runtime state so a
+   *  connection authenticated before the revocation cannot keep flowing. Durable journal rows are
+   *  the storage purge's business, not this method's. */
+  disconnectAgent(agentId: string): void {
+    const connection = this.#current.get(agentId);
+    if (connection !== undefined) {
+      connection.socket.close(1008, "identity revoked");
+      this.#current.delete(agentId);
+    }
+    this.#commandCatalogs.delete(agentId);
+    this.#negotiated.delete(agentId);
+  }
+
   close(): void {
     clearInterval(this.#heartbeat);
     for (const timer of this.#projectionTimers.values()) clearTimeout(timer);

@@ -36,6 +36,7 @@ import {
   BotNameInvalid,
   BotNameTaken,
   BotNotFound,
+  BotTurnActive,
   PROFILE_ID_RE,
   normalizeProfileName,
 } from "./crud.ts";
@@ -463,6 +464,29 @@ export function registerBotRoutes(
         return c.json(errorBody("invalid_request", error.message), 400);
       if (error instanceof BotNameTaken)
         return c.json(extensionErrorBody("conflict", error.message), 409);
+      return failure(c, error);
+    }
+  });
+
+  // Capability 37, the inverse of POST /bots. `?force=1` overrides only the running-turn
+  // refusal; everything else about the delete is unconditional. The 409 carries `turnId` so a
+  // client can name the work it is about to kill in its confirmation copy. The 200 body reports
+  // what was removed and what remains for the operator sweep; a bot neither Hermes nor this
+  // gateway knows answers the ordinary not-found shape.
+  app.delete("/bots/:name", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const force = c.req.query("force") === "1";
+    try {
+      return c.json(await bots.deleteBot(resolved.name, { force }));
+    } catch (error) {
+      if (error instanceof BotNameInvalid)
+        return c.json(errorBody("invalid_request", error.message), 400);
+      if (error instanceof BotTurnActive)
+        return c.json(
+          { ...extensionErrorBody("conflict", error.message), turnId: error.turnId },
+          409,
+        );
       return failure(c, error);
     }
   });
