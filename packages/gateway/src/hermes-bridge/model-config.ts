@@ -1,4 +1,4 @@
-import type { BotModelConfig, BotModelConfigPatch } from "cozygateway-contract";
+import type { BotModelConfig, BotModelConfigPatch, BotModelProvider } from "cozygateway-contract";
 
 import type { HermesClient } from "./client.ts";
 
@@ -50,6 +50,10 @@ interface ModelChoice {
   displayName: string;
   aliases: string[];
   baseUrl?: string;
+  /** Hermes kept this provider visible despite an unusable credential (its explicit_only payload
+   *  re-appends the configured current provider on purpose). The entry stays selectable-looking
+   *  data on the wire; the client renders it disabled with a re-auth hint. */
+  unauthenticated?: true;
 }
 
 export const MODEL_DISCOVERY_TIMEOUT_MS = 750;
@@ -80,7 +84,7 @@ function choicesOf(options: HermesModelOptions): ModelChoice[] {
       ? row.aliases.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
       : [];
     const models = Array.isArray(row.models) ? row.models : [];
-    if (!provider || row.authenticated === false) return [];
+    if (!provider) return [];
     return models.flatMap((entry) => {
       if (typeof entry !== "string" || !entry.trim()) return [];
       const model = entry.trim();
@@ -92,6 +96,7 @@ function choicesOf(options: HermesModelOptions): ModelChoice[] {
           displayName: `${label}: ${model}`,
           aliases,
           ...(typeof row.api_url === "string" && row.api_url.trim() ? { baseUrl: row.api_url.trim() } : {}),
+          ...(row.authenticated === false ? { unauthenticated: true as const } : {}),
         },
       ];
     });
@@ -156,6 +161,9 @@ async function discoveredChoices(options: HermesModelOptions, fetcher: FetchLike
     const provider = typeof row.slug === "string" ? row.slug.trim() : "";
     const label = typeof row.name === "string" && row.name.trim() ? row.name.trim() : provider;
     const baseUrl = typeof row.api_url === "string" ? row.api_url.trim() : "";
+    // An unauthenticated provider's endpoint is not probed: Hermes kept the row for its saved
+    // static selection, and a /v1/models walk without a usable credential would only slow the
+    // read down. Its static choices survive through the merge below instead.
     if (!provider || !baseUrl || row.authenticated === false) return [] as ModelChoice[];
     const discovered = await discoverProviderModels(baseUrl, fetcher);
     if (discovered === undefined) return staticChoices.filter((choice) => choice.provider === provider);
@@ -171,7 +179,8 @@ async function discoveredChoices(options: HermesModelOptions, fetcher: FetchLike
     }));
   }));
   const liveProviders = new Set(providers.flatMap((row) =>
-    typeof row.slug === "string" && typeof row.api_url === "string" && row.api_url.trim()
+    typeof row.slug === "string" && typeof row.api_url === "string" && row.api_url.trim() &&
+    row.authenticated !== false
       ? [row.slug.trim()]
       : []));
   const merged = [
@@ -179,6 +188,29 @@ async function discoveredChoices(options: HermesModelOptions, fetcher: FetchLike
     ...groups.flat(),
   ];
   return [...new Map(merged.map((choice) => [choice.id, choice])).values()];
+}
+
+/** Capability 36: one summary row per provider Hermes returned, in Hermes' own order. A row
+ *  survives at zero catalog entries (no static models, no reachable endpoint) and with a lost
+ *  credential: the explicit_only payload only contains providers the user configured, so the app
+ *  picker mirrors the harness picker instead of silently dropping one. */
+function providersOf(options: HermesModelOptions, choices: ModelChoice[]): BotModelProvider[] {
+  const rows = Array.isArray(options.providers) ? (options.providers as HermesModelProvider[]) : [];
+  return rows.flatMap((row) => {
+    const slug = typeof row.slug === "string" ? row.slug.trim() : "";
+    if (!slug) return [];
+    const name = typeof row.name === "string" && row.name.trim() ? row.name.trim() : slug;
+    const baseUrl = typeof row.api_url === "string" ? row.api_url.trim() : "";
+    return [
+      {
+        slug,
+        name,
+        authenticated: row.authenticated !== false,
+        modelCount: choices.filter((choice) => choice.provider === slug).length,
+        ...(baseUrl ? { baseUrl } : {}),
+      },
+    ];
+  });
 }
 
 async function readHermesModelState(
@@ -195,6 +227,11 @@ async function readHermesModelState(
     client.dashboardJson<HermesWebConfig>(`/api/config?${query}`),
     client.dashboardJson<HermesModelOptions>(`/api/model/options?${query}&explicit_only=1`),
   ]);
+  for (const row of Array.isArray(options.providers) ? (options.providers as HermesModelProvider[]) : []) {
+    if (row.authenticated === false && typeof row.slug === "string" && row.slug.trim()) {
+      process.stderr.write(`[hermes-bridge] model-config: provider ${row.slug.trim()} unauthenticated, kept visible\n`);
+    }
+  }
   return { config, options, choices: await discoveredChoices(options, fetcher) };
 }
 
@@ -215,8 +252,13 @@ function responseOf(state: {
   return {
     model: configuredModel && provider && model ? (selected?.id ?? `${provider}:${model}`) : null,
     effort,
-    catalog: state.choices.map(({ id, displayName }) => ({ id, displayName })),
+    catalog: state.choices.map(({ id, displayName, unauthenticated }) => ({
+      id,
+      displayName,
+      ...(unauthenticated === true ? { unauthenticated: true as const } : {}),
+    })),
     efforts: [...HERMES_REASONING_EFFORTS],
+    providers: providersOf(state.options, state.choices),
   };
 }
 

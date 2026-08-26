@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 34 }
+"capabilities": { "com.cozylabs.bots": 36 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -74,6 +74,7 @@ extension omits the capability and does not register `/bots` routes.
 | 33 | Create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots`, and `BotCreateResponse.warnings`. |
 | 34 | Subagent visibility: `bot_delegation_activity` batch snapshots and a `delegations` array on chat history. |
 | 35 | Live thinking preview: latest-only `bot_thinking_activity` frames (sanitized, <=280 chars, ephemeral). |
+| 36 | Full provider visibility: optional `providers` summary and `unauthenticated` catalog markers on `BotModelConfig`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -102,6 +103,13 @@ a second, hand-copied schema.
 - `BotProfile`, `BotCatalog`, `BotModelConfig`, and `BotRoutine` are Hermes control-plane
   resources. The profile source may report `runtimeInert` sections that Hermes stores but does not
   execute.
+  From capability 36 `BotModelConfig` may carry `providers`: one summary row per provider Hermes
+  reported, kept even when the provider currently contributes zero catalog entries or has lost its
+  credential (`authenticated: false`), and a catalog entry from such a provider may carry
+  `unauthenticated: true`. Hermes keeps an unauthenticated configured provider visible on purpose,
+  so the picker can show the saved selection and a re-auth affordance; a client renders those
+  entries disabled with a sign-in hint rather than hiding them, and a client below 36 ignores both
+  fields.
 - `BotInboxThread` and `BotInboxMessagesResponse` are the read-only Hermes A2A projection.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
 - `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its

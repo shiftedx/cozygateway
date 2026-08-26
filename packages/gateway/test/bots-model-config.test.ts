@@ -138,6 +138,7 @@ describe("bot model config", () => {
         { id: "openrouter:google/gemini-2.5-flash", displayName: "OpenRouter: google/gemini-2.5-flash" },
       ],
       efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+      providers: [{ slug: "openrouter", name: "OpenRouter", authenticated: true, modelCount: 2 }],
     });
     expect(dashboardCalls.every((call) => call.token === "HERMES-TOKEN")).toBe(true);
   });

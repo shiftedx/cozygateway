@@ -123,6 +123,52 @@ describe("Hermes model config", () => {
     });
   });
 
+  it("keeps every configured provider visible: unauthenticated rows stay marked, empty rows stay summarized", async () => {
+    const writes: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    const client = {
+      dashboardJson: async (path: string) => path.startsWith("/api/config?")
+        ? { model: "claude-sonnet-4", agent: {} }
+        : {
+            model: "claude-sonnet-4",
+            provider: "anthropic",
+            providers: [
+              // authenticated is absent on purpose: absent means authenticated.
+              { slug: "openrouter", name: "OpenRouter", models: ["google/gemini-2.5-flash"] },
+              // Hermes' explicit_only payload re-appends the configured current provider when its
+              // credential is lost, so the picker can show the saved selection and a re-auth
+              // affordance. The gateway used to drop exactly this row.
+              { slug: "anthropic", name: "Anthropic", authenticated: false, models: ["claude-sonnet-4"] },
+              // No static models and no api_url: used to vanish from the app entirely.
+              { slug: "mtplx", name: "MTPLX", authenticated: true, models: [] },
+            ],
+          },
+    } as HermesClient;
+
+    const read = await readBotModelConfig(client, "scout");
+    // Healthy entries are byte-identical to before: no marker key at all.
+    expect(read.catalog[0]).toEqual({
+      id: "openrouter:google/gemini-2.5-flash",
+      displayName: "OpenRouter: google/gemini-2.5-flash",
+    });
+    expect(read.catalog[1]).toEqual({
+      id: "anthropic:claude-sonnet-4",
+      displayName: "Anthropic: claude-sonnet-4",
+      unauthenticated: true,
+    });
+    // The saved selection still resolves instead of appearing to jump providers.
+    expect(read.model).toBe("anthropic:claude-sonnet-4");
+    expect(read.providers).toEqual([
+      { slug: "openrouter", name: "OpenRouter", authenticated: true, modelCount: 1 },
+      { slug: "anthropic", name: "Anthropic", authenticated: false, modelCount: 1 },
+      { slug: "mtplx", name: "MTPLX", authenticated: true, modelCount: 0 },
+    ]);
+    expect(writes.join("")).toContain("model-config: provider anthropic unauthenticated, kept visible");
+  });
+
   it("uses the dashboard origin and the established token header", async () => {
     let observed: { url: string; token: string | null } | undefined;
     const client = createHermesClient({
