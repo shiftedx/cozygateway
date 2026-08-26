@@ -834,20 +834,42 @@ export const BotCatalogSchema = Type.Object({
 export type BotCatalog = Static<typeof BotCatalogSchema>;
 
 /** One model the focused bot can select. `id` is the stable picker identity
- *  `<provider>:<model>`; `displayName` is presentation-only. */
+ *  `<provider>:<model>`; `displayName` is presentation-only. From capability 36 an entry may
+ *  carry `unauthenticated: true`: Hermes kept the provider visible although its credential is
+ *  presently unusable, so a picker renders the entry disabled with a re-auth hint instead of
+ *  hiding a selection the user explicitly configured. */
 export const BotModelCatalogEntrySchema = Type.Object({
   id: Type.String(),
   displayName: Type.String(),
+  unauthenticated: Type.Optional(Type.Literal(true)),
 });
 export type BotModelCatalogEntry = Static<typeof BotModelCatalogEntrySchema>;
 
+/** Capability 36: one provider row from the Hermes picker payload, kept EVEN when it currently
+ *  contributes zero catalog entries (no static models and no reachable endpoint) or has lost its
+ *  credential. `modelCount` is how many catalog entries the provider contributes right now;
+ *  `authenticated: false` marks a configured provider awaiting re-auth. The gateway mirrors the
+ *  Hermes picker: every provider the user explicitly configured is visible, none silently
+ *  dropped. */
+export const BotModelProviderSchema = Type.Object({
+  slug: Type.String(),
+  name: Type.String(),
+  authenticated: Type.Boolean(),
+  modelCount: Type.Integer({ minimum: 0 }),
+  baseUrl: Type.Optional(Type.String()),
+});
+export type BotModelProvider = Static<typeof BotModelProviderSchema>;
+
 /** `GET /bots/:name/model-config`. Null means the profile follows Hermes' default for that axis.
- *  The catalog is the configured Hermes picker catalog, not a gateway-maintained model list. */
+ *  The catalog is the configured Hermes picker catalog, not a gateway-maintained model list.
+ *  `providers` (capability 36) is the additive per-provider summary; a client below 36 ignores
+ *  it and keeps rendering `catalog` alone. */
 export const BotModelConfigSchema = Type.Object({
   model: Type.Union([Type.String(), Type.Null()]),
   effort: Type.Union([Type.String(), Type.Null()]),
   catalog: Type.Array(BotModelCatalogEntrySchema),
   efforts: Type.Array(Type.String()),
+  providers: Type.Optional(Type.Array(BotModelProviderSchema)),
 });
 export type BotModelConfig = Static<typeof BotModelConfigSchema>;
 
@@ -1450,4 +1472,12 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  *  ephemeral end to end: not persisted, absent from chat history, and it stops at the turn's
  *  terminal. Additive exactly as 34 was: a client below 35 ignores the unknown frame and keeps
  *  today's shimmer; a client that renders the preview gates on `>= 35`. */
-export const BOTS_CAPABILITY_VERSION = 35;
+/** Capability 36: FULL PROVIDER VISIBILITY. `BotModelConfig` gains the optional `providers`
+ *  summary (one row per provider Hermes reported, kept even at zero selectable models or with a
+ *  lost credential) and catalog entries may carry `unauthenticated: true`. Hermes deliberately
+ *  keeps an unauthenticated configured provider visible so the picker can show the saved
+ *  selection and a re-auth affordance; the gateway now forwards that intent instead of silently
+ *  dropping the rows. Additive exactly as 33 was: a client below 36 ignores the unknown field
+ *  and marker; a client that renders the providers summary or disabled entries gates on
+ *  `>= 36`. */
+export const BOTS_CAPABILITY_VERSION = 36;

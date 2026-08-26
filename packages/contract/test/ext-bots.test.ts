@@ -405,6 +405,32 @@ describe("bot model config", () => {
       }),
     ).toBe(true);
     expect(check(BotModelConfigSchema, { model: null, effort: null, catalog: [], efforts: [] })).toBe(true);
+    // Capability 36: providers summary and the unauthenticated catalog marker are additive.
+    expect(
+      check(BotModelConfigSchema, {
+        model: null,
+        effort: null,
+        catalog: [{ id: "anthropic:claude-sonnet-4", displayName: "Anthropic: claude-sonnet-4", unauthenticated: true }],
+        efforts: [],
+        providers: [
+          { slug: "anthropic", name: "Anthropic", authenticated: false, modelCount: 1 },
+          { slug: "mtplx", name: "MTPLX", authenticated: true, modelCount: 0, baseUrl: "http://127.0.0.1:8000/v1" },
+        ],
+      }),
+    ).toBe(true);
+    // The marker is `true` or absent, never `false`; a count below zero is not a count.
+    expect(
+      check(BotModelConfigSchema, {
+        model: null, effort: null, efforts: [],
+        catalog: [{ id: "a:b", displayName: "A: b", unauthenticated: false }],
+      }),
+    ).toBe(false);
+    expect(
+      check(BotModelConfigSchema, {
+        model: null, effort: null, catalog: [], efforts: [],
+        providers: [{ slug: "anthropic", name: "Anthropic", authenticated: true, modelCount: -1 }],
+      }),
+    ).toBe(false);
     expect(check(BotModelConfigPatchSchema, { model: null })).toBe(true);
     expect(check(BotModelConfigPatchSchema, { effort: "low" })).toBe(true);
     expect(check(BotModelConfigPatchSchema, { model: 1 })).toBe(false);
@@ -495,7 +521,10 @@ describe("capability advertisement", () => {
     // 35 adds the live thinking preview: latest-only `bot_thinking_activity` frames, sanitized
     // and schema-capped at 280 chars, ephemeral end to end. A client below 35 ignores the
     // unknown frame and keeps today's generic shimmer.
-    expect(BOTS_CAPABILITY_VERSION).toBe(35);
+    // 36 adds full provider visibility on `BotModelConfig`: the optional `providers` summary and
+    // the optional `unauthenticated: true` catalog marker. A client below 36 ignores both and
+    // keeps rendering the catalog alone.
+    expect(BOTS_CAPABILITY_VERSION).toBe(36);
   });
 
   it("accepts a capability-33 create with tool selections, and keeps them optional", () => {
