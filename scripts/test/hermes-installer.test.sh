@@ -113,7 +113,13 @@ case "$*" in
     fi
     if [[ "$*" == *"-o /dev/null"* ]]; then printf '200'; else printf '{"attach":{"configured":1,"online":1,"deadLetters":0}}'; fi
     ;;
-  *password-login*) cat >/dev/null; printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE:-200}" ;;
+  *api/health*)
+    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER" ]; then printf '000'; else printf '401'; fi
+    ;;
+  *password-login*)
+    cat >/dev/null
+    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER" ]; then printf '401'; else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE:-200}"; fi
+    ;;
   *) printf '401' ;;
 esac
 CURL
@@ -163,6 +169,8 @@ if grep -Eq 'COZYGATEWAY_(HERMES_PASSWORD|ATTACH_TOKEN)' "$tmp/gateway-live/bin/
   echo 'gateway CLI wrapper must not contain secrets' >&2
   exit 1
 fi
+grep -Fq 'watchFile(config' "$tmp/gateway-live/local/run-gateway.sh"
+grep -Fq 'restartGateway' "$tmp/gateway-live/local/run-gateway.sh"
 remote_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/cozygateway" pair --url https://gateway.example.com)"
 grep -q '"gatewayUrl":"https://gateway.example.com"' <<<"$remote_pair"
 grep -Fq 'parseEnv(readFileSync(gatewayEnvPath' "$tmp/gateway-live/local/run-gateway.sh"
@@ -173,6 +181,71 @@ if grep -Fq '. "' "$tmp/gateway-live/local/run-gateway.sh"; then
   echo 'gateway wrapper must not source credential files' >&2
   exit 1
 fi
+
+# Exercise the generated supervisor rather than only checking its source. An
+# atomic config replacement must terminate the first gateway child and launch
+# a second child that reads the new listener port.
+sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' > "$tmp/supervisor.cjs"
+cat > "$tmp/reload-gateway.mjs" <<'RELOAD_GATEWAY'
+import { appendFileSync, readFileSync } from 'node:fs';
+const configAt = process.argv.indexOf('--config');
+const config = JSON.parse(readFileSync(process.argv[configAt + 1], 'utf8'));
+appendFileSync(process.env.COZYGATEWAY_TEST_RELOAD_LOG, `${process.pid}:${config.port}\n`);
+process.on('SIGTERM', () => process.exit(0));
+setTimeout(() => process.exit(0), 5000);
+RELOAD_GATEWAY
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) reload_log="$(cygpath -w "$tmp/reload.log")"; spawnable_hermes="$(command -v cmd.exe)" ;;
+  *) reload_log="$tmp/reload.log"; spawnable_hermes="$(command -v true)" ;;
+esac
+COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" "$real_node" "$tmp/supervisor.cjs" \
+  "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
+  "$spawnable_hermes" 19119 "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  >"$tmp/supervisor.log" 2>&1 &
+supervisor_pid=$!
+for _ in $(seq 1 50); do [ -s "$tmp/reload.log" ] && break; sleep 0.1; done
+test -s "$tmp/reload.log"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, renameSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const replacement = path + '.replacement';
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.port = 8998;
+writeFileSync(replacement, JSON.stringify(config));
+renameSync(replacement, path);
+NODE
+for _ in $(seq 1 50); do [ "$(wc -l < "$tmp/reload.log")" -ge 2 ] && break; sleep 0.1; done
+kill "$supervisor_pid" 2>/dev/null || true
+wait "$supervisor_pid" 2>/dev/null || true
+test "$(wc -l < "$tmp/reload.log")" -ge 2
+sed -n '1p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8787$'
+sed -n '2p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8998$'
+test "$(cut -d: -f1 "$tmp/reload.log" | sed -n '1p')" != "$(cut -d: -f1 "$tmp/reload.log" | sed -n '2p')"
+
+# Update runs retain a power user's saved listener unless an explicit installer
+# flag asks to replace it.
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.host = '127.0.0.1';
+config.port = 8999;
+writeFileSync(path, JSON.stringify(config));
+NODE
+preserved_listener_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+grep -Fq 'CozyGateway listens on 127.0.0.1:8999' <<<"$preserved_listener_output"
+overridden_listener_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 0.0.0.0 --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+grep -Fq 'CozyGateway listens on 0.0.0.0:9000' <<<"$overridden_listener_output"
+
+# Restore the fixture listener for the live rerun checks below.
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.host = '0.0.0.0';
+config.port = 8787;
+writeFileSync(path, JSON.stringify(config));
+NODE
 
 # A rerun sees all services running, preserves the installer-owned lifecycle
 # records and attach tokens, and never tries to install a second Hermes service.
@@ -246,6 +319,8 @@ cat > "$tmp/windows-bin/powershell.exe" <<'POWERSHELL'
 #!/usr/bin/env bash
 printf 'powershell %s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
 rm -f "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}"
+[ -z "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] || rm -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER"
+[ -z "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER"
 exit 0
 POWERSHELL
 chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/windows-bin/powershell.exe"
@@ -253,6 +328,12 @@ windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="
 grep -Fq '/Create /F /SC ONLOGON /RL LIMITED /TN CozyGateway' "$tmp/windows-commands"
 grep -Fq 'wscript ' "$tmp/windows-commands"
 grep -Fq 'fake-qr' <<<"$windows_output"
+test -f "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq 'gateway.mjs' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
+  echo 'Windows command shim must allow an explicit --config override' >&2
+  exit 1
+fi
 grep -Fq 'shell.Run command, 0, False' "$tmp/gateway-windows-live/local/run-gateway.vbs"
 grep -Fq 'command = """' "$tmp/gateway-windows-live/local/run-gateway.vbs"
 grep -Eq '^COZYGATEWAY_SPOOL_PATH=[A-Za-z]:\\' "$tmp/hermes/.env"
@@ -264,6 +345,20 @@ HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$
 
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+
+# Hermes Dashboard 0.20.x can report a successful `dashboard --stop` on Windows
+# while its Python child still owns the port. The fallback is allowed to stop
+# only that validated Hermes Dashboard listener, then installation continues.
+: > "$tmp/windows-dashboard-wrong"
+set +e
+dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-dashboard-gateway-ready" COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER="$tmp/windows-dashboard-wrong" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$tmp/windows-dashboard-stopped" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-dashboard" 2>&1)"
+set -e
+grep -Fq 'COZYGATEWAY_EXPECTED_DASHBOARD_PORT' "$tmp/windows-dashboard-commands"
+test ! -e "$tmp/windows-dashboard-wrong"
+if grep -Fq 'Dashboard stayed listening after stop' <<<"$dashboard_fallback_output"; then
+  echo 'Windows Dashboard fallback did not release the validated listener' >&2
+  exit 1
+fi
 
 # A listener alone is not sufficient: an existing Dashboard that rejects the
 # credential must be stopped/restarted or fail loudly, never silently accepted.

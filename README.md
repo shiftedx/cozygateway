@@ -34,6 +34,9 @@ installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. Se
 Windows installs under `%LOCALAPPDATA%\cozygateway`, registers a current-user
 `CozyGateway` Scheduled Task with a Startup-folder fallback, and requires no
 administrator prompt. The final screen contains a QR and plain-text setup code.
+Open a new PowerShell or Terminal window and type `cozygateway` for a small menu
+that shows status, prints a fresh pairing QR, or changes the bind address and
+port. The defaults remain `0.0.0.0:8787` until explicitly changed.
 Publishing the short PowerShell URL is tracked separately; before that website
 change, use the `install.ps1` asset from a versioned GitHub release.
 

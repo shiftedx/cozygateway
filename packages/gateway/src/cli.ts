@@ -1,5 +1,9 @@
 #!/usr/bin/env node
+import { execFile as execFileCallback } from "node:child_process";
+import { stdin, stdout } from "node:process";
+import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
+import { promisify } from "node:util";
 
 import { applyEnvOverrides, loadConfig } from "./config.ts";
 import { openStorage } from "./storage.ts";
@@ -8,8 +12,68 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { primaryLanAddress } from "./lan.ts";
 import { QrCapacityError, encodeQr, renderQrHalfBlocks } from "./qr.ts";
 import { gatewayScheme } from "./tls.ts";
+import {
+  listenerOrigin,
+  parseListenerPort,
+  syncManagedListenerTargets,
+  updateListenerConfig,
+  validateListenerHost,
+} from "./configure.ts";
 
-const USAGE = `usage: cozygateway <serve|pair> --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
+const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
+
+export interface CliIo {
+  interactive: boolean;
+  question(prompt: string): Promise<string>;
+  close(): void;
+}
+
+export interface CliRuntime {
+  restartHermesProfile(executable: string, profile: string): Promise<void>;
+  waitForGatewayReady(configPath: string): Promise<void>;
+}
+
+function healthOrigin(config: ReturnType<typeof loadConfig>): string {
+  return listenerOrigin(config.host ?? "0.0.0.0", config.port, gatewayScheme(config));
+}
+
+async function fetchHealth(configPath: string, timeoutMs: number): Promise<Response> {
+  const config = loadConfig(configPath);
+  return fetch(`${healthOrigin(config)}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+}
+
+const defaultRuntime: CliRuntime = {
+  restartHermesProfile: async (executable, profile) => {
+    await promisify(execFileCallback)(executable, ["-p", profile, "gateway", "restart"]);
+  },
+  waitForGatewayReady: async (configPath) => {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetchHealth(configPath, 1_000);
+        if (response.ok) {
+          const health = (await response.json()) as { attach?: { configured?: number; online?: number } };
+          const configured = health.attach?.configured ?? 0;
+          const online = health.attach?.online ?? 0;
+          if (configured > 0 && online === configured) return;
+        }
+      } catch {
+        // The managed supervisor and Hermes profiles may still be restarting.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    throw new Error("CozyGateway did not become ready within 30 seconds");
+  },
+};
+
+function terminalIo(): CliIo {
+  const readline = createInterface({ input: stdin, output: stdout });
+  return {
+    interactive: stdin.isTTY === true && stdout.isTTY === true,
+    question: (prompt) => readline.question(prompt),
+    close: () => readline.close(),
+  };
+}
 
 /** The host a phone should dial. An explicit configured host (loopback included) is advertised
  *  verbatim: it is where the gateway actually answers. A wildcard or absent host listens on
@@ -56,10 +120,125 @@ function describeTtl(ms: number): string {
   return minutes === 1 ? "1 minute" : `${minutes} minutes`;
 }
 
-export async function runCli(argv: string[]): Promise<number> {
-  const command = argv[0];
+async function printStatus(configPath: string): Promise<void> {
+  const config = loadConfig(configPath);
+  const host = config.host ?? "0.0.0.0";
+  const healthUrl = `${healthOrigin(config)}/health`;
+  let status = "offline";
+  try {
+    const response = await fetch(healthUrl, { signal: AbortSignal.timeout(1_000) });
+    if (response.ok) {
+      const health = (await response.json()) as { attach?: { configured?: number; online?: number } };
+      const attach = health.attach;
+      status = attach === undefined ? "online" : `online; Hermes attach ${attach.online ?? 0}/${attach.configured ?? 0}`;
+    }
+  } catch {
+    // An offline gateway is a status result, not a CLI failure.
+  }
+  console.log(`Listener: ${host}:${config.port}`);
+  console.log(`Status:   ${status}`);
+}
+
+async function configureListener(configPath: string, io: CliIo, runtime: CliRuntime): Promise<void> {
+  const current = loadConfig(configPath);
+  const currentHost = current.host ?? "0.0.0.0";
+  let host: string;
+  for (;;) {
+    const answer = await io.question(`Bind address [${currentHost}]: `);
+    try {
+      host = validateListenerHost(answer.trim() === "" ? currentHost : answer);
+      break;
+    } catch (error) {
+      console.log(`Invalid address: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  let port: number;
+  for (;;) {
+    const answer = await io.question(`Port [${current.port}]: `);
+    try {
+      port = parseListenerPort(answer.trim() === "" ? String(current.port) : answer);
+      break;
+    } catch (error) {
+      console.log(`Invalid port: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (host === currentHost && port === current.port) {
+    console.log("No listener changes made.");
+    return;
+  }
+  updateListenerConfig(configPath, host, port);
+  const managed = syncManagedListenerTargets(configPath, host, port);
+  const restarts = await Promise.allSettled(
+    managed.map((profile) => runtime.restartHermesProfile(profile.executable, profile.profile)),
+  );
+  const failed = restarts
+    .map((result, index) => ({ result, profile: managed[index]!.profile }))
+    .filter((entry): entry is { result: PromiseRejectedResult; profile: string } => entry.result.status === "rejected");
+  if (failed.length > 0) {
+    throw new Error(`failed to restart Hermes profile(s): ${failed.map(({ profile }) => profile).join(", ")}`);
+  }
+  if (managed.length > 0) await runtime.waitForGatewayReady(configPath);
+  console.log(
+    managed.length === 0
+      ? `Saved listener ${host}:${port}. Restart CozyGateway to apply it.`
+      : `Saved listener ${host}:${port}. CozyGateway and ${managed.length} Hermes profile(s) are restarting.`,
+  );
+}
+
+async function runPair(configPath: string, advertised: string | undefined, ttl: string | undefined): Promise<void> {
+  const config = applyEnvOverrides(loadConfig(configPath), process.env);
+  const storage = openStorage(config.dbPath);
+  const code = newSetupCode();
+  const ttlMs = ttl === undefined ? SETUP_CODE_TTL_MS : parsedTtlMs(ttl);
+  storage.createSetupCode(code, Date.now() + ttlMs);
+  storage.close();
+  const payload = { gatewayUrl: pairingUrl(config, advertised), setupCode: code };
+  const payloadJson = JSON.stringify(payload);
+  try {
+    console.log(renderQrHalfBlocks(encodeQr(payloadJson), { color: process.stdout.isTTY === true }));
+  } catch (err) {
+    if (!(err instanceof QrCapacityError)) throw err;
+    console.log("QR omitted: the pairing payload is too large to encode. Use the URL and code below.");
+  }
+  console.log(payloadJson);
+  console.log(`Gateway URL: ${payload.gatewayUrl}`);
+  console.log(`Setup code:  ${code}`);
+  console.log("Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.");
+  console.log(`Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`);
+  if (isLoopbackUrl(payload.gatewayUrl)) {
+    console.log(
+      "This URL is loopback, so only this machine can reach it. Remote access (Tailscale and friends) is documented at https://cozylabs.ai/docs/access/.",
+    );
+  }
+}
+
+async function runMenu(configPath: string, io: CliIo, runtime: CliRuntime): Promise<number> {
+  console.log("CozyGateway");
+  await printStatus(configPath);
+  for (;;) {
+    console.log("");
+    console.log("1. Pair a device");
+    console.log("2. Configure listener");
+    console.log("3. Refresh status");
+    console.log("4. Exit");
+    const choice = (await io.question("Choice [1-4]: ")).trim().toLowerCase();
+    if (choice === "1") await runPair(configPath, undefined, undefined);
+    else if (choice === "2") {
+      await configureListener(configPath, io, runtime);
+      await printStatus(configPath);
+    } else if (choice === "3") await printStatus(configPath);
+    else if (choice === "4" || choice === "q" || choice === "quit" || choice === "exit") return 0;
+    else console.log("Choose 1, 2, 3, or 4.");
+  }
+}
+
+export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRuntime = defaultRuntime): Promise<number> {
+  const command = argv[0] !== undefined && !argv[0].startsWith("-") ? argv[0] : undefined;
+  const optionArgs = command === undefined ? argv : argv.slice(1);
   const { values } = parseArgs({
-    args: argv.slice(1),
+    args: optionArgs,
     options: {
       config: { type: "string", default: "cozygateway.config.json" },
       url: { type: "string" },
@@ -67,6 +246,26 @@ export async function runCli(argv: string[]): Promise<number> {
     },
   });
   const configPath = values.config;
+
+  if (command === undefined || command === "configure") {
+    const io = suppliedIo ?? terminalIo();
+    try {
+      if (!io.interactive) {
+        console.error(USAGE);
+        return 1;
+      }
+      return command === "configure"
+        ? (await configureListener(configPath, io, runtime), 0)
+        : await runMenu(configPath, io, runtime);
+    } finally {
+      io.close();
+    }
+  }
+
+  if (command === "status") {
+    await printStatus(configPath);
+    return 0;
+  }
 
   if (command === "serve") {
     const config = applyEnvOverrides(loadConfig(configPath), process.env);
@@ -81,41 +280,7 @@ export async function runCli(argv: string[]): Promise<number> {
   }
 
   if (command === "pair") {
-    const config = applyEnvOverrides(loadConfig(configPath), process.env);
-    const storage = openStorage(config.dbPath);
-    const code = newSetupCode();
-    // Default is the 10-minute code a person types straight into their phone. `--ttl` exists for
-    // the one audience that cannot pair promptly: an App Review reviewer, who receives the code in
-    // the review notes and pairs days later. Bounded at 14 days so a forgotten code cannot become
-    // a standing door; minutes, because that is the unit the default sentence already speaks.
-    const ttlMs = values.ttl === undefined ? SETUP_CODE_TTL_MS : parsedTtlMs(values.ttl);
-    storage.createSetupCode(code, Date.now() + ttlMs);
-    storage.close();
-    // The scheme comes from the config, not a literal: the payload is what the phone dials, so an
-    // https gateway advertising `http://` would send every scan at a port that is not speaking
-    // plaintext. Derived without opening the cert files, since `pair` binds no listener; a broken
-    // pair is `serve`'s to shout about.
-    const payload = { gatewayUrl: pairingUrl(config, values.url), setupCode: code };
-    const payloadJson = JSON.stringify(payload);
-    // The QR encodes the payload JSON byte for byte: that raw string is what CozyChat's scanner
-    // decodes. It is sugar on top of the plain text below; the URL and code are the guarantee,
-    // so a payload too large to encode (or any renderer surprise) never fails the mint.
-    try {
-      console.log(renderQrHalfBlocks(encodeQr(payloadJson), { color: process.stdout.isTTY === true }));
-    } catch (err) {
-      if (!(err instanceof QrCapacityError)) throw err;
-      console.log("QR omitted: the pairing payload is too large to encode. Use the URL and code below.");
-    }
-    console.log(payloadJson);
-    console.log(`Gateway URL: ${payload.gatewayUrl}`);
-    console.log(`Setup code:  ${code}`);
-    console.log("Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.");
-    console.log(`Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`);
-    if (isLoopbackUrl(payload.gatewayUrl)) {
-      console.log(
-        "This URL is loopback, so only this machine can reach it. Remote access (Tailscale and friends) is documented at https://cozylabs.ai/docs/access/.",
-      );
-    }
+    await runPair(configPath, values.url, values.ttl);
     return 0;
   }
 

@@ -169,6 +169,29 @@ function Invoke-CozyGatewayInstaller {
     if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
 }
 
+function Add-CozyGatewayCommandPath {
+    param([string] $BinPath)
+    $full = [IO.Path]::GetFullPath($BinPath).TrimEnd('\')
+    $testPath = [Environment]::GetEnvironmentVariable('COZYGATEWAY_TEST_USER_PATH', 'Process')
+    $userPath = if ($null -ne $testPath) { $testPath } else { [Environment]::GetEnvironmentVariable('PATH', 'User') }
+    $parts = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $present = @($parts | Where-Object { $_.TrimEnd('\') -ieq $full }).Count -gt 0
+    $next = if ($present) { $parts -join ';' } elseif ($parts.Count -gt 0) { "$full;$($parts -join ';')" } else { $full }
+
+    $testLog = [Environment]::GetEnvironmentVariable('COZYGATEWAY_TEST_USER_PATH_LOG', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($testLog)) {
+        [IO.File]::WriteAllText($testLog, $next, (New-Object Text.UTF8Encoding($false)))
+    } else {
+        [Environment]::SetEnvironmentVariable('PATH', $next, 'User')
+    }
+
+    $processParts = @($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (@($processParts | Where-Object { $_.TrimEnd('\') -ieq $full }).Count -eq 0) {
+        $env:PATH = "$full;$env:PATH"
+    }
+    Write-Ok 'the cozygateway command is available in new PowerShell and Terminal windows'
+}
+
 if ($PSVersionTable.PSVersion.Major -lt 5) { Fail 'Windows PowerShell 5.1 or newer is required' }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -194,3 +217,4 @@ Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
 Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
 Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
 Invoke-CozyGatewayInstaller $bash $installerPath $InstallerArguments
+Add-CozyGatewayCommandPath $bin

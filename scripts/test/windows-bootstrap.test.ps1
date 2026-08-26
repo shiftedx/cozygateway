@@ -93,6 +93,7 @@ try {
     $fakeBin = Join-Path $temp 'fake bin'
     $configPath = Join-Path $temp 'Hermes Home\config.yaml'
     $fakeBash = Join-Path $temp 'Git With Spaces\bash.cmd'
+    $pathLog = Join-Path $temp 'user-path.txt'
     New-ReleaseFixtures $fixtures
     New-FakeHermes $fakeBin $configPath $eventLog
     New-FakeBash $fakeBash $eventLog
@@ -103,6 +104,8 @@ try {
         'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $pathLog
     }
     Assert-True ($result.ExitCode -eq 0) "existing-Hermes bootstrap failed: $($result.Output)"
     $events = Get-Content -LiteralPath $eventLog
@@ -112,6 +115,9 @@ try {
     Assert-True ($bashIndex -gt $modelIndex) 'hermes model must finish before the CozyGateway handoff'
     Assert-True (($events -join "`n") -match '--service-platform Windows') 'handoff must select the Windows service platform'
     Assert-True (($events -join "`n") -match 'Cozy Gateway') 'paths containing spaces must survive the handoff'
+    $registeredPath = Get-Content -LiteralPath $pathLog -Raw
+    Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
+    Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'
 
     $missingRoot = Join-Path $temp 'missing hermes case'
     $missingHermes = Join-Path $missingRoot 'hermes\bin\hermes.cmd'

@@ -21,13 +21,13 @@ The configuration flow prompts for bind address and port with current values as 
 
 The existing CLI owns the menu, status request, validation, and atomic JSON update. It uses Node's built-in `readline/promises`; no terminal dependency is added. Input/output is represented by a small injectable interface so tests can drive the real menu state machine without a pseudo-terminal.
 
-The installed service runner watches the configuration file. A successful atomic replacement causes it to stop the current gateway child and start a new child with the new listener settings. The supervisor stays alive, so this works with the Windows Startup fallback as well as launchd and systemd.
+The installed service runner watches the configuration file. A successful atomic replacement causes it to stop the current gateway child and start a new child with the new listener settings. The supervisor stays alive, so this works with the Windows Startup fallback as well as launchd and systemd. The same configuration operation updates only the installer-owned `COZYGATEWAY_URL` line in every managed Hermes profile and restarts those Hermes gateways so attach follows a changed port.
 
 The Windows installer writes `cozygateway.cmd` beside the existing Git Bash wrapper and adds that bin directory to the current process and the user's PATH idempotently. The command file invokes the verified bundled CLI from the managed local directory, so plain `cozygateway` automatically finds the installed configuration.
 
 ## Data Safety and Failure Handling
 
-Configuration changes parse and validate the entire existing config before mutation, preserve unknown and unrelated keys, write a sibling temporary file, and atomically rename it over the original. Secrets remain in environment files and are never read or written by this flow.
+Configuration changes parse and validate the entire existing config before mutation, preserve unknown and unrelated keys, write sibling temporary files, and atomically rename them over the originals. Hermes environment files retain all secret lines byte-for-byte; only the non-secret local gateway URL changes.
 
 The menu reports an offline health endpoint without failing to open. A configuration write succeeds independently of the subsequent readiness check; if the listener cannot return, the user gets the saved address and a clear offline result instead of a false success claim.
 

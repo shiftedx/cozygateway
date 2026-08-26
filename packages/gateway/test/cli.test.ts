@@ -1,11 +1,19 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
 import { runCli } from "../src/cli.ts";
 import { openStorage } from "../src/storage.ts";
+
+function scriptedIo(answers: string[]) {
+  return {
+    interactive: true,
+    question: async (_prompt: string): Promise<string> => answers.shift() ?? "",
+    close: (): void => undefined,
+  };
+}
 
 function tempConfig(extra: Record<string, unknown> = {}): { configPath: string; dbPath: string } {
   const dir = mkdtempSync(join(tmpdir(), "cozygateway-cli-"));
@@ -168,5 +176,121 @@ describe("cozygateway pair finale", () => {
     const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as { gatewayUrl: string };
     expect(payload.gatewayUrl).toBe("https://gateway.example.com");
     expect(lines.some((l) => l.includes("only this machine can reach it"))).toBe(false);
+  });
+});
+
+describe("cozygateway terminal menu", () => {
+  it("opens the basic menu when no command is supplied", async () => {
+    const { configPath } = tempConfig({ host: "0.0.0.0", port: 18787 });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+
+    expect(await runCli(["--config", configPath], scriptedIo(["4"]))).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain("CozyGateway");
+    expect(lines.join("\n")).toContain("0.0.0.0:18787");
+    expect(lines.join("\n")).toContain("Pair a device");
+    expect(lines.join("\n")).toContain("Configure listener");
+  });
+
+  it("configures the listener while preserving all other settings", async () => {
+    const { configPath } = tempConfig({ host: "0.0.0.0", capabilities: { "com.cozylabs.keep": 4 } });
+    const localDir = dirname(configPath);
+    const hermesRoot = mkdtempSync(join(tmpdir(), "cozygateway-hermes-"));
+    writeFileSync(join(hermesRoot, ".env"), "COZYGATEWAY_URL=http://127.0.0.1:18787\nCOZYGATEWAY_TOKEN=secret\n");
+    writeFileSync(
+      join(localDir, "install-state"),
+      `profiles=default\nhermes_root=${hermesRoot}\nhermes_bin=${join(hermesRoot, "hermes")}\n`,
+    );
+    const restarted: string[] = [];
+    let waited = false;
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(
+      await runCli(["configure", "--config", configPath], scriptedIo(["127.0.0.1", "9000"]), {
+        restartHermesProfile: async (_executable, profile) => {
+          restarted.push(profile);
+        },
+        waitForGatewayReady: async () => {
+          waited = true;
+        },
+      }),
+    ).toBe(0);
+
+    vi.restoreAllMocks();
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    expect(config.host).toBe("127.0.0.1");
+    expect(config.port).toBe(9000);
+    expect(config.capabilities).toEqual({ "com.cozylabs.keep": 4 });
+    expect(readFileSync(join(hermesRoot, ".env"), "utf8")).toContain("COZYGATEWAY_URL=http://127.0.0.1:9000");
+    expect(restarted).toEqual(["default"]);
+    expect(waited).toBe(true);
+  });
+
+  it("keeps the current listener when both configuration answers are empty", async () => {
+    const { configPath } = tempConfig({ host: "0.0.0.0", port: 18787 });
+    const before = readFileSync(configPath, "utf8");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await runCli(["configure", "--config", configPath], scriptedIo(["", ""]))).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+  });
+
+  it("attempts every managed Hermes restart before reporting failures", async () => {
+    const { configPath } = tempConfig({ host: "0.0.0.0" });
+    const localDir = dirname(configPath);
+    const hermesRoot = mkdtempSync(join(tmpdir(), "cozygateway-hermes-"));
+    mkdirSync(join(hermesRoot, "profiles", "ops"), { recursive: true });
+    for (const envPath of [join(hermesRoot, ".env"), join(hermesRoot, "profiles", "ops", ".env")]) {
+      writeFileSync(envPath, "COZYGATEWAY_URL=http://127.0.0.1:18787\nCOZYGATEWAY_TOKEN=secret\n");
+    }
+    writeFileSync(
+      join(localDir, "install-state"),
+      `profiles=default,ops\nhermes_root=${hermesRoot}\nhermes_bin=${join(hermesRoot, "hermes")}\n`,
+    );
+    const restarted: string[] = [];
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await expect(
+      runCli(["configure", "--config", configPath], scriptedIo(["127.0.0.1", "9001"]), {
+        restartHermesProfile: async (_executable, profile) => {
+          restarted.push(profile);
+          if (profile === "default") throw new Error("restart failed");
+        },
+        waitForGatewayReady: async () => undefined,
+      }),
+    ).rejects.toThrow(/default/);
+
+    vi.restoreAllMocks();
+    expect(restarted).toEqual(["default", "ops"]);
+  });
+
+  it("runs pairing from the menu and returns to it", async () => {
+    const { configPath, dbPath } = tempConfig();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+
+    expect(await runCli(["--config", configPath], scriptedIo(["1", "4"]))).toBe(0);
+
+    vi.restoreAllMocks();
+    const payload = JSON.parse(lines.find((line) => line.startsWith("{")) ?? "{}") as { setupCode: string };
+    const storage = openStorage(dbPath);
+    expect(storage.consumeSetupCode(payload.setupCode, Date.now())).toBe("ok");
+    storage.close();
+  });
+
+  it("prints listener and offline health through the status command", async () => {
+    const { configPath } = tempConfig({ host: "127.0.0.1", port: 18787 });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+
+    expect(await runCli(["status", "--config", configPath])).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain("127.0.0.1:18787");
+    expect(lines.join("\n")).toMatch(/offline/i);
   });
 });

@@ -12,8 +12,13 @@ PLUGIN_ARCHIVE=""
 HERMES_BIN="${COZYGATEWAY_HERMES_BIN:-hermes}"
 NODE_BIN="${COZYGATEWAY_NODE:-node}"
 PROFILE_SPEC="all"
+BIND_HOST_EXPLICIT=0
+PORT_EXPLICIT=0
+if [ "${COZYGATEWAY_BIND_HOST+x}" = x ]; then BIND_HOST_EXPLICIT=1; fi
+if [ "${COZYGATEWAY_PORT+x}" = x ]; then PORT_EXPLICIT=1; fi
 BIND_HOST="${COZYGATEWAY_BIND_HOST:-0.0.0.0}"
 PORT="${COZYGATEWAY_PORT:-8787}"
+PREVIOUS_PORT=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
 DRY_RUN=0
 UNINSTALL=0
@@ -59,8 +64,8 @@ while [ "$#" -gt 0 ]; do
     --plugin-archive) need_value "$@"; PLUGIN_ARCHIVE="$2"; shift ;;
     --gateway-dir) need_value "$@"; GATEWAY_DIR="$2"; shift ;;
     --profiles) need_value "$@"; PROFILE_SPEC="$2"; shift ;;
-    --bind-host) need_value "$@"; BIND_HOST="$2"; shift ;;
-    --port) need_value "$@"; PORT="$2"; shift ;;
+    --bind-host) need_value "$@"; BIND_HOST="$2"; BIND_HOST_EXPLICIT=1; shift ;;
+    --port) need_value "$@"; PORT="$2"; PORT_EXPLICIT=1; shift ;;
     --dashboard-port) need_value "$@"; DASHBOARD_PORT="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
@@ -94,8 +99,6 @@ if is_windows; then
   [ -z "$PLUGIN_ARCHIVE" ] || PLUGIN_ARCHIVE="$(to_posix_path "$PLUGIN_ARCHIVE")"
 fi
 
-case "$PORT" in ''|*[!0-9]*) die "--port must be 1-65535" ;; esac
-[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be 1-65535"
 case "$DASHBOARD_PORT" in ''|*[!0-9]*) die "--dashboard-port must be 1-65535" ;; esac
 [ "$DASHBOARD_PORT" -ge 1 ] && [ "$DASHBOARD_PORT" -le 65535 ] || die "--dashboard-port must be 1-65535"
 canonical_gateway_dir() {
@@ -119,11 +122,32 @@ DASHBOARD_ENV="$LOCAL_DIR/dashboard.env"
 STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
 CLI_WRAPPER="$GATEWAY_DIR/bin/cozygateway"
+CLI_WINDOWS="$GATEWAY_DIR/bin/cozygateway.cmd"
 GW_LOG="$LOCAL_DIR/cozygateway.log"
 SERVICE_LABEL="ai.cozylabs.cozygateway"
 SERVICE_UNIT="cozygateway.service"
 WINDOWS_TASK="CozyGateway"
 WINDOWS_VBS="$LOCAL_DIR/run-gateway.vbs"
+
+hydrate_listener_settings() {
+  local saved
+  if [ ! -f "$CONFIG_JSON" ]; then return 0; fi
+  saved="$("$NODE_RESOLVED" - "$CONFIG_JSON" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+process.stdout.write(String(config.host ?? '') + '\t' + String(config.port ?? ''));
+NODE
+)" || die "could not read the existing listener from $CONFIG_JSON"
+  local saved_host="${saved%%$'\t'*}" saved_port="${saved#*$'\t'}"
+  PREVIOUS_PORT="$saved_port"
+  [ "$BIND_HOST_EXPLICIT" = 1 ] || [ -z "$saved_host" ] || BIND_HOST="$saved_host"
+  [ "$PORT_EXPLICIT" = 1 ] || [ -z "$saved_port" ] || PORT="$saved_port"
+}
+validate_listener_settings() {
+  [ -n "$BIND_HOST" ] || die "--bind-host must not be empty"
+  case "$PORT" in ''|*[!0-9]*) die "--port must be 1-65535" ;; esac
+  [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be 1-65535"
+}
 
 node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -dc '0-9'; }
 resolve_node() {
@@ -353,11 +377,23 @@ write_state() {
 }
 resolve_platform() { normalize_service_platform; }
 write_cli_wrapper() {
+  local node_native bundle_native local_native
   [ "$DRY_RUN" = 1 ] && { say "DRY   write executable gateway CLI at $CLI_WRAPPER"; return; }
   mkdir -p "$GATEWAY_DIR/bin"
   umask 022
   printf '#!/usr/bin/env bash\nset -euo pipefail\ncd %q\nexec %q %q "$@"\n' "$LOCAL_DIR" "$NODE_RESOLVED" "$BUNDLE_PATH" > "$CLI_WRAPPER"
   chmod 755 "$CLI_WRAPPER"
+  if is_windows; then
+    node_native="$(to_windows_path "$NODE_RESOLVED")"
+    bundle_native="$(to_windows_path "$BUNDLE_PATH")"
+    local_native="$(to_windows_path "$LOCAL_DIR")"
+    {
+      printf '@echo off\r\n'
+      printf 'cd /d "%s"\r\n' "$local_native"
+      printf '"%s" "%s" %%*\r\n' "$node_native" "$bundle_native"
+    } > "$CLI_WINDOWS"
+    chmod 755 "$CLI_WINDOWS" 2>/dev/null || true
+  fi
 }
 write_wrapper() {
   local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg bundle_arg config_arg
@@ -377,7 +413,7 @@ write_wrapper() {
 #!/usr/bin/env bash
 set -euo pipefail
 exec "$NODE_RESOLVED" - "$gateway_env_arg" "$dashboard_env_arg" "$hermes_root_arg" "$hermes_arg" "$DASHBOARD_PORT" "$bundle_arg" "$config_arg" <<'NODE'
-const { readFileSync } = require('node:fs');
+const { readFileSync, unwatchFile, watchFile } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
 async function main() {
@@ -403,10 +439,38 @@ if (health) {
   }).catch(() => undefined);
   if (login?.status !== 200) throw new Error('Hermes Dashboard rejected the configured local credential');
 }
-const child = spawn(process.execPath, [bundle, 'serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
-child.on('error', (error) => { console.error(error); process.exit(1); });
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));
-child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+let child;
+let restarting = false;
+let shuttingDown = false;
+const spawnGateway = () => {
+  child = spawn(process.execPath, [bundle, 'serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
+  child.on('error', (error) => { console.error(error); process.exit(1); });
+  child.on('exit', (code, signal) => {
+    if (shuttingDown) process.exit(code ?? (signal ? 1 : 0));
+    if (restarting) {
+      restarting = false;
+      spawnGateway();
+      return;
+    }
+    process.exit(code ?? (signal ? 1 : 0));
+  });
+};
+const restartGateway = () => {
+  if (shuttingDown || restarting) return;
+  restarting = true;
+  if (child && child.exitCode === null) child.kill('SIGTERM');
+  else { restarting = false; spawnGateway(); }
+};
+watchFile(config, { interval: 500 }, (current, previous) => {
+  if (current.mtimeMs !== previous.mtimeMs) restartGateway();
+});
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
+  shuttingDown = true;
+  unwatchFile(config);
+  if (child && child.exitCode === null) child.kill(signal);
+  else process.exit(0);
+});
+spawnGateway();
 }
 main();
 NODE
@@ -441,10 +505,11 @@ write_windows_launcher() {
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
 stop_owned_windows_gateway() {
-  local config_native code
+  local config_native code expected_port
   config_native="$(to_windows_path "$CONFIG_JSON")"
+  expected_port="${PREVIOUS_PORT:-$PORT}"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$expected_port" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     $connection = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $connection) { exit 0 }
@@ -455,7 +520,7 @@ stop_owned_windows_gateway() {
   ' >/dev/null 2>&1
   code=$?
   set -e
-  [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
+  [ "$code" -eq 0 ] || die "port $expected_port is owned by a process this installer cannot safely stop"
   for _ in $(seq 1 10); do gateway_ready || return 0; sleep 1; done
   die "the previous CozyGateway process stayed listening on port $PORT"
 }
@@ -569,6 +634,24 @@ const child = spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashb
 child.unref();
 NODE
 }
+stop_stubborn_windows_dashboard() {
+  local hermes_native code
+  hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
+  set +e
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
+    $ErrorActionPreference = "Stop"
+    $port = [int]$env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT
+    $connection = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $connection) { exit 0 }
+    $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
+    $command = [string]$process.CommandLine
+    if (-not $command.Contains($env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES) -or -not $command.Contains(" dashboard ") -or -not $command.Contains("--port " + $port)) { exit 42 }
+    Stop-Process -Id $process.ProcessId -Force
+  ' >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop"
+}
 start_dashboard() {
   enable_dashboard_basic_plugin
   [ "$DRY_RUN" = 1 ] && { say "DRY   start/reuse Hermes Dashboard at 127.0.0.1:$DASHBOARD_PORT as the control/read plane"; return; }
@@ -577,6 +660,10 @@ start_dashboard() {
     say "INFO  existing Hermes Dashboard rejected the configured local credential; restarting it with the installer-owned runtime credential"
     HERMES_HOME="$HERMES_ROOT" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
     for _ in $(seq 1 5); do dashboard_ready || break; sleep 1; done
+    if dashboard_ready && is_windows; then
+      stop_stubborn_windows_dashboard
+      for _ in $(seq 1 10); do dashboard_ready || break; sleep 1; done
+    fi
     dashboard_ready && die "Dashboard stayed listening after stop; refusing to launch with an unverified credential"
   fi
   launch_dashboard
@@ -646,11 +733,12 @@ status_install() {
   [ "$persisted" = 1 ] && [ "$live" = 1 ]
 }
 main() {
-  if [ "$STATUS" = 1 ]; then status_install; return; fi
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
+  NODE_RESOLVED="$(resolve_node)"; hydrate_listener_settings; validate_listener_settings
+  if [ "$STATUS" = 1 ]; then status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
-  have "$HERMES_BIN" || die "Hermes must already be installed"; NODE_RESOLVED="$(resolve_node)"; HERMES_RESOLVED="$(resolve_hermes)"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
+  have "$HERMES_BIN" || die "Hermes must already be installed"; HERMES_RESOLVED="$(resolve_hermes)"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; mkdir -p "$LOCAL_DIR"; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready

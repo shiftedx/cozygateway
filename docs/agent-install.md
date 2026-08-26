@@ -66,6 +66,17 @@ minutes; mint another with `~/.cozygateway/bin/cozygateway pair`, or
 The default listener is `0.0.0.0:8787` for local/LAN use. Network reachability
 outside the machine is deliberately not automated; see `docs/connectivity.md`.
 
+After installation, open a new terminal and run `cozygateway` for the basic
+terminal menu. It shows live status, prints a fresh pairing QR, and lets a power
+user change only the bind address and port. Press Enter at either configuration
+prompt to retain the current value. A saved listener change atomically preserves
+the rest of the config, updates the local target for every installer-managed
+Hermes profile without changing its token, and restarts the gateway and those
+Hermes profiles automatically. Rerunning the installer also preserves a saved
+custom listener unless an explicit installer host or port option replaces it.
+The non-interactive `cozygateway status`, `cozygateway pair`, and
+`cozygateway configure` commands expose the same focused operations directly.
+
 On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the
 current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
 when policy blocks task registration. Phone-created bot auto-provisioning is not
