@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 import {
   check,
   MobileNodePhoneStatusResultSchema,
@@ -18,12 +20,22 @@ export type MobileNodeResult =
   | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
   | { requestId: string; status: Exclude<MobileNodeTerminal, "ok"> };
 
+export interface MobileNodeReceiptInput {
+  requestId: string;
+  bot: string;
+  threadId: string;
+  turnId: string;
+  command: MobileNodeCommand;
+  purpose: string;
+}
+
 interface Pending {
   deviceId: string;
   agentId: string;
   turnId: string;
   command: MobileNodeCommand;
   expiresAt: number;
+  frame: MobileNodeRequestFrame;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -35,6 +47,9 @@ export const MOBILE_NODE_FAILURE_REASONS = [
   "frame_send_failed",
   "phone_disconnected_pending",
   "invalid_phone_payload",
+  "lease_mismatch",
+  "cross_device_result",
+  "receipt_persistence_failed",
   "broker_closed_pending",
 ] as const;
 export type MobileNodeFailureReason = typeof MOBILE_NODE_FAILURE_REASONS[number];
@@ -103,6 +118,7 @@ export class MobileNodeBroker {
   readonly #route: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
   readonly #send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
   readonly #result: (agentId: string, frame: MobileNodeResult) => void;
+  readonly #receipt: (receipt: MobileNodeReceiptInput) => boolean;
   readonly #now: () => number;
   readonly #trace: TraceLog | undefined;
   readonly #terminalTtlMs: number;
@@ -113,6 +129,7 @@ export class MobileNodeBroker {
     route?: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
     send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
     result: (agentId: string, frame: MobileNodeResult) => void;
+    receipt: (receipt: MobileNodeReceiptInput) => boolean;
     trace?: TraceLog;
     now?: () => number;
     terminalTtlMs?: number;
@@ -123,6 +140,7 @@ export class MobileNodeBroker {
     this.#route = deps.route ?? ((deviceId, command) => legacyRoute(deps.available!(deviceId, command)));
     this.#send = deps.send;
     this.#result = deps.result;
+    this.#receipt = deps.receipt;
     this.#now = deps.now ?? Date.now;
     this.#trace = deps.trace;
     this.#terminalTtlMs = deps.terminalTtlMs ?? TERMINAL_TTL_MS;
@@ -152,12 +170,13 @@ export class MobileNodeBroker {
     // Dropping a new admission while full is intentionally fail-closed and non-durable.
     if (!this.#canAdmit()) return;
     const frame: MobileNodeRequestFrame = {
-      type: "mobile_node_request", requestId: input.requestId, command: input.command, bot: input.bot,
+      type: "mobile_node_request", requestId: input.requestId, lease: issueLease(),
+      command: input.command, bot: input.bot,
       threadId: input.threadId, turnId: input.turnId, expiresAt: input.expiresAt, purpose: input.purpose,
     };
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
     timer.unref();
-    this.#pending.set(input.requestId, { deviceId: input.deviceId, agentId: input.agentId, turnId: input.turnId, command: input.command, expiresAt: input.expiresAt, timer });
+    this.#pending.set(input.requestId, { deviceId: input.deviceId, agentId: input.agentId, turnId: input.turnId, command: input.command, expiresAt: input.expiresAt, frame, timer });
     let sendOutcome: boolean | MobileNodeSendOutcome;
     try {
       sendOutcome = this.#send(input.deviceId, frame);
@@ -180,17 +199,27 @@ export class MobileNodeBroker {
 
   result(deviceId: string, frame: MobileNodeResultFrame): void {
     const pending = this.#pending.get(frame.requestId);
-    if (pending === undefined || pending.deviceId !== deviceId) return;
+    if (pending === undefined || pending.frame.lease !== frame.lease) {
+      this.#diagnose("lease_mismatch", "unknown", false, noRoute());
+      return;
+    }
+    if (pending.deviceId !== deviceId) {
+      this.#diagnose("cross_device_result", pending.command, true, this.#route(deviceId, pending.command));
+      return;
+    }
     if (pending.expiresAt <= this.#now()) {
       this.#finish(frame.requestId, "expired", true);
       return;
     }
+    // A matching answer consumes the lease before validation, receipt persistence, or attach
+    // settlement. No callback below can leave a reusable authorization behind.
+    this.#consume(frame.requestId, pending);
     if (frame.status === "ok") {
       if (pending.command === "location.current") {
         const route = this.#route(deviceId, pending.command);
         if (route.status !== "available") {
           this.#diagnose(route.status, pending.command, true, route);
-          this.#finish(frame.requestId, "foreground_required");
+          this.#settle(pending, "foreground_required");
           return;
         }
       }
@@ -207,17 +236,19 @@ export class MobileNodeBroker {
           payloadParseable: true,
           payloadSchemaValid: false,
         });
+        this.#settle(pending, "policy_blocked");
         return;
       }
-      this.#finish(frame.requestId, "ok", false, frame.result);
+      this.#settle(pending, "ok", frame.result);
       return;
     }
-    this.#finish(frame.requestId, frame.status);
+    this.#settle(pending, frame.status);
   }
 
   cancelTurn(agentId: string, turnId: string): void {
-    for (const [requestId, pending] of this.#pending) {
-      if (pending.agentId === agentId && pending.turnId === turnId) this.#finish(requestId, "cancelled", true);
+    for (const pending of this.#pending.values()) {
+      if (pending.agentId === agentId && pending.turnId === turnId)
+        this.#finish(pending.frame.requestId, "cancelled", true);
     }
   }
 
@@ -227,10 +258,31 @@ export class MobileNodeBroker {
   }
 
   disconnectDevice(deviceId: string): void {
-    for (const [requestId, pending] of this.#pending) {
-      if (pending.deviceId === deviceId) {
+    for (const pending of this.#pending.values()) {
+      if (pending.deviceId === deviceId)
         this.#diagnose("phone_disconnected_pending", pending.command, true, this.#route(deviceId, pending.command));
-        this.#finish(requestId, "device_unavailable");
+    }
+  }
+
+  reconnectDevice(deviceId: string): void {
+    for (const pending of this.#pending.values()) {
+      if (pending.deviceId !== deviceId) continue;
+      if (pending.expiresAt <= this.#now()) {
+        this.#finish(pending.frame.requestId, "expired", true);
+        continue;
+      }
+      if (this.#route(deviceId, pending.command).status !== "available") continue;
+      try {
+        const outcome = normalizeSendOutcome(this.#send(deviceId, pending.frame));
+        if (outcome !== "sent")
+          this.#diagnose(outcome, pending.command, true, this.#route(deviceId, pending.command));
+      } catch {
+        this.#diagnose(
+          "frame_send_failed",
+          pending.command,
+          true,
+          this.#route(deviceId, pending.command),
+        );
       }
     }
   }
@@ -250,7 +302,7 @@ export class MobileNodeBroker {
 
   #diagnose(
     reason: MobileNodeFailureReason,
-    command: MobileNodeCommand,
+    command: MobileNodeCommand | "unknown",
     selectedDevicePresent: boolean,
     route: MobileNodeRoute,
     payload: Pick<MobileNodeFailureFields, "payloadParseable" | "payloadSchemaValid"> = {},
@@ -267,14 +319,46 @@ export class MobileNodeBroker {
     });
   }
 
-  #finish(requestId: string, status: MobileNodeTerminal, notifyDevice = false, result?: MobileNodePhoneStatusResult | { latitude: number; longitude: number }): void {
-    const pending = this.#pending.get(requestId);
-    if (pending === undefined) return;
+  #consume(requestId: string, pending: Pending): void {
     this.#pending.delete(requestId);
     clearTimeout(pending.timer);
     this.#rememberTerminal(requestId, Math.max(pending.expiresAt, this.#now() + this.#terminalTtlMs));
+  }
+
+  #finish(
+    requestId: string,
+    status: MobileNodeTerminal,
+    notifyDevice = false,
+    result?: MobileNodePhoneStatusResult | { latitude: number; longitude: number },
+  ): void {
+    const pending = this.#pending.get(requestId);
+    if (pending === undefined) return;
+    this.#consume(requestId, pending);
     if (notifyDevice && (status === "cancelled" || status === "expired")) {
-      this.#send(pending.deviceId, { type: "mobile_node_cancel", requestId, status });
+      this.#send(pending.deviceId, {
+        type: "mobile_node_cancel",
+        requestId,
+        lease: pending.frame.lease,
+        status,
+      });
+    }
+    this.#settle(pending, status, result);
+  }
+
+  #settle(
+    pending: Pending,
+    status: MobileNodeTerminal,
+    result?: MobileNodePhoneStatusResult | { latitude: number; longitude: number },
+  ): void {
+    const { requestId, bot, threadId, turnId, command, purpose } = pending.frame;
+    if (status === "ok" && result !== undefined) {
+      let recorded = false;
+      try { recorded = this.#receipt({ requestId, bot, threadId, turnId, command, purpose }); } catch {}
+      if (!recorded) {
+        this.#diagnose("receipt_persistence_failed", command, true, this.#route(pending.deviceId, command));
+        this.#result(pending.agentId, { requestId, status: "device_unavailable" });
+        return;
+      }
     }
     if (status === "ok" && result !== undefined)
       this.#result(pending.agentId, pending.command === "location.current"
@@ -350,6 +434,10 @@ function normalizeSendOutcome(outcome: boolean | MobileNodeSendOutcome): MobileN
   if (outcome === true) return "sent";
   if (outcome === false) return "frame_send_failed";
   return outcome;
+}
+
+function issueLease(): string {
+  return randomBytes(32).toString("base64url");
 }
 
 function isPurpose(value: string): boolean {

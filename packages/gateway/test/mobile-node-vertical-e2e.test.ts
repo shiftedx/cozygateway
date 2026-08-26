@@ -41,7 +41,7 @@ it("routes status through its authenticated origin in background while keeping l
     const appA = await appSocket(gateway.url, tokenA, sockets);
     const appB = await appSocket(gateway.url, tokenB, sockets);
     expect(appA.ready.deviceId).not.toBe(appB.ready.deviceId);
-    expect(appA.ready.gateway.capabilities?.["com.cozylabs.mobile-node"]).toBe(3);
+    expect(appA.ready.gateway.capabilities?.["com.cozylabs.mobile-node"]).toBe(4);
     appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: false }));
     appB.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
     await pause();
@@ -65,12 +65,14 @@ it("routes status through its authenticated origin in background while keeping l
 
     requestStatus(plugin, turn, "approved");
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "approved"));
+    const approved = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "approved") as Extract<(typeof appA.frames)[number], { type: "mobile_node_request" }>;
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request")).toBe(false);
-    appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", status: "denied" }));
+    appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", lease: approved.lease, status: "denied" }));
     await pause();
     expect(results(pluginFrames, "approved")).toEqual([]);
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", status: "ok", result: phoneStatus }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", lease: approved.lease, status: "ok", result: phoneStatus }));
     await settledOnce(pluginFrames, "approved");
+    await until(() => appA.frames.some((frame) => frame.type === "bot_mobile_receipt" && frame.requestId === "approved"));
     expect(results(pluginFrames, "approved")[0]).toEqual({
       kind: "mobile_result", requestId: "approved", status: "ok",
       result: { ...phoneStatus, authenticatedReachable: true, lastAuthenticatedPresenceAt: expect.any(Number) },
@@ -80,13 +82,13 @@ it("routes status through its authenticated origin in background while keeping l
     await pause();
     requestLocation(plugin, turn, "location", "Find nearby coffee");
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "location"));
-    const locationRequest = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "location");
+    const locationRequest = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "location") as Extract<(typeof appA.frames)[number], { type: "mobile_node_request" }>;
     expect(locationRequest).toMatchObject({ command: "location.current", purpose: "Find nearby coffee" });
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "location")).toBe(false);
-    appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } }));
+    appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "location", lease: locationRequest!.lease, status: "ok", result: { latitude: 41.88, longitude: -87.63 } }));
     await pause();
     expect(results(pluginFrames, "location")).toEqual([]);
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "location", lease: locationRequest!.lease, status: "ok", result: { latitude: 41.88, longitude: -87.63 } }));
     await settledOnce(pluginFrames, "location");
     expect(results(pluginFrames, "location")[0]).toEqual({ kind: "mobile_result", requestId: "location", status: "ok", result: { latitude: 41.88, longitude: -87.63 } });
 
@@ -95,8 +97,10 @@ it("routes status through its authenticated origin in background while keeping l
     requestStatus(plugin, turn, "reverse-second");
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "reverse-first"));
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "reverse-second"));
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "reverse-second", status: "denied" }));
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "reverse-first", status: "ok", result: { ...phoneStatus, appState: "foreground" } }));
+    const reverseFirst = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "reverse-first") as Extract<(typeof appA.frames)[number], { type: "mobile_node_request" }>;
+    const reverseSecond = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "reverse-second") as Extract<(typeof appA.frames)[number], { type: "mobile_node_request" }>;
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "reverse-second", lease: reverseSecond.lease, status: "denied" }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "reverse-first", lease: reverseFirst.lease, status: "ok", result: { ...phoneStatus, appState: "foreground" } }));
     await settledOnce(pluginFrames, "reverse-first");
     await settledOnce(pluginFrames, "reverse-second");
     expect(results(pluginFrames, "reverse-first")[0]).toMatchObject({ status: "ok", result: { appState: "foreground", authenticatedReachable: true } });
@@ -110,9 +114,11 @@ it("routes status through its authenticated origin in background while keeping l
 
     requestStatus(plugin, turn, "denied");
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "denied"));
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "denied", status: "denied" }));
+    const denied = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "denied") as Extract<(typeof appA.frames)[number], { type: "mobile_node_request" }>;
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "denied", lease: denied.lease, status: "denied" }));
     await settledOnce(pluginFrames, "denied");
     expect(results(pluginFrames, "denied")[0]).toMatchObject({ status: "denied" });
+    expect(appA.frames.some((frame) => frame.type === "bot_mobile_receipt" && frame.requestId === "denied")).toBe(false);
 
     requestStatus(plugin, turn, "expired", Date.now() + 100);
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "expired"));
@@ -122,20 +128,30 @@ it("routes status through its authenticated origin in background while keeping l
 
     requestStatus(plugin, turn, "disconnect");
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "disconnect"));
+    const disconnected = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "disconnect") as Extract<(typeof appA.frames)[number], { type: "mobile_node_request" }>;
     appA.socket.close();
     await once(appA.socket, "close");
-    await settledOnce(pluginFrames, "disconnect");
-    expect(results(pluginFrames, "disconnect")[0]).toMatchObject({ status: "device_unavailable" });
-
-    // B remains connected but is never substituted for the authenticated origin A.
-    requestStatus(plugin, turn, "backgrounded");
-    await settledOnce(pluginFrames, "backgrounded");
-    expect(results(pluginFrames, "backgrounded")[0]).toMatchObject({ status: "foreground_required" });
-    expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "backgrounded")).toBe(false);
+    await pause();
+    expect(results(pluginFrames, "disconnect")).toEqual([]);
 
     const appA2 = await appSocket(gateway.url, tokenA, sockets);
     appA2.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
-    await pause();
+    await until(() => appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "disconnect"));
+    const resent = appA2.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "disconnect") as Extract<(typeof appA2.frames)[number], { type: "mobile_node_request" }>;
+    expect(resent).toEqual(disconnected);
+    appA2.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "disconnect", lease: resent.lease, status: "ok", result: phoneStatus }));
+    await settledOnce(pluginFrames, "disconnect");
+
+    // Status remains available in background, and B is never substituted for authenticated origin A.
+    appA2.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: false }));
+    requestStatus(plugin, turn, "backgrounded");
+    await until(() => appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "backgrounded"));
+    const backgrounded = appA2.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "backgrounded") as Extract<(typeof appA2.frames)[number], { type: "mobile_node_request" }>;
+    appA2.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "backgrounded", lease: backgrounded.lease, status: "ok", result: phoneStatus }));
+    await settledOnce(pluginFrames, "backgrounded");
+    expect(results(pluginFrames, "backgrounded")[0]).toMatchObject({ status: "ok" });
+    expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "backgrounded")).toBe(false);
+
     requestStatus(plugin, turn, "cancelled");
     await until(() => appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "cancelled"));
     plugin.send(JSON.stringify({ kind: "mobile_cancel", requestId: "cancelled" }));
@@ -174,8 +190,19 @@ it("routes status through its authenticated origin in background while keeping l
 
     pluginReconnect.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "assistant-answer", event: { kind: "commit", threadId: turn.threadId, turnId: turn.turnId, messageId: "ordinary-answer", blocks: [{ type: "paragraph", text: "ordinary assistant response" }] } }));
     await until(() => appA2.frames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "ordinary-answer")));
-    const history = await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${tokenA}` } })).json() as { messages: BotChatMessage[] };
+    const history = await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${tokenA}` } })).json() as {
+      messages: BotChatMessage[];
+      mobileReceipts: Array<Record<string, unknown>>;
+    };
     expect(history.messages.map((message) => message.text)).toEqual(["check status", "ordinary assistant response"]);
+    expect(history.mobileReceipts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        requestId: "approved", bot: "sage", sessionId: turn.threadId,
+        turnId: turn.turnId, command: "device.status", sharedDescription: "Device status",
+        purpose: "Report phone readiness", sharedAt: expect.any(Number),
+      }),
+    ]));
+    expect(JSON.stringify(history.mobileReceipts)).not.toMatch(/lease|deviceId|latitude|longitude|result/i);
     // Only the real turn/commit advance attach's durable cursors; mobile frames stay volatile.
     expect(gateway.storage.attachCommandCursor("sage")).toBe(0);
     expect(gateway.storage.attachEventCursor("sage")).toBe(1);
