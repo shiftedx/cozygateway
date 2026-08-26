@@ -38,6 +38,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The installer preserves this repository-relative layout in its staged
+# payload. Do not change SRC_DIR back to the checkout: a LaunchAgent cannot read
+# a checkout under ~/Documents because macOS TCC blocks background access.
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_DIR="$REPO_ROOT/integrations/attach-plugin"
 

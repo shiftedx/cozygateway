@@ -24,6 +24,11 @@
 # CONCURRENCY
 #   A flock guard means a slow sweep (the provisioner waits up to 90s for the
 #   attach hello) never overlaps the next tick.
+#
+# INSTALLATION
+#   launchd must execute this from the self-contained staged payload installed
+#   by install-bot-provisioner.sh. A checkout under ~/Documents is readable in
+#   Terminal but denied to background LaunchAgents by macOS TCC.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
