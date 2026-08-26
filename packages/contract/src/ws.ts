@@ -50,7 +50,10 @@ export const SyncFrameSchema = Type.Object({
 });
 export type SyncFrame = Static<typeof SyncFrameSchema>;
 
-export const MobileNodeCommandSchema = Type.Union([Type.Literal("device.status"), Type.Literal("location.current")]);
+export const MobileNodeCommandSchema = Type.Union([
+  Type.Literal("device.status"), Type.Literal("location.current"),
+  Type.Literal("camera.capture"), Type.Literal("file.pick"), Type.Literal("notification.present"),
+]);
 const MobileNodePermissionSchema = Type.Union([
   Type.Literal("authorized"), Type.Literal("denied"),
   Type.Literal("restricted"), Type.Literal("not_determined"), Type.Literal("unavailable"),
@@ -61,10 +64,17 @@ const DeviceStatusCommandCapabilitySchema = Type.Object({
 const LocationCurrentCapabilitySchema = Type.Object({
   command: Type.Literal("location.current"), permission: MobileNodePermissionSchema,
 }, { additionalProperties: false });
-/** Capability 3 advertises exactly these two selected-device commands in canonical order. */
+const CameraCaptureCapabilitySchema = Type.Object({ command: Type.Literal("camera.capture"), permission: MobileNodePermissionSchema }, { additionalProperties: false });
+// A system picker grants only the item the person chose, and presenting a notification asks for
+// nothing of its own, so neither carries a permission state the way the camera and location do.
+const FilePickCapabilitySchema = Type.Object({ command: Type.Literal("file.pick"), permission: Type.Literal("not_required") }, { additionalProperties: false });
+const LocalNotificationCapabilitySchema = Type.Object({ command: Type.Literal("notification.present"), permission: Type.Literal("not_required") }, { additionalProperties: false });
+/** The exact command permissions the selected device can offer, in one fixed order.
+ * A tuple rather than an array: every entry is named, so a duplicate, a missing command or a
+ * reordering is a malformed frame rather than something a client has to defend against. */
 const DeviceStatusCapabilitiesSchema = Type.Tuple([
-  DeviceStatusCommandCapabilitySchema,
-  LocationCurrentCapabilitySchema,
+  DeviceStatusCommandCapabilitySchema, LocationCurrentCapabilitySchema,
+  CameraCaptureCapabilitySchema, FilePickCapabilitySchema, LocalNotificationCapabilitySchema,
 ]);
 export const MobileNodePhoneStatusResultSchema = Type.Object({
   appState: Type.Union([Type.Literal("foreground"), Type.Literal("background")]),
@@ -98,10 +108,19 @@ const MobileNodeLocationResultSchema = Type.Object({
   latitude: Type.Number({ minimum: -90, maximum: 90 }),
   longitude: Type.Number({ minimum: -180, maximum: 180 }),
 }, { additionalProperties: false });
+export const MobileNodeMediaDescriptorSchema = Type.Object({
+  mediaId: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" }),
+  mimeType: Type.String({ minLength: 1, maxLength: 128 }), byteCount: Type.Integer({ minimum: 1, maximum: 40 * 1024 * 1024 }), sha256: Type.String({ pattern: "^[a-f0-9]{64}$" }),
+  filename: Type.String({ minLength: 1, maxLength: 255 }),
+  family: Type.Union([Type.Literal("image"), Type.Literal("audio"), Type.Literal("video"), Type.Literal("file")]),
+}, { additionalProperties: false });
+const MobileNodeNotificationResultSchema = Type.Object({
+  action: Type.Union([Type.Literal("approve"), Type.Literal("snooze"), Type.Literal("open"), Type.Literal("cancel")]),
+}, { additionalProperties: false });
 
 export const MobileNodeAdvertiseFrameSchema = Type.Object({
   type: Type.Literal("mobile_node_advertise"),
-  commands: Type.Array(MobileNodeCommandSchema, { minItems: 1, maxItems: 2, uniqueItems: true }),
+  commands: Type.Array(MobileNodeCommandSchema, { minItems: 1, maxItems: 5, uniqueItems: true }),
   foreground: Type.Boolean(),
 }, { additionalProperties: false });
 export type MobileNodeAdvertiseFrame = Static<typeof MobileNodeAdvertiseFrameSchema>;
@@ -109,6 +128,7 @@ export type MobileNodeAdvertiseFrame = Static<typeof MobileNodeAdvertiseFrameSch
 export const MobileNodeResultFrameSchema = Type.Union([
   Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema, status: Type.Literal("ok"), result: MobileNodePhoneStatusResultSchema }, { additionalProperties: false }),
   Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema, status: Type.Literal("ok"), result: MobileNodeLocationResultSchema }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema, status: Type.Literal("ok"), result: MobileNodeNotificationResultSchema }, { additionalProperties: false }),
   Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema, status: Type.Union([Type.Literal("denied"), Type.Literal("cancelled"), Type.Literal("expired"), Type.Literal("foreground_required")]) }, { additionalProperties: false }),
 ]);
 export type MobileNodeResultFrame = Static<typeof MobileNodeResultFrameSchema>;
@@ -201,7 +221,22 @@ const MobileNodeLocationRequestFrameSchema = Type.Object({
   threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }),
   expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
-export const MobileNodeRequestFrameSchema = Type.Union([MobileNodeStatusRequestFrameSchema, MobileNodeLocationRequestFrameSchema]);
+const MobileNodeCameraRequestFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema,
+  command: Type.Literal("camera.capture"), bot: Type.String({ minLength: 1, maxLength: 128 }), threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }), expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
+  camera: Type.Union([Type.Literal("front"), Type.Literal("rear")]), capture: Type.Union([Type.Literal("photo"), Type.Literal("video")]), videoDurationSeconds: Type.Literal(10),
+}, { additionalProperties: false });
+const MobileNodeFileRequestFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema,
+  command: Type.Literal("file.pick"), bot: Type.String({ minLength: 1, maxLength: 128 }), threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }), expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
+  selection: Type.Union([Type.Literal("photo"), Type.Literal("file")]),
+}, { additionalProperties: false });
+const MobileNodeNotificationRequestFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema,
+  command: Type.Literal("notification.present"), bot: Type.String({ minLength: 1, maxLength: 128 }), threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }), expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
+  title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }),
+}, { additionalProperties: false });
+export const MobileNodeRequestFrameSchema = Type.Union([MobileNodeStatusRequestFrameSchema, MobileNodeLocationRequestFrameSchema, MobileNodeCameraRequestFrameSchema, MobileNodeFileRequestFrameSchema, MobileNodeNotificationRequestFrameSchema]);
 export type MobileNodeRequestFrame = Static<typeof MobileNodeRequestFrameSchema>;
 
 export const MobileNodeCancelFrameSchema = Type.Object({

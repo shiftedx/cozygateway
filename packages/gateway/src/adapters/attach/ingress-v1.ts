@@ -264,7 +264,9 @@ export class AttachV1Ingress implements TurnEndpoint {
         return;
       }
       if (frame.kind === "mobile_request") {
-        const required = frame.command === "location.current" ? "mobile_location" : "mobile_node";
+        const required = frame.command === "location.current" ? "mobile_location"
+          : frame.command === "camera.capture" || frame.command === "file.pick" ? "mobile_media"
+          : frame.command === "notification.present" ? "mobile_notifications" : "mobile_node";
         if (!connection.capabilities.has(required)) {
           socket.close(1008, `attach-v1 capability not negotiated: ${required}`);
           return;
@@ -527,7 +529,9 @@ export class AttachV1Ingress implements TurnEndpoint {
     const connection = this.#current.get(agentId);
     const outbound = { kind: "mobile_result" as const, ...frame };
     if (!check(AttachV1MobileResultSchema, outbound)) return false;
-    const required = "result" in frame && isLocationResult(frame.result) ? "mobile_location" : "mobile_node";
+    const required = "result" in frame && isLocationResult(frame.result) ? "mobile_location"
+      : "result" in frame && isMediaResult(frame.result) ? "mobile_media"
+      : "result" in frame && isNotificationResult(frame.result) ? "mobile_notifications" : "mobile_node";
     if (connection === undefined || !connection.hello || !connection.capabilities.has(required)) return false;
     return this.#send(connection, outbound);
   }
@@ -796,6 +800,12 @@ function helloVersionOf(decoded: unknown): string | undefined {
 
 function isLocationResult(value: unknown): value is { latitude: number; longitude: number } {
   return typeof value === "object" && value !== null && "latitude" in value && "longitude" in value;
+}
+function isMediaResult(value: unknown): value is { mediaId: string } {
+  return typeof value === "object" && value !== null && "mediaId" in value;
+}
+function isNotificationResult(value: unknown): value is { action: string } {
+  return typeof value === "object" && value !== null && "action" in value;
 }
 
 function eventCapabilities(frame: AttachV1EventFrame): AttachV1Capability[] {

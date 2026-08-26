@@ -14,6 +14,9 @@ const gatewayStatus: MobileNodeGatewayStatusResult = {
   capabilities: [
     { command: "device.status" as const, permission: "not_required" as const },
     { command: "location.current" as const, permission: "authorized" as const },
+    { command: "camera.capture" as const, permission: "authorized" as const },
+    { command: "file.pick" as const, permission: "not_required" as const },
+    { command: "notification.present" as const, permission: "not_required" as const },
   ],
   authenticatedReachable: true as const, lastAuthenticatedPresenceAt: 1_234,
 };

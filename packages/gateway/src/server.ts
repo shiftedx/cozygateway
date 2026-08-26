@@ -7,6 +7,8 @@ import {
   APPROVALS_CAPABILITY_VERSION,
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
+  MOBILE_NODE_CAPABILITY_ID,
+  MOBILE_NODE_CAPABILITY_VERSION,
   type GatewayInfo,
   type ServerFrame,
 } from "cozygateway-contract";
@@ -161,7 +163,7 @@ export function gatewayInfoForConfig(config: GatewayConfig): GatewayInfo {
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
       ...(config.hermes === undefined
         ? {}
-        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, "com.cozylabs.mobile-node": 4 }),
+        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION }),
       ...(config.pushRelayUrl === undefined
         ? {}
         : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),
@@ -481,6 +483,13 @@ export async function startGateway(
     attachTokens,
     attachMediaAllowed: (agentId: string) =>
       allowedAttachMedia(config, agentId),
+    beginMobileMediaUpload: (deviceId, requestId, lease) => {
+      const claim = mobileNode?.beginMediaUpload(deviceId, requestId, lease);
+      return claim === undefined ? undefined : {
+        agentId: claim.agentId,
+        complete: (media) => mobileNode?.completeMediaUpload(claim, media) ?? false,
+      };
+    },
     presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",
     submitUserMessage: (threadId, blocks) =>
       runner.submitUserMessage(threadId, blocks),

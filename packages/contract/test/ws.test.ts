@@ -7,6 +7,19 @@ import { check } from "../src/validate.ts";
 const lease = "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
 
 describe("client frames", () => {
+  it("accepts only the P1 foreground/media/notification wire shapes", () => {
+    for (const frame of [
+      { type: "mobile_node_request", requestId: "camera", lease, command: "camera.capture", bot: "sage", threadId: "thread", turnId: "turn", expiresAt: 10, purpose: "Read a label", camera: "rear", capture: "video", videoDurationSeconds: 10 },
+      { type: "mobile_node_request", requestId: "file", lease, command: "file.pick", bot: "sage", threadId: "thread", turnId: "turn", expiresAt: 10, purpose: "Read the receipt", selection: "file" },
+      { type: "mobile_node_request", requestId: "notice", lease, command: "notification.present", bot: "sage", threadId: "thread", turnId: "turn", expiresAt: 10, purpose: "Approve the plan", title: "Cozy", body: "Approve?" },
+    ]) expect(check(ServerFrameSchema, frame)).toBe(true);
+    expect(check(ServerFrameSchema, { type: "mobile_node_request", requestId: "bad", lease, command: "camera.capture", bot: "sage", threadId: "thread", turnId: "turn", expiresAt: 10, purpose: "Read", camera: "rear", capture: "video", videoDurationSeconds: 11 })).toBe(false);
+    expect(check(ClientFrameSchema, { type: "mobile_node_result", requestId: "notice", lease, status: "ok", result: { action: "approve" } })).toBe(true);
+    for (const sharedDescription of ["Camera photo", "Camera video", "Selected photo", "Selected file", "Notification action"]) {
+      expect(check(ServerFrameSchema, { type: "bot_mobile_receipt", requestId: "receipt", bot: "sage", sessionId: "thread", turnId: "turn", command: "camera.capture", sharedDescription, purpose: "Read", sharedAt: 1 })).toBe(true);
+    }
+    expect(check(ServerFrameSchema, { type: "bot_mobile_receipt", requestId: "receipt", bot: "sage", sessionId: "thread", turnId: "turn", command: "camera.capture", sharedDescription: "Camera capture", purpose: "Read", sharedAt: 1 })).toBe(false);
+  });
   it("accepts auth and sync", () => {
     const auth: ClientFrame = { type: "auth", token: "tok" };
     const sync: ClientFrame = { type: "sync", threads: { t1: 0, t2: 17 } };
@@ -25,6 +38,9 @@ describe("client frames", () => {
         capabilities: [
           { command: "device.status", permission: "not_required" },
           { command: "location.current", permission: "authorized" },
+          { command: "camera.capture", permission: "authorized" },
+          { command: "file.pick", permission: "not_required" },
+          { command: "notification.present", permission: "not_required" },
         ],
         wakeReason: "notification_action",
       },
@@ -36,6 +52,9 @@ describe("client frames", () => {
         capabilities: [
           { command: "device.status", permission: "not_required" },
           { command: "location.current", permission: "not_determined" },
+          { command: "camera.capture", permission: "not_determined" },
+          { command: "file.pick", permission: "not_required" },
+          { command: "notification.present", permission: "not_required" },
         ],
       },
     })).toBe(true);
@@ -47,6 +66,9 @@ describe("client frames", () => {
       result: { appState: "foreground", lowPowerMode: false, capabilities: [
         { command: "device.status", permission: "not_required" },
         { command: "location.current", permission: "unavailable" },
+        { command: "camera.capture", permission: "unavailable" },
+        { command: "file.pick", permission: "not_required" },
+        { command: "notification.present", permission: "not_required" },
       ] },
     };
     for (const forbidden of [
@@ -77,6 +99,23 @@ describe("client frames", () => {
       [
         { command: "device.status", permission: "authorized" },
         { command: "location.current", permission: "not_required" },
+      ],
+      // Every command is present, but out of the one fixed order.
+      [
+        { command: "location.current", permission: "authorized" },
+        { command: "device.status", permission: "not_required" },
+        { command: "camera.capture", permission: "authorized" },
+        { command: "file.pick", permission: "not_required" },
+        { command: "notification.present", permission: "not_required" },
+      ],
+      // A sixth record, even a well-formed one.
+      [
+        { command: "device.status", permission: "not_required" },
+        { command: "location.current", permission: "authorized" },
+        { command: "camera.capture", permission: "authorized" },
+        { command: "file.pick", permission: "not_required" },
+        { command: "notification.present", permission: "not_required" },
+        { command: "notification.present", permission: "not_required" },
       ],
     ]) expect(check(ClientFrameSchema, { ...base, result: { ...base.result, capabilities } })).toBe(false);
     expect(check(ClientFrameSchema, {

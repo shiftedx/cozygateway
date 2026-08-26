@@ -49,6 +49,7 @@ import {
 import { attachmentDisposition, safeFilename } from "./hermes-bridge/documents.ts";
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
+import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 
 /** The relay's register body, mirrored here rather than imported: the gateway's docker image
  *  bundles only its own package, so a runtime import of cozygateway-relay crashes the container
@@ -99,6 +100,10 @@ export interface AppDeps {
   attachTokens?: ReadonlyMap<string, string>;
   /** Per-agent media rollout gate, evaluated after constant-time attach authentication. */
   attachMediaAllowed?: (agentId: string) => boolean;
+  /** A device-authenticated lease claim for one phone-selected binary payload. */
+  beginMobileMediaUpload?: (deviceId: string, requestId: string, lease: string) =>
+    | { agentId: string; complete: (media: MobileNodeMediaDescriptor | undefined) => boolean }
+    | undefined;
   /** Test seam for `GET /bots/:name/media`. Left undefined in production, where the proxy uses the
    *  global `fetch`; a test supplies its own so the media rules can be exercised without a socket. */
   mediaFetch?: MediaFetch;
@@ -710,6 +715,54 @@ export function createApp(deps: AppDeps): Hono<Env> {
       deps.memory,
     );
   }
+
+  /** The phone has no attach bearer. This is deliberately the same bounded attach_media store and
+   * validation pipeline, but its authorization is the one live device/lease claim, never a spool. */
+  app.post("/mobile-node/media/:requestId", requireDevice, async (c) => {
+    const requestId = c.req.param("requestId");
+    const lease = c.req.header("x-mobile-node-lease") ?? "";
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(requestId) || !/^[A-Za-z0-9_-]{43}$/.test(lease))
+      return c.json(errorBody("invalid_request", "invalid mobile media request"), 400);
+    const claim = deps.beginMobileMediaUpload?.(c.get("deviceId"), requestId, lease);
+    if (claim === undefined)
+      return c.json(errorBody("not_found", "mobile media request is not available"), 404);
+    const fail = (status: 400 | 413 | 415 | 422, body: ErrorBody) => {
+      claim.complete(undefined);
+      return c.json(body, status);
+    };
+    const receivedType = c.req.header("content-type") ?? "";
+    const mimeType = receivedType.split(";")[0]!.trim().toLowerCase();
+    const acceptedType = ASSISTANT_MEDIA_TYPES.get(mimeType);
+    if (acceptedType === undefined)
+      return fail(415, errorBody("invalid_request", "media type is not on the gateway allowlist"));
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > acceptedType.maxBytes)
+      return fail(413, errorBody("invalid_request", "media is over the byte cap"));
+    let bytes: Uint8Array;
+    try {
+      bytes = await readCappedBody(c.req.raw.body, acceptedType.maxBytes);
+      acceptAssistantMediaBytes(mimeType, bytes, sniffImageType);
+    } catch {
+      return fail(415, errorBody("invalid_request", "media bytes did not match the declared type"));
+    }
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const filename = safeFilename(c.req.header("x-attach-filename") ?? "");
+    if (filename === undefined)
+      return fail(400, errorBody("invalid_request", "invalid attach media filename"));
+    const descriptor: AttachV1MediaDescriptor = {
+      mediaId: randomUUID().replaceAll("-", ""), mimeType, byteCount: bytes.byteLength, sha256, filename, family: acceptedType.kind,
+    };
+    try {
+      deps.storage.saveAttachMedia(claim.agentId, descriptor, bytes, deps.now());
+    } catch {
+      return fail(400, errorBody("invalid_request", "could not store mobile media"));
+    }
+    if (!claim.complete(descriptor)) {
+      deps.storage.deleteUnreferencedAttachMedia(claim.agentId, descriptor.mediaId);
+      return c.json(errorBody("invalid_request", "mobile media request expired or changed"), 409);
+    }
+    return c.json({ media: descriptor }, 201);
+  });
 
   if (deps.attachTokens !== undefined && deps.attachTokens.size > 0) {
     app.get("/attach/v1/deliveries/:deliveryId", requireAttach, (c) => {

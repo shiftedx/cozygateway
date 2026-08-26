@@ -2,7 +2,7 @@ import { once } from "node:events";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { GatewayInfo, ServerFrame } from "cozygateway-contract";
+import { MOBILE_NODE_CAPABILITY_VERSION, type GatewayInfo, type ServerFrame } from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
@@ -93,7 +93,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.some-unrecognized-thing": 7,
         approvals: 1,
         "com.cozylabs.bots": expect.any(Number),
-        "com.cozylabs.mobile-node": 4,
+        "com.cozylabs.mobile-node": MOBILE_NODE_CAPABILITY_VERSION,
       });
 
       const code = gw.issueSetupCode();

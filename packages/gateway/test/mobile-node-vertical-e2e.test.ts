@@ -2,7 +2,7 @@ import { once } from "node:events";
 
 import { expect, it } from "vitest";
 import { WebSocket } from "ws";
-import type { BotChatMessage, ReadyFrame, ServerFrame } from "cozygateway-contract";
+import { MOBILE_NODE_CAPABILITY_VERSION, type BotChatMessage, type ReadyFrame, type ServerFrame } from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
@@ -13,9 +13,18 @@ const phoneStatus = {
   capabilities: [
     { command: "device.status" as const, permission: "not_required" as const },
     { command: "location.current" as const, permission: "authorized" as const },
+    { command: "camera.capture" as const, permission: "authorized" as const },
+    { command: "file.pick" as const, permission: "not_required" as const },
+    { command: "notification.present" as const, permission: "not_required" as const },
   ],
   wakeReason: "notification" as const,
 };
+
+it("keeps the P1 command names closed at the app/gateway boundary", () => {
+  expect(["camera.capture", "file.pick", "notification.present"]).toEqual([
+    "camera.capture", "file.pick", "notification.present",
+  ]);
+});
 
 it("routes status through its authenticated origin in background while keeping location foreground-only", async () => {
   process.env["MOBILE_E2E_DASHBOARD_TOKEN"] = "dashboard-secret";
@@ -41,7 +50,7 @@ it("routes status through its authenticated origin in background while keeping l
     const appA = await appSocket(gateway.url, tokenA, sockets);
     const appB = await appSocket(gateway.url, tokenB, sockets);
     expect(appA.ready.deviceId).not.toBe(appB.ready.deviceId);
-    expect(appA.ready.gateway.capabilities?.["com.cozylabs.mobile-node"]).toBe(4);
+    expect(appA.ready.gateway.capabilities?.["com.cozylabs.mobile-node"]).toBe(MOBILE_NODE_CAPABILITY_VERSION);
     appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: false }));
     appB.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
     await pause();
