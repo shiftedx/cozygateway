@@ -127,7 +127,14 @@ for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway
   if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/$asset" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/$asset" | awk '{print $1}')"; fi
   printf '%s  %s\n' "$asset_sha" "$asset" > "$tmp/release-assets/$asset.sha256"
 done
-bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="file://$tmp/release-assets" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
+release_asset_base="file://$tmp/release-assets"
+case "$OSTYPE" in
+  msys*|cygwin*)
+    release_assets_windows="$(cygpath -w "$tmp/release-assets")"
+    release_asset_base="file:///${release_assets_windows//\\//}"
+    ;;
+esac
+bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
 grep -Fq 'DRY   verified assets' <<<"$bootstrap_dry_output"
 test ! -e "$tmp/bootstrap-dry-home"
 
@@ -388,7 +395,7 @@ NODE
 default_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 ops_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 install_count_before="$(grep -c '^default:gateway:install$' "$tmp/commands")"
-rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 # Rerunning on an installed gateway still lands on the pairing finale with a minted code.
 grep -Fq 'fake-qr' <<<"$rerun_output"
 grep -Fq '"setupCode":"TEST-CODE"' <<<"$rerun_output"
