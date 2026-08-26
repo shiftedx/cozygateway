@@ -345,8 +345,12 @@ export class NativeBotDataPlane {
       this.#mobileNode?.reject(key, frame.requestId);
       return;
     }
+    // `kind` belongs to the attach envelope, not to the phone frame. Spreading the whole attach
+    // frame carried it onto the wire, where the app requires an exact key set and silently drops
+    // anything carrying an extra one. Strip it here, at the boundary it stops being meaningful.
+    const { kind: _kind, ...request } = frame;
     this.#mobileNode?.invoke({
-      ...frame, bot: key, agentId: key, deviceId: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
+      ...request, bot: key, agentId: key, deviceId: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
     });
   }
 

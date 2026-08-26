@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import {
   check,
   MobileNodePhoneStatusResultSchema,
+  MobileNodeRequestFrameSchema,
   type MobileNodeCancelFrame,
   type MobileNodeGatewayStatusResult,
   type MobileNodePhoneStatusResult,
@@ -56,6 +57,9 @@ export const MOBILE_NODE_FAILURE_REASONS = [
   "cross_device_result",
   "receipt_persistence_failed",
   "broker_closed_pending",
+  // The gateway built a frame the contract does not allow. The phone would drop it in silence,
+  // so this refuses to send it and says so instead.
+  "malformed_request_frame",
   // A frame the gateway wrote to the phone that no answer ever came back for. Without this an
   // expiry was the one outcome that left no operator reason at all, so a phone that receives a
   // request and silently ignores it looked identical to one that was never sent anything.
@@ -188,6 +192,15 @@ export class MobileNodeBroker {
     }
     const { deviceId: _deviceId, agentId: _agentId, ...request } = input;
     const frame = { type: "mobile_node_request", lease: issueLease(), ...request } as MobileNodeRequestFrame;
+    // The cast above is a compile-time claim, not a runtime one, and a spread can carry a key the
+    // contract forbids. The app validates the exact key set and drops anything else WITHOUT a
+    // word, so an unchecked frame fails as a 30 second silence with nothing to read. Check it here,
+    // where the schema's closed key set can still be enforced.
+    if (!check(MobileNodeRequestFrameSchema, frame)) {
+      this.#diagnose("malformed_request_frame", input.command, true, route);
+      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt);
+      return;
+    }
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
     timer.unref();
     this.#pending.set(input.requestId, { deviceId: input.deviceId, agentId: input.agentId, turnId: input.turnId, command: input.command, expiresAt: input.expiresAt, frame, timer });
