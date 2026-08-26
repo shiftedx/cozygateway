@@ -1,10 +1,18 @@
-import type { MobileNodeCancelFrame, MobileNodeRequestFrame, MobileNodeResultFrame } from "cozygateway-contract";
+import {
+  check,
+  MobileNodePhoneStatusResultSchema,
+  type MobileNodeCancelFrame,
+  type MobileNodeGatewayStatusResult,
+  type MobileNodePhoneStatusResult,
+  type MobileNodeRequestFrame,
+  type MobileNodeResultFrame,
+} from "cozygateway-contract";
 
 export type MobileNodeTerminal =
   | "ok" | "denied" | "expired" | "cancelled" | "device_unavailable"
   | "foreground_required" | "policy_blocked";
 export type MobileNodeResult =
-  | { requestId: string; status: "ok"; result: { foreground: true } }
+  | { requestId: string; status: "ok"; result: MobileNodeGatewayStatusResult }
   | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
   | { requestId: string; status: Exclude<MobileNodeTerminal, "ok"> };
 
@@ -28,13 +36,13 @@ interface MobileNodeInvocationBase {
   agentId: string;
 }
 export type MobileNodeInvocation =
-  | (MobileNodeInvocationBase & { command: "device.status" })
+  | (MobileNodeInvocationBase & { command: "device.status"; purpose: string })
   | (MobileNodeInvocationBase & { command: "location.current"; purpose: string });
 
 const TERMINAL_TTL_MS = 30_000;
 const TERMINAL_LIMIT = 1_024;
 
-/** One foreground-only, origin-bound request at a time. Nothing here is durable. */
+/** Origin-bound ephemeral requests; status may run in background, location may not. */
 export class MobileNodeBroker {
   readonly #pending = new Map<string, Pending>();
   /** Every admitted id remains here until its volatile terminal window lapses. */
@@ -70,7 +78,7 @@ export class MobileNodeBroker {
       this.#terminalize(input.agentId, input.requestId, "device_unavailable", input.expiresAt);
       return;
     }
-    if (input.expiresAt <= this.#now() || input.expiresAt > this.#now() + 30_000 || (input.command === "location.current" && !isPurpose(input.purpose))) {
+    if (input.expiresAt <= this.#now() || input.expiresAt > this.#now() + 30_000 || !isPurpose(input.purpose)) {
       this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt);
       return;
     }
@@ -81,9 +89,10 @@ export class MobileNodeBroker {
     // No eviction is safe: a retained unexpired id is the only duplicate-prompt defense.
     // Dropping a new admission while full is intentionally fail-closed and non-durable.
     if (!this.#canAdmit()) return;
-    const frame: MobileNodeRequestFrame = input.command === "device.status"
-      ? { type: "mobile_node_request", requestId: input.requestId, command: input.command, bot: input.bot, threadId: input.threadId, turnId: input.turnId, expiresAt: input.expiresAt }
-      : { type: "mobile_node_request", requestId: input.requestId, command: input.command, bot: input.bot, threadId: input.threadId, turnId: input.turnId, expiresAt: input.expiresAt, purpose: input.purpose };
+    const frame: MobileNodeRequestFrame = {
+      type: "mobile_node_request", requestId: input.requestId, command: input.command, bot: input.bot,
+      threadId: input.threadId, turnId: input.turnId, expiresAt: input.expiresAt, purpose: input.purpose,
+    };
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
     timer.unref();
     this.#pending.set(input.requestId, { deviceId: input.deviceId, agentId: input.agentId, turnId: input.turnId, command: input.command, expiresAt: input.expiresAt, timer });
@@ -97,8 +106,16 @@ export class MobileNodeBroker {
   result(deviceId: string, frame: MobileNodeResultFrame): void {
     const pending = this.#pending.get(frame.requestId);
     if (pending === undefined || pending.deviceId !== deviceId) return;
+    if (pending.expiresAt <= this.#now()) {
+      this.#finish(frame.requestId, "expired", true);
+      return;
+    }
     if (frame.status === "ok") {
-      if (pending.command === "device.status" && "foreground" in frame.result && frame.result.foreground === true)
+      if (pending.command === "location.current" && !this.#available(deviceId, pending.command)) {
+        this.#finish(frame.requestId, "foreground_required");
+        return;
+      }
+      if (pending.command === "device.status" && check(MobileNodePhoneStatusResultSchema, frame.result))
         this.#finish(frame.requestId, "ok", false, frame.result);
       else if (pending.command === "location.current" && isLocation(frame.result))
         this.#finish(frame.requestId, "ok", false, frame.result);
@@ -134,7 +151,7 @@ export class MobileNodeBroker {
     for (const requestId of this.#pending.keys()) this.#finish(requestId, "device_unavailable");
   }
 
-  #finish(requestId: string, status: MobileNodeTerminal, notifyDevice = false, result?: { foreground: true } | { latitude: number; longitude: number }): void {
+  #finish(requestId: string, status: MobileNodeTerminal, notifyDevice = false, result?: MobileNodePhoneStatusResult | { latitude: number; longitude: number }): void {
     const pending = this.#pending.get(requestId);
     if (pending === undefined) return;
     this.#pending.delete(requestId);
@@ -146,7 +163,14 @@ export class MobileNodeBroker {
     if (status === "ok" && result !== undefined)
       this.#result(pending.agentId, pending.command === "location.current"
         ? { requestId, status, result: result as { latitude: number; longitude: number } }
-        : { requestId, status, result: result as { foreground: true } });
+        : {
+            requestId, status,
+            result: {
+              ...(result as MobileNodePhoneStatusResult),
+              authenticatedReachable: true,
+              lastAuthenticatedPresenceAt: this.#now(),
+            },
+          });
     else this.#result(pending.agentId, { requestId, status: status === "ok" ? "device_unavailable" : status });
   }
 

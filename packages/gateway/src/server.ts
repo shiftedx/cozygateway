@@ -161,7 +161,7 @@ export function gatewayInfoForConfig(config: GatewayConfig): GatewayInfo {
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
       ...(config.hermes === undefined
         ? {}
-        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, "com.cozylabs.mobile-node": 2 }),
+        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, "com.cozylabs.mobile-node": 3 }),
       ...(config.pushRelayUrl === undefined
         ? {}
         : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),

@@ -49,7 +49,7 @@ async function runMobileToolE2E(tool: "status" | "location"): Promise<void> {
     const appA = await appSocket(gateway.url, tokenA, sockets);
     const appB = await appSocket(gateway.url, tokenB, sockets);
     expect(appA.ready.deviceId).not.toBe(appB.ready.deviceId);
-    appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: tool === "location" }));
     appB.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true }));
     await pause();
 
@@ -66,18 +66,26 @@ async function runMobileToolE2E(tool: "status" | "location"): Promise<void> {
     const request = appA.frames.find((frame) => frame.type === "mobile_node_request")!;
     expect(request).toMatchObject(tool === "location"
       ? { command: "location.current", purpose: "Find nearby coffee" }
-      : { command: "device.status" });
+      : { command: "device.status", purpose: "Report phone readiness" });
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request")).toBe(false);
     appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, status: "denied" }));
     await pause();
     expect(harness.events.some((event) => event.e2e === "result")).toBe(false);
     const mobileResult = tool === "location"
       ? { latitude: 41.88, longitude: -87.63 }
-      : { foreground: true };
+      : {
+          appState: "background", lowPowerMode: false,
+          capabilities: [{ command: "device.status", permission: "not_required" }],
+        };
     appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, status: "ok", result: mobileResult }));
 
     const result = await harness.until((event) => event.e2e === "result");
-    expect(result).toMatchObject({ threadId: request.threadId, turnId: request.turnId, result: { status: "ok", result: mobileResult } });
+    expect(result).toMatchObject({
+      threadId: request.threadId, turnId: request.turnId,
+      result: tool === "location"
+        ? { status: "ok", result: mobileResult }
+        : { status: "ok", result: { ...mobileResult, authenticatedReachable: true, lastAuthenticatedPresenceAt: expect.any(Number) } },
+    });
     await harness.exited();
   } finally {
     await harness?.close();

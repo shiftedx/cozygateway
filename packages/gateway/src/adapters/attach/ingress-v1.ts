@@ -23,6 +23,7 @@ import {
   AttachV1MemoryResultSchema,
   AttachV1MobileCancelSchema,
   AttachV1MobileRequestSchema,
+  AttachV1MobileResultSchema,
   type AttachV1Capability,
   type AttachV1ClientFrame,
   type AttachV1Command,
@@ -524,9 +525,11 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   sendMobileResult(agentId: string, frame: AttachV1MobileResultInput): boolean {
     const connection = this.#current.get(agentId);
+    const outbound = { kind: "mobile_result" as const, ...frame };
+    if (!check(AttachV1MobileResultSchema, outbound)) return false;
     const required = "result" in frame && isLocationResult(frame.result) ? "mobile_location" : "mobile_node";
     if (connection === undefined || !connection.hello || !connection.capabilities.has(required)) return false;
-    return this.#send(connection, { kind: "mobile_result", ...frame });
+    return this.#send(connection, outbound);
   }
 
   /** Durably queues one delivery receipt. `false` means the receipt was not queued at all, which

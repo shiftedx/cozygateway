@@ -1,5 +1,10 @@
 import { type Static, Type } from "@sinclair/typebox";
-import { RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryKindSchema, BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema, BotMemoryDeleteResponseSchema } from "cozygateway-contract";
+import {
+  RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryKindSchema,
+  BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema,
+  BotMemoryDeleteResponseSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema,
+  type MobileNodeGatewayStatusResult,
+} from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
  * before either side accepts application frames. */
@@ -278,24 +283,24 @@ export const AttachV1MemoryResultSchema = Type.Object({
 export type AttachV1MemoryResult = Static<typeof AttachV1MemoryResultSchema>;
 const AttachV1MobileStatusRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
-  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
 const AttachV1MobileLocationRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("location.current"),
-  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: Type.String({ minLength: 1, maxLength: 160 }),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
 export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema]);
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
 export const AttachV1MobileResultSchema = Type.Union([
-  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ foreground: Type.Literal(true) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: MobileNodeGatewayStatusResultSchema }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ latitude: Type.Number({ minimum: -90, maximum: 90 }), longitude: Type.Number({ minimum: -180, maximum: 180 }) }, { additionalProperties: false }) }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Union([Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"), Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked")]) }, { additionalProperties: false }),
 ]);
 export type AttachV1MobileResult = Static<typeof AttachV1MobileResultSchema>;
 export type AttachV1MobileResultInput =
-  | { requestId: string; status: "ok"; result: { foreground: true } }
+  | { requestId: string; status: "ok"; result: MobileNodeGatewayStatusResult }
   | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
   | { requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" };
 

@@ -1504,4 +1504,7 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  *  purged, and the attach identity stops authenticating immediately. A running native turn
  *  refuses the delete with `409` extension code `conflict` (the body carries `turnId`) unless
  *  `?force=1`. Additive exactly as 33 was: a client below 37 simply never calls the route. */
-export const BOTS_CAPABILITY_VERSION = 37;
+/** Capability 38: DEVICE STATUS V2. The `cozy_device_status` tool requires a normalized purpose
+ * and returns the closed, privacy-bounded mobile-node v3 status shape. Clients below 38 must not
+ * expose the tool because mobile-node v2 has been deleted rather than retained as a fallback. */
+export const BOTS_CAPABILITY_VERSION = 38;

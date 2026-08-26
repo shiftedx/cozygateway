@@ -87,6 +87,24 @@ class DispatchToolHookForwardsCallIdTests(unittest.TestCase):
         _chat_id, _phase, _tool_name, _detail, call_id = self.adapter.events[0]
         self.assertIsNone(call_id)
 
+    def test_mobile_purpose_and_payload_never_enter_tool_hook_details(self):
+        adapter_module._pre_tool_call(
+            tool_name="cozy_device_status", args={"purpose": "private-purpose"}, tool_call_id="status",
+        )
+        adapter_module._post_tool_call(
+            tool_name="cozy_device_status", status="ok",
+            result={"status": "ok", "result": {"appState": "background"}}, tool_call_id="status",
+        )
+        adapter_module._pre_tool_call(
+            tool_name="cozy_request_location", args={"purpose": "private-location-purpose"}, tool_call_id="location",
+        )
+        adapter_module._post_tool_call(
+            tool_name="cozy_request_location", status="ok",
+            result={"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}}, tool_call_id="location",
+        )
+
+        self.assertEqual([event[3] for event in self.adapter.events], [None, None, None, None])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -269,31 +269,40 @@ When `mobile_node` is negotiated, a plugin may send an unsequenced status `mobil
 the active native Bot Mode turn only:
 
 ```json
-{ "kind": "mobile_request", "requestId": "...", "command": "device.status", "threadId": "...", "turnId": "...", "expiresAt": 0 }
+{ "kind": "mobile_request", "requestId": "...", "command": "device.status", "threadId": "...", "turnId": "...", "expiresAt": 0, "purpose": "Report phone readiness" }
 ```
 
-One-shot `location.current` additionally requires negotiated `mobile_location`; `mobile_node`
-alone remains status-only for old plugin/server pairs:
+One-shot `location.current` additionally requires negotiated `mobile_location`; status requires
+`mobile_node`. Neither capability enables a legacy status shape:
 
 ```json
 { "kind": "mobile_request", "requestId": "...", "command": "location.current", "threadId": "...", "turnId": "...", "expiresAt": 0, "purpose": "Find nearby coffee" }
 ```
 
-`purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
+Every mobile request `purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
 C0/C1 control characters; invalid input is rejected rather than truncated. Location expiry is at
 most 30 seconds. Success remains commandless because the pending `requestId` binds the command:
 `{ "kind": "mobile_result", "requestId": "...", "status": "ok", "result": { "latitude": 41.88, "longitude": -87.63 } }`.
 Both coordinates must be finite, range-bounded (`latitude [-90,90]`, `longitude [-180,180]`), and
 have no more than two decimal places. The gateway rejects an incompatible result shape.
 
-The gateway replies directly with one unsequenced `mobile_result`. This lane is deliberately not
+The gateway replies directly with one unsequenced `mobile_result`. For status it forwards the
+phone's closed v2 operational fields and adds `authenticatedReachable: true` and integer epoch-ms
+`lastAuthenticatedPresenceAt`. Only the gateway stamps those fields, after receiving a valid result
+from the selected authenticated paired-device socket; the phone status schema rejects them. The
+attach status object is closed, its nested capability objects are closed with unique commands, and
+the optional phone fields remain absent when unknowable. It has no version field and rejects
+identifiers, serial/device/model names, SSID/BSSID/IP, and exact battery percentages.
+
+This lane is deliberately not
 an event or command envelope, has no cursor or ACK, is never entered into either durable spool,
-and is dropped on reconnect. The only successful payload is `{ "foreground": true }`; terminal
+and is dropped on reconnect. Terminal
 statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground_required`, and
 `policy_blocked`.
 
 The plugin may send `{ "kind": "mobile_cancel", "requestId": "..." }` to settle its own
 pending tool. It is also negotiated, unsequenced, non-durable, and never replayed; a late phone
 result is ignored. A gateway MUST neither accept a location request nor send a location result
-without `mobile_location` negotiated. Purpose and raw coordinates are in-memory request/result values only and are
-never put in the durable spool, transcript, storage, logs, traces, audit, or push payloads.
+without `mobile_location` negotiated. Purpose and all mobile payload fields are in-memory
+request/result values only and are never put in the durable spool, transcript, storage, diagnostic
+logs/traces, tool-hook details, audit, or push payloads.

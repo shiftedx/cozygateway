@@ -19,6 +19,18 @@ from pathlib import Path
 import cozygateway.adapter as adapter_module
 
 
+GATEWAY_STATUS = {
+    "appState": "background",
+    "lowPowerMode": True,
+    "capabilities": [
+        {"command": "device.status", "permission": "not_required"},
+        {"command": "location.current", "permission": "authorized"},
+    ],
+    "authenticatedReachable": True,
+    "lastAuthenticatedPresenceAt": 1234,
+}
+
+
 class _PluginContext:
     def __init__(self):
         self.tools = []
@@ -38,8 +50,8 @@ class _Client:
         self.calls = []
         self.result = asyncio.get_running_loop().create_future()
 
-    async def request_device_status(self, thread_id, turn_id):
-        self.calls.append((thread_id, turn_id))
+    async def request_device_status(self, thread_id, turn_id, purpose):
+        self.calls.append((thread_id, turn_id, purpose))
         return await self.result
 
     async def request_location(self, thread_id, turn_id, purpose):
@@ -53,8 +65,8 @@ class _Adapter:
         self._active_turn = active_turn or {}
         self._profile = profile
 
-    async def request_device_status(self, thread_id, turn_id):
-        return await self._client.request_device_status(thread_id, turn_id)
+    async def request_device_status(self, thread_id, turn_id, purpose):
+        return await self._client.request_device_status(thread_id, turn_id, purpose)
 
     async def request_location(self, thread_id, turn_id, purpose):
         return await self._client.request_location(thread_id, turn_id, purpose)
@@ -81,22 +93,23 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.tool["toolset"], "cozygateway")
         self.assertTrue(self.tool["is_async"])
         self.assertEqual(self.tool["schema"]["name"], "cozy_device_status")
+        self.assertEqual(self.tool["schema"]["parameters"]["required"], ["purpose"])
 
         client = _Client()
         adapter = _Adapter(client, {"thread-1": "turn-1"})
         adapter_module._register_active_adapter(adapter)
-        call = asyncio.create_task(self.tool["handler"]({}))
+        call = asyncio.create_task(self.tool["handler"]({"purpose": "  Report   phone readiness  "}))
         await asyncio.sleep(0)
-        self.assertEqual(client.calls, [("thread-1", "turn-1")])
-        client.result.set_result({"status": "ok", "result": {"foreground": True}})
-        self.assertEqual(json.loads(await call), {"status": "ok", "result": {"foreground": True}})
+        self.assertEqual(client.calls, [("thread-1", "turn-1", "Report phone readiness")])
+        client.result.set_result({"status": "ok", "result": GATEWAY_STATUS})
+        self.assertEqual(json.loads(await call), {"status": "ok", "result": GATEWAY_STATUS})
 
     async def test_rejects_unbound_context_before_phone_routing(self):
         adapter_module._current_turn_platform_and_chat = lambda: ("cron", "thread-1")
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
 
-        self.assertEqual(json.loads(await self.tool["handler"]({})), {"status": "policy_blocked"})
+        self.assertEqual(json.loads(await self.tool["handler"]({"purpose": "Report phone readiness"})), {"status": "policy_blocked"})
         self.assertEqual(client.calls, [])
 
     async def test_registers_location_with_a_normalized_purpose_and_closed_result(self):
@@ -114,23 +127,23 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
         adapter_module._current_turn_message_and_cron = lambda: ("turn-1", True, "profile-1")
-        self.assertEqual(json.loads(await self.tool["handler"]({})), {"status": "policy_blocked"})
+        self.assertEqual(json.loads(await self.tool["handler"]({"purpose": "Report phone readiness"})), {"status": "policy_blocked"})
         adapter_module._current_turn_message_and_cron = lambda: ("turn-1:steer", False, "profile-1")
-        self.assertEqual(json.loads(await self.tool["handler"]({})), {"status": "policy_blocked"})
+        self.assertEqual(json.loads(await self.tool["handler"]({"purpose": "Report phone readiness"})), {"status": "policy_blocked"})
         self.assertEqual(client.calls, [])
 
     async def test_rejects_a_foreign_profile_before_phone_routing(self):
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
         adapter_module._current_turn_message_and_cron = lambda: ("turn-1", False, "other-profile")
-        self.assertEqual(json.loads(await self.tool["handler"]({})), {"status": "policy_blocked"})
+        self.assertEqual(json.loads(await self.tool["handler"]({"purpose": "Report phone readiness"})), {"status": "policy_blocked"})
         self.assertEqual(client.calls, [])
 
     async def test_rejects_missing_active_turn_before_phone_routing(self):
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client))
 
-        self.assertEqual(json.loads(await self.tool["handler"]({})), {"status": "policy_blocked"})
+        self.assertEqual(json.loads(await self.tool["handler"]({"purpose": "Report phone readiness"})), {"status": "policy_blocked"})
         self.assertEqual(client.calls, [])
 
     async def test_logs_each_fail_closed_guard_without_sensitive_values(self):
@@ -179,7 +192,7 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
                 for active in adapters:
                     adapter_module._register_active_adapter(active)
                 with self.assertLogs(adapter_module.logger, level="WARNING") as captured:
-                    result = json.loads(await self.tool["handler"]({}))
+                    result = json.loads(await self.tool["handler"]({"purpose": "Report phone readiness"}))
                 self.assertEqual(result, {"status": "policy_blocked"})
                 joined = "\n".join(captured.output)
                 self.assertIn(f"reason={reason}", joined)
@@ -200,19 +213,32 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         adapter_module._register_active_adapter(adapter)
         adapter._active_turn.clear()
         with self.assertLogs(adapter_module.logger, level="WARNING") as captured:
-            result = json.loads(await self.tool["handler"]({}))
+            result = json.loads(await self.tool["handler"]({"purpose": "Report phone readiness"}))
         self.assertEqual(result, {"status": "policy_blocked"})
         self.assertEqual(client.calls, [])
         self.assertIn("reason=active_adapter_count", "\n".join(captured.output))
 
+    async def test_post_await_turn_change_discards_the_phone_payload(self):
+        client = _Client()
+        adapter = _Adapter(client, {"thread-1": "turn-1"})
+        adapter_module._register_active_adapter(adapter)
+        call = asyncio.create_task(self.tool["handler"]({"purpose": "Report phone readiness"}))
+        await asyncio.sleep(0)
+        adapter._active_turn["thread-1"] = "turn-2"
+        client.result.set_result({"status": "ok", "result": GATEWAY_STATUS})
+        with self.assertLogs(adapter_module.logger, level="WARNING") as captured:
+            result = json.loads(await call)
+        self.assertEqual(result, {"status": "policy_blocked"})
+        self.assertNotIn("background", "\n".join(captured.output))
+
     async def test_cancellation_is_one_terminal_result(self):
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
-        call = asyncio.create_task(self.tool["handler"]({}))
+        call = asyncio.create_task(self.tool["handler"]({"purpose": "Report phone readiness"}))
         await asyncio.sleep(0)
         call.cancel()
         self.assertEqual(json.loads(await call), {"status": "cancelled"})
-        self.assertEqual(client.calls, [("thread-1", "turn-1")])
+        self.assertEqual(client.calls, [("thread-1", "turn-1", "Report phone readiness")])
 
     async def test_location_cancellation_and_noncanonical_context_never_leak_to_the_phone(self):
         client = _Client()
@@ -271,9 +297,10 @@ class HermesPluginContextTests(unittest.TestCase):
             self.assertTrue(ready.wait(1))
 
             class Client:
-                async def request_device_status(self, _thread_id, _turn_id):
+                async def request_device_status(self, _thread_id, _turn_id, purpose):
                     self.loop_thread = threading.get_ident()
-                    return {"status": "ok", "result": {"foreground": True}}
+                    self.status_purpose = purpose
+                    return {"status": "ok", "result": GATEWAY_STATUS}
 
                 async def request_location(self, _thread_id, _turn_id, purpose):
                     self.loop_thread = threading.get_ident()
@@ -299,10 +326,10 @@ class HermesPluginContextTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(model_tools.handle_function_call(
                         "tool_call",
-                        {"name": "cozy_device_status", "arguments": {}},
+                        {"name": "cozy_device_status", "arguments": {"purpose": "Report phone readiness"}},
                         enabled_toolsets=["cozygateway"],
                     )),
-                    {"status": "ok", "result": {"foreground": True}},
+                    {"status": "ok", "result": GATEWAY_STATUS},
                 )
                 self.assertEqual(
                     json.loads(model_tools.handle_function_call(
@@ -313,6 +340,7 @@ class HermesPluginContextTests(unittest.TestCase):
                     {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}},
                 )
                 self.assertEqual(client.purpose, "Find coffee")
+                self.assertEqual(client.status_purpose, "Report phone readiness")
                 self.assertEqual(client.loop_thread, thread.ident)
             finally:
                 clear_session_vars(tokens)

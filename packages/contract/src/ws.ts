@@ -49,8 +49,43 @@ export const SyncFrameSchema = Type.Object({
 });
 export type SyncFrame = Static<typeof SyncFrameSchema>;
 
-const MobileNodeCommandSchema = Type.Union([Type.Literal("device.status"), Type.Literal("location.current")]);
-const MobileNodeStatusResultSchema = Type.Object({ foreground: Type.Literal(true) }, { additionalProperties: false });
+export const MobileNodeCommandSchema = Type.Union([Type.Literal("device.status"), Type.Literal("location.current")]);
+const MobileNodePermissionSchema = Type.Union([
+  Type.Literal("authorized"), Type.Literal("denied"),
+  Type.Literal("restricted"), Type.Literal("not_determined"), Type.Literal("unavailable"),
+]);
+const DeviceStatusCommandCapabilitySchema = Type.Object({
+  command: Type.Literal("device.status"), permission: Type.Literal("not_required"),
+}, { additionalProperties: false });
+const LocationCurrentCapabilitySchema = Type.Object({
+  command: Type.Literal("location.current"), permission: MobileNodePermissionSchema,
+}, { additionalProperties: false });
+/** Capability 3 advertises exactly these two selected-device commands in canonical order. */
+const DeviceStatusCapabilitiesSchema = Type.Tuple([
+  DeviceStatusCommandCapabilitySchema,
+  LocationCurrentCapabilitySchema,
+]);
+export const MobileNodePhoneStatusResultSchema = Type.Object({
+  appState: Type.Union([Type.Literal("foreground"), Type.Literal("background")]),
+  batteryBand: Type.Optional(Type.Union([Type.Literal("critical"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])),
+  lowPowerMode: Type.Boolean(),
+  thermalState: Type.Optional(Type.Union([Type.Literal("nominal"), Type.Literal("fair"), Type.Literal("serious"), Type.Literal("critical")])),
+  networkClass: Type.Optional(Type.Union([Type.Literal("wifi"), Type.Literal("cellular"), Type.Literal("none")])),
+  capabilities: DeviceStatusCapabilitiesSchema,
+  wakeReason: Type.Optional(Type.Union([Type.Literal("notification"), Type.Literal("notification_action"), Type.Literal("deep_link")])),
+}, { additionalProperties: false });
+export type MobileNodePhoneStatusResult = Static<typeof MobileNodePhoneStatusResultSchema>;
+export const MobileNodeGatewayStatusResultSchema = Type.Object({
+  ...MobileNodePhoneStatusResultSchema.properties,
+  authenticatedReachable: Type.Literal(true),
+  lastAuthenticatedPresenceAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type MobileNodeGatewayStatusResult = Static<typeof MobileNodeGatewayStatusResultSchema>;
+export const MobileNodePurposeSchema = Type.String({
+  minLength: 1,
+  maxLength: 160,
+  pattern: "^[^\\s\\u0000-\\u001f\\u007f-\\u009f]+(?: [^\\s\\u0000-\\u001f\\u007f-\\u009f]+)*$",
+});
 const MobileNodeLocationResultSchema = Type.Object({
   // JSON Schema `multipleOf` is not stable for decimal floating-point values.
   // The broker validates the integer-cent invariant before accepting this result.
@@ -61,12 +96,12 @@ const MobileNodeLocationResultSchema = Type.Object({
 export const MobileNodeAdvertiseFrameSchema = Type.Object({
   type: Type.Literal("mobile_node_advertise"),
   commands: Type.Array(MobileNodeCommandSchema, { minItems: 1, maxItems: 2, uniqueItems: true }),
-  foreground: Type.Literal(true),
+  foreground: Type.Boolean(),
 }, { additionalProperties: false });
 export type MobileNodeAdvertiseFrame = Static<typeof MobileNodeAdvertiseFrameSchema>;
 
 export const MobileNodeResultFrameSchema = Type.Union([
-  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Literal("ok"), result: MobileNodeStatusResultSchema }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Literal("ok"), result: MobileNodePhoneStatusResultSchema }, { additionalProperties: false }),
   Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Literal("ok"), result: MobileNodeLocationResultSchema }, { additionalProperties: false }),
   Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Union([Type.Literal("denied"), Type.Literal("cancelled"), Type.Literal("expired"), Type.Literal("foreground_required")]) }, { additionalProperties: false }),
 ]);
@@ -152,13 +187,13 @@ const MobileNodeStatusRequestFrameSchema = Type.Object({
   type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
   command: Type.Literal("device.status"), bot: Type.String({ minLength: 1, maxLength: 128 }),
   threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }),
-  expiresAt: Type.Integer({ minimum: 0 }),
+  expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
 const MobileNodeLocationRequestFrameSchema = Type.Object({
   type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
   command: Type.Literal("location.current"), bot: Type.String({ minLength: 1, maxLength: 128 }),
   threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }),
-  expiresAt: Type.Integer({ minimum: 0 }), purpose: Type.String({ minLength: 1, maxLength: 160 }),
+  expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
 export const MobileNodeRequestFrameSchema = Type.Union([MobileNodeStatusRequestFrameSchema, MobileNodeLocationRequestFrameSchema]);
 export type MobileNodeRequestFrame = Static<typeof MobileNodeRequestFrameSchema>;

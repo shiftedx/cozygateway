@@ -108,7 +108,9 @@ def main() -> int:
         )
         try:
             name = "cozy_request_location" if tool == "location" else "cozy_device_status"
-            arguments = {"purpose": "Find nearby coffee"} if tool == "location" else {}
+            arguments = {
+                "purpose": "Find nearby coffee" if tool == "location" else "Report phone readiness",
+            }
             result = model_tools.handle_function_call(name, arguments, enabled_tools=[name])
         finally:
             clear_session_vars(tokens)
