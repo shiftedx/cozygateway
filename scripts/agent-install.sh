@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install CozyGateway next to an existing Hermes installation.
+# Install CozyGateway next to a Hermes installation.
 #
 # This intentionally owns only CozyGateway: one gateway service, one checked
 # attach-plugin copy per selected Hermes profile, and the env keys it writes.
@@ -162,18 +162,104 @@ gateway_origin() {
 
 node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -dc '0-9'; }
 resolve_node() {
-  local candidate major
+  local candidate major private="$GATEWAY_DIR/runtime/node/bin/node"
+  if [ "${COZYGATEWAY_NODE+x}" != x ] && [ -x "$private" ]; then
+    major="$(node_major "$private")"; [ "${major:-0}" -ge 24 ] && { printf '%s' "$private"; return; }
+  fi
   candidate="$NODE_BIN"
-  case "$candidate" in */*) [ -x "$candidate" ] || die "node executable not found: $candidate" ;; *) have "$candidate" || die "Node.js 24+ is required" ;; esac
-  major="$(node_major "$candidate")"
-  [ "${major:-0}" -ge 24 ] || die "Node.js 24+ is required (found ${major:-unknown})"
-  case "$candidate" in /*) printf '%s' "$candidate" ;; *) command -v "$candidate" ;; esac
+  if case "$candidate" in */*) [ -x "$candidate" ] ;; *) have "$candidate" ;; esac; then
+    major="$(node_major "$candidate")"
+    if [ "${major:-0}" -ge 24 ]; then case "$candidate" in /*) printf '%s' "$candidate" ;; *) command -v "$candidate" ;; esac; return; fi
+  fi
+  [ "${COZYGATEWAY_NODE+x}" = x ] && return 1
+  return 1
 }
-resolve_hermes() {
-  case "$HERMES_BIN" in
-    /*) [ -x "$HERMES_BIN" ] || die "Hermes executable not found: $HERMES_BIN"; printf '%s' "$HERMES_BIN" ;;
-    *) command -v "$HERMES_BIN" || die "Hermes must already be installed" ;;
-  esac
+sha256_of() { if have shasum; then shasum -a 256 "$1" | awk '{print $1}'; elif have sha256sum; then sha256sum "$1" | awk '{print $1}'; else die "sha256 tool required (shasum or sha256sum)"; fi; }
+sha1_blob_of() {
+  local size
+  size="$(wc -c < "$1" | tr -d ' ')"
+  if have shasum; then { printf 'blob %s\0' "$size"; cat "$1"; } | shasum | awk '{print $1}'
+  elif have sha1sum; then { printf 'blob %s\0' "$size"; cat "$1"; } | sha1sum | awk '{print $1}'
+  else die "sha1 tool required to verify the official Hermes installer"; fi
+}
+copy_or_download() { if [ -f "$1" ]; then cp "$1" "$2"; else curl -fsSL "$1" -o "$2"; fi; }
+node_archive_name() {
+  local os arch
+  case "$SERVICE_PLATFORM" in Darwin) os=darwin ;; Linux) os=linux ;; *) die "private Node bootstrap is supported only on macOS and Linux" ;; esac
+  case "$(uname -m)" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) die "Node.js 24 is unavailable for $(uname -s) $(uname -m); install Node.js 24+ and retry" ;; esac
+  if [ "$os" = linux ] && have ldd && ldd --version 2>&1 | grep -qi musl; then
+    die "official Node.js binaries require glibc; install Node.js 24+ for this musl Linux system and retry"
+  fi
+  printf 'node-%s-%s-%s.tar.gz' "$NODE_INSTALL_VERSION" "$os" "$arch"
+}
+install_node_runtime() {
+  local base="${COZYGATEWAY_NODE_DIST_BASE:-https://nodejs.org/dist}" index version_file archive expected got stage source
+  have curl || die "curl is required to install Node.js"
+  have tar || die "tar is required to install Node.js"
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-node.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
+  NODE_INSTALL_VERSION="${COZYGATEWAY_NODE_VERSION:-}"
+  if [ -z "$NODE_INSTALL_VERSION" ]; then
+    index="$stage/index.tab"; copy_or_download "$base/index.tab" "$index"
+    NODE_INSTALL_VERSION="$(awk 'NR > 1 && $1 ~ /^v24\./ { print $1; exit }' "$index")"
+  fi
+  case "$NODE_INSTALL_VERSION" in v24.*) ;; *) die "could not resolve a current Node.js 24 release" ;; esac
+  archive="$(node_archive_name)"; version_file="$base/$NODE_INSTALL_VERSION"
+  copy_or_download "$version_file/SHASUMS256.txt" "$stage/SHASUMS256.txt"
+  expected="$(awk -v file="$archive" '$2 == file { print $1; exit }' "$stage/SHASUMS256.txt")"
+  [ -n "$expected" ] || die "$archive is absent from the official Node.js checksums"
+  copy_or_download "$version_file/$archive" "$stage/$archive"; got="$(sha256_of "$stage/$archive")"
+  [ "$expected" = "$got" ] || die "$archive checksum mismatch"
+  tar -xzf "$stage/$archive" -C "$stage"
+  source="$stage/${archive%.tar.gz}"; [ -x "$source/bin/node" ] || die "$archive did not contain a Node.js executable"
+  mkdir -p "$GATEWAY_DIR/runtime"; rm -rf "$GATEWAY_DIR/runtime/node"; mv "$source" "$GATEWAY_DIR/runtime/node"
+  NODE_RESOLVED="$GATEWAY_DIR/runtime/node/bin/node"
+  say "OK    installed checksum-verified Node.js $NODE_INSTALL_VERSION for CozyGateway only"
+  rm -rf "$stage"; trap - RETURN
+}
+find_hermes() {
+  local candidate
+  for candidate in "$HERMES_BIN" "$HOME/.local/bin/hermes" "${HERMES_HOME:-$HOME/.hermes}/bin/hermes"; do
+    case "$candidate" in */*) [ -x "$candidate" ] && { printf '%s' "$candidate"; return; } ;; *) have "$candidate" && { command -v "$candidate"; return; } ;; esac
+  done
+  return 1
+}
+fetch_hermes_installer() {
+  local out="$1" source="${COZYGATEWAY_HERMES_INSTALL_URL:-}" expected="${COZYGATEWAY_HERMES_INSTALL_SHA256:-}" tag metadata got
+  if [ -n "$source" ]; then
+    copy_or_download "$source" "$out"
+    if [ -f "$source" ]; then [ -n "$expected" ] || expected="$(sha256_of "$source")"; fi
+    [ -n "$expected" ] || die "COZYGATEWAY_HERMES_INSTALL_SHA256 is required for a remote Hermes installer override"
+    [ "$(sha256_of "$out")" = "$expected" ] || die "Hermes installer checksum mismatch"
+    return
+  fi
+  tag="$(curl -fsSL https://api.github.com/repos/NousResearch/hermes-agent/releases/latest | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  case "$tag" in ''|*[!A-Za-z0-9._-]*) die "could not resolve the latest tagged Hermes release" ;; esac
+  metadata="$(curl -fsSL "https://api.github.com/repos/NousResearch/hermes-agent/contents/scripts/install.sh?ref=$tag")"
+  expected="$(printf '%s' "$metadata" | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+  [ -n "$expected" ] || die "could not resolve the official Hermes installer identity for $tag"
+  curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/$tag/scripts/install.sh" -o "$out"
+  got="$(sha1_blob_of "$out")"; [ "$got" = "$expected" ] || die "Hermes installer identity mismatch"
+  say "OK    verified the official NousResearch Hermes installer from $tag"
+}
+install_hermes() {
+  local stage installer
+  have curl || die "curl is required to install Hermes Agent"
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-hermes.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
+  installer="$stage/install.sh"; fetch_hermes_installer "$installer"; chmod 700 "$installer"
+  say "INFO  Hermes Agent is not installed; starting the official installer."
+  bash "$installer" || die "Hermes installation did not complete successfully"
+  HERMES_RESOLVED="$(find_hermes)" || die "Hermes installation finished but the hermes command was not found; add it to PATH and retry"
+  rm -rf "$stage"; trap - RETURN
+}
+confirm_hermes_model() {
+  local status
+  if [ "$DRY_RUN" = 1 ]; then say "DRY   open hermes model, then verify its active provider and model"; return; fi
+  say "INFO  Choose or confirm the Hermes inference provider and model."
+  "$HERMES_RESOLVED" model || die "Hermes model selection did not complete successfully"
+  status="$("$HERMES_RESOLVED" status 2>&1)" || die "Hermes needs an active provider and model before CozyGateway can be installed"
+  printf '%s\n' "$status" | grep -Eq '^[[:space:]]*(Current model|Model):[[:space:]]*[^[:space:]]' || die "Hermes needs an active provider and model before CozyGateway can be installed"
+  printf '%s\n' "$status" | grep -Eq '^[[:space:]]*(Active provider|Provider):[[:space:]]*[^[:space:]]' || die "Hermes needs an active provider and model before CozyGateway can be installed"
+  say "OK    Hermes provider and model are configured"
 }
 
 # profile names are shell/file-safe Hermes identifiers. Reject anything that
@@ -343,9 +429,15 @@ prior_service_action() {
   local profile="$1" action
   [ -f "$STATE_FILE" ] || return 0
   action="$(awk -F= -v key="service_$profile" '$1 == key { value = $2 } END { if (value != "") print value }' "$STATE_FILE")"
-  case "$action" in ''|preexisting|started|installed) printf '%s' "$action" ;; *) die "invalid Hermes gateway lifecycle state for profile $profile" ;; esac
+  case "$action" in '') ;; unknown) return 0 ;; preexisting|started|installed) printf '%s' "$action" ;; *) die "invalid Hermes gateway lifecycle state for profile $profile" ;; esac
 }
-record_service_action() { SERVICE_PROFILES+=("$1"); SERVICE_ACTIONS+=("$2"); }
+record_service_action() {
+  local index
+  for index in "${!SERVICE_PROFILES[@]}"; do
+    [ "${SERVICE_PROFILES[$index]}" = "$1" ] && { SERVICE_ACTIONS[index]="$2"; return; }
+  done
+  SERVICE_PROFILES+=("$1"); SERVICE_ACTIONS+=("$2")
+}
 ensure_hermes_gateways() {
   local profile state prior action
   for profile in "${SELECTED[@]}"; do
@@ -387,6 +479,17 @@ write_state() {
   chmod 600 "$STATE_FILE"
 }
 resolve_platform() { normalize_service_platform; }
+preflight_service_manager() {
+  resolve_platform
+  [ "$DRY_RUN" = 1 ] && return
+  if [ "$SERVICE_PLATFORM" = Darwin ]; then
+    have launchctl || die "launchd is unavailable; CozyGateway needs a macOS user login service"
+  elif [ "$SERVICE_PLATFORM" = Linux ]; then
+    have systemctl || die "systemd --user is unavailable; CozyGateway cannot install persistently in this Linux environment"
+    have loginctl || die "systemd-logind is unavailable; install systemd-login or use a host with user services"
+    systemctl --user show-environment >/dev/null 2>&1 || die "no systemd user manager is running; containers and WSL without systemd are not supported"
+  fi
+}
 write_cli_wrapper() {
   local node_native bundle_native local_native
   [ "$DRY_RUN" = 1 ] && { say "DRY   write executable gateway CLI at $CLI_WRAPPER"; return; }
@@ -631,13 +734,13 @@ wait_gateway_ready() {
 }
 attach_ready() {
   curl -fsS --max-time 3 "$(gateway_origin)/health" 2>/dev/null |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach;process.exit(h&&h.online===h.configured&&h.deadLetters===0?0:1)}catch{process.exit(1)}})'
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach;process.exit(h&&h.configured>0&&h.online===h.configured&&h.deadLetters===0?0:1)}catch{process.exit(1)}})'
 }
 wait_attach_ready() {
-  [ "$DRY_RUN" = 1 ] && { say "DRY   require attach.online == attach.configured with zero dead letters"; return; }
+  [ "$DRY_RUN" = 1 ] && { say "DRY   require attach.configured > 0, attach.online == attach.configured, and zero dead letters"; return; }
   local attempt
   for attempt in $(seq 1 30); do attach_ready && return; sleep 1; done
-  die "Hermes attach did not become healthy (online must equal configured, with zero dead letters)"
+  die "Hermes attach did not become healthy (configured must be positive, online must equal configured, and dead letters must be zero)"
 }
 install_service() {
   resolve_platform; write_wrapper
@@ -653,7 +756,7 @@ install_service() {
 PLIST
     launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; launchctl bootstrap "gui/$(id -u)" "$plist"
   else
-    local unit_dir="$HOME/.config/systemd/user"; mkdir -p "$unit_dir"
+    local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; mkdir -p "$unit_dir"
     have loginctl || die "Linux logout/reboot persistence needs loginctl; install systemd-login or run CozyGateway as a system service"
     if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)" != yes ]; then
       loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || die "Linux logout/reboot persistence needs lingering; run: sudo loginctl enable-linger $(id -un)"
@@ -754,7 +857,16 @@ start_dashboard() {
 }
 uninstall() {
   local profiles root hermes_bin p home plugin spool action hermes_available=1
-  [ -f "$STATE_FILE" ] || die "no CozyGateway install state at $STATE_FILE"
+  if [ ! -f "$STATE_FILE" ]; then
+    resolve_platform
+    say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
+    if [ "$DRY_RUN" = 1 ]; then run rm -rf "$GATEWAY_DIR"; return; fi
+    if [ "$SERVICE_PLATFORM" = Darwin ]; then launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli
+    elif [ "$SERVICE_PLATFORM" = Linux ]; then systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli
+    fi
+    rm -rf "$GATEWAY_DIR"; say "OK    removed partial CozyGateway state; Hermes was not changed"
+    return
+  fi
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
   hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
@@ -779,19 +891,19 @@ uninstall() {
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
     else launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli; fi
   else
-    if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "$HOME/.config/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
-    else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "$HOME/.config/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
+    if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
+    else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
   fi
   IFS=',' read -r -a SELECTED <<<"$profiles"; HERMES_ROOT="$root"
   for p in "${SELECTED[@]}"; do
     valid_profile "$p" || die "unsafe profile in installer state"; home="$(profile_home "$p")"; plugin="$home/plugins/cozygateway"; spool="$home/plugin-data/cozygateway/attach-v1.sqlite"
     action="$(prior_service_action "$p")"
-    case "$action" in installed|started|preexisting) ;; '') die "missing Hermes gateway lifecycle state for profile $p" ;; *) die "unsafe Hermes gateway lifecycle state for profile $p" ;; esac
+    case "$action" in installed|started|preexisting|unknown) ;; '') die "missing Hermes gateway lifecycle state for profile $p" ;; *) die "unsafe Hermes gateway lifecycle state for profile $p" ;; esac
     if [ "$hermes_available" = 1 ]; then
       case "$action" in
         installed) run "$HERMES_RESOLVED" -p "$p" gateway uninstall; say "OK    removed Hermes gateway service installed by CozyGateway for profile $p" ;;
         started) run "$HERMES_RESOLVED" -p "$p" gateway stop; say "OK    stopped Hermes gateway service started by CozyGateway for profile $p" ;;
-        preexisting) ;;
+        preexisting|unknown) ;;
       esac
       if [ -f "$plugin/.cozygateway-installer-owned" ]; then run "$HERMES_RESOLVED" -p "$p" plugins disable cozygateway; fi
     else
@@ -821,13 +933,32 @@ status_install() {
   [ "$persisted" = 1 ] && [ "$live" = 1 ]
 }
 main() {
+  local prerequisite_missing=0 profile action
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
-  NODE_RESOLVED="$(resolve_node)"; hydrate_listener_settings; validate_listener_settings
+  preflight_service_manager
+  if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+  elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
+  elif is_windows; then die "Node.js 24+ is required"
+  else install_node_runtime
+  fi
+  [ "$prerequisite_missing" = 1 ] || { hydrate_listener_settings; validate_listener_settings; }
   if [ "$STATUS" = 1 ]; then status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
-  have "$HERMES_BIN" || die "Hermes must already be installed"; HERMES_RESOLVED="$(resolve_hermes)"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
-  say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"; write_gateway_env
+  if HERMES_RESOLVED="$(find_hermes)"; then say "OK    using Hermes at $HERMES_RESOLVED"
+  elif [ "$DRY_RUN" = 1 ]; then say "DRY   install Hermes Agent with the verified official tagged NousResearch installer, then resume CozyGateway setup"; prerequisite_missing=1
+  elif is_windows; then die "Hermes must already be installed"
+  else install_hermes
+  fi
+  is_windows || confirm_hermes_model
+  if [ "$prerequisite_missing" = 1 ]; then
+    say "DRY   after prerequisites, configure CozyGateway and require healthy attach state before printing pairing material"
+    return
+  fi
+  HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
+  say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
+  for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
+  write_state; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready

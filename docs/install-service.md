@@ -16,6 +16,12 @@ ownership of those services; uninstall reverses only lifecycle work it caused.
 It also makes `cozygateway` available in new terminal sessions without a global
 package installation.
 
+On macOS and Linux, missing Node.js 24+ is installed as a private,
+checksum-verified runtime under the CozyGateway home. Missing Hermes is
+installed with the verified official tagged NousResearch installer. Setup then
+runs `hermes model` interactively and verifies the active provider and model
+before installing CozyGateway or printing a pairing QR.
+
 The gateway listens on `0.0.0.0:8787` by default, allowing local/LAN access.
 Change it with `--bind-host` or `--port` when installing. The attached Hermes
 plugins use loopback to reach the same machine.
@@ -40,6 +46,9 @@ schtasks /Query /TN CozyGateway /V /FO LIST
 On Linux the installer enables user lingering so the service survives logout
 and reboot. If your host policy blocks that authorization, run
 `sudo loginctl enable-linger "$USER"` once and repeat the installer.
+The unit is written below `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`.
+Linux without `systemctl --user`, `loginctl`, or a running user manager is not a
+supported service host and is rejected before prerequisite installation.
 
 Update by repeating the one-paste line. Remove only installer-owned state:
 

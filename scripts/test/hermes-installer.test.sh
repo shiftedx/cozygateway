@@ -25,6 +25,15 @@ state_file="$root/gateway-$profile.state"
 state() { [ -f "$state_file" ] && cat "$state_file" || printf 'absent'; }
 set_state() { printf '%s\n' "$1" > "$state_file"; }
 log() { printf '%s\n' "$profile:gateway:$1" >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"; }
+if [ "$1" = model ]; then
+  printf 'model\n' >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"
+  [ "${COZYGATEWAY_TEST_MODEL_DECLINE:-}" = 1 ] && exit 1
+  exit 0
+fi
+if [ "$1" = status ]; then
+  printf 'Current model: test/model\nActive provider: test-provider\n'
+  exit 0
+fi
 if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "path" ]; then
   [ "$2" = default ] && printf '%s/config.yaml\n' "$root" || printf '%s/profiles/%s/config.yaml\n' "$root" "$2"
   exit 0
@@ -94,6 +103,20 @@ if (args[0] === 'pair') {
 }
 BUNDLE
 
+# The curl bootstrap still verifies all release assets in dry-run mode, but it
+# stages them outside COZYGATEWAY_HOME and leaves the requested home untouched.
+mkdir -p "$tmp/release-assets"
+cp "$tmp/gateway.mjs" "$tmp/release-assets/cozygateway.mjs"
+cp "$tmp/plugin.tar.gz" "$tmp/release-assets/cozygateway-hermes-attach-plugin.tar.gz"
+cp "$repo_root/scripts/agent-install.sh" "$tmp/release-assets/cozygateway-installer.sh"
+for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway-installer.sh; do
+  if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/$asset" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/$asset" | awk '{print $1}')"; fi
+  printf '%s  %s\n' "$asset_sha" "$asset" > "$tmp/release-assets/$asset.sha256"
+done
+bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="file://$tmp/release-assets" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
+grep -Fq 'DRY   verified assets' <<<"$bootstrap_dry_output"
+test ! -e "$tmp/bootstrap-dry-home"
+
 for platform in Darwin Linux Windows; do
   windows_status=; [ "$platform" = Windows ] && windows_status=1
   output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_STATUS="$windows_status" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM="$platform" bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-$platform")"
@@ -105,8 +128,20 @@ for platform in Darwin Linux Windows; do
   grep -Fq "gateway install --start-now --start-on-login" <<<"$output"
   grep -Fq "gateway start" <<<"$output"
   grep -Fq "gateway restart" <<<"$output"
+  grep -Fq 'using Node.js 24' <<<"$output"
+  [ "$platform" = Windows ] || grep -Fq 'open hermes model' <<<"$output"
   test ! -e "$tmp/gateway-$platform"
 done
+# Existing Node and Hermes are reused. POSIX dry-runs report the interactive
+# model step but do not run it or mutate either prerequisite.
+[ ! -f "$tmp/commands" ] || ! grep -q '^model$' "$tmp/commands"
+
+# Missing prerequisites remain a non-mutating dry-run and describe both
+# bootstraps without attempting any download.
+missing_dry_output="$(HOME="$tmp/missing-dry-home" PATH="$tmp/bin:$PATH" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-missing-dry")"
+grep -Fq 'install the current Node.js 24 release' <<<"$missing_dry_output"
+grep -Fq 'install Hermes Agent with the verified official tagged NousResearch installer' <<<"$missing_dry_output"
+test ! -e "$tmp/gateway-missing-dry"
 if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 'http://not-a-host' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-invalid-host" >/dev/null 2>&1; then
   echo 'expected URL syntax in --bind-host to fail' >&2
   exit 1
@@ -123,6 +158,16 @@ cat > "$tmp/service-bin/launchctl" <<'LAUNCHCTL'
 exit 0
 LAUNCHCTL
 chmod 700 "$tmp/service-bin/launchctl"
+
+# Declining or aborting `hermes model` stops before CozyGateway mutation and
+# never prints pairing material.
+if declined_output="$(HOME="$tmp/model-declined-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/model-declined-commands" COZYGATEWAY_TEST_MODEL_DECLINE=1 COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-model-declined" 2>&1)"; then
+  echo 'expected a declined Hermes model selection to fail' >&2
+  exit 1
+fi
+grep -Fq 'Hermes model selection did not complete successfully' <<<"$declined_output"
+if grep -Fq 'fake-qr' <<<"$declined_output"; then echo 'declined model selection printed pairing material' >&2; exit 1; fi
+test ! -e "$tmp/gateway-model-declined"
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 [ -z "${COZYGATEWAY_TEST_CURL_LOG:-}" ] || printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_CURL_LOG"
@@ -132,7 +177,9 @@ case "$*" in
       if [[ "$*" == *"-o /dev/null"* ]]; then printf '000'; else printf '{"attach":{"configured":1,"online":0,"deadLetters":0}}'; fi
       exit 0
     fi
-    if [[ "$*" == *"-o /dev/null"* ]]; then printf '200'; else printf '{"attach":{"configured":1,"online":1,"deadLetters":0}}'; fi
+    if [[ "$*" == *"-o /dev/null"* ]]; then printf '200'
+    elif [ "${COZYGATEWAY_TEST_ZERO_ATTACH:-}" = 1 ]; then printf '{"attach":{"configured":0,"online":0,"deadLetters":0}}'
+    else printf '{"attach":{"configured":1,"online":1,"deadLetters":0}}'; fi
     ;;
   *api/health*)
     if [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER" ]; then printf '000'; else printf '401'; fi
@@ -145,7 +192,52 @@ case "$*" in
 esac
 CURL
 chmod 700 "$tmp/bin/curl"
-live_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bind-host 192.0.2.10 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+
+# Official Node archives and the official Hermes installer are represented by
+# local, checksum-verified fixtures. This run starts with neither command,
+# installs both, resumes in the same process, confirms the model, and reaches QR.
+node_version=v24.99.0
+case "$(uname -m)" in x86_64|amd64) node_arch=x64 ;; arm64|aarch64) node_arch=arm64 ;; *) echo 'unsupported test architecture' >&2; exit 1 ;; esac
+node_name="node-$node_version-darwin-$node_arch"
+mkdir -p "$tmp/node-dist/$node_version" "$tmp/node-build/$node_name/bin"
+cp "$fake_node" "$tmp/node-build/$node_name/bin/node"
+tar -czf "$tmp/node-dist/$node_version/$node_name.tar.gz" -C "$tmp/node-build" "$node_name"
+if command -v shasum >/dev/null 2>&1; then node_sha="$(shasum -a 256 "$tmp/node-dist/$node_version/$node_name.tar.gz" | awk '{print $1}')"; else node_sha="$(sha256sum "$tmp/node-dist/$node_version/$node_name.tar.gz" | awk '{print $1}')"; fi
+printf '%s  %s.tar.gz\n' "$node_sha" "$node_name" > "$tmp/node-dist/$node_version/SHASUMS256.txt"
+cat > "$tmp/hermes-official-installer.sh" <<'HERMES_INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$HOME/.local/bin"
+cp "${COZYGATEWAY_TEST_HERMES_FIXTURE:?}" "$HOME/.local/bin/hermes"
+chmod 700 "$HOME/.local/bin/hermes"
+HERMES_INSTALLER
+chmod 700 "$tmp/hermes-official-installer.sh"
+if command -v shasum >/dev/null 2>&1; then hermes_installer_sha="$(shasum -a 256 "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; else hermes_installer_sha="$(sha256sum "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; fi
+live_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bind-host 192.0.2.10 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+test -x "$tmp/gateway-live/runtime/node/bin/node"
+grep -Fq 'installed checksum-verified Node.js' <<<"$live_output"
+grep -Fq 'Hermes Agent is not installed; starting the official installer.' <<<"$live_output"
+grep -Fq 'Hermes provider and model are configured' <<<"$live_output"
+grep -q '^model$' "$tmp/commands"
+private_rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+grep -Fq "using Node.js 24 at $tmp/gateway-live/runtime/node/bin/node" <<<"$private_rerun_output"
+
+# A syntactically healthy endpoint with zero configured attach profiles is not
+# ready and cannot reach the pairing finale.
+mkdir -p "$tmp/zero-hermes" "$tmp/one-attempt-bin"
+printf '{}\n' > "$tmp/zero-hermes/config.yaml"
+printf 'absent\n' > "$tmp/zero-hermes/gateway-default.state"
+cat > "$tmp/one-attempt-bin/seq" <<'ONE_ATTEMPT'
+#!/usr/bin/env bash
+printf '1\n'
+ONE_ATTEMPT
+chmod 700 "$tmp/one-attempt-bin/seq"
+if zero_attach_output="$(HOME="$tmp/zero-home" PATH="$tmp/one-attempt-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ZERO_ATTACH=1 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/zero-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/zero-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-zero-attach" 2>&1)"; then
+  echo 'expected zero configured attach profiles to fail readiness' >&2
+  exit 1
+fi
+grep -Fq 'configured must be positive' <<<"$zero_attach_output"
+if grep -Fq 'fake-qr' <<<"$zero_attach_output"; then echo 'unhealthy attach state printed pairing material' >&2; exit 1; fi
 # shellcheck disable=SC2016
 if grep -Fq 'spaces $dollar' <<<"$live_output"; then
   echo 'installer output must not contain credentials' >&2
@@ -185,7 +277,7 @@ grep -q '^active:gateway:restart$' "$tmp/commands"
 grep -q '^service_default=installed$' "$tmp/gateway-live/local/install-state"
 grep -q '^service_ops=started$' "$tmp/gateway-live/local/install-state"
 grep -q '^service_active=preexisting$' "$tmp/gateway-live/local/install-state"
-grep -Fq "hermes_bin=$tmp/bin/hermes" "$tmp/gateway-live/local/install-state"
+grep -Fq "hermes_bin=$tmp/darwin-home/.local/bin/hermes" "$tmp/gateway-live/local/install-state"
 test ! -e "$credential_marker"
 test -x "$tmp/gateway-live/bin/cozygateway"
 if [[ "$(uname -s)" = MINGW* ]]; then
@@ -324,10 +416,10 @@ cat > "$tmp/linux-bin/systemctl" <<'SYSTEMCTL'
 printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_SYSTEM_LOG:?}"
 SYSTEMCTL
 chmod 700 "$tmp/linux-bin/loginctl" "$tmp/linux-bin/systemctl"
-HOME="$tmp/linux-home" PATH="$tmp/linux-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/linux-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/linux-commands" COZYGATEWAY_TEST_SYSTEM_LOG="$tmp/system-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Linux bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-linux-live" >/dev/null
+HOME="$tmp/linux-home" XDG_CONFIG_HOME="$tmp/linux-xdg" PATH="$tmp/linux-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/linux-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/linux-commands" COZYGATEWAY_TEST_SYSTEM_LOG="$tmp/system-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Linux bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-linux-live" >/dev/null
 grep -q '^enable-linger ' "$tmp/system-commands"
 grep -q '^--user enable --now cozygateway.service$' "$tmp/system-commands"
-grep -Fq "ExecStart=/bin/bash $tmp/gateway-linux-live/local/run-gateway.sh" "$tmp/linux-home/.config/systemd/user/cozygateway.service"
+grep -Fq "ExecStart=/bin/bash $tmp/gateway-linux-live/local/run-gateway.sh" "$tmp/linux-xdg/systemd/user/cozygateway.service"
 if [[ "$(uname -s)" = MINGW* ]]; then
   cmp -s "$tmp/linux-home/.local/bin/cozygateway" "$tmp/gateway-linux-live/bin/cozygateway"
 else
@@ -441,5 +533,31 @@ if COZYGATEWAY_HOME=/ COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/inst
   echo 'expected unsafe bootstrap home to be rejected before downloading assets' >&2
   exit 1
 fi
+
+# A bootstrap interrupted before install-state exists is still removable with
+# no Node, Hermes, or config. The dedicated directory is the recovery boundary.
+mkdir -p "$tmp/partial-home" "$tmp/gateway-partial/runtime/node"
+printf 'partial\n' > "$tmp/gateway-partial/runtime/node/marker"
+HOME="$tmp/partial-home" PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-partial" >/dev/null
+test ! -e "$tmp/gateway-partial"
+
+# A container or WSL-like Linux environment with binaries but no running user
+# manager is rejected before Node, Hermes, or CozyGateway can be installed.
+mkdir -p "$tmp/no-systemd-bin"
+cat > "$tmp/no-systemd-bin/systemctl" <<'SYSTEMCTL_MISSING'
+#!/usr/bin/env bash
+exit 1
+SYSTEMCTL_MISSING
+cat > "$tmp/no-systemd-bin/loginctl" <<'LOGINCTL_PRESENT'
+#!/usr/bin/env bash
+exit 0
+LOGINCTL_PRESENT
+chmod 700 "$tmp/no-systemd-bin/systemctl" "$tmp/no-systemd-bin/loginctl"
+if no_systemd_output="$(HOME="$tmp/no-systemd-home" PATH="$tmp/no-systemd-bin:/usr/bin:/bin" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Linux bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-no-systemd" 2>&1)"; then
+  echo 'expected Linux without a systemd user manager to fail' >&2
+  exit 1
+fi
+grep -Fq 'no systemd user manager is running' <<<"$no_systemd_output"
+test ! -e "$tmp/gateway-no-systemd"
 
 echo 'hermes installer dry-run tests passed'
