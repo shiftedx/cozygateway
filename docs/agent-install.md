@@ -1,6 +1,6 @@
 # CozyGateway Hermes install
 
-Use the human-facing one-paste installer for an existing Hermes machine:
+Use the human-facing one-paste installer on a new or existing machine:
 
 Windows PowerShell 5.1+:
 
@@ -20,6 +20,15 @@ macOS/Linux:
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
+If Node.js 24+ is unavailable, the macOS/Linux installer downloads the current
+Node.js 24 archive from nodejs.org, verifies it against that release's official
+`SHASUMS256.txt`, and installs it privately under
+`~/.cozygateway/runtime/node`. It does not use sudo, replace the system Node,
+or change the shell PATH. If Hermes is unavailable, it verifies and runs the
+official installer from the latest tagged NousResearch/hermes-agent release,
+then resumes automatically. Every run gives `hermes model` control of the
+terminal and requires an active provider and model before CozyGateway changes.
+
 It discovers Hermes with `hermes -p <profile> config path`, then uses that
 evidence to find the default home and named profile homes. Every discovered
 profile with a `config.yaml` is configured by default; narrow the scope with
@@ -29,7 +38,11 @@ The release bootstrap downloads and SHA-256 verifies three versioned release
 assets before execution: the gateway bundle, the complete Hermes attach plugin
 archive, and the installer payload. It never executes the mutable raw installer
 after that handoff. The checksum detects incomplete or corrupted downloads;
-release authenticity still relies on GitHub Releases over TLS.
+release authenticity still relies on GitHub Releases over TLS. Node archives
+rely on nodejs.org TLS plus the release checksum manifest. The Hermes bootstrap
+matches the tagged script's Git blob identity from the GitHub Contents API
+before execution; downloads performed by that official installer remain under
+the NousResearch installer trust boundary.
 
 For each selected profile it installs and enables the archive, writes only the
 four CozyGateway variables to that profile's mode-600 `.env`, creates a distinct
@@ -83,7 +96,8 @@ custom listener unless an explicit installer host or port option replaces it.
 LAN-only bind addresses are used consistently for local Hermes attachment and
 health checks. If a managed listener replacement cannot become ready, the CLI
 restores the previous working listener automatically.
-Readiness requires every configured attach profile online and zero dead letters.
+Readiness requires at least one configured attach profile, every configured
+profile online, and zero dead letters. Pairing material is not printed first.
 The non-interactive `cozygateway status`, `cozygateway pair`, and
 `cozygateway configure` commands expose the same focused operations directly.
 
@@ -97,3 +111,7 @@ listener-config parsing, and the continued presence of Hermes, so a damaged
 install remains removable. On macOS and
 Linux the installer also exposes `cozygateway` through `~/.local/bin` in new
 terminal sessions; uninstall removes only its own command entry and profile line.
+Linux service units honor `XDG_CONFIG_HOME` and otherwise use
+`~/.config/systemd/user`. An environment without a running systemd user manager,
+such as a container or WSL instance without systemd, fails before installation
+with an actionable message.

@@ -27,17 +27,18 @@ fetch_verified() {
   mv "$out.new" "$out"; chmod 700 "$out" 2>/dev/null || true; printf 'OK    verified %s\n' "$asset"
 }
 main() {
+  local asset_dir="$HOME_DIR/bin" dry_stage=""
   command -v curl >/dev/null 2>&1 || die "curl is required"
   canonical_home_dir
   if [ -z "$ASSET_BASE" ]; then
     if [ -z "$TAG" ]; then TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"; [ -n "$TAG" ] || die "could not resolve latest release"; fi
     ASSET_BASE="https://github.com/$REPO/releases/download/$TAG"
   fi
-  mkdir -p "$HOME_DIR/bin"
-  fetch_verified cozygateway.mjs "$HOME_DIR/bin/cozygateway.mjs"
-  fetch_verified cozygateway-hermes-attach-plugin.tar.gz "$HOME_DIR/bin/cozygateway-hermes-attach-plugin.tar.gz"
-  fetch_verified cozygateway-installer.sh "$HOME_DIR/bin/agent-install.sh"
-  if [ "${COZYGATEWAY_INSTALL_DRYRUN:-}" = 1 ]; then printf 'DRYRUN  verified assets; would run installer from %s\n' "$HOME_DIR/bin/agent-install.sh"; return; fi
+  if [ "${COZYGATEWAY_INSTALL_DRYRUN:-}" = 1 ]; then dry_stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-bootstrap.XXXXXX")"; asset_dir="$dry_stage"; trap 'rm -rf "$dry_stage"' RETURN; else mkdir -p "$asset_dir"; fi
+  fetch_verified cozygateway.mjs "$asset_dir/cozygateway.mjs"
+  fetch_verified cozygateway-hermes-attach-plugin.tar.gz "$asset_dir/cozygateway-hermes-attach-plugin.tar.gz"
+  fetch_verified cozygateway-installer.sh "$asset_dir/agent-install.sh"
+  if [ -n "$dry_stage" ]; then rm -rf "$dry_stage"; trap - RETURN; printf 'DRY   verified assets; would run installer from %s\n' "$HOME_DIR/bin/agent-install.sh"; return; fi
   exec bash "$HOME_DIR/bin/agent-install.sh" --gateway-dir "$HOME_DIR" --bundle "$HOME_DIR/bin/cozygateway.mjs" --plugin-archive "$HOME_DIR/bin/cozygateway-hermes-attach-plugin.tar.gz" "$@"
 }
 main "$@"
