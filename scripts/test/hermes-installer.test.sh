@@ -7,6 +7,9 @@ real_node="$(command -v node)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-installer-test.XXXXXX")"
 tmp="$(cd -P "$tmp" && pwd)"
 trap 'rm -rf "$tmp"' EXIT
+# Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
+# reach reads as "it stopped somewhere". Name the line and the command that failed.
+trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
 mkdir -p "$tmp/hermes/profiles/ops" "$tmp/hermes/profiles/active" "$tmp/bin"
 printf '{}\n' > "$tmp/hermes/config.yaml"
 printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
