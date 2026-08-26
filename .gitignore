@@ -10,4 +10,5 @@ coverage/
 .DS_Store
 .env
 .superpowers/
+.worktrees/
 __pycache__/
