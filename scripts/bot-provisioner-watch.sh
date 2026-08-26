@@ -114,6 +114,44 @@ missing_reason() {
   return 1
 }
 
+# ── Deprovision sweep ────────────────────────────────────────────────────────
+# A launchd gateway service whose Hermes profile no longer exists is the residue
+# of a deleted bot. `DELETE /bots/:name` removes the profile and purges the
+# gateway's own state, but it runs in a container and cannot reach this Mac's
+# launchd, the box config, or the box .env. That residue used to be REPORTED to
+# whoever pressed Delete, which put an operator's chore in front of a person who
+# just wanted the bot gone (Kyle, 2026-08-26). This sweep does it instead.
+#
+# The profile directory being absent is the whole test, and it is a safe one: a
+# live bot always has its directory, and Hermes deletes that directory itself as
+# the last step of a profile delete.
+DEPROVISION="$SCRIPT_DIR/deprovision-bot.sh"
+orphans=()
+if [ -x "$DEPROVISION" ]; then
+  while IFS= read -r label; do
+    [ -n "$label" ] || continue
+    profile="${label#ai.hermes.gateway-}"
+    [ "$profile" != "$label" ] || continue
+    [ -d "$HERMES_HOME_ROOT/profiles/$profile" ] && continue
+    orphans+=("$profile")
+    log "orphaned: $profile (launchd service with no profile directory)"
+  done <<ORPHANS
+$(launchctl list 2>/dev/null | awk '{ print $3 }' | grep '^ai\.hermes\.gateway-' || true)
+ORPHANS
+fi
+
+if [ "${#orphans[@]}" -gt 0 ]; then
+  for profile in ${orphans[@]+"${orphans[@]}"}; do
+    dargs=()
+    [ "$DRY_RUN" = 1 ] && dargs+=(--dry-run)
+    if "$DEPROVISION" ${dargs[@]+"${dargs[@]}"} "$profile" >> "$LOG_FILE" 2>&1; then
+      log "deprovisioned: $profile"
+    else
+      log "deprovision FAILED for $profile (see the output above)"
+    fi
+  done
+fi
+
 pending=()
 for dir in "$HERMES_HOME_ROOT"/profiles/*/; do
   [ -d "$dir" ] || continue
