@@ -1295,7 +1295,7 @@ class AttachAdapter:
         except Exception:  # noqa: BLE001 - an attach fault is never a tool crash
             return {"status": "device_unavailable"}
 
-    def _inbound_source(self, thread_id: str) -> Any:
+    def _inbound_source(self, thread_id: str, *, message_id: Optional[str] = None) -> Any:
         """Build the synthetic-inbound ``source`` shared by turn, steer, and interrupt.
 
         ``_handle_turn``, ``_handle_steer``, and ``_handle_interrupt`` each inject a message on
@@ -1311,13 +1311,20 @@ class AttachAdapter:
         authorized by the gateway that issued the token, so the identity here is deliberately
         neutral (see ``INBOUND_USER``).
         """
-        return self.build_source(  # type: ignore[attr-defined]
+        source = self.build_source(  # type: ignore[attr-defined]
             chat_id=thread_id,
             chat_type="dm",
             user_name=INBOUND_USER,
             user_id=INBOUND_USER,
+            message_id=message_id,
             role_authorized=True,
         )
+        # A single-profile gateway has no profile route to stamp on the source.
+        # Bind the adapter's loader-owned profile without overriding an explicit
+        # route; _cozy_mobile still requires exact equality and fails closed.
+        if not getattr(source, "profile", None) and self._profile:
+            source.profile = self._profile
+        return source
 
     # -- inbound turn ---------------------------------------------------------
     def _on_turn(self, turn: TurnFrame) -> None:
@@ -1352,7 +1359,10 @@ class AttachAdapter:
         self._active_turn[turn.thread_id] = turn.turn_id
         # See _inbound_source for why turn/steer/interrupt share one source builder.
         # message_id is the per-turn reply anchor.
-        source = self._inbound_source(turn.thread_id)
+        # Hermes binds HERMES_SESSION_MESSAGE_ID from SessionSource.message_id,
+        # not MessageEvent.message_id. Carry the gateway-issued turn id on the
+        # trusted source so worker/deferred ContextVar copies retain it.
+        source = self._inbound_source(turn.thread_id, message_id=turn.turn_id)
         media_urls: List[str] = []
         media_types: List[str] = []
         client = self._client
@@ -2599,6 +2609,36 @@ def _mobile_tool_result(status: str, result: Optional[Dict[str, Any]] = None) ->
     return json.dumps(payload, separators=(",", ":"))
 
 
+def _log_mobile_policy_block(
+    reason: str,
+    *,
+    actual_platform: Optional[str] = None,
+    chat_present: Optional[bool] = None,
+    cron: Optional[bool] = None,
+    adapter_count: Optional[int] = None,
+    profile_present: Optional[bool] = None,
+    profile_match: Optional[bool] = None,
+    message_present: Optional[bool] = None,
+    message_match: Optional[bool] = None,
+) -> None:
+    """Log a bounded reason code and non-sensitive policy comparisons only."""
+    comparisons = [f"expected_platform={PLATFORM_NAME}"]
+    if actual_platform is not None:
+        comparisons.append(f"actual_platform={str(actual_platform)[:32]}")
+    for key, value in (
+        ("chat_present", chat_present),
+        ("cron", cron),
+        ("adapter_count", adapter_count),
+        ("profile_present", profile_present),
+        ("profile_match", profile_match),
+        ("message_present", message_present),
+        ("message_match", message_match),
+    ):
+        if value is not None:
+            comparisons.append(f"{key}={value}")
+    logger.warning("attach mobile policy blocked reason=%s %s", reason, " ".join(comparisons))
+
+
 async def _cozy_device_status(_args: Dict[str, Any], **_kwargs: Any) -> str:
     """The one MN-0 tool: only a live CozyGateway turn may reach the phone."""
     return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_device_status(chat_id, turn_id))
@@ -2607,6 +2647,7 @@ async def _cozy_device_status(_args: Dict[str, Any], **_kwargs: Any) -> str:
 async def _cozy_request_location(args: Dict[str, Any], **_kwargs: Any) -> str:
     purpose = normalize_location_purpose(args.get("purpose"))
     if purpose is None:
+        _log_mobile_policy_block("invalid_location_purpose")
         return _mobile_tool_result("policy_blocked")
     return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_location(chat_id, turn_id, purpose), location=True)
 
@@ -2616,17 +2657,39 @@ async def _cozy_mobile(request: Any, location: bool = False) -> str:
         platform, chat_id = _current_turn_platform_and_chat()
         message_id, cron, profile = _current_turn_message_and_cron()
     except Exception:  # noqa: BLE001 - an unavailable harness context is noninteractive
+        _log_mobile_policy_block("session_context_unavailable")
         return _mobile_tool_result("policy_blocked")
-    if platform != PLATFORM_NAME or not chat_id or cron:
+    if platform != PLATFORM_NAME:
+        _log_mobile_policy_block("wrong_platform", actual_platform=platform)
+        return _mobile_tool_result("policy_blocked")
+    if not chat_id:
+        _log_mobile_policy_block("missing_chat_id", chat_present=False)
+        return _mobile_tool_result("policy_blocked")
+    if cron:
+        _log_mobile_policy_block("cron_session", chat_present=True, cron=True)
         return _mobile_tool_result("policy_blocked")
     adapters = [
         adapter for adapter in _active_adapters_snapshot()
         if getattr(adapter, "_active_turn", {}).get(chat_id)
     ]
-    if len(adapters) != 1 or not profile or profile != getattr(adapters[0], "_profile", None):
+    if len(adapters) != 1:
+        _log_mobile_policy_block("active_adapter_count", adapter_count=len(adapters))
+        return _mobile_tool_result("policy_blocked")
+    profile_match = bool(profile) and profile == getattr(adapters[0], "_profile", None)
+    if not profile_match:
+        _log_mobile_policy_block(
+            "profile_mismatch",
+            profile_present=bool(profile),
+            profile_match=False,
+        )
         return _mobile_tool_result("policy_blocked")
     turn_id = adapters[0]._active_turn[chat_id]
     if message_id != turn_id:
+        _log_mobile_policy_block(
+            "turn_message_mismatch",
+            message_present=bool(message_id),
+            message_match=False,
+        )
         return _mobile_tool_result("policy_blocked")
     try:
         outcome = await request(adapters[0], chat_id, turn_id)
