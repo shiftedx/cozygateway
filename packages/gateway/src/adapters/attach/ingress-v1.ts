@@ -46,7 +46,11 @@ export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "memory_management", "delivery_receipts", "delegation", "thinking"] as const satisfies readonly AttachV1Capability[];
+/** Every capability the gateway will negotiate. `satisfies` proves each entry is a real
+ *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
+ *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
+ *  this list against the schema for exactly that reason. */
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts", "delegation", "thinking"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
