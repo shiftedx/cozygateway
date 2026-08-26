@@ -100,6 +100,7 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
     def _make_adapter(self):
         adapter = AttachAdapter()
         adapter._attach_init(types.SimpleNamespace(extra={}))
+        adapter._profile = "profile-1"
         adapter.injected = []  # type: ignore[attr-defined]
 
         def _fake_build_source(**kwargs):
@@ -153,14 +154,13 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
         # A failed inject must degrade to a best-effort no-op, not crash the drain loop.
         await adapter._handle_interrupt(InterruptFrame(thread_id="chat-1", turn_id="turn-1"))
 
-    async def test_turn_steer_interrupt_share_the_same_source_shape(self):
-        """Pin the invariant _inbound_source exists to keep in lockstep.
+    async def test_turn_carries_trusted_turn_id_on_session_source(self):
+        """The live turn id must reach Hermes through SessionSource.message_id.
 
         Turn, steer, and interrupt each inject a message on the same thread and must
-        resolve to the same harness session, so all three must build an identical
-        source (same chat_id/chat_type/user identity/authorization) for the same
-        thread_id. A future edit to one call site drifting from the others would
-        break this test.
+        resolve to the same harness session. Only the initial turn may carry the
+        trusted live-turn id used by the phone-node policy; steer/interrupt must not
+        mint or replay that authority.
         """
         adapter = self._make_adapter()
         thread_id = "chat-1"
@@ -173,18 +173,17 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(adapter.injected), 3)
         sources = [vars(event.source) for event in adapter.injected]
-        self.assertEqual(sources[0], sources[1])
-        self.assertEqual(sources[1], sources[2])
-        self.assertEqual(
-            sources[0],
-            {
+        common = {
                 "chat_id": thread_id,
                 "chat_type": "dm",
                 "user_name": INBOUND_USER,
                 "user_id": INBOUND_USER,
                 "role_authorized": True,
-            },
-        )
+                "profile": "profile-1",
+        }
+        self.assertEqual(sources[0], {**common, "message_id": "turn-1"})
+        self.assertEqual(sources[1], {**common, "message_id": None})
+        self.assertEqual(sources[2], {**common, "message_id": None})
 
     async def test_turn_downloads_and_caches_gateway_media_before_injecting(self):
         adapter = self._make_adapter()

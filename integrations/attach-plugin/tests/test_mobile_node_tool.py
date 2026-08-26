@@ -132,6 +132,78 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(await self.tool["handler"]({})), {"status": "policy_blocked"})
         self.assertEqual(client.calls, [])
 
+    async def test_logs_each_fail_closed_guard_without_sensitive_values(self):
+        cases = [
+            (
+                "session_context_unavailable",
+                lambda: (_ for _ in ()).throw(RuntimeError("unavailable")),
+                lambda: ("turn-1", False, "profile-1"),
+                [],
+            ),
+            ("wrong_platform", lambda: ("other", "thread-1"), lambda: ("turn-1", False, "profile-1"), []),
+            ("missing_chat_id", lambda: (adapter_module.PLATFORM_NAME, None), lambda: ("turn-1", False, "profile-1"), []),
+            ("cron_session", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", True, "profile-1"), []),
+            ("active_adapter_count", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), []),
+            (
+                "active_adapter_count",
+                lambda: (adapter_module.PLATFORM_NAME, "thread-1"),
+                lambda: ("turn-1", False, "profile-1"),
+                [_Adapter(_Client(), {"thread-1": "turn-1"}), _Adapter(_Client(), {"thread-1": "turn-2"})],
+            ),
+            (
+                "profile_mismatch",
+                lambda: (adapter_module.PLATFORM_NAME, "thread-1"),
+                lambda: ("turn-1", False, None),
+                [_Adapter(_Client(), {"thread-1": "turn-1"})],
+            ),
+            (
+                "profile_mismatch",
+                lambda: (adapter_module.PLATFORM_NAME, "thread-1"),
+                lambda: ("turn-1", False, "other-profile"),
+                [_Adapter(_Client(), {"thread-1": "turn-1"})],
+            ),
+            (
+                "turn_message_mismatch",
+                lambda: (adapter_module.PLATFORM_NAME, "thread-1"),
+                lambda: ("other-turn", False, "profile-1"),
+                [_Adapter(_Client(), {"thread-1": "turn-1"})],
+            ),
+        ]
+        for reason, platform_context, message_context, adapters in cases:
+            with self.subTest(reason=reason, adapter_count=len(adapters)):
+                for active in adapter_module._active_adapters_snapshot():
+                    adapter_module._unregister_active_adapter(active)
+                adapter_module._current_turn_platform_and_chat = platform_context
+                adapter_module._current_turn_message_and_cron = message_context
+                for active in adapters:
+                    adapter_module._register_active_adapter(active)
+                with self.assertLogs(adapter_module.logger, level="WARNING") as captured:
+                    result = json.loads(await self.tool["handler"]({}))
+                self.assertEqual(result, {"status": "policy_blocked"})
+                joined = "\n".join(captured.output)
+                self.assertIn(f"reason={reason}", joined)
+                for secret in ("thread-1", "turn-1", "other-turn", "profile-1"):
+                    self.assertNotIn(secret, joined)
+
+    async def test_logs_invalid_location_purpose_before_blocking(self):
+        with self.assertLogs(adapter_module.logger, level="WARNING") as captured:
+            result = json.loads(await self.location_tool["handler"]({"purpose": "secret\ncontent"}))
+        self.assertEqual(result, {"status": "policy_blocked"})
+        joined = "\n".join(captured.output)
+        self.assertIn("reason=invalid_location_purpose", joined)
+        self.assertNotIn("secret", joined)
+
+    async def test_post_turn_replay_is_blocked_without_phone_routing(self):
+        client = _Client()
+        adapter = _Adapter(client, {"thread-1": "turn-1"})
+        adapter_module._register_active_adapter(adapter)
+        adapter._active_turn.clear()
+        with self.assertLogs(adapter_module.logger, level="WARNING") as captured:
+            result = json.loads(await self.tool["handler"]({}))
+        self.assertEqual(result, {"status": "policy_blocked"})
+        self.assertEqual(client.calls, [])
+        self.assertIn("reason=active_adapter_count", "\n".join(captured.output))
+
     async def test_cancellation_is_one_terminal_result(self):
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
@@ -213,25 +285,36 @@ class HermesPluginContextTests(unittest.TestCase):
             adapter._loop = loop_box[0]
             adapter._active_turn = {"thread-1": "turn-1"}
             adapter._profile = "profile-1"
-            original = adapter_module._current_turn_platform_and_chat
-            original_message = adapter_module._current_turn_message_and_cron
-            adapter_module._current_turn_platform_and_chat = lambda: (adapter_module.PLATFORM_NAME, "thread-1")
-            adapter_module._current_turn_message_and_cron = lambda: ("turn-1", False, "profile-1")
             adapter_module._register_active_adapter(adapter)
+            from gateway.session_context import clear_session_vars, set_session_vars
+            tokens = set_session_vars(
+                platform=adapter_module.PLATFORM_NAME,
+                chat_id="thread-1",
+                message_id="turn-1",
+                profile="profile-1",
+                cron_session="",
+            )
             try:
                 self.assertEqual(
-                    json.loads(model_tools.handle_function_call("cozy_device_status", {})),
+                    json.loads(model_tools.handle_function_call(
+                        "tool_call",
+                        {"name": "cozy_device_status", "arguments": {}},
+                        enabled_toolsets=["cozygateway"],
+                    )),
                     {"status": "ok", "result": {"foreground": True}},
                 )
                 self.assertEqual(
-                    json.loads(model_tools.handle_function_call("cozy_request_location", {"purpose": "Find coffee"})),
+                    json.loads(model_tools.handle_function_call(
+                        "tool_call",
+                        {"name": "cozy_request_location", "arguments": {"purpose": "Find coffee"}},
+                        enabled_toolsets=["cozygateway"],
+                    )),
                     {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}},
                 )
                 self.assertEqual(client.purpose, "Find coffee")
                 self.assertEqual(client.loop_thread, thread.ident)
             finally:
-                adapter_module._current_turn_platform_and_chat = original
-                adapter_module._current_turn_message_and_cron = original_message
+                clear_session_vars(tokens)
                 adapter_module._unregister_active_adapter(adapter)
                 loop_box[0].call_soon_threadsafe(loop_box[0].stop)
                 thread.join(1)
