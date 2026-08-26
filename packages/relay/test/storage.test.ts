@@ -17,7 +17,7 @@ const MAX_REGISTRATIONS = 10000;
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
-  for (const cleanup of cleanups.splice(0)) cleanup();
+  for (const cleanup of cleanups.splice(0).reverse()) cleanup();
 });
 
 function memoryStorage(): RelayStorage {

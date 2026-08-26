@@ -179,7 +179,7 @@ describe("parseCliConfig", () => {
 // itself, and so the CLI-driven bind is proven over a real socket end to end.
 describe("runCli", () => {
   it(
-    "binds on the CLI-driven host/port and exits 0 after SIGTERM closes it cleanly",
+    "binds on the CLI-driven host/port and follows platform SIGTERM semantics",
     async () => {
       await withSpawnedRelay([], async (child, url) => {
         const health = await fetch(`${url}/health`);
@@ -189,25 +189,35 @@ describe("runCli", () => {
         const exited = waitForExit(child);
         child.kill("SIGTERM");
         const { code, signal } = await exited;
-        // runCli awaits relay.close() then resolves 0, and the wrapper calls process.exit(0):
-        // a clean exit is code 0 with no delivered signal, not a signal-terminated process.
-        expect(code).toBe(0);
-        expect(signal).toBeNull();
+        if (process.platform === "win32") {
+          // Node maps child.kill(signal) to TerminateProcess on Windows; the child
+          // cannot intercept it as a POSIX signal, and reports the requested signal.
+          expect(code).toBeNull();
+          expect(signal).toBe("SIGTERM");
+        } else {
+          expect(code).toBe(0);
+          expect(signal).toBeNull();
+        }
       });
     },
     SPAWN_TIMEOUT_MS,
   );
 
   it(
-    "exits 0 after SIGINT closes it cleanly",
+    "follows platform SIGINT semantics",
     async () => {
       await withSpawnedRelay([], async (child, url) => {
         expect((await fetch(`${url}/health`)).status).toBe(200);
         const exited = waitForExit(child);
         child.kill("SIGINT");
         const { code, signal } = await exited;
-        expect(code).toBe(0);
-        expect(signal).toBeNull();
+        if (process.platform === "win32") {
+          expect(code).toBeNull();
+          expect(signal).toBe("SIGINT");
+        } else {
+          expect(code).toBe(0);
+          expect(signal).toBeNull();
+        }
       });
     },
     SPAWN_TIMEOUT_MS,
