@@ -10,6 +10,15 @@ There are two ways in. Pick the one that fits your machine.
 
 ### Simple (recommended): one line, runs as a service
 
+Windows PowerShell (Hermes is installed automatically if needed, then you
+choose or confirm its model and provider):
+
+```powershell
+irm https://cozylabs.ai/install.ps1 | iex
+```
+
+macOS/Linux:
+
 ```sh
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
@@ -22,7 +31,13 @@ profile gateway services stay Hermes-owned. The default listener is local/LAN (`
 installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. See
 `docs/install-service.md` and `docs/connectivity.md`.
 
-Uninstall:
+Windows installs under `%LOCALAPPDATA%\cozygateway`, registers a current-user
+`CozyGateway` Scheduled Task with a Startup-folder fallback, and requires no
+administrator prompt. The final screen contains a QR and plain-text setup code.
+Publishing the short PowerShell URL is tracked separately; before that website
+change, use the `install.ps1` asset from a versioned GitHub release.
+
+Uninstall on macOS/Linux:
 
 ```sh
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway

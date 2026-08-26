@@ -18,8 +18,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - the native Hermes host is POSIX
+except ImportError:  # pragma: no cover - exercised by the native Windows host
     fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised by POSIX hosts
+    msvcrt = None
 
 
 logger = logging.getLogger(__name__)
@@ -168,7 +173,7 @@ class AttachSpool:
         """Become the sole websocket owner for this spool without touching its durable rows."""
         if self._lease_file is not None:
             return True
-        if fcntl is None:
+        if fcntl is None and msvcrt is None:
             return False
         lock_path = self._path + ".transport.lock"
         with _TRANSPORT_LEASES_LOCK:
@@ -176,7 +181,17 @@ class AttachSpool:
                 return False
             handle = open(lock_path, "a+b")
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    # msvcrt locks a byte range from the current file position. A persistent
+                    # sentinel makes the same lock file usable before and after a crash.
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError:
                 handle.close()
                 return False
@@ -190,7 +205,11 @@ class AttachSpool:
             return
         lock_path = self._path + ".transport.lock"
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         finally:
             handle.close()
             with _TRANSPORT_LEASES_LOCK:

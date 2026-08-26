@@ -14,6 +14,7 @@
 - Require no administrator prompt and register only current-user persistence.
 - Reuse Hermes Desktop's Hermes CLI, Node 24+, and Git Bash when present.
 - If Hermes is absent, invoke the official tagged NousResearch Hermes Windows installer and its normal setup wizard, then continue in the same PowerShell session.
+- Always run `hermes model` interactively and verify an active provider/default model before changing CozyGateway state.
 - Verify every downloaded executable artifact against its release SHA-256 sidecar before use.
 - Preserve existing Hermes profiles and Hermes-owned services.
 - Keep the Windows gateway isolated under `%LOCALAPPDATA%\cozygateway` by default.
@@ -49,7 +50,7 @@
 
 - [ ] **Step 1: Write failing bootstrap tests**
 
-Create a dependency-free PowerShell test that starts a loopback `HttpListener`, serves fixtures and SHA-256 sidecars, sets `COZYGATEWAY_GIT_BASH` to a fake `.cmd` recorder, dot-invokes `scripts/install.ps1`, and asserts the recorder received all absolute paths plus `--service-platform Windows`. Add separate cases proving an existing Hermes CLI is reused, a missing Hermes CLI invokes the fake official installer and continues after its fake CLI/profile appear, incomplete Hermes setup fails clearly, checksum mismatch exits nonzero, paths containing spaces survive, dry-run never invokes Bash, and Windows' `System32\bash.exe` is not accepted as a fallback.
+Create a dependency-free PowerShell test that starts a loopback `HttpListener`, serves fixtures and SHA-256 sidecars, sets `COZYGATEWAY_GIT_BASH` to a fake `.cmd` recorder, dot-invokes `scripts/install.ps1`, and asserts the recorder received all absolute paths plus `--service-platform Windows`. Add separate cases proving an existing Hermes CLI is reused, a missing Hermes CLI invokes the fake official installer and continues after its fake CLI/profile appear, `hermes model` is invoked before Bash on every run, missing provider/model evidence blocks the handoff, incomplete Hermes setup fails clearly, checksum mismatch exits nonzero, paths containing spaces survive, dry-run never invokes Bash, and Windows' `System32\bash.exe` is not accepted as a fallback.
 
 ```powershell
 $env:COZYGATEWAY_INSTALL_ASSET_BASE = $server.BaseUrl
@@ -78,13 +79,14 @@ Implement explicit functions with these signatures:
 function Resolve-InstallHome { param([string] $RequestedHome) }
 function Resolve-Hermes { param([string] $InstallerUri) }
 function Refresh-HermesEnvironment { param([string] $HermesHome) }
+function Confirm-HermesModel { param([string] $HermesPath) }
 function Get-LatestTag { param([string] $Repository) }
 function Get-VerifiedAsset { param([string] $Name, [string] $Destination, [string] $BaseUri) }
 function Resolve-GitBash { param([string] $ExplicitPath) }
 function Invoke-CozyGatewayInstaller { param([string] $BashPath, [string] $InstallerPath, [string[]] $ForwardedArguments) }
 ```
 
-Use `Invoke-WebRequest -UseBasicParsing`, `Get-FileHash -Algorithm SHA256`, atomic `.new` files, and `[Environment]::GetEnvironmentVariable('HERMES_GIT_BASH_PATH','User')`. `Resolve-Hermes` first probes the command and `%LOCALAPPDATA%\hermes\bin\hermes.exe`; when absent it resolves the latest `NousResearch/hermes-agent` release tag, downloads that tag's `scripts/install.ps1`, executes its normal setup wizard, refreshes `HERMES_HOME`, User PATH, and `HERMES_GIT_BASH_PATH`, then requires `hermes -p default config path` to name an existing file. Search Bash overrides first, then Hermes-managed `bin`/`usr\bin`, Git's install root, Program Files, and LocalAppData. Invoke the verified CozyGateway shell installer only after all CozyGateway assets pass. Default the install home to `$env:LOCALAPPDATA\cozygateway`.
+Use `Invoke-WebRequest -UseBasicParsing`, `Get-FileHash -Algorithm SHA256`, atomic `.new` files, and `[Environment]::GetEnvironmentVariable('HERMES_GIT_BASH_PATH','User')`. `Resolve-Hermes` first probes the command and `%LOCALAPPDATA%\hermes\bin\hermes.exe`; when absent it resolves the latest `NousResearch/hermes-agent` release tag, downloads that tag's `scripts/install.ps1`, executes its normal setup wizard, refreshes `HERMES_HOME`, User PATH, and `HERMES_GIT_BASH_PATH`, then requires `hermes -p default config path` to name an existing file. `Confirm-HermesModel` always launches `hermes model`, requires exit 0, and confirms the command's non-interactive/current-state output contains both `Current model:` and `Active provider:` with nonempty values before any CozyGateway download or mutation. Search Bash overrides first, then Hermes-managed `bin`/`usr\bin`, Git's install root, Program Files, and LocalAppData. Invoke the verified CozyGateway shell installer only after all CozyGateway assets pass. Default the install home to `$env:LOCALAPPDATA\cozygateway`.
 
 - [ ] **Step 4: Run the bootstrap tests and verify GREEN**
 
@@ -238,7 +240,7 @@ Copy `scripts/install.ps1` to `dist-bundle/install.ps1`, hash it with the existi
 
 - [ ] **Step 3: Update human documentation**
 
-Document the eventual `irm https://cozylabs.ai/install.ps1 | iex` command, automatic official Hermes installation and setup when absent, reuse when present, checkout/release testing before website publication, `%LOCALAPPDATA%\cozygateway`, `--status`, logs, rerun semantics, uninstall, Scheduled Task/Startup behavior, pairing-code expiry, and the explicit absence of Windows bot auto-provisioning.
+Document the eventual `irm https://cozylabs.ai/install.ps1 | iex` command, automatic official Hermes installation and setup when absent, reuse when present, mandatory provider/model selection through `hermes model`, checkout/release testing before website publication, `%LOCALAPPDATA%\cozygateway`, `--status`, logs, rerun semantics, uninstall, Scheduled Task/Startup behavior, pairing-code expiry, and the explicit absence of Windows bot auto-provisioning.
 
 - [ ] **Step 4: Verify release and docs**
 

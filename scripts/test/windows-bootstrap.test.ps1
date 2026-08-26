@@ -35,9 +35,12 @@ function New-FakeHermes {
 @echo off
 echo hermes:%*>>"$EventLog"
 if "%1"=="model" (
-  echo   Current model:    fixture-model
+  exit /b 0
+)
+if "%1"=="status" (
+  echo   Model:        fixture-model
   if "%COZYGATEWAY_TEST_MODEL_INCOMPLETE%"=="1" exit /b 0
-  echo   Active provider:  fixture-provider
+  echo   Provider:     fixture-provider
   exit /b 0
 )
 if "%1"=="-p" if "%3"=="config" if "%4"=="path" (

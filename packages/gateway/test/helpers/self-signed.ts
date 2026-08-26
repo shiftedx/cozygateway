@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,19 @@ export interface SelfSignedPair {
   certPem: string;
 }
 
+function opensslExecutable(): string {
+  const explicit = process.env["OPENSSL_BIN"]?.trim();
+  if (explicit) return explicit;
+  if (process.platform === "win32") {
+    const programFiles = process.env["ProgramFiles"];
+    if (programFiles) {
+      const gitOpenSsl = join(programFiles, "Git", "usr", "bin", "openssl.exe");
+      if (existsSync(gitOpenSsl)) return gitOpenSsl;
+    }
+  }
+  return "openssl";
+}
+
 /** Generates a throwaway self-signed cert/key pair on disk for the TLS tests. Uses the system
  *  `openssl` (present on macOS and on the CI image) because Node ships no certificate generator;
  *  a checked-in fixture pair would be an expired-by-tomorrow liability instead. */
@@ -22,7 +35,7 @@ export function generateSelfSigned(): SelfSignedPair {
   const certFile = join(dir, "cert.pem");
   const keyFile = join(dir, "key.pem");
   execFileSync(
-    "openssl",
+    opensslExecutable(),
     [
       "req",
       "-x509",

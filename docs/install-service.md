@@ -5,7 +5,9 @@ curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
 The installer registers exactly one CozyGateway login service: launchd on
-macOS, or a systemd user service on Linux. It reads gateway tokens and the
+macOS, a systemd user service on Linux, or the current-user `CozyGateway`
+Scheduled Task on Windows. If Windows policy blocks task creation, it writes a
+hidden launcher to the user's Startup folder. It reads gateway tokens and the
 local Dashboard password at runtime from mode-600 files; neither unit includes
 a secret. The service starts or reuses the loopback Hermes Dashboard as the
 control/read plane. Each selected Hermes profile gateway is restarted, started,
@@ -24,6 +26,13 @@ launchctl print gui/$UID/ai.cozylabs.cozygateway
 
 # Linux
 systemctl --user status cozygateway
+```
+
+Windows PowerShell:
+
+```powershell
+& "$env:ProgramFiles\Git\bin\bash.exe" "$env:LOCALAPPDATA\cozygateway\bin\agent-install.sh" --status --gateway-dir "$env:LOCALAPPDATA\cozygateway"
+schtasks /Query /TN CozyGateway /V /FO LIST
 ```
 
 On Linux the installer enables user lingering so the service survives logout

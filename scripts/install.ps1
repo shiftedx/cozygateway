@@ -114,12 +114,19 @@ function Confirm-HermesModel {
         return
     }
     Write-Info 'Choose or confirm the Hermes inference provider and model.'
-    $modelOutput = (& $HermesPath model 2>&1 | Out-String)
+    & $HermesPath model
     $modelExit = $LASTEXITCODE
-    if (-not [string]::IsNullOrWhiteSpace($modelOutput)) { Write-Host $modelOutput.TrimEnd() }
-    if ($modelExit -ne 0 -or $modelOutput -notmatch '(?m)^\s*Current model:\s*\S+' -or $modelOutput -notmatch '(?m)^\s*Active provider:\s*\S+') {
+    if ($modelExit -ne 0) {
+        Fail 'Hermes model selection did not complete successfully'
+    }
+    $statusOutput = (& $HermesPath status 2>&1 | Out-String)
+    $statusExit = $LASTEXITCODE
+    $hasModel = $statusOutput -match '(?m)^\s*(?:Current model|Model):\s*\S+'
+    $hasProvider = $statusOutput -match '(?m)^\s*(?:Active provider|Provider):\s*\S+'
+    if ($statusExit -ne 0 -or -not $hasModel -or -not $hasProvider) {
         Fail 'Hermes needs an active provider and model before CozyGateway can be installed'
     }
+    Write-Ok 'Hermes provider and model are configured'
 }
 
 function Resolve-GitBash {

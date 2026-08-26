@@ -2,6 +2,20 @@
 
 Use the human-facing one-paste installer for an existing Hermes machine:
 
+Windows PowerShell 5.1+:
+
+```powershell
+irm https://cozylabs.ai/install.ps1 | iex
+```
+
+The Windows bootstrap reuses Hermes when installed. If Hermes is absent, it
+runs the official tagged NousResearch Windows installer and setup wizard. Every
+run opens `hermes model` before any CozyGateway changes so the operator selects
+or confirms an inference provider and default model. It then checksum-verifies
+the CozyGateway release assets and hands off through Hermes-compatible Git Bash.
+
+macOS/Linux:
+
 ```sh
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
@@ -51,3 +65,8 @@ minutes; mint another with `~/.cozygateway/bin/cozygateway pair`, or
 
 The default listener is `0.0.0.0:8787` for local/LAN use. Network reachability
 outside the machine is deliberately not automated; see `docs/connectivity.md`.
+
+On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the
+current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
+when policy blocks task registration. Phone-created bot auto-provisioning is not
+part of the Windows installer.

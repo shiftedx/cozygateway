@@ -227,8 +227,8 @@ gateway_state() {
   status="$($HERMES_BIN -p "$1" gateway status 2>&1 || true)"
   case "$status" in
     *"not installed"*|*"not configured"*|*"No gateway service"*|*"Gateway service not found"*) printf 'absent' ;;
-    *"Gateway is not running"*|*"Gateway is stopped"*|*"Gateway is inactive"*) printf 'stopped' ;;
-    *"Gateway is supervised"*|*"Gateway is running"*|*"Gateway is active"*) printf 'running' ;;
+    *"Gateway is not running"*|*"Gateway is stopped"*|*"Gateway is inactive"*|*"No gateway process detected"*) printf 'stopped' ;;
+    *"Gateway is supervised"*|*"Gateway is running"*|*"Gateway is active"*|*"Gateway process running"*) printf 'running' ;;
     *) die "could not determine Hermes gateway service state for profile $1: $status" ;;
   esac
 }
@@ -279,7 +279,7 @@ prepare_dashboard_credential() {
   chmod 600 "$DASHBOARD_ENV"
 }
 write_gateway_env() {
-  local p token env_name profile_env seen_token seen_name
+  local p token env_name profile_env spool_path seen_token seen_name
   prepare_dashboard_credential
   [ "$DRY_RUN" = 1 ] && { say "DRY   write gateway token environment at $GATEWAY_ENV (values redacted)"; return; }
   umask 077; : > "$GATEWAY_ENV"
@@ -290,7 +290,9 @@ write_gateway_env() {
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done
     TOKENS+=("$token"); TOKEN_ENVS+=("$env_name")
     env_put "$profile_env" COZYGATEWAY_URL "http://127.0.0.1:$PORT"; env_put "$profile_env" COZYGATEWAY_TOKEN "$token"
-    env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
+    spool_path="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
+    is_windows && spool_path="$(to_windows_path "$spool_path")"
+    env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$spool_path"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
     env_write "$GATEWAY_ENV" "$env_name" "$token"
   done
   chmod 600 "$GATEWAY_ENV"
@@ -358,17 +360,28 @@ write_cli_wrapper() {
   chmod 755 "$CLI_WRAPPER"
 }
 write_wrapper() {
+  local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg bundle_arg config_arg
   [ "$DRY_RUN" = 1 ] && { say "DRY   write 0700 gateway wrapper that reads $GATEWAY_ENV at runtime"; return; }
+  gateway_env_arg="$GATEWAY_ENV"; dashboard_env_arg="$DASHBOARD_ENV"; hermes_root_arg="$HERMES_ROOT"
+  hermes_arg="$HERMES_RESOLVED"; bundle_arg="$BUNDLE_PATH"; config_arg="$CONFIG_JSON"
+  if is_windows; then
+    gateway_env_arg="$(to_windows_path "$gateway_env_arg")"
+    dashboard_env_arg="$(to_windows_path "$dashboard_env_arg")"
+    hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
+    hermes_arg="$(to_windows_path "$hermes_arg")"
+    bundle_arg="$(to_windows_path "$bundle_arg")"
+    config_arg="$(to_windows_path "$config_arg")"
+  fi
   # shellcheck disable=SC2016,SC2086,SC2154
   umask 077; cat > "$WRAPPER" <<WRAPPER
 #!/usr/bin/env bash
 set -euo pipefail
-exec "$NODE_RESOLVED" - "$GATEWAY_ENV" "$DASHBOARD_ENV" "$HERMES_ROOT" "$HERMES_RESOLVED" "$DASHBOARD_PORT" "$CLI_WRAPPER" "$CONFIG_JSON" <<'NODE'
+exec "$NODE_RESOLVED" - "$gateway_env_arg" "$dashboard_env_arg" "$hermes_root_arg" "$hermes_arg" "$DASHBOARD_PORT" "$bundle_arg" "$config_arg" <<'NODE'
 const { readFileSync } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
 async function main() {
-const [gatewayEnvPath, dashboardEnvPath, hermesRoot, hermes, dashboardPort, cli, config] = process.argv.slice(2);
+const [gatewayEnvPath, dashboardEnvPath, hermesRoot, hermes, dashboardPort, bundle, config] = process.argv.slice(2);
 const gatewayEnv = parseEnv(readFileSync(gatewayEnvPath, 'utf8'));
 const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
 const dashboardEnv = {
@@ -390,7 +403,8 @@ if (health) {
   }).catch(() => undefined);
   if (login?.status !== 200) throw new Error('Hermes Dashboard rejected the configured local credential');
 }
-const child = spawn(cli, ['serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
+const child = spawn(process.execPath, [bundle, 'serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
+child.on('error', (error) => { console.error(error); process.exit(1); });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));
 child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 }
@@ -417,7 +431,7 @@ write_windows_launcher() {
   [ -f "$bash_posix" ] || die "Git Bash executable is unavailable: $bash_posix"
   bash_native="$(to_windows_path "$bash_posix")"
   wrapper_native="$(to_windows_path "$WRAPPER")"
-  command="$(vbs_quote "$bash_native") & \" \" & $(vbs_quote "$wrapper_native")"
+  command="$(vbs_quote "\"$bash_native\" \"$wrapper_native\"")"
   [ "$DRY_RUN" = 1 ] && { say "DRY   write hidden Windows launcher at $WINDOWS_VBS"; return; }
   {
     printf 'Set shell = CreateObject("WScript.Shell")\r\n'
@@ -425,6 +439,25 @@ write_windows_launcher() {
     printf 'shell.Run command, 0, False\r\n'
   } > "$WINDOWS_VBS"
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
+}
+stop_owned_windows_gateway() {
+  local config_native code
+  config_native="$(to_windows_path "$CONFIG_JSON")"
+  set +e
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$PORT" powershell.exe -NoProfile -NonInteractive -Command '
+    $ErrorActionPreference = "Stop"
+    $connection = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $connection) { exit 0 }
+    $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
+    $command = [string]$process.CommandLine
+    if (-not $command.Contains("cozygateway.mjs") -or -not $command.Contains(" serve ") -or -not $command.Contains($env:COZYGATEWAY_EXPECTED_CONFIG)) { exit 42 }
+    Stop-Process -Id $process.ProcessId -Force
+  ' >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
+  for _ in $(seq 1 10); do gateway_ready || return 0; sleep 1; done
+  die "the previous CozyGateway process stayed listening on port $PORT"
 }
 install_windows_service() {
   local vbs_native task_command output code startup entry
@@ -439,11 +472,36 @@ install_windows_service() {
   if [ "$code" -ne 0 ]; then
     startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
     mkdir -p "$startup"; cp "$WINDOWS_VBS" "$entry"
-    say "INFO  Scheduled Task unavailable; installed current-user Startup fallback: $entry"
+    say "INFO  Scheduled Task unavailable ($output); installed current-user Startup fallback: $entry"
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
   fi
+  if gateway_ready; then
+    stop_owned_windows_gateway
+    say "OK    stopped the previous CozyGateway process for an in-place update"
+  fi
   wscript.exe "$vbs_native"
+}
+gateway_ready() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+  [ "$code" = 200 ]
+}
+wait_gateway_ready() {
+  [ "$DRY_RUN" = 1 ] && { say "DRY   wait for CozyGateway health before starting Hermes attach"; return; }
+  local attempt
+  for attempt in $(seq 1 30); do gateway_ready && return; sleep 1; done
+  die "CozyGateway did not become healthy on 127.0.0.1:$PORT"
+}
+attach_ready() {
+  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null |
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach;process.exit(h&&h.online===h.configured&&h.deadLetters===0?0:1)}catch{process.exit(1)}})'
+}
+wait_attach_ready() {
+  [ "$DRY_RUN" = 1 ] && { say "DRY   require attach.online == attach.configured with zero dead letters"; return; }
+  local attempt
+  for attempt in $(seq 1 30); do attach_ready && return; sleep 1; done
+  die "Hermes attach did not become healthy (online must equal configured, with zero dead letters)"
 }
 install_service() {
   resolve_platform; write_wrapper
@@ -545,6 +603,7 @@ uninstall() {
     else
       MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
       rm -f "$startup_entry"
+      gateway_ready && stop_owned_windows_gateway
     fi
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
@@ -594,7 +653,8 @@ main() {
   have "$HERMES_BIN" || die "Hermes must already be installed"; NODE_RESOLVED="$(resolve_node)"; HERMES_RESOLVED="$(resolve_hermes)"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; mkdir -p "$LOCAL_DIR"; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
-  write_gateway_config; ensure_hermes_gateways; write_state; write_cli_wrapper; start_dashboard; install_service
+  write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready
+  ensure_hermes_gateways; write_state; wait_attach_ready
   say "OK    CozyGateway listens on $BIND_HOST:$PORT. Remote exposure is user-managed."
   # The finale: mint a pairing code and print the QR so install -> scan -> chatting needs no
   # further commands. A rerun on an installed gateway lands here too, with a fresh code.

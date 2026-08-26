@@ -30,6 +30,10 @@ if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "path" ]; then
   exit 0
 fi
 if [ "$1" = "-p" ] && [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
+  if [ "${COZYGATEWAY_TEST_WINDOWS_STATUS:-}" = 1 ] && [ "$profile" = active ]; then
+    printf '✓ Scheduled Task registered: Hermes_Gateway\n  Status: Ready\n✓ Gateway process running (PID: 33036)\n'
+    exit 0
+  fi
   case "$(state)" in
     absent) printf 'Gateway is not installed\n' ;;
     stopped) printf 'Gateway is not running\n' ;;
@@ -76,7 +80,8 @@ if (args[0] === 'pair') {
 BUNDLE
 
 for platform in Darwin Linux Windows; do
-  output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM="$platform" bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-$platform")"
+  windows_status=; [ "$platform" = Windows ] && windows_status=1
+  output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_STATUS="$windows_status" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM="$platform" bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-$platform")"
   grep -q 'Profiles: default active ops' <<<"$output"
   grep -q "one CozyGateway $platform service" <<<"$output"
   grep -q 'Hermes Dashboard as local control plane' <<<"$output"
@@ -101,7 +106,13 @@ chmod 700 "$tmp/service-bin/launchctl"
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 case "$*" in
-  *127.0.0.1:8787/health*) printf '200' ;;
+  *127.0.0.1:8787/health*)
+    if [ -n "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}" ] && [ ! -f "$COZYGATEWAY_TEST_GATEWAY_MARKER" ]; then
+      if [[ "$*" == *"-o /dev/null"* ]]; then printf '000'; else printf '{"attach":{"configured":1,"online":0,"deadLetters":0}}'; fi
+      exit 0
+    fi
+    if [[ "$*" == *"-o /dev/null"* ]]; then printf '200'; else printf '{"attach":{"configured":1,"online":1,"deadLetters":0}}'; fi
+    ;;
   *password-login*) cat >/dev/null; printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE:-200}" ;;
   *) printf '401' ;;
 esac
@@ -156,6 +167,7 @@ remote_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/co
 grep -q '"gatewayUrl":"https://gateway.example.com"' <<<"$remote_pair"
 grep -Fq 'parseEnv(readFileSync(gatewayEnvPath' "$tmp/gateway-live/local/run-gateway.sh"
 grep -Fq '/auth/password-login' "$tmp/gateway-live/local/run-gateway.sh"
+grep -Fq 'spawn(process.execPath, [bundle' "$tmp/gateway-live/local/run-gateway.sh"
 sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' | "$real_node" --check -
 if grep -Fq '. "' "$tmp/gateway-live/local/run-gateway.sh"; then
   echo 'gateway wrapper must not source credential files' >&2
@@ -227,18 +239,30 @@ SCHTASKS
 cat > "$tmp/windows-bin/wscript.exe" <<'WSCRIPT'
 #!/usr/bin/env bash
 printf 'wscript %s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+[ -z "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_GATEWAY_MARKER"
 exit 0
 WSCRIPT
-chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe"
-windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
+cat > "$tmp/windows-bin/powershell.exe" <<'POWERSHELL'
+#!/usr/bin/env bash
+printf 'powershell %s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+rm -f "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}"
+exit 0
+POWERSHELL
+chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/windows-bin/powershell.exe"
+windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
 grep -Fq '/Create /F /SC ONLOGON /RL LIMITED /TN CozyGateway' "$tmp/windows-commands"
 grep -Fq 'wscript ' "$tmp/windows-commands"
 grep -Fq 'fake-qr' <<<"$windows_output"
 grep -Fq 'shell.Run command, 0, False' "$tmp/gateway-windows-live/local/run-gateway.vbs"
+grep -Fq 'command = """' "$tmp/gateway-windows-live/local/run-gateway.vbs"
+grep -Eq '^COZYGATEWAY_SPOOL_PATH=[A-Za-z]:\\' "$tmp/hermes/.env"
 file "$tmp/gateway-windows-live/local/run-gateway.vbs" | grep -Fq 'CRLF'
+# A rerun stops only the validated listener and starts the newly installed bundle.
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live"
+grep -Fq 'powershell -NoProfile -NonInteractive -Command' "$tmp/windows-commands"
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-live" | grep -Fq 'health endpoint is live'
 
-HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 
 # A listener alone is not sufficient: an existing Dashboard that rejects the

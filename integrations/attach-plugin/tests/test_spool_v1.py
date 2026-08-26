@@ -12,6 +12,16 @@ class AttachSpoolTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_transport_lease_is_exclusive_and_reusable(self):
+        first = AttachSpool(self.path)
+        second = AttachSpool(self.path)
+        self.assertTrue(first.acquire_transport_lease())
+        self.assertFalse(second.acquire_transport_lease())
+        first.release_transport_lease()
+        self.assertTrue(second.acquire_transport_lease())
+        first.close()
+        second.close()
+
     def test_event_sequence_and_unacked_replay_survive_restart(self):
         spool = AttachSpool(self.path)
         first = spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})

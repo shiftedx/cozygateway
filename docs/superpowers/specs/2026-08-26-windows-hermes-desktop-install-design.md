@@ -50,16 +50,21 @@ It:
    and verifies the resulting CLI and default profile before continuing. A test
    override permits a local fake installer; production does not silently use a
    fork or mirror.
-3. Resolves the requested CozyGateway release tag or the repository's latest release.
-4. Downloads the gateway bundle, attach-plugin archive, and shared installer,
+3. Runs `hermes model` interactively on every install or reinstall, after Hermes
+   exists and before any CozyGateway state is changed. The user explicitly
+   selects or confirms the inference provider and default model. The bootstrap
+   then verifies that Hermes reports an active provider and current model; a
+   cancelled or incomplete selection stops the run.
+4. Resolves the requested CozyGateway release tag or the repository's latest release.
+5. Downloads the gateway bundle, attach-plugin archive, and shared installer,
    plus each asset's SHA-256 sidecar.
-5. Verifies every CozyGateway artifact with `Get-FileHash` before replacing an installed
+6. Verifies every CozyGateway artifact with `Get-FileHash` before replacing an installed
    copy or executing code.
-6. Locates Git Bash in Hermes' documented order: `HERMES_GIT_BASH_PATH`,
+7. Locates Git Bash in Hermes' documented order: `HERMES_GIT_BASH_PATH`,
    Hermes-managed PortableGit layouts, Git associated with `git.exe`, standard
    Program Files locations, and the per-user Git location. It never mistakes
    Windows' WSL `bash.exe` shim for Git Bash.
-7. Invokes the verified shared installer with explicit Windows paths and
+8. Invokes the verified shared installer with explicit Windows paths and
    `--service-platform Windows`.
 
 The bootstrap does not independently install Node, Git, or WSL. When Hermes is
@@ -132,6 +137,8 @@ Automated coverage will exercise:
 - PowerShell 5.1-compatible syntax and checksum success/failure;
 - reuse of an existing Hermes install, official Hermes bootstrap when missing,
   environment refresh, and a cancelled/incomplete Hermes setup failure;
+- mandatory `hermes model` invocation and rejection of a missing active provider
+  or default model before CozyGateway mutation;
 - Git Bash discovery, including paths with spaces and rejection of WSL Bash;
 - Windows platform detection and path conversion;
 - Scheduled Task creation, idempotent replacement, status, and uninstall;
