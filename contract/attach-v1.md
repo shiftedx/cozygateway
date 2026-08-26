@@ -74,7 +74,7 @@ MUST invoke no Hermes action. Stable
 agent/thread/turn/message/approval/clarify ids are preserved end to end.
 
 Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `delegation`,
-`approval`, `clarify`, `scheduled`, `media`, and `presence`.
+`thinking`, `approval`, `clarify`, `scheduled`, `media`, and `presence`.
 
 - A draft is full-replace decoration and may be dropped by clients.
 - A `commit` projects one durable message. It also SEALS the turn unless it carries
@@ -113,6 +113,13 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   dispatch), so events legitimately arrive after the turn sealed. Like `draft` and `tool` it is
   EPHEMERAL rendering state: an undeliverable one is skipped after bounded retries and must
   never dead-letter the stream.
+- `thinking` (capability `thinking`) is a rolling live-reasoning preview behind the turn's
+  thinking shimmer: a sanitized tail of at most 280 chars (schema-enforced), a plugin-monotonic
+  per-turn `seq` (lower-or-equal replays are acknowledged and dropped), and a plugin-clock
+  `lastActiveAt`. Latest-only: each event replaces the previous one for its turn. It is never
+  emitted after the turn's terminal, never persisted, and gone on reopen. Like `draft` and
+  `tool` it is EPHEMERAL rendering state: an undeliverable one is skipped after bounded retries
+  and must never dead-letter the stream.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.
 - `scheduled` is an unanchored durable delivery with a caller-owned occurrence key. Its target is either
@@ -136,8 +143,13 @@ terminal timestamps; plus durable command queue depth and dead-letter count. It 
 profile ids, instance ids, frame ids, or payload content. A timestamp is `null` until observed in
 the current process (heartbeat) or durable journal (event/terminal).
 
-There is deliberately no thinking, reasoning, or chain-of-thought event. Unknown and invalid
-frames are never projected into the transcript.
+This contract deliberately shipped with no thinking/reasoning/chain-of-thought event. The
+`thinking` capability is a CONSCIOUS, bounded reopening of that rule (approved 2026-08):
+reasoning models deliver their visible reply in one end burst, leaving the whole turn a generic
+spinner. What reopened is a sanitized 280-char latest-only preview -- raw chain of thought, tool
+args/results, prompts, credentials, and file paths still never cross this wire, and the preview
+is never part of the transcript. Unknown and invalid frames are never projected into the
+transcript.
 
 An admitted event whose app projection transiently fails remains unapplied and is retried in
 sequence by a bounded in-process exponential-backoff worker. Successful retries are idempotent.

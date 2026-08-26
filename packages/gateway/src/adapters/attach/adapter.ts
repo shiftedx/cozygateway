@@ -264,6 +264,10 @@ export function createAttachAdapter(deps: {
           // Delegation batch cards are a Bot Mode surface (capability 34): the native sink
           // projects them and the frozen core-thread contract carries no equivalent frame.
           return true;
+        case "thinking":
+          // The live thinking preview is a Bot Mode surface (capability 35): the native sink
+          // projects it and the frozen core-thread contract carries no equivalent frame.
+          return true;
       }
     },
 

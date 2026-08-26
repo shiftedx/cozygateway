@@ -322,7 +322,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(HELLO_CAPABILITIES), {
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "memory_management", "delivery_receipts",
-            "delegation",
+            "delegation", "thinking",
         })
 
     def test_hello_ack_budget_is_not_a_one_second_race(self):

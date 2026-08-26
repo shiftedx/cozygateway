@@ -1354,6 +1354,58 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("projects a latest-only thinking preview, drops stale seq, and suppresses it after the seal", async () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        storage.enqueueAttachCommand(bot, `turn:${String(input.turnId)}`, { kind: "turn", ...input } as never, 1);
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => now++,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "think it through");
+    const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+    const think = (eventId: string, sequence: number, seq: number, text: string) => ({
+      kind: "event" as const, sequence, eventId,
+      event: { kind: "thinking", threadId: sent.sessionId, turnId, text, seq, lastActiveAt: 5 } as never,
+    });
+    const previews = () =>
+      frames.filter((frame): frame is Extract<ServerFrame, { type: "bot_thinking_activity" }> => frame.type === "bot_thinking_activity");
+
+    expect(plane.handle("sage", think("t1", 1, 1, "weighing the options"))).toBe(true);
+    expect(plane.handle("sage", think("t2", 2, 2, "checking the diff"))).toBe(true);
+    expect(plane.handle("sage", think("t3", 3, 3, "writing the answer"))).toBe(true);
+    // An at-least-once replay with an old seq is acknowledged but can never regress the preview.
+    expect(plane.handle("sage", think("stale", 4, 2, "checking the diff"))).toBe(true);
+    // The commit seals the turn and flushes the coalescing window.
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 5, eventId: "commit", event: {
+        kind: "commit", threadId: sent.sessionId, turnId, messageId: "answer",
+        blocks: [{ type: "paragraph", text: "done" }],
+      } as never,
+    })).toBe(true);
+
+    // Latest-only: inside one flush window only the newest preview survives (1 immediate, 3 on
+    // flush); the stale replay broadcast nothing.
+    expect(previews().map((frame) => frame.seq)).toEqual([1, 3]);
+    expect(previews().at(-1)).toMatchObject({ bot: "sage", turnId, text: "writing the answer" });
+
+    // Post-terminal suppression: a late preview is acknowledged (never dead-letters, never
+    // retries) and never reaches a client.
+    expect(plane.handle("sage", think("late", 6, 4, "after the seal"))).toBe(true);
+    expect(previews()).toHaveLength(2);
+
+    // Ephemeral by design: reopen recovers commits and tool steps, never thinking.
+    expect(await plane.surface().chatHistory("sage")).not.toHaveProperty("thinking");
+    plane.close();
+    storage.close();
+  });
+
   it("treats a replayed delegation state as a projected no-op and never resurrects a settled child", () => {
     const storage = openStorage(":memory:");
     const frames: ServerFrame[] = [];
