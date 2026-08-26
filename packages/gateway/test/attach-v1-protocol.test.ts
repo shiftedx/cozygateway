@@ -106,6 +106,22 @@ describe("attach-v1 protocol", () => {
     expect(check(AttachV1EventFrameSchema, { kind: "event", sequence: 1, eventId: "leak", event: { kind: "reasoning", text: "secret" } })).toBe(false);
   });
 
+  it("lets a delegation event carry the canonical batch alias without changing identity", () => {
+    const frame = {
+      kind: "event", sequence: 12, eventId: "deleg-1",
+      event: {
+        kind: "delegation", threadId: "thread", turnId: "turn",
+        batchId: "call_d3R3sBldNWhDI0Kqqqk3P2Xi", childId: "20260825_195359_003db6",
+        index: 0, count: 1, status: "succeeded", lastActiveAt: 5,
+        aliasId: "deleg_c6eb9310",
+      },
+    };
+    expect(check(AttachV1EventFrameSchema, frame)).toBe(true);
+    // Alias-free events stay exactly as they were: an older plugin never sends the field.
+    const { aliasId: _omitted, ...bare } = frame.event;
+    expect(check(AttachV1EventFrameSchema, { ...frame, event: bare })).toBe(true);
+  });
+
   it("carries a bounded latest-only thinking preview and refuses anything past its bounds", () => {
     const event = (body: Record<string, unknown>) => ({
       kind: "event", sequence: 1, eventId: "think-1",

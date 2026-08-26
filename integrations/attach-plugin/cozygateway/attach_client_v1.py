@@ -444,6 +444,7 @@ class AttachV1Client:
         api_calls: Optional[int] = None,
         tool_count: Optional[int] = None,
         last_active_at: Optional[int] = None,
+        alias_id: Optional[str] = None,
     ) -> None:
         """Queue one ephemeral delegation lifecycle event (capability ``delegation``).
 
@@ -457,6 +458,9 @@ class AttachV1Client:
             "status": status,
             "lastActiveAt": max(0, int(last_active_at or 0)),
         }
+        if alias_id:
+            # Batch-level canonical Hermes delegation id (``deleg_...``); optional and additive.
+            event["aliasId"] = alias_id[:256]
         if label:
             event["label"] = label[:200]
         if current_tool:

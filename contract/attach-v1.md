@@ -110,7 +110,11 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   label, a closed status vocabulary, and at most a tool NAME -- never args, results, reasoning,
   or child summaries. Identity is (batchId, childId); `childId` is the Hermes child session id,
   present on both lifecycle legs, so it is the upsert key. A batch may outlive its turn (async
-  dispatch), so events legitimately arrive after the turn sealed. Like `draft` and `tool` it is
+  dispatch), so events legitimately arrive after the turn sealed. Once the plugin learns the
+  canonical Hermes delegation id from the structured `delegation_id` field of the parent
+  `delegate_task` result, subsequent events for the batch carry it as an optional batch-level
+  `aliasId` (typically from the finish legs onward); it never replaces (batchId, childId) as
+  identity, and a gateway that predates the field ignores it. Like `draft` and `tool` it is
   EPHEMERAL rendering state: an undeliverable one is skipped after bounded retries and must
   never dead-letter the stream.
 - `thinking` (capability `thinking`) is a rolling live-reasoning preview behind the turn's

@@ -1544,4 +1544,141 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(reopened.botChatDelegations(sent.sessionId, 0)[0]).toMatchObject({ status: "unknown" });
     reopened.close();
   });
+
+  it("carries the canonical Hermes alias from the terminal leg into snapshots, history, and reopen", async () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        storage.enqueueAttachCommand(bot, `turn:${String(input.turnId)}`, { kind: "turn", ...input } as never, 1);
+        return true;
+      },
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: (frame) => frames.push(frame), now: () => now++,
+    });
+    const sent = await plane.surface().sendChatMessage("sage", "delegate");
+    const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+    // The spawn leg runs INSIDE the delegate_task call, before its result exists: no alias.
+    expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "run", event: {
+      kind: "delegation", threadId: sent.sessionId, turnId,
+      batchId: "call_d3R3", childId: "sa-0", index: 0, count: 1, status: "running", lastActiveAt: 5,
+    } as never })).toBe(true);
+    expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "commit", event: {
+      kind: "commit", threadId: sent.sessionId, turnId, messageId: "answer",
+      blocks: [{ type: "paragraph", text: "dispatched" }],
+    } as never })).toBe(true);
+    // The async finish leg carries the canonical deleg_... id the plugin read from the result.
+    expect(plane.handle("sage", { kind: "event", sequence: 3, eventId: "done", event: {
+      kind: "delegation", threadId: sent.sessionId, turnId,
+      batchId: "call_d3R3", childId: "sa-0", index: 0, count: 1, status: "succeeded",
+      lastActiveAt: 6, aliasId: "deleg_c6eb9310",
+    } as never })).toBe(true);
+
+    const last = frames
+      .filter((frame): frame is Extract<ServerFrame, { type: "bot_delegation_activity" }> => frame.type === "bot_delegation_activity")
+      .at(-1)!;
+    expect(last).toMatchObject({
+      batchId: "call_d3R3", aliasId: "deleg_c6eb9310", done: true,
+      children: [{ childId: "sa-0", status: "succeeded" }],
+    });
+    expect(storage.botChatDelegations(sent.sessionId, 0)[0]).toMatchObject({ aliasId: "deleg_c6eb9310" });
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({
+      delegations: [{ batchId: "call_d3R3", aliasId: "deleg_c6eb9310" }],
+    });
+    plane.close();
+    // A reopened plane restores the alias for reconnecting clients along with the batch.
+    const reopened = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: () => undefined, now: () => now++,
+    });
+    expect(await reopened.surface().chatHistory("sage")).toMatchObject({
+      delegations: [{ batchId: "call_d3R3", aliasId: "deleg_c6eb9310" }],
+    });
+    reopened.close();
+    storage.close();
+  });
+
+  it("adopts a late alias without resurrecting a settled child and logs a broadcast-free terminal ack", () => {
+    const storage = openStorage(":memory:");
+    const frames: ServerFrame[] = [];
+    const logs: string[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame),
+      now: () => 100, log: (message) => logs.push(message),
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+    const base = {
+      kind: "delegation", threadId: chat.sessionId, turnId: "turn",
+      batchId: "call-1", childId: "sa-0", index: 0, count: 1,
+    };
+    expect(plane.handle("sage", { kind: "event", sequence: 1, eventId: "run",
+      event: { ...base, status: "running", lastActiveAt: 5 } as never })).toBe(true);
+    // An otherwise-identical replay whose only news is the alias must NOT be dropped.
+    expect(plane.handle("sage", { kind: "event", sequence: 2, eventId: "run-alias",
+      event: { ...base, status: "running", lastActiveAt: 5, aliasId: "deleg_11223344" } as never })).toBe(true);
+    expect(storage.botChatDelegations(chat.sessionId, 0)[0]).toMatchObject({
+      status: "running", aliasId: "deleg_11223344",
+    });
+    const succeeded = { ...base, status: "succeeded", lastActiveAt: 6, aliasId: "deleg_11223344" };
+    expect(plane.handle("sage", { kind: "event", sequence: 3, eventId: "done",
+      event: succeeded as never })).toBe(true);
+    // A running replay AFTER settle never resurrects, even when it carries the alias.
+    expect(plane.handle("sage", { kind: "event", sequence: 4, eventId: "stale",
+      event: { ...base, status: "running", lastActiveAt: 5, aliasId: "deleg_11223344" } as never })).toBe(true);
+    expect(storage.botChatDelegations(chat.sessionId, 0)[0]).toMatchObject({
+      status: "succeeded", aliasId: "deleg_11223344",
+    });
+    // A duplicate settled replay is a no-op ack -- and an acknowledged TERMINAL event that
+    // produces no broadcast is exactly the stuck-card shape, so it must hit the log.
+    const rows = storage.botChatDelegations(chat.sessionId, 0).length;
+    expect(plane.handle("sage", { kind: "event", sequence: 5, eventId: "dup",
+      event: succeeded as never })).toBe(true);
+    expect(storage.botChatDelegations(chat.sessionId, 0)).toHaveLength(rows);
+    expect(logs.some((line) => line.includes("acknowledged without broadcast"))).toBe(true);
+    plane.close();
+    storage.close();
+  });
+
+  it("keeps aliases per batch when overlapping batches settle independently", () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 100,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+    const child = (batchId: string, body: Record<string, unknown>) => ({
+      kind: "delegation", threadId: chat.sessionId, turnId: "turn",
+      batchId, childId: "sa-0", index: 0, count: 1, ...body,
+    });
+    let sequence = 0;
+    const deliver = (eventId: string, event: unknown) =>
+      plane.handle("sage", { kind: "event", sequence: ++sequence, eventId, event: event as never });
+    expect(deliver("a-run", child("call-A", { status: "running", lastActiveAt: 5 }))).toBe(true);
+    expect(deliver("b-run", child("call-B", { status: "running", lastActiveAt: 5 }))).toBe(true);
+    // B settles FIRST: event ordering across batches must not matter, and each batch keeps
+    // its own alias.
+    expect(deliver("b-done", child("call-B", { status: "succeeded", lastActiveAt: 6, aliasId: "deleg_bbbb2222" }))).toBe(true);
+    expect(deliver("a-done", child("call-A", { status: "succeeded", lastActiveAt: 7, aliasId: "deleg_aaaa1111" }))).toBe(true);
+    const rows = storage.botChatDelegations(chat.sessionId, 0);
+    expect(rows.find((row) => row.batchId === "call-A")).toMatchObject({
+      status: "succeeded", aliasId: "deleg_aaaa1111",
+    });
+    expect(rows.find((row) => row.batchId === "call-B")).toMatchObject({
+      status: "succeeded", aliasId: "deleg_bbbb2222",
+    });
+    plane.close();
+    storage.close();
+  });
 });

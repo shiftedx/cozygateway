@@ -10,6 +10,7 @@ batch identity, spawn-order indices, the closed status vocabulary, and the
 bounded display fields (a truncated goal label, a tool count; nothing else).
 """
 
+import json
 import unittest
 
 import cozygateway.adapter as adapter_module
@@ -27,6 +28,7 @@ def _reset_registry():
     with adapter_module._DELEGATION_BATCHES_LOCK:
         adapter_module._DELEGATION_BATCHES.clear()
         adapter_module._DELEGATION_PARENT_LATEST.clear()
+        adapter_module._DELEGATION_PENDING_ALIASES.clear()
 
 
 class DelegationHookDispatchTests(unittest.TestCase):
@@ -196,3 +198,118 @@ class DelegationHookDispatchTests(unittest.TestCase):
         self.assertEqual(stop_payload["batch_id"], "call-7")
         self.assertEqual(stop_payload["index"], 0)
         self.assertEqual(self.adapter.events[1][1]["batch_id"], "call-8")
+
+
+class DelegationAliasCaptureTests(unittest.TestCase):
+    """``post_tool_call`` captures Hermes's canonical delegation id from the
+    STRUCTURED ``delegate_task`` result (a JSON object string carrying a
+    top-level ``delegation_id``; the ``live_transcripts`` path segment is the
+    explicit documented fallback) and rides it on subsequent frames as
+    ``alias_id``. An older result shape yields no alias and changes nothing
+    else."""
+
+    DISPATCHED = {
+        "status": "dispatched",
+        "mode": "background",
+        "count": 1,
+        "delegation_id": "deleg_c6eb9310",
+        "goals": ["g"],
+        "note": "Subagent is running in the background.",
+    }
+
+    def setUp(self):
+        self._orig_lookup = adapter_module._current_turn_platform_and_chat
+        adapter_module._current_turn_platform_and_chat = lambda: (
+            adapter_module.PLATFORM_NAME,
+            "chat-1",
+        )
+        self.adapter = _RecordingAdapter()
+        adapter_module._register_active_adapter(self.adapter)
+        adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+        _reset_registry()
+
+    def tearDown(self):
+        adapter_module._current_turn_platform_and_chat = self._orig_lookup
+        adapter_module._unregister_active_adapter(self.adapter)
+        adapter_module._CURRENT_DELEGATION_CALL.set(None)
+        _reset_registry()
+
+    def _finish(self, result):
+        """The async shape: spawn leg inside the call, then the tool result."""
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="g"
+        )
+        adapter_module._post_tool_call(
+            tool_name="delegate_task", tool_call_id="call-7", result=result
+        )
+        adapter_module._subagent_stop(
+            parent_session_id="parent",
+            child_session_id="child-1",
+            child_status="completed",
+            tool_call_history=[],
+        )
+
+    def test_structured_delegation_id_rides_subsequent_frames(self):
+        self._finish(json.dumps(self.DISPATCHED))
+        start_payload = self.adapter.events[0][1]
+        stop_payload = self.adapter.events[-1][1]
+        # The spawn leg ran before the result existed: no alias yet.
+        self.assertNotIn("alias_id", start_payload)
+        self.assertEqual(stop_payload["alias_id"], "deleg_c6eb9310")
+        self.assertEqual(stop_payload["batch_id"], "call-7")
+        self.assertEqual(stop_payload["status"], "succeeded")
+
+    def test_live_transcript_path_is_the_explicit_documented_fallback(self):
+        payload = dict(self.DISPATCHED)
+        del payload["delegation_id"]
+        payload["live_transcripts"] = [
+            "/Users/u/.hermes/profiles/cleo/cache/delegation/live/deleg_ab12cd34/task-0.log"
+        ]
+        self._finish(json.dumps(payload))
+        self.assertEqual(self.adapter.events[-1][1]["alias_id"], "deleg_ab12cd34")
+
+    def test_older_result_shapes_yield_no_alias_and_change_nothing_else(self):
+        for result in (
+            json.dumps({"status": "success", "results": ["done"]}),  # sync aggregate
+            "All 1 subagent(s) completed.",  # prose, never parsed
+            "{not json",  # malformed
+            None,
+        ):
+            self.adapter.events.clear()
+            _reset_registry()
+            adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+            self._finish(result)
+            stop_payload = self.adapter.events[-1][1]
+            self.assertNotIn("alias_id", stop_payload, result)
+            self.assertEqual(stop_payload["status"], "succeeded", result)
+            self.assertEqual(stop_payload["batch_id"], "call-7", result)
+
+    def test_malformed_delegation_id_shapes_are_refused(self):
+        for alias in ("", "deleg_", "sa-0-d94c0393", "../etc/passwd", 7):
+            self.adapter.events.clear()
+            _reset_registry()
+            adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+            self._finish(json.dumps({**self.DISPATCHED, "delegation_id": alias}))
+            self.assertNotIn("alias_id", self.adapter.events[-1][1], alias)
+
+    def test_alias_parked_before_the_batch_exists_is_adopted_at_creation(self):
+        # Defensive ordering: the result lands before any lifecycle leg made the batch.
+        adapter_module._post_tool_call(
+            tool_name="delegate_task",
+            tool_call_id="call-7",
+            result=json.dumps(self.DISPATCHED),
+        )
+        adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="g"
+        )
+        self.assertEqual(self.adapter.events[0][1]["alias_id"], "deleg_c6eb9310")
+
+    def test_alias_widens_the_bounded_payload_by_exactly_one_field(self):
+        self._finish(json.dumps(self.DISPATCHED))
+        allowed = {
+            "batch_id", "child_id", "index", "count", "status",
+            "label", "tool_count", "last_active_at", "alias_id",
+        }
+        for _chat, payload in self.adapter.events:
+            self.assertLessEqual(set(payload), allowed, payload)

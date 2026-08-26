@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS bot_chat_delegations (
   child_id TEXT NOT NULL,
   child_index INTEGER NOT NULL,
   batch_count INTEGER NOT NULL,
+  alias_id TEXT,
   label TEXT,
   status TEXT NOT NULL,
   current_tool TEXT,
@@ -987,6 +988,8 @@ export class Storage {
     sessionId: string;
     turnId: string;
     batchId: string;
+    /** Batch-level canonical Hermes alias; keep-first, a null never erases a stored one. */
+    aliasId?: string | undefined;
     childId: string;
     index: number;
     count: number;
@@ -1002,11 +1005,13 @@ export class Storage {
     this.#db
       .prepare(
         `INSERT INTO bot_chat_delegations
-           (bot, session_id, turn_id, batch_id, child_id, child_index, batch_count, label,
-            status, current_tool, api_calls, tool_count, last_active_at, started_at, ended_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (bot, session_id, turn_id, batch_id, alias_id, child_id, child_index, batch_count,
+            label, status, current_tool, api_calls, tool_count, last_active_at, started_at,
+            ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(bot, turn_id, batch_id, child_id) DO UPDATE SET
            batch_count = MAX(bot_chat_delegations.batch_count, excluded.batch_count),
+           alias_id = COALESCE(bot_chat_delegations.alias_id, excluded.alias_id),
            label = COALESCE(bot_chat_delegations.label, excluded.label),
            status = excluded.status,
            current_tool = excluded.current_tool,
@@ -1020,6 +1025,7 @@ export class Storage {
         child.sessionId,
         child.turnId,
         child.batchId,
+        child.aliasId ?? null,
         child.childId,
         child.index,
         child.count,
@@ -1041,6 +1047,7 @@ export class Storage {
   ): Array<{
     turnId: string;
     batchId: string;
+    aliasId: string | null;
     childId: string;
     index: number;
     count: number;
@@ -1055,7 +1062,8 @@ export class Storage {
   }> {
     return this.#db
       .prepare(
-        `SELECT turn_id AS turnId, batch_id AS batchId, child_id AS childId,
+        `SELECT turn_id AS turnId, batch_id AS batchId, alias_id AS aliasId,
+                child_id AS childId,
                 child_index AS "index", batch_count AS count, label, status,
                 current_tool AS currentTool, api_calls AS apiCalls, tool_count AS toolCount,
                 last_active_at AS lastActiveAt, started_at AS startedAt, ended_at AS endedAt
@@ -1066,6 +1074,7 @@ export class Storage {
       .all(sessionId, notBefore) as unknown as Array<{
       turnId: string;
       batchId: string;
+      aliasId: string | null;
       childId: string;
       index: number;
       count: number;
@@ -2942,6 +2951,13 @@ export function openStorage(dbPath: string): Storage {
     if (!streamColumns.some((column) => column.name === name))
       db.exec(`ALTER TABLE attach_streams ADD COLUMN ${name} ${definition}`);
   }
+  // Capability 34 additive alias: the canonical Hermes delegation id for a batch, learned from
+  // the parent delegate_task result. Existing rows stay unaliased, which is what they are.
+  const delegationColumns = db
+    .prepare("SELECT name FROM pragma_table_info('bot_chat_delegations')")
+    .all() as Array<{ name: string }>;
+  if (!delegationColumns.some((column) => column.name === "alias_id"))
+    db.exec("ALTER TABLE bot_chat_delegations ADD COLUMN alias_id TEXT");
   // v0.1 stored only a selected native-chat pointer and transcript rows. v0.2 split sessions
   // into their own table; recreate every existing session without changing populated new rows.
   db.exec(`

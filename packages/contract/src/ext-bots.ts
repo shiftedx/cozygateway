@@ -460,6 +460,11 @@ export const BotDelegationActivityFrameSchema = Type.Object({
   sessionId: Type.String(),
   turnId: Type.String(),
   batchId: Type.String(),
+  /** Canonical Hermes delegation id (`deleg_...`) for this batch, when known. `batchId` stays
+   *  the identity; a client whose exact-`batchId` reconciliation with Hermes's synthetic
+   *  "[ASYNC DELEGATION BATCH COMPLETE - <deleg_id>]" transcript row fails falls back to
+   *  matching that row's id against `aliasId`. Additive under capability 34. */
+  aliasId: Type.Optional(Type.String()),
   /** Children known to the batch so far; grows monotonically. */
   count: Type.Integer(),
   children: Type.Array(BotDelegationChildSchema),
@@ -475,6 +480,9 @@ export type BotDelegationActivityFrame = Static<typeof BotDelegationActivityFram
 export const BotTurnDelegationsSchema = Type.Object({
   turnId: Type.String(),
   batchId: Type.String(),
+  /** Canonical Hermes delegation id (`deleg_...`) for this batch, when known. See
+   *  `BotDelegationActivityFrameSchema.aliasId`. */
+  aliasId: Type.Optional(Type.String()),
   count: Type.Integer(),
   startedAt: Type.Integer(),
   endedAt: Type.Optional(Type.Integer()),
