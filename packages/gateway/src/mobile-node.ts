@@ -56,6 +56,10 @@ export const MOBILE_NODE_FAILURE_REASONS = [
   "cross_device_result",
   "receipt_persistence_failed",
   "broker_closed_pending",
+  // A frame the gateway wrote to the phone that no answer ever came back for. Without this an
+  // expiry was the one outcome that left no operator reason at all, so a phone that receives a
+  // request and silently ignores it looked identical to one that was never sent anything.
+  "request_expired_unanswered",
 ] as const;
 export type MobileNodeFailureReason = typeof MOBILE_NODE_FAILURE_REASONS[number];
 export type MobileNodeSendOutcome = "sent"
@@ -194,6 +198,16 @@ export class MobileNodeBroker {
       sendOutcome = "frame_send_failed";
     }
     const normalizedSend = normalizeSendOutcome(sendOutcome);
+    if (normalizedSend === "sent") {
+      emitTrace(this.#trace, "mobile_node_dispatch", {
+        command: input.command,
+        selectedSocketPresent: route.selectedSocketPresent,
+        selectedSocketOpen: route.selectedSocketOpen,
+        commandAdvertised: route.commandAdvertised,
+        connectedSocketCount: route.connectedSocketCount,
+        foreground: route.foreground === true,
+      });
+    }
     if (normalizedSend !== "sent") {
       const failedRoute = normalizedSend === "frame_send_failed"
         ? route
@@ -373,6 +387,10 @@ export class MobileNodeBroker {
     const pending = this.#pending.get(requestId);
     if (pending === undefined) return;
     this.#consume(requestId, pending);
+    if (status === "expired") {
+      this.#diagnose("request_expired_unanswered", pending.command, true,
+                     this.#route(pending.deviceId, pending.command));
+    }
     if (notifyDevice && (status === "cancelled" || status === "expired")) {
       this.#send(pending.deviceId, {
         type: "mobile_node_cancel",
