@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import cozygateway.adapter as adapter_module
@@ -328,3 +329,29 @@ class HermesPluginContextTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProfileFromHermesHomeTests(unittest.TestCase):
+    """The profile a per-profile install never configures, derived from the process itself.
+
+    Nothing sets `HERMES_PROFILE` or a plugin `profile` key in a normal install, so before this
+    the adapter's profile was empty and every phone-node call was refused with profile_mismatch.
+    """
+
+    def test_a_profile_home_yields_its_name(self) -> None:
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/Users/x/.hermes/profiles/cleo"}):
+            self.assertEqual(adapter_module._profile_from_hermes_home(), "cleo")
+
+    def test_a_trailing_separator_is_tolerated(self) -> None:
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/Users/x/.hermes/profiles/night-owl/"}):
+            self.assertEqual(adapter_module._profile_from_hermes_home(), "night-owl")
+
+    def test_a_non_profile_home_yields_nothing(self) -> None:
+        # The default profile and test harnesses do not live under profiles/, and guessing a name
+        # there would hand the gate an identity the operator never granted.
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/Users/x/.hermes"}):
+            self.assertEqual(adapter_module._profile_from_hermes_home(), "")
+
+    def test_an_absent_home_yields_nothing(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(adapter_module._profile_from_hermes_home(), "")
