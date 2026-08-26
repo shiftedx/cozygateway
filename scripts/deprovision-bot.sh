@@ -68,6 +68,7 @@ Idempotent. Safe to re-run. Refuses reserved profile names.
   --box-repo DIR         repo checkout on the box (default $BOX_REPO)
   --hermes-home DIR      hermes home (default \$HERMES_HOME_ROOT or ~/.hermes)
   --verify-timeout SEC   how long to wait for the count to drop (default $VERIFY_TIMEOUT)
+  --list-configured      print the profile names the box configures, one per line, and exit
   -h, --help             show this help
 USAGE
 }
@@ -81,6 +82,7 @@ while [ "$#" -gt 0 ]; do
     --box-repo) BOX_REPO="$2"; shift 2 ;;
     --hermes-home) HERMES_HOME_ROOT="$2"; shift 2 ;;
     --verify-timeout) VERIFY_TIMEOUT="$2"; shift 2 ;;
+    --list-configured) LIST_CONFIGURED=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option: $1" ;;
@@ -88,6 +90,29 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 for arg in ${@+"$@"}; do PROFILES+=("$arg"); done
+
+# The reconciliation half of the provisioner sweep needs to know what the BOX still configures,
+# because a bot deleted from the phone takes its profile and its launchd service with it and
+# leaves only a config entry behind. Printing that list is a read, so it takes none of the
+# teardown path below.
+if [ "${LIST_CONFIGURED:-0}" = 1 ]; then
+  have ssh || die "ssh not found on PATH"
+  ssh -o BatchMode=yes "$BOX_SSH" \
+    "python3 - '$BOX_REPO/$BOX_CONFIG_REL'" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        config = json.load(handle)
+except Exception:
+    sys.exit(0)
+hermes = config.get("hermes") or {}
+profiles = hermes.get("profiles") or {}
+if isinstance(profiles, dict):
+    for name in profiles:
+        print(name)
+PY
+  exit 0
+fi
 
 [ "${#PROFILES[@]}" -gt 0 ] || { usage >&2; die "no profile named"; }
 have ssh || die "ssh not found on PATH"

@@ -128,6 +128,16 @@ missing_reason() {
 DEPROVISION="$SCRIPT_DIR/deprovision-bot.sh"
 orphans=()
 if [ -x "$DEPROVISION" ]; then
+  # Residue shows up in TWO shapes and the second one is the common one.
+  #
+  #  1. A launchd gateway service whose profile directory is gone.
+  #  2. A BOX CONFIG entry whose profile is gone. When a bot is deleted from the phone, the
+  #     gateway removes the Hermes profile and Hermes stops and removes the service with it, so
+  #     shape 1 never appears and only the box's hermes.profiles entry and token env line linger
+  #     (observed 2026-08-26: 6 real profiles, 9 configured, 3 absent).
+  #
+  # Shape 1 is free to check. Shape 2 costs one ssh, so it runs on a slow cadence rather than
+  # every 30 second tick; residue is not urgent, it is just untidy.
   while IFS= read -r label; do
     [ -n "$label" ] || continue
     profile="${label#ai.hermes.gateway-}"
@@ -138,6 +148,25 @@ if [ -x "$DEPROVISION" ]; then
   done <<ORPHANS
 $(launchctl list 2>/dev/null | awk '{ print $3 }' | grep '^ai\.hermes\.gateway-' || true)
 ORPHANS
+
+  # Shape 2, at most once every RECONCILE_SECONDS, tracked by a stamp file.
+  RECONCILE_SECONDS="${COZY_PROVISIONER_RECONCILE_SECONDS:-600}"
+  STAMP="${TMPDIR:-/tmp}/cozylabs-bot-provisioner.reconcile"
+  now_epoch="$(date +%s)"
+  last_epoch=0
+  [ -f "$STAMP" ] && last_epoch="$(cat "$STAMP" 2>/dev/null || printf 0)"
+  case "$last_epoch" in ''|*[!0-9]*) last_epoch=0 ;; esac
+  if [ "$(( now_epoch - last_epoch ))" -ge "$RECONCILE_SECONDS" ]; then
+    printf '%s' "$now_epoch" > "$STAMP" 2>/dev/null || true
+    configured="$("$DEPROVISION" --list-configured 2>/dev/null || true)"
+    for profile in $configured; do
+      [ -n "$profile" ] || continue
+      [ -d "$HERMES_HOME_ROOT/profiles/$profile" ] && continue
+      case " ${orphans[*]+${orphans[*]}} " in *" $profile "*) continue ;; esac
+      orphans+=("$profile")
+      log "orphaned: $profile (box config entry with no profile directory)"
+    done
+  fi
 fi
 
 if [ "${#orphans[@]}" -gt 0 ]; then
