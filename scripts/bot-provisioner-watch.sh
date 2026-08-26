@@ -131,7 +131,7 @@ fi
 log "provisioning: ${pending[*]}"
 args=()
 [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
-if "$PROVISION" "${args[@]}" "${pending[@]}" >> "$LOG_FILE" 2>&1; then
+if "$PROVISION" ${args[@]+"${args[@]}"} "${pending[@]}" >> "$LOG_FILE" 2>&1; then
   log "sweep done: ${pending[*]} provisioned"
 else
   log "sweep FAILED for one or more of: ${pending[*]} (see the output above)"
