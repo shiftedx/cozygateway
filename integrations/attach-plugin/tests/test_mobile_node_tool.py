@@ -104,6 +104,12 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         client.result.set_result({"status": "ok", "result": GATEWAY_STATUS})
         self.assertEqual(json.loads(await call), {"status": "ok", "result": GATEWAY_STATUS})
 
+    async def test_registers_p1_camera_file_and_actionable_notification_tools(self):
+        by_name = {tool["name"]: tool for tool in self.context.tools}
+        self.assertEqual(set(("cozy_capture_camera", "cozy_pick_file", "cozy_present_notification")) - set(by_name), set())
+        self.assertEqual(by_name["cozy_capture_camera"]["schema"]["parameters"]["properties"]["capture"]["enum"], ["photo", "video"])
+        self.assertEqual(by_name["cozy_pick_file"]["schema"]["parameters"]["properties"]["selection"]["enum"], ["photo", "file"])
+
     async def test_rejects_unbound_context_before_phone_routing(self):
         adapter_module._current_turn_platform_and_chat = lambda: ("cron", "thread-1")
         client = _Client()

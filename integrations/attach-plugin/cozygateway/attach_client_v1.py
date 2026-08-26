@@ -61,7 +61,7 @@ HELLO_ACK_TIMEOUT_SECONDS = 5
 HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
-    "mobile_node", "mobile_location", "memory_management", "delivery_receipts",
+    "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts",
     "delegation", "thinking",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
@@ -235,8 +235,17 @@ class AttachV1Client:
             return {"status": "policy_blocked"}
         return await self._request_mobile("location.current", thread_id, turn_id, purpose)
 
-    async def _request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: Optional[str] = None) -> MobileDeviceStatusResult:
-        required_capability = "mobile_location" if command == "location.current" else "mobile_node"
+    async def request_camera(self, thread_id: str, turn_id: str, purpose: str, camera: str, capture: str) -> MobileDeviceStatusResult:
+        return await self._request_mobile("camera.capture", thread_id, turn_id, purpose, {"camera": camera, "capture": capture, "videoDurationSeconds": 10})
+
+    async def request_file(self, thread_id: str, turn_id: str, purpose: str, selection: str) -> MobileDeviceStatusResult:
+        return await self._request_mobile("file.pick", thread_id, turn_id, purpose, {"selection": selection})
+
+    async def present_notification(self, thread_id: str, turn_id: str, purpose: str, title: str, body: str) -> MobileDeviceStatusResult:
+        return await self._request_mobile("notification.present", thread_id, turn_id, purpose, {"title": title, "body": body})
+
+    async def _request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> MobileDeviceStatusResult:
+        required_capability = "mobile_location" if command == "location.current" else "mobile_media" if command in {"camera.capture", "file.pick"} else "mobile_notifications" if command == "notification.present" else "mobile_node"
         if not self._negotiated or required_capability not in self._capabilities:
             return {"status": "device_unavailable"}
         request_id = str(uuid.uuid4())
@@ -250,6 +259,8 @@ class AttachV1Client:
             }
             if purpose is not None:
                 frame["purpose"] = purpose
+            if options is not None:
+                frame.update(options)
             await self._send(frame)
             return await asyncio.wait_for(asyncio.shield(future), MOBILE_STATUS_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
@@ -1020,7 +1031,7 @@ class AttachV1Client:
         result: MobileDeviceStatusResult = {"status": status}
         payload = frame.get("result")
         if status == "ok":
-            if (command == "device.status" and not _is_device_status(payload)) or (command == "location.current" and not _is_location(payload)):
+            if (command == "device.status" and not _is_device_status(payload)) or (command == "location.current" and not _is_location(payload)) or (command in {"camera.capture", "file.pick"} and not _is_media(payload)) or (command == "notification.present" and not _is_notification(payload)):
                 future.set_result({"status": "device_unavailable"})
                 return
             result["result"] = payload
@@ -1090,6 +1101,12 @@ def _is_location(value: Any) -> bool:
         and abs(latitude * 100 - round(latitude * 100)) < 1e-8
         and abs(longitude * 100 - round(longitude * 100)) < 1e-8
     )
+
+def _is_media(value: Any) -> bool:
+    return isinstance(value, dict) and isinstance(value.get("mediaId"), str) and isinstance(value.get("mimeType"), str) and isinstance(value.get("byteCount"), int) and isinstance(value.get("filename"), str) and isinstance(value.get("sha256"), str)
+
+def _is_notification(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("action") in {"approve", "snooze", "open", "cancel"} and len(value) == 1
 
 
 def normalize_location_purpose(value: Any) -> Optional[str]:

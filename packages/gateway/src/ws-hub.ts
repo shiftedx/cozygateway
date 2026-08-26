@@ -28,6 +28,7 @@ interface Client {
   deviceId: string;
   heartbeatAlive: boolean;
   mobileCommands: Set<MobileNodeRequestFrame["command"]>;
+  mobileForeground: boolean;
 }
 
 const HEARTBEAT_MS = 5_000;
@@ -155,7 +156,7 @@ export class WsHub {
         }
         clearTimeout(authTimer);
         this.#storage.touchDevice(device.id, this.#now());
-        client = { socket, deviceId: device.id, heartbeatAlive: true, mobileCommands: new Set() };
+        client = { socket, deviceId: device.id, heartbeatAlive: true, mobileCommands: new Set(), mobileForeground: false };
         emitTrace(this.#trace, "app_ws_auth", { connection, device: traceId(device.id) });
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
@@ -170,6 +171,7 @@ export class WsHub {
       }
 
       if (frame.type === "mobile_node_advertise") {
+        client.mobileForeground = frame.foreground;
         client.mobileCommands = new Set(
           frame.foreground ? frame.commands : frame.commands.filter((command) => command === "device.status"),
         );
@@ -284,6 +286,7 @@ export class WsHub {
         selectedSocketPresent: false,
         selectedSocketOpen: false,
         commandAdvertised: false,
+        foreground: false,
         connectedSocketCount,
       };
     }
@@ -296,6 +299,7 @@ export class WsHub {
       selectedSocketPresent: true,
       selectedSocketOpen,
       commandAdvertised,
+      foreground: client.mobileForeground,
       connectedSocketCount,
     };
   }

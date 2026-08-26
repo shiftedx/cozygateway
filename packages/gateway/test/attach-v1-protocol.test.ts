@@ -159,6 +159,9 @@ describe("attach-v1 protocol", () => {
         networkClass: "wifi", capabilities: [
           { command: "device.status", permission: "not_required" },
           { command: "location.current", permission: "authorized" },
+          { command: "camera.capture", permission: "authorized" },
+          { command: "file.pick", permission: "not_required" },
+          { command: "notification.present", permission: "not_required" },
         ],
         wakeReason: "deep_link", authenticatedReachable: true, lastAuthenticatedPresenceAt: 1_234,
       },

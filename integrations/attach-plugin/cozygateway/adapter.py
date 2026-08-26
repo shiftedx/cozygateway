@@ -56,6 +56,8 @@ from .attach_client_v1 import (
     AttachV1ClientConfig,
     _is_device_status,
     _is_location,
+    _is_media,
+    _is_notification,
     _media_byte_limit,
     normalize_location_purpose,
 )
@@ -1318,6 +1320,18 @@ class AttachAdapter:
                 pending.cancel()
             return {"status": "cancelled"}
         except Exception:  # noqa: BLE001 - an attach fault is never a tool crash
+            return {"status": "device_unavailable"}
+
+    async def request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: str, **options: Any) -> Dict[str, Any]:
+        client, loop = self._client, self._loop
+        if client is None or loop is None or loop.is_closed():
+            return {"status": "device_unavailable"}
+        call = client._request_mobile(command, thread_id, turn_id, purpose, options)
+        try:
+            return await call if asyncio.get_running_loop() is loop else await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(call, loop))
+        except asyncio.CancelledError:
+            return {"status": "cancelled"}
+        except Exception:  # noqa: BLE001
             return {"status": "device_unavailable"}
 
     def _inbound_source(self, thread_id: str, *, message_id: Optional[str] = None) -> Any:
@@ -2682,8 +2696,26 @@ async def _cozy_request_location(args: Dict[str, Any], **_kwargs: Any) -> str:
         return _mobile_tool_result("policy_blocked")
     return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_location(chat_id, turn_id, purpose), location=True)
 
+async def _cozy_capture_camera(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose, camera, capture = normalize_location_purpose(args.get("purpose")), args.get("camera"), args.get("capture")
+    if purpose is None or camera not in {"front", "rear"} or capture not in {"photo", "video"}:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("camera.capture", chat_id, turn_id, purpose, camera=camera, capture=capture, videoDurationSeconds=10), media=True)
 
-async def _cozy_mobile(request: Any, location: bool = False) -> str:
+async def _cozy_pick_file(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose, selection = normalize_location_purpose(args.get("purpose")), args.get("selection")
+    if purpose is None or selection not in {"photo", "file"}:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("file.pick", chat_id, turn_id, purpose, selection=selection), media=True)
+
+async def _cozy_present_notification(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose, title, body = normalize_location_purpose(args.get("purpose")), args.get("title"), args.get("body")
+    if purpose is None or not isinstance(title, str) or not isinstance(body, str) or not 0 < len(title) <= 80 or not 0 < len(body) <= 240:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("notification.present", chat_id, turn_id, purpose, title=title, body=body), notification=True)
+
+
+async def _cozy_mobile(request: Any, location: bool = False, media: bool = False, notification: bool = False) -> str:
     try:
         platform, chat_id = _current_turn_platform_and_chat()
         message_id, cron, profile = _current_turn_message_and_cron()
@@ -2746,7 +2778,8 @@ async def _cozy_mobile(request: Any, location: bool = False) -> str:
         return _mobile_tool_result("policy_blocked")
     status = outcome.get("status")
     result = outcome.get("result")
-    if status == "ok" and (not _is_location(result) if location else not _is_device_status(result)):
+    valid = _is_location(result) if location else _is_media(result) if media else _is_notification(result) if notification else _is_device_status(result)
+    if status == "ok" and not valid:
         status, result = "device_unavailable", None
     return _mobile_tool_result(
         status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
@@ -4056,6 +4089,9 @@ def register(ctx: Any) -> None:
         description="Request one consented approximate location in the active CozyGateway turn.",
         emoji="📍",
     )
+    ctx.register_tool(name="cozy_capture_camera", toolset="cozygateway", schema={"name": "cozy_capture_camera", "description": "Request one foreground camera capture from the phone that started this turn.", "parameters": {"type": "object", "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}, "camera": {"type": "string", "enum": ["front", "rear"]}, "capture": {"type": "string", "enum": ["photo", "video"]}}, "required": ["purpose", "camera", "capture"], "additionalProperties": False}}, handler=_cozy_capture_camera, is_async=True, description="Request one consented foreground camera capture.", emoji="📷")
+    ctx.register_tool(name="cozy_pick_file", toolset="cozygateway", schema={"name": "cozy_pick_file", "description": "Ask the user to choose one photo or file to share from their phone.", "parameters": {"type": "object", "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}, "selection": {"type": "string", "enum": ["photo", "file"]}}, "required": ["purpose", "selection"], "additionalProperties": False}}, handler=_cozy_pick_file, is_async=True, description="Request one user-selected phone file.", emoji="📎")
+    ctx.register_tool(name="cozy_present_notification", toolset="cozygateway", schema={"name": "cozy_present_notification", "description": "Present an actionable local notification for this live turn.", "parameters": {"type": "object", "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}, "title": {"type": "string", "minLength": 1, "maxLength": 80}, "body": {"type": "string", "minLength": 1, "maxLength": 240}}, "required": ["purpose", "title", "body"], "additionalProperties": False}}, handler=_cozy_present_notification, is_async=True, description="Present an actionable local notification.", emoji="🔔")
     # Register the tool-lifecycle hooks that feed the live tool-chip tap. If the
     # harness build does not support hook registration, degrade gracefully: the
     # platform still streams text, only the chips are absent.

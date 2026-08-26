@@ -2,7 +2,7 @@ import { type Static, Type } from "@sinclair/typebox";
 import {
   RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryKindSchema,
   BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema,
-  BotMemoryDeleteResponseSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema,
+  BotMemoryDeleteResponseSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema, MobileNodeMediaDescriptorSchema,
   type MobileNodeGatewayStatusResult,
 } from "cozygateway-contract";
 
@@ -22,6 +22,8 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("scheduled"),
   Type.Literal("mobile_node"),
   Type.Literal("mobile_location"),
+  Type.Literal("mobile_media"),
+  Type.Literal("mobile_notifications"),
   Type.Literal("memory_management"),
   Type.Literal("delivery_receipts"),
   Type.Literal("delegation"),
@@ -289,19 +291,26 @@ const AttachV1MobileLocationRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("location.current"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
-export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema]);
+const AttachV1MobileCameraRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("camera.capture"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, camera: Type.Union([Type.Literal("front"), Type.Literal("rear")]), capture: Type.Union([Type.Literal("photo"), Type.Literal("video")]), videoDurationSeconds: Type.Literal(10) }, { additionalProperties: false });
+const AttachV1MobileFileRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("file.pick"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, selection: Type.Union([Type.Literal("photo"), Type.Literal("file")]) }, { additionalProperties: false });
+const AttachV1MobileNotificationRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("notification.present"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false });
+export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema, AttachV1MobileCameraRequestSchema, AttachV1MobileFileRequestSchema, AttachV1MobileNotificationRequestSchema]);
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
 export const AttachV1MobileResultSchema = Type.Union([
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: MobileNodeGatewayStatusResultSchema }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ latitude: Type.Number({ minimum: -90, maximum: 90 }), longitude: Type.Number({ minimum: -180, maximum: 180 }) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: MobileNodeMediaDescriptorSchema }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ action: Type.Union([Type.Literal("approve"), Type.Literal("snooze"), Type.Literal("open"), Type.Literal("cancel")]) }, { additionalProperties: false }) }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Union([Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"), Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked")]) }, { additionalProperties: false }),
 ]);
 export type AttachV1MobileResult = Static<typeof AttachV1MobileResultSchema>;
 export type AttachV1MobileResultInput =
   | { requestId: string; status: "ok"; result: MobileNodeGatewayStatusResult }
   | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
+  | { requestId: string; status: "ok"; result: { mediaId: string; mimeType: string; byteCount: number; sha256: string; filename: string; family: "image" | "audio" | "video" | "file" } }
+  | { requestId: string; status: "ok"; result: { action: "approve" | "snooze" | "open" | "cancel" } }
   | { requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" };
 
 /** This union was deliberately closed to reasoning ("no thinking/reasoning/chain-of-thought

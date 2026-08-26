@@ -243,10 +243,18 @@ export const BotMobileReceiptSchema = Type.Object({
   command: Type.Union([
     Type.Literal("device.status"),
     Type.Literal("location.current"),
+    Type.Literal("camera.capture"),
+    Type.Literal("file.pick"),
+    Type.Literal("notification.present"),
   ]),
   sharedDescription: Type.Union([
     Type.Literal("Device status"),
     Type.Literal("Approximate location"),
+    Type.Literal("Camera photo"),
+    Type.Literal("Camera video"),
+    Type.Literal("Selected photo"),
+    Type.Literal("Selected file"),
+    Type.Literal("Notification action"),
   ]),
   purpose: Type.String({
     minLength: 1,
@@ -1441,6 +1449,14 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    `>= 32`. An out-of-range value clamps into `0...blocks.length`; it never drops the
  *    attachment. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
+/** The phone-as-node capability, advertised beside the bots one.
+ *  4: device status v2 answers over an authenticated origin, under a single-use lease.
+ *  5: the phone can also capture a photo or a short video, hand over a file the person picked,
+ *     and present an actionable notification. Each still requires its own lease and writes a
+ *     receipt, and each byte payload rides the existing attachment upload rather than the
+ *     ephemeral result frame. */
+export const MOBILE_NODE_CAPABILITY_ID = "com.cozylabs.mobile-node";
+export const MOBILE_NODE_CAPABILITY_VERSION = 5;
 /** Capability 30: a bounded, source-labelled projection of memory owned by the
  * attached Hermes profile.  `attributes` deliberately does not exist: every
  * field a client can render is named and bounded here, and a capability flag

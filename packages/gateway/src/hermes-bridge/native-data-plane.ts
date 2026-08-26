@@ -357,7 +357,7 @@ export class NativeBotDataPlane {
       sessionId: input.threadId,
       turnId: input.turnId,
       command: input.command,
-      sharedDescription: input.command === "device.status" ? "Device status" : "Approximate location",
+      sharedDescription: input.sharedDescription,
       purpose: input.purpose,
       sharedAt: this.#now(),
     });
