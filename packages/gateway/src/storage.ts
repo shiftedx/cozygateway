@@ -1667,8 +1667,9 @@ export class Storage {
   }
 
   /** Inbox admission is the ACK boundary. Sequence must be contiguous; duplicates by eventId are
-   * harmless; and a terminal transition seals its turn so a late draft is journaled/ACKed but never
-   * applied. */
+   * harmless; and a terminal transition seals its turn so late turn events are journaled/ACKed but
+   * never applied. Delegation lifecycle is the one exception: async children can settle after their
+   * parent turn seals, and the data plane applies those updates idempotently. */
   acceptAttachEvent(
     agentId: string,
     frame: AttachV1EventFrame,
@@ -1734,7 +1735,7 @@ export class Storage {
         ? undefined
         : (this.#db.prepare("SELECT event_id AS eventId FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(agentId, turnId) as { eventId: string } | undefined);
       let disposition: "accepted" | "ignored_terminal" | "ignored_delivery" =
-        sealed === undefined ? "accepted" : "ignored_terminal";
+        sealed === undefined || event.kind === "delegation" ? "accepted" : "ignored_terminal";
       if (event.kind === "scheduled") {
         const prior = this.#db
           .prepare(
