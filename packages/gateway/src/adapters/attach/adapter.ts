@@ -292,6 +292,14 @@ export class AttachRouter {
     this.#adapters.get(agentId)?.handleDisconnect();
   }
 
+  /** Drops a deleted bot's adapter. Any turn still in flight is failed first, exactly as a
+   *  dropped socket would fail it: the identity is gone, so nothing can ever commit that turn,
+   *  and leaving the caller's promise pending would hold the turn open forever. */
+  unregister(agentId: string): void {
+    this.#adapters.get(agentId)?.handleDisconnect();
+    this.#adapters.delete(agentId);
+  }
+
   onV1Event(agentId: string, frame: AttachV1EventFrame): boolean {
     return this.#adapters.get(agentId)?.handleV1Event(frame) ?? false;
   }

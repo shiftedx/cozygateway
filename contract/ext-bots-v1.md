@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 36 }
+"capabilities": { "com.cozylabs.bots": 37 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -75,6 +75,7 @@ extension omits the capability and does not register `/bots` routes.
 | 34 | Subagent visibility: `bot_delegation_activity` batch snapshots and a `delegations` array on chat history. |
 | 35 | Live thinking preview: latest-only `bot_thinking_activity` frames (sanitized, <=280 chars, ephemeral). |
 | 36 | Full provider visibility: optional `providers` summary and `unauthenticated` catalog markers on `BotModelConfig`. |
+| 37 | Bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Removes the Hermes profile, purges gateway state, and revokes the attach identity. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -130,8 +131,10 @@ a second, hand-copied schema.
   or an option label. The gateway retains only the newest 100 terminal receipts per bot.
 
 Only profiles configured in `hermes.profiles` are exposed as CozyChat bots. Profile lifecycle
-belongs to Hermes: create or delete the profile there, then rerun the CozyGateway installer (its
-default `--profiles all` selection reconciles plugin, token, service, and gateway configuration).
+belongs to Hermes, and from capability 37 both ends of it are reachable from the phone:
+`POST /bots` creates the profile and `DELETE /bots/:name` removes it. A profile created or deleted
+in Hermes directly still needs the CozyGateway installer rerun (its default `--profiles all`
+selection reconciles plugin, token, service, and gateway configuration).
 
 `POST /bots` creates the Hermes profile and then SEEDS it as a blank slate: the `file` + `terminal`
 toolset floor on the `cozygateway` and `cli` platforms, `approvals.mode: manual`, inherited MCP
@@ -150,6 +153,48 @@ explicit selection is still honoured when they do, and the skills OFF-list stops
 toolset floor does. There is no create-time `skills` field: the app's post-create
 `PATCH /bots/:name/profile disabledSkills` is replace-whole and lands after the seed, so a user's
 explicit skill selection wins wholesale while an untouched create keeps the floor. See `docs/attach-v1-operations.md`.
+
+### Bot deletion (capability 37)
+
+`DELETE /bots/:name` is the inverse of `POST /bots`, and it is written to one promise: after it
+returns, the Hermes host holds no trace of the bot. The order is deliberate and is part of the
+contract, because each step is only safe once the one before it succeeded.
+
+1. **The host first.** The gateway asks Hermes to delete the profile, which removes the whole
+   profile directory: config, API keys, memories, sessions, skills, cron jobs, the synced
+   `cozygateway` plugin and the `.env` holding its attach token. Hermes stops and uninstalls the
+   profile's gateway service as part of the same delete. If Hermes refuses or cannot be reached,
+   the route fails and NOTHING is purged: a gateway that dropped its own rows while the profile
+   kept running on the host is the exact opposite of what this route promises. Hermes answering
+   `404` is not a failure but the recovery half of the same promise, reported as
+   `hermesProfile: "already_absent"`, and the purge proceeds.
+2. **The identity next.** Before any row is dropped, the bot's attach identity is revoked in
+   process: its token is removed from the map both public attach surfaces authenticate against,
+   its live stream is closed, its capability grant and adapter are dropped. From this point the
+   token authenticates nothing, so no in-flight connection can race the purge and write rows back
+   in behind it. `tokenRevoked` reports whether an identity was held at all.
+3. **The gateway state last.** Every durable row the bot owned is deleted in one transaction:
+   the roster row, the native chat plane (active pointer, sessions, transcript, receipts, turn
+   media bindings, interactions, turn terminals), tool steps, delegations, routine overrides, the
+   attach journals (stream cursor, command outbox, event inbox, turn terminals, media blobs,
+   scheduled deliveries), group-turn tombstones, Live Activity registrations, and the bot's half of
+   the core thread surface. `purged` reports the row count per area, keyed by stable wire ids, with
+   zero-row areas omitted; it is a report of what was removed, never an assertion that it was.
+
+Group ROOMS are deliberately not deleted. A room is a user-owned resource that may name a departed
+member, and the room surface already renders a missing member honestly.
+
+A bot with a native turn in flight is refused with `409` and extension code `conflict`; the body
+carries `turnId` so a client can name the work it is about to end in its confirmation copy.
+`?force=1` overrides that one refusal and nothing else. A name neither Hermes nor this gateway
+knows answers the ordinary not-found shape, so a repeated delete is a clean `404` rather than a
+second success. Reserved profile names are refused with `400`.
+
+`residue` is a bounded list of display-safe operator English naming what this gateway cannot remove
+from where it runs: the box gateway config entry, the token line in the box `.env`, and the host
+launchd service if it outlived the profile. None of it can authenticate, because the token was
+already revoked in step 2. `scripts/deprovision-bot.sh <profile>` sweeps all of it and is
+idempotent, so it is equally safe to run after this route or on its own.
 
 ### Slash commands
 
@@ -374,6 +419,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | --- | --- | --- | --- |
 | `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots. |
 | `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate. `409` extension code `conflict` when the name is taken. |
+| `DELETE /bots/:name` | optional `?force=1` | `200 BotDeleteResponse` | Capability 37. Deletes the Hermes profile and purges every gateway row the bot owned. `409` extension code `conflict` (body carries `turnId`) when a native turn is running, unless `force=1`. `404` when neither Hermes nor this gateway knows the name. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
 | `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. |

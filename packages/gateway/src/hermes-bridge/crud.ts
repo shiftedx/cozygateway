@@ -29,6 +29,19 @@ export class BotNotFound extends Error {
   }
 }
 
+/** The bot has a live native turn, so a delete would kill work in flight. `?force=1` proceeds. */
+export class BotTurnActive extends Error {
+  readonly botName: string;
+  readonly turnId: string;
+
+  constructor(botName: string, turnId: string) {
+    super(`bot "${botName}" has a running turn (${turnId}); retry with force=1 to delete it anyway`);
+    this.name = "BotTurnActive";
+    this.botName = botName;
+    this.turnId = turnId;
+  }
+}
+
 export class BotNameTaken extends Error {
   readonly botName: string;
 

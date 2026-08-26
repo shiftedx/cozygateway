@@ -25,6 +25,7 @@ import {
   createAttachAdapter,
   type TurnEndpoint,
 } from "./adapters/attach/adapter.ts";
+import { revokeAttachTokens } from "./adapters/attach/token-auth.ts";
 import { createApp } from "./http.ts";
 import { WsHub } from "./ws-hub.ts";
 import { MobileNodeBroker } from "./mobile-node.ts";
@@ -224,6 +225,11 @@ export async function startGateway(
   // notifier does not exist yet, and no approval can be raised before the listener is bound.
   let raiseApprovalPush: (payload: ApprovalPushPayload) => void = () => {};
   let raiseChatMessagePush: (event: ChatMessagePushEvent) => void = () => {};
+  // Same indirection again, for capability 37's delete. The runtime attach identity (token map,
+  // live socket, capability grant, adapter) is built below the bridge, so the bridge reaches it
+  // through this hole rather than the construction order being rearranged around one route.
+  // Until it is filled no bot can be deleted, because the listener is not bound yet.
+  let killAttachIdentity: (name: string) => boolean = () => false;
   let raiseLiveActivityFrame: (frame: ServerFrame) => void = () => {};
 
   const client = createHermesClient({
@@ -244,6 +250,7 @@ export async function startGateway(
       : { bridgeProfile: hermesOptions.bridgeProfile }),
     seedBlankSlateBots: hermesOptions.seedBlankSlateBots,
     blankSlateSkillsOn: hermesOptions.blankSlateSkillsOn,
+    revokeAttachIdentity: (name) => killAttachIdentity(name),
     // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
     // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
     // rather than borrowed from a chat thread, so a client that does not know about rooms yet
@@ -342,6 +349,20 @@ export async function startGateway(
       return [profileId, adapter] as const;
     }),
   );
+  // Capability 37. Every runtime surface that would still answer for a deleted bot, torn down in
+  // one place: the token map both public attach surfaces authenticate against (the WebSocket
+  // upgrade and HTTP media share this exact Map object, so one delete covers both), the live
+  // socket and its per-profile ingress state, the capability grant, and the adapter that would
+  // otherwise keep a turn pending forever. Returns whether an attach identity was actually held,
+  // which is what the delete response reports as `tokenRevoked`.
+  killAttachIdentity = (name: string): boolean => {
+    const revoked = revokeAttachTokens(attachTokens, name);
+    attachV1Ingress.disconnectAgent(name);
+    allowedCapabilities.delete(name);
+    router.unregister(name);
+    adapters.delete(name);
+    return revoked;
+  };
   const notifier = new RelayNotifier({
     storage,
     ...(config.pushRelayUrl === undefined
