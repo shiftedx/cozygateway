@@ -23,7 +23,8 @@ short URL is a separate website task. Until that task ships, the script can be
 run from a checkout or a versioned GitHub release URL.
 
 The installer supports built-in Windows PowerShell 5.1, runs without elevation,
-uses the existing Hermes Desktop installation, and ends by printing:
+uses an existing Hermes Desktop installation when present, installs Hermes Agent
+through its official Windows installer when absent, and ends by printing:
 
 - a terminal QR containing the gateway URL and setup code;
 - the gateway URL in plain text;
@@ -42,20 +43,30 @@ code.
 It:
 
 1. Requires PowerShell 5.1 or newer and enables TLS 1.2 where necessary.
-2. Resolves the requested release tag or the repository's latest release.
-3. Downloads the gateway bundle, attach-plugin archive, and shared installer,
+2. Resolves Hermes first. If `hermes.exe` and a default profile are already
+   usable, it leaves them untouched. Otherwise it downloads the official Hermes
+   Windows installer from the latest tagged NousResearch/hermes-agent release,
+   runs its normal interactive setup, refreshes the current process environment,
+   and verifies the resulting CLI and default profile before continuing. A test
+   override permits a local fake installer; production does not silently use a
+   fork or mirror.
+3. Resolves the requested CozyGateway release tag or the repository's latest release.
+4. Downloads the gateway bundle, attach-plugin archive, and shared installer,
    plus each asset's SHA-256 sidecar.
-4. Verifies every artifact with `Get-FileHash` before replacing an installed
+5. Verifies every CozyGateway artifact with `Get-FileHash` before replacing an installed
    copy or executing code.
-5. Locates Git Bash in Hermes' documented order: `HERMES_GIT_BASH_PATH`,
+6. Locates Git Bash in Hermes' documented order: `HERMES_GIT_BASH_PATH`,
    Hermes-managed PortableGit layouts, Git associated with `git.exe`, standard
    Program Files locations, and the per-user Git location. It never mistakes
    Windows' WSL `bash.exe` shim for Git Bash.
-6. Invokes the verified shared installer with explicit Windows paths and
+7. Invokes the verified shared installer with explicit Windows paths and
    `--service-platform Windows`.
 
-The bootstrap does not install Node, Git, WSL, or Hermes. A missing compatible
-Hermes Desktop prerequisite produces one actionable error.
+The bootstrap does not independently install Node, Git, or WSL. When Hermes is
+absent, Hermes' own installer owns those prerequisites and its setup wizard. If
+the user cancels Hermes setup or no default profile exists afterward, the run
+stops with an instruction to finish Hermes setup and paste the same CozyGateway
+command again.
 
 ### Shared installer Windows support
 
@@ -119,6 +130,8 @@ pairing code for an unreachable service.
 Automated coverage will exercise:
 
 - PowerShell 5.1-compatible syntax and checksum success/failure;
+- reuse of an existing Hermes install, official Hermes bootstrap when missing,
+  environment refresh, and a cancelled/incomplete Hermes setup failure;
 - Git Bash discovery, including paths with spaces and rejection of WSL Bash;
 - Windows platform detection and path conversion;
 - Scheduled Task creation, idempotent replacement, status, and uninstall;
