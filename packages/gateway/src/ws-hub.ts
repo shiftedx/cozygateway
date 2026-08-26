@@ -33,7 +33,8 @@ export class WsHub {
   readonly #authTimeoutMs: number;
   readonly #heartbeatTimer: ReturnType<typeof setInterval>;
   readonly #clients = new Set<Client>();
-  /** The latest advertised foreground socket per device. Older sibling sockets never receive
+  /** The latest advertised eligible socket per device. Status remains eligible in background;
+   * location does not. Older sibling sockets never receive
    * a mobile request and cannot cancel the selected node when they close. */
   readonly #mobileNodes = new Map<string, Client>();
   // Counts sockets per device rather than a boolean, so a second socket for the same device
@@ -144,8 +145,15 @@ export class WsHub {
       }
 
       if (frame.type === "mobile_node_advertise") {
-        client.mobileCommands = frame.foreground ? new Set(frame.commands) : new Set();
-        if (client.mobileCommands.size) this.#mobileNodes.set(client.deviceId, client);
+        client.mobileCommands = new Set(
+          frame.foreground ? frame.commands : frame.commands.filter((command) => command === "device.status"),
+        );
+        if (client.mobileCommands.size) {
+          this.#mobileNodes.set(client.deviceId, client);
+        } else if (this.#mobileNodes.get(client.deviceId) === client) {
+          this.#mobileNodes.delete(client.deviceId);
+          this.#onDeviceDisconnect?.(client.deviceId);
+        }
         return;
       }
       if (frame.type === "mobile_node_result") {

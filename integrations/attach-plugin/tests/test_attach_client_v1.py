@@ -16,6 +16,18 @@ from cozygateway.attach_client import ToolChip
 from cozygateway.attach_spool import AttachSpool
 
 
+GATEWAY_STATUS = {
+    "appState": "background", "batteryBand": "low", "lowPowerMode": True,
+    "thermalState": "serious", "networkClass": "cellular",
+    "capabilities": [
+        {"command": "device.status", "permission": "not_required"},
+        {"command": "location.current", "permission": "authorized"},
+    ],
+    "wakeReason": "notification", "authenticatedReachable": True,
+    "lastAuthenticatedPresenceAt": 1234,
+}
+
+
 class FakeSocket:
     def __init__(self):
         self.sent = []
@@ -593,25 +605,26 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_device_status_is_ephemeral_and_settles_once(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["draft", "mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
-        request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "  Report   phone readiness "))
         await __import__("asyncio").sleep(0)
         frame = self.socket.sent[-1]
         self.assertEqual(frame["kind"], "mobile_request")
         self.assertEqual(frame["command"], "device.status")
+        self.assertEqual(frame["purpose"], "Report phone readiness")
         self.assertEqual(self.spool.pending_events(10, 100000), [])
-        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "ok", "result": {"foreground": True}}))
-        self.assertEqual(await request, {"status": "ok", "result": {"foreground": True}})
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "ok", "result": GATEWAY_STATUS}))
+        self.assertEqual(await request, {"status": "ok", "result": GATEWAY_STATUS})
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
 
     async def test_device_status_cancellation_and_disconnect_do_not_leave_pending_work(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
-        cancelled = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        cancelled = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "Report phone readiness"))
         await __import__("asyncio").sleep(0)
         cancelled.cancel()
         self.assertEqual(await cancelled, {"status": "cancelled"})
         self.assertEqual(self.socket.sent[-1]["kind"], "mobile_cancel")
-        pending = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        pending = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "Report phone readiness"))
         await __import__("asyncio").sleep(0)
         await self.client.close()
         self.assertEqual(await pending, {"status": "device_unavailable"})
@@ -620,17 +633,44 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
         with patch("cozygateway.attach_client_v1.MOBILE_STATUS_TIMEOUT_SECONDS", 0.001):
-            self.assertEqual(await self.client.request_device_status("thread", "turn"), {"status": "expired"})
+            self.assertEqual(await self.client.request_device_status("thread", "turn", "Report phone readiness"), {"status": "expired"})
         self.assertEqual([frame["kind"] for frame in self.socket.sent[-2:]], ["mobile_request", "mobile_cancel"])
 
     async def test_device_status_rejects_arbitrary_result_payloads(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
-        request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn"))
+        request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "Report phone readiness"))
         await __import__("asyncio").sleep(0)
         request_id = self.socket.sent[-1]["requestId"]
-        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": request_id, "status": "ok", "result": {"foreground": True, "serial": "never forward"}}))
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": request_id, "status": "ok", "result": {**GATEWAY_STATUS, "serialNumber": "never forward"}}))
         self.assertEqual(await request, {"status": "device_unavailable"})
+
+    async def test_device_status_rejects_nested_extras_and_duplicate_commands(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        for payload in (
+            {**GATEWAY_STATUS, "capabilities": [{"command": "device.status", "permission": "not_required", "ssid": "secret"}]},
+            {**GATEWAY_STATUS, "capabilities": [{"command": "device.status", "permission": "not_required"}]},
+            {**GATEWAY_STATUS, "capabilities": [
+                {"command": "device.status", "permission": "not_required"},
+                {"command": "device.status", "permission": "authorized"},
+            ]},
+            {**GATEWAY_STATUS, "capabilities": [
+                {"command": "device.status", "permission": "authorized"},
+                {"command": "location.current", "permission": "not_required"},
+            ]},
+        ):
+            request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "Report phone readiness"))
+            await __import__("asyncio").sleep(0)
+            request_id = self.socket.sent[-1]["requestId"]
+            await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": request_id, "status": "ok", "result": payload}))
+            self.assertEqual(await request, {"status": "device_unavailable"})
+
+    async def test_device_status_rejects_invalid_purpose_without_sending(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        self.assertEqual(await self.client.request_device_status("thread", "turn", "bad\npurpose"), {"status": "policy_blocked"})
+        self.assertEqual([frame for frame in self.socket.sent if frame["kind"] == "mobile_request"], [])
 
     async def test_location_requires_its_own_negotiated_capability(self):
         await self.client.connect()

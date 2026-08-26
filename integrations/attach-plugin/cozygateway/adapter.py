@@ -54,6 +54,7 @@ from .attach_client_v1 import (
     MOBILE_STATUS_VALUES,
     AttachV1Client,
     AttachV1ClientConfig,
+    _is_device_status,
     _is_location,
     _media_byte_limit,
     normalize_location_purpose,
@@ -1278,7 +1279,7 @@ class AttachAdapter:
             self._spool.close()
             self._spool = None
 
-    async def request_device_status(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
+    async def request_device_status(self, thread_id: str, turn_id: str, purpose: str) -> Dict[str, Any]:
         """One live-turn Mobile Node request; no client means no phone action."""
         client = self._client
         loop = self._loop
@@ -1287,9 +1288,9 @@ class AttachAdapter:
         pending = None
         try:
             if asyncio.get_running_loop() is loop:
-                return await client.request_device_status(thread_id, turn_id)
+                return await client.request_device_status(thread_id, turn_id, purpose)
             pending = asyncio.run_coroutine_threadsafe(
-                client.request_device_status(thread_id, turn_id), loop,
+                client.request_device_status(thread_id, turn_id, purpose), loop,
             )
             return await asyncio.wrap_future(pending)
         except asyncio.CancelledError:
@@ -2663,9 +2664,15 @@ def _log_mobile_policy_block(
     logger.warning("attach mobile policy blocked reason=%s %s", reason, " ".join(comparisons))
 
 
-async def _cozy_device_status(_args: Dict[str, Any], **_kwargs: Any) -> str:
+async def _cozy_device_status(args: Dict[str, Any], **_kwargs: Any) -> str:
     """The one MN-0 tool: only a live CozyGateway turn may reach the phone."""
-    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_device_status(chat_id, turn_id))
+    purpose = normalize_location_purpose(args.get("purpose"))
+    if purpose is None:
+        _log_mobile_policy_block("invalid_status_purpose")
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(
+        lambda adapter, chat_id, turn_id: adapter.request_device_status(chat_id, turn_id, purpose),
+    )
 
 
 async def _cozy_request_location(args: Dict[str, Any], **_kwargs: Any) -> str:
@@ -2719,9 +2726,27 @@ async def _cozy_mobile(request: Any, location: bool = False) -> str:
         outcome = await request(adapters[0], chat_id, turn_id)
     except asyncio.CancelledError:
         return _mobile_tool_result("cancelled")
+    try:
+        after_platform, after_chat_id = _current_turn_platform_and_chat()
+        after_message_id, after_cron, after_profile = _current_turn_message_and_cron()
+        after_adapters = [
+            adapter for adapter in _active_adapters_snapshot()
+            if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+        ]
+    except Exception:  # noqa: BLE001 - payload release must fail closed
+        after_adapters = []
+        after_platform = after_chat_id = after_message_id = after_profile = None
+        after_cron = True
+    if (
+        after_platform != platform or after_chat_id != chat_id or after_message_id != turn_id
+        or after_cron or after_profile != profile or len(after_adapters) != 1
+        or after_adapters[0] is not adapters[0]
+    ):
+        _log_mobile_policy_block("context_changed_after_request")
+        return _mobile_tool_result("policy_blocked")
     status = outcome.get("status")
     result = outcome.get("result")
-    if status == "ok" and (not _is_location(result) if location else result != {"foreground": True}):
+    if status == "ok" and (not _is_location(result) if location else not _is_device_status(result)):
         status, result = "device_unavailable", None
     return _mobile_tool_result(
         status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
@@ -2782,7 +2807,11 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
         if not tool_name:
             return
         call_id = _tool_call_id(kwargs)
-        if phase == "start":
+        if tool_name in {"cozy_device_status", "cozy_request_location"}:
+            # Purpose and phone payloads are live-turn-only data. Tool chips may name the
+            # operation, but never retain either side of this sensitive exchange as detail.
+            detail = None
+        elif phase == "start":
             detail = _preview(kwargs.get("args"))
         elif str(kwargs.get("status") or "").lower() == "error":
             detail = _preview(kwargs.get("error_message") or kwargs.get("result"))
@@ -3999,7 +4028,11 @@ def register(ctx: Any) -> None:
         schema={
             "name": "cozy_device_status",
             "description": "Request one consented status reading from the phone that started this live chat turn.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            "parameters": {
+                "type": "object",
+                "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}},
+                "required": ["purpose"], "additionalProperties": False,
+            },
         },
         handler=_cozy_device_status,
         is_async=True,

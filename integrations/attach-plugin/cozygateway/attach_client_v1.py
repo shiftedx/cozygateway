@@ -14,7 +14,7 @@ import ssl
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
+from typing import Any, Callable, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -89,8 +89,21 @@ class MobileDeviceStatusResult(TypedDict, total=False):
     result: Union["DeviceStatus", "Location"]
 
 
+class DeviceStatusCapability(TypedDict):
+    command: Literal["device.status", "location.current"]
+    permission: Literal["not_required", "authorized", "denied", "restricted", "not_determined", "unavailable"]
+
+
 class DeviceStatus(TypedDict):
-    foreground: Literal[True]
+    appState: Literal["foreground", "background"]
+    batteryBand: NotRequired[Literal["critical", "low", "medium", "high"]]
+    lowPowerMode: bool
+    thermalState: NotRequired[Literal["nominal", "fair", "serious", "critical"]]
+    networkClass: NotRequired[Literal["wifi", "cellular", "none"]]
+    capabilities: List[DeviceStatusCapability]
+    wakeReason: NotRequired[Literal["notification", "notification_action", "deep_link"]]
+    authenticatedReachable: Literal[True]
+    lastAuthenticatedPresenceAt: int
 
 
 class Location(TypedDict):
@@ -208,9 +221,12 @@ class AttachV1Client:
         }
         await self._send(hello)
 
-    async def request_device_status(self, thread_id: str, turn_id: str) -> MobileDeviceStatusResult:
+    async def request_device_status(self, thread_id: str, turn_id: str, purpose: str) -> MobileDeviceStatusResult:
         """Request one ephemeral status result for this live turn, never via the spool."""
-        return await self._request_mobile("device.status", thread_id, turn_id)
+        purpose = normalize_location_purpose(purpose)
+        if not purpose:
+            return {"status": "policy_blocked"}
+        return await self._request_mobile("device.status", thread_id, turn_id, purpose)
 
     async def request_location(self, thread_id: str, turn_id: str, purpose: str) -> MobileDeviceStatusResult:
         """Request one approximate foreground location, never via the spool."""
@@ -1024,7 +1040,43 @@ class AttachV1Client:
 
 
 def _is_device_status(value: Any) -> bool:
-    return isinstance(value, dict) and value == {"foreground": True}
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "appState", "lowPowerMode", "capabilities",
+        "authenticatedReachable", "lastAuthenticatedPresenceAt",
+    }
+    allowed = required | {"batteryBand", "thermalState", "networkClass", "wakeReason"}
+    if not required.issubset(value) or not set(value).issubset(allowed):
+        return False
+    if value["appState"] not in {"foreground", "background"} or not isinstance(value["lowPowerMode"], bool):
+        return False
+    if value["authenticatedReachable"] is not True:
+        return False
+    presence = value["lastAuthenticatedPresenceAt"]
+    if not isinstance(presence, int) or isinstance(presence, bool) or presence < 0:
+        return False
+    optionals = (
+        ("batteryBand", {"critical", "low", "medium", "high"}),
+        ("thermalState", {"nominal", "fair", "serious", "critical"}),
+        ("networkClass", {"wifi", "cellular", "none"}),
+        ("wakeReason", {"notification", "notification_action", "deep_link"}),
+    )
+    if any(key in value and value[key] not in choices for key, choices in optionals):
+        return False
+    capabilities = value["capabilities"]
+    if not isinstance(capabilities, list) or len(capabilities) != 2:
+        return False
+    expected = (
+        ("device.status", {"not_required"}),
+        ("location.current", {"authorized", "denied", "restricted", "not_determined", "unavailable"}),
+    )
+    for capability, (expected_command, permissions) in zip(capabilities, expected):
+        if not isinstance(capability, dict) or set(capability) != {"command", "permission"}:
+            return False
+        if capability["command"] != expected_command or capability["permission"] not in permissions:
+            return False
+    return True
 
 
 def _is_location(value: Any) -> bool:

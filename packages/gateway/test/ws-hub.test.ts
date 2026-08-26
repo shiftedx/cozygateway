@@ -306,10 +306,12 @@ describe("mobile node selection", () => {
     await once(wsB, "open");
     wsB.send(JSON.stringify({ type: "auth", token }));
     await until(() => seenB.some((frame) => frame.type === "ready"));
-    wsB.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
+    wsB.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: false }));
     await until(() => hub.isMobileNodeAvailable("d1"));
+    expect(hub.isMobileNodeAvailable("d1", "device.status")).toBe(true);
+    expect(hub.isMobileNodeAvailable("d1", "location.current")).toBe(false);
 
-    expect(hub.sendToDevice("d1", { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000 })).toBe(true);
+    expect(hub.sendToDevice("d1", { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness" })).toBe(true);
     await until(() => seenB.some((frame) => frame.type === "mobile_node_request"));
     expect(seenA.some((frame) => frame.type === "mobile_node_request")).toBe(false);
 

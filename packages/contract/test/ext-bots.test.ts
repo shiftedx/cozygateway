@@ -527,7 +527,8 @@ describe("capability advertisement", () => {
     // keeps rendering the catalog alone.
     // 37 adds bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Additive in the
     // simplest possible way, since a client below 37 simply never calls the route.
-    expect(BOTS_CAPABILITY_VERSION).toBe(37);
+    // 38 replaces device status v1 with the normalized-purpose, closed mobile-node v3 result.
+    expect(BOTS_CAPABILITY_VERSION).toBe(38);
   });
 
   it("accepts a capability-33 create with tool selections, and keeps them optional", () => {

@@ -7,7 +7,17 @@ import type { BotChatMessage, ReadyFrame, ServerFrame } from "cozygateway-contra
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
-it("routes one native status tool turn only through its foreground origin device", async () => {
+const phoneStatus = {
+  appState: "background" as const, batteryBand: "medium" as const, lowPowerMode: false,
+  thermalState: "nominal" as const, networkClass: "wifi" as const,
+  capabilities: [
+    { command: "device.status" as const, permission: "not_required" as const },
+    { command: "location.current" as const, permission: "authorized" as const },
+  ],
+  wakeReason: "notification" as const,
+};
+
+it("routes status through its authenticated origin in background while keeping location foreground-only", async () => {
   process.env["MOBILE_E2E_DASHBOARD_TOKEN"] = "dashboard-secret";
   process.env["MOBILE_E2E_SAGE_TOKEN"] = "attach-secret";
   let gateway: RunningGateway | undefined;
@@ -31,7 +41,8 @@ it("routes one native status tool turn only through its foreground origin device
     const appA = await appSocket(gateway.url, tokenA, sockets);
     const appB = await appSocket(gateway.url, tokenB, sockets);
     expect(appA.ready.deviceId).not.toBe(appB.ready.deviceId);
-    appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true }));
+    expect(appA.ready.gateway.capabilities?.["com.cozylabs.mobile-node"]).toBe(3);
+    appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: false }));
     appB.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
     await pause();
 
@@ -58,10 +69,15 @@ it("routes one native status tool turn only through its foreground origin device
     appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", status: "denied" }));
     await pause();
     expect(results(pluginFrames, "approved")).toEqual([]);
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", status: "ok", result: { foreground: true } }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "approved", status: "ok", result: phoneStatus }));
     await settledOnce(pluginFrames, "approved");
-    expect(results(pluginFrames, "approved")[0]).toMatchObject({ status: "ok", result: { foreground: true } });
+    expect(results(pluginFrames, "approved")[0]).toEqual({
+      kind: "mobile_result", requestId: "approved", status: "ok",
+      result: { ...phoneStatus, authenticatedReachable: true, lastAuthenticatedPresenceAt: expect.any(Number) },
+    });
 
+    appA.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true }));
+    await pause();
     requestLocation(plugin, turn, "location", "Find nearby coffee");
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "location"));
     const locationRequest = appA.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "location");
@@ -80,10 +96,10 @@ it("routes one native status tool turn only through its foreground origin device
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "reverse-first"));
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "reverse-second"));
     appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "reverse-second", status: "denied" }));
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "reverse-first", status: "ok", result: { foreground: true } }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "reverse-first", status: "ok", result: { ...phoneStatus, appState: "foreground" } }));
     await settledOnce(pluginFrames, "reverse-first");
     await settledOnce(pluginFrames, "reverse-second");
-    expect(results(pluginFrames, "reverse-first")[0]).toMatchObject({ status: "ok", result: { foreground: true } });
+    expect(results(pluginFrames, "reverse-first")[0]).toMatchObject({ status: "ok", result: { appState: "foreground", authenticatedReachable: true } });
     expect(results(pluginFrames, "reverse-second")[0]).toMatchObject({ status: "denied" });
 
     // A duplicate attach request and late phone result cannot make a second tool terminal.
@@ -136,7 +152,7 @@ it("routes one native status tool turn only through its foreground origin device
 
     // Noninteractive/routine-style targets do not match the active canonical turn and never route.
     for (const requestId of ["routine", "scheduled", "historical"]) {
-      plugin.send(JSON.stringify({ kind: "mobile_request", requestId, command: "device.status", threadId: requestId, turnId: "not-the-active-turn", expiresAt: Date.now() + 1_000 }));
+      plugin.send(JSON.stringify({ kind: "mobile_request", requestId, command: "device.status", threadId: requestId, turnId: "not-the-active-turn", expiresAt: Date.now() + 1_000, purpose: "Report phone readiness" }));
       await settledOnce(pluginFrames, requestId);
       expect(results(pluginFrames, requestId)[0]).toMatchObject({ status: "policy_blocked" });
       expect(appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === requestId)).toBe(false);
@@ -189,7 +205,7 @@ async function appSocket(url: string, token: string, sockets: WebSocket[]): Prom
 }
 
 function requestStatus(plugin: WebSocket, turn: { threadId: string; turnId: string }, requestId: string, expiresAt = Date.now() + 1_000): void {
-  plugin.send(JSON.stringify({ kind: "mobile_request", requestId, command: "device.status", threadId: turn.threadId, turnId: turn.turnId, expiresAt }));
+  plugin.send(JSON.stringify({ kind: "mobile_request", requestId, command: "device.status", threadId: turn.threadId, turnId: turn.turnId, expiresAt, purpose: "Report phone readiness" }));
 }
 
 function requestLocation(plugin: WebSocket, turn: { threadId: string; turnId: string }, requestId: string, purpose: string): void {

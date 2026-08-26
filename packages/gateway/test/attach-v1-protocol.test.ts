@@ -141,10 +141,11 @@ describe("attach-v1 protocol", () => {
 
   it("keeps negotiated mobile requests and results outside the durable envelopes", () => {
     expect(check(AttachV1ClientFrameSchema, {
-      kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000,
+      kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Report phone readiness",
     })).toBe(true);
     expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1" })).toBe(true);
-    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, extra: true })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000 })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: " bad  spacing " })).toBe(false);
     expect(check(AttachV1ClientFrameSchema, {
       kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee",
     })).toBe(true);
@@ -153,10 +154,27 @@ describe("attach-v1 protocol", () => {
     })).toBe(false);
     expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1", extra: true })).toBe(false);
     expect(check(AttachV1ServerFrameSchema, {
-      kind: "mobile_result", requestId: "request-1", status: "ok", result: { foreground: true },
+      kind: "mobile_result", requestId: "request-1", status: "ok", result: {
+        appState: "background", batteryBand: "high", lowPowerMode: false, thermalState: "fair",
+        networkClass: "wifi", capabilities: [
+          { command: "device.status", permission: "not_required" },
+          { command: "location.current", permission: "authorized" },
+        ],
+        wakeReason: "deep_link", authenticatedReachable: true, lastAuthenticatedPresenceAt: 1_234,
+      },
     })).toBe(true);
     expect(check(AttachV1ServerFrameSchema, {
-      kind: "mobile_result", requestId: "request-1", status: "ok", result: { foreground: true, location: "no" },
+      kind: "mobile_result", requestId: "request-1", status: "ok", result: {
+        appState: "foreground", lowPowerMode: false,
+        capabilities: [
+          { command: "device.status", permission: "not_required", ssid: "secret" },
+          { command: "location.current", permission: "authorized" },
+        ],
+        authenticatedReachable: true, lastAuthenticatedPresenceAt: 1_234,
+      },
+    })).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "legacy", status: "ok", result: { foreground: true },
     })).toBe(false);
     expect(check(AttachV1ServerFrameSchema, {
       kind: "mobile_result", requestId: "location-1", status: "ok", result: { latitude: 41.88, longitude: -87.63 },

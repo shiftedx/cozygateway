@@ -3,10 +3,20 @@ import { once } from "node:events";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { MobileNodeGatewayStatusResult } from "cozygateway-contract";
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame, AttachV1MemoryResult, AttachV1MobileRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
+
+const gatewayStatus: MobileNodeGatewayStatusResult = {
+  appState: "background" as const, lowPowerMode: false,
+  capabilities: [
+    { command: "device.status" as const, permission: "not_required" as const },
+    { command: "location.current" as const, permission: "authorized" as const },
+  ],
+  authenticatedReachable: true as const, lastAuthenticatedPresenceAt: 1_234,
+};
 
 describe("attach-v1 ingress", () => {
   let server: Server;
@@ -129,14 +139,21 @@ describe("attach-v1 ingress", () => {
 
   it("routes negotiated mobile frames without creating a durable event or command", async () => {
     const peer = await dial(undefined, ["mobile_node"]);
-    peer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000 }));
+    peer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Private status purpose" }));
     peer.ws.send(JSON.stringify({ kind: "mobile_cancel", requestId: "request-1" }));
     await until(() => mobileRequests.length === 1 && mobileCancels.length === 1);
 
-    expect(ingress.sendMobileResult("sage", { requestId: "request-1", status: "ok", result: { foreground: true } })).toBe(true);
+    expect(ingress.sendMobileResult("sage", { requestId: "request-1", status: "ok", result: gatewayStatus })).toBe(true);
     await until(() => peer.frames.some((frame) => frame.kind === "mobile_result"));
+    expect(ingress.sendMobileResult("sage", {
+      requestId: "forbidden", status: "ok", result: { ...gatewayStatus, serialNumber: "secret" },
+    } as never)).toBe(false);
+    expect(peer.frames.some((frame) => frame.kind === "mobile_result" && frame.requestId === "forbidden")).toBe(false);
     expect(storage.attachEventCursor("sage")).toBe(0);
     expect(storage.attachCommandCursor("sage")).toBe(0);
+    expect(storage.pendingAttachCommands("sage", 0, 10)).toEqual([]);
+    expect([...logs, ...traces].join("\n")).not.toContain("Private status purpose");
+    expect([...logs, ...traces].join("\n")).not.toContain("background");
     peer.ws.close();
   });
 
@@ -162,7 +179,7 @@ describe("attach-v1 ingress", () => {
   it("keeps location behind mobile_location while preserving status-only mobile_node peers", async () => {
     const oldPeer = await dial(undefined, ["mobile_node"]);
     expect(oldPeer.frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["mobile_node"] });
-    oldPeer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "status-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000 }));
+    oldPeer.ws.send(JSON.stringify({ kind: "mobile_request", requestId: "status-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Report phone readiness" }));
     await until(() => mobileRequests.some((frame) => frame.requestId === "status-1"));
     expect(ingress.sendMobileResult("sage", { requestId: "location-old-result", status: "ok", result: { latitude: 41.88, longitude: -87.63 } })).toBe(false);
     expect(oldPeer.frames.some((frame) => frame.kind === "mobile_result" && frame.requestId === "location-old-result")).toBe(false);
