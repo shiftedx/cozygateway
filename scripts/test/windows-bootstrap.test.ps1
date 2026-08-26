@@ -140,11 +140,26 @@ try {
     Assert-True (-not ($uninstalledPath -match [regex]::Escape($managedBin))) 'uninstall must remove the managed command directory from the user PATH'
     Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw) -match 'hermes:model')) 'uninstall must not open Hermes model selection'
 
+    $dryUninstallPathLog = Join-Path $temp 'dry-uninstall-user-path.txt'
+    Remove-Item -LiteralPath $eventLog -Force
+    $dryUninstall = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$managedBin"
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $dryUninstallPathLog
+    } @('--uninstall')
+    Assert-True ($dryUninstall.ExitCode -eq 0) "bootstrap uninstall dry run failed: $($dryUninstall.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $dryUninstallPathLog)) 'uninstall dry run must not mutate the user PATH'
+    Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match '--uninstall.*--dry-run|--dry-run.*--uninstall') 'bootstrap must forward dry run to uninstall'
+
     $dryRunPathLog = Join-Path $temp 'dry-run-user-path.txt'
+    $dryRunHome = Join-Path $temp 'Dry Run Gateway'
     $dryRun = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
-        'COZYGATEWAY_HOME' = (Join-Path $temp 'Dry Run Gateway')
+        'COZYGATEWAY_HOME' = $dryRunHome
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
         'COZYGATEWAY_INSTALL_DRYRUN' = '1'
@@ -153,6 +168,7 @@ try {
     }
     Assert-True ($dryRun.ExitCode -eq 0) "bootstrap dry run failed: $($dryRun.Output)"
     Assert-True (-not (Test-Path -LiteralPath $dryRunPathLog)) 'dry run must not mutate the user PATH'
+    Assert-True (-not (Test-Path -LiteralPath $dryRunHome)) 'dry run must not create or replace managed install files'
 
     $missingRoot = Join-Path $temp 'missing hermes case'
     $missingHermes = Join-Path $missingRoot 'hermes\bin\hermes.cmd'

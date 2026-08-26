@@ -66,6 +66,8 @@ IPv6 listener addresses are bracketed in generated URLs. With gateway-native
 TLS, configuration keeps the existing HTTPS hostname so Hermes validates the
 certificate name; private certificate authorities still use
 `COZYGATEWAY_CA_FILE`.
+Local CLI health checks also pin the configured leaf certificate while allowing
+the bind address to differ from its DNS name.
 
 The default listener is `0.0.0.0:8787` for local/LAN use. Network reachability
 outside the machine is deliberately not automated; see `docs/connectivity.md`.
@@ -90,7 +92,8 @@ current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
 when policy blocks task registration. Phone-created bot auto-provisioning is not
 part of the Windows installer.
 
-Uninstall is deliberately independent of model selection, downloads, Node, and
-listener-config parsing, so a damaged install remains removable. On macOS and
+Uninstall is deliberately independent of model selection, downloads, Node,
+listener-config parsing, and the continued presence of Hermes, so a damaged
+install remains removable. On macOS and
 Linux the installer also exposes `cozygateway` through `~/.local/bin` in new
 terminal sessions; uninstall removes only its own command entry and profile line.

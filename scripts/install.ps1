@@ -201,13 +201,27 @@ $script:InstallHome = Resolve-InstallHome $env:COZYGATEWAY_HOME
 $bin = Join-Path $script:InstallHome 'bin'
 $installerPath = Join-Path $bin 'agent-install.sh'
 $isUninstall = $InstallerArguments -contains '--uninstall'
+$isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
 
 if ($isUninstall) {
     $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
     if (-not (Test-Path -LiteralPath $installerPath)) { Fail "no CozyGateway installer was found at $installerPath" }
-    & $bash $installerPath '--service-platform' 'Windows' '--gateway-dir' $script:InstallHome @InstallerArguments
+    $uninstallArguments = @($installerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome) + @($InstallerArguments)
+    if ($isDryRun -and -not ($uninstallArguments -contains '--dry-run')) { $uninstallArguments += '--dry-run' }
+    & $bash @uninstallArguments
     if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
-    Set-CozyGatewayCommandPath $bin $false
+    if (-not $isDryRun) { Set-CozyGatewayCommandPath $bin $false }
+    return
+}
+
+if ($isDryRun) {
+    if (Find-Hermes) {
+        Write-Info 'dry run: would open hermes model, then verify its active provider and model'
+    } else {
+        Write-Info 'dry run: would install Hermes Agent, complete its setup, then open hermes model'
+    }
+    Write-Info 'dry run: would resolve and checksum-verify the CozyGateway release assets'
+    Write-Info "dry run: would install CozyGateway under $script:InstallHome without administrator rights"
     return
 }
 

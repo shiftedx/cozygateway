@@ -68,7 +68,9 @@ It:
    `--service-platform Windows`.
 
 Uninstall takes a recovery-only path before Hermes discovery, model selection,
-downloads, Node checks, or listener parsing. Dry runs do not edit the user PATH.
+downloads, Node checks, or listener parsing and still removes owned files when
+the recorded Hermes executable is gone. Dry runs do not install Hermes,
+download into the managed directory, edit PATH, or remove an installation.
 
 The bootstrap does not independently install Node, Git, or WSL. When Hermes is
 absent, Hermes' own installer owns those prerequisites and its setup wizard. If
@@ -100,6 +102,8 @@ The Windows branch:
 - removes both persistence forms during uninstall.
 - identifies a running managed gateway by its exact config path before stopping
   it, including when an update changes the listener port.
+- validates a stubborn Dashboard listener against either the resolved Hermes
+  executable or Hermes' root launcher before stopping its Python child.
 
 The Scheduled Task and Startup fallback are login persistence mechanisms. Live
 status also verifies the CozyGateway process or health endpoint so a registered

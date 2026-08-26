@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFile as execFileCallback } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { stdin, stdout } from "node:process";
@@ -42,6 +43,10 @@ function healthOrigin(config: ReturnType<typeof loadConfig>): string {
 
 type GatewayHealth = { attach?: { configured?: number; online?: number; deadLetters?: number } };
 
+export function isExpectedCertificate(configured: Buffer, peer: Buffer): boolean {
+  return new X509Certificate(configured).fingerprint256 === new X509Certificate(peer).fingerprint256;
+}
+
 async function fetchHealth(configPath: string, timeoutMs: number): Promise<GatewayHealth> {
   const config = loadConfig(configPath);
   const url = `${healthOrigin(config)}/health`;
@@ -50,13 +55,15 @@ async function fetchHealth(configPath: string, timeoutMs: number): Promise<Gatew
     if (!response.ok) throw new Error(`gateway health returned HTTP ${response.status}`);
     return response.json() as Promise<GatewayHealth>;
   }
-  const ca = [...rootCertificates, readFileSync(config.tls.certFile)];
+  const configuredCertificate = readFileSync(config.tls.certFile);
+  const ca = [...rootCertificates, configuredCertificate];
   return new Promise((resolve, reject) => {
     const request = httpsRequest(
       url,
       {
         ca,
-        checkServerIdentity: () => undefined,
+        checkServerIdentity: (_hostname, certificate) =>
+          isExpectedCertificate(configuredCertificate, certificate.raw) ? undefined : new Error("gateway health certificate does not match the configured certificate"),
       },
       (response) => {
         let body = "";

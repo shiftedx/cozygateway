@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { isGatewayReady, runCli } from "../src/cli.ts";
+import { isExpectedCertificate, isGatewayReady, runCli } from "../src/cli.ts";
 import { startGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
 import { generateSelfSigned } from "./helpers/self-signed.ts";
@@ -190,6 +190,13 @@ describe("cozygateway terminal menu", () => {
   it("requires zero dead letters before a managed listener is ready", () => {
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 1 } })).toBe(false);
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 0 } })).toBe(true);
+  });
+
+  it("pins local TLS health to the configured leaf certificate", () => {
+    const configured = generateSelfSigned();
+    const other = generateSelfSigned();
+    expect(isExpectedCertificate(readFileSync(configured.certFile), readFileSync(configured.certFile))).toBe(true);
+    expect(isExpectedCertificate(readFileSync(configured.certFile), readFileSync(other.certFile))).toBe(false);
   });
 
   it("reports a local self-signed TLS gateway online", async () => {

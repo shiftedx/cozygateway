@@ -433,7 +433,7 @@ remove_posix_cli() {
   if [ -f "$link" ] && cmp -s "$link" "$CLI_WRAPPER"; then rm -f "$link"; fi
   for profile in "$HOME/.profile" "$HOME/.zprofile"; do
     [ -f "$profile" ] || continue
-    temp="$profile.cozygateway.$$"
+    temp="$(umask 077; mktemp "$profile.cozygateway.XXXXXX")"
     grep -Fvx "$CLI_PATH_LINE" "$profile" > "$temp" || true
     cat "$temp" > "$profile"
     rm -f "$temp"
@@ -558,19 +558,29 @@ write_windows_launcher() {
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
 stop_owned_windows_gateway() {
-  local config_native code
+  local config_native code check_target_port="${1:-1}"
   config_native="$(to_windows_path "$CONFIG_JSON")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$PORT" COZYGATEWAY_CHECK_TARGET_PORT="$check_target_port" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
+    $expected = [IO.Path]::GetFullPath($env:COZYGATEWAY_EXPECTED_CONFIG)
     $managed = Get-CimInstance Win32_Process | Where-Object {
       $command = [string]$_.CommandLine
-      $command.Contains("cozygateway.mjs") -and $command.Contains(" serve ") -and $command.Contains($env:COZYGATEWAY_EXPECTED_CONFIG)
+      if (-not $command.Contains("cozygateway.mjs") -or -not $command.Contains(" serve ")) { return $false }
+      $tokens = @([regex]::Matches($command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
+      $candidate = $null
+      for ($index = 0; $index -lt $tokens.Count; $index++) {
+        if ($tokens[$index] -eq "--config" -and $index + 1 -lt $tokens.Count) { $candidate = $tokens[$index + 1]; break }
+        if ($tokens[$index].StartsWith("--config=")) { $candidate = $tokens[$index].Substring(9); break }
+      }
+      if ([string]::IsNullOrWhiteSpace($candidate)) { return $false }
+      try { [IO.Path]::GetFullPath($candidate).Equals($expected, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
     } | Select-Object -First 1
     if ($null -ne $managed) {
       Stop-Process -Id $managed.ProcessId -Force
       exit 0
     }
+    if ($env:COZYGATEWAY_CHECK_TARGET_PORT -ne "1") { exit 3 }
     $connection = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $connection) { exit 42 }
     exit 3
@@ -692,17 +702,20 @@ child.unref();
 NODE
 }
 stop_stubborn_windows_dashboard() {
-  local hermes_native code
+  local hermes_native launcher_native code
   hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
+  launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     $port = [int]$env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT
     $connection = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $connection) { exit 0 }
     $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
     $command = [string]$process.CommandLine
-    if (-not $command.Contains($env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES) -or -not $command.Contains(" dashboard ") -or -not $command.Contains("--port " + $port)) { exit 42 }
+    $ownsHermes = $command.IndexOf($env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+      $command.IndexOf($env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    if (-not $ownsHermes -or -not $command.Contains(" dashboard ") -or -not $command.Contains("--port " + $port)) { exit 42 }
     Stop-Process -Id $process.ProcessId -Force
   ' >/dev/null 2>&1
   code=$?
@@ -728,7 +741,7 @@ start_dashboard() {
   die "Hermes Dashboard did not accept the local control-plane credential on 127.0.0.1:$DASHBOARD_PORT"
 }
 uninstall() {
-  local profiles root hermes_bin p home plugin spool action
+  local profiles root hermes_bin p home plugin spool action hermes_available=1
   [ -f "$STATE_FILE" ] || die "no CozyGateway install state at $STATE_FILE"
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
@@ -736,7 +749,7 @@ uninstall() {
   profiles="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"
   [ -n "$root" ] && [ -n "$hermes_bin" ] && [ -n "$profiles" ] || die "install state is incomplete"
   case "$hermes_bin" in /*) ;; *) die "installer state has an unsafe Hermes executable path" ;; esac
-  [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || die "Hermes executable from installer state is unavailable: $hermes_bin"
+  [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || hermes_available=0
   HERMES_RESOLVED="$hermes_bin"
   resolve_platform
   if [ "$SERVICE_PLATFORM" = Windows ]; then
@@ -747,7 +760,7 @@ uninstall() {
     else
       MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
       rm -f "$startup_entry"
-      stop_owned_windows_gateway || true
+      stop_owned_windows_gateway 0 || true
     fi
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
@@ -761,13 +774,18 @@ uninstall() {
   for p in "${SELECTED[@]}"; do
     valid_profile "$p" || die "unsafe profile in installer state"; home="$(profile_home "$p")"; plugin="$home/plugins/cozygateway"; spool="$home/plugin-data/cozygateway/attach-v1.sqlite"
     action="$(prior_service_action "$p")"
-    case "$action" in
-      installed) run "$HERMES_RESOLVED" -p "$p" gateway uninstall; say "OK    removed Hermes gateway service installed by CozyGateway for profile $p" ;;
-      started) run "$HERMES_RESOLVED" -p "$p" gateway stop; say "OK    stopped Hermes gateway service started by CozyGateway for profile $p" ;;
-      preexisting) ;;
-      '') die "missing Hermes gateway lifecycle state for profile $p" ;;
-    esac
-    if [ -f "$plugin/.cozygateway-installer-owned" ]; then run "$HERMES_RESOLVED" -p "$p" plugins disable cozygateway; run rm -rf "$plugin"; fi
+    case "$action" in installed|started|preexisting) ;; '') die "missing Hermes gateway lifecycle state for profile $p" ;; *) die "unsafe Hermes gateway lifecycle state for profile $p" ;; esac
+    if [ "$hermes_available" = 1 ]; then
+      case "$action" in
+        installed) run "$HERMES_RESOLVED" -p "$p" gateway uninstall; say "OK    removed Hermes gateway service installed by CozyGateway for profile $p" ;;
+        started) run "$HERMES_RESOLVED" -p "$p" gateway stop; say "OK    stopped Hermes gateway service started by CozyGateway for profile $p" ;;
+        preexisting) ;;
+      esac
+      if [ -f "$plugin/.cozygateway-installer-owned" ]; then run "$HERMES_RESOLVED" -p "$p" plugins disable cozygateway; fi
+    else
+      say "INFO  Hermes executable is unavailable; removing CozyGateway files without invoking Hermes lifecycle commands"
+    fi
+    [ -f "$plugin/.cozygateway-installer-owned" ] && run rm -rf "$plugin"
     env_remove_owned "$home/.env"; run rm -f "$spool" "$spool-wal" "$spool-shm"
   done
   run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
@@ -799,8 +817,9 @@ main() {
   have "$HERMES_BIN" || die "Hermes must already be installed"; HERMES_RESOLVED="$(resolve_hermes)"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; mkdir -p "$LOCAL_DIR"; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
-  write_gateway_config; write_cli_wrapper; is_windows || install_posix_cli; start_dashboard; install_service; wait_gateway_ready
+  write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
+  is_windows || install_posix_cli
   say "OK    CozyGateway listens on $BIND_HOST:$PORT. Remote exposure is user-managed."
   # The finale: mint a pairing code and print the QR so install -> scan -> chatting needs no
   # further commands. A rerun on an installed gateway lands here too, with a fresh code.
