@@ -1438,6 +1438,95 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("admits and projects delegation updates after the attach turn seals", () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 100,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+
+    const project = (frame: AttachV1EventFrame) => {
+      expect(storage.unappliedAttachEvents("sage").map((pending) => pending.eventId)).toContain(frame.eventId);
+      expect(plane.handle("sage", frame)).toBe(true);
+      storage.markAttachEventApplied("sage", frame.eventId, frame.sequence);
+    };
+    const running = {
+      kind: "event", sequence: 1, eventId: "running", event: {
+        kind: "delegation", threadId: chat.sessionId, turnId: "turn",
+        batchId: "batch", childId: "child", index: 0, count: 1,
+        status: "running", lastActiveAt: 1,
+      },
+    } as AttachV1EventFrame;
+    expect(storage.acceptAttachEvent("sage", running, 1)).toEqual({
+      status: "accepted", acknowledgedSequence: 1,
+    });
+    project(running);
+
+    const commit = {
+      kind: "event", sequence: 2, eventId: "commit", event: {
+        kind: "commit", threadId: chat.sessionId, turnId: "turn", messageId: "answer",
+        blocks: [{ type: "paragraph", text: "dispatched" }],
+      },
+    } as AttachV1EventFrame;
+    expect(storage.acceptAttachEvent("sage", commit, 2)).toEqual({
+      status: "accepted", acknowledgedSequence: 2,
+    });
+    project(commit);
+    expect(storage.nativeBotTurnTerminal("sage", chat.sessionId, "turn")).toMatchObject({
+      status: "completed",
+    });
+
+    const succeeded = {
+      kind: "event", sequence: 3, eventId: "succeeded", event: {
+        ...running.event, status: "succeeded", lastActiveAt: 3,
+      },
+    } as AttachV1EventFrame;
+    expect(storage.acceptAttachEvent("sage", succeeded, 3)).toEqual({
+      status: "accepted", acknowledgedSequence: 3,
+    });
+    project(succeeded);
+    expect(storage.botChatDelegations(chat.sessionId, 0)[0]).toMatchObject({ status: "succeeded" });
+    expect(storage.acceptAttachEvent("sage", succeeded, 4)).toEqual({
+      status: "duplicate", acknowledgedSequence: 3,
+    });
+
+    const lateDraft = {
+      kind: "event", sequence: 4, eventId: "late-draft", event: {
+        kind: "draft", threadId: chat.sessionId, turnId: "turn", blocks: [],
+      },
+    } as AttachV1EventFrame;
+    expect(storage.acceptAttachEvent("sage", lateDraft, 4)).toEqual({
+      status: "ignored_terminal", acknowledgedSequence: 4,
+    });
+    const lateThinking = {
+      kind: "event", sequence: 5, eventId: "late-thinking", event: {
+        kind: "thinking", threadId: chat.sessionId, turnId: "turn",
+        text: "after seal", seq: 1, lastActiveAt: 5,
+      },
+    } as AttachV1EventFrame;
+    expect(storage.acceptAttachEvent("sage", lateThinking, 5)).toEqual({
+      status: "ignored_terminal", acknowledgedSequence: 5,
+    });
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+
+    const staleRunning = {
+      ...running, sequence: 6, eventId: "stale-running",
+    } as AttachV1EventFrame;
+    expect(storage.acceptAttachEvent("sage", staleRunning, 6)).toEqual({
+      status: "accepted", acknowledgedSequence: 6,
+    });
+    project(staleRunning);
+    expect(storage.botChatDelegations(chat.sessionId, 0)[0]).toMatchObject({ status: "succeeded" });
+
+    plane.close();
+    storage.close();
+  });
+
   it("an interrupted turn settles its live children interrupted, leaving no spinner", async () => {
     const storage = openStorage(":memory:");
     const frames: ServerFrame[] = [];
