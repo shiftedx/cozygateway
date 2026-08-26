@@ -17,6 +17,7 @@ import {
   BotChatFrameSchema,
   BotChatResetFrameSchema,
   BotChatStateFrameSchema,
+  BotMobileReceiptFrameSchema,
   BotGroupFrameSchema,
   BotGroupStateFrameSchema,
   BotInboxActivityFrameSchema,
@@ -86,6 +87,11 @@ export const MobileNodePurposeSchema = Type.String({
   maxLength: 160,
   pattern: "^[^\\s\\u0000-\\u001f\\u007f-\\u009f]+(?: [^\\s\\u0000-\\u001f\\u007f-\\u009f]+)*$",
 });
+export const MobileNodeLeaseSchema = Type.String({
+  minLength: 43,
+  maxLength: 43,
+  pattern: "^[A-Za-z0-9_-]{43}$",
+});
 const MobileNodeLocationResultSchema = Type.Object({
   // JSON Schema `multipleOf` is not stable for decimal floating-point values.
   // The broker validates the integer-cent invariant before accepting this result.
@@ -101,9 +107,9 @@ export const MobileNodeAdvertiseFrameSchema = Type.Object({
 export type MobileNodeAdvertiseFrame = Static<typeof MobileNodeAdvertiseFrameSchema>;
 
 export const MobileNodeResultFrameSchema = Type.Union([
-  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Literal("ok"), result: MobileNodePhoneStatusResultSchema }, { additionalProperties: false }),
-  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Literal("ok"), result: MobileNodeLocationResultSchema }, { additionalProperties: false }),
-  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), status: Type.Union([Type.Literal("denied"), Type.Literal("cancelled"), Type.Literal("expired"), Type.Literal("foreground_required")]) }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema, status: Type.Literal("ok"), result: MobileNodePhoneStatusResultSchema }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema, status: Type.Literal("ok"), result: MobileNodeLocationResultSchema }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("mobile_node_result"), requestId: Type.String({ minLength: 1, maxLength: 256 }), lease: MobileNodeLeaseSchema, status: Type.Union([Type.Literal("denied"), Type.Literal("cancelled"), Type.Literal("expired"), Type.Literal("foreground_required")]) }, { additionalProperties: false }),
 ]);
 export type MobileNodeResultFrame = Static<typeof MobileNodeResultFrameSchema>;
 
@@ -185,13 +191,13 @@ export type ErrorFrame = Static<typeof ErrorFrameSchema>;
 
 const MobileNodeStatusRequestFrameSchema = Type.Object({
   type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
-  command: Type.Literal("device.status"), bot: Type.String({ minLength: 1, maxLength: 128 }),
+  lease: MobileNodeLeaseSchema, command: Type.Literal("device.status"), bot: Type.String({ minLength: 1, maxLength: 128 }),
   threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }),
   expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
 const MobileNodeLocationRequestFrameSchema = Type.Object({
   type: Type.Literal("mobile_node_request"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
-  command: Type.Literal("location.current"), bot: Type.String({ minLength: 1, maxLength: 128 }),
+  lease: MobileNodeLeaseSchema, command: Type.Literal("location.current"), bot: Type.String({ minLength: 1, maxLength: 128 }),
   threadId: Type.String({ minLength: 1, maxLength: 256 }), turnId: Type.String({ minLength: 1, maxLength: 256 }),
   expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
 }, { additionalProperties: false });
@@ -200,6 +206,7 @@ export type MobileNodeRequestFrame = Static<typeof MobileNodeRequestFrameSchema>
 
 export const MobileNodeCancelFrameSchema = Type.Object({
   type: Type.Literal("mobile_node_cancel"), requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  lease: MobileNodeLeaseSchema,
   status: Type.Union([Type.Literal("cancelled"), Type.Literal("expired")]),
 }, { additionalProperties: false });
 export type MobileNodeCancelFrame = Static<typeof MobileNodeCancelFrameSchema>;
@@ -220,6 +227,7 @@ export const ServerFrameSchema = Type.Union([
   // that advertises the capability; clients that do not know it ignore unknown frame types.
   BotRosterFrameSchema,
   BotPresenceFrameSchema,
+  BotMobileReceiptFrameSchema,
   BotChatFrameSchema,
   BotChatStateFrameSchema,
   BotChatDeltaFrameSchema,

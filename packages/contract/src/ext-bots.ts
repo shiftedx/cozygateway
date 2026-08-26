@@ -233,6 +233,36 @@ export const BotChatFrameSchema = Type.Object({
 });
 export type BotChatFrame = Static<typeof BotChatFrameSchema>;
 
+/** Durable metadata describing one successful phone-node share. Capability 39.
+ * The lease, originating device, and shared payload are deliberately absent. */
+export const BotMobileReceiptSchema = Type.Object({
+  requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  bot: Type.String({ minLength: 1, maxLength: 128 }),
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  turnId: Type.String({ minLength: 1, maxLength: 256 }),
+  command: Type.Union([
+    Type.Literal("device.status"),
+    Type.Literal("location.current"),
+  ]),
+  sharedDescription: Type.Union([
+    Type.Literal("Device status"),
+    Type.Literal("Approximate location"),
+  ]),
+  purpose: Type.String({
+    minLength: 1,
+    maxLength: 160,
+    pattern: "^[^\\s\\u0000-\\u001f\\u007f-\\u009f]+(?: [^\\s\\u0000-\\u001f\\u007f-\\u009f]+)*$",
+  }),
+  sharedAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotMobileReceipt = Static<typeof BotMobileReceiptSchema>;
+
+export const BotMobileReceiptFrameSchema = Type.Object({
+  type: Type.Literal("bot_mobile_receipt"),
+  ...BotMobileReceiptSchema.properties,
+}, { additionalProperties: false });
+export type BotMobileReceiptFrame = Static<typeof BotMobileReceiptFrameSchema>;
+
 /** Capability 23's exact app-facing native-turn status. `queued` means the command is durably in
  * the attach outbox; `connectivity_lost` keeps that same durable command for replay. */
 export const BotChatStatusSchema = Type.Union([
@@ -1507,4 +1537,9 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
 /** Capability 38: DEVICE STATUS V2. The `cozy_device_status` tool requires a normalized purpose
  * and returns the closed, privacy-bounded mobile-node v3 status shape. Clients below 38 must not
  * expose the tool because mobile-node v2 has been deleted rather than retained as a fallback. */
-export const BOTS_CAPABILITY_VERSION = 38;
+/** Capability 39: CAPABILITY LEASES AND PHONE-SHARING RECEIPTS. Every phone-node answer requires
+ * the originating device and the server-issued, short-lived, single-use lease. A successful share
+ * emits `bot_mobile_receipt` and is returned in history as `mobileReceipts`. Receipts contain only
+ * request identity, conversation identity, command, normalized purpose, and gateway timestamp:
+ * never the lease, device id, status/location result, or another phone payload. */
+export const BOTS_CAPABILITY_VERSION = 39;

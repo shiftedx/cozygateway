@@ -5,6 +5,7 @@ import type {
   AttachmentBlock,
   BotChatAttachment,
   BotChatMessage,
+  BotMobileReceipt,
   BotInteractionSettlement,
   BotPendingClarification,
   BotSummary,
@@ -342,6 +343,20 @@ CREATE TABLE IF NOT EXISTS bot_message_receipts (
   device_id TEXT NOT NULL,
   PRIMARY KEY (bot, message_id)
 ) STRICT, WITHOUT ROWID;
+-- Capability 39 phone-sharing receipts. The request id is the idempotency key; the remaining
+-- columns are chat-visible metadata. Device identity, lease, and shared result are never stored.
+CREATE TABLE IF NOT EXISTS bot_mobile_receipts (
+  request_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  command TEXT NOT NULL CHECK (command IN ('device.status', 'location.current')),
+  shared_description TEXT NOT NULL CHECK (shared_description IN ('Device status', 'Approximate location')),
+  purpose TEXT NOT NULL,
+  shared_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_mobile_receipts_session
+  ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
 -- Binds one committed TURN reply that carried attachments to the delivery id its plugin already
 -- keyed the media lifecycle under (turn:<turnId>). Scheduled deliveries have
 -- attach_scheduled_deliveries for this; a turn had nothing, which is why turn media could never
@@ -2426,6 +2441,49 @@ export class Storage {
     return rows.map(nativeBotMessage);
   }
 
+  /** First write wins on requestId. Only metadata is accepted by this API. */
+  recordBotMobileReceipt(input: {
+    requestId: string;
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    command: BotMobileReceipt["command"];
+    sharedDescription: BotMobileReceipt["sharedDescription"];
+    purpose: string;
+    sharedAt: number;
+  }): BotMobileReceipt | undefined {
+    const written = this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO bot_mobile_receipts
+           (request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.requestId,
+        input.bot,
+        input.sessionId,
+        input.turnId,
+        input.command,
+        input.sharedDescription,
+        input.purpose,
+        input.sharedAt,
+      );
+    if (written.changes !== 1) return undefined;
+    return input;
+  }
+
+  nativeBotMobileReceipts(bot: string, sessionId: string): BotMobileReceipt[] {
+    return this.#db
+      .prepare(
+        `SELECT request_id AS requestId, bot, session_id AS sessionId,
+                turn_id AS turnId, command, shared_description AS sharedDescription, purpose, shared_at AS sharedAt
+         FROM bot_mobile_receipts
+         WHERE bot = ? AND session_id = ?
+         ORDER BY shared_at, request_id`,
+      )
+      .all(bot, sessionId) as unknown as BotMobileReceipt[];
+  }
+
   /** Agent-sent artifacts across configured profiles and every durable session. Filtering stays in
    * SQLite so a phone asking for one page never makes the gateway hydrate an unbounded transcript. */
   nativeBotAttachmentHistory(input: {
@@ -2920,6 +2978,7 @@ export class Storage {
       ["sessions", "bot_native_sessions", "bot"],
       ["messages", "bot_native_messages", "bot"],
       ["receipts", "bot_message_receipts", "bot"],
+      ["mobileReceipts", "bot_mobile_receipts", "bot"],
       ["turnMediaDeliveries", "bot_turn_media_deliveries", "bot"],
       ["interactions", "bot_native_interactions", "bot"],
       ["turnTerminals", "bot_native_turn_terminals", "bot"],

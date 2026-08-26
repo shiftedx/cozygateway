@@ -93,7 +93,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.some-unrecognized-thing": 7,
         approvals: 1,
         "com.cozylabs.bots": expect.any(Number),
-        "com.cozylabs.mobile-node": 3,
+        "com.cozylabs.mobile-node": 4,
       });
 
       const code = gw.issueSetupCode();

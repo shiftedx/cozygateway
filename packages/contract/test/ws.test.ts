@@ -4,6 +4,8 @@ import type { ClientFrame, ServerFrame } from "../src/ws.ts";
 import { ClientFrameSchema, ServerFrameSchema } from "../src/ws.ts";
 import { check } from "../src/validate.ts";
 
+const lease = "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
+
 describe("client frames", () => {
   it("accepts auth and sync", () => {
     const auth: ClientFrame = { type: "auth", token: "tok" };
@@ -17,7 +19,7 @@ describe("client frames", () => {
       type: "mobile_node_advertise", commands: ["device.status"], foreground: false,
     })).toBe(true);
     expect(check(ClientFrameSchema, {
-      type: "mobile_node_result", requestId: "request-1", status: "ok", result: {
+      type: "mobile_node_result", requestId: "request-1", lease, status: "ok", result: {
         appState: "background", batteryBand: "low", lowPowerMode: true,
         thermalState: "serious", networkClass: "cellular",
         capabilities: [
@@ -29,7 +31,7 @@ describe("client frames", () => {
     })).toBe(true);
     // Genuinely unknowable optional fields are absent, not defaulted.
     expect(check(ClientFrameSchema, {
-      type: "mobile_node_result", requestId: "minimal", status: "ok", result: {
+      type: "mobile_node_result", requestId: "minimal", lease, status: "ok", result: {
         appState: "foreground", lowPowerMode: false,
         capabilities: [
           { command: "device.status", permission: "not_required" },
@@ -41,7 +43,7 @@ describe("client frames", () => {
 
   it("rejects forbidden status keys, nested extras, duplicate capabilities, and legacy v1", () => {
     const base = {
-      type: "mobile_node_result", requestId: "request-1", status: "ok",
+      type: "mobile_node_result", requestId: "request-1", lease, status: "ok",
       result: { appState: "foreground", lowPowerMode: false, capabilities: [
         { command: "device.status", permission: "not_required" },
         { command: "location.current", permission: "unavailable" },
@@ -78,19 +80,22 @@ describe("client frames", () => {
       ],
     ]) expect(check(ClientFrameSchema, { ...base, result: { ...base.result, capabilities } })).toBe(false);
     expect(check(ClientFrameSchema, {
-      type: "mobile_node_result", requestId: "legacy", status: "ok", result: { foreground: true },
+      type: "mobile_node_result", requestId: "legacy", lease, status: "ok", result: { foreground: true },
     })).toBe(false);
   });
 
   it("accepts the closed location result", () => {
     expect(check(ClientFrameSchema, {
-      type: "mobile_node_result", requestId: "location-1", status: "ok", result: { latitude: 41.88, longitude: -87.63 },
+      type: "mobile_node_result", requestId: "location-1", lease, status: "ok", result: { latitude: 41.88, longitude: -87.63 },
     })).toBe(true);
     expect(check(ClientFrameSchema, {
-      type: "mobile_node_result", requestId: "location-1", status: "ok", result: { latitude: 41.881, longitude: -87.63 },
+      type: "mobile_node_result", requestId: "location-1", lease, status: "ok", result: { latitude: 41.881, longitude: -87.63 },
     })).toBe(true); // integer-cent precision is enforced against the pending command in the broker.
     expect(check(ClientFrameSchema, {
-      type: "mobile_node_result", requestId: "location-1", status: "ok", result: { latitude: 91, longitude: -87.63 },
+      type: "mobile_node_result", requestId: "location-1", lease, status: "ok", result: { latitude: 91, longitude: -87.63 },
+    })).toBe(false);
+    expect(check(ClientFrameSchema, {
+      type: "mobile_node_result", requestId: "missing-lease", status: "denied",
     })).toBe(false);
   });
 
@@ -129,21 +134,27 @@ describe("server frames", () => {
       { type: "error", code: "backend_unavailable", message: "agent offline", threadId: "t1" },
       { type: "bot_clarify_pending", bot: "sage", sessionId: "s1", turnId: "turn-1", clarifyId: "question-1", prompt: "Choose", options: [{ id: "a", label: "A" }], expiresAt: 100, updatedAt: 1 },
       { type: "bot_clarify_resolved", bot: "sage", sessionId: "s1", turnId: "turn-1", clarifyId: "question-1", outcome: "selected", selectedOptionId: "a", updatedAt: 2 },
+      { type: "bot_mobile_receipt", requestId: "request-1", bot: "sage", sessionId: "thread-1", turnId: "turn-1", command: "device.status", sharedDescription: "Device status", purpose: "Report phone readiness", sharedAt: 100 },
       { type: "synced" },
-      { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 100, purpose: "Report phone readiness" },
-      { type: "mobile_node_request", requestId: "location-1", command: "location.current", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 100, purpose: "Find nearby coffee" },
-      { type: "mobile_node_cancel", requestId: "request-1", status: "cancelled" },
+      { type: "mobile_node_request", requestId: "request-1", lease, command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 100, purpose: "Report phone readiness" },
+      { type: "mobile_node_request", requestId: "location-1", lease, command: "location.current", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 100, purpose: "Find nearby coffee" },
+      { type: "mobile_node_cancel", requestId: "request-1", lease, status: "cancelled" },
     ];
     for (const frame of frames) {
       expect(check(ServerFrameSchema, frame)).toBe(true);
     }
     expect(check(ServerFrameSchema, {
       type: "mobile_node_request", requestId: "legacy", command: "device.status", bot: "sage",
-      threadId: "thread-1", turnId: "turn-1", expiresAt: 100,
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 100, purpose: "Report phone readiness",
     })).toBe(false);
     expect(check(ServerFrameSchema, {
-      type: "mobile_node_request", requestId: "bad-purpose", command: "device.status", bot: "sage",
+      type: "mobile_node_request", requestId: "bad-purpose", lease, command: "device.status", bot: "sage",
       threadId: "thread-1", turnId: "turn-1", expiresAt: 100, purpose: " bad  spacing ",
+    })).toBe(false);
+    expect(check(ServerFrameSchema, {
+      type: "bot_mobile_receipt", requestId: "request-1", bot: "sage",
+      sessionId: "thread-1", turnId: "turn-1", command: "location.current", sharedDescription: "Approximate location",
+      purpose: "Find nearby coffee", sharedAt: 100, lease,
     })).toBe(false);
   });
 });

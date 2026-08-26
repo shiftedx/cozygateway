@@ -12,6 +12,8 @@ import {
   BotChatDisplayedResponseSchema,
   BotChatStateFrameSchema,
   BotChatMessageSchema,
+  BotMobileReceiptFrameSchema,
+  BotMobileReceiptSchema,
   BotChatResetFrameSchema,
   BotChatResetResponseSchema,
   BotChatStopResponseSchema,
@@ -527,8 +529,29 @@ describe("capability advertisement", () => {
     // keeps rendering the catalog alone.
     // 37 adds bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Additive in the
     // simplest possible way, since a client below 37 simply never calls the route.
-    // 38 replaces device status v1 with the normalized-purpose, closed mobile-node v3 result.
-    expect(BOTS_CAPABILITY_VERSION).toBe(38);
+    // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts.
+    expect(BOTS_CAPABILITY_VERSION).toBe(39);
+  });
+
+  it("keeps mobile receipts closed and metadata-only", () => {
+    const receipt = {
+      requestId: "request-1",
+      bot: "sage",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      command: "location.current",
+      sharedDescription: "Approximate location",
+      purpose: "Find nearby coffee",
+      sharedAt: 100,
+    };
+    expect(check(BotMobileReceiptSchema, receipt)).toBe(true);
+    expect(check(BotMobileReceiptFrameSchema, {
+      type: "bot_mobile_receipt",
+      ...receipt,
+    })).toBe(true);
+    for (const forbidden of ["lease", "deviceId", "result", "latitude", "longitude"]) {
+      expect(check(BotMobileReceiptSchema, { ...receipt, [forbidden]: "secret" })).toBe(false);
+    }
   });
 
   it("accepts a capability-33 create with tool selections, and keeps them optional", () => {

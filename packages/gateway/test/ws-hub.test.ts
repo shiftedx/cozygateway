@@ -295,6 +295,85 @@ describe("per-device presence", () => {
 });
 
 describe("mobile node selection", () => {
+  it("distinguishes an unadvertised command from an unavailable selected socket", async () => {
+    expect(hub.mobileNodeRoute("d1", "device.status")).toMatchObject({
+      status: "selected_socket_unavailable", selectedSocketPresent: false,
+      selectedSocketOpen: false, commandAdvertised: false, connectedSocketCount: 0,
+    });
+
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((frame) => frame.type === "ready"));
+
+    expect(hub.mobileNodeRoute("d1", "device.status")).toMatchObject({
+      status: "command_not_advertised", selectedSocketPresent: false,
+      selectedSocketOpen: false, commandAdvertised: false, connectedSocketCount: 1,
+    });
+    ws.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status"], foreground: true,
+    }));
+    await until(() => hub.mobileNodeRoute("d1", "device.status").status === "available");
+    expect(hub.mobileNodeRoute("d1", "location.current")).toMatchObject({
+      status: "command_not_advertised", selectedSocketPresent: true,
+      selectedSocketOpen: true, commandAdvertised: false, connectedSocketCount: 1,
+    });
+    ws.close();
+    await once(ws, "close");
+    await until(() => !hub.isDeviceConnected("d1"));
+  });
+
+  it("logs an unparseable selected-phone payload without logging its bytes", async () => {
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((frame) => frame.type === "ready"));
+    ws.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status"], foreground: true,
+    }));
+    await until(() => hub.mobileNodeRoute("d1", "device.status").status === "available");
+
+    ws.send("unparseable-phone-secret");
+
+    await until(() => traces.some((line) => JSON.parse(line).reason === "invalid_phone_payload"));
+    const payload = traces.map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((entry) => entry.reason === "invalid_phone_payload");
+    expect(payload).toMatchObject({
+      event: "mobile_node_failure", reason: "invalid_phone_payload", command: "unknown",
+      selectedDevicePresent: true, selectedSocketPresent: true, selectedSocketOpen: true,
+      commandAdvertised: true, connectedSocketCount: 1,
+      payloadParseable: false, payloadSchemaValid: false,
+    });
+    expect(traces.join("\n")).not.toContain("unparseable-phone-secret");
+    expect(traces.join("\n")).not.toContain(token);
+    ws.close();
+    await once(ws, "close");
+    await until(() => !hub.isDeviceConnected("d1"));
+  });
+
+  it("sends cancel frames over the selected socket without command gating", async () => {
+    const ws = connect();
+    const seen = frames(ws);
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((frame) => frame.type === "ready"));
+    ws.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["location.current"], foreground: true,
+    }));
+    await until(() => hub.mobileNodeRoute("d1", "location.current").status === "available");
+
+    expect(hub.sendToDevice("d1", {
+      type: "mobile_node_cancel", requestId: "cancel-location", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", status: "cancelled",
+    })).toBe(true);
+    await until(() => seen.some((frame) => frame.type === "mobile_node_cancel"));
+
+    ws.close();
+    await once(ws, "close");
+    await until(() => !hub.isDeviceConnected("d1"));
+  });
+
   it("targets only the advertised socket and ignores a sibling socket closing", async () => {
     const wsA = connect();
     const seenA = frames(wsA);
@@ -311,14 +390,14 @@ describe("mobile node selection", () => {
     expect(hub.isMobileNodeAvailable("d1", "device.status")).toBe(true);
     expect(hub.isMobileNodeAvailable("d1", "location.current")).toBe(false);
 
-    expect(hub.sendToDevice("d1", { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness" })).toBe(true);
+    expect(hub.sendToDevice("d1", { type: "mobile_node_request", requestId: "request-1", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness" })).toBe(true);
     await until(() => seenB.some((frame) => frame.type === "mobile_node_request"));
     expect(seenA.some((frame) => frame.type === "mobile_node_request")).toBe(false);
 
-    wsA.send(JSON.stringify({ type: "mobile_node_result", requestId: "forged", status: "cancelled" }));
+    wsA.send(JSON.stringify({ type: "mobile_node_result", requestId: "forged", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", status: "cancelled" }));
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(mobileResults).toEqual([]);
-    wsB.send(JSON.stringify({ type: "mobile_node_result", requestId: "selected", status: "cancelled" }));
+    wsB.send(JSON.stringify({ type: "mobile_node_result", requestId: "selected", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", status: "cancelled" }));
     await until(() => mobileResults.includes("selected"));
 
     wsA.close();
