@@ -113,7 +113,7 @@ export async function runCli(argv: string[]): Promise<number> {
     console.log(`Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`);
     if (isLoopbackUrl(payload.gatewayUrl)) {
       console.log(
-        "This URL is loopback, so only this machine can reach it. Remote access (Tailscale and friends) is documented at https://cozylabs.ai.",
+        "This URL is loopback, so only this machine can reach it. Remote access (Tailscale and friends) is documented at https://cozylabs.ai/docs/access/.",
       );
     }
     return 0;
