@@ -10,6 +10,17 @@ trap 'rm -rf "$tmp"' EXIT
 # Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
 # reach reads as "it stopped somewhere". Name the line and the command that failed.
 trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
+
+# An assertion that greps a captured string and fails prints only the line number, which says
+# nothing about what the string actually contained. This shows it.
+expect_contains() {
+  local haystack="$1" needle="$2"
+  if ! grep -q "$needle" <<<"$haystack"; then
+    printf 'FAIL  expected output to contain: %s\n--- actual output ---\n%s\n--- end ---\n' \
+      "$needle" "$haystack" >&2
+    return 1
+  fi
+}
 mkdir -p "$tmp/hermes/profiles/ops" "$tmp/hermes/profiles/active" "$tmp/bin"
 printf '{}\n' > "$tmp/hermes/config.yaml"
 printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
@@ -523,7 +534,7 @@ if wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST
   echo 'expected wrong Dashboard credential to fail' >&2
   exit 1
 fi
-grep -q 'Dashboard stayed listening after stop' <<<"$wrong_output"
+expect_contains "$wrong_output" 'Dashboard stayed listening after stop'
 test ! -e "$tmp/wrong-home/.local/bin/cozygateway"
 [ ! -f "$tmp/wrong-home/.profile" ] || ! grep -Fq '# CozyGateway CLI' "$tmp/wrong-home/.profile"
 [ ! -f "$tmp/wrong-home/.zprofile" ] || ! grep -Fq '# CozyGateway CLI' "$tmp/wrong-home/.zprofile"
