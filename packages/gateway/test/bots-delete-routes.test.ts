@@ -185,6 +185,10 @@ function seedEverything(storage: Storage, bot: string, deviceId: string): string
   storage.recordNativeBotTerminal({
     bot, sessionId, turnId: `${bot}-t1`, status: "interrupted", cause: "cancelled", completedAt: NOW,
   });
+  storage.recordBotMobileReceipt({
+    requestId: `${bot}-phone-1`, bot, sessionId, turnId: `${bot}-t1`, command: "device.status",
+    sharedDescription: "Device status", purpose: "Check phone status", sharedAt: NOW,
+  });
   storage.enqueueAttachCommand(
     bot,
     "cmd-1",
@@ -250,7 +254,7 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
     // Every area that was seeded reports a purge, and nothing is left for a second sweep.
     for (const area of [
       "roster", "toolSteps", "delegations", "routineOverrides", "chatPointer", "sessions",
-      "messages", "receipts", "turnMediaDeliveries", "interactions", "turnTerminals",
+      "messages", "receipts", "mobileReceipts", "turnMediaDeliveries", "interactions", "turnTerminals",
       "attachStream", "attachCommands", "attachMedia", "liveActivities",
       "coreMessages", "coreThreads", "agentRow",
     ]) {
@@ -371,7 +375,7 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
 describe("capability 37 is additive", () => {
   it("advertises the bumped integer and adds no field to any pre-37 shape", async () => {
     const h = await setup();
-    expect(BOTS_CAPABILITY_VERSION).toBe(38);
+    expect(BOTS_CAPABILITY_VERSION).toBe(39);
 
     const before = (await (await h.authed("/bots")).json()) as { bots: Array<Record<string, unknown>> };
     expect((await h.authed(`/bots/${BOT}`, DELETE_REQUEST)).status).toBe(200);

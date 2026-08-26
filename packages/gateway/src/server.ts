@@ -161,7 +161,7 @@ export function gatewayInfoForConfig(config: GatewayConfig): GatewayInfo {
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
       ...(config.hermes === undefined
         ? {}
-        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, "com.cozylabs.mobile-node": 3 }),
+        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, "com.cozylabs.mobile-node": 4 }),
       ...(config.pushRelayUrl === undefined
         ? {}
         : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),
@@ -207,6 +207,7 @@ export async function startGateway(
     storage, gatewayInfo, now: () => Date.now(), trace: traceLog,
     onMobileResult: (deviceId, frame) => mobileNode?.result(deviceId, frame),
     onDeviceDisconnect: (deviceId) => mobileNode?.disconnectDevice(deviceId),
+    onMobileAvailable: (deviceId) => mobileNode?.reconnectDevice(deviceId),
   });
 
   // Dial-out JSON-RPC client to the Hermes gateway plus the cache/refresh/focus machinery on top
@@ -395,6 +396,7 @@ export async function startGateway(
     route: (deviceId, command) => hub.mobileNodeRoute(deviceId, command),
     send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
     result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
+    receipt: (receipt) => nativeBotPlane?.recordMobileReceipt(receipt) !== undefined,
     trace: traceLog,
   });
   nativeBotPlane = new NativeBotDataPlane({

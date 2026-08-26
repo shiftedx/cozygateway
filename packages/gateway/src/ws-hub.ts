@@ -51,6 +51,7 @@ export class WsHub {
   readonly #trace: TraceLog | undefined;
   readonly #onMobileResult: ((deviceId: string, frame: MobileNodeResultFrame) => void) | undefined;
   readonly #onDeviceDisconnect: ((deviceId: string) => void) | undefined;
+  readonly #onMobileAvailable: ((deviceId: string) => void) | undefined;
 
   constructor(deps: {
     storage: Storage;
@@ -61,6 +62,7 @@ export class WsHub {
     trace?: TraceLog;
     onMobileResult?: (deviceId: string, frame: MobileNodeResultFrame) => void;
     onDeviceDisconnect?: (deviceId: string) => void;
+    onMobileAvailable?: (deviceId: string) => void;
   }) {
     this.#storage = deps.storage;
     this.#gatewayInfo = deps.gatewayInfo;
@@ -69,6 +71,7 @@ export class WsHub {
     this.#trace = deps.trace;
     this.#onMobileResult = deps.onMobileResult;
     this.#onDeviceDisconnect = deps.onDeviceDisconnect;
+    this.#onMobileAvailable = deps.onMobileAvailable;
     const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_MS;
     // noServer: true means this WebSocketServer never attaches its own 'upgrade' listener; the
     // caller routes matching requests to handleUpgrade() below. See upgrade-dispatcher.ts.
@@ -172,6 +175,7 @@ export class WsHub {
         );
         if (client.mobileCommands.size) {
           this.#mobileNodes.set(client.deviceId, client);
+          this.#onMobileAvailable?.(client.deviceId);
         } else if (this.#mobileNodes.get(client.deviceId) === client) {
           this.#mobileNodes.delete(client.deviceId);
           this.#onDeviceDisconnect?.(client.deviceId);

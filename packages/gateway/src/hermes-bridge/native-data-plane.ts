@@ -10,6 +10,7 @@ import type {
   BotChatMessage,
   BotChatStateCause,
   BotChatStateFrame,
+  BotMobileReceipt,
   BotChatStatus,
   BotInteractionSettlement,
   BotClarifyPendingFrame,
@@ -33,7 +34,7 @@ import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
 import type { AttachV1EventFrame, AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
-import type { MobileNodeBroker } from "../mobile-node.ts";
+import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import type {
@@ -349,6 +350,25 @@ export class NativeBotDataPlane {
     });
   }
 
+  recordMobileReceipt(input: MobileNodeReceiptInput): BotMobileReceipt | undefined {
+    const receipt = this.#storage.recordBotMobileReceipt({
+      requestId: input.requestId,
+      bot: input.bot,
+      sessionId: input.threadId,
+      turnId: input.turnId,
+      command: input.command,
+      sharedDescription: input.command === "device.status" ? "Device status" : "Approximate location",
+      purpose: input.purpose,
+      sharedAt: this.#now(),
+    });
+    if (receipt === undefined) return undefined;
+    // Durability gates sharing. Live emission is best effort because history replays the stored receipt.
+    try {
+      this.#broadcast({ type: "bot_mobile_receipt", ...receipt });
+    } catch {}
+    return receipt;
+  }
+
   /** Attach transport presence is the only connectivity signal. Commands remain durably queued;
    * this projects that fact without creating a second retry or timeout policy. */
   handleAttachPresence(bot: string, state: "online" | "degraded" | "absent"): void {
@@ -645,6 +665,7 @@ export class NativeBotDataPlane {
       sessionId: chat.sessionId,
       adoption: chat.created ? ("created" as const) : ("pin" as const),
       messages,
+      mobileReceipts: this.#storage.nativeBotMobileReceipts(bot, chat.sessionId),
       running: chat.activeTurnId !== undefined,
       inflight: chat.activeTurnId !== undefined,
       ...(state === undefined ? {} : state),

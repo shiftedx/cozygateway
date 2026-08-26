@@ -35,14 +35,15 @@ function brokerFor(options: {
 } = {}) {
   const traces: string[] = [];
   const result = vi.fn();
-  const broker = new MobileNodeBroker({
+  const send = vi.fn((_deviceId: string, _frame: unknown) => options.send ?? "sent");
+  const broker = new MobileNodeBroker({ receipt: () => true,
     route: () => options.route ?? availableRoute,
-    send: () => options.send ?? "sent",
+    send,
     result,
     now: () => 1_000,
     trace: (line) => traces.push(line),
   });
-  return { broker, result, traces };
+  return { broker, result, send, traces };
 }
 
 describe("mobile-node operator failure diagnostics", () => {
@@ -112,19 +113,22 @@ describe("mobile-node operator failure diagnostics", () => {
   });
 
   it("produces invalid_phone_payload", () => {
-    const { broker, result, traces } = brokerFor();
+    const { broker, result, send, traces } = brokerFor();
     broker.invoke({ ...invocation, requestId: "invalid-result" });
+    const request = send.mock.calls[0]?.[1] as { lease: string };
 
     broker.result("device-1", {
       type: "mobile_node_result",
       requestId: "invalid-result",
+      lease: request.lease,
       status: "ok",
       result: { latitude: 41.881, longitude: -87.63 },
     } as never);
 
     expect(reasons(traces)).toEqual(["invalid_phone_payload"]);
-    expect(result).not.toHaveBeenCalled();
-    broker.cancelRequest("sage", "invalid-result");
+    expect(result).toHaveBeenCalledWith("sage", {
+      requestId: "invalid-result", status: "policy_blocked",
+    });
   });
 
   it("produces broker_closed_pending", () => {
@@ -149,7 +153,7 @@ describe("mobile-node operator failure diagnostics", () => {
 
   it("logs only bounded fields and no forbidden request values", () => {
     const traces: string[] = [];
-    const broker = new MobileNodeBroker({
+    const broker = new MobileNodeBroker({ receipt: () => true,
       route: () => availableRoute,
       send: () => "frame_send_failed",
       result: vi.fn(),

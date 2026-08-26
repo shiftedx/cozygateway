@@ -365,7 +365,7 @@ describe("mobile node selection", () => {
     await until(() => hub.mobileNodeRoute("d1", "location.current").status === "available");
 
     expect(hub.sendToDevice("d1", {
-      type: "mobile_node_cancel", requestId: "cancel-location", status: "cancelled",
+      type: "mobile_node_cancel", requestId: "cancel-location", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", status: "cancelled",
     })).toBe(true);
     await until(() => seen.some((frame) => frame.type === "mobile_node_cancel"));
 
@@ -390,14 +390,14 @@ describe("mobile node selection", () => {
     expect(hub.isMobileNodeAvailable("d1", "device.status")).toBe(true);
     expect(hub.isMobileNodeAvailable("d1", "location.current")).toBe(false);
 
-    expect(hub.sendToDevice("d1", { type: "mobile_node_request", requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness" })).toBe(true);
+    expect(hub.sendToDevice("d1", { type: "mobile_node_request", requestId: "request-1", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness" })).toBe(true);
     await until(() => seenB.some((frame) => frame.type === "mobile_node_request"));
     expect(seenA.some((frame) => frame.type === "mobile_node_request")).toBe(false);
 
-    wsA.send(JSON.stringify({ type: "mobile_node_result", requestId: "forged", status: "cancelled" }));
+    wsA.send(JSON.stringify({ type: "mobile_node_result", requestId: "forged", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", status: "cancelled" }));
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(mobileResults).toEqual([]);
-    wsB.send(JSON.stringify({ type: "mobile_node_result", requestId: "selected", status: "cancelled" }));
+    wsB.send(JSON.stringify({ type: "mobile_node_result", requestId: "selected", lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", status: "cancelled" }));
     await until(() => mobileResults.includes("selected"));
 
     wsA.close();

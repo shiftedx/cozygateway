@@ -68,7 +68,7 @@ async function runMobileToolE2E(tool: "status" | "location"): Promise<void> {
       ? { command: "location.current", purpose: "Find nearby coffee" }
       : { command: "device.status", purpose: "Report phone readiness" });
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request")).toBe(false);
-    appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, status: "denied" }));
+    appB.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, lease: request.lease, status: "denied" }));
     await pause();
     expect(harness.events.some((event) => event.e2e === "result")).toBe(false);
     const mobileResult = tool === "location"
@@ -77,7 +77,7 @@ async function runMobileToolE2E(tool: "status" | "location"): Promise<void> {
           appState: "background", lowPowerMode: false,
           capabilities: [{ command: "device.status", permission: "not_required" }],
         };
-    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, status: "ok", result: mobileResult }));
+    appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, lease: request.lease, status: "ok", result: mobileResult }));
 
     const result = await harness.until((event) => event.e2e === "result");
     expect(result).toMatchObject({

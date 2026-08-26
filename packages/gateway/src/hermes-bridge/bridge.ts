@@ -6,6 +6,7 @@ import type {
   BotDeleteResponse,
   BotChatMessage,
   BotChatStateCause,
+  BotMobileReceipt,
   BotChatStatus,
   BotGroup,
   BotGroupDetail,
@@ -167,6 +168,7 @@ export interface BotChatHistory {
   sessionId: string;
   adoption: ChatAdoption;
   messages: BotChatMessage[];
+  mobileReceipts: BotMobileReceipt[];
   running: boolean;
   inflight: boolean;
   /** Capability 23 exact turn status. Absent only when this session has never run a turn. */
