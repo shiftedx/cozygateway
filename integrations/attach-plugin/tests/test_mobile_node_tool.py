@@ -25,6 +25,9 @@ GATEWAY_STATUS = {
     "capabilities": [
         {"command": "device.status", "permission": "not_required"},
         {"command": "location.current", "permission": "authorized"},
+        {"command": "camera.capture", "permission": "authorized"},
+        {"command": "file.pick", "permission": "not_required"},
+        {"command": "notification.present", "permission": "not_required"},
     ],
     "authenticatedReachable": True,
     "lastAuthenticatedPresenceAt": 1234,

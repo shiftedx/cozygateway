@@ -1076,12 +1076,19 @@ def _is_device_status(value: Any) -> bool:
     if any(key in value and value[key] not in choices for key, choices in optionals):
         return False
     capabilities = value["capabilities"]
-    if not isinstance(capabilities, list) or len(capabilities) != 2:
-        return False
+    # The phone reports one record per selected command, in one fixed order. This list grew from
+    # two to five when camera, file picking and notifications arrived; a validator still expecting
+    # two turned every valid answer into device_unavailable.
+    asked = {"authorized", "denied", "restricted", "not_determined", "unavailable"}
     expected = (
         ("device.status", {"not_required"}),
-        ("location.current", {"authorized", "denied", "restricted", "not_determined", "unavailable"}),
+        ("location.current", asked),
+        ("camera.capture", asked),
+        ("file.pick", {"not_required"}),
+        ("notification.present", {"not_required"}),
     )
+    if not isinstance(capabilities, list) or len(capabilities) != len(expected):
+        return False
     for capability, (expected_command, permissions) in zip(capabilities, expected):
         if not isinstance(capability, dict) or set(capability) != {"command", "permission"}:
             return False

@@ -10,7 +10,7 @@ from websockets.frames import Close
 
 from cozygateway.attach_client_v1 import (
     AttachV1Client, AttachV1ClientConfig, HELLO_CAPABILITIES, HELLO_VERSION,
-    _HashingReader,
+    _HashingReader, _is_device_status,
 )
 from cozygateway.attach_client import ToolChip
 from cozygateway.attach_spool import AttachSpool
@@ -22,6 +22,9 @@ GATEWAY_STATUS = {
     "capabilities": [
         {"command": "device.status", "permission": "not_required"},
         {"command": "location.current", "permission": "authorized"},
+        {"command": "camera.capture", "permission": "authorized"},
+        {"command": "file.pick", "permission": "not_required"},
+        {"command": "notification.present", "permission": "not_required"},
     ],
     "wakeReason": "notification", "authenticatedReachable": True,
     "lastAuthenticatedPresenceAt": 1234,
@@ -707,3 +710,42 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeviceStatusCapabilityShapeTests(unittest.TestCase):
+    """The phone reports one capability record per selected command, in one fixed order.
+
+    That list grew from two to five when camera, file picking and notifications arrived. The
+    validator kept requiring two, so a correct answer from a correct phone was rejected and
+    reported to the asking bot as `device_unavailable`, which reads as a hardware or connection
+    problem rather than a contract disagreement.
+    """
+
+    def _status(self, capabilities):
+        return {
+            "appState": "foreground",
+            "lowPowerMode": False,
+            "capabilities": capabilities,
+            "authenticatedReachable": True,
+            "lastAuthenticatedPresenceAt": 1,
+        }
+
+    def _full(self):
+        return [
+            {"command": "device.status", "permission": "not_required"},
+            {"command": "location.current", "permission": "authorized"},
+            {"command": "camera.capture", "permission": "not_determined"},
+            {"command": "file.pick", "permission": "not_required"},
+            {"command": "notification.present", "permission": "not_required"},
+        ]
+
+    def test_accepts_the_full_command_inventory(self):
+        self.assertTrue(_is_device_status(self._status(self._full())))
+
+    def test_rejects_a_short_inventory(self):
+        self.assertFalse(_is_device_status(self._status(self._full()[:2])))
+
+    def test_rejects_a_reordered_inventory(self):
+        shuffled = self._full()
+        shuffled[0], shuffled[1] = shuffled[1], shuffled[0]
+        self.assertFalse(_is_device_status(self._status(shuffled)))
