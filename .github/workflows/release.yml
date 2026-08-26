@@ -51,4 +51,6 @@ jobs:
             dist-bundle/cozygateway-installer.sh.sha256
             dist-bundle/install.ps1
             dist-bundle/install.ps1.sha256
+            dist-bundle/install.sh
+            dist-bundle/install.sh.sha256
           generate_release_notes: true
