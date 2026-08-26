@@ -256,14 +256,26 @@ that has opted in but is not yet wired, and leaves everything else alone.
 `docs/ai.cozylabs.bot-provisioner.plist` runs that sweep every 30 seconds, so a
 bot created from the phone becomes chattable without anyone at a terminal.
 
-The plist is a template and is NOT installed by default. To enable it:
+The plist is a template and is NOT installed by default. Do not install it with
+the checkout path: a macOS LaunchAgent is denied TCC access to `~/Documents`,
+`~/Desktop`, and `~/Downloads` without an interactive privacy grant. That would
+block both the watcher script and the provisioner's later read of
+`integrations/attach-plugin`.
+
+Instead, run the installer once from Terminal:
 
 ```bash
-sed "s#REPLACE_ME_REPO#$PWD#g" docs/ai.cozylabs.bot-provisioner.plist \
-  > ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist \
-  && launchctl bootstrap "gui/$(id -u)" \
-       ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist
+scripts/install-bot-provisioner.sh
 ```
+
+It copies the watcher, provisioner, and attach-plugin source to
+`~/Library/Application Support/cozylabs/provisioner`, points the LaunchAgent at
+that self-contained payload, and reloads it in the current Aqua user session.
+The staged payload is deliberately a snapshot: launchd cannot safely refresh it
+from a protected checkout. Re-run the same command after every checkout update
+that changes either provisioner script or `integrations/attach-plugin`; refresh
+is atomic for future sweeps and the staged `STAGED_FROM` file records its source
+revision.
 
 To stop it: `launchctl bootout "gui/$(id -u)/ai.cozylabs.bot-provisioner"`.
 The log is `~/Library/Logs/cozylabs-bot-provisioner.log`.
@@ -300,3 +312,7 @@ observed live while building it:
   over the real plugin. The provisioner refuses to run when it finds one.
 - **`docker compose up -d gateway`, not `--build`.** Only the env and the mounted
   config changed; a recreate re-reads both, and a rebuild is a deploy.
+- **Never point this LaunchAgent at a protected checkout.** Terminal and launchd
+  have different TCC identities. Re-run `scripts/install-bot-provisioner.sh`
+  after relevant repo updates instead of teaching the background job to read
+  `~/Documents`.

@@ -7,13 +7,13 @@
   attach surface but are not yet wired for it, and provisions them. See
   docs/attach-v1-operations.md, section "Automatic bot provisioning".
 
-  TEMPLATE. Replace every REPLACE_ME_REPO with the absolute path to the
-  cozygateway checkout on this Mac before installing, then:
+  TEMPLATE. Do not point this at a checkout under Documents, Desktop, or
+  Downloads: macOS TCC denies background LaunchAgents access there even though
+  the same command works in Terminal. The installer stages every runtime input
+  in a TCC-free per-user directory, substitutes REPLACE_ME_PAYLOAD, and loads
+  this template:
 
-    sed "s#REPLACE_ME_REPO#$PWD#g" docs/ai.cozylabs.bot-provisioner.plist \
-      > ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist
-    launchctl bootstrap "gui/$(id -u)" \
-      ~/Library/LaunchAgents/ai.cozylabs.bot-provisioner.plist
+    scripts/install-bot-provisioner.sh
 
   To stop it:
 
@@ -32,11 +32,11 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>REPLACE_ME_REPO/scripts/bot-provisioner-watch.sh</string>
+        <string>REPLACE_ME_PAYLOAD/current/scripts/bot-provisioner-watch.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>REPLACE_ME_REPO</string>
+    <string>REPLACE_ME_PAYLOAD/current</string>
 
     <!-- The sweep is cheap when there is nothing to do: a readdir, a YAML parse
          per profile, and a launchctl print. It only reaches the network once a
@@ -53,10 +53,7 @@
     <false/>
 
     <key>LimitLoadToSessionType</key>
-    <array>
-        <string>Aqua</string>
-        <string>Background</string>
-    </array>
+    <string>Aqua</string>
 
     <!-- A sweep waits up to 90s for the attach hello, so a slow one can still
          be running when the next tick fires. The script's own lock makes that
