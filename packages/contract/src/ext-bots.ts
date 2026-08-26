@@ -482,6 +482,30 @@ export const BotTurnDelegationsSchema = Type.Object({
 });
 export type BotTurnDelegations = Static<typeof BotTurnDelegationsSchema>;
 
+/** A short rolling preview of the bot's live reasoning for one native turn. Capability 35.
+ *
+ *  LATEST-ONLY full replace: `text` is the WHOLE preview, tail-truncated to 280 chars, so every
+ *  frame is independently sufficient and any subset is droppable. `seq` is monotonic within one
+ *  `turnId`; a frame whose `seq` is not greater than the last one rendered is stale and dropped.
+ *
+ *  EPHEMERAL BY DESIGN: never persisted, never in chat history, gone on reopen. The turn's
+ *  terminal is the hard stop -- no frame follows it. Privacy bounds are enforced on BOTH sides:
+ *  the plugin sanitizes (no tool args or results, no prompts, no credentials, no file paths)
+ *  and the schema caps length, so an unsanitized peer still cannot exceed the preview budget.
+ *  NOT PUSHED, ever, for the same reason tool activity is not. */
+export const BotThinkingActivityFrameSchema = Type.Object({
+  type: Type.Literal("bot_thinking_activity"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  /** Sanitized rolling tail, at most 280 chars. */
+  text: Type.String({ maxLength: 280 }),
+  /** Monotonic within one `turnId`, starting at 1. */
+  seq: Type.Integer({ minimum: 1 }),
+  updatedAt: Type.Integer(),
+});
+export type BotThinkingActivityFrame = Static<typeof BotThinkingActivityFrameSchema>;
+
 export const BotApprovalPendingFrameSchema = Type.Object({
   type: Type.Literal("bot_approval_pending"),
   bot: Type.String(),
@@ -1410,4 +1434,12 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  *  Children carry only bounded display metadata (a truncated task label, a tool name); raw
  *  child transcripts, summaries, args, and results never cross this wire, a restart with a
  *  child in flight settles it `unknown` -- never `failed` -- and nothing here is pushed. */
-export const BOTS_CAPABILITY_VERSION = 34;
+/** Capability 35: LIVE THINKING PREVIEW. A deliberate, bounded reopening of the old
+ *  "no reasoning on the wire" rule (approved 2026-08: reasoning models emit their whole reply in
+ *  one end burst, so a turn otherwise shows only a generic thinking state). What crosses the wire
+ *  is `bot_thinking_activity`: a latest-only, sanitized, <=280-char rolling preview -- never the
+ *  chain of thought itself, never tool args/results, prompts, credentials, or paths. It is
+ *  ephemeral end to end: not persisted, absent from chat history, and it stops at the turn's
+ *  terminal. Additive exactly as 34 was: a client below 35 ignores the unknown frame and keeps
+ *  today's shimmer; a client that renders the preview gates on `>= 35`. */
+export const BOTS_CAPABILITY_VERSION = 35;

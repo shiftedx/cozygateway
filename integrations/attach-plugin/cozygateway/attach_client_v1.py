@@ -62,7 +62,7 @@ HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "memory_management", "delivery_receipts",
-    "delegation",
+    "delegation", "thinking",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
@@ -382,6 +382,27 @@ class AttachV1Client:
         if detail:
             event["detail"] = detail[:1024]
         await self._queue_event(event)
+
+    async def send_thinking(
+        self, thread_id: str, turn_id: str, text: str, *, seq: int,
+        last_active_at: Optional[int] = None,
+    ) -> None:
+        """Queue one EPHEMERAL latest-only reasoning preview (capability ``thinking``).
+
+        ``text`` is already sanitized by the adapter; the 280-char cap is re-applied here and
+        enforced again by the gateway schema. The spool's terminal seal (thinking has no
+        exemption, unlike ``delegation``) plus the adapter's active-turn check make a
+        post-terminal preview impossible; a gateway that never negotiated the capability makes
+        ``_queue_event`` drop the event silently.
+        """
+        preview = str(text)[:280]
+        if not preview:
+            return
+        await self._queue_event({
+            "kind": "thinking", "threadId": thread_id, "turnId": turn_id,
+            "text": preview, "seq": max(1, int(seq)),
+            "lastActiveAt": max(0, int(last_active_at or 0)),
+        })
 
     async def send_scheduled(
         self,
@@ -1117,6 +1138,8 @@ def _event_capabilities(event: Dict[str, Any]) -> List[str]:
         return ["tools"]
     if kind == "delegation":
         return ["delegation"]
+    if kind == "thinking":
+        return ["thinking"]
     if kind == "approval":
         return ["approvals"]
     if kind == "clarify":

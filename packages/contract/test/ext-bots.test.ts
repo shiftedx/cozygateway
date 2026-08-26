@@ -37,6 +37,7 @@ import {
   BotToolActivityFrameSchema,
   BotDelegationChildSchema,
   BotDelegationActivityFrameSchema,
+  BotThinkingActivityFrameSchema,
   BotTurnDelegationsSchema,
   BotToolStepSchema,
   BotTurnToolStepsSchema,
@@ -491,7 +492,10 @@ describe("capability advertisement", () => {
     // 34 adds subagent visibility: `bot_delegation_activity` full-replace batch snapshots and
     // the optional `delegations` array on chat history. A client below 34 ignores both and
     // keeps today's behavior (the outer delegate_task chip plus the terminal completion card).
-    expect(BOTS_CAPABILITY_VERSION).toBe(34);
+    // 35 adds the live thinking preview: latest-only `bot_thinking_activity` frames, sanitized
+    // and schema-capped at 280 chars, ephemeral end to end. A client below 35 ignores the
+    // unknown frame and keeps today's generic shimmer.
+    expect(BOTS_CAPABILITY_VERSION).toBe(35);
   });
 
   it("accepts a capability-33 create with tool selections, and keeps them optional", () => {
@@ -731,5 +735,40 @@ describe("delegation activity (capability 34)", () => {
       turnId: frame.turnId, batchId: "call-1", count: 5,
       startedAt: 1_800_000_000_000, endedAt: 1_800_000_002_000, children: [child],
     })).toBe(true);
+  });
+});
+
+describe("thinking preview (capability 35)", () => {
+  const frame = {
+    type: "bot_thinking_activity",
+    bot: "scout",
+    sessionId: "sess-1",
+    turnId: "sess-1#1800000000000-1",
+    text: "weighing the two options",
+    seq: 1,
+    updatedAt: 1_800_000_000_000,
+  };
+
+  it("accepts a bounded preview and keeps it a ServerFrame member", () => {
+    expect(check(BotThinkingActivityFrameSchema, frame)).toBe(true);
+    expect(check(BotThinkingActivityFrameSchema, { ...frame, text: "x".repeat(280) })).toBe(true);
+    expect(check(ServerFrameSchema, frame)).toBe(true);
+  });
+
+  it("enforces the 280-char cap and a monotonic integer seq on the schema itself", () => {
+    expect(check(BotThinkingActivityFrameSchema, { ...frame, text: "x".repeat(281) })).toBe(false);
+    expect(check(BotThinkingActivityFrameSchema, { ...frame, seq: 0 })).toBe(false);
+    expect(check(BotThinkingActivityFrameSchema, { ...frame, seq: 1.5 })).toBe(false);
+  });
+
+  it("declares only the preview text -- the property set is the privacy contract", () => {
+    // Same redaction-guard shape pin as BotDelegationChildSchema: reasoning crosses this wire
+    // ONLY as the one bounded display tail; nothing structural can ride along.
+    expect(Object.keys(BotThinkingActivityFrameSchema.properties).sort()).toEqual([
+      "bot", "seq", "sessionId", "text", "turnId", "type", "updatedAt",
+    ]);
+    for (const leak of ["reasoning", "args", "result", "prompt", "blocks", "raw", "detail"]) {
+      expect(BotThinkingActivityFrameSchema.properties).not.toHaveProperty(leak);
+    }
   });
 });

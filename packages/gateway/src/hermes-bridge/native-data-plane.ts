@@ -21,6 +21,7 @@ import type {
   BotDelegationActivityFrame,
   BotDelegationChild,
   BotTurnDelegations,
+  BotThinkingActivityFrame,
   BotSummary,
   BotPendingClarification,
   BotPendingApproval,
@@ -111,7 +112,7 @@ const DELEGATION_SETTLED = new Set<BotDelegationChild["status"]>([
   "succeeded", "failed", "interrupted", "stalled", "unknown",
 ]);
 
-type LiveTurnFrame = BotChatDeltaFrame | BotToolActivityFrame | BotDelegationActivityFrame | BotChatStateFrame;
+type LiveTurnFrame = BotChatDeltaFrame | BotToolActivityFrame | BotDelegationActivityFrame | BotThinkingActivityFrame | BotChatStateFrame;
 
 interface LiveTurnBatch {
   timer: ReturnType<typeof setTimeout>;
@@ -153,6 +154,9 @@ export class NativeBotDataPlane {
   readonly #mobileNode: MobileNodeBroker | undefined;
   readonly #turnOrigins = new Map<string, string>();
   readonly #draftSeq = new Map<string, number>();
+  /** Last plugin-side thinking `seq` per turnId. In-memory only: thinking is ephemeral by
+   *  design (capability 35), so there is no storage row and no restore on reboot. */
+  readonly #thinkingSeq = new Map<string, number>();
   readonly #toolFrames = new Map<string, ToolFrameState>();
   readonly #delegationFrames = new Map<string, Map<string, DelegationFrameState>>();
   readonly #tracedTurnStates = new Map<string, string>();
@@ -518,6 +522,7 @@ export class NativeBotDataPlane {
       return true;
     }
     if (event.kind === "tool") return this.#tool(key, sessionId, event);
+    if (event.kind === "thinking") return this.#thinking(key, sessionId, event);
     if (event.kind === "delegation") return this.#delegation(key, sessionId, event, true);
     if (event.kind === "approval") return this.#approval(key, sessionId, event);
     if (event.kind === "clarify") return this.#clarify(key, sessionId, event);
@@ -1023,6 +1028,7 @@ export class NativeBotDataPlane {
       done: true,
     });
     this.#draftSeq.delete(turnId);
+    this.#thinkingSeq.delete(turnId);
     this.#state(bot, sessionId, terminal.phase, false, terminal);
   }
 
@@ -1291,6 +1297,39 @@ export class NativeBotDataPlane {
       return { ...turn, ...(endedAt === undefined ? {} : { endedAt }) };
     });
     return toolSteps.length === 0 ? {} : { toolSteps };
+  }
+
+  /** EPHEMERAL latest-only reasoning preview (capability 35). Deliberately touches no storage:
+   *  thinking is gone on reopen by design, so there is no history field and no restore path.
+   *  Post-terminal suppression lives in `handle`: a sealed turn acknowledges the event without
+   *  reaching here (thinking has no post-seal carve-out, unlike delegation). */
+  #thinking(
+    bot: string,
+    sessionId: string,
+    event: Extract<AttachV1EventFrame["event"], { kind: "thinking" }>,
+  ): boolean {
+    const last = this.#thinkingSeq.get(event.turnId) ?? 0;
+    // Attach-v1 is at-least-once: a replayed or reordered preview is acknowledged without a
+    // rebroadcast, so a stale preview can never overwrite a newer one.
+    if (event.seq <= last) return true;
+    this.#thinkingSeq.set(event.turnId, event.seq);
+    const wire: BotThinkingActivityFrame = {
+      type: "bot_thinking_activity",
+      bot,
+      sessionId,
+      turnId: event.turnId,
+      // The schema already refuses >280; the slice keeps the bound even for a caller that
+      // bypassed admission (defense in depth on the one privacy-critical field).
+      text: event.text.slice(0, 280),
+      seq: event.seq,
+      updatedAt: this.#now(),
+    };
+    this.#coalesceLiveTurn(
+      this.#nativeTurnKey(bot, sessionId, event.turnId),
+      wire,
+      this.#stateFrame(bot, sessionId, "polling", true),
+    );
+    return true;
   }
 
   #delegation(
@@ -2201,7 +2240,7 @@ export class NativeBotDataPlane {
   }
 
   #broadcastLiveFrames(frames: ReadonlyMap<string, LiveTurnFrame>): void {
-    for (const type of ["bot_chat_delta", "bot_tool_activity"] as const) {
+    for (const type of ["bot_chat_delta", "bot_tool_activity", "bot_thinking_activity"] as const) {
       const frame = frames.get(type);
       if (frame !== undefined) this.#broadcast(frame);
     }

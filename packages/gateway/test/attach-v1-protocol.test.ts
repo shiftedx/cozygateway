@@ -102,7 +102,25 @@ describe("attach-v1 protocol", () => {
       kind: "heartbeat", sentAt: 100,
       telemetry: { eventOutboxDepth: 1, oldestEventAgeMs: 2, eventAckCursor: 3, commandInboxDepth: 5, lastEventAckProgressAt: 4 },
     })).toBe(false);
+    // The old closed rule survives for anything unbounded: a raw `reasoning` event still fails.
     expect(check(AttachV1EventFrameSchema, { kind: "event", sequence: 1, eventId: "leak", event: { kind: "reasoning", text: "secret" } })).toBe(false);
+  });
+
+  it("carries a bounded latest-only thinking preview and refuses anything past its bounds", () => {
+    const event = (body: Record<string, unknown>) => ({
+      kind: "event", sequence: 1, eventId: "think-1",
+      event: { kind: "thinking", threadId: "thread", turnId: "turn", text: "weighing the two options", seq: 1, lastActiveAt: 1_800_000_000_000, ...body },
+    });
+    expect(check(AttachV1EventFrameSchema, event({}))).toBe(true);
+    expect(check(AttachV1EventFrameSchema, event({ text: "x".repeat(280) }))).toBe(true);
+    // The 280-char cap is enforced ON THE SCHEMA: an unsanitized peer cannot exceed it.
+    expect(check(AttachV1EventFrameSchema, event({ text: "x".repeat(281) }))).toBe(false);
+    // `seq` starts at 1 and is an integer: 0 and fractions cannot express "latest".
+    expect(check(AttachV1EventFrameSchema, event({ seq: 0 }))).toBe(false);
+    expect(check(AttachV1EventFrameSchema, event({ seq: 1.5 }))).toBe(false);
+    expect(check(AttachV1EventFrameSchema, event({ lastActiveAt: -1 }))).toBe(false);
+    // The preview is one bounded text field: no blocks, args, or attachments ride along.
+    expect(check(AttachV1EventFrameSchema, event({ seq: undefined }))).toBe(false);
   });
 
   it("keeps negotiated mobile requests and results outside the durable envelopes", () => {

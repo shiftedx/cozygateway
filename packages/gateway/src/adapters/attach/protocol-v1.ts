@@ -20,6 +20,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("memory_management"),
   Type.Literal("delivery_receipts"),
   Type.Literal("delegation"),
+  Type.Literal("thinking"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -213,6 +214,23 @@ const DelegationEvent = Type.Object({
   /** MILLISECONDS, plugin clock: when the child last showed observable activity. */
   lastActiveAt: Type.Integer({ minimum: 0 }),
 });
+/** EPHEMERAL rolling reasoning preview behind the turn's thinking shimmer (capability
+ * `thinking`). A deliberate, bounded reopening of the closed no-reasoning rule below: reasoning
+ * models deliver their visible reply in one end burst, so without this the whole turn is a
+ * generic spinner. One event REPLACES the previous one for its turn (latest-only; `seq` is the
+ * plugin's monotonic per-turn counter, so a stale replay cannot regress the preview). `text` is
+ * a sanitized tail preview, capped at 280 chars ON THE SCHEMA so the bound holds even against an
+ * unsanitized peer -- never tool args or results, prompts, credentials, or file paths. Never
+ * emitted after the turn's terminal, never persisted, gone on reopen. Like `draft`/`tool`, it is
+ * rendering state: an undeliverable one is skipped after bounded retries, never dead-lettered. */
+const ThinkingEvent = Type.Object({
+  kind: Type.Literal("thinking"), threadId: Id, turnId: Id,
+  text: Type.String({ maxLength: 280 }),
+  /** Plugin's per-turn preview counter, from 1. Lower-or-equal = stale, dropped. */
+  seq: Type.Integer({ minimum: 1 }),
+  /** MILLISECONDS, plugin clock: when reasoning last streamed. */
+  lastActiveAt: Type.Integer({ minimum: 0 }),
+});
 const ApprovalEvent = Type.Object({
   kind: Type.Literal("approval"), threadId: Id, turnId: Id, approvalId: Id, callId: Id,
   name: Type.String({ minLength: 1, maxLength: 128 }),
@@ -274,9 +292,13 @@ export type AttachV1MobileResultInput =
   | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
   | { requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" };
 
-/** Deliberately closed: no thinking/reasoning/chain-of-thought event exists. */
+/** This union was deliberately closed to reasoning ("no thinking/reasoning/chain-of-thought
+ * event exists"). Capability `thinking` consciously reopens it, bounded: `ThinkingEvent` is a
+ * sanitized, latest-only, schema-capped 280-char preview -- not the chain of thought, not a
+ * transcript, and raw reasoning still never crosses this wire. */
 export const AttachV1EventSchema = Type.Union([
   DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent, DelegationEvent,
+  ThinkingEvent,
   ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, PresenceEvent,
 ]);
 export type AttachV1Event = Static<typeof AttachV1EventSchema>;

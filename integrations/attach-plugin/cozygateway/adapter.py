@@ -829,6 +829,13 @@ class AttachAdapter:
         # projection carve-out expects it), not whatever turn is active by then.
         self._delegation_turns: "OrderedDict[str, str]" = OrderedDict()
         self._delegation_turns_max = 64
+        # Per-turn live-reasoning preview state (capability ``thinking``): a rolling raw
+        # buffer, the last sanitized emit, and the coalescing task. Keyed by turn id and
+        # dropped at that turn's local seal, so a delta landing after the terminal finds
+        # nothing to emit into.
+        self._thinking: Dict[str, _ThinkingState] = {}
+        # Injectable so tests are deterministic (same pattern as ``_interrupt_sleep``).
+        self._thinking_sleep = asyncio.sleep
         # (threadId, turnId) already seen or in flight: a repeat is dropped, but
         # only within a bounded retention window -- see below.
         #
@@ -1839,6 +1846,70 @@ class AttachAdapter:
         except Exception:  # noqa: BLE001 - a card is presentation-only
             logger.debug("attach: delegation event emit failed", exc_info=True)
 
+    # -- live thinking tap -----------------------------------------------------
+    def observe_reasoning_delta(self, delta: str) -> None:
+        """Sync entry from Hermes' plugin-stream worker thread (``on_stream_delta``).
+        Never raises.
+
+        Hops onto the adapter's event loop, exactly as ``observe_tool_event`` does, so the
+        routing, coalescing, and send happen single-threaded. A missing loop degrades silently.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._apply_reasoning_delta(delta), loop)
+        except Exception:  # noqa: BLE001 - a dead loop must degrade silently
+            logger.debug("attach: observe_reasoning_delta schedule failed", exc_info=True)
+
+    async def _apply_reasoning_delta(self, delta: str) -> None:
+        """Fold one raw reasoning delta into the active turn's rolling preview.
+
+        ponytail: the stream-hook payload carries no chat id and its worker thread has no
+        session context, so the delta routes to the SOLE active turn; with two chats live at
+        once the preview is dropped whole (never misrouted -- the reply itself is untouched).
+        Ceiling: concurrent-chat turns show no thinking preview. Upgrade path: chat context on
+        Hermes' stream-hook payload (proposed upstream), or a hermes-session -> chat map.
+        """
+        if len(self._active_turn) != 1:
+            return
+        ((chat_id, turn_id),) = self._active_turn.items()
+        state = self._thinking.setdefault(turn_id, _ThinkingState())
+        state.buffer = (state.buffer + delta)[-_THINKING_BUFFER_MAX_CHARS:]
+        if state.task is not None and not state.task.done():
+            return  # an emit is already scheduled; it reads the buffer when it fires
+        delay = max(0.0, THINKING_COALESCE_SECONDS - (time.monotonic() - state.last_emit))
+        state.task = asyncio.get_running_loop().create_task(
+            self._emit_thinking_after(chat_id, turn_id, delay)
+        )
+
+    async def _emit_thinking_after(self, chat_id: str, turn_id: str, delay: float) -> None:
+        """Emit one coalesced preview after ``delay``: at most one send per coalesce window,
+        each carrying the full sanitized tail (latest-only on the wire). Never raises."""
+        try:
+            if delay > 0:
+                await self._thinking_sleep(delay)
+            state = self._thinking.get(turn_id)
+            if state is None:
+                return
+            state.last_emit = time.monotonic()
+            client = self._client
+            # The seal is the hard stop: a delta scheduled before the terminal but firing
+            # after it finds the turn gone and emits nothing (the spool seal backstops this).
+            if client is None or self._active_turn.get(chat_id) != turn_id:
+                return
+            text = _sanitize_thinking(state.buffer)
+            if not text or text == state.last_text:
+                return
+            state.seq += 1
+            state.last_text = text
+            await client.send_thinking(
+                chat_id, turn_id, text,
+                seq=state.seq, last_active_at=int(time.time() * 1000),
+            )
+        except Exception:  # noqa: BLE001 - a preview is presentation-only
+            logger.debug("attach: thinking emit failed", exc_info=True)
+
     def _chips(self, turn_id: str) -> Optional[List[Any]]:
         tracker = self._tool_chips.get(turn_id)
         chips = tracker.chips() if tracker else []
@@ -2202,6 +2273,10 @@ class AttachAdapter:
         self._tool_chips.pop(turn_id, None)
         self._normalizers.pop(turn_id, None)
         self._content_seen.pop(turn_id, None)
+        if not keep_active:
+            # NOT on the interim path: resetting mid-turn would restart the preview ``seq``
+            # at 1, which the gateway rightly drops as stale for the rest of the turn.
+            self._thinking.pop(turn_id, None)
         if not keep_active and self._active_turn.get(chat_id) == turn_id:
             self._active_turn.pop(chat_id, None)
 
@@ -2813,6 +2888,90 @@ def _subagent_start(**kwargs: Any) -> None:
 def _subagent_stop(**kwargs: Any) -> None:
     """``subagent_stop`` hook: a child's finish leg (carries the outcome)."""
     _dispatch_delegation_hook("stop", kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Live thinking preview tap (capability ``thinking``).
+#
+# Reasoning models emit their visible reply in one end burst, so a turn otherwise shows only a
+# generic thinking state. Hermes streams reasoning deltas to plugins through the supported
+# ``on_stream_delta`` hook (kind == "reasoning"), gated OFF by default behind the user config
+# ``plugins.stream_reasoning_deltas: true``. The hook hands RAW chain-of-thought on a worker
+# thread with no session context, so this tap (a) filters to this platform's surface, (b)
+# routes inside the adapter, (c) coalesces to at most one emit per second, and (d) sanitizes
+# hard before a single character reaches the wire: fenced/inline code (where tool args and
+# results get quoted), credential-looking assignments and opaque token runs, and filesystem
+# paths are all dropped or redacted, then the tail is truncated to the 280-char preview the
+# gateway schema also enforces. Redaction over fidelity, always: this is a shimmer preview,
+# not a transcript.
+# ---------------------------------------------------------------------------
+
+THINKING_PREVIEW_MAX_CHARS = 280
+THINKING_COALESCE_SECONDS = 1.0
+_THINKING_BUFFER_MAX_CHARS = 4096
+
+_THINKING_FENCED_RE = re.compile(r"```.*?(?:```|$)", re.S)
+_THINKING_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+_THINKING_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(token|secret|password|passwd|api[_-]?key|apikey|authorization|credential)s?\b\s*[:=]\s*\S+"
+)
+_THINKING_BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
+_THINKING_OPAQUE_RE = re.compile(r"\b[A-Za-z0-9+/_-]{20,}={0,2}\b")
+_THINKING_PATH_RE = re.compile(r"(?:~|/|[A-Za-z]:\\)(?:[\w.-]+[/\\])+[\w.-]*")
+
+
+@dataclass
+class _ThinkingState:
+    """One turn's rolling preview: raw tail, last emit, and the coalescing task."""
+
+    buffer: str = ""
+    seq: int = 0
+    last_text: str = ""
+    last_emit: float = 0.0
+    task: Optional[asyncio.Task] = None
+
+
+def _sanitize_thinking(text: str) -> str:
+    """A bounded display preview of raw model reasoning.
+
+    Order matters: code spans go first (tool args/results are quoted there), then credential
+    shapes, then paths, then whitespace collapse and TAIL truncation (the newest reasoning is
+    the interesting end). Over-redaction of an odd long word is an accepted price.
+    """
+    text = _THINKING_FENCED_RE.sub(" ", text)
+    text = _THINKING_INLINE_CODE_RE.sub(" ", text)
+    # Bearer before the assign shape: "authorization: bearer <token>" must lose the token,
+    # not just the word "bearer".
+    text = _THINKING_BEARER_RE.sub("[redacted]", text)
+    text = _THINKING_SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _THINKING_OPAQUE_RE.sub("[redacted]", text)
+    text = _THINKING_PATH_RE.sub("[path]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > THINKING_PREVIEW_MAX_CHARS:
+        text = "\u2026" + text[-(THINKING_PREVIEW_MAX_CHARS - 1):]
+    return text
+
+
+def _on_stream_delta(**kwargs: Any) -> None:
+    """``on_stream_delta`` hook: the live-reasoning tap. Observer only, never raises.
+
+    Runs on Hermes' bounded plugin-stream worker thread (drop-oldest under backlog), which
+    carries no session contextvars -- so no ``get_session_env`` here; the surface field and the
+    adapter's own active-turn state do the routing. Content deltas (``kind == "text"``) already
+    reach this platform through the draft path and are ignored.
+    """
+    try:
+        if kwargs.get("kind") != "reasoning":
+            return
+        if str(kwargs.get("surface") or "") != PLATFORM_NAME:
+            return
+        delta = str(kwargs.get("delta") or "")
+        if not delta:
+            return
+        for adapter in _active_adapters_snapshot():
+            adapter.observe_reasoning_delta(delta)
+    except Exception:  # noqa: BLE001 - a preview must never crash the stream worker
+        logger.debug("attach: reasoning-hook dispatch failed", exc_info=True)
 
 
 #: The Hermes approval surfaces whose prompt this platform actually answers.
@@ -3703,5 +3862,8 @@ def register(ctx: Any) -> None:
         ctx.register_hook("post_approval_response", _post_approval_response)
         ctx.register_hook("subagent_start", _subagent_start)
         ctx.register_hook("subagent_stop", _subagent_stop)
+        # Live thinking preview (capability ``thinking``). Inert until the user opts in
+        # with ``plugins.stream_reasoning_deltas: true`` in the Hermes config.
+        ctx.register_hook("on_stream_delta", _on_stream_delta)
     except Exception:  # noqa: BLE001 - no chips, never crash
         logger.debug("attach: tool-lifecycle hooks unavailable; chips disabled", exc_info=True)

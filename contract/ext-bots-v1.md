@@ -73,6 +73,7 @@ extension omits the capability and does not register `/bots` routes.
 | 32 | Inline media ordering: `BotChatMessage.attachments[].position`. |
 | 33 | Create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots`, and `BotCreateResponse.warnings`. |
 | 34 | Subagent visibility: `bot_delegation_activity` batch snapshots and a `delegations` array on chat history. |
+| 35 | Live thinking preview: latest-only `bot_thinking_activity` frames (sanitized, <=280 chars, ephemeral). |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -455,6 +456,14 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   `unknown` -- never `failed`. Active and past batches also ride chat history as the optional
   `delegations` array, so reconnect does not erase a live card, and `batchId` keys client
   reconciliation with the terminal "[ASYNC DELEGATION BATCH COMPLETE ...]" transcript row.
+- `bot_thinking_activity` (capability 35): latest-only sanitized preview of the bot's live
+  reasoning for one native turn, shown in the thinking shimmer. `text` is a tail-truncated
+  <=280-char display string (schema-enforced); `seq` is monotonic within `turnId` and a
+  lower-or-equal frame is stale. EPHEMERAL BY DESIGN: never persisted, never in chat history,
+  gone on reopen, and no frame follows the turn's terminal. This is a conscious, bounded
+  reopening of the old "no reasoning on the wire" rule: the preview crosses, the chain of
+  thought does not -- tool args, results, prompts, credentials, and file paths never appear.
+  NOT pushed, ever.
 - `bot_approval_pending`, `bot_approval_resolution_requested`, and `bot_approval_resolved`:
   durable native tool-approval lifecycle. The requested frame means outbox admission only; a
   terminal frame is emitted solely from the later plugin terminal event (or local expiry).
@@ -473,9 +482,10 @@ Committed transcript history remains the recovery source after reconnect.
   path, Hermes Dashboard id, or URL from them.
 - Attachment and media validation rejects unsafe bytes, unsupported types, oversized bodies, and
   invalid ranges before those values enter a transcript.
-- Tool detail, approval display names, clarification prompts/options, and group notes are
-  presentation fields. Raw tool arguments, results, command text, and model reasoning are not
-  serialized.
+- Tool detail, approval display names, clarification prompts/options, group notes, and the
+  capability-35 thinking preview are presentation fields. Raw tool arguments, results, command
+  text, and full model reasoning are not serialized; the thinking preview is a sanitized,
+  bounded display tail, not the chain of thought.
 - The inbox has no send route. Bot-to-bot traffic is not another client composer.
 - A client handles an unknown extension frame or optional field by ignoring it, then re-reads the
   documented REST state when it needs recovery.
