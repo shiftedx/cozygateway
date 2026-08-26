@@ -74,6 +74,9 @@ the rest of the config, updates the local target for every installer-managed
 Hermes profile without changing its token, and restarts the gateway and those
 Hermes profiles automatically. Rerunning the installer also preserves a saved
 custom listener unless an explicit installer host or port option replaces it.
+LAN-only bind addresses are used consistently for local Hermes attachment and
+health checks. If a managed listener replacement cannot become ready, the CLI
+restores the previous working listener automatically.
 The non-interactive `cozygateway status`, `cozygateway pair`, and
 `cozygateway configure` commands expose the same focused operations directly.
 

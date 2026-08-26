@@ -265,7 +265,40 @@ describe("cozygateway terminal menu", () => {
     ).rejects.toThrow(/default/);
 
     vi.restoreAllMocks();
-    expect(restarted).toEqual(["default", "ops"]);
+    expect(restarted).toEqual(["default", "ops", "default", "ops"]);
+  });
+
+  it("restores the previous managed listener when the replacement never becomes ready", async () => {
+    const { configPath } = tempConfig({ host: "0.0.0.0", port: 18787 });
+    const localDir = dirname(configPath);
+    const hermesRoot = mkdtempSync(join(tmpdir(), "cozygateway-hermes-"));
+    writeFileSync(join(hermesRoot, ".env"), "COZYGATEWAY_URL=http://127.0.0.1:18787\nCOZYGATEWAY_TOKEN=secret\n");
+    writeFileSync(
+      join(localDir, "install-state"),
+      `profiles=default\nhermes_root=${hermesRoot}\nhermes_bin=${join(hermesRoot, "hermes")}\n`,
+    );
+    const restarted: string[] = [];
+    let readinessChecks = 0;
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await expect(
+      runCli(["configure", "--config", configPath], scriptedIo(["127.0.0.1", "9002"]), {
+        restartHermesProfile: async (_executable, profile) => {
+          restarted.push(profile);
+        },
+        waitForGatewayReady: async () => {
+          readinessChecks += 1;
+          if (readinessChecks === 1) throw new Error("replacement unavailable");
+        },
+      }),
+    ).rejects.toThrow(/restored.*0\.0\.0\.0:18787/i);
+
+    vi.restoreAllMocks();
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as { host: string; port: number };
+    expect(config).toMatchObject({ host: "0.0.0.0", port: 18787 });
+    expect(readFileSync(join(hermesRoot, ".env"), "utf8")).toContain("COZYGATEWAY_URL=http://127.0.0.1:18787");
+    expect(restarted).toEqual(["default", "default"]);
+    expect(readinessChecks).toBe(2);
   });
 
   it("runs pairing from the menu and returns to it", async () => {

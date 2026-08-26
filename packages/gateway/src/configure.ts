@@ -28,12 +28,13 @@ export function parseListenerPort(raw: string): number {
   return port;
 }
 
-function writeAtomic(path: string, content: string): void {
+function writeAtomic(path: string, content: string, validate?: (temporary: string) => void): void {
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
     const mode = statSync(path).mode;
     writeFileSync(temporary, content, { encoding: "utf8", mode });
     chmodSync(temporary, mode);
+    validate?.(temporary);
     renameSync(temporary, path);
   } catch (error) {
     try {
@@ -53,22 +54,7 @@ export function updateListenerConfig(path: string, requestedHost: string, reques
     throw new Error("gateway configuration must be a JSON object");
   }
 
-  const updated = { ...existing, host, port };
-  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    writeFileSync(temporary, `${JSON.stringify(updated, null, 2)}\n`, { encoding: "utf8", mode: statSync(path).mode });
-    loadConfig(temporary);
-    const content = readFileSync(temporary, "utf8");
-    unlinkSync(temporary);
-    writeAtomic(path, content);
-  } catch (error) {
-    try {
-      unlinkSync(temporary);
-    } catch {
-      // The temporary file may not have been created or may already have been renamed.
-    }
-    throw error;
-  }
+  writeAtomic(path, `${JSON.stringify({ ...existing, host, port }, null, 2)}\n`, loadConfig);
 }
 
 export interface ManagedHermesProfile {
@@ -88,9 +74,10 @@ export function listenerOrigin(host: string, port: number, scheme: "http" | "htt
   return `${scheme}://${urlHost}:${port}`;
 }
 
-export function syncManagedListenerTargets(configPath: string, requestedHost: string, requestedPort: number): ManagedHermesProfile[] {
-  const host = validateListenerHost(requestedHost);
-  const port = parseListenerPort(String(requestedPort));
+export function syncManagedListenerTargets(configPath: string): ManagedHermesProfile[] {
+  const config = loadConfig(configPath);
+  const host = validateListenerHost(config.host ?? "0.0.0.0");
+  const port = parseListenerPort(String(config.port));
   const statePath = join(dirname(configPath), "install-state");
   if (!existsSync(statePath)) return [];
 
@@ -111,7 +98,6 @@ export function syncManagedListenerTargets(configPath: string, requestedHost: st
 
   const hermesRoot = nativeManagedPath(rawRoot);
   const executable = nativeManagedPath(rawExecutable);
-  const config = loadConfig(configPath);
   const target = listenerOrigin(host, port, config.tls === undefined ? "http" : "https");
   const updates = profiles.map((profile) => {
     const envPath = profile === "default" ? join(hermesRoot, ".env") : join(hermesRoot, "profiles", profile, ".env");

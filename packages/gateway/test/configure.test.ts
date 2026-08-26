@@ -91,7 +91,8 @@ describe("listener configuration", () => {
     writeFileSync(defaultEnv, "COZYGATEWAY_URL=http://127.0.0.1:8787\nCOZYGATEWAY_TOKEN=default-secret\n");
     writeFileSync(opsEnv, "COZYGATEWAY_TOKEN=ops-secret\nCOZYGATEWAY_URL=http://127.0.0.1:8787\n");
 
-    const managed = syncManagedListenerTargets(path, "0.0.0.0", 9000);
+    updateListenerConfig(path, "0.0.0.0", 9000);
+    const managed = syncManagedListenerTargets(path);
 
     expect(managed.map((entry) => entry.profile)).toEqual(["default", "ops"]);
     expect(readFileSync(defaultEnv, "utf8")).toBe(
@@ -109,11 +110,12 @@ describe("listener configuration", () => {
     mkdirSync(hermesRoot, { recursive: true });
     const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     config.tls = { certFile: "cert.pem", keyFile: "key.pem" };
+    config.port = 9443;
     writeFileSync(path, JSON.stringify(config));
     writeFileSync(join(localDir, "install-state"), `profiles=default\nhermes_root=${hermesRoot}\nhermes_bin=${join(hermesRoot, "hermes")}\n`);
     writeFileSync(join(hermesRoot, ".env"), "COZYGATEWAY_URL=http://127.0.0.1:8787\nCOZYGATEWAY_TOKEN=secret\n");
 
-    syncManagedListenerTargets(path, "0.0.0.0", 9443);
+    syncManagedListenerTargets(path);
 
     expect(readFileSync(join(hermesRoot, ".env"), "utf8")).toContain("COZYGATEWAY_URL=https://127.0.0.1:9443");
   });

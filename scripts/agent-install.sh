@@ -147,6 +147,17 @@ validate_listener_settings() {
   [ -n "$BIND_HOST" ] || die "--bind-host must not be empty"
   case "$PORT" in ''|*[!0-9]*) die "--port must be 1-65535" ;; esac
   [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be 1-65535"
+  "$NODE_RESOLVED" - "$BIND_HOST" <<'NODE' || die "--bind-host must be a hostname or IP address, not a URL or whitespace"
+const { isIP } = require('node:net');
+const host = process.argv[2];
+const validName = host.length <= 253 && host.split('.').every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label));
+process.exit(isIP(host) !== 0 || validName ? 0 : 1);
+NODE
+}
+gateway_origin() {
+  local host="$BIND_HOST"
+  case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::) host='[::1]' ;; *:*) host="[$host]" ;; esac
+  printf 'http://%s:%s' "$host" "$PORT"
 }
 
 node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -dc '0-9'; }
@@ -313,7 +324,7 @@ write_gateway_env() {
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done
     TOKENS+=("$token"); TOKEN_ENVS+=("$env_name")
-    env_put "$profile_env" COZYGATEWAY_URL "http://127.0.0.1:$PORT"; env_put "$profile_env" COZYGATEWAY_TOKEN "$token"
+    env_put "$profile_env" COZYGATEWAY_URL "$(gateway_origin)"; env_put "$profile_env" COZYGATEWAY_TOKEN "$token"
     spool_path="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
     is_windows && spool_path="$(to_windows_path "$spool_path")"
     env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$spool_path"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
@@ -394,6 +405,15 @@ write_cli_wrapper() {
     } > "$CLI_WINDOWS"
     chmod 755 "$CLI_WINDOWS" 2>/dev/null || true
   fi
+}
+remove_windows_cli_path() {
+  local bin_native
+  bin_native="$(to_windows_path "$GATEWAY_DIR/bin")"
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_CLI_BIN="$bin_native" powershell.exe -NoProfile -NonInteractive -Command '
+    $target = [IO.Path]::GetFullPath($env:COZYGATEWAY_CLI_BIN).TrimEnd("\")
+    $parts = @([Environment]::GetEnvironmentVariable("PATH", "User") -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_.TrimEnd("\") -ine $target })
+    [Environment]::SetEnvironmentVariable("PATH", ($parts -join ";"), "User")
+  '
 }
 write_wrapper() {
   local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg bundle_arg config_arg
@@ -549,17 +569,17 @@ install_windows_service() {
 }
 gateway_ready() {
   local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$(gateway_origin)/health" 2>/dev/null || true)"
   [ "$code" = 200 ]
 }
 wait_gateway_ready() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   wait for CozyGateway health before starting Hermes attach"; return; }
   local attempt
   for attempt in $(seq 1 30); do gateway_ready && return; sleep 1; done
-  die "CozyGateway did not become healthy on 127.0.0.1:$PORT"
+  die "CozyGateway did not become healthy on $(gateway_origin)"
 }
 attach_ready() {
-  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null |
+  curl -fsS --max-time 3 "$(gateway_origin)/health" 2>/dev/null |
     "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach;process.exit(h&&h.online===h.configured&&h.deadLetters===0?0:1)}catch{process.exit(1)}})'
 }
 wait_attach_ready() {
@@ -692,6 +712,7 @@ uninstall() {
       rm -f "$startup_entry"
       gateway_ready && stop_owned_windows_gateway
     fi
+    [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
     else launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; fi
@@ -726,15 +747,15 @@ status_install() {
   else
     systemctl --user is-enabled "$SERVICE_UNIT" >/dev/null 2>&1 && { say "OK    systemd user service registered: $SERVICE_UNIT"; persisted=1; }
   fi
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$(gateway_origin)/health" 2>/dev/null || true)"
   [ "$code" = 200 ] && { say "OK    CozyGateway health endpoint is live"; live=1; }
   [ "$persisted" = 1 ] || say "FAIL  CozyGateway login persistence is absent"
   [ "$live" = 1 ] || say "FAIL  CozyGateway health endpoint is not responding"
   [ "$persisted" = 1 ] && [ "$live" = 1 ]
 }
 main() {
-  if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   NODE_RESOLVED="$(resolve_node)"; hydrate_listener_settings; validate_listener_settings
+  if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   if [ "$STATUS" = 1 ]; then status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"

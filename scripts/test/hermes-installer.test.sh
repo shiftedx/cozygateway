@@ -91,6 +91,10 @@ for platform in Darwin Linux Windows; do
   grep -Fq "gateway start" <<<"$output"
   grep -Fq "gateway restart" <<<"$output"
 done
+if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 'http://not-a-host' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-invalid-host" >/dev/null 2>&1; then
+  echo 'expected URL syntax in --bind-host to fail' >&2
+  exit 1
+fi
 
 # A non-dry macOS-path run proves the installer writes the Hermes-only config
 # and secret files without needing a real launchd or Hermes process. Keep the
@@ -105,8 +109,9 @@ LAUNCHCTL
 chmod 700 "$tmp/service-bin/launchctl"
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
+[ -z "${COZYGATEWAY_TEST_CURL_LOG:-}" ] || printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_CURL_LOG"
 case "$*" in
-  *127.0.0.1:8787/health*)
+  *127.0.0.1:8787/health*|*192.0.2.10:8787/health*)
     if [ -n "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}" ] && [ ! -f "$COZYGATEWAY_TEST_GATEWAY_MARKER" ]; then
       if [[ "$*" == *"-o /dev/null"* ]]; then printf '000'; else printf '{"attach":{"configured":1,"online":0,"deadLetters":0}}'; fi
       exit 0
@@ -124,7 +129,7 @@ case "$*" in
 esac
 CURL
 chmod 700 "$tmp/bin/curl"
-live_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+live_output="$(PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bind-host 192.0.2.10 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 # shellcheck disable=SC2016
 if grep -Fq 'spaces $dollar' <<<"$live_output"; then
   echo 'installer output must not contain credentials' >&2
@@ -136,6 +141,8 @@ grep -Fq '"setupCode":"TEST-CODE"' <<<"$live_output"
 grep -Fq "mint a fresh QR and code with: $tmp/gateway-live/bin/cozygateway pair" <<<"$live_output"
 grep -q '"profiles"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
+grep -Fq 'COZYGATEWAY_URL=http://192.0.2.10:8787' "$tmp/hermes/.env"
+grep -Fq 'http://192.0.2.10:8787/health' "$tmp/curl.log"
 mode_of() {
   case "$(uname -s)" in
     Darwin) stat -f '%Lp' "$1" ;;
@@ -266,7 +273,7 @@ test "$(grep -c '^default:gateway:restart$' "$tmp/commands")" = 1
 # pre-existing active service is left untouched.
 # Deliberately remove the fake Hermes directory and omit COZYGATEWAY_HERMES_BIN:
 # uninstall must use the absolute executable captured at install time.
-PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
+PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
 grep -q '^default:gateway:uninstall$' "$tmp/commands"
 grep -q '^ops:gateway:stop$' "$tmp/commands"
 if grep -q '^active:gateway:\(stop\|uninstall\)$' "$tmp/commands"; then

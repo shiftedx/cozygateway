@@ -29,7 +29,7 @@ The Windows installer writes `cozygateway.cmd` beside the existing Git Bash wrap
 
 Configuration changes parse and validate the entire existing config before mutation, preserve unknown and unrelated keys, write sibling temporary files, and atomically rename them over the originals. Hermes environment files retain all secret lines byte-for-byte; only the non-secret local gateway URL changes.
 
-The menu reports an offline health endpoint without failing to open. A configuration write succeeds independently of the subsequent readiness check; if the listener cannot return, the user gets the saved address and a clear offline result instead of a false success claim.
+The menu reports an offline health endpoint without failing to open. A managed listener change is accepted only after the gateway and Hermes attach return healthy; a failed replacement atomically restores the previous listener and Hermes target.
 
 ## Testing
 

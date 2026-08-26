@@ -37,9 +37,11 @@ function healthOrigin(config: ReturnType<typeof loadConfig>): string {
   return listenerOrigin(config.host ?? "0.0.0.0", config.port, gatewayScheme(config));
 }
 
-async function fetchHealth(configPath: string, timeoutMs: number): Promise<Response> {
+async function fetchHealth(configPath: string, timeoutMs: number): Promise<{ attach?: { configured?: number; online?: number } }> {
   const config = loadConfig(configPath);
-  return fetch(`${healthOrigin(config)}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+  const response = await fetch(`${healthOrigin(config)}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!response.ok) throw new Error(`gateway health returned HTTP ${response.status}`);
+  return response.json() as Promise<{ attach?: { configured?: number; online?: number } }>;
 }
 
 const defaultRuntime: CliRuntime = {
@@ -50,13 +52,10 @@ const defaultRuntime: CliRuntime = {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
       try {
-        const response = await fetchHealth(configPath, 1_000);
-        if (response.ok) {
-          const health = (await response.json()) as { attach?: { configured?: number; online?: number } };
-          const configured = health.attach?.configured ?? 0;
-          const online = health.attach?.online ?? 0;
-          if (configured > 0 && online === configured) return;
-        }
+        const health = await fetchHealth(configPath, 1_000);
+        const configured = health.attach?.configured ?? 0;
+        const online = health.attach?.online ?? 0;
+        if (configured > 0 && online === configured) return;
       } catch {
         // The managed supervisor and Hermes profiles may still be restarting.
       }
@@ -123,15 +122,10 @@ function describeTtl(ms: number): string {
 async function printStatus(configPath: string): Promise<void> {
   const config = loadConfig(configPath);
   const host = config.host ?? "0.0.0.0";
-  const healthUrl = `${healthOrigin(config)}/health`;
   let status = "offline";
   try {
-    const response = await fetch(healthUrl, { signal: AbortSignal.timeout(1_000) });
-    if (response.ok) {
-      const health = (await response.json()) as { attach?: { configured?: number; online?: number } };
-      const attach = health.attach;
-      status = attach === undefined ? "online" : `online; Hermes attach ${attach.online ?? 0}/${attach.configured ?? 0}`;
-    }
+    const attach = (await fetchHealth(configPath, 1_000)).attach;
+    status = attach === undefined ? "online" : `online; Hermes attach ${attach.online ?? 0}/${attach.configured ?? 0}`;
   } catch {
     // An offline gateway is a status result, not a CLI failure.
   }
@@ -169,21 +163,32 @@ async function configureListener(configPath: string, io: CliIo, runtime: CliRunt
     return;
   }
   updateListenerConfig(configPath, host, port);
-  const managed = syncManagedListenerTargets(configPath, host, port);
-  const restarts = await Promise.allSettled(
-    managed.map((profile) => runtime.restartHermesProfile(profile.executable, profile.profile)),
-  );
-  const failed = restarts
-    .map((result, index) => ({ result, profile: managed[index]!.profile }))
-    .filter((entry): entry is { result: PromiseRejectedResult; profile: string } => entry.result.status === "rejected");
-  if (failed.length > 0) {
-    throw new Error(`failed to restart Hermes profile(s): ${failed.map(({ profile }) => profile).join(", ")}`);
+  const activate = async (): Promise<number> => {
+    const managed = syncManagedListenerTargets(configPath);
+    const results = await Promise.allSettled(
+      managed.map((profile) => runtime.restartHermesProfile(profile.executable, profile.profile)),
+    );
+    const failed = managed.filter((_profile, index) => results[index]?.status === "rejected");
+    if (failed.length > 0) throw new Error(`failed to restart Hermes profile(s): ${failed.map(({ profile }) => profile).join(", ")}`);
+    if (managed.length > 0) await runtime.waitForGatewayReady(configPath);
+    return managed.length;
+  };
+  let managedCount: number;
+  try {
+    managedCount = await activate();
+  } catch (error) {
+    updateListenerConfig(configPath, currentHost, current.port);
+    try {
+      await activate();
+    } catch (rollbackError) {
+      throw new Error(`listener change failed (${String(error)}); restoring ${currentHost}:${current.port} also failed (${String(rollbackError)})`);
+    }
+    throw new Error(`listener change failed (${String(error)}); restored ${currentHost}:${current.port}`);
   }
-  if (managed.length > 0) await runtime.waitForGatewayReady(configPath);
   console.log(
-    managed.length === 0
+    managedCount === 0
       ? `Saved listener ${host}:${port}. Restart CozyGateway to apply it.`
-      : `Saved listener ${host}:${port}. CozyGateway and ${managed.length} Hermes profile(s) are restarting.`,
+      : `Saved listener ${host}:${port}. CozyGateway and ${managedCount} Hermes profile(s) are ready.`,
   );
 }
 

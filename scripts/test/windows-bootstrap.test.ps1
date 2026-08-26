@@ -61,7 +61,8 @@ function New-FakeBash {
 function Invoke-Bootstrap {
     param(
         [string] $Installer,
-        [hashtable] $Environment
+        [hashtable] $Environment,
+        [string[]] $Arguments = @()
     )
     $old = @{}
     foreach ($key in $Environment.Keys) {
@@ -71,7 +72,7 @@ function Invoke-Bootstrap {
     try {
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer 2>&1
+        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer @Arguments 2>&1
         return @{ ExitCode = $LASTEXITCODE; Output = ($output -join "`n") }
     } finally {
         $ErrorActionPreference = $previousPreference
@@ -118,6 +119,21 @@ try {
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
     Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
     Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'
+
+    $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
+    $managedBin = Join-Path $temp 'Cozy Gateway\bin'
+    $uninstall = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$managedBin"
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $uninstallPathLog
+    } @('--uninstall')
+    Assert-True ($uninstall.ExitCode -eq 0) "bootstrap uninstall failed: $($uninstall.Output)"
+    $uninstalledPath = Get-Content -LiteralPath $uninstallPathLog -Raw
+    Assert-True (-not ($uninstalledPath -match [regex]::Escape($managedBin))) 'uninstall must remove the managed command directory from the user PATH'
 
     $missingRoot = Join-Path $temp 'missing hermes case'
     $missingHermes = Join-Path $missingRoot 'hermes\bin\hermes.cmd'
