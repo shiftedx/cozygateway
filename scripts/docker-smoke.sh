@@ -50,11 +50,30 @@ for i in $(seq 1 30); do
 done
 
 echo "==> minting a setup code inside the container"
-# Capture the full pair output first, then take the first line locally. Piping the docker exec
-# straight into `head -1` makes head close the pipe after one line; any further CLI output then
+# Capture the full pair output first, then find the machine-readable line locally. Piping the
+# docker exec through a selector makes the selector close the pipe early; any later CLI output then
 # hits SIGPIPE, and under `set -o pipefail` the 141 kills the whole smoke (seen on Linux CI).
 PAIR_OUTPUT="$(docker exec "$NAME" node dist/cli.js pair --config /config/cozygateway.config.json --url "http://127.0.0.1:$PORT")"
-PAIR_JSON="$(printf '%s\n' "$PAIR_OUTPUT" | head -1)"
+PAIR_JSON="$(printf '%s\n' "$PAIR_OUTPUT" | node -e '
+let output = "";
+process.stdin.on("data", chunk => output += chunk).on("end", () => {
+  let jsonLine;
+  for (const line of output.split(/\r?\n/)) {
+    try {
+      const value = JSON.parse(line);
+      if (typeof value?.setupCode === "string" && typeof value?.gatewayUrl === "string") {
+        jsonLine = line;
+        break;
+      }
+    } catch {}
+  }
+  if (!jsonLine) {
+    console.error(`failed to find pairing JSON line in output:\n${output}`);
+    process.exit(1);
+  }
+  process.stdout.write(jsonLine);
+});
+')"
 SETUP_CODE="$(printf '%s' "$PAIR_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).setupCode))")"
 if [ -z "$SETUP_CODE" ]; then echo "failed to mint a setup code"; docker logs "$NAME"; exit 1; fi
 PAIR_URL="$(printf '%s' "$PAIR_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).gatewayUrl))")"

@@ -127,7 +127,14 @@ for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway
   if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/$asset" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/$asset" | awk '{print $1}')"; fi
   printf '%s  %s\n' "$asset_sha" "$asset" > "$tmp/release-assets/$asset.sha256"
 done
-bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="file://$tmp/release-assets" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
+release_asset_base="file://$tmp/release-assets"
+case "$OSTYPE" in
+  msys*|cygwin*)
+    release_assets_windows="$(cygpath -w "$tmp/release-assets")"
+    release_asset_base="file:///${release_assets_windows//\\//}"
+    ;;
+esac
+bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
 grep -Fq 'DRY   verified assets' <<<"$bootstrap_dry_output"
 test ! -e "$tmp/bootstrap-dry-home"
 
