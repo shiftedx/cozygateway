@@ -8,6 +8,8 @@ import {
   type MobileNodeResultFrame,
 } from "cozygateway-contract";
 
+import { emitTrace, type TraceLog } from "./trace.ts";
+
 export type MobileNodeTerminal =
   | "ok" | "denied" | "expired" | "cancelled" | "device_unavailable"
   | "foreground_required" | "policy_blocked";
@@ -25,7 +27,58 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
-type MobileNodeCommand = "device.status" | "location.current";
+export type MobileNodeCommand = "device.status" | "location.current";
+export const MOBILE_NODE_FAILURE_REASONS = [
+  "no_selected_device",
+  "command_not_advertised",
+  "selected_socket_unavailable",
+  "frame_send_failed",
+  "phone_disconnected_pending",
+  "invalid_phone_payload",
+  "broker_closed_pending",
+] as const;
+export type MobileNodeFailureReason = typeof MOBILE_NODE_FAILURE_REASONS[number];
+export type MobileNodeSendOutcome = "sent"
+  | "command_not_advertised" | "selected_socket_unavailable" | "frame_send_failed";
+export interface MobileNodeRoute {
+  status: "available" | "command_not_advertised" | "selected_socket_unavailable";
+  selectedSocketPresent: boolean;
+  selectedSocketOpen: boolean;
+  commandAdvertised: boolean;
+  connectedSocketCount: number;
+}
+
+export interface MobileNodeFailureFields {
+  command: MobileNodeCommand | "unknown";
+  selectedDevicePresent: boolean;
+  selectedSocketPresent: boolean;
+  selectedSocketOpen: boolean;
+  commandAdvertised: boolean;
+  connectedSocketCount: number;
+  pendingCount?: number;
+  payloadParseable?: boolean;
+  payloadSchemaValid?: boolean;
+}
+
+/** Emit only a bounded reason and non-sensitive route state. */
+export function emitMobileNodeFailure(
+  trace: TraceLog | undefined,
+  reason: MobileNodeFailureReason,
+  fields: MobileNodeFailureFields,
+): void {
+  emitTrace(trace, "mobile_node_failure", {
+    reason,
+    command: fields.command,
+    selectedDevicePresent: fields.selectedDevicePresent,
+    selectedSocketPresent: fields.selectedSocketPresent,
+    selectedSocketOpen: fields.selectedSocketOpen,
+    commandAdvertised: fields.commandAdvertised,
+    connectedSocketCount: boundedCount(fields.connectedSocketCount),
+    ...(fields.pendingCount === undefined ? {} : { pendingCount: boundedCount(fields.pendingCount) }),
+    ...(fields.payloadParseable === undefined ? {} : { payloadParseable: fields.payloadParseable }),
+    ...(fields.payloadSchemaValid === undefined ? {} : { payloadSchemaValid: fields.payloadSchemaValid }),
+  });
+}
 interface MobileNodeInvocationBase {
   requestId: string;
   bot: string;
@@ -47,25 +100,31 @@ export class MobileNodeBroker {
   readonly #pending = new Map<string, Pending>();
   /** Every admitted id remains here until its volatile terminal window lapses. */
   readonly #terminal = new Map<string, number>();
-  readonly #available: (deviceId: string, command: MobileNodeCommand) => boolean;
-  readonly #send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean;
+  readonly #route: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
+  readonly #send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
   readonly #result: (agentId: string, frame: MobileNodeResult) => void;
   readonly #now: () => number;
+  readonly #trace: TraceLog | undefined;
   readonly #terminalTtlMs: number;
   readonly #terminalLimit: number;
 
   constructor(deps: {
-    available: (deviceId: string, command: MobileNodeCommand) => boolean;
-    send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean;
+    available?: (deviceId: string, command: MobileNodeCommand) => boolean;
+    route?: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
+    send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
     result: (agentId: string, frame: MobileNodeResult) => void;
+    trace?: TraceLog;
     now?: () => number;
     terminalTtlMs?: number;
     terminalLimit?: number;
   }) {
-    this.#available = deps.available;
+    if (deps.route === undefined && deps.available === undefined)
+      throw new Error("mobile-node route dependency is required");
+    this.#route = deps.route ?? ((deviceId, command) => legacyRoute(deps.available!(deviceId, command)));
     this.#send = deps.send;
     this.#result = deps.result;
     this.#now = deps.now ?? Date.now;
+    this.#trace = deps.trace;
     this.#terminalTtlMs = deps.terminalTtlMs ?? TERMINAL_TTL_MS;
     this.#terminalLimit = deps.terminalLimit ?? TERMINAL_LIMIT;
   }
@@ -75,6 +134,7 @@ export class MobileNodeBroker {
     // `requestId` is a one-shot idempotency key. Never replace a live timer/prompt.
     if (this.#pending.has(input.requestId) || this.#terminal.has(input.requestId)) return;
     if (!input.deviceId) {
+      this.#diagnose("no_selected_device", input.command, false, noRoute());
       this.#terminalize(input.agentId, input.requestId, "device_unavailable", input.expiresAt);
       return;
     }
@@ -82,7 +142,9 @@ export class MobileNodeBroker {
       this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt);
       return;
     }
-    if (!this.#available(input.deviceId, input.command)) {
+    const route = this.#route(input.deviceId, input.command);
+    if (route.status !== "available") {
+      this.#diagnose(route.status, input.command, true, route);
       this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt);
       return;
     }
@@ -96,7 +158,20 @@ export class MobileNodeBroker {
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
     timer.unref();
     this.#pending.set(input.requestId, { deviceId: input.deviceId, agentId: input.agentId, turnId: input.turnId, command: input.command, expiresAt: input.expiresAt, timer });
-    if (!this.#send(input.deviceId, frame)) this.#finish(input.requestId, "device_unavailable");
+    let sendOutcome: boolean | MobileNodeSendOutcome;
+    try {
+      sendOutcome = this.#send(input.deviceId, frame);
+    } catch {
+      sendOutcome = "frame_send_failed";
+    }
+    const normalizedSend = normalizeSendOutcome(sendOutcome);
+    if (normalizedSend !== "sent") {
+      const failedRoute = normalizedSend === "frame_send_failed"
+        ? route
+        : this.#route(input.deviceId, input.command);
+      this.#diagnose(normalizedSend, input.command, true, failedRoute);
+      this.#finish(input.requestId, "device_unavailable");
+    }
   }
 
   reject(agentId: string, requestId: string, status: Exclude<MobileNodeTerminal, "ok"> = "policy_blocked"): void {
@@ -111,14 +186,30 @@ export class MobileNodeBroker {
       return;
     }
     if (frame.status === "ok") {
-      if (pending.command === "location.current" && !this.#available(deviceId, pending.command)) {
-        this.#finish(frame.requestId, "foreground_required");
+      if (pending.command === "location.current") {
+        const route = this.#route(deviceId, pending.command);
+        if (route.status !== "available") {
+          this.#diagnose(route.status, pending.command, true, route);
+          this.#finish(frame.requestId, "foreground_required");
+          return;
+        }
+      }
+      let valid = false;
+      try {
+        valid = pending.command === "device.status"
+          ? check(MobileNodePhoneStatusResultSchema, frame.result)
+          : isLocation(frame.result);
+      } catch {
+        valid = false;
+      }
+      if (!valid) {
+        this.#diagnose("invalid_phone_payload", pending.command, true, this.#route(deviceId, pending.command), {
+          payloadParseable: true,
+          payloadSchemaValid: false,
+        });
         return;
       }
-      if (pending.command === "device.status" && check(MobileNodePhoneStatusResultSchema, frame.result))
-        this.#finish(frame.requestId, "ok", false, frame.result);
-      else if (pending.command === "location.current" && isLocation(frame.result))
-        this.#finish(frame.requestId, "ok", false, frame.result);
+      this.#finish(frame.requestId, "ok", false, frame.result);
       return;
     }
     this.#finish(frame.requestId, frame.status);
@@ -137,7 +228,10 @@ export class MobileNodeBroker {
 
   disconnectDevice(deviceId: string): void {
     for (const [requestId, pending] of this.#pending) {
-      if (pending.deviceId === deviceId) this.#finish(requestId, "device_unavailable");
+      if (pending.deviceId === deviceId) {
+        this.#diagnose("phone_disconnected_pending", pending.command, true, this.#route(deviceId, pending.command));
+        this.#finish(requestId, "device_unavailable");
+      }
     }
   }
 
@@ -148,7 +242,29 @@ export class MobileNodeBroker {
   }
 
   close(): void {
-    for (const requestId of this.#pending.keys()) this.#finish(requestId, "device_unavailable");
+    for (const [requestId, pending] of this.#pending) {
+      this.#diagnose("broker_closed_pending", pending.command, true, this.#route(pending.deviceId, pending.command));
+      this.#finish(requestId, "device_unavailable");
+    }
+  }
+
+  #diagnose(
+    reason: MobileNodeFailureReason,
+    command: MobileNodeCommand,
+    selectedDevicePresent: boolean,
+    route: MobileNodeRoute,
+    payload: Pick<MobileNodeFailureFields, "payloadParseable" | "payloadSchemaValid"> = {},
+  ): void {
+    emitMobileNodeFailure(this.#trace, reason, {
+      command,
+      selectedDevicePresent,
+      selectedSocketPresent: route.selectedSocketPresent,
+      selectedSocketOpen: route.selectedSocketOpen,
+      commandAdvertised: route.commandAdvertised,
+      connectedSocketCount: route.connectedSocketCount,
+      pendingCount: this.#pending.size,
+      ...payload,
+    });
   }
 
   #finish(requestId: string, status: MobileNodeTerminal, notifyDevice = false, result?: MobileNodePhoneStatusResult | { latitude: number; longitude: number }): void {
@@ -202,6 +318,38 @@ export class MobileNodeBroker {
       if (until <= now) this.#terminal.delete(requestId);
     }
   }
+}
+
+function boundedCount(value: number): number {
+  return Math.min(Math.max(Math.trunc(value), 0), 1_024);
+}
+
+function noRoute(): MobileNodeRoute {
+  return {
+    status: "selected_socket_unavailable",
+    selectedSocketPresent: false,
+    selectedSocketOpen: false,
+    commandAdvertised: false,
+    connectedSocketCount: 0,
+  };
+}
+
+function legacyRoute(available: boolean): MobileNodeRoute {
+  return available
+    ? {
+        status: "available", selectedSocketPresent: true, selectedSocketOpen: true,
+        commandAdvertised: true, connectedSocketCount: 1,
+      }
+    : {
+        status: "command_not_advertised", selectedSocketPresent: false, selectedSocketOpen: false,
+        commandAdvertised: false, connectedSocketCount: 0,
+      };
+}
+
+function normalizeSendOutcome(outcome: boolean | MobileNodeSendOutcome): MobileNodeSendOutcome {
+  if (outcome === true) return "sent";
+  if (outcome === false) return "frame_send_failed";
+  return outcome;
 }
 
 function isPurpose(value: string): boolean {
