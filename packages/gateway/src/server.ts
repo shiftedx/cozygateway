@@ -392,9 +392,10 @@ export async function startGateway(
     (event) => liveActivityNotifier.coveredDeviceIdsForChat(event),
   );
   mobileNode = new MobileNodeBroker({
-    available: (deviceId, command) => hub.isMobileNodeAvailable(deviceId, command),
-    send: (deviceId, frame) => hub.sendToDevice(deviceId, frame),
+    route: (deviceId, command) => hub.mobileNodeRoute(deviceId, command),
+    send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
     result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
+    trace: traceLog,
   });
   nativeBotPlane = new NativeBotDataPlane({
     control: bridge,

@@ -15,6 +15,12 @@ import {
 
 import type { Storage } from "./storage.ts";
 import { hashToken } from "./auth.ts";
+import {
+  emitMobileNodeFailure,
+  type MobileNodeCommand,
+  type MobileNodeRoute,
+  type MobileNodeSendOutcome,
+} from "./mobile-node.ts";
 import { emitTrace, traceId, type TraceLog } from "./trace.ts";
 
 interface Client {
@@ -108,6 +114,22 @@ export class WsHub {
         frame = undefined;
       }
       if (!check(ClientFrameSchema, frame)) {
+        const looksLikeMobileResult = typeof frame === "object" && frame !== null
+          && (frame as { type?: unknown }).type === "mobile_node_result";
+        if (client !== undefined && this.#mobileNodes.get(client.deviceId) === client
+          && (frame === undefined || looksLikeMobileResult)) {
+          const selected = this.#mobileNodes.get(client.deviceId);
+          emitMobileNodeFailure(this.#trace, "invalid_phone_payload", {
+            command: "unknown",
+            selectedDevicePresent: true,
+            selectedSocketPresent: selected !== undefined,
+            selectedSocketOpen: selected?.socket.readyState === WebSocket.OPEN,
+            commandAdvertised: (selected?.mobileCommands.size ?? 0) > 0,
+            connectedSocketCount: this.#connectedSocketCount(client.deviceId),
+            payloadParseable: frame !== undefined,
+            payloadSchemaValid: false,
+          });
+        }
         if (client === undefined) {
           this.#send(socket, { type: "error", code: "unauthorized", message: "first frame must be auth" });
           socket.close(1008, "unauthenticated");
@@ -241,16 +263,62 @@ export class WsHub {
     }
   }
 
-  sendToDevice(deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame): boolean {
+  #connectedSocketCount(deviceId: string): number {
+    let count = 0;
+    for (const client of this.#clients) {
+      if (client.deviceId === deviceId && client.socket.readyState === WebSocket.OPEN) count += 1;
+    }
+    return count;
+  }
+
+  mobileNodeRoute(deviceId: string, command: MobileNodeCommand = "device.status"): MobileNodeRoute {
     const client = this.#mobileNodes.get(deviceId);
-    if (client === undefined || client.socket.readyState !== WebSocket.OPEN || (frame.type === "mobile_node_request" && !client.mobileCommands.has(frame.command))) return false;
-    client.socket.send(JSON.stringify(frame));
-    return true;
+    const connectedSocketCount = this.#connectedSocketCount(deviceId);
+    if (client === undefined) {
+      return {
+        status: connectedSocketCount > 0 ? "command_not_advertised" : "selected_socket_unavailable",
+        selectedSocketPresent: false,
+        selectedSocketOpen: false,
+        commandAdvertised: false,
+        connectedSocketCount,
+      };
+    }
+    const selectedSocketOpen = client.socket.readyState === WebSocket.OPEN;
+    const commandAdvertised = client.mobileCommands.has(command);
+    return {
+      status: !selectedSocketOpen
+        ? "selected_socket_unavailable"
+        : commandAdvertised ? "available" : "command_not_advertised",
+      selectedSocketPresent: true,
+      selectedSocketOpen,
+      commandAdvertised,
+      connectedSocketCount,
+    };
+  }
+
+  sendMobileNodeFrame(
+    deviceId: string,
+    frame: MobileNodeRequestFrame | MobileNodeCancelFrame,
+  ): MobileNodeSendOutcome {
+    const client = this.#mobileNodes.get(deviceId);
+    if (client === undefined) return "selected_socket_unavailable";
+    if (client.socket.readyState !== WebSocket.OPEN) return "selected_socket_unavailable";
+    if (frame.type === "mobile_node_request" && !client.mobileCommands.has(frame.command))
+      return "command_not_advertised";
+    try {
+      client.socket.send(JSON.stringify(frame));
+      return "sent";
+    } catch {
+      return "frame_send_failed";
+    }
+  }
+
+  sendToDevice(deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame): boolean {
+    return this.sendMobileNodeFrame(deviceId, frame) === "sent";
   }
 
   isMobileNodeAvailable(deviceId: string, command: MobileNodeRequestFrame["command"] = "device.status"): boolean {
-    const client = this.#mobileNodes.get(deviceId);
-    return client !== undefined && client.socket.readyState === WebSocket.OPEN && client.mobileCommands.has(command);
+    return this.mobileNodeRoute(deviceId, command).status === "available";
   }
 
   close(): void {
