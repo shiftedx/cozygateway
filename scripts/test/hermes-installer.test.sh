@@ -59,6 +59,21 @@ fi
 exit 0
 HERMES
 chmod 700 "$tmp/bin/hermes" "$fake_node"
+# Git Bash ships cygpath and the installer rightly refuses to guess without it, but these cases
+# drive the Windows path from macOS and from the Linux CI runner, where it does not exist. The
+# stub converts the two ways the installer asks: `-u` is already POSIX here, and `-w` produces a
+# recognisably Windows-shaped path so an assertion about one cannot pass by accident.
+cat > "$tmp/bin/cygpath" <<'CYGPATH'
+#!/usr/bin/env bash
+mode="$1"; shift
+path="$1"
+case "$mode" in
+  -u) path="${path//\\//}"; printf '%s' "${path#[A-Za-z]:}" ;;
+  -w) printf 'C:%s' "${path//\//\\}" ;;
+  *) printf '%s' "$path" ;;
+esac
+CYGPATH
+chmod 700 "$tmp/bin/cygpath"
 printf 'absent\n' > "$tmp/hermes/gateway-default.state"
 printf 'stopped\n' > "$tmp/hermes/gateway-ops.state"
 printf 'running\n' > "$tmp/hermes/gateway-active.state"
@@ -398,7 +413,10 @@ fi
 # Removal is a recovery path: it must work from persisted install state even
 # when the listener config is corrupt and Node cannot be resolved.
 printf '{not-json\n' > "$tmp/gateway-windows-fallback/local/cozygateway.config.json"
-sed -i "s|^hermes_bin=.*|hermes_bin=$tmp/missing-hermes|" "$tmp/gateway-windows-fallback/local/install-state"
+# Not `sed -i`: BSD sed requires a backup suffix for it and reads the expression as one, so the
+# in-place form runs on the Linux runner and fails on the Mac this is written on.
+sed "s|^hermes_bin=.*|hermes_bin=$tmp/missing-hermes|" "$tmp/gateway-windows-fallback/local/install-state" > "$tmp/install-state.rewritten"
+mv "$tmp/install-state.rewritten" "$tmp/gateway-windows-fallback/local/install-state"
 curl_count_before_uninstall="$(wc -l < "$tmp/curl.log")"
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_UNRELATED_LISTENER=1 COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test "$(wc -l < "$tmp/curl.log")" = "$curl_count_before_uninstall"

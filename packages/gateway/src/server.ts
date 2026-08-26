@@ -48,7 +48,7 @@ import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 
-export const GATEWAY_VERSION = "0.2.8";
+export const GATEWAY_VERSION = "0.2.9";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
