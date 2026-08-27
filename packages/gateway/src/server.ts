@@ -29,6 +29,7 @@ import {
 } from "./adapters/attach/adapter.ts";
 import { revokeAttachTokens } from "./adapters/attach/token-auth.ts";
 import { createApp } from "./http.ts";
+import type { PairingAttemptLimiter } from "./pairing-admission.ts";
 import { WsHub } from "./ws-hub.ts";
 import { MobileNodeBroker } from "./mobile-node.ts";
 import { TurnRunner } from "./turns.ts";
@@ -134,6 +135,9 @@ export interface StartGatewayOptions {
   approvalLog?: (message: string) => void;
   /** JSON-line, privacy-safe transport transition diagnostics. */
   traceLog?: TraceLog;
+  /** Test-only `/pair` admission seam. The production path always uses the default bucket built
+   *  from its wall clock; a long-running black-box harness may supply a virtual-clock bucket. */
+  pairingAdmission?: PairingAttemptLimiter;
 }
 
 /** The assembly seam between Hermes' settled-chat event and the relay notifier. Kept pure so the
@@ -474,6 +478,7 @@ export async function startGateway(
     storage,
     config,
     gatewayInfo,
+    ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),
     attachDeadLetters: () => storage.attachProjectionDeadLetters(),
     releaseAttachDeadLetter: (agentId, eventId) =>

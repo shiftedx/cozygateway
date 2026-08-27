@@ -38,6 +38,10 @@ function makeApp(now = () => 1_000, attachHealth?: () => AttachHealthSummary) {
 async function pair(app: ReturnType<typeof makeApp>["app"], storage: ReturnType<typeof openStorage>, now = 1_000) {
   const code = newSetupCode();
   storage.createSetupCode(code, now + SETUP_CODE_TTL_MS);
+  return pairWithCode(app, code);
+}
+
+async function pairWithCode(app: ReturnType<typeof makeApp>["app"], code: string) {
   const res = await app.request("/pair", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -138,6 +142,87 @@ describe("POST /pair", () => {
       body: JSON.stringify({ deviceName: "no code" }),
     });
     expect(res.status).toBe(400);
+  });
+
+  it("rejects a declared body over 4 KiB before it consumes the setup code", async () => {
+    const { app, storage } = makeApp();
+    const code = newSetupCode();
+    storage.createSetupCode(code, 1_000 + SETUP_CODE_TTL_MS);
+
+    const refused = await app.request("/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": "4097" },
+      body: JSON.stringify({ setupCode: code, deviceName: "Test phone" }),
+    });
+    expect(refused.status).toBe(413);
+    expect((await refused.json()) as { error: { code: string } }).toEqual({
+      error: { code: "invalid_request", message: "pairing request is over the 4096 byte cap" },
+    });
+
+    expect((await pairWithCode(app, code)).status).toBe(200);
+  });
+
+  it("cuts off a streamed body over 4 KiB before it consumes the setup code", async () => {
+    const { app, storage } = makeApp();
+    const code = newSetupCode();
+    storage.createSetupCode(code, 1_000 + SETUP_CODE_TTL_MS);
+    const encoder = new TextEncoder();
+    const body = JSON.stringify({ setupCode: code, deviceName: "Test phone", ignored: "x".repeat(4096) });
+    const init: RequestInit = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(body.slice(0, 100)));
+          controller.enqueue(encoder.encode(body.slice(100)));
+          controller.close();
+        },
+      }),
+    };
+    Reflect.set(init, "duplex", "half");
+    const request = new Request("http://localhost/pair", init);
+
+    const refused = await app.fetch(request);
+    expect(refused.status).toBe(413);
+    expect((await pairWithCode(app, code)).status).toBe(200);
+  });
+
+  it("shares ten attempts across malformed, invalid, and successful pairs, then refills on its clock", async () => {
+    let now = 1_000;
+    const { app, storage } = makeApp(() => now);
+    for (let i = 0; i < 8; i += 1) {
+      expect((await app.request("/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{ malformed",
+      })).status).toBe(400);
+    }
+    expect((await app.request("/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setupCode: "NOPE-0000", deviceName: "Test phone" }),
+    })).status).toBe(401);
+
+    const successfulCode = newSetupCode();
+    storage.createSetupCode(successfulCode, now + SETUP_CODE_TTL_MS);
+    expect((await pairWithCode(app, successfulCode)).status).toBe(200);
+
+    const blockedCode = newSetupCode();
+    storage.createSetupCode(blockedCode, now + SETUP_CODE_TTL_MS);
+    const limited = await pairWithCode(app, blockedCode);
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("6");
+    expect((await limited.json()) as { error: { code: string } }).toEqual({
+      error: { code: "invalid_request", message: "too many pairing attempts; try again later" },
+    });
+
+    now += 5_001;
+    const nearlyRefilled = await pairWithCode(app, blockedCode);
+    expect(nearlyRefilled.status).toBe(429);
+    expect(nearlyRefilled.headers.get("retry-after")).toBe("1");
+
+    now += 999;
+    expect((await pairWithCode(app, blockedCode)).status).toBe(200);
   });
 });
 

@@ -50,6 +50,7 @@ import { attachmentDisposition, safeFilename } from "./hermes-bridge/documents.t
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
+import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
 
 /** The relay's register body, mirrored here rather than imported: the gateway's docker image
  *  bundles only its own package, so a runtime import of cozygateway-relay crashes the container
@@ -89,6 +90,9 @@ const LiveActivityRegisterRequestSchema = Type.Object(
 
 export interface AppDeps {
   storage: Storage;
+  /** Test-only override for the gateway-wide `/pair` bucket. Production leaves this absent and
+   *  builds its limiter from `now`; a long-lived black-box harness supplies one with virtual time. */
+  pairingAdmission?: PairingAttemptLimiter;
   /** The bots bridge, present only when a hermes bridge is configured. When absent the `/bots`
    *  routes are not registered at all and the capability is not advertised, so an app probing
    *  `GatewayInfo.capabilities` sees the truth. */
@@ -177,6 +181,7 @@ type Env = { Variables: { deviceId: string } };
 
 export function createApp(deps: AppDeps): Hono<Env> {
   const app = new Hono<Env>();
+  const pairingAdmission = deps.pairingAdmission ?? new PairingAdmission(deps.now);
 
   const requireDevice = createMiddleware<Env>(async (c, next) => {
     const header = c.req.header("authorization") ?? "";
@@ -276,10 +281,24 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   app.post("/pair", async (c) => {
-    const body = await readBody(c);
+    const body = await readPairBody(c.req.raw);
+    if (body.kind === "too_large") {
+      return c.json(
+        errorBody("invalid_request", `pairing request is over the ${PAIR_REQUEST_MAX_BYTES} byte cap`),
+        413,
+      );
+    }
+    const retryAfter = pairingAdmission.attempt();
+    if (retryAfter !== undefined) {
+      return c.json(
+        errorBody("invalid_request", "too many pairing attempts; try again later"),
+        429,
+        { "retry-after": String(retryAfter) },
+      );
+    }
     let pairRequest;
     try {
-      pairRequest = assertValid(PairRequestSchema, body);
+      pairRequest = assertValid(PairRequestSchema, body.value);
     } catch (err) {
       const detail =
         err instanceof ContractViolation ? err.message : "malformed body";
