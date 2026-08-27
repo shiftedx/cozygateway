@@ -827,17 +827,36 @@ export class Storage {
     this.#db.prepare("DELETE FROM push_registrations WHERE device_id = ?").run(deviceId);
   }
 
-  saveLiveActivityRegistration(row: Omit<LiveActivityRegistrationRow, "eventSequence" | "lastTimestamp">): string | undefined {
-    const previous = this.liveActivityRegistration(row.deviceId, row.activityId)?.pushId;
-    this.#db.prepare(
-      `INSERT INTO live_activity_registrations
-       (device_id, activity_id, run_id, conversation_id, bot, push_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(device_id, activity_id) DO UPDATE SET
-         run_id = excluded.run_id, conversation_id = excluded.conversation_id,
-         bot = excluded.bot, push_id = excluded.push_id, created_at = excluded.created_at`,
-    ).run(row.deviceId, row.activityId, row.runId, row.conversationId, row.bot, row.pushId, row.createdAt);
-    return previous;
+  /** Stores the one ActivityKit card owned by this device conversation and returns relay push ids
+   * that the caller must retire. The replacement and stale-row removal are one transaction so a
+   * turn can never observe both the superseded card and its replacement. */
+  saveLiveActivityRegistration(
+    row: Omit<LiveActivityRegistrationRow, "eventSequence" | "lastTimestamp">,
+  ): string[] {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.#db.prepare(
+        `SELECT push_id AS pushId FROM live_activity_registrations
+         WHERE device_id = ? AND (conversation_id = ? OR activity_id = ?)`,
+      ).all(row.deviceId, row.conversationId, row.activityId) as Array<{ pushId: string }>;
+      this.#db.prepare(
+        `DELETE FROM live_activity_registrations
+         WHERE device_id = ? AND conversation_id = ? AND activity_id <> ?`,
+      ).run(row.deviceId, row.conversationId, row.activityId);
+      this.#db.prepare(
+        `INSERT INTO live_activity_registrations
+         (device_id, activity_id, run_id, conversation_id, bot, push_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(device_id, activity_id) DO UPDATE SET
+           run_id = excluded.run_id, conversation_id = excluded.conversation_id,
+           bot = excluded.bot, push_id = excluded.push_id, created_at = excluded.created_at`,
+      ).run(row.deviceId, row.activityId, row.runId, row.conversationId, row.bot, row.pushId, row.createdAt);
+      this.#db.exec("COMMIT");
+      return [...new Set(previous.map(({ pushId }) => pushId).filter((pushId) => pushId !== row.pushId))];
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   liveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {

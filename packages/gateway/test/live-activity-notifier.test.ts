@@ -165,4 +165,53 @@ describe("live activity notifier", () => {
     })]).toEqual([]);
     storage.close();
   });
+
+  it("never fans a current conversation frame out to stale conversations from the same bot", async () => {
+    const storage = openStorage(":memory:");
+    for (let index = 0; index < 10; index += 1) {
+      storage.createDevice({
+        id: `stale-device-${index}`, name: `stale phone ${index}`,
+        tokenHash: `stale-hash-${index}`, createdAt: 1,
+      });
+      storage.saveLiveActivityRegistration({
+        deviceId: `stale-device-${index}`, activityId: `stale-${index}`, runId: `stale-run-${index}`,
+        conversationId: "session-a", bot: "sage", pushId: `stale-push-${index}`, createdAt: index,
+      });
+    }
+    storage.createDevice({ id: "device", name: "phone", tokenHash: "hash", createdAt: 1 });
+    storage.saveLiveActivityRegistration({
+      deviceId: "device", activityId: "current", runId: "current-run",
+      conversationId: "session-b", bot: "sage", pushId: "current-push", createdAt: 20,
+    });
+    const bodies: any[] = [];
+    const notifier = new LiveActivityNotifier({
+      storage, relayBaseUrl: "https://relay.test", now: () => 10_000, toolCoalesceMs: 0,
+      fetchImpl: async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(null, { status: 202 });
+      },
+    });
+    const notify = async (frame: ServerFrame) => {
+      const before = bodies.length;
+      notifier.handleFrame(frame);
+      await tick();
+      expect.soft(bodies.slice(before).map((body) => body.pushId)).toEqual(["current-push"]);
+    };
+
+    await notify({ type: "bot_chat_state", bot: "sage", sessionId: "session-b", phase: "polling",
+      running: true, inflight: true, updatedAt: 1 } as ServerFrame);
+    await notify({ type: "bot_tool_activity", bot: "sage", sessionId: "session-b", turnId: "turn",
+      steps: [{ id: "call", name: "shell", state: "running" }], updatedAt: 2 } as unknown as ServerFrame);
+    await notify({ type: "bot_chat_delta", bot: "sage", sessionId: "session-b", turnId: "turn",
+      text: "draft", updatedAt: 3 } as unknown as ServerFrame);
+    await notify({ type: "bot_approval_pending", bot: "sage", sessionId: "session-b", turnId: "turn",
+      toolCallId: "call", name: "shell", updatedAt: 4 } as unknown as ServerFrame);
+    await notify({ type: "bot_approval_resolved", bot: "sage", sessionId: "session-b", turnId: "turn",
+      toolCallId: "call", outcome: "approved", updatedAt: 5 } as unknown as ServerFrame);
+    await notify({ type: "bot_chat_state", bot: "sage", sessionId: "session-b", phase: "complete",
+      running: false, inflight: false, updatedAt: 6 } as ServerFrame);
+
+    expect.soft(bodies).toHaveLength(6);
+    storage.close();
+  });
 });

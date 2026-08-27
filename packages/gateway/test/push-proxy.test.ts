@@ -15,8 +15,9 @@ interface RelayCall {
   authorization: string | null;
 }
 
-async function setup() {
+async function setup(liveActivityPushIds: readonly string[] = ["relay-push-id"]) {
   const calls: RelayCall[] = [];
+  let liveActivityRegistration = 0;
   const relayFetch: typeof fetch = async (input, init) => {
     const request = new Request(input, init);
     calls.push({
@@ -27,7 +28,9 @@ async function setup() {
     });
     return request.method === "DELETE"
       ? new Response(null, { status: 204 })
-      : new Response('{"pushId":"relay-push-id"}', {
+      : new Response(JSON.stringify({
+          pushId: liveActivityPushIds[liveActivityRegistration++] ?? "relay-push-id",
+        }), {
           status: 201,
           headers: { "content-type": "application/json" },
         });
@@ -68,7 +71,7 @@ async function setup() {
       ...init,
       headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` },
     });
-  return { app, authed, calls };
+  return { app, authed, calls, storage };
 }
 
 describe("authenticated push relay proxy", () => {
@@ -154,6 +157,25 @@ describe("authenticated push relay proxy", () => {
     expect(calls[1]).toMatchObject({
       method: "DELETE", url: "http://relay.internal:8788/register/relay-push-id",
     });
+  });
+
+  it("retires a superseded Live Activity registration for the same device conversation", async () => {
+    const { authed, calls, storage } = await setup(["stale-push-id", "current-push-id"]);
+    const register = (activityId: string, runId: string) => authed("/push/live-activities/register", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ activityId, runId, conversationId: "gateway-1", bot: "sage",
+        token: "aa".repeat(32), environment: "development" }),
+    });
+
+    expect((await register("stale-activity", "run-1")).status).toBe(200);
+    expect((await register("current-activity", "run-2")).status).toBe(200);
+
+    expect.soft(storage.liveActivityRegistrations("sage")).toMatchObject([
+      { activityId: "current-activity", pushId: "current-push-id" },
+    ]);
+    expect.soft(calls.filter((call) => call.method === "DELETE")).toMatchObject([
+      { url: "http://relay.internal:8788/register/stale-push-id" },
+    ]);
   });
 
   it("advertises the push proxy capability in health", async () => {

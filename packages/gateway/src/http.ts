@@ -694,7 +694,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
     if (typeof result.pushId !== "string" || result.pushId.length === 0) {
       return c.json(errorBody("internal", "relay returned no push id"), 502);
     }
-    const previous = deps.storage.saveLiveActivityRegistration({
+    const superseded = deps.storage.saveLiveActivityRegistration({
       deviceId: c.get("deviceId"),
       activityId: decoded.activityId,
       runId: decoded.runId,
@@ -703,10 +703,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
       pushId: result.pushId,
       createdAt: deps.now(),
     });
-    if (previous !== undefined && previous !== result.pushId) {
-      void relayFetch(`${relayBase}/register/${encodeURIComponent(previous)}`, {
-        method: "DELETE",
-      });
+    for (const pushId of superseded) {
+      void relayFetch(`${relayBase}/register/${encodeURIComponent(pushId)}`, { method: "DELETE" });
     }
     return c.json({ ok: true });
   });
