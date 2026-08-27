@@ -138,6 +138,14 @@ export type MobileNodeInvocation =
 
 const TERMINAL_TTL_MS = 30_000;
 const TERMINAL_LIMIT = 1_024;
+const QUERY_DEADLINE_MS = 30_000;
+const INTERACTION_DEADLINE_MS = 120_000;
+
+function maxDeadlineMs(command: MobileNodeCommand): number {
+  return command === "device.status" || command === "location.current"
+    ? QUERY_DEADLINE_MS
+    : INTERACTION_DEADLINE_MS;
+}
 
 /** Origin-bound ephemeral requests; status may run in background, location may not. */
 export class MobileNodeBroker {
@@ -186,7 +194,9 @@ export class MobileNodeBroker {
         failure("routing", "no_selected_device"));
       return;
     }
-    if (input.expiresAt <= this.#now() || input.expiresAt > this.#now() + 30_000 || !isPurpose(input.purpose)) {
+    if (input.expiresAt <= this.#now()
+      || input.expiresAt > this.#now() + maxDeadlineMs(input.command)
+      || !isPurpose(input.purpose)) {
       this.#diagnose("request_policy_rejected", input.command, true, noRoute());
       this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt,
         failure("policy", "request_policy_rejected"));
@@ -391,7 +401,9 @@ export class MobileNodeBroker {
       this.#settle(claim.pending, "policy_blocked", undefined, failure("media", failedReason));
       return false;
     }
-    if (claim.pending.expiresAt <= this.#now()) { this.#settle(claim.pending, "expired"); return false; }
+    // beginMediaUpload consumed the one-shot lease before the request body was admitted. Once
+    // that happened on time, the original interaction deadline must not invalidate bytes merely
+    // because reading, validating, and storing them crossed the deadline.
     const route = this.#route(claim.pending.deviceId, claim.pending.command);
     if (route.status !== "available" || route.foreground !== true) { this.#settle(claim.pending, "foreground_required"); return false; }
     return this.#settle(claim.pending, "ok", media);
