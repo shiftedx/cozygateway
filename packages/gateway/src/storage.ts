@@ -38,6 +38,22 @@ export type NativeInteractionResolutionRequest =
  * never pruned; retain only the newest bounded terminal proof per profile. */
 const NATIVE_INTERACTION_SETTLEMENT_LIMIT = 100;
 
+const BOT_MOBILE_RECEIPT_COLUMNS = `
+  request_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  command TEXT NOT NULL CHECK (command IN (
+    'device.status', 'location.current', 'camera.capture', 'file.pick', 'notification.present'
+  )),
+  shared_description TEXT NOT NULL CHECK (shared_description IN (
+    'Device status', 'Approximate location', 'Camera photo', 'Camera video',
+    'Selected photo', 'Selected file', 'Notification action'
+  )),
+  purpose TEXT NOT NULL,
+  shared_at INTEGER NOT NULL
+`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
@@ -346,14 +362,7 @@ CREATE TABLE IF NOT EXISTS bot_message_receipts (
 -- Capability 39 phone-sharing receipts. The request id is the idempotency key; the remaining
 -- columns are chat-visible metadata. Device identity, lease, and shared result are never stored.
 CREATE TABLE IF NOT EXISTS bot_mobile_receipts (
-  request_id TEXT PRIMARY KEY,
-  bot TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  turn_id TEXT NOT NULL,
-  command TEXT NOT NULL CHECK (command IN ('device.status', 'location.current')),
-  shared_description TEXT NOT NULL CHECK (shared_description IN ('Device status', 'Approximate location')),
-  purpose TEXT NOT NULL,
-  shared_at INTEGER NOT NULL
+${BOT_MOBILE_RECEIPT_COLUMNS}
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_mobile_receipts_session
   ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
@@ -2465,9 +2474,10 @@ export class Storage {
   }): BotMobileReceipt | undefined {
     const written = this.#db
       .prepare(
-        `INSERT OR IGNORE INTO bot_mobile_receipts
+        `INSERT INTO bot_mobile_receipts
            (request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(request_id) DO NOTHING`,
       )
       .run(
         input.requestId,
@@ -3158,12 +3168,49 @@ export function openStorage(dbPath: string): Storage {
   // heal. The honest watermark is therefore "replay begins with events journaled after this
   // migration": every pre-existing unapplied row is stamped applied at its own received_at, so
   // the first boot replays nothing historical.
-  const { user_version: schemaVersion } = db
+  let { user_version: schemaVersion } = db
     .prepare("PRAGMA user_version")
     .get() as { user_version: number };
   if (schemaVersion < 1) {
     db.exec("UPDATE attach_event_inbox SET applied_at = received_at WHERE applied_at IS NULL");
     db.exec("PRAGMA user_version = 1");
+    schemaVersion = 1;
+  }
+  // Capability 39 originally shipped with receipt constraints for status and location only.
+  // Expanded phone commands reached the broker later, so SQLite rejected every successful camera,
+  // picker, and notification receipt. Rebuild the table transactionally because SQLite cannot
+  // alter a CHECK constraint in place; the old table's narrower constraints guarantee every copied
+  // row is valid under the expanded domain.
+  if (schemaVersion < 2) {
+    const receiptTable = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bot_mobile_receipts'")
+      .get() as { sql: string };
+    if (!receiptTable.sql.includes("'notification.present'")) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec(`
+          DROP INDEX IF EXISTS bot_mobile_receipts_session;
+          ALTER TABLE bot_mobile_receipts RENAME TO bot_mobile_receipts_v1;
+          CREATE TABLE bot_mobile_receipts (
+${BOT_MOBILE_RECEIPT_COLUMNS}
+          ) STRICT, WITHOUT ROWID;
+          INSERT INTO bot_mobile_receipts
+            (request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at)
+          SELECT request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at
+          FROM bot_mobile_receipts_v1;
+          DROP TABLE bot_mobile_receipts_v1;
+          CREATE INDEX bot_mobile_receipts_session
+            ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
+          PRAGMA user_version = 2;
+          COMMIT;
+        `);
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    } else {
+      db.exec("PRAGMA user_version = 2");
+    }
   }
   return new Storage(db);
 }
