@@ -259,6 +259,44 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"status": "policy_blocked"})
         self.assertNotIn("background", "\n".join(captured.output))
 
+    async def test_later_message_context_does_not_discard_the_originating_turns_phone_payload(self):
+        client = _Client()
+        adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+        call = asyncio.create_task(self.tool["handler"]({"purpose": "Report phone readiness"}))
+        await asyncio.sleep(0)
+
+        adapter_module._current_turn_platform_and_chat = lambda: (adapter_module.PLATFORM_NAME, "thread-2")
+        adapter_module._current_turn_message_and_cron = lambda: ("turn-2", False, "profile-1")
+        client.result.set_result({"status": "ok", "result": GATEWAY_STATUS})
+
+        self.assertEqual(json.loads(await call), {"status": "ok", "result": GATEWAY_STATUS})
+
+    async def test_origin_ownership_changes_while_awaiting_still_discard_the_phone_payload(self):
+        for change in ("ended_turn", "changed_profile", "replaced_adapter"):
+            with self.subTest(change=change):
+                for active in adapter_module._active_adapters_snapshot():
+                    adapter_module._unregister_active_adapter(active)
+                client = _Client()
+                origin = _Adapter(client, {"thread-1": "turn-1"})
+                adapter_module._register_active_adapter(origin)
+                call = asyncio.create_task(self.tool["handler"]({"purpose": "Report phone readiness"}))
+                await asyncio.sleep(0)
+
+                if change == "ended_turn":
+                    origin._active_turn.clear()
+                elif change == "changed_profile":
+                    origin._profile = "profile-2"
+                else:
+                    adapter_module._unregister_active_adapter(origin)
+                    adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+                client.result.set_result({"status": "ok", "result": GATEWAY_STATUS})
+
+                with self.assertLogs(adapter_module.logger, level="WARNING") as captured:
+                    result = json.loads(await call)
+                self.assertEqual(result, {"status": "policy_blocked"})
+                self.assertIn("reason=origin_turn_changed_after_request", "\n".join(captured.output))
+                self.assertNotIn("background", "\n".join(captured.output))
+
     async def test_cancellation_is_one_terminal_result(self):
         client = _Client()
         adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))

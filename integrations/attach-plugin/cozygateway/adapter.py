@@ -2747,7 +2747,8 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
     if len(adapters) != 1:
         _log_mobile_policy_block("active_adapter_count", adapter_count=len(adapters))
         return _mobile_tool_result("policy_blocked")
-    profile_match = bool(profile) and profile == getattr(adapters[0], "_profile", None)
+    origin_adapter = adapters[0]
+    profile_match = bool(profile) and profile == getattr(origin_adapter, "_profile", None)
     if not profile_match:
         _log_mobile_policy_block(
             "profile_mismatch",
@@ -2755,7 +2756,7 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
             profile_match=False,
         )
         return _mobile_tool_result("policy_blocked")
-    turn_id = adapters[0]._active_turn[chat_id]
+    turn_id = origin_adapter._active_turn[chat_id]
     if message_id != turn_id:
         _log_mobile_policy_block(
             "turn_message_mismatch",
@@ -2764,26 +2765,19 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
         )
         return _mobile_tool_result("policy_blocked")
     try:
-        outcome = await request(adapters[0], chat_id, turn_id)
+        outcome = await request(origin_adapter, chat_id, turn_id)
     except asyncio.CancelledError:
         return _mobile_tool_result("cancelled")
-    try:
-        after_platform, after_chat_id = _current_turn_platform_and_chat()
-        after_message_id, after_cron, after_profile = _current_turn_message_and_cron()
-        after_adapters = [
-            adapter for adapter in _active_adapters_snapshot()
-            if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
-        ]
-    except Exception:  # noqa: BLE001 - payload release must fail closed
-        after_adapters = []
-        after_platform = after_chat_id = after_message_id = after_profile = None
-        after_cron = True
-    if (
-        after_platform != platform or after_chat_id != chat_id or after_message_id != turn_id
-        or after_cron or after_profile != profile or len(after_adapters) != 1
-        or after_adapters[0] is not adapters[0]
-    ):
-        _log_mobile_policy_block("context_changed_after_request")
+    # The admitted tuple above is the request's immutable origin. Hermes' current
+    # message context may legitimately move while a person answers the phone sheet;
+    # only replacement or loss of that exact origin adapter/turn invalidates its lease.
+    after_adapters = [
+        adapter for adapter in _active_adapters_snapshot()
+        if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+        and getattr(adapter, "_profile", None) == profile
+    ]
+    if len(after_adapters) != 1 or after_adapters[0] is not origin_adapter:
+        _log_mobile_policy_block("origin_turn_changed_after_request")
         return _mobile_tool_result("policy_blocked")
     status = outcome.get("status")
     result = outcome.get("result")
