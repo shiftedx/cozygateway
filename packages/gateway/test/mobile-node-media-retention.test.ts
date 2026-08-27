@@ -16,7 +16,7 @@ const config: GatewayConfig = {
 };
 
 describe("mobile-node media retention", () => {
-  it("assigns uploaded media the bounded attachment expiry and makes it unreadable at that deadline", async () => {
+  it("retains the storage expiry without adding it to the agent result", async () => {
     const storage = openStorage(":memory:");
     const now = 1_000;
     const token = "device-token";
@@ -53,7 +53,14 @@ describe("mobile-node media retention", () => {
       expect(response.status).toBe(201);
       const body = await response.json() as { media: { mediaId: string; expiresAt?: number } };
       expect(body.media.expiresAt).toBe(now + ATTACH_MEDIA_TTL_MS);
-      expect(completed[0]?.[0]).toMatchObject({ expiresAt: now + ATTACH_MEDIA_TTL_MS });
+      expect(completed[0]?.[0]).toEqual({
+        mediaId: body.media.mediaId,
+        mimeType: "image/png",
+        byteCount: 8,
+        sha256: "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+        filename: "camera.png",
+        family: "image",
+      });
       expect(storage.attachMediaInfo("sage", body.media.mediaId, now)?.descriptor).toMatchObject({
         expiresAt: now + ATTACH_MEDIA_TTL_MS,
       });
