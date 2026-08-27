@@ -18,6 +18,7 @@ import {
   RenameThreadRequestSchema,
   SendMessageRequestSchema,
   assertValid,
+  GatewaySettingsSchema,
 } from "cozygateway-contract";
 
 import { Type } from "@sinclair/typebox";
@@ -130,6 +131,10 @@ export interface AppDeps {
   pushRelayFetch?: typeof fetch;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
+  gatewaySettings?: {
+    read(): unknown;
+    update(input: unknown): unknown;
+  };
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
@@ -250,6 +255,25 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return undefined;
     }
   };
+
+  app.get("/gateway/settings", requireDevice, (c) => {
+    if (deps.gatewaySettings === undefined)
+      return c.json(errorBody("invalid_request", "gateway settings are not editable: no writable source config path"), 409);
+    return c.json(deps.gatewaySettings.read());
+  });
+
+  app.put("/gateway/settings", requireDevice, async (c) => {
+    if (deps.gatewaySettings === undefined)
+      return c.json(errorBody("invalid_request", "gateway settings are not editable: no writable source config path"), 409);
+    try {
+      const input = assertValid(GatewaySettingsSchema, await readBody(c));
+      return c.json(deps.gatewaySettings.update(input));
+    } catch (error) {
+      if (error instanceof ContractViolation)
+        return c.json(errorBody("invalid_request", error.message), 400);
+      throw error;
+    }
+  });
 
   // `deps.gatewayInfo` is a static snapshot taken once at server assembly (it also seeds `/pair`
   // and the `ready` frame), so it cannot carry live bridge state. `bridges` is computed fresh on

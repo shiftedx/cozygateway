@@ -81,6 +81,19 @@ describe("startGateway end to end", () => {
     }
   });
 
+  it("keeps settings authenticated but non-editable without a source config path", async () => {
+    expect((await fetch(`${gateway.url}/gateway/settings`)).status).toBe(401);
+    const pair = await fetch(`${gateway.url}/pair`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "settings phone" }),
+    });
+    const token = ((await pair.json()) as { deviceToken: string }).deviceToken;
+    const response = await fetch(`${gateway.url}/gateway/settings`, { headers: { authorization: `Bearer ${token}` } });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { code: "invalid_request" } });
+  });
+
   it("pairs and authenticates a client over WebSocket", async () => {
     const code = gateway.issueSetupCode();
     const pairRes = await fetch(`${gateway.url}/pair`, {

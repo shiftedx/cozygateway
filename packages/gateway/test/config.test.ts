@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ContractViolation } from "cozygateway-contract";
 
-import { applyEnvOverrides, loadConfig, type GatewayConfig } from "../src/config.ts";
+import { applyEnvOverrides, hermesEndpoints, loadConfig, publicProfileId, type GatewayConfig } from "../src/config.ts";
 import { parseHermesOptions } from "../src/hermes-bridge/config.ts";
 
 function writeConfig(value: unknown): string {
@@ -94,6 +94,33 @@ describe("loadConfig", () => {
       hermes: { ...hermes, profiles: { Sage: { tokenEnv: "A" }, sage: { tokenEnv: "B" } } },
     });
     expect(() => loadConfig(path)).toThrow(/duplicate Hermes profile id/i);
+  });
+
+  it("loads multiple endpoints and gives every profile a stable endpoint namespace", () => {
+    const config = loadConfig(writeConfig({
+      name: "federated",
+      hermesEndpoints: [
+        { id: "home", label: "Home Mac", ...hermes },
+        { id: "studio", label: "Studio", ...hermes },
+      ],
+    }));
+    expect(hermesEndpoints(config).map((endpoint) =>
+      publicProfileId(endpoint, "sage"))).toEqual(["home:sage", "studio:sage"]);
+  });
+
+  it("rejects duplicate endpoint ids and mixed legacy/federated configuration", () => {
+    expect(() => loadConfig(writeConfig({
+      name: "duplicate",
+      hermesEndpoints: [
+        { id: "home", ...hermes },
+        { id: "home", ...hermes },
+      ],
+    }))).toThrow(/duplicate Hermes endpoint id/i);
+    expect(() => loadConfig(writeConfig({
+      name: "mixed",
+      hermes,
+      hermesEndpoints: [{ id: "home", ...hermes }],
+    }))).toThrow(/exactly one/i);
   });
 
   // Issue #16: capabilities is an optional gateway-level config field, surfaced as

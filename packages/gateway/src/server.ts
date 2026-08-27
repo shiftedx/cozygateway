@@ -9,11 +9,14 @@ import {
   BOTS_CAPABILITY_VERSION,
   MOBILE_NODE_CAPABILITY_ID,
   MOBILE_NODE_CAPABILITY_VERSION,
+  GATEWAY_MANAGEMENT_CAPABILITY_ID,
+  GATEWAY_MANAGEMENT_CAPABILITY_VERSION,
   type GatewayInfo,
   type ServerFrame,
 } from "cozygateway-contract";
 
-import { validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { hermesEndpoints, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { fileGatewaySettings } from "./gateway-settings.ts";
 import { openStorage, type Storage } from "./storage.ts";
 import {
   ATTACH_V1_CAPABILITIES,
@@ -44,13 +47,14 @@ import {
 import { createHermesClient } from "./hermes-bridge/client.ts";
 import { parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
+import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 
-export const GATEWAY_VERSION = "0.2.12";
+export const GATEWAY_VERSION = "0.3.0";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -107,9 +111,8 @@ function acknowledgeOrphanedAttachEvent(
 }
 
 function allowedAttachMedia(config: GatewayConfig, agentId: string): boolean {
-  return Object.keys(config.hermes.profiles).some(
-    (profile) => profile.trim().toLowerCase() === agentId,
-  );
+  return hermesEndpoints(config).some((endpoint) =>
+    Object.keys(endpoint.config.profiles).some((profile) => publicProfileId(endpoint, profile) === agentId));
 }
 
 export interface RunningGateway {
@@ -121,6 +124,8 @@ export interface RunningGateway {
 }
 
 export interface StartGatewayOptions {
+  /** Writable source JSON path. Enables authenticated device management and atomic persistence. */
+  configPath?: string;
   /** Overrides the push notifier's fire-and-forget failure log sink. Not part of
    *  `GatewayConfig` (which is JSON-schema-validated and loadable from disk) since a log
    *  function isn't serializable; this is a programmatic-only seam. Defaults to the
@@ -158,7 +163,7 @@ export function createChatMessagePushHandler(
 }
 
 /** One shared immutable GatewayInfo for health, pairing, and the ready frame. */
-export function gatewayInfoForConfig(config: GatewayConfig): GatewayInfo {
+export function gatewayInfoForConfig(config: GatewayConfig, management = false): GatewayInfo {
   return {
     name: config.name,
     version: GATEWAY_VERSION,
@@ -166,7 +171,8 @@ export function gatewayInfoForConfig(config: GatewayConfig): GatewayInfo {
     capabilities: {
       ...(config.capabilities ?? {}),
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
-      ...(config.hermes === undefined
+      ...(management ? { [GATEWAY_MANAGEMENT_CAPABILITY_ID]: GATEWAY_MANAGEMENT_CAPABILITY_VERSION } : {}),
+      ...(hermesEndpoints(config).length === 0
         ? {}
         : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION }),
       ...(config.pushRelayUrl === undefined
@@ -195,9 +201,10 @@ export async function startGateway(
   const scheme = tls === undefined ? "http" : "https";
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
-  const profileEntries = Object.entries(config.hermes.profiles).map(
-    ([rawId, profile]) => [rawId.trim().toLowerCase(), profile] as const,
-  );
+  const endpoints = hermesEndpoints(config);
+  const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
+    ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,
+  ));
   for (const [id, profile] of profileEntries) {
     storage.upsertAgent({
       id,
@@ -212,8 +219,9 @@ export async function startGateway(
   //
   // Built-in optional surfaces advertise vendor capability ids only when their backing config is
   // present. Each integer version advances independently of the frozen contract literal.
-  const hermesOptions = parseHermesOptions(config.hermes, process.env);
-  const gatewayInfo = gatewayInfoForConfig(config);
+  const parsedEndpoints = endpoints.map((endpoint) => ({ endpoint, options: parseHermesOptions(endpoint.config, process.env) }));
+  const hermesOptions = parsedEndpoints[0]!.options;
+  const gatewayInfo = gatewayInfoForConfig(config, options.configPath !== undefined);
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({
     storage, gatewayInfo, now: () => Date.now(), trace: traceLog,
@@ -245,25 +253,33 @@ export async function startGateway(
   let killAttachIdentity: (name: string) => boolean = () => false;
   let raiseLiveActivityFrame: (frame: ServerFrame) => void = () => {};
 
-  const client = createHermesClient({
-    url: hermesOptions.url,
-    auth: hermesOptions.auth,
-  });
-  const bridge = new HermesBridge({
+  let federation: FederatedBotControlSurface | undefined;
+  const bridgeMembers = parsedEndpoints.map(({ endpoint, options: memberOptions }) => {
+    const client = createHermesClient({ url: memberOptions.url, auth: memberOptions.auth });
+    const memberStorage = endpoint.namespace ? endpointStorage(storage, endpoint.id!) : storage;
+    const member = new HermesBridge({
     client,
-    storage,
+    storage: memberStorage,
     broadcast: (frame) => {
-      hub.broadcast(frame);
-      raiseLiveActivityFrame(frame);
+      if (endpoint.namespace && (frame.type === "bot_roster" || frame.type === "bot_presence")) {
+        federation?.publish();
+      } else if (endpoint.namespace && frame.type === "bot_routines") {
+        const namespaced = { ...frame, bot: publicProfileId(endpoint, frame.bot) };
+        hub.broadcast(namespaced);
+        raiseLiveActivityFrame(namespaced);
+      } else {
+        hub.broadcast(frame);
+        raiseLiveActivityFrame(frame);
+      }
     },
     now: () => Date.now(),
-    hiddenProfiles: hermesOptions.hiddenProfiles,
-    ...(hermesOptions.bridgeProfile === undefined
+    hiddenProfiles: memberOptions.hiddenProfiles,
+    ...(memberOptions.bridgeProfile === undefined
       ? {}
-      : { bridgeProfile: hermesOptions.bridgeProfile }),
-    seedBlankSlateBots: hermesOptions.seedBlankSlateBots,
-    blankSlateSkillsOn: hermesOptions.blankSlateSkillsOn,
-    revokeAttachIdentity: (name) => killAttachIdentity(name),
+      : { bridgeProfile: memberOptions.bridgeProfile }),
+    seedBlankSlateBots: memberOptions.seedBlankSlateBots,
+    blankSlateSkillsOn: memberOptions.blankSlateSkillsOn,
+    revokeAttachIdentity: (name) => killAttachIdentity(publicProfileId(endpoint, name)),
     // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
     // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
     // rather than borrowed from a chat thread, so a client that does not know about rooms yet
@@ -276,14 +292,38 @@ export async function startGateway(
         preview: event.text,
       });
     },
+    });
+    return { endpoint, client, bridge: member };
   });
+  const bridge = bridgeMembers.length === 1 && bridgeMembers[0]!.endpoint.namespace === false
+    ? bridgeMembers[0]!.bridge
+    : (federation = new FederatedBotControlSurface(
+        bridgeMembers.map(({ endpoint, bridge: member }) => ({ id: endpoint.id!, bridge: member })),
+        (view) => {
+          const updatedAt = view.updatedAt ?? Date.now();
+          const roster = { type: "bot_roster" as const, bots: view.bots, updatedAt };
+          const presence = { type: "bot_presence" as const, active: view.bots.filter((bot) => bot.active).map((bot) => bot.name), updatedAt };
+          hub.broadcast(roster);
+          hub.broadcast(presence);
+          raiseLiveActivityFrame(roster);
+          raiseLiveActivityFrame(presence);
+        },
+      ));
 
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
   const nativeBotEntries = profileEntries;
   const router = new AttachRouter();
   let nativeSink: AttachNativeSink | undefined;
-  const attachTokens = collectAttachTokens(config.hermes.profiles, process.env);
+  const attachTokens = new Map<string, string>();
+  for (const { endpoint } of parsedEndpoints) {
+    const tokens = collectAttachTokens(endpoint.config.profiles, process.env);
+    for (const [token, rawProfile] of tokens) {
+      if (attachTokens.has(token))
+        throw new Error("duplicate attach credential across Hermes endpoints; every profile must use a distinct token");
+      attachTokens.set(token, publicProfileId(endpoint, rawProfile));
+    }
+  }
   let nativeBotPlane: NativeBotDataPlane | undefined;
   let memorySurface: AttachMemorySurface | undefined;
   let botsSurface: BotsSurface;
@@ -300,7 +340,7 @@ export async function startGateway(
     trace: traceLog,
     events: {
       canAcceptEvent: (agentId, frame) => {
-        if (bridge.canAcceptGroupAttachEvent(agentId, frame)) return true;
+        if (bridge instanceof HermesBridge && bridge.canAcceptGroupAttachEvent(agentId, frame)) return true;
         if (nativeBotPlane?.canAccept(agentId, frame)) return true;
         if (!("threadId" in frame.event))
           return (
@@ -310,7 +350,7 @@ export async function startGateway(
         return thread !== undefined && thread.agentId === agentId;
       },
       onEvent: (agentId, frame) => {
-        if (bridge.handleGroupAttachEvent(agentId, frame)) return true;
+        if (bridge instanceof HermesBridge && bridge.handleGroupAttachEvent(agentId, frame)) return true;
         if (router.onV1Event(agentId, frame)) return true;
         if (nativeBotPlane?.handle(agentId, frame)) return true;
         if (frame.event.kind === "media" || frame.event.kind === "presence")
@@ -346,7 +386,7 @@ export async function startGateway(
     sendApprovalResolution: (agentId, input) =>
       attachV1Ingress.sendApprovalResolution(agentId, input),
   };
-  bridge.setGroupNativeTurns({
+  if (bridge instanceof HermesBridge) bridge.setGroupNativeTurns({
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
     sendNativeTurn: (agentId, input) =>
       attachV1Ingress.sendNativeTurn(agentId, input),
@@ -484,6 +524,7 @@ export async function startGateway(
     storage,
     config,
     gatewayInfo,
+    ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),
     attachDeadLetters: () => storage.attachProjectionDeadLetters(),
@@ -557,7 +598,7 @@ export async function startGateway(
   server.on("upgrade", createUpgradeDispatcher(routes));
   // Started after the listener is up so the first roster refresh cannot race the hub it
   // broadcasts through.
-  bridge.start();
+  for (const member of bridgeMembers) member.bridge.start();
   // Start periodic retention only after startup succeeds. A failed startup must not leave a timer
   // repeatedly touching a database that no running gateway owns, and a later disk fault must not
   // escape the timer callback and terminate an otherwise healthy process.
@@ -597,7 +638,7 @@ export async function startGateway(
       memorySurface?.close();
       attachV1Ingress.close();
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
-      await bridge.close();
+      await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
       nativeBotPlane.close();
       mobileNode?.close();
       await new Promise<void>((resolve, reject) => {
