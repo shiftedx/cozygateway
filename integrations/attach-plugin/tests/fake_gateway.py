@@ -57,7 +57,7 @@ from websockets.exceptions import ConnectionClosed
 # Capabilities a healthy gateway offers. Tests narrow this to prove a surface goes dark.
 DEFAULT_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
-    "mobile_node", "mobile_location", "memory_management", "delivery_receipts",
+    "mobile_node", "mobile_location", "memory_management", "delivery_receipts", "mobile_failure_details",
 )
 DEFAULT_LIMITS = {"maxInFlightEvents": 64, "maxInFlightBytes": 4 * 1024 * 1024}
 # Everything here is loopback and in-process, so a wait that reaches this bound is a real

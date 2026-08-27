@@ -9,6 +9,7 @@ const availableRoute: MobileNodeRoute = {
   selectedSocketOpen: true,
   commandAdvertised: true,
   connectedSocketCount: 1,
+  foreground: true,
 };
 const invocation = {
   requestId: "request-1",
@@ -56,6 +57,7 @@ describe("mobile-node operator failure diagnostics", () => {
     expect(reasons(traces)).toEqual(["no_selected_device"]);
     expect(result).toHaveBeenCalledWith("sage", {
       requestId: "missing-device", status: "device_unavailable",
+      stage: "routing", reason: "no_selected_device",
     });
   });
 
@@ -74,6 +76,7 @@ describe("mobile-node operator failure diagnostics", () => {
     expect(reasons(traces)).toEqual(["command_not_advertised"]);
     expect(result).toHaveBeenCalledWith("sage", {
       requestId: "not-advertised", status: "foreground_required",
+      stage: "routing", reason: "command_not_advertised",
     });
   });
 
@@ -100,6 +103,7 @@ describe("mobile-node operator failure diagnostics", () => {
     expect(reasons(traces)).toEqual(["frame_send_failed"]);
     expect(result).toHaveBeenCalledWith("sage", {
       requestId: "send-failed", status: "device_unavailable",
+      stage: "dispatch", reason: "frame_send_failed",
     });
   });
 
@@ -128,6 +132,7 @@ describe("mobile-node operator failure diagnostics", () => {
     expect(reasons(traces)).toEqual(["invalid_phone_payload"]);
     expect(result).toHaveBeenCalledWith("sage", {
       requestId: "invalid-result", status: "policy_blocked",
+      stage: "response", reason: "invalid_phone_payload",
     });
   });
 
@@ -140,15 +145,81 @@ describe("mobile-node operator failure diagnostics", () => {
     expect(reasons(traces)).toEqual(["broker_closed_pending"]);
   });
 
-  it("keeps the public typed result unchanged and omits the internal reason", () => {
+  it("refuses a malformed broker-produced request with a closed diagnostic", () => {
+    const { broker, result, send } = brokerFor();
+    broker.invoke({ ...invocation, requestId: "malformed", privatePath: "/secret/file" } as never);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(result).toHaveBeenCalledWith("sage", {
+      requestId: "malformed", status: "policy_blocked",
+      stage: "dispatch", reason: "malformed_request_frame",
+    });
+    expect(JSON.stringify(result.mock.calls)).not.toContain("/secret/file");
+  });
+
+  it("returns a closed dispatch failure without leaking request values", () => {
     const { broker, result } = brokerFor({ send: "frame_send_failed" });
 
     broker.invoke({ ...invocation, requestId: "public-shape" });
 
     const publicResult = result.mock.calls[0]?.[1] as Record<string, unknown>;
-    expect(publicResult).toEqual({ requestId: "public-shape", status: "device_unavailable" });
-    expect(Object.keys(publicResult).sort()).toEqual(["requestId", "status"]);
-    expect(publicResult).not.toHaveProperty("reason");
+    expect(publicResult).toEqual({
+      requestId: "public-shape", status: "device_unavailable",
+      stage: "dispatch", reason: "frame_send_failed",
+    });
+    expect(Object.keys(publicResult).sort()).toEqual(["reason", "requestId", "stage", "status"]);
+  });
+
+  it("distinguishes unanswered, invalid phone, policy, route, and media failures", () => {
+    vi.useFakeTimers();
+    try {
+      const { broker, result, send } = brokerFor();
+      broker.invoke({ ...invocation, requestId: "unanswered", expiresAt: 1_010 });
+      vi.advanceTimersByTime(10);
+      broker.invoke({ ...invocation, requestId: "invalid" });
+      broker.result("device-1", {
+        type: "mobile_node_result", requestId: "invalid", lease: (send.mock.calls.at(-1)?.[1] as { lease: string }).lease,
+        status: "ok", result: { privatePath: "/secret", latitude: 99 },
+      } as never);
+      broker.invoke({ ...invocation, requestId: "policy", purpose: "secret\npurpose" });
+      const noRoute: MobileNodeRoute = {
+        status: "selected_socket_unavailable", selectedSocketPresent: false,
+        selectedSocketOpen: false, commandAdvertised: false, connectedSocketCount: 0,
+      };
+      const routed = brokerFor({ route: noRoute });
+      routed.broker.invoke({ ...invocation, requestId: "route" });
+
+      const media = brokerFor();
+      for (const [requestId, mediaReason] of [
+        ["media-validation", "media_validation_failed"],
+        ["media-storage", "media_storage_failed"],
+      ] as const) {
+        media.broker.invoke({
+          ...invocation, requestId, command: "camera.capture",
+          camera: "rear", capture: "photo", videoDurationSeconds: 10,
+        });
+        const mediaLease = (media.send.mock.calls.at(-1)?.[1] as { lease: string }).lease;
+        const claim = media.broker.beginMediaUpload("device-1", requestId, mediaLease);
+        media.broker.completeMediaUpload(claim!, undefined, mediaReason);
+      }
+
+      expect(result.mock.calls.map((call) => call[1])).toEqual([
+        { requestId: "unanswered", status: "expired", stage: "response", reason: "request_expired_unanswered" },
+        { requestId: "invalid", status: "policy_blocked", stage: "response", reason: "invalid_phone_payload" },
+        { requestId: "policy", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" },
+      ]);
+      expect(routed.result).toHaveBeenCalledWith("sage", {
+        requestId: "route", status: "foreground_required", stage: "routing", reason: "selected_socket_unavailable",
+      });
+      expect(media.result.mock.calls.map((call) => call[1])).toEqual([
+        { requestId: "media-validation", status: "policy_blocked", stage: "media", reason: "media_validation_failed" },
+        { requestId: "media-storage", status: "policy_blocked", stage: "media", reason: "media_storage_failed" },
+      ]);
+      expect(JSON.stringify([...result.mock.calls, ...routed.result.mock.calls, ...media.result.mock.calls]))
+        .not.toMatch(/secret|privatePath|latitude|purpose/i);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("logs only bounded fields and no forbidden request values", () => {

@@ -51,6 +51,8 @@ from .attach_client import (
 )
 from .attach_client_v1 import (
     HELLO_ACK_TIMEOUT_SECONDS,
+    MOBILE_FAILURE_REASONS,
+    MOBILE_FAILURE_STAGES,
     MOBILE_STATUS_VALUES,
     AttachV1Client,
     AttachV1ClientConfig,
@@ -2641,10 +2643,17 @@ def _caller_owns_active_turn(turn_id: str) -> bool:
     return message_id == turn_id or message_id.startswith(f"{turn_id}:")
 
 
-def _mobile_tool_result(status: str, result: Optional[Dict[str, Any]] = None) -> str:
+def _mobile_tool_result(
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    stage: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> str:
     payload: Dict[str, Any] = {"status": status}
     if result is not None:
         payload["result"] = result
+    if status != "ok" and stage in MOBILE_FAILURE_STAGES and reason in MOBILE_FAILURE_REASONS:
+        payload["stage"], payload["reason"] = stage, reason
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -2784,6 +2793,8 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
     return _mobile_tool_result(
         status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
         result if isinstance(result, dict) else None,
+        outcome.get("stage") if isinstance(outcome.get("stage"), str) else None,
+        outcome.get("reason") if isinstance(outcome.get("reason"), str) else None,
     )
 
 

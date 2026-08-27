@@ -16,12 +16,20 @@ import { emitTrace, type TraceLog } from "./trace.ts";
 export type MobileNodeTerminal =
   | "ok" | "denied" | "expired" | "cancelled" | "device_unavailable"
   | "foreground_required" | "policy_blocked";
+export const MOBILE_NODE_FAILURE_STAGES = [
+  "policy", "routing", "dispatch", "response", "media", "receipt", "lifecycle",
+] as const;
+export type MobileNodeFailureStage = typeof MOBILE_NODE_FAILURE_STAGES[number];
+export interface MobileNodeFailureDiagnostic {
+  stage: MobileNodeFailureStage;
+  reason: MobileNodeFailureReason;
+}
 export type MobileNodeResult =
   | { requestId: string; status: "ok"; result: MobileNodeGatewayStatusResult }
   | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
   | { requestId: string; status: "ok"; result: MobileNodeMediaDescriptor }
   | { requestId: string; status: "ok"; result: { action: "approve" | "snooze" | "open" | "cancel" } }
-  | { requestId: string; status: Exclude<MobileNodeTerminal, "ok"> };
+  | ({ requestId: string; status: Exclude<MobileNodeTerminal, "ok"> } & Partial<MobileNodeFailureDiagnostic>);
 
 export interface MobileNodeReceiptInput {
   requestId: string;
@@ -64,6 +72,10 @@ export const MOBILE_NODE_FAILURE_REASONS = [
   // expiry was the one outcome that left no operator reason at all, so a phone that receives a
   // request and silently ignores it looked identical to one that was never sent anything.
   "request_expired_unanswered",
+  "request_policy_rejected",
+  "selected_app_not_foreground",
+  "media_validation_failed",
+  "media_storage_failed",
 ] as const;
 export type MobileNodeFailureReason = typeof MOBILE_NODE_FAILURE_REASONS[number];
 export type MobileNodeSendOutcome = "sent"
@@ -170,24 +182,30 @@ export class MobileNodeBroker {
     if (this.#pending.has(input.requestId) || this.#terminal.has(input.requestId)) return;
     if (!input.deviceId) {
       this.#diagnose("no_selected_device", input.command, false, noRoute());
-      this.#terminalize(input.agentId, input.requestId, "device_unavailable", input.expiresAt);
+      this.#terminalize(input.agentId, input.requestId, "device_unavailable", input.expiresAt,
+        failure("routing", "no_selected_device"));
       return;
     }
     if (input.expiresAt <= this.#now() || input.expiresAt > this.#now() + 30_000 || !isPurpose(input.purpose)) {
-      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt);
+      this.#diagnose("request_policy_rejected", input.command, true, noRoute());
+      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt,
+        failure("policy", "request_policy_rejected"));
       return;
     }
     const route = this.#route(input.deviceId, input.command);
     if (route.status !== "available") {
       this.#diagnose(route.status, input.command, true, route);
-      this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt);
+      this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt,
+        failure("routing", route.status));
       return;
     }
     // No eviction is safe: a retained unexpired id is the only duplicate-prompt defense.
     // Dropping a new admission while full is intentionally fail-closed and non-durable.
     if (!this.#canAdmit()) return;
     if (requiresForeground(input.command) && route.foreground !== true) {
-      this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt);
+      this.#diagnose("selected_app_not_foreground", input.command, true, route);
+      this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt,
+        failure("routing", "selected_app_not_foreground"));
       return;
     }
     const { deviceId: _deviceId, agentId: _agentId, ...request } = input;
@@ -198,7 +216,8 @@ export class MobileNodeBroker {
     // where the schema's closed key set can still be enforced.
     if (!check(MobileNodeRequestFrameSchema, frame)) {
       this.#diagnose("malformed_request_frame", input.command, true, route);
-      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt);
+      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt,
+        failure("dispatch", "malformed_request_frame"));
       return;
     }
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
@@ -226,12 +245,14 @@ export class MobileNodeBroker {
         ? route
         : this.#route(input.deviceId, input.command);
       this.#diagnose(normalizedSend, input.command, true, failedRoute);
-      this.#finish(input.requestId, "device_unavailable");
+      this.#finish(input.requestId, "device_unavailable", false, undefined,
+        failure("dispatch", normalizedSend));
     }
   }
 
   reject(agentId: string, requestId: string, status: Exclude<MobileNodeTerminal, "ok"> = "policy_blocked"): void {
-    this.#terminalize(agentId, requestId, status, this.#now());
+    this.#terminalize(agentId, requestId, status, this.#now(),
+      status === "policy_blocked" ? failure("policy", "request_policy_rejected") : undefined);
   }
 
   result(deviceId: string, frame: MobileNodeResultFrame): void {
@@ -256,7 +277,7 @@ export class MobileNodeBroker {
         const route = this.#route(deviceId, pending.command);
         if (route.status !== "available") {
           this.#diagnose(route.status, pending.command, true, route);
-          this.#settle(pending, "foreground_required");
+          this.#settle(pending, "foreground_required", undefined, failure("routing", route.status));
           return;
         }
       }
@@ -275,7 +296,7 @@ export class MobileNodeBroker {
           payloadParseable: true,
           payloadSchemaValid: false,
         });
-        this.#settle(pending, "policy_blocked");
+        this.#settle(pending, "policy_blocked", undefined, failure("response", "invalid_phone_payload"));
         return;
       }
       this.#settle(pending, "ok", frame.result);
@@ -336,7 +357,8 @@ export class MobileNodeBroker {
   close(): void {
     for (const [requestId, pending] of this.#pending) {
       this.#diagnose("broker_closed_pending", pending.command, true, this.#route(pending.deviceId, pending.command));
-      this.#finish(requestId, "device_unavailable");
+      this.#finish(requestId, "device_unavailable", false, undefined,
+        failure("lifecycle", "broker_closed_pending"));
     }
   }
 
@@ -358,8 +380,17 @@ export class MobileNodeBroker {
     return { agentId: pending.agentId, command: pending.command, pending };
   }
 
-  completeMediaUpload(claim: MobileNodeMediaUploadClaim, media: MobileNodeMediaDescriptor | undefined): boolean {
-    if (media === undefined) { this.#settle(claim.pending, "policy_blocked"); return false; }
+  completeMediaUpload(
+    claim: MobileNodeMediaUploadClaim,
+    media: MobileNodeMediaDescriptor | undefined,
+    failedReason: "media_validation_failed" | "media_storage_failed" = "media_validation_failed",
+  ): boolean {
+    if (media === undefined) {
+      this.#diagnose(failedReason, claim.pending.command, true,
+        this.#route(claim.pending.deviceId, claim.pending.command));
+      this.#settle(claim.pending, "policy_blocked", undefined, failure("media", failedReason));
+      return false;
+    }
     if (claim.pending.expiresAt <= this.#now()) { this.#settle(claim.pending, "expired"); return false; }
     const route = this.#route(claim.pending.deviceId, claim.pending.command);
     if (route.status !== "available" || route.foreground !== true) { this.#settle(claim.pending, "foreground_required"); return false; }
@@ -396,6 +427,7 @@ export class MobileNodeBroker {
     status: MobileNodeTerminal,
     notifyDevice = false,
     result?: MobileNodePhoneStatusResult | { latitude: number; longitude: number } | MobileNodeMediaDescriptor | { action: "approve" | "snooze" | "open" | "cancel" },
+    diagnostic?: MobileNodeFailureDiagnostic,
   ): void {
     const pending = this.#pending.get(requestId);
     if (pending === undefined) return;
@@ -403,6 +435,7 @@ export class MobileNodeBroker {
     if (status === "expired") {
       this.#diagnose("request_expired_unanswered", pending.command, true,
                      this.#route(pending.deviceId, pending.command));
+      diagnostic = failure("response", "request_expired_unanswered");
     }
     if (notifyDevice && (status === "cancelled" || status === "expired")) {
       this.#send(pending.deviceId, {
@@ -412,13 +445,14 @@ export class MobileNodeBroker {
         status,
       });
     }
-    this.#settle(pending, status, result);
+    this.#settle(pending, status, result, diagnostic);
   }
 
   #settle(
     pending: Pending,
     status: MobileNodeTerminal,
     result?: MobileNodePhoneStatusResult | { latitude: number; longitude: number } | MobileNodeMediaDescriptor | { action: "approve" | "snooze" | "open" | "cancel" },
+    diagnostic?: MobileNodeFailureDiagnostic,
   ): boolean {
     const { requestId, bot, threadId, turnId, command, purpose } = pending.frame;
     if (status === "ok" && result !== undefined) {
@@ -426,7 +460,9 @@ export class MobileNodeBroker {
       try { recorded = this.#receipt({ requestId, bot, threadId, turnId, command, purpose, sharedDescription: receiptDescription(pending.frame) }); } catch {}
       if (!recorded) {
         this.#diagnose("receipt_persistence_failed", command, true, this.#route(pending.deviceId, command));
-        this.#result(pending.agentId, { requestId, status: "device_unavailable" });
+        this.#result(pending.agentId, {
+          requestId, status: "device_unavailable", ...failure("receipt", "receipt_persistence_failed"),
+        });
         return false;
       }
     }
@@ -445,7 +481,9 @@ export class MobileNodeBroker {
           : pending.command === "notification.present"
             ? { requestId, status, result: result as { action: "approve" | "snooze" | "open" | "cancel" } }
             : { requestId, status, result: result as MobileNodeMediaDescriptor });
-    else this.#result(pending.agentId, { requestId, status: status === "ok" ? "device_unavailable" : status });
+    else this.#result(pending.agentId, {
+      requestId, status: status === "ok" ? "device_unavailable" : status, ...diagnostic,
+    });
     return status === "ok";
   }
 
@@ -460,11 +498,12 @@ export class MobileNodeBroker {
     requestId: string,
     status: Exclude<MobileNodeTerminal, "ok">,
     expiresAt: number,
+    diagnostic?: MobileNodeFailureDiagnostic,
   ): void {
     this.#pruneTerminal();
     if (this.#pending.has(requestId) || this.#terminal.has(requestId) || !this.#canAdmit()) return;
     this.#terminal.set(requestId, Math.max(expiresAt, this.#now() + this.#terminalTtlMs));
-    this.#result(agentId, { requestId, status });
+    this.#result(agentId, { requestId, status, ...diagnostic });
   }
 
   #canAdmit(): boolean {
@@ -477,6 +516,10 @@ export class MobileNodeBroker {
       if (until <= now) this.#terminal.delete(requestId);
     }
   }
+}
+
+function failure(stage: MobileNodeFailureStage, reason: MobileNodeFailureReason): MobileNodeFailureDiagnostic {
+  return { stage, reason };
 }
 
 function boundedCount(value: number): number {
