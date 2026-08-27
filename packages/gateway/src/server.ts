@@ -446,6 +446,7 @@ export async function startGateway(
   );
   mobileNode = new MobileNodeBroker({
     route: (deviceId, command) => hub.mobileNodeRoute(deviceId, command),
+    wake: (deviceId) => notifier.notifyMobileNodeWake(deviceId),
     send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
     result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
     receipt: (receipt) => nativeBotPlane?.recordMobileReceipt(receipt) !== undefined,

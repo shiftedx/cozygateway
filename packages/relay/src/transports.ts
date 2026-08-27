@@ -22,7 +22,7 @@ export const DELIVERY_TIMEOUT_MS = 10_000;
  *  on. No field describing the tool call itself appears here; that all rides inside the
  *  `ciphertext` the relay cannot read. */
 export interface PushDeliveryOptions {
-  /** Actionable category id; becomes `aps.category` on APNs. */
+  /** Envelope category id; alert categories become `aps.category` on APNs. */
   category?: PushCategoryId;
   /** Coalescing key; becomes `apns-collapse-id` on APNs. Approvals pass the `toolCallId`; bot
    *  messages pass an opaque digest of bot name and canonical chat session. */

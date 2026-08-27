@@ -153,6 +153,7 @@ export class MobileNodeBroker {
   /** Every admitted id remains here until its volatile terminal window lapses. */
   readonly #terminal = new Map<string, number>();
   readonly #route: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
+  readonly #wake: ((deviceId: string) => boolean) | undefined;
   readonly #send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
   readonly #result: (agentId: string, frame: MobileNodeResult) => void;
   readonly #receipt: (receipt: MobileNodeReceiptInput) => boolean;
@@ -164,6 +165,7 @@ export class MobileNodeBroker {
   constructor(deps: {
     available?: (deviceId: string, command: MobileNodeCommand) => boolean;
     route?: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
+    wake?: (deviceId: string) => boolean;
     send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
     result: (agentId: string, frame: MobileNodeResult) => void;
     receipt: (receipt: MobileNodeReceiptInput) => boolean;
@@ -175,6 +177,7 @@ export class MobileNodeBroker {
     if (deps.route === undefined && deps.available === undefined)
       throw new Error("mobile-node route dependency is required");
     this.#route = deps.route ?? ((deviceId, command) => legacyRoute(deps.available!(deviceId, command)));
+    this.#wake = deps.wake;
     this.#send = deps.send;
     this.#result = deps.result;
     this.#receipt = deps.receipt;
@@ -203,7 +206,8 @@ export class MobileNodeBroker {
       return;
     }
     const route = this.#route(input.deviceId, input.command);
-    if (route.status !== "available") {
+    const wakeEligible = input.command === "device.status" && route.status === "selected_socket_unavailable";
+    if (route.status !== "available" && !wakeEligible) {
       this.#diagnose(route.status, input.command, true, route);
       this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt,
         failure("routing", route.status));
@@ -233,6 +237,20 @@ export class MobileNodeBroker {
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
     timer.unref();
     this.#pending.set(input.requestId, { deviceId: input.deviceId, agentId: input.agentId, turnId: input.turnId, command: input.command, expiresAt: input.expiresAt, frame, timer });
+    if (wakeEligible) {
+      let scheduled = false;
+      try {
+        scheduled = this.#wake?.(input.deviceId) === true;
+      } catch {
+        scheduled = false;
+      }
+      if (!scheduled) {
+        this.#diagnose("selected_socket_unavailable", input.command, true, route);
+        this.#finish(input.requestId, "foreground_required", false, undefined,
+          failure("routing", "selected_socket_unavailable"));
+      }
+      return;
+    }
     let sendOutcome: boolean | MobileNodeSendOutcome;
     try {
       sendOutcome = this.#send(input.deviceId, frame);

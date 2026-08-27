@@ -91,13 +91,16 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
 
   return {
     deliver(token: string, ciphertext: string, push?: PushDeliveryOptions): Promise<void> {
-      // The category shapes the ENVELOPE only: which actionable category the app renders its
-      // Approve/Deny buttons for, and the fallback alert shown if the Notification Service
-      // Extension cannot run. The relay never reads the ciphertext, so the alert it builds is
-      // a fixed, content-free string per category; the NSE decrypts and rewrites it on device.
+      // The category shapes the ENVELOPE only: an alert category and its content-free fallback,
+      // or a silent/background wake. The relay never reads the ciphertext; for alerts, the NSE
+      // decrypts and rewrites the fixed fallback on device.
       const spec = push?.category === undefined ? undefined : PUSH_CATEGORIES[push.category];
-      const alert = spec?.alert ?? DEFAULT_ALERT;
-      const body = push?.liveActivity === undefined ? JSON.stringify({
+      const background = spec?.pushType === "background";
+      const alert = spec?.pushType === "alert" ? spec.alert : DEFAULT_ALERT;
+      const body = push?.liveActivity === undefined && background ? JSON.stringify({
+        aps: { "content-available": 1 },
+        c: ciphertext,
+      }) : push?.liveActivity === undefined ? JSON.stringify({
         aps: {
           alert: { title: alert.title, body: alert.body },
           "mutable-content": 1,
@@ -147,7 +150,7 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
             ? config.topic
             : `${config.topic}.push-type.liveactivity`,
           "apns-push-type": push?.liveActivity === undefined ? (spec?.pushType ?? "alert") : "liveactivity",
-          "apns-priority": String(push?.liveActivity?.priority ?? 10),
+          "apns-priority": String(push?.liveActivity?.priority ?? (background ? 5 : 10)),
           "content-type": "application/json",
           // Coalescing: a later push with the same collapse id REPLACES the delivered one on
           // device. Approvals pass the toolCallId; bot messages pass a bot/chat digest so a burst

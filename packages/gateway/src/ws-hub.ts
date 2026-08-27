@@ -176,8 +176,15 @@ export class WsHub {
           frame.foreground ? frame.commands : frame.commands.filter((command) => command === "device.status"),
         );
         if (client.mobileCommands.size) {
-          this.#mobileNodes.set(client.deviceId, client);
-          this.#onMobileAvailable?.(client.deviceId);
+          const selected = this.#mobileNodes.get(client.deviceId);
+          const liveSiblingForeground = selected !== undefined
+            && selected !== client
+            && selected.socket.readyState === WebSocket.OPEN
+            && selected.mobileForeground;
+          if (!liveSiblingForeground || client.mobileForeground) {
+            this.#mobileNodes.set(client.deviceId, client);
+            this.#onMobileAvailable?.(client.deviceId);
+          }
         } else if (this.#mobileNodes.get(client.deviceId) === client) {
           this.#mobileNodes.delete(client.deviceId);
           this.#onDeviceDisconnect?.(client.deviceId);

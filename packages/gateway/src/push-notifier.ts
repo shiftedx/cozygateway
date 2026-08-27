@@ -17,6 +17,10 @@ const APPROVAL_CATEGORY = {
 } as const;
 
 const CHAT_MESSAGE_CATEGORY = "message";
+const MOBILE_NODE_WAKE_ROUTING = {
+  category: "mobile.status.wake",
+  collapseId: "mobile.status",
+} as const;
 
 export interface ChatMessagePushEvent {
   bot: string;
@@ -100,13 +104,8 @@ export class RelayNotifier implements Notifier {
     event: { threadId: string; agentName: string; preview: string },
     connectedDeviceIds: ReadonlySet<string>,
   ): void {
-    let registrations: PushRegistrationRow[];
-    try {
-      registrations = this.#storage.pushRegistrations();
-    } catch (err) {
-      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
     // Per-device targeting (issue #11): a device with a live socket at commit time gets its
     // update over the WS instead, so it is excluded here rather than pushed to redundantly.
     const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
@@ -126,16 +125,27 @@ export class RelayNotifier implements Notifier {
     }
   }
 
+  /** Schedule one silent wake for a selected idle device. The boolean means only that a matching
+   *  registration was found and its fire-and-forget relay send was scheduled; APNs delivery is
+   *  deliberately unknowable at this seam. */
+  notifyMobileNodeWake(deviceId: string): boolean {
+    const registration = this.#registrations()?.find((candidate) => candidate.deviceId === deviceId);
+    if (registration === undefined) return false;
+    void this.#send(registration, { kind: "mobile_node_wake" }, MOBILE_NODE_WAKE_ROUTING).catch((err: unknown) => {
+      this.#log(
+        `push: mobile-node wake failed for device ${registration.deviceId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+    return true;
+  }
+
   /** A settled canonical bot reply. It uses the existing encrypted message payload and adds only
    *  the relay-visible category/collapse pair needed for a burst from one bot chat to coalesce. */
   notifyChatMessage(event: ChatMessagePushEvent, connectedDeviceIds: ReadonlySet<string>): void {
-    let registrations: PushRegistrationRow[];
-    try {
-      registrations = this.#storage.pushRegistrations();
-    } catch (err) {
-      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
     const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
     if (targets.length === 0) return;
     const payload: PushPayload = {
@@ -180,13 +190,8 @@ export class RelayNotifier implements Notifier {
       );
       return;
     }
-    let registrations: PushRegistrationRow[];
-    try {
-      registrations = this.#storage.pushRegistrations();
-    } catch (err) {
-      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
     const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
     if (targets.length === 0) return;
     const category = APPROVAL_CATEGORY[payload.kind];
@@ -196,6 +201,15 @@ export class RelayNotifier implements Notifier {
           `push: approval notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
+    }
+  }
+
+  #registrations(): PushRegistrationRow[] | undefined {
+    try {
+      return this.#storage.pushRegistrations();
+    } catch (err) {
+      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
     }
   }
 

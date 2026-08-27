@@ -231,9 +231,9 @@ describe("apnsTransport.deliver", () => {
 
 describe("apnsTransport push categories", () => {
   async function deliverWithCategory(
-    category: "message" | "approval.pending" | "approval.resolved",
+    category: "message" | "approval.pending" | "approval.resolved" | "mobile.status.wake",
     collapseId: string,
-  ): Promise<{ headers: Record<string, unknown>; body: Record<string, unknown> }> {
+  ): Promise<{ headers: Record<string, unknown>; body: Record<string, unknown>; rawBody: string }> {
     const { config } = testConfig();
     let seen: { headers: Record<string, unknown>; body: string } | undefined;
     const baseUrl = await fakeApns((headers, body, stream) => {
@@ -242,7 +242,8 @@ describe("apnsTransport push categories", () => {
       stream.end();
     });
     await apnsTransport(config, { baseUrl }).deliver("DEVTOK", "CIPHERBLOB", { category, collapseId });
-    return { headers: seen?.headers ?? {}, body: JSON.parse(seen?.body ?? "{}") as Record<string, unknown> };
+    const rawBody = seen?.body ?? "{}";
+    return { headers: seen?.headers ?? {}, body: JSON.parse(rawBody) as Record<string, unknown>, rawBody };
   }
 
   it("sets aps.category so the app can attach its Approve/Deny actions client-side", async () => {
@@ -252,12 +253,33 @@ describe("apnsTransport push categories", () => {
   });
 
   it("uses the content-free message alert and caller collapse id for bot replies", async () => {
-    const { headers, body } = await deliverWithCategory("message", "botmsg.abc123");
+    const { headers, body, rawBody } = await deliverWithCategory("message", "botmsg.abc123");
     expect(headers["apns-collapse-id"]).toBe("botmsg.abc123");
-    expect(body["aps"]).toMatchObject({
-      category: "message",
-      alert: { title: "CozyChat", body: "New message" },
+    expect(headers["apns-push-type"]).toBe("alert");
+    expect(headers["apns-priority"]).toBe("10");
+    expect(body).toEqual({
+      aps: {
+        alert: { title: "CozyChat", body: "New message" },
+        "mutable-content": 1,
+        category: "message",
+      },
+      c: "CIPHERBLOB",
     });
+    expect(rawBody).toBe(
+      '{"aps":{"alert":{"title":"CozyChat","body":"New message"},"mutable-content":1,"category":"message"},"c":"CIPHERBLOB"}',
+    );
+  });
+
+  it("sends mobile status wakes as an exact silent background APNs envelope", async () => {
+    const { headers, body, rawBody } = await deliverWithCategory("mobile.status.wake", "mobile.status");
+    expect(headers["apns-collapse-id"]).toBe("mobile.status");
+    expect(headers["apns-push-type"]).toBe("background");
+    expect(headers["apns-priority"]).toBe("5");
+    expect(body).toEqual({
+      aps: { "content-available": 1 },
+      c: "CIPHERBLOB",
+    });
+    expect(rawBody).toBe('{"aps":{"content-available":1},"c":"CIPHERBLOB"}');
   });
 
   it("coalesces on the caller's collapse id (apns-collapse-id = toolCallId)", async () => {
@@ -273,7 +295,20 @@ describe("apnsTransport push categories", () => {
   });
 
   it("carries only a value-free fallback alert; every approval detail stays inside the ciphertext", async () => {
-    const { body } = await deliverWithCategory("approval.pending", "toolu_01");
+    const { headers, body, rawBody } = await deliverWithCategory("approval.pending", "toolu_01");
+    expect(headers["apns-push-type"]).toBe("alert");
+    expect(headers["apns-priority"]).toBe("10");
+    expect(body).toEqual({
+      aps: {
+        alert: { title: "CozyChat", body: "Approval requested" },
+        "mutable-content": 1,
+        category: "approval.pending",
+      },
+      c: "CIPHERBLOB",
+    });
+    expect(rawBody).toBe(
+      '{"aps":{"alert":{"title":"CozyChat","body":"Approval requested"},"mutable-content":1,"category":"approval.pending"},"c":"CIPHERBLOB"}',
+    );
     const aps = body["aps"] as { alert: { title: string; body: string } };
     expect(aps.alert).toEqual({ title: "CozyChat", body: "Approval requested" });
     // The APNs JSON, minus the opaque ciphertext, names nothing about the tool call itself.
