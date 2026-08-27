@@ -42,6 +42,22 @@ describe("schemas", () => {
     expect(Value.Check(NotifyRequestSchema, { pushId: "p", ciphertext: "x".repeat(CIPHERTEXT_MAX_LENGTH + 1) })).toBe(false);
   });
 
+  it("allowlists mobile status wakes without opening the notify schema", () => {
+    expect(Value.Check(NotifyRequestSchema, {
+      pushId: "p",
+      ciphertext: "opaque",
+      category: "mobile.status.wake",
+      collapseId: "mobile.status",
+    })).toBe(true);
+    expect(Value.Check(NotifyRequestSchema, {
+      pushId: "p",
+      ciphertext: "opaque",
+      category: "mobile.status.wake",
+      collapseId: "mobile.status",
+      requestId: "relay-visible-detail",
+    })).toBe(false);
+  });
+
   it("builds the error envelope", () => {
     expect(relayError("not_found", "nope")).toEqual({ error: { code: "not_found", message: "nope" } });
   });
