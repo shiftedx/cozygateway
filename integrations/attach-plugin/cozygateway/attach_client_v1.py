@@ -63,6 +63,7 @@ MOBILE_FAILURE_REASONS = frozenset({
     "media_validation_failed", "media_storage_failed",
 })
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
+MOBILE_INTERACTION_TIMEOUT_SECONDS = 120
 # How long to wait for hello_ack before concluding the handshake stalled and re-dialing with the
 # same hello. The gateway gives a peer 5 seconds to say hello; this is the matching budget in the
 # other direction.
@@ -264,18 +265,23 @@ class AttachV1Client:
         request_id = str(uuid.uuid4())
         future: asyncio.Future[MobileDeviceStatusResult] = asyncio.get_running_loop().create_future()
         self._mobile_requests[request_id] = (command, future)
+        timeout_seconds = (
+            MOBILE_STATUS_TIMEOUT_SECONDS
+            if command in {"device.status", "location.current"}
+            else MOBILE_INTERACTION_TIMEOUT_SECONDS
+        )
         try:
             frame: Dict[str, Any] = {
                 "kind": "mobile_request", "requestId": request_id,
                 "command": command, "threadId": thread_id, "turnId": turn_id,
-                "expiresAt": int(time.time() * 1000) + MOBILE_STATUS_TIMEOUT_SECONDS * 1000,
+                "expiresAt": int(time.time() * 1000) + timeout_seconds * 1000,
             }
             if purpose is not None:
                 frame["purpose"] = purpose
             if options is not None:
                 frame.update(options)
             await self._send(frame)
-            return await asyncio.wait_for(asyncio.shield(future), MOBILE_STATUS_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(asyncio.shield(future), timeout_seconds)
         except asyncio.TimeoutError:
             await self._cancel_mobile_request(request_id)
             return {"status": "expired"}

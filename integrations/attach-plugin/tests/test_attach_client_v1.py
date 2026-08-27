@@ -664,6 +664,29 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.client.request_device_status("thread", "turn", "Report phone readiness"), {"status": "expired"})
         self.assertEqual([frame["kind"] for frame in self.socket.sent[-2:]], ["mobile_request", "mobile_cancel"])
 
+    async def test_mobile_deadlines_distinguish_queries_from_human_interactions(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_media"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        with patch("cozygateway.attach_client_v1.time.time", return_value=1_000):
+            status_request = __import__("asyncio").create_task(
+                self.client.request_device_status("thread", "turn", "Report phone readiness")
+            )
+            await __import__("asyncio").sleep(0)
+            status_frame = self.socket.sent[-1]
+            status_request.cancel()
+            self.assertEqual(await status_request, {"status": "cancelled"})
+            request = __import__("asyncio").create_task(
+                self.client.request_camera("thread", "turn", "Capture a test photo", "rear", "photo")
+            )
+            await __import__("asyncio").sleep(0)
+        frame = self.socket.sent[-1]
+        self.assertEqual(status_frame["command"], "device.status")
+        self.assertEqual(status_frame["expiresAt"], 1_030_000)
+        self.assertEqual(frame["command"], "camera.capture")
+        self.assertEqual(frame["expiresAt"], 1_120_000)
+        request.cancel()
+        self.assertEqual(await request, {"status": "cancelled"})
+
     async def test_device_status_rejects_arbitrary_result_payloads(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))

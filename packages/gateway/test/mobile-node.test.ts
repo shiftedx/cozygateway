@@ -32,7 +32,63 @@ type P1RequestShape =
   | { command: "notification.present"; title: string; body: string };
 
 describe("MobileNodeBroker", () => {
-  it("settles successful P1 media exactly once and rechecks expiry and foreground during upload", () => {
+  it("admits a human-scale camera deadline instead of expiring during capture", () => {
+    const send = vi.fn(() => true);
+    const result = vi.fn();
+    const broker = new MobileNodeBroker({
+      receipt: () => true,
+      available: () => true,
+      send,
+      result,
+      now: () => 1_000,
+    });
+
+    broker.invoke({
+      requestId: "camera-human-delay",
+      command: "camera.capture",
+      bot: "cleo",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      expiresAt: 121_000,
+      purpose: "Capture a test photo",
+      deviceId: "origin",
+      agentId: "cleo",
+      camera: "rear",
+      capture: "photo",
+      videoDurationSeconds: 10,
+    });
+
+    expect(send).toHaveBeenCalledWith("origin", expect.objectContaining({
+      type: "mobile_node_request",
+      requestId: "camera-human-delay",
+      expiresAt: 121_000,
+    }));
+    expect(result).not.toHaveBeenCalled();
+  });
+
+  it("keeps query deadlines short and rejects overlong interaction deadlines", () => {
+    const send = vi.fn(() => true);
+    const result = vi.fn();
+    const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => 1_000 });
+
+    broker.invoke({
+      requestId: "long-status", command: "device.status", bot: "cleo", threadId: "thread", turnId: "turn",
+      expiresAt: 31_001, purpose, deviceId: "origin", agentId: "cleo",
+    });
+    broker.invoke({
+      requestId: "overlong-camera", command: "camera.capture", bot: "cleo", threadId: "thread", turnId: "turn",
+      expiresAt: 121_001, purpose, deviceId: "origin", agentId: "cleo", camera: "rear", capture: "photo",
+      videoDurationSeconds: 10,
+    });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(result.mock.calls.map(([, value]) => value)).toEqual([
+      { requestId: "long-status", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" },
+      { requestId: "overlong-camera", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" },
+    ]);
+  });
+
+  it("settles successful P1 media exactly once and rechecks foreground during upload", () => {
     vi.useFakeTimers();
     try {
       let now = 1_000;
@@ -65,11 +121,11 @@ describe("MobileNodeBroker", () => {
           expect(broker.beginMediaUpload("origin", requestId, lease)).toBeUndefined(); // replay
         }
       }
-      broker.invoke({ command: "camera.capture", camera: "front", capture: "photo", videoDurationSeconds: 10, requestId: "expired-p1", bot: "sage", threadId: "thread", turnId: "turn", purpose, deviceId: "origin", agentId: "sage", expiresAt: 1_001 });
-      const expiredClaim = broker.beginMediaUpload("origin", "expired-p1", leaseFor(send, "expired-p1"));
+      broker.invoke({ command: "camera.capture", camera: "front", capture: "photo", videoDurationSeconds: 10, requestId: "claimed-before-expiry", bot: "sage", threadId: "thread", turnId: "turn", purpose, deviceId: "origin", agentId: "sage", expiresAt: 1_001 });
+      const expiredClaim = broker.beginMediaUpload("origin", "claimed-before-expiry", leaseFor(send, "claimed-before-expiry"));
       now = 1_001;
-      expect(broker.completeMediaUpload(expiredClaim!, { mediaId: "expired", mimeType: "image/jpeg", byteCount: 1, sha256: "a".repeat(64), filename: "photo.jpg", family: "image" })).toBe(false);
-      expect(result.mock.calls.some(([_, value]) => value.requestId === "expired-p1" && value.status === "expired")).toBe(true);
+      expect(broker.completeMediaUpload(expiredClaim!, { mediaId: "accepted", mimeType: "image/jpeg", byteCount: 1, sha256: "a".repeat(64), filename: "photo.jpg", family: "image" })).toBe(true);
+      expect(result.mock.calls.some(([_, value]) => value.requestId === "claimed-before-expiry" && value.status === "ok")).toBe(true);
       now = 1_000;
       broker.invoke({ command: "file.pick", selection: "photo", requestId: "background-p1", bot: "sage", threadId: "thread", turnId: "turn", purpose, deviceId: "origin", agentId: "sage", expiresAt: 2_000 });
       const backgroundClaim = broker.beginMediaUpload("origin", "background-p1", leaseFor(send, "background-p1"));

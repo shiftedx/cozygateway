@@ -280,8 +280,10 @@ One-shot `location.current` additionally requires negotiated `mobile_location`; 
 ```
 
 Every mobile request `purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
-C0/C1 control characters; invalid input is rejected rather than truncated. Location expiry is at
-most 30 seconds. Success remains commandless because the pending `requestId` binds the command:
+C0/C1 control characters; invalid input is rejected rather than truncated. Status and location
+expire within 30 seconds. Camera, file-picker, and notification interactions expire within 120
+seconds so a foreground human action can finish while remaining bounded. Success remains
+commandless because the pending `requestId` binds the command:
 `{ "kind": "mobile_result", "requestId": "...", "status": "ok", "result": { "latitude": 41.88, "longitude": -87.63 } }`.
 Both coordinates must be finite, range-bounded (`latitude [-90,90]`, `longitude [-180,180]`), and
 have no more than two decimal places. The gateway rejects an incompatible result shape.
@@ -326,3 +328,8 @@ result is ignored. A gateway MUST neither accept a location request nor send a l
 without `mobile_location` negotiated. Purpose and all mobile payload fields are in-memory
 request/result values only and are never put in the durable spool, transcript, storage, diagnostic
 logs/traces, tool-hook details, audit, or push payloads.
+
+For camera and file-picker media, the deadline governs admission to the authenticated upload route.
+The gateway consumes the one-shot device/lease claim before reading the request body. An upload
+claimed before the deadline may finish reading, validating, and storing after it; the consumed
+claim remains replay-safe and cannot authorize a second upload.
