@@ -195,11 +195,6 @@ export async function startGateway(
   const scheme = tls === undefined ? "http" : "https";
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
-  const attachMediaSweep = setInterval(
-    () => storage.pruneExpiredAttachMedia(Date.now()),
-    PHOTO_SWEEP_MS,
-  );
-  attachMediaSweep.unref?.();
   const profileEntries = Object.entries(config.hermes.profiles).map(
     ([rawId, profile]) => [rawId.trim().toLowerCase(), profile] as const,
   );
@@ -563,6 +558,19 @@ export async function startGateway(
   // Started after the listener is up so the first roster refresh cannot race the hub it
   // broadcasts through.
   bridge.start();
+  // Start periodic retention only after startup succeeds. A failed startup must not leave a timer
+  // repeatedly touching a database that no running gateway owns, and a later disk fault must not
+  // escape the timer callback and terminate an otherwise healthy process.
+  const attachMediaSweep = setInterval(() => {
+    try {
+      storage.pruneExpiredAttachMedia(Date.now());
+    } catch (error) {
+      console.error(
+        `attachment media retention sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }, PHOTO_SWEEP_MS);
+  attachMediaSweep.unref?.();
   const address = server.address();
   const port =
     address !== null && typeof address === "object"
