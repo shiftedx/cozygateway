@@ -9,6 +9,7 @@ import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { BackendUnavailable } from "../src/errors.ts";
+import { ATTACH_MEDIA_TTL_MS } from "../src/hermes-bridge/photos.ts";
 import { openStorage } from "../src/storage.ts";
 
 describe("attach-v1 native Bot Mode plane", () => {
@@ -174,27 +175,36 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
-  it("queues a document as gateway-owned file media", async () => {
+  it("bounds gateway-owned native attachments and photos to the attachment retention window", async () => {
     const storage = openStorage(":memory:");
     const turns: Array<{ mediaIds?: string[] }> = [];
-    let mediaWasAvailable = false;
+    const now = 10;
     const plane = new NativeBotDataPlane({
       control: {} as BotsSurface, storage,
       ingress: { sendNativeTurn: (bot: string, turn: { mediaIds?: string[] }) => {
         turns.push(turn);
-        mediaWasAvailable = storage.attachMediaInfo(bot, turn.mediaIds?.[0] ?? "", 10) !== undefined;
         return true;
       } } as unknown as AttachV1Ingress,
-      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 10,
+      nativeBots: ["sage", "cleo"], chatSuggestion: "", broadcast: () => undefined, now: () => now,
     });
-    const sent = await plane.surface().sendChatAttachment("sage", {
+    const attachmentSent = await plane.surface().sendChatAttachment("sage", {
       bytes: new TextEncoder().encode('{"ok":true}'), mime: "application/json", name: "report.json", text: "Read this.",
     });
-    const attachment = sent.message.attachments?.[0];
+    const photoSent = await plane.surface().sendChatPhoto("cleo", {
+      bytes: new Uint8Array([137, 80, 78, 71]), mime: "image/png", ext: "png", text: "Look at this.",
+    });
+    const attachment = attachmentSent.message.attachments?.[0]!;
+    const photo = photoSent.message.attachments?.[0]!;
     expect(attachment).toMatchObject({ name: "report.json", mimeType: "application/json", mediaKind: "file" });
-    expect(turns[0]?.mediaIds).toEqual([attachment?.fileId]);
-    expect(mediaWasAvailable).toBe(true);
-    expect(storage.attachMediaInfo("sage", attachment!.fileId, 10)?.descriptor.family).toBe("file");
+    expect(photo).toMatchObject({ name: "image.png", mimeType: "image/png", mediaKind: "image" });
+    expect(turns.map((turn) => turn.mediaIds)).toEqual([[attachment.fileId], [photo.fileId]]);
+    for (const [bot, media] of [["sage", attachment], ["cleo", photo]] as const) {
+      const stored = storage.attachMediaInfo(bot, media.fileId, now);
+      expect(stored?.descriptor).toMatchObject({ expiresAt: now + ATTACH_MEDIA_TTL_MS });
+      expect(storage.attachMediaSlice(bot, media.fileId, 0, 1, now + ATTACH_MEDIA_TTL_MS - 1)).toBeDefined();
+      expect(storage.attachMediaInfo(bot, media.fileId, now + ATTACH_MEDIA_TTL_MS)).toBeUndefined();
+      expect(storage.attachMediaSlice(bot, media.fileId, 0, 1, now + ATTACH_MEDIA_TTL_MS)).toBeUndefined();
+    }
     plane.close();
     storage.close();
   });

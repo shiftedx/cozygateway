@@ -37,6 +37,7 @@ import type {
   MediaLookup,
 } from "./hermes-bridge/media.ts";
 import {
+  ATTACH_MEDIA_TTL_MS,
   PhotoRefused,
   readCappedBody,
   sniffImageType,
@@ -770,6 +771,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return fail(400, errorBody("invalid_request", "invalid attach media filename"));
     const descriptor: AttachV1MediaDescriptor = {
       mediaId: randomUUID().replaceAll("-", ""), mimeType, byteCount: bytes.byteLength, sha256, filename, family: acceptedType.kind,
+      expiresAt: deps.now() + ATTACH_MEDIA_TTL_MS,
     };
     try {
       deps.storage.saveAttachMedia(claim.agentId, descriptor, bytes, deps.now());
