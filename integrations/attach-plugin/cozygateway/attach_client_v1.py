@@ -51,6 +51,17 @@ MobileStatus = Literal[
     "foreground_required", "policy_blocked",
 ]
 MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
+MOBILE_FAILURE_STAGES = frozenset({
+    "policy", "routing", "dispatch", "response", "media", "receipt", "lifecycle",
+})
+MOBILE_FAILURE_REASONS = frozenset({
+    "no_selected_device", "command_not_advertised", "selected_socket_unavailable",
+    "frame_send_failed", "phone_disconnected_pending", "invalid_phone_payload",
+    "lease_mismatch", "cross_device_result", "receipt_persistence_failed",
+    "broker_closed_pending", "malformed_request_frame", "request_expired_unanswered",
+    "request_policy_rejected", "selected_app_not_foreground",
+    "media_validation_failed", "media_storage_failed",
+})
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
 # How long to wait for hello_ack before concluding the handshake stalled and re-dialing with the
 # same hello. The gateway gives a peer 5 seconds to say hello; this is the matching budget in the
@@ -62,7 +73,7 @@ HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts",
-    "delegation", "thinking",
+    "delegation", "thinking", "mobile_failure_details",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
@@ -87,6 +98,8 @@ ATTACH_FILE_MAX_BYTES = 20 * 1024 * 1024
 class MobileDeviceStatusResult(TypedDict, total=False):
     status: MobileStatus
     result: Union["DeviceStatus", "Location"]
+    stage: str
+    reason: str
 
 
 class DeviceStatusCapability(TypedDict):
@@ -1035,6 +1048,10 @@ class AttachV1Client:
                 future.set_result({"status": "device_unavailable"})
                 return
             result["result"] = payload
+        elif "mobile_failure_details" in self._capabilities:
+            stage, reason = frame.get("stage"), frame.get("reason")
+            if stage in MOBILE_FAILURE_STAGES and reason in MOBILE_FAILURE_REASONS:
+                result["stage"], result["reason"] = stage, reason
         future.set_result(result)
 
     def _settle_mobile_requests(self, status: MobileStatus) -> None:

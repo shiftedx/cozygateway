@@ -300,6 +300,26 @@ and is dropped on reconnect. Terminal
 statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground_required`, and
 `policy_blocked`.
 
+`mobile_failure_details` is an optional attach capability for truthful terminal diagnostics. A
+gateway MUST send the historical `{ kind, requestId, status }` terminal shape when the plugin did
+not negotiate it. When it is negotiated, a non-`ok` result MAY additionally carry both `stage` and
+`reason` (never only one). Successful results are unchanged.
+
+Stages are the closed set `policy`, `routing`, `dispatch`, `response`, `media`, `receipt`, and
+`lifecycle`. Reasons are the closed set `no_selected_device`, `command_not_advertised`,
+`selected_socket_unavailable`, `frame_send_failed`, `phone_disconnected_pending`,
+`invalid_phone_payload`, `lease_mismatch`, `cross_device_result`, `receipt_persistence_failed`,
+`broker_closed_pending`, `malformed_request_frame`, `request_expired_unanswered`,
+`request_policy_rejected`, `selected_app_not_foreground`, `media_validation_failed`, and
+`media_storage_failed`. Peers MUST reject unknown stages/reasons and MUST NOT substitute raw error
+text. These fields describe only the bounded failure class: they never contain a purpose, request,
+thread, turn, device or media identifier, path, coordinates, tokens, media contents, socket state,
+or private payload. In particular, an unanswered dispatched request is `expired` with
+`response/request_expired_unanswered`; an invalid phone result is `policy_blocked` with
+`response/invalid_phone_payload`; and media validation/storage failures are `policy_blocked` with
+the corresponding `media/*` reason. Status remains authoritative and no failure diagnostic may be
+represented as `ok`.
+
 The plugin may send `{ "kind": "mobile_cancel", "requestId": "..." }` to settle its own
 pending tool. It is also negotiated, unsequenced, non-durable, and never replayed; a late phone
 result is ignored. A gateway MUST neither accept a location request nor send a location result

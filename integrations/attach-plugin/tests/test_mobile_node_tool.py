@@ -107,6 +107,25 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         client.result.set_result({"status": "ok", "result": GATEWAY_STATUS})
         self.assertEqual(json.loads(await call), {"status": "ok", "result": GATEWAY_STATUS})
 
+    async def test_preserves_bounded_failure_details_in_the_hermes_tool_json(self):
+        client = _Client()
+        adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+        call = asyncio.create_task(self.tool["handler"]({"purpose": "Report phone readiness"}))
+        await asyncio.sleep(0)
+        client.result.set_result({
+            "status": "device_unavailable", "stage": "dispatch", "reason": "frame_send_failed",
+        })
+        self.assertEqual(json.loads(await call), {
+            "status": "device_unavailable", "stage": "dispatch", "reason": "frame_send_failed",
+        })
+
+        self.assertEqual(
+            json.loads(adapter_module._mobile_tool_result(
+                "device_unavailable", stage="token-secret", reason="path-secret",
+            )),
+            {"status": "device_unavailable"},
+        )
+
     async def test_registers_p1_camera_file_and_actionable_notification_tools(self):
         by_name = {tool["name"]: tool for tool in self.context.tools}
         self.assertEqual(set(("cozy_capture_camera", "cozy_pick_file", "cozy_present_notification")) - set(by_name), set())

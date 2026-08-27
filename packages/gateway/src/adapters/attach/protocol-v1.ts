@@ -28,6 +28,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("delivery_receipts"),
   Type.Literal("delegation"),
   Type.Literal("thinking"),
+  Type.Literal("mobile_failure_details"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -298,12 +299,35 @@ export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusReque
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
+export const AttachV1MobileFailureStageSchema = Type.Union([
+  Type.Literal("policy"), Type.Literal("routing"), Type.Literal("dispatch"),
+  Type.Literal("response"), Type.Literal("media"), Type.Literal("receipt"),
+  Type.Literal("lifecycle"),
+]);
+export const AttachV1MobileFailureReasonSchema = Type.Union([
+  Type.Literal("no_selected_device"), Type.Literal("command_not_advertised"),
+  Type.Literal("selected_socket_unavailable"), Type.Literal("frame_send_failed"),
+  Type.Literal("phone_disconnected_pending"), Type.Literal("invalid_phone_payload"),
+  Type.Literal("lease_mismatch"), Type.Literal("cross_device_result"),
+  Type.Literal("receipt_persistence_failed"), Type.Literal("broker_closed_pending"),
+  Type.Literal("malformed_request_frame"), Type.Literal("request_expired_unanswered"),
+  Type.Literal("request_policy_rejected"), Type.Literal("selected_app_not_foreground"),
+  Type.Literal("media_validation_failed"), Type.Literal("media_storage_failed"),
+]);
+const AttachV1MobileTerminalStatusSchema = Type.Union([
+  Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"),
+  Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked"),
+]);
 export const AttachV1MobileResultSchema = Type.Union([
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: MobileNodeGatewayStatusResultSchema }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ latitude: Type.Number({ minimum: -90, maximum: 90 }), longitude: Type.Number({ minimum: -180, maximum: 180 }) }, { additionalProperties: false }) }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: MobileNodeMediaDescriptorSchema }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ action: Type.Union([Type.Literal("approve"), Type.Literal("snooze"), Type.Literal("open"), Type.Literal("cancel")]) }, { additionalProperties: false }) }, { additionalProperties: false }),
-  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Union([Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"), Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked")]) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: AttachV1MobileTerminalStatusSchema }, { additionalProperties: false }),
+  Type.Object({
+    kind: Type.Literal("mobile_result"), requestId: Id, status: AttachV1MobileTerminalStatusSchema,
+    stage: AttachV1MobileFailureStageSchema, reason: AttachV1MobileFailureReasonSchema,
+  }, { additionalProperties: false }),
 ]);
 export type AttachV1MobileResult = Static<typeof AttachV1MobileResultSchema>;
 export type AttachV1MobileResultInput =
@@ -311,7 +335,8 @@ export type AttachV1MobileResultInput =
   | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
   | { requestId: string; status: "ok"; result: { mediaId: string; mimeType: string; byteCount: number; sha256: string; filename: string; family: "image" | "audio" | "video" | "file" } }
   | { requestId: string; status: "ok"; result: { action: "approve" | "snooze" | "open" | "cancel" } }
-  | { requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" };
+  | ({ requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" }
+    & Partial<{ stage: Static<typeof AttachV1MobileFailureStageSchema>; reason: Static<typeof AttachV1MobileFailureReasonSchema> }>);
 
 /** This union was deliberately closed to reasoning ("no thinking/reasoning/chain-of-thought
  * event exists"). Capability `thinking` consciously reopens it, bounded: `ThinkingEvent` is a

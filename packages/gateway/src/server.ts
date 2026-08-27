@@ -539,7 +539,7 @@ export async function startGateway(
       const claim = mobileNode?.beginMediaUpload(deviceId, requestId, lease);
       return claim === undefined ? undefined : {
         agentId: claim.agentId,
-        complete: (media) => mobileNode?.completeMediaUpload(claim, media) ?? false,
+        complete: (media, reason) => mobileNode?.completeMediaUpload(claim, media, reason) ?? false,
       };
     },
     presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",

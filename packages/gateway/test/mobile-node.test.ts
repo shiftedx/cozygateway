@@ -105,7 +105,9 @@ describe("MobileNodeBroker", () => {
     now = 1_001;
     if (command === "camera.capture" || command === "file.pick") expect(broker.beginMediaUpload("origin", "expired", expiryLease)).toBeUndefined();
     else broker.result("origin", { type: "mobile_node_result", requestId: "expired", lease: expiryLease, status: "denied" });
-    expect(result).toHaveBeenCalledWith("sage", { requestId: "expired", status: "expired" });
+    expect(result).toHaveBeenCalledWith("sage", {
+      requestId: "expired", status: "expired", stage: "response", reason: "request_expired_unanswered",
+    });
   });
   it("delivers one closed status request and ignores a duplicate request id", () => {
     const send = vi.fn(() => true);
@@ -158,10 +160,10 @@ describe("MobileNodeBroker", () => {
     broker.invoke({ ...base, requestId: "oversize", purpose: "x".repeat(161) });
 
     expect(result.mock.calls).toEqual([
-      ["sage", { requestId: "location", status: "policy_blocked" }],
-      ["sage", { requestId: "control", status: "policy_blocked" }],
-      ["sage", { requestId: "empty", status: "policy_blocked" }],
-      ["sage", { requestId: "oversize", status: "policy_blocked" }],
+      ["sage", { requestId: "location", status: "policy_blocked", stage: "response", reason: "invalid_phone_payload" }],
+      ["sage", { requestId: "control", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" }],
+      ["sage", { requestId: "empty", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" }],
+      ["sage", { requestId: "oversize", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" }],
     ]);
   });
 
@@ -186,7 +188,10 @@ describe("MobileNodeBroker", () => {
       result: { latitude: 41.88, longitude: -87.63 },
     });
 
-    expect(result).toHaveBeenCalledWith("sage", { requestId: "location-backgrounded", status: "foreground_required" });
+    expect(result).toHaveBeenCalledWith("sage", {
+      requestId: "location-backgrounded", status: "foreground_required",
+      stage: "routing", reason: "command_not_advertised",
+    });
   });
 
   it("settles an agent cancellation once and drops the late phone result", () => {
@@ -249,9 +254,9 @@ describe("MobileNodeBroker", () => {
     broker.invoke({ ...base, requestId: "late", deviceId: "device-1", expiresAt: 32_000 });
 
     expect(result.mock.calls).toEqual([
-      ["sage", { requestId: "missing", status: "device_unavailable" }],
-      ["sage", { requestId: "unavailable", status: "foreground_required" }],
-      ["sage", { requestId: "late", status: "policy_blocked" }],
+      ["sage", { requestId: "missing", status: "device_unavailable", stage: "routing", reason: "no_selected_device" }],
+      ["sage", { requestId: "unavailable", status: "foreground_required", stage: "routing", reason: "command_not_advertised" }],
+      ["sage", { requestId: "late", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" }],
     ]);
   });
 
@@ -269,10 +274,10 @@ describe("MobileNodeBroker", () => {
     broker.reject("sage", "reject");
 
     expect(result.mock.calls).toEqual([
-      ["sage", { requestId: "missing", status: "device_unavailable" }],
-      ["sage", { requestId: "unavailable", status: "foreground_required" }],
-      ["sage", { requestId: "policy", status: "policy_blocked" }],
-      ["sage", { requestId: "reject", status: "policy_blocked" }],
+      ["sage", { requestId: "missing", status: "device_unavailable", stage: "routing", reason: "no_selected_device" }],
+      ["sage", { requestId: "unavailable", status: "foreground_required", stage: "routing", reason: "command_not_advertised" }],
+      ["sage", { requestId: "policy", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" }],
+      ["sage", { requestId: "reject", status: "policy_blocked", stage: "policy", reason: "request_policy_rejected" }],
     ]);
   });
 
@@ -301,7 +306,9 @@ describe("MobileNodeBroker", () => {
       broker.result("origin", { type: "mobile_node_result", requestId: "disconnect", lease: reconnectLease, status: "ok", result: phoneStatus });
       broker.result("origin", { type: "mobile_node_result", requestId: "disconnect", lease: reconnectLease, status: "ok", result: phoneStatus });
 
-      expect(result.mock.calls[0]).toEqual(["sage", { requestId: "expiry", status: "expired" }]);
+      expect(result.mock.calls[0]).toEqual(["sage", {
+        requestId: "expiry", status: "expired", stage: "response", reason: "request_expired_unanswered",
+      }]);
       expect(result.mock.calls.filter(([_, value]) => value.requestId === "disconnect")).toHaveLength(1);
       expect(send).toHaveBeenCalledWith("origin", expect.objectContaining({
         type: "mobile_node_cancel", requestId: "expiry", lease: expiryLease, status: "expired",
@@ -327,7 +334,9 @@ describe("MobileNodeBroker", () => {
       lease: leaseFor(send, "late-result"),
     });
 
-    expect(result).toHaveBeenCalledWith("sage", { requestId: "late-result", status: "expired" });
+    expect(result).toHaveBeenCalledWith("sage", {
+      requestId: "late-result", status: "expired", stage: "response", reason: "request_expired_unanswered",
+    });
     expect(send).toHaveBeenLastCalledWith("origin", {
       type: "mobile_node_cancel", requestId: "late-result", status: "expired",
       lease: expect.any(String),

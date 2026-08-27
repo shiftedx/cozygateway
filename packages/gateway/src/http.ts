@@ -108,7 +108,7 @@ export interface AppDeps {
   attachMediaAllowed?: (agentId: string) => boolean;
   /** A device-authenticated lease claim for one phone-selected binary payload. */
   beginMobileMediaUpload?: (deviceId: string, requestId: string, lease: string) =>
-    | { agentId: string; complete: (media: MobileNodeMediaDescriptor | undefined) => boolean }
+    | { agentId: string; complete: (media: MobileNodeMediaDescriptor | undefined, reason?: "media_validation_failed" | "media_storage_failed") => boolean }
     | undefined;
   /** Test seam for `GET /bots/:name/media`. Left undefined in production, where the proxy uses the
    *  global `fetch`; a test supplies its own so the media rules can be exercised without a socket. */
@@ -770,8 +770,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
     const claim = deps.beginMobileMediaUpload?.(c.get("deviceId"), requestId, lease);
     if (claim === undefined)
       return c.json(errorBody("not_found", "mobile media request is not available"), 404);
-    const fail = (status: 400 | 413 | 415 | 422, body: ErrorBody) => {
-      claim.complete(undefined);
+    const fail = (status: 400 | 413 | 415 | 422, body: ErrorBody, reason: "media_validation_failed" | "media_storage_failed" = "media_validation_failed") => {
+      claim.complete(undefined, reason);
       return c.json(body, status);
     };
     const receivedType = c.req.header("content-type") ?? "";
@@ -800,7 +800,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
     try {
       deps.storage.saveAttachMedia(claim.agentId, descriptor, bytes, deps.now());
     } catch {
-      return fail(400, errorBody("invalid_request", "could not store mobile media"));
+      return fail(400, errorBody("invalid_request", "could not store mobile media"), "media_storage_failed");
     }
     if (!claim.complete(descriptor)) {
       deps.storage.deleteUnreferencedAttachMedia(claim.agentId, descriptor.mediaId);
