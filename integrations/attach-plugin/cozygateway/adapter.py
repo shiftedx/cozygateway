@@ -2694,12 +2694,16 @@ async def _materialize_mobile_artifact(adapter: Any, descriptor: Dict[str, Any])
     established document-cache/read_file contract. Other families fail closed: a
     descriptor or local path alone is not evidence that the configured model can inspect it.
     """
-    failure = _mobile_tool_result("artifact_unavailable")
+    failure = _mobile_tool_result(
+        "device_unavailable", stage="media", reason="media_validation_failed"
+    )
     if not _is_media(descriptor) or not _valid_mobile_artifact_filename(descriptor.get("filename")):
         return failure
     # A structurally valid descriptor is safe to retain as the audit reference even
     # when the authenticated bytes later fail verification. It contains no device path.
-    failure = _mobile_tool_result("artifact_unavailable", dict(descriptor))
+    failure = _mobile_tool_result(
+        "device_unavailable", dict(descriptor), "media", "media_validation_failed"
+    )
 
     media_id = descriptor["mediaId"]
     mime = descriptor["mimeType"].split(";", 1)[0].strip().lower()
@@ -2802,7 +2806,10 @@ async def _materialize_mobile_artifact(adapter: Any, descriptor: Dict[str, Any])
         }
     cache[media_id] = (audit, result)
     cache.move_to_end(media_id)
-    while len(cache) > 32:
+    # Image entries carry an inline base64 part. Four maximum keeps the resident
+    # adapter's worst-case retained image payload bounded to roughly 32 MiB of
+    # source bytes (plus encoding overhead); replay safety does not justify 32.
+    while len(cache) > 4:
         cache.popitem(last=False)
     return result
 
@@ -2936,28 +2943,19 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
         status, result = "device_unavailable", None
     if status == "ok" and media and isinstance(result, dict):
         try:
-            artifact_result = await _materialize_mobile_artifact(adapters[0], result)
+            artifact_result = await _materialize_mobile_artifact(origin_adapter, result)
         except asyncio.CancelledError:
             return _mobile_tool_result("cancelled")
-        # The authenticated download/cache leg is part of the phone request. Re-check
-        # the resident turn after it too, so bytes cannot land in a replacement turn.
-        try:
-            final_platform, final_chat_id = _current_turn_platform_and_chat()
-            final_message_id, final_cron, final_profile = _current_turn_message_and_cron()
-            final_adapters = [
-                adapter for adapter in _active_adapters_snapshot()
-                if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
-            ]
-        except Exception:  # noqa: BLE001 - payload release must fail closed
-            final_adapters = []
-            final_platform = final_chat_id = final_message_id = final_profile = None
-            final_cron = True
-        if (
-            final_platform != platform or final_chat_id != chat_id or final_message_id != turn_id
-            or final_cron or final_profile != profile or len(final_adapters) != 1
-            or final_adapters[0] is not adapters[0]
-        ):
-            _log_mobile_policy_block("context_changed_after_artifact_download")
+        # The download is still part of the admitted lease. Mutable Hermes message
+        # context may move while bytes are fetched; only loss or replacement of the
+        # immutable origin adapter/profile/chat/turn invalidates their release.
+        final_adapters = [
+            adapter for adapter in _active_adapters_snapshot()
+            if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+            and getattr(adapter, "_profile", None) == profile
+        ]
+        if len(final_adapters) != 1 or final_adapters[0] is not origin_adapter:
+            _log_mobile_policy_block("origin_turn_changed_after_artifact_download")
             return _mobile_tool_result("policy_blocked")
         return artifact_result
     return _mobile_tool_result(

@@ -235,7 +235,16 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
                     result = await self.camera_tool["handler"]({
                         "purpose": "Inspect it", "camera": "rear", "capture": "photo",
                     })
-                self.assertEqual(json.loads(result)["status"], "artifact_unavailable")
+                expected = {
+                    "status": "device_unavailable",
+                    "stage": "media", "reason": "media_validation_failed",
+                }
+                # A structurally safe descriptor remains useful as the audit
+                # reference. A path-like filename fails before any descriptor is
+                # released into model context.
+                if descriptor["filename"] != "../private.png":
+                    expected["result"] = descriptor
+                self.assertEqual(json.loads(result), expected)
                 cache.assert_not_called()
 
     async def test_mobile_artifact_tool_hooks_never_project_bytes_or_cache_paths(self):
@@ -294,7 +303,11 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
                     result = await self.file_tool["handler"]({
                         "purpose": "Inspect it", "selection": "file",
                     })
-                self.assertEqual(json.loads(result)["status"], "artifact_unavailable")
+                expected = {
+                    "status": "device_unavailable", "result": descriptor,
+                    "stage": "media", "reason": "media_validation_failed",
+                }
+                self.assertEqual(json.loads(result), expected)
                 cache.assert_not_called()
 
     async def test_rejects_unbound_context_before_phone_routing(self):
