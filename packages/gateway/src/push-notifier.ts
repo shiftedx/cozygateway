@@ -17,6 +17,10 @@ const APPROVAL_CATEGORY = {
 } as const;
 
 const CHAT_MESSAGE_CATEGORY = "message";
+const MOBILE_NODE_WAKE_ROUTING = {
+  category: "mobile.status.wake",
+  collapseId: "mobile.status",
+} as const;
 
 export interface ChatMessagePushEvent {
   bot: string;
@@ -124,6 +128,28 @@ export class RelayNotifier implements Notifier {
         );
       });
     }
+  }
+
+  /** Schedule one silent wake for a selected idle device. The boolean means only that a matching
+   *  registration was found and its fire-and-forget relay send was scheduled; APNs delivery is
+   *  deliberately unknowable at this seam. */
+  notifyMobileNodeWake(deviceId: string): boolean {
+    let registration: PushRegistrationRow | undefined;
+    try {
+      registration = this.#storage.pushRegistrations().find((candidate) => candidate.deviceId === deviceId);
+    } catch (err) {
+      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+    if (registration === undefined) return false;
+    void this.#send(registration, { kind: "mobile_node_wake" }, MOBILE_NODE_WAKE_ROUTING).catch((err: unknown) => {
+      this.#log(
+        `push: mobile-node wake failed for device ${registration.deviceId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+    return true;
   }
 
   /** A settled canonical bot reply. It uses the existing encrypted message payload and adds only

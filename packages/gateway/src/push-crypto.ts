@@ -49,8 +49,13 @@ export interface ApprovalResolvedPushPayload {
 
 export type ApprovalPushPayload = ApprovalPendingPushPayload | ApprovalResolvedPushPayload;
 
-/** The in-ciphertext notification payload: one envelope, three plaintexts. */
-export type PushPayload = MessagePushPayload | ApprovalPushPayload;
+/** Privacy-minimal signal telling an idle phone to reconnect for a retained status request. */
+export interface MobileNodeWakePushPayload {
+  kind: "mobile_node_wake";
+}
+
+/** The in-ciphertext notification payload. */
+export type PushPayload = MessagePushPayload | ApprovalPushPayload | MobileNodeWakePushPayload;
 
 /** Contract v1 froze pushKey as ANY minLength-1 string, so the AES key is derived rather
  *  than decoded: HKDF-SHA256(ikm = utf8(pushKey), salt = empty, info = PUSH_HKDF_INFO, 32). */

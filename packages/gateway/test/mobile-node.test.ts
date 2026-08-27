@@ -32,6 +32,125 @@ type P1RequestShape =
   | { command: "notification.present"; title: string; body: string };
 
 describe("MobileNodeBroker", () => {
+  it("retains one idle status request across a scheduled wake and resends that exact frame on reconnect", () => {
+    let available = false;
+    const route = () => available
+      ? { status: "available" as const, selectedSocketPresent: true, selectedSocketOpen: true, commandAdvertised: true, connectedSocketCount: 1, foreground: false }
+      : { status: "selected_socket_unavailable" as const, selectedSocketPresent: false, selectedSocketOpen: false, commandAdvertised: false, connectedSocketCount: 0, foreground: false };
+    const wake = vi.fn(() => true);
+    const send = vi.fn(() => "sent" as const);
+    const result = vi.fn();
+    const broker = new MobileNodeBroker({ route, wake, send, result, receipt: () => true, now: () => 1_000 });
+    const request = {
+      requestId: "idle-status", command: "device.status" as const, bot: "sage", threadId: "thread-1",
+      turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "origin", agentId: "sage",
+    };
+
+    broker.invoke(request);
+    broker.invoke(request);
+
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledWith("origin");
+    expect(send).not.toHaveBeenCalled();
+    expect(result).not.toHaveBeenCalled();
+
+    available = true;
+    broker.reconnectDevice("origin");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith("origin", expect.objectContaining({
+      type: "mobile_node_request", requestId: "idle-status", lease: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose,
+    }));
+  });
+
+  it("admits the request before scheduling its wake and keeps the original deadline", () => {
+    vi.useFakeTimers();
+    try {
+      let now = 1_000;
+      let available = false;
+      const route = () => available
+        ? { status: "available" as const, selectedSocketPresent: true, selectedSocketOpen: true, commandAdvertised: true, connectedSocketCount: 1, foreground: false }
+        : { status: "selected_socket_unavailable" as const, selectedSocketPresent: false, selectedSocketOpen: false, commandAdvertised: false, connectedSocketCount: 0, foreground: false };
+      const send = vi.fn(() => "sent" as const);
+      const result = vi.fn();
+      let broker!: MobileNodeBroker;
+      const wake = vi.fn(() => {
+        available = true;
+        broker.reconnectDevice("origin");
+        return true;
+      });
+      broker = new MobileNodeBroker({ route, wake, send, result, receipt: () => true, now: () => now });
+
+      broker.invoke({
+        requestId: "wake-race", command: "device.status", bot: "sage", threadId: "thread-1",
+        turnId: "turn-1", expiresAt: 1_010, purpose, deviceId: "origin", agentId: "sage",
+      });
+      expect(send).toHaveBeenCalledWith("origin", expect.objectContaining({
+        type: "mobile_node_request", requestId: "wake-race", expiresAt: 1_010,
+      }));
+
+      now = 1_010;
+      vi.advanceTimersByTime(10);
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(result).toHaveBeenCalledWith("sage", {
+        requestId: "wake-race", status: "expired", stage: "response", reason: "request_expired_unanswered",
+      });
+      expect(wake).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves immediate foreground_required when no wake registration matches", () => {
+    const wake = vi.fn(() => false);
+    const send = vi.fn(() => "sent" as const);
+    const result = vi.fn();
+    const route = () => ({ status: "selected_socket_unavailable" as const, selectedSocketPresent: false, selectedSocketOpen: false, commandAdvertised: false, connectedSocketCount: 0, foreground: false });
+    const broker = new MobileNodeBroker({ route, wake, send, result, receipt: () => true, now: () => 1_000 });
+    const request = {
+      requestId: "unregistered", command: "device.status" as const, bot: "sage", threadId: "thread-1",
+      turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "origin", agentId: "sage",
+    };
+
+    broker.invoke(request);
+    broker.invoke(request);
+
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+    expect(result).toHaveBeenCalledTimes(1);
+    expect(result).toHaveBeenCalledWith("sage", {
+      requestId: "unregistered", status: "foreground_required", stage: "routing", reason: "selected_socket_unavailable",
+    });
+  });
+
+  it.each(["location.current", "camera.capture", "file.pick", "notification.present"] as const)(
+    "does not wake idle %s commands",
+    (command) => {
+      const wake = vi.fn(() => true);
+      const result = vi.fn();
+      const broker = new MobileNodeBroker({
+        route: () => ({ status: "selected_socket_unavailable", selectedSocketPresent: false, selectedSocketOpen: false, commandAdvertised: false, connectedSocketCount: 0, foreground: false }),
+        wake, send: () => "sent", result, receipt: () => true, now: () => 1_000,
+      });
+      const common = {
+        requestId: `idle-${command}`, bot: "sage", threadId: "thread-1", turnId: "turn-1",
+        expiresAt: 2_000, purpose, deviceId: "origin", agentId: "sage",
+      };
+      const invocation = command === "camera.capture"
+        ? { ...common, command, camera: "rear" as const, capture: "photo" as const, videoDurationSeconds: 10 as const }
+        : command === "file.pick" ? { ...common, command, selection: "file" as const }
+        : command === "notification.present" ? { ...common, command, title: "Cozy", body: "Check status" }
+        : { ...common, command };
+
+      broker.invoke(invocation);
+
+      expect(wake).not.toHaveBeenCalled();
+      expect(result).toHaveBeenCalledWith("sage", {
+        requestId: `idle-${command}`, status: "foreground_required", stage: "routing", reason: "selected_socket_unavailable",
+      });
+    },
+  );
+
   it("admits a human-scale camera deadline instead of expiring during capture", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();
