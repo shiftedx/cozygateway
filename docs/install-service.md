@@ -22,9 +22,13 @@ installed with the verified official tagged NousResearch installer. Setup then
 runs `hermes model` interactively and verifies the active provider and model
 before installing CozyGateway or printing a pairing QR.
 
-The gateway listens on `0.0.0.0:8787` by default, allowing local/LAN access.
-Change it with `--bind-host` or `--port` when installing. The attached Hermes
-plugins use loopback to reach the same machine.
+Fresh installs listen on `127.0.0.1:8787`. Choose LAN access explicitly with
+`--bind-host 0.0.0.0`, or record a user-managed tunnel's strict HTTPS origin with
+`--public-url https://gateway.example.com`; a public origin fails closed unless the listener is
+loopback. Change the port with `--port`. The attached Hermes plugins use loopback to reach the
+same machine. Updates preserve the saved listener and public origin unless an explicit flag changes
+the posture. Use `--clear-public-url --bind-host 0.0.0.0` to explicitly leave the public posture and
+return to LAN access; `--clear-public-url` cannot be combined with `--public-url`.
 
 Check the service:
 

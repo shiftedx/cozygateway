@@ -4,6 +4,7 @@ import { WebSocket } from "ws";
 import { startGateway, type RunningGateway } from "cozygateway";
 
 import { startFakeHermesServer, type FakeHermesServer } from "../../gateway/test/support/fake-hermes-server.ts";
+import { PairingAdmission } from "../../gateway/src/pairing-admission.ts";
 
 type PeerKind = "echo" | "stall" | "approval";
 
@@ -106,6 +107,11 @@ export class ReferenceAttachGateway {
   #peers: AttachPeer[] = [];
   readonly #withHooks: boolean;
   readonly #notifierLog: (line: string) => void;
+  #pairingClock = 0;
+  readonly #pairingAdmission = new PairingAdmission(() => {
+    this.#pairingClock += 6_000;
+    return this.#pairingClock;
+  });
 
   constructor(withHooks: boolean, notifierLog: (line: string) => void) {
     this.#withHooks = withHooks;
@@ -134,7 +140,7 @@ export class ReferenceAttachGateway {
       turnTimeoutSeconds: 0,
       capabilities: this.#withHooks ? { "com.cozylabs.test": 1 } : undefined,
       hermes: { url: this.#hermes.url, tokenEnv: "CONFORMANCE_CONTROL_TOKEN", profiles },
-    }, { notifierLog: this.#notifierLog });
+    }, { notifierLog: this.#notifierLog, pairingAdmission: this.#pairingAdmission });
     this.#peers = [
       new AttachPeer(() => this.requireGateway(), "echo-secret", "echo"),
       ...(this.#withHooks ? [

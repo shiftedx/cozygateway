@@ -9,7 +9,7 @@ import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { promisify } from "node:util";
 
-import { applyEnvOverrides, loadConfig } from "./config.ts";
+import { applyEnvOverrides, loadConfig, validatePublicDeployment } from "./config.ts";
 import { openStorage } from "./storage.ts";
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
@@ -135,6 +135,19 @@ function isLoopbackUrl(url: string): boolean {
 }
 
 function pairingUrl(config: ReturnType<typeof loadConfig>, advertised: string | undefined): string {
+  if (config.publicUrl !== undefined) {
+    if (advertised === undefined) return config.publicUrl;
+    let override: string;
+    try {
+      override = validatePublicDeployment({ ...config, publicUrl: advertised }).publicUrl!;
+    } catch {
+      throw new Error("--url must match the configured publicUrl HTTPS origin");
+    }
+    if (override !== config.publicUrl) {
+      throw new Error("--url must match the configured publicUrl HTTPS origin");
+    }
+    return config.publicUrl;
+  }
   if (advertised === undefined) return listenerOrigin(pairingHost(config), config.port, gatewayScheme(config));
   const url = new URL(advertised);
   if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username !== "" || url.password !== "") {
@@ -237,13 +250,14 @@ async function configureListener(configPath: string, io: CliIo, runtime: CliRunt
 }
 
 async function runPair(configPath: string, advertised: string | undefined, ttl: string | undefined): Promise<void> {
-  const config = applyEnvOverrides(loadConfig(configPath), process.env);
+  const config = validatePublicDeployment(applyEnvOverrides(loadConfig(configPath), process.env));
+  const gatewayUrl = pairingUrl(config, advertised);
+  const ttlMs = ttl === undefined ? SETUP_CODE_TTL_MS : parsedTtlMs(ttl);
   const storage = openStorage(config.dbPath);
   const code = newSetupCode();
-  const ttlMs = ttl === undefined ? SETUP_CODE_TTL_MS : parsedTtlMs(ttl);
   storage.createSetupCode(code, Date.now() + ttlMs);
   storage.close();
-  const payload = { gatewayUrl: pairingUrl(config, advertised), setupCode: code };
+  const payload = { gatewayUrl, setupCode: code };
   const payloadJson = JSON.stringify(payload);
   try {
     console.log(renderQrHalfBlocks(encodeQr(payloadJson), { color: process.stdout.isTTY === true }));

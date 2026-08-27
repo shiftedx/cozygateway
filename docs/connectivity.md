@@ -1,7 +1,8 @@
 # Connectivity choices
 
-CozyGateway binds to `0.0.0.0:8787` by default so the machine and its LAN can
-reach it. The installer does not alter network infrastructure.
+Fresh managed installs bind to `127.0.0.1:8787`, so only the machine can reach the plaintext
+origin. Choose LAN access explicitly with `--bind-host 0.0.0.0`. The installer does not alter
+network infrastructure.
 
 ## User-managed Tailscale
 
@@ -32,10 +33,12 @@ to enable them in your tailnet's DNS settings. It provisions the certificate for
 host's MagicDNS name and persists its own configuration; do not use Funnel, which
 would make the endpoint public. Pair CozyChat with the HTTPS MagicDNS origin reported by
 `tailscale serve status`, for example
-`https://my-hermes.tailnet-name.ts.net`, and mint its code with:
+`https://my-hermes.tailnet-name.ts.net`, and persist that advertised origin by rerunning the
+verified installer with:
 
 ```sh
-~/.cozygateway/bin/cozygateway pair --url https://my-hermes.tailnet-name.ts.net
+curl -fsSL https://cozylabs.ai/install.sh | bash -s -- \
+  --public-url https://my-hermes.tailnet-name.ts.net
 ```
 
 Limit the service to the intended phones with your tailnet ACL/grant policy. The
@@ -69,17 +72,23 @@ ingress:
 ```
 
 Run it yourself with `cloudflared tunnel run cozygateway`, or install its
-service using Cloudflare's documented command for your operating system. The
-tunnel/proxy must support WebSocket upgrades and forward `Authorization` and
-`Range` headers for `/attach/v1`. Pair the phone with
-`https://gateway.example.com` by minting a code using the installed gateway
-CLI's remote URL option:
+service using Cloudflare's documented command for your operating system. The tunnel/proxy must
+support `/ws` upgrades and preserve `Authorization` and `Range` on authenticated REST requests.
+The tunnel supplies HTTPS transport and reachability; CozyGateway's device token remains the app
+authentication. Persist the exact public origin (which also moves an existing installer-managed LAN
+listener back to loopback) with:
 
 ```sh
-~/.cozygateway/bin/cozygateway pair --url https://gateway.example.com
+curl -fsSL https://cozylabs.ai/install.sh | bash -s -- \
+  --public-url https://gateway.example.com
 ```
-Do not use a quick tunnel for a durable phone endpoint, and do not put bearer
-tokens in the public hostname or URL.
+Then `cozygateway pair` advertises that origin automatically. Do not use a quick tunnel for a
+durable phone endpoint, and do not put bearer tokens in the public hostname or URL.
 
 Neither choice is necessary for same-LAN use. Keep the gateway private unless
 you deliberately need remote access.
+
+To stop using a saved tunnel and return an installer-managed gateway to LAN access, rerun the same
+verified installer with `--clear-public-url --bind-host 0.0.0.0`. This removes `publicUrl` from the
+persisted config before the LAN listener is activated, so later pairing codes no longer advertise
+the retired tunnel.

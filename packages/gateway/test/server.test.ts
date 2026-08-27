@@ -1,4 +1,7 @@
 import { once } from "node:events";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -51,6 +54,40 @@ describe("startGateway end to end", () => {
     }
     expect(seen.some((f) => f.type === "ready")).toBe(true);
     ws.close();
+  });
+});
+
+describe("public deployment startup posture", () => {
+  it("rejects an invalid public posture before creating the SQLite database", async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "cozygateway-public-start-")), "gateway.sqlite");
+    await expect(startGateway({
+      name: "unsafe-public",
+      host: "0.0.0.0",
+      publicUrl: "https://gateway.example",
+      port: 0,
+      dbPath,
+      turnTimeoutSeconds: 0,
+      hermes: testHermes(),
+    })).rejects.toThrow(/publicUrl.*loopback/i);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("starts a loopback origin with a valid advertised HTTPS origin", async () => {
+    const gw = await startGateway({
+      name: "safe-public",
+      host: "127.0.0.1",
+      publicUrl: "https://gateway.example",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermes: testHermes(),
+    });
+    try {
+      expect(gw.url).toMatch(/^http:\/\/127\.0\.0\.1:/);
+      expect((await fetch(`${gw.url}/health`)).status).toBe(200);
+    } finally {
+      await gw.close();
+    }
   });
 });
 

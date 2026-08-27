@@ -72,9 +72,9 @@ The install (and every re-run) finishes by minting a pairing code and printing
 a terminal QR plus the gateway URL and setup code in plain text, so a fresh
 device goes install, scan, chatting with no further commands. The QR encodes
 the `{"gatewayUrl":...,"setupCode":...}` payload from contract section 4; the
-URL prefers the machine's LAN address over loopback. Codes expire after 10
-minutes; mint another with `~/.cozygateway/bin/cozygateway pair`, or
-`pair --url https://...` for a remote origin such as a Tailscale hostname.
+URL uses the configured listener unless `publicUrl` records a user-managed HTTPS origin. Codes
+expire after 10 minutes; mint another with `~/.cozygateway/bin/cozygateway pair`. A configured
+public origin is authoritative; `pair --url` may only repeat the same canonical origin.
 IPv6 listener addresses are bracketed in generated URLs. With gateway-native
 TLS, configuration keeps the existing HTTPS hostname so Hermes validates the
 certificate name; private certificate authorities still use
@@ -82,8 +82,14 @@ certificate name; private certificate authorities still use
 Local CLI health checks also pin the configured leaf certificate while allowing
 the bind address to differ from its DNS name.
 
-The default listener is `0.0.0.0:8787` for local/LAN use. Network reachability
-outside the machine is deliberately not automated; see `docs/connectivity.md`.
+Fresh installs listen on `127.0.0.1:8787`. Use `--bind-host 0.0.0.0` explicitly for LAN access.
+For a tunnel, pass `--public-url https://gateway.example.com`; the installer persists the canonical
+origin and requires/sets loopback. Network reachability outside the machine is deliberately not
+automated; see `docs/connectivity.md`.
+
+To retire that public origin and return an existing install to LAN access, rerun the installer with
+`--clear-public-url --bind-host 0.0.0.0`. Clearing is explicit so an ordinary update cannot silently
+replace a saved HTTPS pairing origin; `--clear-public-url` and `--public-url` are mutually exclusive.
 
 After installation, open a new terminal and run `cozygateway` for the basic
 terminal menu. It shows live status, prints a fresh pairing QR, and lets a power

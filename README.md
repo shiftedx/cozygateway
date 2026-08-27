@@ -29,7 +29,7 @@ No Docker, git, or build tools. It requires an existing Hermes installation and 
 bootstrap verifies versioned release checksums for the gateway bundle, complete Hermes attach-plugin
 archive, and installer payload. It discovers Hermes profile homes through the Hermes CLI, installs
 one attach identity per selected profile, and supervises one shared gateway service. Existing Hermes
-profile gateway services stay Hermes-owned. The default listener is local/LAN (`0.0.0.0:8787`); the
+profile gateway services stay Hermes-owned. Fresh installs listen on loopback (`127.0.0.1:8787`); the
 installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. See
 `docs/install-service.md` and `docs/connectivity.md`.
 
@@ -38,7 +38,8 @@ Windows installs under `%LOCALAPPDATA%\cozygateway`, registers a current-user
 administrator prompt. The final screen contains a QR and plain-text setup code.
 Open a new PowerShell or Terminal window and type `cozygateway` for a small menu
 that shows status, prints a fresh pairing QR, or changes the bind address and
-port. The defaults remain `0.0.0.0:8787` until explicitly changed.
+port. Existing installs retain their saved listener; LAN access is an explicit
+`--bind-host 0.0.0.0` choice.
 Publishing the short PowerShell URL is tracked separately; before that website
 change, use the `install.ps1` asset from a versioned GitHub release.
 

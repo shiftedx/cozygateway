@@ -103,13 +103,15 @@ printf 'running\n' > "$tmp/hermes/gateway-active.state"
 tar -czf "$tmp/plugin.tar.gz" -C "$repo_root/integrations" attach-plugin
 cat > "$tmp/gateway.mjs" <<'BUNDLE'
 import { existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args[0] === 'pair') {
   const configAt = args.indexOf('--config');
   const config = configAt === -1 ? 'cozygateway.config.json' : args[configAt + 1];
   if (!existsSync(config)) process.exit(2);
   const urlAt = args.indexOf('--url');
-  const gatewayUrl = urlAt === -1 ? 'http://127.0.0.1:8787' : args[urlAt + 1];
+  const configured = JSON.parse(readFileSync(config, 'utf8'));
+  const gatewayUrl = urlAt === -1 ? (configured.publicUrl ?? 'http://127.0.0.1:8787') : args[urlAt + 1];
   process.stdout.write('█▀▀▀▀▀█ fake-qr █▀▀▀▀▀█\n');
   process.stdout.write(JSON.stringify({ gatewayUrl, setupCode: 'TEST-CODE' }) + '\n');
   process.stdout.write('Gateway URL: ' + gatewayUrl + '\n');
@@ -145,7 +147,7 @@ for platform in Darwin Linux Windows; do
   grep -q "one CozyGateway $platform service" <<<"$output"
   grep -q 'Hermes Dashboard as local control plane' <<<"$output"
   grep -q 'mint pairing code and QR' <<<"$output"
-  grep -Fq "$tmp/gateway-$platform/bin/cozygateway pair --url https://gateway.example.com" <<<"$output"
+  grep -Fq -- '--public-url https://gateway.example.com' <<<"$output"
   grep -Fq "gateway install --start-now --start-on-login" <<<"$output"
   grep -Fq "gateway start" <<<"$output"
   grep -Fq "gateway restart" <<<"$output"
@@ -167,6 +169,25 @@ if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_
   echo 'expected URL syntax in --bind-host to fail' >&2
   exit 1
 fi
+if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --public-url 'http://gateway.example.com' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-invalid-public" >/dev/null 2>&1; then
+  echo 'expected a non-HTTPS --public-url to fail' >&2
+  exit 1
+fi
+for invalid_public_url in $'https://gateway.example.com\t' $'https://gateway.example.com\r' $'https://gateway.example.com\n'; do
+  if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --public-url "$invalid_public_url" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-invalid-public-control" >/dev/null 2>&1; then
+    echo 'expected ASCII whitespace in --public-url to fail' >&2
+    exit 1
+  fi
+done
+if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --public-url 'https://gateway.example.com' --bind-host '0.0.0.0' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-invalid-public-bind" >/dev/null 2>&1; then
+  echo 'expected --public-url with a non-loopback explicit bind to fail' >&2
+  exit 1
+fi
+if conflicting_public_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --public-url 'https://gateway.example.com' --clear-public-url --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-conflicting-public" 2>&1)"; then
+  echo 'expected --public-url and --clear-public-url together to fail' >&2
+  exit 1
+fi
+grep -Fq 'mutually exclusive' <<<"$conflicting_public_output"
 
 # A non-dry macOS-path run proves the installer writes the Hermes-only config
 # and secret files without needing a real launchd or Hermes process. Keep the
@@ -259,6 +280,7 @@ if zero_attach_output="$(HOME="$tmp/zero-home" PATH="$tmp/one-attempt-bin:$tmp/s
 fi
 grep -Fq 'configured must be positive' <<<"$zero_attach_output"
 if grep -Fq 'fake-qr' <<<"$zero_attach_output"; then echo 'unhealthy attach state printed pairing material' >&2; exit 1; fi
+grep -Fq '"host": "127.0.0.1"' "$tmp/gateway-zero-attach/local/cozygateway.config.json"
 # shellcheck disable=SC2016
 if grep -Fq 'spaces $dollar' <<<"$live_output"; then
   echo 'installer output must not contain credentials' >&2
@@ -403,6 +425,30 @@ test "$default_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")
 test "$ops_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 test "$install_count_before" = "$(grep -c '^default:gateway:install$' "$tmp/commands")"
 test "$(grep -c '^default:gateway:restart$' "$tmp/commands")" = 1
+
+# Opting into a public origin moves an existing LAN listener back to loopback,
+# persists the canonical HTTPS origin, and advertises it in the automatic pairing finale.
+public_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --public-url 'HTTPS://Gateway.Example:443/' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+grep -Fq '"gatewayUrl":"https://gateway.example"' <<<"$public_output"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+if (config.host !== '127.0.0.1' || config.publicUrl !== 'https://gateway.example') process.exit(1);
+NODE
+
+preserved_public_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+grep -Fq '"gatewayUrl":"https://gateway.example"' <<<"$preserved_public_output"
+
+# Leaving the managed public posture is explicit: clear the saved origin and choose the LAN bind in
+# the same update. The config no longer advertises the retired tunnel on later pair commands.
+lan_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --clear-public-url --bind-host 0.0.0.0 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+grep -Fq 'CozyGateway listens on 0.0.0.0:8787' <<<"$lan_output"
+grep -Fq '"gatewayUrl":"http://127.0.0.1:8787"' <<<"$lan_output"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+if (config.host !== '0.0.0.0' || Object.hasOwn(config, 'publicUrl')) process.exit(1);
+NODE
 
 # Uninstall reverses only lifecycle work owned by CozyGateway: its installed
 # default service is removed, its started existing service is stopped, and the

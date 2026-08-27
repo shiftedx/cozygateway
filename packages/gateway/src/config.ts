@@ -112,10 +112,53 @@ const GatewayConfigSchema = Type.Object({
   /** Private push relay origin used by the authenticated `/push` proxy. The gateway and relay may
    *  share a Docker network without exposing the relay listener on the public host. */
   pushRelayUrl: Type.Optional(Type.String({ minLength: 1 })),
+  /** HTTPS origin advertised to phones when a user-managed tunnel or reverse proxy fronts the
+   *  gateway. Presence is a deployment posture, not merely display text: the listener must remain
+   *  on exact loopback so the public proxy is the only network path into the plaintext origin. */
+  publicUrl: Type.Optional(Type.String({ minLength: 1 })),
   hermes: HermesBridgeConfigSchema,
   tls: Type.Optional(TlsConfigSchema),
 });
 export type GatewayConfig = Static<typeof GatewayConfigSchema>;
+
+const LOOPBACK_LISTENERS = new Set(["127.0.0.1", "::1", "localhost"]);
+
+/** Validate and canonicalize the one public-deployment interface. Kept here so config files,
+ * programmatic hosts, CLI pairing, and startup all share the same invariant rather than each
+ * learning a slightly different definition of an HTTPS origin. */
+export function validatePublicDeployment(config: GatewayConfig): GatewayConfig {
+  if (config.publicUrl === undefined) return config;
+  if (/[\u0000-\u0020\u007f]/.test(config.publicUrl)) {
+    throw new ContractViolation("publicUrl must be a strict HTTPS origin", "/publicUrl");
+  }
+  const isOriginSyntax = /^https:\/\/[^/?#]+\/?$/i.test(config.publicUrl);
+  let url: URL;
+  try {
+    url = new URL(config.publicUrl);
+  } catch {
+    throw new ContractViolation("publicUrl must be a strict HTTPS origin", "/publicUrl");
+  }
+  if (
+    !isOriginSyntax ||
+    url.protocol !== "https:" ||
+    url.hostname === "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new ContractViolation("publicUrl must be a strict HTTPS origin", "/publicUrl");
+  }
+  const listener = config.host ?? "127.0.0.1";
+  if (!LOOPBACK_LISTENERS.has(listener.toLowerCase())) {
+    throw new ContractViolation(
+      "publicUrl requires an exact loopback listener (127.0.0.1, ::1, or localhost)",
+      "/host",
+    );
+  }
+  return url.origin === config.publicUrl ? config : { ...config, publicUrl: url.origin };
+}
 
 export function loadConfig(path: string): GatewayConfig {
   const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
@@ -123,7 +166,7 @@ export function loadConfig(path: string): GatewayConfig {
     typeof raw === "object" && raw !== null
       ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 0, ...raw }
       : raw;
-  const config = assertValid(GatewayConfigSchema, withDefaults);
+  const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults));
   const seen = new Set<string>();
   for (const rawProfile of Object.keys(config.hermes.profiles)) {
     const profile = rawProfile.trim().toLowerCase();

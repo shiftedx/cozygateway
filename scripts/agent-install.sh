@@ -14,10 +14,13 @@ NODE_BIN="${COZYGATEWAY_NODE:-node}"
 PROFILE_SPEC="all"
 BIND_HOST_EXPLICIT=0
 PORT_EXPLICIT=0
+PUBLIC_URL_EXPLICIT=0
+CLEAR_PUBLIC_URL=0
 if [ "${COZYGATEWAY_BIND_HOST+x}" = x ]; then BIND_HOST_EXPLICIT=1; fi
 if [ "${COZYGATEWAY_PORT+x}" = x ]; then PORT_EXPLICIT=1; fi
-BIND_HOST="${COZYGATEWAY_BIND_HOST:-0.0.0.0}"
+BIND_HOST="${COZYGATEWAY_BIND_HOST:-127.0.0.1}"
 PORT="${COZYGATEWAY_PORT:-8787}"
+PUBLIC_URL=""
 PREVIOUS_PORT=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
 DRY_RUN=0
@@ -45,8 +48,10 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --plugin-archive PATH   verified CozyGateway Hermes plugin archive
   --gateway-dir DIR       CozyGateway-owned state directory (default ~/.cozygateway)
   --profiles all|A,B      Hermes profiles to connect (default all discovered profiles)
-  --bind-host HOST        gateway listener address (default 0.0.0.0: local/LAN)
+  --bind-host HOST        gateway listener address (default 127.0.0.1: loopback)
   --port PORT             gateway listener port (default 8787)
+  --public-url URL        advertise one HTTPS origin; requires a loopback listener
+  --clear-public-url      stop advertising the saved public origin
   --dashboard-port PORT   local Hermes Dashboard control-plane port (default 9119)
   --dry-run               show discovered work without changing anything
   --service-platform OS   override service platform (Darwin, Linux, Windows)
@@ -66,6 +71,8 @@ while [ "$#" -gt 0 ]; do
     --profiles) need_value "$@"; PROFILE_SPEC="$2"; shift ;;
     --bind-host) need_value "$@"; BIND_HOST="$2"; BIND_HOST_EXPLICIT=1; shift ;;
     --port) need_value "$@"; PORT="$2"; PORT_EXPLICIT=1; shift ;;
+    --public-url) need_value "$@"; PUBLIC_URL="$2"; PUBLIC_URL_EXPLICIT=1; shift ;;
+    --clear-public-url) CLEAR_PUBLIC_URL=1 ;;
     --dashboard-port) need_value "$@"; DASHBOARD_PORT="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
@@ -76,6 +83,9 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+[ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$CLEAR_PUBLIC_URL" = 0 ] || \
+  die "--public-url and --clear-public-url are mutually exclusive"
 
 normalize_service_platform() {
   [ -n "$SERVICE_PLATFORM" ] || SERVICE_PLATFORM="$(uname -s)"
@@ -130,18 +140,27 @@ WINDOWS_TASK="CozyGateway"
 WINDOWS_VBS="$LOCAL_DIR/run-gateway.vbs"
 
 hydrate_listener_settings() {
-  local saved
+  local saved remainder saved_host saved_port saved_public
   if [ ! -f "$CONFIG_JSON" ]; then return 0; fi
   saved="$("$NODE_RESOLVED" - "$CONFIG_JSON" <<'NODE'
 const { readFileSync } = require('node:fs');
 const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-process.stdout.write(String(config.host ?? '') + '\t' + String(config.port ?? ''));
+process.stdout.write(String(config.host ?? '') + '\t' + String(config.port ?? '') + '\t' + String(config.publicUrl ?? ''));
 NODE
 )" || die "could not read the existing listener from $CONFIG_JSON"
-  local saved_host="${saved%%$'\t'*}" saved_port="${saved#*$'\t'}"
+  saved_host="${saved%%$'\t'*}"; remainder="${saved#*$'\t'}"
+  saved_port="${remainder%%$'\t'*}"; saved_public="${remainder#*$'\t'}"
   PREVIOUS_PORT="$saved_port"
   [ "$BIND_HOST_EXPLICIT" = 1 ] || [ -z "$saved_host" ] || BIND_HOST="$saved_host"
   [ "$PORT_EXPLICIT" = 1 ] || [ -z "$saved_port" ] || PORT="$saved_port"
+  if [ "$CLEAR_PUBLIC_URL" = 1 ]; then
+    PUBLIC_URL=""
+  elif [ "$PUBLIC_URL_EXPLICIT" = 0 ] && [ -n "$saved_public" ]; then
+    PUBLIC_URL="$saved_public"
+  fi
+  # Opting into a public origin is a posture, not a label. Unless the operator explicitly supplied
+  # another bind (which validation below will reject), move an existing LAN install back to loopback.
+  [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$BIND_HOST_EXPLICIT" = 1 ] || BIND_HOST=127.0.0.1
 }
 validate_listener_settings() {
   [ -n "$BIND_HOST" ] || die "--bind-host must not be empty"
@@ -153,6 +172,22 @@ const host = process.argv[2];
 const validName = host.length <= 253 && host.split('.').every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label));
 process.exit(isIP(host) !== 0 || validName ? 0 : 1);
 NODE
+  if [ -n "$PUBLIC_URL" ]; then
+    PUBLIC_URL="$("$NODE_RESOLVED" - "$PUBLIC_URL" <<'NODE'
+const raw = process.argv[2];
+if (/[\u0000-\u0020\u007f]/.test(raw)) process.exit(1);
+let url;
+try { url = new URL(raw); } catch { process.exit(1); }
+if (!/^https:\/\/[^/?#]+\/?$/i.test(raw) || url.protocol !== 'https:' || url.hostname === '' || url.username !== '' || url.password !== '' ||
+    url.pathname !== '/' || url.search !== '' || url.hash !== '') process.exit(1);
+process.stdout.write(url.origin);
+NODE
+    )" || die "--public-url must be a strict HTTPS origin without ASCII whitespace/control characters, credentials, path, query, or fragment"
+    case "$(printf '%s' "$BIND_HOST" | tr '[:upper:]' '[:lower:]')" in
+      127.0.0.1|::1|localhost) ;;
+      *) die "--public-url requires a loopback --bind-host (127.0.0.1, ::1, or localhost)" ;;
+    esac
+  fi
 }
 gateway_origin() {
   local host="$BIND_HOST"
@@ -376,13 +411,13 @@ write_gateway_config() {
   umask 077; printf '{' > "$map"
   for p in "${SELECTED[@]}"; do env_name="$(token_env_name "$p")"; printf '%s\n' "$comma\"$p\":{\"tokenEnv\":\"$env_name\"}" >> "$map"; comma=,; done
   printf '}\n' >> "$map"
-  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$DASHBOARD_USER" <<'NODE'
+  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$DASHBOARD_USER" "$PUBLIC_URL" <<'NODE'
 const fs = require('node:fs');
-const [mapPath, output, host, port, dbPath, dashboardPort, dashboardUser] = process.argv.slice(2);
+const [mapPath, output, host, port, dbPath, dashboardPort, dashboardUser, publicUrl] = process.argv.slice(2);
 const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
 const baseUrl = `http://127.0.0.1:${dashboardPort}`;
 fs.writeFileSync(output, JSON.stringify({
-  name: 'cozygateway', host, port: Number(port), dbPath,
+  name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
   hermes: { url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'password', username: dashboardUser, passwordEnv: 'COZYGATEWAY_HERMES_PASSWORD', baseUrl, profile: 'default', profiles },
 }, null, 2) + '\n', { mode: 0o600 });
 NODE
@@ -963,11 +998,15 @@ main() {
   write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli
-  say "OK    CozyGateway listens on $BIND_HOST:$PORT. Remote exposure is user-managed."
+  if [ -n "$PUBLIC_URL" ]; then
+    say "OK    CozyGateway listens on $BIND_HOST:$PORT and advertises $PUBLIC_URL. HTTPS exposure is user-managed."
+  else
+    say "OK    CozyGateway listens on $BIND_HOST:$PORT. External exposure is user-managed and requires HTTPS."
+  fi
   # The finale: mint a pairing code and print the QR so install -> scan -> chatting needs no
   # further commands. A rerun on an installed gateway lands here too, with a fresh code.
   if [ "$DRY_RUN" = 0 ]; then "$CLI_WRAPPER" pair --config "$CONFIG_JSON"; else say "DRY   mint pairing code and QR with $CLI_WRAPPER pair"; fi
   say "INFO  codes expire after 10 minutes; mint a fresh QR and code with: $CLI_WRAPPER pair"
-  say "INFO  pair a remote URL with: $CLI_WRAPPER pair --url https://gateway.example.com"
+  say "INFO  for a tunnel, rerun the installer with: --public-url https://gateway.example.com"
 }
 main

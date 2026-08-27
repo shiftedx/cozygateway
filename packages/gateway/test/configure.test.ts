@@ -79,6 +79,18 @@ describe("listener configuration", () => {
     expect(readFileSync(path, "utf8")).toBe(before);
   });
 
+  it("does not move a configured public origin off loopback", () => {
+    const path = configFile();
+    const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    config.host = "127.0.0.1";
+    config.publicUrl = "https://gateway.example";
+    writeFileSync(path, JSON.stringify(config));
+    const before = readFileSync(path, "utf8");
+
+    expect(() => updateListenerConfig(path, "0.0.0.0", 8787)).toThrow(/publicUrl.*loopback/i);
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
   it("updates every installer-managed Hermes profile target without exposing or changing tokens", () => {
     const path = configFile();
     const localDir = dirname(path);
