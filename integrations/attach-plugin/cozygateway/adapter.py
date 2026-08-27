@@ -25,6 +25,7 @@ How the harness's native stream maps onto the attach protocol:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -68,6 +69,8 @@ from .media_descriptor import (
     MEDIA_COMPATIBILITY_POLICY,
     MediaDescriptor,
     MediaProbeError,
+    detect_mime,
+    family_for,
     probe as probe_media,
 )
 from .text_blocks import (
@@ -2657,6 +2660,160 @@ def _mobile_tool_result(
     return json.dumps(payload, separators=(",", ":"))
 
 
+def _valid_mobile_artifact_filename(value: Any) -> bool:
+    """True for a display name that cannot smuggle a device path into Hermes."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 255
+        and value == value.strip()
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not re.search(r"[\x00-\x1f\x7f-\x9f]", value)
+    )
+
+
+def _mobile_artifact_audit(descriptor: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        descriptor["mediaId"], descriptor["mimeType"], descriptor["byteCount"],
+        descriptor["sha256"], descriptor["filename"], descriptor["family"],
+    )
+
+
+def _cache_mobile_artifact_bytes(data: bytes, *, filename: str, mime_type: str) -> Any:
+    """Small lazy boundary around Hermes's controlled attachment cache."""
+    from gateway.platforms.base import cache_media_bytes  # harness-defined interface
+
+    return cache_media_bytes(data, filename=filename, mime_type=mime_type)
+
+
+async def _materialize_mobile_artifact(adapter: Any, descriptor: Dict[str, Any]) -> Any:
+    """Verify, cache, and expose one phone artifact through Hermes's real model seams.
+
+    Images become the supported multimodal tool-result envelope. PDFs use Hermes's
+    established document-cache/read_file contract. Other families fail closed: a
+    descriptor or local path alone is not evidence that the configured model can inspect it.
+    """
+    failure = _mobile_tool_result(
+        "device_unavailable", stage="media", reason="media_validation_failed"
+    )
+    if not _is_media(descriptor) or not _valid_mobile_artifact_filename(descriptor.get("filename")):
+        return failure
+    # A structurally valid descriptor is safe to retain as the audit reference even
+    # when the authenticated bytes later fail verification. It contains no device path.
+    failure = _mobile_tool_result(
+        "device_unavailable", dict(descriptor), "media", "media_validation_failed"
+    )
+
+    media_id = descriptor["mediaId"]
+    mime = descriptor["mimeType"].split(";", 1)[0].strip().lower()
+    family = descriptor["family"]
+    if mime != descriptor["mimeType"] or family_for(mime) != family:
+        return failure
+    rule = MEDIA_COMPATIBILITY_POLICY.get(mime)
+    if not rule or rule.get("status") != "supported":
+        return failure
+    # Hermes has a native model-visible seam for raster images and a supported
+    # cached-document path for PDF. Video/audio/archives have neither in a tool result.
+    if family == "image":
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            return failure
+    elif mime != "application/pdf" or family != "file":
+        return failure
+
+    audit = _mobile_artifact_audit(descriptor)
+    cache: "OrderedDict[str, Tuple[Tuple[Any, ...], Any]]" = getattr(
+        adapter, "_mobile_artifact_cache", None
+    )
+    if cache is None:
+        cache = OrderedDict()
+        setattr(adapter, "_mobile_artifact_cache", cache)
+    cached_entry = cache.get(media_id)
+    if cached_entry is not None:
+        if cached_entry[0] != audit:
+            return failure
+        cache.move_to_end(media_id)
+        return cached_entry[1]
+
+    declared_bytes = descriptor["byteCount"]
+    byte_limit = _media_byte_limit(mime)
+    if declared_bytes > byte_limit:
+        return failure
+    try:
+        data, downloaded_name, downloaded_mime = await adapter._client.download_media(
+            media_id, max_bytes=byte_limit
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - download failures are bounded tool failures
+        return failure
+    downloaded_mime = str(downloaded_mime).split(";", 1)[0].strip().lower()
+    if (
+        len(data) != declared_bytes
+        or hashlib.sha256(data).hexdigest() != descriptor["sha256"]
+        or downloaded_mime != mime
+        or downloaded_name != descriptor["filename"]
+        or detect_mime(data) != mime
+    ):
+        return failure
+
+    cache_ext = {
+        "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+        "image/gif": ".gif", "application/pdf": ".pdf",
+    }[mime]
+    # The device's filename remains display-only audit metadata. The host cache
+    # sees a controlled media-id name and canonical extension, never a source path.
+    cache_filename = f"mobile_{media_id}{cache_ext}"
+    try:
+        cached = _cache_mobile_artifact_bytes(
+            data, filename=cache_filename, mime_type=mime
+        )
+    except Exception:  # noqa: BLE001 - never claim an artifact the controlled cache refused
+        return failure
+    if cached is None or getattr(cached, "media_type", None) != mime:
+        return failure
+
+    audit_text = (
+        f"Verified phone artifact {descriptor['filename']} "
+        f"(mediaId={media_id}, sha256={descriptor['sha256']}, bytes={declared_bytes})."
+    )
+    if family == "image":
+        if getattr(cached, "kind", None) != "image":
+            return failure
+        result: Any = {
+            "_multimodal": True,
+            "content": [
+                {"type": "text", "text": audit_text + " The image is attached natively; inspect it now."},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+                }},
+            ],
+            "text_summary": audit_text + " A vision-capable model is required to inspect it.",
+        }
+    else:
+        if getattr(cached, "kind", None) != "document" or not getattr(cached, "path", None):
+            return failure
+        result = {
+            "_multimodal": True,
+            "content": [{
+                "type": "text",
+                "text": (
+                    audit_text + f" The verified PDF is available at {cached.path}. "
+                    "Read it with read_file before answering the user."
+                ),
+            }],
+            "text_summary": audit_text + " The verified PDF is available to the document tools.",
+        }
+    cache[media_id] = (audit, result)
+    cache.move_to_end(media_id)
+    # Image entries carry an inline base64 part. Four maximum keeps the resident
+    # adapter's worst-case retained image payload bounded to roughly 32 MiB of
+    # source bytes (plus encoding overhead); replay safety does not justify 32.
+    while len(cache) > 4:
+        cache.popitem(last=False)
+    return result
+
+
 def _log_mobile_policy_block(
     reason: str,
     *,
@@ -2784,6 +2941,23 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
     valid = _is_location(result) if location else _is_media(result) if media else _is_notification(result) if notification else _is_device_status(result)
     if status == "ok" and not valid:
         status, result = "device_unavailable", None
+    if status == "ok" and media and isinstance(result, dict):
+        try:
+            artifact_result = await _materialize_mobile_artifact(origin_adapter, result)
+        except asyncio.CancelledError:
+            return _mobile_tool_result("cancelled")
+        # The download is still part of the admitted lease. Mutable Hermes message
+        # context may move while bytes are fetched; only loss or replacement of the
+        # immutable origin adapter/profile/chat/turn invalidates their release.
+        final_adapters = [
+            adapter for adapter in _active_adapters_snapshot()
+            if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+            and getattr(adapter, "_profile", None) == profile
+        ]
+        if len(final_adapters) != 1 or final_adapters[0] is not origin_adapter:
+            _log_mobile_policy_block("origin_turn_changed_after_artifact_download")
+            return _mobile_tool_result("policy_blocked")
+        return artifact_result
     return _mobile_tool_result(
         status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
         result if isinstance(result, dict) else None,
@@ -2845,9 +3019,14 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
         if not tool_name:
             return
         call_id = _tool_call_id(kwargs)
-        if tool_name in {"cozy_device_status", "cozy_request_location"}:
+        if tool_name in {
+            "cozy_device_status", "cozy_request_location",
+            "cozy_capture_camera", "cozy_pick_file",
+        }:
             # Purpose and phone payloads are live-turn-only data. Tool chips may name the
             # operation, but never retain either side of this sensitive exchange as detail.
+            # Media results can contain a cache path or base64 model attachment, so this
+            # guard also prevents those from being projected back to CozyChat.
             detail = None
         elif phase == "start":
             detail = _preview(kwargs.get("args"))

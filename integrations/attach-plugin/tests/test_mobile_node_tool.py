@@ -8,6 +8,7 @@ registered async handler exactly as Hermes's tool registry does.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -61,6 +62,10 @@ class _Client:
         self.calls.append((thread_id, turn_id, purpose))
         return await self.result
 
+    async def download_media(self, media_id, max_bytes):
+        self.download_calls.append((media_id, max_bytes))
+        return self.download
+
 
 class _Adapter:
     def __init__(self, client, active_turn=None, profile="profile-1"):
@@ -74,6 +79,10 @@ class _Adapter:
     async def request_location(self, thread_id, turn_id, purpose):
         return await self._client.request_location(thread_id, turn_id, purpose)
 
+    async def request_mobile(self, command, thread_id, turn_id, purpose, **options):
+        self._client.calls.append((command, thread_id, turn_id, purpose, options))
+        return await self._client.result
+
 
 class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -81,6 +90,8 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         adapter_module.register(self.context)
         self.tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_device_status")
         self.location_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_request_location")
+        self.camera_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_capture_camera")
+        self.file_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_pick_file")
         self.original_context = adapter_module._current_turn_platform_and_chat
         self.original_message_context = adapter_module._current_turn_message_and_cron
         adapter_module._current_turn_platform_and_chat = lambda: (adapter_module.PLATFORM_NAME, "thread-1")
@@ -131,6 +142,173 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(("cozy_capture_camera", "cozy_pick_file", "cozy_present_notification")) - set(by_name), set())
         self.assertEqual(by_name["cozy_capture_camera"]["schema"]["parameters"]["properties"]["capture"]["enum"], ["photo", "video"])
         self.assertEqual(by_name["cozy_pick_file"]["schema"]["parameters"]["properties"]["selection"]["enum"], ["photo", "file"])
+
+    async def test_camera_photo_returns_the_verified_bytes_on_hermes_multimodal_seam(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"artifact"
+        digest = hashlib.sha256(png).hexdigest()
+        descriptor = {
+            "mediaId": "media-photo", "mimeType": "image/png", "byteCount": len(png),
+            "sha256": digest, "filename": "photo.png", "family": "image",
+        }
+        client = _Client()
+        client.download_calls = []
+        client.download = (png, "photo.png", "image/png")
+        client.result.set_result({"status": "ok", "result": descriptor})
+        adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+        cached = type("Cached", (), {
+            "path": "/agent/cache/images/image.png", "media_type": "image/png",
+            "kind": "image", "display_name": "photo.png",
+        })()
+
+        with mock.patch.object(adapter_module, "_cache_mobile_artifact_bytes", return_value=cached) as cache:
+            result = await self.camera_tool["handler"]({
+                "purpose": "Read the label", "camera": "rear", "capture": "photo",
+            })
+
+        self.assertTrue(result["_multimodal"])
+        self.assertEqual(result["content"][1]["type"], "image_url")
+        self.assertTrue(result["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        self.assertIn("media-photo", result["content"][0]["text"])
+        self.assertNotIn("/agent/cache", result["content"][0]["text"])
+        self.assertEqual(client.download_calls, [("media-photo", 8 * 1024 * 1024)])
+        cache.assert_called_once_with(png, filename="mobile_media-photo.png", mime_type="image/png")
+
+    async def test_pdf_uses_the_supported_cached_document_read_file_contract(self):
+        pdf = b"%PDF-1.7\nartifact"
+        descriptor = {
+            "mediaId": "media-pdf", "mimeType": "application/pdf", "byteCount": len(pdf),
+            "sha256": hashlib.sha256(pdf).hexdigest(),
+            "filename": "report.pdf", "family": "file",
+        }
+        client = _Client()
+        client.download_calls = []
+        client.download = (pdf, "report.pdf", "application/pdf")
+        client.result.set_result({"status": "ok", "result": descriptor})
+        adapter = _Adapter(client, {"thread-1": "turn-1"})
+        adapter_module._register_active_adapter(adapter)
+        cached = type("Cached", (), {
+            "path": "/agent/cache/documents/report.pdf", "media_type": "application/pdf",
+            "kind": "document", "display_name": "report.pdf",
+        })()
+
+        with mock.patch.object(adapter_module, "_cache_mobile_artifact_bytes", return_value=cached) as cache:
+            first = await self.file_tool["handler"]({"purpose": "Summarize it", "selection": "file"})
+            # A replayed descriptor is served from the adapter's bounded verified cache.
+            client.result = asyncio.get_running_loop().create_future()
+            client.result.set_result({"status": "ok", "result": descriptor})
+            second = await self.file_tool["handler"]({"purpose": "Summarize it", "selection": "file"})
+
+        self.assertTrue(first["_multimodal"])
+        self.assertEqual(first, second)
+        self.assertEqual(len(first["content"]), 1)
+        note = first["content"][0]["text"]
+        self.assertIn("/agent/cache/documents/report.pdf", note)
+        self.assertIn("read_file", note)
+        self.assertIn("media-pdf", note)
+        self.assertEqual(client.download_calls, [("media-pdf", 20 * 1024 * 1024)])
+        cache.assert_called_once_with(pdf, filename="mobile_media-pdf.pdf", mime_type="application/pdf")
+
+    async def test_mismatch_and_unsupported_families_never_return_ok(self):
+        png = b"\x89PNG\r\n\x1a\nartifact"
+        base = {
+            "mediaId": "media-bad", "mimeType": "image/png", "byteCount": len(png),
+            "sha256": hashlib.sha256(png).hexdigest(),
+            "filename": "photo.png", "family": "image",
+        }
+        cases = [
+            ({**base, "byteCount": len(png) + 1}, (png, "photo.png", "image/png")),
+            ({**base, "sha256": "0" * 64}, (png, "photo.png", "image/png")),
+            ({**base, "mimeType": "image/jpeg"}, (png, "photo.png", "image/jpeg")),
+            ({**base, "filename": "../private.png"}, (png, "private.png", "image/png")),
+            ({**base, "mimeType": "video/mp4", "family": "video", "filename": "clip.mp4"}, (b"x", "clip.mp4", "video/mp4")),
+        ]
+        for descriptor, download in cases:
+            with self.subTest(descriptor=descriptor):
+                for active in adapter_module._active_adapters_snapshot():
+                    adapter_module._unregister_active_adapter(active)
+                client = _Client()
+                client.download_calls = []
+                client.download = download
+                client.result.set_result({"status": "ok", "result": descriptor})
+                adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+                with mock.patch.object(adapter_module, "_cache_mobile_artifact_bytes") as cache:
+                    result = await self.camera_tool["handler"]({
+                        "purpose": "Inspect it", "camera": "rear", "capture": "photo",
+                    })
+                expected = {
+                    "status": "device_unavailable",
+                    "stage": "media", "reason": "media_validation_failed",
+                }
+                # A structurally safe descriptor remains useful as the audit
+                # reference. A path-like filename fails before any descriptor is
+                # released into model context.
+                if descriptor["filename"] != "../private.png":
+                    expected["result"] = descriptor
+                self.assertEqual(json.loads(result), expected)
+                cache.assert_not_called()
+
+    async def test_mobile_artifact_tool_hooks_never_project_bytes_or_cache_paths(self):
+        observed = []
+        active = type("Observed", (), {
+            "observe_tool_event": lambda _self, *args: observed.append(args),
+        })()
+        adapter_module._register_active_adapter(active)
+        secret_result = {
+            "_multimodal": True,
+            "content": [{"type": "text", "text": "/private/cache/report.pdf"}, {
+                "type": "image_url", "image_url": {"url": "data:image/png;base64,SECRET"},
+            }],
+        }
+        with mock.patch.object(
+            adapter_module, "_current_turn_platform_and_chat",
+            return_value=(adapter_module.PLATFORM_NAME, "thread-1"),
+        ):
+            adapter_module._dispatch_tool_hook("complete", {
+                "tool_name": "cozy_capture_camera", "result": secret_result,
+            })
+            adapter_module._dispatch_tool_hook("complete", {
+                "tool_name": "cozy_pick_file", "result": secret_result,
+            })
+        self.assertEqual([event[2] for event in observed], ["cozy_capture_camera", "cozy_pick_file"])
+        self.assertEqual([event[3] for event in observed], [None, None])
+
+    async def test_oversize_and_download_failure_never_cache_or_return_ok(self):
+        cases = [
+            ({
+                "mediaId": "too-large", "mimeType": "image/png",
+                "byteCount": 8 * 1024 * 1024 + 1, "sha256": "a" * 64,
+                "filename": "large.png", "family": "image",
+            }, None),
+            ({
+                "mediaId": "missing", "mimeType": "application/pdf", "byteCount": 12,
+                "sha256": "a" * 64, "filename": "missing.pdf", "family": "file",
+            }, FileNotFoundError("missing")),
+        ]
+        for descriptor, download_error in cases:
+            with self.subTest(media_id=descriptor["mediaId"]):
+                for active in adapter_module._active_adapters_snapshot():
+                    adapter_module._unregister_active_adapter(active)
+                client = _Client()
+                client.download_calls = []
+                if download_error is None:
+                    client.download = (b"", descriptor["filename"], descriptor["mimeType"])
+                else:
+                    async def fail_download(media_id, max_bytes, error=download_error):
+                        client.download_calls.append((media_id, max_bytes))
+                        raise error
+                    client.download_media = fail_download
+                client.result.set_result({"status": "ok", "result": descriptor})
+                adapter_module._register_active_adapter(_Adapter(client, {"thread-1": "turn-1"}))
+                with mock.patch.object(adapter_module, "_cache_mobile_artifact_bytes") as cache:
+                    result = await self.file_tool["handler"]({
+                        "purpose": "Inspect it", "selection": "file",
+                    })
+                expected = {
+                    "status": "device_unavailable", "result": descriptor,
+                    "stage": "media", "reason": "media_validation_failed",
+                }
+                self.assertEqual(json.loads(result), expected)
+                cache.assert_not_called()
 
     async def test_rejects_unbound_context_before_phone_routing(self):
         adapter_module._current_turn_platform_and_chat = lambda: ("cron", "thread-1")
@@ -346,6 +524,9 @@ class HermesPluginContextTests(unittest.TestCase):
             self.assertIsNotNone(location_entry)
             self.assertTrue(location_entry.is_async)
             self.assertEqual(location_entry.schema["parameters"]["properties"]["purpose"]["maxLength"], 160)
+            camera_entry = registry.get_entry("cozy_capture_camera")
+            self.assertIsNotNone(camera_entry)
+            self.assertTrue(camera_entry.is_async)
             ready = threading.Event()
             stopped = threading.Event()
             loop_box = []
@@ -363,6 +544,8 @@ class HermesPluginContextTests(unittest.TestCase):
             self.assertTrue(ready.wait(1))
 
             class Client:
+                media_bytes = b"\x89PNG\r\n\x1a\nresident-turn"
+
                 async def request_device_status(self, _thread_id, _turn_id, purpose):
                     self.loop_thread = threading.get_ident()
                     self.status_purpose = purpose
@@ -372,6 +555,19 @@ class HermesPluginContextTests(unittest.TestCase):
                     self.loop_thread = threading.get_ident()
                     self.purpose = purpose
                     return {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}}
+
+                async def _request_mobile(self, command, _thread_id, _turn_id, _purpose, _options):
+                    self.command = command
+                    return {"status": "ok", "result": {
+                        "mediaId": "resident-photo", "mimeType": "image/png",
+                        "byteCount": len(self.media_bytes),
+                        "sha256": hashlib.sha256(self.media_bytes).hexdigest(),
+                        "filename": "resident.png", "family": "image",
+                    }}
+
+                async def download_media(self, media_id, max_bytes):
+                    self.download = (media_id, max_bytes)
+                    return self.media_bytes, "resident.png", "image/png"
 
             client = Client()
             adapter = adapter_module.AttachAdapter()
@@ -405,9 +601,51 @@ class HermesPluginContextTests(unittest.TestCase):
                     )),
                     {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}},
                 )
+                cached = type("Cached", (), {
+                    "path": "/agent/cache/images/resident.png", "media_type": "image/png",
+                    "kind": "image", "display_name": "resident.png",
+                })()
+                with mock.patch.object(adapter_module, "_cache_mobile_artifact_bytes", return_value=cached):
+                    artifact = model_tools.handle_function_call(
+                        "tool_call",
+                        {"name": "cozy_capture_camera", "arguments": {
+                            "purpose": "Read the label", "camera": "rear", "capture": "photo",
+                        }},
+                        enabled_toolsets=["cozygateway"],
+                    )
+                self.assertTrue(artifact["_multimodal"])
+                self.assertEqual(artifact["content"][1]["type"], "image_url")
+                # This is the runner seam that puts the image parts in the next
+                # model/tool message in the same resident turn.
+                from run_agent import AIAgent
+
+                class VisionRunner:
+                    provider = "openai"
+                    model = "vision-test"
+                    _no_list_tool_content_models = set()
+
+                    @staticmethod
+                    def _content_has_image_parts(content):
+                        return AIAgent._content_has_image_parts(content)
+
+                    @staticmethod
+                    def _model_supports_vision():
+                        return True
+
+                    @staticmethod
+                    def _provider_supports_vision_tool_messages():
+                        return True
+
+                self.assertEqual(
+                    AIAgent._tool_result_content_for_active_model(
+                        VisionRunner(), "cozy_capture_camera", artifact
+                    ),
+                    artifact["content"],
+                )
                 self.assertEqual(client.purpose, "Find coffee")
                 self.assertEqual(client.status_purpose, "Report phone readiness")
                 self.assertEqual(client.loop_thread, thread.ident)
+                self.assertEqual(client.download, ("resident-photo", 8 * 1024 * 1024))
             finally:
                 clear_session_vars(tokens)
                 adapter_module._unregister_active_adapter(adapter)
