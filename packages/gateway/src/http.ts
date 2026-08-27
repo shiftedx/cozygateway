@@ -802,7 +802,15 @@ export function createApp(deps: AppDeps): Hono<Env> {
     } catch {
       return fail(400, errorBody("invalid_request", "could not store mobile media"), "media_storage_failed");
     }
-    if (!claim.complete(descriptor)) {
+    const mobileDescriptor: MobileNodeMediaDescriptor = {
+      mediaId: descriptor.mediaId,
+      mimeType: descriptor.mimeType,
+      byteCount: descriptor.byteCount,
+      sha256: descriptor.sha256,
+      filename: descriptor.filename,
+      family: descriptor.family,
+    };
+    if (!claim.complete(mobileDescriptor)) {
       deps.storage.deleteUnreferencedAttachMedia(claim.agentId, descriptor.mediaId);
       return c.json(errorBody("invalid_request", "mobile media request expired or changed"), 409);
     }

@@ -224,6 +224,93 @@ it("routes status through its authenticated origin in background while keeping l
   }
 }, 20_000);
 
+it("returns an uploaded camera artifact to the requesting attach peer", async () => {
+  process.env["MOBILE_MEDIA_E2E_DASHBOARD_TOKEN"] = "dashboard-secret";
+  process.env["MOBILE_MEDIA_E2E_SAGE_TOKEN"] = "attach-secret";
+  let gateway: RunningGateway | undefined;
+  let hermes: FakeHermesServer | undefined;
+  const sockets: WebSocket[] = [];
+  try {
+    hermes = await startFakeHermesServer({
+      methods: {
+        "profiles.list": () => ({ profiles: [{ name: "sage", description: "native", has_avatar: false, ui_meta: { "hermes-bots": { title: "Sage" } } }], bot_mode_protocol: true }),
+      },
+    });
+    gateway = await startGateway({
+      name: "mobile-media-e2e", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
+      hermes: {
+        url: hermes.url, tokenEnv: "MOBILE_MEDIA_E2E_DASHBOARD_TOKEN",
+        profiles: { sage: { tokenEnv: "MOBILE_MEDIA_E2E_SAGE_TOKEN", name: "Sage" } },
+      },
+    });
+    const deviceToken = await pair(gateway);
+    const app = await appSocket(gateway.url, deviceToken, sockets);
+    app.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["camera.capture"], foreground: true }));
+
+    const pluginFrames: Array<Record<string, any>> = [];
+    const plugin = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
+    sockets.push(plugin);
+    plugin.on("message", (data) => pluginFrames.push(JSON.parse(String(data))));
+    await once(plugin, "open");
+    plugin.send(JSON.stringify({
+      kind: "hello", version: 2, instanceId: "mobile-media-e2e",
+      capabilities: ["draft", "mobile_node", "mobile_media"],
+      resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
+
+    await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "sage"));
+    const sent = await fetch(`${gateway.url}/bots/sage/chat/messages`, {
+      method: "POST", headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ text: "take a photo", clientId: "camera-origin" }),
+    });
+    expect(sent.status).toBe(202);
+    await until(() => pluginFrames.some((frame) => frame.kind === "command" && frame.command.kind === "turn"));
+    const turn = pluginFrames.find((frame) => frame.kind === "command" && frame.command.kind === "turn")!.command;
+
+    plugin.send(JSON.stringify({
+      kind: "mobile_request", requestId: "camera-upload", command: "camera.capture",
+      threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 120_000,
+      purpose: "Capture one test photo", camera: "rear", capture: "photo", videoDurationSeconds: 10,
+    }));
+    await until(() => app.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "camera-upload"));
+    const request = app.frames.find((frame): frame is Extract<ServerFrame, { type: "mobile_node_request" }> =>
+      frame.type === "mobile_node_request" && frame.requestId === "camera-upload")!;
+    const uploaded = await fetch(`${gateway.url}/mobile-node/media/camera-upload`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "image/png",
+        "x-mobile-node-lease": request.lease,
+        "x-attach-filename": "camera.png",
+      },
+      body: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+    });
+    expect(uploaded.status).toBe(201);
+    const uploadBody = await uploaded.json() as { media: Record<string, unknown> };
+    expect(uploadBody.media.expiresAt).toEqual(expect.any(Number));
+
+    await settledOnce(pluginFrames, "camera-upload");
+    expect(results(pluginFrames, "camera-upload")[0]).toEqual({
+      kind: "mobile_result", requestId: "camera-upload", status: "ok",
+      result: {
+        mediaId: uploadBody.media.mediaId,
+        mimeType: "image/png",
+        byteCount: 8,
+        sha256: expect.any(String),
+        filename: "camera.png",
+        family: "image",
+      },
+    });
+  } finally {
+    for (const socket of sockets) if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
+    await gateway?.close();
+    await hermes?.close();
+    delete process.env["MOBILE_MEDIA_E2E_DASHBOARD_TOKEN"];
+    delete process.env["MOBILE_MEDIA_E2E_SAGE_TOKEN"];
+  }
+}, 20_000);
+
 async function pair(gateway: RunningGateway): Promise<string> {
   const response = await fetch(`${gateway.url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });
   return ((await response.json()) as { deviceToken: string }).deviceToken;
