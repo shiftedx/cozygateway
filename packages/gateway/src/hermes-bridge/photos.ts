@@ -56,12 +56,15 @@ export const PHOTO_QUEUE_WAIT_MS = 5_000;
 export const PHOTO_RATE_CAPACITY = 8;
 export const PHOTO_RATE_REFILL_MS = 5_000;
 
-/** How long the gateway keeps its copy of a photo. Long enough that scrolling back through a week of
- *  chat still shows the pictures, short enough that a household gateway's database does not grow
- *  without bound. When a copy is swept the message keeps its text and simply stops carrying the
+/** How long the gateway keeps a user-uploaded attachment. Long enough that scrolling back through a
+ *  week of chat still shows it, short enough that a household gateway's database does not grow
+ *  without bound. When a copy expires the message keeps its text and simply stops carrying the
  *  attachment block, which is what the contract promises: the bytes expire, the conversation does
  *  not. */
-export const PHOTO_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+export const ATTACH_MEDIA_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+
+/** Compatibility name for callers concerned specifically with photos. */
+export const PHOTO_TTL_MS = ATTACH_MEDIA_TTL_MS;
 
 /** How often the bridge reclaims the disk behind expired photos.
  *

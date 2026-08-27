@@ -37,6 +37,7 @@ import type { AttachV1EventFrame, AttachV1MobileRequest } from "../adapters/atta
 import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
+import { ATTACH_MEDIA_TTL_MS } from "./photos.ts";
 import type {
   BotApprovalDecision,
   BotClarifyResolveOutcome,
@@ -815,6 +816,7 @@ export class NativeBotDataPlane {
         sha256: createHash("sha256").update(input.bytes).digest("hex"),
         filename: input.name,
         family: input.family,
+        expiresAt: now + ATTACH_MEDIA_TTL_MS,
       },
       input.bytes,
       now,
