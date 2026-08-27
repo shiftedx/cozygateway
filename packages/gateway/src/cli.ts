@@ -332,7 +332,7 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
 
   if (command === "serve") {
     const config = applyEnvOverrides(loadConfig(configPath), process.env);
-    const gateway = await startGateway(config);
+    const gateway = await startGateway(config, { configPath });
     console.log(`cozygateway ${GATEWAY_VERSION} listening on ${gateway.url}`);
     await new Promise<void>((resolve) => {
       process.once("SIGINT", () => resolve());

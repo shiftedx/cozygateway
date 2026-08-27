@@ -1,11 +1,13 @@
-import { readFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { type Static, Type } from "@sinclair/typebox";
 import { ContractViolation, assertValid } from "cozygateway-contract";
 
 /** Hermes is the only supported runtime. Each profile is configured once and the same attach-v1
  * identity powers both the frozen core thread surface and Bot Mode. */
-const HermesBridgeConfigSchema = Type.Object({
+export const HermesBridgeConfigSchema = Type.Object({
   /** The Hermes gateway WebSocket URL, e.g. ws://homelab:8790/api/ws */
   url: Type.String({ minLength: 1 }),
   /** How the WS upgrade is authenticated. "token" (default) is the loopback shape: the credential
@@ -73,6 +75,17 @@ const HermesBridgeConfigSchema = Type.Object({
 });
 export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
 
+export const HermesEndpointConfigSchema = Type.Intersect([
+  HermesBridgeConfigSchema,
+  Type.Object({
+    /** Stable gateway-local namespace. It is part of every app-facing bot id. */
+    id: Type.String({ minLength: 1, maxLength: 48, pattern: "^[a-z0-9][a-z0-9_-]*$" }),
+    /** Optional human label for settings UI; identity never depends on it. */
+    label: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  }),
+]);
+export type HermesEndpointConfig = Static<typeof HermesEndpointConfigSchema>;
+
 /** Optional gateway-native TLS. Both halves are required together: a cert without a key (or the
  *  reverse) is a half-configured deployment, not a default, and is refused rather than quietly
  *  falling back to plaintext. Paths only -- key material never enters the config file. Omitting the
@@ -116,10 +129,38 @@ const GatewayConfigSchema = Type.Object({
    *  gateway. Presence is a deployment posture, not merely display text: the listener must remain
    *  on exact loopback so the public proxy is the only network path into the plaintext origin. */
   publicUrl: Type.Optional(Type.String({ minLength: 1 })),
-  hermes: HermesBridgeConfigSchema,
+  /** Legacy single-endpoint shape. Its app-facing profile ids remain bare for compatibility. */
+  hermes: Type.Optional(HermesBridgeConfigSchema),
+  /** Federated shape. Profile ids are exposed as `<endpoint-id>:<profile-id>`. */
+  hermesEndpoints: Type.Optional(Type.Array(HermesEndpointConfigSchema, { minItems: 1, maxItems: 32 })),
   tls: Type.Optional(TlsConfigSchema),
 });
-export type GatewayConfig = Static<typeof GatewayConfigSchema>;
+type ParsedGatewayConfig = Static<typeof GatewayConfigSchema>;
+/** Source-compatible type for existing programmatic single-endpoint hosts. Federated configs are
+ * produced by `loadConfig`; callers constructing one directly should use that loader boundary. */
+export type GatewayConfig = ParsedGatewayConfig & { hermes: HermesBridgeConfig };
+
+export interface ResolvedHermesEndpoint {
+  id: string | undefined;
+  namespace: boolean;
+  config: HermesBridgeConfig;
+}
+
+export function hermesEndpoints(config: GatewayConfig): ResolvedHermesEndpoint[] {
+  if (config.hermesEndpoints !== undefined) {
+    return config.hermesEndpoints.map(({ id, label: _label, ...endpoint }) => ({
+      id,
+      namespace: true,
+      config: endpoint,
+    }));
+  }
+  return config.hermes === undefined ? [] : [{ id: undefined, namespace: false, config: config.hermes }];
+}
+
+export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: string): string {
+  const normalized = profile.trim().toLowerCase();
+  return endpoint.namespace ? `${endpoint.id}:${normalized}` : normalized;
+}
 
 const LOOPBACK_LISTENERS = new Set(["127.0.0.1", "::1", "localhost"]);
 
@@ -166,19 +207,48 @@ export function loadConfig(path: string): GatewayConfig {
     typeof raw === "object" && raw !== null
       ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 0, ...raw }
       : raw;
-  const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults));
+  const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults) as GatewayConfig);
+  if ((config.hermes === undefined) === (config.hermesEndpoints === undefined)) {
+    throw new ContractViolation(
+      'configure exactly one of legacy "hermes" or federated "hermesEndpoints"',
+      "/hermesEndpoints",
+    );
+  }
+  const endpointIds = new Set<string>();
+  for (const endpoint of config.hermesEndpoints ?? []) {
+    if (endpointIds.has(endpoint.id))
+      throw new ContractViolation(`duplicate Hermes endpoint id "${endpoint.id}"`, "/hermesEndpoints");
+    endpointIds.add(endpoint.id);
+  }
   const seen = new Set<string>();
-  for (const rawProfile of Object.keys(config.hermes.profiles)) {
-    const profile = rawProfile.trim().toLowerCase();
+  for (const endpoint of hermesEndpoints(config)) {
+    for (const rawProfile of Object.keys(endpoint.config.profiles)) {
+      const profile = publicProfileId(endpoint, rawProfile);
     if (profile.length === 0) {
       throw new ContractViolation("Hermes profile ids must not be blank", "/hermes/profiles");
     }
     if (seen.has(profile)) {
       throw new ContractViolation(`duplicate Hermes profile id "${profile}"`, "/hermes/profiles");
     }
-    seen.add(profile);
+      seen.add(profile);
+    }
   }
   return config;
+}
+
+/** Atomic, permission-preserving whole-file replacement used by the authenticated management API. */
+export function saveConfig(path: string, config: GatewayConfig): void {
+  // Validate through the same public loader without weakening it for in-memory callers.
+  const mode = statSync(path).mode & 0o777;
+  const temp = join(dirname(path), `.cozygateway.config.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode });
+    chmodSync(temp, mode);
+    renameSync(temp, path);
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* nothing was written */ }
+    throw error;
+  }
 }
 
 /** Apply container-friendly environment overrides on top of a loaded config. Returns a new object;

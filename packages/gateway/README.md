@@ -71,7 +71,8 @@ or reverse proxy you set up and control remains a perfectly good alternative.
 | `port` | integer | `8787` | TCP port to listen on. |
 | `dbPath` | string | `cozygateway.db` | SQLite file path (or `:memory:` for ephemeral runs). |
 | `turnTimeoutSeconds` | integer | `0` | Optional operator-enforced wall-clock bound, in seconds. `0` disables it (the default), allowing legitimate long-running tool use and context compaction to finish. A positive value interrupts through the ordinary manual-stop path. Applies to every interruptible backend; config-file only, not env-driven. |
-| `hermes` | object | required | Hermes Dashboard control/read connection and the single attach identity for each profile: `url`, password-auth fields, and `profiles.<name>.tokenEnv`. The installer writes this object; it does not use a separate `agents` list. |
+| `hermes` | object | required for legacy single endpoint | Hermes Dashboard control/read connection and the single attach identity for each profile. Existing files retain bare bot ids. |
+| `hermesEndpoints` | array | alternative to `hermes` | Federates 1-32 distinct Hermes gateways. Each entry adds stable `id` and optional `label` to the `hermes` fields; app-facing bot ids are always `<endpoint-id>:<profile-id>`. Configure exactly one of `hermes` or `hermesEndpoints`. |
 | `capabilities` | object | `{}` | Map of capability id to integer version, surfaced verbatim as `GatewayInfo.capabilities` (the `GET /health` response, the pair response, and the `ready` frame all carry it). Ids under `com.cozylabs.*` are vendor extensions, versioned independently of the contract; see contract/v1.md section 5. |
 | `pushRelayUrl` | string | absent | Private relay origin shared by authenticated `/push` registration proxy calls and the gateway's own `/notify` calls. Setting it advertises `com.cozylabs.push-proxy: 1`. Overridable with `COZYGATEWAY_PUSH_RELAY_URL`. |
 | `publicUrl` | string | absent | Strict HTTPS origin advertised by `cozygateway pair` for a user-managed tunnel or reverse proxy. Requires an exact loopback `host`; startup fails before storage or the listener when either invariant is broken. |
@@ -124,6 +125,11 @@ proceed on the second.
 - `~/.cozygateway/bin/cozygateway serve --config <path>`: start the gateway and run until interrupted.
 - `~/.cozygateway/bin/cozygateway pair --config <path>`: mint a fresh setup code against the configured
   database and print the QR payload for the app to scan.
+
+When `serve` receives `--config`, it advertises `com.cozylabs.gateway-management: 1` and enables
+authenticated `GET`/`PUT /gateway/settings`. The API exposes environment variable names, never
+their credential values, persists updates atomically, and requires a restart to apply them. See
+[`contract/gateway-management-v1.md`](../../contract/gateway-management-v1.md).
 
 ## License
 
