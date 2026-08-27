@@ -20,6 +20,7 @@ Hermes profile. It intentionally does not create legacy `agents[]` identities
 or duplicate native-data-plane identities. Tokens stay in mode-600 environment
 files and configuration carries token environment-variable names only.
 
-Network exposure is outside installer scope. LAN binding is the default;
-Tailscale, Cloudflare named tunnels, certificates, DNS, and firewall policy
-remain explicit operator work.
+Network exposure is outside installer scope. Fresh installs bind loopback; LAN binding is an
+explicit `--bind-host 0.0.0.0` choice. `--public-url` records one HTTPS origin and keeps the
+listener on loopback, but Tailscale, Cloudflare named tunnels, certificates, DNS, and firewall
+policy remain explicit operator work. Updates preserve an existing saved listener.

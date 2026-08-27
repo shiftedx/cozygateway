@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -120,6 +120,53 @@ describe("cozygateway pair", () => {
     vi.restoreAllMocks();
     const payload = JSON.parse(lines.find((line) => line.startsWith("{")) ?? "{}") as { gatewayUrl: string };
     expect(payload.gatewayUrl).toBe("https://gateway.example.com");
+  });
+
+  it("advertises the persisted publicUrl and rejects a different --url", async () => {
+    const { configPath } = tempConfig({
+      host: "127.0.0.1",
+      publicUrl: "HTTPS://Gateway.Example:443/",
+    });
+    expect((await pairPayload(configPath)).gatewayUrl).toBe("https://gateway.example");
+
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => lines.push(String(line)));
+    expect(await runCli([
+      "pair", "--config", configPath, "--url", "https://gateway.example/",
+    ])).toBe(0);
+    vi.restoreAllMocks();
+    expect(JSON.parse(lines.find((line) => line.startsWith("{")) ?? "{}").gatewayUrl)
+      .toBe("https://gateway.example");
+
+    await expect(runCli([
+      "pair", "--config", configPath, "--url", "https://other.example",
+    ])).rejects.toThrow(/--url.*publicUrl/i);
+  });
+
+  it("rejects a mismatched --url before creating storage or a setup code", async () => {
+    const { configPath, dbPath } = tempConfig({
+      host: "127.0.0.1",
+      publicUrl: "https://gateway.example",
+    });
+
+    await expect(runCli([
+      "pair", "--config", configPath, "--url", "https://other.example",
+    ])).rejects.toThrow(/--url.*publicUrl/i);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("rejects a non-loopback environment override before creating storage or a setup code", async () => {
+    const { configPath, dbPath } = tempConfig({
+      host: "127.0.0.1",
+      publicUrl: "https://gateway.example",
+    });
+    vi.stubEnv("COZYGATEWAY_HOST", "0.0.0.0");
+    try {
+      await expect(runCli(["pair", "--config", configPath])).rejects.toThrow(/publicUrl.*loopback/i);
+      expect(existsSync(dbPath)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("fails with a usage message on an unknown command", async () => {

@@ -124,6 +124,51 @@ describe("loadConfig", () => {
     expect(loadConfig(path).pushRelayUrl).toBe("http://relay:8788");
   });
 
+  it("canonicalizes a public HTTPS origin on a loopback listener", () => {
+    const path = writeConfig({
+      name: "public-gateway",
+      host: "127.0.0.1",
+      publicUrl: "HTTPS://Gateway.Example:443/",
+      hermes,
+    });
+    expect(loadConfig(path).publicUrl).toBe("https://gateway.example");
+  });
+
+  it.each([
+    "http://gateway.example",
+    "https://user@gateway.example",
+    "https://user:secret@gateway.example",
+    "https://gateway.example/path",
+    "https://gateway.example/path/..",
+    "https://gateway.example?mode=public",
+    "https://gateway.example#pair",
+    " https://gateway.example ",
+    "https://gateway.example\t",
+    "https://gateway.example\r",
+    "https://gateway.example\n",
+    "https://gateway.example\0",
+    "not a URL",
+  ])("rejects a publicUrl that is not a strict HTTPS origin: %s", (publicUrl) => {
+    expect(() => loadConfig(writeConfig({
+      name: "public-gateway",
+      host: "127.0.0.1",
+      publicUrl,
+      hermes,
+    }))).toThrow(/publicUrl.*HTTPS origin/i);
+  });
+
+  it.each(["0.0.0.0", "192.168.1.20", "gateway.local"])(
+    "rejects publicUrl on the non-loopback listener %s",
+    (host) => {
+      expect(() => loadConfig(writeConfig({
+        name: "public-gateway",
+        host,
+        publicUrl: "https://gateway.example",
+        hermes,
+      }))).toThrow(/publicUrl.*loopback/i);
+    },
+  );
+
   it("rejects a non-integer capability version", () => {
     const path = writeConfig({
       name: "g",

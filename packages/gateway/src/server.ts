@@ -13,7 +13,7 @@ import {
   type ServerFrame,
 } from "cozygateway-contract";
 
-import type { GatewayConfig } from "./config.ts";
+import { validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { openStorage, type Storage } from "./storage.ts";
 import {
   ATTACH_V1_CAPABILITIES,
@@ -179,6 +179,10 @@ export async function startGateway(
   config: GatewayConfig,
   options: StartGatewayOptions = {},
 ): Promise<RunningGateway> {
+  // Validate the public posture before TLS files, storage, bridges, or the listener can produce a
+  // side effect. Programmatic hosts do not necessarily pass through loadConfig(), so startup owns
+  // this last fail-closed check too.
+  config = validatePublicDeployment(config);
   // Transition records deliberately have a useful production default. They remain injectable so
   // embedded hosts and tests can collect them without intercepting stderr.
   const traceLog = options.traceLog ?? ((line: string) => process.stderr.write(`${line}\n`));
