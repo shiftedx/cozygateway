@@ -162,13 +162,6 @@ export function createChatMessagePushHandler(
     );
 }
 
-/** Assembly seam for the broker's synchronous wake-admission decision. */
-export function createMobileNodeWakeHandler(
-  notifier: Pick<RelayNotifier, "notifyMobileNodeWake">,
-): (deviceId: string) => boolean {
-  return (deviceId) => notifier.notifyMobileNodeWake(deviceId);
-}
-
 /** One shared immutable GatewayInfo for health, pairing, and the ready frame. */
 export function gatewayInfoForConfig(config: GatewayConfig, management = false): GatewayInfo {
   return {
@@ -453,7 +446,7 @@ export async function startGateway(
   );
   mobileNode = new MobileNodeBroker({
     route: (deviceId, command) => hub.mobileNodeRoute(deviceId, command),
-    wake: createMobileNodeWakeHandler(notifier),
+    wake: (deviceId) => notifier.notifyMobileNodeWake(deviceId),
     send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
     result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
     receipt: (receipt) => nativeBotPlane?.recordMobileReceipt(receipt) !== undefined,

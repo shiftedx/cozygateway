@@ -162,6 +162,16 @@ field emits exactly that payload without it. A gateway at this revision or later
 `"kind": "message"` explicitly, so the discriminator is present in practice and "no kind" only
 ever means "older gateway".
 
+**`kind: "mobile_node_wake"`** (a silent request for the selected idle phone to reconnect;
+category `mobile.status.wake`, collapse id `mobile.status`):
+
+```json
+{ "kind": "mobile_node_wake" }
+```
+
+The decrypted plaintext is exactly the object above. It contains no request, lease, agent, chat,
+or device identifiers.
+
 **`kind: "approval_pending"`** (a tool call is waiting on a decision; category
 `approval.pending`, collapse id = `toolCallId`):
 
