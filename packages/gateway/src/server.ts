@@ -46,6 +46,7 @@ import { parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
+import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 
@@ -193,6 +194,12 @@ export async function startGateway(
   const tls = resolveTlsMaterial(config.tls);
   const scheme = tls === undefined ? "http" : "https";
   const storage = openStorage(config.dbPath);
+  storage.pruneExpiredAttachMedia(Date.now());
+  const attachMediaSweep = setInterval(
+    () => storage.pruneExpiredAttachMedia(Date.now()),
+    PHOTO_SWEEP_MS,
+  );
+  attachMediaSweep.unref?.();
   const profileEntries = Object.entries(config.hermes.profiles).map(
     ([rawId, profile]) => [rawId.trim().toLowerCase(), profile] as const,
   );
@@ -572,6 +579,7 @@ export async function startGateway(
       return code;
     },
     close: async () => {
+      clearInterval(attachMediaSweep);
       const durableAttachShutdown = profileEntries.some(([profileId]) =>
         attachV1Ingress.hasNegotiated(profileId),
       );

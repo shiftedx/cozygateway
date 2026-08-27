@@ -2229,6 +2229,17 @@ export class Storage {
       .run(agentId, mediaId);
   }
 
+  /** Reclaim only rows whose producer explicitly gave them a retention deadline. Attach-plugin
+   * descriptors without `expiresAt` remain under the plugin's existing retention policy. */
+  pruneExpiredAttachMedia(now: number): number {
+    return Number(
+      this.#db
+        .prepare("DELETE FROM attach_media WHERE expires_at IS NOT NULL AND expires_at <= ?")
+        .run(now)
+        .changes,
+    );
+  }
+
   /** Delete only media that cannot yet be reached from any durable attach event or native
    * transcript. This is the rollback half of an atomic producer occurrence; a referenced object
    * is deliberately retained rather than turning a successfully committed attachment into a 404. */

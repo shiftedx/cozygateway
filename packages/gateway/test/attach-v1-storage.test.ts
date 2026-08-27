@@ -219,16 +219,24 @@ describe("attach-v1 durable transport storage", () => {
     storage.close();
   });
 
-  it("stores immutable media bytes scoped by agent and expires them", () => {
+  it("prunes only explicitly expired media bytes while preserving live and plugin-supplied rows", () => {
     const storage = openStorage(":memory:");
     const bytes = new Uint8Array([137, 80, 78, 71]);
     const sha256 = createHash("sha256").update(bytes).digest("hex");
-    storage.saveAttachMedia("sage", { mediaId: "media", mimeType: "image/png", byteCount: bytes.length, sha256, filename: "x.png", family: "image", expiresAt: 100 }, bytes, 1);
-    expect(storage.attachMediaInfo("sage", "media", 99)?.size).toBe(4);
-    expect(storage.attachMediaSlice("sage", "media", 1, 2, 99)).toEqual(new Uint8Array([80, 78]));
-    expect(storage.attachMediaInfo("other", "media", 99)).toBeUndefined();
-    expect(storage.attachMediaInfo("sage", "media", 100)).toBeUndefined();
-    expect(() => storage.saveAttachMedia("sage", { mediaId: "media", mimeType: "image/png", byteCount: bytes.length, sha256, filename: "different.png", family: "image" }, bytes, 2)).toThrow();
+    const descriptor = (mediaId: string, expiresAt?: number) => ({
+      mediaId, mimeType: "image/png", byteCount: bytes.length, sha256, filename: `${mediaId}.png`, family: "image" as const,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+    });
+    storage.saveAttachMedia("sage", descriptor("expired", 100), bytes, 1);
+    storage.saveAttachMedia("sage", descriptor("live", 101), bytes, 1);
+    storage.saveAttachMedia("sage", descriptor("plugin"), bytes, 1);
+    expect(storage.pruneExpiredAttachMedia(100)).toBe(1);
+    // A different descriptor can reuse this id only if the expired row's bytes were actually deleted.
+    expect(storage.saveAttachMedia("sage", { ...descriptor("expired"), filename: "replacement.png" }, bytes, 101)).toBe(true);
+    expect(storage.attachMediaInfo("sage", "live", 100)?.size).toBe(4);
+    expect(storage.attachMediaSlice("sage", "live", 1, 2, 100)).toEqual(new Uint8Array([80, 78]));
+    expect(storage.attachMediaInfo("sage", "plugin", 100)?.size).toBe(4);
+    expect(storage.pruneExpiredAttachMedia(100)).toBe(0);
     storage.close();
   });
 

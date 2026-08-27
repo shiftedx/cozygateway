@@ -1,14 +1,17 @@
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { WebSocket } from "ws";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MOBILE_NODE_CAPABILITY_VERSION, type GatewayInfo, type ServerFrame } from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
+import { openStorage } from "../src/storage.ts";
+import { PHOTO_SWEEP_MS } from "../src/hermes-bridge/photos.ts";
 
 let gateway: RunningGateway;
 
@@ -31,6 +34,53 @@ afterEach(async () => {
 });
 
 describe("startGateway end to end", () => {
+  it("prunes explicitly expired attachment bytes at startup while preserving NULL-expiry plugin media", async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "cozygateway-attachment-prune-")), "gateway.sqlite");
+    const bytes = new Uint8Array([137, 80, 78, 71]);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const descriptor = (mediaId: string, expiresAt?: number) => ({
+      mediaId, mimeType: "image/png", byteCount: bytes.byteLength, sha256, filename: `${mediaId}.png`, family: "image" as const,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+    });
+    const beforeStart = openStorage(dbPath);
+    beforeStart.saveAttachMedia("sage", descriptor("expired", 0), bytes, 0);
+    beforeStart.saveAttachMedia("sage", descriptor("plugin"), bytes, 0);
+    beforeStart.close();
+
+    const gw = await startGateway({
+      name: "attachment-prune", port: 0, dbPath, turnTimeoutSeconds: 0, hermes: testHermes(),
+    });
+    try {
+      expect(gw.storage.saveAttachMedia("sage", { ...descriptor("expired"), filename: "replacement.png" }, bytes, Date.now())).toBe(true);
+      expect(gw.storage.attachMediaInfo("sage", "plugin", Date.now())?.size).toBe(4);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it("unrefs the attachment sweep and clears it before its storage closes", async () => {
+    const setIntervalSpy = vi.spyOn(global, "setInterval");
+    const clearIntervalSpy = vi.spyOn(global, "clearInterval");
+    let gw: RunningGateway | undefined;
+    try {
+      gw = await startGateway({
+        name: "attachment-sweep", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes(),
+      });
+      const index = setIntervalSpy.mock.calls.findIndex(([, interval]) => interval === PHOTO_SWEEP_MS);
+      expect(index).toBeGreaterThanOrEqual(0);
+      const timer = setIntervalSpy.mock.results[index]?.value as NodeJS.Timeout;
+      expect(timer.hasRef()).toBe(false);
+
+      await gw.close();
+      gw = undefined;
+      expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+    } finally {
+      await gw?.close();
+      clearIntervalSpy.mockRestore();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("pairs and authenticates a client over WebSocket", async () => {
     const code = gateway.issueSetupCode();
     const pairRes = await fetch(`${gateway.url}/pair`, {

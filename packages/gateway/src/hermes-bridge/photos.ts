@@ -66,14 +66,12 @@ export const ATTACH_MEDIA_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 /** Compatibility name for callers concerned specifically with photos. */
 export const PHOTO_TTL_MS = ATTACH_MEDIA_TTL_MS;
 
-/** How often the bridge reclaims the disk behind expired photos.
+/** How often the gateway reclaims expired user-uploaded attachment bytes.
  *
- *  Note what this is NOT: it is not what makes the TTL true. Both reads filter on `created_at`, so a
- *  photo past its expiry is unreachable the moment it expires whether or not anything has swept. That
- *  ordering matters because the gateway this feature is aimed at is a quiet household box: a house
- *  that sends photos for a week and then stops would never fire a write-time sweep again, and an
- *  expiry that depended on one would simply never happen. The timer only decides how long the bytes
- *  linger on disk after they have stopped being served. */
+ *  The `expires_at` read predicate makes an attachment unreachable at its deadline even before a
+ *  sweep runs. The startup prune removes bytes that expired while the gateway was down; this unref'd
+ *  interval bounds the remaining on-disk linger for a running gateway to one hour. Rows with a NULL
+ *  `expires_at` come from attach-plugin descriptors and are intentionally not touched here. */
 export const PHOTO_SWEEP_MS = 60 * 60 * 1000;
 
 /** What the app may cache a served attachment for. Same posture as the capability-7 proxy: the bytes
