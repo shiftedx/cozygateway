@@ -1127,7 +1127,22 @@ def _is_location(value: Any) -> bool:
     )
 
 def _is_media(value: Any) -> bool:
-    return isinstance(value, dict) and isinstance(value.get("mediaId"), str) and isinstance(value.get("mimeType"), str) and isinstance(value.get("byteCount"), int) and isinstance(value.get("filename"), str) and isinstance(value.get("sha256"), str)
+    return (
+        isinstance(value, dict)
+        and set(value) == {"mediaId", "mimeType", "byteCount", "sha256", "filename", "family"}
+        and isinstance(value.get("mediaId"), str)
+        and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value["mediaId"]))
+        and isinstance(value.get("mimeType"), str)
+        and 0 < len(value["mimeType"]) <= 128
+        and isinstance(value.get("byteCount"), int)
+        and not isinstance(value["byteCount"], bool)
+        and 0 < value["byteCount"] <= ATTACH_AUDIO_VIDEO_MAX_BYTES
+        and isinstance(value.get("filename"), str)
+        and 0 < len(value["filename"]) <= 255
+        and isinstance(value.get("sha256"), str)
+        and bool(re.fullmatch(r"[a-f0-9]{64}", value["sha256"]))
+        and value.get("family") in {"image", "audio", "video", "file"}
+    )
 
 def _is_notification(value: Any) -> bool:
     return isinstance(value, dict) and value.get("action") in {"approve", "snooze", "open", "cancel"} and len(value) == 1
