@@ -2252,16 +2252,61 @@ class AttachAdapter:
         temporarily unwritable client is indistinguishable from no new gateway fact.
         Local durable rows remain the fallback in that case.
         """
-        client = self._client
+        client, loop = self._client, self._loop
         if not isinstance(client, AttachV1Client) or not self._ready.is_set():
             return None
+        timeout = max(0.05, min(float(timeout_seconds), 1.0))
+        pending = None
         try:
-            return await client.delivery_receipt(
-                delivery_id, max(0.05, min(float(timeout_seconds), 1.0))
+            if loop is None or asyncio.get_running_loop() is loop:
+                return await client.delivery_receipt(delivery_id, timeout)
+            if loop.is_closed():
+                return None
+            pending = asyncio.run_coroutine_threadsafe(
+                client.delivery_receipt(delivery_id, timeout), loop
             )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            raise
         except Exception:  # noqa: BLE001 - status must not invent a failure from a read error
             logger.debug("attach: media delivery receipt read failed", exc_info=True)
             return None
+
+    async def media_delivery_status_snapshot(
+        self, delivery_id: str, timeout_seconds: float = 0.5
+    ) -> Dict[str, Any]:
+        """Read remote and local receipt facts on the spool-owning event loop."""
+        loop = self._loop
+        if loop is None or asyncio.get_running_loop() is loop:
+            return await self._media_delivery_status_snapshot_on_owner_loop(
+                delivery_id, timeout_seconds
+            )
+        if loop.is_closed():
+            return {"receipt": None, "rows": [], "localReceipt": None}
+        pending = asyncio.run_coroutine_threadsafe(
+            self._media_delivery_status_snapshot_on_owner_loop(delivery_id, timeout_seconds),
+            loop,
+        )
+        try:
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            pending.cancel()
+            raise
+
+    async def _media_delivery_status_snapshot_on_owner_loop(
+        self, delivery_id: str, timeout_seconds: float
+    ) -> Dict[str, Any]:
+        receipt = await self.media_delivery_receipt(delivery_id, timeout_seconds)
+        rows = _safe_media_rows(self._spool, delivery_id)
+        local_receipt = None
+        if self._spool is not None:
+            try:
+                local_receipt = self._spool.delivery_receipt_row(delivery_id)
+            except Exception:  # noqa: BLE001 - remote receipt remains usable
+                logger.debug("attach: local delivery receipt read failed", exc_info=True)
+        return {"receipt": receipt, "rows": rows, "localReceipt": local_receipt}
 
     async def send_proactive(
         self,
@@ -2277,7 +2322,52 @@ class AttachAdapter:
 
         ``media_positions``, when given, is aligned index-for-index with ``media_files``
         and says which block each attachment renders before.
+
+        Hermes tool handlers run on their own event loop.  The resident attach client,
+        its asyncio locks, and its SQLite spool belong to the adapter loop that opened
+        them, so cross that boundary before probing or uploading any bytes.  Crossing
+        halfway through leaves a successfully uploaded object without a journal row.
         """
+        loop = self._loop
+        if loop is None or asyncio.get_running_loop() is loop:
+            return await self._send_proactive_on_owner_loop(
+                chat_id,
+                message,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+                media_positions=media_positions,
+            )
+        if loop.is_closed():
+            return _proactive_failure("attach_not_writable")
+        pending = asyncio.run_coroutine_threadsafe(
+            self._send_proactive_on_owner_loop(
+                chat_id,
+                message,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+                media_positions=media_positions,
+            ),
+            loop,
+        )
+        try:
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            pending.cancel()
+            raise
+
+    async def _send_proactive_on_owner_loop(
+        self,
+        chat_id: str,
+        message: str,
+        media_files: List[str],
+        *,
+        canonical_home: bool,
+        delivery_key: str,
+        media_positions: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Run one proactive occurrence on the loop that owns client and spool."""
         client = self._client
         if not isinstance(client, AttachV1Client) or not self._ready.is_set():
             return _proactive_failure("attach_not_writable")
@@ -3063,6 +3153,17 @@ def _send_media_tool_result(
                 # a source path into a model-visible result.
                 if key != "error" or re.fullmatch(r"[A-Za-z0-9_:-]{1,128}", value):
                     payload[key] = value[:256]
+        result_error = result.get("error")
+        if isinstance(result_error, str):
+            failure_phase = {
+                "media_upload_failed": "upload",
+                "scheduled_delivery_unavailable": "journal",
+                "scheduled_not_supported": "journal",
+                "attach_not_writable": "transport",
+                "delivery_failed": "delivery",
+            }.get(result_error)
+            if failure_phase is not None:
+                payload["failurePhase"] = failure_phase
     if error:
         payload["error"] = error[:128]
     return json.dumps(payload, separators=(",", ":"))
@@ -3160,6 +3261,7 @@ async def _cozy_send_media(args: Dict[str, Any], **kwargs: Any) -> str:
     # call in the same turn a distinct durable delivery.
     occurrence = str(kwargs.get(TOOL_CALL_ID_KEY) or _occurrence_key()).strip()
     delivery_key = _send_media_delivery_key(occurrence, chat_id, caption, paths)
+    delivery_id, message_id = _proactive_identity(delivery_key)
     try:
         result = await origin_adapter.send_proactive(
             chat_id,
@@ -3173,14 +3275,23 @@ async def _cozy_send_media(args: Dict[str, Any], **kwargs: Any) -> str:
             accepted=False, state="failed", conversation_id=chat_id, error="cancelled"
         )
     except Exception:  # noqa: BLE001 - never expose a local exception or a path
-        logger.warning("attach live media send failed")
+        logger.warning("attach live media send failed", exc_info=True)
         return _send_media_tool_result(
-            accepted=False, state="failed", conversation_id=chat_id, error="delivery_failed"
+            accepted=False,
+            state="failed",
+            conversation_id=chat_id,
+            result=_proactive_failure("delivery_failed", delivery_id, message_id),
         )
     if not isinstance(result, dict):
         return _send_media_tool_result(
-            accepted=False, state="failed", conversation_id=chat_id, error="delivery_failed"
+            accepted=False,
+            state="failed",
+            conversation_id=chat_id,
+            result=_proactive_failure("delivery_failed", delivery_id, message_id),
         )
+    result = dict(result)
+    result.setdefault("deliveryId", delivery_id)
+    result.setdefault("messageId", message_id)
     state = result.get("state") if isinstance(result.get("state"), str) else "failed"
     accepted = state in {"journaled", "projected", "displayed"}
     return _send_media_tool_result(
@@ -3199,26 +3310,46 @@ async def _cozy_media_delivery_status(args: Dict[str, Any], **_kwargs: Any) -> s
         return _media_status_tool_result(delivery_id, message_id, "blocked", None, [], error="policy_blocked")
     origin_adapter, _chat_id, _turn_id, _profile = origin
     receipt: Optional[Dict[str, Any]] = None
-    reader = getattr(origin_adapter, "media_delivery_receipt", None)
-    if callable(reader):
+    rows: List[Dict[str, Any]] = []
+    local_receipt: Optional[Dict[str, Any]] = None
+    snapshot_reader = getattr(origin_adapter, "media_delivery_status_snapshot", None)
+    if callable(snapshot_reader):
         try:
-            candidate = await reader(delivery_id, 0.5)
+            snapshot = await snapshot_reader(delivery_id, 0.5)
         except Exception:  # noqa: BLE001 - local journal remains the truthful fallback
-            candidate = None
+            snapshot = None
+        if isinstance(snapshot, dict):
+            candidate = snapshot.get("receipt")
+            candidate_rows = snapshot.get("rows")
+            if isinstance(candidate_rows, list):
+                rows = candidate_rows
+            candidate_local = snapshot.get("localReceipt")
+            if isinstance(candidate_local, dict):
+                local_receipt = candidate_local
         if isinstance(candidate, dict) and candidate.get("state") in {
             "admitted", "projected", "blocked", "displayed", "failed",
         }:
             receipt = candidate
-    spool = getattr(origin_adapter, "_spool", None)
-    rows = _safe_media_rows(spool, delivery_id)
-    local_receipt: Optional[Dict[str, Any]] = None
-    if spool is not None:
-        try:
-            candidate = spool.delivery_receipt_row(delivery_id)
-            if isinstance(candidate, dict):
-                local_receipt = candidate
-        except Exception:  # noqa: BLE001 - same fallback as a transient gateway 404
-            logger.debug("attach: local delivery receipt read failed", exc_info=True)
+    else:
+        reader = getattr(origin_adapter, "media_delivery_receipt", None)
+        if callable(reader):
+            try:
+                candidate = await reader(delivery_id, 0.5)
+            except Exception:  # noqa: BLE001 - local journal remains the truthful fallback
+                candidate = None
+            if isinstance(candidate, dict) and candidate.get("state") in {
+                "admitted", "projected", "blocked", "displayed", "failed",
+            }:
+                receipt = candidate
+        spool = getattr(origin_adapter, "_spool", None)
+        rows = _safe_media_rows(spool, delivery_id)
+        if spool is not None:
+            try:
+                candidate = spool.delivery_receipt_row(delivery_id)
+                if isinstance(candidate, dict):
+                    local_receipt = candidate
+            except Exception:  # noqa: BLE001 - same fallback as a transient gateway 404
+                logger.debug("attach: local delivery receipt read failed", exc_info=True)
     if receipt is not None:
         state = str(receipt["state"])
         # The HTTP ABI keeps its durable projection fact at the top level.  A

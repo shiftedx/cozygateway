@@ -296,11 +296,36 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         pending = json.loads(await self.send_media_tool["handler"](args))
         self.assertEqual((pending["accepted"], pending["state"], pending["pending"]), (True, "journaled", True))
         origin.proactive_result = {"state": "blocked", "accepted_pending": False, "error": "media_upload_failed"}
-        self.assertEqual(json.loads(await self.send_media_tool["handler"](args)), {
+        blocked = json.loads(await self.send_media_tool["handler"](args))
+        delivery_id, message_id = adapter_module._proactive_identity(
+            origin.proactive_calls[-1][3]["delivery_key"]
+        )
+        self.assertEqual(blocked, {
             "accepted": False, "state": "blocked", "conversationId": "thread-1",
             "pending": False, "committed": False, "displayed": False, "verified": False,
-            "error": "media_upload_failed",
+            "error": "media_upload_failed", "failurePhase": "upload",
+            "deliveryId": delivery_id, "messageId": message_id,
         })
+
+    async def test_send_media_adapter_failure_keeps_inspectable_delivery_identity(self):
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        origin.send_proactive = mock.AsyncMock(side_effect=RuntimeError("private transport detail"))
+        adapter_module._register_active_adapter(origin)
+
+        token = adapter_module._CURRENT_TOOL_OCCURRENCE.set("failed-call")
+        try:
+            result = json.loads(await self.send_media_tool["handler"]({
+                "paths": ["/private/secret.png"], "caption": "caption",
+            }))
+        finally:
+            adapter_module._CURRENT_TOOL_OCCURRENCE.reset(token)
+
+        self.assertEqual(result["error"], "delivery_failed")
+        self.assertEqual(result["failurePhase"], "delivery")
+        self.assertRegex(result["deliveryId"], r"^scheduled:live-media:[0-9a-f]{64}$")
+        self.assertTrue(result["messageId"].startswith("scheduled-"))
+        self.assertNotIn("/private", json.dumps(result))
+        self.assertNotIn("transport detail", json.dumps(result))
 
     async def test_send_media_receipt_exposes_safe_ordered_attachment_descriptors(self):
         origin = _Adapter(_Client(), {"thread-1": "turn-1"})
