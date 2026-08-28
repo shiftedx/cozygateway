@@ -13,9 +13,21 @@ import json
 import os
 import sys
 import threading
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
+
+# Keep this registration-seam suite stdlib-only when the optional transport package is absent.
+try:
+    import websockets.exceptions  # type: ignore[import-not-found]  # noqa: F401
+except ModuleNotFoundError:
+    websocket_exceptions = types.ModuleType("websockets.exceptions")
+    websocket_exceptions.ConnectionClosed = RuntimeError
+    websockets = types.ModuleType("websockets")
+    websockets.exceptions = websocket_exceptions
+    sys.modules["websockets"] = websockets
+    sys.modules["websockets.exceptions"] = websocket_exceptions
 
 import cozygateway.adapter as adapter_module
 
@@ -37,10 +49,11 @@ GATEWAY_STATUS = {
 
 class _PluginContext:
     def __init__(self):
+        self.platforms = []
         self.tools = []
 
-    def register_platform(self, **_kwargs):
-        pass
+    def register_platform(self, **kwargs):
+        self.platforms.append(kwargs)
 
     def register_hook(self, *_args, **_kwargs):
         pass
@@ -117,6 +130,18 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, [("thread-1", "turn-1", "Report phone readiness")])
         client.result.set_result({"status": "ok", "result": GATEWAY_STATUS})
         self.assertEqual(json.loads(await call), {"status": "ok", "result": GATEWAY_STATUS})
+
+    async def test_registration_teaches_native_media_delivery(self):
+        platform = self.context.platforms[0]
+        self.assertEqual(platform["name"], adapter_module.PLATFORM_NAME)
+        hint = platform["platform_hint"]
+
+        self.assertIn("MEDIA:/absolute/path", hint)
+        self.assertIn("one MEDIA:/absolute/path directive on each line", hint)
+        self.assertIn("multiple directive lines send multiple attachments", hint)
+        self.assertIn("outside code fences", hint)
+        self.assertIn("directives automatically target this originating conversation", hint)
+        self.assertIn("instead of sandbox links or file:// URLs", hint)
 
     async def test_preserves_bounded_failure_details_in_the_hermes_tool_json(self):
         client = _Client()
