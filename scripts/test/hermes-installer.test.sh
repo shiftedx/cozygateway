@@ -645,9 +645,12 @@ chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/w
 # After the installer-owned plugin is disabled, uninstall restarts exactly that
 # profile once, retries cleanup, and leaves its service running.
 mkdir -p "$tmp/hermes/profiles/locked-windows/plugins/cozygateway" "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway" "$tmp/gateway-windows-locked/local"
+mkdir -p "$tmp/hermes/profiles/unrelated/plugin-data/unrelated"
 : > "$tmp/hermes/profiles/locked-windows/plugins/cozygateway/.cozygateway-installer-owned"
 : > "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
 printf 'running\n' > "$tmp/hermes/gateway-locked-windows.state"
+printf 'running\n' > "$tmp/hermes/gateway-unrelated.state"
+printf 'preserve-me\n' > "$tmp/hermes/profiles/unrelated/plugin-data/unrelated/sentinel"
 cat > "$tmp/gateway-windows-locked/local/install-state" <<WINDOWS_LOCKED_STATE
 profiles=locked-windows
 hermes_root=$tmp/hermes
@@ -656,9 +659,12 @@ service_locked-windows=preexisting
 WINDOWS_LOCKED_STATE
 windows_spool_marker="$tmp/windows-spool.locked"
 HOME="$tmp/windows-locked-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/locked-spool-bin:$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$windows_spool_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=locked-windows COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-locked-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-locked-native-commands" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-locked" >/dev/null
-grep -Fxq 'locked-windows:gateway:restart' "$tmp/windows-locked-commands"
+test "$(grep -Fxc 'locked-windows:gateway:restart' "$tmp/windows-locked-commands")" = 1
 ! grep -q '^locked-windows:gateway:\(stop\|uninstall\)$' "$tmp/windows-locked-commands"
 test "$(cat "$tmp/hermes/gateway-locked-windows.state")" = running
+test "$(cat "$tmp/hermes/gateway-unrelated.state")" = running
+test "$(cat "$tmp/hermes/profiles/unrelated/plugin-data/unrelated/sentinel")" = preserve-me
+! grep -q '^unrelated:' "$tmp/windows-locked-commands"
 test ! -e "$tmp/gateway-windows-locked"
 test ! -e "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
 
