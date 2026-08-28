@@ -93,6 +93,9 @@ class _Adapter:
             "messageId": "scheduled-message-1",
             "eventId": "event-1",
         }
+        self._spool = None
+        self.receipt = None
+        self.status_calls = []
 
     async def request_device_status(self, thread_id, turn_id, purpose):
         return await self._client.request_device_status(thread_id, turn_id, purpose)
@@ -108,6 +111,21 @@ class _Adapter:
         self.proactive_calls.append((chat_id, message, media_files, kwargs))
         return self.proactive_result
 
+    async def media_delivery_receipt(self, delivery_id, timeout_seconds):
+        self.status_calls.append((delivery_id, timeout_seconds))
+        return self.receipt
+
+
+class _StatusSpool:
+    def __init__(self, rows=None, receipt=None):
+        self.rows, self.receipt = list(rows or []), receipt
+
+    def media_rows(self, _delivery_id):
+        return list(self.rows)
+
+    def delivery_receipt_row(self, _delivery_id):
+        return self.receipt
+
 
 class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -118,6 +136,7 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.camera_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_capture_camera")
         self.file_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_pick_file")
         self.send_media_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_send_media")
+        self.media_status_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_media_delivery_status")
         self.original_context = adapter_module._current_turn_platform_and_chat
         self.original_message_context = adapter_module._current_turn_message_and_cron
         adapter_module._current_turn_platform_and_chat = lambda: (adapter_module.PLATFORM_NAME, "thread-1")
@@ -150,6 +169,8 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         hint = platform["platform_hint"]
 
         self.assertIn("cozy_send_media", hint)
+        self.assertIn("cozy_media_delivery_status", hint)
+        self.assertIn("journaled attachment result is pending", hint)
         self.assertIn("prefer", hint)
         self.assertIn("do not repeat MEDIA: directives for the same files", hint)
         self.assertIn("MEDIA:/absolute/path is the fallback", hint)
@@ -214,7 +235,7 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(other.proactive_calls, [])
         self.assertEqual(result, {
             "accepted": True, "state": "journaled", "conversationId": "thread-1",
-            "pending": True,
+            "pending": True, "committed": False, "displayed": False, "verified": False,
             "deliveryId": "scheduled:live-media-1", "messageId": "scheduled-message-1",
             "eventId": "event-1",
         })
@@ -277,9 +298,91 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         origin.proactive_result = {"state": "blocked", "accepted_pending": False, "error": "media_upload_failed"}
         self.assertEqual(json.loads(await self.send_media_tool["handler"](args)), {
             "accepted": False, "state": "blocked", "conversationId": "thread-1",
-            "pending": False,
+            "pending": False, "committed": False, "displayed": False, "verified": False,
             "error": "media_upload_failed",
         })
+
+    async def test_send_media_receipt_exposes_safe_ordered_attachment_descriptors(self):
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        origin.proactive_result["attachments"] = [
+            {"attachmentId": "a" * 32, "name": "first.png", "mimeType": "image/png", "bytes": 12, "mediaKind": "image", "source": "/private/secret/first.png", "sha256": "secret"},
+            {"attachmentId": "b" * 32, "name": "second.pdf", "mimeType": "application/pdf", "bytes": 34, "mediaKind": "file", "source": "/private/secret/second.pdf"},
+        ]
+        adapter_module._register_active_adapter(origin)
+        result = json.loads(await self.send_media_tool["handler"]({"paths": ["/private/a", "/private/b"]}))
+        self.assertEqual(result["attachments"], [
+            {"attachmentId": "a" * 32, "name": "first.png", "mimeType": "image/png", "bytes": 12, "mediaKind": "image"},
+            {"attachmentId": "b" * 32, "name": "second.pdf", "mimeType": "application/pdf", "bytes": 34, "mediaKind": "file"},
+        ])
+        self.assertNotIn("/private", json.dumps(result))
+        self.assertNotIn("sha256", json.dumps(result))
+
+    async def test_registers_media_delivery_status_with_exact_schema(self):
+        self.assertEqual(self.media_status_tool["schema"]["parameters"], {
+            "type": "object", "properties": {"deliveryId": {
+                "type": "string", "description": "The deliveryId returned by cozy_send_media.",
+                "pattern": "^scheduled:live-media:[0-9a-f]{64}$",
+            }}, "required": ["deliveryId"], "additionalProperties": False,
+        })
+        self.assertTrue(self.media_status_tool["is_async"])
+
+    async def test_media_delivery_status_uses_receipts_and_never_resends(self):
+        delivery_id = "scheduled:live-media:" + "a" * 64
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        origin._spool = _StatusSpool(rows=[{"mediaId": "b" * 32, "pathMeta": "chart.png", "state": "journaled", "sha256": "secret", "detail": "/private/secret"}])
+        origin.receipt = {"state": "projected", "mediaVerified": True, "expectedMediaIds": ["b" * 32, "/private/nope", "x" * 129], "committedMediaIds": ["b" * 32]}
+        adapter_module._register_active_adapter(origin)
+        result = json.loads(await self.media_status_tool["handler"]({"deliveryId": delivery_id}))
+        self.assertEqual(origin.status_calls, [(delivery_id, 0.5)])
+        self.assertEqual(origin.proactive_calls, [])
+        self.assertEqual((result["state"], result["committed"], result["displayed"], result["verified"]), ("projected", True, False, True))
+        self.assertEqual(result["expectedMediaIds"], ["b" * 32])
+        self.assertEqual(result["committedMediaIds"], ["b" * 32])
+        self.assertNotIn("sha256", json.dumps(result))
+        self.assertNotIn("/private", json.dumps(result))
+
+    async def test_media_delivery_status_404_distinguishes_journaled_from_unknown(self):
+        delivery_id = "scheduled:live-media:" + "c" * 64
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        origin._spool = _StatusSpool(rows=[{"mediaId": "d" * 32, "pathMeta": "a.png", "state": "journaled"}])
+        adapter_module._register_active_adapter(origin)
+        journaled = json.loads(await self.media_status_tool["handler"]({"deliveryId": delivery_id}))
+        origin._spool = _StatusSpool()
+        unknown = json.loads(await self.media_status_tool["handler"]({"deliveryId": delivery_id}))
+        self.assertEqual((journaled["state"], journaled["accepted"], journaled["pending"], journaled["committed"]), ("journaled", True, True, False))
+        self.assertEqual((unknown["state"], unknown["accepted"]), ("unknown", False))
+
+    async def test_media_delivery_status_receipt_states_and_origin_validation_are_honest(self):
+        delivery_id = "scheduled:live-media:" + "e" * 64
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        adapter_module._register_active_adapter(origin)
+        for state, expected in (("admitted", (False, False, False)), ("projected", (True, False, False)), ("blocked", (False, False, False)), ("displayed", (True, True, False)), ("failed", (False, False, False))):
+            origin.receipt = {"state": state, "mediaVerified": False}
+            result = json.loads(await self.media_status_tool["handler"]({"deliveryId": delivery_id}))
+            self.assertEqual((result["committed"], result["displayed"], result["verified"]), expected)
+        invalid = json.loads(await self.media_status_tool["handler"]({"deliveryId": "scheduled:live-media:ABC"}))
+        self.assertEqual((invalid["state"], invalid["error"]), ("blocked", "invalid_delivery_id"))
+        with mock.patch.object(adapter_module, "_current_turn_message_and_cron", return_value=("turn-1", True, "profile-1")):
+            blocked = json.loads(await self.media_status_tool["handler"]({"deliveryId": delivery_id}))
+        self.assertEqual((blocked["state"], blocked["error"]), ("blocked", "policy_blocked"))
+
+    async def test_media_delivery_status_recognizes_display_terminal_on_projected_receipt(self):
+        delivery_id = "scheduled:live-media:" + "f" * 64
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        origin.receipt = {
+            "state": "projected",
+            "terminal": {"state": "displayed", "at": 1700},
+            "mediaVerified": False,
+        }
+        adapter_module._register_active_adapter(origin)
+
+        result = json.loads(await self.media_status_tool["handler"]({"deliveryId": delivery_id}))
+
+        self.assertEqual((result["state"], result["lifecycle"]), ("displayed", "displayed"))
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["displayed"])
+        self.assertFalse(result["verified"])
+        self.assertFalse(result["mediaVerified"])
 
     async def test_send_media_tool_chips_never_include_paths(self):
         observed = []
@@ -297,7 +400,10 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
             adapter_module._dispatch_tool_hook("complete", {
                 "tool_name": "cozy_send_media", "result": {"error": "/private/secret.png"},
             })
-        self.assertEqual([event[3] for event in observed], [None, None])
+            adapter_module._dispatch_tool_hook("start", {
+                "tool_name": "cozy_media_delivery_status", "args": {"deliveryId": "scheduled:live-media:" + "a" * 64},
+            })
+        self.assertEqual([event[3] for event in observed], [None, None, None])
 
     async def test_preserves_bounded_failure_details_in_the_hermes_tool_json(self):
         client = _Client()
@@ -739,6 +845,13 @@ class HermesPluginContextTests(unittest.TestCase):
                     "additionalProperties": False,
                 },
             })
+            media_status_entry = registry.get_entry("cozy_media_delivery_status")
+            self.assertIsNotNone(media_status_entry)
+            self.assertTrue(media_status_entry.is_async)
+            self.assertEqual(
+                media_status_entry.schema["parameters"]["properties"]["deliveryId"]["pattern"],
+                "^scheduled:live-media:[0-9a-f]{64}$",
+            )
             camera_entry = registry.get_entry("cozy_capture_camera")
             self.assertIsNotNone(camera_entry)
             self.assertTrue(camera_entry.is_async)
