@@ -11,7 +11,6 @@ import type {
   BotGroup,
   BotGroupDetail,
   BotGroupMessage,
-  BotInboxThread,
   BotModelConfig,
   BotModelConfigPatch,
   BotInteractionSettlement,
@@ -39,7 +38,6 @@ import {
   type HermesState,
 } from "./client.ts";
 import {
-  listBotSessions,
   sessionKind,
 } from "./sessions.ts";
 import {
@@ -56,8 +54,6 @@ import type {
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
-import { parseChatSnapshot } from "./chat-messages.ts";
-import { inboxMessages as projectInboxMessages, inboxThread } from "./inbox.ts";
 import { GroupRooms } from "./group-rooms.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import {
@@ -93,8 +89,6 @@ import {
   type BlankSlateSelection,
 } from "./blank-slate-seed.ts";
 
-export const INBOX_THREAD_LIMIT = 50;
-export const INBOX_SESSION_SCAN_LIMIT = 200;
 const CHANGE_DEBOUNCE_MS = 250;
 export type BotFocusScreen = "roster" | "routines";
 export interface BotRosterView {
@@ -123,12 +117,6 @@ export interface BotSessionAdoption {
 export interface BotNewSessionResult {
   sessionId: string;
   previousSessionId: string;
-}
-export interface BotInboxView {
-  threads: BotInboxThread[];
-}
-export interface BotInboxMessagesView {
-  messages: BotGroupMessage[];
 }
 export interface BotChatPhotoUpload {
   bytes: Uint8Array;
@@ -207,8 +195,6 @@ export interface BotControlSurface {
   deleteBot(name: string, opts?: { force?: boolean }): Promise<BotDeleteResponse>;
   health(): BridgeLiveness;
   refreshSoon(reason: string): void;
-  inbox(name: string): Promise<BotInboxView>;
-  inboxMessages(name: string, threadId: string): Promise<BotInboxMessagesView>;
   botProfile(name: string): Promise<BotProfile>;
   configureProfile(
     name: string,
@@ -713,43 +699,6 @@ export class HermesBridge implements BotControlSurface {
       this.#lastActive = activeJson;
       this.#broadcast({ type: "bot_presence", active, updatedAt });
     }
-  }
-  async inbox(name: string): Promise<BotInboxView> {
-    await this.#assertBotKnown(name);
-    const rows = (
-      await listBotSessions(this.#client, name, INBOX_SESSION_SCAN_LIMIT)
-    )
-      .filter((row) => sessionKind(row) === "a2a")
-      .slice(0, INBOX_THREAD_LIMIT);
-    return {
-      threads: rows.map((row) => inboxThread(row, row.messageCount ?? 0)),
-    };
-  }
-  async inboxMessages(
-    name: string,
-    threadId: string,
-  ): Promise<BotInboxMessagesView> {
-    await this.#assertBotKnown(name);
-    const row = (
-      await listBotSessions(this.#client, name, INBOX_SESSION_SCAN_LIMIT)
-    ).find((item) => item.id === threadId);
-    if (row === undefined || sessionKind(row) !== "a2a")
-      throw new BotSessionNotFound(threadId);
-    const snapshot = parseChatSnapshot(
-      await this.#client.request("session.resume", {
-        session_id: threadId,
-        profile: name,
-        omit_messages: false,
-      }),
-      threadId,
-    );
-    return {
-      messages: projectInboxMessages(
-        snapshot,
-        name,
-        (bot) => this.#memberInfo(bot).displayName,
-      ),
-    };
   }
   async #assertBotKnown(name: string): Promise<void> {
     if (!(await this.#freshProfileNames()).has(name))

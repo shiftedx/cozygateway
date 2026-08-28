@@ -5,10 +5,7 @@ import type {
 } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
-import type {
-  BotControlSurface, BotFocusScreen, BotInboxMessagesView, BotInboxView,
-  BotRoutineList, BotRosterView,
-} from "./bridge.ts";
+import type { BotControlSurface, BotFocusScreen, BotRoutineList, BotRosterView } from "./bridge.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
 import type { RoutineWriteResult } from "./routines.ts";
 
@@ -101,8 +98,6 @@ export class FederatedBotControlSurface implements BotControlSurface {
     return { ...result, bot: summary(route.member.id, result.bot) };
   }
   async deleteBot(name: string, opts?: { force?: boolean }): Promise<BotDeleteResponse> { const r = this.#route(name); const result = await r.member.bridge.deleteBot(r.profile, opts); return { ...result, name }; }
-  async inbox(name: string): Promise<BotInboxView> { const r = this.#route(name); return r.member.bridge.inbox(r.profile); }
-  async inboxMessages(name: string, id: string): Promise<BotInboxMessagesView> { const r = this.#route(name); return r.member.bridge.inboxMessages(r.profile, id); }
   async botProfile(name: string): Promise<BotProfile> { const r = this.#route(name); return r.member.bridge.botProfile(r.profile); }
   async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> { const r = this.#route(name); return r.member.bridge.configureProfile(r.profile, patch); }
   async modelConfig(name: string): Promise<BotModelConfig> { const r = this.#route(name); return r.member.bridge.modelConfig(r.profile); }

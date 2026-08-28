@@ -15,7 +15,7 @@ implementation matches the contract, not that it shares the reference code.
 The suite covers the core groups: health, capabilities, pairing, the auth wall, device lifecycle,
 agents, thread lifecycle, message round trip and seq discipline, WebSocket lifecycle, streaming
 order, reconnect dedup, turn failure, mid-turn interrupt, the live in-flight interrupt, and the
-approval lifecycle, plus the agent inbox. Optional backend-specific groups activate only when the
+approval lifecycle. Optional backend-specific groups activate only when the
 gateway declares the matching hook and are otherwise reported as skipped.
 
 The capabilities group checks the additive `GatewayInfo.capabilities` block (contract v1.md
@@ -66,8 +66,6 @@ export interface ConformanceEnv {
   stallAgentId?: string;
   /** Optional: agent id of an approval-capable backend. See "The optional approval hook". */
   approvalAgentId?: string;
-  /** Optional: one seeded capability-17 a2a thread. See "The optional agent inbox hook". */
-  botInbox?: { botName: string; threadId: string };
   /** Optional: one capability-18 Hermes bot. See "The optional bot model-config hook". */
   botModelConfig?: { botName: string };
   /** Optional: one capability-19 Hermes bot. See "The optional bot chat-stop hook". */
@@ -200,17 +198,6 @@ is reported as skipped while every other assertion runs unchanged. The same hook
 The reference gateway implements it with an attach-v1 approval peer (one draft, one pending
 approval, then it parks until the approval is resolved).
 
-## The optional agent inbox hook
-
-The agent inbox is a vendor extension backed by Hermes rather than the reference echo peer, so a
-portable conformance run cannot create its own a2a fixture. Declare `botInbox` when the gateway under
-test has a seeded capability-17 thread. `botName` names its owning bot and `threadId` names a thread
-that must appear in that bot's newest 50 inbox rows.
-
-The suite validates both authenticated GET routes against the contract schemas. It also checks the
-50-row bound, newest-first ordering, device authentication, per-agent `member` attribution, and the
-absence of a POST send route. Omit `botInbox` and this group is reported as skipped.
-
 ## Running the reference gateway's own conformance
 
 This repo ships two runners, both exercised by one command:
@@ -223,4 +210,4 @@ pnpm --filter cozygateway-conformance test
   attach-v1 echo, stall, and approval peers, declares both hooks, and runs the whole suite
   including the live in-flight interrupt and approval groups.
 - `test/reference-gateway-hookless.test.ts` starts it with the attach-v1 echo peer alone and declares no
-  hooks, so the live-202, approval, and agent-inbox cases are skipped and the rest must still be green.
+  hooks, so the live-202 and approval cases are skipped and the rest must still be green.

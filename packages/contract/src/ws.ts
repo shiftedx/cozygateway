@@ -20,7 +20,6 @@ import {
   BotMobileReceiptFrameSchema,
   BotGroupFrameSchema,
   BotGroupStateFrameSchema,
-  BotInboxActivityFrameSchema,
   BotPresenceFrameSchema,
   BotRosterFrameSchema,
   BotRoutinesFrameSchema,
@@ -280,6 +279,5 @@ export const ServerFrameSchema = Type.Union([
   BotToolActivityFrameSchema,
   BotDelegationActivityFrameSchema,
   BotThinkingActivityFrameSchema,
-  BotInboxActivityFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

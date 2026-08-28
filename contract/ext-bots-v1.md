@@ -11,7 +11,7 @@ unions are closed, following the core contract.
 Bot Mode is split deliberately:
 
 - Hermes Dashboard is the **control/read plane** for the profile roster, profile editing, model
-  configuration, catalog, routines, and read-only A2A inbox.
+  configuration, catalog, and routines.
 - attach-v1 is the **Bot Mode chat data plane**. For every configured
   `hermes.profiles.<profile>` identity, CozyGateway owns the chat session ids, transcript,
   attachments, active-turn state, tool activity, approvals, and clarification state in its SQLite
@@ -23,8 +23,7 @@ Bot Mode is split deliberately:
 Therefore Bot Mode chat must never be implemented with Dashboard `session.create`,
 `session.resume`, or `prompt.submit`, nor with a Dashboard transcript as a fallback. A Dashboard
 or Hermes outage can affect control-plane reads, but it does not change the ownership of a native
-Bot Mode transcript. The A2A inbox is intentionally different: it remains a read-only projection
-of Hermes sessions and may use Hermes session list/resume operations.
+Bot Mode transcript.
 
 CozyChat talks only to CozyGateway's existing HTTP, WebSocket, attachment, and push surfaces; it
 does not connect to Hermes or attach-v1.
@@ -55,7 +54,7 @@ extension omits the capability and does not register `/bots` routes.
 | 14 | `bot_chat_adopted` and manual session adoption. |
 | 15 | Assistant attachment ingestion. |
 | 16 | Native session history and manual restore. |
-| 17 | Read-only A2A inbox. |
+| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent. |
 | 18 | Per-bot model configuration. |
 | 19 | Stop and start-new-chat actions. |
 | 20 | Audio/video attachment playback with byte ranges. |
@@ -82,6 +81,12 @@ extension omits the capability and does not register `/bots` routes.
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
+
+`com.cozylabs.agent-inbox` is a reserved, dormant capability id. It has no advertised version:
+do not advertise it or expose an inbox page until Hermes supplies durable structured A2A sender,
+delivery/reply, and conversation metadata plus bounded replay. It is deliberately separate from
+`com.cozylabs.bots`, whose current version remains 40 while the old capability-17 surface stays
+withdrawn.
 
 ## Resources
 
@@ -114,7 +119,6 @@ a second, hand-copied schema.
   so the picker can show the saved selection and a re-auth affordance; a client renders those
   entries disabled with a sign-in hint rather than hiding them, and a client below 36 ignores both
   fields.
-- `BotInboxThread` and `BotInboxMessagesResponse` are the read-only Hermes A2A projection.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
 - `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its
   slash-prefixed `name` is the exact invocation; `description`, optional `argsHint`, and optional
@@ -443,8 +447,6 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/:name/sessions` | — | `BotSessionsResponse` | Gateway-owned native sessions. |
 | `POST /bots/:name/sessions/new` | — | `BotNewSessionResponse` | Fresh native chat, previous history retained. |
 | `POST /bots/:name/sessions/:id/adopt` | — | `BotSessionAdoptResponse` | Selects an owned native session. |
-| `GET /bots/:name/inbox` | — | `BotInboxResponse` | Read-only Hermes A2A inbox. |
-| `GET /bots/:name/inbox/:threadId/messages` | — | `BotInboxMessagesResponse` | Read-only Hermes A2A transcript; no POST sibling exists. |
 | `GET /bots/:name/routines` | — | `BotRoutineListResponse` | Hermes routine read. |
 | `POST /bots/:name/routines` | `BotRoutineCreateRequest` | `BotRoutineWriteResponse` | Hermes routine create. |
 | `PATCH /bots/:name/routines/:id` | `BotRoutinePatch` | `BotRoutineWriteResponse` | Hermes routine update. |
@@ -537,7 +539,6 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   native clarification lifecycle. A
   pending card contains only a display prompt and bounded option ids/labels, never model reasoning.
 - `bot_group`, `bot_group_state`: durable gateway-owned group-room transcript and state.
-- `bot_inbox_activity`: a currently open read-only Hermes A2A thread changed; re-read it.
 
 Frames are independently safe to drop where their schema says they are deltas or snapshots.
 Committed transcript history remains the recovery source after reconnect.
@@ -552,6 +553,5 @@ Committed transcript history remains the recovery source after reconnect.
   capability-35 thinking preview are presentation fields. Raw tool arguments, results, command
   text, and full model reasoning are not serialized; the thinking preview is a sanitized,
   bounded display tail, not the chain of thought.
-- The inbox has no send route. Bot-to-bot traffic is not another client composer.
 - A client handles an unknown extension frame or optional field by ignoring it, then re-reads the
   documented REST state when it needs recovery.

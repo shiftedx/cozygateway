@@ -1544,32 +1544,6 @@ export function registerBotRoutes(
     }
   });
 
-  app.get("/bots/:name/inbox", requireDevice, async (c) => {
-    const resolved = canonicalName(c);
-    if ("response" in resolved) return resolved.response;
-    try {
-      return c.json(await bots.inbox(resolved.name));
-    } catch (err) {
-      return failure(c, err);
-    }
-  });
-
-  // Read-only by contract. There is intentionally no POST sibling for inbox threads: a2a sessions
-  // are traffic between agents, not another composer addressed by a paired device.
-  app.get("/bots/:name/inbox/:threadId/messages", requireDevice, async (c) => {
-    const resolved = canonicalName(c);
-    if ("response" in resolved) return resolved.response;
-    const threadId = c.req.param("threadId") ?? "";
-    if (threadId.length === 0) {
-      return c.json(errorBody("invalid_request", "thread id is required"), 400);
-    }
-    try {
-      return c.json(await bots.inboxMessages(resolved.name, threadId));
-    } catch (err) {
-      return failure(c, err);
-    }
-  });
-
   app.post("/bots/:name/sessions/:id/adopt", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;

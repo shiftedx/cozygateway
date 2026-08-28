@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/index.ts";
 import {
+  AGENT_INBOX_CAPABILITY_ID,
   BotCreateRequestSchema,
   BotCreateResponseSchema,
   BotDeleteResponseSchema,
@@ -23,9 +24,6 @@ import {
   BotGroupMessageSchema,
   BotGroupSchema,
   BotGroupSendRequestSchema,
-  BotInboxActivityFrameSchema,
-  BotInboxMessagesResponseSchema,
-  BotInboxResponseSchema,
   BotModelConfigPatchSchema,
   BotModelConfigSchema,
   BotNewSessionResponseSchema,
@@ -472,6 +470,7 @@ describe("chat reset", () => {
 describe("capability advertisement", () => {
   it("is a vendor-scoped id with an integer version", () => {
     expect(BOTS_CAPABILITY_ID).toBe("com.cozylabs.bots");
+    expect(AGENT_INBOX_CAPABILITY_ID).toBe("com.cozylabs.agent-inbox");
     // 2 for the composer (a v1 gateway 404s the send route), 3 for the edit-profile surface
     // (a v2 gateway 404s the profile routes, which reads as a Save that silently does nothing),
     // 4 for the routines surface (a v3 gateway 404s them and never sends `bot_routines`),
@@ -502,7 +501,8 @@ describe("capability advertisement", () => {
     // clients below 15 keep rendering text and ignore the new block.
     // 16 for listing and manually restoring one of a bot's Hermes sessions. A manual restore emits
     // the existing adoption frame and holds until the next new conversational session appears.
-    // 17 for the read-only agent inbox routes and their coarse activity invalidation frame.
+    // 17 was the withdrawn heuristic agent inbox. Its replacement has a separate dormant
+    // capability id, so this capability remains at 40 until a different bots surface is added.
     // 18 for bot model config plus accepted-but-inert per-routine model and effort metadata.
     // 19 for the authenticated hard-stop route and its existing complete state-frame terminal edge,
     // plus new-session minting through the existing adoption frame without retiring the old chat.
@@ -691,43 +691,6 @@ describe("capability advertisement", () => {
         previousSessionId: "session-0",
       }),
     ).toBe(true);
-  });
-
-  it("accepts capability-17 inbox responses and activity frames", () => {
-    expect(
-      check(BotInboxResponseSchema, {
-        threads: [
-          {
-            id: "a2a-1",
-            peers: ["pixel"],
-            startedAt: 1_800_000_000_000,
-            lastActiveAt: 1_800_000_001_000,
-            preview: "deploy is green",
-            messageCount: 2,
-          },
-        ],
-      }),
-    ).toBe(true);
-    expect(
-      check(BotInboxMessagesResponseSchema, {
-        messages: [
-          {
-            seq: 1,
-            from: { kind: "member", name: "pixel", displayName: "Pixel" },
-            text: "deploy is green",
-            at: 1_800_000_000_000,
-          },
-        ],
-      }),
-    ).toBe(true);
-    const activity = {
-      type: "bot_inbox_activity",
-      bot: "scout",
-      threadId: "a2a-1",
-      updatedAt: 1_800_000_002_000,
-    };
-    expect(check(BotInboxActivityFrameSchema, activity)).toBe(true);
-    expect(check(ServerFrameSchema, activity)).toBe(true);
   });
 
   it("bounds the capability-31 displayed report and keeps its response a plain count", () => {

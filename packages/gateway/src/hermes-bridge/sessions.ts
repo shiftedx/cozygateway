@@ -1,5 +1,3 @@
-import { A2A_RE } from "./roster.ts";
-
 export interface SessionRow {
   id: string;
   title: string;
@@ -10,7 +8,7 @@ export interface SessionRow {
   messageCount?: number;
 }
 
-export type BotSessionKind = "conversation" | "cron" | "routine" | "group" | "a2a";
+export type BotSessionKind = "conversation" | "cron" | "routine" | "group";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -59,7 +57,6 @@ export function sessionKind(row: SessionRow): BotSessionKind {
   if (source === "cron" || row.id.startsWith("cron_")) return "cron";
   if (row.title.startsWith("Routine: ")) return "routine";
   if (row.title.startsWith("Group: ")) return "group";
-  if (row.preview !== null && A2A_RE.test(row.preview.trim())) return "a2a";
   return "conversation";
 }
 

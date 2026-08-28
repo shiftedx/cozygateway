@@ -9,7 +9,7 @@
  *  file, and nowhere else. Naming a number up here is how this comment came to claim "version 6"
  *  through three bumps.
  *
- *  Profile, catalog, routine, and inbox resources mirror Hermes control-plane data. Configured
+ *  Profile, catalog, and routine resources mirror Hermes control-plane data. Configured
  *  Bot Mode chats, their sessions, messages, attachments, and turn state are gateway-owned
  *  attach-v1 projections. Every timestamp on this wire is milliseconds. */
 import { type Static, Type } from "@sinclair/typebox";
@@ -143,24 +143,6 @@ export const BotNewSessionResponseSchema = Type.Object({
   previousSessionId: Type.String(),
 });
 export type BotNewSessionResponse = Static<typeof BotNewSessionResponseSchema>;
-
-/** One bot-to-bot session surfaced in the agent inbox (capability 17). `peers` names the
- *  counterpart agents visible in the a2a delivery prefix; the bot addressed by the route is not
- *  repeated there. */
-export const BotInboxThreadSchema = Type.Object({
-  id: Type.String(),
-  peers: Type.Array(Type.String()),
-  startedAt: Type.Integer(),
-  lastActiveAt: Type.Integer(),
-  preview: Type.String(),
-  messageCount: Type.Integer({ minimum: 0 }),
-});
-export type BotInboxThread = Static<typeof BotInboxThreadSchema>;
-
-export const BotInboxResponseSchema = Type.Object({
-  threads: Type.Array(BotInboxThreadSchema),
-});
-export type BotInboxResponse = Static<typeof BotInboxResponseSchema>;
 
 /** Full-replace roster snapshot. Sent whenever the bridge's cached roster changes. */
 export const BotRosterFrameSchema = Type.Object({
@@ -1108,13 +1090,6 @@ export const BotGroupMessageSchema = Type.Object({
 });
 export type BotGroupMessage = Static<typeof BotGroupMessageSchema>;
 
-/** Read-only transcript of an a2a inbox thread. Entries deliberately reuse the group-room message
- *  shape so every line carries its agent speaker. Capability 17 defines no send request schema. */
-export const BotInboxMessagesResponseSchema = Type.Object({
-  messages: Type.Array(BotGroupMessageSchema),
-});
-export type BotInboxMessagesResponse = Static<typeof BotInboxMessagesResponseSchema>;
-
 /** A room, without its log. `members` are Hermes profile names in the order the room was created
  *  with, and that order is what the per-round speaker rotation turns. `state` is the room's live
  *  orchestration state; `needsYou` is the sticky escalation flag (a member's reply mentioned
@@ -1181,16 +1156,6 @@ export const BotGroupStateFrameSchema = Type.Object({
   updatedAt: Type.Integer(),
 });
 export type BotGroupStateFrame = Static<typeof BotGroupStateFrameSchema>;
-
-/** Coarse invalidation for an open agent-inbox thread. The client re-reads the transcript instead
- *  of attempting to merge a second delta family into the group-room message projection. */
-export const BotInboxActivityFrameSchema = Type.Object({
-  type: Type.Literal("bot_inbox_activity"),
-  bot: Type.String(),
-  threadId: Type.String(),
-  updatedAt: Type.Integer(),
-});
-export type BotInboxActivityFrame = Static<typeof BotInboxActivityFrameSchema>;
 
 /** `POST /bots/groups` body. Membership is 2 to 6 bots, the desktop's own bounds, and every name is
  *  validated against the roster before the room exists. */
@@ -1395,10 +1360,10 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    starts a fresh one. It tells paired clients to rebind and reload the durable local transcript.
  *  - `15`: assistant attach-v1 media becomes gateway-owned `BotChatMessage.attachments`.
  *  - `16`: `GET /bots/:name/sessions` and manual native-session adoption.
- *  - `17`: AGENT INBOX (issue #95). `GET /bots/:name/inbox` lists the newest 50 a2a sessions and
- *    `GET /bots/:name/inbox/:threadId/messages` returns a read-only transcript in the group-room
- *    message shape. An open thread that gains rendered messages emits `bot_inbox_activity`, a
- *    coarse signal telling clients to re-read it. There is deliberately no inbox send route.
+ *  - `17`: WITHDRAWN AGENT INBOX (issue #95). The former heuristic Hermes projection and both
+ *    routes were removed because session text cannot prove durable A2A identity or privacy
+ *    boundaries. This historical capability number is never advertised again; the future seam is
+ *    the separately versioned `com.cozylabs.agent-inbox` capability below.
  *  - `18`: BOT MODEL CONFIG (issue #106). Adds authenticated GET/PUT
  *    `/bots/:name/model-config`, backed by Hermes profile config and its configured picker catalog.
  *    Routine records and writes accept nullable model/effort selections. The surveyed cron RPC
@@ -1459,6 +1424,11 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    `>= 32`. An out-of-range value clamps into `0...blocks.length`; it never drops the
  *    attachment. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
+/** Reserved future A2A inbox seam. This capability has no version and is deliberately NOT
+ * advertised until Hermes exposes durable structured A2A identity, delivery/reply metadata, and
+ * bounded replay. It is separate from `com.cozylabs.bots` so restoring the inbox never changes
+ * that capability's current version merely for a withdrawn surface. */
+export const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
 /** The phone-as-node capability, advertised beside the bots one.
  *  4: device status v2 answers over an authenticated origin, under a single-use lease.
  *  5: the phone can also capture a photo or a short video, hand over a file the person picked,
