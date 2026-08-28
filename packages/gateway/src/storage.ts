@@ -898,7 +898,11 @@ export class Storage {
     return this.liveActivityRegistration(deviceId, activityId)?.eventSequence ?? 0;
   }
 
-  deleteLiveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {
+  deleteLiveActivityRegistration(
+    deviceId: string,
+    activityId: string,
+    queuedAt = Date.now(),
+  ): LiveActivityRegistrationRow | undefined {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const row = this.liveActivityRegistration(deviceId, activityId);
@@ -906,7 +910,7 @@ export class Storage {
         this.#db.prepare(
           `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
            VALUES (?, ?)`,
-        ).run(row.pushId, Date.now());
+        ).run(row.pushId, queuedAt);
         this.#db.prepare(
           "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
         ).run(deviceId, activityId);

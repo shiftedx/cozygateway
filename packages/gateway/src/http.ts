@@ -56,6 +56,10 @@ import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
 
 const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
+// The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
+// shorter deadline risks duplicate retries during transient APNs work; no deadline wedges the
+// durable single-flight drain forever when a transport never settles.
+const LIVE_ACTIVITY_RELAY_DELETE_TIMEOUT_MS = 10_000;
 
 /** The relay's register body, mirrored here rather than imported: the gateway's docker image
  *  bundles only its own package, so a runtime import of cozygateway-relay crashes the container
@@ -134,6 +138,8 @@ export interface AppDeps {
   pushRelayFetch?: typeof fetch;
   /** Sink for durable Live Activity relay cleanup failures. */
   pushRelayLog?: (message: string) => void;
+  /** Test-only override for the per-DELETE outbox deadline. */
+  pushRelayDeleteTimeoutMs?: number;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
   gatewaySettings?: {
@@ -207,7 +213,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
         try {
           const response = await relayFetch(
             `${relayBase}/register/${encodeURIComponent(pushId)}`,
-            { method: "DELETE" },
+            {
+              method: "DELETE",
+              signal: AbortSignal.timeout(
+                Math.max(1, deps.pushRelayDeleteTimeoutMs
+                  ?? LIVE_ACTIVITY_RELAY_DELETE_TIMEOUT_MS),
+              ),
+            },
           );
           if (response.ok) {
             deps.storage.completeLiveActivityRelayDeletion(pushId);
@@ -759,6 +771,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
     deps.storage.deleteLiveActivityRegistration(
       c.get("deviceId"),
       c.req.param("activityId"),
+      deps.now(),
     );
     requestLiveActivityDeletionDrain();
     return c.body(null, 204);

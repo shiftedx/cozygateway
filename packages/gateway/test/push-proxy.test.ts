@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { testHermes } from "./support/test-config.ts";
-import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
+import { SETUP_CODE_TTL_MS, hashToken, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createApp } from "../src/http.ts";
 import { gatewayInfoForConfig } from "../src/server.ts";
@@ -246,6 +246,77 @@ describe("authenticated push relay proxy", () => {
     expect(reopened.liveActivityRelayDeletions(10)).toEqual([]);
     reopened.close();
     rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("times out a stuck deletion and honors a trigger that arrived while draining", async () => {
+    const storage = openStorage(":memory:");
+    storage.createDevice({
+      id: "device", name: "phone", tokenHash: hashToken("device-token"), createdAt: 1,
+    });
+    storage.saveLiveActivityRegistration({ deviceId: "device", activityId: "stale", runId: "run-1",
+      conversationId: "gateway-1", bot: "sage", pushId: "stale-push-id", createdAt: 1 });
+    storage.saveLiveActivityRegistration({ deviceId: "device", activityId: "current", runId: "run-2",
+      conversationId: "gateway-1", bot: "sage", pushId: "current-push-id", createdAt: 2 });
+    const logs: string[] = [];
+    let deleteCalls = 0;
+    let firstAborted = false;
+    let outboxAtRetry: string[] = [];
+    const relayFetch: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "POST") {
+        return new Response('{"pushId":"registration-push-id"}', {
+          status: 201, headers: { "content-type": "application/json" },
+        });
+      }
+      deleteCalls += 1;
+      if (deleteCalls === 1) {
+        return await new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal === undefined || signal === null) {
+            reject(new Error("missing abort signal"));
+            return;
+          }
+          const abort = () => {
+            firstAborted = true;
+            reject(signal.reason);
+          };
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        });
+      }
+      outboxAtRetry = storage.liveActivityRelayDeletions(10);
+      return new Response(null, { status: 204 });
+    };
+    const config: GatewayConfig = { name: "timeout", port: 8787, dbPath: ":memory:",
+      turnTimeoutSeconds: 0, hermes: testHermes(), pushRelayUrl: "http://relay.internal:8788/" };
+    const app = createApp({
+      storage, config, pushRelayFetch: relayFetch,
+      pushRelayDeleteTimeoutMs: 50, pushRelayLog: (line) => logs.push(line),
+      gatewayInfo: gatewayInfoForConfig(config), presenceOf: () => "online",
+      submitUserMessage: () => { throw new Error("not used"); }, interruptThread: () => "idle",
+      resolveApproval: () => Promise.resolve("unknown" as const), onDeviceRevoked: () => {},
+      now: () => 1_000,
+    });
+    expect(deleteCalls).toBe(1);
+
+    const registered = await app.request("/push/live-activities/register", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer device-token" },
+      body: JSON.stringify({ activityId: "other", runId: "other", conversationId: "other",
+        bot: "sage", token: "aa".repeat(32), environment: "development" }),
+    });
+    expect(registered.status).toBe(200);
+    expect(deleteCalls).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(deleteCalls).toBe(2);
+    expect(firstAborted).toBe(true);
+    expect(logs).toEqual([
+      "live activity relay cleanup: DELETE failed with a network error",
+    ]);
+    expect(outboxAtRetry).toEqual(["stale-push-id"]);
+    expect(storage.liveActivityRelayDeletions(10)).toEqual([]);
+    storage.close();
   });
 
   it("advertises the push proxy capability in health", async () => {
