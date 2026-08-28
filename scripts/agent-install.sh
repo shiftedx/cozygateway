@@ -48,7 +48,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --plugin-archive PATH   verified CozyGateway Hermes plugin archive
   --gateway-dir DIR       CozyGateway-owned state directory (default ~/.cozygateway)
   --profiles all|A,B      Hermes profiles to connect (default all discovered profiles)
-  --bind-host HOST        gateway listener address (default 127.0.0.1: loopback)
+  --bind-host HOST        gateway listener address (skips the fresh-install LAN prompt)
   --port PORT             gateway listener port (default 8787)
   --public-url URL        advertise one HTTPS origin; requires a loopback listener
   --clear-public-url      stop advertising the saved public origin
@@ -163,21 +163,29 @@ NODE
   [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$BIND_HOST_EXPLICIT" = 1 ] || BIND_HOST=127.0.0.1
 }
 choose_fresh_listener() {
-  local answer
+  local input answer
   [ ! -f "$CONFIG_JSON" ] || return 0
   [ "$BIND_HOST_EXPLICIT" = 0 ] || return 0
   [ "$PUBLIC_URL_EXPLICIT" = 0 ] || return 0
   [ "$CLEAR_PUBLIC_URL" = 0 ] || return 0
   [ "$DRY_RUN" = 0 ] || return 0
-  [ -t 0 ] || [ "${COZYGATEWAY_TEST_INTERACTIVE:-0}" = 1 ] || return 0
+
+  # The supported one-paste command pipes the bootstrap through stdin, so the question must use
+  # the controlling terminal rather than fd 0. Without a terminal this remains safely loopback.
+  input="${COZYGATEWAY_TEST_LAN_PROMPT_INPUT:-/dev/tty}"
+  if [ -z "${COZYGATEWAY_TEST_LAN_PROMPT_INPUT:-}" ] && { [ ! -t 2 ] || [ ! -r /dev/tty ]; }; then return 0; fi
+  [ -r "$input" ] || return 0
+  exec 9<"$input" || return 0
   while true; do
-    read -r -p 'Allow devices on your local network to connect? [y/N] ' answer || return 0
-    case "$answer" in
-      y|Y|yes|YES|Yes) BIND_HOST=0.0.0.0; return ;;
-      ''|n|N|no|NO|No) return ;;
-      *) say 'Please answer y or n.' ;;
+    printf 'Allow CozyChat to access this Gateway over your local network? [y/N] ' >&2
+    if ! IFS= read -r answer <&9; then answer=""; fi
+    case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) BIND_HOST=0.0.0.0; break ;;
+      ''|n|no) break ;;
+      *) say 'Please answer y or n.' >&2 ;;
     esac
   done
+  exec 9<&-
 }
 validate_listener_settings() {
   [ -n "$BIND_HOST" ] || die "--bind-host must not be empty"

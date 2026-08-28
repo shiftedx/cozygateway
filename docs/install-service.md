@@ -23,8 +23,10 @@ runs `hermes model` interactively only when the active provider/model is
 incomplete, then verifies it
 before installing CozyGateway or printing a pairing QR.
 
-Fresh installs listen on `127.0.0.1:8787`. Choose LAN access explicitly with
-`--bind-host 0.0.0.0`, or record a user-managed tunnel's strict HTTPS origin with
+Fresh interactive installs ask whether CozyChat may access the Gateway over the local network.
+No (the default) listens on `127.0.0.1:8787`; Yes listens on `0.0.0.0:8787` and makes the pairing
+QR use the detected LAN address. Non-interactive installs keep loopback unless `--bind-host`
+chooses otherwise. To use a tunnel, record its strict HTTPS origin with
 `--public-url https://gateway.example.com`; a public origin fails closed unless the listener is
 loopback. Change the port with `--port`. The attached Hermes plugins use loopback to reach the
 same machine. Updates preserve the saved listener and public origin unless an explicit flag changes

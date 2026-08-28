@@ -54,8 +54,9 @@ configure. The gateway reads plaintext to drive your agent and stream replies ba
 never sends that content anywhere else: there is no cloud relay, no third-party server, and no
 telemetry in the loop. By default the bundle's `~/.cozygateway/bin/cozygateway serve` binds `127.0.0.1` only, plain HTTP, and
 answers on loopback alone: the gateway does not expose itself on your network by itself. The
-Hermes one-paste installer keeps that loopback bind. LAN access remains available through an
-explicit `--bind-host 0.0.0.0`, but the installer does not configure Tailscale, tunnels, DNS, or
+Hermes one-paste installer asks one fresh-install question before pairing: No keeps that loopback
+bind, while Yes binds `0.0.0.0` and advertises the detected LAN address. `--bind-host` remains the
+non-interactive override, but the installer does not configure Tailscale, tunnels, DNS, or
 firewalls. Give it a
 `tls` block (or `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`) and it serves HTTPS instead, with `/ws`
 and `/attach/v1` becoming `wss` along with it; the app pins the certificate on first use, so a
