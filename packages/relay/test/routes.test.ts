@@ -366,6 +366,7 @@ describe("POST /notify", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(deliveries).toHaveLength(0);
     expect(storage.notifyCount(pushId, "2026-07-07")).toBe(1);
+    expect(storage.registrationByPushId(pushId)).toBeDefined();
   });
 
   it("enforces the daily cap, which rolls over at midnight UTC", async () => {

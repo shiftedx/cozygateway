@@ -60,6 +60,18 @@ function toError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
 
+/** An HTTP response from APNs that refused a delivery. Kept APNs-specific so relay policy can
+ * distinguish Apple's terminal token invalidation from generic webhook or network failures. */
+export class ApnsDeliveryError extends Error {
+  readonly status: number;
+
+  constructor(status: number, responseBody: string) {
+    super(`apns delivery failed: HTTP ${status} ${responseBody}`.trim());
+    this.name = "ApnsDeliveryError";
+    this.status = status;
+  }
+}
+
 /** A first-class APNs delivery transport. Token-based auth (ES256 provider JWT, cached and
  *  refreshed). The relay never decrypts: the opaque ciphertext rides under the top-level custom
  *  key "c" (the iOS Notification Service Extension reads exactly payload["c"]). Uses node:http2
@@ -172,7 +184,7 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
         });
         req.on("end", () => {
           if (status >= 200 && status < 300) settle();
-          else settle(new Error(`apns delivery failed: HTTP ${status} ${responseBody}`.trim()));
+          else settle(new ApnsDeliveryError(status, responseBody));
         });
         req.on("error", (err) => settle(toError(err)));
         req.write(body);
