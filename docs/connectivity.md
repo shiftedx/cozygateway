@@ -1,10 +1,15 @@
 # Connectivity choices
 
-Fresh managed installs bind to `127.0.0.1:8787`, so only the machine can reach the plaintext
-origin. Choose LAN access explicitly with `--bind-host 0.0.0.0`. The installer does not alter
-network infrastructure.
+Fresh interactive installs ask whether CozyChat should be allowed over the local network. Answer
+Yes to bind to `0.0.0.0:8787` and put the detected LAN address in the pairing QR; answer No to keep
+the plaintext origin on `127.0.0.1:8787`. A non-interactive install also defaults to loopback, and
+`--bind-host` remains the explicit no-prompt override. The installer does not alter network
+infrastructure.
 
 ## User-managed Tailscale
+
+Answer No to the installer's LAN question so CozyGateway remains on loopback, then configure the
+Tailscale Serve proxy below. The installer does not ask about or configure Tailscale.
 
 Install Tailscale on the Hermes/gateway host, sign in, and note its tailnet
 address:

@@ -70,9 +70,15 @@ curl -fsSL https://cozylabs.ai/install.sh | bash
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
 
-The install (and every re-run) finishes by minting a pairing code and printing
-a terminal QR plus the gateway URL and setup code in plain text, so a fresh
-device goes install, scan, chatting with no further commands. The QR encodes
+Near the end of a fresh interactive install, the installer asks one networking question:
+`Allow CozyChat to access this Gateway over your local network? [y/N]`. Yes binds CozyGateway to
+all local interfaces and makes the pairing QR advertise the machine's detected LAN address. No,
+an empty answer, or a non-interactive install keeps the listener on `127.0.0.1`. An explicit
+`--bind-host` skips the question, and updates preserve the listener already saved in the config.
+
+The install (and every re-run) then finishes by minting a pairing code and printing a terminal QR
+plus the gateway URL and setup code in plain text, so a fresh device goes install, scan, chatting
+with no further commands when the selected listener is reachable from that device. The QR encodes
 the `{"gatewayUrl":...,"setupCode":...}` payload from contract section 4; the
 URL uses the configured listener unless `publicUrl` records a user-managed HTTPS origin. Codes
 expire after 10 minutes; mint another with `~/.cozygateway/bin/cozygateway pair`. A configured
@@ -84,14 +90,9 @@ certificate name; private certificate authorities still use
 Local CLI health checks also pin the configured leaf certificate while allowing
 the bind address to differ from its DNS name.
 
-Fresh interactive installs ask whether devices on the local network should be
-allowed to connect. Press Enter or answer `n` to keep the safe
-`127.0.0.1:8787` default; answer `y` to listen on `0.0.0.0` and put the
-machine's detected LAN address in the pairing QR. LAN mode is plaintext and is
-only appropriate on a trusted private network before moving to the documented
-Tailscale setup. Explicit listener/public URL options, saved installs, dry
-runs, and noninteractive installs bypass the question. Power users can still
-choose LAN access directly with `--bind-host 0.0.0.0`.
+LAN mode is plaintext and is appropriate only on a trusted private network. Explicit
+listener/public URL options, saved installs, dry runs, and noninteractive installs bypass the
+question; power users can still choose directly with `--bind-host`.
 For a tunnel, pass `--public-url https://gateway.example.com`; the installer persists the canonical
 origin and requires/sets loopback. Network reachability outside the machine is deliberately not
 automated; see `docs/connectivity.md`.

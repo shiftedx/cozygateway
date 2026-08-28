@@ -128,7 +128,9 @@ if (args[0] === 'pair') {
   if (!existsSync(config)) process.exit(2);
   const urlAt = args.indexOf('--url');
   const configured = JSON.parse(readFileSync(config, 'utf8'));
-  const gatewayUrl = urlAt === -1 ? (configured.publicUrl ?? 'http://127.0.0.1:8787') : args[urlAt + 1];
+  const wildcard = configured.host === '0.0.0.0' || configured.host === '::';
+  const host = wildcard ? (process.env.COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS ?? '127.0.0.1') : configured.host;
+  const gatewayUrl = urlAt === -1 ? (configured.publicUrl ?? `http://${host}:${configured.port}`) : args[urlAt + 1];
   process.stdout.write('█▀▀▀▀▀█ fake-qr █▀▀▀▀▀█\n');
   process.stdout.write(JSON.stringify({ gatewayUrl, setupCode: 'TEST-CODE' }) + '\n');
   process.stdout.write('Gateway URL: ' + gatewayUrl + '\n');
@@ -275,11 +277,14 @@ chmod 700 "$HOME/.local/bin/hermes"
 HERMES_INSTALLER
 chmod 700 "$tmp/hermes-official-installer.sh"
 if command -v shasum >/dev/null 2>&1; then hermes_installer_sha="$(shasum -a 256 "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; else hermes_installer_sha="$(sha256sum "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; fi
-live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bind-host 192.0.2.10 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+printf 'yes\n' > "$tmp/lan-yes"
+live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
 test -x "$tmp/gateway-live/runtime/node/bin/node"
 grep -Fq 'installed checksum-verified Node.js' <<<"$live_output"
 grep -Fq 'Hermes Agent is not installed; starting the official installer.' <<<"$live_output"
 grep -Fq 'Hermes provider and model are configured' <<<"$live_output"
+grep -Fq 'Allow CozyChat to access this Gateway over your local network? [y/N]' <<<"$live_output"
+grep -Fq 'for devices on your local network' <<<"$live_output"
 grep -q '^model$' "$tmp/commands"
 private_rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq "using Node.js 24 at $tmp/gateway-live/runtime/node/bin/node" <<<"$private_rerun_output"
@@ -308,12 +313,14 @@ if grep -Fq 'spaces $dollar' <<<"$live_output"; then
 fi
 # The install finishes on the pairing finale: QR, payload JSON, and the re-mint one-liner.
 grep -Fq 'fake-qr' <<<"$live_output"
+grep -Fq '"gatewayUrl":"http://192.0.2.10:8787"' <<<"$live_output"
 grep -Fq '"setupCode":"TEST-CODE"' <<<"$live_output"
 grep -Fq "mint a fresh QR and code with: $tmp/gateway-live/bin/cozygateway pair" <<<"$live_output"
 grep -q '"profiles"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
-grep -Fq 'COZYGATEWAY_URL=http://192.0.2.10:8787' "$tmp/hermes/.env"
-grep -Fq 'http://192.0.2.10:8787/health' "$tmp/curl.log"
+grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-live/local/cozygateway.config.json"
+grep -Fq 'COZYGATEWAY_URL=http://127.0.0.1:8787' "$tmp/hermes/.env"
+grep -Fq 'http://127.0.0.1:8787/health' "$tmp/curl.log"
 mode_of() {
   case "$(uname -s)" in
     Darwin) stat -f '%Lp' "$1" ;;
@@ -421,6 +428,10 @@ preserved_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp
 grep -Fq 'CozyGateway listens on 127.0.0.1:8999' <<<"$preserved_listener_output"
 overridden_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 0.0.0.0 --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq 'CozyGateway listens on 0.0.0.0:9000' <<<"$overridden_listener_output"
+if grep -Fq 'ask whether CozyChat may access' <<<"$overridden_listener_output"; then
+  echo 'an explicit bind host must skip the LAN prompt' >&2
+  exit 1
+fi
 
 # Restore the fixture listener for the live rerun checks below.
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
@@ -441,6 +452,10 @@ rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" C
 # Rerunning on an installed gateway still lands on the pairing finale with a minted code.
 grep -Fq 'fake-qr' <<<"$rerun_output"
 grep -Fq '"setupCode":"TEST-CODE"' <<<"$rerun_output"
+if grep -Fq 'Allow CozyChat to access this Gateway' <<<"$rerun_output"; then
+  echo 'an update must preserve its saved listener without prompting again' >&2
+  exit 1
+fi
 test "$default_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 test "$ops_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 test "$install_count_before" = "$(grep -c '^default:gateway:install$' "$tmp/commands")"
@@ -503,7 +518,11 @@ cat > "$tmp/linux-bin/systemctl" <<'SYSTEMCTL'
 printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_SYSTEM_LOG:?}"
 SYSTEMCTL
 chmod 700 "$tmp/linux-bin/loginctl" "$tmp/linux-bin/systemctl"
-HOME="$tmp/linux-home" XDG_CONFIG_HOME="$tmp/linux-xdg" PATH="$tmp/linux-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/linux-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/linux-commands" COZYGATEWAY_TEST_SYSTEM_LOG="$tmp/system-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Linux bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-linux-live" >/dev/null
+printf 'no\n' > "$tmp/lan-no"
+linux_output="$(HOME="$tmp/linux-home" XDG_CONFIG_HOME="$tmp/linux-xdg" PATH="$tmp/linux-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-no" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/linux-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/linux-commands" COZYGATEWAY_TEST_SYSTEM_LOG="$tmp/system-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Linux bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-linux-live" 2>&1)"
+grep -Fq 'Allow CozyChat to access this Gateway over your local network? [y/N]' <<<"$linux_output"
+grep -Fq 'CozyGateway listens on 127.0.0.1:8787' <<<"$linux_output"
+grep -Fq '"host": "127.0.0.1"' "$tmp/gateway-linux-live/local/cozygateway.config.json"
 grep -q '^enable-linger ' "$tmp/system-commands"
 grep -q '^--user enable --now cozygateway.service$' "$tmp/system-commands"
 grep -Fq "ExecStart=/bin/bash $tmp/gateway-linux-live/local/run-gateway.sh" "$tmp/linux-xdg/systemd/user/cozygateway.service"
@@ -571,7 +590,8 @@ windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="
 # A fresh interactive install can opt into same-LAN access. Invalid input repeats
 # the one question; the affirmative answer persists the wildcard listener and
 # prints the temporary/private-network guidance before pairing.
-windows_lan_output="$(printf 'maybe\ny\n' | HOME="$tmp/windows-lan-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_INTERACTIVE=1 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-lan-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-lan-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-lan-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-lan")"
+printf 'maybe\ny\n' > "$tmp/windows-lan-answer"
+windows_lan_output="$(HOME="$tmp/windows-lan-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/windows-lan-answer" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-lan-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-lan-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-lan-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-lan" 2>&1)"
 grep -Fq 'Please answer y or n.' <<<"$windows_lan_output"
 grep -Fq 'trusted private network' <<<"$windows_lan_output"
 grep -Fq 'Tailscale' <<<"$windows_lan_output"
