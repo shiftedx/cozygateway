@@ -78,7 +78,7 @@ extension omits the capability and does not register `/bots` routes.
 | 38 | Device status v2: normalized status purpose and the closed mobile-node v3 operational status result; no v1 fallback. |
 | 39 | Capability leases and durable metadata-only receipts for phone-node sharing. |
 | 40 | Bot readiness: `GET /bots/:name/readiness` distinguishes a created profile from an attached bot that can accept turns. |
-| 41 | Model-provider setup: Hermes' unified provider universe, credential fields, and PKCE/device-code sessions under `/bots/:name/model-providers`. |
+| 41 | Transitional bot-scoped model-provider setup routes. Canonical ownership moved to `com.cozylabs.harness-settings` v1. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -120,7 +120,7 @@ a second, hand-copied schema.
   so the picker can show the saved selection and a re-auth affordance; a client renders those
   entries disabled with a sign-in hint rather than hiding them, and a client below 36 ignores both
   fields.
-  Capability 41's `BotModelProviderSetupCatalog` is the wider setup universe in the same order as
+  Capability 41's compatibility `BotModelProviderSetupCatalog` is the wider setup universe in the same order as
   `hermes model`. It is normalized live from Hermes; CozyGateway has no provider registry. A setup
   field reports only `isSet`, never a value or redacted suffix. A method is `fields`, Hermes-hosted
   `oauth`, or an honest `external` CLI handoff.
@@ -438,7 +438,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. |
 | `GET /bots/:name/model-config` | — | `BotModelConfig` | Hermes profile model read. |
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Hermes profile model update. |
-| `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41. Hermes' complete provider setup catalog for this profile. |
+| `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. |
 | `PUT /bots/:name/model-providers/:provider/fields/:field` | `BotModelProviderFieldUpdate` | `BotModelProviderSetupCatalog` | Writes one field through Hermes after re-validating that the field belongs to the provider. |
 | `DELETE /bots/:name/model-providers/:provider/fields/:field` | — | `BotModelProviderSetupCatalog` | Clears one Hermes-owned provider field and returns refreshed state. |
 | `POST /bots/:name/model-providers/:provider/oauth` | — | `BotModelProviderOAuthSession` | Starts a Hermes-hosted PKCE or device-code session. External CLI-only methods are rejected. |

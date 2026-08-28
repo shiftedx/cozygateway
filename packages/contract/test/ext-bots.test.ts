@@ -440,7 +440,7 @@ describe("bot model config", () => {
     expect(check(BotModelConfigPatchSchema, { model: 1 })).toBe(false);
   });
 
-  it("models provider setup without returning credential values", () => {
+  it("keeps capability 41 provider setup valid without the harness-level models field", () => {
     expect(
       check(BotModelProviderSetupCatalogSchema, {
         providers: [{

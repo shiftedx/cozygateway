@@ -1,9 +1,9 @@
 import type {
   BotModelProviderOAuthSession,
-  BotModelProviderSetup,
-  BotModelProviderSetupCatalog,
-  BotModelProviderSetupField,
-  BotModelProviderSetupMethod,
+  ModelProviderSetup,
+  ModelProviderSetupCatalog,
+  ModelProviderSetupField,
+  ModelProviderSetupMethod,
 } from "cozygateway-contract";
 
 import type { HermesClient } from "./client.ts";
@@ -94,14 +94,14 @@ function fieldLabel(key: string): string {
   return key.toLowerCase().split("_").map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
 }
 
-function fieldsByProvider(raw: unknown): Map<string, BotModelProviderSetupField[]> {
-  const groups = new Map<string, BotModelProviderSetupField[]>();
+function fieldsByProvider(raw: unknown): Map<string, ModelProviderSetupField[]> {
+  const groups = new Map<string, ModelProviderSetupField[]>();
   const rows = record(raw) ?? {};
   for (const [key, value] of Object.entries(rows)) {
     const row = record(value) as HermesEnvField | undefined;
     const provider = text(row?.provider);
     if (!provider || row?.channel_managed === true) continue;
-    const field: BotModelProviderSetupField = {
+    const field: ModelProviderSetupField = {
       key,
       label: fieldLabel(key),
       secret: row?.is_password === true,
@@ -125,7 +125,7 @@ function oauthByProvider(raw: unknown): Map<string, HermesOAuthProvider> {
   }));
 }
 
-function oauthMethod(row: HermesOAuthProvider): BotModelProviderSetupMethod | undefined {
+function oauthMethod(row: HermesOAuthProvider): ModelProviderSetupMethod | undefined {
   const flow = text(row.flow);
   const status = record(row.status) as HermesOAuthStatus | undefined;
   const common = {
@@ -143,11 +143,21 @@ function oauthMethod(row: HermesOAuthProvider): BotModelProviderSetupMethod | un
   return undefined;
 }
 
+function modelIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw.flatMap((value) => {
+    if (typeof value === "string") return text(value) ? [text(value)!] : [];
+    const row = record(value);
+    const id = text(row?.["id"]) ?? text(row?.["name"]);
+    return id ? [id] : [];
+  }))];
+}
+
 export async function readProviderSetupCatalog(
   client: HermesClient,
   name: string,
   now: () => number = Date.now,
-): Promise<BotModelProviderSetupCatalog> {
+): Promise<ModelProviderSetupCatalog> {
   const query = profileQuery(name);
   const [options, env, oauth] = await Promise.all([
     client.dashboardJson<HermesModelOptions>(`/api/model/options?${query}&include_unconfigured=1`),
@@ -157,12 +167,12 @@ export async function readProviderSetupCatalog(
   const fields = fieldsByProvider(env);
   const accounts = oauthByProvider(oauth);
   const rows = Array.isArray(options.providers) ? options.providers as unknown[] : [];
-  const providers: BotModelProviderSetup[] = rows.flatMap((value) => {
+  const providers: ModelProviderSetup[] = rows.flatMap((value) => {
     const row = record(value) as HermesProviderRow | undefined;
     const slug = text(row?.slug);
     if (!slug) return [];
     const setupFields = fields.get(slug) ?? [];
-    const methods: BotModelProviderSetupMethod[] = [];
+    const methods: ModelProviderSetupMethod[] = [];
     if (setupFields.length > 0) {
       methods.push({
         id: "fields",
@@ -175,11 +185,12 @@ export async function readProviderSetupCatalog(
     const account = accounts.get(slug);
     const accountMethod = account ? oauthMethod(account) : undefined;
     if (accountMethod) methods.push(accountMethod);
-    const models = Array.isArray(row?.models) ? row.models : [];
+    const models = modelIds(row?.models);
     return [{
       slug,
       name: text(row?.name) ?? slug,
       authenticated: row?.authenticated === true || methods.some((method) => method.connected),
+      models,
       modelCount: models.length,
       methods,
     }];
@@ -192,7 +203,7 @@ async function setupField(
   name: string,
   provider: string,
   field: string,
-): Promise<BotModelProviderSetupField> {
+): Promise<ModelProviderSetupField> {
   const catalog = await readProviderSetupCatalog(client, name);
   const row = catalog.providers.find((candidate) => candidate.slug === provider);
   const match = row?.methods.flatMap((method) => method.fields ?? []).find((candidate) => candidate.key === field);
@@ -207,7 +218,7 @@ export async function writeProviderSetupField(
   provider: string,
   field: string,
   value: string,
-): Promise<BotModelProviderSetupCatalog> {
+): Promise<ModelProviderSetupCatalog> {
   await setupField(client, name, provider, field);
   await client.dashboardJson(`/api/env?${profileQuery(name)}`, {
     method: "PUT",
@@ -221,7 +232,7 @@ export async function deleteProviderSetupField(
   name: string,
   provider: string,
   field: string,
-): Promise<BotModelProviderSetupCatalog> {
+): Promise<ModelProviderSetupCatalog> {
   await setupField(client, name, provider, field);
   await client.dashboardJson(`/api/env?${profileQuery(name)}`, {
     method: "DELETE",
@@ -234,7 +245,7 @@ async function oauthSetupMethod(
   client: HermesClient,
   name: string,
   provider: string,
-): Promise<BotModelProviderSetupMethod> {
+): Promise<ModelProviderSetupMethod> {
   // OAuth polling can run every two seconds. Read only Hermes' OAuth catalog here; the full setup
   // catalog also probes model options and env metadata and would turn one poll into four requests.
   const raw = await client.dashboardJson<HermesOAuthCatalog>(

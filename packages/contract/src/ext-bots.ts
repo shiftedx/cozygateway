@@ -16,6 +16,19 @@ import { type Static, Type } from "@sinclair/typebox";
 
 import { AttachmentBlockSchema } from "./rich-blocks.ts";
 import { ApprovalOutcomeSchema } from "./resources.ts";
+import {
+  ModelProviderFieldUpdateSchema,
+  ModelProviderOAuthCodeSchema,
+  ModelProviderOAuthSessionSchema,
+  ModelProviderSetupFieldSchema,
+  ModelProviderSetupMethodSchema,
+  ModelProviderSetupSchema,
+  type ModelProviderFieldUpdate,
+  type ModelProviderOAuthCode,
+  type ModelProviderOAuthSession,
+  type ModelProviderSetupField,
+  type ModelProviderSetupMethod,
+} from "./model-provider-setup.ts";
 
 /** The roster preview line, already classified. `a2a` is a bot-to-bot delivery whose
  *  `Message from ... :` prefix has been stripped, with the sender handle carried separately;
@@ -932,45 +945,19 @@ export type BotModelConfigPatch = Static<typeof BotModelConfigPatchSchema>;
  * credential state exposed to clients; the stored value and Hermes' redacted suffix never cross
  * the CozyGateway wire. `key` is an opaque Hermes field id (usually an environment-variable
  * name) and is accepted back only for the provider row that advertised it. */
-export const BotModelProviderSetupFieldSchema = Type.Object({
-  key: Type.String({ minLength: 1 }),
-  label: Type.String({ minLength: 1 }),
-  secret: Type.Boolean(),
-  advanced: Type.Boolean(),
-  isSet: Type.Boolean(),
-  helpUrl: Type.Optional(Type.String()),
-});
-export type BotModelProviderSetupField = Static<typeof BotModelProviderSetupFieldSchema>;
+export const BotModelProviderSetupFieldSchema = ModelProviderSetupFieldSchema;
+export type BotModelProviderSetupField = ModelProviderSetupField;
 
 /** A setup method surfaced by Hermes' unified provider catalog. `fields` means values may be
  * pasted in CozyChat; `oauth` is a Hermes-hosted PKCE or device-code session; `external` is a
  * CLI-owned login that cannot truthfully be completed by the phone and therefore carries the
  * exact Hermes command as a handoff. */
-export const BotModelProviderSetupMethodSchema = Type.Object({
-  id: Type.String({ minLength: 1 }),
-  kind: Type.Union([
-    Type.Literal("fields"),
-    Type.Literal("oauth"),
-    Type.Literal("external"),
-  ]),
-  label: Type.String({ minLength: 1 }),
-  connected: Type.Boolean(),
-  fields: Type.Optional(Type.Array(BotModelProviderSetupFieldSchema)),
-  flow: Type.Optional(Type.Union([Type.Literal("pkce"), Type.Literal("device_code")])),
-  command: Type.Optional(Type.String({ minLength: 1 })),
-  helpUrl: Type.Optional(Type.String()),
-});
-export type BotModelProviderSetupMethod = Static<typeof BotModelProviderSetupMethodSchema>;
+export const BotModelProviderSetupMethodSchema = ModelProviderSetupMethodSchema;
+export type BotModelProviderSetupMethod = ModelProviderSetupMethod;
 
 /** One provider in the same canonical order as `hermes model`. This is a setup catalog, not a
  * second provider registry: every row and method is normalized from Hermes on each read. */
-export const BotModelProviderSetupSchema = Type.Object({
-  slug: Type.String({ minLength: 1 }),
-  name: Type.String({ minLength: 1 }),
-  authenticated: Type.Boolean(),
-  modelCount: Type.Integer({ minimum: 0 }),
-  methods: Type.Array(BotModelProviderSetupMethodSchema),
-});
+export const BotModelProviderSetupSchema = Type.Omit(ModelProviderSetupSchema, ["models"]);
 export type BotModelProviderSetup = Static<typeof BotModelProviderSetupSchema>;
 
 export const BotModelProviderSetupCatalogSchema = Type.Object({
@@ -981,33 +968,14 @@ export type BotModelProviderSetupCatalog = Static<typeof BotModelProviderSetupCa
 
 /** The value is deliberately the whole body and never appears in a URL, process argument, result,
  * or log. The route re-resolves `provider` + `field` against Hermes before forwarding it. */
-export const BotModelProviderFieldUpdateSchema = Type.Object({
-  value: Type.String({ minLength: 1, maxLength: 65_536 }),
-});
-export type BotModelProviderFieldUpdate = Static<typeof BotModelProviderFieldUpdateSchema>;
+export const BotModelProviderFieldUpdateSchema = ModelProviderFieldUpdateSchema;
+export type BotModelProviderFieldUpdate = ModelProviderFieldUpdate;
 
-export const BotModelProviderOAuthSessionSchema = Type.Object({
-  provider: Type.String({ minLength: 1 }),
-  sessionId: Type.String({ minLength: 1 }),
-  flow: Type.Union([Type.Literal("pkce"), Type.Literal("device_code")]),
-  status: Type.Union([
-    Type.Literal("pending"),
-    Type.Literal("approved"),
-    Type.Literal("expired"),
-    Type.Literal("error"),
-  ]),
-  authorizationUrl: Type.Optional(Type.String({ minLength: 1 })),
-  userCode: Type.Optional(Type.String({ minLength: 1 })),
-  expiresAt: Type.Optional(Type.Integer()),
-  pollIntervalMs: Type.Optional(Type.Integer({ minimum: 250 })),
-  error: Type.Optional(Type.String()),
-});
-export type BotModelProviderOAuthSession = Static<typeof BotModelProviderOAuthSessionSchema>;
+export const BotModelProviderOAuthSessionSchema = ModelProviderOAuthSessionSchema;
+export type BotModelProviderOAuthSession = ModelProviderOAuthSession;
 
-export const BotModelProviderOAuthCodeSchema = Type.Object({
-  code: Type.String({ minLength: 1, maxLength: 8_192 }),
-});
-export type BotModelProviderOAuthCode = Static<typeof BotModelProviderOAuthCodeSchema>;
+export const BotModelProviderOAuthCodeSchema = ModelProviderOAuthCodeSchema;
+export type BotModelProviderOAuthCode = ModelProviderOAuthCode;
 
 /** One routine's schedule. `raw` is the Hermes-native schedule string EXACTLY as the backend stores
  *  it (`30m`, `every 2h`, `0 9 * * 1-5`), which is also exactly what a client sends back on a write:
@@ -1624,8 +1592,7 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * from an attach transport that is online. The route is read-only and returns `starting` until the
  * bot's authenticated attach-v1 hello has settled, then `ready`. A client that gates its composer
  * on this route must require >= 40; older gateways do not expose the readiness fact. */
-/** Capability 41: MODEL PROVIDER SETUP. CozyGateway normalizes Hermes' unified `hermes model`
- * provider universe and wraps its credential lifecycle plus PKCE/device-code sessions under
- * `/bots/:name/model-providers`. CozyChat renders that state without owning a provider registry or
- * retaining secrets. External CLI-only methods remain explicit handoffs. */
+/** Capability 41: MODEL PROVIDER SETUP COMPATIBILITY. Canonical provider administration now lives
+ * at gateway → harness → configuration scope under `com.cozylabs.harness-settings`. These bot
+ * routes remain temporarily so capability-41 clients do not break. */
 export const BOTS_CAPABILITY_VERSION = 41;

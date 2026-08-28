@@ -11,6 +11,8 @@ import {
   MOBILE_NODE_CAPABILITY_VERSION,
   GATEWAY_MANAGEMENT_CAPABILITY_ID,
   GATEWAY_MANAGEMENT_CAPABILITY_VERSION,
+  HARNESS_SETTINGS_CAPABILITY_ID,
+  HARNESS_SETTINGS_CAPABILITY_VERSION,
   type GatewayInfo,
   type ServerFrame,
 } from "cozygateway-contract";
@@ -53,6 +55,7 @@ import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
+import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
 
 export const GATEWAY_VERSION = "0.3.0";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
@@ -174,7 +177,11 @@ export function gatewayInfoForConfig(config: GatewayConfig, management = false):
       ...(management ? { [GATEWAY_MANAGEMENT_CAPABILITY_ID]: GATEWAY_MANAGEMENT_CAPABILITY_VERSION } : {}),
       ...(hermesEndpoints(config).length === 0
         ? {}
-        : { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION, [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION }),
+        : {
+            [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
+            [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
+            [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
+          }),
       ...(config.pushRelayUrl === undefined
         ? {}
         : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),
@@ -309,6 +316,9 @@ export async function startGateway(
           raiseLiveActivityFrame(presence);
         },
       ));
+  const harnessSettings = new GatewayHarnessSettings(
+    bridgeMembers.map(({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client)),
+  );
 
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
@@ -527,6 +537,7 @@ export async function startGateway(
     gatewayInfo,
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
     ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
+    harnessSettings,
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),
     attachDeadLetters: () => storage.attachProjectionDeadLetters(),

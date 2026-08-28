@@ -19,6 +19,8 @@ import {
   SendMessageRequestSchema,
   assertValid,
   GatewaySettingsSchema,
+  ModelProviderFieldUpdateSchema,
+  ModelProviderOAuthCodeSchema,
 } from "cozygateway-contract";
 
 import { Type } from "@sinclair/typebox";
@@ -28,7 +30,9 @@ import type { GatewayConfig } from "./config.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
+import { GatewayHarnessSettings, HarnessSettingsInvalid } from "./harness-settings.ts";
 import type { BotControlSurface, BotsSurface } from "./hermes-bridge/bridge.ts";
+import { ProviderSetupInvalid } from "./hermes-bridge/provider-setup.ts";
 import type { MemorySurface } from "./hermes-bridge/memory.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
@@ -146,6 +150,8 @@ export interface AppDeps {
     read(): unknown;
     update(input: unknown): unknown;
   };
+  /** Gateway-owned inventory of agent harnesses and their harness-native model settings. */
+  harnessSettings?: GatewayHarnessSettings;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
@@ -346,6 +352,78 @@ export function createApp(deps: AppDeps): Hono<Env> {
         return c.json(errorBody("invalid_request", error.message), 400);
       throw error;
     }
+  });
+
+  app.get("/gateway/harnesses", requireDevice, (c) => {
+    if (deps.harnessSettings === undefined)
+      return c.json(errorBody("invalid_request", "agent harness settings are unavailable"), 404);
+    return c.json(deps.harnessSettings.catalog());
+  });
+
+  const harnessFailure = (c: Context<Env>, error: unknown) => {
+    if (error instanceof HarnessSettingsInvalid)
+      return c.json(errorBody("invalid_request", error.message), 404);
+    if (error instanceof ProviderSetupInvalid || error instanceof ContractViolation)
+      return c.json(errorBody("invalid_request", error.message), 400);
+    throw error;
+  };
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/model-providers", requireDevice, async (c) => {
+    try {
+      if (deps.harnessSettings === undefined) throw new HarnessSettingsInvalid("agent harness settings are unavailable");
+      return c.json(await deps.harnessSettings.adapter(c.req.param("harnessId")).modelProviders(c.req.param("scopeId")));
+    } catch (error) { return harnessFailure(c, error); }
+  });
+
+  app.put("/gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/fields/:field", requireDevice, async (c) => {
+    try {
+      if (deps.harnessSettings === undefined) throw new HarnessSettingsInvalid("agent harness settings are unavailable");
+      const input = assertValid(ModelProviderFieldUpdateSchema, await readBody(c));
+      const adapter = deps.harnessSettings.adapter(c.req.param("harnessId"));
+      return c.json(await adapter.configureField(c.req.param("scopeId"), c.req.param("provider"), c.req.param("field"), input.value));
+    } catch (error) { return harnessFailure(c, error); }
+  });
+
+  app.delete("/gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/fields/:field", requireDevice, async (c) => {
+    try {
+      if (deps.harnessSettings === undefined) throw new HarnessSettingsInvalid("agent harness settings are unavailable");
+      const adapter = deps.harnessSettings.adapter(c.req.param("harnessId"));
+      return c.json(await adapter.clearField(c.req.param("scopeId"), c.req.param("provider"), c.req.param("field")));
+    } catch (error) { return harnessFailure(c, error); }
+  });
+
+  app.post("/gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/oauth", requireDevice, async (c) => {
+    try {
+      if (deps.harnessSettings === undefined) throw new HarnessSettingsInvalid("agent harness settings are unavailable");
+      const adapter = deps.harnessSettings.adapter(c.req.param("harnessId"));
+      return c.json(await adapter.startOAuth(c.req.param("scopeId"), c.req.param("provider")));
+    } catch (error) { return harnessFailure(c, error); }
+  });
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/oauth/:sessionId", requireDevice, async (c) => {
+    try {
+      if (deps.harnessSettings === undefined) throw new HarnessSettingsInvalid("agent harness settings are unavailable");
+      const adapter = deps.harnessSettings.adapter(c.req.param("harnessId"));
+      return c.json(await adapter.pollOAuth(c.req.param("scopeId"), c.req.param("provider"), c.req.param("sessionId")));
+    } catch (error) { return harnessFailure(c, error); }
+  });
+
+  app.post("/gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/oauth/:sessionId/code", requireDevice, async (c) => {
+    try {
+      if (deps.harnessSettings === undefined) throw new HarnessSettingsInvalid("agent harness settings are unavailable");
+      const input = assertValid(ModelProviderOAuthCodeSchema, await readBody(c));
+      const adapter = deps.harnessSettings.adapter(c.req.param("harnessId"));
+      return c.json(await adapter.submitOAuthCode(c.req.param("scopeId"), c.req.param("provider"), c.req.param("sessionId"), input.code));
+    } catch (error) { return harnessFailure(c, error); }
+  });
+
+  app.delete("/gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/oauth/:sessionId", requireDevice, async (c) => {
+    try {
+      if (deps.harnessSettings === undefined) throw new HarnessSettingsInvalid("agent harness settings are unavailable");
+      const adapter = deps.harnessSettings.adapter(c.req.param("harnessId"));
+      await adapter.cancelOAuth(c.req.param("scopeId"), c.req.param("provider"), c.req.param("sessionId"));
+      return c.body(null, 204);
+    } catch (error) { return harnessFailure(c, error); }
   });
 
   // `deps.gatewayInfo` is a static snapshot taken once at server assembly (it also seeds `/pair`

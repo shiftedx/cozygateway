@@ -4,6 +4,7 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
 import { createApp } from "../src/http.ts";
+import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "../src/harness-settings.ts";
 import { openStorage } from "../src/storage.ts";
 import { testHermes } from "./support/test-config.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
@@ -40,7 +41,8 @@ async function setup() {
       if (method === "GET" && path === "/api/model/options") {
         expect(query.get("include_unconfigured")).toBe("1");
         return { body: { providers: [
-          { slug: "openrouter", name: "OpenRouter", authenticated: openRouterKey !== undefined, models: [] },
+          { slug: "openrouter", name: "OpenRouter", authenticated: openRouterKey !== undefined,
+            models: ["openai/gpt-5", { id: "anthropic/claude-sonnet-4" }, { name: "google/gemini-2.5-flash" }] },
           { slug: "openai-codex", name: "ChatGPT or Codex Subscription", authenticated: false, models: [] },
           { slug: "anthropic", name: "Anthropic", authenticated: false, models: [] },
           { slug: "qwen-oauth", name: "Qwen", authenticated: false, models: [] },
@@ -120,10 +122,21 @@ async function setup() {
   const storage = openStorage(":memory:");
   const client = createHermesClient({ url: server.url, auth: { mode: "token", token: "HERMES-TOKEN" } });
   const bridge = new HermesBridge({ client, storage, broadcast: () => {}, logSink: () => {}, now: () => 1_800_000_000_000 });
+  const hermesConfig = {
+    ...testHermes(),
+    profiles: { scout: { tokenEnv: "TEST_ATTACH_TOKEN" } },
+  };
+  const harnessSettings = new GatewayHarnessSettings([
+    new HermesHarnessModelSettingsAdapter(
+      { id: undefined, label: undefined, namespace: false, config: hermesConfig },
+      client,
+    ),
+  ], () => 1_800_000_000_000);
   const app = createApp({
     storage,
-    config: { name: "g", port: 8787, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes() },
+    config: { name: "g", port: 8787, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: hermesConfig },
     bots: bridge,
+    harnessSettings,
     gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 41 } },
     presenceOf: () => "online",
     submitUserMessage: () => { throw new Error("unused"); },
@@ -163,7 +176,8 @@ describe("bot model provider setup", () => {
     expect(JSON.parse(text)).toEqual({
       providers: [
         {
-          slug: "openrouter", name: "OpenRouter", authenticated: false, modelCount: 0,
+          slug: "openrouter", name: "OpenRouter", authenticated: false,
+          models: ["openai/gpt-5", "anthropic/claude-sonnet-4", "google/gemini-2.5-flash"], modelCount: 3,
           methods: [{ id: "fields", kind: "fields", label: "API key", connected: false, fields: [{
             key: "OPENROUTER_API_KEY", label: "API key", secret: true, advanced: false,
             isSet: false, helpUrl: "https://openrouter.ai/keys",
@@ -171,16 +185,16 @@ describe("bot model provider setup", () => {
         },
         {
           slug: "openai-codex", name: "ChatGPT or Codex Subscription", authenticated: false,
-          modelCount: 0, methods: [{ id: "account", kind: "oauth", label: "Account",
+          models: [], modelCount: 0, methods: [{ id: "account", kind: "oauth", label: "Account",
             connected: false, flow: "device_code", helpUrl: "https://chatgpt.com" }],
         },
         {
-          slug: "anthropic", name: "Anthropic", authenticated: false, modelCount: 0,
+          slug: "anthropic", name: "Anthropic", authenticated: false, models: [], modelCount: 0,
           methods: [{ id: "account", kind: "oauth", label: "Account", connected: false,
             flow: "pkce", helpUrl: "https://claude.ai" }],
         },
         {
-          slug: "qwen-oauth", name: "Qwen", authenticated: false, modelCount: 0,
+          slug: "qwen-oauth", name: "Qwen", authenticated: false, models: [], modelCount: 0,
           methods: [{ id: "account", kind: "external", label: "Account", connected: false,
             command: "hermes auth add qwen-oauth", helpUrl: "https://qwen.ai" }],
         },
@@ -233,5 +247,78 @@ describe("bot model provider setup", () => {
     expect(body).not.toContain("pasted-code");
     expect(JSON.parse(body).status).toBe("approved");
     expect((await authed("/bots/scout/model-providers/openai-codex/oauth/oauth-device", { method: "DELETE" })).status).toBe(204);
+  });
+});
+
+describe("gateway harness model provider setup", () => {
+  it("lists the official harness identity and routes a selected configuration scope", async () => {
+    const { app, authed, calls } = await setup();
+    expect((await app.request("/gateway/harnesses")).status).toBe(401);
+    expect(await (await authed("/gateway/harnesses")).json()).toEqual({
+      harnesses: [{
+        id: "default",
+        vendor: {
+          id: "hermes-agent",
+          name: "Hermes Agent",
+          logoAsset: "hermes-agent",
+          logoSourceUrl: "https://github.com/NousResearch/hermes-agent/blob/main/website/static/img/favicon.svg",
+        },
+        scopes: [{ id: "scout", name: "scout" }],
+      }],
+      updatedAt: 1_800_000_000_000,
+    });
+
+    expect((await authed("/gateway/harnesses/missing/scopes/scout/model-providers")).status).toBe(404);
+    expect((await authed("/gateway/harnesses/default/scopes/missing/model-providers")).status).toBe(404);
+    const catalog = await authed("/gateway/harnesses/default/scopes/scout/model-providers");
+    expect(catalog.status).toBe(200);
+    expect((await catalog.json() as { providers: unknown[] }).providers).toHaveLength(4);
+
+    const saved = await authed(
+      "/gateway/harnesses/default/scopes/scout/model-providers/openrouter/fields/OPENROUTER_API_KEY",
+      { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: "sk-gateway-only" }) },
+    );
+    expect(saved.status).toBe(200);
+    expect(await saved.text()).not.toContain("sk-gateway-only");
+    expect(calls.find((call) => call.method === "PUT")?.body).toEqual({
+      key: "OPENROUTER_API_KEY", value: "sk-gateway-only",
+    });
+
+    const cleared = await authed(
+      "/gateway/harnesses/default/scopes/scout/model-providers/openrouter/fields/OPENROUTER_API_KEY",
+      { method: "DELETE" },
+    );
+    expect(cleared.status).toBe(200);
+    expect((await cleared.json() as { providers: Array<{ authenticated: boolean }> }).providers[0]?.authenticated)
+      .toBe(false);
+
+    const oauth = await authed(
+      "/gateway/harnesses/default/scopes/scout/model-providers/openai-codex/oauth",
+      { method: "POST" },
+    );
+    expect(await oauth.json()).toMatchObject({
+      provider: "openai-codex", sessionId: "oauth-device", status: "pending",
+    });
+    const polled = await authed(
+      "/gateway/harnesses/default/scopes/scout/model-providers/openai-codex/oauth/oauth-device",
+    );
+    expect(await polled.json()).toMatchObject({ provider: "openai-codex", status: "approved" });
+    expect((await authed(
+      "/gateway/harnesses/default/scopes/scout/model-providers/openai-codex/oauth/oauth-device",
+      { method: "DELETE" },
+    )).status).toBe(204);
+
+    const pkce = await authed(
+      "/gateway/harnesses/default/scopes/scout/model-providers/anthropic/oauth",
+      { method: "POST" },
+    );
+    expect(await pkce.json()).toMatchObject({ provider: "anthropic", sessionId: "oauth-pkce" });
+    const submitted = await authed(
+      "/gateway/harnesses/default/scopes/scout/model-providers/anthropic/oauth/oauth-pkce/code",
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: "pasted-code" }) },
+    );
+    const submittedText = await submitted.text();
+    expect(submittedText).not.toContain("pasted-code");
+    expect(JSON.parse(submittedText)).toMatchObject({ provider: "anthropic", status: "approved" });
   });
 });

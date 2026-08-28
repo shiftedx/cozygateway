@@ -12,3 +12,5 @@ export * from "./ws.ts";
 /** Vendor extension, versioned independently of the frozen core: contract/ext-bots-v1.md. */
 export * from "./ext-bots.ts";
 export * from "./gateway-management.ts";
+export * from "./model-provider-setup.ts";
+export * from "./harness-settings.ts";

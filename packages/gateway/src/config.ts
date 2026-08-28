@@ -142,19 +142,21 @@ export type GatewayConfig = ParsedGatewayConfig & { hermes: HermesBridgeConfig }
 
 export interface ResolvedHermesEndpoint {
   id: string | undefined;
+  label: string | undefined;
   namespace: boolean;
   config: HermesBridgeConfig;
 }
 
 export function hermesEndpoints(config: GatewayConfig): ResolvedHermesEndpoint[] {
   if (config.hermesEndpoints !== undefined) {
-    return config.hermesEndpoints.map(({ id, label: _label, ...endpoint }) => ({
+    return config.hermesEndpoints.map(({ id, label, ...endpoint }) => ({
       id,
+      label,
       namespace: true,
       config: endpoint,
     }));
   }
-  return config.hermes === undefined ? [] : [{ id: undefined, namespace: false, config: config.hermes }];
+  return config.hermes === undefined ? [] : [{ id: undefined, label: undefined, namespace: false, config: config.hermes }];
 }
 
 export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: string): string {

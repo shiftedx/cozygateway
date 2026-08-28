@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0084
 ---
 
 # ADR 0083: Provider setup wraps Hermes instead of reimplementing it
@@ -22,7 +22,9 @@ Hermes providers visible without an app release and avoids two configuration sys
 
 ## Consequences
 
-Capability 41 gates every setup affordance and route. Credential values travel once in the paired
+Capability 41 originally gated every setup affordance and route. ADR-0084 moves the canonical
+surface to gateway-owned harness settings; these bot-scoped routes remain transitional compatibility
+only. Credential values travel once in the paired
 device request body and once in the authenticated Hermes request body; they are not put in URLs,
 process arguments, logs, responses, observable store state, or WebSocket frames. Reads expose only
 whether a field is set. CozyGateway re-resolves a provider and field from Hermes before every
