@@ -34,7 +34,6 @@ import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import {
   HermesRpcError,
-  HermesUnavailable,
   type HermesClient,
   type HermesState,
 } from "./client.ts";
@@ -93,10 +92,6 @@ import {
   type BlankSlateSelection,
 } from "./blank-slate-seed.ts";
 
-export const ROSTER_POLL_MS = 5_000;
-export const ROUTINES_POLL_MS = 20_000;
-export const FOCUS_TTL_MS = 60_000;
-export const ROUTINE_WATCH_TTL_MS = 5 * 60_000;
 export const INBOX_THREAD_LIMIT = 50;
 export const INBOX_SESSION_SCAN_LIMIT = 200;
 const CHANGE_DEBOUNCE_MS = 250;
@@ -946,7 +941,4 @@ export class HermesBridge implements BotControlSurface {
     await this.#groups.close();
     await this.#client.close();
   }
-}
-export function isHermesUnavailable(error: unknown): boolean {
-  return error instanceof HermesUnavailable;
 }

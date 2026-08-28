@@ -159,10 +159,6 @@ export function isContextCompactionText(text: string): boolean {
   return SKILL_PRUNED_RE.test(first) && closedSummary;
 }
 
-export function isContextCompactionMarker(message: Pick<BotChatMessage, "text">): boolean {
-  return message.text === CONTEXT_COMPACTION_MARKER;
-}
-
 /** The only two roles that reach a chat bubble. Everything else in a Hermes transcript is turn
  *  machinery: a `system` prompt, a `tool` result, and an assistant message whose content is a bare
  *  `tool_use` part all belong to the turn, not to the conversation. The desktop consumer this is
@@ -208,21 +204,6 @@ function decodeChatRow(raw: unknown): DecodedRow | undefined {
   // `role`, `text`, `timestamp` and `row_id`, and no `id` at all).
   const id = asId(record["id"]) ?? asId(record["message_id"]) ?? asId(record["row_id"]);
   return { id, role: renderedRole, text, at: messageTimestamp(record) };
-}
-
-/** Maps one raw message, or drops it. The single-row form of `parseChatSnapshot`'s decode, so a row
- *  with no id of its own is given the FIRST synthesized identity for its content. Used where one raw
- *  row is decoded on its own; a whole transcript goes through `parseChatSnapshot`, which counts
- *  repeated content and is the only thing that can number it. */
-export function mapChatMessage(raw: unknown, sessionId: string): BotChatMessage | undefined {
-  const row = decodeChatRow(raw);
-  if (row === undefined) return undefined;
-  return {
-    id: row.id ?? syntheticChatId(sessionId, row.role, row.text, 0),
-    role: row.role,
-    text: row.text,
-    at: row.at,
-  };
 }
 
 /** Gives an identity to a decoded transcript, in order.

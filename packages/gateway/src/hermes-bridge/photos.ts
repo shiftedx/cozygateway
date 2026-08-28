@@ -18,8 +18,6 @@
  *  that stand between a device and the rest of the feature, and a rule that can only be exercised
  *  through a socket is a rule that does not get tested. */
 
-import { randomBytes } from "node:crypto";
-
 /** Bytes, per image. Chosen against three ceilings rather than picked round: hermes' own
  *  `_ATTACH_BYTES_MAX_BYTES` is 25 MB, the Anthropic-family providers reject a single image over
  *  5 MB (hermes shrinks and retries once, which costs a whole provider round trip), and a 2048 px
@@ -62,9 +60,6 @@ export const PHOTO_RATE_REFILL_MS = 5_000;
  *  attachment block, which is what the contract promises: the bytes expire, the conversation does
  *  not. */
 export const ATTACH_MEDIA_TTL_MS = 14 * 24 * 60 * 60 * 1000;
-
-/** Compatibility name for callers concerned specifically with photos. */
-export const PHOTO_TTL_MS = ATTACH_MEDIA_TTL_MS;
 
 /** How often the gateway reclaims expired user-uploaded attachment bytes.
  *
@@ -298,14 +293,6 @@ export async function readCappedBody(
   return out;
 }
 
-/** The shape of a stored attachment's public id. Opaque, fixed length, and drawn from a CSPRNG: it is
- *  handed to devices and comes back in a URL path, so it must carry no filename, no path, no session
- *  id and nothing guessable. Validated on the way back in (`isPhotoFileId`) so nothing path-shaped
- *  ever reaches a lookup. */
-export function newPhotoFileId(): string {
-  return randomBytes(16).toString("hex");
-}
-
 const FILE_ID_RE = /^[0-9a-f]{32}$/;
 
 export function isPhotoFileId(value: string): boolean {
@@ -327,15 +314,6 @@ const ATTACH_MEDIA_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 export function isFetchableAttachmentId(value: string): boolean {
   return ATTACH_MEDIA_ID_RE.test(value);
-}
-
-/** The name that rides the `attachment` block. Generated, never the client's: a filename is the one
- *  field of an upload that is pure attacker-controlled text with a long history of being interpreted
- *  (path traversal, extension confusion, markup in whatever renders it), and nothing in this feature
- *  needs it. The extension comes from the sniffed bytes, so the name always describes what the file
- *  really is. */
-export function photoDisplayName(ext: string): string {
-  return `photo.${ext}`;
 }
 
 /** Replaces anything path-shaped in a hermes error string with a placeholder.

@@ -210,8 +210,6 @@ export interface HermesClient {
   /** Calls the authenticated dashboard REST surface on the same Hermes connection. `path` is
    *  origin-relative and may include a query string. */
   dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown }): Promise<T>;
-  /** Reads one Hermes-host file through the authenticated dashboard. */
-  readMediaDataUrl(path: string): Promise<string>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
    *  `cron.changed` broadcasts. Handlers cannot be removed. */
   onEvent(handler: (event: HermesEvent) => void): void;
@@ -535,53 +533,6 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     }
   }
 
-  async function dashboardRequest(endpoint: string, filePath: string): Promise<Response> {
-    const url = new URL(endpoint, `${dashboardBaseUrl}/`);
-    url.searchParams.set("path", filePath);
-    const headers: Record<string, string> = {};
-    if (auth.mode === "password") {
-      if (sessionCookie === undefined) {
-        await login(auth.baseUrl, auth.username, auth.password, auth.provider ?? DEFAULT_AUTH_PROVIDER);
-      }
-      headers.cookie = sessionCookie!;
-    } else {
-      headers["x-hermes-session-token"] = auth.token;
-    }
-    return doFetch(url, { headers, signal: AbortSignal.timeout(authHttpTimeoutMs) });
-  }
-
-  async function readMediaDataUrl(filePath: string): Promise<string> {
-    let relogged = false;
-    const get = async (endpoint: string): Promise<Response> => {
-      let response = await dashboardRequest(endpoint, filePath);
-      if (auth.mode === "password" && !relogged && response.status === 401) {
-        await response.text().catch(() => "");
-        sessionCookie = undefined;
-        relogged = true;
-        response = await dashboardRequest(endpoint, filePath);
-      }
-      return response;
-    };
-
-    for (const endpoint of ["/api/media", "/api/fs/read-data-url"]) {
-      let response: Response;
-      try {
-        response = await get(endpoint);
-      } catch {
-        continue;
-      }
-      if (!response.ok) {
-        await response.text().catch(() => "");
-        continue;
-      }
-      const body: unknown = await response.json().catch(() => undefined);
-      const record = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
-      const dataUrl = record["data_url"] ?? record["dataUrl"];
-      if (typeof dataUrl === "string" && dataUrl.length > 0) return dataUrl;
-    }
-    throw new Error("hermes dashboard could not read the media file");
-  }
-
   async function dashboardJson<T>(
     path: string,
     init: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown } = {},
@@ -699,8 +650,6 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     },
 
     dashboardJson,
-
-    readMediaDataUrl,
 
     onEvent(handler: (event: HermesEvent) => void): void {
       eventHandlers.push(handler);
