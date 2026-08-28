@@ -529,8 +529,9 @@ describe("capability advertisement", () => {
     // keeps rendering the catalog alone.
     // 37 adds bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Additive in the
     // simplest possible way, since a client below 37 simply never calls the route.
-    // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts.
-    expect(BOTS_CAPABILITY_VERSION).toBe(39);
+    // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts;
+    // 40 distinguishes a created profile from an attached, writable bot.
+    expect(BOTS_CAPABILITY_VERSION).toBe(40);
   });
 
   it("keeps mobile receipts closed and metadata-only", () => {

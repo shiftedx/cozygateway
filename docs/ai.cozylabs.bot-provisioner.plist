@@ -63,8 +63,12 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- Resolved to an absolute executable by the installer. User-local Python installs
+             commonly place Hermes in ~/.local/bin, which launchd never inherits from a shell. -->
+        <key>HERMES_BIN</key>
+        <string>REPLACE_ME_HERMES_BIN</string>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>REPLACE_ME_HERMES_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <!-- The script keeps its own timestamped log; these two catch anything that

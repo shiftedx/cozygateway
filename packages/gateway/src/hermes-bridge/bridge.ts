@@ -19,6 +19,7 @@ import type {
   BotPendingApproval,
   BotProfile,
   BotProfilePatch,
+  BotReadiness,
   BotRoutine,
   BotRoutineCreateRequest,
   BotRoutinePatch,
@@ -247,6 +248,7 @@ export interface BotControlSurface {
   ): BotGroupMessage;
 }
 export interface BotsSurface extends BotControlSurface {
+  readiness(name: string): BotReadiness;
   commands(name: string): readonly BotSlashCommand[];
   /** Capability 27: current durable approvals only; terminal records stay private to lifecycle
    * settlement and never appear in the user's decision inbox. */

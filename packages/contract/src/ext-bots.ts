@@ -79,6 +79,16 @@ export const BotCreateResponseSchema = Type.Object({
 });
 export type BotCreateResponse = Static<typeof BotCreateResponseSchema>;
 
+/** Capability 40: whether a bot's attach transport can accept a turn right now. A freshly
+ * created Hermes profile can exist before its per-profile gateway process has attached; clients
+ * use this read-only state to keep the composer closed during that provisioning seam. */
+export const BotReadinessSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  status: Type.Union([Type.Literal("starting"), Type.Literal("ready")]),
+  updatedAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotReadiness = Static<typeof BotReadinessSchema>;
+
 /** The `DELETE /bots/:name` reply (capability 37). `hermesProfile` says what happened on the
  * Hermes host: `deleted` when the dashboard removed the profile directory on this call, or
  * `already_absent` when Hermes no longer had it and only gateway state remained. `purged` counts
@@ -1558,4 +1568,8 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * emits `bot_mobile_receipt` and is returned in history as `mobileReceipts`. Receipts contain only
  * request identity, conversation identity, command, normalized purpose, and gateway timestamp:
  * never the lease, device id, status/location result, or another phone payload. */
-export const BOTS_CAPABILITY_VERSION = 39;
+/** Capability 40: BOT READINESS. `GET /bots/:name/readiness` distinguishes a profile that exists
+ * from an attach transport that is online. The route is read-only and returns `starting` until the
+ * bot's authenticated attach-v1 hello has settled, then `ready`. A client that gates its composer
+ * on this route must require >= 40; older gateways do not expose the readiness fact. */
+export const BOTS_CAPABILITY_VERSION = 40;
