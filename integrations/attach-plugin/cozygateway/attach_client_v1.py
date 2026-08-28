@@ -614,7 +614,21 @@ class AttachV1Client:
         descriptor = await asyncio.to_thread(
             self._upload_media_sync, media_id, path, mime, size_bytes, sha256, expires_at,
         )
-        await self._queue_event({"kind": "media", "media": descriptor})
+        try:
+            await self._queue_event({"kind": "media", "media": descriptor})
+        except Exception:
+            # The object is not deliverable until its descriptor has a durable event.
+            # Withdraw a descriptor that made it into the spool, then use the durable
+            # cleanup lane for the HTTP object. If enqueue itself failed, the same lane
+            # still records the cleanup before attempting the delete.
+            try:
+                await self.rollback_uploaded_media([media_id])
+            except Exception:
+                logger.warning(
+                    "attach: could not clean up unjournaled media %s", media_id,
+                    exc_info=True,
+                )
+            raise
         return descriptor
 
     async def rollback_uploaded_media(self, media_ids: List[str]) -> None:

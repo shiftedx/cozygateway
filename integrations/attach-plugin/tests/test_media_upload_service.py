@@ -18,6 +18,7 @@ import tempfile
 import types
 import unittest
 import zipfile
+from unittest.mock import AsyncMock
 
 from cozygateway.adapter import AttachAdapter, MediaDestination, MediaUploadService
 from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
@@ -178,6 +179,7 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "attachmentId": media_id, "name": "shot.png", "mimeType": "image/png",
             "bytes": len(PNG_1X1), "mediaKind": "image",
         }])
+
         self.assertNotIn("source", str(result["attachments"]))
         self.assertNotIn("sha256", str(result["attachments"]))
         self.assertNotIn(self.tmp.name, str(result["attachments"]))
@@ -196,6 +198,64 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             lambda: self._rows(delivery_id) == {media_id: "displayed"}, what="the displayed row",
         )
         self.assertEqual(self.spool.delivery_receipt_row(delivery_id)["state"], "displayed")
+
+    async def test_a_tool_loop_dispatches_proactive_media_to_the_adapter_owner_loop(self):
+        """Hermes tool handlers need not run on the resident adapter's event loop.
+
+        The HTTP upload itself is thread-safe, but its descriptor event, lifecycle rows,
+        rollback, and scheduled commit all belong to the loop/thread that opened the
+        adapter spool.  A live tool call from another loop must cross that boundary
+        before it starts the occurrence, not halfway through after bytes were uploaded.
+        """
+        self.adapter._loop = asyncio.get_running_loop()
+
+        def invoke_from_tool_loop():
+            return asyncio.run(self.adapter.send_proactive(
+                CHAT,
+                "sent from the Hermes tool loop",
+                [self.png],
+                canonical_home=False,
+                delivery_key="live-media:foreign-loop",
+            ))
+
+        result = await asyncio.to_thread(invoke_from_tool_loop)
+
+        self.assertEqual(result["state"], "journaled")
+        self.assertTrue(result["accepted_pending"])
+        await self.gateway.wait_for_event_kind("scheduled")
+        media_id = self.gateway.upload_media_ids[-1]
+        self.assertEqual(self._rows(result["deliveryId"]), {media_id: "journaled"})
+
+        self.gateway.script_receipt(
+            result["deliveryId"], receipt("projected", projected_at=11)
+        )
+
+        def read_status_from_tool_loop():
+            return asyncio.run(self.adapter.media_delivery_status_snapshot(
+                result["deliveryId"], 0.5
+            ))
+
+        snapshot = await asyncio.to_thread(read_status_from_tool_loop)
+        self.assertEqual(snapshot["receipt"]["state"], "projected")
+        self.assertEqual(snapshot["rows"], [{
+            "attachmentId": media_id,
+            "name": "shot.png",
+            "state": "projected",
+            "lifecycle": "projected",
+        }])
+
+    async def test_a_descriptor_journal_failure_deletes_the_unreferenced_upload(self):
+        """A successful HTTP object is not accepted until its descriptor is journaled."""
+        media_id = "a" * 32
+        self.client._queue_event = AsyncMock(side_effect=RuntimeError("journal unavailable"))
+
+        with self.assertRaisesRegex(RuntimeError, "journal unavailable"):
+            await self.client.upload_media(media_id, self.png, "image", mime="image/png")
+
+        await self.gateway.wait_for(
+            lambda: media_id in self.gateway.deleted_media_ids,
+            what="the unjournaled upload cleanup",
+        )
 
     async def test_a_late_duplicate_receipt_updates_the_row_exactly_once(self):
         result = await self._proactive([self.png])
