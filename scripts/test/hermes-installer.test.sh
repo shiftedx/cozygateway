@@ -528,12 +528,8 @@ const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 if (config.host !== '0.0.0.0' || Object.hasOwn(config, 'publicUrl')) process.exit(1);
 NODE
 
-# Uninstall reverses only lifecycle work owned by CozyGateway: its installed
-# default service is removed, its started existing service is stopped, and the
-# pre-existing active service is restarted only when Windows-style file locking
-# keeps the disabled plugin's owned spool open, then remains running.
-# Deliberately remove the fake Hermes directory and omit COZYGATEWAY_HERMES_BIN:
-# uninstall must use the absolute executable captured at install time.
+# A failed delete outside Windows is not evidence of an open-file lock. It must
+# fail without restarting an unrelated pre-existing Hermes gateway.
 mkdir -p "$tmp/locked-spool-bin"
 cat > "$tmp/locked-spool-bin/rm" <<'LOCKED_RM'
 #!/usr/bin/env bash
@@ -544,12 +540,33 @@ fi
 exec /usr/bin/rm "$@"
 LOCKED_RM
 chmod 700 "$tmp/locked-spool-bin/rm"
-locked_spool_marker="$tmp/active-spool.locked"
+mkdir -p "$tmp/hermes/profiles/locked-nonwindows/plugins/cozygateway" "$tmp/hermes/profiles/locked-nonwindows/plugin-data/cozygateway" "$tmp/gateway-nonwindows-locked/local"
+: > "$tmp/hermes/profiles/locked-nonwindows/plugins/cozygateway/.cozygateway-installer-owned"
+: > "$tmp/hermes/profiles/locked-nonwindows/plugin-data/cozygateway/attach-v1.sqlite"
+printf 'running\n' > "$tmp/hermes/gateway-locked-nonwindows.state"
+cat > "$tmp/gateway-nonwindows-locked/local/install-state" <<NONWINDOWS_STATE
+profiles=locked-nonwindows
+hermes_root=$tmp/hermes
+hermes_bin=$tmp/bin/hermes
+service_locked-nonwindows=preexisting
+NONWINDOWS_STATE
+nonwindows_spool_marker="$tmp/nonwindows-spool.locked"
+if HOME="$tmp/darwin-home" PATH="$tmp/locked-spool-bin:$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$nonwindows_spool_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=locked-nonwindows COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/nonwindows-locked-commands" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-nonwindows-locked" >/dev/null 2>&1; then
+  echo 'a non-Windows spool deletion failure must not trigger lock recovery' >&2
+  exit 1
+fi
+[ ! -f "$tmp/nonwindows-locked-commands" ] || ! grep -q '^locked-nonwindows:gateway:restart$' "$tmp/nonwindows-locked-commands"
+
+# Normal uninstall reverses only lifecycle work owned by CozyGateway: its
+# installed default service is removed, its started existing service is stopped,
+# and the pre-existing active service remains running without a restart.
+# Deliberately omit COZYGATEWAY_HERMES_BIN: uninstall must use the absolute
+# executable captured at install time.
 active_restarts_before_uninstall="$(grep -c '^active:gateway:restart$' "$tmp/commands")"
-HOME="$tmp/darwin-home" PATH="$tmp/locked-spool-bin:$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$locked_spool_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=active COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
+HOME="$tmp/darwin-home" PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
 grep -q '^default:gateway:uninstall$' "$tmp/commands"
 grep -q '^ops:gateway:stop$' "$tmp/commands"
-test "$(grep -c '^active:gateway:restart$' "$tmp/commands")" = "$((active_restarts_before_uninstall + 1))"
+test "$(grep -c '^active:gateway:restart$' "$tmp/commands")" = "$active_restarts_before_uninstall"
 ! grep -q '^active:gateway:\(stop\|uninstall\)$' "$tmp/commands"
 test "$(cat "$tmp/hermes/gateway-default.state")" = absent
 test "$(cat "$tmp/hermes/gateway-ops.state")" = stopped
@@ -623,6 +640,27 @@ rm -f "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}"
 exit 0
 POWERSHELL
 chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/windows-bin/powershell.exe"
+
+# Windows cannot unlink SQLite files held by a pre-existing Hermes gateway.
+# After the installer-owned plugin is disabled, uninstall restarts exactly that
+# profile once, retries cleanup, and leaves its service running.
+mkdir -p "$tmp/hermes/profiles/locked-windows/plugins/cozygateway" "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway" "$tmp/gateway-windows-locked/local"
+: > "$tmp/hermes/profiles/locked-windows/plugins/cozygateway/.cozygateway-installer-owned"
+: > "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
+printf 'running\n' > "$tmp/hermes/gateway-locked-windows.state"
+cat > "$tmp/gateway-windows-locked/local/install-state" <<WINDOWS_LOCKED_STATE
+profiles=locked-windows
+hermes_root=$tmp/hermes
+hermes_bin=$tmp/bin/hermes
+service_locked-windows=preexisting
+WINDOWS_LOCKED_STATE
+windows_spool_marker="$tmp/windows-spool.locked"
+HOME="$tmp/windows-locked-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/locked-spool-bin:$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$windows_spool_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=locked-windows COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-locked-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-locked-native-commands" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-locked" >/dev/null
+grep -Fxq 'locked-windows:gateway:restart' "$tmp/windows-locked-commands"
+! grep -q '^locked-windows:gateway:\(stop\|uninstall\)$' "$tmp/windows-locked-commands"
+test "$(cat "$tmp/hermes/gateway-locked-windows.state")" = running
+test ! -e "$tmp/gateway-windows-locked"
+test ! -e "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
 
 # A machine with Hermes and Git Bash but no Node receives a private, checksum-
 # verified Windows Node 24 runtime and resumes installation in the same process.
