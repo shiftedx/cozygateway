@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Message, RichBlock } from "cozygateway-contract";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { testHermes } from "./support/test-config.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
@@ -7,6 +10,8 @@ import type { GatewayConfig } from "../src/config.ts";
 import { createApp } from "../src/http.ts";
 import { gatewayInfoForConfig } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 interface RelayCall {
   method: string;
@@ -176,6 +181,71 @@ describe("authenticated push relay proxy", () => {
     expect.soft(calls.filter((call) => call.method === "DELETE")).toMatchObject([
       { url: "http://relay.internal:8788/register/stale-push-id" },
     ]);
+  });
+
+  it("keeps a failed relay deletion durable across reopen and retries it at app construction", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-live-activity-outbox-"));
+    const path = join(directory, "gateway.sqlite");
+    const storage = openStorage(path);
+    storage.createDevice({ id: "device", name: "phone", tokenHash: "hash", createdAt: 1 });
+    storage.saveLiveActivityRegistration({ deviceId: "device", activityId: "stale", runId: "run-1",
+      conversationId: "gateway-1", bot: "sage", pushId: "stale-push-id", createdAt: 1 });
+    storage.saveLiveActivityRegistration({ deviceId: "device", activityId: "current", runId: "run-2",
+      conversationId: "gateway-1", bot: "sage", pushId: "current-push-id", createdAt: 2 });
+    storage.createDevice({ id: "device-2", name: "tablet", tokenHash: "hash-2", createdAt: 1 });
+    storage.saveLiveActivityRegistration({ deviceId: "device-2", activityId: "stale-2", runId: "run-1",
+      conversationId: "gateway-2", bot: "sage", pushId: "stale-push-id-2", createdAt: 3 });
+    storage.saveLiveActivityRegistration({ deviceId: "device-2", activityId: "current-2", runId: "run-2",
+      conversationId: "gateway-2", bot: "sage", pushId: "current-push-id-2", createdAt: 4 });
+    const failedCalls: RelayCall[] = [];
+    const logs: string[] = [];
+    const config: GatewayConfig = { name: "retry", port: 8787, dbPath: path, turnTimeoutSeconds: 0,
+      hermes: testHermes(), pushRelayUrl: "http://relay.internal:8788/" };
+    createApp({
+      storage, config, gatewayInfo: gatewayInfoForConfig(config),
+      pushRelayFetch: async (input, init) => {
+        const request = new Request(input, init);
+        failedCalls.push({ method: request.method, url: request.url, body: await request.text(),
+          authorization: request.headers.get("authorization") });
+        if (failedCalls.length === 1) throw new Error("offline");
+        return new Response(null, { status: 503 });
+      },
+      pushRelayLog: (line) => logs.push(line),
+      presenceOf: () => "online", submitUserMessage: () => { throw new Error("not used"); },
+      interruptThread: () => "idle", resolveApproval: () => Promise.resolve("unknown" as const),
+      onDeviceRevoked: () => {}, now: () => 1_000,
+    });
+    await tick();
+    expect(failedCalls).toHaveLength(2);
+    expect(logs).toEqual([
+      "live activity relay cleanup: DELETE failed with a network error",
+      "live activity relay cleanup: DELETE returned HTTP 503",
+    ]);
+    expect(storage.liveActivityRelayDeletions(10)).toEqual([
+      "stale-push-id", "stale-push-id-2",
+    ]);
+    storage.close();
+
+    const reopened = openStorage(path);
+    const successfulCalls: string[] = [];
+    createApp({
+      storage: reopened, config, gatewayInfo: gatewayInfoForConfig(config),
+      pushRelayFetch: async (input, init) => {
+        successfulCalls.push(new Request(input, init).url);
+        return new Response(null, { status: 204 });
+      },
+      presenceOf: () => "online", submitUserMessage: () => { throw new Error("not used"); },
+      interruptThread: () => "idle", resolveApproval: () => Promise.resolve("unknown" as const),
+      onDeviceRevoked: () => {}, now: () => 1_000,
+    });
+    await tick();
+    expect(successfulCalls).toEqual([
+      "http://relay.internal:8788/register/stale-push-id",
+      "http://relay.internal:8788/register/stale-push-id-2",
+    ]);
+    expect(reopened.liveActivityRelayDeletions(10)).toEqual([]);
+    reopened.close();
+    rmSync(directory, { recursive: true, force: true });
   });
 
   it("advertises the push proxy capability in health", async () => {

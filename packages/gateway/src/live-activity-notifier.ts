@@ -139,8 +139,7 @@ export class LiveActivityNotifier {
     }
     if (this.#settledCompletions.has(completionKey)) return new Set();
 
-    const rows = this.#storage.liveActivityRegistrations(event.bot)
-      .filter((row) => row.conversationId === event.chatSessionId);
+    const rows = this.#conversationRows(event.bot, event.chatSessionId);
     for (const row of rows) this.#claimedActivities.add(this.#key(row));
     return new Set(rows.map((row) => row.deviceId));
   }
@@ -206,8 +205,7 @@ export class LiveActivityNotifier {
   #end(bot: string, sessionId: string, succeeded: boolean): void {
     this.#settledCompletions.add(this.#completionKey(bot, sessionId));
     this.#pendingApprovals.delete(this.#completionKey(bot, sessionId));
-    const rows = this.#storage.liveActivityRegistrations(bot)
-      .filter((row) => row.conversationId === sessionId);
+    const rows = this.#conversationRows(bot, sessionId);
     const uncoveredDevices = new Set<string>();
     for (const row of rows) {
       const key = this.#key(row);

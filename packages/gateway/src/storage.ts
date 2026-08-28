@@ -111,6 +111,10 @@ CREATE TABLE IF NOT EXISTS live_activity_registrations (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (device_id, activity_id)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS live_activity_relay_deletion_outbox (
+  push_id TEXT PRIMARY KEY,
+  queued_at INTEGER NOT NULL
+) STRICT;
 -- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
 -- tables below.
 CREATE TABLE IF NOT EXISTS bot_roster (
@@ -827,9 +831,9 @@ export class Storage {
     this.#db.prepare("DELETE FROM push_registrations WHERE device_id = ?").run(deviceId);
   }
 
-  /** Stores the one ActivityKit card owned by this device conversation and returns relay push ids
-   * that the caller must retire. The replacement and stale-row removal are one transaction so a
-   * turn can never observe both the superseded card and its replacement. */
+  /** Stores the one ActivityKit card owned by this device conversation and durably queues the
+   * superseded relay push ids it returns. The replacement, queueing, and stale-row removal are one
+   * transaction so a turn can never observe both the superseded card and its replacement. */
   saveLiveActivityRegistration(
     row: Omit<LiveActivityRegistrationRow, "eventSequence" | "lastTimestamp">,
   ): string[] {
@@ -839,6 +843,14 @@ export class Storage {
         `SELECT push_id AS pushId FROM live_activity_registrations
          WHERE device_id = ? AND (conversation_id = ? OR activity_id = ?)`,
       ).all(row.deviceId, row.conversationId, row.activityId) as Array<{ pushId: string }>;
+      const superseded = [...new Set(
+        previous.map(({ pushId }) => pushId).filter((pushId) => pushId !== row.pushId),
+      )];
+      const enqueue = this.#db.prepare(
+        `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+         VALUES (?, ?)`,
+      );
+      for (const pushId of superseded) enqueue.run(pushId, row.createdAt);
       this.#db.prepare(
         `DELETE FROM live_activity_registrations
          WHERE device_id = ? AND conversation_id = ? AND activity_id <> ?`,
@@ -852,7 +864,7 @@ export class Storage {
            bot = excluded.bot, push_id = excluded.push_id, created_at = excluded.created_at`,
       ).run(row.deviceId, row.activityId, row.runId, row.conversationId, row.bot, row.pushId, row.createdAt);
       this.#db.exec("COMMIT");
-      return [...new Set(previous.map(({ pushId }) => pushId).filter((pushId) => pushId !== row.pushId))];
+      return superseded;
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
@@ -887,11 +899,37 @@ export class Storage {
   }
 
   deleteLiveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {
-    const row = this.liveActivityRegistration(deviceId, activityId);
-    this.#db.prepare(
-      "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
-    ).run(deviceId, activityId);
-    return row;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.liveActivityRegistration(deviceId, activityId);
+      if (row !== undefined) {
+        this.#db.prepare(
+          `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+           VALUES (?, ?)`,
+        ).run(row.pushId, Date.now());
+        this.#db.prepare(
+          "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
+        ).run(deviceId, activityId);
+      }
+      this.#db.exec("COMMIT");
+      return row;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  liveActivityRelayDeletions(limit: number): string[] {
+    return (this.#db.prepare(
+      `SELECT push_id AS pushId FROM live_activity_relay_deletion_outbox
+       ORDER BY queued_at, push_id LIMIT ?`,
+    ).all(Math.max(0, limit)) as Array<{ pushId: string }>).map(({ pushId }) => pushId);
+  }
+
+  completeLiveActivityRelayDeletion(pushId: string): boolean {
+    return this.#db.prepare(
+      "DELETE FROM live_activity_relay_deletion_outbox WHERE push_id = ?",
+    ).run(pushId).changes === 1;
   }
 
   /** Replaces the whole cached roster in one transaction, preserving build order. */
@@ -3096,6 +3134,42 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // Older builds keyed activities only by ActivityKit id, so every new run could leave another
+  // row for the same device conversation. Retire all but the newest row durably before installing
+  // the invariant that prevents that fan-out shape from returning.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`
+      WITH ranked AS (
+        SELECT rowid AS registrationRowId, push_id AS pushId,
+          ROW_NUMBER() OVER (
+            PARTITION BY device_id, conversation_id
+            ORDER BY created_at DESC, rowid DESC
+          ) AS recency
+        FROM live_activity_registrations
+      )
+      INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+      SELECT pushId, ? FROM ranked WHERE recency > 1
+    `).run(Date.now());
+    db.exec(`
+      DELETE FROM live_activity_registrations WHERE rowid IN (
+        SELECT registrationRowId FROM (
+          SELECT rowid AS registrationRowId,
+            ROW_NUMBER() OVER (
+              PARTITION BY device_id, conversation_id
+              ORDER BY created_at DESC, rowid DESC
+            ) AS recency
+          FROM live_activity_registrations
+        ) WHERE recency > 1
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS live_activity_device_conversation
+        ON live_activity_registrations (device_id, conversation_id);
+    `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
   // Capability 28 distinguishes a submitted device decision from Hermes' later terminal event.
   // Existing durable rows remain pending with all request fields null after this additive migration.
   const interactionColumns = db
