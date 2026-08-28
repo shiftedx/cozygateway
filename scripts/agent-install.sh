@@ -882,10 +882,10 @@ dashboard_credentials_work() {
 enable_dashboard_basic_plugin() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   enable bundled Hermes dashboard_auth/basic for the root Dashboard profile"; return; }
   "$HERMES_RESOLVED" -p default plugins enable basic --no-allow-tool-override >/dev/null
-  local disabled repaired code
+  local disabled repair_plan expected actual code index
   disabled="$("$HERMES_RESOLVED" -p default config get plugins.disabled --json 2>/dev/null)" || return
   set +e
-  repaired="$(printf '%s' "$disabled" | "$NODE_RESOLVED" -e '
+  repair_plan="$(printf '%s' "$disabled" | "$NODE_RESOLVED" -e '
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { input += chunk; });
@@ -893,18 +893,35 @@ process.stdin.on("end", () => {
   let disabled;
   try { disabled = JSON.parse(input); } catch { process.exit(2); }
   if (!Array.isArray(disabled) || disabled.some((name) => typeof name !== "string")) process.exit(2);
-  const repaired = disabled.filter((name) => name !== "basic" && name !== "dashboard_auth/basic");
-  if (repaired.length === disabled.length) process.exit(3);
-  process.stdout.write(JSON.stringify(repaired));
+  const blocked = new Set(["basic", "dashboard_auth/basic"]);
+  const indices = disabled.flatMap((name, index) => blocked.has(name) ? [index] : []).reverse();
+  if (indices.length === 0) process.exit(3);
+  process.stdout.write(JSON.stringify(disabled.filter((name) => !blocked.has(name))) + "\n" + indices.join("\n"));
 });
 ')"
   code=$?
   set -e
   case "$code" in
-    0) "$HERMES_RESOLVED" -p default config set plugins.disabled "$repaired" >/dev/null ;;
+    0) ;;
     3) return ;;
     *) die "Hermes returned an invalid plugins.disabled value; refusing to rewrite plugin configuration" ;;
   esac
+  expected="$(printf '%s\n' "$repair_plan" | sed -n '1p')"
+  while IFS= read -r index; do
+    [ -n "$index" ] || continue
+    "$HERMES_RESOLVED" -p default config unset "plugins.disabled.$index" >/dev/null || die "Hermes could not remove a stale Dashboard basic auth plugin block"
+  done <<EOF
+$(printf '%s\n' "$repair_plan" | sed '1d')
+EOF
+  actual="$("$HERMES_RESOLVED" -p default config get plugins.disabled --json 2>/dev/null)" || die "Hermes could not verify the repaired plugin configuration"
+  EXPECTED_DISABLED="$expected" ACTUAL_DISABLED="$actual" "$NODE_RESOLVED" -e '
+let expected, actual;
+try {
+  expected = JSON.parse(process.env.EXPECTED_DISABLED);
+  actual = JSON.parse(process.env.ACTUAL_DISABLED);
+} catch { process.exit(2); }
+if (!Array.isArray(actual) || JSON.stringify(actual) !== JSON.stringify(expected)) process.exit(2);
+' || die "Hermes did not preserve plugins.disabled as the expected list after repair"
 }
 launch_dashboard() {
   local hermes_root_arg="$HERMES_ROOT"

@@ -66,7 +66,22 @@ if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "get" ] && [ "$5" = "plugi
 fi
 if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ] && [ "$5" = "plugins.disabled" ]; then
   [ -n "${COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE:-}" ] || exit 2
-  printf '%s\n' "$6" > "$COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE"
+  # Match pre-July Hermes: structured command-line values were stored as
+  # strings. The installer must not use this path to repair a typed list.
+  "$COZYGATEWAY_TEST_REAL_NODE" -e 'process.stdout.write(JSON.stringify(process.argv[1]) + "\n")' "$6" > "$COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE"
+  exit 0
+fi
+if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "unset" ] && [[ "$5" = plugins.disabled.* ]]; then
+  [ -n "${COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE:-}" ] || exit 2
+  "$COZYGATEWAY_TEST_REAL_NODE" - "$COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE" "${5##*.}" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const [path, rawIndex] = process.argv.slice(2);
+const disabled = JSON.parse(readFileSync(path, 'utf8'));
+const index = Number(rawIndex);
+if (!Array.isArray(disabled) || !Number.isSafeInteger(index) || index < 0 || index >= disabled.length) process.exit(2);
+disabled.splice(index, 1);
+writeFileSync(path, JSON.stringify(disabled) + '\n');
+NODE
   exit 0
 fi
 if [ "$1" = "-p" ] && [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
@@ -321,6 +336,25 @@ grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
 grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -Fq 'COZYGATEWAY_URL=http://127.0.0.1:8787' "$tmp/hermes/.env"
 grep -Fq 'http://127.0.0.1:8787/health' "$tmp/curl.log"
+
+# On util-linux hosts, exercise the public one-paste shape with installer stdin
+# occupied by a pipe while a separate controlling terminal supplies the LAN
+# answer. A regression to `read` from fd 0 skips this prompt and stays loopback.
+if script --version 2>&1 | grep -qi util-linux; then
+  pty_output="$({ sleep 1; printf 'yes\n'; } | script -qec "printf 'bootstrap-stdin\\n' | env HOME='$tmp/pty-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.11 COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty'" /dev/null)"
+  grep -Fq 'Allow CozyChat to access this Gateway over your local network? [y/N]' <<<"$pty_output"
+  grep -Fq '"gatewayUrl":"http://192.0.2.11:8787"' <<<"$pty_output"
+  grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-pty/local/cozygateway.config.json"
+
+  # Keep a real controlling terminal present for the explicit-bind case too;
+  # otherwise the no-TTY guard could hide a regression in explicit suppression.
+  pty_explicit_output="$({ sleep 1; printf 'yes\n'; } | script -qec "env HOME='$tmp/pty-explicit-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-explicit-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bind-host 127.0.0.1 --port 9000 --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty-explicit'" /dev/null)"
+  grep -Fq 'CozyGateway listens on 127.0.0.1:9000' <<<"$pty_explicit_output"
+  if grep -Fq 'Allow CozyChat to access this Gateway' <<<"$pty_explicit_output"; then
+    echo 'an explicit bind host must skip the LAN prompt' >&2
+    exit 1
+  fi
+fi
 mode_of() {
   case "$(uname -s)" in
     Darwin) stat -f '%Lp' "$1" ;;
@@ -428,10 +462,6 @@ preserved_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp
 grep -Fq 'CozyGateway listens on 127.0.0.1:8999' <<<"$preserved_listener_output"
 overridden_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 0.0.0.0 --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq 'CozyGateway listens on 0.0.0.0:9000' <<<"$overridden_listener_output"
-if grep -Fq 'ask whether CozyChat may access' <<<"$overridden_listener_output"; then
-  echo 'an explicit bind host must skip the LAN prompt' >&2
-  exit 1
-fi
 
 # Restore the fixture listener for the live rerun checks below.
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
