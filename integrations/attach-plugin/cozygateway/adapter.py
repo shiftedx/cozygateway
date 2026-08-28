@@ -4236,7 +4236,11 @@ def register(ctx: Any) -> None:
             "the conversation. Markdown renders richly: use ## headings, - bullet / "
             "1. numbered / - [ ] task lists, | pipe | tables |, fenced code blocks, "
             "and $$ math. Inline bold and links show as literal text, so prefer the "
-            "block forms above."
+            "block forms above. For native attachments, put one MEDIA:/absolute/path "
+            "directive on each line of your final response; multiple directive lines "
+            "send multiple attachments. Keep directives outside code fences. These "
+            "directives automatically target this originating conversation. Use MEDIA: instead "
+            "of sandbox links or file:// URLs for native delivery."
         ),
     )
     ctx.register_tool(
