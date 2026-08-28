@@ -228,11 +228,13 @@ case "$*" in
     else printf '{"attach":{"configured":1,"online":1,"deadLetters":0}}'; fi
     ;;
   *api/health*)
-    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER" ]; then printf '000'; else printf '401'; fi
+    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER" ]; then printf '000'; else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_HEALTH_CODE:-401}"; fi
     ;;
   *password-login*)
     cat >/dev/null
-    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER" ]; then printf '401'; else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE:-200}"; fi
+    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_MISSING_PROVIDER_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_MISSING_PROVIDER_MARKER" ]; then printf '404'
+    elif [ -n "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER" ]; then printf '401'
+    else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE:-200}"; fi
     ;;
   *) printf '401' ;;
 esac
@@ -547,10 +549,20 @@ printf '%s  %s\n' "$windows_node_sha" "$windows_node_archive" > "$tmp/windows-no
 windows_node_output="$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" PROCESSOR_ARCHITECTURE=AMD64 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-node-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-node-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_NODE_FIXTURE="$fake_node" COZYGATEWAY_TEST_NODE_DIRECTORY="$windows_node_directory" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$windows_node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/windows-node-dist" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-node")"
 test -x "$tmp/gateway-windows-node/runtime/node/node.exe"
 grep -Fq 'installed checksum-verified Node.js' <<<"$windows_node_output"
-grep -Fq 'Expand-Archive -LiteralPath' "$tmp/windows-node-commands"
+grep -Fq '[IO.Compression.ZipFile]::ExtractToDirectory' "$tmp/windows-node-commands"
 grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <<<"$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-node")"
 
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
+
+# A fresh interactive install can opt into same-LAN access. Invalid input repeats
+# the one question; the affirmative answer persists the wildcard listener and
+# prints the temporary/private-network guidance before pairing.
+windows_lan_output="$(printf 'maybe\ny\n' | HOME="$tmp/windows-lan-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_INTERACTIVE=1 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-lan-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-lan-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-lan-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-lan")"
+grep -Fq 'Please answer y or n.' <<<"$windows_lan_output"
+grep -Fq 'trusted private network' <<<"$windows_lan_output"
+grep -Fq 'Tailscale' <<<"$windows_lan_output"
+grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-windows-lan/local/cozygateway.config.json"
+
 grep -Fq '/Create /F /SC ONLOGON /RL LIMITED /TN CozyGateway' "$tmp/windows-commands"
 grep -Fq 'wscript ' "$tmp/windows-commands"
 grep -Fq 'fake-qr' <<<"$windows_output"
@@ -571,8 +583,21 @@ dashboard_home_log="$tmp/windows-dashboard-home.log"
 dashboard_stopped_marker="$tmp/windows-native-dashboard-stopped"
 expected_windows_hermes_home="$("$tmp/bin/cygpath" -w "$tmp/hermes")"
 : > "$dashboard_stopped_marker"
-COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_home_log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_stopped_marker" HOME="$tmp/windows-native-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-native-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-native-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-native-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-native" >/dev/null
+COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_home_log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_stopped_marker" HOME="$tmp/windows-native-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-native-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-native-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-native-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-native" >/dev/null
 grep -Fxq "$expected_windows_hermes_home" "$dashboard_home_log"
+
+# Once a newly launched Dashboard is healthy, a missing password provider is
+# configuration/version failure, not a reason to hammer the login endpoint and
+# eventually misreport a generic credential timeout.
+dashboard_missing_provider_marker="$tmp/windows-dashboard-missing-provider-stopped"
+dashboard_missing_provider_auth_marker="$tmp/windows-dashboard-missing-provider-auth"
+: > "$dashboard_missing_provider_marker"
+: > "$dashboard_missing_provider_auth_marker"
+if dashboard_missing_provider_output="$(COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$tmp/windows-dashboard-missing-provider-home.log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_missing_provider_marker" COZYGATEWAY_TEST_DASHBOARD_MISSING_PROVIDER_MARKER="$dashboard_missing_provider_auth_marker" HOME="$tmp/windows-missing-provider-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-missing-provider-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-missing-provider-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-missing-provider-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-missing-provider" 2>&1)"; then
+  echo 'expected missing Dashboard basic auth provider to fail' >&2
+  exit 1
+fi
+expect_contains "$dashboard_missing_provider_output" 'basic auth provider is unavailable (HTTP 404)'
 # A rerun stops only the validated listener and starts the newly installed bundle.
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live"
 grep -Fq 'powershell -NoProfile -NonInteractive -Command' "$tmp/windows-commands"
@@ -596,7 +621,7 @@ test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/Cozy
 dashboard_stop_home_log="$tmp/windows-dashboard-stop-home.log"
 dashboard_relaunch_home_log="$tmp/windows-dashboard-relaunch-home.log"
 set +e
-dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-dashboard-gateway-ready" COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER="$tmp/windows-dashboard-wrong" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$tmp/windows-dashboard-stopped" COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG="$dashboard_stop_home_log" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_relaunch_home_log" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-dashboard" 2>&1)"
+dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-dashboard-gateway-ready" COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER="$tmp/windows-dashboard-wrong" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$tmp/windows-dashboard-stopped" COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG="$dashboard_stop_home_log" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_relaunch_home_log" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-dashboard" 2>&1)"
 dashboard_fallback_status=$?
 set -e
 test "$dashboard_fallback_status" -eq 0

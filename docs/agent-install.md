@@ -84,7 +84,14 @@ certificate name; private certificate authorities still use
 Local CLI health checks also pin the configured leaf certificate while allowing
 the bind address to differ from its DNS name.
 
-Fresh installs listen on `127.0.0.1:8787`. Use `--bind-host 0.0.0.0` explicitly for LAN access.
+Fresh interactive installs ask whether devices on the local network should be
+allowed to connect. Press Enter or answer `n` to keep the safe
+`127.0.0.1:8787` default; answer `y` to listen on `0.0.0.0` and put the
+machine's detected LAN address in the pairing QR. LAN mode is plaintext and is
+only appropriate on a trusted private network before moving to the documented
+Tailscale setup. Explicit listener/public URL options, saved installs, dry
+runs, and noninteractive installs bypass the question. Power users can still
+choose LAN access directly with `--bind-host 0.0.0.0`.
 For a tunnel, pass `--public-url https://gateway.example.com`; the installer persists the canonical
 origin and requires/sets loopback. Network reachability outside the machine is deliberately not
 automated; see `docs/connectivity.md`.

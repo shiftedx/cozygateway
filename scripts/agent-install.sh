@@ -162,6 +162,23 @@ NODE
   # another bind (which validation below will reject), move an existing LAN install back to loopback.
   [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$BIND_HOST_EXPLICIT" = 1 ] || BIND_HOST=127.0.0.1
 }
+choose_fresh_listener() {
+  local answer
+  [ ! -f "$CONFIG_JSON" ] || return 0
+  [ "$BIND_HOST_EXPLICIT" = 0 ] || return 0
+  [ "$PUBLIC_URL_EXPLICIT" = 0 ] || return 0
+  [ "$CLEAR_PUBLIC_URL" = 0 ] || return 0
+  [ "$DRY_RUN" = 0 ] || return 0
+  [ -t 0 ] || [ "${COZYGATEWAY_TEST_INTERACTIVE:-0}" = 1 ] || return 0
+  while true; do
+    read -r -p 'Allow devices on your local network to connect? [y/N] ' answer || return 0
+    case "$answer" in
+      y|Y|yes|YES|Yes) BIND_HOST=0.0.0.0; return ;;
+      ''|n|N|no|NO|No) return ;;
+      *) say 'Please answer y or n.' ;;
+    esac
+  done
+}
 validate_listener_settings() {
   [ -n "$BIND_HOST" ] || die "--bind-host must not be empty"
   case "$PORT" in ''|*[!0-9]*) die "--port must be 1-65535" ;; esac
@@ -264,7 +281,7 @@ install_node_runtime() {
       COZYGATEWAY_NODE_EXPAND_ARCHIVE="$(to_windows_path "$stage/$archive")" \
       COZYGATEWAY_NODE_EXPAND_DESTINATION="$(to_windows_path "$stage")" \
       powershell.exe -NoProfile -NonInteractive -Command \
-        'Expand-Archive -LiteralPath $env:COZYGATEWAY_NODE_EXPAND_ARCHIVE -DestinationPath $env:COZYGATEWAY_NODE_EXPAND_DESTINATION -Force'
+        'Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::ExtractToDirectory($env:COZYGATEWAY_NODE_EXPAND_ARCHIVE, $env:COZYGATEWAY_NODE_EXPAND_DESTINATION)'
     source="$stage/${archive%.zip}"
     [ -x "$source/node.exe" ] || die "$archive did not contain a Node.js executable"
   else
@@ -843,13 +860,16 @@ dashboard_ready() {
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$DASHBOARD_PORT/api/health" 2>/dev/null || true)"
   [ "$code" = 200 ] || [ "$code" = 401 ]
 }
-dashboard_credentials_work() {
+dashboard_credentials_status() {
   local code
   code="$(
     DASHBOARD_USERNAME="$DASHBOARD_USER" DASHBOARD_PASSWORD="$DASHBOARD_PASSWORD" "$NODE_RESOLVED" -e 'process.stdout.write(JSON.stringify({provider:"basic", username:process.env.DASHBOARD_USERNAME, password:process.env.DASHBOARD_PASSWORD}))' |
       curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "http://127.0.0.1:$DASHBOARD_PORT/auth/password-login" -H 'content-type: application/json' --data-binary @- 2>/dev/null || true
   )"
-  [ "$code" = 200 ]
+  printf '%s' "$code"
+}
+dashboard_credentials_work() {
+  [ "$(dashboard_credentials_status)" = 200 ]
 }
 enable_dashboard_basic_plugin() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   enable bundled Hermes dashboard_auth/basic for the root Dashboard profile"; return; }
@@ -866,6 +886,7 @@ const [dashboardEnvPath, hermesRoot, hermes, dashboardPort] = process.argv.slice
 const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
 const child = spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'], {
   detached: true,
+  windowsHide: process.platform === 'win32',
   stdio: 'ignore',
   env: { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_BASIC_AUTH_USERNAME: dashboard.DASHBOARD_USERNAME, HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: dashboard.DASHBOARD_PASSWORD },
 });
@@ -902,7 +923,7 @@ stop_stubborn_windows_dashboard() {
   [ "$code" -eq 0 ] || die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop"
 }
 start_dashboard() {
-  local hermes_root_arg="$HERMES_ROOT"
+  local hermes_root_arg="$HERMES_ROOT" code
   is_windows && hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
   enable_dashboard_basic_plugin
   [ "$DRY_RUN" = 1 ] && { say "DRY   start/reuse Hermes Dashboard at 127.0.0.1:$DASHBOARD_PORT as the control/read plane"; return; }
@@ -918,8 +939,16 @@ start_dashboard() {
     dashboard_ready && die "Dashboard stayed listening after stop; refusing to launch with an unverified credential"
   fi
   launch_dashboard
-  for _ in $(seq 1 30); do dashboard_credentials_work && return; sleep 1; done
-  die "Hermes Dashboard did not accept the local control-plane credential on 127.0.0.1:$DASHBOARD_PORT"
+  for _ in $(seq 1 30); do dashboard_ready && break; sleep 1; done
+  dashboard_ready || die "Hermes Dashboard did not start listening on 127.0.0.1:$DASHBOARD_PORT"
+  code="$(dashboard_credentials_status)"
+  case "$code" in
+    200) return ;;
+    404) die "Hermes Dashboard started, but its basic auth provider is unavailable (HTTP 404); update Hermes Agent and retry" ;;
+    401) die "Hermes Dashboard rejected the installer-owned local credential (HTTP 401)" ;;
+    429) die "Hermes Dashboard rate-limited local credential verification (HTTP 429); stop the Dashboard and retry after one minute" ;;
+    *) die "Hermes Dashboard credential verification failed with HTTP ${code:-000} on 127.0.0.1:$DASHBOARD_PORT" ;;
+  esac
 }
 uninstall() {
   local profiles root hermes_bin p home plugin spool action hermes_available=1
@@ -1006,8 +1035,8 @@ main() {
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
   else install_node_runtime
   fi
-  [ "$prerequisite_missing" = 1 ] || { hydrate_listener_settings; validate_listener_settings; }
-  if [ "$STATUS" = 1 ]; then status_install; return; fi
+  [ "$prerequisite_missing" = 1 ] || hydrate_listener_settings
+  if [ "$STATUS" = 1 ]; then validate_listener_settings; status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
   if HERMES_RESOLVED="$(find_hermes)"; then say "OK    using Hermes at $HERMES_RESOLVED"
@@ -1020,6 +1049,8 @@ main() {
     say "DRY   after prerequisites, configure CozyGateway and require healthy attach state before printing pairing material"
     return
   fi
+  choose_fresh_listener
+  validate_listener_settings
   HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
@@ -1030,6 +1061,10 @@ main() {
   is_windows || install_posix_cli
   if [ -n "$PUBLIC_URL" ]; then
     say "OK    CozyGateway listens on $BIND_HOST:$PORT and advertises $PUBLIC_URL. HTTPS exposure is user-managed."
+  elif [ "$BIND_HOST" = 0.0.0.0 ] || [ "$BIND_HOST" = :: ]; then
+    say "OK    CozyGateway listens on $BIND_HOST:$PORT for devices on your local network."
+    say "WARN  LAN access is plaintext; use it only on a trusted private network."
+    say "INFO  for remote access, switch to Tailscale: https://cozylabs.ai/docs/access/"
   else
     say "OK    CozyGateway listens on $BIND_HOST:$PORT. External exposure is user-managed and requires HTTPS."
   fi
