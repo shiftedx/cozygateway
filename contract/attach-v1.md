@@ -188,6 +188,20 @@ capability and both absent until the fact they describe exists:
   outranks `failed`, states never regress, and `stage` is `authorization` (quarantined at inbox
   admission) or `projection` (dead-lettered after retries).
 
+When the admitted `scheduled` event has a non-empty `mediaIds` array, the HTTP receipt additionally
+carries these three fields together (and omits all three for text-only deliveries, preserving that
+legacy response shape):
+
+- `expectedMediaIds`: the admitted event's media IDs, in order, bounded to the protocol maximum of
+  16;
+- `committedMediaIds`: the `fileId` values actually present on the committed native
+  `BotChatMessage`, in attachment order. It is `[]` before durable projection or when that row has
+  no attachments;
+- `mediaVerified`: `true` only when projection is durable and those two arrays are exactly equal,
+  including order. Admission, upload, notification, and `displayedAt` are not media verification.
+
+These are read-back-only HTTP facts. They do not enlarge the durable `delivery_receipt` command.
+
 ### `delivery_receipt` command
 
 Negotiating `delivery_receipts` asks the gateway to push those same facts back down the ordinary

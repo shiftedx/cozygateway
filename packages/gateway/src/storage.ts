@@ -524,6 +524,13 @@ export interface AttachScheduledDeliveryReceipt {
   deadLetteredAt?: number;
   /** Capability 31. When a paired device reported the projected row on screen. */
   displayedAt?: number;
+  /** Present together only when the admitted scheduled event expected media. These are a bounded
+   * read-back of its requested IDs and the committed native row's actual attachment IDs. */
+  expectedMediaIds?: string[];
+  committedMediaIds?: string[];
+  /** True only when projection is durable and the committed native attachment IDs exactly match
+   * the expected IDs in order. Display and media upload are deliberately not substitutes. */
+  mediaVerified?: boolean;
   /** The one terminal fact about this occurrence, once it has one. `state` above stays the
    * projection-pipeline position it has always been, so an existing reader is untouched. */
   terminal?: {
@@ -2229,18 +2236,22 @@ export class Storage {
                 inbox.applied_at AS projectedAt, inbox.projection_attempts AS attempts,
                 inbox.dead_lettered_at AS deadLetteredAt, inbox.disposition AS disposition,
                 inbox.projection_error AS projectionError,
-                receipt.displayed_at AS displayedAt
+                receipt.displayed_at AS displayedAt,
+                message.attachments_json AS attachmentsJson
          FROM attach_scheduled_deliveries AS delivery
          JOIN attach_event_inbox AS inbox
            ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
          LEFT JOIN bot_message_receipts AS receipt
            ON receipt.bot = delivery.agent_id AND receipt.message_id = delivery.message_id
+         LEFT JOIN bot_native_messages AS message
+           ON message.bot = delivery.agent_id AND message.message_id = delivery.message_id
          WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
       )
       .get(agentId, deliveryId) as {
         threadId: string; messageId: string; frameJson: string; admittedAt: number;
         projectedAt: number | null; attempts: number; deadLetteredAt: number | null;
         disposition: string; projectionError: string | null; displayedAt: number | null;
+        attachmentsJson: string | null;
       } | undefined;
     if (row === undefined) return undefined;
     const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
@@ -2263,22 +2274,38 @@ export class Storage {
       ...(row.displayedAt === null ? {} : { displayedAt: row.displayedAt }),
       ...(terminal === undefined ? {} : { terminal }),
     };
+    const expectedMediaIds = frame.event.kind === "scheduled" && frame.event.mediaIds?.length
+      ? frame.event.mediaIds.slice(0, 16)
+      : undefined;
+    const committedMediaIds = row.projectedAt === null || row.attachmentsJson === null
+      ? []
+      : (JSON.parse(row.attachmentsJson) as BotChatAttachment[])
+        .flatMap((attachment) => typeof attachment.fileId === "string" ? [attachment.fileId] : []);
+    const media = expectedMediaIds === undefined
+      ? {}
+      : {
+        expectedMediaIds,
+        committedMediaIds,
+        mediaVerified: row.projectedAt !== null
+          && expectedMediaIds.length === committedMediaIds.length
+          && expectedMediaIds.every((mediaId, index) => mediaId === committedMediaIds[index]),
+      };
     if (row.projectedAt !== null) {
       return {
         deliveryId, messageId: row.messageId, target,
-        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt, ...extras,
+        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt, ...extras, ...media,
       };
     }
     if (row.deadLetteredAt !== null) {
       return {
         deliveryId, messageId: row.messageId, target,
         state: "blocked", admittedAt: row.admittedAt, attempts: row.attempts,
-        deadLetteredAt: row.deadLetteredAt, ...extras,
+        deadLetteredAt: row.deadLetteredAt, ...extras, ...media,
       };
     }
     return {
       deliveryId, messageId: row.messageId, target,
-      state: "admitted", admittedAt: row.admittedAt, ...extras,
+      state: "admitted", admittedAt: row.admittedAt, ...extras, ...media,
     };
   }
 
