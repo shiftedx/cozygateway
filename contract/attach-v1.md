@@ -188,6 +188,20 @@ capability and both absent until the fact they describe exists:
   outranks `failed`, states never regress, and `stage` is `authorization` (quarantined at inbox
   admission) or `projection` (dead-lettered after retries).
 
+When the admitted `scheduled` event has a non-empty `mediaIds` array, the HTTP receipt additionally
+carries these three fields together (and omits all three for text-only deliveries, preserving that
+legacy response shape):
+
+- `expectedMediaIds`: the admitted event's media IDs, in order, bounded to the protocol maximum of
+  16;
+- `committedMediaIds`: the `fileId` values actually present on the committed native
+  `BotChatMessage`, in attachment order. It is `[]` before durable projection or when that row has
+  no attachments;
+- `mediaVerified`: `true` only when projection is durable and those two arrays are exactly equal,
+  including order. Admission, upload, notification, and `displayedAt` are not media verification.
+
+These are read-back-only HTTP facts. They do not enlarge the durable `delivery_receipt` command.
+
 ### `delivery_receipt` command
 
 Negotiating `delivery_receipts` asks the gateway to push those same facts back down the ordinary
@@ -280,8 +294,10 @@ One-shot `location.current` additionally requires negotiated `mobile_location`; 
 ```
 
 Every mobile request `purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
-C0/C1 control characters; invalid input is rejected rather than truncated. Location expiry is at
-most 30 seconds. Success remains commandless because the pending `requestId` binds the command:
+C0/C1 control characters; invalid input is rejected rather than truncated. Status and location
+expire within 30 seconds. Camera, file-picker, and notification interactions expire within 120
+seconds so a foreground human action can finish while remaining bounded. Success remains
+commandless because the pending `requestId` binds the command:
 `{ "kind": "mobile_result", "requestId": "...", "status": "ok", "result": { "latitude": 41.88, "longitude": -87.63 } }`.
 Both coordinates must be finite, range-bounded (`latitude [-90,90]`, `longitude [-180,180]`), and
 have no more than two decimal places. The gateway rejects an incompatible result shape.
@@ -300,9 +316,34 @@ and is dropped on reconnect. Terminal
 statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground_required`, and
 `policy_blocked`.
 
+`mobile_failure_details` is an optional attach capability for truthful terminal diagnostics. A
+gateway MUST send the historical `{ kind, requestId, status }` terminal shape when the plugin did
+not negotiate it. When it is negotiated, a non-`ok` result MAY additionally carry both `stage` and
+`reason` (never only one). Successful results are unchanged.
+
+Stages are the closed set `policy`, `routing`, `dispatch`, `response`, `media`, `receipt`, and
+`lifecycle`. Reasons are the closed set `no_selected_device`, `command_not_advertised`,
+`selected_socket_unavailable`, `frame_send_failed`, `phone_disconnected_pending`,
+`invalid_phone_payload`, `lease_mismatch`, `cross_device_result`, `receipt_persistence_failed`,
+`broker_closed_pending`, `malformed_request_frame`, `request_expired_unanswered`,
+`request_policy_rejected`, `selected_app_not_foreground`, `media_validation_failed`, and
+`media_storage_failed`. Peers MUST reject unknown stages/reasons and MUST NOT substitute raw error
+text. These fields describe only the bounded failure class: they never contain a purpose, request,
+thread, turn, device or media identifier, path, coordinates, tokens, media contents, socket state,
+or private payload. In particular, an unanswered dispatched request is `expired` with
+`response/request_expired_unanswered`; an invalid phone result is `policy_blocked` with
+`response/invalid_phone_payload`; and media validation/storage failures are `policy_blocked` with
+the corresponding `media/*` reason. Status remains authoritative and no failure diagnostic may be
+represented as `ok`.
+
 The plugin may send `{ "kind": "mobile_cancel", "requestId": "..." }` to settle its own
 pending tool. It is also negotiated, unsequenced, non-durable, and never replayed; a late phone
 result is ignored. A gateway MUST neither accept a location request nor send a location result
 without `mobile_location` negotiated. Purpose and all mobile payload fields are in-memory
 request/result values only and are never put in the durable spool, transcript, storage, diagnostic
 logs/traces, tool-hook details, audit, or push payloads.
+
+For camera and file-picker media, the deadline governs admission to the authenticated upload route.
+The gateway consumes the one-shot device/lease claim before reading the request body. An upload
+claimed before the deadline may finish reading, validating, and storing after it; the consumed
+claim remains replay-safe and cannot authorize a second upload.

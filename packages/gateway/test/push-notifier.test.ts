@@ -48,6 +48,28 @@ async function settle(): Promise<void> {
 }
 
 describe("RelayNotifier", () => {
+  it("schedules one privacy-minimal status wake for the selected registered device", async () => {
+    const storage = seeded([
+      { deviceId: "selected", pushId: "selected-push", relayUrl: "http://relay.test", pushKey: "selected-key" },
+      { deviceId: "other", pushId: "other-push", relayUrl: "http://relay.test", pushKey: "other-key" },
+    ]);
+    const { impl, sent } = fetchStub(() => 202);
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {} });
+
+    expect(notifier.notifyMobileNodeWake("selected")).toBe(true);
+    expect(notifier.notifyMobileNodeWake("missing")).toBe(false);
+    await settle();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body).toMatchObject({
+      pushId: "selected-push",
+      category: "mobile.status.wake",
+      collapseId: "mobile.status",
+    });
+    expect(decrypt("selected-key", sent[0]!.body.ciphertext)).toEqual({ kind: "mobile_node_wake" });
+    storage.close();
+  });
+
   it("is a no-op with zero registrations", async () => {
     const storage = seeded([]);
     const { impl, sent } = fetchStub(() => 202);

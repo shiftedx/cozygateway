@@ -43,6 +43,12 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     await until(() => clientFrames.some((frame) => frame.type === "ready"));
     await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "sage"));
 
+    const readinessURL = `${gateway.url}/bots/sage/readiness`;
+    const auth = { authorization: `Bearer ${deviceToken}` };
+    expect(await (await fetch(readinessURL, { headers: auth })).json()).toMatchObject({
+      name: "sage", status: "starting",
+    });
+
     const pluginFrames: any[] = [];
     const plugin = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
     sockets.push(plugin);
@@ -50,6 +56,8 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     await once(plugin, "open");
     plugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "hermes-sage", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
+    await until(async () =>
+      ((await (await fetch(readinessURL, { headers: auth })).json()) as { status: string }).status === "ready");
     expect(pluginFrames.find((frame) => frame.kind === "hello_ack")?.capabilities).not.toContain("media");
 
     const send = await fetch(`${gateway.url}/bots/sage/chat/messages`, {
@@ -195,9 +203,9 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
   }
 });
 
-async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
+async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - start > timeoutMs) throw new Error("timeout");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }

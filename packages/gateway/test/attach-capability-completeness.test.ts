@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 
 import { ATTACH_V1_CAPABILITIES } from "../src/adapters/attach/ingress-v1.ts";
-import { AttachV1CapabilitySchema } from "../src/adapters/attach/protocol-v1.ts";
+import {
+  AttachV1CapabilitySchema, AttachV1MobileFailureReasonSchema, AttachV1MobileFailureStageSchema,
+} from "../src/adapters/attach/protocol-v1.ts";
+import { MOBILE_NODE_FAILURE_REASONS, MOBILE_NODE_FAILURE_STAGES } from "../src/mobile-node.ts";
 
 /**
  * The schema says which capability names are legal; this list says which ones the gateway will
@@ -25,5 +28,12 @@ describe("the capabilities the gateway will negotiate", () => {
 
   it("contain no duplicates", () => {
     expect(new Set(ATTACH_V1_CAPABILITIES).size).toBe(ATTACH_V1_CAPABILITIES.length);
+  });
+
+  it("keeps the attach diagnostic vocabulary identical to the broker catalog", () => {
+    expect(AttachV1MobileFailureStageSchema.anyOf.map((member) => member.const).sort())
+      .toEqual([...MOBILE_NODE_FAILURE_STAGES].sort());
+    expect(AttachV1MobileFailureReasonSchema.anyOf.map((member) => member.const).sort())
+      .toEqual([...MOBILE_NODE_FAILURE_REASONS].sort());
   });
 });

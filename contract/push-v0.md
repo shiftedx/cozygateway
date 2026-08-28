@@ -58,8 +58,9 @@ service for that registration; omission uses the relay's configured default.
 - `apns`: token-based APNs (ES256 provider JWT) when the relay is configured with an APNs key
   (env: APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC, APNS_ENVIRONMENT); `token` is the
   hex device token. When APNs is not configured, an `apns` registration returns 501
-  `unsupported_platform`. The push payload is an alert with `mutable-content: 1` carrying the opaque
-  ciphertext under the top-level custom key `c`; the relay never decrypts it.
+  `unsupported_platform`. Ordinary and actionable push payloads are alerts with `mutable-content: 1`;
+  the `mobile.status.wake` payload is silent/background. Both carry the opaque ciphertext under the
+  top-level custom key `c`; the relay never decrypts it.
 
 Response: 201 `{"pushId": string}`. The pushId is 16 random bytes, base64url. It is
 unguessable and knowing it is the de-facto capability to notify that registration.
@@ -86,10 +87,11 @@ Registered categories:
 | `message` | `alert` | `message` | CozyChat / "New message" | digest of bot name + canonical chat session, required |
 | `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
 | `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
+| `mobile.status.wake` | `background` | omitted | none | `mobile.status`, required |
 
-On APNs the category becomes `aps.category` and the collapse id becomes the `apns-collapse-id`
-header; on a webhook both fields are added to the delivered JSON body next to `ciphertext`. Bot
-chat replies use category `message`; the stable collapse id coalesces a burst from one bot's
+On APNs an alert category becomes `aps.category` and the collapse id becomes the
+`apns-collapse-id` header; on a webhook both fields are added to the delivered JSON body next to
+`ciphertext`. Bot chat replies use category `message`; the stable collapse id coalesces a burst from one bot's
 canonical chat without exposing its raw name or Hermes session id. A category outside the
 allowlist is 400. `collapseId` is bounded to an opaque-id charset
 (`[A-Za-z0-9_.:-]`, 1 to 64 characters), the only caller-controlled cleartext string besides the
@@ -104,11 +106,21 @@ unnoticed but correct "resolved" banner rather than a lying "pending" one. The a
 relay sends carries nothing: it cannot read the ciphertext, so it emits a fixed, content-free
 alert per category and the device's notification service extension rewrites it after decrypting.
 
+`mobile.status.wake` is the silent exception: APNs receives
+`{"aps":{"content-available":1},"c":"<ciphertext>"}` with `apns-push-type: background`,
+`apns-priority: 5`, and `apns-collapse-id: mobile.status`. Its `aps` dictionary contains no
+alert, badge, sound, category, or `mutable-content`. Delivery is explicitly best-effort: iOS may
+throttle or drop the wake, and the relay does not queue or retry it. Request, lease, chat, and
+device details remain inside the ciphertext and never become relay-visible.
+
 Response: 202 `{}` once the notify is accepted and handed to the transport. Delivery is
 best-effort; the relay does not queue or retry in v0, and a delivery failure still
 returns 202 and still counts against the cap. A delivery refused by restricted-egress
 mode (the resolved address is in a blocked range) is handled the same way as any other
-delivery failure.
+delivery failure. After APNs asynchronously rejects a delivery with HTTP 410, the relay
+deletes that terminally invalid registration; the accepted request remains 202, and a
+subsequent notify for the same `pushId` returns 404. Other APNs HTTP statuses and network
+failures retain the registration.
 
 - Unknown pushId: 404 `not_found`. A gateway receiving this should delete its stored
   registration for that device.
@@ -152,6 +164,16 @@ A receiver MUST treat an ABSENT `kind` as `"message"`: every gateway that shippe
 field emits exactly that payload without it. A gateway at this revision or later always sends
 `"kind": "message"` explicitly, so the discriminator is present in practice and "no kind" only
 ever means "older gateway".
+
+**`kind: "mobile_node_wake"`** (a silent request for the selected idle phone to reconnect;
+category `mobile.status.wake`, collapse id `mobile.status`):
+
+```json
+{ "kind": "mobile_node_wake" }
+```
+
+The decrypted plaintext is exactly the object above. It contains no request, lease, agent, chat,
+or device identifiers.
 
 **`kind: "approval_pending"`** (a tool call is waiting on a decision; category
 `approval.pending`, collapse id = `toolCallId`):

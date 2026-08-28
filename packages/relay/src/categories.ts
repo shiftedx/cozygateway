@@ -2,26 +2,40 @@
  * Push categories (cozygateway issue #19, section 2).
  *
  * A category is the ONE piece of routing metadata the relay is allowed to see in the clear.
- * It tells a transport how to shape the envelope (which actionable notification category the
- * app should attach buttons to, and that this push coalesces), and nothing about the content:
+ * It tells a transport how to shape the envelope (alert/actionable or silent/background,
+ * and that this push coalesces), and nothing about the content:
  * every field describing the notification itself rides inside the opaque ciphertext the relay
  * cannot read. See the relay README, "Push categories".
  */
 
-export const PUSH_CATEGORY_IDS = ["message", "approval.pending", "approval.resolved"] as const;
+export const PUSH_CATEGORY_IDS = [
+  "message",
+  "approval.pending",
+  "approval.resolved",
+  "mobile.status.wake",
+] as const;
 export type PushCategoryId = (typeof PUSH_CATEGORY_IDS)[number];
 
-export interface PushCategorySpec {
-  /** The category id, echoed into the APNs payload as `aps.category`. */
+interface PushCategorySpecBase {
+  /** The cleartext routing id; alert categories are echoed as `aps.category`. */
   readonly id: PushCategoryId;
-  /** APNs `apns-push-type`. */
-  readonly pushType: "alert";
   /** When true, `/notify` refuses this category without a collapse id. */
   readonly requiresCollapseId: boolean;
+}
+
+interface AlertPushCategorySpec extends PushCategorySpecBase {
+  /** APNs `apns-push-type`. */
+  readonly pushType: "alert";
   /** Fallback alert the relay can build without reading anything: no content, ever. On iOS
    *  the Notification Service Extension decrypts the payload and rewrites this in place. */
   readonly alert: { readonly title: string; readonly body: string };
 }
+
+interface BackgroundPushCategorySpec extends PushCategorySpecBase {
+  readonly pushType: "background";
+}
+
+export type PushCategorySpec = AlertPushCategorySpec | BackgroundPushCategorySpec;
 
 /**
  * `approval.resolved` is deliberately an ALERT push on the same collapse id rather than a
@@ -51,6 +65,11 @@ export const PUSH_CATEGORIES: Readonly<Record<PushCategoryId, PushCategorySpec>>
     pushType: "alert",
     requiresCollapseId: true,
     alert: { title: "CozyChat", body: "Approval resolved" },
+  },
+  "mobile.status.wake": {
+    id: "mobile.status.wake",
+    pushType: "background",
+    requiresCollapseId: true,
   },
 };
 

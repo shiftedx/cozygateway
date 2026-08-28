@@ -25,6 +25,7 @@ How the harness's native stream maps onto the attach protocol:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -51,6 +52,8 @@ from .attach_client import (
 )
 from .attach_client_v1 import (
     HELLO_ACK_TIMEOUT_SECONDS,
+    MOBILE_FAILURE_REASONS,
+    MOBILE_FAILURE_STAGES,
     MOBILE_STATUS_VALUES,
     AttachV1Client,
     AttachV1ClientConfig,
@@ -66,6 +69,8 @@ from .media_descriptor import (
     MEDIA_COMPATIBILITY_POLICY,
     MediaDescriptor,
     MediaProbeError,
+    detect_mime,
+    family_for,
     probe as probe_media,
 )
 from .text_blocks import (
@@ -331,6 +336,22 @@ class MediaBatch:
     def error_lines(self) -> List[str]:
         """The bounded human-readable failure lines the durable result ABI carries."""
         return [str(entry["error"]) for entry in self.failed]
+
+    def attachment_descriptors(self) -> List[Dict[str, Any]]:
+        """The deliberately small attachment receipt surface for an agent tool.
+
+        ``uploaded`` is an internal transport record: it needs a source path and a
+        digest for retries and cleanup.  Those are not facts an agent needs (and a
+        source path is especially not a fact it may disclose), so tool results must
+        pass through this one narrowing seam.
+        """
+        return [{
+            "attachmentId": str(entry["mediaId"]),
+            "name": str(entry["path"]),
+            "mimeType": str(entry["mime"]),
+            "bytes": int(entry["bytes"]),
+            "mediaKind": str(entry["family"]),
+        } for entry in self.uploaded]
 
     def failure_sentence(self) -> str:
         """One plain sentence naming what the person will NOT see (spec finding 2)."""
@@ -2221,6 +2242,72 @@ class AttachAdapter:
         interim_metadata["_interim_send"] = True
         return await self.send(chat_id, content, metadata=interim_metadata)
 
+    async def media_delivery_receipt(
+        self, delivery_id: str, timeout_seconds: float = 0.5
+    ) -> Optional[Dict[str, Any]]:
+        """Read one media delivery receipt through this adapter's live transport.
+
+        Tool handlers must never reach into a client directly: the adapter owns both
+        the socket readiness boundary and the bounded HTTP reader.  A missing or
+        temporarily unwritable client is indistinguishable from no new gateway fact.
+        Local durable rows remain the fallback in that case.
+        """
+        client, loop = self._client, self._loop
+        if not isinstance(client, AttachV1Client) or not self._ready.is_set():
+            return None
+        timeout = max(0.05, min(float(timeout_seconds), 1.0))
+        pending = None
+        try:
+            if loop is None or asyncio.get_running_loop() is loop:
+                return await client.delivery_receipt(delivery_id, timeout)
+            if loop.is_closed():
+                return None
+            pending = asyncio.run_coroutine_threadsafe(
+                client.delivery_receipt(delivery_id, timeout), loop
+            )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            raise
+        except Exception:  # noqa: BLE001 - status must not invent a failure from a read error
+            logger.debug("attach: media delivery receipt read failed", exc_info=True)
+            return None
+
+    async def media_delivery_status_snapshot(
+        self, delivery_id: str, timeout_seconds: float = 0.5
+    ) -> Dict[str, Any]:
+        """Read remote and local receipt facts on the spool-owning event loop."""
+        loop = self._loop
+        if loop is None or asyncio.get_running_loop() is loop:
+            return await self._media_delivery_status_snapshot_on_owner_loop(
+                delivery_id, timeout_seconds
+            )
+        if loop.is_closed():
+            return {"receipt": None, "rows": [], "localReceipt": None}
+        pending = asyncio.run_coroutine_threadsafe(
+            self._media_delivery_status_snapshot_on_owner_loop(delivery_id, timeout_seconds),
+            loop,
+        )
+        try:
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            pending.cancel()
+            raise
+
+    async def _media_delivery_status_snapshot_on_owner_loop(
+        self, delivery_id: str, timeout_seconds: float
+    ) -> Dict[str, Any]:
+        receipt = await self.media_delivery_receipt(delivery_id, timeout_seconds)
+        rows = _safe_media_rows(self._spool, delivery_id)
+        local_receipt = None
+        if self._spool is not None:
+            try:
+                local_receipt = self._spool.delivery_receipt_row(delivery_id)
+            except Exception:  # noqa: BLE001 - remote receipt remains usable
+                logger.debug("attach: local delivery receipt read failed", exc_info=True)
+        return {"receipt": receipt, "rows": rows, "localReceipt": local_receipt}
+
     async def send_proactive(
         self,
         chat_id: str,
@@ -2235,7 +2322,52 @@ class AttachAdapter:
 
         ``media_positions``, when given, is aligned index-for-index with ``media_files``
         and says which block each attachment renders before.
+
+        Hermes tool handlers run on their own event loop.  The resident attach client,
+        its asyncio locks, and its SQLite spool belong to the adapter loop that opened
+        them, so cross that boundary before probing or uploading any bytes.  Crossing
+        halfway through leaves a successfully uploaded object without a journal row.
         """
+        loop = self._loop
+        if loop is None or asyncio.get_running_loop() is loop:
+            return await self._send_proactive_on_owner_loop(
+                chat_id,
+                message,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+                media_positions=media_positions,
+            )
+        if loop.is_closed():
+            return _proactive_failure("attach_not_writable")
+        pending = asyncio.run_coroutine_threadsafe(
+            self._send_proactive_on_owner_loop(
+                chat_id,
+                message,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+                media_positions=media_positions,
+            ),
+            loop,
+        )
+        try:
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            pending.cancel()
+            raise
+
+    async def _send_proactive_on_owner_loop(
+        self,
+        chat_id: str,
+        message: str,
+        media_files: List[str],
+        *,
+        canonical_home: bool,
+        delivery_key: str,
+        media_positions: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Run one proactive occurrence on the loop that owns client and spool."""
         client = self._client
         if not isinstance(client, AttachV1Client) or not self._ready.is_set():
             return _proactive_failure("attach_not_writable")
@@ -2283,6 +2415,7 @@ class AttachAdapter:
             "deliveryId": delivery_id,
             "messageId": message_id,
             "eventId": frame["eventId"],
+            "attachments": batch.attachment_descriptors(),
         }
         # Projection is asynchronous and durable (spec finding 4). The delivery is
         # accepted and pending; the receipts machinery upgrades the rows when the
@@ -2641,11 +2774,172 @@ def _caller_owns_active_turn(turn_id: str) -> bool:
     return message_id == turn_id or message_id.startswith(f"{turn_id}:")
 
 
-def _mobile_tool_result(status: str, result: Optional[Dict[str, Any]] = None) -> str:
+def _mobile_tool_result(
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    stage: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> str:
     payload: Dict[str, Any] = {"status": status}
     if result is not None:
         payload["result"] = result
+    if status != "ok" and stage in MOBILE_FAILURE_STAGES and reason in MOBILE_FAILURE_REASONS:
+        payload["stage"], payload["reason"] = stage, reason
     return json.dumps(payload, separators=(",", ":"))
+
+
+def _valid_mobile_artifact_filename(value: Any) -> bool:
+    """True for a display name that cannot smuggle a device path into Hermes."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 255
+        and value == value.strip()
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not re.search(r"[\x00-\x1f\x7f-\x9f]", value)
+    )
+
+
+def _mobile_artifact_audit(descriptor: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        descriptor["mediaId"], descriptor["mimeType"], descriptor["byteCount"],
+        descriptor["sha256"], descriptor["filename"], descriptor["family"],
+    )
+
+
+def _cache_mobile_artifact_bytes(data: bytes, *, filename: str, mime_type: str) -> Any:
+    """Small lazy boundary around Hermes's controlled attachment cache."""
+    from gateway.platforms.base import cache_media_bytes  # harness-defined interface
+
+    return cache_media_bytes(data, filename=filename, mime_type=mime_type)
+
+
+async def _materialize_mobile_artifact(adapter: Any, descriptor: Dict[str, Any]) -> Any:
+    """Verify, cache, and expose one phone artifact through Hermes's real model seams.
+
+    Images become the supported multimodal tool-result envelope. PDFs use Hermes's
+    established document-cache/read_file contract. Other families fail closed: a
+    descriptor or local path alone is not evidence that the configured model can inspect it.
+    """
+    failure = _mobile_tool_result(
+        "device_unavailable", stage="media", reason="media_validation_failed"
+    )
+    if not _is_media(descriptor) or not _valid_mobile_artifact_filename(descriptor.get("filename")):
+        return failure
+    # A structurally valid descriptor is safe to retain as the audit reference even
+    # when the authenticated bytes later fail verification. It contains no device path.
+    failure = _mobile_tool_result(
+        "device_unavailable", dict(descriptor), "media", "media_validation_failed"
+    )
+
+    media_id = descriptor["mediaId"]
+    mime = descriptor["mimeType"].split(";", 1)[0].strip().lower()
+    family = descriptor["family"]
+    if mime != descriptor["mimeType"] or family_for(mime) != family:
+        return failure
+    rule = MEDIA_COMPATIBILITY_POLICY.get(mime)
+    if not rule or rule.get("status") != "supported":
+        return failure
+    # Hermes has a native model-visible seam for raster images and a supported
+    # cached-document path for PDF. Video/audio/archives have neither in a tool result.
+    if family == "image":
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            return failure
+    elif mime != "application/pdf" or family != "file":
+        return failure
+
+    audit = _mobile_artifact_audit(descriptor)
+    cache: "OrderedDict[str, Tuple[Tuple[Any, ...], Any]]" = getattr(
+        adapter, "_mobile_artifact_cache", None
+    )
+    if cache is None:
+        cache = OrderedDict()
+        setattr(adapter, "_mobile_artifact_cache", cache)
+    cached_entry = cache.get(media_id)
+    if cached_entry is not None:
+        if cached_entry[0] != audit:
+            return failure
+        cache.move_to_end(media_id)
+        return cached_entry[1]
+
+    declared_bytes = descriptor["byteCount"]
+    byte_limit = _media_byte_limit(mime)
+    if declared_bytes > byte_limit:
+        return failure
+    try:
+        data, downloaded_name, downloaded_mime = await adapter._client.download_media(
+            media_id, max_bytes=byte_limit
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - download failures are bounded tool failures
+        return failure
+    downloaded_mime = str(downloaded_mime).split(";", 1)[0].strip().lower()
+    if (
+        len(data) != declared_bytes
+        or hashlib.sha256(data).hexdigest() != descriptor["sha256"]
+        or downloaded_mime != mime
+        or downloaded_name != descriptor["filename"]
+        or detect_mime(data) != mime
+    ):
+        return failure
+
+    cache_ext = {
+        "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+        "image/gif": ".gif", "application/pdf": ".pdf",
+    }[mime]
+    # The device's filename remains display-only audit metadata. The host cache
+    # sees a controlled media-id name and canonical extension, never a source path.
+    cache_filename = f"mobile_{media_id}{cache_ext}"
+    try:
+        cached = _cache_mobile_artifact_bytes(
+            data, filename=cache_filename, mime_type=mime
+        )
+    except Exception:  # noqa: BLE001 - never claim an artifact the controlled cache refused
+        return failure
+    if cached is None or getattr(cached, "media_type", None) != mime:
+        return failure
+
+    audit_text = (
+        f"Verified phone artifact {descriptor['filename']} "
+        f"(mediaId={media_id}, sha256={descriptor['sha256']}, bytes={declared_bytes})."
+    )
+    if family == "image":
+        if getattr(cached, "kind", None) != "image":
+            return failure
+        result: Any = {
+            "_multimodal": True,
+            "content": [
+                {"type": "text", "text": audit_text + " The image is attached natively; inspect it now."},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+                }},
+            ],
+            "text_summary": audit_text + " A vision-capable model is required to inspect it.",
+        }
+    else:
+        if getattr(cached, "kind", None) != "document" or not getattr(cached, "path", None):
+            return failure
+        result = {
+            "_multimodal": True,
+            "content": [{
+                "type": "text",
+                "text": (
+                    audit_text + f" The verified PDF is available at {cached.path}. "
+                    "Read it with read_file before answering the user."
+                ),
+            }],
+            "text_summary": audit_text + " The verified PDF is available to the document tools.",
+        }
+    cache[media_id] = (audit, result)
+    cache.move_to_end(media_id)
+    # Image entries carry an inline base64 part. Four maximum keeps the resident
+    # adapter's worst-case retained image payload bounded to roughly 32 MiB of
+    # source bytes (plus encoding overhead); replay safety does not justify 32.
+    while len(cache) > 4:
+        cache.popitem(last=False)
+    return result
 
 
 def _log_mobile_policy_block(
@@ -2715,75 +3009,417 @@ async def _cozy_present_notification(args: Dict[str, Any], **_kwargs: Any) -> st
     return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("notification.present", chat_id, turn_id, purpose, title=title, body=body), notification=True)
 
 
-async def _cozy_mobile(request: Any, location: bool = False, media: bool = False, notification: bool = False) -> str:
+def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
+    """Resolve the sole adapter allowed to act for this exact live turn.
+
+    Mobile-node requests and live attachment sends have the same trust boundary:
+    they may act only for the adapter, profile, chat, and turn that originated the
+    current model call.  This resolver owns the fail-closed checks and their
+    intentionally path-free audit logs; callers retain their operation-specific
+    result envelope and any post-await lease checks.
+    """
     try:
         platform, chat_id = _current_turn_platform_and_chat()
         message_id, cron, profile = _current_turn_message_and_cron()
     except Exception:  # noqa: BLE001 - an unavailable harness context is noninteractive
         _log_mobile_policy_block("session_context_unavailable")
-        return _mobile_tool_result("policy_blocked")
+        return None
     if platform != PLATFORM_NAME:
         _log_mobile_policy_block("wrong_platform", actual_platform=platform)
-        return _mobile_tool_result("policy_blocked")
+        return None
     if not chat_id:
         _log_mobile_policy_block("missing_chat_id", chat_present=False)
-        return _mobile_tool_result("policy_blocked")
+        return None
     if cron:
         _log_mobile_policy_block("cron_session", chat_present=True, cron=True)
-        return _mobile_tool_result("policy_blocked")
+        return None
     adapters = [
         adapter for adapter in _active_adapters_snapshot()
         if getattr(adapter, "_active_turn", {}).get(chat_id)
     ]
     if len(adapters) != 1:
         _log_mobile_policy_block("active_adapter_count", adapter_count=len(adapters))
-        return _mobile_tool_result("policy_blocked")
-    profile_match = bool(profile) and profile == getattr(adapters[0], "_profile", None)
-    if not profile_match:
+        return None
+    origin_adapter = adapters[0]
+    if not (profile and profile == getattr(origin_adapter, "_profile", None)):
         _log_mobile_policy_block(
-            "profile_mismatch",
-            profile_present=bool(profile),
-            profile_match=False,
+            "profile_mismatch", profile_present=bool(profile), profile_match=False
         )
-        return _mobile_tool_result("policy_blocked")
-    turn_id = adapters[0]._active_turn[chat_id]
+        return None
+    turn_id = origin_adapter._active_turn[chat_id]
     if message_id != turn_id:
         _log_mobile_policy_block(
-            "turn_message_mismatch",
-            message_present=bool(message_id),
-            message_match=False,
+            "turn_message_mismatch", message_present=bool(message_id), message_match=False
         )
-        return _mobile_tool_result("policy_blocked")
+        return None
+    return origin_adapter, chat_id, turn_id, profile
+
+
+_SEND_MEDIA_CAPTION_MAX = 4096
+_LIVE_MEDIA_DELIVERY_RE = re.compile(r"^scheduled:live-media:[0-9a-f]{64}$")
+_MEDIA_RECEIPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MEDIA_RECEIPT_MAX_ITEMS = 16
+
+
+def _safe_media_ids(value: Any) -> List[str]:
+    """Accept a small list of opaque media ids, never an arbitrary wire payload."""
+    if not isinstance(value, list):
+        return []
+    safe: List[str] = []
+    for item in value:
+        if isinstance(item, str) and _MEDIA_RECEIPT_ID_RE.fullmatch(item):
+            safe.append(item)
+            if len(safe) == _MEDIA_RECEIPT_MAX_ITEMS:
+                break
+    return safe
+
+
+def _safe_tool_attachments(value: Any) -> List[Dict[str, Any]]:
+    """Defence in depth for the only media descriptor tool results may expose."""
+    if not isinstance(value, list):
+        return []
+    safe: List[Dict[str, Any]] = []
+    for item in value[:_MEDIA_RECEIPT_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        attachment_id = item.get("attachmentId")
+        name = item.get("name")
+        mime_type = item.get("mimeType")
+        size = item.get("bytes")
+        kind = item.get("mediaKind")
+        if (
+            not isinstance(attachment_id, str) or not _MEDIA_RECEIPT_ID_RE.fullmatch(attachment_id)
+            or not isinstance(name, str) or not name or os.path.basename(name) != name or len(name) > 128
+            or not isinstance(mime_type, str) or not mime_type or len(mime_type) > 128
+            or not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= MEDIA_AGGREGATE_MAX_BYTES
+            or not isinstance(kind, str) or kind not in {"image", "audio", "video", "file"}
+        ):
+            continue
+        safe.append({
+            "attachmentId": attachment_id,
+            "name": name,
+            "mimeType": mime_type,
+            "bytes": size,
+            "mediaKind": kind,
+        })
+    return safe
+
+
+def _media_delivery_flags(state: str, media_verified: bool = False) -> Dict[str, bool]:
+    """Keep delivery claims monotonic and deliberately weaker than transport success."""
+    accepted = state in {"journaled", "admitted", "projected", "displayed"}
+    return {
+        "accepted": accepted,
+        "pending": state in {"journaled", "admitted"},
+        "committed": state in {"projected", "displayed"},
+        "displayed": state == "displayed",
+        "verified": media_verified is True,
+    }
+
+
+def _send_media_tool_result(
+    *,
+    accepted: bool,
+    state: str,
+    conversation_id: Optional[str],
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> str:
+    """Return the small, path-free contract for ``cozy_send_media``.
+
+    A proactive delivery is only *accepted* once it is durably journaled; that is
+    deliberately weaker than saying a person has received it.  Do not copy media
+    upload diagnostics here: even a basename can disclose a private local path.
+    """
+    payload: Dict[str, Any] = {
+        "accepted": accepted,
+        "state": state[:32],
+        "conversationId": conversation_id[:256] if isinstance(conversation_id, str) else None,
+    }
+    payload.update(_media_delivery_flags(state))
+    payload["accepted"] = accepted
+    if isinstance(result, dict):
+        if isinstance(result.get("accepted_pending"), bool):
+            payload["pending"] = result["accepted_pending"]
+        payload["verified"] = result.get("mediaVerified") is True
+        attachments = _safe_tool_attachments(result.get("attachments"))
+        if attachments:
+            payload["attachments"] = attachments
+        for key in ("deliveryId", "messageId", "eventId", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value:
+                # ``send_proactive`` returns symbolic failure codes.  Keep that
+                # contract narrow so a future transport exception cannot smuggle
+                # a source path into a model-visible result.
+                if key != "error" or re.fullmatch(r"[A-Za-z0-9_:-]{1,128}", value):
+                    payload[key] = value[:256]
+        result_error = result.get("error")
+        if isinstance(result_error, str):
+            failure_phase = {
+                "media_upload_failed": "upload",
+                "scheduled_delivery_unavailable": "journal",
+                "scheduled_not_supported": "journal",
+                "attach_not_writable": "transport",
+                "delivery_failed": "delivery",
+            }.get(result_error)
+            if failure_phase is not None:
+                payload["failurePhase"] = failure_phase
+    if error:
+        payload["error"] = error[:128]
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _safe_media_rows(spool: Optional[AttachSpool], delivery_id: str) -> List[Dict[str, Any]]:
+    """Return lifecycle facts with neither filesystem metadata nor content hashes."""
+    if spool is None:
+        return []
     try:
-        outcome = await request(adapters[0], chat_id, turn_id)
+        rows = spool.media_rows(delivery_id)
+    except Exception:  # noqa: BLE001 - unreadable local state is simply absent state
+        logger.debug("attach: media lifecycle read failed", exc_info=True)
+        return []
+    safe: List[Dict[str, Any]] = []
+    for row in rows[:_MEDIA_RECEIPT_MAX_ITEMS]:
+        media_id = row.get("mediaId")
+        state = row.get("state")
+        name = row.get("pathMeta")
+        if not isinstance(media_id, str) or not _MEDIA_RECEIPT_ID_RE.fullmatch(media_id):
+            continue
+        if not isinstance(state, str) or state not in {
+            "prepared", "uploaded", "journaled", "projected", "displayed", "blocked", "upload_failed",
+        }:
+            continue
+        item: Dict[str, Any] = {"attachmentId": media_id, "state": state, "lifecycle": state}
+        if isinstance(name, str) and name and os.path.basename(name) == name and len(name) <= 128:
+            item["name"] = name
+        safe.append(item)
+    return safe
+
+
+def _media_status_tool_result(
+    delivery_id: str, message_id: str, state: str, receipt: Optional[Dict[str, Any]], rows: List[Dict[str, Any]],
+    *, error: Optional[str] = None,
+) -> str:
+    """A bounded status result that never repackages raw receipt diagnostics."""
+    media_verified = bool(receipt and receipt.get("mediaVerified") is True)
+    payload: Dict[str, Any] = {
+        "state": state, "lifecycle": state, "deliveryId": delivery_id, "messageId": message_id,
+        **_media_delivery_flags(state, media_verified),
+        "expectedMediaIds": _safe_media_ids(receipt.get("expectedMediaIds")) if receipt else [],
+        "committedMediaIds": _safe_media_ids(receipt.get("committedMediaIds")) if receipt else [],
+        "mediaVerified": media_verified, "media": rows,
+    }
+    if error:
+        payload["error"] = error
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _valid_send_media_paths(value: Any) -> Optional[List[str]]:
+    """Accept only the declared JSON-array shape, before a transport is selected."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 16:
+        return None
+    if any(not isinstance(path, str) or not path or not os.path.isabs(path) for path in value):
+        return None
+    return list(value)
+
+
+def _send_media_delivery_key(
+    occurrence: str, chat_id: str, caption: str, paths: List[str]
+) -> str:
+    """Bind an attachment commit to one native tool occurrence, never a target argument."""
+    material = json.dumps(
+        {"occurrence": occurrence, "conversation": chat_id, "caption": caption, "paths": paths},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "live-media:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+async def _cozy_send_media(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Commit attachments to exactly the currently-originating live conversation."""
+    paths = _valid_send_media_paths(args.get("paths"))
+    caption = args.get("caption", "")
+    if (
+        paths is None
+        or not isinstance(caption, str)
+        or len(caption) > _SEND_MEDIA_CAPTION_MAX
+    ):
+        _log_mobile_policy_block("invalid_send_media_args")
+        return _send_media_tool_result(
+            accepted=False, state="blocked", conversation_id=None, error="invalid_arguments"
+        )
+
+    origin = _resolve_live_origin()
+    if origin is None:
+        return _send_media_tool_result(
+            accepted=False, state="blocked", conversation_id=None, error="policy_blocked"
+        )
+    origin_adapter, chat_id, _turn_id, _profile = origin
+
+    # Hooks set the real call id for this tool.  The fallback preserves the existing
+    # session-context behaviour in older harnesses, while the hook makes a second
+    # call in the same turn a distinct durable delivery.
+    occurrence = str(kwargs.get(TOOL_CALL_ID_KEY) or _occurrence_key()).strip()
+    delivery_key = _send_media_delivery_key(occurrence, chat_id, caption, paths)
+    delivery_id, message_id = _proactive_identity(delivery_key)
+    try:
+        result = await origin_adapter.send_proactive(
+            chat_id,
+            caption,
+            paths,
+            canonical_home=False,
+            delivery_key=delivery_key,
+        )
+    except asyncio.CancelledError:
+        return _send_media_tool_result(
+            accepted=False, state="failed", conversation_id=chat_id, error="cancelled"
+        )
+    except Exception:  # noqa: BLE001 - never expose a local exception or a path
+        logger.warning("attach live media send failed", exc_info=True)
+        return _send_media_tool_result(
+            accepted=False,
+            state="failed",
+            conversation_id=chat_id,
+            result=_proactive_failure("delivery_failed", delivery_id, message_id),
+        )
+    if not isinstance(result, dict):
+        return _send_media_tool_result(
+            accepted=False,
+            state="failed",
+            conversation_id=chat_id,
+            result=_proactive_failure("delivery_failed", delivery_id, message_id),
+        )
+    result = dict(result)
+    result.setdefault("deliveryId", delivery_id)
+    result.setdefault("messageId", message_id)
+    state = result.get("state") if isinstance(result.get("state"), str) else "failed"
+    accepted = state in {"journaled", "projected", "displayed"}
+    return _send_media_tool_result(
+        accepted=accepted, state=state, conversation_id=chat_id, result=result
+    )
+
+
+async def _cozy_media_delivery_status(args: Dict[str, Any], **_kwargs: Any) -> str:
+    """Read one prior live-media delivery without making another delivery attempt."""
+    delivery_id = args.get("deliveryId") if isinstance(args, dict) else None
+    if not isinstance(delivery_id, str) or not _LIVE_MEDIA_DELIVERY_RE.fullmatch(delivery_id):
+        return _media_status_tool_result("", "", "blocked", None, [], error="invalid_delivery_id")
+    origin = _resolve_live_origin()
+    message_id = _proactive_identity(delivery_id[len("scheduled:"):])[1]
+    if origin is None:
+        return _media_status_tool_result(delivery_id, message_id, "blocked", None, [], error="policy_blocked")
+    origin_adapter, _chat_id, _turn_id, _profile = origin
+    receipt: Optional[Dict[str, Any]] = None
+    rows: List[Dict[str, Any]] = []
+    local_receipt: Optional[Dict[str, Any]] = None
+    snapshot_reader = getattr(origin_adapter, "media_delivery_status_snapshot", None)
+    if callable(snapshot_reader):
+        try:
+            snapshot = await snapshot_reader(delivery_id, 0.5)
+        except Exception:  # noqa: BLE001 - local journal remains the truthful fallback
+            snapshot = None
+        if isinstance(snapshot, dict):
+            candidate = snapshot.get("receipt")
+            candidate_rows = snapshot.get("rows")
+            if isinstance(candidate_rows, list):
+                rows = candidate_rows
+            candidate_local = snapshot.get("localReceipt")
+            if isinstance(candidate_local, dict):
+                local_receipt = candidate_local
+        if isinstance(candidate, dict) and candidate.get("state") in {
+            "admitted", "projected", "blocked", "displayed", "failed",
+        }:
+            receipt = candidate
+    else:
+        reader = getattr(origin_adapter, "media_delivery_receipt", None)
+        if callable(reader):
+            try:
+                candidate = await reader(delivery_id, 0.5)
+            except Exception:  # noqa: BLE001 - local journal remains the truthful fallback
+                candidate = None
+            if isinstance(candidate, dict) and candidate.get("state") in {
+                "admitted", "projected", "blocked", "displayed", "failed",
+            }:
+                receipt = candidate
+        spool = getattr(origin_adapter, "_spool", None)
+        rows = _safe_media_rows(spool, delivery_id)
+        if spool is not None:
+            try:
+                candidate = spool.delivery_receipt_row(delivery_id)
+                if isinstance(candidate, dict):
+                    local_receipt = candidate
+            except Exception:  # noqa: BLE001 - same fallback as a transient gateway 404
+                logger.debug("attach: local delivery receipt read failed", exc_info=True)
+    if receipt is not None:
+        state = str(receipt["state"])
+        # The HTTP ABI keeps its durable projection fact at the top level.  A
+        # later terminal display is additive (`projected` +
+        # `terminal:{state:"displayed"}`), rather than a replacement top-level
+        # state.  Treat that terminal fact as the lifecycle answer, while still
+        # leaving verification exclusively to `mediaVerified` below.
+        terminal = receipt.get("terminal")
+        if (
+            state == "projected"
+            and isinstance(terminal, dict)
+            and terminal.get("state") == "displayed"
+        ):
+            state = "displayed"
+    elif local_receipt is not None and local_receipt.get("state") in {"displayed", "failed"}:
+        state = str(local_receipt["state"])
+    elif rows:
+        state = "journaled"
+    else:
+        state = "unknown"
+    return _media_status_tool_result(delivery_id, message_id, state, receipt, rows)
+
+
+async def _cozy_mobile(request: Any, location: bool = False, media: bool = False, notification: bool = False) -> str:
+    origin = _resolve_live_origin()
+    if origin is None:
+        return _mobile_tool_result("policy_blocked")
+    origin_adapter, chat_id, turn_id, profile = origin
+    try:
+        outcome = await request(origin_adapter, chat_id, turn_id)
     except asyncio.CancelledError:
         return _mobile_tool_result("cancelled")
-    try:
-        after_platform, after_chat_id = _current_turn_platform_and_chat()
-        after_message_id, after_cron, after_profile = _current_turn_message_and_cron()
-        after_adapters = [
-            adapter for adapter in _active_adapters_snapshot()
-            if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
-        ]
-    except Exception:  # noqa: BLE001 - payload release must fail closed
-        after_adapters = []
-        after_platform = after_chat_id = after_message_id = after_profile = None
-        after_cron = True
-    if (
-        after_platform != platform or after_chat_id != chat_id or after_message_id != turn_id
-        or after_cron or after_profile != profile or len(after_adapters) != 1
-        or after_adapters[0] is not adapters[0]
-    ):
-        _log_mobile_policy_block("context_changed_after_request")
+    # The admitted tuple above is the request's immutable origin. Hermes' current
+    # message context may legitimately move while a person answers the phone sheet;
+    # only replacement or loss of that exact origin adapter/turn invalidates its lease.
+    after_adapters = [
+        adapter for adapter in _active_adapters_snapshot()
+        if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+        and getattr(adapter, "_profile", None) == profile
+    ]
+    if len(after_adapters) != 1 or after_adapters[0] is not origin_adapter:
+        _log_mobile_policy_block("origin_turn_changed_after_request")
         return _mobile_tool_result("policy_blocked")
     status = outcome.get("status")
     result = outcome.get("result")
     valid = _is_location(result) if location else _is_media(result) if media else _is_notification(result) if notification else _is_device_status(result)
     if status == "ok" and not valid:
         status, result = "device_unavailable", None
+    if status == "ok" and media and isinstance(result, dict):
+        try:
+            artifact_result = await _materialize_mobile_artifact(origin_adapter, result)
+        except asyncio.CancelledError:
+            return _mobile_tool_result("cancelled")
+        # The download is still part of the admitted lease. Mutable Hermes message
+        # context may move while bytes are fetched; only loss or replacement of the
+        # immutable origin adapter/profile/chat/turn invalidates their release.
+        final_adapters = [
+            adapter for adapter in _active_adapters_snapshot()
+            if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+            and getattr(adapter, "_profile", None) == profile
+        ]
+        if len(final_adapters) != 1 or final_adapters[0] is not origin_adapter:
+            _log_mobile_policy_block("origin_turn_changed_after_artifact_download")
+            return _mobile_tool_result("policy_blocked")
+        return artifact_result
     return _mobile_tool_result(
         status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
         result if isinstance(result, dict) else None,
+        outcome.get("stage") if isinstance(outcome.get("stage"), str) else None,
+        outcome.get("reason") if isinstance(outcome.get("reason"), str) else None,
     )
 
 
@@ -2840,9 +3476,15 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
         if not tool_name:
             return
         call_id = _tool_call_id(kwargs)
-        if tool_name in {"cozy_device_status", "cozy_request_location"}:
+        if tool_name in {
+            "cozy_device_status", "cozy_request_location",
+            "cozy_capture_camera", "cozy_pick_file",
+            "cozy_send_media", "cozy_media_delivery_status",
+        }:
             # Purpose and phone payloads are live-turn-only data. Tool chips may name the
             # operation, but never retain either side of this sensitive exchange as detail.
+            # Media results can contain a cache path or base64 model attachment, so this
+            # guard also prevents those from being projected back to CozyChat.
             detail = None
         elif phase == "start":
             detail = _preview(kwargs.get("args"))
@@ -2861,7 +3503,7 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
 def _pre_tool_call(**kwargs: Any) -> None:
     """``pre_tool_call`` hook: the chip-open leg. Observer only (returns None)."""
     tool_name = str(kwargs.get("tool_name") or "")
-    if tool_name == "send_message":
+    if tool_name in {"send_message", "cozy_send_media"}:
         _CURRENT_TOOL_OCCURRENCE.set(_tool_call_id(kwargs))
     elif tool_name == "delegate_task":
         # The batch id for this call's delegation cards: the parent's own tool-call id (the
@@ -2878,7 +3520,7 @@ def _post_tool_call(**kwargs: Any) -> None:
         _dispatch_tool_hook("complete", kwargs)
     finally:
         tool_name = str(kwargs.get("tool_name") or "")
-        if tool_name == "send_message":
+        if tool_name in {"send_message", "cozy_send_media"}:
             _CURRENT_TOOL_OCCURRENCE.set(None)
         elif tool_name == "delegate_task":
             try:
@@ -4052,8 +4694,79 @@ def register(ctx: Any) -> None:
             "the conversation. Markdown renders richly: use ## headings, - bullet / "
             "1. numbered / - [ ] task lists, | pipe | tables |, fenced code blocks, "
             "and $$ math. Inline bold and links show as literal text, so prefer the "
-            "block forms above."
+            "block forms above. For native attachments, prefer the cozy_send_media tool: "
+            "it sends native attachments immediately to this originating conversation, "
+            "and after using it do not repeat MEDIA: directives for the same files. "
+            "A journaled attachment result is pending, not proof of commit or display; "
+            "use cozy_media_delivery_status with its deliveryId before claiming either. "
+            "If the typed tool is unavailable, MEDIA:/absolute/path is the fallback: put "
+            "one MEDIA:/absolute/path directive on each line of your final response; multiple directive lines "
+            "send multiple attachments. Keep directives outside code fences. These "
+            "directives automatically target this originating conversation. Use MEDIA: instead "
+            "of sandbox links or file:// URLs for native delivery."
         ),
+    )
+    ctx.register_tool(
+        name="cozy_send_media",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_send_media",
+            "description": (
+                "Send 1-16 absolute local-path native attachments immediately to the current "
+                "originating CozyGateway conversation. Do not repeat MEDIA: directives for the "
+                "same files after using it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "description": "One to 16 absolute local paths to attach, in delivery order.",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {
+                            "type": "string",
+                            "description": "An absolute local path.",
+                            "minLength": 1,
+                        },
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption shown with the attachments.",
+                        "maxLength": _SEND_MEDIA_CAPTION_MAX,
+                    },
+                },
+                "required": ["paths"],
+                "additionalProperties": False,
+            },
+        },
+        handler=_cozy_send_media,
+        is_async=True,
+        description="Send native attachments to the current CozyGateway conversation.",
+        emoji="📤",
+    )
+    ctx.register_tool(
+        name="cozy_media_delivery_status",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_media_delivery_status",
+            "description": (
+                "Check the receipt for a prior cozy_send_media delivery in this exact live "
+                "conversation. A journaled result remains pending until a receipt confirms it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"deliveryId": {
+                    "type": "string", "description": "The deliveryId returned by cozy_send_media.",
+                    "pattern": "^scheduled:live-media:[0-9a-f]{64}$",
+                }},
+                "required": ["deliveryId"], "additionalProperties": False,
+            },
+        },
+        handler=_cozy_media_delivery_status,
+        is_async=True,
+        description="Check a native attachment delivery receipt in the current live conversation.",
+        emoji="📬",
     )
     ctx.register_tool(
         name="cozy_device_status",

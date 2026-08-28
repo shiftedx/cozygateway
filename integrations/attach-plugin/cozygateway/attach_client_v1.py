@@ -51,7 +51,19 @@ MobileStatus = Literal[
     "foreground_required", "policy_blocked",
 ]
 MOBILE_STATUS_VALUES = frozenset(MobileStatus.__args__)
+MOBILE_FAILURE_STAGES = frozenset({
+    "policy", "routing", "dispatch", "response", "media", "receipt", "lifecycle",
+})
+MOBILE_FAILURE_REASONS = frozenset({
+    "no_selected_device", "command_not_advertised", "selected_socket_unavailable",
+    "frame_send_failed", "phone_disconnected_pending", "invalid_phone_payload",
+    "lease_mismatch", "cross_device_result", "receipt_persistence_failed",
+    "broker_closed_pending", "malformed_request_frame", "request_expired_unanswered",
+    "request_policy_rejected", "selected_app_not_foreground",
+    "media_validation_failed", "media_storage_failed",
+})
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
+MOBILE_INTERACTION_TIMEOUT_SECONDS = 120
 # How long to wait for hello_ack before concluding the handshake stalled and re-dialing with the
 # same hello. The gateway gives a peer 5 seconds to say hello; this is the matching budget in the
 # other direction.
@@ -62,7 +74,7 @@ HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts",
-    "delegation", "thinking",
+    "delegation", "thinking", "mobile_failure_details",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
@@ -87,6 +99,8 @@ ATTACH_FILE_MAX_BYTES = 20 * 1024 * 1024
 class MobileDeviceStatusResult(TypedDict, total=False):
     status: MobileStatus
     result: Union["DeviceStatus", "Location"]
+    stage: str
+    reason: str
 
 
 class DeviceStatusCapability(TypedDict):
@@ -251,18 +265,23 @@ class AttachV1Client:
         request_id = str(uuid.uuid4())
         future: asyncio.Future[MobileDeviceStatusResult] = asyncio.get_running_loop().create_future()
         self._mobile_requests[request_id] = (command, future)
+        timeout_seconds = (
+            MOBILE_STATUS_TIMEOUT_SECONDS
+            if command in {"device.status", "location.current"}
+            else MOBILE_INTERACTION_TIMEOUT_SECONDS
+        )
         try:
             frame: Dict[str, Any] = {
                 "kind": "mobile_request", "requestId": request_id,
                 "command": command, "threadId": thread_id, "turnId": turn_id,
-                "expiresAt": int(time.time() * 1000) + MOBILE_STATUS_TIMEOUT_SECONDS * 1000,
+                "expiresAt": int(time.time() * 1000) + timeout_seconds * 1000,
             }
             if purpose is not None:
                 frame["purpose"] = purpose
             if options is not None:
                 frame.update(options)
             await self._send(frame)
-            return await asyncio.wait_for(asyncio.shield(future), MOBILE_STATUS_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(asyncio.shield(future), timeout_seconds)
         except asyncio.TimeoutError:
             await self._cancel_mobile_request(request_id)
             return {"status": "expired"}
@@ -595,7 +614,21 @@ class AttachV1Client:
         descriptor = await asyncio.to_thread(
             self._upload_media_sync, media_id, path, mime, size_bytes, sha256, expires_at,
         )
-        await self._queue_event({"kind": "media", "media": descriptor})
+        try:
+            await self._queue_event({"kind": "media", "media": descriptor})
+        except Exception:
+            # The object is not deliverable until its descriptor has a durable event.
+            # Withdraw a descriptor that made it into the spool, then use the durable
+            # cleanup lane for the HTTP object. If enqueue itself failed, the same lane
+            # still records the cleanup before attempting the delete.
+            try:
+                await self.rollback_uploaded_media([media_id])
+            except Exception:
+                logger.warning(
+                    "attach: could not clean up unjournaled media %s", media_id,
+                    exc_info=True,
+                )
+            raise
         return descriptor
 
     async def rollback_uploaded_media(self, media_ids: List[str]) -> None:
@@ -1035,6 +1068,10 @@ class AttachV1Client:
                 future.set_result({"status": "device_unavailable"})
                 return
             result["result"] = payload
+        elif "mobile_failure_details" in self._capabilities:
+            stage, reason = frame.get("stage"), frame.get("reason")
+            if stage in MOBILE_FAILURE_STAGES and reason in MOBILE_FAILURE_REASONS:
+                result["stage"], result["reason"] = stage, reason
         future.set_result(result)
 
     def _settle_mobile_requests(self, status: MobileStatus) -> None:
@@ -1110,7 +1147,22 @@ def _is_location(value: Any) -> bool:
     )
 
 def _is_media(value: Any) -> bool:
-    return isinstance(value, dict) and isinstance(value.get("mediaId"), str) and isinstance(value.get("mimeType"), str) and isinstance(value.get("byteCount"), int) and isinstance(value.get("filename"), str) and isinstance(value.get("sha256"), str)
+    return (
+        isinstance(value, dict)
+        and set(value) == {"mediaId", "mimeType", "byteCount", "sha256", "filename", "family"}
+        and isinstance(value.get("mediaId"), str)
+        and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value["mediaId"]))
+        and isinstance(value.get("mimeType"), str)
+        and 0 < len(value["mimeType"]) <= 128
+        and isinstance(value.get("byteCount"), int)
+        and not isinstance(value["byteCount"], bool)
+        and 0 < value["byteCount"] <= ATTACH_AUDIO_VIDEO_MAX_BYTES
+        and isinstance(value.get("filename"), str)
+        and 0 < len(value["filename"]) <= 255
+        and isinstance(value.get("sha256"), str)
+        and bool(re.fullmatch(r"[a-f0-9]{64}", value["sha256"]))
+        and value.get("family") in {"image", "audio", "video", "file"}
+    )
 
 def _is_notification(value: Any) -> bool:
     return isinstance(value, dict) and value.get("action") in {"approve", "snooze", "open", "cancel"} and len(value) == 1

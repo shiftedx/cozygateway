@@ -47,6 +47,13 @@ case "$STAGE_ROOT" in
 esac
 
 have rsync || die "rsync not found"
+[ -n "${HERMES_BIN:-}" ] || HERMES_BIN="$(command -v hermes || true)"
+[ -n "$HERMES_BIN" ] || die "hermes not found; install Hermes or set HERMES_BIN to its executable"
+case "$HERMES_BIN" in
+  /*) ;;
+  *) HERMES_BIN="$(cd "$(dirname "$HERMES_BIN")" && pwd)/$(basename "$HERMES_BIN")" ;;
+esac
+[ -x "$HERMES_BIN" ] || die "Hermes executable is not runnable: $HERMES_BIN"
 [ -x /usr/bin/plutil ] || die "/usr/bin/plutil not found"
 [ -f "$SCRIPT_DIR/bot-provisioner-watch.sh" ] || die "watcher missing from checkout"
 [ -f "$SCRIPT_DIR/provision-bot.sh" ] || die "provisioner missing from checkout"
@@ -115,7 +122,15 @@ mv "$staging" "$release"
 # the path first, then escape sed replacement metacharacters.
 xml_stage="$(printf '%s' "$STAGE_ROOT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
 escaped_stage="$(printf '%s' "$xml_stage" | sed 's/[&|]/\\&/g')"
-sed "s|REPLACE_ME_PAYLOAD|$escaped_stage|g" "$PLIST_TEMPLATE" > "$plist_tmp"
+xml_hermes="$(printf '%s' "$HERMES_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+escaped_hermes="$(printf '%s' "$xml_hermes" | sed 's/[&|]/\\&/g')"
+hermes_dir="$(dirname "$HERMES_BIN")"
+xml_hermes_dir="$(printf '%s' "$hermes_dir" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+escaped_hermes_dir="$(printf '%s' "$xml_hermes_dir" | sed 's/[&|]/\\&/g')"
+sed -e "s|REPLACE_ME_PAYLOAD|$escaped_stage|g" \
+    -e "s|REPLACE_ME_HERMES_BIN|$escaped_hermes|g" \
+    -e "s|REPLACE_ME_HERMES_DIR|$escaped_hermes_dir|g" \
+    "$PLIST_TEMPLATE" > "$plist_tmp"
 /usr/bin/plutil -lint "$plist_tmp" >/dev/null
 
 # A relative target keeps the symlink valid if the provisioner tree is copied as

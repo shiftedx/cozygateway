@@ -48,11 +48,18 @@ import {
   ASSISTANT_MEDIA_TYPES,
   acceptAssistantMediaBytes,
 } from "./hermes-bridge/assistant-media.ts";
+
 import { attachmentDisposition, safeFilename } from "./hermes-bridge/documents.ts";
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
+
+const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
+// The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
+// shorter deadline risks duplicate retries during transient APNs work; no deadline wedges the
+// durable single-flight drain forever when a transport never settles.
+const LIVE_ACTIVITY_RELAY_DELETE_TIMEOUT_MS = 10_000;
 
 /** The relay's register body, mirrored here rather than imported: the gateway's docker image
  *  bundles only its own package, so a runtime import of cozygateway-relay crashes the container
@@ -108,7 +115,7 @@ export interface AppDeps {
   attachMediaAllowed?: (agentId: string) => boolean;
   /** A device-authenticated lease claim for one phone-selected binary payload. */
   beginMobileMediaUpload?: (deviceId: string, requestId: string, lease: string) =>
-    | { agentId: string; complete: (media: MobileNodeMediaDescriptor | undefined) => boolean }
+    | { agentId: string; complete: (media: MobileNodeMediaDescriptor | undefined, reason?: "media_validation_failed" | "media_storage_failed") => boolean }
     | undefined;
   /** Test seam for `GET /bots/:name/media`. Left undefined in production, where the proxy uses the
    *  global `fetch`; a test supplies its own so the media rules can be exercised without a socket. */
@@ -129,6 +136,10 @@ export interface AppDeps {
   photoRateLimiter?: PhotoRateLimiter;
   /** Test seam for the private relay boundary. Production uses the global fetch. */
   pushRelayFetch?: typeof fetch;
+  /** Sink for durable Live Activity relay cleanup failures. */
+  pushRelayLog?: (message: string) => void;
+  /** Test-only override for the per-DELETE outbox deadline. */
+  pushRelayDeleteTimeoutMs?: number;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
   gatewaySettings?: {
@@ -188,6 +199,68 @@ type Env = { Variables: { deviceId: string } };
 export function createApp(deps: AppDeps): Hono<Env> {
   const app = new Hono<Env>();
   const pairingAdmission = deps.pairingAdmission ?? new PairingAdmission(deps.now);
+  const relayFetch = deps.pushRelayFetch ?? fetch;
+  const relayLog = deps.pushRelayLog ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const relayBase = deps.config.pushRelayUrl?.replace(/\/+$/, "");
+  const requestLiveActivityDeletionDrain = (() => {
+    let draining = false;
+    let requested = false;
+    const drainSnapshot = async () => {
+      if (relayBase === undefined) return;
+      const highWater = deps.storage.liveActivityRelayDeletionHighWater();
+      if (highWater === undefined) return;
+      let cursor = 0;
+      while (cursor < highWater) {
+        const page = deps.storage.liveActivityRelayDeletionPage(
+          cursor,
+          highWater,
+          LIVE_ACTIVITY_DELETION_DRAIN_LIMIT,
+        );
+        if (page.length === 0) return;
+        for (const { pushId } of page) {
+          try {
+            const response = await relayFetch(
+              `${relayBase}/register/${encodeURIComponent(pushId)}`,
+              {
+                method: "DELETE",
+                signal: AbortSignal.timeout(
+                  Math.max(1, deps.pushRelayDeleteTimeoutMs
+                    ?? LIVE_ACTIVITY_RELAY_DELETE_TIMEOUT_MS),
+                ),
+              },
+            );
+            if (response.ok) {
+              deps.storage.completeLiveActivityRelayDeletion(pushId);
+            } else {
+              relayLog(`live activity relay cleanup: DELETE returned HTTP ${response.status}`);
+            }
+          } catch {
+            relayLog("live activity relay cleanup: DELETE failed with a network error");
+          }
+        }
+        cursor = page.at(-1)!.sequence;
+      }
+    };
+    return () => {
+      requested = true;
+      if (draining) return;
+      draining = true;
+      void (async () => {
+        try {
+          while (requested) {
+            requested = false;
+            await drainSnapshot();
+          }
+        } catch {
+          relayLog("live activity relay cleanup: outbox drain failed");
+        } finally {
+          draining = false;
+          if (requested) requestLiveActivityDeletionDrain();
+        }
+      })();
+    };
+  })();
+  requestLiveActivityDeletionDrain();
 
   const requireDevice = createMiddleware<Env>(async (c, next) => {
     const header = c.req.header("authorization") ?? "";
@@ -621,7 +694,6 @@ export function createApp(deps: AppDeps): Hono<Env> {
         404,
       );
     }
-    const relayFetch = deps.pushRelayFetch ?? fetch;
     const upstream = await relayFetch(
       `${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register`,
       {
@@ -646,7 +718,6 @@ export function createApp(deps: AppDeps): Hono<Env> {
         404,
       );
     }
-    const relayFetch = deps.pushRelayFetch ?? fetch;
     const pushId = encodeURIComponent(c.req.param("pushId"));
     const upstream = await relayFetch(
       `${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register/${pushId}`,
@@ -673,7 +744,6 @@ export function createApp(deps: AppDeps): Hono<Env> {
         404,
       );
     }
-    const relayFetch = deps.pushRelayFetch ?? fetch;
     const relayBase = deps.config.pushRelayUrl.replace(/\/+$/, "");
     const upstream = await relayFetch(`${relayBase}/register`, {
       method: "POST",
@@ -694,7 +764,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
     if (typeof result.pushId !== "string" || result.pushId.length === 0) {
       return c.json(errorBody("internal", "relay returned no push id"), 502);
     }
-    const previous = deps.storage.saveLiveActivityRegistration({
+    deps.storage.saveLiveActivityRegistration({
       deviceId: c.get("deviceId"),
       activityId: decoded.activityId,
       runId: decoded.runId,
@@ -703,26 +773,17 @@ export function createApp(deps: AppDeps): Hono<Env> {
       pushId: result.pushId,
       createdAt: deps.now(),
     });
-    if (previous !== undefined && previous !== result.pushId) {
-      void relayFetch(`${relayBase}/register/${encodeURIComponent(previous)}`, {
-        method: "DELETE",
-      });
-    }
+    requestLiveActivityDeletionDrain();
     return c.json({ ok: true });
   });
 
   app.delete("/push/live-activities/:activityId", requireDevice, async (c) => {
-    const row = deps.storage.deleteLiveActivityRegistration(
+    deps.storage.deleteLiveActivityRegistration(
       c.get("deviceId"),
       c.req.param("activityId"),
+      { queuedAt: deps.now() },
     );
-    if (row !== undefined && deps.config.pushRelayUrl !== undefined) {
-      const relayFetch = deps.pushRelayFetch ?? fetch;
-      await relayFetch(
-        `${deps.config.pushRelayUrl.replace(/\/+$/, "")}/register/${encodeURIComponent(row.pushId)}`,
-        { method: "DELETE" },
-      ).catch(() => undefined);
-    }
+    requestLiveActivityDeletionDrain();
     return c.body(null, 204);
   });
 
@@ -770,8 +831,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
     const claim = deps.beginMobileMediaUpload?.(c.get("deviceId"), requestId, lease);
     if (claim === undefined)
       return c.json(errorBody("not_found", "mobile media request is not available"), 404);
-    const fail = (status: 400 | 413 | 415 | 422, body: ErrorBody) => {
-      claim.complete(undefined);
+    const fail = (status: 400 | 413 | 415 | 422, body: ErrorBody, reason: "media_validation_failed" | "media_storage_failed" = "media_validation_failed") => {
+      claim.complete(undefined, reason);
       return c.json(body, status);
     };
     const receivedType = c.req.header("content-type") ?? "";
@@ -800,9 +861,17 @@ export function createApp(deps: AppDeps): Hono<Env> {
     try {
       deps.storage.saveAttachMedia(claim.agentId, descriptor, bytes, deps.now());
     } catch {
-      return fail(400, errorBody("invalid_request", "could not store mobile media"));
+      return fail(400, errorBody("invalid_request", "could not store mobile media"), "media_storage_failed");
     }
-    if (!claim.complete(descriptor)) {
+    const mobileDescriptor: MobileNodeMediaDescriptor = {
+      mediaId: descriptor.mediaId,
+      mimeType: descriptor.mimeType,
+      byteCount: descriptor.byteCount,
+      sha256: descriptor.sha256,
+      filename: descriptor.filename,
+      family: descriptor.family,
+    };
+    if (!claim.complete(mobileDescriptor)) {
       deps.storage.deleteUnreferencedAttachMedia(claim.agentId, descriptor.mediaId);
       return c.json(errorBody("invalid_request", "mobile media request expired or changed"), 409);
     }

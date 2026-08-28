@@ -11,6 +11,9 @@ import {
   buildProviderJwt,
   type ApnsConfig,
 } from "../src/apns.ts";
+import { createRelayApp } from "../src/http.ts";
+import { openRelayStorage, type RelayStorage } from "../src/storage.ts";
+import type { Transport } from "../src/transports.ts";
 
 function testConfig(): { config: ApnsConfig; publicKey: ReturnType<typeof generateKeyPairSync>["publicKey"] } {
   const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -27,12 +30,14 @@ function testConfig(): { config: ApnsConfig; publicKey: ReturnType<typeof genera
 }
 
 let server: Http2Server | undefined;
+const relayStorages: RelayStorage[] = [];
 
 afterEach(async () => {
   if (server !== undefined) {
     await new Promise<void>((resolve) => server?.close(() => resolve()));
     server = undefined;
   }
+  for (const storage of relayStorages.splice(0)) storage.close();
 });
 
 async function fakeApns(
@@ -229,11 +234,94 @@ describe("apnsTransport.deliver", () => {
   });
 });
 
+describe("relay APNs registration invalidation", () => {
+  async function notifyThrough(
+    transport: Transport,
+    failureFragments: string[],
+  ): Promise<{ storage: RelayStorage; pushId: string }> {
+    const storage = openRelayStorage(":memory:");
+    relayStorages.push(storage);
+    let deliveryFailed!: () => void;
+    const deliveryFailure = new Promise<void>((resolve) => {
+      deliveryFailed = resolve;
+    });
+    const app = createRelayApp({
+      storage,
+      transports: { apns: transport },
+      dailyCap: 500,
+      maxRegistrations: 10_000,
+      version: "test",
+      now: () => Date.UTC(2026, 6, 7, 12, 0, 0),
+      restrictEgress: false,
+      log: (message) => {
+        if (message.includes("delivery failed") && failureFragments.every((part) => message.includes(part))) {
+          deliveryFailed();
+        }
+      },
+    });
+
+    const registered = await app.request("/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ platform: "apns", token: "EXPIREDDEVICETOKEN" }),
+    });
+    expect(registered.status).toBe(201);
+    const { pushId } = (await registered.json()) as { pushId: string };
+
+    const notified = await app.request("/notify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pushId, ciphertext: "CIPHER" }),
+    });
+    expect(notified.status).toBe(202);
+    await deliveryFailure;
+    return { storage, pushId };
+  }
+
+  it("deletes the registration after APNs rejects its token with terminal HTTP 410 ExpiredToken", async () => {
+    const { config } = testConfig();
+    const baseUrl = await fakeApns((_headers, _body, stream) => {
+      stream.respond({ ":status": 410 });
+      stream.end(JSON.stringify({ reason: "ExpiredToken" }));
+    });
+    const { storage, pushId } = await notifyThrough(
+      apnsTransport(config, { baseUrl }),
+      ["HTTP 410", "ExpiredToken"],
+    );
+
+    expect(storage.registrationByPushId(pushId)).toBeUndefined();
+  });
+
+  it.each([400, 403, 429, 500])("retains the registration after nonterminal APNs HTTP %i", async (status) => {
+    const { config } = testConfig();
+    const baseUrl = await fakeApns((_headers, _body, stream) => {
+      stream.respond({ ":status": status });
+      stream.end(JSON.stringify({ reason: "NonterminalFailure" }));
+    });
+    const { storage, pushId } = await notifyThrough(
+      apnsTransport(config, { baseUrl }),
+      [`HTTP ${status}`, "NonterminalFailure"],
+    );
+
+    expect(storage.registrationByPushId(pushId)).toBeDefined();
+  });
+
+  it("retains the registration after an APNs network failure", async () => {
+    const { config } = testConfig();
+    const { storage, pushId } = await notifyThrough(
+      apnsTransport(config, { connect: () => { throw new Error("network unavailable"); } }),
+      ["network unavailable"],
+    );
+
+    expect(storage.registrationByPushId(pushId)).toBeDefined();
+  });
+});
+
 describe("apnsTransport push categories", () => {
   async function deliverWithCategory(
-    category: "message" | "approval.pending" | "approval.resolved",
+    category: "message" | "approval.pending" | "approval.resolved" | "mobile.status.wake",
     collapseId: string,
-  ): Promise<{ headers: Record<string, unknown>; body: Record<string, unknown> }> {
+  ): Promise<{ headers: Record<string, unknown>; body: Record<string, unknown>; rawBody: string }> {
     const { config } = testConfig();
     let seen: { headers: Record<string, unknown>; body: string } | undefined;
     const baseUrl = await fakeApns((headers, body, stream) => {
@@ -242,7 +330,8 @@ describe("apnsTransport push categories", () => {
       stream.end();
     });
     await apnsTransport(config, { baseUrl }).deliver("DEVTOK", "CIPHERBLOB", { category, collapseId });
-    return { headers: seen?.headers ?? {}, body: JSON.parse(seen?.body ?? "{}") as Record<string, unknown> };
+    const rawBody = seen?.body ?? "{}";
+    return { headers: seen?.headers ?? {}, body: JSON.parse(rawBody) as Record<string, unknown>, rawBody };
   }
 
   it("sets aps.category so the app can attach its Approve/Deny actions client-side", async () => {
@@ -252,12 +341,33 @@ describe("apnsTransport push categories", () => {
   });
 
   it("uses the content-free message alert and caller collapse id for bot replies", async () => {
-    const { headers, body } = await deliverWithCategory("message", "botmsg.abc123");
+    const { headers, body, rawBody } = await deliverWithCategory("message", "botmsg.abc123");
     expect(headers["apns-collapse-id"]).toBe("botmsg.abc123");
-    expect(body["aps"]).toMatchObject({
-      category: "message",
-      alert: { title: "CozyChat", body: "New message" },
+    expect(headers["apns-push-type"]).toBe("alert");
+    expect(headers["apns-priority"]).toBe("10");
+    expect(body).toEqual({
+      aps: {
+        alert: { title: "CozyChat", body: "New message" },
+        "mutable-content": 1,
+        category: "message",
+      },
+      c: "CIPHERBLOB",
     });
+    expect(rawBody).toBe(
+      '{"aps":{"alert":{"title":"CozyChat","body":"New message"},"mutable-content":1,"category":"message"},"c":"CIPHERBLOB"}',
+    );
+  });
+
+  it("sends mobile status wakes as an exact silent background APNs envelope", async () => {
+    const { headers, body, rawBody } = await deliverWithCategory("mobile.status.wake", "mobile.status");
+    expect(headers["apns-collapse-id"]).toBe("mobile.status");
+    expect(headers["apns-push-type"]).toBe("background");
+    expect(headers["apns-priority"]).toBe("5");
+    expect(body).toEqual({
+      aps: { "content-available": 1 },
+      c: "CIPHERBLOB",
+    });
+    expect(rawBody).toBe('{"aps":{"content-available":1},"c":"CIPHERBLOB"}');
   });
 
   it("coalesces on the caller's collapse id (apns-collapse-id = toolCallId)", async () => {
@@ -273,7 +383,20 @@ describe("apnsTransport push categories", () => {
   });
 
   it("carries only a value-free fallback alert; every approval detail stays inside the ciphertext", async () => {
-    const { body } = await deliverWithCategory("approval.pending", "toolu_01");
+    const { headers, body, rawBody } = await deliverWithCategory("approval.pending", "toolu_01");
+    expect(headers["apns-push-type"]).toBe("alert");
+    expect(headers["apns-priority"]).toBe("10");
+    expect(body).toEqual({
+      aps: {
+        alert: { title: "CozyChat", body: "Approval requested" },
+        "mutable-content": 1,
+        category: "approval.pending",
+      },
+      c: "CIPHERBLOB",
+    });
+    expect(rawBody).toBe(
+      '{"aps":{"alert":{"title":"CozyChat","body":"Approval requested"},"mutable-content":1,"category":"approval.pending"},"c":"CIPHERBLOB"}',
+    );
     const aps = body["aps"] as { alert: { title: string; body: string } };
     expect(aps.alert).toEqual({ title: "CozyChat", body: "Approval requested" });
     // The APNs JSON, minus the opaque ciphertext, names nothing about the tool call itself.

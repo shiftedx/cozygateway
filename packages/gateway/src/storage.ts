@@ -38,6 +38,22 @@ export type NativeInteractionResolutionRequest =
  * never pruned; retain only the newest bounded terminal proof per profile. */
 const NATIVE_INTERACTION_SETTLEMENT_LIMIT = 100;
 
+const BOT_MOBILE_RECEIPT_COLUMNS = `
+  request_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  command TEXT NOT NULL CHECK (command IN (
+    'device.status', 'location.current', 'camera.capture', 'file.pick', 'notification.present'
+  )),
+  shared_description TEXT NOT NULL CHECK (shared_description IN (
+    'Device status', 'Approximate location', 'Camera photo', 'Camera video',
+    'Selected photo', 'Selected file', 'Notification action'
+  )),
+  purpose TEXT NOT NULL,
+  shared_at INTEGER NOT NULL
+`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
@@ -94,6 +110,11 @@ CREATE TABLE IF NOT EXISTS live_activity_registrations (
   last_timestamp INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (device_id, activity_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS live_activity_relay_deletion_outbox (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  push_id TEXT NOT NULL UNIQUE,
+  queued_at INTEGER NOT NULL
 ) STRICT;
 -- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
 -- tables below.
@@ -346,14 +367,7 @@ CREATE TABLE IF NOT EXISTS bot_message_receipts (
 -- Capability 39 phone-sharing receipts. The request id is the idempotency key; the remaining
 -- columns are chat-visible metadata. Device identity, lease, and shared result are never stored.
 CREATE TABLE IF NOT EXISTS bot_mobile_receipts (
-  request_id TEXT PRIMARY KEY,
-  bot TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  turn_id TEXT NOT NULL,
-  command TEXT NOT NULL CHECK (command IN ('device.status', 'location.current')),
-  shared_description TEXT NOT NULL CHECK (shared_description IN ('Device status', 'Approximate location')),
-  purpose TEXT NOT NULL,
-  shared_at INTEGER NOT NULL
+${BOT_MOBILE_RECEIPT_COLUMNS}
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_mobile_receipts_session
   ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
@@ -510,6 +524,13 @@ export interface AttachScheduledDeliveryReceipt {
   deadLetteredAt?: number;
   /** Capability 31. When a paired device reported the projected row on screen. */
   displayedAt?: number;
+  /** Present together only when the admitted scheduled event expected media. These are a bounded
+   * read-back of its requested IDs and the committed native row's actual attachment IDs. */
+  expectedMediaIds?: string[];
+  committedMediaIds?: string[];
+  /** True only when projection is durable and the committed native attachment IDs exactly match
+   * the expected IDs in order. Display and media upload are deliberately not substitutes. */
+  mediaVerified?: boolean;
   /** The one terminal fact about this occurrence, once it has one. `state` above stays the
    * projection-pipeline position it has always been, so an existing reader is untouched. */
   terminal?: {
@@ -818,17 +839,44 @@ export class Storage {
     this.#db.prepare("DELETE FROM push_registrations WHERE device_id = ?").run(deviceId);
   }
 
-  saveLiveActivityRegistration(row: Omit<LiveActivityRegistrationRow, "eventSequence" | "lastTimestamp">): string | undefined {
-    const previous = this.liveActivityRegistration(row.deviceId, row.activityId)?.pushId;
-    this.#db.prepare(
-      `INSERT INTO live_activity_registrations
-       (device_id, activity_id, run_id, conversation_id, bot, push_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(device_id, activity_id) DO UPDATE SET
-         run_id = excluded.run_id, conversation_id = excluded.conversation_id,
-         bot = excluded.bot, push_id = excluded.push_id, created_at = excluded.created_at`,
-    ).run(row.deviceId, row.activityId, row.runId, row.conversationId, row.bot, row.pushId, row.createdAt);
-    return previous;
+  /** Stores the one ActivityKit card owned by this device conversation and durably queues the
+   * superseded relay push ids it returns. The replacement, queueing, and stale-row removal are one
+   * transaction so a turn can never observe both the superseded card and its replacement. */
+  saveLiveActivityRegistration(
+    row: Omit<LiveActivityRegistrationRow, "eventSequence" | "lastTimestamp">,
+  ): string[] {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.#db.prepare(
+        `SELECT push_id AS pushId FROM live_activity_registrations
+         WHERE device_id = ? AND (conversation_id = ? OR activity_id = ?)`,
+      ).all(row.deviceId, row.conversationId, row.activityId) as Array<{ pushId: string }>;
+      const superseded = [...new Set(
+        previous.map(({ pushId }) => pushId).filter((pushId) => pushId !== row.pushId),
+      )];
+      const enqueue = this.#db.prepare(
+        `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+         VALUES (?, ?)`,
+      );
+      for (const pushId of superseded) enqueue.run(pushId, row.createdAt);
+      this.#db.prepare(
+        `DELETE FROM live_activity_registrations
+         WHERE device_id = ? AND conversation_id = ? AND activity_id <> ?`,
+      ).run(row.deviceId, row.conversationId, row.activityId);
+      this.#db.prepare(
+        `INSERT INTO live_activity_registrations
+         (device_id, activity_id, run_id, conversation_id, bot, push_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(device_id, activity_id) DO UPDATE SET
+           run_id = excluded.run_id, conversation_id = excluded.conversation_id,
+           bot = excluded.bot, push_id = excluded.push_id, created_at = excluded.created_at`,
+      ).run(row.deviceId, row.activityId, row.runId, row.conversationId, row.bot, row.pushId, row.createdAt);
+      this.#db.exec("COMMIT");
+      return superseded;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   liveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {
@@ -858,12 +906,69 @@ export class Storage {
     return this.liveActivityRegistration(deviceId, activityId)?.eventSequence ?? 0;
   }
 
-  deleteLiveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {
-    const row = this.liveActivityRegistration(deviceId, activityId);
-    this.#db.prepare(
-      "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
-    ).run(deviceId, activityId);
-    return row;
+  /** Atomically queues and removes the current row. `expectedPushId` makes asynchronous relay
+   * responses compare-and-delete, so an old response cannot remove a rotated registration. */
+  deleteLiveActivityRegistration(
+    deviceId: string,
+    activityId: string,
+    options: { expectedPushId?: string; queuedAt?: number } = {},
+  ): LiveActivityRegistrationRow | undefined {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.liveActivityRegistration(deviceId, activityId);
+      if (row !== undefined
+        && (options.expectedPushId === undefined || row.pushId === options.expectedPushId)) {
+        this.#db.prepare(
+          `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+           VALUES (?, ?)`,
+        ).run(row.pushId, options.queuedAt ?? Date.now());
+        this.#db.prepare(
+          "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
+        ).run(deviceId, activityId);
+      } else if (row !== undefined) {
+        this.#db.exec("COMMIT");
+        return undefined;
+      }
+      this.#db.exec("COMMIT");
+      return row;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  liveActivityRelayDeletions(limit: number): string[] {
+    return (this.#db.prepare(
+      `SELECT push_id AS pushId FROM live_activity_relay_deletion_outbox
+       ORDER BY queued_at, push_id LIMIT ?`,
+    ).all(Math.max(0, limit)) as Array<{ pushId: string }>).map(({ pushId }) => pushId);
+  }
+
+  liveActivityRelayDeletionHighWater(): number | undefined {
+    const row = this.#db.prepare(
+      "SELECT MAX(sequence) AS sequence FROM live_activity_relay_deletion_outbox",
+    ).get() as { sequence: number | null };
+    return row.sequence ?? undefined;
+  }
+
+  liveActivityRelayDeletionPage(
+    afterSequence: number,
+    throughSequence: number,
+    limit: number,
+  ): Array<{ pushId: string; sequence: number }> {
+    return this.#db.prepare(
+      `SELECT push_id AS pushId, sequence FROM live_activity_relay_deletion_outbox
+       WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT ?`,
+    ).all(afterSequence, throughSequence, Math.max(0, limit)) as Array<{
+      pushId: string;
+      sequence: number;
+    }>;
+  }
+
+  completeLiveActivityRelayDeletion(pushId: string): boolean {
+    return this.#db.prepare(
+      "DELETE FROM live_activity_relay_deletion_outbox WHERE push_id = ?",
+    ).run(pushId).changes === 1;
   }
 
   /** Replaces the whole cached roster in one transaction, preserving build order. */
@@ -2131,18 +2236,22 @@ export class Storage {
                 inbox.applied_at AS projectedAt, inbox.projection_attempts AS attempts,
                 inbox.dead_lettered_at AS deadLetteredAt, inbox.disposition AS disposition,
                 inbox.projection_error AS projectionError,
-                receipt.displayed_at AS displayedAt
+                receipt.displayed_at AS displayedAt,
+                message.attachments_json AS attachmentsJson
          FROM attach_scheduled_deliveries AS delivery
          JOIN attach_event_inbox AS inbox
            ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
          LEFT JOIN bot_message_receipts AS receipt
            ON receipt.bot = delivery.agent_id AND receipt.message_id = delivery.message_id
+         LEFT JOIN bot_native_messages AS message
+           ON message.bot = delivery.agent_id AND message.message_id = delivery.message_id
          WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
       )
       .get(agentId, deliveryId) as {
         threadId: string; messageId: string; frameJson: string; admittedAt: number;
         projectedAt: number | null; attempts: number; deadLetteredAt: number | null;
         disposition: string; projectionError: string | null; displayedAt: number | null;
+        attachmentsJson: string | null;
       } | undefined;
     if (row === undefined) return undefined;
     const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
@@ -2165,22 +2274,38 @@ export class Storage {
       ...(row.displayedAt === null ? {} : { displayedAt: row.displayedAt }),
       ...(terminal === undefined ? {} : { terminal }),
     };
+    const expectedMediaIds = frame.event.kind === "scheduled" && frame.event.mediaIds?.length
+      ? frame.event.mediaIds.slice(0, 16)
+      : undefined;
+    const committedMediaIds = row.projectedAt === null || row.attachmentsJson === null
+      ? []
+      : (JSON.parse(row.attachmentsJson) as BotChatAttachment[])
+        .flatMap((attachment) => typeof attachment.fileId === "string" ? [attachment.fileId] : []);
+    const media = expectedMediaIds === undefined
+      ? {}
+      : {
+        expectedMediaIds,
+        committedMediaIds,
+        mediaVerified: row.projectedAt !== null
+          && expectedMediaIds.length === committedMediaIds.length
+          && expectedMediaIds.every((mediaId, index) => mediaId === committedMediaIds[index]),
+      };
     if (row.projectedAt !== null) {
       return {
         deliveryId, messageId: row.messageId, target,
-        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt, ...extras,
+        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt, ...extras, ...media,
       };
     }
     if (row.deadLetteredAt !== null) {
       return {
         deliveryId, messageId: row.messageId, target,
         state: "blocked", admittedAt: row.admittedAt, attempts: row.attempts,
-        deadLetteredAt: row.deadLetteredAt, ...extras,
+        deadLetteredAt: row.deadLetteredAt, ...extras, ...media,
       };
     }
     return {
       deliveryId, messageId: row.messageId, target,
-      state: "admitted", admittedAt: row.admittedAt, ...extras,
+      state: "admitted", admittedAt: row.admittedAt, ...extras, ...media,
     };
   }
 
@@ -2465,9 +2590,10 @@ export class Storage {
   }): BotMobileReceipt | undefined {
     const written = this.#db
       .prepare(
-        `INSERT OR IGNORE INTO bot_mobile_receipts
+        `INSERT INTO bot_mobile_receipts
            (request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(request_id) DO NOTHING`,
       )
       .run(
         input.requestId,
@@ -3067,6 +3193,69 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // The first outbox build keyed only by push id. Rebuild once with an AUTOINCREMENT sequence so
+  // a drain can capture a stable high-water snapshot that new enqueue traffic can never enter.
+  const outboxColumns = db
+    .prepare("SELECT name FROM pragma_table_info('live_activity_relay_deletion_outbox')")
+    .all() as Array<{ name: string }>;
+  if (!outboxColumns.some((column) => column.name === "sequence")) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec(`
+        ALTER TABLE live_activity_relay_deletion_outbox
+          RENAME TO live_activity_relay_deletion_outbox_v1;
+        CREATE TABLE live_activity_relay_deletion_outbox (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          push_id TEXT NOT NULL UNIQUE,
+          queued_at INTEGER NOT NULL
+        ) STRICT;
+        INSERT INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+        SELECT push_id, queued_at FROM live_activity_relay_deletion_outbox_v1
+        ORDER BY queued_at, push_id;
+        DROP TABLE live_activity_relay_deletion_outbox_v1;
+      `);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  // Older builds keyed activities only by ActivityKit id, so every new run could leave another
+  // row for the same device conversation. Retire all but the newest row durably before installing
+  // the invariant that prevents that fan-out shape from returning.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`
+      WITH ranked AS (
+        SELECT rowid AS registrationRowId, push_id AS pushId,
+          ROW_NUMBER() OVER (
+            PARTITION BY device_id, conversation_id
+            ORDER BY created_at DESC, rowid DESC
+          ) AS recency
+        FROM live_activity_registrations
+      )
+      INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+      SELECT pushId, ? FROM ranked WHERE recency > 1
+    `).run(Date.now());
+    db.exec(`
+      DELETE FROM live_activity_registrations WHERE rowid IN (
+        SELECT registrationRowId FROM (
+          SELECT rowid AS registrationRowId,
+            ROW_NUMBER() OVER (
+              PARTITION BY device_id, conversation_id
+              ORDER BY created_at DESC, rowid DESC
+            ) AS recency
+          FROM live_activity_registrations
+        ) WHERE recency > 1
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS live_activity_device_conversation
+        ON live_activity_registrations (device_id, conversation_id);
+    `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
   // Capability 28 distinguishes a submitted device decision from Hermes' later terminal event.
   // Existing durable rows remain pending with all request fields null after this additive migration.
   const interactionColumns = db
@@ -3158,12 +3347,49 @@ export function openStorage(dbPath: string): Storage {
   // heal. The honest watermark is therefore "replay begins with events journaled after this
   // migration": every pre-existing unapplied row is stamped applied at its own received_at, so
   // the first boot replays nothing historical.
-  const { user_version: schemaVersion } = db
+  let { user_version: schemaVersion } = db
     .prepare("PRAGMA user_version")
     .get() as { user_version: number };
   if (schemaVersion < 1) {
     db.exec("UPDATE attach_event_inbox SET applied_at = received_at WHERE applied_at IS NULL");
     db.exec("PRAGMA user_version = 1");
+    schemaVersion = 1;
+  }
+  // Capability 39 originally shipped with receipt constraints for status and location only.
+  // Expanded phone commands reached the broker later, so SQLite rejected every successful camera,
+  // picker, and notification receipt. Rebuild the table transactionally because SQLite cannot
+  // alter a CHECK constraint in place; the old table's narrower constraints guarantee every copied
+  // row is valid under the expanded domain.
+  if (schemaVersion < 2) {
+    const receiptTable = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bot_mobile_receipts'")
+      .get() as { sql: string };
+    if (!receiptTable.sql.includes("'notification.present'")) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec(`
+          DROP INDEX IF EXISTS bot_mobile_receipts_session;
+          ALTER TABLE bot_mobile_receipts RENAME TO bot_mobile_receipts_v1;
+          CREATE TABLE bot_mobile_receipts (
+${BOT_MOBILE_RECEIPT_COLUMNS}
+          ) STRICT, WITHOUT ROWID;
+          INSERT INTO bot_mobile_receipts
+            (request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at)
+          SELECT request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at
+          FROM bot_mobile_receipts_v1;
+          DROP TABLE bot_mobile_receipts_v1;
+          CREATE INDEX bot_mobile_receipts_session
+            ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
+          PRAGMA user_version = 2;
+          COMMIT;
+        `);
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    } else {
+      db.exec("PRAGMA user_version = 2");
+    }
   }
   return new Storage(db);
 }

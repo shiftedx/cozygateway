@@ -366,6 +366,7 @@ describe("POST /notify", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(deliveries).toHaveLength(0);
     expect(storage.notifyCount(pushId, "2026-07-07")).toBe(1);
+    expect(storage.registrationByPushId(pushId)).toBeDefined();
   });
 
   it("enforces the daily cap, which rolls over at midnight UTC", async () => {
@@ -520,6 +521,23 @@ describe("POST /notify, push categories", () => {
     expect(deliveries[0]?.options).toEqual({ category: "message", collapseId: "botmsg.abc123" });
   });
 
+  it("passes a mobile status wake and its required collapse id through without extra detail", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const res = await notify(app, {
+      pushId,
+      ciphertext: "CIPHER",
+      category: "mobile.status.wake",
+      collapseId: "mobile.status",
+    });
+    expect(res.status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(deliveries[0]?.options).toEqual({
+      category: "mobile.status.wake",
+      collapseId: "mobile.status",
+    });
+  });
+
   it("carries approval.resolved on the same collapse id, so a resolve replaces its own pending push", async () => {
     const { app, deliveries } = harness();
     const pushId = await registeredPushId(app);
@@ -553,6 +571,15 @@ describe("POST /notify, push categories", () => {
     const res = await notify(app, { pushId, ciphertext: "C", category: "approval.pending" });
     expect(res.status).toBe(400);
     expect(await errorCode(res)).toBe("invalid_request");
+  });
+
+  it("rejects a mobile status wake without its collapse id", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    const res = await notify(app, { pushId, ciphertext: "C", category: "mobile.status.wake" });
+    expect(res.status).toBe(400);
+    expect(await errorCode(res)).toBe("invalid_request");
+    expect(deliveries).toEqual([]);
   });
 
   it("rejects a collapse id without a category (nothing for the app to coalesce it against)", async () => {

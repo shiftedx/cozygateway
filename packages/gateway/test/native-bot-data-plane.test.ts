@@ -13,6 +13,33 @@ import { ATTACH_MEDIA_TTL_MS } from "../src/hermes-bridge/photos.ts";
 import { openStorage } from "../src/storage.ts";
 
 describe("attach-v1 native Bot Mode plane", () => {
+  it("distinguishes a listed profile from an attached bot", () => {
+    const storage = openStorage(":memory:");
+    let attached = false;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: { isAttached: () => attached } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 42,
+    });
+
+    expect(plane.surface().readiness("sage")).toEqual({
+      name: "sage", status: "starting", updatedAt: 42,
+    });
+    attached = true;
+    plane.handleAttachPresence("sage", "online");
+    expect(plane.surface().readiness("sage")).toEqual({
+      name: "sage", status: "ready", updatedAt: 42,
+    });
+    plane.handleAttachPresence("sage", "degraded");
+    expect(plane.surface().readiness("sage").status).toBe("starting");
+    plane.close();
+    storage.close();
+  });
+
   it("lists only configured attach identities", () => {
     const storage = openStorage(":memory:");
     const control = {

@@ -58,7 +58,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_DIR="$REPO_ROOT/integrations/attach-plugin"
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-DEFAULT_PROFILES=(cleo dewy-candle glowing-pixel night-owl polished-satellite rustic-squirrel)
+DEFAULT_PROFILES=(bayberry breezy-rill cleo drowsy-lark night-owl polished-satellite)
 PROFILES=()
 
 QUIET_WINDOW=20      # seconds the event_outbox sequence must hold steady

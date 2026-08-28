@@ -8,6 +8,7 @@ import { Value } from "@sinclair/typebox/value";
 import type { Static, TSchema } from "@sinclair/typebox";
 
 import { isBlockedLiteralHost, stripIpv6Brackets } from "./egress.ts";
+import { ApnsDeliveryError } from "./apns.ts";
 import { PerMinuteRateLimiter } from "./rate-limit.ts";
 import { NotifyRequestSchema, RegisterRequestSchema, relayError } from "./schemas.ts";
 import { DEFAULT_REGISTRATION_TTL_DAYS, utcDay, type RelayStorage } from "./storage.ts";
@@ -209,6 +210,9 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
       ? push
       : { liveActivity: parsed.liveActivity };
     void transport.deliver(registration.token, parsed.ciphertext ?? "", delivery).catch((err: unknown) => {
+      if (err instanceof ApnsDeliveryError && err.status === 410) {
+        deps.storage.deleteRegistration(registration.pushId);
+      }
       log(`push id ${registration.pushId}: delivery failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     return c.json({}, 202);

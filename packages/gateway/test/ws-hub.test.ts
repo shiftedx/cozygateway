@@ -295,6 +295,112 @@ describe("per-device presence", () => {
 });
 
 describe("mobile node selection", () => {
+  it("keeps a live foreground node selected when a delayed silent wake adds a background advertiser", async () => {
+    const foreground = connect();
+    const foregroundFrames = frames(foreground);
+    await once(foreground, "open");
+    foreground.send(JSON.stringify({ type: "auth", token }));
+    await until(() => foregroundFrames.some((frame) => frame.type === "ready"));
+    foreground.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true,
+    }));
+    await until(() => hub.mobileNodeRoute("d1", "location.current").status === "available");
+
+    const delayedWake = connect();
+    const delayedWakeFrames = frames(delayedWake);
+    await once(delayedWake, "open");
+    delayedWake.send(JSON.stringify({ type: "auth", token }));
+    await until(() => delayedWakeFrames.some((frame) => frame.type === "ready"));
+    delayedWake.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status"], foreground: false,
+    }));
+    delayedWake.send(JSON.stringify({ type: "sync", threads: {} }));
+    await until(() => delayedWakeFrames.some((frame) => frame.type === "synced"));
+
+    expect(hub.mobileNodeRoute("d1", "location.current")).toMatchObject({
+      status: "available", foreground: true,
+    });
+    expect(hub.sendMobileNodeFrame("d1", {
+      type: "mobile_node_request", requestId: "foreground-wins",
+      lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", command: "device.status", bot: "sage",
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness",
+    })).toBe("sent");
+    await until(() => foregroundFrames.some((frame) => frame.type === "mobile_node_request"));
+    expect(delayedWakeFrames.some((frame) => frame.type === "mobile_node_request")).toBe(false);
+
+    foreground.close();
+    delayedWake.close();
+  });
+
+  it("replaces a selected background node when a foreground advertiser arrives", async () => {
+    const background = connect();
+    const backgroundFrames = frames(background);
+    await once(background, "open");
+    background.send(JSON.stringify({ type: "auth", token }));
+    await until(() => backgroundFrames.some((frame) => frame.type === "ready"));
+    background.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status"], foreground: false,
+    }));
+    await until(() => hub.mobileNodeRoute("d1").foreground === false);
+
+    const foreground = connect();
+    const foregroundFrames = frames(foreground);
+    await once(foreground, "open");
+    foreground.send(JSON.stringify({ type: "auth", token }));
+    await until(() => foregroundFrames.some((frame) => frame.type === "ready"));
+    foreground.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status", "location.current"], foreground: true,
+    }));
+    await until(() => hub.mobileNodeRoute("d1", "location.current").status === "available");
+
+    expect(hub.sendMobileNodeFrame("d1", {
+      type: "mobile_node_request", requestId: "foreground-replaces-background",
+      lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", command: "device.status", bot: "sage",
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness",
+    })).toBe("sent");
+    await until(() => foregroundFrames.some((frame) => frame.type === "mobile_node_request"));
+    expect(backgroundFrames.some((frame) => frame.type === "mobile_node_request")).toBe(false);
+
+    background.close();
+    foreground.close();
+  });
+
+  it.each([false, true])("selects the newer %s advertiser during a same-priority reconnect", async (foreground) => {
+    const oldSocket = connect();
+    const oldFrames = frames(oldSocket);
+    await once(oldSocket, "open");
+    oldSocket.send(JSON.stringify({ type: "auth", token }));
+    await until(() => oldFrames.some((frame) => frame.type === "ready"));
+    oldSocket.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status"], foreground,
+    }));
+    await until(() => hub.mobileNodeRoute("d1").status === "available");
+
+    const newSocket = connect();
+    const newFrames = frames(newSocket);
+    await once(newSocket, "open");
+    newSocket.send(JSON.stringify({ type: "auth", token }));
+    await until(() => newFrames.some((frame) => frame.type === "ready"));
+    newSocket.send(JSON.stringify({
+      type: "mobile_node_advertise", commands: ["device.status"], foreground,
+    }));
+    newSocket.send(JSON.stringify({ type: "sync", threads: {} }));
+    await until(() => newFrames.some((frame) => frame.type === "synced"));
+
+    expect(hub.sendMobileNodeFrame("d1", {
+      type: "mobile_node_request", requestId: `new-${foreground}`,
+      lease: "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678", command: "device.status", bot: "sage",
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose: "Report phone readiness",
+    })).toBe("sent");
+    await until(() => newFrames.some((frame) => frame.type === "mobile_node_request"));
+    expect(oldFrames.some((frame) => frame.type === "mobile_node_request")).toBe(false);
+
+    oldSocket.close();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(hub.mobileNodeRoute("d1").status).toBe("available");
+    newSocket.close();
+  });
+
   it("distinguishes an unadvertised command from an unavailable selected socket", async () => {
     expect(hub.mobileNodeRoute("d1", "device.status")).toMatchObject({
       status: "selected_socket_unavailable", selectedSocketPresent: false,

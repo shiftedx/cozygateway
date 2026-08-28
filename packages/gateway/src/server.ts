@@ -446,6 +446,7 @@ export async function startGateway(
   );
   mobileNode = new MobileNodeBroker({
     route: (deviceId, command) => hub.mobileNodeRoute(deviceId, command),
+    wake: (deviceId) => notifier.notifyMobileNodeWake(deviceId),
     send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
     result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
     receipt: (receipt) => nativeBotPlane?.recordMobileReceipt(receipt) !== undefined,
@@ -524,6 +525,7 @@ export async function startGateway(
     storage,
     config,
     gatewayInfo,
+    ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
     ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),
@@ -539,7 +541,7 @@ export async function startGateway(
       const claim = mobileNode?.beginMediaUpload(deviceId, requestId, lease);
       return claim === undefined ? undefined : {
         agentId: claim.agentId,
-        complete: (media) => mobileNode?.completeMediaUpload(claim, media) ?? false,
+        complete: (media, reason) => mobileNode?.completeMediaUpload(claim, media, reason) ?? false,
       };
     },
     presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",

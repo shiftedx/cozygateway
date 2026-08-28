@@ -10,7 +10,12 @@ import {
 
 describe("push category registry", () => {
   it("exposes message coalescing and the approval pair", () => {
-    expect(PUSH_CATEGORY_IDS).toEqual(["message", "approval.pending", "approval.resolved"]);
+    expect(PUSH_CATEGORY_IDS).toEqual([
+      "message",
+      "approval.pending",
+      "approval.resolved",
+      "mobile.status.wake",
+    ]);
   });
 
   it("keys every spec by its own id, so a category cannot be mis-mapped", () => {
@@ -23,14 +28,25 @@ describe("push category registry", () => {
     expect(PUSH_CATEGORIES["message"].requiresCollapseId).toBe(true);
     expect(PUSH_CATEGORIES["approval.pending"].requiresCollapseId).toBe(true);
     expect(PUSH_CATEGORIES["approval.resolved"].requiresCollapseId).toBe(true);
+    expect(PUSH_CATEGORIES["mobile.status.wake"].requiresCollapseId).toBe(true);
   });
 
   it("ships a value-free fallback alert per category (the relay cannot read the ciphertext)", () => {
-    for (const id of PUSH_CATEGORY_IDS) {
-      const { alert } = PUSH_CATEGORIES[id];
+    for (const id of ["message", "approval.pending", "approval.resolved"] as const) {
+      const spec = PUSH_CATEGORIES[id];
+      if (spec.pushType !== "alert") throw new Error(`${id} must remain an alert category`);
+      const { alert } = spec;
       expect(alert.title.length).toBeGreaterThan(0);
       expect(alert.body.length).toBeGreaterThan(0);
     }
+  });
+
+  it("registers mobile status wakes as silent background pushes", () => {
+    expect(PUSH_CATEGORIES["mobile.status.wake"]).toEqual({
+      id: "mobile.status.wake",
+      pushType: "background",
+      requiresCollapseId: true,
+    });
   });
 
   it("recognizes exactly the registered ids", () => {

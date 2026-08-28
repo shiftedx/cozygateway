@@ -221,6 +221,7 @@ export class NativeBotDataPlane {
   surface(): BotsSurface {
     const overrides: Partial<BotsSurface> = {
       roster: () => this.#roster(),
+      readiness: (name) => this.#readiness(name),
       commands: (name) => this.#commands(name),
       pendingApprovals: () => this.#pendingApprovals(),
       pendingClarifications: () => this.#pendingClarifications(),
@@ -316,6 +317,22 @@ export class NativeBotDataPlane {
   #roster() {
     const view = this.#control.roster();
     return { ...view, bots: this.rosterBots(view.bots) };
+  }
+
+  /** A profile is not usable merely because Hermes lists it. Native Bot Mode becomes writable
+   * only after the profile's authenticated attach-v1 transport is online. Unconfigured profiles
+   * deliberately report `starting`: the Mac provisioner adds them to the gateway config and the
+   * ensuing restart constructs the native plane that can eventually call them ready. */
+  #readiness(name: string) {
+    const key = normalize(name);
+    const presence = this.#attachPresence.get(key);
+    const ready = this.handles(key) && presence !== "degraded" && presence !== "absent" &&
+      (presence === "online" || this.#ingress.isAttached?.(key) === true);
+    return {
+      name: key,
+      status: ready ? "ready" as const : "starting" as const,
+      updatedAt: this.#now(),
+    };
   }
 
   handles(bot: string): boolean {

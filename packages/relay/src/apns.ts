@@ -60,6 +60,18 @@ function toError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
 
+/** An HTTP response from APNs that refused a delivery. Kept APNs-specific so relay policy can
+ * distinguish Apple's terminal token invalidation from generic webhook or network failures. */
+export class ApnsDeliveryError extends Error {
+  readonly status: number;
+
+  constructor(status: number, responseBody: string) {
+    super(`apns delivery failed: HTTP ${status} ${responseBody}`.trim());
+    this.name = "ApnsDeliveryError";
+    this.status = status;
+  }
+}
+
 /** A first-class APNs delivery transport. Token-based auth (ES256 provider JWT, cached and
  *  refreshed). The relay never decrypts: the opaque ciphertext rides under the top-level custom
  *  key "c" (the iOS Notification Service Extension reads exactly payload["c"]). Uses node:http2
@@ -91,13 +103,16 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
 
   return {
     deliver(token: string, ciphertext: string, push?: PushDeliveryOptions): Promise<void> {
-      // The category shapes the ENVELOPE only: which actionable category the app renders its
-      // Approve/Deny buttons for, and the fallback alert shown if the Notification Service
-      // Extension cannot run. The relay never reads the ciphertext, so the alert it builds is
-      // a fixed, content-free string per category; the NSE decrypts and rewrites it on device.
+      // The category shapes the ENVELOPE only: an alert category and its content-free fallback,
+      // or a silent/background wake. The relay never reads the ciphertext; for alerts, the NSE
+      // decrypts and rewrites the fixed fallback on device.
       const spec = push?.category === undefined ? undefined : PUSH_CATEGORIES[push.category];
-      const alert = spec?.alert ?? DEFAULT_ALERT;
-      const body = push?.liveActivity === undefined ? JSON.stringify({
+      const background = spec?.pushType === "background";
+      const alert = spec?.pushType === "alert" ? spec.alert : DEFAULT_ALERT;
+      const body = push?.liveActivity === undefined && background ? JSON.stringify({
+        aps: { "content-available": 1 },
+        c: ciphertext,
+      }) : push?.liveActivity === undefined ? JSON.stringify({
         aps: {
           alert: { title: alert.title, body: alert.body },
           "mutable-content": 1,
@@ -147,7 +162,7 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
             ? config.topic
             : `${config.topic}.push-type.liveactivity`,
           "apns-push-type": push?.liveActivity === undefined ? (spec?.pushType ?? "alert") : "liveactivity",
-          "apns-priority": String(push?.liveActivity?.priority ?? 10),
+          "apns-priority": String(push?.liveActivity?.priority ?? (background ? 5 : 10)),
           "content-type": "application/json",
           // Coalescing: a later push with the same collapse id REPLACES the delivered one on
           // device. Approvals pass the toolCallId; bot messages pass a bot/chat digest so a burst
@@ -169,7 +184,7 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
         });
         req.on("end", () => {
           if (status >= 200 && status < 300) settle();
-          else settle(new Error(`apns delivery failed: HTTP ${status} ${responseBody}`.trim()));
+          else settle(new ApnsDeliveryError(status, responseBody));
         });
         req.on("error", (err) => settle(toError(err)));
         req.write(body);

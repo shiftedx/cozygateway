@@ -91,7 +91,10 @@ before the relay connects to it.
 `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`, `APNS_ENVIRONMENT`, all five together or
 none). Delivery is an alert with `mutable-content: 1` carrying the opaque ciphertext
 under the top-level custom key `c`. Registering `platform: "apns"` on a relay with no
-APNs key returns 501 `unsupported_platform`.
+APNs key returns 501 `unsupported_platform`. An APNs HTTP 410 response terminally
+invalidates and deletes that registration after the detached delivery settles. The
+current `/notify` remains 202; later requests for the deleted `pushId` return 404.
+Nonterminal APNs statuses and network failures leave the registration in place.
 
 ## Push categories
 

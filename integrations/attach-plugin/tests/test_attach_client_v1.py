@@ -353,6 +353,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "mobile_media", "mobile_notifications",
             "memory_management", "delivery_receipts", "delegation", "thinking",
+            "mobile_failure_details",
         })
 
     def test_hello_ack_budget_is_not_a_one_second_race(self):
@@ -619,6 +620,30 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await request, {"status": "ok", "result": GATEWAY_STATUS})
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
 
+    async def test_mobile_failure_details_are_closed_and_preserved(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_failure_details"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "Report phone readiness"))
+        await __import__("asyncio").sleep(0)
+        request_id = self.socket.sent[-1]["requestId"]
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "mobile_result", "requestId": request_id, "status": "device_unavailable",
+            "stage": "dispatch", "reason": "frame_send_failed",
+        }))
+        self.assertEqual(await request, {
+            "status": "device_unavailable", "stage": "dispatch", "reason": "frame_send_failed",
+        })
+
+        for stage, reason in (("secret-stage", "frame_send_failed"), ("dispatch", "secret-reason")):
+            pending = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "Report phone readiness"))
+            await __import__("asyncio").sleep(0)
+            request_id = self.socket.sent[-1]["requestId"]
+            await self.client._dispatch_inbound(json.dumps({
+                "kind": "mobile_result", "requestId": request_id, "status": "device_unavailable",
+                "stage": stage, "reason": reason,
+            }))
+            self.assertEqual(await pending, {"status": "device_unavailable"})
+
     async def test_device_status_cancellation_and_disconnect_do_not_leave_pending_work(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
@@ -638,6 +663,29 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         with patch("cozygateway.attach_client_v1.MOBILE_STATUS_TIMEOUT_SECONDS", 0.001):
             self.assertEqual(await self.client.request_device_status("thread", "turn", "Report phone readiness"), {"status": "expired"})
         self.assertEqual([frame["kind"] for frame in self.socket.sent[-2:]], ["mobile_request", "mobile_cancel"])
+
+    async def test_mobile_deadlines_distinguish_queries_from_human_interactions(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_media"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        with patch("cozygateway.attach_client_v1.time.time", return_value=1_000):
+            status_request = __import__("asyncio").create_task(
+                self.client.request_device_status("thread", "turn", "Report phone readiness")
+            )
+            await __import__("asyncio").sleep(0)
+            status_frame = self.socket.sent[-1]
+            status_request.cancel()
+            self.assertEqual(await status_request, {"status": "cancelled"})
+            request = __import__("asyncio").create_task(
+                self.client.request_camera("thread", "turn", "Capture a test photo", "rear", "photo")
+            )
+            await __import__("asyncio").sleep(0)
+        frame = self.socket.sent[-1]
+        self.assertEqual(status_frame["command"], "device.status")
+        self.assertEqual(status_frame["expiresAt"], 1_030_000)
+        self.assertEqual(frame["command"], "camera.capture")
+        self.assertEqual(frame["expiresAt"], 1_120_000)
+        request.cancel()
+        self.assertEqual(await request, {"status": "cancelled"})
 
     async def test_device_status_rejects_arbitrary_result_payloads(self):
         await self.client.connect()
