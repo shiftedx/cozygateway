@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 40. This extension is independent of the frozen core
+Status: v1 extension, capability version 41. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 40 }
+"capabilities": { "com.cozylabs.bots": 41 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -54,7 +54,7 @@ extension omits the capability and does not register `/bots` routes.
 | 14 | `bot_chat_adopted` and manual session adoption. |
 | 15 | Assistant attachment ingestion. |
 | 16 | Native session history and manual restore. |
-| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent, even though the current bots scalar (40) is numerically >= 17. |
+| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent, even though the current bots scalar is numerically >= 17. |
 | 18 | Per-bot model configuration. |
 | 19 | Stop and start-new-chat actions. |
 | 20 | Audio/video attachment playback with byte ranges. |
@@ -78,6 +78,7 @@ extension omits the capability and does not register `/bots` routes.
 | 38 | Device status v2: normalized status purpose and the closed mobile-node v3 operational status result; no v1 fallback. |
 | 39 | Capability leases and durable metadata-only receipts for phone-node sharing. |
 | 40 | Bot readiness: `GET /bots/:name/readiness` distinguishes a created profile from an attached bot that can accept turns. |
+| 41 | Model-provider setup: Hermes' unified provider universe, credential fields, and PKCE/device-code sessions under `/bots/:name/model-providers`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -85,8 +86,8 @@ and unknown server frames are ignored.
 `com.cozylabs.agent-inbox` is a reserved, dormant capability id and the sole future advertisement
 for Agent Inbox. It has no advertised version: do not advertise it or expose an inbox page until
 Hermes supplies durable structured A2A sender, delivery/reply, and conversation metadata plus
-bounded replay. It is deliberately separate from `com.cozylabs.bots`: that scalar remains 40, so
-clients must not infer the withdrawn capability-17 surface from `com.cozylabs.bots >= 17`.
+bounded replay. It is deliberately separate from `com.cozylabs.bots`: clients must not infer the
+withdrawn capability-17 surface from any later `com.cozylabs.bots` version.
 
 ## Resources
 
@@ -119,6 +120,10 @@ a second, hand-copied schema.
   so the picker can show the saved selection and a re-auth affordance; a client renders those
   entries disabled with a sign-in hint rather than hiding them, and a client below 36 ignores both
   fields.
+  Capability 41's `BotModelProviderSetupCatalog` is the wider setup universe in the same order as
+  `hermes model`. It is normalized live from Hermes; CozyGateway has no provider registry. A setup
+  field reports only `isSet`, never a value or redacted suffix. A method is `fields`, Hermes-hosted
+  `oauth`, or an honest `external` CLI handoff.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
 - `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its
   slash-prefixed `name` is the exact invocation; `description`, optional `argsHint`, and optional
@@ -433,6 +438,13 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. |
 | `GET /bots/:name/model-config` | — | `BotModelConfig` | Hermes profile model read. |
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Hermes profile model update. |
+| `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41. Hermes' complete provider setup catalog for this profile. |
+| `PUT /bots/:name/model-providers/:provider/fields/:field` | `BotModelProviderFieldUpdate` | `BotModelProviderSetupCatalog` | Writes one field through Hermes after re-validating that the field belongs to the provider. |
+| `DELETE /bots/:name/model-providers/:provider/fields/:field` | — | `BotModelProviderSetupCatalog` | Clears one Hermes-owned provider field and returns refreshed state. |
+| `POST /bots/:name/model-providers/:provider/oauth` | — | `BotModelProviderOAuthSession` | Starts a Hermes-hosted PKCE or device-code session. External CLI-only methods are rejected. |
+| `GET /bots/:name/model-providers/:provider/oauth/:sessionId` | — | `BotModelProviderOAuthSession` | Polls Hermes' session; clients stop at `approved`, `expired`, or `error`. |
+| `POST /bots/:name/model-providers/:provider/oauth/:sessionId/code` | `BotModelProviderOAuthCode` | `BotModelProviderOAuthSession` | Submits a PKCE authorization code to Hermes. |
+| `DELETE /bots/:name/model-providers/:provider/oauth/:sessionId` | — | `204 No Content` | Cancels the Hermes OAuth session. |
 | `GET /bots/:name/readiness` | — | `BotReadiness` | Capability 40. Reports `starting` until the configured attach identity is online, then `ready`. |
 | `GET /bots/:name/chat` | — | `{ name, sessionId, adoption: "created" \| "pin" }` | Resolves the selected native chat. |
 | `GET /bots/:name/chat/messages` | — | `{ name, sessionId, adoption, messages, running, inflight, updatedAt, suggestion?, toolSteps? }` | Reads native transcript and native tool history. |
@@ -553,5 +565,9 @@ Committed transcript history remains the recovery source after reconnect.
   capability-35 thinking preview are presentation fields. Raw tool arguments, results, command
   text, and full model reasoning are not serialized; the thinking preview is a sanitized,
   bounded display tail, not the chain of thought.
+- Provider credentials and authorization codes may appear only in the authenticated request body
+  for the one write that consumes them. They never appear in URLs, process arguments, responses,
+  logs, WebSocket frames, or gateway persistence. Provider reads expose only `isSet`; even Hermes'
+  redacted suffix is discarded at the bridge.
 - A client handles an unknown extension frame or optional field by ignoring it, then re-reads the
   documented REST state when it needs recovery.

@@ -13,6 +13,8 @@ import type {
   BotGroupMessage,
   BotModelConfig,
   BotModelConfigPatch,
+  BotModelProviderOAuthSession,
+  BotModelProviderSetupCatalog,
   BotInteractionSettlement,
   BotPendingClarification,
   BotPendingApproval,
@@ -83,6 +85,15 @@ import {
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
+import {
+  cancelProviderOAuth,
+  deleteProviderSetupField,
+  pollProviderOAuth,
+  readProviderSetupCatalog,
+  startProviderOAuth,
+  submitProviderOAuthCode,
+  writeProviderSetupField,
+} from "./provider-setup.ts";
 import {
   BLANK_SLATE_SKILLS_ON,
   seedBlankSlateProfile,
@@ -205,6 +216,21 @@ export interface BotControlSurface {
     name: string,
     patch: BotModelConfigPatch,
   ): Promise<BotModelConfig>;
+  modelProviders(name: string): Promise<BotModelProviderSetupCatalog>;
+  configureModelProviderField(
+    name: string, provider: string, field: string, value: string,
+  ): Promise<BotModelProviderSetupCatalog>;
+  clearModelProviderField(
+    name: string, provider: string, field: string,
+  ): Promise<BotModelProviderSetupCatalog>;
+  startModelProviderOAuth(name: string, provider: string): Promise<BotModelProviderOAuthSession>;
+  pollModelProviderOAuth(
+    name: string, provider: string, sessionId: string,
+  ): Promise<BotModelProviderOAuthSession>;
+  submitModelProviderOAuthCode(
+    name: string, provider: string, sessionId: string, code: string,
+  ): Promise<BotModelProviderOAuthSession>;
+  cancelModelProviderOAuth(name: string, provider: string, sessionId: string): Promise<void>;
   catalog(query: string): Promise<BotCatalog>;
   routines(name: string): Promise<BotRoutineList>;
   createRoutine(
@@ -735,6 +761,44 @@ export class HermesBridge implements BotControlSurface {
     return this.#chain(name, () =>
       writeBotModelConfig(this.#client, name, patch),
     );
+  }
+  async modelProviders(name: string): Promise<BotModelProviderSetupCatalog> {
+    await this.#assertBotKnown(name);
+    return readProviderSetupCatalog(this.#client, name, this.#now);
+  }
+  async configureModelProviderField(
+    name: string, provider: string, field: string, value: string,
+  ): Promise<BotModelProviderSetupCatalog> {
+    await this.#assertBotKnown(name);
+    return this.#chain(name, () => writeProviderSetupField(this.#client, name, provider, field, value));
+  }
+  async clearModelProviderField(
+    name: string, provider: string, field: string,
+  ): Promise<BotModelProviderSetupCatalog> {
+    await this.#assertBotKnown(name);
+    return this.#chain(name, () => deleteProviderSetupField(this.#client, name, provider, field));
+  }
+  async startModelProviderOAuth(
+    name: string, provider: string,
+  ): Promise<BotModelProviderOAuthSession> {
+    await this.#assertBotKnown(name);
+    return this.#chain(name, () => startProviderOAuth(this.#client, name, provider));
+  }
+  async pollModelProviderOAuth(
+    name: string, provider: string, sessionId: string,
+  ): Promise<BotModelProviderOAuthSession> {
+    await this.#assertBotKnown(name);
+    return pollProviderOAuth(this.#client, name, provider, sessionId);
+  }
+  async submitModelProviderOAuthCode(
+    name: string, provider: string, sessionId: string, code: string,
+  ): Promise<BotModelProviderOAuthSession> {
+    await this.#assertBotKnown(name);
+    return this.#chain(name, () => submitProviderOAuthCode(this.#client, name, provider, sessionId, code));
+  }
+  async cancelModelProviderOAuth(name: string, provider: string, sessionId: string): Promise<void> {
+    await this.#assertBotKnown(name);
+    await cancelProviderOAuth(this.#client, name, provider, sessionId);
   }
   async catalog(query: string): Promise<BotCatalog> {
     const cached = this.#catalog.get(query);

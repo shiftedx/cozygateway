@@ -1,7 +1,8 @@
 import type {
   BotCatalog, BotCreateRequest, BotCreateResponse, BotDeleteResponse, BotGroup,
   BotGroupDetail, BotGroupMessage, BotModelConfig, BotModelConfigPatch, BotProfile,
-  BotProfilePatch, BotRoutineCreateRequest, BotRoutinePatch, BotSummary, BridgeLiveness,
+  BotModelProviderOAuthSession, BotModelProviderSetupCatalog, BotProfilePatch,
+  BotRoutineCreateRequest, BotRoutinePatch, BotSummary, BridgeLiveness,
 } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -102,6 +103,13 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> { const r = this.#route(name); return r.member.bridge.configureProfile(r.profile, patch); }
   async modelConfig(name: string): Promise<BotModelConfig> { const r = this.#route(name); return r.member.bridge.modelConfig(r.profile); }
   async configureModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig> { const r = this.#route(name); return r.member.bridge.configureModel(r.profile, patch); }
+  async modelProviders(name: string): Promise<BotModelProviderSetupCatalog> { const r = this.#route(name); return r.member.bridge.modelProviders(r.profile); }
+  async configureModelProviderField(name: string, provider: string, field: string, value: string): Promise<BotModelProviderSetupCatalog> { const r = this.#route(name); return r.member.bridge.configureModelProviderField(r.profile, provider, field, value); }
+  async clearModelProviderField(name: string, provider: string, field: string): Promise<BotModelProviderSetupCatalog> { const r = this.#route(name); return r.member.bridge.clearModelProviderField(r.profile, provider, field); }
+  async startModelProviderOAuth(name: string, provider: string): Promise<BotModelProviderOAuthSession> { const r = this.#route(name); return r.member.bridge.startModelProviderOAuth(r.profile, provider); }
+  async pollModelProviderOAuth(name: string, provider: string, sessionId: string): Promise<BotModelProviderOAuthSession> { const r = this.#route(name); return r.member.bridge.pollModelProviderOAuth(r.profile, provider, sessionId); }
+  async submitModelProviderOAuthCode(name: string, provider: string, sessionId: string, code: string): Promise<BotModelProviderOAuthSession> { const r = this.#route(name); return r.member.bridge.submitModelProviderOAuthCode(r.profile, provider, sessionId, code); }
+  async cancelModelProviderOAuth(name: string, provider: string, sessionId: string): Promise<void> { const r = this.#route(name); return r.member.bridge.cancelModelProviderOAuth(r.profile, provider, sessionId); }
   async catalog(query: string): Promise<BotCatalog> {
     const member = [...this.#members.values()].find((item) => item.bridge.health().online) ?? [...this.#members.values()][0];
     if (member === undefined) throw new BackendUnavailable("no Hermes endpoint is configured");

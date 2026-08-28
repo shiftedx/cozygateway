@@ -26,6 +26,9 @@ import {
   BotGroupSendRequestSchema,
   BotModelConfigPatchSchema,
   BotModelConfigSchema,
+  BotModelProviderFieldUpdateSchema,
+  BotModelProviderOAuthSessionSchema,
+  BotModelProviderSetupCatalogSchema,
   BotNewSessionResponseSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
@@ -436,6 +439,47 @@ describe("bot model config", () => {
     expect(check(BotModelConfigPatchSchema, { effort: "low" })).toBe(true);
     expect(check(BotModelConfigPatchSchema, { model: 1 })).toBe(false);
   });
+
+  it("models provider setup without returning credential values", () => {
+    expect(
+      check(BotModelProviderSetupCatalogSchema, {
+        providers: [{
+          slug: "openrouter",
+          name: "OpenRouter",
+          authenticated: false,
+          modelCount: 0,
+          methods: [{
+            id: "fields",
+            kind: "fields",
+            label: "API key",
+            connected: false,
+            fields: [{
+              key: "OPENROUTER_API_KEY",
+              label: "OpenRouter API key",
+              secret: true,
+              advanced: false,
+              isSet: false,
+              helpUrl: "https://openrouter.ai/keys",
+            }],
+          }],
+        }],
+        updatedAt: 1_800_000_000_000,
+      }),
+    ).toBe(true);
+    expect(check(BotModelProviderFieldUpdateSchema, { value: "sk-secret" })).toBe(true);
+    expect(check(BotModelProviderFieldUpdateSchema, { value: "" })).toBe(false);
+    expect(
+      check(BotModelProviderOAuthSessionSchema, {
+        provider: "openai-codex",
+        sessionId: "oauth-1",
+        flow: "device_code",
+        status: "pending",
+        authorizationUrl: "https://example.test/device",
+        userCode: "ABCD-EFGH",
+        pollIntervalMs: 2_000,
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("chat reset", () => {
@@ -502,7 +546,7 @@ describe("capability advertisement", () => {
     // 16 for listing and manually restoring one of a bot's Hermes sessions. A manual restore emits
     // the existing adoption frame and holds until the next new conversational session appears.
     // 17 was the withdrawn heuristic agent inbox. Its replacement has a separate dormant
-    // capability id, so this capability remains at 40 until a different bots surface is added.
+    // capability id, so later bots capability bumps still do not revive the withdrawn surface.
     // 18 for bot model config plus accepted-but-inert per-routine model and effort metadata.
     // 19 for the authenticated hard-stop route and its existing complete state-frame terminal edge,
     // plus new-session minting through the existing adoption frame without retiring the old chat.
@@ -530,8 +574,9 @@ describe("capability advertisement", () => {
     // 37 adds bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Additive in the
     // simplest possible way, since a client below 37 simply never calls the route.
     // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts;
-    // 40 distinguishes a created profile from an attached, writable bot.
-    expect(BOTS_CAPABILITY_VERSION).toBe(40);
+    // 40 distinguishes a created profile from an attached, writable bot; 41 wraps Hermes' model
+    // provider setup catalog, credential lifecycle, and OAuth sessions for the phone.
+    expect(BOTS_CAPABILITY_VERSION).toBe(41);
   });
 
   it("keeps mobile receipts closed and metadata-only", () => {

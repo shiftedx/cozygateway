@@ -928,6 +928,87 @@ export const BotModelConfigPatchSchema = Type.Object({
 });
 export type BotModelConfigPatch = Static<typeof BotModelConfigPatchSchema>;
 
+/** Capability 41: one Hermes-owned setup field for a model provider. `isSet` is the only
+ * credential state exposed to clients; the stored value and Hermes' redacted suffix never cross
+ * the CozyGateway wire. `key` is an opaque Hermes field id (usually an environment-variable
+ * name) and is accepted back only for the provider row that advertised it. */
+export const BotModelProviderSetupFieldSchema = Type.Object({
+  key: Type.String({ minLength: 1 }),
+  label: Type.String({ minLength: 1 }),
+  secret: Type.Boolean(),
+  advanced: Type.Boolean(),
+  isSet: Type.Boolean(),
+  helpUrl: Type.Optional(Type.String()),
+});
+export type BotModelProviderSetupField = Static<typeof BotModelProviderSetupFieldSchema>;
+
+/** A setup method surfaced by Hermes' unified provider catalog. `fields` means values may be
+ * pasted in CozyChat; `oauth` is a Hermes-hosted PKCE or device-code session; `external` is a
+ * CLI-owned login that cannot truthfully be completed by the phone and therefore carries the
+ * exact Hermes command as a handoff. */
+export const BotModelProviderSetupMethodSchema = Type.Object({
+  id: Type.String({ minLength: 1 }),
+  kind: Type.Union([
+    Type.Literal("fields"),
+    Type.Literal("oauth"),
+    Type.Literal("external"),
+  ]),
+  label: Type.String({ minLength: 1 }),
+  connected: Type.Boolean(),
+  fields: Type.Optional(Type.Array(BotModelProviderSetupFieldSchema)),
+  flow: Type.Optional(Type.Union([Type.Literal("pkce"), Type.Literal("device_code")])),
+  command: Type.Optional(Type.String({ minLength: 1 })),
+  helpUrl: Type.Optional(Type.String()),
+});
+export type BotModelProviderSetupMethod = Static<typeof BotModelProviderSetupMethodSchema>;
+
+/** One provider in the same canonical order as `hermes model`. This is a setup catalog, not a
+ * second provider registry: every row and method is normalized from Hermes on each read. */
+export const BotModelProviderSetupSchema = Type.Object({
+  slug: Type.String({ minLength: 1 }),
+  name: Type.String({ minLength: 1 }),
+  authenticated: Type.Boolean(),
+  modelCount: Type.Integer({ minimum: 0 }),
+  methods: Type.Array(BotModelProviderSetupMethodSchema),
+});
+export type BotModelProviderSetup = Static<typeof BotModelProviderSetupSchema>;
+
+export const BotModelProviderSetupCatalogSchema = Type.Object({
+  providers: Type.Array(BotModelProviderSetupSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotModelProviderSetupCatalog = Static<typeof BotModelProviderSetupCatalogSchema>;
+
+/** The value is deliberately the whole body and never appears in a URL, process argument, result,
+ * or log. The route re-resolves `provider` + `field` against Hermes before forwarding it. */
+export const BotModelProviderFieldUpdateSchema = Type.Object({
+  value: Type.String({ minLength: 1, maxLength: 65_536 }),
+});
+export type BotModelProviderFieldUpdate = Static<typeof BotModelProviderFieldUpdateSchema>;
+
+export const BotModelProviderOAuthSessionSchema = Type.Object({
+  provider: Type.String({ minLength: 1 }),
+  sessionId: Type.String({ minLength: 1 }),
+  flow: Type.Union([Type.Literal("pkce"), Type.Literal("device_code")]),
+  status: Type.Union([
+    Type.Literal("pending"),
+    Type.Literal("approved"),
+    Type.Literal("expired"),
+    Type.Literal("error"),
+  ]),
+  authorizationUrl: Type.Optional(Type.String({ minLength: 1 })),
+  userCode: Type.Optional(Type.String({ minLength: 1 })),
+  expiresAt: Type.Optional(Type.Integer()),
+  pollIntervalMs: Type.Optional(Type.Integer({ minimum: 250 })),
+  error: Type.Optional(Type.String()),
+});
+export type BotModelProviderOAuthSession = Static<typeof BotModelProviderOAuthSessionSchema>;
+
+export const BotModelProviderOAuthCodeSchema = Type.Object({
+  code: Type.String({ minLength: 1, maxLength: 8_192 }),
+});
+export type BotModelProviderOAuthCode = Static<typeof BotModelProviderOAuthCodeSchema>;
+
 /** One routine's schedule. `raw` is the Hermes-native schedule string EXACTLY as the backend stores
  *  it (`30m`, `every 2h`, `0 9 * * 1-5`), which is also exactly what a client sends back on a write:
  *  the schedule is never re-encoded on this wire, because the picker's frequency choice is not
@@ -1362,7 +1443,7 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *  - `16`: `GET /bots/:name/sessions` and manual native-session adoption.
  *  - `17`: WITHDRAWN AGENT INBOX (issue #95). The former heuristic Hermes projection and both
  *    routes were removed because session text cannot prove durable A2A identity or privacy
- *    boundaries. Because the current bots scalar is still 40, clients MUST NOT infer this
+ *    boundaries. Clients MUST NOT infer this
  *    withdrawn surface from `com.cozylabs.bots >= 17`; its sole future advertisement is the
  *    separately versioned `com.cozylabs.agent-inbox` capability below.
  *  - `18`: BOT MODEL CONFIG (issue #106). Adds authenticated GET/PUT
@@ -1427,8 +1508,8 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
 /** Reserved future A2A inbox seam. This is the sole future advertisement for the withdrawn
  * surface and has no version until Hermes exposes durable structured A2A identity, delivery/reply
- * metadata, and bounded replay. It is separate from `com.cozylabs.bots` because that scalar
- * remains 40 and must not be read as support for capability 17. */
+ * metadata, and bounded replay. It is separate from `com.cozylabs.bots` because no later value
+ * of that scalar may be read as support for withdrawn capability 17. */
 export const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
 /** The phone-as-node capability, advertised beside the bots one.
  *  4: device status v2 answers over an authenticated origin, under a single-use lease.
@@ -1543,4 +1624,8 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * from an attach transport that is online. The route is read-only and returns `starting` until the
  * bot's authenticated attach-v1 hello has settled, then `ready`. A client that gates its composer
  * on this route must require >= 40; older gateways do not expose the readiness fact. */
-export const BOTS_CAPABILITY_VERSION = 40;
+/** Capability 41: MODEL PROVIDER SETUP. CozyGateway normalizes Hermes' unified `hermes model`
+ * provider universe and wraps its credential lifecycle plus PKCE/device-code sessions under
+ * `/bots/:name/model-providers`. CozyChat renders that state without owning a provider registry or
+ * retaining secrets. External CLI-only methods remain explicit handoffs. */
+export const BOTS_CAPABILITY_VERSION = 41;

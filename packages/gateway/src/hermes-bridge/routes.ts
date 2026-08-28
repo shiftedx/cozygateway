@@ -12,6 +12,8 @@ import {
   BotGroupCreateRequestSchema,
   BotGroupSendRequestSchema,
   BotModelConfigPatchSchema,
+  BotModelProviderFieldUpdateSchema,
+  BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
   BotRoutineCreateRequestSchema,
   BotRoutinePatchSchema,
@@ -26,6 +28,7 @@ import type { BotMemoryKind } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
+import { ProviderSetupInvalid } from "./provider-setup.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
@@ -217,6 +220,8 @@ function failure(c: Context<Env>, err: unknown) {
   if (err instanceof BotSessionNotFound)
     return c.json(errorBody("not_found", err.message), 404);
   if (err instanceof ModelConfigInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
+  if (err instanceof ProviderSetupInvalid)
     return c.json(errorBody("invalid_request", err.message), 400);
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
@@ -809,6 +814,105 @@ export function registerBotRoutes(
     }
     try {
       return c.json(await bots.configureModel(resolved.name, parsed));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.get("/bots/:name/model-providers", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(await bots.modelProviders(resolved.name));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.put("/bots/:name/model-providers/:provider/fields/:field", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { body = undefined; }
+    let parsed;
+    try {
+      parsed = assertValid(BotModelProviderFieldUpdateSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      return c.json(await bots.configureModelProviderField(
+        resolved.name, c.req.param("provider"), c.req.param("field"), parsed.value,
+      ));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.delete("/bots/:name/model-providers/:provider/fields/:field", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(await bots.clearModelProviderField(
+        resolved.name, c.req.param("provider"), c.req.param("field"),
+      ));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.post("/bots/:name/model-providers/:provider/oauth", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(await bots.startModelProviderOAuth(resolved.name, c.req.param("provider")));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.get("/bots/:name/model-providers/:provider/oauth/:sessionId", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(await bots.pollModelProviderOAuth(
+        resolved.name, c.req.param("provider"), c.req.param("sessionId"),
+      ));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.post("/bots/:name/model-providers/:provider/oauth/:sessionId/code", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { body = undefined; }
+    let parsed;
+    try {
+      parsed = assertValid(BotModelProviderOAuthCodeSchema, body);
+    } catch (err) {
+      const detail = err instanceof ContractViolation ? err.message : "malformed body";
+      return c.json(errorBody("invalid_request", detail), 400);
+    }
+    try {
+      return c.json(await bots.submitModelProviderOAuthCode(
+        resolved.name, c.req.param("provider"), c.req.param("sessionId"), parsed.code,
+      ));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.delete("/bots/:name/model-providers/:provider/oauth/:sessionId", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      await bots.cancelModelProviderOAuth(
+        resolved.name, c.req.param("provider"), c.req.param("sessionId"),
+      );
+      return c.body(null, 204);
     } catch (err) {
       return failure(c, err);
     }
