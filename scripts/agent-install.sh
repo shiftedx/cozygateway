@@ -874,6 +874,29 @@ dashboard_credentials_work() {
 enable_dashboard_basic_plugin() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   enable bundled Hermes dashboard_auth/basic for the root Dashboard profile"; return; }
   "$HERMES_RESOLVED" -p default plugins enable basic --no-allow-tool-override >/dev/null
+  local disabled repaired code
+  disabled="$("$HERMES_RESOLVED" -p default config get plugins.disabled --json 2>/dev/null)" || return
+  set +e
+  repaired="$(printf '%s' "$disabled" | "$NODE_RESOLVED" -e '
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  let disabled;
+  try { disabled = JSON.parse(input); } catch { process.exit(2); }
+  if (!Array.isArray(disabled) || disabled.some((name) => typeof name !== "string")) process.exit(2);
+  const repaired = disabled.filter((name) => name !== "basic" && name !== "dashboard_auth/basic");
+  if (repaired.length === disabled.length) process.exit(3);
+  process.stdout.write(JSON.stringify(repaired));
+});
+')"
+  code=$?
+  set -e
+  case "$code" in
+    0) "$HERMES_RESOLVED" -p default config set plugins.disabled "$repaired" >/dev/null ;;
+    3) return ;;
+    *) die "Hermes returned an invalid plugins.disabled value; refusing to rewrite plugin configuration" ;;
+  esac
 }
 launch_dashboard() {
   local hermes_root_arg="$HERMES_ROOT"

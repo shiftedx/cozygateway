@@ -56,6 +56,19 @@ if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "path" ]; then
   [ "$2" = default ] && printf '%s/config.yaml\n' "$root" || printf '%s/profiles/%s/config.yaml\n' "$root" "$2"
   exit 0
 fi
+if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "get" ] && [ "$5" = "plugins.disabled" ]; then
+  if [ -n "${COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE:-}" ]; then
+    cat "$COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE"
+  else
+    printf '[]\n'
+  fi
+  exit 0
+fi
+if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ] && [ "$5" = "plugins.disabled" ]; then
+  [ -n "${COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE:-}" ] || exit 2
+  printf '%s\n' "$6" > "$COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE"
+  exit 0
+fi
 if [ "$1" = "-p" ] && [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
   if [ "${COZYGATEWAY_TEST_WINDOWS_STATUS:-}" = 1 ] && [ "$profile" = active ]; then
     printf '✓ Scheduled Task registered: Hermes_Gateway\n  Status: Ready\n✓ Gateway process running (PID: 33036)\n'
@@ -233,6 +246,7 @@ case "$*" in
   *password-login*)
     cat >/dev/null
     if [ -n "${COZYGATEWAY_TEST_DASHBOARD_MISSING_PROVIDER_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_MISSING_PROVIDER_MARKER" ]; then printf '404'
+    elif [ -n "${COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE:-}" ] && grep -Eq '"(basic|dashboard_auth/basic)"' "$COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE"; then printf '404'
     elif [ -n "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER" ]; then printf '401'
     else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE:-200}"; fi
     ;;
@@ -585,6 +599,17 @@ expected_windows_hermes_home="$("$tmp/bin/cygpath" -w "$tmp/hermes")"
 : > "$dashboard_stopped_marker"
 COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_home_log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_stopped_marker" HOME="$tmp/windows-native-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-native-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-native-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-native-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-native" >/dev/null
 grep -Fxq "$expected_windows_hermes_home" "$dashboard_home_log"
+
+# Hermes releases before the upstream alias fix can report success from
+# `plugins enable basic` while a legacy deny-list entry still prevents the
+# provider from loading. Repair only those aliases and preserve every other
+# disabled plugin.
+dashboard_stale_disabled_marker="$tmp/windows-dashboard-stale-disabled-stopped"
+dashboard_disabled_plugins="$tmp/windows-dashboard-disabled-plugins.json"
+: > "$dashboard_stale_disabled_marker"
+printf '["basic","dashboard_auth/basic","keep-disabled"]\n' > "$dashboard_disabled_plugins"
+COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$tmp/windows-dashboard-stale-disabled-home.log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_stale_disabled_marker" COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE="$dashboard_disabled_plugins" HOME="$tmp/windows-stale-disabled-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-stale-disabled-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-stale-disabled-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-stale-disabled-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-stale-disabled" >/dev/null
+grep -Fxq '["keep-disabled"]' "$dashboard_disabled_plugins"
 
 # Once a newly launched Dashboard is healthy, a missing password provider is
 # configuration/version failure, not a reason to hammer the login endpoint and
