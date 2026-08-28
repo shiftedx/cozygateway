@@ -16,10 +16,11 @@ ownership of those services; uninstall reverses only lifecycle work it caused.
 It also makes `cozygateway` available in new terminal sessions without a global
 package installation.
 
-On macOS and Linux, missing Node.js 24+ is installed as a private,
+On Windows, macOS, and Linux, missing Node.js 24+ is installed as a private,
 checksum-verified runtime under the CozyGateway home. Missing Hermes is
 installed with the verified official tagged NousResearch installer. Setup then
-runs `hermes model` interactively and verifies the active provider and model
+runs `hermes model` interactively only when the active provider/model is
+incomplete, then verifies it
 before installing CozyGateway or printing a pairing QR.
 
 Fresh installs listen on `127.0.0.1:8787`. Choose LAN access explicitly with

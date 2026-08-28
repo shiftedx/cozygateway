@@ -14,7 +14,7 @@
 - Require no administrator prompt and register only current-user persistence.
 - Reuse Hermes Desktop's Hermes CLI, Node 24+, and Git Bash when present.
 - If Hermes is absent, invoke the official tagged NousResearch Hermes Windows installer and its normal setup wizard, then continue in the same PowerShell session.
-- Always run `hermes model` interactively and verify an active provider/default model before changing CozyGateway state.
+- Verify the active Hermes provider/default model before changing CozyGateway state; run `hermes model` interactively only when that setup is incomplete.
 - Verify every downloaded executable artifact against its release SHA-256 sidecar before use.
 - Preserve existing Hermes profiles and Hermes-owned services.
 - Keep the Windows gateway isolated under `%LOCALAPPDATA%\cozygateway` by default.
@@ -86,7 +86,7 @@ function Resolve-GitBash { param([string] $ExplicitPath) }
 function Invoke-CozyGatewayInstaller { param([string] $BashPath, [string] $InstallerPath, [string[]] $ForwardedArguments) }
 ```
 
-Use `Invoke-WebRequest -UseBasicParsing`, `Get-FileHash -Algorithm SHA256`, atomic `.new` files, and `[Environment]::GetEnvironmentVariable('HERMES_GIT_BASH_PATH','User')`. `Resolve-Hermes` first probes the command and `%LOCALAPPDATA%\hermes\bin\hermes.exe`; when absent it resolves the latest `NousResearch/hermes-agent` release tag, downloads that tag's `scripts/install.ps1`, executes its normal setup wizard, refreshes `HERMES_HOME`, User PATH, and `HERMES_GIT_BASH_PATH`, then requires `hermes -p default config path` to name an existing file. `Confirm-HermesModel` always launches `hermes model`, requires exit 0, and confirms the command's non-interactive/current-state output contains both `Current model:` and `Active provider:` with nonempty values before any CozyGateway download or mutation. Search Bash overrides first, then Hermes-managed `bin`/`usr\bin`, Git's install root, Program Files, and LocalAppData. Invoke the verified CozyGateway shell installer only after all CozyGateway assets pass. Default the install home to `$env:LOCALAPPDATA\cozygateway`.
+Use `Invoke-WebRequest -UseBasicParsing`, `Get-FileHash -Algorithm SHA256`, atomic `.new` files, and `[Environment]::GetEnvironmentVariable('HERMES_GIT_BASH_PATH','User')`. `Resolve-Hermes` first probes the command and `%LOCALAPPDATA%\hermes\bin\hermes.exe`; when absent it resolves the latest `NousResearch/hermes-agent` release tag, downloads that tag's `scripts/install.ps1`, executes its normal setup wizard, refreshes `HERMES_HOME`, User PATH, and `HERMES_GIT_BASH_PATH`, then requires `hermes -p default config path` to name an existing file. `Confirm-HermesModel` first checks current state and skips the interactive screen when both `Current model:` and `Active provider:` (or their short forms) are nonempty. Otherwise it launches `hermes model`, requires exit 0, and verifies the same evidence before any CozyGateway download or mutation. Search Bash overrides first, then Hermes-managed `bin`/`usr\bin`, Git's install root, Program Files, and LocalAppData. Invoke the verified CozyGateway shell installer only after all CozyGateway assets pass. Default the install home to `$env:LOCALAPPDATA\cozygateway`.
 
 - [ ] **Step 4: Run the bootstrap tests and verify GREEN**
 
@@ -240,7 +240,7 @@ Copy `scripts/install.ps1` to `dist-bundle/install.ps1`, hash it with the existi
 
 - [ ] **Step 3: Update human documentation**
 
-Document the eventual `irm https://cozylabs.ai/install.ps1 | iex` command, automatic official Hermes installation and setup when absent, reuse when present, mandatory provider/model selection through `hermes model`, checkout/release testing before website publication, `%LOCALAPPDATA%\cozygateway`, `--status`, logs, rerun semantics, uninstall, Scheduled Task/Startup behavior, pairing-code expiry, and the explicit absence of Windows bot auto-provisioning.
+Document the eventual `irm https://cozylabs.ai/install.ps1 | iex` command, automatic official Hermes installation and setup when absent, reuse when present, model-status detection with interactive selection only when incomplete, checkout/release testing before website publication, `%LOCALAPPDATA%\cozygateway`, `--status`, logs, rerun semantics, uninstall, Scheduled Task/Startup behavior, pairing-code expiry, and the explicit absence of Windows bot auto-provisioning.
 
 - [ ] **Step 4: Verify release and docs**
 

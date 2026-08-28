@@ -9,10 +9,11 @@ irm https://cozylabs.ai/install.ps1 | iex
 ```
 
 The Windows bootstrap reuses Hermes when installed. If Hermes is absent, it
-runs the official tagged NousResearch Windows installer and setup wizard. Every
-run opens `hermes model` before any CozyGateway changes so the operator selects
-or confirms an inference provider and default model. It then checksum-verifies
-the CozyGateway release assets and hands off through Hermes-compatible Git Bash.
+runs the official tagged NousResearch Windows installer and setup wizard. It
+checks the current Hermes provider and default model before any CozyGateway
+changes, and opens `hermes model` only when that setup is incomplete. It then
+checksum-verifies the CozyGateway release assets and hands off through
+Hermes-compatible Git Bash.
 
 macOS/Linux:
 
@@ -20,10 +21,11 @@ macOS/Linux:
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
-If Node.js 24+ is unavailable, the macOS/Linux installer downloads the current
+If Node.js 24+ is unavailable, the Windows/macOS/Linux installer downloads the current
 Node.js 24 archive from nodejs.org, verifies it against that release's official
 `SHASUMS256.txt`, and installs it privately under
-`~/.cozygateway/runtime/node`. It does not use sudo, replace the system Node,
+the CozyGateway home's `runtime/node` directory. It does not use elevation,
+replace the system Node,
 or change the shell PATH. If Hermes is unavailable, it verifies and runs the
 official installer from the latest tagged NousResearch/hermes-agent release,
 then resumes automatically. Every run gives `hermes model` control of the
