@@ -85,6 +85,14 @@ class _Adapter:
         self._client = client
         self._active_turn = active_turn or {}
         self._profile = profile
+        self.proactive_calls = []
+        self.proactive_result = {
+            "state": "journaled",
+            "accepted_pending": True,
+            "deliveryId": "scheduled:live-media-1",
+            "messageId": "scheduled-message-1",
+            "eventId": "event-1",
+        }
 
     async def request_device_status(self, thread_id, turn_id, purpose):
         return await self._client.request_device_status(thread_id, turn_id, purpose)
@@ -96,6 +104,10 @@ class _Adapter:
         self._client.calls.append((command, thread_id, turn_id, purpose, options))
         return await self._client.result
 
+    async def send_proactive(self, chat_id, message, media_files, **kwargs):
+        self.proactive_calls.append((chat_id, message, media_files, kwargs))
+        return self.proactive_result
+
 
 class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -105,6 +117,7 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.location_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_request_location")
         self.camera_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_capture_camera")
         self.file_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_pick_file")
+        self.send_media_tool = next(tool for tool in self.context.tools if tool["name"] == "cozy_send_media")
         self.original_context = adapter_module._current_turn_platform_and_chat
         self.original_message_context = adapter_module._current_turn_message_and_cron
         adapter_module._current_turn_platform_and_chat = lambda: (adapter_module.PLATFORM_NAME, "thread-1")
@@ -136,12 +149,155 @@ class MobileNodeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(platform["name"], adapter_module.PLATFORM_NAME)
         hint = platform["platform_hint"]
 
-        self.assertIn("MEDIA:/absolute/path", hint)
+        self.assertIn("cozy_send_media", hint)
+        self.assertIn("prefer", hint)
+        self.assertIn("do not repeat MEDIA: directives for the same files", hint)
+        self.assertIn("MEDIA:/absolute/path is the fallback", hint)
         self.assertIn("one MEDIA:/absolute/path directive on each line", hint)
         self.assertIn("multiple directive lines send multiple attachments", hint)
         self.assertIn("outside code fences", hint)
         self.assertIn("directives automatically target this originating conversation", hint)
         self.assertIn("instead of sandbox links or file:// URLs", hint)
+
+    async def test_registers_live_origin_media_tool_with_the_exact_public_schema(self):
+        tool = self.send_media_tool
+        self.assertEqual(tool["toolset"], "cozygateway")
+        self.assertTrue(tool["is_async"])
+        self.assertEqual(tool["schema"], {
+            "name": "cozy_send_media",
+            "description": (
+                "Send 1-16 absolute local-path native attachments immediately to the current "
+                "originating CozyGateway conversation. Do not repeat MEDIA: directives for the "
+                "same files after using it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "description": "One to 16 absolute local paths to attach, in delivery order.",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {
+                            "type": "string",
+                            "description": "An absolute local path.",
+                            "minLength": 1,
+                        },
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption shown with the attachments.",
+                        "maxLength": 4096,
+                    },
+                },
+                "required": ["paths"],
+                "additionalProperties": False,
+            },
+        })
+
+    async def test_send_media_calls_only_the_admitted_origin_with_ordered_paths(self):
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        other = _Adapter(_Client(), {"thread-2": "turn-2"})
+        adapter_module._register_active_adapter(origin)
+        adapter_module._register_active_adapter(other)
+
+        paths = ["/private/a.png", "/private/b.pdf"]
+        result = json.loads(await self.send_media_tool["handler"]({
+            "paths": paths, "caption": "The requested files",
+        }))
+        paths.append("/private/not-admitted.mov")
+
+        self.assertEqual(origin.proactive_calls, [(
+            "thread-1", "The requested files", ["/private/a.png", "/private/b.pdf"],
+            {"canonical_home": False, "delivery_key": mock.ANY},
+        )])
+        self.assertEqual(other.proactive_calls, [])
+        self.assertEqual(result, {
+            "accepted": True, "state": "journaled", "conversationId": "thread-1",
+            "pending": True,
+            "deliveryId": "scheduled:live-media-1", "messageId": "scheduled-message-1",
+            "eventId": "event-1",
+        })
+
+    async def test_send_media_delivery_key_is_stable_for_a_retry_and_changes_per_occurrence(self):
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        adapter_module._register_active_adapter(origin)
+        args = {"paths": ["/private/a.png"], "caption": "caption"}
+
+        token = adapter_module._CURRENT_TOOL_OCCURRENCE.set("call-one")
+        try:
+            await self.send_media_tool["handler"](args)
+            await self.send_media_tool["handler"](args)
+        finally:
+            adapter_module._CURRENT_TOOL_OCCURRENCE.reset(token)
+        token = adapter_module._CURRENT_TOOL_OCCURRENCE.set("call-two")
+        try:
+            await self.send_media_tool["handler"](args)
+        finally:
+            adapter_module._CURRENT_TOOL_OCCURRENCE.reset(token)
+
+        keys = [call[3]["delivery_key"] for call in origin.proactive_calls]
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], keys[2])
+
+    async def test_send_media_refuses_invalid_origin_or_paths_before_any_send(self):
+        cases = [
+            ("wrong_platform", lambda: ("other", "thread-1"), lambda: ("turn-1", False, "profile-1"), [], {"paths": ["/private/a.png"]}),
+            ("cron", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", True, "profile-1"), [], {"paths": ["/private/a.png"]}),
+            ("missing", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), [], {"paths": ["/private/a.png"]}),
+            ("ambiguous", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), [_Adapter(_Client(), {"thread-1": "turn-1"}), _Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": ["/private/a.png"]}),
+            ("profile", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "foreign"), [_Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": ["/private/a.png"]}),
+            ("turn", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("other-turn", False, "profile-1"), [_Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": ["/private/a.png"]}),
+            ("relative", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), [_Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": ["relative.png"]}),
+            ("non_string", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), [_Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": [7]}),
+            ("empty", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), [_Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": []}),
+            ("too_many", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), [_Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": [f"/private/{number}" for number in range(17)]}),
+            ("long_caption", lambda: (adapter_module.PLATFORM_NAME, "thread-1"), lambda: ("turn-1", False, "profile-1"), [_Adapter(_Client(), {"thread-1": "turn-1"})], {"paths": ["/private/a.png"], "caption": "x" * 4097}),
+        ]
+        for name, platform_context, message_context, adapters, args in cases:
+            with self.subTest(name=name):
+                for active in adapter_module._active_adapters_snapshot():
+                    adapter_module._unregister_active_adapter(active)
+                adapter_module._current_turn_platform_and_chat = platform_context
+                adapter_module._current_turn_message_and_cron = message_context
+                for adapter in adapters:
+                    adapter_module._register_active_adapter(adapter)
+                result = json.loads(await self.send_media_tool["handler"](args))
+                self.assertEqual(result["accepted"], False)
+                self.assertEqual(result["state"], "blocked")
+                self.assertTrue(all(not adapter.proactive_calls for adapter in adapters))
+
+    async def test_send_media_keeps_pending_and_errors_honest(self):
+        origin = _Adapter(_Client(), {"thread-1": "turn-1"})
+        adapter_module._register_active_adapter(origin)
+        args = {"paths": ["/private/a.png"]}
+
+        pending = json.loads(await self.send_media_tool["handler"](args))
+        self.assertEqual((pending["accepted"], pending["state"], pending["pending"]), (True, "journaled", True))
+        origin.proactive_result = {"state": "blocked", "accepted_pending": False, "error": "media_upload_failed"}
+        self.assertEqual(json.loads(await self.send_media_tool["handler"](args)), {
+            "accepted": False, "state": "blocked", "conversationId": "thread-1",
+            "pending": False,
+            "error": "media_upload_failed",
+        })
+
+    async def test_send_media_tool_chips_never_include_paths(self):
+        observed = []
+        active = type("Observed", (), {
+            "observe_tool_event": lambda _self, *args: observed.append(args),
+        })()
+        adapter_module._register_active_adapter(active)
+        with mock.patch.object(
+            adapter_module, "_current_turn_platform_and_chat",
+            return_value=(adapter_module.PLATFORM_NAME, "thread-1"),
+        ):
+            adapter_module._dispatch_tool_hook("start", {
+                "tool_name": "cozy_send_media", "args": {"paths": ["/private/secret.png"]},
+            })
+            adapter_module._dispatch_tool_hook("complete", {
+                "tool_name": "cozy_send_media", "result": {"error": "/private/secret.png"},
+            })
+        self.assertEqual([event[3] for event in observed], [None, None])
 
     async def test_preserves_bounded_failure_details_in_the_hermes_tool_json(self):
         client = _Client()
@@ -549,6 +705,40 @@ class HermesPluginContextTests(unittest.TestCase):
             self.assertIsNotNone(location_entry)
             self.assertTrue(location_entry.is_async)
             self.assertEqual(location_entry.schema["parameters"]["properties"]["purpose"]["maxLength"], 160)
+            media_entry = registry.get_entry("cozy_send_media")
+            self.assertIsNotNone(media_entry)
+            self.assertTrue(media_entry.is_async)
+            self.assertEqual(media_entry.schema, {
+                "name": "cozy_send_media",
+                "description": (
+                    "Send 1-16 absolute local-path native attachments immediately to the current "
+                    "originating CozyGateway conversation. Do not repeat MEDIA: directives for the "
+                    "same files after using it."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "description": "One to 16 absolute local paths to attach, in delivery order.",
+                            "minItems": 1,
+                            "maxItems": 16,
+                            "items": {
+                                "type": "string",
+                                "description": "An absolute local path.",
+                                "minLength": 1,
+                            },
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "Optional caption shown with the attachments.",
+                            "maxLength": 4096,
+                        },
+                    },
+                    "required": ["paths"],
+                    "additionalProperties": False,
+                },
+            })
             camera_entry = registry.get_entry("cozy_capture_camera")
             self.assertIsNotNone(camera_entry)
             self.assertTrue(camera_entry.is_async)
