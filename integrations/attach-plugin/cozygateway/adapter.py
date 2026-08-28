@@ -2881,46 +2881,170 @@ async def _cozy_present_notification(args: Dict[str, Any], **_kwargs: Any) -> st
     return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("notification.present", chat_id, turn_id, purpose, title=title, body=body), notification=True)
 
 
-async def _cozy_mobile(request: Any, location: bool = False, media: bool = False, notification: bool = False) -> str:
+def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
+    """Resolve the sole adapter allowed to act for this exact live turn.
+
+    Mobile-node requests and live attachment sends have the same trust boundary:
+    they may act only for the adapter, profile, chat, and turn that originated the
+    current model call.  This resolver owns the fail-closed checks and their
+    intentionally path-free audit logs; callers retain their operation-specific
+    result envelope and any post-await lease checks.
+    """
     try:
         platform, chat_id = _current_turn_platform_and_chat()
         message_id, cron, profile = _current_turn_message_and_cron()
     except Exception:  # noqa: BLE001 - an unavailable harness context is noninteractive
         _log_mobile_policy_block("session_context_unavailable")
-        return _mobile_tool_result("policy_blocked")
+        return None
     if platform != PLATFORM_NAME:
         _log_mobile_policy_block("wrong_platform", actual_platform=platform)
-        return _mobile_tool_result("policy_blocked")
+        return None
     if not chat_id:
         _log_mobile_policy_block("missing_chat_id", chat_present=False)
-        return _mobile_tool_result("policy_blocked")
+        return None
     if cron:
         _log_mobile_policy_block("cron_session", chat_present=True, cron=True)
-        return _mobile_tool_result("policy_blocked")
+        return None
     adapters = [
         adapter for adapter in _active_adapters_snapshot()
         if getattr(adapter, "_active_turn", {}).get(chat_id)
     ]
     if len(adapters) != 1:
         _log_mobile_policy_block("active_adapter_count", adapter_count=len(adapters))
-        return _mobile_tool_result("policy_blocked")
+        return None
     origin_adapter = adapters[0]
-    profile_match = bool(profile) and profile == getattr(origin_adapter, "_profile", None)
-    if not profile_match:
+    if not (profile and profile == getattr(origin_adapter, "_profile", None)):
         _log_mobile_policy_block(
-            "profile_mismatch",
-            profile_present=bool(profile),
-            profile_match=False,
+            "profile_mismatch", profile_present=bool(profile), profile_match=False
         )
-        return _mobile_tool_result("policy_blocked")
+        return None
     turn_id = origin_adapter._active_turn[chat_id]
     if message_id != turn_id:
         _log_mobile_policy_block(
-            "turn_message_mismatch",
-            message_present=bool(message_id),
-            message_match=False,
+            "turn_message_mismatch", message_present=bool(message_id), message_match=False
         )
+        return None
+    return origin_adapter, chat_id, turn_id, profile
+
+
+_SEND_MEDIA_CAPTION_MAX = 4096
+
+
+def _send_media_tool_result(
+    *,
+    accepted: bool,
+    state: str,
+    conversation_id: Optional[str],
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> str:
+    """Return the small, path-free contract for ``cozy_send_media``.
+
+    A proactive delivery is only *accepted* once it is durably journaled; that is
+    deliberately weaker than saying a person has received it.  Do not copy media
+    upload diagnostics here: even a basename can disclose a private local path.
+    """
+    payload: Dict[str, Any] = {
+        "accepted": accepted,
+        "state": state[:32],
+        "conversationId": conversation_id[:256] if isinstance(conversation_id, str) else None,
+    }
+    if isinstance(result, dict):
+        if isinstance(result.get("accepted_pending"), bool):
+            payload["pending"] = result["accepted_pending"]
+        for key in ("deliveryId", "messageId", "eventId", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value:
+                # ``send_proactive`` returns symbolic failure codes.  Keep that
+                # contract narrow so a future transport exception cannot smuggle
+                # a source path into a model-visible result.
+                if key != "error" or re.fullmatch(r"[A-Za-z0-9_:-]{1,128}", value):
+                    payload[key] = value[:256]
+    if error:
+        payload["error"] = error[:128]
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _valid_send_media_paths(value: Any) -> Optional[List[str]]:
+    """Accept only the declared JSON-array shape, before a transport is selected."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 16:
+        return None
+    if any(not isinstance(path, str) or not path or not os.path.isabs(path) for path in value):
+        return None
+    return list(value)
+
+
+def _send_media_delivery_key(
+    occurrence: str, chat_id: str, caption: str, paths: List[str]
+) -> str:
+    """Bind an attachment commit to one native tool occurrence, never a target argument."""
+    material = json.dumps(
+        {"occurrence": occurrence, "conversation": chat_id, "caption": caption, "paths": paths},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "live-media:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+async def _cozy_send_media(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Commit attachments to exactly the currently-originating live conversation."""
+    paths = _valid_send_media_paths(args.get("paths"))
+    caption = args.get("caption", "")
+    if (
+        paths is None
+        or not isinstance(caption, str)
+        or len(caption) > _SEND_MEDIA_CAPTION_MAX
+    ):
+        _log_mobile_policy_block("invalid_send_media_args")
+        return _send_media_tool_result(
+            accepted=False, state="blocked", conversation_id=None, error="invalid_arguments"
+        )
+
+    origin = _resolve_live_origin()
+    if origin is None:
+        return _send_media_tool_result(
+            accepted=False, state="blocked", conversation_id=None, error="policy_blocked"
+        )
+    origin_adapter, chat_id, _turn_id, _profile = origin
+
+    # Hooks set the real call id for this tool.  The fallback preserves the existing
+    # session-context behaviour in older harnesses, while the hook makes a second
+    # call in the same turn a distinct durable delivery.
+    occurrence = str(kwargs.get(TOOL_CALL_ID_KEY) or _occurrence_key()).strip()
+    delivery_key = _send_media_delivery_key(occurrence, chat_id, caption, paths)
+    try:
+        result = await origin_adapter.send_proactive(
+            chat_id,
+            caption,
+            paths,
+            canonical_home=False,
+            delivery_key=delivery_key,
+        )
+    except asyncio.CancelledError:
+        return _send_media_tool_result(
+            accepted=False, state="failed", conversation_id=chat_id, error="cancelled"
+        )
+    except Exception:  # noqa: BLE001 - never expose a local exception or a path
+        logger.warning("attach live media send failed")
+        return _send_media_tool_result(
+            accepted=False, state="failed", conversation_id=chat_id, error="delivery_failed"
+        )
+    if not isinstance(result, dict):
+        return _send_media_tool_result(
+            accepted=False, state="failed", conversation_id=chat_id, error="delivery_failed"
+        )
+    state = result.get("state") if isinstance(result.get("state"), str) else "failed"
+    accepted = state in {"journaled", "projected", "displayed"}
+    return _send_media_tool_result(
+        accepted=accepted, state=state, conversation_id=chat_id, result=result
+    )
+
+
+async def _cozy_mobile(request: Any, location: bool = False, media: bool = False, notification: bool = False) -> str:
+    origin = _resolve_live_origin()
+    if origin is None:
         return _mobile_tool_result("policy_blocked")
+    origin_adapter, chat_id, turn_id, profile = origin
     try:
         outcome = await request(origin_adapter, chat_id, turn_id)
     except asyncio.CancelledError:
@@ -3022,6 +3146,7 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
         if tool_name in {
             "cozy_device_status", "cozy_request_location",
             "cozy_capture_camera", "cozy_pick_file",
+            "cozy_send_media",
         }:
             # Purpose and phone payloads are live-turn-only data. Tool chips may name the
             # operation, but never retain either side of this sensitive exchange as detail.
@@ -3045,7 +3170,7 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
 def _pre_tool_call(**kwargs: Any) -> None:
     """``pre_tool_call`` hook: the chip-open leg. Observer only (returns None)."""
     tool_name = str(kwargs.get("tool_name") or "")
-    if tool_name == "send_message":
+    if tool_name in {"send_message", "cozy_send_media"}:
         _CURRENT_TOOL_OCCURRENCE.set(_tool_call_id(kwargs))
     elif tool_name == "delegate_task":
         # The batch id for this call's delegation cards: the parent's own tool-call id (the
@@ -3062,7 +3187,7 @@ def _post_tool_call(**kwargs: Any) -> None:
         _dispatch_tool_hook("complete", kwargs)
     finally:
         tool_name = str(kwargs.get("tool_name") or "")
-        if tool_name == "send_message":
+        if tool_name in {"send_message", "cozy_send_media"}:
             _CURRENT_TOOL_OCCURRENCE.set(None)
         elif tool_name == "delegate_task":
             try:
@@ -4236,12 +4361,54 @@ def register(ctx: Any) -> None:
             "the conversation. Markdown renders richly: use ## headings, - bullet / "
             "1. numbered / - [ ] task lists, | pipe | tables |, fenced code blocks, "
             "and $$ math. Inline bold and links show as literal text, so prefer the "
-            "block forms above. For native attachments, put one MEDIA:/absolute/path "
-            "directive on each line of your final response; multiple directive lines "
+            "block forms above. For native attachments, prefer the cozy_send_media tool: "
+            "it sends native attachments immediately to this originating conversation, "
+            "and after using it do not repeat MEDIA: directives for the same files. "
+            "If the typed tool is unavailable, MEDIA:/absolute/path is the fallback: put "
+            "one MEDIA:/absolute/path directive on each line of your final response; multiple directive lines "
             "send multiple attachments. Keep directives outside code fences. These "
             "directives automatically target this originating conversation. Use MEDIA: instead "
             "of sandbox links or file:// URLs for native delivery."
         ),
+    )
+    ctx.register_tool(
+        name="cozy_send_media",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_send_media",
+            "description": (
+                "Send 1-16 absolute local-path native attachments immediately to the current "
+                "originating CozyGateway conversation. Do not repeat MEDIA: directives for the "
+                "same files after using it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "description": "One to 16 absolute local paths to attach, in delivery order.",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {
+                            "type": "string",
+                            "description": "An absolute local path.",
+                            "minLength": 1,
+                        },
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption shown with the attachments.",
+                        "maxLength": _SEND_MEDIA_CAPTION_MAX,
+                    },
+                },
+                "required": ["paths"],
+                "additionalProperties": False,
+            },
+        },
+        handler=_cozy_send_media,
+        is_async=True,
+        description="Send native attachments to the current CozyGateway conversation.",
+        emoji="📤",
     )
     ctx.register_tool(
         name="cozy_device_status",
