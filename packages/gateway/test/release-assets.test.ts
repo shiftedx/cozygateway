@@ -13,7 +13,7 @@ import { describe, it, expect } from "vitest";
  */
 
 const ROOT = join(import.meta.dirname, "..", "..", "..");
-const WORKFLOW = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8");
+const WORKFLOW = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replaceAll("\r\n", "\n");
 const BUNDLER = readFileSync(join(ROOT, "scripts/build-bundle.mjs"), "utf8");
 
 const REQUIRED = [

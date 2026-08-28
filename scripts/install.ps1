@@ -107,10 +107,31 @@ function Resolve-Hermes {
     return $hermes
 }
 
+function Get-HermesModelState {
+    param([string] $HermesPath)
+    $statusOutput = (& $HermesPath status 2>&1 | Out-String)
+    $statusExit = $LASTEXITCODE
+    $modelMatch = [regex]::Match($statusOutput, '(?m)^\s*(?:Current model|Model):\s*(?<value>[^\r\n]+)')
+    $providerMatch = [regex]::Match($statusOutput, '(?m)^\s*(?:Active provider|Provider):\s*(?<value>[^\r\n]+)')
+    $model = if ($modelMatch.Success) { $modelMatch.Groups['value'].Value.Trim() } else { '' }
+    $provider = if ($providerMatch.Success) { $providerMatch.Groups['value'].Value.Trim() } else { '' }
+    $placeholder = '^(?i:\(?\s*(?:not set|not configured|unknown|none|null)\s*\)?)$'
+    $hasModel = -not [string]::IsNullOrWhiteSpace($model) -and $model -notmatch $placeholder
+    $hasProvider = -not [string]::IsNullOrWhiteSpace($provider) -and $provider -notmatch $placeholder
+    return [pscustomobject]@{
+        Configured = ($statusExit -eq 0 -and $hasModel -and $hasProvider)
+    }
+}
+
 function Confirm-HermesModel {
     param([string] $HermesPath)
     if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') {
-        Write-Info 'dry run: would open hermes model before CozyGateway installation'
+        Write-Info 'dry run: would inspect Hermes model status and open model selection only when setup is incomplete'
+        return
+    }
+    $state = Get-HermesModelState $HermesPath
+    if ($state.Configured) {
+        Write-Ok 'Hermes provider and model are already configured; skipping model selection'
         return
     }
     Write-Info 'Choose or confirm the Hermes inference provider and model.'
@@ -119,11 +140,8 @@ function Confirm-HermesModel {
     if ($modelExit -ne 0) {
         Fail 'Hermes model selection did not complete successfully'
     }
-    $statusOutput = (& $HermesPath status 2>&1 | Out-String)
-    $statusExit = $LASTEXITCODE
-    $hasModel = $statusOutput -match '(?m)^\s*(?:Current model|Model):\s*\S+'
-    $hasProvider = $statusOutput -match '(?m)^\s*(?:Active provider|Provider):\s*\S+'
-    if ($statusExit -ne 0 -or -not $hasModel -or -not $hasProvider) {
+    $state = Get-HermesModelState $HermesPath
+    if (-not $state.Configured) {
         Fail 'Hermes needs an active provider and model before CozyGateway can be installed'
     }
     Write-Ok 'Hermes provider and model are configured'
@@ -216,9 +234,9 @@ if ($isUninstall) {
 
 if ($isDryRun) {
     if (Find-Hermes) {
-        Write-Info 'dry run: would open hermes model, then verify its active provider and model'
+        Write-Info 'dry run: would inspect Hermes model status and open model selection only when setup is incomplete'
     } else {
-        Write-Info 'dry run: would install Hermes Agent, complete its setup, then open hermes model'
+        Write-Info 'dry run: would install Hermes Agent, inspect its model status, and open model selection only when setup is incomplete'
     }
     Write-Info 'dry run: would resolve and checksum-verify the CozyGateway release assets'
     Write-Info "dry run: would install CozyGateway under $script:InstallHome without administrator rights"

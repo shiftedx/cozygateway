@@ -38,8 +38,12 @@ if "%1"=="model" (
   exit /b 0
 )
 if "%1"=="status" (
+  if "%COZYGATEWAY_TEST_MODEL_INCOMPLETE%"=="1" (
+    echo   Model:        ^(not set^)
+    echo   Provider:     Auto
+    exit /b 0
+  )
   echo   Model:        fixture-model
-  if "%COZYGATEWAY_TEST_MODEL_INCOMPLETE%"=="1" exit /b 0
   echo   Provider:     fixture-provider
   exit /b 0
 )
@@ -111,9 +115,12 @@ try {
     Assert-True ($result.ExitCode -eq 0) "existing-Hermes bootstrap failed: $($result.Output)"
     $events = Get-Content -LiteralPath $eventLog
     $modelIndex = [Array]::IndexOf($events, 'hermes:model')
+    $statusIndex = [Array]::IndexOf($events, 'hermes:status')
     $bashIndex = ($events | Select-String '^bash:' | Select-Object -First 1).LineNumber - 1
-    Assert-True ($modelIndex -ge 0) 'bootstrap must invoke hermes model'
-    Assert-True ($bashIndex -gt $modelIndex) 'hermes model must finish before the CozyGateway handoff'
+    Assert-True ($modelIndex -eq -1) 'bootstrap must skip hermes model when a provider and model are already configured'
+    Assert-True ($statusIndex -ge 0) 'bootstrap must inspect the existing Hermes provider and model'
+    Assert-True ($bashIndex -gt $statusIndex) 'Hermes model status must be confirmed before the CozyGateway handoff'
+    Assert-True ($result.Output -match 'already configured') 'configured Hermes should report that model selection was skipped'
     Assert-True (($events -join "`n") -match '--service-platform Windows') 'handoff must select the Windows service platform'
     Assert-True (($events -join "`n") -match 'Cozy Gateway') 'paths containing spaces must survive the handoff'
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
@@ -205,6 +212,7 @@ Copy-Item -LiteralPath '$preparedHermes' -Destination '$missingHermes' -Force
     Assert-True ($incomplete.ExitCode -ne 0) 'missing provider evidence must fail before CozyGateway handoff'
     Assert-True ($incomplete.Output -match 'active provider and model') 'model/provider failure must be actionable'
     $incompleteEvents = Get-Content -LiteralPath $eventLog
+    Assert-True (($incompleteEvents -join "`n") -match '(?m)^hermes:model$') 'incomplete Hermes setup must open model selection'
     Assert-True (-not (($incompleteEvents -join "`n") -match '^bash:')) 'incomplete Hermes model selection must not invoke Bash'
 
     Write-Utf8NoBom (Join-Path $fixtures 'cozygateway.mjs.sha256') (('0' * 64) + "  cozygateway.mjs`n")
