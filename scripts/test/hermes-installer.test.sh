@@ -98,7 +98,14 @@ if [ "$1" = "-p" ] && [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
 fi
 if [ "$1" = "-p" ] && [ "$3" = "gateway" ]; then
   case "$4" in
-    restart) [ "$(state)" = running ] || exit 2; log restart; set_state running ;;
+    restart)
+      [ "$(state)" = running ] || exit 2
+      log restart
+      set_state running
+      if [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:-}" ] && [ "$profile" = "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
+        : > "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked"
+      fi
+      ;;
     start) [ "$(state)" = stopped ] || exit 2; log start; set_state running ;;
     install) [ "$(state)" = absent ] || exit 2; [ "$5" = --start-now ] && [ "$6" = --start-on-login ] || exit 2; log install; set_state running ;;
     stop) [ "$(state)" = running ] || exit 2; log stop; set_state stopped ;;
@@ -109,6 +116,12 @@ if [ "$1" = "-p" ] && [ "$3" = "gateway" ]; then
 fi
 if [ "$1" = "-p" ] && [ "$3" = "plugins" ] && [ "$4" = "enable" ]; then
   printf '%s\n' "$2:$5" >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"
+  exit 0
+fi
+if [ "$1" = "-p" ] && [ "$3" = "plugins" ] && [ "$4" = "disable" ]; then
+  if [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:-}" ] && [ "$profile" = "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
+    : > "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER"
+  fi
   exit 0
 fi
 exit 0
@@ -517,16 +530,27 @@ NODE
 
 # Uninstall reverses only lifecycle work owned by CozyGateway: its installed
 # default service is removed, its started existing service is stopped, and the
-# pre-existing active service is left untouched.
+# pre-existing active service is restarted only when Windows-style file locking
+# keeps the disabled plugin's owned spool open, then remains running.
 # Deliberately remove the fake Hermes directory and omit COZYGATEWAY_HERMES_BIN:
 # uninstall must use the absolute executable captured at install time.
-HOME="$tmp/darwin-home" PATH="$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
-grep -q '^default:gateway:uninstall$' "$tmp/commands"
-grep -q '^ops:gateway:stop$' "$tmp/commands"
-if grep -q '^active:gateway:\(stop\|uninstall\)$' "$tmp/commands"; then
-  echo 'uninstall must not alter a pre-existing Hermes service' >&2
+mkdir -p "$tmp/locked-spool-bin"
+cat > "$tmp/locked-spool-bin/rm" <<'LOCKED_RM'
+#!/usr/bin/env bash
+if [[ "$*" == *attach-v1.sqlite* ]] && [ -f "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:?}" ] && [ ! -f "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked" ]; then
+  printf 'Device or resource busy\n' >&2
   exit 1
 fi
+exec /usr/bin/rm "$@"
+LOCKED_RM
+chmod 700 "$tmp/locked-spool-bin/rm"
+locked_spool_marker="$tmp/active-spool.locked"
+active_restarts_before_uninstall="$(grep -c '^active:gateway:restart$' "$tmp/commands")"
+HOME="$tmp/darwin-home" PATH="$tmp/locked-spool-bin:$tmp/service-bin:/usr/bin:/bin" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$locked_spool_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=active COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-live" >/dev/null
+grep -q '^default:gateway:uninstall$' "$tmp/commands"
+grep -q '^ops:gateway:stop$' "$tmp/commands"
+test "$(grep -c '^active:gateway:restart$' "$tmp/commands")" = "$((active_restarts_before_uninstall + 1))"
+! grep -q '^active:gateway:\(stop\|uninstall\)$' "$tmp/commands"
 test "$(cat "$tmp/hermes/gateway-default.state")" = absent
 test "$(cat "$tmp/hermes/gateway-ops.state")" = stopped
 test "$(cat "$tmp/hermes/gateway-active.state")" = running
