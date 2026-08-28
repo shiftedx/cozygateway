@@ -198,6 +198,7 @@ gateway_origin() {
 node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -dc '0-9'; }
 resolve_node() {
   local candidate major private="$GATEWAY_DIR/runtime/node/bin/node"
+  is_windows && private="$GATEWAY_DIR/runtime/node/node.exe"
   if [ "${COZYGATEWAY_NODE+x}" != x ] && [ -x "$private" ]; then
     major="$(node_major "$private")"; [ "${major:-0}" -ge 24 ] && { printf '%s' "$private"; return; }
   fi
@@ -219,18 +220,29 @@ sha1_blob_of() {
 }
 copy_or_download() { if [ -f "$1" ]; then cp "$1" "$2"; else curl -fsSL "$1" -o "$2"; fi; }
 node_archive_name() {
-  local os arch
-  case "$SERVICE_PLATFORM" in Darwin) os=darwin ;; Linux) os=linux ;; *) die "private Node bootstrap is supported only on macOS and Linux" ;; esac
-  case "$(uname -m)" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) die "Node.js 24 is unavailable for $(uname -s) $(uname -m); install Node.js 24+ and retry" ;; esac
+  local os arch machine extension=tar.gz
+  machine="$(uname -m)"
+  case "$SERVICE_PLATFORM" in
+    Darwin) os=darwin ;;
+    Linux) os=linux ;;
+    Windows)
+      os=win; extension=zip
+      machine="${PROCESSOR_ARCHITEW6432:-${PROCESSOR_ARCHITECTURE:-$machine}}"
+      ;;
+    *) die "private Node bootstrap is unavailable for $SERVICE_PLATFORM" ;;
+  esac
+  machine="$(printf '%s' "$machine" | tr '[:upper:]' '[:lower:]')"
+  case "$machine" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) die "Node.js 24 is unavailable for $(uname -s) $(uname -m); install Node.js 24+ and retry" ;; esac
   if [ "$os" = linux ] && have ldd && ldd --version 2>&1 | grep -qi musl; then
     die "official Node.js binaries require glibc; install Node.js 24+ for this musl Linux system and retry"
   fi
-  printf 'node-%s-%s-%s.tar.gz' "$NODE_INSTALL_VERSION" "$os" "$arch"
+  printf 'node-%s-%s-%s.%s' "$NODE_INSTALL_VERSION" "$os" "$arch" "$extension"
 }
 install_node_runtime() {
   local base="${COZYGATEWAY_NODE_DIST_BASE:-https://nodejs.org/dist}" index version_file archive expected got stage source
   have curl || die "curl is required to install Node.js"
-  have tar || die "tar is required to install Node.js"
+  if is_windows; then have powershell.exe || die "Windows PowerShell is required to install Node.js"
+  else have tar || die "tar is required to install Node.js"; fi
   stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-node.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
   NODE_INSTALL_VERSION="${COZYGATEWAY_NODE_VERSION:-}"
   if [ -z "$NODE_INSTALL_VERSION" ]; then
@@ -244,10 +256,25 @@ install_node_runtime() {
   [ -n "$expected" ] || die "$archive is absent from the official Node.js checksums"
   copy_or_download "$version_file/$archive" "$stage/$archive"; got="$(sha256_of "$stage/$archive")"
   [ "$expected" = "$got" ] || die "$archive checksum mismatch"
-  tar -xzf "$stage/$archive" -C "$stage"
-  source="$stage/${archive%.tar.gz}"; [ -x "$source/bin/node" ] || die "$archive did not contain a Node.js executable"
+  if is_windows; then
+    # PowerShell expands these environment variables. They must stay single-
+    # quoted here so Bash does not interpret the PowerShell `$env:` syntax.
+    # shellcheck disable=SC2016
+    MSYS_NO_PATHCONV=1 \
+      COZYGATEWAY_NODE_EXPAND_ARCHIVE="$(to_windows_path "$stage/$archive")" \
+      COZYGATEWAY_NODE_EXPAND_DESTINATION="$(to_windows_path "$stage")" \
+      powershell.exe -NoProfile -NonInteractive -Command \
+        'Expand-Archive -LiteralPath $env:COZYGATEWAY_NODE_EXPAND_ARCHIVE -DestinationPath $env:COZYGATEWAY_NODE_EXPAND_DESTINATION -Force'
+    source="$stage/${archive%.zip}"
+    [ -x "$source/node.exe" ] || die "$archive did not contain a Node.js executable"
+  else
+    tar -xzf "$stage/$archive" -C "$stage"
+    source="$stage/${archive%.tar.gz}"
+    [ -x "$source/bin/node" ] || die "$archive did not contain a Node.js executable"
+  fi
   mkdir -p "$GATEWAY_DIR/runtime"; rm -rf "$GATEWAY_DIR/runtime/node"; mv "$source" "$GATEWAY_DIR/runtime/node"
-  NODE_RESOLVED="$GATEWAY_DIR/runtime/node/bin/node"
+  if is_windows; then NODE_RESOLVED="$GATEWAY_DIR/runtime/node/node.exe"
+  else NODE_RESOLVED="$GATEWAY_DIR/runtime/node/bin/node"; fi
   say "OK    installed checksum-verified Node.js $NODE_INSTALL_VERSION for CozyGateway only"
   rm -rf "$stage"; trap - RETURN
 }
@@ -973,7 +1000,6 @@ main() {
   preflight_service_manager
   if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
-  elif is_windows; then die "Node.js 24+ is required"
   else install_node_runtime
   fi
   [ "$prerequisite_missing" = 1 ] || { hydrate_listener_settings; validate_listener_settings; }

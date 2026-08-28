@@ -50,11 +50,10 @@ It:
    and verifies the resulting CLI and default profile before continuing. A test
    override permits a local fake installer; production does not silently use a
    fork or mirror.
-3. Runs `hermes model` interactively on every install or reinstall, after Hermes
-   exists and before any CozyGateway state is changed. The user explicitly
-   selects or confirms the inference provider and default model. The bootstrap
-   then verifies that Hermes reports an active provider and current model; a
-   cancelled or incomplete selection stops the run.
+3. Checks Hermes model status before any CozyGateway state is changed. When an
+   active provider and current model already exist, it skips the interactive
+   screen. Otherwise it runs `hermes model`, then verifies the completed setup;
+   a cancelled or incomplete selection stops the run.
 4. Resolves the requested CozyGateway release tag or the repository's latest release.
 5. Downloads the gateway bundle, attach-plugin archive, and shared installer,
    plus each asset's SHA-256 sidecar.
@@ -72,8 +71,11 @@ downloads, Node checks, or listener parsing and still removes owned files when
 the recorded Hermes executable is gone. Dry runs do not install Hermes,
 download into the managed directory, edit PATH, or remove an installation.
 
-The bootstrap does not independently install Node, Git, or WSL. When Hermes is
-absent, Hermes' own installer owns those prerequisites and its setup wizard. If
+The PowerShell bootstrap does not independently install Git or WSL. The shared
+installer downloads the current Node 24 Windows ZIP, verifies it against the
+official Node.js checksum manifest, and installs it privately under the
+CozyGateway home when no compatible Node is available. When Hermes is absent,
+Hermes' own installer owns its remaining prerequisites and setup wizard. If
 the user cancels Hermes setup or no default profile exists afterward, the run
 stops with an instruction to finish Hermes setup and paste the same CozyGateway
 command again.
@@ -90,6 +92,7 @@ The Windows branch:
 - normalizes Windows paths returned by Hermes into Git Bash paths before POSIX
   filesystem operations, while preserving native Windows spellings for native
   launchers;
+- installs and pins a private checksum-verified Node 24 runtime when needed;
 - generates runtime files with intentional line endings and quotes paths that
   contain spaces;
 - writes a Windows launcher that starts the Node gateway with its installer-owned
@@ -146,8 +149,8 @@ Automated coverage will exercise:
 - PowerShell 5.1-compatible syntax and checksum success/failure;
 - reuse of an existing Hermes install, official Hermes bootstrap when missing,
   environment refresh, and a cancelled/incomplete Hermes setup failure;
-- mandatory `hermes model` invocation and rejection of a missing active provider
-  or default model before CozyGateway mutation;
+- skipping `hermes model` when the provider/default model already exists, while
+  rejecting incomplete setup before CozyGateway mutation;
 - Git Bash discovery, including paths with spaces and rejection of WSL Bash;
 - Windows platform detection and path conversion;
 - Scheduled Task creation, idempotent replacement, status, and uninstall;
