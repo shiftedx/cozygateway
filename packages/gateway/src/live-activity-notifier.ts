@@ -54,8 +54,9 @@ export class LiveActivityNotifier {
   readonly #settledCompletions = new Set<string>();
   /** Per activity, the projection to restore once the run stops being blocked. */
   readonly #preApproval = new Map<string, Projection>();
-  /** Per bot, the approvals still awaiting a decision, oldest first. A turn can raise several at
-   * once, so resolving one must not clear the card while the others still block the run. */
+  /** Per bot conversation, the approvals still awaiting a decision, oldest first. A turn can
+   * raise several at once, so resolving one must not clear the card while the others still block
+   * the run. */
   readonly #pendingApprovals = new Map<string, string[]>();
 
   constructor(deps: LiveActivityNotifierDeps) {
@@ -73,7 +74,9 @@ export class LiveActivityNotifier {
       case "bot_chat_state":
         if (frame.phase === "polling") {
           this.#settledCompletions.delete(this.#completionKey(frame.bot, frame.sessionId));
-          this.#publish(frame.bot, { phase: "thinking", toolCallCount: 0, shortStatus: "Thinking" });
+          this.#publish(frame.bot, frame.sessionId, {
+            phase: "thinking", toolCallCount: 0, shortStatus: "Thinking",
+          });
         } else if (frame.phase === "timeout" || frame.phase === "failed") {
           this.#end(frame.bot, frame.sessionId, false);
         } else if (frame.phase === "complete") {
@@ -82,35 +85,37 @@ export class LiveActivityNotifier {
         return;
       case "bot_tool_activity":
         if (frame.room !== undefined) return;
-        this.#publishTools(frame.bot, frame.steps.length);
+        this.#publishTools(frame.bot, frame.sessionId, frame.steps.length);
         return;
       case "bot_approval_pending": {
         if (frame.room !== undefined) return;
-        const pending = this.#pendingApprovals.get(frame.bot) ?? [];
+        const conversationKey = this.#completionKey(frame.bot, frame.sessionId);
+        const pending = this.#pendingApprovals.get(conversationKey) ?? [];
         if (!pending.includes(frame.toolCallId)) pending.push(frame.toolCallId);
-        this.#pendingApprovals.set(frame.bot, pending);
-        this.#publishApproval(frame.bot, pending[0] ?? frame.toolCallId);
+        this.#pendingApprovals.set(conversationKey, pending);
+        this.#publishApproval(frame.bot, frame.sessionId, pending[0] ?? frame.toolCallId);
         return;
       }
       case "bot_approval_resolved": {
         if (frame.room !== undefined) return;
-        const rest = (this.#pendingApprovals.get(frame.bot) ?? [])
+        const conversationKey = this.#completionKey(frame.bot, frame.sessionId);
+        const rest = (this.#pendingApprovals.get(conversationKey) ?? [])
           .filter((id) => id !== frame.toolCallId);
         const next = rest[0];
         if (next === undefined) {
-          this.#pendingApprovals.delete(frame.bot);
-          this.#resumeFromApproval(frame.bot);
+          this.#pendingApprovals.delete(conversationKey);
+          this.#resumeFromApproval(frame.bot, frame.sessionId);
         } else {
-          this.#pendingApprovals.set(frame.bot, rest);
-          this.#publishApproval(frame.bot, next);
+          this.#pendingApprovals.set(conversationKey, rest);
+          this.#publishApproval(frame.bot, frame.sessionId, next);
         }
         return;
       }
       case "bot_chat_delta":
         if (frame.room !== undefined || frame.text.length === 0) return;
-        this.#publish(frame.bot, {
+        this.#publish(frame.bot, frame.sessionId, {
           phase: "writing",
-          toolCallCount: this.#toolCount(frame.bot),
+          toolCallCount: this.#toolCount(frame.bot, frame.sessionId),
           shortStatus: "Writing response",
         });
         return;
@@ -134,15 +139,14 @@ export class LiveActivityNotifier {
     }
     if (this.#settledCompletions.has(completionKey)) return new Set();
 
-    const rows = this.#storage.liveActivityRegistrations(event.bot)
-      .filter((row) => row.conversationId === event.chatSessionId);
+    const rows = this.#conversationRows(event.bot, event.chatSessionId);
     for (const row of rows) this.#claimedActivities.add(this.#key(row));
     return new Set(rows.map((row) => row.deviceId));
   }
 
-  #publishTools(bot: string, count: number): void {
+  #publishTools(bot: string, sessionId: string, count: number): void {
     const now = this.#now();
-    for (const row of this.#storage.liveActivityRegistrations(bot)) {
+    for (const row of this.#conversationRows(bot, sessionId)) {
       const key = this.#key(row);
       const previous = this.#lastProjection.get(key);
       const firstTools = previous?.phase !== "usingTools";
@@ -158,8 +162,8 @@ export class LiveActivityNotifier {
 
   /** A run blocked on an approval is stopped, not working, and the card said "Thinking" before
    * this. Carrying the approval id is what lets the Live Activity answer it in place. */
-  #publishApproval(bot: string, approvalID: string): void {
-    for (const row of this.#storage.liveActivityRegistrations(bot)) {
+  #publishApproval(bot: string, sessionId: string, approvalID: string): void {
+    for (const row of this.#conversationRows(bot, sessionId)) {
       const key = this.#key(row);
       const previous = this.#lastProjection.get(key);
       if (previous !== undefined && previous.phase !== "waitingOnApproval") {
@@ -167,7 +171,7 @@ export class LiveActivityNotifier {
       }
     }
     // `toolCallCount: 0` so #publish carries the count the run already reported forward.
-    this.#publish(bot, {
+    this.#publish(bot, sessionId, {
       phase: "waitingOnApproval",
       toolCallCount: 0,
       shortStatus: "Waiting on your approval",
@@ -177,8 +181,8 @@ export class LiveActivityNotifier {
 
   /** Every resolution path lands here through `bot_approval_resolved`, expiry included, so the card
    * leaves the blocked state even when nobody answered on this device. */
-  #resumeFromApproval(bot: string): void {
-    for (const row of this.#storage.liveActivityRegistrations(bot)) {
+  #resumeFromApproval(bot: string, sessionId: string): void {
+    for (const row of this.#conversationRows(bot, sessionId)) {
       const key = this.#key(row);
       if (this.#lastProjection.get(key)?.phase !== "waitingOnApproval") continue;
       const resumed = this.#preApproval.get(key);
@@ -187,8 +191,8 @@ export class LiveActivityNotifier {
     }
   }
 
-  #publish(bot: string, projection: Projection): void {
-    for (const row of this.#storage.liveActivityRegistrations(bot)) {
+  #publish(bot: string, sessionId: string, projection: Projection): void {
+    for (const row of this.#conversationRows(bot, sessionId)) {
       const previous = this.#lastProjection.get(this.#key(row));
       const merged = projection.toolCallCount === 0 && previous !== undefined
         ? { ...projection, toolCallCount: previous.toolCallCount }
@@ -200,9 +204,8 @@ export class LiveActivityNotifier {
 
   #end(bot: string, sessionId: string, succeeded: boolean): void {
     this.#settledCompletions.add(this.#completionKey(bot, sessionId));
-    this.#pendingApprovals.delete(bot);
-    const rows = this.#storage.liveActivityRegistrations(bot)
-      .filter((row) => row.conversationId === sessionId);
+    this.#pendingApprovals.delete(this.#completionKey(bot, sessionId));
+    const rows = this.#conversationRows(bot, sessionId);
     const uncoveredDevices = new Set<string>();
     for (const row of rows) {
       const key = this.#key(row);
@@ -227,9 +230,14 @@ export class LiveActivityNotifier {
     }
   }
 
-  #toolCount(bot: string): number {
-    const row = this.#storage.liveActivityRegistrations(bot)[0];
+  #toolCount(bot: string, sessionId: string): number {
+    const row = this.#conversationRows(bot, sessionId)[0];
     return row === undefined ? 0 : (this.#lastProjection.get(this.#key(row))?.toolCallCount ?? 0);
+  }
+
+  #conversationRows(bot: string, sessionId: string): LiveActivityRegistrationRow[] {
+    return this.#storage.liveActivityRegistrations(bot)
+      .filter((row) => row.conversationId === sessionId);
   }
 
   #send(row: LiveActivityRegistrationRow, projection: Projection, terminal: boolean): void {
@@ -270,10 +278,16 @@ export class LiveActivityNotifier {
         result: response.ok ? "ok" : response.status === 404 ? "not_found" : "http_error",
       });
       if (response.status === 404) {
-        this.#storage.deleteLiveActivityRegistration(row.deviceId, row.activityId);
-        this.#lastProjection.delete(key);
-        this.#lastToolUpdate.delete(key);
-        this.#preApproval.delete(key);
+        const deleted = this.#storage.deleteLiveActivityRegistration(
+          row.deviceId,
+          row.activityId,
+          { expectedPushId: row.pushId, queuedAt: this.#now() },
+        );
+        if (deleted !== undefined) {
+          this.#lastProjection.delete(key);
+          this.#lastToolUpdate.delete(key);
+          this.#preApproval.delete(key);
+        }
       }
       if (!response.ok && response.status !== 404) throw new Error(`relay returned HTTP ${response.status}`);
     }).catch((error: unknown) => {

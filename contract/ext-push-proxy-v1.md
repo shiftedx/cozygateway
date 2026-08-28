@@ -74,9 +74,14 @@ notification suppression so an unrelated scheduled message from the same bot is 
 the user-started run represented by the Live Activity.
 
 The gateway registers the raw token with its private relay as `apns-liveactivity`, stores only the
-opaque relay push id, and deletes the replaced relay registration. Canonical bot state, tool and
-delta frames drive coarse `thinking`, `usingTools`, and `writing` updates. Only an authoritative
-terminal `bot_chat_state` updates the conversation activity to its completed or failed state;
+opaque relay push id, and keeps at most one activity per authenticated device and canonical bot
+conversation. Registering a fresh activity id for that device conversation atomically replaces its
+gateway row and durably queues every superseded opaque relay registration for idempotent deletion.
+Cleanup is retried after later registrations and gateway restarts until the relay confirms success,
+without delaying the registration response. Canonical bot state, tool and
+delta frames drive coarse `thinking`, `usingTools`, and `writing` updates only for registrations
+whose `conversationId` matches the frame's `sessionId`. Only an authoritative terminal
+`bot_chat_state` updates the matching conversation activity to its completed or failed state;
 transcript/history snapshots never do. The registration remains available so the next run in that
 same bot conversation updates the existing Activity instead of creating another Lock Screen card.
 Payloads contain

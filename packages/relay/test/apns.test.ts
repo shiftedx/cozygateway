@@ -11,6 +11,9 @@ import {
   buildProviderJwt,
   type ApnsConfig,
 } from "../src/apns.ts";
+import { createRelayApp } from "../src/http.ts";
+import { openRelayStorage, type RelayStorage } from "../src/storage.ts";
+import type { Transport } from "../src/transports.ts";
 
 function testConfig(): { config: ApnsConfig; publicKey: ReturnType<typeof generateKeyPairSync>["publicKey"] } {
   const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -27,12 +30,14 @@ function testConfig(): { config: ApnsConfig; publicKey: ReturnType<typeof genera
 }
 
 let server: Http2Server | undefined;
+const relayStorages: RelayStorage[] = [];
 
 afterEach(async () => {
   if (server !== undefined) {
     await new Promise<void>((resolve) => server?.close(() => resolve()));
     server = undefined;
   }
+  for (const storage of relayStorages.splice(0)) storage.close();
 });
 
 async function fakeApns(
@@ -226,6 +231,89 @@ describe("apnsTransport.deliver", () => {
       stream.end(JSON.stringify({ reason: "BadDeviceToken" }));
     });
     await expect(apnsTransport(config, { baseUrl }).deliver("tok", "c")).rejects.toThrow(/HTTP 400/);
+  });
+});
+
+describe("relay APNs registration invalidation", () => {
+  async function notifyThrough(
+    transport: Transport,
+    failureFragments: string[],
+  ): Promise<{ storage: RelayStorage; pushId: string }> {
+    const storage = openRelayStorage(":memory:");
+    relayStorages.push(storage);
+    let deliveryFailed!: () => void;
+    const deliveryFailure = new Promise<void>((resolve) => {
+      deliveryFailed = resolve;
+    });
+    const app = createRelayApp({
+      storage,
+      transports: { apns: transport },
+      dailyCap: 500,
+      maxRegistrations: 10_000,
+      version: "test",
+      now: () => Date.UTC(2026, 6, 7, 12, 0, 0),
+      restrictEgress: false,
+      log: (message) => {
+        if (message.includes("delivery failed") && failureFragments.every((part) => message.includes(part))) {
+          deliveryFailed();
+        }
+      },
+    });
+
+    const registered = await app.request("/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ platform: "apns", token: "EXPIREDDEVICETOKEN" }),
+    });
+    expect(registered.status).toBe(201);
+    const { pushId } = (await registered.json()) as { pushId: string };
+
+    const notified = await app.request("/notify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pushId, ciphertext: "CIPHER" }),
+    });
+    expect(notified.status).toBe(202);
+    await deliveryFailure;
+    return { storage, pushId };
+  }
+
+  it("deletes the registration after APNs rejects its token with terminal HTTP 410 ExpiredToken", async () => {
+    const { config } = testConfig();
+    const baseUrl = await fakeApns((_headers, _body, stream) => {
+      stream.respond({ ":status": 410 });
+      stream.end(JSON.stringify({ reason: "ExpiredToken" }));
+    });
+    const { storage, pushId } = await notifyThrough(
+      apnsTransport(config, { baseUrl }),
+      ["HTTP 410", "ExpiredToken"],
+    );
+
+    expect(storage.registrationByPushId(pushId)).toBeUndefined();
+  });
+
+  it.each([400, 403, 429, 500])("retains the registration after nonterminal APNs HTTP %i", async (status) => {
+    const { config } = testConfig();
+    const baseUrl = await fakeApns((_headers, _body, stream) => {
+      stream.respond({ ":status": status });
+      stream.end(JSON.stringify({ reason: "NonterminalFailure" }));
+    });
+    const { storage, pushId } = await notifyThrough(
+      apnsTransport(config, { baseUrl }),
+      [`HTTP ${status}`, "NonterminalFailure"],
+    );
+
+    expect(storage.registrationByPushId(pushId)).toBeDefined();
+  });
+
+  it("retains the registration after an APNs network failure", async () => {
+    const { config } = testConfig();
+    const { storage, pushId } = await notifyThrough(
+      apnsTransport(config, { connect: () => { throw new Error("network unavailable"); } }),
+      ["network unavailable"],
+    );
+
+    expect(storage.registrationByPushId(pushId)).toBeDefined();
   });
 });
 

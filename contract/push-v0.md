@@ -117,7 +117,10 @@ Response: 202 `{}` once the notify is accepted and handed to the transport. Deli
 best-effort; the relay does not queue or retry in v0, and a delivery failure still
 returns 202 and still counts against the cap. A delivery refused by restricted-egress
 mode (the resolved address is in a blocked range) is handled the same way as any other
-delivery failure.
+delivery failure. After APNs asynchronously rejects a delivery with HTTP 410, the relay
+deletes that terminally invalid registration; the accepted request remains 202, and a
+subsequent notify for the same `pushId` returns 404. Other APNs HTTP statuses and network
+failures retain the registration.
 
 - Unknown pushId: 404 `not_found`. A gateway receiving this should delete its stored
   registration for that device.
