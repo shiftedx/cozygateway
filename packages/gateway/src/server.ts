@@ -54,7 +54,7 @@ import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 
-export const GATEWAY_VERSION = "0.3.1";
+export const GATEWAY_VERSION = "0.3.2";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
