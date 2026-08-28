@@ -319,11 +319,11 @@ describe("authenticated push relay proxy", () => {
     storage.close();
   });
 
-  it("continues after a full successful page without hot-spinning a failed page", async () => {
+  it("walks a fixed outbox snapshot once despite failed head rows", async () => {
     const config: GatewayConfig = { name: "pages", port: 8787, dbPath: ":memory:",
       turnTimeoutSeconds: 0, hermes: testHermes(), pushRelayUrl: "http://relay.internal:8788/" };
-    const seed = (storage: ReturnType<typeof openStorage>) => {
-      for (let index = 0; index < 51; index += 1) {
+    const seed = (storage: ReturnType<typeof openStorage>, count = 51) => {
+      for (let index = 0; index < count; index += 1) {
         const deviceId = `device-${index}`;
         storage.createDevice({ id: deviceId, name: deviceId,
           tokenHash: `hash-${index}`, createdAt: index });
@@ -353,17 +353,22 @@ describe("authenticated push relay proxy", () => {
     expect(successful.liveActivityRelayDeletions(100)).toEqual([]);
     successful.close();
 
-    const failed = openStorage(":memory:");
-    seed(failed);
-    let failedDeletes = 0;
-    createApp(appDeps(failed, async () => {
-      failedDeletes += 1;
-      return new Response(null, { status: 503 });
+    const mixed = openStorage(":memory:");
+    seed(mixed, 52);
+    const attempts = new Map<string, number>();
+    createApp(appDeps(mixed, async (input) => {
+      const pushId = decodeURIComponent(new URL(new Request(input).url).pathname.split("/").at(-1)!);
+      attempts.set(pushId, (attempts.get(pushId) ?? 0) + 1);
+      const index = Number(pushId.slice("old-push-".length));
+      return new Response(null, { status: index < 50 ? 503 : 204 });
     }));
     await tick();
-    expect(failedDeletes).toBe(50);
-    expect(failed.liveActivityRelayDeletions(100)).toHaveLength(51);
-    failed.close();
+    expect(attempts.size).toBe(52);
+    expect([...attempts.values()]).toEqual(Array.from({ length: 52 }, () => 1));
+    expect(mixed.liveActivityRelayDeletions(100)).toEqual(
+      Array.from({ length: 50 }, (_, index) => `old-push-${index}`),
+    );
+    mixed.close();
   });
 
   it("advertises the push proxy capability in health", async () => {

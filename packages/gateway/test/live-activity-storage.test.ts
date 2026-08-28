@@ -75,6 +75,29 @@ describe("live activity storage migration", () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
+  it("upgrades the durable deletion outbox with stable sequence cursors", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-live-activity-outbox-"));
+    const path = join(directory, "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE live_activity_relay_deletion_outbox (
+        push_id TEXT PRIMARY KEY, queued_at INTEGER NOT NULL
+      ) STRICT;
+      INSERT INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+      VALUES ('later', 20), ('earlier', 10);
+    `);
+    legacy.close();
+
+    const storage = openStorage(path);
+    expect(storage.liveActivityRelayDeletionHighWater()).toBe(2);
+    expect(storage.liveActivityRelayDeletionPage(0, 2, 50)).toEqual([
+      { pushId: "earlier", sequence: 1 },
+      { pushId: "later", sequence: 2 },
+    ]);
+    storage.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
   it("conditionally deletes only the relay registration version it was asked to retire", () => {
     const storage = openStorage(":memory:");
     storage.createDevice({ id: "device", name: "phone", tokenHash: "hash", createdAt: 1 });

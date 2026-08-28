@@ -205,37 +205,41 @@ export function createApp(deps: AppDeps): Hono<Env> {
   const requestLiveActivityDeletionDrain = (() => {
     let draining = false;
     let requested = false;
-    const drainBatch = async (): Promise<boolean> => {
-      if (relayBase === undefined) return false;
-      const pushIds = deps.storage.liveActivityRelayDeletions(
-        LIVE_ACTIVITY_DELETION_DRAIN_LIMIT,
-      );
-      let completed = 0;
-      for (const pushId of pushIds) {
-        try {
-          const response = await relayFetch(
-            `${relayBase}/register/${encodeURIComponent(pushId)}`,
-            {
-              method: "DELETE",
-              signal: AbortSignal.timeout(
-                Math.max(1, deps.pushRelayDeleteTimeoutMs
-                  ?? LIVE_ACTIVITY_RELAY_DELETE_TIMEOUT_MS),
-              ),
-            },
-          );
-          if (response.ok) {
-            deps.storage.completeLiveActivityRelayDeletion(pushId);
-            completed += 1;
-          } else {
-            relayLog(`live activity relay cleanup: DELETE returned HTTP ${response.status}`);
+    const drainSnapshot = async () => {
+      if (relayBase === undefined) return;
+      const highWater = deps.storage.liveActivityRelayDeletionHighWater();
+      if (highWater === undefined) return;
+      let cursor = 0;
+      while (cursor < highWater) {
+        const page = deps.storage.liveActivityRelayDeletionPage(
+          cursor,
+          highWater,
+          LIVE_ACTIVITY_DELETION_DRAIN_LIMIT,
+        );
+        if (page.length === 0) return;
+        for (const { pushId } of page) {
+          try {
+            const response = await relayFetch(
+              `${relayBase}/register/${encodeURIComponent(pushId)}`,
+              {
+                method: "DELETE",
+                signal: AbortSignal.timeout(
+                  Math.max(1, deps.pushRelayDeleteTimeoutMs
+                    ?? LIVE_ACTIVITY_RELAY_DELETE_TIMEOUT_MS),
+                ),
+              },
+            );
+            if (response.ok) {
+              deps.storage.completeLiveActivityRelayDeletion(pushId);
+            } else {
+              relayLog(`live activity relay cleanup: DELETE returned HTTP ${response.status}`);
+            }
+          } catch {
+            relayLog("live activity relay cleanup: DELETE failed with a network error");
           }
-        } catch {
-          relayLog("live activity relay cleanup: DELETE failed with a network error");
         }
+        cursor = page.at(-1)!.sequence;
       }
-      // Continue only when this bounded page was full AND changed durable state. An all-failure
-      // page stays queued for a later external trigger instead of hot-spinning.
-      return pushIds.length === LIVE_ACTIVITY_DELETION_DRAIN_LIMIT && completed > 0;
     };
     return () => {
       requested = true;
@@ -245,7 +249,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
         try {
           while (requested) {
             requested = false;
-            if (await drainBatch()) requested = true;
+            await drainSnapshot();
           }
         } catch {
           relayLog("live activity relay cleanup: outbox drain failed");

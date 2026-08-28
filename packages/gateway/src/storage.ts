@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS live_activity_registrations (
   PRIMARY KEY (device_id, activity_id)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS live_activity_relay_deletion_outbox (
-  push_id TEXT PRIMARY KEY,
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  push_id TEXT NOT NULL UNIQUE,
   queued_at INTEGER NOT NULL
 ) STRICT;
 -- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
@@ -934,6 +935,27 @@ export class Storage {
       `SELECT push_id AS pushId FROM live_activity_relay_deletion_outbox
        ORDER BY queued_at, push_id LIMIT ?`,
     ).all(Math.max(0, limit)) as Array<{ pushId: string }>).map(({ pushId }) => pushId);
+  }
+
+  liveActivityRelayDeletionHighWater(): number | undefined {
+    const row = this.#db.prepare(
+      "SELECT MAX(sequence) AS sequence FROM live_activity_relay_deletion_outbox",
+    ).get() as { sequence: number | null };
+    return row.sequence ?? undefined;
+  }
+
+  liveActivityRelayDeletionPage(
+    afterSequence: number,
+    throughSequence: number,
+    limit: number,
+  ): Array<{ pushId: string; sequence: number }> {
+    return this.#db.prepare(
+      `SELECT push_id AS pushId, sequence FROM live_activity_relay_deletion_outbox
+       WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT ?`,
+    ).all(afterSequence, throughSequence, Math.max(0, limit)) as Array<{
+      pushId: string;
+      sequence: number;
+    }>;
   }
 
   completeLiveActivityRelayDeletion(pushId: string): boolean {
@@ -3144,6 +3166,33 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // The first outbox build keyed only by push id. Rebuild once with an AUTOINCREMENT sequence so
+  // a drain can capture a stable high-water snapshot that new enqueue traffic can never enter.
+  const outboxColumns = db
+    .prepare("SELECT name FROM pragma_table_info('live_activity_relay_deletion_outbox')")
+    .all() as Array<{ name: string }>;
+  if (!outboxColumns.some((column) => column.name === "sequence")) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec(`
+        ALTER TABLE live_activity_relay_deletion_outbox
+          RENAME TO live_activity_relay_deletion_outbox_v1;
+        CREATE TABLE live_activity_relay_deletion_outbox (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          push_id TEXT NOT NULL UNIQUE,
+          queued_at INTEGER NOT NULL
+        ) STRICT;
+        INSERT INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+        SELECT push_id, queued_at FROM live_activity_relay_deletion_outbox_v1
+        ORDER BY queued_at, push_id;
+        DROP TABLE live_activity_relay_deletion_outbox_v1;
+      `);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
   // Older builds keyed activities only by ActivityKit id, so every new run could leave another
   // row for the same device conversation. Retire all but the newest row durably before installing
   // the invariant that prevents that fan-out shape from returning.
