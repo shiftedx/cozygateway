@@ -1,6 +1,6 @@
 {
   "name": "cozygateway",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Self-hosted gateway that turns your AI agent into a chat contact on your phone. Speaks the cozygateway wire contract; drives backends through adapters.",
   "type": "module",
   "license": "MIT",
