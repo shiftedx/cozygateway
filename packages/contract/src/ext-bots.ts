@@ -1362,8 +1362,9 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *  - `16`: `GET /bots/:name/sessions` and manual native-session adoption.
  *  - `17`: WITHDRAWN AGENT INBOX (issue #95). The former heuristic Hermes projection and both
  *    routes were removed because session text cannot prove durable A2A identity or privacy
- *    boundaries. This historical capability number is never advertised again; the future seam is
- *    the separately versioned `com.cozylabs.agent-inbox` capability below.
+ *    boundaries. Because the current bots scalar is still 40, clients MUST NOT infer this
+ *    withdrawn surface from `com.cozylabs.bots >= 17`; its sole future advertisement is the
+ *    separately versioned `com.cozylabs.agent-inbox` capability below.
  *  - `18`: BOT MODEL CONFIG (issue #106). Adds authenticated GET/PUT
  *    `/bots/:name/model-config`, backed by Hermes profile config and its configured picker catalog.
  *    Routine records and writes accept nullable model/effort selections. The surveyed cron RPC
@@ -1424,10 +1425,10 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    `>= 32`. An out-of-range value clamps into `0...blocks.length`; it never drops the
  *    attachment. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
-/** Reserved future A2A inbox seam. This capability has no version and is deliberately NOT
- * advertised until Hermes exposes durable structured A2A identity, delivery/reply metadata, and
- * bounded replay. It is separate from `com.cozylabs.bots` so restoring the inbox never changes
- * that capability's current version merely for a withdrawn surface. */
+/** Reserved future A2A inbox seam. This is the sole future advertisement for the withdrawn
+ * surface and has no version until Hermes exposes durable structured A2A identity, delivery/reply
+ * metadata, and bounded replay. It is separate from `com.cozylabs.bots` because that scalar
+ * remains 40 and must not be read as support for capability 17. */
 export const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
 /** The phone-as-node capability, advertised beside the bots one.
  *  4: device status v2 answers over an authenticated origin, under a single-use lease.

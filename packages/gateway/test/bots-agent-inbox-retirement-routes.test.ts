@@ -1,13 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type GatewayInfo } from "cozygateway-contract";
+import {
+  AGENT_INBOX_CAPABILITY_ID,
+  BOTS_CAPABILITY_ID,
+  BOTS_CAPABILITY_VERSION,
+  type GatewayInfo,
+} from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
 const gateways: RunningGateway[] = [];
 const servers: FakeHermesServer[] = [];
-const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
-
 afterEach(async () => {
   for (const gateway of gateways.splice(0)) await gateway.close();
   for (const server of servers.splice(0)) await server.close();

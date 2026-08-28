@@ -54,7 +54,7 @@ extension omits the capability and does not register `/bots` routes.
 | 14 | `bot_chat_adopted` and manual session adoption. |
 | 15 | Assistant attachment ingestion. |
 | 16 | Native session history and manual restore. |
-| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent. |
+| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent, even though the current bots scalar (40) is numerically >= 17. |
 | 18 | Per-bot model configuration. |
 | 19 | Stop and start-new-chat actions. |
 | 20 | Audio/video attachment playback with byte ranges. |
@@ -82,11 +82,11 @@ extension omits the capability and does not register `/bots` routes.
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
 
-`com.cozylabs.agent-inbox` is a reserved, dormant capability id. It has no advertised version:
-do not advertise it or expose an inbox page until Hermes supplies durable structured A2A sender,
-delivery/reply, and conversation metadata plus bounded replay. It is deliberately separate from
-`com.cozylabs.bots`, whose current version remains 40 while the old capability-17 surface stays
-withdrawn.
+`com.cozylabs.agent-inbox` is a reserved, dormant capability id and the sole future advertisement
+for Agent Inbox. It has no advertised version: do not advertise it or expose an inbox page until
+Hermes supplies durable structured A2A sender, delivery/reply, and conversation metadata plus
+bounded replay. It is deliberately separate from `com.cozylabs.bots`: that scalar remains 40, so
+clients must not infer the withdrawn capability-17 surface from `com.cozylabs.bots >= 17`.
 
 ## Resources
 

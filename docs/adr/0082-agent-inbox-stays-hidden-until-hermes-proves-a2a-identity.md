@@ -20,8 +20,9 @@ GET routes and `bot_inbox_activity` frame rather than expose a privacy-unsafe pa
 
 ## Consequences
 
-`com.cozylabs.bots` remains at version 40; capability history records 17 as withdrawn instead of
-reusing or bumping that version. `com.cozylabs.agent-inbox` is reserved but has no version and is
-not advertised. Reintroduce the page and advertise that independent capability only after Hermes
-offers durable structured A2A sender, delivery/reply, and conversation metadata with bounded
-replay. This ADR then becomes superseded.
+`com.cozylabs.bots` remains at version 40; consumers must not infer the withdrawn capability-17
+surface from its `>= 17` value. Capability history records 17 as withdrawn instead of reusing or
+bumping that version. `com.cozylabs.agent-inbox` is reserved but has no version and is the sole
+future advertisement. Reintroduce the page and advertise that independent capability only after
+Hermes offers durable structured A2A sender, delivery/reply, and conversation metadata with
+bounded replay. This ADR then becomes superseded.
