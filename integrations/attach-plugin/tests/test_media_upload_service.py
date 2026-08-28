@@ -174,6 +174,13 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "journaled")
         self.assertTrue(result["accepted_pending"])
         media_id = self.gateway.upload_media_ids[0]
+        self.assertEqual(result["attachments"], [{
+            "attachmentId": media_id, "name": "shot.png", "mimeType": "image/png",
+            "bytes": len(PNG_1X1), "mediaKind": "image",
+        }])
+        self.assertNotIn("source", str(result["attachments"]))
+        self.assertNotIn("sha256", str(result["attachments"]))
+        self.assertNotIn(self.tmp.name, str(result["attachments"]))
         self.assertEqual(self._rows(delivery_id), {media_id: "journaled"})
 
         # The HTTP receipt read carries "projected" down onto the attachment...

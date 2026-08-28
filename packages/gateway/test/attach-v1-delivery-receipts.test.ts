@@ -34,19 +34,50 @@ function receiptApp(storage: Storage, mediaAllowed = true) {
   });
 }
 
-function scheduled(deliveryId: string, sequence = 1) {
+function scheduled(
+  deliveryId: string,
+  options: { sequence?: number; threadId?: string; mediaIds?: string[] } = {},
+) {
   return {
     kind: "event" as const,
-    sequence,
+    sequence: options.sequence ?? 1,
     eventId: `event-${deliveryId}`,
     event: {
       kind: "scheduled" as const,
-      threadId: "home-a",
+      threadId: options.threadId ?? "home-a",
       deliveryId,
       messageId: `message-${deliveryId}`,
       blocks: [{ type: "paragraph" as const, text: "nightly report" }],
+      ...(options.mediaIds === undefined ? {} : { mediaIds: options.mediaIds }),
     },
   };
+}
+
+function projectNativeMessage(
+  storage: Storage,
+  frame: ReturnType<typeof scheduled>,
+  attachmentIds: string[],
+  at = 2_000,
+) {
+  storage.appendNativeBotMessage({
+    bot: "sage",
+    sessionId: frame.event.threadId,
+    messageId: frame.event.messageId,
+    role: "assistant",
+    text: "nightly report",
+    at,
+    ...(attachmentIds.length === 0 ? {} : {
+      attachments: attachmentIds.map((fileId) => ({
+        type: "attachment" as const,
+        fileId,
+        name: `${fileId}.png`,
+        mimeType: "image/png",
+        size: 1,
+        mediaKind: "image" as const,
+      })),
+    }),
+  });
+  storage.markAttachEventApplied("sage", frame.eventId, at);
 }
 
 function read(app: ReturnType<typeof receiptApp>, deliveryId: string, token = receiptToken) {
@@ -89,13 +120,13 @@ describe("attach-v1 delivery receipts", () => {
 
       const admitted = await read(app, frame.event.deliveryId);
       expect(admitted.status).toBe(200);
-      expect(await admitted.json()).toEqual({
+      expect(await admitted.text()).toBe(JSON.stringify({
         deliveryId: "daily-1",
         messageId: "message-daily-1",
         target: { kind: "thread", threadId: "home-a" },
         state: "admitted",
         admittedAt: 1_000,
-      });
+      }));
 
       storage.markAttachEventApplied("sage", frame.eventId, 2_000);
       const projected = await read(app, frame.event.deliveryId);
@@ -107,6 +138,102 @@ describe("attach-v1 delivery receipts", () => {
         state: "projected",
         admittedAt: 1_000,
         projectedAt: 2_000,
+      });
+    } finally {
+      storage.close();
+    }
+  });
+
+  it("reports expected media at admission without claiming it committed", async () => {
+    const storage = openStorage(":memory:");
+    try {
+      const chat = storage.nativeBotChat("sage", 1);
+      const frame = scheduled("daily-media-admitted", {
+        threadId: chat.sessionId,
+        mediaIds: ["report-png", "chart-png"],
+      });
+      storage.acceptAttachEvent("sage", frame, 1_000);
+
+      expect(await (await read(receiptApp(storage), frame.event.deliveryId)).json()).toEqual({
+        deliveryId: "daily-media-admitted",
+        messageId: "message-daily-media-admitted",
+        target: { kind: "thread", threadId: chat.sessionId },
+        state: "admitted",
+        admittedAt: 1_000,
+        expectedMediaIds: ["report-png", "chart-png"],
+        committedMediaIds: [],
+        mediaVerified: false,
+      });
+    } finally {
+      storage.close();
+    }
+  });
+
+  it("verifies a projected native message only when its media IDs match in order", async () => {
+    const storage = openStorage(":memory:");
+    try {
+      const chat = storage.nativeBotChat("sage", 1);
+      const expected = ["report-png", "chart-png"];
+      const frame = scheduled("daily-media-complete", { threadId: chat.sessionId, mediaIds: expected });
+      storage.acceptAttachEvent("sage", frame, 1_000);
+      projectNativeMessage(storage, frame, expected);
+
+      expect(await (await read(receiptApp(storage), frame.event.deliveryId)).json()).toMatchObject({
+        state: "projected",
+        expectedMediaIds: expected,
+        committedMediaIds: expected,
+        mediaVerified: true,
+      });
+    } finally {
+      storage.close();
+    }
+  });
+
+  it.each([
+    ["missing", ["report-png"]],
+    ["reordered", ["chart-png", "report-png"]],
+    ["extra", ["report-png", "chart-png", "extra-png"]],
+  ])("reports committed %s media IDs honestly without verifying them", async (_caseName, attachmentIds) => {
+    const storage = openStorage(":memory:");
+    try {
+      const chat = storage.nativeBotChat("sage", 1);
+      const frame = scheduled(`daily-media-${_caseName}`, {
+        threadId: chat.sessionId,
+        mediaIds: ["report-png", "chart-png"],
+      });
+      storage.acceptAttachEvent("sage", frame, 1_000);
+      projectNativeMessage(storage, frame, attachmentIds);
+
+      expect(await (await read(receiptApp(storage), frame.event.deliveryId)).json()).toMatchObject({
+        state: "projected",
+        expectedMediaIds: ["report-png", "chart-png"],
+        committedMediaIds: attachmentIds,
+        mediaVerified: false,
+      });
+    } finally {
+      storage.close();
+    }
+  });
+
+  it("does not treat a displayed media row as verified when its committed IDs differ", async () => {
+    const storage = openStorage(":memory:");
+    try {
+      const chat = storage.nativeBotChat("sage", 1);
+      const frame = scheduled("daily-media-displayed", {
+        threadId: chat.sessionId,
+        mediaIds: ["report-png", "chart-png"],
+      });
+      storage.acceptAttachEvent("sage", frame, 1_000);
+      projectNativeMessage(storage, frame, ["report-png"]);
+      storage.recordBotMessageDisplayed("sage", [frame.event.messageId], "device-1", 3_000);
+
+      expect(await (await read(receiptApp(storage), frame.event.deliveryId)).json()).toMatchObject({
+        state: "projected",
+        displayedAt: 3_000,
+        terminal: { state: "displayed", at: 3_000 },
+        expectedMediaIds: ["report-png", "chart-png"],
+        committedMediaIds: ["report-png"],
+        mediaVerified: false,
       });
     } finally {
       storage.close();

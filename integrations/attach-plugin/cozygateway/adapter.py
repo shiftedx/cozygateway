@@ -337,6 +337,22 @@ class MediaBatch:
         """The bounded human-readable failure lines the durable result ABI carries."""
         return [str(entry["error"]) for entry in self.failed]
 
+    def attachment_descriptors(self) -> List[Dict[str, Any]]:
+        """The deliberately small attachment receipt surface for an agent tool.
+
+        ``uploaded`` is an internal transport record: it needs a source path and a
+        digest for retries and cleanup.  Those are not facts an agent needs (and a
+        source path is especially not a fact it may disclose), so tool results must
+        pass through this one narrowing seam.
+        """
+        return [{
+            "attachmentId": str(entry["mediaId"]),
+            "name": str(entry["path"]),
+            "mimeType": str(entry["mime"]),
+            "bytes": int(entry["bytes"]),
+            "mediaKind": str(entry["family"]),
+        } for entry in self.uploaded]
+
     def failure_sentence(self) -> str:
         """One plain sentence naming what the person will NOT see (spec finding 2)."""
         names = [str(entry["path"]) for entry in self.failed]
@@ -2226,6 +2242,27 @@ class AttachAdapter:
         interim_metadata["_interim_send"] = True
         return await self.send(chat_id, content, metadata=interim_metadata)
 
+    async def media_delivery_receipt(
+        self, delivery_id: str, timeout_seconds: float = 0.5
+    ) -> Optional[Dict[str, Any]]:
+        """Read one media delivery receipt through this adapter's live transport.
+
+        Tool handlers must never reach into a client directly: the adapter owns both
+        the socket readiness boundary and the bounded HTTP reader.  A missing or
+        temporarily unwritable client is indistinguishable from no new gateway fact.
+        Local durable rows remain the fallback in that case.
+        """
+        client = self._client
+        if not isinstance(client, AttachV1Client) or not self._ready.is_set():
+            return None
+        try:
+            return await client.delivery_receipt(
+                delivery_id, max(0.05, min(float(timeout_seconds), 1.0))
+            )
+        except Exception:  # noqa: BLE001 - status must not invent a failure from a read error
+            logger.debug("attach: media delivery receipt read failed", exc_info=True)
+            return None
+
     async def send_proactive(
         self,
         chat_id: str,
@@ -2288,6 +2325,7 @@ class AttachAdapter:
             "deliveryId": delivery_id,
             "messageId": message_id,
             "eventId": frame["eventId"],
+            "attachments": batch.attachment_descriptors(),
         }
         # Projection is asynchronous and durable (spec finding 4). The delivery is
         # accepted and pending; the receipts machinery upgrades the rows when the
@@ -2928,6 +2966,65 @@ def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
 
 
 _SEND_MEDIA_CAPTION_MAX = 4096
+_LIVE_MEDIA_DELIVERY_RE = re.compile(r"^scheduled:live-media:[0-9a-f]{64}$")
+_MEDIA_RECEIPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MEDIA_RECEIPT_MAX_ITEMS = 16
+
+
+def _safe_media_ids(value: Any) -> List[str]:
+    """Accept a small list of opaque media ids, never an arbitrary wire payload."""
+    if not isinstance(value, list):
+        return []
+    safe: List[str] = []
+    for item in value:
+        if isinstance(item, str) and _MEDIA_RECEIPT_ID_RE.fullmatch(item):
+            safe.append(item)
+            if len(safe) == _MEDIA_RECEIPT_MAX_ITEMS:
+                break
+    return safe
+
+
+def _safe_tool_attachments(value: Any) -> List[Dict[str, Any]]:
+    """Defence in depth for the only media descriptor tool results may expose."""
+    if not isinstance(value, list):
+        return []
+    safe: List[Dict[str, Any]] = []
+    for item in value[:_MEDIA_RECEIPT_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        attachment_id = item.get("attachmentId")
+        name = item.get("name")
+        mime_type = item.get("mimeType")
+        size = item.get("bytes")
+        kind = item.get("mediaKind")
+        if (
+            not isinstance(attachment_id, str) or not _MEDIA_RECEIPT_ID_RE.fullmatch(attachment_id)
+            or not isinstance(name, str) or not name or os.path.basename(name) != name or len(name) > 128
+            or not isinstance(mime_type, str) or not mime_type or len(mime_type) > 128
+            or not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= MEDIA_AGGREGATE_MAX_BYTES
+            or not isinstance(kind, str) or kind not in {"image", "audio", "video", "file"}
+        ):
+            continue
+        safe.append({
+            "attachmentId": attachment_id,
+            "name": name,
+            "mimeType": mime_type,
+            "bytes": size,
+            "mediaKind": kind,
+        })
+    return safe
+
+
+def _media_delivery_flags(state: str, media_verified: bool = False) -> Dict[str, bool]:
+    """Keep delivery claims monotonic and deliberately weaker than transport success."""
+    accepted = state in {"journaled", "admitted", "projected", "displayed"}
+    return {
+        "accepted": accepted,
+        "pending": state in {"journaled", "admitted"},
+        "committed": state in {"projected", "displayed"},
+        "displayed": state == "displayed",
+        "verified": media_verified is True,
+    }
 
 
 def _send_media_tool_result(
@@ -2949,9 +3046,15 @@ def _send_media_tool_result(
         "state": state[:32],
         "conversationId": conversation_id[:256] if isinstance(conversation_id, str) else None,
     }
+    payload.update(_media_delivery_flags(state))
+    payload["accepted"] = accepted
     if isinstance(result, dict):
         if isinstance(result.get("accepted_pending"), bool):
             payload["pending"] = result["accepted_pending"]
+        payload["verified"] = result.get("mediaVerified") is True
+        attachments = _safe_tool_attachments(result.get("attachments"))
+        if attachments:
+            payload["attachments"] = attachments
         for key in ("deliveryId", "messageId", "eventId", "error"):
             value = result.get(key)
             if isinstance(value, str) and value:
@@ -2962,6 +3065,51 @@ def _send_media_tool_result(
                     payload[key] = value[:256]
     if error:
         payload["error"] = error[:128]
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _safe_media_rows(spool: Optional[AttachSpool], delivery_id: str) -> List[Dict[str, Any]]:
+    """Return lifecycle facts with neither filesystem metadata nor content hashes."""
+    if spool is None:
+        return []
+    try:
+        rows = spool.media_rows(delivery_id)
+    except Exception:  # noqa: BLE001 - unreadable local state is simply absent state
+        logger.debug("attach: media lifecycle read failed", exc_info=True)
+        return []
+    safe: List[Dict[str, Any]] = []
+    for row in rows[:_MEDIA_RECEIPT_MAX_ITEMS]:
+        media_id = row.get("mediaId")
+        state = row.get("state")
+        name = row.get("pathMeta")
+        if not isinstance(media_id, str) or not _MEDIA_RECEIPT_ID_RE.fullmatch(media_id):
+            continue
+        if not isinstance(state, str) or state not in {
+            "prepared", "uploaded", "journaled", "projected", "displayed", "blocked", "upload_failed",
+        }:
+            continue
+        item: Dict[str, Any] = {"attachmentId": media_id, "state": state, "lifecycle": state}
+        if isinstance(name, str) and name and os.path.basename(name) == name and len(name) <= 128:
+            item["name"] = name
+        safe.append(item)
+    return safe
+
+
+def _media_status_tool_result(
+    delivery_id: str, message_id: str, state: str, receipt: Optional[Dict[str, Any]], rows: List[Dict[str, Any]],
+    *, error: Optional[str] = None,
+) -> str:
+    """A bounded status result that never repackages raw receipt diagnostics."""
+    media_verified = bool(receipt and receipt.get("mediaVerified") is True)
+    payload: Dict[str, Any] = {
+        "state": state, "lifecycle": state, "deliveryId": delivery_id, "messageId": message_id,
+        **_media_delivery_flags(state, media_verified),
+        "expectedMediaIds": _safe_media_ids(receipt.get("expectedMediaIds")) if receipt else [],
+        "committedMediaIds": _safe_media_ids(receipt.get("committedMediaIds")) if receipt else [],
+        "mediaVerified": media_verified, "media": rows,
+    }
+    if error:
+        payload["error"] = error
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -3038,6 +3186,60 @@ async def _cozy_send_media(args: Dict[str, Any], **kwargs: Any) -> str:
     return _send_media_tool_result(
         accepted=accepted, state=state, conversation_id=chat_id, result=result
     )
+
+
+async def _cozy_media_delivery_status(args: Dict[str, Any], **_kwargs: Any) -> str:
+    """Read one prior live-media delivery without making another delivery attempt."""
+    delivery_id = args.get("deliveryId") if isinstance(args, dict) else None
+    if not isinstance(delivery_id, str) or not _LIVE_MEDIA_DELIVERY_RE.fullmatch(delivery_id):
+        return _media_status_tool_result("", "", "blocked", None, [], error="invalid_delivery_id")
+    origin = _resolve_live_origin()
+    message_id = _proactive_identity(delivery_id[len("scheduled:"):])[1]
+    if origin is None:
+        return _media_status_tool_result(delivery_id, message_id, "blocked", None, [], error="policy_blocked")
+    origin_adapter, _chat_id, _turn_id, _profile = origin
+    receipt: Optional[Dict[str, Any]] = None
+    reader = getattr(origin_adapter, "media_delivery_receipt", None)
+    if callable(reader):
+        try:
+            candidate = await reader(delivery_id, 0.5)
+        except Exception:  # noqa: BLE001 - local journal remains the truthful fallback
+            candidate = None
+        if isinstance(candidate, dict) and candidate.get("state") in {
+            "admitted", "projected", "blocked", "displayed", "failed",
+        }:
+            receipt = candidate
+    spool = getattr(origin_adapter, "_spool", None)
+    rows = _safe_media_rows(spool, delivery_id)
+    local_receipt: Optional[Dict[str, Any]] = None
+    if spool is not None:
+        try:
+            candidate = spool.delivery_receipt_row(delivery_id)
+            if isinstance(candidate, dict):
+                local_receipt = candidate
+        except Exception:  # noqa: BLE001 - same fallback as a transient gateway 404
+            logger.debug("attach: local delivery receipt read failed", exc_info=True)
+    if receipt is not None:
+        state = str(receipt["state"])
+        # The HTTP ABI keeps its durable projection fact at the top level.  A
+        # later terminal display is additive (`projected` +
+        # `terminal:{state:"displayed"}`), rather than a replacement top-level
+        # state.  Treat that terminal fact as the lifecycle answer, while still
+        # leaving verification exclusively to `mediaVerified` below.
+        terminal = receipt.get("terminal")
+        if (
+            state == "projected"
+            and isinstance(terminal, dict)
+            and terminal.get("state") == "displayed"
+        ):
+            state = "displayed"
+    elif local_receipt is not None and local_receipt.get("state") in {"displayed", "failed"}:
+        state = str(local_receipt["state"])
+    elif rows:
+        state = "journaled"
+    else:
+        state = "unknown"
+    return _media_status_tool_result(delivery_id, message_id, state, receipt, rows)
 
 
 async def _cozy_mobile(request: Any, location: bool = False, media: bool = False, notification: bool = False) -> str:
@@ -3146,7 +3348,7 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
         if tool_name in {
             "cozy_device_status", "cozy_request_location",
             "cozy_capture_camera", "cozy_pick_file",
-            "cozy_send_media",
+            "cozy_send_media", "cozy_media_delivery_status",
         }:
             # Purpose and phone payloads are live-turn-only data. Tool chips may name the
             # operation, but never retain either side of this sensitive exchange as detail.
@@ -4364,6 +4566,8 @@ def register(ctx: Any) -> None:
             "block forms above. For native attachments, prefer the cozy_send_media tool: "
             "it sends native attachments immediately to this originating conversation, "
             "and after using it do not repeat MEDIA: directives for the same files. "
+            "A journaled attachment result is pending, not proof of commit or display; "
+            "use cozy_media_delivery_status with its deliveryId before claiming either. "
             "If the typed tool is unavailable, MEDIA:/absolute/path is the fallback: put "
             "one MEDIA:/absolute/path directive on each line of your final response; multiple directive lines "
             "send multiple attachments. Keep directives outside code fences. These "
@@ -4409,6 +4613,29 @@ def register(ctx: Any) -> None:
         is_async=True,
         description="Send native attachments to the current CozyGateway conversation.",
         emoji="📤",
+    )
+    ctx.register_tool(
+        name="cozy_media_delivery_status",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_media_delivery_status",
+            "description": (
+                "Check the receipt for a prior cozy_send_media delivery in this exact live "
+                "conversation. A journaled result remains pending until a receipt confirms it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"deliveryId": {
+                    "type": "string", "description": "The deliveryId returned by cozy_send_media.",
+                    "pattern": "^scheduled:live-media:[0-9a-f]{64}$",
+                }},
+                "required": ["deliveryId"], "additionalProperties": False,
+            },
+        },
+        handler=_cozy_media_delivery_status,
+        is_async=True,
+        description="Check a native attachment delivery receipt in the current live conversation.",
+        emoji="📬",
     )
     ctx.register_tool(
         name="cozy_device_status",
