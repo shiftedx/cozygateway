@@ -278,10 +278,16 @@ export class LiveActivityNotifier {
         result: response.ok ? "ok" : response.status === 404 ? "not_found" : "http_error",
       });
       if (response.status === 404) {
-        this.#storage.deleteLiveActivityRegistration(row.deviceId, row.activityId);
-        this.#lastProjection.delete(key);
-        this.#lastToolUpdate.delete(key);
-        this.#preApproval.delete(key);
+        const deleted = this.#storage.deleteLiveActivityRegistration(
+          row.deviceId,
+          row.activityId,
+          { expectedPushId: row.pushId, queuedAt: this.#now() },
+        );
+        if (deleted !== undefined) {
+          this.#lastProjection.delete(key);
+          this.#lastToolUpdate.delete(key);
+          this.#preApproval.delete(key);
+        }
       }
       if (!response.ok && response.status !== 404) throw new Error(`relay returned HTTP ${response.status}`);
     }).catch((error: unknown) => {

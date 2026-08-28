@@ -166,6 +166,46 @@ describe("live activity notifier", () => {
     storage.close();
   });
 
+  it("does not let an old 404 delete a rotated registration or its projection state", async () => {
+    const storage = openStorage(":memory:");
+    storage.createDevice({ id: "device", name: "phone", tokenHash: "hash", createdAt: 1 });
+    storage.saveLiveActivityRegistration({ deviceId: "device", activityId: "activity", runId: "old",
+      conversationId: "session", bot: "sage", pushId: "old-push", createdAt: 1 });
+    const bodies: any[] = [];
+    let resolveOld: ((response: Response) => void) | undefined;
+    const oldResponse = new Promise<Response>((resolve) => { resolveOld = resolve; });
+    const notifier = new LiveActivityNotifier({
+      storage, relayBaseUrl: "https://relay.test", now: () => 10_000,
+      fetchImpl: async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return bodies.length === 1 ? await oldResponse : new Response(null, { status: 202 });
+      },
+    });
+    const polling = { type: "bot_chat_state", bot: "sage", sessionId: "session", phase: "polling",
+      running: true, inflight: true, updatedAt: 1 } as ServerFrame;
+    notifier.handleFrame(polling);
+    expect(bodies).toMatchObject([{ pushId: "old-push" }]);
+
+    storage.saveLiveActivityRegistration({ deviceId: "device", activityId: "activity", runId: "new",
+      conversationId: "session", bot: "sage", pushId: "new-push", createdAt: 2 });
+    resolveOld?.(new Response(null, { status: 404 }));
+    await tick();
+
+    expect(storage.liveActivityRegistration("device", "activity")).toMatchObject({
+      runId: "new", pushId: "new-push",
+    });
+    expect(storage.liveActivityRelayDeletions(10)).toEqual(["old-push"]);
+    notifier.handleFrame(polling);
+    await tick();
+    expect(bodies).toHaveLength(1);
+
+    notifier.handleFrame({ type: "bot_chat_delta", bot: "sage", sessionId: "session", turnId: "turn",
+      text: "new draft", updatedAt: 2 } as unknown as ServerFrame);
+    await tick();
+    expect(bodies.at(-1)).toMatchObject({ pushId: "new-push" });
+    storage.close();
+  });
+
   it("never fans a current conversation frame out to stale conversations from the same bot", async () => {
     const storage = openStorage(":memory:");
     for (let index = 0; index < 10; index += 1) {

@@ -898,22 +898,28 @@ export class Storage {
     return this.liveActivityRegistration(deviceId, activityId)?.eventSequence ?? 0;
   }
 
+  /** Atomically queues and removes the current row. `expectedPushId` makes asynchronous relay
+   * responses compare-and-delete, so an old response cannot remove a rotated registration. */
   deleteLiveActivityRegistration(
     deviceId: string,
     activityId: string,
-    queuedAt = Date.now(),
+    options: { expectedPushId?: string; queuedAt?: number } = {},
   ): LiveActivityRegistrationRow | undefined {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const row = this.liveActivityRegistration(deviceId, activityId);
-      if (row !== undefined) {
+      if (row !== undefined
+        && (options.expectedPushId === undefined || row.pushId === options.expectedPushId)) {
         this.#db.prepare(
           `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
            VALUES (?, ?)`,
-        ).run(row.pushId, queuedAt);
+        ).run(row.pushId, options.queuedAt ?? Date.now());
         this.#db.prepare(
           "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
         ).run(deviceId, activityId);
+      } else if (row !== undefined) {
+        this.#db.exec("COMMIT");
+        return undefined;
       }
       this.#db.exec("COMMIT");
       return row;

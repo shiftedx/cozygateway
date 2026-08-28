@@ -319,6 +319,53 @@ describe("authenticated push relay proxy", () => {
     storage.close();
   });
 
+  it("continues after a full successful page without hot-spinning a failed page", async () => {
+    const config: GatewayConfig = { name: "pages", port: 8787, dbPath: ":memory:",
+      turnTimeoutSeconds: 0, hermes: testHermes(), pushRelayUrl: "http://relay.internal:8788/" };
+    const seed = (storage: ReturnType<typeof openStorage>) => {
+      for (let index = 0; index < 51; index += 1) {
+        const deviceId = `device-${index}`;
+        storage.createDevice({ id: deviceId, name: deviceId,
+          tokenHash: `hash-${index}`, createdAt: index });
+        storage.saveLiveActivityRegistration({ deviceId, activityId: "old", runId: "old",
+          conversationId: "session", bot: "sage", pushId: `old-push-${index}`, createdAt: index });
+        storage.saveLiveActivityRegistration({ deviceId, activityId: "new", runId: "new",
+          conversationId: "session", bot: "sage", pushId: `new-push-${index}`, createdAt: index });
+      }
+    };
+    const appDeps = (storage: ReturnType<typeof openStorage>, relayFetch: typeof fetch) => ({
+      storage, config, pushRelayFetch: relayFetch, pushRelayLog: () => {},
+      gatewayInfo: gatewayInfoForConfig(config), presenceOf: () => "online" as const,
+      submitUserMessage: () => { throw new Error("not used"); }, interruptThread: () => "idle" as const,
+      resolveApproval: () => Promise.resolve("unknown" as const), onDeviceRevoked: () => {},
+      now: () => 1_000,
+    });
+
+    const successful = openStorage(":memory:");
+    seed(successful);
+    let successfulDeletes = 0;
+    createApp(appDeps(successful, async () => {
+      successfulDeletes += 1;
+      return new Response(null, { status: 204 });
+    }));
+    await tick();
+    expect(successfulDeletes).toBe(51);
+    expect(successful.liveActivityRelayDeletions(100)).toEqual([]);
+    successful.close();
+
+    const failed = openStorage(":memory:");
+    seed(failed);
+    let failedDeletes = 0;
+    createApp(appDeps(failed, async () => {
+      failedDeletes += 1;
+      return new Response(null, { status: 503 });
+    }));
+    await tick();
+    expect(failedDeletes).toBe(50);
+    expect(failed.liveActivityRelayDeletions(100)).toHaveLength(51);
+    failed.close();
+  });
+
   it("advertises the push proxy capability in health", async () => {
     const { app } = await setup();
 

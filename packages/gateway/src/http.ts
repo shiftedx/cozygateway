@@ -205,11 +205,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
   const requestLiveActivityDeletionDrain = (() => {
     let draining = false;
     let requested = false;
-    const drainBatch = async () => {
-      if (relayBase === undefined) return;
-      for (const pushId of deps.storage.liveActivityRelayDeletions(
+    const drainBatch = async (): Promise<boolean> => {
+      if (relayBase === undefined) return false;
+      const pushIds = deps.storage.liveActivityRelayDeletions(
         LIVE_ACTIVITY_DELETION_DRAIN_LIMIT,
-      )) {
+      );
+      let completed = 0;
+      for (const pushId of pushIds) {
         try {
           const response = await relayFetch(
             `${relayBase}/register/${encodeURIComponent(pushId)}`,
@@ -223,6 +225,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
           );
           if (response.ok) {
             deps.storage.completeLiveActivityRelayDeletion(pushId);
+            completed += 1;
           } else {
             relayLog(`live activity relay cleanup: DELETE returned HTTP ${response.status}`);
           }
@@ -230,6 +233,9 @@ export function createApp(deps: AppDeps): Hono<Env> {
           relayLog("live activity relay cleanup: DELETE failed with a network error");
         }
       }
+      // Continue only when this bounded page was full AND changed durable state. An all-failure
+      // page stays queued for a later external trigger instead of hot-spinning.
+      return pushIds.length === LIVE_ACTIVITY_DELETION_DRAIN_LIMIT && completed > 0;
     };
     return () => {
       requested = true;
@@ -239,7 +245,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
         try {
           while (requested) {
             requested = false;
-            await drainBatch();
+            if (await drainBatch()) requested = true;
           }
         } catch {
           relayLog("live activity relay cleanup: outbox drain failed");
@@ -771,7 +777,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
     deps.storage.deleteLiveActivityRegistration(
       c.get("deviceId"),
       c.req.param("activityId"),
-      deps.now(),
+      { queuedAt: deps.now() },
     );
     requestLiveActivityDeletionDrain();
     return c.body(null, 204);
