@@ -42,7 +42,7 @@ describe("fileGatewaySettings", () => {
     });
     expect(response.restartRequired).toBe(true);
     expect(fileGatewaySettings(path).read().hermesEndpoints.map((e) => e.id)).toEqual(["home", "studio"]);
-    expect(statSync(path).mode & 0o777).toBe(0o640);
+    if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o640);
     const disk = readFileSync(path, "utf8");
     expect(disk).not.toContain("Old name");
     expect(disk).not.toContain("actual-secret");

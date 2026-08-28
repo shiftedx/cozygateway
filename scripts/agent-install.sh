@@ -856,7 +856,9 @@ enable_dashboard_basic_plugin() {
   "$HERMES_RESOLVED" -p default plugins enable basic --no-allow-tool-override >/dev/null
 }
 launch_dashboard() {
-  "$NODE_RESOLVED" - "$DASHBOARD_ENV" "$HERMES_ROOT" "$HERMES_RESOLVED" "$DASHBOARD_PORT" <<'NODE'
+  local hermes_root_arg="$HERMES_ROOT"
+  is_windows && hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
+  "$NODE_RESOLVED" - "$DASHBOARD_ENV" "$hermes_root_arg" "$HERMES_RESOLVED" "$DASHBOARD_PORT" <<'NODE'
 const { readFileSync } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
@@ -900,12 +902,14 @@ stop_stubborn_windows_dashboard() {
   [ "$code" -eq 0 ] || die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop"
 }
 start_dashboard() {
+  local hermes_root_arg="$HERMES_ROOT"
+  is_windows && hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
   enable_dashboard_basic_plugin
   [ "$DRY_RUN" = 1 ] && { say "DRY   start/reuse Hermes Dashboard at 127.0.0.1:$DASHBOARD_PORT as the control/read plane"; return; }
   if dashboard_ready; then
     dashboard_credentials_work && return
     say "INFO  existing Hermes Dashboard rejected the configured local credential; restarting it with the installer-owned runtime credential"
-    HERMES_HOME="$HERMES_ROOT" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
+    HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
     for _ in $(seq 1 5); do dashboard_ready || break; sleep 1; done
     if dashboard_ready && is_windows; then
       stop_stubborn_windows_dashboard
