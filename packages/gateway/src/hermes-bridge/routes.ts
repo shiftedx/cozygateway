@@ -830,6 +830,19 @@ export function registerBotRoutes(
     }
   });
 
+  // Capability 40. Profile creation and attach readiness are different facts: the Mac-side
+  // provisioner may still be wiring the bot after POST /bots has returned 201. This read has no
+  // chat/session side effect, so a client can poll it while showing the creation handoff.
+  app.get("/bots/:name/readiness", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json(chat.readiness(resolved.name));
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
   app.get("/bots/:name/commands", requireDevice, (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;

@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 38. This extension is independent of the frozen core
+Status: v1 extension, capability version 40. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -32,7 +32,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 38 }
+"capabilities": { "com.cozylabs.bots": 40 }
 ```
 
 Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
@@ -77,6 +77,8 @@ extension omits the capability and does not register `/bots` routes.
 | 36 | Full provider visibility: optional `providers` summary and `unauthenticated` catalog markers on `BotModelConfig`. |
 | 37 | Bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Removes the Hermes profile, purges gateway state, and revokes the attach identity. |
 | 38 | Device status v2: normalized status purpose and the closed mobile-node v3 operational status result; no v1 fallback. |
+| 39 | Capability leases and durable metadata-only receipts for phone-node sharing. |
+| 40 | Bot readiness: `GET /bots/:name/readiness` distinguishes a created profile from an attached bot that can accept turns. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -427,6 +429,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. |
 | `GET /bots/:name/model-config` | — | `BotModelConfig` | Hermes profile model read. |
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Hermes profile model update. |
+| `GET /bots/:name/readiness` | — | `BotReadiness` | Capability 40. Reports `starting` until the configured attach identity is online, then `ready`. |
 | `GET /bots/:name/chat` | — | `{ name, sessionId, adoption: "created" \| "pin" }` | Resolves the selected native chat. |
 | `GET /bots/:name/chat/messages` | — | `{ name, sessionId, adoption, messages, running, inflight, updatedAt, suggestion?, toolSteps? }` | Reads native transcript and native tool history. |
 | `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Admits a native turn or steer, then appends locally. |
