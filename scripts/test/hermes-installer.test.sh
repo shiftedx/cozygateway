@@ -634,6 +634,10 @@ if [ -n "${COZYGATEWAY_NODE_EXPAND_DESTINATION:-}" ]; then
   exit 0
 fi
 if [ "${COZYGATEWAY_TEST_UNRELATED_LISTENER:-}" = 1 ] && [ "${COZYGATEWAY_CHECK_TARGET_PORT:-}" = 1 ]; then exit 42; fi
+if [ "${COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER:-}" = 1 ] && [ -n "${COZYGATEWAY_EXPECTED_DASHBOARD_PORT:-}" ]; then
+  [ -n "${COZYGATEWAY_EXPECTED_DASHBOARD_ROOT:-}" ] || exit 42
+  [[ "$*" == *'Test-CozyDashboardOwner'* ]] || exit 42
+fi
 rm -f "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}"
 [ -z "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] || rm -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER"
 [ -z "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER"
@@ -764,15 +768,19 @@ test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/Cozy
 dashboard_stop_home_log="$tmp/windows-dashboard-stop-home.log"
 dashboard_relaunch_home_log="$tmp/windows-dashboard-relaunch-home.log"
 set +e
-dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-dashboard-gateway-ready" COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER="$tmp/windows-dashboard-wrong" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$tmp/windows-dashboard-stopped" COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG="$dashboard_stop_home_log" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_relaunch_home_log" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-dashboard" 2>&1)"
+dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-dashboard-gateway-ready" COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER="$tmp/windows-dashboard-wrong" COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER=1 COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$tmp/windows-dashboard-stopped" COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG="$dashboard_stop_home_log" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_relaunch_home_log" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-dashboard" 2>&1)"
 dashboard_fallback_status=$?
 set -e
+if [ "$dashboard_fallback_status" -ne 0 ]; then
+  printf '%s\n--- powershell log ---\n' "$dashboard_fallback_output" >&2
+  cat "$tmp/windows-dashboard-commands" >&2
+fi
 test "$dashboard_fallback_status" -eq 0
 grep -Fxq "$expected_windows_hermes_home" "$dashboard_stop_home_log"
 grep -Fxq "$expected_windows_hermes_home" "$dashboard_relaunch_home_log"
 grep -Fq 'COZYGATEWAY_EXPECTED_DASHBOARD_PORT' "$tmp/windows-dashboard-commands"
 grep -Fq 'COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER' "$tmp/windows-dashboard-commands"
-grep -Fq 'GetFullPath($token)' "$repo_root/scripts/agent-install.sh"
+grep -Fq 'COZYGATEWAY_DASHBOARD_OWNER_BEGIN' "$repo_root/scripts/agent-install.sh"
 test ! -e "$tmp/windows-dashboard-wrong"
 if grep -Fq 'Dashboard stayed listening after stop' <<<"$dashboard_fallback_output"; then
   echo 'Windows Dashboard fallback did not release the validated listener' >&2

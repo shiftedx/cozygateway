@@ -942,28 +942,75 @@ child.unref();
 NODE
 }
 stop_stubborn_windows_dashboard() {
-  local hermes_native launcher_native code
+  local hermes_native launcher_native root_native code
   hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
   launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
+  root_native="$(to_windows_path "$HERMES_ROOT")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_DASHBOARD_ROOT="$root_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     $port = [int]$env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT
     $connection = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $connection) { exit 0 }
     $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
-    $command = [string]$process.CommandLine
-    $expectedHermes = [IO.Path]::GetFullPath($env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES)
-    $expectedLauncher = [IO.Path]::GetFullPath($env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER)
-    $tokens = @([regex]::Matches($command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
-    $ownsHermes = @($tokens | Where-Object {
-      $token = $_
-      try {
-        $full = [IO.Path]::GetFullPath($token)
-        $full.Equals($expectedHermes, [StringComparison]::OrdinalIgnoreCase) -or $full.Equals($expectedLauncher, [StringComparison]::OrdinalIgnoreCase)
-      } catch { $false }
-    }).Count -gt 0
-    if (-not $ownsHermes -or -not $command.Contains(" dashboard ") -or -not $command.Contains("--port " + $port)) { exit 42 }
+    # COZYGATEWAY_DASHBOARD_OWNER_BEGIN
+    function Test-CozyDashboardOwner {
+      param(
+        $Process,
+        [string]$ExpectedRoot,
+        [string]$ExpectedHermes,
+        [string]$ExpectedLauncher,
+        [int]$ExpectedPort,
+        [scriptblock]$ResolveProcess
+      )
+      $root = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+      $hermes = [IO.Path]::GetFullPath($ExpectedHermes)
+      $launcher = [IO.Path]::GetFullPath($ExpectedLauncher)
+      $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
+
+      $runtimeUnderRoot = $false
+      $candidate = $Process
+      for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
+        try {
+          if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+            $runtimeUnderRoot = $true
+            break
+          }
+        } catch {}
+        if (-not $candidate.ParentProcessId) { break }
+        $candidate = & $ResolveProcess ([int]$candidate.ParentProcessId)
+      }
+
+      $dashboardIndex = -1
+      $scriptSuffix = [IO.Path]::DirectorySeparatorChar + "hermes_cli" + [IO.Path]::DirectorySeparatorChar + "main.py"
+      $processExecutable = $null
+      $firstToken = $null
+      $secondToken = $null
+      try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch {}
+      if ($tokens.Count -gt 0) { try { $firstToken = [IO.Path]::GetFullPath($tokens[0]) } catch {} }
+      if ($tokens.Count -gt 1) { try { $secondToken = [IO.Path]::GetFullPath($tokens[1]) } catch {} }
+      $firstIsExecutable = $null -ne $processExecutable -and $null -ne $firstToken -and $firstToken.Equals($processExecutable, [StringComparison]::OrdinalIgnoreCase)
+      $pythonRuntime = $firstIsExecutable -and @("python.exe", "pythonw.exe") -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
+      $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
+      if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq "dashboard") {
+        $dashboardIndex = 1
+      } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
+        $dashboardIndex = 2
+      } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
+        $dashboardIndex = 3
+      } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase) -and $tokens[2] -eq "dashboard") {
+        $dashboardIndex = 2
+      }
+      if ($dashboardIndex -lt 0) { return $false }
+      for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
+        if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return $true }
+        if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return $true }
+      }
+      return $false
+    }
+    # COZYGATEWAY_DASHBOARD_OWNER_END
+    $resolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
+    if (-not (Test-CozyDashboardOwner -Process $process -ExpectedRoot $env:COZYGATEWAY_EXPECTED_DASHBOARD_ROOT -ExpectedHermes $env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES -ExpectedLauncher $env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER -ExpectedPort $port -ResolveProcess $resolver)) { exit 42 }
     Stop-Process -Id $process.ProcessId -Force
   ' >/dev/null 2>&1
   code=$?

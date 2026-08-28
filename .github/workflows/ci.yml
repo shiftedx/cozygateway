@@ -48,6 +48,7 @@ jobs:
         with: { python-version: "3.11" }
       - run: pnpm install --frozen-lockfile
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1
       - run: bash scripts/test/hermes-installer.test.sh
         shell: bash
       - run: python -m unittest discover -s integrations/attach-plugin/tests -p test_spool_v1.py
