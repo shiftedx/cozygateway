@@ -742,11 +742,13 @@ function Stop-CozyDashboardOwner {
     [scriptblock]$KillTree,
     [scriptblock]$Sleep
   )
-  try { $firstListener = & $ResolveListener } catch { return 45 }
+  try { $firstListener = & $ResolveListener } catch { return 43 }
   if ($null -eq $firstListener) { return 0 }
   try { $firstProcess = & $ResolveProcess ([int]$firstListener.OwningProcess) } catch { return 43 }
   if ($null -eq $firstProcess -or [int]$firstProcess.ProcessId -ne [int]$firstListener.OwningProcess) { return 43 }
-  $firstOwner = Test-CozyDashboardOwner -Process $firstProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  try {
+    $firstOwner = Test-CozyDashboardOwner -Process $firstProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  } catch { return 43 }
   if ($firstOwner -eq "Foreign") { return 42 }
   if ($firstOwner -ne "Owned" -or [string]::IsNullOrWhiteSpace([string]$firstProcess.CreationDate)) { return 43 }
 
@@ -755,7 +757,9 @@ function Stop-CozyDashboardOwner {
   try { $secondProcess = & $ResolveProcess ([int]$secondListener.OwningProcess) } catch { return 45 }
   if ($null -eq $secondProcess -or [int]$secondProcess.ProcessId -ne [int]$secondListener.OwningProcess -or [string]::IsNullOrWhiteSpace([string]$secondProcess.CreationDate) -or
       -not ([string]$secondProcess.CreationDate).Equals([string]$firstProcess.CreationDate, [StringComparison]::Ordinal)) { return 45 }
-  $secondOwner = Test-CozyDashboardOwner -Process $secondProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  try {
+    $secondOwner = Test-CozyDashboardOwner -Process $secondProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  } catch { return 45 }
   if ($secondOwner -ne "Owned") { return 45 }
 
   try { $killCode = & $KillTree ([int]$secondProcess.ProcessId) } catch { return 45 }
@@ -768,7 +772,11 @@ function Stop-CozyDashboardOwner {
   return 45
 }
 # COZYGATEWAY_DASHBOARD_OWNER_END
-$listenerResolver = { Get-NetTCPConnection -State Listen -LocalAddress "127.0.0.1" -LocalPort $ExpectedPort -ErrorAction SilentlyContinue | Select-Object -First 1 }
+$listenerResolver = {
+  Get-NetTCPConnection -State Listen -ErrorAction Stop |
+    Where-Object { $_.LocalAddress -eq "127.0.0.1" -and $_.LocalPort -eq $ExpectedPort } |
+    Select-Object -First 1
+}
 $processResolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
 $treeKiller = {
   param([int]$processId)

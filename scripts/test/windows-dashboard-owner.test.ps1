@@ -133,6 +133,104 @@ Assert-Owner 'same-user/session/name/port evidence without executable path' 'Ind
 $missingListenerCommand = New-TestProcess 951 0 $uvPython $null
 Assert-Owner 'same-user/session/name/port evidence without command line' 'Indeterminate' $missingListenerCommand @{ 951 = $missingListenerCommand }
 
+function Invoke-TestStop {
+    param(
+        [scriptblock] $ResolveListener,
+        [scriptblock] $ResolveProcess,
+        [int] $KillCode = 0
+    )
+    $state = @{ KillCount = 0 }
+    $killTree = { param([int] $Id) $state.KillCount++; return $KillCode }.GetNewClosure()
+    try {
+        $code = Stop-CozyDashboardOwner `
+            -ExpectedRoot $root `
+            -ExpectedHermes $hermes `
+            -ExpectedLauncher $launcher `
+            -ExpectedPort 9119 `
+            -ResolveListener $ResolveListener `
+            -ResolveProcess $ResolveProcess `
+            -KillTree $killTree `
+            -Sleep { param([int] $Milliseconds) }
+    } catch {
+        $code = 'Threw: ' + $_.Exception.Message
+    }
+    [pscustomobject]@{ Code = $code; KillCount = $state.KillCount }
+}
+
+if (Get-Command Stop-CozyDashboardOwner -ErrorAction SilentlyContinue) {
+    $ownedProcess = New-TestProcess 1000 0 $launcher ('"{0}" dashboard --port 9119' -f $launcher)
+    $listener = [pscustomobject]@{ OwningProcess = 1000 }
+
+    $result = Invoke-TestStop { $null } { param([int] $Id) throw 'process lookup should not run' }
+    Assert-Equal 'absent listener exit code' 0 $result.Code
+    Assert-Equal 'absent listener taskkill count' 0 $result.KillCount
+
+    $foreignProcess = New-TestProcess 1000 0 $launcher ('"{0}" dashboard --port 9120' -f $launcher)
+    $result = Invoke-TestStop { $listener }.GetNewClosure() { param([int] $Id) $foreignProcess }.GetNewClosure()
+    Assert-Equal 'foreign listener exit code' 42 $result.Code
+    Assert-Equal 'foreign listener taskkill count' 0 $result.KillCount
+
+    $inaccessibleProcess = New-TestProcess 1000 0 $null $null
+    $result = Invoke-TestStop { $listener }.GetNewClosure() { param([int] $Id) $inaccessibleProcess }.GetNewClosure()
+    Assert-Equal 'first-pass inaccessible process metadata exit code' 43 $result.Code
+    Assert-Equal 'first-pass inaccessible process metadata taskkill count' 0 $result.KillCount
+
+    $listenerState = @{ Count = 0 }
+    $releaseListener = {
+        $listenerState.Count++
+        if ($listenerState.Count -le 2) { return $listener }
+        return $null
+    }.GetNewClosure()
+    $result = Invoke-TestStop $releaseListener { param([int] $Id) $ownedProcess }.GetNewClosure()
+    Assert-Equal 'successful termination exit code' 0 $result.Code
+    Assert-Equal 'successful termination taskkill count' 1 $result.KillCount
+
+    $result = Invoke-TestStop { $listener }.GetNewClosure() { param([int] $Id) $ownedProcess }.GetNewClosure()
+    Assert-Equal 'port-release failure exit code' 45 $result.Code
+    Assert-Equal 'port-release failure taskkill count' 1 $result.KillCount
+
+    $result = Invoke-TestStop { throw 'listener query denied' } { param([int] $Id) $ownedProcess }.GetNewClosure()
+    Assert-Equal 'first-pass listener resolver exception exit code' 43 $result.Code
+    Assert-Equal 'first-pass listener resolver exception taskkill count' 0 $result.KillCount
+
+    $listenerState = @{ Count = 0 }
+    $secondListenerFailure = {
+        $listenerState.Count++
+        if ($listenerState.Count -eq 1) { return $listener }
+        throw 'listener query denied'
+    }.GetNewClosure()
+    $result = Invoke-TestStop $secondListenerFailure { param([int] $Id) $ownedProcess }.GetNewClosure()
+    Assert-Equal 'second-pass listener resolver exception exit code' 45 $result.Code
+    Assert-Equal 'second-pass listener resolver exception taskkill count' 0 $result.KillCount
+
+    $moduleWithParent = New-TestProcess 1100 1101 $uvPython ('"{0}" -m hermes_cli.main dashboard --port 9119' -f $uvPython)
+    $moduleListenerSnapshot = [pscustomobject]@{ OwningProcess = 1100 }
+    $firstAncestryFailure = {
+        param([int] $Id)
+        if ($Id -eq 1100) { return $moduleWithParent }
+        throw 'ancestry query denied'
+    }.GetNewClosure()
+    $result = Invoke-TestStop { $moduleListenerSnapshot }.GetNewClosure() $firstAncestryFailure
+    Assert-Equal 'first-pass ancestry resolver exception exit code' 43 $result.Code
+    Assert-Equal 'first-pass ancestry resolver exception taskkill count' 0 $result.KillCount
+
+    $underRootParent = New-TestProcess 1101 0 $venvPython ('"{0}" worker' -f $venvPython)
+    $listenerState = @{ Count = 0 }
+    $twoPassListener = { $listenerState.Count++; return $moduleListenerSnapshot }.GetNewClosure()
+    $secondAncestryFailure = {
+        param([int] $Id)
+        if ($Id -eq 1100) { return $moduleWithParent }
+        if ($listenerState.Count -eq 1) { return $underRootParent }
+        throw 'ancestry query denied'
+    }.GetNewClosure()
+    $result = Invoke-TestStop $twoPassListener $secondAncestryFailure
+    Assert-Equal 'second-pass ancestry resolver exception exit code' 45 $result.Code
+    Assert-Equal 'second-pass ancestry resolver exception taskkill count' 0 $result.KillCount
+}
+
+$productionListenerResolver = [regex]::Match($installer, '(?s)\$listenerResolver = \{(.*?)\r?\n\}').Value
+Assert-Equal 'production listener resolver surfaces query failures' $true ($productionListenerResolver -match '-ErrorAction Stop')
+
 if (-not (Get-Command Stop-CozyDashboardOwner -ErrorAction SilentlyContinue)) {
     $failures.Add('race-safe stop function Stop-CozyDashboardOwner is missing')
 } else {
