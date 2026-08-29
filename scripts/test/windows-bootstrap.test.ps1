@@ -147,6 +147,86 @@ function ConvertTo-PowerShellSingleQuotedLiteral {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
+function New-FakeUserNetTCPIPModule {
+    param([string] $MarkerPath)
+    $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    Assert-True (-not [string]::IsNullOrWhiteSpace($documents)) 'Windows must expose the current user Documents directory for the PSModulePath regression test'
+    $windowsPowerShellRoot = Join-Path $documents 'WindowsPowerShell'
+    $modulesRoot = Join-Path $windowsPowerShellRoot 'Modules'
+    $moduleRoot = Join-Path $modulesRoot 'NetTCPIP'
+    Assert-True (-not (Test-Path -LiteralPath $moduleRoot)) "PSModulePath regression test refuses to replace an existing user NetTCPIP module at $moduleRoot"
+    $module = [pscustomobject]@{
+        ModuleRoot = $moduleRoot
+        ModulesRoot = $modulesRoot
+        WindowsPowerShellRoot = $windowsPowerShellRoot
+        OwnsModuleRoot = $false
+        CreatedModulesRoot = $false
+        CreatedWindowsPowerShellRoot = $false
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $windowsPowerShellRoot)) {
+            try {
+                New-Item -ItemType Directory -Path $windowsPowerShellRoot -ErrorAction Stop | Out-Null
+                $module.CreatedWindowsPowerShellRoot = $true
+            } catch {
+                if (-not (Test-Path -LiteralPath $windowsPowerShellRoot -PathType Container)) { throw }
+            }
+        }
+        if (-not (Test-Path -LiteralPath $modulesRoot)) {
+            try {
+                New-Item -ItemType Directory -Path $modulesRoot -ErrorAction Stop | Out-Null
+                $module.CreatedModulesRoot = $true
+            } catch {
+                if (-not (Test-Path -LiteralPath $modulesRoot -PathType Container)) { throw }
+            }
+        }
+        New-Item -ItemType Directory -Path $moduleRoot -ErrorAction Stop | Out-Null
+        $module.OwnsModuleRoot = $true
+        $markerLiteral = ConvertTo-PowerShellSingleQuotedLiteral $MarkerPath
+        $body = @"
+[IO.File]::AppendAllText($markerLiteral, "fake-user-NetTCPIP-executed``r``n")
+function Get-NetTCPConnection {
+    [CmdletBinding()]
+    param([string]`$State)
+    return @()
+}
+Export-ModuleMember -Function Get-NetTCPConnection
+"@
+        Write-Utf8NoBom (Join-Path $moduleRoot 'NetTCPIP.psm1') $body
+        return $module
+    } catch {
+        Remove-FakeUserNetTCPIPModule $module
+        throw
+    }
+}
+
+function Remove-FakeUserNetTCPIPModule {
+    param($Module)
+    if ($null -eq $Module) { return }
+    if ($Module.OwnsModuleRoot -and (Test-Path -LiteralPath $Module.ModuleRoot)) {
+        Remove-Item -LiteralPath $Module.ModuleRoot -Recurse -Force -ErrorAction Stop
+    }
+    if ($Module.OwnsModuleRoot -and (Test-Path -LiteralPath $Module.ModuleRoot)) { throw "failed to remove temporary user NetTCPIP module: $($Module.ModuleRoot)" }
+    if ($Module.CreatedModulesRoot -and (Test-Path -LiteralPath $Module.ModulesRoot) -and @((Get-ChildItem -LiteralPath $Module.ModulesRoot -Force)).Count -eq 0) {
+        Remove-Item -LiteralPath $Module.ModulesRoot -Force -ErrorAction Stop
+    }
+    if ($Module.CreatedWindowsPowerShellRoot -and (Test-Path -LiteralPath $Module.WindowsPowerShellRoot) -and @((Get-ChildItem -LiteralPath $Module.WindowsPowerShellRoot -Force)).Count -eq 0) {
+        Remove-Item -LiteralPath $Module.WindowsPowerShellRoot -Force -ErrorAction Stop
+    }
+}
+
+function Invoke-OwnerHelperScript {
+    param([string] $ScriptPath, [int] $Port)
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ScriptPath 'C:\Expected Hermes Root' 'C:\Expected Hermes Root\bin\hermes.exe' 'C:\Expected Hermes Root\bin\hermes.exe' $Port 2>&1
+        return @{ ExitCode = $LASTEXITCODE; Output = ($output -join "`n") }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 function New-FakePowerShell {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
@@ -212,6 +292,9 @@ function Read-ElevationChildCapture {
         TempValue = $values.TempValue
         TmpValue = $values.TmpValue
         BoundarySentinel = $values.BoundarySentinel
+        NetTCPIPModulePath = $values.NetTCPIPModulePath
+        CimCmdletsModuleBase = $values.CimCmdletsModuleBase
+        CimCmdletsAssemblyLocation = $values.CimCmdletsAssemblyLocation
     }
 }
 
@@ -290,6 +373,10 @@ $ExpectedLauncher = [string]$args[2]
 $ExpectedPort = [int]$args[3]
 $ElevatedChild = [string]$args[4] -ceq '-ElevatedChild'
 $extraArgumentCount = [Math]::Max(0, $args.Count - 5)
+$null = Get-NetTCPConnection -State Listen -ErrorAction Stop
+$null = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID) -ErrorAction Stop
+$netTCPIPCommand = Get-Command Get-NetTCPConnection -CommandType Function,Cmdlet -ErrorAction Stop
+$cimCmdletsCommand = Get-Command Get-CimInstance -CommandType Function,Cmdlet -ErrorAction Stop
 function ConvertTo-CaptureValue {
     param($Value)
     if ($null -eq $Value) { return '<null>' }
@@ -314,6 +401,9 @@ $captureLines = @(
     ('TempValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TEMP', 'Process'))))
     ('TmpValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TMP', 'Process'))))
     ('BoundarySentinel=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('COZYGATEWAY_UAC_BOUNDARY_SENTINEL', 'Process'))))
+    ('NetTCPIPModulePath=' + (ConvertTo-CaptureValue $netTCPIPCommand.Module.Path))
+    ('CimCmdletsModuleBase=' + (ConvertTo-CaptureValue $cimCmdletsCommand.Module.ModuleBase))
+    ('CimCmdletsAssemblyLocation=' + (ConvertTo-CaptureValue $cimCmdletsCommand.ImplementingType.Assembly.Location))
 )
 [IO.File]::WriteAllLines(__CHILD_CAPTURE__, [string[]]$captureLines, [Text.UTF8Encoding]::new($false))
 exit __CHILD_CODE__
@@ -411,6 +501,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $installer = Join-Path $repoRoot 'scripts\install.ps1'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-bootstrap-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
+$fakeUserNetTCPIP = $null
 
 try {
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
@@ -646,6 +737,8 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 
     $elevationMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_ELEVATION'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_ELEVATION")
     Assert-True $elevationMatch.Success 'shared installer must generate a PowerShell elevation wrapper'
+    $ownerMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_OWNER'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_OWNER")
+    Assert-True $ownerMatch.Success 'shared installer must generate a PowerShell Dashboard owner helper'
     $runAsMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_RUNAS'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_RUNAS")
     Assert-True (-not $runAsMatch.Success) 'shared installer must not generate a second PowerShell elevation stage'
     $elevationWrapper = Join-Path $temp 'dashboard owner elevate.ps1'
@@ -672,8 +765,48 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True ($elevationWriterMatch.Value -match 'is_windows \|\| return 0') 'elevation helper files must be generated only on Windows'
     Assert-True ($agentInstaller -match 'is_windows && write_dashboard_elevation_helper') 'non-Windows install flow must not invoke elevation-helper generation'
 
-    $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
+    $fakeModuleMarker = Join-Path $temp 'fake-user-module-executed.txt'
+    $ownerProbeCapture = Join-Path $temp 'owner-module-probe.xml'
+    $ownerProbeCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $ownerProbeCapture
+    $ownerProbe = @"
+`$netTCPIPCommand = Get-Command Get-NetTCPConnection -CommandType Function,Cmdlet -ErrorAction Stop
+`$cimCmdletsCommand = Get-Command Get-CimInstance -CommandType Function,Cmdlet -ErrorAction Stop
+[pscustomobject]@{
+  PSModulePath = `$env:PSModulePath
+  AutoLoading = [string]`$PSModuleAutoLoadingPreference
+  NetTCPIPModulePath = `$netTCPIPCommand.Module.Path
+  CimCmdletsModuleBase = `$cimCmdletsCommand.Module.ModuleBase
+  CimCmdletsAssemblyLocation = `$cimCmdletsCommand.ImplementingType.Assembly.Location
+} | Export-Clixml -LiteralPath $ownerProbeCaptureLiteral
+"@
+    $taskkillNeedle = '$taskkillExecutable = Resolve-CozySystemExecutable "taskkill.exe"'
+    $instrumentedOwnerBody = $ownerMatch.Groups['Body'].Value.Replace($taskkillNeedle, $ownerProbe + "`r`n" + $taskkillNeedle)
+    Assert-True ($instrumentedOwnerBody -cne $ownerMatch.Groups['Body'].Value) 'owner helper test must instrument the production module initialization boundary'
+    $instrumentedOwner = Join-Path $temp 'instrumented dashboard owner.ps1'
+    Write-Utf8NoBom $instrumentedOwner $instrumentedOwnerBody
+    $failedImportOwner = Join-Path $temp 'failed-import dashboard owner.ps1'
+    $failedImportBody = $ownerMatch.Groups['Body'].Value.Replace('Import-Module -Name $trustedNetTCPIPManifest -Force -ErrorAction Stop', 'throw "forced trusted module import failure"')
+    Assert-True ($failedImportBody -cne $ownerMatch.Groups['Body'].Value) 'owner helper failure test must replace the production trusted module import'
+    Write-Utf8NoBom $failedImportOwner $failedImportBody
+    $portReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $portReservation.Start()
+    $ownerProbePort = ([Net.IPEndPoint]$portReservation.LocalEndpoint).Port
+    $portReservation.Stop()
+    $fakeUserNetTCPIP = New-FakeUserNetTCPIPModule $fakeModuleMarker
+    try {
+        $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
+        $ownerProbeResult = Invoke-OwnerHelperScript $instrumentedOwner $ownerProbePort
+        $failedImportResult = Invoke-OwnerHelperScript $failedImportOwner $ownerProbePort
+    } finally {
+        Remove-FakeUserNetTCPIPModule $fakeUserNetTCPIP
+        $fakeUserNetTCPIP = $null
+    }
     Assert-True ($wrapperResult.ExitCode -eq 0) "elevation wrapper must return elevated child 0: $($wrapperResult.Output)"
+    $fakeModuleEvidence = if (Test-Path -LiteralPath $fakeModuleMarker) { Get-Content -LiteralPath $fakeModuleMarker -Raw } else { '<none>' }
+    Assert-True (-not (Test-Path -LiteralPath $fakeModuleMarker)) "fake user-scope NetTCPIP module must never execute in the elevated PS5.1 child; marker: $fakeModuleEvidence"
+    Assert-True ($ownerProbeResult.ExitCode -eq 0) "instrumented production owner helper must succeed on an absent listener: $($ownerProbeResult.Output)"
+    Assert-True ($failedImportResult.ExitCode -eq 43) "trusted module setup failure must remain an indeterminate pre-inspection result (actual $($failedImportResult.ExitCode)): $($failedImportResult.Output)"
+    $ownerProbeResult = Import-Clixml -LiteralPath $ownerProbeCapture
     $environmentDifference = @(@($wrapperResult.Before.Keys) + @($wrapperResult.After.Keys) | Sort-Object -Unique | Where-Object {
         -not $wrapperResult.Before.ContainsKey($_) -or -not $wrapperResult.After.ContainsKey($_) -or $wrapperResult.Before[$_] -cne $wrapperResult.After[$_]
     })
@@ -688,8 +821,10 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True (-not ($elevationBody -match '\$PSHOME')) 'elevation wrapper must not select an executable through PSHOME'
     Assert-True ($startInvocation.Verb -eq 'RunAs' -and $startInvocation.Wait -and $startInvocation.PassThru -and -not $startInvocation.UseNewEnvironment) 'elevation wrapper must use one -Verb RunAs -Wait -PassThru call without -UseNewEnvironment'
     $startEnvironmentNames = @($startInvocation.Environment.Keys | ForEach-Object { [string]$_ })
-    Assert-True (($startEnvironmentNames | Where-Object { $_ -notin @('SystemRoot', 'WINDIR') }).Count -eq 0 -and $startEnvironmentNames.Count -eq 2) 'RunAs environment must contain only OS-derived SystemRoot and WINDIR'
+    Assert-True (($startEnvironmentNames | Where-Object { $_ -notin @('SystemRoot', 'WINDIR', 'PSModulePath') }).Count -eq 0 -and $startEnvironmentNames.Count -eq 3) 'RunAs environment must contain only OS-derived SystemRoot, WINDIR, and PSModulePath'
     Assert-True ($startInvocation.Environment.SystemRoot -ceq $trustedWindowsDirectory -and $startInvocation.Environment.WINDIR -ceq $trustedWindowsDirectory) 'RunAs environment must derive SystemRoot and WINDIR from the native Windows directory'
+    $trustedModuleRoot = [IO.Path]::Combine($trustedSystemDirectory, 'WindowsPowerShell', 'v1.0', 'Modules')
+    Assert-True ($startInvocation.Environment.PSModulePath.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase)) 'RunAs PSModulePath must contain only the native system Windows PowerShell module root'
     $childInvocation = Read-ElevationChildCapture $childCapture
     Assert-True ($childInvocation.ExpectedRoot -ceq $wrapperPaths.Root) 'PS5.1 parsing must preserve expected root as one argument'
     Assert-True ($childInvocation.ExpectedHermes -ceq $wrapperPaths.Hermes) 'PS5.1 parsing must preserve Hermes executable as one argument'
@@ -707,8 +842,22 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.TmpValue)) 'actual PowerShell 5.1 child must not inherit TMP'
     Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.BoundarySentinel)) 'actual PowerShell 5.1 child must not inherit the UAC-boundary sentinel'
     $poisonedPathPrefix = Join-Path $temp 'poisoned-installer-environment'
-    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.PSModulePathValue) -or -not $childInvocation.PSModulePathValue.StartsWith($poisonedPathPrefix, [StringComparison]::OrdinalIgnoreCase)) 'actual PowerShell 5.1 child must not inherit poisoned PSModulePath'
+    $trustedAllUsersModuleRoot = [IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles), 'WindowsPowerShell', 'Modules')
+    $effectiveModuleRoots = @($childInvocation.PSModulePathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $unexpectedModuleRoots = @($effectiveModuleRoots | Where-Object { -not $_.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase) -and -not $_.Equals($trustedAllUsersModuleRoot, [StringComparison]::OrdinalIgnoreCase) })
+    Assert-True (($effectiveModuleRoots | Where-Object { $_.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 -and $unexpectedModuleRoots.Count -eq 0) "actual PowerShell 5.1 child must expose only protected system/all-users module roots (actual: $($childInvocation.PSModulePathValue))"
     Assert-True ($childInvocation.SystemRootValue -ceq $trustedWindowsDirectory -and $childInvocation.WindirValue -ceq $trustedWindowsDirectory) 'actual PowerShell 5.1 child must receive only native-derived Windows roots'
+    $trustedNetTCPIPManifest = [IO.Path]::Combine($trustedModuleRoot, 'NetTCPIP', 'NetTCPIP.psd1')
+    $trustedCimCmdletsBase = [IO.Path]::Combine($trustedModuleRoot, 'CimCmdlets')
+    $trustedCimCmdletsGacRoot = [IO.Path]::Combine($trustedWindowsDirectory, 'Microsoft.Net', 'assembly', 'GAC_MSIL', 'Microsoft.Management.Infrastructure.CimCmdlets') + [IO.Path]::DirectorySeparatorChar
+    Assert-True ($childInvocation.NetTCPIPModulePath.Equals($trustedNetTCPIPManifest, [StringComparison]::OrdinalIgnoreCase)) 'Get-NetTCPConnection must resolve from the trusted inbox NetTCPIP manifest'
+    Assert-True ($childInvocation.CimCmdletsModuleBase.Equals($trustedCimCmdletsBase, [StringComparison]::OrdinalIgnoreCase)) 'Get-CimInstance must resolve from the trusted inbox CimCmdlets module base'
+    Assert-True ($childInvocation.CimCmdletsAssemblyLocation.StartsWith($trustedCimCmdletsGacRoot, [StringComparison]::OrdinalIgnoreCase)) 'Get-CimInstance must execute from the OS GAC CimCmdlets assembly'
+    Assert-True ($ownerProbeResult.PSModulePath.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must reset PSModulePath to the native system module root'
+    Assert-True ($ownerProbeResult.AutoLoading -ceq 'None') 'production owner helper must disable module autoload after trusted imports'
+    Assert-True ($ownerProbeResult.NetTCPIPModulePath.Equals($trustedNetTCPIPManifest, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must import Get-NetTCPConnection from the trusted inbox manifest'
+    Assert-True ($ownerProbeResult.CimCmdletsModuleBase.Equals($trustedCimCmdletsBase, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must import Get-CimInstance from the trusted inbox module base'
+    Assert-True ($ownerProbeResult.CimCmdletsAssemblyLocation.StartsWith($trustedCimCmdletsGacRoot, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must execute Get-CimInstance from the OS GAC assembly'
     $startArguments = $startInvocation.ArgumentList -join "`n"
     Assert-True ($startArguments -match '(?m)^-NoProfile$' -and $startArguments -match '(?m)^-NonInteractive$' -and $startArguments -match '(?m)^-ExecutionPolicy$' -and $startArguments -match '(?m)^Bypass$' -and $startArguments -match '(?m)^-File$') 'elevation wrapper must carry the required PowerShell argument array'
     $wrapperEvidence = $wrapperResult.Output + "`n" + (Get-Content -LiteralPath $startCapture -Raw)
@@ -740,5 +889,6 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 
     Write-Host 'windows bootstrap tests passed'
 } finally {
+    Remove-FakeUserNetTCPIPModule $fakeUserNetTCPIP
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }

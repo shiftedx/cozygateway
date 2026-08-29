@@ -850,6 +850,20 @@ $listenerResolver = {
     Select-Object -First 1
 }
 $processResolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
+$trustedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-CozyNativeDirectory "System"), "WindowsPowerShell", "v1.0", "Modules"))
+$trustedNetTCPIPManifest = [IO.Path]::Combine($trustedModuleRoot, "NetTCPIP", "NetTCPIP.psd1")
+$trustedCimCmdletsManifest = [IO.Path]::Combine($trustedModuleRoot, "CimCmdlets", "CimCmdlets.psd1")
+if (-not [IO.File]::Exists($trustedNetTCPIPManifest) -or -not [IO.File]::Exists($trustedCimCmdletsManifest)) {
+  exit 43
+}
+$env:PSModulePath = $trustedModuleRoot
+try {
+  Import-Module -Name $trustedNetTCPIPManifest -Force -ErrorAction Stop
+  Import-Module -Name $trustedCimCmdletsManifest -Force -ErrorAction Stop
+  $PSModuleAutoLoadingPreference = "None"
+} catch {
+  exit 43
+}
 $taskkillExecutable = Resolve-CozySystemExecutable "taskkill.exe"
 $treeKiller = {
   param([int]$processId)
@@ -960,8 +974,11 @@ function Clear-CozyProcessEnvironment {
 try {
   $trustedSystemDirectory = Get-CozyNativeDirectory "System"
   $trustedWindowsDirectory = Get-CozyNativeDirectory "Windows"
+  $trustedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($trustedSystemDirectory, "WindowsPowerShell", "v1.0", "Modules"))
   $powerShellExecutable = [IO.Path]::GetFullPath([IO.Path]::Combine($trustedSystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"))
-  if (-not [IO.File]::Exists($powerShellExecutable)) { throw "trusted Windows PowerShell is unavailable" }
+  if (-not [IO.File]::Exists($powerShellExecutable) -or -not [IO.Directory]::Exists($trustedModuleRoot)) {
+    throw "trusted Windows PowerShell runtime is unavailable"
+  }
 } catch {
   exit 46
 }
@@ -973,6 +990,7 @@ $startProcessCommand = Get-Command Start-Process -ErrorAction Stop
 $launchEnvironment = @{
   "SystemRoot" = $trustedWindowsDirectory
   "WINDIR" = $trustedWindowsDirectory
+  "PSModulePath" = $trustedModuleRoot
 }
 $childArguments = @(
   "-NoProfile",
