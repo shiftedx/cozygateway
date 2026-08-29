@@ -130,6 +130,13 @@ function cleanupCode(error: unknown): WindowsOwnedNetworkCleanupErrorCode {
 type WindowsOnboardingHelper = Pick<WindowsHelperClient,
   "protectPath" | "adapterInventory" | "inspectNetworkSafety" | "discoverTailscale" | "installTailscale" | "setPreference" | "openBrowser">;
 
+type WindowsCleanupHelper = WindowsOnboardingHelper & Pick<WindowsHelperClient, "setPreferenceForCleanup">;
+
+export interface WindowsOwnedNetworkReconciliationDependencies {
+  /** Test/embedding seam. Production omits this and constructs the path-validating Windows client. */
+  helper?: WindowsCleanupHelper;
+}
+
 interface OperatorClient {
   begin(
     mode: Parameters<OperatorOnboardingClient["begin"]>[0],
@@ -1098,11 +1105,12 @@ export async function reconcileWindowsOwnedNetworkState(
   configPath: string,
   runtime: CliRuntime,
   signal?: AbortSignal,
+  dependencies: WindowsOwnedNetworkReconciliationDependencies = {},
 ): Promise<void> {
   const config = loadConfig(configPath);
   const localRoot = dirname(configPath);
   const installRoot = dirname(localRoot);
-  const helper = new WindowsHelperClient({
+  const helper = dependencies.helper ?? new WindowsHelperClient({
     helperPath: join(installRoot, "bin", "cozygateway-windows-helper.ps1"),
   });
   const dbPath = config.dbPath;

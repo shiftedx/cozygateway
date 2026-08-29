@@ -36,7 +36,7 @@ import {
   readManagedListenerSnapshot,
 } from "../src/configure.ts";
 import { TailscaleModeAdapter } from "../src/tailscale-mode.ts";
-import { WindowsHelperClient } from "../src/windows-helper.ts";
+import { WindowsHelperClient, type WindowsHelperRunner } from "../src/windows-helper.ts";
 
 const roots: string[] = [];
 const tailscaleFixture = (name: string) => readFileSync(
@@ -180,6 +180,42 @@ function helper(inventory: WindowsLanInventory) {
   };
 }
 
+function installedCleanupHelper(): WindowsHelperClient {
+  const runner: WindowsHelperRunner = async (_file, args) => {
+    const command = args.at(-1)!;
+    const result = command === "discover-tailscale"
+      ? {
+          state: "ready", cliPath: "C:\\Program Files\\Tailscale\\tailscale.exe",
+          daemonPath: "C:\\Program Files\\Tailscale\\tailscaled.exe",
+        }
+      : command === "adapter-inventory"
+        ? structuredClone(oneLan)
+        : command === "inspect-network-safety"
+          ? { networkCategory: "private", firewallEnabled: true, defaultInboundAction: "block" }
+          : { applied: true };
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({ schemaVersion: 1, ok: true, command, result }),
+      stderr: "",
+    };
+  };
+  return new WindowsHelperClient({
+    helperPath: "C:\\CozyGateway\\bin\\cozygateway-windows-helper.ps1",
+    powershellPath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    runner,
+  });
+}
+
+function reconcileInstalledNetworkState(
+  configPath: string,
+  hostRuntime: CliRuntime,
+  signal?: AbortSignal,
+): Promise<void> {
+  return reconcileWindowsOwnedNetworkState(
+    configPath, hostRuntime, signal, { helper: installedCleanupHelper() },
+  );
+}
+
 const oneLan: WindowsLanInventory = {
   schemaVersion: 1,
   adapters: [{
@@ -209,6 +245,24 @@ function dependencies(storage: Storage, inventory: WindowsLanInventory, control:
 }
 
 describe("createWindowsOnboardingController composition", () => {
+  it("uses the injected installed helper during cross-platform cleanup", async () => {
+    const { configPath, storage } = fixture();
+    storage.close();
+    const injected = installedCleanupHelper();
+    const protect = vi.spyOn(injected, "protectPath");
+    vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+    vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
+      .mockResolvedValue(undefined);
+    vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+
+    await expect(reconcileWindowsOwnedNetworkState(
+      configPath, runtime(), undefined, { helper: injected },
+    )).resolves.toBeUndefined();
+    expect(protect).toHaveBeenCalledWith(
+      dirname(dirname(configPath)), join(dirname(configPath), "gateway.sqlite"), expect.any(AbortSignal),
+    );
+  });
+
   it("forwards durable reconciliation through Windows wrappers", async () => {
     const { configPath, storage } = fixture();
     const delegate: NetworkModeAdapter = {
@@ -253,11 +307,11 @@ describe("createWindowsOnboardingController composition", () => {
     const close = vi.spyOn(Storage.prototype, "close");
     vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
 
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).resolves.toBeUndefined();
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).resolves.toBeUndefined();
     expect(events).toEqual(["tailscale", "lan", "advanced"]);
     expect(close).toHaveBeenCalledTimes(1);
 
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow("tailscale cleanup failed");
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).rejects.toThrow("tailscale cleanup failed");
     expect(lan).toHaveBeenCalledTimes(2);
     expect(advanced).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledTimes(2);
@@ -284,7 +338,7 @@ describe("createWindowsOnboardingController composition", () => {
     vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
     vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
 
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toMatchObject({ code });
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).rejects.toMatchObject({ code });
   });
 
   it("settles each timed-out adapter before attempting the next and closing SQLite", async () => {
@@ -314,15 +368,19 @@ describe("createWindowsOnboardingController composition", () => {
       return originalClose.call(this);
     });
 
-    const cleanup = reconcileWindowsOwnedNetworkState(configPath, runtime());
-    const rejection = expect(cleanup).rejects.toThrow(/timed out/i);
+    const cleanup = reconcileInstalledNetworkState(configPath, runtime());
+    const settled = cleanup.then(
+      () => ({ status: "fulfilled" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
     try {
       await vi.advanceTimersByTimeAsync(30_000);
       expect(events).toEqual(["tailscale:attempted", "tailscale:aborted"]);
       await vi.advanceTimersByTimeAsync(999);
       expect(events).not.toContain("lan:attempted");
       await vi.advanceTimersByTimeAsync(1);
-      await rejection;
+      const result = await settled;
+      expect(result).toMatchObject({ status: "rejected", error: expect.objectContaining({ code: "timeout" }) });
       expect(events).toEqual([
         "tailscale:attempted", "tailscale:aborted", "tailscale:settled",
         "lan:attempted", "advanced:attempted", "storage:closed",
@@ -344,7 +402,7 @@ describe("createWindowsOnboardingController composition", () => {
       .mockResolvedValue(undefined);
     vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
 
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow();
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).rejects.toThrow();
     expect(existsSync(dbPath)).toBe(false);
   });
 
@@ -356,7 +414,7 @@ describe("createWindowsOnboardingController composition", () => {
     mkdirSync(dbPath);
     const protect = vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
 
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow(/existing.*database/i);
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).rejects.toThrow(/existing.*database/i);
     expect(protect).not.toHaveBeenCalled();
   });
 
@@ -370,7 +428,7 @@ describe("createWindowsOnboardingController composition", () => {
       .mockResolvedValue(undefined);
     vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
 
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow(/repair.*path.*permission/i);
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).rejects.toThrow(/repair.*path.*permission/i);
     expect(protect).toHaveBeenCalledWith(
       dirname(dirname(configPath)), join(dirname(configPath), "gateway.sqlite"), expect.any(AbortSignal),
     );
@@ -391,7 +449,7 @@ describe("createWindowsOnboardingController composition", () => {
     vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
       .mockResolvedValue(undefined);
     vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
-    await expect(reconcileWindowsOwnedNetworkState(first.configPath, runtime())).rejects.toThrow();
+    await expect(reconcileInstalledNetworkState(first.configPath, runtime())).rejects.toThrow();
 
     vi.restoreAllMocks();
     const second = fixture();
@@ -403,7 +461,7 @@ describe("createWindowsOnboardingController composition", () => {
     writeFileSync(second.configPath, `${JSON.stringify(outsideConfig, null, 2)}\n`);
     const protect = vi.spyOn(WindowsHelperClient.prototype, "protectPath")
       .mockRejectedValue(new Error("outside protected root"));
-    await expect(reconcileWindowsOwnedNetworkState(second.configPath, runtime())).rejects.toThrow(/repair.*path.*permission/i);
+    await expect(reconcileInstalledNetworkState(second.configPath, runtime())).rejects.toThrow(/repair.*path.*permission/i);
     expect(protect).toHaveBeenCalled();
   });
 
@@ -421,7 +479,7 @@ describe("createWindowsOnboardingController composition", () => {
       .mockResolvedValue(undefined);
     vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
 
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).resolves.toBeUndefined();
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).resolves.toBeUndefined();
     expect(protect).toHaveBeenCalledWith(dirname(dirname(configPath)), custom, expect.any(AbortSignal));
     expect(existsSync(custom)).toBe(true);
   });
@@ -459,7 +517,7 @@ describe("createWindowsOnboardingController composition", () => {
     vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
     const hostRuntime = runtime();
 
-    await reconcileWindowsOwnedNetworkState(configPath, hostRuntime);
+    await reconcileInstalledNetworkState(configPath, hostRuntime);
 
     expect(readManagedListenerSnapshot(configPath)).toEqual(beforeSnapshot);
     expect(hostRuntime.restartHermesProfile).toHaveBeenCalledTimes(1);
@@ -652,7 +710,7 @@ describe("createWindowsOnboardingController composition", () => {
 
     vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
     const recovery = runtime();
-    await reconcileWindowsOwnedNetworkState(configPath, recovery);
+    await reconcileInstalledNetworkState(configPath, recovery);
     expect(readManagedListenerSnapshot(configPath)).toEqual(before);
     expect(recovery.restartHermesProfile).toHaveBeenCalledOnce();
     const reopened = openStorage(join(dirname(configPath), "gateway.sqlite"));
@@ -707,7 +765,7 @@ describe("createWindowsOnboardingController composition", () => {
 
     vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
     const recovery = runtime();
-    await reconcileWindowsOwnedNetworkState(configPath, recovery);
+    await reconcileInstalledNetworkState(configPath, recovery);
     expect(recovery.restartHermesProfile).toHaveBeenCalledOnce();
     const reopened = openStorage(join(dirname(configPath), "gateway.sqlite"));
     expect(reopened.onboardingOwnership("advanced:listener")).toBeUndefined();
@@ -782,7 +840,7 @@ describe("createWindowsOnboardingController composition", () => {
     controller.close();
 
     vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
-    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toMatchObject({
+    await expect(reconcileInstalledNetworkState(configPath, runtime())).rejects.toMatchObject({
       code: "listener_changed",
     });
     expect(readManagedListenerSnapshot(configPath)).toEqual(externalSnapshot);
