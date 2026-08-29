@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import {
   TailscaleCli,
+  TailscaleCliError,
+  type TailscaleCliErrorReason,
   type TailscaleCliRunner,
   type TailscaleStatus,
 } from "./tailscale-cli.ts";
@@ -10,33 +12,67 @@ import type {
   OnboardingOwnershipInput,
   OnboardingOwnershipWriteResult,
 } from "./storage.ts";
-import type { TailscaleDiscovery } from "./windows-helper.ts";
+import type { TailscaleDiscovery, WindowsHelperReason } from "./windows-helper.ts";
 
 export type TailscaleModePauseReason =
   | "not_installed"
   | "install_cancelled"
+  | "install_reboot_required"
+  | "install_verification_failed"
+  | "install_failed"
   | "unsupported_install"
   | "unsupported_version"
+  | "status_unavailable"
+  | "login_failed"
+  | "login_browser_failed"
   | "login_pending"
   | "machine_auth_required"
   | "not_running"
   | "account_not_confirmed"
   | "unattended_consent_required"
   | "incoming_consent_required"
+  | "preference_cancelled"
+  | "preference_verification_failed"
   | "managed_policy"
+  | "https_consent_failed"
+  | "https_consent_browser_failed"
   | "https_consent_required"
   | "no_safe_consent_port"
+  | "mapping_inspection_failed"
+  | "mapping_mutation_failed"
   | "mapping_conflict";
+
+export type TailscaleModePauseDetail = WindowsHelperReason | TailscaleCliErrorReason;
 
 export class TailscaleModePause extends Error {
   readonly retryable = true;
   readonly reason: TailscaleModePauseReason;
+  readonly detail?: TailscaleModePauseDetail;
 
-  constructor(reason: TailscaleModePauseReason) {
+  constructor(reason: TailscaleModePauseReason, detail?: TailscaleModePauseDetail) {
     super(`Personal Tailscale onboarding paused: ${reason}`);
     this.name = "TailscaleModePause";
     this.reason = reason;
+    this.detail = detail;
   }
+}
+
+function typedReason(error: unknown): TailscaleModePauseDetail | undefined {
+  if (!(error instanceof Error) || !("reason" in error) || typeof error.reason !== "string") return undefined;
+  return error.reason as TailscaleModePauseDetail;
+}
+
+function cliPause(reason: TailscaleModePauseReason, error: unknown): TailscaleModePause {
+  return new TailscaleModePause(reason, error instanceof TailscaleCliError ? error.reason : undefined);
+}
+
+function preferencePause(error: unknown): TailscaleModePause {
+  const detail = typedReason(error);
+  if (detail === "preference_cancelled") return new TailscaleModePause("preference_cancelled", detail);
+  if (detail === "preference_verification_failed")
+    return new TailscaleModePause("preference_verification_failed", detail);
+  if (detail === "preference_failed") return new TailscaleModePause("managed_policy", detail);
+  return new TailscaleModePause("managed_policy", detail);
 }
 
 export type TailscaleModeReadinessReason =
@@ -307,7 +343,7 @@ export function inspectTailscaleMappings(
   const target = `127.0.0.1:${gatewayPort}`;
   const ports = new Set<number>();
   collectPorts(serve, ports);
-  collectPorts(funnel.AllowFunnel, ports);
+  collectPorts(funnel, ports);
   const occupiedPorts = [...ports].sort((left, right) => left - right);
   if (funnel443(funnel) || funnel443(serve) || hasPort443OutsideExactMapping(serve))
     return { outcome: "conflict", occupiedPorts };
@@ -410,24 +446,42 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     try {
       await cli.requireSupportedVersion(signal);
     } catch (error) {
-      if (error instanceof Error && "reason" in error && error.reason === "unsupported_version")
-        throw new TailscaleModePause("unsupported_version");
-      throw error;
+      if (error instanceof TailscaleCliError && error.reason === "unsupported_version")
+        throw new TailscaleModePause("unsupported_version", error.reason);
+      throw cliPause("status_unavailable", error);
     }
-    let status = await cli.status(signal);
+    let status: TailscaleStatus;
+    try {
+      status = await cli.status(signal);
+    } catch (error) {
+      throw cliPause("status_unavailable", error);
+    }
     if (status.state === "needs_login") {
-      const login = await cli.beginLogin(signal);
+      let login;
+      try {
+        login = await cli.beginLogin(signal);
+      } catch (error) {
+        throw cliPause("login_failed", error);
+      }
       await this.#inject("login");
       if (login.outcome === "machine_auth_required") throw new TailscaleModePause("machine_auth_required");
       if (login.outcome === "auth_required") {
-        await this.#dependencies.helper.openBrowser("login", login.authUrl, signal);
+        try {
+          await this.#dependencies.helper.openBrowser("login", login.authUrl, signal);
+        } catch (error) {
+          throw new TailscaleModePause("login_browser_failed", typedReason(error));
+        }
         await this.#inject("login_browser");
       }
       const attempts = this.#dependencies.loginPollAttempts ?? 30;
       const delayMs = this.#dependencies.loginPollDelayMs ?? 1_000;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         if (attempt > 0 && delayMs > 0) await this.#delay(delayMs, signal);
-        status = await cli.status(signal);
+        try {
+          status = await cli.status(signal);
+        } catch (error) {
+          throw cliPause("status_unavailable", error);
+        }
         if (status.state === "running" || status.state === "needs_machine_auth") break;
       }
     }
@@ -440,24 +494,38 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       tailnetName: status.tailnetName,
     }, signal);
     if (!confirmed) throw new TailscaleModePause("account_not_confirmed");
+    let preflight = await this.#mappingInspection(cli, status.dnsName, signal);
+    if (preflight.outcome === "conflict") throw new TailscaleModePause("mapping_conflict");
     if (!status.certificateReady) {
       if (!await this.#dependencies.io.confirmCertificateTransparency(signal))
         throw new TailscaleModePause("https_consent_required");
-      const [beforeServe, beforeFunnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
-      const before = inspectTailscaleMappings(beforeServe, beforeFunnel, status.dnsName, this.#dependencies.gatewayPort);
-      const port = await this.#dependencies.io.chooseHttpsConsentPort?.(before.occupiedPorts, signal);
+      const port = await this.#dependencies.io.chooseHttpsConsentPort?.(preflight.occupiedPorts, signal);
       if (port === undefined || !Number.isSafeInteger(port) || port < 1_024 || port > 65_535
-        || port === 443 || before.occupiedPorts.includes(port))
+        || port === 443 || preflight.occupiedPorts.includes(port))
         throw new TailscaleModePause("no_safe_consent_port");
-      const consentUrl = await cli.beginHttpsConsent(port, signal);
+      let consentUrl: string;
+      try {
+        consentUrl = await cli.beginHttpsConsent(port, signal);
+      } catch (error) {
+        throw cliPause("https_consent_failed", error);
+      }
       await this.#inject("https_consent");
-      await this.#dependencies.helper.openBrowser("https-consent", consentUrl, signal);
+      try {
+        await this.#dependencies.helper.openBrowser("https-consent", consentUrl, signal);
+      } catch (error) {
+        throw new TailscaleModePause("https_consent_browser_failed", typedReason(error));
+      }
       await this.#inject("https_consent_browser");
       const attempts = this.#dependencies.loginPollAttempts ?? 30;
       const delayMs = this.#dependencies.loginPollDelayMs ?? 1_000;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         if (attempt > 0 && delayMs > 0) await this.#delay(delayMs, signal);
-        const current = await cli.status(signal);
+        let current: TailscaleStatus;
+        try {
+          current = await cli.status(signal);
+        } catch (error) {
+          throw cliPause("status_unavailable", error);
+        }
         if (current.state === "needs_machine_auth") throw new TailscaleModePause("machine_auth_required");
         if (current.state === "running" && current.certificateReady) {
           if (accountHash(current) !== accountHash(status)) throw new TailscaleModeReadinessError("status");
@@ -466,45 +534,45 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
         }
       }
       if (!status.certificateReady) throw new TailscaleModePause("https_consent_required");
-      const [afterServe, afterFunnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
-      const after = inspectTailscaleMappings(afterServe, afterFunnel, status.dnsName, this.#dependencies.gatewayPort);
-      if (after.occupiedPorts.includes(port)) throw new TailscaleModePause("mapping_conflict");
+      preflight = await this.#mappingInspection(cli, status.dnsName, signal);
+      if (preflight.outcome === "conflict" || preflight.occupiedPorts.includes(port))
+        throw new TailscaleModePause("mapping_conflict");
     }
-    if (!await cli.preference("unattended", signal)) {
+    if (!await this.#preference(cli, "unattended", signal)) {
       if (!await this.#dependencies.io.confirmPreference("unattended", true, signal))
         throw new TailscaleModePause("unattended_consent_required");
       try {
         await this.#dependencies.helper.setPreference("unattended", true, signal);
-      } catch {
-        throw new TailscaleModePause("managed_policy");
+      } catch (error) {
+        throw preferencePause(error);
       }
       await this.#inject("unattended_write");
-      if (!await cli.preference("unattended", signal)) throw new TailscaleModePause("managed_policy");
+      if (!await this.#preference(cli, "unattended", signal))
+        throw new TailscaleModePause("preference_verification_failed", "preference_verification_failed");
     }
-    if (await cli.preference("shields-up", signal)) {
+    if (await this.#preference(cli, "shields-up", signal)) {
       if (!await this.#dependencies.io.confirmPreference("shields-up", false, signal))
         throw new TailscaleModePause("incoming_consent_required");
       try {
         await this.#dependencies.helper.setPreference("shields-up", false, signal);
-      } catch {
-        throw new TailscaleModePause("managed_policy");
+      } catch (error) {
+        throw preferencePause(error);
       }
       await this.#inject("shields_up_write");
-      if (await cli.preference("shields-up", signal)) throw new TailscaleModePause("managed_policy");
+      if (await this.#preference(cli, "shields-up", signal))
+        throw new TailscaleModePause("preference_verification_failed", "preference_verification_failed");
     }
     const localProbe = await this.#dependencies.probes.loopback(this.#dependencies.gatewayPort, signal);
     await this.#inject("loopback_probe");
     verifyLoopback(localProbe);
-    const [serve, funnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
-    const mapping = inspectTailscaleMappings(serve, funnel, status.dnsName, this.#dependencies.gatewayPort);
+    const mapping = await this.#mappingInspection(cli, status.dnsName, signal);
     if (mapping.outcome === "conflict") throw new TailscaleModePause("mapping_conflict");
     const expectedFingerprint = mappingFingerprint(status.dnsName, this.#dependencies.gatewayPort);
     const priorOwnership = await this.#dependencies.ownership.read(signal);
     let created: TailscaleMappingOwnership | undefined;
     let ownershipWritten = false;
     if (mapping.outcome === "empty") {
-      await cli.createTlsTerminatedMapping(this.#dependencies.gatewayPort, signal);
-      created = {
+      const candidate: TailscaleMappingOwnership = {
         schemaVersion: 1,
         mappingFingerprint: expectedFingerprint,
         accountTailnetHash: accountHash(status),
@@ -512,6 +580,14 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
         target: `127.0.0.1:${this.#dependencies.gatewayPort}`,
         createdAt: this.#now(),
       };
+      try {
+        await cli.createTlsTerminatedMapping(this.#dependencies.gatewayPort, signal);
+      } catch (error) {
+        const reconciled = await this.#mappingInspection(cli, status.dnsName, signal);
+        if (reconciled.outcome !== "compatible" || reconciled.mappingFingerprint !== expectedFingerprint)
+          throw cliPause("mapping_mutation_failed", error);
+      }
+      created = candidate;
       this.#owned = created;
       try {
         await this.#inject("mapping_create");
@@ -521,12 +597,15 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       }
     }
     try {
-      const [finalStatus, finalServe, finalFunnel] = await Promise.all([
-        cli.status(signal), cli.serveState(signal), cli.funnelState(signal),
-      ]);
+      let finalStatus: TailscaleStatus;
+      try {
+        finalStatus = await cli.status(signal);
+      } catch (error) {
+        throw cliPause("status_unavailable", error);
+      }
       if (finalStatus.state !== "running" || accountHash(finalStatus) !== accountHash(status))
         throw new TailscaleModeReadinessError("status");
-      const finalMapping = inspectTailscaleMappings(finalServe, finalFunnel, status.dnsName, this.#dependencies.gatewayPort);
+      const finalMapping = await this.#mappingInspection(cli, status.dnsName, signal);
       await this.#inject("mapping_reinspect");
       if (finalMapping.outcome !== "compatible" || finalMapping.mappingFingerprint !== expectedFingerprint)
         throw new TailscaleModeReadinessError("mapping");
@@ -586,20 +665,33 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       || endpoint.canonicalOrigin !== `https://${owned.dnsName}`
     ) return;
     const cli = await this.#cli(signal, false);
-    const status = await cli.status(signal);
+    let status: TailscaleStatus;
+    try {
+      status = await cli.status(signal);
+    } catch (error) {
+      throw cliPause("status_unavailable", error);
+    }
     if (status.state !== "running" || accountHash(status) !== owned.accountTailnetHash) return;
-    const [serve, funnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
-    const mapping = inspectTailscaleMappings(serve, funnel, owned.dnsName, this.#dependencies.gatewayPort);
+    const mapping = await this.#mappingInspection(cli, owned.dnsName, signal);
+    if (mapping.outcome === "empty") {
+      await this.#removeOwnershipIdempotently(owned, signal);
+      return;
+    }
     if (mapping.outcome !== "compatible" || mapping.mappingFingerprint !== owned.mappingFingerprint) return;
-    await cli.removeTlsTerminatedMapping(signal);
-    await this.#inject("mapping_remove");
-    const [afterServe, afterFunnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
-    if (inspectTailscaleMappings(afterServe, afterFunnel, owned.dnsName, this.#dependencies.gatewayPort).outcome !== "empty")
-      throw new TailscaleModeReadinessError("mapping");
-    if (!await this.#dependencies.ownership.remove(owned, signal))
-      throw new TailscaleModeReadinessError("ownership");
-    await this.#inject("ownership_remove");
-    this.#owned = undefined;
+    let removalError: unknown;
+    try {
+      await cli.removeTlsTerminatedMapping(signal);
+    } catch (error) {
+      removalError = error;
+    }
+    const after = await this.#mappingInspection(cli, owned.dnsName, signal);
+    if (after.outcome === "empty") {
+      await this.#inject("mapping_remove");
+      await this.#removeOwnershipIdempotently(owned, signal);
+      return;
+    }
+    if (removalError !== undefined) throw cliPause("mapping_mutation_failed", removalError);
+    throw new TailscaleModeReadinessError("mapping");
   }
 
   async #cli(signal: AbortSignal | undefined, allowInstall: boolean): Promise<TailscaleCli> {
@@ -610,20 +702,65 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       try {
         await this.#dependencies.helper.installTailscale(signal);
       } catch (error) {
-        const reason = error instanceof Error && "reason" in error ? error.reason : undefined;
-        throw new TailscaleModePause(reason === "installer_cancelled" ? "install_cancelled" : "unsupported_install");
+        const detail = typedReason(error);
+        if (detail === "installer_cancelled") throw new TailscaleModePause("install_cancelled", detail);
+        if (detail === "installer_reboot_required") throw new TailscaleModePause("install_reboot_required", detail);
+        if (detail === "installer_signature_invalid")
+          throw new TailscaleModePause("install_verification_failed", detail);
+        throw new TailscaleModePause("install_failed", detail);
       }
       await this.#inject("install");
       discovery = await this.#dependencies.helper.discoverTailscale(signal);
     }
     if (discovery.state !== "ready") throw new TailscaleModePause(
       discovery.reason === "tailscale_not_installed" ? "not_installed" : "unsupported_install",
+      discovery.reason,
     );
     return new TailscaleCli({
       executable: discovery.cliPath,
       runner: this.#dependencies.cliRunner,
       timeoutMs: this.#dependencies.cliTimeoutMs,
     });
+  }
+
+  async #mappingInspection(
+    cli: TailscaleCli,
+    dnsName: string,
+    signal?: AbortSignal,
+  ): Promise<TailscaleMappingInspection> {
+    try {
+      const [serve, funnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
+      return inspectTailscaleMappings(serve, funnel, dnsName, this.#dependencies.gatewayPort);
+    } catch (error) {
+      if (error instanceof TailscaleModePause) throw error;
+      throw cliPause("mapping_inspection_failed", error);
+    }
+  }
+
+  async #preference(
+    cli: TailscaleCli,
+    name: "unattended" | "shields-up",
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    try {
+      return await cli.preference(name, signal);
+    } catch (error) {
+      throw new TailscaleModePause(
+        "preference_verification_failed",
+        error instanceof TailscaleCliError ? error.reason : undefined,
+      );
+    }
+  }
+
+  async #removeOwnershipIdempotently(
+    owned: TailscaleMappingOwnership,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const removed = await this.#dependencies.ownership.remove(owned, signal);
+    if (!removed && await this.#dependencies.ownership.read(signal) !== undefined)
+      throw new TailscaleModeReadinessError("ownership");
+    await this.#inject("ownership_remove");
+    this.#owned = undefined;
   }
 
   async #inject(boundary: TailscaleFailureBoundary): Promise<void> {
@@ -658,11 +795,19 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     const [serve, funnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
     const mapping = inspectTailscaleMappings(serve, funnel, owned.dnsName, this.#dependencies.gatewayPort);
     if (mapping.outcome !== "compatible" || mapping.mappingFingerprint !== owned.mappingFingerprint) return;
-    await cli.removeTlsTerminatedMapping(signal);
-    const [afterServe, afterFunnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
-    if (inspectTailscaleMappings(afterServe, afterFunnel, owned.dnsName, this.#dependencies.gatewayPort).outcome !== "empty")
+    let removalError: unknown;
+    try {
+      await cli.removeTlsTerminatedMapping(signal);
+    } catch (error) {
+      removalError = error;
+    }
+    const after = await this.#mappingInspection(cli, owned.dnsName, signal);
+    if (after.outcome !== "empty") {
+      if (removalError !== undefined) throw cliPause("mapping_mutation_failed", removalError);
       return;
-    if (ownershipWritten) await this.#dependencies.ownership.remove(owned, signal);
-    this.#owned = undefined;
+    }
+    await this.#inject("mapping_remove");
+    if (ownershipWritten) await this.#removeOwnershipIdempotently(owned, signal);
+    else this.#owned = undefined;
   }
 }

@@ -254,6 +254,23 @@ describe("NetworkOnboarding", () => {
     expect(dependencies.createSetupCode).not.toHaveBeenCalled();
   });
 
+  it("preserves a typed retryable adapter pause for the setup flow", async () => {
+    const { onboarding, dependencies, adapter, io } = harness();
+    (adapter.prepare as ReturnType<typeof vi.fn>).mockRejectedValue(Object.assign(
+      new Error("Personal Tailscale onboarding paused"),
+      { retryable: true as const, reason: "install_reboot_required", detail: "installer_reboot_required" },
+    ));
+
+    await expect(onboarding.run(io)).resolves.toEqual({
+      outcome: "paused",
+      mode: "tailscale",
+      reason: "install_reboot_required",
+      detail: "installer_reboot_required",
+    });
+    expect(dependencies.phoneVerification.begin).not.toHaveBeenCalled();
+    expect(dependencies.publishPairing).not.toHaveBeenCalled();
+  });
+
   it("rolls back a prepared endpoint when challenge startup fails", async () => {
     const { onboarding, dependencies, adapter, io } = harness();
     (dependencies.phoneVerification.begin as ReturnType<typeof vi.fn>)

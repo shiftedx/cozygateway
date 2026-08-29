@@ -2,6 +2,6 @@
   "Version":"1.102.1-tfixture","BackendState":"Running","HaveNodeKey":true,"Health":[],
   "CurrentTailnet":{"Name":"fixture@example.com","MagicDNSSuffix":"fixture-tailnet.ts.net","MagicDNSEnabled":true},
   "CertDomains":[],
-  "Self":{"DNSName":"cozy.fixture-tailnet.ts.net.","UserID":1001,"Online":true,"Active":true,"Tags":[]},
+  "Self":{"DNSName":"cozy.fixture-tailnet.ts.net","UserID":1001,"Online":true,"Active":true,"Tags":[]},
   "User":{"1001":{"ID":1001,"LoginName":"fixture@example.com","DisplayName":"Fixture User"}}
 }

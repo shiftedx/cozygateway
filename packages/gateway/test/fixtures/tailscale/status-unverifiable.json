@@ -2,6 +2,6 @@
   "Version":"1.102.1-tfixture","BackendState":"Running","HaveNodeKey":true,"Health":[],
   "CurrentTailnet":{"Name":"fixture@example.com","MagicDNSSuffix":"custom.internal","MagicDNSEnabled":true},
   "CertDomains":["cozy.custom.internal"],
-  "Self":{"DNSName":"cozy.custom.internal.","UserID":1001,"Online":true,"Active":true,"Tags":[]},
+  "Self":{"DNSName":"cozy.custom.internal","UserID":1001,"Online":true,"Active":true,"Tags":[]},
   "User":{"1001":{"ID":1001,"LoginName":"fixture@example.com","DisplayName":"Fixture User"}}
 }

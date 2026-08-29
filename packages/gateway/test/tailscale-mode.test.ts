@@ -8,11 +8,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SqliteTailscaleOwnershipStore,
   TailscaleModeAdapter,
+  inspectTailscaleMappings,
+  type TailscaleMappingOwnership,
   type TailscaleModeProbes,
 } from "../src/tailscale-mode.ts";
-import type { TailscaleCliRunner } from "../src/tailscale-cli.ts";
+import { TailscaleCliError, type TailscaleCliRunner } from "../src/tailscale-cli.ts";
 import { openStorage } from "../src/storage.ts";
-import type { TailscaleDiscovery } from "../src/windows-helper.ts";
+import { WindowsHelperError, type TailscaleDiscovery } from "../src/windows-helper.ts";
 
 const fixture = (name: string) => readFileSync(
   fileURLToPath(new URL(`./fixtures/tailscale/${name}`, import.meta.url)),
@@ -108,9 +110,9 @@ function happyDependencies(options: {
     })),
   };
   const ownership = {
-    read: vi.fn(async () => undefined),
-    write: vi.fn(async () => "written" as const),
-    remove: vi.fn(async () => true),
+    read: vi.fn(async (_signal?: AbortSignal): Promise<TailscaleMappingOwnership | undefined> => undefined),
+    write: vi.fn(async (_ownership: TailscaleMappingOwnership, _signal?: AbortSignal) => "written" as const),
+    remove: vi.fn(async (_ownership: TailscaleMappingOwnership, _signal?: AbortSignal) => true),
   };
   return { calls, runner, helper, io, probes, ownership };
 }
@@ -203,6 +205,17 @@ describe("TailscaleModeAdapter", () => {
     await expect(adapter.prepare()).resolves.toMatchObject({ ready: true, createdByWizard: false });
   });
 
+  it("collects occupied consent ports from the complete Funnel document", () => {
+    const funnel = JSON.parse(fixture("funnel-empty.json")) as Record<string, unknown>;
+    funnel.Services = { "svc:fixture": { TCP: { "9443": { TCPForward: "127.0.0.1:9000" } } } };
+    expect(inspectTailscaleMappings(
+      JSON.parse(fixture("serve-empty.json")) as Record<string, unknown>,
+      funnel,
+      "cozy.fixture-tailnet.ts.net",
+      18_787,
+    )).toMatchObject({ outcome: "empty", occupiedPorts: [9_443] });
+  });
+
   it("resumes public-CLI login through the exact validated URL and independent status polling", async () => {
     const dependencies = happyDependencies({
       status: [fixture("status-needs-login.json"), fixture("status-running.json")],
@@ -286,6 +299,25 @@ describe("TailscaleModeAdapter", () => {
     ]);
     expect(dependencies.calls.some((call) => call.startsWith("up --unattended"))).toBe(false);
     expect(dependencies.calls.some((call) => call === "logout")).toBe(false);
+  });
+
+  it("refuses ready and certificate-missing port-443 conflicts before consent or preference mutation", async () => {
+    for (const status of [[fixture("status-running.json")], [fixture("status-cert-unavailable.json")]]) {
+      const dependencies = happyDependencies({
+        status,
+        serve: fixture("serve-conflicting-web.json"),
+        preferences: { unattended: false, shieldsUp: true },
+      });
+      const adapter = new TailscaleModeAdapter({
+        gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      });
+
+      await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping_conflict" });
+      expect(dependencies.helper.setPreference).not.toHaveBeenCalled();
+      expect(dependencies.io.confirmCertificateTransparency).not.toHaveBeenCalled();
+      expect(dependencies.calls.some((call) => call.startsWith("serve --https="))).toBe(false);
+    }
   });
 
   it("requires separate preference consent and pauses precisely when policy prevents a verified change", async () => {
@@ -394,6 +426,7 @@ describe("TailscaleModeAdapter", () => {
       serve: fixture("serve-empty.json"),
       serveSequence: [
         fixture("serve-empty.json"),
+        fixture("serve-empty.json"),
         fixture("serve-compatible.json"),
         fixture("serve-conflicting-tcp.json"),
       ],
@@ -405,6 +438,156 @@ describe("TailscaleModeAdapter", () => {
     const concurrentEndpoint = await concurrentAdapter.prepare();
     await concurrentAdapter.rollbackOwned(concurrentEndpoint);
     expect(concurrent.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+  });
+
+  it("reconciles a timed-out create that applied and records exact ownership", async () => {
+    const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
+    const original = dependencies.runner.getMockImplementation()!;
+    dependencies.runner.mockImplementation(async (...args) => {
+      const result = await original(...args);
+      if (args[1].join(" ").startsWith("serve --bg --tls-terminated-tcp=443 "))
+        throw new TailscaleCliError("timeout");
+      return result;
+    });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+    });
+
+    await expect(adapter.prepare()).resolves.toMatchObject({ createdByWizard: true });
+    expect(dependencies.ownership.write).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles uncertain removal and stale ownership after removal failure injection", async () => {
+    for (const boundary of ["mapping_remove", "ownership_remove"] as const) {
+      const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
+      let stored: Awaited<ReturnType<typeof dependencies.ownership.read>>;
+      dependencies.ownership.read.mockImplementation(async () => stored);
+      dependencies.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+      dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
+      const adapter = new TailscaleModeAdapter({
+        gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        injectFailure: (current) => {
+          if (current === boundary) throw new Error(`fixture failure: ${boundary}`);
+        },
+      });
+      const endpoint = await adapter.prepare();
+      await expect(adapter.rollbackOwned(endpoint)).rejects.toThrow(`fixture failure: ${boundary}`);
+
+      const resumed = new TailscaleModeAdapter({
+        gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      });
+      await expect(resumed.rollbackOwned(endpoint)).resolves.toBeUndefined();
+      expect(stored).toBeUndefined();
+      expect(dependencies.calls.filter((call) => call === "serve --tls-terminated-tcp=443 off")).toHaveLength(1);
+    }
+
+    const timedOut = happyDependencies({ serve: fixture("serve-empty.json") });
+    let stored: Awaited<ReturnType<typeof timedOut.ownership.read>>;
+    timedOut.ownership.read.mockImplementation(async () => stored);
+    timedOut.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+    timedOut.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
+    const timedOutAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: timedOut.runner, helper: timedOut.helper,
+      io: timedOut.io, probes: timedOut.probes, ownership: timedOut.ownership,
+    });
+    const endpoint = await timedOutAdapter.prepare();
+    const original = timedOut.runner.getMockImplementation()!;
+    timedOut.runner.mockImplementation(async (...args) => {
+      const result = await original(...args);
+      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off") throw new TailscaleCliError("timeout");
+      return result;
+    });
+    await expect(timedOutAdapter.rollbackOwned(endpoint)).resolves.toBeUndefined();
+    expect(stored).toBeUndefined();
+  });
+
+  it("maps helper failures to precise typed retryable pauses", async () => {
+    for (const [helperReason, pauseReason] of [
+      ["installer_cancelled", "install_cancelled"],
+      ["installer_reboot_required", "install_reboot_required"],
+      ["installer_signature_invalid", "install_verification_failed"],
+    ] as const) {
+      const dependencies = happyDependencies();
+      dependencies.io.offerInstall.mockResolvedValue(true);
+      dependencies.helper.discoverTailscale.mockResolvedValue({ state: "paused", reason: "tailscale_not_installed" });
+      dependencies.helper.installTailscale.mockRejectedValue(new WindowsHelperError(helperReason));
+      const adapter = new TailscaleModeAdapter({
+        gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      });
+      await expect(adapter.prepare()).rejects.toMatchObject({
+        retryable: true, reason: pauseReason, detail: helperReason,
+      });
+    }
+
+    const browser = happyDependencies({ status: [fixture("status-needs-login.json")] });
+    browser.helper.openBrowser.mockRejectedValue(new WindowsHelperError("browser_open_failed"));
+    const browserAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: browser.runner, helper: browser.helper,
+      io: browser.io, probes: browser.probes, ownership: browser.ownership,
+    });
+    await expect(browserAdapter.prepare()).rejects.toMatchObject({
+      reason: "login_browser_failed", detail: "browser_open_failed", retryable: true,
+    });
+
+    const policy = happyDependencies({ preferences: { unattended: false, shieldsUp: false } });
+    policy.helper.setPreference.mockRejectedValue(new WindowsHelperError("preference_cancelled"));
+    const policyAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: policy.runner, helper: policy.helper,
+      io: policy.io, probes: policy.probes, ownership: policy.ownership,
+    });
+    await expect(policyAdapter.prepare()).rejects.toMatchObject({
+      reason: "preference_cancelled", detail: "preference_cancelled", retryable: true,
+    });
+
+    const verification = happyDependencies({ preferences: { unattended: false, shieldsUp: false } });
+    verification.helper.setPreference.mockResolvedValue(undefined);
+    const verificationAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: verification.runner, helper: verification.helper,
+      io: verification.io, probes: verification.probes, ownership: verification.ownership,
+    });
+    await expect(verificationAdapter.prepare()).rejects.toMatchObject({
+      reason: "preference_verification_failed", detail: "preference_verification_failed", retryable: true,
+    });
+  });
+
+  it("maps CLI login, status, and HTTPS-consent failures to redacted typed pauses", async () => {
+    const login = happyDependencies({
+      status: [fixture("status-needs-login.json")],
+      login: fixture("login-malformed.txt"),
+    });
+    const loginAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: login.runner, helper: login.helper,
+      io: login.io, probes: login.probes, ownership: login.ownership,
+    });
+    await expect(loginAdapter.prepare()).rejects.toMatchObject({
+      reason: "login_failed", detail: "malformed_json", retryable: true,
+    });
+
+    const status = happyDependencies({ status: [fixture("status-unverifiable.json")] });
+    const statusAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: status.runner, helper: status.helper,
+      io: status.io, probes: status.probes, ownership: status.ownership,
+    });
+    await expect(statusAdapter.prepare()).rejects.toMatchObject({
+      reason: "status_unavailable", detail: "invalid_status", retryable: true,
+    });
+
+    const consent = happyDependencies({ status: [fixture("status-cert-unavailable.json")] });
+    const original = consent.runner.getMockImplementation()!;
+    consent.runner.mockImplementation(async (...args) => args[1].join(" ").startsWith("serve --https=")
+      ? { exitCode: 0, stdout: "https://console.tailscale.com.evil/admin/feature/secret\n", stderr: "" }
+      : original(...args));
+    const consentAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: consent.runner, helper: consent.helper,
+      io: consent.io, probes: consent.probes, ownership: consent.ownership,
+    });
+    const error = await consentAdapter.prepare().catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ reason: "https_consent_failed", detail: "unexpected_output", retryable: true });
+    expect(String(error)).not.toContain("secret");
   });
 
   it("persists exact mapping ownership in SQLite with conflict-safe write and conditional remove", async () => {

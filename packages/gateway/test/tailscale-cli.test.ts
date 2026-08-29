@@ -42,6 +42,16 @@ describe("TailscaleCli", () => {
     await expect(cli.version()).rejects.toMatchObject({ reason: "timeout" } satisfies Partial<TailscaleCliError>);
   });
 
+  it("does not invoke the runner when its signal is already aborted", async () => {
+    const runner = vi.fn<TailscaleCliRunner>();
+    const controller = new AbortController();
+    controller.abort();
+    const cli = new TailscaleCli({ executable, runner });
+
+    await expect(cli.version(controller.signal)).rejects.toMatchObject({ reason: "cancelled" });
+    expect(runner).not.toHaveBeenCalled();
+  });
+
   it("honors cancellation and rejects invalid UTF-8 or combined output beyond the total bound", async () => {
     const controller = new AbortController();
     const cancelled = new TailscaleCli({
@@ -112,6 +122,7 @@ describe("TailscaleCli", () => {
       fixture("status-running.json").replaceAll("fixture-tailnet.ts.net", "fixture-tailnet.ts.net.evil"),
       fixture("status-running.json").replaceAll("cozy.fixture", "coz\u00ff.fixture"),
       fixture("status-running.json").replace('"cozy.fixture-tailnet.ts.net"]', '"cozy.fixture-tailnet.ts.net."]'),
+      fixture("status-running.json").replace('"DNSName":"cozy.fixture-tailnet.ts.net"', '"DNSName":"cozy.fixture-tailnet.ts.net."'),
     ]) {
       const cli = new TailscaleCli({ executable, runner: async () => ({ exitCode: 0, stdout: hostile, stderr: "" }) });
       await expect(cli.status()).rejects.toMatchObject({ reason: "invalid_status" } satisfies Partial<TailscaleCliError>);
@@ -225,6 +236,61 @@ describe("TailscaleCli", () => {
       "serve", "--https=8443", "text:CozyGateway HTTPS consent",
     ]);
     expect(runner.mock.calls[0]?.[2]).toMatchObject({ shell: false, windowsHide: true });
+  });
+
+  it("bounds HTTPS consent with fatal incremental UTF-8, combined output limits, redacted errors, and awaited termination", async () => {
+    const invalidUtf8 = new TailscaleCli({
+      executable,
+      runner: async (_file, _argv, options) => {
+        options.onStdoutChunk?.(new Uint8Array([0xc3, 0x28]));
+        return { exitCode: 0, stdout: new Uint8Array([0xc3, 0x28]), stderr: "" };
+      },
+    });
+    await expect(invalidUtf8.beginHttpsConsent(8_443)).rejects.toMatchObject({ reason: "invalid_utf8" });
+
+    const combinedOverflow = new TailscaleCli({
+      executable,
+      runner: async () => ({
+        exitCode: 0,
+        stdout: "https://console.tailscale.com/admin/feature/fixture\n" + "x".repeat(192 * 1024),
+        stderr: "x".repeat(65 * 1024),
+      }),
+    });
+    await expect(combinedOverflow.beginHttpsConsent(8_443)).rejects.toMatchObject({ reason: "output_too_large" });
+
+    const overflowAfterUrl = new TailscaleCli({
+      executable,
+      runner: async (_file, _argv, options) => {
+        options.onStdoutChunk?.(Buffer.from("https://console.tailscale.com/admin/feature/fixture\n"));
+        options.onStdoutChunk?.(Buffer.alloc(256 * 1024));
+        return { exitCode: 1, stdout: "", stderr: "" };
+      },
+    });
+    await expect(overflowAfterUrl.beginHttpsConsent(8_443)).rejects.toMatchObject({ reason: "output_too_large" });
+
+    const rawFailure = new TailscaleCli({
+      executable,
+      runner: async () => { throw new Error("https://console.tailscale.com/admin/feature/secret"); },
+    });
+    const error = await rawFailure.beginHttpsConsent(8_443).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ reason: "command_failed" });
+    expect(String(error)).not.toContain("secret");
+
+    let terminated = false;
+    const foreground = new TailscaleCli({
+      executable,
+      runner: async (_file, _argv, options) => new Promise((resolve) => {
+        options.signal.addEventListener("abort", () => {
+          setTimeout(() => {
+            terminated = true;
+            resolve({ exitCode: 1, stdout: "", stderr: "" });
+          }, 5);
+        }, { once: true });
+        options.onStdoutChunk?.(Buffer.from("https://console.tailscale.com/admin/feature/fixture\n"));
+      }),
+    });
+    await expect(foreground.beginHttpsConsent(8_443)).resolves.toContain("console.tailscale.com");
+    expect(terminated).toBe(true);
   });
 
   it("rejects duplicate JSON keys, including Unicode-escaped aliases, before interpretation", async () => {

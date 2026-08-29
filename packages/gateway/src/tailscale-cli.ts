@@ -386,39 +386,55 @@ export class TailscaleCli {
     argv: readonly string[],
     signal?: AbortSignal,
     onStdoutChunk?: (chunk: Uint8Array) => void,
+    stopAfterStdout?: () => boolean,
   ): Promise<TailscaleCliRunResult> {
+    if (signal?.aborted) throw new TailscaleCliError("cancelled");
     const controller = new AbortController();
     let timedOut = false;
-    const onAbort = () => controller.abort(signal?.reason);
+    let cancelled = false;
+    let stopRequested = false;
+    let rejectCancelled!: (error: TailscaleCliError) => void;
+    const cancellation = new Promise<never>((_resolve, reject) => { rejectCancelled = reject; });
+    const onAbort = () => {
+      cancelled = true;
+      controller.abort(signal?.reason);
+      rejectCancelled(new TailscaleCliError("cancelled"));
+    };
     signal?.addEventListener("abort", onAbort, { once: true });
+    let rejectDeadline!: (error: TailscaleCliError) => void;
+    const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
+      rejectDeadline(new TailscaleCliError("timeout"));
     }, this.#timeoutMs);
     try {
-      const run = this.#runner(this.#executable, [...argv], {
+      const run = Promise.resolve().then(() => this.#runner(this.#executable, [...argv], {
         shell: false,
         windowsHide: true,
         timeoutMs: this.#timeoutMs,
         maxObjectBytes: TAILSCALE_CLI_MAX_OBJECT_BYTES,
         maxTotalBytes: TAILSCALE_CLI_MAX_TOTAL_BYTES,
         signal: controller.signal,
-        onStdoutChunk,
-      });
-      const aborted = new Promise<never>((_resolve, reject) => {
-        controller.signal.addEventListener("abort", () => {
-          reject(new TailscaleCliError(timedOut ? "timeout" : "cancelled"));
-        }, { once: true });
-      });
-      const result = await Promise.race([run, aborted]);
+        onStdoutChunk: onStdoutChunk === undefined ? undefined : (chunk) => {
+          onStdoutChunk(chunk);
+          if (stopAfterStdout?.() === true && !stopRequested) {
+            stopRequested = true;
+            controller.abort();
+          }
+        },
+      }));
+      const result = await Promise.race([run, deadline, cancellation]);
       const total = chunks(result.stdout).reduce((sum, part) => sum + bytes(part).byteLength, 0)
         + chunks(result.stderr).reduce((sum, part) => sum + bytes(part).byteLength, 0);
       if (total > TAILSCALE_CLI_MAX_TOTAL_BYTES) throw new TailscaleCliError("output_too_large");
       return result;
     } catch (error) {
+      if (stopRequested && !timedOut && !cancelled && !(error instanceof TailscaleCliError))
+        return { exitCode: 0, stdout: "", stderr: "" };
       if (error instanceof TailscaleCliError) throw error;
-      if (controller.signal.aborted)
-        throw new TailscaleCliError(timedOut ? "timeout" : "cancelled");
+      if (timedOut) throw new TailscaleCliError("timeout");
+      if (cancelled) throw new TailscaleCliError("cancelled");
       throw new TailscaleCliError("command_failed");
     } finally {
       clearTimeout(timer);
@@ -495,9 +511,7 @@ export class TailscaleCli {
       throw new TailscaleCliError("invalid_status");
     if (typeof value.Self.DNSName !== "string" || value.Self.DNSName.trim() !== value.Self.DNSName)
       throw new TailscaleCliError("invalid_status");
-    const canonicalDns = value.Self.DNSName.endsWith(".")
-      ? value.Self.DNSName.slice(0, -1)
-      : value.Self.DNSName;
+    const canonicalDns = value.Self.DNSName;
     if (!dnsName(canonicalDns)) throw new TailscaleCliError("invalid_status");
     if (!record(value.CurrentTailnet) || typeof value.CurrentTailnet.Name !== "string"
       || value.CurrentTailnet.Name.trim().length === 0 || value.CurrentTailnet.Name.length > 255
@@ -592,61 +606,31 @@ export class TailscaleCli {
   async beginHttpsConsent(port: number, signal?: AbortSignal): Promise<string> {
     if (!Number.isSafeInteger(port) || port < 1_024 || port > 65_535 || port === 443)
       throw new Error("invalid HTTPS consent port");
-    const controller = new AbortController();
-    let timedOut = false;
-    const onAbort = () => controller.abort(signal?.reason);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    let observed = Buffer.alloc(0);
-    let resolveObserved!: (url: string) => void;
-    let rejectObserved!: (error: Error) => void;
-    const found = new Promise<string>((resolve, reject) => {
-      resolveObserved = resolve;
-      rejectObserved = reject;
-    });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, this.#timeoutMs);
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let observedBytes = 0;
+    let observedText = "";
+    let observedUrl: string | undefined;
     const argv = ["serve", `--https=${port}`, "text:CozyGateway HTTPS consent"] as const;
-    const run = this.#runner(this.#executable, argv, {
-      shell: false,
-      windowsHide: true,
-      timeoutMs: this.#timeoutMs,
-      maxObjectBytes: TAILSCALE_CLI_MAX_OBJECT_BYTES,
-      maxTotalBytes: TAILSCALE_CLI_MAX_TOTAL_BYTES,
-      signal: controller.signal,
-      onStdoutChunk: (chunk) => {
-        observed = Buffer.concat([observed, Buffer.from(chunk)]);
-        if (observed.byteLength > TAILSCALE_CLI_MAX_TOTAL_BYTES) {
-          rejectObserved(new TailscaleCliError("output_too_large"));
-          controller.abort();
-          return;
+    try {
+      const result = await this.#run(argv, signal, (chunk) => {
+        observedBytes += chunk.byteLength;
+        if (observedBytes > TAILSCALE_CLI_MAX_TOTAL_BYTES)
+          throw new TailscaleCliError("output_too_large");
+        try {
+          observedText += decoder.decode(chunk, { stream: true });
+        } catch {
+          throw new TailscaleCliError("invalid_utf8");
         }
-        const url = consentUrl(observed.toString("utf8"), false);
-        if (url !== undefined) resolveObserved(url);
-      },
-    });
-    // A foreground Serve command is expected to keep running while consent is pending. Suppress
-    // the AbortError produced after a validated URL lets us terminate that disposable mapping.
-    void run.catch(() => undefined);
-    const completed = run.then((result) => {
+        observedUrl = consentUrl(observedText, false);
+      }, () => observedUrl !== undefined);
+      if (observedUrl !== undefined) return observedUrl;
       if (result.exitCode !== 0) throw new TailscaleCliError("command_failed");
       const url = consentUrl(decodeBounded(result.stdout, TAILSCALE_CLI_MAX_TOTAL_BYTES), true);
       if (url === undefined) throw new TailscaleCliError("unexpected_output");
       return url;
-    });
-    const aborted = new Promise<never>((_resolve, reject) => {
-      controller.signal.addEventListener("abort", () => {
-        reject(new TailscaleCliError(timedOut ? "timeout" : "cancelled"));
-      }, { once: true });
-    });
-    try {
-      const url = await Promise.race([found, completed, aborted]);
-      controller.abort();
-      return url;
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+    } catch (error) {
+      if (error instanceof TailscaleCliError) throw error;
+      throw new TailscaleCliError("command_failed");
     }
   }
 }

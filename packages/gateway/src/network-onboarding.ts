@@ -124,7 +124,18 @@ export type OnboardingOutcome =
   | { outcome: "not_confirmed"; reason: "phone" | "desktop" }
   | { outcome: "invalidated"; reason: "posture" | "verification_epoch" | "phrase" }
   | { outcome: "lost_race" }
+  | { outcome: "paused"; mode: OnboardingMode; reason: string; detail?: string }
   | { outcome: "failed"; reason: "readiness" | "publication" | "rollback_failed" };
+
+function retryableAdapterPause(error: unknown): { reason: string; detail?: string } | undefined {
+  if (typeof error !== "object" || error === null || !("retryable" in error) || error.retryable !== true
+    || !("reason" in error) || typeof error.reason !== "string"
+    || error.reason.length === 0 || error.reason.length > 128)
+    return undefined;
+  if (!("detail" in error) || error.detail === undefined) return { reason: error.reason };
+  if (typeof error.detail !== "string" || error.detail.length === 0 || error.detail.length > 128) return undefined;
+  return { reason: error.reason, detail: error.detail };
+}
 
 export interface NetworkOnboardingStatus {
   stage: "not_started" | NetworkOnboardingState["stage"] | "changed";
@@ -305,7 +316,9 @@ export class NetworkOnboarding {
     let endpoint: PreparedEndpoint;
     try {
       endpoint = prepare ? await adapter.prepare(signal) : inspected!;
-    } catch {
+    } catch (error) {
+      const pause = retryableAdapterPause(error);
+      if (pause !== undefined) return { outcome: "paused", mode, ...pause };
       return { outcome: "failed", reason: "readiness" };
     }
     if (endpoint.mode !== mode || !endpoint.ready) return this.#rollbackFailure(adapter, endpoint, signal, "readiness");

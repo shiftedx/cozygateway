@@ -76,3 +76,41 @@ decline, and managed-policy refusal coverage.
   without any certificate bypass.
 - Fixture identities, domains, URLs, targets, and node identifiers are synthetic or sanitized;
   browser URLs and identities are never incorporated into error messages.
+
+## Review-finding remediation
+
+All findings in `task-9-review-findings.md` were resolved test-first:
+
+1. Added uncertain-outcome reconciliation around exact mapping creation and removal. A timed-out
+   create proceeds only when complete reinspection finds the exact requested mapping, which is then
+   proven and owned normally. Removal always reinspects; an already-applied removal clears matching
+   SQLite ownership idempotently. Restart tests cover failures immediately after mapping removal and
+   ownership removal, while concurrent conflicting state remains untouched.
+2. Moved complete Serve/Funnel inspection to immediately after current-account confirmation. Both
+   certificate-ready and certificate-consent paths now refuse every port-443 conflict before any
+   preference, consent, probe, or mapping mutation.
+3. Added structured retryable adapter reasons plus bounded helper/CLI detail codes for installer
+   cancellation, reboot, signature verification, login, browser, preference cancellation/policy/
+   verification, status, HTTPS consent, mapping inspection, and mapping mutation. `NetworkOnboarding`
+   preserves these as a typed `paused` outcome instead of collapsing them to generic readiness.
+4. Occupied temporary-consent ports now come from the complete Funnel document, including nested
+   services and foreground state rather than only `AllowFunnel`.
+5. Unified HTTPS consent with the trusted bounded runner. Pre-aborted signals never invoke a runner;
+   streaming UTF-8 is fatal, per-stream/combined caps remain enforced even after a URL is observed,
+   runner failures are redacted to fixed codes, and foreground termination is awaited before the URL
+   is returned.
+6. Removed trailing-dot normalization. `Self.DNSName` must now be the exact lowercase ASCII `.ts.net`
+   value present in `CertDomains`; trailing-dot fixtures and mismatches are rejected.
+
+The RED run produced nine failures spanning all six technical findings. The GREEN remediation gates
+then passed:
+
+- Task 9 CLI/mode suites: 2 files, 35 tests passed.
+- Task 9 plus orchestration suites: 3 files, 68 tests passed.
+- Focused suites plus onboarding storage: 4 files, 84 tests passed.
+- Gateway typecheck and build: passed.
+- Full isolated Gateway suite: 96 files passed, 1 skipped; 990 tests passed, 2 skipped.
+- `git diff --check`: clean apart from LF-to-CRLF notices.
+
+All cases use injected runners/helpers/probes or disposable SQLite files. No live Tailscale,
+installer, UAC, browser, service, preference, Serve, Funnel, or network mutation was performed.
