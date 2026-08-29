@@ -81,6 +81,8 @@ function preferencePause(error: unknown): TailscaleModePause {
 
 export type TailscaleModeReadinessReason =
   | "status"
+  | "not_running"
+  | "logged_out"
   | "account_changed"
   | "loopback"
   | "mapping"
@@ -728,8 +730,13 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       if (owned.ownershipSubtype !== "wizard-created" || owned.phase === "active")
         throw new TailscaleModeReadinessError("mapping");
       try {
-        await cli.createTlsTerminatedMapping(this.#dependencies.gatewayPort, signal);
+        const created = await this.#serveConfigClient.createExactTlsTerminatedMapping({
+          dnsName: status.dnsName,
+          target: `127.0.0.1:${this.#dependencies.gatewayPort}`,
+        }, signal);
+        if (created !== "created") throw new TailscaleModeReadinessError("mapping");
       } catch (error) {
+        if (error instanceof TailscaleModeReadinessError) throw error;
         const reconciled = await this.#recoveryMappingInspection(cli, status.dnsName);
         if (reconciled.outcome !== "compatible" || reconciled.mappingFingerprint !== expectedStateFingerprint)
           throw cliPause("mapping_mutation_failed", error);
@@ -858,7 +865,9 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     } catch (error) {
       throw cliPause("status_unavailable", error);
     }
-    if (status.state !== "running") throw new TailscaleModeReadinessError("status");
+    if (status.state !== "running") throw new TailscaleModeReadinessError(
+      status.state === "needs_login" || status.state === "needs_machine_auth" ? "logged_out" : "not_running",
+    );
     if (accountHash(status, identityKey) !== owned.accountTailnetHash)
       throw new TailscaleModeReadinessError("account_changed");
     if (owned.phase === "preferences") {
@@ -1069,7 +1078,9 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
   ): Promise<void> {
     const status = await cli.status(signal);
     const identityKey = await this.#loadIdentityKey(signal);
-    if (status.state !== "running") throw new TailscaleModeReadinessError("status");
+    if (status.state !== "running") throw new TailscaleModeReadinessError(
+      status.state === "needs_login" || status.state === "needs_machine_auth" ? "logged_out" : "not_running",
+    );
     if (accountHash(status, identityKey) !== owned.accountTailnetHash)
       throw new TailscaleModeReadinessError("account_changed");
   }
@@ -1128,7 +1139,9 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
   ): Promise<void> {
     const status = await cli.status(signal);
     const identityKey = await this.#loadIdentityKey(signal);
-    if (status.state !== "running") throw new TailscaleModeReadinessError("status");
+    if (status.state !== "running") throw new TailscaleModeReadinessError(
+      status.state === "needs_login" || status.state === "needs_machine_auth" ? "logged_out" : "not_running",
+    );
     if (accountHash(status, identityKey) !== owned.accountTailnetHash)
       throw new TailscaleModeReadinessError("account_changed");
     if (owned.phase === "preferences") {

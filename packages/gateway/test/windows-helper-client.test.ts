@@ -7,6 +7,7 @@ import {
   runWindowsHelperProcess,
   WindowsHelperClient,
   WindowsHelperProtocolError,
+  type WindowsHelperRunOptions,
   type WindowsHelperRunner,
 } from "../src/windows-helper.ts";
 
@@ -18,6 +19,17 @@ function response(command: string, result: unknown): string {
 }
 
 describe("WindowsHelperClient", () => {
+  it("keeps cleanup preference mutation outside every RunAs-capable helper path", () => {
+    const source = readFileSync(new URL("../../../scripts/cozygateway-windows-helper.ps1", import.meta.url), "utf8");
+    const cleanup = source.slice(
+      source.indexOf("function Invoke-SetPreferenceCleanup"),
+      source.indexOf("function Invoke-OpenBrowser"),
+    );
+    expect(cleanup).toContain("Test-CurrentProcessElevated");
+    expect(cleanup.indexOf("Test-CurrentProcessElevated")).toBeLessThan(cleanup.indexOf("Get-TrustedTailscale"));
+    expect(cleanup).not.toMatch(/Invoke-UacProcess|Start-Process|-Verb\s+RunAs/i);
+  });
+
   it("kills a timed-out real child and waits for close before rejecting", async () => {
     const directory = mkdtempSync(join(tmpdir(), "cozy-helper-child-"));
     const script = join(directory, "hang.js");
@@ -155,6 +167,35 @@ describe("WindowsHelperClient", () => {
       { command: "set-preference-cleanup", input: { preference: "shields-up", enabled: false } },
       { command: "open-browser", input: { purpose: "login", url: "https://login.tailscale.com/a/opaque" } },
     ]);
+  });
+
+  it("does not apply the fixed helper timeout or abort policy to interactive UAC commands", async () => {
+    vi.useFakeTimers();
+    try {
+      const observed: WindowsHelperRunOptions[] = [];
+      const runner: WindowsHelperRunner = async (_file, args, options) => {
+        observed.push(options);
+        await new Promise((resolve) => setTimeout(resolve, 31_000));
+        const command = args.at(-1)!;
+        return { exitCode: 0, stdout: response(command, { applied: true }), stderr: "" };
+      };
+      const client = new WindowsHelperClient({ helperPath: helper, powershellPath: powershell, runner, timeoutMs: 30_000 });
+      const controller = new AbortController();
+      const pending = Promise.all([
+        client.installTailscale(controller.signal),
+        client.setPreference("unattended", true, controller.signal),
+      ]);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(31_000);
+      await expect(pending).resolves.toEqual([undefined, undefined]);
+      expect(observed).toHaveLength(2);
+      for (const options of observed) {
+        expect(options.timeoutMs).toBeUndefined();
+        expect(options.signal).toBeUndefined();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("surfaces a fixed helper reason without stderr or request secrets", async () => {

@@ -13,7 +13,7 @@ import {
   type TailscaleMappingOwnership,
   type TailscaleModeProbes,
 } from "../src/tailscale-mode.ts";
-import { TailscaleCliError, type TailscaleCliRunner, type TailscaleServeConfigClient } from "../src/tailscale-cli.ts";
+import { TailscaleCliError, TailscaleLocalApiError, type TailscaleCliRunner, type TailscaleServeConfigClient } from "../src/tailscale-cli.ts";
 import { openStorage } from "../src/storage.ts";
 import { WindowsHelperError, type TailscaleDiscovery } from "../src/windows-helper.ts";
 
@@ -68,10 +68,6 @@ function happyDependencies(options: {
       stderr: "",
     };
     if (command === "funnel status --json") return { exitCode: 0, stdout: options.funnel ?? fixture("funnel-empty.json"), stderr: "" };
-    if (command === "serve --bg --tls-terminated-tcp=443 tcp://127.0.0.1:18787") {
-      serveState = fixture("serve-compatible.json");
-      return { exitCode: 0, stdout: "", stderr: "" };
-    }
     if (command === "serve --https=8443 text:CozyGateway HTTPS consent") return {
       exitCode: 0,
       stdout: "https://console.tailscale.com/admin/feature/fixture\n",
@@ -132,7 +128,16 @@ function happyDependencies(options: {
       serveState = JSON.stringify(config);
       return "removed" as const;
     });
-  const serveConfigClient = { removeExactTlsTerminatedMapping };
+  const createExactTlsTerminatedMapping = vi.fn<TailscaleServeConfigClient["createExactTlsTerminatedMapping"]>(async (input) => {
+    calls.push("localapi create exact mapping");
+    const config = JSON.parse(serveState) as { TCP?: Record<string, unknown> };
+    config.TCP ??= {};
+    if (config.TCP["443"] !== undefined) return "conflict";
+    config.TCP["443"] = { TCPForward: input.target, TerminateTLS: input.dnsName };
+    serveState = JSON.stringify(config);
+    return "created";
+  });
+  const serveConfigClient = { createExactTlsTerminatedMapping, removeExactTlsTerminatedMapping };
   return { calls, runner, helper, io, probes, ownership, preferenceState, serveConfigClient };
 }
 
@@ -229,7 +234,7 @@ describe("TailscaleModeAdapter", () => {
     });
 
     await expect(adapter.prepare()).resolves.toMatchObject({ ready: true, createdByWizard: true });
-    expect(dependencies.calls).toContain("serve --bg --tls-terminated-tcp=443 tcp://127.0.0.1:18787");
+    expect(dependencies.calls).toContain("localapi create exact mapping");
     expect(dependencies.ownership.write).toHaveBeenCalledWith(expect.objectContaining({
       schemaVersion: 2,
       phase: "preferences",
@@ -238,6 +243,28 @@ describe("TailscaleModeAdapter", () => {
       target: "127.0.0.1:18787",
       createdAt: 1_700_000_000_000,
     }), undefined);
+  });
+
+  it("retains provisional ownership and reports mapping when LocalAPI creation loses the ETag race", async () => {
+    const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
+    let stored: TailscaleMappingOwnership | undefined;
+    dependencies.ownership.read.mockImplementation(async () => stored);
+    dependencies.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+    dependencies.ownership.replace.mockImplementation(async (expected, replacement) => {
+      if (stored !== expected) return false;
+      stored = replacement;
+      return true;
+    });
+    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockResolvedValue("concurrent");
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      serveConfigClient: dependencies.serveConfigClient,
+    });
+
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping" });
+    expect(stored).toMatchObject({ phase: "provisional", ownershipSubtype: "wizard-created" });
+    expect(dependencies.calls.some((call) => call.startsWith("serve --bg "))).toBe(false);
   });
 
   it("binds mapping and durable fingerprints to wizard-created versus reused ownership", async () => {
@@ -762,12 +789,10 @@ describe("TailscaleModeAdapter", () => {
 
   it("reconciles a timed-out create that applied and records exact ownership", async () => {
     const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
-    const original = dependencies.runner.getMockImplementation()!;
-    dependencies.runner.mockImplementation(async (...args) => {
-      const result = await original(...args);
-      if (args[1].join(" ").startsWith("serve --bg --tls-terminated-tcp=443 "))
-        throw new TailscaleCliError("timeout");
-      return result;
+    const originalCreate = dependencies.serveConfigClient.createExactTlsTerminatedMapping.getMockImplementation()!;
+    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockImplementation(async (...args) => {
+      await originalCreate(...args);
+      throw new TailscaleLocalApiError("timeout");
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
@@ -782,10 +807,10 @@ describe("TailscaleModeAdapter", () => {
     const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
     const sequence: string[] = [];
     let stored: TailscaleMappingOwnership | undefined;
-    const original = dependencies.runner.getMockImplementation()!;
-    dependencies.runner.mockImplementation(async (...args) => {
-      if (args[1].join(" ").startsWith("serve --bg ")) sequence.push("serve:create");
-      return original(...args);
+    const originalCreate = dependencies.serveConfigClient.createExactTlsTerminatedMapping.getMockImplementation()!;
+    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockImplementation(async (...args) => {
+      sequence.push("serve:create");
+      return originalCreate(...args);
     });
     dependencies.ownership.write.mockImplementation(async (value) => {
       sequence.push(`ownership:${value.phase}`);
@@ -917,10 +942,10 @@ describe("TailscaleModeAdapter", () => {
   it("uses fresh bounded recovery reads when create applies as the caller aborts", async () => {
     const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
     const controller = new AbortController();
-    const original = dependencies.runner.getMockImplementation()!;
-    dependencies.runner.mockImplementation(async (...args) => {
-      const result = await original(...args);
-      if (args[1].join(" ").startsWith("serve --bg --tls-terminated-tcp=443 ")) controller.abort();
+    const originalCreate = dependencies.serveConfigClient.createExactTlsTerminatedMapping.getMockImplementation()!;
+    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockImplementation(async (...args) => {
+      const result = await originalCreate(...args);
+      controller.abort();
       return result;
     });
     const adapter = new TailscaleModeAdapter({

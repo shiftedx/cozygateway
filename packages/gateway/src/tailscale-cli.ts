@@ -381,8 +381,13 @@ export const runTailscaleCliProcess: TailscaleCliRunner = (executable, argv, opt
 });
 
 export type TailscaleServeConfigMutationResult = "removed" | "absent" | "concurrent" | "conflict";
+export type TailscaleServeConfigCreationResult = "created" | "concurrent" | "conflict";
 
 export interface TailscaleServeConfigClient {
+  createExactTlsTerminatedMapping(
+    input: { dnsName: string; target: string },
+    signal?: AbortSignal,
+  ): Promise<TailscaleServeConfigCreationResult>;
   removeExactTlsTerminatedMapping(
     input: { dnsName: string; target: string },
     signal?: AbortSignal,
@@ -429,6 +434,12 @@ function validateServeConfig(value: Record<string, unknown>): void {
     }
   };
   visit(value, 0);
+}
+
+function validateLocalApiMappingInput(input: { dnsName: string; target: string }): void {
+  const port = /^127\.0\.0\.1:(\d{1,5})$/.exec(input.target)?.[1];
+  if (!dnsName(input.dnsName) || port === undefined || Number(port) < 1 || Number(port) > 65_535)
+    throw new TailscaleLocalApiError("invalid_response");
 }
 
 export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
@@ -510,6 +521,7 @@ export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
     input: { dnsName: string; target: string },
     signal?: AbortSignal,
   ): Promise<TailscaleServeConfigMutationResult> {
+    validateLocalApiMappingInput(input);
     const snapshot = await this.#request("GET", undefined, undefined, signal);
     if (snapshot.statusCode !== 200 || snapshot.etag === undefined
       || !/^[a-f0-9]{64}$/i.test(snapshot.etag)) throw new TailscaleLocalApiError("invalid_response");
@@ -537,6 +549,36 @@ export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
     if (result.statusCode === 412) return "concurrent";
     if (result.statusCode !== 200) throw new TailscaleLocalApiError("unavailable");
     return "removed";
+  }
+
+  async createExactTlsTerminatedMapping(
+    input: { dnsName: string; target: string },
+    signal?: AbortSignal,
+  ): Promise<TailscaleServeConfigCreationResult> {
+    validateLocalApiMappingInput(input);
+    const snapshot = await this.#request("GET", undefined, undefined, signal);
+    if (snapshot.statusCode !== 200 || snapshot.etag === undefined
+      || !/^[a-f0-9]{64}$/i.test(snapshot.etag)) throw new TailscaleLocalApiError("invalid_response");
+    let config: Record<string, unknown>;
+    try { config = parseSingleObject(snapshot.body); }
+    catch { throw new TailscaleLocalApiError("invalid_response"); }
+    validateServeConfig(config);
+    const tcp = config.TCP as Record<string, unknown> | undefined;
+    if (tcp?.["443"] !== undefined) return "conflict";
+    const web = config.Web as Record<string, unknown> | undefined;
+    if (web?.[`${input.dnsName}:443`] !== undefined) return "conflict";
+    const allowFunnel = config.AllowFunnel as Record<string, unknown> | undefined;
+    if (allowFunnel?.[`${input.dnsName}:443`] === true) return "conflict";
+    const replacement = structuredClone(config);
+    const replacementTcp = (replacement.TCP ??= {}) as Record<string, unknown>;
+    replacementTcp["443"] = { TCPForward: input.target, TerminateTLS: input.dnsName };
+    const encoded = Buffer.from(JSON.stringify(replacement), "utf8");
+    if (encoded.byteLength > TAILSCALE_CLI_MAX_TOTAL_BYTES)
+      throw new TailscaleLocalApiError("invalid_response");
+    const result = await this.#request("POST", encoded, snapshot.etag, signal);
+    if (result.statusCode === 412) return "concurrent";
+    if (result.statusCode !== 200) throw new TailscaleLocalApiError("unavailable");
+    return "created";
   }
 }
 
@@ -775,17 +817,6 @@ export class TailscaleCli {
 
   funnelState(signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.#json(["funnel", "status", "--json"], signal);
-  }
-
-  async createTlsTerminatedMapping(gatewayPort: number, signal?: AbortSignal): Promise<void> {
-    if (!Number.isSafeInteger(gatewayPort) || gatewayPort < 1 || gatewayPort > 65_535)
-      throw new Error("invalid loopback Gateway port");
-    await this.#command([
-      "serve",
-      "--bg",
-      "--tls-terminated-tcp=443",
-      `tcp://127.0.0.1:${gatewayPort}`,
-    ], signal);
   }
 
   async beginHttpsConsent(port: number, signal?: AbortSignal): Promise<string> {

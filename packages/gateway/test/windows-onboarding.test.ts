@@ -264,6 +264,24 @@ describe("createWindowsOnboardingController composition", () => {
     expect(tailscale).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    [{ reason: "not_running" }, "tailscale_not_running"],
+    [{ reason: "not_installed" }, "tailscale_not_running"],
+    [{ reason: "status_unavailable", detail: "command_failed" }, "tailscale_not_running"],
+    [{ reason: "logged_out" }, "logged_out"],
+    [{ reason: "unsupported_install" }, "old_version"],
+    [{ reason: "unsupported_version" }, "old_version"],
+  ] as const)("maps cleanup failure %o to the safe diagnostic %s", async (failure, code) => {
+    const { configPath, storage } = fixture();
+    storage.close();
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned").mockRejectedValue(Object.assign(new Error("fixture"), failure));
+    vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+    vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toMatchObject({ code });
+  });
+
   it("settles each timed-out adapter before attempting the next and closing SQLite", async () => {
     vi.useFakeTimers();
     const { configPath, storage } = fixture();

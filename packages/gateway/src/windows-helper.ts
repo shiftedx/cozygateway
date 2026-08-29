@@ -48,7 +48,7 @@ export interface WindowsHelperRunOptions {
   stdin: string;
   shell: false;
   windowsHide: true;
-  timeoutMs: number;
+  timeoutMs?: number;
   maxOutputBytes: number;
   signal?: AbortSignal;
 }
@@ -221,13 +221,13 @@ export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, o
   const rejectNow = (error: Error) => {
     if (settled) return;
     settled = true;
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
     reject(error);
   };
   const terminate = (error: Error) => {
     if (settled || pendingError !== undefined) return;
     pendingError = error;
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
     if (child.pid === undefined) rejectNow(error);
     else if (process.platform === "win32" && process.env.SystemRoot !== undefined) {
       const killer = spawn(`${process.env.SystemRoot}\\System32\\taskkill.exe`, ["/pid", String(child.pid), "/t", "/f"], {
@@ -237,7 +237,9 @@ export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, o
       killer.once("close", () => child.kill());
     } else child.kill();
   };
-  const timer = setTimeout(() => terminate(new WindowsHelperProtocolError("Windows helper timed out")), options.timeoutMs);
+  const timer = options.timeoutMs === undefined ? undefined : setTimeout(
+    () => terminate(new WindowsHelperProtocolError("Windows helper timed out")), options.timeoutMs,
+  );
   child.on("error", (error) => {
     if (child.pid === undefined) rejectNow(error);
     else terminate(error);
@@ -257,7 +259,7 @@ export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, o
   child.on("close", (code) => {
     if (settled) return;
     settled = true;
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
     options.signal?.removeEventListener("abort", abort);
     if (pendingError !== undefined) reject(pendingError);
     else resolve({ exitCode: code ?? 1, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
@@ -288,10 +290,16 @@ export class WindowsHelperClient {
   async #invoke(command: WindowsHelperCommand, input: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     const stdin = JSON.stringify(input);
     if (Buffer.byteLength(stdin, "utf8") > WINDOWS_HELPER_MAX_BYTES) throw new Error("Windows helper request exceeded its bound");
+    const interactiveUac = command === "install-tailscale" || command === "set-preference";
     const run = await this.#runner(
       this.#powershellPath,
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", this.#helperPath, command],
-      { stdin, shell: false, windowsHide: true, timeoutMs: this.#timeoutMs, maxOutputBytes: WINDOWS_HELPER_MAX_BYTES, signal },
+      {
+        stdin, shell: false, windowsHide: true,
+        ...(interactiveUac ? {} : { timeoutMs: this.#timeoutMs }),
+        maxOutputBytes: WINDOWS_HELPER_MAX_BYTES,
+        ...(interactiveUac ? {} : { signal }),
+      },
     );
     const raw = text(run.stdout, WINDOWS_HELPER_MAX_BYTES).trim();
     let envelope: unknown;

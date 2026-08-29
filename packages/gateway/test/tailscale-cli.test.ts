@@ -276,11 +276,9 @@ describe("TailscaleCli", () => {
 
     await expect(cli.serveState()).resolves.toMatchObject({ TCP: {}, Web: {} });
     await expect(cli.funnelState()).resolves.toMatchObject({ AllowFunnel: {} });
-    await cli.createTlsTerminatedMapping(18787);
     expect(runner.mock.calls.map((call) => call[1])).toEqual([
       ["serve", "status", "--json"],
       ["funnel", "status", "--json"],
-      ["serve", "--bg", "--tls-terminated-tcp=443", "tcp://127.0.0.1:18787"],
     ]);
   });
 
@@ -383,6 +381,79 @@ describe("WindowsTailscaleLocalApi", () => {
   const socketPath = () => process.platform === "win32"
     ? `\\\\.\\pipe\\cozy-tailscale-localapi-${randomUUID()}`
     : join(tmpdir(), `cozy-tailscale-localapi-${randomUUID()}.sock`);
+
+  it("creates only the exact mapping in an empty ServeConfig with If-Match", async () => {
+    const pipe = socketPath();
+    const etag = "c".repeat(64);
+    let config: Record<string, unknown> = {
+      TCP: { "8443": { TCPForward: "127.0.0.1:9000" } },
+      Web: {}, Services: {}, Foreground: {}, AllowFunnel: { "other.fixture.ts.net:443": true },
+    };
+    const server = createServer((request, response) => {
+      if (request.method === "GET") {
+        response.setHeader("ETag", etag);
+        response.end(JSON.stringify(config));
+        return;
+      }
+      expect(request.headers["if-match"]).toBe(etag);
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        config = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        response.statusCode = 200;
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
+    try {
+      const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      await expect(client.createExactTlsTerminatedMapping({
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+      })).resolves.toBe("created");
+      expect(config).toEqual({
+        TCP: {
+          "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" },
+          "8443": { TCPForward: "127.0.0.1:9000" },
+        },
+        Web: {}, Services: {}, Foreground: {}, AllowFunnel: { "other.fixture.ts.net:443": true },
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") rmSync(pipe, { force: true });
+    }
+  });
+
+  it("leaves a concurrent user mapping untouched when creation If-Match fails", async () => {
+    const pipe = socketPath();
+    const etag = "d".repeat(64);
+    const replacement = {
+      TCP: { "443": { TCPForward: "127.0.0.1:9999", TerminateTLS: "user.fixture.ts.net" } },
+      Web: {}, Services: {}, Foreground: {}, AllowFunnel: {},
+    };
+    let config: Record<string, unknown> = { TCP: {}, Web: {}, Services: {}, Foreground: {}, AllowFunnel: {} };
+    const server = createServer((request, response) => {
+      if (request.method === "GET") {
+        response.setHeader("ETag", etag);
+        response.end(JSON.stringify(config));
+        config = replacement;
+        return;
+      }
+      expect(request.headers["if-match"]).toBe(etag);
+      response.statusCode = 412;
+      response.end();
+    });
+    await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
+    try {
+      const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      await expect(client.createExactTlsTerminatedMapping({
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+      })).resolves.toBe("concurrent");
+      expect(config).toEqual(replacement);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") rmSync(pipe, { force: true });
+    }
+  });
 
   it("removes only the exact owned entry from the full ServeConfig with If-Match", async () => {
     const pipe = socketPath();

@@ -98,12 +98,19 @@ function cleanupCode(error: unknown): WindowsOwnedNetworkCleanupErrorCode {
   if (error instanceof WindowsOwnedNetworkCleanupError) return error.code;
   const reason = typeof error === "object" && error !== null && "reason" in error
     ? String((error as { reason: unknown }).reason) : "";
+  const detail = typeof error === "object" && error !== null && "detail" in error
+    ? String((error as { detail: unknown }).detail) : "";
   if (reason === "preference_elevation_required") return "elevation_required";
   if (reason === "account_changed") return "account_changed";
   if (reason.includes("custom_control")) return "custom_control";
-  if (reason.includes("version")) return "old_version";
+  if (reason.includes("version") || reason === "unsupported_install") return "old_version";
   if (reason.includes("logged_out")) return "logged_out";
-  if (reason.includes("not_running")) return "tailscale_not_running";
+  if (reason.includes("not_running") || reason === "not_installed") return "tailscale_not_running";
+  if (reason === "status_unavailable") {
+    if (detail === "timeout") return "timeout";
+    return detail === "command_failed" || detail === "spawn_failed"
+      ? "tailscale_not_running" : "helper_invalid";
+  }
   if (reason.includes("mapping")) return "mapping_changed";
   if (reason.includes("preference") || reason === "status") return "preference_changed";
   if (reason.includes("listener") || error instanceof AdvancedModeRollbackError) return "listener_changed";
