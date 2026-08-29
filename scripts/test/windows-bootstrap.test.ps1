@@ -177,6 +177,44 @@ function Read-FakePowerShellCalls {
     })
 }
 
+function Read-ElevationChildCapture {
+    param([string] $Path)
+    $values = @{}
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        $separatorIndex = $line.IndexOf('=')
+        $name = $line.Substring(0, $separatorIndex)
+        $encodedValue = $line.Substring($separatorIndex + 1)
+        if ($encodedValue -eq '<null>') {
+            $values[$name] = $null
+        } else {
+            try { $values[$name] = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedValue)) }
+            catch { throw "invalid child capture value for $name`: $encodedValue" }
+        }
+    }
+    $extraArguments = @()
+    if ([int]$values.ExtraArgumentCount -gt 0) { $extraArguments = @(1..([int]$values.ExtraArgumentCount)) }
+    return [pscustomobject]@{
+        ExpectedRoot = $values.ExpectedRoot
+        ExpectedHermes = $values.ExpectedHermes
+        ExpectedLauncher = $values.ExpectedLauncher
+        ExpectedPort = [int]$values.ExpectedPort
+        ElevatedChild = $values.ElevatedChild -eq 'True'
+        ExtraArguments = $extraArguments
+        DashboardSessionToken = $values.DashboardSessionToken
+        ProviderApiKey = $values.ProviderApiKey
+        ArbitrarySecret = $values.ArbitrarySecret
+        PathValue = $values.PathValue
+        PSHomeValue = $values.PSHomeValue
+        PSModulePathValue = $values.PSModulePathValue
+        SystemRootValue = $values.SystemRootValue
+        WindirValue = $values.WindirValue
+        ComSpecValue = $values.ComSpecValue
+        TempValue = $values.TempValue
+        TmpValue = $values.TmpValue
+        BoundarySentinel = $values.BoundarySentinel
+    }
+}
+
 function Invoke-DashboardStopHarness {
     param(
         [string] $FunctionText,
@@ -243,26 +281,41 @@ function Invoke-ElevationWrapperHarness {
     $resultPathLiteral = ConvertTo-PowerShellSingleQuotedLiteral $resultPath
     $cancelLiteral = if ($Cancel) { '$true' } else { '$false' }
     $childCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $ChildCapturePath
+    $poisonPrefix = Join-Path (Split-Path -Parent $Harness) 'poisoned-installer-environment'
+    $poisonPrefixLiteral = ConvertTo-PowerShellSingleQuotedLiteral $poisonPrefix
     $childBody = @'
-param(
-    [Parameter(Position = 0)][string]$ExpectedRoot,
-    [Parameter(Position = 1)][string]$ExpectedHermes,
-    [Parameter(Position = 2)][string]$ExpectedLauncher,
-    [Parameter(Position = 3)][int]$ExpectedPort,
-    [switch]$ElevatedChild
+$ExpectedRoot = [string]$args[0]
+$ExpectedHermes = [string]$args[1]
+$ExpectedLauncher = [string]$args[2]
+$ExpectedPort = [int]$args[3]
+$ElevatedChild = [string]$args[4] -ceq '-ElevatedChild'
+$extraArgumentCount = [Math]::Max(0, $args.Count - 5)
+function ConvertTo-CaptureValue {
+    param($Value)
+    if ($null -eq $Value) { return '<null>' }
+    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Value))
+}
+$captureLines = @(
+    ('ExpectedRoot=' + (ConvertTo-CaptureValue $ExpectedRoot))
+    ('ExpectedHermes=' + (ConvertTo-CaptureValue $ExpectedHermes))
+    ('ExpectedLauncher=' + (ConvertTo-CaptureValue $ExpectedLauncher))
+    ('ExpectedPort=' + (ConvertTo-CaptureValue ([string]$ExpectedPort)))
+    ('ElevatedChild=' + (ConvertTo-CaptureValue ([string]$ElevatedChild)))
+    ('ExtraArgumentCount=' + (ConvertTo-CaptureValue ([string]$extraArgumentCount)))
+    ('DashboardSessionToken=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('DASHBOARD_SESSION_TOKEN', 'Process'))))
+    ('ProviderApiKey=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PROVIDER_API_KEY', 'Process'))))
+    ('ArbitrarySecret=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TASK2_REVIEW_ARBITRARY_SECRET', 'Process'))))
+    ('PathValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PATH', 'Process'))))
+    ('PSHomeValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PSHOME', 'Process'))))
+    ('PSModulePathValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PSModulePath', 'Process'))))
+    ('SystemRootValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('SystemRoot', 'Process'))))
+    ('WindirValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('WINDIR', 'Process'))))
+    ('ComSpecValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('COMSPEC', 'Process'))))
+    ('TempValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TEMP', 'Process'))))
+    ('TmpValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TMP', 'Process'))))
+    ('BoundarySentinel=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('COZYGATEWAY_UAC_BOUNDARY_SENTINEL', 'Process'))))
 )
-[pscustomobject]@{
-    ExpectedRoot = $ExpectedRoot
-    ExpectedHermes = $ExpectedHermes
-    ExpectedLauncher = $ExpectedLauncher
-    ExpectedPort = $ExpectedPort
-    ElevatedChild = $ElevatedChild.IsPresent
-    ExtraArguments = @($args)
-    DashboardSessionToken = $env:DASHBOARD_SESSION_TOKEN
-    ProviderApiKey = $env:PROVIDER_API_KEY
-    ArbitrarySecret = $env:TASK2_REVIEW_ARBITRARY_SECRET
-    EnvironmentNames = @([Environment]::GetEnvironmentVariables('Process').Keys | ForEach-Object { [string]$_ })
-} | Export-Clixml -LiteralPath __CHILD_CAPTURE__
+[IO.File]::WriteAllLines(__CHILD_CAPTURE__, [string[]]$captureLines, [Text.UTF8Encoding]::new($false))
 exit __CHILD_CODE__
 '@
     $childBody = $childBody.Replace('__CHILD_CAPTURE__', $childCaptureLiteral).Replace('__CHILD_CODE__', [string]$ChildCode)
@@ -277,11 +330,12 @@ function Get-ProcessEnvironment {
     return $snapshot
 }
 function Start-Process {
-    param([string]$FilePath, [string]$Verb, [switch]$Wait, [switch]$PassThru, [switch]$UseNewEnvironment, [string[]]$ArgumentList)
+    param([string]$FilePath, [string]$WorkingDirectory, [string]$Verb, [switch]$Wait, [switch]$PassThru, [switch]$UseNewEnvironment, [string[]]$ArgumentList)
     $script:StartCount++
     [pscustomobject]@{
         Count = $script:StartCount
         FilePath = $FilePath
+        WorkingDirectory = $WorkingDirectory
         Verb = $Verb
         Wait = $Wait.IsPresent
         PassThru = $PassThru.IsPresent
@@ -290,8 +344,9 @@ function Start-Process {
         Environment = Get-ProcessEnvironment
     } | Export-Clixml -LiteralPath __START_CAPTURE__
     if (__CANCEL__) { throw 'The operation was canceled by the user.' }
-    $info = New-Object Diagnostics.ProcessStartInfo
+    $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $FilePath
+    $info.WorkingDirectory = $WorkingDirectory
     $info.Arguments = $ArgumentList -join ' '
     $info.UseShellExecute = $false
     $process = [Diagnostics.Process]::Start($info)
@@ -299,6 +354,18 @@ function Start-Process {
     return [pscustomobject]@{ ExitCode = $process.ExitCode }
 }
 $script:StartCount = 0
+[pscustomobject]@{ Warm = $true } | Export-Clixml -LiteralPath __START_CAPTURE__
+Remove-Item -LiteralPath __START_CAPTURE__ -Force
+$poisonPrefix = __POISON_PREFIX__
+$env:PATH = Join-Path $poisonPrefix 'PATH'
+$env:PSHOME = Join-Path $poisonPrefix 'PSHOME'
+$env:PSModulePath = Join-Path $poisonPrefix 'PSModulePath'
+$env:SystemRoot = Join-Path $poisonPrefix 'SystemRoot'
+$env:WINDIR = Join-Path $poisonPrefix 'WINDIR'
+$env:COMSPEC = Join-Path $poisonPrefix 'COMSPEC\cmd.exe'
+$env:TEMP = Join-Path $poisonPrefix 'TEMP'
+$env:TMP = Join-Path $poisonPrefix 'TMP'
+$env:COZYGATEWAY_UAC_BOUNDARY_SENTINEL = Join-Path $poisonPrefix 'sentinel'
 $before = Get-ProcessEnvironment
 & $Wrapper $Root $Hermes $Launcher $Port $Helper
 $wrapperExitCode = $LASTEXITCODE
@@ -316,7 +383,7 @@ foreach ($key in $before.Keys) {
 } | Export-Clixml -LiteralPath __RESULT_PATH__
 exit 0
 '@
-    $harnessBody = $harnessBody.Replace('__START_CAPTURE__', $startCaptureLiteral).Replace('__CANCEL__', $cancelLiteral).Replace('__RESULT_PATH__', $resultPathLiteral)
+    $harnessBody = $harnessBody.Replace('__START_CAPTURE__', $startCaptureLiteral).Replace('__CANCEL__', $cancelLiteral).Replace('__RESULT_PATH__', $resultPathLiteral).Replace('__POISON_PREFIX__', $poisonPrefixLiteral)
     Write-Utf8NoBom $Harness $harnessBody
     Remove-Item -LiteralPath $CapturePath, $ChildCapturePath, $resultPath -Force -ErrorAction SilentlyContinue
     $keys = @('DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY', 'TASK2_REVIEW_ARBITRARY_SECRET')
@@ -597,9 +664,11 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     $elevationBody = $elevationMatch.Groups['Body'].Value
     Assert-True (-not ($elevationBody -match 'UseNewEnvironment')) 'elevation wrapper must not use -UseNewEnvironment'
     Assert-True ($elevationBody -match 'GetEnvironmentVariables\("Process"\)') 'elevation wrapper must snapshot and enumerate every Process-scope environment entry'
-    Assert-True ($elevationBody -match '\$setEnvironmentVariable\.Invoke\(\$null, @\(\[string\]\$name, \$null\)\)') 'elevation wrapper must clear every enumerated Process-scope entry rather than use a secret-name denylist'
+    Assert-True ($elevationBody -match 'Set-CozyProcessEnvironmentVariable \(\[string\]\$name\) \$null') 'elevation wrapper must clear every enumerated Process-scope entry rather than use a secret-name denylist'
     Assert-True (-not ($elevationBody -match 'DASHBOARD_SESSION_TOKEN|PROVIDER_API_KEY|TASK2_REVIEW_ARBITRARY_SECRET')) 'production sanitization must not depend on known secret names'
     Assert-True (-not ($elevationBody -match 'GetEnvironmentVariables\("(?:User|Machine)"\)')) 'elevation wrapper must not source User or Machine environment blocks'
+    Assert-True ($elevationBody -match 'GetSystemDirectoryW' -and $elevationBody -match 'GetWindowsDirectoryW' -and $elevationBody -match 'kernel32\.dll') 'elevation wrapper must resolve native Windows directories through kernel32 KnownDLL'
+    Assert-True ($elevationBody -match 'SetLastError' -and $elevationBody -match '\[Runtime\.InteropServices\.Marshal\]::GetLastWin32Error\(\)') 'elevation wrapper must preserve and check errors from each native call'
     Assert-True ($elevationWriterMatch.Value -match 'is_windows \|\| return 0') 'elevation helper files must be generated only on Windows'
     Assert-True ($agentInstaller -match 'is_windows && write_dashboard_elevation_helper') 'non-Windows install flow must not invoke elevation-helper generation'
 
@@ -611,13 +680,17 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True $wrapperResult.EnvironmentRestored "elevation wrapper must exactly restore its parent Process environment after success; differences: $($environmentDifference -join ', ')"
     $startInvocation = Import-Clixml -LiteralPath $startCapture
     Assert-True ($startInvocation.Count -eq 1) 'elevation wrapper must make exactly one Start-Process call'
-    $expectedPowerShell = [IO.Path]::GetFullPath((Join-Path $PSHOME 'powershell.exe'))
-    Assert-True ($startInvocation.FilePath -ceq $expectedPowerShell) 'elevation wrapper must launch the captured full PowerShell executable path'
+    $trustedSystemDirectory = [Environment]::SystemDirectory
+    $trustedWindowsDirectory = [IO.Directory]::GetParent($trustedSystemDirectory).FullName
+    $expectedPowerShell = [IO.Path]::Combine($trustedSystemDirectory, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    Assert-True ($startInvocation.FilePath -ceq $expectedPowerShell) 'elevation wrapper must launch absolute Windows PowerShell from the native system directory'
+    Assert-True ($startInvocation.WorkingDirectory -ceq $trustedSystemDirectory) 'elevation wrapper must launch from the native system directory'
+    Assert-True (-not ($elevationBody -match '\$PSHOME')) 'elevation wrapper must not select an executable through PSHOME'
     Assert-True ($startInvocation.Verb -eq 'RunAs' -and $startInvocation.Wait -and $startInvocation.PassThru -and -not $startInvocation.UseNewEnvironment) 'elevation wrapper must use one -Verb RunAs -Wait -PassThru call without -UseNewEnvironment'
-    $allowedEnvironment = @('SystemRoot', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP')
     $startEnvironmentNames = @($startInvocation.Environment.Keys | ForEach-Object { [string]$_ })
-    Assert-True (($startEnvironmentNames | Where-Object { $_ -notin $allowedEnvironment }).Count -eq 0) 'RunAs call environment must contain only the documented launch allowlist'
-    $childInvocation = Import-Clixml -LiteralPath $childCapture
+    Assert-True (($startEnvironmentNames | Where-Object { $_ -notin @('SystemRoot', 'WINDIR') }).Count -eq 0 -and $startEnvironmentNames.Count -eq 2) 'RunAs environment must contain only OS-derived SystemRoot and WINDIR'
+    Assert-True ($startInvocation.Environment.SystemRoot -ceq $trustedWindowsDirectory -and $startInvocation.Environment.WINDIR -ceq $trustedWindowsDirectory) 'RunAs environment must derive SystemRoot and WINDIR from the native Windows directory'
+    $childInvocation = Read-ElevationChildCapture $childCapture
     Assert-True ($childInvocation.ExpectedRoot -ceq $wrapperPaths.Root) 'PS5.1 parsing must preserve expected root as one argument'
     Assert-True ($childInvocation.ExpectedHermes -ceq $wrapperPaths.Hermes) 'PS5.1 parsing must preserve Hermes executable as one argument'
     Assert-True ($childInvocation.ExpectedLauncher -ceq $wrapperPaths.Launcher) 'PS5.1 parsing must preserve launcher path as one argument'
@@ -627,10 +700,19 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.DashboardSessionToken)) 'actual PowerShell child must not inherit the Dashboard session token'
     Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.ProviderApiKey)) 'actual PowerShell child must not inherit provider credentials'
     Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.ArbitrarySecret)) 'actual PowerShell child must not inherit an unrelated Process-scope sentinel'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.PathValue)) 'actual PowerShell 5.1 child must not inherit PATH'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.PSHomeValue)) 'actual PowerShell 5.1 child must not inherit PSHOME'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.ComSpecValue)) 'actual PowerShell 5.1 child must not inherit COMSPEC'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.TempValue)) 'actual PowerShell 5.1 child must not inherit TEMP'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.TmpValue)) 'actual PowerShell 5.1 child must not inherit TMP'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.BoundarySentinel)) 'actual PowerShell 5.1 child must not inherit the UAC-boundary sentinel'
+    $poisonedPathPrefix = Join-Path $temp 'poisoned-installer-environment'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.PSModulePathValue) -or -not $childInvocation.PSModulePathValue.StartsWith($poisonedPathPrefix, [StringComparison]::OrdinalIgnoreCase)) 'actual PowerShell 5.1 child must not inherit poisoned PSModulePath'
+    Assert-True ($childInvocation.SystemRootValue -ceq $trustedWindowsDirectory -and $childInvocation.WindirValue -ceq $trustedWindowsDirectory) 'actual PowerShell 5.1 child must receive only native-derived Windows roots'
     $startArguments = $startInvocation.ArgumentList -join "`n"
     Assert-True ($startArguments -match '(?m)^-NoProfile$' -and $startArguments -match '(?m)^-NonInteractive$' -and $startArguments -match '(?m)^-ExecutionPolicy$' -and $startArguments -match '(?m)^Bypass$' -and $startArguments -match '(?m)^-File$') 'elevation wrapper must carry the required PowerShell argument array'
     $wrapperEvidence = $wrapperResult.Output + "`n" + (Get-Content -LiteralPath $startCapture -Raw)
-    Assert-True (-not ($wrapperEvidence -match 'task-2-secret-token|task-2-provider-secret|task-2-arbitrary-secret')) 'elevation wrapper arguments and logs must not expose Process-scope secrets'
+    Assert-True (-not ($wrapperEvidence -match 'task-2-secret-token|task-2-provider-secret|task-2-arbitrary-secret|poisoned-installer-environment')) 'elevation wrapper FilePath, arguments, and logs must not expose Process-scope or poisoned path values'
 
     foreach ($childCode in @(42, 43, 45, 99)) {
         $childFailure = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths $childCode

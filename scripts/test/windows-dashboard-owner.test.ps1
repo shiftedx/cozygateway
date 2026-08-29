@@ -54,6 +54,47 @@ $launcher = Join-Path $root 'bin\hermes.exe'
 $venvPython = Join-Path $root 'hermes-agent\venv\Scripts\python.exe'
 $uvPython = 'C:\Users\Alex\AppData\Roaming\uv\python\cpython-3.11\python.exe'
 
+$ownerHelper = [regex]::Match($installer, "(?ms)<<'POWERSHELL_OWNER'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_OWNER")
+Assert-Equal 'generated owner helper is present' $true $ownerHelper.Success
+Assert-Equal 'owner helper exposes trusted system executable resolver' $true ($null -ne (Get-Command Resolve-CozySystemExecutable -ErrorAction SilentlyContinue))
+if (Get-Command Resolve-CozySystemExecutable -ErrorAction SilentlyContinue) {
+    $poisonedEnvironment = @{
+        PATH = 'C:\poison\path'
+        PSHOME = 'C:\poison\powershell-home'
+        PSModulePath = 'C:\poison\modules'
+        SystemRoot = 'C:\poison\system-root'
+        WINDIR = 'C:\poison\windows'
+        COMSPEC = 'C:\poison\cmd.exe'
+        TEMP = 'C:\poison\temp'
+        TMP = 'C:\poison\tmp'
+        COZYGATEWAY_UAC_BOUNDARY_SENTINEL = 'C:\poison\sentinel'
+    }
+    $savedEnvironment = @{}
+    foreach ($entry in $poisonedEnvironment.GetEnumerator()) {
+        $savedEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+    }
+    try {
+        $resolvedTaskkill = Resolve-CozySystemExecutable 'taskkill.exe'
+        $expectedTaskkill = [IO.Path]::Combine([Environment]::SystemDirectory, 'taskkill.exe')
+        Assert-Equal 'taskkill path ignores poisoned installer environment' $expectedTaskkill $resolvedTaskkill
+        Assert-Equal 'taskkill path contains no poisoned value' $false ($resolvedTaskkill -match '(?i)poison')
+    } finally {
+        foreach ($entry in $savedEnvironment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+        }
+    }
+}
+foreach ($methodName in @('GetSystemDirectoryW', 'GetWindowsDirectoryW')) {
+    $nativeMethod = $script:CozyNativeDirectoryApi.GetMethod($methodName)
+    $import = $nativeMethod.GetCustomAttributes([Runtime.InteropServices.DllImportAttribute], $false)[0]
+    Assert-Equal "$methodName preserves its Win32 error" $true $import.SetLastError
+}
+Assert-Equal 'owner helper reads only preserved native errors' $true ($ownerHelper.Groups['Body'].Value -match '\[Runtime\.InteropServices\.Marshal\]::GetLastWin32Error\(\)')
+Assert-Equal 'owner helper does not select taskkill through inherited environment' $false ($ownerHelper.Groups['Body'].Value -match '\$env:(?:PATH|PSHOME|SystemRoot|WINDIR|COMSPEC|TEMP|TMP)')
+Assert-Equal 'owner helper resolves the system directory through kernel32 KnownDLL' $true ($ownerHelper.Groups['Body'].Value -match 'GetSystemDirectoryW' -and $ownerHelper.Groups['Body'].Value -match 'kernel32\.dll')
+Assert-Equal 'owner helper invokes an absolute resolved taskkill executable' $true ($ownerHelper.Groups['Body'].Value -match '(?m)^\s*& \$taskkillExecutable /PID')
+
 $launcherProcess = New-TestProcess 100 0 $launcher ('"{0}" dashboard --host 127.0.0.1 --port 9119 --no-open' -f $launcher)
 Assert-Owner 'native launcher' 'Owned' $launcherProcess @{ 100 = $launcherProcess }
 

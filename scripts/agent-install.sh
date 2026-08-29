@@ -661,6 +661,75 @@ $ErrorActionPreference = "Stop"
 # ElevatedChild marks the terminal scoped-UAC invocation. This ownership helper
 # never launches another process or requests elevation itself.
 # COZYGATEWAY_DASHBOARD_OWNER_BEGIN
+function Initialize-CozyNativeDirectoryApi {
+  if ($null -ne $script:CozyNativeDirectoryApi) { return }
+  $assemblyName = [Reflection.AssemblyName]::new("CozyGateway.NativeDirectory." + [guid]::NewGuid().ToString("N"))
+  $assemblyBuilder = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+  $moduleBuilder = $assemblyBuilder.DefineDynamicModule("NativeDirectory")
+  $typeBuilder = $moduleBuilder.DefineType("CozyGatewayNativeDirectory", [Reflection.TypeAttributes] "Public, Sealed, Abstract")
+  $dllImportConstructor = [Runtime.InteropServices.DllImportAttribute].GetConstructor([Type[]] @([string]))
+  $dllImportFields = [Reflection.FieldInfo[]] @(
+    [Runtime.InteropServices.DllImportAttribute].GetField("EntryPoint"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CharSet"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CallingConvention"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("SetLastError"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("PreserveSig")
+  )
+  foreach ($definition in @(
+    @{ Name = "GetSystemDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) },
+    @{ Name = "GetWindowsDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) }
+  )) {
+    $method = $typeBuilder.DefineMethod(
+      [string]$definition.Name, [Reflection.MethodAttributes] "Public, Static, PinvokeImpl",
+      [Type]$definition.ReturnType, [Type[]]$definition.Parameters
+    )
+    $dllImportValues = [object[]] @(
+      [string]$definition.Name,
+      [Runtime.InteropServices.CharSet]::Unicode,
+      [Runtime.InteropServices.CallingConvention]::Winapi,
+      $true,
+      $true
+    )
+    $dllImport = [Reflection.Emit.CustomAttributeBuilder]::new(
+      $dllImportConstructor, [object[]] @("kernel32.dll"), $dllImportFields, $dllImportValues
+    )
+    $method.SetCustomAttribute($dllImport)
+  }
+  $script:CozyNativeDirectoryApi = $typeBuilder.CreateType()
+}
+function Get-CozyNativeDirectory {
+  param([ValidateSet("System", "Windows")][string]$Kind)
+  Initialize-CozyNativeDirectoryApi
+  $methodName = if ($Kind -eq "System") { "GetSystemDirectoryW" } else { "GetWindowsDirectoryW" }
+  $method = $script:CozyNativeDirectoryApi.GetMethod($methodName)
+  $capacity = 260
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    $buffer = [Text.StringBuilder]::new($capacity)
+    $arguments = [object[]] @($buffer, [uint32]$capacity)
+    $length = [uint32]$method.Invoke($null, $arguments)
+    if ($length -eq 0) {
+      $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      throw "$methodName failed with Win32 error $errorCode"
+    }
+    if ($length -lt [uint32]$capacity) {
+      $value = $buffer.ToString()
+      if ($value.Length -ne [int]$length -or -not [IO.Path]::IsPathRooted($value) -or -not [IO.Directory]::Exists($value)) {
+        throw "$methodName returned an invalid directory"
+      }
+      return [IO.Path]::GetFullPath($value)
+    }
+    if ($length -gt 32768) { throw "$methodName returned an invalid buffer length" }
+    $capacity = [int]$length
+  }
+  throw "$methodName did not fit within the validated buffer limit"
+}
+function Resolve-CozySystemExecutable {
+  param([string]$Name)
+  if ([string]::IsNullOrWhiteSpace($Name) -or [IO.Path]::GetFileName($Name) -cne $Name) { throw "invalid system executable name" }
+  $path = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-CozyNativeDirectory "System"), $Name))
+  if (-not [IO.File]::Exists($path)) { throw "trusted system executable is unavailable: $Name" }
+  return $path
+}
 function Test-CozyDashboardOwner {
   param(
     $Process,
@@ -781,9 +850,10 @@ $listenerResolver = {
     Select-Object -First 1
 }
 $processResolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
+$taskkillExecutable = Resolve-CozySystemExecutable "taskkill.exe"
 $treeKiller = {
   param([int]$processId)
-  & ([IO.Path]::Combine($env:SystemRoot, "System32", "taskkill.exe")) /PID ([string]$processId) /T /F | Out-Null
+  & $taskkillExecutable /PID ([string]$processId) /T /F | Out-Null
   return $LASTEXITCODE
 }
 $sleeper = { param([int]$milliseconds) Start-Sleep -Milliseconds $milliseconds }
@@ -803,6 +873,69 @@ param(
   [Parameter(Mandatory = $true, Position = 4)][string]$OwnerHelper
 )
 $ErrorActionPreference = "Stop"
+function Initialize-CozyNativeDirectoryApi {
+  if ($null -ne $script:CozyNativeDirectoryApi) { return }
+  $assemblyName = [Reflection.AssemblyName]::new("CozyGateway.NativeDirectory." + [guid]::NewGuid().ToString("N"))
+  $assemblyBuilder = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+  $moduleBuilder = $assemblyBuilder.DefineDynamicModule("NativeDirectory")
+  $typeBuilder = $moduleBuilder.DefineType("CozyGatewayNativeDirectory", [Reflection.TypeAttributes] "Public, Sealed, Abstract")
+  $dllImportConstructor = [Runtime.InteropServices.DllImportAttribute].GetConstructor([Type[]] @([string]))
+  $dllImportFields = [Reflection.FieldInfo[]] @(
+    [Runtime.InteropServices.DllImportAttribute].GetField("EntryPoint"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CharSet"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CallingConvention"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("SetLastError"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("PreserveSig")
+  )
+  foreach ($definition in @(
+    @{ Name = "GetSystemDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) },
+    @{ Name = "GetWindowsDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) },
+    @{ Name = "SetEnvironmentVariableW"; ReturnType = [bool]; Parameters = [Type[]] @([string], [string]) }
+  )) {
+    $method = $typeBuilder.DefineMethod(
+      [string]$definition.Name, [Reflection.MethodAttributes] "Public, Static, PinvokeImpl",
+      [Type]$definition.ReturnType, [Type[]]$definition.Parameters
+    )
+    $dllImportValues = [object[]] @(
+      [string]$definition.Name,
+      [Runtime.InteropServices.CharSet]::Unicode,
+      [Runtime.InteropServices.CallingConvention]::Winapi,
+      $true,
+      $true
+    )
+    $dllImport = [Reflection.Emit.CustomAttributeBuilder]::new(
+      $dllImportConstructor, [object[]] @("kernel32.dll"), $dllImportFields, $dllImportValues
+    )
+    $method.SetCustomAttribute($dllImport)
+  }
+  $script:CozyNativeDirectoryApi = $typeBuilder.CreateType()
+}
+function Get-CozyNativeDirectory {
+  param([ValidateSet("System", "Windows")][string]$Kind)
+  Initialize-CozyNativeDirectoryApi
+  $methodName = if ($Kind -eq "System") { "GetSystemDirectoryW" } else { "GetWindowsDirectoryW" }
+  $method = $script:CozyNativeDirectoryApi.GetMethod($methodName)
+  $capacity = 260
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    $buffer = [Text.StringBuilder]::new($capacity)
+    $arguments = [object[]] @($buffer, [uint32]$capacity)
+    $length = [uint32]$method.Invoke($null, $arguments)
+    if ($length -eq 0) {
+      $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      throw "$methodName failed with Win32 error $errorCode"
+    }
+    if ($length -lt [uint32]$capacity) {
+      $value = $buffer.ToString()
+      if ($value.Length -ne [int]$length -or -not [IO.Path]::IsPathRooted($value) -or -not [IO.Directory]::Exists($value)) {
+        throw "$methodName returned an invalid directory"
+      }
+      return [IO.Path]::GetFullPath($value)
+    }
+    if ($length -gt 32768) { throw "$methodName returned an invalid buffer length" }
+    $capacity = [int]$length
+  }
+  throw "$methodName did not fit within the validated buffer limit"
+}
 function ConvertTo-CozyNativeArgument {
   param([string]$Value)
   if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
@@ -810,26 +943,36 @@ function ConvertTo-CozyNativeArgument {
   $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
   return '"' + $escaped + '"'
 }
-function Clear-CozyProcessEnvironment {
-  foreach ($name in @([Environment]::GetEnvironmentVariables("Process").Keys)) {
-    if (-not $setEnvironmentVariable.Invoke($null, @([string]$name, $null))) {
-      throw "could not remove a Process-scope environment entry"
-    }
+function Set-CozyProcessEnvironmentVariable {
+  param([string]$Name, $Value)
+  Initialize-CozyNativeDirectoryApi
+  $method = $script:CozyNativeDirectoryApi.GetMethod("SetEnvironmentVariableW")
+  if (-not [bool]$method.Invoke($null, [object[]] @($Name, $Value))) {
+    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    throw "SetEnvironmentVariableW failed with Win32 error $errorCode"
   }
 }
-$powerShellExecutable = [IO.Path]::GetFullPath([IO.Path]::Combine($PSHOME, "powershell.exe"))
-$setEnvironmentVariable = [Environment].Assembly.GetType("Microsoft.Win32.Win32Native").GetMethod(
-  "SetEnvironmentVariable",
-  [Reflection.BindingFlags] "Static,NonPublic"
-)
-if ($null -eq $setEnvironmentVariable) { exit 46 }
+function Clear-CozyProcessEnvironment {
+  foreach ($name in @([Environment]::GetEnvironmentVariables("Process").Keys)) {
+    Set-CozyProcessEnvironmentVariable ([string]$name) $null
+  }
+}
+try {
+  $trustedSystemDirectory = Get-CozyNativeDirectory "System"
+  $trustedWindowsDirectory = Get-CozyNativeDirectory "Windows"
+  $powerShellExecutable = [IO.Path]::GetFullPath([IO.Path]::Combine($trustedSystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"))
+  if (-not [IO.File]::Exists($powerShellExecutable)) { throw "trusted Windows PowerShell is unavailable" }
+} catch {
+  exit 46
+}
 $originalEnvironment = @{}
 foreach ($entry in [Environment]::GetEnvironmentVariables("Process").GetEnumerator()) {
   $originalEnvironment[[string]$entry.Key] = [string]$entry.Value
 }
-$launchEnvironment = @{}
-foreach ($name in @("SystemRoot", "WINDIR", "COMSPEC", "TEMP", "TMP")) {
-  if ($originalEnvironment.ContainsKey($name)) { $launchEnvironment[$name] = $originalEnvironment[$name] }
+$startProcessCommand = Get-Command Start-Process -ErrorAction Stop
+$launchEnvironment = @{
+  "SystemRoot" = $trustedWindowsDirectory
+  "WINDIR" = $trustedWindowsDirectory
 }
 $childArguments = @(
   "-NoProfile",
@@ -847,20 +990,16 @@ $childArguments = @(
 try {
   Clear-CozyProcessEnvironment
   foreach ($name in $launchEnvironment.Keys) {
-    if (-not $setEnvironmentVariable.Invoke($null, @([string]$name, [string]$launchEnvironment[$name]))) {
-      throw "could not prepare the sanitized Process environment"
-    }
+    Set-CozyProcessEnvironmentVariable ([string]$name) ([string]$launchEnvironment[$name])
   }
-  $child = Start-Process $powerShellExecutable -Verb RunAs -Wait -PassThru -ArgumentList $childArguments
+  $child = & $startProcessCommand $powerShellExecutable -WorkingDirectory $trustedSystemDirectory -Verb RunAs -Wait -PassThru -ArgumentList $childArguments
   exit ([int]$child.ExitCode)
 } catch {
   exit 46
 } finally {
   Clear-CozyProcessEnvironment
   foreach ($name in $originalEnvironment.Keys) {
-    if (-not $setEnvironmentVariable.Invoke($null, @([string]$name, [string]$originalEnvironment[$name]))) {
-      throw "could not restore the original Process environment"
-    }
+    Set-CozyProcessEnvironmentVariable ([string]$name) ([string]$originalEnvironment[$name])
   }
 }
 POWERSHELL_ELEVATION
