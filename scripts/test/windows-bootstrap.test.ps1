@@ -10,6 +10,30 @@ function Write-Utf8NoBom {
     [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Add-BroadInheritedReadAcl {
+    param([string] $Path)
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    $users = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+        $users,
+        [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl = Get-Acl -LiteralPath $Path
+    [void]$acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Assert-NoBroadReadAcl {
+    param([string] $Path)
+    $users = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+    Assert-True (-not ($rules | Where-Object { $_.IdentityReference -eq $users -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow })) "$Path must not grant the built-in Users group access"
+}
+
 function New-ReleaseFixtures {
     param([string] $Directory)
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null
@@ -59,7 +83,7 @@ exit /b 0
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -123,9 +147,30 @@ try {
     Assert-True ($result.Output -match 'already configured') 'configured Hermes should report that model selection was skipped'
     Assert-True (($events -join "`n") -match '--service-platform Windows') 'handoff must select the Windows service platform'
     Assert-True (($events -join "`n") -match 'Cozy Gateway') 'paths containing spaces must survive the handoff'
+    Assert-True (($events -join "`n") -match [regex]::Escape("bash-hermes:$(Join-Path $fakeBin 'hermes.cmd')")) 'handoff must expose the resolved Hermes executable to the shared installer'
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
     Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
     Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'
+
+    $broadParent = Join-Path $temp 'broad acl parent'
+    $protectedHome = Join-Path $broadParent 'Protected Cozy Gateway'
+    $protectedSecret = Join-Path $protectedHome 'local\dashboard.env'
+    $protectedPathLog = Join-Path $temp 'protected-user-path.txt'
+    Add-BroadInheritedReadAcl $broadParent
+    $protected = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = $protectedHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_SECRET_PATH' = $protectedSecret
+        'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $protectedPathLog
+    }
+    Assert-True ($protected.ExitCode -eq 0) "protected bootstrap failed: $($protected.Output)"
+    Assert-True ((Get-Acl -LiteralPath $protectedHome).AreAccessRulesProtected) 'managed install root must disable inherited access rules before the Bash handoff'
+    Assert-NoBroadReadAcl $protectedHome
+    Assert-NoBroadReadAcl $protectedSecret
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
@@ -199,6 +244,7 @@ Copy-Item -LiteralPath '$preparedHermes' -Destination '$missingHermes' -Force
     }
     Assert-True ($missing.ExitCode -eq 0) "missing-Hermes bootstrap failed: $($missing.Output)"
     Assert-True ($missing.Output -match 'Hermes Agent is not installed') 'missing Hermes must invoke the official installer path'
+    Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match [regex]::Escape("bash-hermes:$missingHermes")) 'fresh-install handoff must expose Hermes when it exists only under LOCALAPPDATA'
 
     Remove-Item -LiteralPath $eventLog -Force
     $incomplete = Invoke-Bootstrap $installer @{

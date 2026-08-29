@@ -482,9 +482,6 @@ NODE
 }
 prepare_dashboard_credential() {
   DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
-  # v0.3.7 called the same installer-owned random value a password. Reuse it on upgrade so a
-  # running Dashboard and CozyGateway can switch auth modes without needless credential churn.
-  [ -n "$DASHBOARD_SESSION_TOKEN" ] || DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_PASSWORD)"
   safe_secret "$DASHBOARD_SESSION_TOKEN" || DASHBOARD_SESSION_TOKEN="$(new_token)"
   [ "$DRY_RUN" = 1 ] && { say "DRY   reuse or mint local Hermes Dashboard credential in $DASHBOARD_ENV (value redacted)"; return; }
   umask 077
@@ -681,13 +678,17 @@ const health = await fetch('http://127.0.0.1:' + dashboardPort + '/api/health', 
   .then((response) => response.status === 200 || response.status === 401)
   .catch(() => false);
 if (!health) spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'], { detached: true, stdio: 'ignore', env: dashboardEnv }).unref();
-if (health) {
-  const probe = await fetch('http://127.0.0.1:' + dashboardPort + '/api/config', {
+let probe;
+for (let attempt = 0; attempt < 30; attempt += 1) {
+  probe = await fetch('http://127.0.0.1:' + dashboardPort + '/api/config', {
     headers: { 'x-hermes-session-token': dashboard.DASHBOARD_SESSION_TOKEN },
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(2000),
   }).catch(() => undefined);
-  if (probe?.status !== 200) throw new Error('Hermes Dashboard rejected the configured local session token');
+  if (probe?.status === 200) break;
+  if (probe?.status === 401 || probe?.status === 403) throw new Error('Hermes Dashboard rejected the configured local session token');
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 }
+if (probe?.status !== 200) throw new Error('Hermes Dashboard did not become ready for authenticated local access');
 let child;
 let restarting = false;
 let shuttingDown = false;

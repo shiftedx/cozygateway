@@ -179,12 +179,41 @@ function Resolve-GitBash {
 }
 
 function Invoke-CozyGatewayInstaller {
-    param([string] $BashPath, [string] $InstallerPath, [string[]] $ForwardedArguments)
+    param([string] $BashPath, [string] $InstallerPath, [string] $HermesPath, [string[]] $ForwardedArguments)
     $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome, '--bundle', $script:BundlePath, '--plugin-archive', $script:PluginPath)
     if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') { $arguments += '--dry-run' }
     if ($ForwardedArguments) { $arguments += $ForwardedArguments }
-    & $BashPath @arguments
-    if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
+    $previousHermes = [Environment]::GetEnvironmentVariable('COZYGATEWAY_HERMES_BIN', 'Process')
+    try {
+        $env:COZYGATEWAY_HERMES_BIN = $HermesPath
+        & $BashPath @arguments
+        if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
+    } finally {
+        [Environment]::SetEnvironmentVariable('COZYGATEWAY_HERMES_BIN', $previousHermes, 'Process')
+    }
+}
+
+function Protect-CozyGatewayHome {
+    param([string] $Path)
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $system = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $administrators = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($currentUser)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($identity in @($currentUser, $system, $administrators)) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            $identity,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
 function Set-CozyGatewayCommandPath {
@@ -255,11 +284,12 @@ if ([string]::IsNullOrWhiteSpace($base)) {
     $base = "https://github.com/$repo/releases/download/$tag"
 }
 
+Protect-CozyGatewayHome $script:InstallHome
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
 $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
 Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
 Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
 Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
-Invoke-CozyGatewayInstaller $bash $installerPath $InstallerArguments
+Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
 if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }

@@ -420,6 +420,10 @@ if (!/^[A-Za-z0-9_-]{32,128}$/.test(dashboard.DASHBOARD_SESSION_TOKEN) ||
     dashboard.DASHBOARD_USERNAME !== undefined || dashboard.DASHBOARD_PASSWORD !== undefined ||
     gateway.COZYGATEWAY_HERMES_PASSWORD !== undefined) process.exit(1);
 NODE
+if grep -Fq 'DASHBOARD_PASSWORD' "$repo_root/scripts/agent-install.sh"; then
+  echo 'fresh-install credential setup must not retain the v0.3.7 password migration path' >&2
+  exit 1
+fi
 ! grep -q '^default:basic$' "$tmp/commands"
 grep -q '^default:gateway:install$' "$tmp/commands"
 grep -q '^ops:gateway:start$' "$tmp/commands"
@@ -464,7 +468,8 @@ fi
 # a second child that reads the new listener port.
 sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' > "$tmp/supervisor.cjs"
 cat > "$tmp/reload-gateway.mjs" <<'RELOAD_GATEWAY'
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+if (!existsSync(process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER)) process.exit(2);
 const configAt = process.argv.indexOf('--config');
 const config = JSON.parse(readFileSync(process.argv[configAt + 1], 'utf8'));
 appendFileSync(process.env.COZYGATEWAY_TEST_RELOAD_LOG, `${process.pid}:${config.port}\n`);
@@ -472,17 +477,28 @@ process.on('SIGTERM', () => process.exit(0));
 setTimeout(() => process.exit(0), 5000);
 RELOAD_GATEWAY
 cat > "$tmp/mock-dashboard.mjs" <<'MOCK_DASHBOARD'
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { parseEnv } from 'node:util';
+const expectedToken = parseEnv(readFileSync(process.argv[2], 'utf8')).DASHBOARD_SESSION_TOKEN;
+let readyAt;
 const server = createServer((request, response) => {
-  const authenticated = request.url === '/api/config' && request.headers['x-hermes-session-token'];
+  if (request.url === '/api/health' && readyAt === undefined) readyAt = Date.now() + 750;
+  if (readyAt === undefined || Date.now() < readyAt) {
+    response.writeHead(503, { 'content-type': 'application/json' });
+    response.end('{"detail":"starting"}\n');
+    return;
+  }
+  const authenticated = request.url === '/api/config' && request.headers['x-hermes-session-token'] === expectedToken;
+  if (authenticated) writeFileSync(process.argv[4], `${expectedToken}\n`);
   response.writeHead(authenticated ? 200 : 401, { 'content-type': 'application/json' });
   response.end(authenticated ? '{}\n' : '{"detail":"unauthorized"}\n');
 });
-server.listen(0, '127.0.0.1', () => writeFileSync(process.argv[2], String(server.address().port)));
+server.listen(0, '127.0.0.1', () => writeFileSync(process.argv[3], String(server.address().port)));
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 MOCK_DASHBOARD
-"$real_node" "$tmp/mock-dashboard.mjs" "$tmp/mock-dashboard.port" >"$tmp/mock-dashboard.log" 2>&1 &
+dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
+"$real_node" "$tmp/mock-dashboard.mjs" "$tmp/gateway-live/local/dashboard.env" "$tmp/mock-dashboard.port" "$dashboard_auth_marker" >"$tmp/mock-dashboard.log" 2>&1 &
 mock_dashboard_pid=$!
 for _ in $(seq 1 50); do [ -s "$tmp/mock-dashboard.port" ] && break; sleep 0.1; done
 test -s "$tmp/mock-dashboard.port"
@@ -491,7 +507,7 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) reload_log="$(cygpath -w "$tmp/reload.log")"; spawnable_hermes="$(command -v cmd.exe)" ;;
   *) reload_log="$tmp/reload.log"; spawnable_hermes="$(command -v true)" ;;
 esac
-COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" "$real_node" "$tmp/supervisor.cjs" \
+COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker" "$real_node" "$tmp/supervisor.cjs" \
   "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
   "$spawnable_hermes" "$mock_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
   >"$tmp/supervisor.log" 2>&1 &
@@ -519,6 +535,12 @@ kill "$mock_dashboard_pid" 2>/dev/null || true
 wait "$mock_dashboard_pid" 2>/dev/null || true
 mock_dashboard_pid=
 test "$(wc -l < "$tmp/reload.log")" -ge 2
+"$real_node" - "$tmp/gateway-live/local/dashboard.env" "$dashboard_auth_marker" <<'NODE'
+const { readFileSync } = require('node:fs');
+const { parseEnv } = require('node:util');
+const expected = parseEnv(readFileSync(process.argv[2], 'utf8')).DASHBOARD_SESSION_TOKEN;
+if (readFileSync(process.argv[3], 'utf8').trim() !== expected) process.exit(1);
+NODE
 sed -n '1p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8787$'
 sed -n '2p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8998$'
 test "$(cut -d: -f1 "$tmp/reload.log" | sed -n '1p')" != "$(cut -d: -f1 "$tmp/reload.log" | sed -n '2p')"
