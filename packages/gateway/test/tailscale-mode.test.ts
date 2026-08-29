@@ -22,6 +22,7 @@ const fixture = (name: string) => readFileSync(
   "utf8",
 );
 const executable = "C:\\Program Files\\Tailscale\\tailscale.exe";
+const ownedServeEtag = "e".repeat(64);
 const tempDirectories: string[] = [];
 
 afterEach(() => {
@@ -119,6 +120,7 @@ function happyDependencies(options: {
   };
   const removeExactTlsTerminatedMapping = vi.fn<TailscaleServeConfigClient["removeExactTlsTerminatedMapping"]>(async (input) => {
       calls.push("localapi remove exact mapping");
+      if (input.ownedEtag !== ownedServeEtag) return "concurrent" as const;
       const config = JSON.parse(serveState) as { TCP?: Record<string, unknown> };
       const handler = config.TCP?.["443"] as { TCPForward?: unknown; TerminateTLS?: unknown } | undefined;
       if (handler === undefined) return "absent" as const;
@@ -128,11 +130,13 @@ function happyDependencies(options: {
       serveState = JSON.stringify(config);
       return "removed" as const;
     });
-  const createExactTlsTerminatedMapping = vi.fn<TailscaleServeConfigClient["createExactTlsTerminatedMapping"]>(async (input) => {
-    calls.push("localapi create exact mapping");
+  const createExactTlsTerminatedMapping = vi.fn<TailscaleServeConfigClient["createExactTlsTerminatedMapping"]>(async (input, journalExpectedEtag) => {
+    calls.push("localapi inspect exact mapping");
     const config = JSON.parse(serveState) as { TCP?: Record<string, unknown> };
     config.TCP ??= {};
     if (config.TCP["443"] !== undefined) return "conflict";
+    await journalExpectedEtag(ownedServeEtag);
+    calls.push("localapi create exact mapping");
     config.TCP["443"] = { TCPForward: input.target, TerminateTLS: input.dnsName };
     serveState = JSON.stringify(config);
     return "created";
@@ -236,8 +240,9 @@ describe("TailscaleModeAdapter", () => {
     await expect(adapter.prepare()).resolves.toMatchObject({ ready: true, createdByWizard: true });
     expect(dependencies.calls).toContain("localapi create exact mapping");
     expect(dependencies.ownership.write).toHaveBeenCalledWith(expect.objectContaining({
-      schemaVersion: 2,
+      schemaVersion: 3,
       phase: "preferences",
+      serveConfigEtag: null,
       ownershipSubtype: "wizard-created",
       dnsName: "cozy.fixture-tailnet.ts.net",
       target: "127.0.0.1:18787",
@@ -245,7 +250,7 @@ describe("TailscaleModeAdapter", () => {
     }), undefined);
   });
 
-  it("retains provisional ownership and reports mapping when LocalAPI creation loses the ETag race", async () => {
+  it("never rolls back an identical mapping created by a concurrent actor after HTTP 412", async () => {
     const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
     let stored: TailscaleMappingOwnership | undefined;
     dependencies.ownership.read.mockImplementation(async () => stored);
@@ -255,7 +260,12 @@ describe("TailscaleModeAdapter", () => {
       stored = replacement;
       return true;
     });
-    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockResolvedValue("concurrent");
+    dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
+    const originalCreate = dependencies.serveConfigClient.createExactTlsTerminatedMapping.getMockImplementation()!;
+    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockImplementation(async (...args) => {
+      await originalCreate(...args);
+      return "concurrent";
+    });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
       io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
@@ -263,7 +273,8 @@ describe("TailscaleModeAdapter", () => {
     });
 
     await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping" });
-    expect(stored).toMatchObject({ phase: "provisional", ownershipSubtype: "wizard-created" });
+    expect(stored).toBeUndefined();
+    expect(dependencies.calls).not.toContain("localapi remove exact mapping");
     expect(dependencies.calls.some((call) => call.startsWith("serve --bg "))).toBe(false);
   });
 
@@ -592,8 +603,9 @@ describe("TailscaleModeAdapter", () => {
       magicDnsSuffix: "fixture-tailnet.ts.net",
     })).digest("hex");
     const owned: TailscaleMappingOwnership = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       phase: "preferences",
+      serveConfigEtag: null,
       ownershipSubtype: "wizard-created",
       mappingFingerprint: "a".repeat(64),
       mappingStateFingerprint: "b".repeat(64),
@@ -745,7 +757,11 @@ describe("TailscaleModeAdapter", () => {
         boundary,
         removals: dependencies.calls.filter((call) => call === "localapi remove exact mapping").length,
         ownershipRemovals: dependencies.ownership.remove.mock.calls.length,
-      }).toEqual({ boundary, removals: boundary === "ownership_write" ? 0 : 1, ownershipRemovals: 1 });
+      }).toEqual({
+        boundary,
+        removals: boundary === "ownership_write" || boundary === "mapping_create" ? 0 : 1,
+        ownershipRemovals: boundary === "mapping_create" ? 0 : 1,
+      });
     }
   });
 
@@ -787,7 +803,7 @@ describe("TailscaleModeAdapter", () => {
     expect(concurrent.calls).not.toContain("localapi remove exact mapping");
   });
 
-  it("reconciles a timed-out create that applied and records exact ownership", async () => {
+  it("leaves a safe durable orphan when creation outcome is uncertain", async () => {
     const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
     const originalCreate = dependencies.serveConfigClient.createExactTlsTerminatedMapping.getMockImplementation()!;
     dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockImplementation(async (...args) => {
@@ -799,8 +815,9 @@ describe("TailscaleModeAdapter", () => {
       io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
-    await expect(adapter.prepare()).resolves.toMatchObject({ createdByWizard: true });
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping_mutation_failed" });
     expect(dependencies.ownership.write).toHaveBeenCalledTimes(1);
+    expect(dependencies.calls).not.toContain("localapi remove exact mapping");
   });
 
   it("durably records provisional creation before Serve mutation and promotes only after proof", async () => {
@@ -808,9 +825,13 @@ describe("TailscaleModeAdapter", () => {
     const sequence: string[] = [];
     let stored: TailscaleMappingOwnership | undefined;
     const originalCreate = dependencies.serveConfigClient.createExactTlsTerminatedMapping.getMockImplementation()!;
-    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockImplementation(async (...args) => {
+    dependencies.serveConfigClient.createExactTlsTerminatedMapping.mockImplementation(async (input, journal, signal) => {
+      const result = await originalCreate(input, async (etag) => {
+        await journal(etag);
+        sequence.push("serve:journaled");
+      }, signal);
       sequence.push("serve:create");
-      return originalCreate(...args);
+      return result;
     });
     dependencies.ownership.write.mockImplementation(async (value) => {
       sequence.push(`ownership:${value.phase}`);
@@ -830,12 +851,14 @@ describe("TailscaleModeAdapter", () => {
 
     await expect(adapter.prepare()).resolves.toMatchObject({ createdByWizard: true });
     expect(sequence).toEqual([
-      "ownership:preferences", "ownership:provisional", "serve:create", "ownership:active",
+      "ownership:preferences", "ownership:provisional", "serve:journaled", "serve:create", "ownership:active",
     ]);
-    expect(stored).toMatchObject({ phase: "active", ownershipSubtype: "wizard-created" });
+    expect(stored).toMatchObject({
+      phase: "active", ownershipSubtype: "wizard-created", serveConfigEtag: ownedServeEtag,
+    });
   });
 
-  it("reconciles an exact live mapping from durable provisional ownership after process loss", async () => {
+  it("fails closed on exact live state from crash-uncertain provisional ownership", async () => {
     const source = happyDependencies({ serve: fixture("serve-empty.json") });
     await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: source.runner, helper: source.helper,
@@ -853,18 +876,17 @@ describe("TailscaleModeAdapter", () => {
       stored = replacement;
       return true;
     });
-    const endpoint = await new TailscaleModeAdapter({
+    await expect(new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: resumed.runner, helper: resumed.helper,
       io: resumed.io, probes: resumed.probes, ownership: resumed.ownership, serveConfigClient: resumed.serveConfigClient,
-    }).prepare();
+    }).prepare()).rejects.toMatchObject({ reason: "ownership" });
 
-    expect(endpoint.createdByWizard).toBe(true);
-    expect(stored).toMatchObject({ phase: "active" });
+    expect(stored).toMatchObject({ phase: "provisional", serveConfigEtag: ownedServeEtag });
     expect(resumed.calls.some((call) => call.startsWith("serve --bg "))).toBe(false);
     expect(resumed.calls).not.toContain("localapi remove exact mapping");
   });
 
-  it("conditionally removes exact provisional Serve state during crash or uninstall recovery", async () => {
+  it("never removes crash-uncertain provisional Serve state during recovery", async () => {
     const source = happyDependencies({ serve: fixture("serve-empty.json") });
     await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: source.runner, helper: source.helper,
@@ -881,24 +903,13 @@ describe("TailscaleModeAdapter", () => {
       stored = undefined;
       return true;
     });
-    await new TailscaleModeAdapter({
+    await expect(new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: recovered.runner, helper: recovered.helper,
       io: recovered.io, probes: recovered.probes, ownership: recovered.ownership, serveConfigClient: recovered.serveConfigClient,
-    }).reconcileOwned();
+    }).reconcileOwned()).rejects.toMatchObject({ reason: "ownership" });
 
-    expect(recovered.calls.filter((call) => call === "localapi remove exact mapping")).toHaveLength(1);
-    expect(stored).toBeUndefined();
-
-    const concurrent = happyDependencies({ serve: fixture("serve-conflicting-tcp.json") });
-    let concurrentStored: TailscaleMappingOwnership | undefined = provisional;
-    concurrent.ownership.read.mockImplementation(async () => concurrentStored);
-    concurrent.ownership.remove.mockImplementation(async () => { concurrentStored = undefined; return true; });
-    await new TailscaleModeAdapter({
-      gatewayPort: 18_787, cliRunner: concurrent.runner, helper: concurrent.helper,
-      io: concurrent.io, probes: concurrent.probes, ownership: concurrent.ownership, serveConfigClient: concurrent.serveConfigClient,
-    }).reconcileOwned();
-    expect(concurrent.calls).not.toContain("localapi remove exact mapping");
-    expect(concurrentStored).toBeUndefined();
+    expect(recovered.calls).not.toContain("localapi remove exact mapping");
+    expect(stored).toEqual(provisional);
   });
 
   it("CAS-adds newly changed preferences to active ownership for later conditional rollback", async () => {
@@ -1103,7 +1114,7 @@ describe("TailscaleModeAdapter", () => {
     expect(dependencies.calls).not.toContain("serve --tls-terminated-tcp=443 off");
   });
 
-  it("throws typed mapping failure immediately when prepare rollback cannot remove exact Serve state", async () => {
+  it("retains a safe orphan after a simulated post-create process loss", async () => {
     const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
     let stored: TailscaleMappingOwnership | undefined;
     dependencies.ownership.read.mockImplementation(async () => stored);
@@ -1122,8 +1133,9 @@ describe("TailscaleModeAdapter", () => {
       },
     });
 
-    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping" });
+    await expect(adapter.prepare()).rejects.toThrow("simulated post-create process loss");
     expect(stored).toMatchObject({ phase: "provisional", ownershipSubtype: "wizard-created" });
+    expect(dependencies.calls).not.toContain("localapi remove exact mapping");
   });
 
   it("maps helper failures to precise typed retryable pauses", async () => {
@@ -1218,8 +1230,9 @@ describe("TailscaleModeAdapter", () => {
     const storage = openStorage(join(directory, "gateway.sqlite"));
     const ownership = new SqliteTailscaleOwnershipStore(storage);
     const value = {
-      schemaVersion: 2 as const,
+      schemaVersion: 3 as const,
       phase: "provisional" as const,
+      serveConfigEtag: ownedServeEtag,
       ownershipSubtype: "wizard-created" as const,
       mappingFingerprint: "a".repeat(64),
       mappingStateFingerprint: "d".repeat(64),

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
 
 export const TAILSCALE_CLI_MAX_OBJECT_BYTES = 64 * 1024;
@@ -386,10 +387,11 @@ export type TailscaleServeConfigCreationResult = "created" | "concurrent" | "con
 export interface TailscaleServeConfigClient {
   createExactTlsTerminatedMapping(
     input: { dnsName: string; target: string },
+    journalExpectedEtag: (expectedPostEtag: string) => Promise<void>,
     signal?: AbortSignal,
   ): Promise<TailscaleServeConfigCreationResult>;
   removeExactTlsTerminatedMapping(
-    input: { dnsName: string; target: string },
+    input: { dnsName: string; target: string; ownedEtag: string },
     signal?: AbortSignal,
   ): Promise<TailscaleServeConfigMutationResult>;
 }
@@ -412,33 +414,174 @@ export class TailscaleLocalApiError extends Error {
 
 type LocalApiResponse = { statusCode: number; etag?: string; body: Buffer };
 
-function validateServeConfig(value: Record<string, unknown>): void {
-  const allowed = new Set(["TCP", "Web", "Services", "AllowFunnel", "Foreground"]);
-  if (Object.keys(value).some((key) => !allowed.has(key))) throw new TailscaleLocalApiError("invalid_response");
-  for (const name of allowed) {
-    const member = value[name];
-    if (member !== undefined && !record(member)) throw new TailscaleLocalApiError("invalid_response");
-  }
-  let nodes = 0;
-  const visit = (member: unknown, depth: number): void => {
-    if (++nodes > 2_048 || depth > 8) throw new TailscaleLocalApiError("invalid_response");
-    if (Array.isArray(member)) {
-      for (const item of member) visit(item, depth + 1);
-      return;
-    }
-    if (!record(member)) return;
-    for (const [key, item] of Object.entries(member)) {
-      if (key === "__proto__" || key === "prototype" || key === "constructor")
-        throw new TailscaleLocalApiError("invalid_response");
-      visit(item, depth + 1);
-    }
-  };
-  visit(value, 0);
+function invalidLocalApiResponse(): never {
+  throw new TailscaleLocalApiError("invalid_response");
 }
 
-function validateLocalApiMappingInput(input: { dnsName: string; target: string }): void {
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): void {
+  const names = new Set(allowed);
+  if (Object.keys(value).some((key) => !names.has(key)
+    || key === "__proto__" || key === "prototype" || key === "constructor")) invalidLocalApiResponse();
+}
+
+function goJsonString(value: string): string {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) invalidLocalApiResponse();
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) invalidLocalApiResponse();
+  }
+  const htmlUnsafe = new RegExp(`[<>&${String.fromCharCode(0x2028)}${String.fromCharCode(0x2029)}]`, "gu");
+  return JSON.stringify(value).replace(htmlUnsafe, (character) =>
+    `${String.fromCharCode(92)}u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+function sortedMapEntries(value: Record<string, unknown>): [string, unknown][] {
+  return Object.entries(value).sort(([left], [right]) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+}
+
+function encodeMap(value: Record<string, unknown>, encode: (item: unknown) => string): string {
+  return `{${sortedMapEntries(value).map(([key, item]) => `${goJsonString(key)}:${encode(item)}`).join(",")}}`;
+}
+
+function encodeTcpHandler(value: unknown): string {
+  if (value === null) return "null";
+  if (!record(value)) invalidLocalApiResponse();
+  exactKeys(value, ["HTTPS", "HTTP", "TCPForward", "TerminateTLS", "ProxyProtocol"]);
+  const fields: string[] = [];
+  for (const name of ["HTTPS", "HTTP"] as const) {
+    const member = value[name];
+    if (member !== undefined && typeof member !== "boolean") invalidLocalApiResponse();
+    if (member === true) fields.push(`${goJsonString(name)}:true`);
+  }
+  for (const name of ["TCPForward", "TerminateTLS"] as const) {
+    const member = value[name];
+    if (member !== undefined && typeof member !== "string") invalidLocalApiResponse();
+    if (typeof member === "string" && member !== "") fields.push(`${goJsonString(name)}:${goJsonString(member)}`);
+  }
+  const proxyProtocol = value.ProxyProtocol;
+  if (proxyProtocol !== undefined && (!Number.isSafeInteger(proxyProtocol) || (proxyProtocol as number) < 0))
+    invalidLocalApiResponse();
+  if (proxyProtocol !== undefined && proxyProtocol !== 0)
+    fields.push(`${goJsonString("ProxyProtocol")}:${String(proxyProtocol)}`);
+  return `{${fields.join(",")}}`;
+}
+
+function encodeHttpHandler(value: unknown): string {
+  if (value === null) return "null";
+  if (!record(value)) invalidLocalApiResponse();
+  exactKeys(value, ["Path", "Proxy", "Text", "AcceptAppCaps", "Redirect"]);
+  const fields: string[] = [];
+  for (const name of ["Path", "Proxy", "Text"] as const) {
+    const member = value[name];
+    if (member !== undefined && typeof member !== "string") invalidLocalApiResponse();
+    if (typeof member === "string" && member !== "") fields.push(`${goJsonString(name)}:${goJsonString(member)}`);
+  }
+  const capabilities = value.AcceptAppCaps;
+  if (capabilities !== undefined && (!Array.isArray(capabilities)
+    || !capabilities.every((item) => typeof item === "string"))) invalidLocalApiResponse();
+  if (Array.isArray(capabilities) && capabilities.length > 0)
+    fields.push(`${goJsonString("AcceptAppCaps")}:[${capabilities.map(goJsonString).join(",")}]`);
+  if (value.Redirect !== undefined && typeof value.Redirect !== "string") invalidLocalApiResponse();
+  if (typeof value.Redirect === "string" && value.Redirect !== "")
+    fields.push(`${goJsonString("Redirect")}:${goJsonString(value.Redirect)}`);
+  return `{${fields.join(",")}}`;
+}
+
+function encodeWebServer(value: unknown): string {
+  if (value === null) return "null";
+  if (!record(value)) invalidLocalApiResponse();
+  exactKeys(value, ["Handlers"]);
+  const handlers = value.Handlers;
+  if (handlers === undefined || handlers === null) return "{\"Handlers\":null}";
+  if (!record(handlers)) invalidLocalApiResponse();
+  return `{\"Handlers\":${encodeMap(handlers, encodeHttpHandler)}}`;
+}
+
+function encodeService(value: unknown): string {
+  if (value === null) return "null";
+  if (!record(value)) invalidLocalApiResponse();
+  exactKeys(value, ["TCP", "Web", "Tun"]);
+  const fields: string[] = [];
+  if (value.TCP !== undefined && !record(value.TCP)) invalidLocalApiResponse();
+  if (record(value.TCP) && Object.keys(value.TCP).length > 0)
+    fields.push(`${goJsonString("TCP")}:${encodeMap(value.TCP, encodeTcpHandler)}`);
+  if (value.Web !== undefined && !record(value.Web)) invalidLocalApiResponse();
+  if (record(value.Web) && Object.keys(value.Web).length > 0)
+    fields.push(`${goJsonString("Web")}:${encodeMap(value.Web, encodeWebServer)}`);
+  if (value.Tun !== undefined && typeof value.Tun !== "boolean") invalidLocalApiResponse();
+  if (value.Tun === true) fields.push(`${goJsonString("Tun")}:true`);
+  return `{${fields.join(",")}}`;
+}
+
+/** Mirrors encoding/json for the Tailscale v1.102.1 ServeConfig schema. The current GET must
+ * match this encoder before its predicted post-write ETag is trusted. */
+function encodeServeConfig(value: Record<string, unknown>, depth = 0): Buffer {
+  if (depth > 8) invalidLocalApiResponse();
+  exactKeys(value, ["TCP", "Web", "Services", "AllowFunnel", "Foreground"]);
+  const fields: string[] = [];
+  if (value.TCP !== undefined && !record(value.TCP)) invalidLocalApiResponse();
+  if (record(value.TCP) && Object.keys(value.TCP).length > 0)
+    fields.push(`${goJsonString("TCP")}:${encodeMap(value.TCP, encodeTcpHandler)}`);
+  if (value.Web !== undefined && !record(value.Web)) invalidLocalApiResponse();
+  if (record(value.Web) && Object.keys(value.Web).length > 0)
+    fields.push(`${goJsonString("Web")}:${encodeMap(value.Web, encodeWebServer)}`);
+  if (value.Services !== undefined && !record(value.Services)) invalidLocalApiResponse();
+  if (record(value.Services) && Object.keys(value.Services).length > 0)
+    fields.push(`${goJsonString("Services")}:${encodeMap(value.Services, encodeService)}`);
+  if (value.AllowFunnel !== undefined && !record(value.AllowFunnel)) invalidLocalApiResponse();
+  if (record(value.AllowFunnel) && Object.keys(value.AllowFunnel).length > 0) {
+    fields.push(`${goJsonString("AllowFunnel")}:${encodeMap(value.AllowFunnel, (item) => {
+      if (typeof item !== "boolean") invalidLocalApiResponse();
+      return String(item);
+    })}`);
+  }
+  if (value.Foreground !== undefined && !record(value.Foreground)) invalidLocalApiResponse();
+  if (record(value.Foreground) && Object.keys(value.Foreground).length > 0) {
+    fields.push(`${goJsonString("Foreground")}:${encodeMap(value.Foreground, (item) => {
+      if (item === null) return "null";
+      if (!record(item)) invalidLocalApiResponse();
+      return encodeServeConfig(item, depth + 1).toString("utf8");
+    })}`);
+  }
+  return Buffer.from(`{${fields.join(",")}}`, "utf8");
+}
+
+function serveConfigEtag(encoded: Uint8Array): string {
+  return createHash("sha256").update(encoded).digest("hex");
+}
+
+function validateSnapshot(config: Record<string, unknown>, body: Buffer, etag: string): void {
+  if (serveConfigEtag(body) !== etag.toLowerCase()
+    || serveConfigEtag(encodeServeConfig(config)) !== etag.toLowerCase()) invalidLocalApiResponse();
+}
+
+function hostPort443(key: string): boolean {
+  return /:443$/.test(key);
+}
+
+function serviceUsesPort443(value: unknown): boolean {
+  if (!record(value)) return false;
+  return (record(value.TCP) && value.TCP["443"] !== undefined)
+    || (record(value.Web) && Object.keys(value.Web).some(hostPort443));
+}
+
+function serveConfigUsesPort443(value: Record<string, unknown>): boolean {
+  if (record(value.TCP) && value.TCP["443"] !== undefined) return true;
+  if (record(value.Web) && Object.keys(value.Web).some(hostPort443)) return true;
+  if (record(value.AllowFunnel) && Object.keys(value.AllowFunnel).some(hostPort443)) return true;
+  if (record(value.Services) && Object.values(value.Services).some(serviceUsesPort443)) return true;
+  return record(value.Foreground) && Object.values(value.Foreground).some((item) =>
+    record(item) && serveConfigUsesPort443(item));
+}
+
+function validateLocalApiMappingInput(input: { dnsName: string; target: string; ownedEtag?: string }): void {
   const port = /^127\.0\.0\.1:(\d{1,5})$/.exec(input.target)?.[1];
   if (!dnsName(input.dnsName) || port === undefined || Number(port) < 1 || Number(port) > 65_535)
+    throw new TailscaleLocalApiError("invalid_response");
+  if (input.ownedEtag !== undefined && !/^[a-f0-9]{64}$/i.test(input.ownedEtag))
     throw new TailscaleLocalApiError("invalid_response");
 }
 
@@ -518,17 +661,18 @@ export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
   }
 
   async removeExactTlsTerminatedMapping(
-    input: { dnsName: string; target: string },
+    input: { dnsName: string; target: string; ownedEtag: string },
     signal?: AbortSignal,
   ): Promise<TailscaleServeConfigMutationResult> {
     validateLocalApiMappingInput(input);
     const snapshot = await this.#request("GET", undefined, undefined, signal);
     if (snapshot.statusCode !== 200 || snapshot.etag === undefined
       || !/^[a-f0-9]{64}$/i.test(snapshot.etag)) throw new TailscaleLocalApiError("invalid_response");
+    if (snapshot.etag.toLowerCase() !== input.ownedEtag.toLowerCase()) return "concurrent";
     let config: Record<string, unknown>;
     try { config = parseSingleObject(snapshot.body); }
     catch { throw new TailscaleLocalApiError("invalid_response"); }
-    validateServeConfig(config);
+    validateSnapshot(config, snapshot.body, snapshot.etag);
     const tcp = config.TCP as Record<string, unknown> | undefined;
     const handler = tcp?.["443"];
     if (handler === undefined) return "absent";
@@ -542,7 +686,7 @@ export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
     if (web?.[`${input.dnsName}:443`] !== undefined) return "conflict";
     const replacement = structuredClone(config);
     delete (replacement.TCP as Record<string, unknown>)["443"];
-    const encoded = Buffer.from(JSON.stringify(replacement), "utf8");
+    const encoded = encodeServeConfig(replacement);
     if (encoded.byteLength > TAILSCALE_CLI_MAX_TOTAL_BYTES)
       throw new TailscaleLocalApiError("invalid_response");
     const result = await this.#request("POST", encoded, snapshot.etag, signal);
@@ -553,6 +697,7 @@ export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
 
   async createExactTlsTerminatedMapping(
     input: { dnsName: string; target: string },
+    journalExpectedEtag: (expectedPostEtag: string) => Promise<void>,
     signal?: AbortSignal,
   ): Promise<TailscaleServeConfigCreationResult> {
     validateLocalApiMappingInput(input);
@@ -562,19 +707,15 @@ export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
     let config: Record<string, unknown>;
     try { config = parseSingleObject(snapshot.body); }
     catch { throw new TailscaleLocalApiError("invalid_response"); }
-    validateServeConfig(config);
-    const tcp = config.TCP as Record<string, unknown> | undefined;
-    if (tcp?.["443"] !== undefined) return "conflict";
-    const web = config.Web as Record<string, unknown> | undefined;
-    if (web?.[`${input.dnsName}:443`] !== undefined) return "conflict";
-    const allowFunnel = config.AllowFunnel as Record<string, unknown> | undefined;
-    if (allowFunnel?.[`${input.dnsName}:443`] === true) return "conflict";
+    validateSnapshot(config, snapshot.body, snapshot.etag);
+    if (serveConfigUsesPort443(config)) return "conflict";
     const replacement = structuredClone(config);
     const replacementTcp = (replacement.TCP ??= {}) as Record<string, unknown>;
     replacementTcp["443"] = { TCPForward: input.target, TerminateTLS: input.dnsName };
-    const encoded = Buffer.from(JSON.stringify(replacement), "utf8");
+    const encoded = encodeServeConfig(replacement);
     if (encoded.byteLength > TAILSCALE_CLI_MAX_TOTAL_BYTES)
       throw new TailscaleLocalApiError("invalid_response");
+    await journalExpectedEtag(serveConfigEtag(encoded));
     const result = await this.#request("POST", encoded, snapshot.etag, signal);
     if (result.statusCode === 412) return "concurrent";
     if (result.statusCode !== 200) throw new TailscaleLocalApiError("unavailable");

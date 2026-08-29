@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -384,17 +384,21 @@ describe("WindowsTailscaleLocalApi", () => {
 
   it("creates only the exact mapping in an empty ServeConfig with If-Match", async () => {
     const pipe = socketPath();
-    const etag = "c".repeat(64);
+    const etag = "5f01816dc8d8cf90862c9f4dba30f53689ce9f5fe773bfd0782b172b7f65adbb";
+    const expectedPostEtag = "2708a3b4b1bc16d11c4773ef509093f476f8fb0b5e835c0c2afdc80f916f0d7d";
+    const sequence: string[] = [];
     let config: Record<string, unknown> = {
       TCP: { "8443": { TCPForward: "127.0.0.1:9000" } },
-      Web: {}, Services: {}, Foreground: {}, AllowFunnel: { "other.fixture.ts.net:443": true },
+      AllowFunnel: { "other.fixture.ts.net:444": true },
     };
     const server = createServer((request, response) => {
       if (request.method === "GET") {
+        sequence.push("get");
         response.setHeader("ETag", etag);
         response.end(JSON.stringify(config));
         return;
       }
+      sequence.push("post");
       expect(request.headers["if-match"]).toBe(etag);
       const chunks: Buffer[] = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -409,14 +413,60 @@ describe("WindowsTailscaleLocalApi", () => {
       const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
       await expect(client.createExactTlsTerminatedMapping({
         dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+      }, async (ownedEtag) => {
+        sequence.push(`journal:${ownedEtag}`);
+        expect(config.TCP).toEqual({ "8443": { TCPForward: "127.0.0.1:9000" } });
       })).resolves.toBe("created");
+      expect(sequence).toEqual(["get", `journal:${expectedPostEtag}`, "post"]);
       expect(config).toEqual({
         TCP: {
           "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" },
           "8443": { TCPForward: "127.0.0.1:9000" },
         },
-        Web: {}, Services: {}, Foreground: {}, AllowFunnel: { "other.fixture.ts.net:443": true },
+        AllowFunnel: { "other.fixture.ts.net:444": true },
       });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") rmSync(pipe, { force: true });
+    }
+  });
+
+  it.each([
+    { TCP: { "443": { TCPForward: "127.0.0.1:9000" } } },
+    { Web: { "other.fixture.ts.net:443": { Handlers: { "/": { Text: "occupied" } } } } },
+    { AllowFunnel: { "other.fixture.ts.net:443": false } },
+    { Foreground: { session: { TCP: { "443": { TCPForward: "127.0.0.1:9000" } } } } },
+    {
+      Services: {
+        "svc:other": {
+          Web: { "other.fixture.ts.net:443": { Handlers: { "/": { Text: "occupied" } } } },
+        },
+      },
+    },
+  ])("rejects every complete ServeConfig port-443 conflict before journaling or POST: %j", async (config) => {
+    const pipe = socketPath();
+    let posts = 0;
+    const body = JSON.stringify(config);
+    const etag = createHash("sha256").update(body).digest("hex");
+    const journal = vi.fn(async () => undefined);
+    const server = createServer((request, response) => {
+      if (request.method === "GET") {
+        response.setHeader("ETag", etag);
+        response.end(body);
+        return;
+      }
+      posts += 1;
+      response.statusCode = 200;
+      response.end();
+    });
+    await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
+    try {
+      const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      await expect(client.createExactTlsTerminatedMapping({
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+      }, journal)).resolves.toBe("conflict");
+      expect(journal).not.toHaveBeenCalled();
+      expect(posts).toBe(0);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (process.platform !== "win32") rmSync(pipe, { force: true });
@@ -425,12 +475,11 @@ describe("WindowsTailscaleLocalApi", () => {
 
   it("leaves a concurrent user mapping untouched when creation If-Match fails", async () => {
     const pipe = socketPath();
-    const etag = "d".repeat(64);
+    const etag = createHash("sha256").update("{}").digest("hex");
     const replacement = {
       TCP: { "443": { TCPForward: "127.0.0.1:9999", TerminateTLS: "user.fixture.ts.net" } },
-      Web: {}, Services: {}, Foreground: {}, AllowFunnel: {},
     };
-    let config: Record<string, unknown> = { TCP: {}, Web: {}, Services: {}, Foreground: {}, AllowFunnel: {} };
+    let config: Record<string, unknown> = {};
     const server = createServer((request, response) => {
       if (request.method === "GET") {
         response.setHeader("ETag", etag);
@@ -445,10 +494,43 @@ describe("WindowsTailscaleLocalApi", () => {
     await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
     try {
       const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      const journal = vi.fn(async () => undefined);
       await expect(client.createExactTlsTerminatedMapping({
         dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
-      })).resolves.toBe("concurrent");
+      }, journal)).resolves.toBe("concurrent");
+      expect(journal).toHaveBeenCalledTimes(1);
       expect(config).toEqual(replacement);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") rmSync(pipe, { force: true });
+    }
+  });
+
+  it("refuses an identical removal when the live ETag is not the durable owned ETag", async () => {
+    const pipe = socketPath();
+    let posts = 0;
+    const config = {
+      TCP: { "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" } },
+    };
+    const server = createServer((request, response) => {
+      if (request.method === "GET") {
+        response.setHeader("ETag", createHash("sha256").update(JSON.stringify(config)).digest("hex"));
+        response.end(JSON.stringify(config));
+        return;
+      }
+      posts += 1;
+      response.statusCode = 200;
+      response.end();
+    });
+    await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
+    try {
+      const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      await expect(client.removeExactTlsTerminatedMapping({
+        dnsName: "cozy.fixture-tailnet.ts.net",
+        target: "127.0.0.1:18787",
+        ownedEtag: "a".repeat(64),
+      })).resolves.toBe("concurrent");
+      expect(posts).toBe(0);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (process.platform !== "win32") rmSync(pipe, { force: true });
@@ -457,15 +539,14 @@ describe("WindowsTailscaleLocalApi", () => {
 
   it("removes only the exact owned entry from the full ServeConfig with If-Match", async () => {
     const pipe = socketPath();
-    const etag = "a".repeat(64);
     let config: Record<string, unknown> = {
       TCP: {
         "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" },
         "8443": { TCPForward: "127.0.0.1:9000" },
       },
-      Web: {}, Services: {}, Foreground: {},
-      AllowFunnel: { "other.fixture.ts.net:443": true },
+      AllowFunnel: { "other.fixture.ts.net:444": true },
     };
+    const etag = createHash("sha256").update(JSON.stringify(config)).digest("hex");
     const server = createServer((request, response) => {
       if (request.method === "GET") {
         response.setHeader("ETag", etag);
@@ -485,12 +566,11 @@ describe("WindowsTailscaleLocalApi", () => {
     try {
       const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
       await expect(client.removeExactTlsTerminatedMapping({
-        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787", ownedEtag: etag,
       })).resolves.toBe("removed");
       expect(config).toEqual({
         TCP: { "8443": { TCPForward: "127.0.0.1:9000" } },
-        Web: {}, Services: {}, Foreground: {},
-        AllowFunnel: { "other.fixture.ts.net:443": true },
+        AllowFunnel: { "other.fixture.ts.net:444": true },
       });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -500,15 +580,13 @@ describe("WindowsTailscaleLocalApi", () => {
 
   it("retains a concurrently swapped unowned mapping when If-Match fails", async () => {
     const pipe = socketPath();
-    const firstEtag = "a".repeat(64);
     const replacement = {
       TCP: { "443": { TCPForward: "127.0.0.1:9999", TerminateTLS: "cozy.fixture-tailnet.ts.net" } },
-      Web: {}, Services: {}, Foreground: {}, AllowFunnel: {},
     };
     let config: Record<string, unknown> = {
       TCP: { "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" } },
-      Web: {}, Services: {}, Foreground: {}, AllowFunnel: {},
     };
+    const firstEtag = createHash("sha256").update(JSON.stringify(config)).digest("hex");
     const server = createServer((request, response) => {
       if (request.method === "GET") {
         response.setHeader("ETag", firstEtag);
@@ -524,7 +602,7 @@ describe("WindowsTailscaleLocalApi", () => {
     try {
       const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
       await expect(client.removeExactTlsTerminatedMapping({
-        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787", ownedEtag: firstEtag,
       })).resolves.toBe("concurrent");
       expect(config).toEqual(replacement);
     } finally {

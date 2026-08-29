@@ -160,8 +160,9 @@ export interface TailscalePreferenceRestoration {
 }
 
 export interface TailscaleMappingOwnership {
-  schemaVersion: 2;
+  schemaVersion: 3;
   phase: "preferences" | "provisional" | "active";
+  serveConfigEtag: string | null;
   ownershipSubtype: TailscaleOwnershipSubtype;
   mappingFingerprint: string;
   mappingStateFingerprint: string;
@@ -198,6 +199,7 @@ function ownershipJson(value: TailscaleMappingOwnership): string {
   return JSON.stringify({
     schemaVersion: value.schemaVersion,
     phase: value.phase,
+    serveConfigEtag: value.serveConfigEtag,
     ownershipSubtype: value.ownershipSubtype,
     mappingFingerprint: value.mappingFingerprint,
     mappingStateFingerprint: value.mappingStateFingerprint,
@@ -212,9 +214,12 @@ function ownershipJson(value: TailscaleMappingOwnership): string {
 function validOwnership(value: unknown): value is TailscaleMappingOwnership {
   if (!record(value)) return false;
   const keys = Object.keys(value).sort();
-  if (keys.join(",") !== "accountTailnetHash,createdAt,dnsName,mappingFingerprint,mappingStateFingerprint,ownershipSubtype,phase,preferenceRestorations,schemaVersion,target") return false;
-  return value.schemaVersion === 2
+  if (keys.join(",") !== "accountTailnetHash,createdAt,dnsName,mappingFingerprint,mappingStateFingerprint,ownershipSubtype,phase,preferenceRestorations,schemaVersion,serveConfigEtag,target") return false;
+  return value.schemaVersion === 3
     && (value.phase === "preferences" || value.phase === "provisional" || value.phase === "active")
+    && (value.serveConfigEtag === null
+      || (typeof value.serveConfigEtag === "string" && /^[0-9a-f]{64}$/.test(value.serveConfigEtag)))
+    && (value.ownershipSubtype === "reused" || value.phase === "preferences" || value.serveConfigEtag !== null)
     && (value.ownershipSubtype === "wizard-created" || value.ownershipSubtype === "reused")
     && typeof value.mappingFingerprint === "string" && /^[0-9a-f]{64}$/.test(value.mappingFingerprint)
     && typeof value.mappingStateFingerprint === "string" && /^[0-9a-f]{64}$/.test(value.mappingStateFingerprint)
@@ -654,11 +659,16 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       || owned.dnsName !== status.dnsName
       || owned.target !== target
     )) throw new TailscaleModeReadinessError("ownership");
+    // A prior process can disappear after the write-ahead journal but before learning whether
+    // LocalAPI committed or rejected the POST. A content ETag cannot distinguish that exact 412
+    // race, so this state is deliberately retained as a safe orphan for manual reconciliation.
+    if (owned?.phase === "provisional") throw new TailscaleModeReadinessError("ownership");
     if (owned === undefined) {
       const ownershipSubtype: TailscaleOwnershipSubtype = preflight.outcome === "empty" ? "wizard-created" : "reused";
       owned = {
-        schemaVersion: 2,
+        schemaVersion: 3,
         phase: "preferences",
+        serveConfigEtag: null,
         ownershipSubtype,
         mappingFingerprint: mappingFingerprint(status.dnsName, this.#dependencies.gatewayPort, ownershipSubtype),
         mappingStateFingerprint: expectedStateFingerprint,
@@ -680,6 +690,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     }
     this.#owned = owned;
     const preferenceMutations: TailscalePreferenceRestoration[] = [];
+    let creationConfirmed = owned.ownershipSubtype === "reused";
     try {
     if (!await this.#preference(cli, "unattended", signal)) {
       if (!await this.#dependencies.io.confirmPreference("unattended", true, signal))
@@ -720,11 +731,13 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       if ((owned.ownershipSubtype === "wizard-created" && mapping.outcome !== "empty")
         || (owned.ownershipSubtype === "reused" && mapping.outcome !== "compatible"))
         throw new TailscaleModePause("mapping_conflict");
-      const provisional: TailscaleMappingOwnership = { ...owned, phase: "provisional" };
-      if (!await this.#dependencies.ownership.replace(owned, provisional, signal))
-        throw new TailscaleModeReadinessError("ownership");
-      owned = provisional;
-      this.#owned = provisional;
+      if (owned.ownershipSubtype === "reused") {
+        const provisional: TailscaleMappingOwnership = { ...owned, phase: "provisional" };
+        if (!await this.#dependencies.ownership.replace(owned, provisional, signal))
+          throw new TailscaleModeReadinessError("ownership");
+        owned = provisional;
+        this.#owned = provisional;
+      }
     }
     if (mapping.outcome === "empty") {
       if (owned.ownershipSubtype !== "wizard-created" || owned.phase === "active")
@@ -733,15 +746,38 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
         const created = await this.#serveConfigClient.createExactTlsTerminatedMapping({
           dnsName: status.dnsName,
           target: `127.0.0.1:${this.#dependencies.gatewayPort}`,
+        }, async (expectedPostEtag) => {
+          const expectedOwned = owned;
+          if (expectedOwned === undefined || expectedOwned.phase !== "preferences")
+            throw new TailscaleModeReadinessError("ownership");
+          const provisional: TailscaleMappingOwnership = {
+            ...expectedOwned,
+            phase: "provisional",
+            serveConfigEtag: expectedPostEtag,
+          };
+          if (!await this.#dependencies.ownership.replace(expectedOwned, provisional, signal))
+            throw new TailscaleModeReadinessError("ownership");
+          owned = provisional;
+          this.#owned = provisional;
         }, signal);
-        if (created !== "created") throw new TailscaleModeReadinessError("mapping");
+        if (created !== "created") {
+          if (owned.phase === "provisional") {
+            await this.#removeOwnershipIdempotently(owned, signal);
+            owned = { ...owned, phase: "preferences", serveConfigEtag: null };
+          }
+          throw new TailscaleModeReadinessError("mapping");
+        }
+        creationConfirmed = true;
       } catch (error) {
         if (error instanceof TailscaleModeReadinessError) throw error;
-        const reconciled = await this.#recoveryMappingInspection(cli, status.dnsName);
-        if (reconciled.outcome !== "compatible" || reconciled.mappingFingerprint !== expectedStateFingerprint)
-          throw cliPause("mapping_mutation_failed", error);
+        throw cliPause("mapping_mutation_failed", error);
       }
-      await this.#inject("mapping_create");
+      try {
+        await this.#inject("mapping_create");
+      } catch (error) {
+        creationConfirmed = false;
+        throw error;
+      }
     } else if (owned.ownershipSubtype === "wizard-created" && owned.phase === "active") {
       // A durable active record proves that this exact compatible mapping was created by this
       // installation. This is the normal resume path after a completed setup.
@@ -785,7 +821,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     }
     } catch (error) {
       let rollbackError: unknown;
-      if (!priorWasActive) {
+      if (!priorWasActive && (owned.phase !== "provisional" || creationConfirmed)) {
         try {
           await this.#rollbackExact(cli, owned, signal);
         } catch (caught) {
@@ -875,6 +911,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
+    if (owned.phase === "provisional") throw new TailscaleModeReadinessError("ownership");
     const mapping = await this.#mappingInspection(cli, owned.dnsName, signal);
     if (mapping.outcome === "empty") {
       await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
@@ -990,10 +1027,6 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     }
   }
 
-  #recoveryMappingInspection(cli: TailscaleCli, dnsName: string): Promise<TailscaleMappingInspection> {
-    return this.#withRecoverySignal((recoverySignal) => this.#mappingInspection(cli, dnsName, recoverySignal));
-  }
-
   async #preference(
     cli: TailscaleCli,
     name: "unattended" | "shields-up",
@@ -1090,10 +1123,12 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     owned: TailscaleMappingOwnership,
     signal?: AbortSignal,
   ) {
+    if (owned.serveConfigEtag === null) throw new TailscaleModeReadinessError("ownership");
     await this.#assertOwnedAccount(cli, owned, signal);
     const result = await this.#serveConfigClient.removeExactTlsTerminatedMapping({
       dnsName: owned.dnsName,
       target: owned.target,
+      ownedEtag: owned.serveConfigEtag,
     }, signal);
     await this.#assertOwnedAccount(cli, owned, signal);
     return result;
