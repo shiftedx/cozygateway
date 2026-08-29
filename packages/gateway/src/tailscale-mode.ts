@@ -583,7 +583,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       try {
         await cli.createTlsTerminatedMapping(this.#dependencies.gatewayPort, signal);
       } catch (error) {
-        const reconciled = await this.#mappingInspection(cli, status.dnsName, signal);
+        const reconciled = await this.#recoveryMappingInspection(cli, status.dnsName);
         if (reconciled.outcome !== "compatible" || reconciled.mappingFingerprint !== expectedFingerprint)
           throw cliPause("mapping_mutation_failed", error);
       }
@@ -684,14 +684,16 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     } catch (error) {
       removalError = error;
     }
-    const after = await this.#mappingInspection(cli, owned.dnsName, signal);
-    if (after.outcome === "empty") {
-      await this.#inject("mapping_remove");
-      await this.#removeOwnershipIdempotently(owned, signal);
-      return;
-    }
-    if (removalError !== undefined) throw cliPause("mapping_mutation_failed", removalError);
-    throw new TailscaleModeReadinessError("mapping");
+    await this.#withRecoverySignal(async (recoverySignal) => {
+      const after = await this.#mappingInspection(cli, owned.dnsName, recoverySignal);
+      if (after.outcome === "empty") {
+        await this.#inject("mapping_remove");
+        await this.#removeOwnershipIdempotently(owned, recoverySignal);
+        return;
+      }
+      if (removalError !== undefined) throw cliPause("mapping_mutation_failed", removalError);
+      throw new TailscaleModeReadinessError("mapping");
+    });
   }
 
   async #cli(signal: AbortSignal | undefined, allowInstall: boolean): Promise<TailscaleCli> {
@@ -735,6 +737,24 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       if (error instanceof TailscaleModePause) throw error;
       throw cliPause("mapping_inspection_failed", error);
     }
+  }
+
+  async #withRecoverySignal<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const configured = this.#dependencies.cliTimeoutMs ?? 15_000;
+    const milliseconds = Number.isFinite(configured)
+      ? Math.min(30_000, Math.max(1, configured))
+      : 15_000;
+    const timer = setTimeout(() => controller.abort(), milliseconds);
+    try {
+      return await operation(controller.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  #recoveryMappingInspection(cli: TailscaleCli, dnsName: string): Promise<TailscaleMappingInspection> {
+    return this.#withRecoverySignal((recoverySignal) => this.#mappingInspection(cli, dnsName, recoverySignal));
   }
 
   async #preference(
@@ -785,6 +805,20 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
   }
 
   async #rollbackExact(
+    cli: TailscaleCli,
+    owned: TailscaleMappingOwnership,
+    ownershipWritten: boolean,
+    _signal?: AbortSignal,
+  ): Promise<void> {
+    await this.#withRecoverySignal((recoverySignal) => this.#rollbackExactWithSignal(
+      cli,
+      owned,
+      ownershipWritten,
+      recoverySignal,
+    ));
+  }
+
+  async #rollbackExactWithSignal(
     cli: TailscaleCli,
     owned: TailscaleMappingOwnership,
     ownershipWritten: boolean,

@@ -623,6 +623,11 @@ export class TailscaleCli {
         }
         observedUrl = consentUrl(observedText, false);
       }, () => observedUrl !== undefined);
+      try {
+        observedText += decoder.decode();
+      } catch {
+        throw new TailscaleCliError("invalid_utf8");
+      }
       if (observedUrl !== undefined) return observedUrl;
       if (result.exitCode !== 0) throw new TailscaleCliError("command_failed");
       const url = consentUrl(decodeBounded(result.stdout, TAILSCALE_CLI_MAX_TOTAL_BYTES), true);

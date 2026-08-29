@@ -268,6 +268,16 @@ describe("TailscaleCli", () => {
     });
     await expect(overflowAfterUrl.beginHttpsConsent(8_443)).rejects.toMatchObject({ reason: "output_too_large" });
 
+    const truncatedAfterUrl = new TailscaleCli({
+      executable,
+      runner: async (_file, _argv, options) => {
+        options.onStdoutChunk?.(Buffer.from("https://console.tailscale.com/admin/feature/fixture\n"));
+        options.onStdoutChunk?.(new Uint8Array([0xc3]));
+        return { exitCode: 1, stdout: "", stderr: "" };
+      },
+    });
+    await expect(truncatedAfterUrl.beginHttpsConsent(8_443)).rejects.toMatchObject({ reason: "invalid_utf8" });
+
     const rawFailure = new TailscaleCli({
       executable,
       runner: async () => { throw new Error("https://console.tailscale.com/admin/feature/secret"); },

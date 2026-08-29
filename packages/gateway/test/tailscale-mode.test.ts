@@ -458,6 +458,26 @@ describe("TailscaleModeAdapter", () => {
     expect(dependencies.ownership.write).toHaveBeenCalledTimes(1);
   });
 
+  it("uses fresh bounded recovery reads when create applies as the caller aborts", async () => {
+    const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
+    const controller = new AbortController();
+    const original = dependencies.runner.getMockImplementation()!;
+    dependencies.runner.mockImplementation(async (...args) => {
+      const result = await original(...args);
+      if (args[1].join(" ").startsWith("serve --bg --tls-terminated-tcp=443 ")) controller.abort();
+      return result;
+    });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      cliTimeoutMs: 100,
+    });
+
+    await expect(adapter.prepare(controller.signal)).rejects.toMatchObject({ retryable: true });
+    expect(dependencies.calls).toContain("serve --tls-terminated-tcp=443 off");
+    expect(dependencies.ownership.write).not.toHaveBeenCalled();
+  });
+
   it("reconciles uncertain removal and stale ownership after removal failure injection", async () => {
     for (const boundary of ["mapping_remove", "ownership_remove"] as const) {
       const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
@@ -502,6 +522,27 @@ describe("TailscaleModeAdapter", () => {
     });
     await expect(timedOutAdapter.rollbackOwned(endpoint)).resolves.toBeUndefined();
     expect(stored).toBeUndefined();
+
+    const aborted = happyDependencies({ serve: fixture("serve-empty.json") });
+    let abortedStored: Awaited<ReturnType<typeof aborted.ownership.read>>;
+    aborted.ownership.read.mockImplementation(async () => abortedStored);
+    aborted.ownership.write.mockImplementation(async (value) => { abortedStored = value; return "written"; });
+    aborted.ownership.remove.mockImplementation(async () => { abortedStored = undefined; return true; });
+    const abortedAdapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: aborted.runner, helper: aborted.helper,
+      io: aborted.io, probes: aborted.probes, ownership: aborted.ownership,
+      cliTimeoutMs: 100,
+    });
+    const abortedEndpoint = await abortedAdapter.prepare();
+    const controller = new AbortController();
+    const abortedOriginal = aborted.runner.getMockImplementation()!;
+    aborted.runner.mockImplementation(async (...args) => {
+      const result = await abortedOriginal(...args);
+      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off") controller.abort();
+      return result;
+    });
+    await expect(abortedAdapter.rollbackOwned(abortedEndpoint, controller.signal)).resolves.toBeUndefined();
+    expect(abortedStored).toBeUndefined();
   });
 
   it("maps helper failures to precise typed retryable pauses", async () => {

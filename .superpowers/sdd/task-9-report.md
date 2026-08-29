@@ -114,3 +114,30 @@ then passed:
 
 All cases use injected runners/helpers/probes or disposable SQLite files. No live Tailscale,
 installer, UAC, browser, service, preference, Serve, Funnel, or network mutation was performed.
+
+## Second review-finding remediation
+
+Both findings in `task-9-review-findings-2.md` were reproduced and resolved test-first:
+
+1. Exact create/remove outcome reconciliation no longer inherits an already-aborted caller signal.
+   Complete read-only recovery inspection and conditional rollback use a fresh controller with a
+   finite timeout capped at 30 seconds. Regression cases abort at the instant the fake CLI applies
+   creation or removal: applied creation is detected and conditionally removed after the cancelled
+   prepare, while applied removal is detected and matching SQLite ownership is cleared. Neither can
+   become a silently reused unowned mapping.
+2. HTTPS consent now flushes its fatal streaming `TextDecoder` after the foreground runner has fully
+   terminated and before accepting the observed URL. A valid URL followed by an incomplete final
+   multibyte sequence fails with the fixed `invalid_utf8` reason.
+
+The RED run failed all three safety assertions (create-abort recovery, remove-abort recovery, and
+decoder finalization). Fresh GREEN gates passed:
+
+- Task 9 CLI/mode suites: 2 files, 36 tests passed.
+- Focused Task 9/orchestration/storage suites: 4 files, 85 tests passed.
+- Gateway typecheck and build: passed.
+- Full isolated Gateway suite: 96 files passed, 1 skipped; 991 tests passed, 2 skipped.
+- `git diff --check`: clean apart from LF-to-CRLF notices.
+
+The first unchanged full-suite attempt ended with the repository's known Vitest worker
+`ERR_IPC_CHANNEL_CLOSED` infrastructure failure and no assertion failure. The immediate identical
+isolated rerun completed with the counts above. No live Tailscale or other host mutation was used.
