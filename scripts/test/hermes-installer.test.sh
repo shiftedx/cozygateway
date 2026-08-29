@@ -526,6 +526,7 @@ if (hermesArgs[0] === 'dashboard') {
   const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
     args: hermesArgs,
+    launcherPid: process.pid,
     tokenMatches: process.env.HERMES_DASHBOARD_SESSION_TOKEN === expectedToken,
     homeMatches,
   }) + '\n');
@@ -533,25 +534,13 @@ if (hermesArgs[0] === 'dashboard') {
   if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
   if (!homeMatches) process.exit(43);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
-  if (process.env.COZYGATEWAY_TEST_HERMES_DIRECT_DASHBOARD === '1') {
-    const { createServer } = require('node:http');
-    const server = createServer((_request, response) => {
-      response.writeHead(401, { 'content-type': 'application/json' });
-      response.end('{"detail":"unauthorized"}\n');
-    });
-    server.listen(Number(process.env.COZYGATEWAY_TEST_DASHBOARD_PORT), '127.0.0.1', () => {
-      writeFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_PID_FILE, String(process.pid));
-    });
-    process.on('SIGTERM', () => server.close(() => process.exit(0)));
-  } else {
-    spawn(process.execPath, [
-      process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
-      process.env.COZYGATEWAY_TEST_DASHBOARD_PORT,
-      process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER,
-      process.env.COZYGATEWAY_TEST_DASHBOARD_PID_FILE,
-    ], { detached: true, stdio: 'ignore', env: process.env }).unref();
-    process.exit(0);
-  }
+  spawn(process.execPath, [
+    process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
+    process.env.COZYGATEWAY_TEST_DASHBOARD_PORT,
+    process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER,
+    process.env.COZYGATEWAY_TEST_DASHBOARD_PID_FILE,
+  ], { detached: true, stdio: 'ignore', env: process.env }).unref();
+  process.exit(0);
 }
 HERMES_STUB
 dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
@@ -642,10 +631,9 @@ test "$(cut -d: -f1 "$tmp/reload.log" | sed -n '1p')" != "$(cut -d: -f1 "$tmp/re
 # supervisor exits; the successful cold start above remains detached.
 failed_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
 rm -f "$tmp/mock-dashboard.pid"
-: > "$tmp/dashboard"
 set +e
 failed_supervisor_status=0
-(trap - ERR; cd "$tmp" && NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_DASHBOARD_REJECT=1 COZYGATEWAY_TEST_HERMES_DIRECT_DASHBOARD=1 COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" \
+(trap - ERR; NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_DASHBOARD_REJECT=1 COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" \
   COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" \
   COZYGATEWAY_TEST_DASHBOARD_SCRIPT="$dashboard_script" COZYGATEWAY_TEST_DASHBOARD_PID_FILE="$dashboard_pid_file" \
   COZYGATEWAY_TEST_DASHBOARD_PORT="$failed_dashboard_port" COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" \
@@ -663,6 +651,12 @@ if [ ! -s "$tmp/mock-dashboard.pid" ]; then
   exit 1
 fi
 failed_dashboard_pid="$(cat "$tmp/mock-dashboard.pid")"
+failed_launcher_pid="$("$real_node" -e "process.stdout.write(String(JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')).launcherPid))" "$tmp/hermes-stub-trace")"
+test "$failed_launcher_pid" != "$failed_dashboard_pid"
+if "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$failed_launcher_pid"; then
+  echo 'failed-readiness Hermes launcher did not exit before descendant cleanup' >&2
+  exit 1
+fi
 for _ in $(seq 1 50); do
   if ! "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$failed_dashboard_pid"; then break; fi
   sleep 0.1

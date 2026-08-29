@@ -667,13 +667,21 @@ const { readFileSync, unwatchFile, watchFile } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-async function stopOwnedDashboard(child) {
+async function stopOwnedDashboard(child, dashboardPort) {
   if (process.platform === 'win32') {
     const taskkill = (process.env.SystemRoot || process.env.WINDIR) + '\\System32\\taskkill.exe';
     const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
     await new Promise((resolve) => { killer.once('error', resolve); killer.once('exit', resolve); });
     if (child.exitCode === null) child.kill();
     await wait(100);
+    const cleanupPort = Number(dashboardPort);
+    if (!Number.isInteger(cleanupPort) || cleanupPort < 1 || cleanupPort > 65535) throw new Error('invalid Hermes Dashboard cleanup port');
+    const listenerCleanup = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      '& { param([string]\$rawPort) \$port = 0; if (-not [int]::TryParse(\$rawPort, [ref]\$port) -or \$port -lt 1 -or \$port -gt 65535) { exit 2 }; \$listener = Get-NetTCPConnection -State Listen -LocalAddress "127.0.0.1" -LocalPort \$port -ErrorAction SilentlyContinue | Select-Object -First 1; if (\$null -eq \$listener) { exit 0 }; & ([IO.Path]::Combine(\$env:SystemRoot, "System32", "taskkill.exe")) /PID ([string]\$listener.OwningProcess) /T /F | Out-Null; exit \$LASTEXITCODE }',
+      String(cleanupPort),
+    ], { stdio: 'ignore', windowsHide: true });
+    await new Promise((resolve) => { listenerCleanup.once('error', resolve); listenerCleanup.once('exit', resolve); });
     return;
   }
   try { process.kill(-child.pid, 'SIGTERM'); } catch (error) { if (error.code === 'ESRCH') return; throw error; }
@@ -710,7 +718,7 @@ try {
   }
   if (probe?.status !== 200) throw new Error('Hermes Dashboard did not become ready for authenticated local access');
 } catch (error) {
-  if (dashboardChild) await stopOwnedDashboard(dashboardChild);
+  if (dashboardChild) await stopOwnedDashboard(dashboardChild, dashboardPort);
   throw error;
 }
 if (dashboardChild) dashboardChild.unref();
