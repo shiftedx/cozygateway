@@ -201,7 +201,6 @@ function Protect-CozyGatewayHome {
     $administrators = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
     $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
     $acl = New-Object Security.AccessControl.DirectorySecurity
-    $acl.SetOwner($currentUser)
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($identity in @($currentUser, $system, $administrators)) {
         $rule = New-Object Security.AccessControl.FileSystemAccessRule(
@@ -213,7 +212,7 @@ function Protect-CozyGatewayHome {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    (Get-Item -LiteralPath $Path).SetAccessControl($acl)
 }
 
 function Set-CozyGatewayCommandPath {

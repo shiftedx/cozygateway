@@ -189,6 +189,17 @@ if (`$env:COZYGATEWAY_HERMES_BIN -cne 'preexisting-hermes-value') { exit 31 }
     Assert-True ((Get-Acl -LiteralPath $protectedHome).AreAccessRulesProtected) 'managed install root must disable inherited access rules before the Bash handoff'
     Assert-NoBroadReadAcl $protectedHome
     Assert-NoBroadReadAcl $protectedSecret
+    $protectedRerun = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = $protectedHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_SECRET_PATH' = $protectedSecret
+        'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $protectedPathLog
+    }
+    Assert-True ($protectedRerun.ExitCode -eq 0) "protected install home must support an unprivileged rerun: $($protectedRerun.Output)"
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
