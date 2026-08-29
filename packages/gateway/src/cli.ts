@@ -59,6 +59,9 @@ export interface OnboardingPairingRequest {
 export interface OnboardingPairingDependencies {
   createSetupCode(): string;
   render(input: PairingOutputInput): PreparedPairingOutput;
+  /** Optional live-posture gate used by network onboarding. It runs after the complete output has
+   * rendered successfully and immediately before the authoritative SQLite transaction. */
+  beforeFinalize?(): void | Promise<void>;
   finalize(input: FinalizeInput): FinalizeResult;
   write(output: string): void | Promise<void>;
   activate(input: PublishedCode): TransitionResult<SetupCodeOutputState>;
@@ -80,6 +83,7 @@ export async function publishOnboardingPairing(
     color: request.color,
     strictQr: true,
   });
+  await dependencies.beforeFinalize?.();
   const finalized = dependencies.finalize({
     ...request.finalizeContext,
     setupCode,

@@ -357,6 +357,30 @@ describe("verified onboarding pairing publication", () => {
     expect(deps.activate).not.toHaveBeenCalled();
   });
 
+  it("permits an asynchronous live-posture check after rendering and immediately before finalization", async () => {
+    const deps = publicationDeps();
+    const calls: string[] = [];
+    deps.render.mockImplementation((input) => {
+      calls.push("render");
+      return { setupCode: input.setupCode, payloadJson: "payload", terminalOutput: "complete output\n" };
+    });
+    const withPostureCheck: OnboardingPairingDependencies = {
+      ...deps,
+      beforeFinalize: vi.fn(async () => {
+        calls.push("inspect");
+      }),
+      finalize: vi.fn(() => {
+        calls.push("finalize");
+        return { outcome: "invalid_state" as const };
+      }),
+    };
+
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "y" }, withPostureCheck))
+      .resolves.toBe("not_published");
+
+    expect(calls).toEqual(["render", "inspect", "finalize"]);
+  });
+
   it("revokes the pending code when the buffered write fails", async () => {
     const deps = publicationDeps();
     const writeError = new Error("terminal closed");
