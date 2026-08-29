@@ -55,11 +55,19 @@ conditions:
 
 - the listener is bound to exact loopback address `127.0.0.1` and the requested
   Dashboard port;
-- the process shape is a direct expected Hermes launcher, an accepted
-  under-root Python/module chain, or an accepted under-root `main.py` chain;
+- the process shape is a direct expected Hermes launcher, Python executing the
+  exact normalized expected Hermes/launcher script, an accepted under-root
+  Python module chain, or an accepted under-root `main.py` chain;
 - the `dashboard` subcommand is in the expected command position;
 - `--port PORT` or `--port=PORT` matches the requested port; and
 - Hermes root and executable comparisons use normalized absolute paths.
+
+The exact-script Python shape does not require under-root runtime ancestry.
+Hermes can delegate that configured script to the external `uv` Python runtime,
+leaving every readable ancestor outside `HERMES_HOME`; requiring ancestry would
+misclassify the real expected launcher as foreign. Module form
+(`python -m hermes_cli.main`) contains no exact configured script identity and
+therefore still requires under-root ancestry.
 
 The helper records the initially classified listener PID and process creation
 time, then immediately reacquires the listener and process before termination.

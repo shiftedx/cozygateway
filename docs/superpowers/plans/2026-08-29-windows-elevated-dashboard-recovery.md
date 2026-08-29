@@ -36,7 +36,7 @@
 
 - [ ] **Step 1: Add failing classifier cases**
 
-Add table-driven snapshots to `windows-dashboard-owner.test.ps1` for Alex's four-`python.exe` ancestry ending in `hermes.exe`: null `ExecutablePath`/`CommandLine` must equal `Indeterminate`; the same readable under-root command chain must equal `Owned`; readable wrong root, command grammar, subcommand, and port must each equal `Foreign`. Assert that same-user/session/name/port evidence with missing paths never becomes `Owned`.
+Add table-driven snapshots to `windows-dashboard-owner.test.ps1` for Alex's four-`python.exe` ancestry ending in `hermes.exe`: null `ExecutablePath`/`CommandLine` must equal `Indeterminate`; Python executing the exact normalized expected Hermes/launcher script must equal `Owned` even when the delegated `uv` runtime ancestry is external; module form and generic `main.py` form must retain under-root requirements; readable wrong script, root, command grammar, subcommand, and port must each equal `Foreign`. Assert that same-user/session/name/port evidence with missing paths never becomes `Owned`.
 
 - [ ] **Step 2: Add failing race cases**
 
@@ -151,7 +151,7 @@ Use `packages/gateway/test/release-version.test.ts` as the authority for the thr
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
-pnpm --filter @cozygateway/gateway test -- release-version.test.ts release-assets.test.ts
+pnpm --filter cozygateway exec vitest run test/release-version.test.ts test/release-assets.test.ts
 ```
 
 Expected: all commands exit 0.
