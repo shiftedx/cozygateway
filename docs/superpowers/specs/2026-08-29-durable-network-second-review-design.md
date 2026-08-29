@@ -21,3 +21,11 @@ The wrapper adapters forward `reconcileOwned`. Advanced mode uses its own SQLite
 ## Tests
 
 Tests cover the production Windows listener runtime's applied-revision adoption, crashes at both preference-write boundaries, restart-required authority retained across restart failure and cleared only after a successful retry, exact Serve state remaining after removal, wrapper forwarding, real installed-path cleanup construction, sequential cleanup, storage closure, and failure propagation. Existing focused, typecheck, build, and full Gateway gates remain required.
+
+## Final review hardening
+
+Cleanup must never let SQLite create or select an authority database. It resolves `config.dbPath` relative to the configuration directory, requires the exact existing target to be a readable regular non-reparse file, rejects canonical-path indirection, asks the installed Windows helper to prove the path is contained by the protected install root and apply its private DACL, repeats the local file proof, and only then calls `openStorage`. Missing, unsafe, unreadable, or externally located authority fails closed without relocation, fallback creation, or deletion.
+
+Preference restoration is account-scoped. Immediately before any rollback preference read or write, the adapter reads current Tailscale status, derives the keyed account/tailnet HMAC, and compares it with ownership. A mismatch throws typed `account_changed`, retains ownership, and performs no preference access or mutation.
+
+Cleanup has a 120-second total deadline and bounded sequential per-adapter budgets. Tailscale, LAN, and Advanced are all attempted even after an earlier timeout. Runtime restart/readiness operations and helper/CLI child processes receive linked abort signals; killed children are awaited through actual close before an adapter settles. SQLite closes only after every started adapter operation and process has settled or terminated. Concurrent cleanup and race-only timeout designs are excluded because they can race listener state or leave continuations using closed authority.
