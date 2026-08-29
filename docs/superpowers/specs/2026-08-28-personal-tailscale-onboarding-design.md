@@ -196,22 +196,37 @@ model.
 The standalone Windows CLI reaches the verifier in the already-running Gateway through one local
 operator route, `POST /cozy/operator/onboarding`. The route is absent unless config names a private
 token file. Fresh Windows bootstrap generates a 256-bit base64url token outside config, protects it
-with the fixed Windows helper, and stores only its path in config. The route accepts only loopback
-socket peers (including IPv4-mapped loopback), constant-time Bearer authentication, and exact JSON
-no larger than 512 bytes. It exposes only `begin`, `status`, and `cancel`; failures are uniform and
-neither capabilities nor tokens are logged. `begin` receives the adapter-proven canonical origin
-and durable fingerprint, advances the SQLite runtime context for that final route, and returns only
-the connectivity verification URL and bounded status metadata. The CLI polls for the authoritative
-phrase; setup-code finalization remains the SQLite transaction described above. Gateway restart
-invalidates an outstanding bridge challenge, so a resumed CLI begins a fresh proof.
+with the fixed Windows helper, and stores only its path in config. The route accepts loopback socket
+peers (including IPv4-mapped loopback). Advanced onboarding may instead use a concrete interface on
+the same machine, but only when the socket's normalized `remoteAddress === localAddress`; wildcard,
+forwarded, and merely same-subnet peers do not qualify. Every permitted path requires constant-time
+Bearer authentication and exact JSON no larger than 512 bytes. Advanced HTTPS operator requests
+pin the configured Gateway certificate rather than falling back to ambient trust. The route exposes
+only `begin`, `status`, and `cancel`; failures are uniform and neither capabilities nor tokens are
+logged. `begin` receives the adapter-proven canonical origin and durable fingerprint, advances the
+SQLite runtime context for that final route, and returns only the connectivity verification URL and
+bounded status metadata. The CLI polls for the authoritative phrase; setup-code finalization remains
+the SQLite transaction described above. Gateway restart invalidates an outstanding bridge
+challenge, so a resumed CLI begins a fresh proof.
 
 ## Windows Tailscale adapter
 
-The adapter uses only public, local Tailscale CLI behavior and a user-confirmed account. It invokes
-an absolute trusted executable with argument arrays, bounded output, and timeouts. Supported
-clients must provide the current status, targeted `set/get`, certificate-domain, and
-TLS-terminated-TCP command surface (baseline Tailscale 1.102.1 or newer). Older clients are offered
-an official update or manual setup; the adapter does not mutate them through ambiguous fallbacks.
+The adapter uses a user-confirmed account and keeps discovery, version/status, login,
+certificate-domain inspection, and targeted preference `set/get` on the supported Tailscale CLI and
+fixed-helper surfaces. It invokes an absolute trusted executable with argument arrays, bounded
+output, and timeouts. Supported clients must provide those surfaces and the required ServeConfig
+shape (baseline Tailscale 1.102.1 or newer). Older clients are offered an official update or manual
+setup; the adapter does not mutate them through ambiguous fallbacks.
+
+The sole narrower mutation exception is the local Tailscale LocalAPI
+`/localapi/v0/serve-config` endpoint over tailscaled's protected Windows named pipe. CozyGateway may
+GET the complete bounded ServeConfig, require a valid response ETag, calculate only the exact owned
+TLS-terminated-TCP mapping addition or removal, and POST the complete replacement with that ETag in
+`If-Match`. A missing or malformed ETag, HTTP 412, unexpected state, conflicting mapping, timeout,
+or pipe failure stops or pauses the operation without retrying a blind write. This LocalAPI use is
+authorized because ETag/`If-Match` provides local atomic compare-and-swap safety for preserving
+unrelated Serve/Funnel state; it does not imply a Tailscale partnership, partner API, special access,
+or vendor commitment. LocalAPI is not used for discovery, status, login, or preference mutation.
 
 ### Detection and installation
 
@@ -303,13 +318,8 @@ mapping, require:
 
 The mapping fingerprint records mode, port 443, no-PROXY, exact target, Funnel false, ownership,
 and account/tailnet hash. Conditional rollback removes only an exact live mapping with
-`createdByWizard=true`:
-
-```text
-tailscale serve --tls-terminated-tcp=443 off
-```
-
-It never removes a reused compatible mapping or concurrent user change.
+`createdByWizard=true`, using the same ETag/`If-Match` ServeConfig compare-and-swap. It never removes
+a reused compatible mapping or a concurrent user change.
 
 ## LAN adapter
 

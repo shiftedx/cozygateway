@@ -292,6 +292,10 @@ function roundTripWebSocket(origin, expectedHost, connectHost, timeoutMs, soakSe
           const lines = pending.subarray(0, headerEnd).toString("latin1").split("\r\n");
           if (lines[0] !== "HTTP/1.1 101 Switching Protocols") fail(`WSS handshake failed: ${lines[0]}`);
           if (headerValue(lines, "upgrade")?.toLowerCase() !== "websocket") fail("WSS handshake omitted Upgrade: websocket");
+          const connectionTokens = (headerValue(lines, "connection") ?? "")
+            .split(",")
+            .map((token) => token.trim().toLowerCase());
+          if (!connectionTokens.includes("upgrade")) fail("WSS handshake omitted Connection: Upgrade token");
           if (headerValue(lines, "sec-websocket-accept") !== expectedAccept) fail("WSS handshake accept value is invalid");
           pending = pending.subarray(headerEnd + 4);
           handshakeComplete = true;

@@ -86,7 +86,7 @@ async function startFixture(certificate, options = {}) {
     socket.write(
       "HTTP/1.1 101 Switching Protocols\r\n" +
         "Upgrade: websocket\r\n" +
-        "Connection: Upgrade\r\n" +
+        `Connection: ${options.websocketConnection ?? "Upgrade"}\r\n` +
         `Sec-WebSocket-Accept: ${websocketAccept(key)}\r\n\r\n`,
     );
     if (options.websocket === "early-close") {
@@ -201,6 +201,17 @@ try {
     const result = await runProbe(probe, port, "probe.transport.test", exact.certPath);
     assert(result.code !== 0, "failed WSS handshake must fail verification");
     assert(/WSS handshake failed/i.test(result.stderr), `failed WSS must be actionable: ${result.stderr}`);
+  });
+
+  await withFixture(exact, { websocketConnection: "keep-alive" }, async (port) => {
+    const result = await runProbe(probe, port, "probe.transport.test", exact.certPath);
+    assert(result.code !== 0, "101 response without an Upgrade connection token must fail verification");
+    assert(/Connection.*Upgrade/i.test(result.stderr), `missing connection token must be actionable: ${result.stderr}`);
+  });
+
+  await withFixture(exact, { websocketConnection: "keep-alive, UpGrAdE" }, async (port) => {
+    const result = await runProbe(probe, port, "probe.transport.test", exact.certPath);
+    assert(result.code === 0, `comma-separated case-insensitive Upgrade token must pass: ${result.stderr}`);
   });
 
   await withFixture(exact, { websocket: "early-close" }, async (port) => {
