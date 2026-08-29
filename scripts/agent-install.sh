@@ -107,6 +107,7 @@ if is_windows; then
   GATEWAY_DIR="$(to_posix_path "$GATEWAY_DIR")"
   [ -z "$BUNDLE_PATH" ] || BUNDLE_PATH="$(to_posix_path "$BUNDLE_PATH")"
   [ -z "$PLUGIN_ARCHIVE" ] || PLUGIN_ARCHIVE="$(to_posix_path "$PLUGIN_ARCHIVE")"
+  case "$HERMES_BIN" in [A-Za-z]:\\*|[A-Za-z]:/*) HERMES_BIN="$(to_posix_path "$HERMES_BIN")" ;; esac
 fi
 
 case "$DASHBOARD_PORT" in ''|*[!0-9]*) die "--dashboard-port must be 1-65535" ;; esac
