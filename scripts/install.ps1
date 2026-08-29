@@ -67,14 +67,29 @@ function Refresh-HermesEnvironment {
     if (-not [string]::IsNullOrWhiteSpace($userBash)) { $env:HERMES_GIT_BASH_PATH = $userBash }
 }
 
-function Find-Hermes {
-    if (-not [string]::IsNullOrWhiteSpace($env:COZYGATEWAY_TEST_HERMES) -and (Test-Path -LiteralPath $env:COZYGATEWAY_TEST_HERMES)) {
-        return [IO.Path]::GetFullPath($env:COZYGATEWAY_TEST_HERMES)
+function Resolve-NativeHermesPath {
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $full = [IO.Path]::GetFullPath($Path)
+    if ([IO.Path]::GetExtension($full) -ieq '.cmd') {
+        $full = [IO.Path]::ChangeExtension($full, '.exe')
     }
-    $command = Get-Command hermes.exe, hermes.cmd, hermes -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($command) { return $command.Source }
-    $candidate = Join-Path $env:LOCALAPPDATA 'hermes\bin\hermes.exe'
-    if (Test-Path -LiteralPath $candidate) { return $candidate }
+    if ([IO.Path]::GetExtension($full) -ieq '.exe' -and (Test-Path -LiteralPath $full -PathType Leaf)) {
+        return $full
+    }
+    return $null
+}
+
+function Find-Hermes {
+    $resolved = Resolve-NativeHermesPath $env:COZYGATEWAY_TEST_HERMES
+    if ($resolved) { return $resolved }
+    $command = Get-Command hermes.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) {
+        $resolved = Resolve-NativeHermesPath $command.Source
+        if ($resolved) { return $resolved }
+    }
+    $resolved = Resolve-NativeHermesPath (Join-Path $env:LOCALAPPDATA 'hermes\bin\hermes.exe')
+    if ($resolved) { return $resolved }
     return $null
 }
 

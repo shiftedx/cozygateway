@@ -17,7 +17,7 @@ stop_test_pid() {
     *) kill "$pid" 2>/dev/null || true ;;
   esac
 }
-trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
+trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; stop_test_pid "${failed_dashboard_pid:-}"; stop_test_pid "${preexisting_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
 # Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
 # reach reads as "it stopped somewhere". Name the line and the command that failed.
 trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
@@ -506,7 +506,7 @@ const server = createServer((request, response) => {
     response.end('{"detail":"starting"}\n');
     return;
   }
-  const authenticated = request.url === '/api/config' && request.headers['x-hermes-session-token'] === expectedToken;
+  const authenticated = process.env.COZYGATEWAY_TEST_DASHBOARD_REJECT !== '1' && request.url === '/api/config' && request.headers['x-hermes-session-token'] === expectedToken;
   if (authenticated) writeFileSync(authMarker, `${expectedToken}\n`);
   response.writeHead(authenticated ? 200 : 401, { 'content-type': 'application/json' });
   response.end(authenticated ? '{}\n' : '{"detail":"unauthorized"}\n');
@@ -533,18 +533,31 @@ if (hermesArgs[0] === 'dashboard') {
   if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
   if (!homeMatches) process.exit(43);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
-  spawn(process.execPath, [
-    process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
-    process.env.COZYGATEWAY_TEST_DASHBOARD_PORT,
-    process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER,
-    process.env.COZYGATEWAY_TEST_DASHBOARD_PID_FILE,
-  ], { detached: true, stdio: 'ignore', env: process.env }).unref();
-  process.exit(0);
+  if (process.env.COZYGATEWAY_TEST_HERMES_DIRECT_DASHBOARD === '1') {
+    const { createServer } = require('node:http');
+    const server = createServer((_request, response) => {
+      response.writeHead(401, { 'content-type': 'application/json' });
+      response.end('{"detail":"unauthorized"}\n');
+    });
+    server.listen(Number(process.env.COZYGATEWAY_TEST_DASHBOARD_PORT), '127.0.0.1', () => {
+      writeFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_PID_FILE, String(process.pid));
+    });
+    process.on('SIGTERM', () => server.close(() => process.exit(0)));
+  } else {
+    spawn(process.execPath, [
+      process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
+      process.env.COZYGATEWAY_TEST_DASHBOARD_PORT,
+      process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER,
+      process.env.COZYGATEWAY_TEST_DASHBOARD_PID_FILE,
+    ], { detached: true, stdio: 'ignore', env: process.env }).unref();
+    process.exit(0);
+  }
 }
 HERMES_STUB
 dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
 mock_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) hermes_stub="$tmp/hermes-stub.exe" ;; *) hermes_stub="$tmp/hermes-stub" ;; esac
+mkdir -p "$tmp/Hermes Bin"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) hermes_stub="$tmp/Hermes Bin/hermes-stub.exe" ;; *) hermes_stub="$tmp/Hermes Bin/hermes-stub" ;; esac
 cp "$real_node" "$hermes_stub"
 chmod 700 "$hermes_stub"
 case "$(uname -s)" in
@@ -610,6 +623,7 @@ for _ in $(seq 1 50); do [ "$(wc -l < "$tmp/reload.log")" -ge 2 ] && break; slee
 kill "$supervisor_pid" 2>/dev/null || true
 wait "$supervisor_pid" 2>/dev/null || true
 supervisor_pid=
+"$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$mock_dashboard_pid"
 stop_test_pid "$mock_dashboard_pid"
 mock_dashboard_pid=
 test "$(wc -l < "$tmp/reload.log")" -ge 2
@@ -622,6 +636,42 @@ NODE
 sed -n '1p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8787$'
 sed -n '2p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8998$'
 test "$(cut -d: -f1 "$tmp/reload.log" | sed -n '1p')" != "$(cut -d: -f1 "$tmp/reload.log" | sed -n '2p')"
+
+# A Dashboard spawned by this supervisor remains owned until authenticated
+# readiness. Rejection must stop its detached process tree before the
+# supervisor exits; the successful cold start above remains detached.
+failed_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
+rm -f "$tmp/mock-dashboard.pid"
+: > "$tmp/dashboard"
+set +e
+failed_supervisor_status=0
+(trap - ERR; cd "$tmp" && NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_DASHBOARD_REJECT=1 COZYGATEWAY_TEST_HERMES_DIRECT_DASHBOARD=1 COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" \
+  COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" \
+  COZYGATEWAY_TEST_DASHBOARD_SCRIPT="$dashboard_script" COZYGATEWAY_TEST_DASHBOARD_PID_FILE="$dashboard_pid_file" \
+  COZYGATEWAY_TEST_DASHBOARD_PORT="$failed_dashboard_port" COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" \
+  COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
+  "$real_node" "$tmp/supervisor.cjs" \
+  "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
+  "$hermes_stub_arg" "$failed_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  >"$tmp/failed-supervisor.log" 2>&1) || failed_supervisor_status=$?
+set -e
+test "$failed_supervisor_status" -ne 0
+if [ ! -s "$tmp/mock-dashboard.pid" ]; then
+  echo 'failed-readiness Hermes fixture did not start' >&2
+  cat "$tmp/failed-supervisor.log" >&2
+  [ ! -f "$tmp/hermes-stub-trace" ] || cat "$tmp/hermes-stub-trace" >&2
+  exit 1
+fi
+failed_dashboard_pid="$(cat "$tmp/mock-dashboard.pid")"
+for _ in $(seq 1 50); do
+  if ! "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$failed_dashboard_pid"; then break; fi
+  sleep 0.1
+done
+if "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$failed_dashboard_pid"; then
+  echo 'failed authenticated readiness left the spawned Dashboard running' >&2
+  exit 1
+fi
+failed_dashboard_pid=
 
 # Update runs retain a power user's saved listener unless an explicit installer
 # flag asks to replace it.

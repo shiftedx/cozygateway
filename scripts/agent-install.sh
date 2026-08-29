@@ -666,6 +666,20 @@ exec "$NODE_RESOLVED" - "$gateway_env_arg" "$dashboard_env_arg" "$hermes_root_ar
 const { readFileSync, unwatchFile, watchFile } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function stopOwnedDashboard(child) {
+  if (process.platform === 'win32') {
+    const taskkill = (process.env.SystemRoot || process.env.WINDIR) + '\\System32\\taskkill.exe';
+    const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    await new Promise((resolve) => { killer.once('error', resolve); killer.once('exit', resolve); });
+    if (child.exitCode === null) child.kill();
+    await wait(100);
+    return;
+  }
+  try { process.kill(-child.pid, 'SIGTERM'); } catch (error) { if (error.code === 'ESRCH') return; throw error; }
+  await wait(1000);
+  try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+}
 async function main() {
 const [gatewayEnvPath, dashboardEnvPath, hermesRoot, hermes, dashboardPort, bundle, config] = process.argv.slice(2);
 const gatewayEnv = parseEnv(readFileSync(gatewayEnvPath, 'utf8'));
@@ -678,18 +692,28 @@ const dashboardEnv = {
 const health = await fetch('http://127.0.0.1:' + dashboardPort + '/api/health', { signal: AbortSignal.timeout(2000) })
   .then((response) => response.status === 200 || response.status === 401)
   .catch(() => false);
-if (!health) spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'], { detached: true, stdio: 'ignore', env: dashboardEnv }).unref();
-let probe;
-for (let attempt = 0; attempt < 30; attempt += 1) {
-  probe = await fetch('http://127.0.0.1:' + dashboardPort + '/api/config', {
-    headers: { 'x-hermes-session-token': dashboard.DASHBOARD_SESSION_TOKEN },
-    signal: AbortSignal.timeout(2000),
-  }).catch(() => undefined);
-  if (probe?.status === 200) break;
-  if (probe?.status === 401 || probe?.status === 403) throw new Error('Hermes Dashboard rejected the configured local session token');
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+let dashboardChild;
+if (!health) {
+  dashboardChild = spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'], { detached: true, stdio: 'ignore', env: dashboardEnv });
+  await new Promise((resolve, reject) => { dashboardChild.once('spawn', resolve); dashboardChild.once('error', reject); });
 }
-if (probe?.status !== 200) throw new Error('Hermes Dashboard did not become ready for authenticated local access');
+try {
+  let probe;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    probe = await fetch('http://127.0.0.1:' + dashboardPort + '/api/config', {
+      headers: { 'x-hermes-session-token': dashboard.DASHBOARD_SESSION_TOKEN },
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => undefined);
+    if (probe?.status === 200) break;
+    if (probe?.status === 401 || probe?.status === 403) throw new Error('Hermes Dashboard rejected the configured local session token');
+    await wait(1000);
+  }
+  if (probe?.status !== 200) throw new Error('Hermes Dashboard did not become ready for authenticated local access');
+} catch (error) {
+  if (dashboardChild) await stopOwnedDashboard(dashboardChild);
+  throw error;
+}
+if (dashboardChild) dashboardChild.unref();
 let child;
 let restarting = false;
 let shuttingDown = false;
