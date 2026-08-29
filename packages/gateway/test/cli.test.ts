@@ -300,14 +300,17 @@ describe("verified onboarding pairing publication", () => {
     for (const dependency of Object.values(deps)) expect(dependency).not.toHaveBeenCalled();
   });
 
-  it.each(["", "n", "no"])("does nothing for the nonaffirmative answer %j", async (desktopAnswer) => {
-    const deps = publicationDeps();
+  it.each(["", "n", "no", " Y ", "YES", " yes "])(
+    "does nothing for the nonaffirmative answer %j",
+    async (desktopAnswer) => {
+      const deps = publicationDeps();
 
-    await expect(publishOnboardingPairing({ ...request, desktopAnswer }, deps))
-      .resolves.toBe("not_published");
+      await expect(publishOnboardingPairing({ ...request, desktopAnswer }, deps))
+        .resolves.toBe("not_published");
 
-    for (const dependency of Object.values(deps)) expect(dependency).not.toHaveBeenCalled();
-  });
+      for (const dependency of Object.values(deps)) expect(dependency).not.toHaveBeenCalled();
+    },
+  );
 
   it("does nothing when desktop confirmation is premature", async () => {
     const deps = publicationDeps();
@@ -372,6 +375,40 @@ describe("verified onboarding pairing publication", () => {
     expect(deps.activate).not.toHaveBeenCalled();
   });
 
+  it("combines the write error with an unsuccessful revocation result", async () => {
+    const deps = publicationDeps();
+    const writeError = new Error("terminal closed");
+    deps.write.mockRejectedValue(writeError);
+    deps.revoke.mockReturnValue({ outcome: "invalid_state", state: "active" });
+
+    const error = await publishOnboardingPairing({ ...request, desktopAnswer: "yes" }, deps)
+      .then(() => undefined, (caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors[0]).toBe(writeError);
+    expect((error as AggregateError).errors[1]).toMatchObject({
+      message: expect.stringMatching(/revocation.*invalid_state.*active/i),
+    });
+    expect(deps.activate).not.toHaveBeenCalled();
+  });
+
+  it("combines the write error with a thrown revocation failure", async () => {
+    const deps = publicationDeps();
+    const writeError = new Error("terminal closed");
+    const revocationError = new Error("database unavailable");
+    deps.write.mockRejectedValue(writeError);
+    deps.revoke.mockImplementation(() => {
+      throw revocationError;
+    });
+
+    const error = await publishOnboardingPairing({ ...request, desktopAnswer: "yes" }, deps)
+      .then(() => undefined, (caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([writeError, revocationError]);
+    expect(deps.activate).not.toHaveBeenCalled();
+  });
+
   it("writes one complete buffer and activates only after successful output", async () => {
     const deps = publicationDeps();
     const calls: string[] = [];
@@ -383,7 +420,7 @@ describe("verified onboarding pairing publication", () => {
       return { outcome: "advanced", state: "active" };
     });
 
-    await expect(publishOnboardingPairing({ ...request, desktopAnswer: " Y " }, deps))
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "y" }, deps))
       .resolves.toBe("published");
 
     expect(calls).toEqual(["write:complete output\n", "activate:COZY-1234"]);

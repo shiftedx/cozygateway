@@ -69,7 +69,7 @@ export async function publishOnboardingPairing(
   request: OnboardingPairingRequest,
   dependencies: OnboardingPairingDependencies,
 ): Promise<"published" | "not_published"> {
-  const answer = request.desktopAnswer?.trim().toLowerCase();
+  const answer = request.desktopAnswer;
   if (answer !== "y" && answer !== "yes") return "not_published";
   if (!request.phoneConfirmed) return "not_published";
   const setupCode = dependencies.createSetupCode();
@@ -93,9 +93,29 @@ export async function publishOnboardingPairing(
   };
   try {
     await dependencies.write(prepared.terminalOutput);
-  } catch (error) {
-    dependencies.revoke(publishedCode);
-    throw error;
+  } catch (writeError) {
+    let revocationFailed = false;
+    let revocationError: unknown;
+    try {
+      const revoked = dependencies.revoke(publishedCode);
+      if (
+        (revoked.outcome !== "advanced" && revoked.outcome !== "already")
+        || revoked.state !== "revoked"
+      ) {
+        revocationFailed = true;
+        revocationError = new Error(`setup-code revocation failed: ${JSON.stringify(revoked)}`);
+      }
+    } catch (error) {
+      revocationFailed = true;
+      revocationError = error;
+    }
+    if (revocationFailed) {
+      throw new AggregateError(
+        [writeError, revocationError],
+        "pairing output write failed and pending setup-code revocation also failed",
+      );
+    }
+    throw writeError;
   }
   const activated = dependencies.activate(publishedCode);
   if (
