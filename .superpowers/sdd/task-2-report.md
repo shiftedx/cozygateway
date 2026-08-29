@@ -38,10 +38,13 @@ ownership failure and did not request scoped elevation.
 - Mapped normal exit `0` to continue, `42` to the existing ownership-safety
   failure, `43` to exactly one scoped elevation attempt, and `45`/unexpected
   values to a verified-Dashboard recovery failure.
-- Used `Start-Process powershell.exe -Verb RunAs -Wait -PassThru` with an
-  explicit argument array containing `-NoProfile`, `-NonInteractive`,
-  `-ExecutionPolicy Bypass`, `-File`, helper path, expected root, Hermes
-  executable, launcher, port, and `-ElevatedChild`.
+- Uses a PowerShell 5.1-compatible sterile launcher followed by a RunAs stage:
+  the first `Start-Process powershell.exe -UseNewEnvironment -Wait -PassThru`
+  strips inherited secrets, then the sterile process uses
+  `Start-Process powershell.exe -Verb RunAs -Wait -PassThru`. Both stages use
+  explicit argument arrays; the elevated child receives `-NoProfile`,
+  `-NonInteractive`, `-ExecutionPolicy Bypass`, `-File`, helper path, expected
+  root, Hermes executable, launcher, port, and `-ElevatedChild`.
 - Preserved elevated helper exit codes and reserved `46` for UAC cancellation,
   denial, unavailability, or launch failure.
 - Added a manual-close/rerun instruction for scoped-UAC launch failure and
@@ -154,3 +157,98 @@ one-shot behavior, cancellation mapping, and secret hygiene without presenting
 a real UAC prompt. Approval of an actual UAC prompt against a real
 higher-integrity stale Hermes Dashboard remains the Task 3/host acceptance
 boundary described by the approved design.
+
+## Task 2 review fixes
+
+### Findings addressed
+
+- The original RunAs launch inherited the installer's complete environment.
+  The generated elevation flow now uses two PowerShell 5.1-compatible stages
+  because `-UseNewEnvironment` and `-Verb RunAs` belong to different
+  `Start-Process` parameter sets in Windows PowerShell 5.1. The first stage
+  starts from the default environment with `-UseNewEnvironment`; only that
+  sterile stage requests RunAs for the ownership helper.
+- Root, Hermes executable, launcher, owner-helper path, RunAs-helper path, and
+  port remain explicit process arguments. No provider/session credential is
+  copied into either argument list or reconstructed in the sterile process.
+- Test fixture controls are embedded in generated harness scripts or passed as
+  file paths/arguments. They do not rely on environment variables that
+  `-UseNewEnvironment` is expected to remove.
+- A real compiled child process now records its environment after the generated
+  sterile wrapper requests `-UseNewEnvironment`; sentinel
+  `DASHBOARD_SESSION_TOKEN` and `PROVIDER_API_KEY` values are both absent.
+- `write_dashboard_elevation_helper` has an internal Windows guard, and `main`
+  invokes it only behind `is_windows &&`, so neither generated elevation file
+  is written on macOS or Linux.
+
+### Review-fix RED evidence
+
+After replacing inherited test controls with explicit scripts/files and adding
+the actual-child environment assertions, this command exited `1`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
+```
+
+Expected security failure:
+
+```text
+ASSERT: actual child process must not inherit the Dashboard session token
+```
+
+After shaping the final two-stage regression, the same command remained red
+against the old implementation:
+
+```text
+ASSERT: shared installer must generate a sterile-context RunAs wrapper
+```
+
+### Review-fix GREEN evidence
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
+```
+
+Exit `0`:
+
+```text
+windows bootstrap tests passed
+```
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1
+```
+
+Exit `0`:
+
+```text
+windows dashboard ownership tests passed
+```
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' -n scripts/agent-install.sh
+git diff --check
+```
+
+Both exited `0` with no syntax or whitespace errors. Git emitted only its
+working-copy LF-to-CRLF warning.
+
+### Review-fix self-review and concerns
+
+- Confirmed normal exit `43` still causes exactly one scoped recovery attempt;
+  no elevated failure recurses.
+- Confirmed the sterile stage uses `-UseNewEnvironment` without `-Verb`, while
+  the following sterile-context stage uses `-Verb RunAs`; this avoids the
+  Windows PowerShell 5.1 ambiguous-parameter-set failure.
+- Confirmed the final elevated ownership helper receives all required values as
+  distinct arguments under Windows PowerShell 5.1 parsing.
+- Confirmed sentinel provider/session secrets are absent in an actual child
+  process, not merely absent from argument and diagnostic captures.
+- Confirmed no release-version source was edited.
+- This host's Windows PowerShell 5.1 reports managed-loader error `8009001d`
+  when `powershell.exe` itself is launched directly with a default environment.
+  The regression therefore executes the generated sterile wrapper with a
+  `Start-Process` capture and a real compiled environment-probe child. A real
+  UAC-approved end-to-end run on the target host remains the acceptance
+  boundary; launch failure continues to fail closed with manual recovery
+  instructions.

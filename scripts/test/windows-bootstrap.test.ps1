@@ -142,6 +142,11 @@ function ConvertTo-BashSingleQuotedLiteral {
     return "'" + $Value.Replace("'", $embeddedApostrophe) + "'"
 }
 
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param([string] $Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
 function New-FakePowerShell {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
@@ -162,6 +167,77 @@ public static class $className {
 }
 "@
     Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $Path -OutputType ConsoleApplication
+}
+
+function New-EnvironmentProbe {
+    param([string] $Path)
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    $className = 'EnvironmentProbe' + [guid]::NewGuid().ToString('N')
+    $source = @"
+using System;
+using System.IO;
+public static class $className {
+    public static int Main(string[] args) {
+        File.WriteAllLines(args[0], new[] {
+            "DASHBOARD_SESSION_TOKEN=" + (Environment.GetEnvironmentVariable("DASHBOARD_SESSION_TOKEN") ?? "<null>"),
+            "PROVIDER_API_KEY=" + (Environment.GetEnvironmentVariable("PROVIDER_API_KEY") ?? "<null>")
+        });
+        return 0;
+    }
+}
+"@
+    Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $Path -OutputType ConsoleApplication
+}
+
+function Invoke-SterileWrapperProbe {
+    param(
+        [string] $Wrapper,
+        [string] $Harness,
+        [string] $Probe,
+        [string] $EnvironmentCapturePath,
+        [string] $StartCapturePath,
+        [hashtable] $Paths,
+        [string] $RunAsHelper
+    )
+    $probeLiteral = ConvertTo-PowerShellSingleQuotedLiteral $Probe
+    $environmentCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral ('"' + $EnvironmentCapturePath + '"')
+    $startCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $StartCapturePath
+    $harnessBody = @'
+param([string]$Wrapper, [string]$Root, [string]$Hermes, [string]$Launcher, [int]$Port, [string]$Helper, [string]$RunAsHelper)
+function Start-Process {
+    param([string]$FilePath, [switch]$UseNewEnvironment, [switch]$Wait, [switch]$PassThru, [string[]]$ArgumentList)
+    [pscustomobject]@{
+        FilePath = $FilePath
+        UseNewEnvironment = $UseNewEnvironment.IsPresent
+        Wait = $Wait.IsPresent
+        PassThru = $PassThru.IsPresent
+        ArgumentList = @($ArgumentList)
+    } | Export-Clixml -LiteralPath __START_CAPTURE__
+    $process = Microsoft.PowerShell.Management\Start-Process __PROBE__ -UseNewEnvironment -Wait -PassThru -ArgumentList __ENV_CAPTURE__
+    return $process
+}
+& $Wrapper $Root $Hermes $Launcher $Port $Helper $RunAsHelper
+exit $LASTEXITCODE
+'@
+    $harnessBody = $harnessBody.Replace('__START_CAPTURE__', $startCaptureLiteral).Replace('__PROBE__', $probeLiteral).Replace('__ENV_CAPTURE__', $environmentCaptureLiteral)
+    Write-Utf8NoBom $Harness $harnessBody
+    Remove-Item -LiteralPath $EnvironmentCapturePath, $StartCapturePath -Force -ErrorAction SilentlyContinue
+    $keys = @('DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY')
+    $old = @{}
+    foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
+    try {
+        $env:DASHBOARD_SESSION_TOKEN = 'task-2-secret-token'
+        $env:PROVIDER_API_KEY = 'task-2-provider-secret'
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Harness $Wrapper $Paths.Root $Paths.Hermes $Paths.Launcher 9119 $Paths.Helper $RunAsHelper 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousPreference
+        return @{ ExitCode = $exitCode; Output = ($output -join "`n") }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, $old[$key], 'Process') }
+    }
 }
 
 function Read-FakePowerShellCalls {
@@ -193,6 +269,7 @@ HERMES_ROOT=$(ConvertTo-BashSingleQuotedLiteral $Paths.Root)
 HERMES_RESOLVED=$(ConvertTo-BashSingleQuotedLiteral $Paths.Hermes)
 DASHBOARD_OWNER_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.Helper)
 DASHBOARD_ELEVATION_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.ElevationHelper)
+DASHBOARD_RUNAS_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.RunAsHelper)
 DASHBOARD_PORT=9119
 $FunctionText
 stop_stubborn_windows_dashboard
@@ -232,6 +309,31 @@ function Invoke-ElevationWrapperHarness {
         [int] $ChildCode,
         [switch] $Cancel
     )
+    $startCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $CapturePath
+    $cancelLiteral = if ($Cancel) { '$true' } else { '$false' }
+    $childCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $ChildCapturePath
+    $childBody = @'
+param(
+    [Parameter(Position = 0)][string]$ExpectedRoot,
+    [Parameter(Position = 1)][string]$ExpectedHermes,
+    [Parameter(Position = 2)][string]$ExpectedLauncher,
+    [Parameter(Position = 3)][int]$ExpectedPort,
+    [switch]$ElevatedChild
+)
+[pscustomobject]@{
+    ExpectedRoot = $ExpectedRoot
+    ExpectedHermes = $ExpectedHermes
+    ExpectedLauncher = $ExpectedLauncher
+    ExpectedPort = $ExpectedPort
+    ElevatedChild = $ElevatedChild.IsPresent
+    ExtraArguments = @($args)
+    DashboardSessionToken = $env:DASHBOARD_SESSION_TOKEN
+    ProviderApiKey = $env:PROVIDER_API_KEY
+} | Export-Clixml -LiteralPath __CHILD_CAPTURE__
+exit __CHILD_CODE__
+'@
+    $childBody = $childBody.Replace('__CHILD_CAPTURE__', $childCaptureLiteral).Replace('__CHILD_CODE__', [string]$ChildCode)
+    Write-Utf8NoBom $Paths.Helper $childBody
     $harnessBody = @'
 param([string]$Wrapper, [string]$Root, [string]$Hermes, [string]$Launcher, [int]$Port, [string]$Helper)
 function Start-Process {
@@ -242,8 +344,8 @@ function Start-Process {
         Wait = $Wait.IsPresent
         PassThru = $PassThru.IsPresent
         ArgumentList = @($ArgumentList)
-    } | Export-Clixml -LiteralPath $env:COZYGATEWAY_TEST_START_CAPTURE
-    if ($env:COZYGATEWAY_TEST_CANCEL -eq '1') { throw 'The operation was canceled by the user.' }
+    } | Export-Clixml -LiteralPath __START_CAPTURE__
+    if (__CANCEL__) { throw 'The operation was canceled by the user.' }
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $FilePath
     $info.Arguments = $ArgumentList -join ' '
@@ -255,16 +357,13 @@ function Start-Process {
 & $Wrapper $Root $Hermes $Launcher $Port $Helper
 exit $LASTEXITCODE
 '@
+    $harnessBody = $harnessBody.Replace('__START_CAPTURE__', $startCaptureLiteral).Replace('__CANCEL__', $cancelLiteral)
     Write-Utf8NoBom $Harness $harnessBody
     Remove-Item -LiteralPath $CapturePath, $ChildCapturePath -Force -ErrorAction SilentlyContinue
-    $keys = @('COZYGATEWAY_TEST_START_CAPTURE', 'COZYGATEWAY_TEST_CHILD_CAPTURE', 'COZYGATEWAY_TEST_CHILD_CODE', 'COZYGATEWAY_TEST_CANCEL', 'DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY')
+    $keys = @('DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY')
     $old = @{}
     foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
     try {
-        $env:COZYGATEWAY_TEST_START_CAPTURE = $CapturePath
-        $env:COZYGATEWAY_TEST_CHILD_CAPTURE = $ChildCapturePath
-        $env:COZYGATEWAY_TEST_CHILD_CODE = [string]$ChildCode
-        $env:COZYGATEWAY_TEST_CANCEL = if ($Cancel) { '1' } else { '0' }
         $env:DASHBOARD_SESSION_TOKEN = 'task-2-secret-token'
         $env:PROVIDER_API_KEY = 'task-2-provider-secret'
         $previousPreference = $ErrorActionPreference
@@ -464,6 +563,8 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 
     $agentInstallerPath = Join-Path $repoRoot 'scripts\agent-install.sh'
     $agentInstaller = Get-Content -LiteralPath $agentInstallerPath -Raw
+    $elevationWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_dashboard_elevation_helper\(\) \{.*?^\}')
+    Assert-True $elevationWriterMatch.Success 'shared installer must define write_dashboard_elevation_helper'
     $stopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_stubborn_windows_dashboard\(\) \{.*?^\}')
     Assert-True $stopFunctionMatch.Success 'shared installer must define stop_stubborn_windows_dashboard'
     $gitCommand = Get-Command git.exe -ErrorAction Stop
@@ -481,6 +582,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
         Helper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner.ps1"
         Launcher = "C:\Users\O'Brien\Hermes Root\bin\hermes.exe"
         ElevationHelper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner elevate.ps1"
+        RunAsHelper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner runas.ps1"
     }
 
     $normal43 = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 43 0
@@ -515,28 +617,14 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 
     $elevationMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_ELEVATION'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_ELEVATION")
     Assert-True $elevationMatch.Success 'shared installer must generate a PowerShell elevation wrapper'
+    $runAsMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_RUNAS'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_RUNAS")
+    Assert-True $runAsMatch.Success 'shared installer must generate a sterile-context RunAs wrapper'
     $elevationWrapper = Join-Path $temp 'dashboard owner elevate.ps1'
+    $runAsWrapper = Join-Path $temp 'dashboard owner runas.ps1'
     Write-Utf8NoBom $elevationWrapper $elevationMatch.Groups['Body'].Value
+    Write-Utf8NoBom $runAsWrapper $runAsMatch.Groups['Body'].Value
     $elevatedChild = Join-Path $temp "O'Brien Cozy Gateway\dashboard owner.ps1"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $elevatedChild) | Out-Null
-    Write-Utf8NoBom $elevatedChild @'
-param(
-    [Parameter(Position = 0)][string]$ExpectedRoot,
-    [Parameter(Position = 1)][string]$ExpectedHermes,
-    [Parameter(Position = 2)][string]$ExpectedLauncher,
-    [Parameter(Position = 3)][int]$ExpectedPort,
-    [switch]$ElevatedChild
-)
-[pscustomobject]@{
-    ExpectedRoot = $ExpectedRoot
-    ExpectedHermes = $ExpectedHermes
-    ExpectedLauncher = $ExpectedLauncher
-    ExpectedPort = $ExpectedPort
-    ElevatedChild = $ElevatedChild.IsPresent
-    ExtraArguments = @($args)
-} | Export-Clixml -LiteralPath $env:COZYGATEWAY_TEST_CHILD_CAPTURE
-exit ([int]$env:COZYGATEWAY_TEST_CHILD_CODE)
-'@
     $wrapperPaths = @{
         Root = $dashboardPaths.Root
         Hermes = $dashboardPaths.Hermes
@@ -546,11 +634,31 @@ exit ([int]$env:COZYGATEWAY_TEST_CHILD_CODE)
     $startCapture = Join-Path $temp 'start-process.xml'
     $childCapture = Join-Path $temp 'elevated-child.xml'
     $wrapperHarness = Join-Path $temp 'elevation wrapper harness.ps1'
-    $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
-    Assert-True ($wrapperResult.ExitCode -eq 0) "elevation wrapper must return elevated child 0: $($wrapperResult.Output)"
+
+    $environmentProbe = Join-Path $temp "O'Brien Cozy Gateway\environment probe.exe"
+    $environmentCapture = Join-Path $temp "O'Brien Cozy Gateway\environment capture.txt"
+    $sterileHarness = Join-Path $temp 'sterile wrapper harness.ps1'
+    $sterileStartCapture = Join-Path $temp 'sterile start-process.xml'
+    New-EnvironmentProbe $environmentProbe
+    $sterileResult = Invoke-SterileWrapperProbe $elevationWrapper $sterileHarness $environmentProbe $environmentCapture $sterileStartCapture $wrapperPaths $runAsWrapper
+    Assert-True ($sterileResult.ExitCode -eq 0) "PowerShell 5.1 -UseNewEnvironment wrapper probe must run successfully: $($sterileResult.Output)"
+    $sterileStart = Import-Clixml -LiteralPath $sterileStartCapture
+    Assert-True ($sterileStart.FilePath -eq 'powershell.exe' -and $sterileStart.UseNewEnvironment -and $sterileStart.Wait -and $sterileStart.PassThru) 'sterile wrapper must launch powershell.exe with -UseNewEnvironment -Wait -PassThru'
+    $sterileArguments = $sterileStart.ArgumentList -join "`n"
+    Assert-True ($sterileArguments -match [regex]::Escape($runAsWrapper) -and $sterileArguments -match [regex]::Escape($wrapperPaths.Helper)) 'sterile wrapper must carry both helper paths in its explicit argument list'
+    $probeEnvironment = [IO.File]::ReadAllLines($environmentCapture)
+    Assert-True ($probeEnvironment -contains 'DASHBOARD_SESSION_TOKEN=<null>') 'actual sterile child process must not inherit the Dashboard session token'
+    Assert-True ($probeEnvironment -contains 'PROVIDER_API_KEY=<null>') 'actual sterile child process must not inherit provider credentials'
+    Assert-True ($elevationMatch.Groups['Body'].Value -match '-UseNewEnvironment') 'sterile launcher must use PowerShell 5.1-compatible -UseNewEnvironment'
+    Assert-True ($elevationMatch.Groups['Body'].Value -match '\$RunAsHelper' -and $elevationMatch.Groups['Body'].Value -match '\$OwnerHelper') 'sterile launcher must carry helper paths explicitly'
+    Assert-True ($elevationWriterMatch.Value -match 'is_windows \|\| return 0') 'elevation helper files must be generated only on Windows'
+    Assert-True ($agentInstaller -match 'is_windows && write_dashboard_elevation_helper') 'non-Windows install flow must not invoke elevation-helper generation'
+
+    $wrapperResult = Invoke-ElevationWrapperHarness $runAsWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
+    Assert-True ($wrapperResult.ExitCode -eq 0) "RunAs wrapper must return elevated child 0: $($wrapperResult.Output)"
     $startInvocation = Import-Clixml -LiteralPath $startCapture
-    Assert-True ($startInvocation.FilePath -eq 'powershell.exe') 'elevation wrapper must launch powershell.exe'
-    Assert-True ($startInvocation.Verb -eq 'RunAs' -and $startInvocation.Wait -and $startInvocation.PassThru) 'elevation wrapper must use -Verb RunAs -Wait -PassThru'
+    Assert-True ($startInvocation.FilePath -eq 'powershell.exe') 'RunAs wrapper must launch powershell.exe'
+    Assert-True ($startInvocation.Verb -eq 'RunAs' -and $startInvocation.Wait -and $startInvocation.PassThru) 'RunAs wrapper must use -Verb RunAs -Wait -PassThru'
     $childInvocation = Import-Clixml -LiteralPath $childCapture
     Assert-True ($childInvocation.ExpectedRoot -ceq $wrapperPaths.Root) 'PS5.1 parsing must preserve expected root as one argument'
     Assert-True ($childInvocation.ExpectedHermes -ceq $wrapperPaths.Hermes) 'PS5.1 parsing must preserve Hermes executable as one argument'
@@ -560,15 +668,15 @@ exit ([int]$env:COZYGATEWAY_TEST_CHILD_CODE)
     Assert-True ($childInvocation.ExtraArguments.Count -eq 0) 'elevated helper must receive no merged or extra arguments'
     $startArguments = $startInvocation.ArgumentList -join "`n"
     Assert-True ($startArguments -match '(?m)^-NoProfile$' -and $startArguments -match '(?m)^-NonInteractive$' -and $startArguments -match '(?m)^-ExecutionPolicy$' -and $startArguments -match '(?m)^Bypass$' -and $startArguments -match '(?m)^-File$') 'elevation wrapper must carry the required PowerShell argument array'
-    $wrapperEvidence = $wrapperResult.Output + "`n" + (Get-Content -LiteralPath $startCapture -Raw) + "`n" + (Get-Content -LiteralPath $childCapture -Raw)
+    $wrapperEvidence = $wrapperResult.Output + "`n" + (Get-Content -LiteralPath $startCapture -Raw)
     Assert-True (-not ($wrapperEvidence -match 'task-2-secret-token|task-2-provider-secret')) 'elevation wrapper arguments and logs must not expose token or provider secrets'
 
     foreach ($childCode in @(42, 43, 45, 99)) {
-        $childFailure = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths $childCode
+        $childFailure = Invoke-ElevationWrapperHarness $runAsWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths $childCode
         Assert-True ($childFailure.ExitCode -eq $childCode) "elevation wrapper must preserve elevated child exit code $childCode"
     }
 
-    $cancelResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0 -Cancel
+    $cancelResult = Invoke-ElevationWrapperHarness $runAsWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0 -Cancel
     Assert-True ($cancelResult.ExitCode -eq 46) "UAC cancellation or Start-Process failure must return the launch-failure code (actual $($cancelResult.ExitCode)): $($cancelResult.Output)"
     Assert-True (-not (Test-Path -LiteralPath $childCapture)) 'UAC cancellation must not run the elevated child'
 
