@@ -289,10 +289,15 @@ function Get-TrustedTailscale {
     $daemon = [IO.Path]::GetFullPath((Join-Path $directory 'tailscaled.exe'))
     $cli = [IO.Path]::GetFullPath((Join-Path $directory 'tailscale.exe'))
     $legacy = [IO.Path]::GetFullPath((Join-Path $directory 'tailscale-ipn.exe'))
-    if ((Test-Path -LiteralPath $legacy) -and -not (Test-Path -LiteralPath $cli)) { Throw-Reason 'tailscale_legacy_unsupported' }
-    if (-not (Test-Path -LiteralPath $daemon) -or -not (Test-Path -LiteralPath $cli)) { Throw-Reason 'tailscale_not_installed' }
-    if ((Test-ReparsePath $directory) -or (Test-ReparsePath $daemon) -or (Test-ReparsePath $cli)) { Throw-Reason 'tailscale_service_mismatch' }
+    $daemonExists = Test-Path -LiteralPath $daemon
+    $cliExists = Test-Path -LiteralPath $cli
+    if ((Test-Path -LiteralPath $legacy) -and -not $cliExists) { Throw-Reason 'tailscale_legacy_unsupported' }
     $service = Get-ServiceRecord
+    if (-not $daemonExists -or -not $cliExists) {
+        if (($null -ne $service -and [bool]$service.exists) -or $daemonExists -or $cliExists) { Throw-Reason 'tailscale_service_mismatch' }
+        Throw-Reason 'tailscale_not_installed'
+    }
+    if ((Test-ReparsePath $directory) -or (Test-ReparsePath $daemon) -or (Test-ReparsePath $cli)) { Throw-Reason 'tailscale_service_mismatch' }
     if ($null -eq $service -or -not [bool]$service.exists) { Throw-Reason 'tailscale_service_mismatch' }
     $serviceExecutable = Get-ServiceExecutable ([string]$service.imagePath)
     if ($null -eq $serviceExecutable -or -not [string]::Equals($serviceExecutable, $daemon, [StringComparison]::OrdinalIgnoreCase)) { Throw-Reason 'tailscale_service_mismatch' }

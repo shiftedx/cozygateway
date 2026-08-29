@@ -24,6 +24,11 @@ export type TailscaleModePauseReason =
   | "install_failed"
   | "unsupported_install"
   | "unsupported_version"
+  | "tailscale_legacy_unsupported"
+  | "tailscale_service_mismatch"
+  | "tailscale_signature_invalid"
+  | "tailscale_publisher_invalid"
+  | "tailscale_prerequisite_disabled"
   | "custom_control_server"
   | "status_unavailable"
   | "login_failed"
@@ -113,6 +118,7 @@ export interface TailscaleModeHelper {
 
 export interface TailscaleModeIo {
   offerInstall(signal?: AbortSignal): Promise<boolean>;
+  offerUpdate(signal?: AbortSignal): Promise<boolean>;
   confirmCurrentAccount(
     account: { accountLabel: string; tailnetName: string },
     signal?: AbortSignal,
@@ -539,14 +545,8 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
   }
 
   async prepare(signal?: AbortSignal): Promise<TailscalePreparedEndpoint> {
-    const cli = await this.#cli(signal, true);
-    try {
-      await cli.requireSupportedVersion(signal);
-    } catch (error) {
-      if (error instanceof TailscaleCliError && error.reason === "unsupported_version")
-        throw new TailscaleModePause("unsupported_version", error.reason);
-      throw cliPause("status_unavailable", error);
-    }
+    let cli = await this.#cli(signal, true);
+    cli = await this.#ensureSupportedCli(cli, signal);
     try {
       await cli.requireOfficialControlServer(signal);
     } catch (error) {
@@ -955,28 +955,61 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     if (discovery.state !== "ready" && discovery.reason === "tailscale_not_installed") {
       if (!allowInstall) throw new TailscaleModePause("not_installed");
       if (!await this.#dependencies.io.offerInstall(signal)) throw new TailscaleModePause("not_installed");
-      try {
-        await this.#dependencies.helper.installTailscale(signal);
-      } catch (error) {
-        const detail = typedReason(error);
-        if (detail === "installer_cancelled") throw new TailscaleModePause("install_cancelled", detail);
-        if (detail === "installer_reboot_required") throw new TailscaleModePause("install_reboot_required", detail);
-        if (detail === "installer_signature_invalid")
-          throw new TailscaleModePause("install_verification_failed", detail);
-        throw new TailscaleModePause("install_failed", detail);
-      }
-      await this.#inject("install");
+      await this.#installOfficial(signal);
       discovery = await this.#dependencies.helper.discoverTailscale(signal);
     }
-    if (discovery.state !== "ready") throw new TailscaleModePause(
-      discovery.reason === "tailscale_not_installed" ? "not_installed" : "unsupported_install",
-      discovery.reason,
-    );
+    if (discovery.state !== "ready") throw this.#discoveryPause(discovery.reason);
     return new TailscaleCli({
       executable: discovery.cliPath,
       runner: this.#dependencies.cliRunner,
       timeoutMs: this.#dependencies.cliTimeoutMs,
     });
+  }
+
+  async #ensureSupportedCli(cli: TailscaleCli, signal?: AbortSignal): Promise<TailscaleCli> {
+    try {
+      await cli.requireSupportedVersion(signal);
+      return cli;
+    } catch (error) {
+      if (!(error instanceof TailscaleCliError) || error.reason !== "unsupported_version")
+        throw cliPause("status_unavailable", error);
+    }
+    if (!await this.#dependencies.io.offerUpdate(signal))
+      throw new TailscaleModePause("unsupported_version", "unsupported_version");
+    await this.#installOfficial(signal);
+    const updated = await this.#cli(signal, false);
+    try {
+      await updated.requireSupportedVersion(signal);
+      return updated;
+    } catch (error) {
+      if (error instanceof TailscaleCliError && error.reason === "unsupported_version")
+        throw new TailscaleModePause("unsupported_version", error.reason);
+      throw cliPause("status_unavailable", error);
+    }
+  }
+
+  async #installOfficial(signal?: AbortSignal): Promise<void> {
+    try {
+      await this.#dependencies.helper.installTailscale(signal);
+    } catch (error) {
+      const detail = typedReason(error);
+      if (detail === "installer_cancelled") throw new TailscaleModePause("install_cancelled", detail);
+      if (detail === "installer_reboot_required") throw new TailscaleModePause("install_reboot_required", detail);
+      if (detail === "installer_signature_invalid")
+        throw new TailscaleModePause("install_verification_failed", detail);
+      throw new TailscaleModePause("install_failed", detail);
+    }
+    await this.#inject("install");
+  }
+
+  #discoveryPause(reason: Exclude<TailscaleDiscovery, { state: "ready" }>["reason"]): TailscaleModePause {
+    if (reason === "tailscale_not_installed") return new TailscaleModePause("not_installed", reason);
+    if (reason === "tailscale_legacy_unsupported"
+      || reason === "tailscale_service_mismatch"
+      || reason === "tailscale_signature_invalid"
+      || reason === "tailscale_publisher_invalid"
+      || reason === "tailscale_prerequisite_disabled") return new TailscaleModePause(reason, reason);
+    return new TailscaleModePause("unsupported_install", reason);
   }
 
   async #mappingInspection(

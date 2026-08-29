@@ -466,6 +466,9 @@ function resumeSetupCommand(configPath: string): string {
   return `cozygateway setup --config "${configPath}"`;
 }
 
+const COZYGATEWAY_REINSTALL_COMMAND = "irm https://cozylabs.ai/setup | iex";
+const TAILSCALE_INSTALLER_COMMAND = "Start-Process 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'";
+
 function setupIo(io: CliIo): OnboardingIo {
   return {
     chooseNetworkMode: async () => {
@@ -536,13 +539,18 @@ function setupIo(io: CliIo): OnboardingIo {
 }
 
 const PAUSE_COPY: Readonly<Record<string, string>> = {
-  not_installed: "Install the official Tailscale app, then resume setup.",
+  not_installed: `Install the official Tailscale app with: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
   install_cancelled: "Tailscale installation was cancelled in Windows. Nothing was paired.",
   install_reboot_required: "Restart Windows, then resume this setup.",
-  install_verification_failed: "The Tailscale installer signature could not be verified. Download the current official installer, then resume.",
-  install_failed: "Tailscale installation did not complete. Finish the official installer, then resume.",
-  unsupported_install: "Remove the unsupported copy and install a supported official Tailscale installation, then resume.",
-  unsupported_version: "Update Tailscale to a supported version, then resume.",
+  install_verification_failed: `The Tailscale installer signature could not be verified. Retry only from the official package with: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  install_failed: `Tailscale installation did not complete. Re-open the signed official installer with: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  unsupported_install: `This Tailscale installation could not be verified for automatic use. Keep its account and tailnet state; update or repair it with the signed official installer: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  unsupported_version: `Update Tailscale with the signed official installer: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  tailscale_legacy_unsupported: `A legacy Tailscale client was found. Upgrade it with: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  tailscale_service_mismatch: `The Tailscale Windows service does not match the official Program Files binaries. Re-run the signed official installer with: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  tailscale_signature_invalid: `The installed Tailscale binary signature is invalid. Do not run it; reinstall from the signed official package with: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  tailscale_publisher_invalid: `The installed Tailscale publisher could not be verified as Tailscale Inc. Do not run it; reinstall from the signed official package with: ${TAILSCALE_INSTALLER_COMMAND} ; then resume setup.`,
+  tailscale_prerequisite_disabled: "The Tailscale Windows service is disabled. In Services, enable and start Tailscale if allowed; if the control is locked, ask the Windows administrator or policy owner, then resume setup. Reinstalling or removing the tailnet is not required.",
   custom_control_server: "Sign in through the official Tailscale control server; custom control servers are not supported by this setup flow, then resume.",
   status_unavailable: "Start the Tailscale service and confirm the app is responsive, then resume.",
   login_pending: "Finish signing in to Tailscale in the browser, then resume.",
@@ -587,7 +595,7 @@ const INSPECTION_COPY: Readonly<Record<Extract<NonNullable<NetworkOnboardingStat
 
 function ownedNetworkCleanupFailure(error: unknown): string {
   if (!(error instanceof WindowsOwnedNetworkCleanupError))
-    return "Owned network cleanup could not verify a safe rollback. Run the CozyGateway installer Repair action, then retry uninstall.";
+    return `Owned network cleanup could not verify a safe rollback. Reinstall CozyGateway with: ${COZYGATEWAY_REINSTALL_COMMAND} ; then retry uninstall.`;
   const code = error.code;
   const prefix = `Owned network cleanup paused (${code}). `;
   switch (code) {
@@ -595,6 +603,14 @@ function ownedNetworkCleanupFailure(error: unknown): string {
       return `${prefix}Start the Tailscale service, then retry uninstall.`;
     case "old_version":
       return `${prefix}Update the official Tailscale app, then retry uninstall.`;
+    case "tailscale_legacy_unsupported":
+      return `${prefix}A legacy Tailscale client cannot safely reconcile the owned route. Update it with: ${TAILSCALE_INSTALLER_COMMAND} ; then retry uninstall.`;
+    case "tailscale_service_mismatch":
+      return `${prefix}The Tailscale Windows service does not match the official Program Files binaries. Re-run the signed official installer with: ${TAILSCALE_INSTALLER_COMMAND} ; then retry uninstall.`;
+    case "tailscale_signature_invalid":
+      return `${prefix}The installed Tailscale signature or publisher could not be verified. Do not run it; reinstall from: ${TAILSCALE_INSTALLER_COMMAND} ; then retry uninstall.`;
+    case "tailscale_prerequisite_disabled":
+      return `${prefix}The Tailscale service is disabled. Enable and start it in Services if allowed, or ask the Windows policy owner, then retry uninstall.`;
     case "logged_out":
       return `${prefix}Sign in to the Tailscale account that owns this route, then retry uninstall.`;
     case "custom_control":
@@ -612,7 +628,7 @@ function ownedNetworkCleanupFailure(error: unknown): string {
     case "authority_unsafe":
       return `${prefix}Restore the configured database path to its original regular file, then retry uninstall.`;
     case "helper_invalid":
-      return `${prefix}Run the CozyGateway installer Repair action to restore the helper path and ACLs, then retry uninstall.`;
+      return `${prefix}Reinstall CozyGateway to restore the helper path and ACLs with: ${COZYGATEWAY_REINSTALL_COMMAND} ; then retry uninstall.`;
     case "listener_changed":
       return `${prefix}Restore the CozyGateway listener configuration recorded by setup, then retry uninstall.`;
     case "timeout":
@@ -681,6 +697,9 @@ async function runSetup(
     console.log(`Resume: ${resumeSetupCommand(configPath)}`);
   } else if (outcome.outcome === "not_confirmed") {
     console.log("The phone connection check was not confirmed. No pairing material was created.");
+    if (outcome.reason === "phone" && outcome.mode === "tailscale") {
+      console.log("Before retrying, confirm Tailscale is signed in and its VPN is active on the phone, the phone and PC use the same intended tailnet, and tailnet policy permits the phone to reach this PC.");
+    }
     console.log(`Resume: ${resumeSetupCommand(configPath)}`);
   } else if (outcome.outcome === "invalidated") {
     console.log("The network changed during verification. Run setup again for the current route.");

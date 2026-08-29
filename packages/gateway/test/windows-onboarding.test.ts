@@ -271,6 +271,11 @@ describe("createWindowsOnboardingController composition", () => {
     [{ reason: "logged_out" }, "logged_out"],
     [{ reason: "unsupported_install" }, "old_version"],
     [{ reason: "unsupported_version" }, "old_version"],
+    [{ reason: "tailscale_legacy_unsupported" }, "tailscale_legacy_unsupported"],
+    [{ reason: "tailscale_service_mismatch" }, "tailscale_service_mismatch"],
+    [{ reason: "tailscale_signature_invalid" }, "tailscale_signature_invalid"],
+    [{ reason: "tailscale_publisher_invalid" }, "tailscale_signature_invalid"],
+    [{ reason: "tailscale_prerequisite_disabled" }, "tailscale_prerequisite_disabled"],
   ] as const)("maps cleanup failure %o to the safe diagnostic %s", async (failure, code) => {
     const { configPath, storage } = fixture();
     storage.close();
@@ -668,7 +673,7 @@ describe("createWindowsOnboardingController composition", () => {
     )!;
 
     await expect(controller.run(onboardingIo("advanced"))).resolves.toEqual({
-      outcome: "not_confirmed", reason: "phone",
+      outcome: "not_confirmed", reason: "phone", mode: "advanced",
     });
     expect(readManagedListenerSnapshot(configPath)).toEqual(before);
     expect(storage.onboardingOwnership("advanced:listener")).toBeUndefined();

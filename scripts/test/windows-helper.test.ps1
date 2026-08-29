@@ -163,6 +163,14 @@ try {
     Remove-Item -LiteralPath $legacy -Force
     Write-Utf8NoBom $cli 'cli'
 
+    Remove-Item -LiteralPath $cli -Force
+    Assert-Paused (Invoke-Helper -Command 'discover-tailscale' -Input @{} -Fixture $trusted) 'tailscale_service_mismatch'
+    Write-Utf8NoBom $cli 'cli'
+
+    $missingService = @{} + $trusted
+    $missingService.service = @{ exists = $false }
+    Assert-Paused (Invoke-Helper -Command 'discover-tailscale' -Input @{} -Fixture $missingService) 'tailscale_service_mismatch'
+
     $mismatch = @{} + $trusted
     $mismatch.service = @{ exists = $true; imagePath = 'C:\Users\Public\tailscaled.exe'; startMode = 'Auto'; state = 'Running' }
     Assert-Paused (Invoke-Helper -Command 'discover-tailscale' -Input @{} -Fixture $mismatch) 'tailscale_service_mismatch'

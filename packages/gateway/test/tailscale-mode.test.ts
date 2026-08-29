@@ -37,11 +37,13 @@ function happyDependencies(options: {
   preferences?: { unattended: boolean; shieldsUp: boolean };
   serveSequence?: string[];
   controlUrl?: string;
+  versions?: string[];
 } = {}) {
   const calls: string[] = [];
   let serveState = options.serve ?? fixture("serve-compatible.json");
   const serveSequence = options.serveSequence === undefined ? undefined : [...options.serveSequence];
   const statuses = [...(options.status ?? [fixture("status-running.json")])];
+  const versions = [...(options.versions ?? [fixture("version-supported.json")])];
   const preferenceState = {
     unattended: options.preferences?.unattended ?? true,
     shieldsUp: options.preferences?.shieldsUp ?? false,
@@ -49,7 +51,11 @@ function happyDependencies(options: {
   const runner = vi.fn<TailscaleCliRunner>(async (_file, argv) => {
     const command = argv.join(" ");
     calls.push(command);
-    if (command === "version --json") return { exitCode: 0, stdout: fixture("version-supported.json"), stderr: "" };
+    if (command === "version --json") return {
+      exitCode: 0,
+      stdout: versions.length > 1 ? versions.shift()! : versions[0]!,
+      stderr: "",
+    };
     if (command === "debug prefs") return {
       exitCode: 0,
       stdout: JSON.stringify({ ControlURL: options.controlUrl ?? "https://controlplane.tailscale.com" }),
@@ -91,6 +97,7 @@ function happyDependencies(options: {
   };
   const io = {
     offerInstall: vi.fn(async () => false),
+    offerUpdate: vi.fn(async () => false),
     confirmCurrentAccount: vi.fn(async () => true),
     confirmPreference: vi.fn(async () => true),
     confirmCertificateTransparency: vi.fn(async () => true),
@@ -409,6 +416,63 @@ describe("TailscaleModeAdapter", () => {
     });
     await expect(installedAdapter.prepare()).resolves.toMatchObject({ ready: true });
     expect(installed.helper.installTailscale).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers one explicit signed-official update for an old trusted client, then rediscovers and rechecks", async () => {
+    const dependencies = happyDependencies({
+      versions: [fixture("version-old.json"), fixture("version-supported.json")],
+    });
+    dependencies.io.offerUpdate.mockResolvedValue(true);
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      serveConfigClient: dependencies.serveConfigClient,
+    });
+
+    await expect(adapter.prepare()).resolves.toMatchObject({ ready: true });
+    expect(dependencies.io.offerUpdate).toHaveBeenCalledTimes(1);
+    expect(dependencies.helper.installTailscale).toHaveBeenCalledTimes(1);
+    expect(dependencies.helper.discoverTailscale).toHaveBeenCalledTimes(2);
+    expect(dependencies.calls.filter((call) => call === "version --json")).toHaveLength(2);
+  });
+
+  it("leaves an old trusted client and its tailnet untouched when the signed update is declined", async () => {
+    const dependencies = happyDependencies({ versions: [fixture("version-old.json")] });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      serveConfigClient: dependencies.serveConfigClient,
+    });
+
+    await expect(adapter.prepare()).rejects.toMatchObject({
+      reason: "unsupported_version", detail: "unsupported_version", retryable: true,
+    });
+    expect(dependencies.io.offerUpdate).toHaveBeenCalledTimes(1);
+    expect(dependencies.helper.installTailscale).not.toHaveBeenCalled();
+    expect(dependencies.helper.setPreference).not.toHaveBeenCalled();
+    expect(dependencies.calls).toEqual(["version --json"]);
+  });
+
+  it.each([
+    "tailscale_legacy_unsupported",
+    "tailscale_service_mismatch",
+    "tailscale_signature_invalid",
+    "tailscale_publisher_invalid",
+    "tailscale_prerequisite_disabled",
+  ] as const)("preserves typed discovery pause %s without uninstall, update, or tailnet mutation", async (reason) => {
+    const dependencies = happyDependencies();
+    dependencies.helper.discoverTailscale.mockResolvedValue({ state: "paused", reason });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      serveConfigClient: dependencies.serveConfigClient,
+    });
+
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason, detail: reason, retryable: true });
+    expect(dependencies.io.offerInstall).not.toHaveBeenCalled();
+    expect(dependencies.io.offerUpdate).not.toHaveBeenCalled();
+    expect(dependencies.helper.installTailscale).not.toHaveBeenCalled();
+    expect(dependencies.calls).toEqual([]);
   });
 
   it("changes only consented unattended and shields-up preferences and verifies each targeted value", async () => {

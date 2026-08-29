@@ -108,6 +108,15 @@ protection > Advanced settings > Inbound Rules**, or choose personal Tailscale; 
 firewall or add an all-ports rule.
 Personal Tailscale must remain active on both PC and phone. Authorized/shared tailnet peers may
 reach the service when policy permits, and tailnet administrators can observe/manage the device.
+If the phone connection check cannot complete, first confirm the phone is signed in with Tailscale,
+its VPN is active, the phone and PC are on the intended tailnet, and tailnet policy permits the
+phone to reach the PC. The terminal then prints the exact `cozygateway setup --config "..."` command
+that resumes the same deterministic flow; it does not create pairing material on a failed check.
+An old but correctly signed official Tailscale client is offered one explicit-consent update through
+the same signed official installer path used for a fresh install. Declining leaves the existing
+client and tailnet untouched and prints a manual update command. Disabled-service/policy,
+service/binary mismatch, invalid signature/publisher, and legacy-client discoveries remain distinct
+diagnostics; setup does not collapse them into an instruction to uninstall Tailscale.
 Advanced setup requires a concrete hostname or IP address reachable from the phone. Loopback and
 wildcard addresses are never placed in a pairing or verification QR.
 
@@ -184,6 +193,13 @@ remain governed by the recorded ownership rules; unrelated processes and persist
 not stopped. Every Windows removal path validates the private install marker first and deletes only
 an explicit allowlist of CozyGateway files plus the owned private Node runtime. It removes the install
 root only when empty; user-added files are retained in place and the retained root is reported.
+There is no separate installer Repair action. Re-run the one-paste installer from PowerShell to
+restore the verified CozyGateway helper and bundle while preserving owned state:
+
+```powershell
+irm https://cozylabs.ai/setup | iex
+```
+
 Linux service units honor `XDG_CONFIG_HOME` and otherwise use
 `~/.config/systemd/user`. An environment without a running systemd user manager,
 such as a container or WSL instance without systemd, fails before installation

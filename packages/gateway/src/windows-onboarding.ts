@@ -68,6 +68,8 @@ import { WindowsHelperClient } from "./windows-helper.ts";
 
 export type WindowsOwnedNetworkCleanupErrorCode =
   | "tailscale_not_running" | "old_version" | "logged_out" | "custom_control"
+  | "tailscale_legacy_unsupported" | "tailscale_service_mismatch"
+  | "tailscale_signature_invalid" | "tailscale_prerequisite_disabled"
   | "account_changed" | "mapping_changed" | "elevation_required"
   | "preference_changed"
   | "authority_missing" | "authority_unsafe" | "helper_invalid"
@@ -104,6 +106,11 @@ function cleanupCode(error: unknown): WindowsOwnedNetworkCleanupErrorCode {
   if (reason === "account_changed") return "account_changed";
   if (reason.includes("custom_control")) return "custom_control";
   if (reason.includes("version") || reason === "unsupported_install") return "old_version";
+  if (reason === "tailscale_legacy_unsupported") return "tailscale_legacy_unsupported";
+  if (reason === "tailscale_service_mismatch") return "tailscale_service_mismatch";
+  if (reason === "tailscale_signature_invalid" || reason === "tailscale_publisher_invalid")
+    return "tailscale_signature_invalid";
+  if (reason === "tailscale_prerequisite_disabled") return "tailscale_prerequisite_disabled";
   if (reason.includes("logged_out")) return "logged_out";
   if (reason.includes("not_running") || reason === "not_installed") return "tailscale_not_running";
   if (reason === "status_unavailable") {
@@ -905,6 +912,7 @@ function tailscaleIo(io?: CliIo): TailscaleModeIo {
   const yes = async (prompt: string) => io !== undefined && /^(?:y|yes)$/i.test((await io.question(prompt)).trim());
   return {
     offerInstall: () => yes("Install the official signed Tailscale app? Windows may show UAC. [y/N] "),
+    offerUpdate: () => yes("Update this trusted Tailscale client with the official signed installer? Windows may show UAC. [y/N] "),
     confirmCurrentAccount: ({ accountLabel, tailnetName }) =>
       yes(`Use the currently signed-in Tailscale account ${accountLabel} on ${tailnetName}? [y/N] `),
     confirmPreference: (preference, desired) => yes(

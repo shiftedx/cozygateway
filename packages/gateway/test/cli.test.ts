@@ -278,7 +278,7 @@ describe("cozygateway pair finale", () => {
     expect(io.close).toHaveBeenCalledOnce();
     expect(controller.close).toHaveBeenCalledOnce();
     expect(lines).toHaveLength(1);
-    expect(lines.join("\n")).toContain("installer Repair action");
+    expect(lines.join("\n")).toContain("irm https://cozylabs.ai/setup | iex");
     expect(lines.join("\n")).not.toMatch(/secret\.invalid|do-not-print|authUrl|token/i);
     vi.restoreAllMocks();
   });
@@ -286,6 +286,10 @@ describe("cozygateway pair finale", () => {
   it.each([
     ["tailscale_not_running", "Start the Tailscale service"],
     ["old_version", "Update the official Tailscale app"],
+    ["tailscale_legacy_unsupported", "legacy Tailscale client"],
+    ["tailscale_service_mismatch", "Tailscale Windows service does not match"],
+    ["tailscale_signature_invalid", "installed Tailscale signature or publisher"],
+    ["tailscale_prerequisite_disabled", "service is disabled"],
     ["logged_out", "Sign in to the Tailscale account"],
     ["custom_control", "official control server"],
     ["account_changed", "tailnet account that created this route"],
@@ -294,7 +298,7 @@ describe("cozygateway pair finale", () => {
     ["preference_changed", "restore the prior Tailscale preferences"],
     ["authority_missing", "Restore the configured CozyGateway database"],
     ["authority_unsafe", "original regular file"],
-    ["helper_invalid", "helper path and ACLs"],
+    ["helper_invalid", "irm https://cozylabs.ai/setup | iex"],
     ["listener_changed", "Restore the CozyGateway listener configuration"],
     ["timeout", "wait for both to respond"],
   ] as const)("prints safe cleanup code %s with one concrete repair step", async (code, repair) => {
@@ -825,8 +829,13 @@ describe("cozygateway terminal menu", () => {
     ["install_reboot_required", "Restart Windows, then resume"],
     ["install_verification_failed", "Tailscale installer signature could not be verified"],
     ["install_failed", "Tailscale installation did not complete"],
-    ["unsupported_install", "supported official Tailscale installation"],
+    ["unsupported_install", "Keep its account and tailnet state"],
     ["unsupported_version", "Update Tailscale"],
+    ["tailscale_legacy_unsupported", "legacy Tailscale client"],
+    ["tailscale_service_mismatch", "Tailscale Windows service does not match"],
+    ["tailscale_signature_invalid", "signature is invalid"],
+    ["tailscale_publisher_invalid", "publisher could not be verified"],
+    ["tailscale_prerequisite_disabled", "service is disabled"],
     ["custom_control_server", "official Tailscale control server"],
     ["status_unavailable", "Start the Tailscale service"],
     ["login_pending", "Finish signing in to Tailscale"],
@@ -869,6 +878,30 @@ describe("cozygateway terminal menu", () => {
     expect(lines.join("\n")).toContain(copy);
     expect(lines.join("\n")).toContain("cozygateway setup");
     expect(lines.join("\n")).not.toMatch(/diagnostic dump|authUrl|token/i);
+  });
+
+  it("gives a failed personal-Tailscale phone check a complete phone-side checklist and exact resume command", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      resume: vi.fn(async () => ({
+        outcome: "not_confirmed" as const,
+        reason: "phone" as const,
+        mode: "tailscale" as const,
+      })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    const output = lines.join("\n");
+    expect(output).toContain("Tailscale is signed in and its VPN is active on the phone");
+    expect(output).toContain("same intended tailnet");
+    expect(output).toContain("tailnet policy permits the phone to reach this PC");
+    expect(lines.filter((line) => line.startsWith("Resume:"))).toEqual([
+      `Resume: cozygateway setup --config "${configPath}"`,
+    ]);
   });
 
   it("blocks fresh/changed pairing, allows matching complete pairing, and preserves legacy pairing", async () => {

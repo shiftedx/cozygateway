@@ -130,7 +130,7 @@ export type OnboardingOutcome =
   | { outcome: "already_complete"; mode: OnboardingMode; endpoint: PreparedEndpoint }
   | { outcome: "deferred" }
   | { outcome: "cancelled" }
-  | { outcome: "not_confirmed"; reason: "phone" | "desktop" }
+  | { outcome: "not_confirmed"; reason: "phone" | "desktop"; mode?: OnboardingMode }
   | { outcome: "invalidated"; reason: "posture" | "verification_epoch" | "phrase" }
   | { outcome: "lost_race" }
   | { outcome: "paused"; mode: OnboardingMode; reason: string; detail?: string }
@@ -574,7 +574,8 @@ export class NetworkOnboarding {
     } catch {
       return { outcome: "failed", reason: "rollback_failed" };
     }
-    if (reason === "phone" || reason === "desktop") return { outcome: "not_confirmed", reason };
+    if (reason === "phone" || reason === "desktop")
+      return { outcome: "not_confirmed", reason, mode: adapter.mode };
     if (reason === "posture" || reason === "verification_epoch" || reason === "phrase")
       return { outcome: "invalidated", reason };
     return { outcome: "failed", reason };
