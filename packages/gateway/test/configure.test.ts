@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -195,6 +195,65 @@ describe("listener configuration", () => {
     updateListenerConfig(path, "192.168.1.50", 9555, { clearPublicUrl: true });
     expect(compareAndSwapManagedListener(path, prepared, "127.0.0.1", 8787, { clearPublicUrl: true })).toBe(false);
     expect(loadConfig(path)).toMatchObject({ host: "192.168.1.50", port: 9555 });
+  });
+
+  it("reports a real live listener writer lock as a typed resumable listener change", () => {
+    const path = configFile();
+    const lockPath = `${path}.listener.lock`;
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), `${JSON.stringify({
+      version: 1, pid: process.pid, nonce: "a".repeat(32),
+    })}\n`);
+
+    expect(() => readManagedListenerSnapshot(path)).toThrow(expect.objectContaining({
+      retryable: true, reason: "listener_changed",
+    }));
+    expect(readFileSync(join(lockPath, "owner.json"), "utf8")).toContain(`"pid":${process.pid}`);
+  });
+
+  it("quarantines one exactly verified dead owner and recovers the stale writer lock", () => {
+    const path = configFile();
+    const expected = readManagedListenerSnapshot(path);
+    const lockPath = `${path}.listener.lock`;
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), `${JSON.stringify({
+      version: 1, pid: 2_147_483_647, nonce: "c".repeat(32),
+    })}\n`);
+
+    expect(compareAndSwapManagedListener(path, expected, "127.0.0.1", 9000)).toBe(true);
+    expect(loadConfig(path)).toMatchObject({ host: "127.0.0.1", port: 9000 });
+    expect(existsSync(lockPath)).toBe(false);
+    expect(readdirSync(dirname(path)).filter((name) => name.includes(".listener.lock.stale."))).toEqual([]);
+  });
+
+  it("fails closed without changing a malformed lock owner", () => {
+    const path = configFile();
+    const original = readFileSync(path, "utf8");
+    const lockPath = `${path}.listener.lock`;
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), "not bounded owner json\n");
+
+    expect(() => updateListenerConfig(path, "127.0.0.1", 9000)).toThrow(expect.objectContaining({
+      retryable: true, reason: "listener_changed",
+    }));
+    expect(readFileSync(join(lockPath, "owner.json"), "utf8")).toBe("not bounded owner json\n");
+    expect(readFileSync(path, "utf8")).toBe(original);
+  });
+
+  it("never broadly deletes an unrecognized entry while checking a dead stale lock", () => {
+    const path = configFile();
+    const lockPath = `${path}.listener.lock`;
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), `${JSON.stringify({
+      version: 1, pid: 2_147_483_647, nonce: "d".repeat(32),
+    })}\n`);
+    writeFileSync(join(lockPath, "preserve-me"), "owned by another writer\n");
+
+    expect(() => readManagedListenerSnapshot(path)).toThrow(expect.objectContaining({
+      retryable: true, reason: "listener_changed",
+    }));
+    expect(readFileSync(join(lockPath, "preserve-me"), "utf8")).toBe("owned by another writer\n");
+    expect(readdirSync(dirname(path)).filter((name) => name.includes(".listener.lock.stale."))).toEqual([]);
   });
 
   it("uses https for managed Hermes targets when gateway-native TLS is configured", () => {

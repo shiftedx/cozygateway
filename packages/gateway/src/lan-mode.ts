@@ -70,7 +70,8 @@ export interface LanPreparedEndpoint extends PreparedEndpoint {
 
 export class LanModePause extends Error {
   readonly retryable = true;
-  readonly reason: Extract<PhysicalLanSelection, { outcome: "paused" }>["reason"] | "listener_changed";
+  readonly reason: Extract<PhysicalLanSelection, { outcome: "paused" }>["reason"]
+    | "adapter_changed" | "listener_changed";
   readonly candidates: PhysicalLanCandidate[];
 
   constructor(
@@ -303,8 +304,18 @@ export class LanModeAdapter implements NetworkModeAdapter {
     if (this.#selectedAdapterId === undefined && this.#runtime.readSelectedAdapter !== undefined)
       this.#selectedAdapterId = await this.#runtime.readSelectedAdapter(signal);
     if (selection.outcome === "selected") {
-      if (this.#selectedAdapterId !== undefined && selection.candidate.adapterId !== this.#selectedAdapterId)
+      if (this.#selectedAdapterId !== undefined && selection.candidate.adapterId !== this.#selectedAdapterId) {
+        if (allowChoice && this.#runtime.chooseAdapter !== undefined) {
+          const replacement = await this.#runtime.chooseAdapter([selection.candidate], signal);
+          if (replacement === selection.candidate.adapterId) {
+            await this.#runtime.writeSelectedAdapter?.(replacement, signal);
+            this.#selectedAdapterId = replacement;
+            return selection.candidate;
+          }
+        }
+        if (allowChoice) throw new LanModePause("adapter_changed", [selection.candidate]);
         throw new LanModeReadinessError("posture");
+      }
       return selection.candidate;
     }
     if (selection.reason !== "multiple_up_physical_private_ipv4")

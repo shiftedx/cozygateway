@@ -158,3 +158,43 @@ Fresh final verification after that change:
 One earlier full-suite attempt run concurrently with build/typecheck ended in Vitest worker shutdown
 with `ERR_IPC_CHANNEL_CLOSED` and no assertion failure. The required standalone rerun completed with
 the counts above and exit status zero.
+
+## Second-review remediation
+
+Every item in `task-10-review-findings-2.md` was reproduced and resolved test-first:
+
+1. SQLite now records whether an otherwise terminal challenge was invalidated specifically by a
+   later Gateway boot. Authenticated status returns `gateway_restarted` only for that cause; expiry,
+   cancellation, and unknown challenges retain their distinct results. The operator client and real
+   Windows controller translate boot invalidation to the typed `gateway_restarting` pause. A
+   controller integration restarts the Gateway entirely between two post-begin polls and verifies
+   that the prepared adapter is not rolled back and no setup code or pairing output is produced.
+2. A persisted LAN choice remains drift during inspect when only a different physical candidate is
+   available. Prepare now requires explicit replacement confirmation, rejects cancel/invalid
+   responses as `adapter_changed`, and persists an accepted normalized ID through the helper ACL.
+   The real controller test completes Wi-Fi onboarding, reopens SQLite/controller state with sole
+   Ethernet, observes changed status, confirms Ethernet, and completes with the new durable choice.
+3. Real managed-listener lock contention is a typed `listener_changed` pause. Both the configuration
+   boundary and controller composition tests hold the actual lock and verify retryable output, no
+   Hermes restart, and no verification begin.
+4. Managed-listener locks now have bounded exact PID/nonce owner records and are atomically installed
+   from a private staging directory. Contention checks liveness without mutation. Only an owner PID
+   that returns definite `ESRCH` is eligible for one atomic quarantine attempt; the owner bytes must
+   match exactly after rename before the single known owner file and empty directory are removed.
+   Live, unknown, malformed, raced, or non-empty locks fail closed. Tests cover live contention,
+   dead-owner recovery, malformed ownership, and preservation of an unexpected sentinel without
+   recursive or broad deletion.
+
+Fresh final gates:
+
+- Focused CLI/controller/control/storage/network/configuration suites: 8 files, 189 tests passed.
+- Full Gateway suite: 100 files passed, 1 skipped; 1,078 tests passed, 2 skipped.
+- Gateway build and typecheck: passed.
+- Windows bootstrap regression suite: passed.
+- Full Hermes installer dry-run suite: passed.
+- `git diff --check`: clean apart from Git's LF-to-CRLF working-copy notices.
+
+No test invoked a live installer, UAC prompt, browser, Tailscale service, preference, Serve/Funnel
+mutation, or external network. The first full-suite attempt ended in the known Vitest worker
+`ERR_IPC_CHANNEL_CLOSED` shutdown with no assertion failure; the complete authoritative rerun exited
+zero with the counts above.

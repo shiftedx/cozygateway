@@ -207,7 +207,7 @@ export class PhoneVerification {
   status(challengeId: string):
     | { state: "pending"; expiresAt: number }
     | { state: "confirmed"; phrase: string; expiresAt: number }
-    | { state: "expired" | "cancelled" | "not_found" } {
+    | { state: "expired" | "cancelled" | "gateway_restarted" | "not_found" } {
     return this.#storage.onboardingVerificationStatus(challengeId, this.#now());
   }
 

@@ -11,7 +11,7 @@ const MAX_RESPONSE_BYTES = 4_096;
 export type OperatorPhoneStatus =
   | { state: "pending"; expiresAt: number }
   | { state: "confirmed"; phrase: string; expiresAt: number }
-  | { state: "expired" | "cancelled" | "not_found" };
+  | { state: "expired" | "cancelled" | "gateway_restarted" | "not_found" };
 
 export interface OperatorPhoneVerification {
   begin(mode: OnboardingMode, context: { canonicalOrigin: string; durableFingerprint: string }): {
@@ -309,6 +309,8 @@ export class OperatorOnboardingClient {
   status(challengeId: string, signal?: AbortSignal): Promise<OperatorPhoneStatus> {
     return this.#challengeCall("status", challengeId, signal).then((value) => {
       if (!record(value) || typeof value.state !== "string") throw new Error("local onboarding control failed");
+      if (value.state === "gateway_restarted" && exactKeys(value, ["state"]))
+        throw new OperatorOnboardingUnavailableError();
       if (value.state === "pending" && exactKeys(value, ["state", "expiresAt"]) && timestamp(value.expiresAt))
         return value as unknown as OperatorPhoneStatus;
       if (value.state === "confirmed" && exactKeys(value, ["state", "phrase", "expiresAt"])

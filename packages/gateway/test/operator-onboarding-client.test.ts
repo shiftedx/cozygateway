@@ -77,6 +77,20 @@ describe("operator onboarding client", () => {
     await expect(client.status("challenge-1")).rejects.toThrow("local onboarding control failed");
   });
 
+  it("turns authoritative boot invalidation into a resumable Gateway restart pause", async () => {
+    const client = new OperatorOnboardingClient({
+      localOrigin: "http://127.0.0.1:8787",
+      token: TOKEN,
+      fetch: vi.fn(async () => new Response('{"state":"gateway_restarted"}', {
+        status: 200, headers: { "content-type": "application/json" },
+      })) as typeof fetch,
+    });
+
+    await expect(client.status("challenge-1")).rejects.toMatchObject({
+      retryable: true, reason: "gateway_restarting",
+    });
+  });
+
   it("always composes a fixed deadline with caller cancellation and types endpoint absence as transient", async () => {
     vi.useFakeTimers();
     try {

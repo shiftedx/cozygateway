@@ -178,7 +178,7 @@ describe("running Gateway operator onboarding control", () => {
     const second = await gateway({ dbPath, tokenPath });
     const stale = await control(second, { action: "status", challengeId });
     expect(stale.status).toBe(200);
-    expect(await stale.json()).toEqual({ state: "not_found" });
+    expect(await stale.json()).toEqual({ state: "gateway_restarted" });
     expect((await control(second, beginBody(second, "tailscale"))).status).toBe(200);
   });
 });

@@ -174,6 +174,38 @@ describe("LanModeAdapter", () => {
     });
   });
 
+  it("explicitly replaces a persisted adapter when prepare finds a different sole candidate", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.selectedAdapterId = "wifi-that-went-away";
+    runtime.chooseAdapter = async (candidates) => {
+      expect(candidates).toEqual([
+        expect.objectContaining({ adapterId: "physical-ethernet", address: "192.168.1.23" }),
+      ]);
+      return "physical-ethernet";
+    };
+
+    await expect(new LanModeAdapter(runtime).prepare()).resolves.toMatchObject({
+      physicalAdapterId: "physical-ethernet", dhcpAddress: "192.168.1.23",
+    });
+    expect(runtime.selectedAdapterId).toBe("physical-ethernet");
+  });
+
+  it.each([undefined, "not-a-current-candidate"])(
+    "pauses without mutation when replacement-adapter confirmation returns %s",
+    async (replacement) => {
+    const runtime = new FakeLanRuntime();
+    runtime.selectedAdapterId = "wifi-that-went-away";
+    runtime.chooseAdapter = async () => replacement;
+
+    await expect(new LanModeAdapter(runtime).prepare()).rejects.toMatchObject({
+      retryable: true, reason: "adapter_changed",
+    });
+    expect(runtime.selectedAdapterId).toBe("wifi-that-went-away");
+    expect(runtime.compareAndSwapCalls).toEqual([]);
+    expect(runtime.restartCalls).toEqual([]);
+    },
+  );
+
   it.each([
     [{ health: false, webSocket: true, attachReady: true }, "health"],
     [{ health: true, webSocket: false, attachReady: true }, "websocket"],

@@ -27,6 +27,7 @@ import {
 import { NetworkOnboardingStateFile, type NetworkOnboardingStateProjection } from "./onboarding-state.ts";
 import {
   OperatorOnboardingClient,
+  OperatorOnboardingUnavailableError,
   loadOperatorControlToken,
   type OperatorBeginResult,
   type OperatorPhoneStatus,
@@ -443,6 +444,7 @@ export function createWindowsOnboardingController(
           console.log(`${index + 1}. ${name} (${candidate.kind}, ${candidate.address})`);
         }
         const answer = (await io.question(`Adapter [1-${candidates.length}]: `)).trim();
+        if (answer.toLowerCase() === "q" || answer.toLowerCase() === "cancel") return undefined;
         if (/^\d+$/.test(answer)) {
           const selected = candidates[Number(answer) - 1];
           if (selected !== undefined) return selected.adapterId;
@@ -543,6 +545,7 @@ export function createWindowsOnboardingController(
           }
           const current = await control.status(challenge.challengeId, signal);
           if (current.state === "confirmed") return current.phrase;
+          if (current.state === "gateway_restarted") throw new OperatorOnboardingUnavailableError();
           if (current.state !== "pending" || (dependencies.now ?? Date.now)() > current.expiresAt) return undefined;
           await (dependencies.delay ?? boundedDelay)(500, signal);
         }

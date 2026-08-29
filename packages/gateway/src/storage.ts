@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS onboarding_challenges (
   state TEXT NOT NULL CHECK (state IN ('active', 'ws_probed', 'phone_confirmed', 'consumed')),
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
-  invalidated_at INTEGER
+  invalidated_at INTEGER,
+  invalidated_by_restart INTEGER NOT NULL DEFAULT 0 CHECK (invalidated_by_restart IN (0, 1))
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS onboarding_one_live_challenge
   ON onboarding_challenges (session_id)
@@ -864,11 +865,12 @@ export class Storage {
   onboardingVerificationStatus(challengeId: string, now: number):
     | { state: "pending"; expiresAt: number }
     | { state: "confirmed"; phrase: string; expiresAt: number }
-    | { state: "expired" | "not_found" } {
+    | { state: "expired" | "gateway_restarted" | "not_found" } {
     if (challengeId.length < 1 || challengeId.length > 128 || !Number.isSafeInteger(now) || now < 0)
       return { state: "not_found" };
     const row = this.#db.prepare(`
-      SELECT c.state, c.phrase, c.expires_at AS expiresAt, s.state AS sessionState
+      SELECT c.state, c.phrase, c.expires_at AS expiresAt, s.state AS sessionState,
+        c.invalidated_by_restart AS invalidatedByRestart
       FROM onboarding_challenges c
       JOIN onboarding_sessions s ON s.session_id = c.session_id
       WHERE c.challenge_id = ?
@@ -877,7 +879,9 @@ export class Storage {
       phrase: string;
       expiresAt: number;
       sessionState: "active" | "complete" | "abandoned";
+      invalidatedByRestart: 0 | 1;
     } | undefined;
+    if (row?.invalidatedByRestart === 1) return { state: "gateway_restarted" };
     if (row === undefined || row.sessionState !== "active"
       || !["active", "ws_probed", "phone_confirmed"].includes(row.state))
       return { state: "not_found" };
@@ -997,7 +1001,8 @@ export class Storage {
         WHERE output_state = 'pending_output'
       `).run();
       this.#db.prepare(`
-        UPDATE onboarding_challenges SET state = 'consumed', invalidated_at = ?
+        UPDATE onboarding_challenges
+        SET state = 'consumed', invalidated_at = ?, invalidated_by_restart = 1
         WHERE state IN ('active', 'ws_probed', 'phone_confirmed')
       `).run(input.startedAt);
       this.#db.prepare(`
@@ -4065,6 +4070,15 @@ export function openStorage(dbPath: string): Storage {
       db.exec(`
         ALTER TABLE setup_codes ADD COLUMN output_state TEXT NOT NULL DEFAULT 'active'
           CHECK (output_state IN ('pending_output', 'active', 'revoked'))
+      `);
+    }
+    const challengeColumns = db
+      .prepare("SELECT name FROM pragma_table_info('onboarding_challenges')")
+      .all() as Array<{ name: string }>;
+    if (!challengeColumns.some(({ name }) => name === "invalidated_by_restart")) {
+      db.exec(`
+        ALTER TABLE onboarding_challenges ADD COLUMN invalidated_by_restart INTEGER NOT NULL DEFAULT 0
+          CHECK (invalidated_by_restart IN (0, 1))
       `);
     }
     db.exec(`

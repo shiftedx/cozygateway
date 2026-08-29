@@ -97,6 +97,53 @@ describe("phone verification page", () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
+  it("distinguishes a challenge invalidated by a later Gateway boot", () => {
+    const storage = openStorage(":memory:");
+    storage.beginGatewayBoot({
+      bootGeneration: "boot-before", verificationEpoch: "epoch-before",
+      canonicalOrigin: "https://gateway.example", durableFingerprint: "posture", startedAt: 1,
+    });
+    const verifier = new PhoneVerification({ storage, now: () => 3, monotonicNow: () => 3 });
+    verifier.activate({
+      bootGeneration: "boot-before", verificationEpoch: "epoch-before",
+      canonicalOrigin: "https://gateway.example", durableFingerprint: "posture",
+    });
+    const challenge = verifier.begin("tailscale");
+
+    storage.beginGatewayBoot({
+      bootGeneration: "boot-after", verificationEpoch: "epoch-after",
+      canonicalOrigin: "https://gateway.example", durableFingerprint: "posture", startedAt: 2,
+    });
+
+    expect(verifier.status(challenge.challengeId)).toEqual({ state: "gateway_restarted" });
+    verifier.close();
+    storage.close();
+  });
+
+  it("does not relabel an already cancelled challenge as a Gateway restart", () => {
+    const storage = openStorage(":memory:");
+    storage.beginGatewayBoot({
+      bootGeneration: "boot-before", verificationEpoch: "epoch-before",
+      canonicalOrigin: "https://gateway.example", durableFingerprint: "posture", startedAt: 1,
+    });
+    const verifier = new PhoneVerification({ storage, now: () => 2, monotonicNow: () => 2 });
+    verifier.activate({
+      bootGeneration: "boot-before", verificationEpoch: "epoch-before",
+      canonicalOrigin: "https://gateway.example", durableFingerprint: "posture",
+    });
+    const challenge = verifier.begin("tailscale");
+    expect(verifier.cancel(challenge.challengeId)).toBe(true);
+
+    storage.beginGatewayBoot({
+      bootGeneration: "boot-after", verificationEpoch: "epoch-after",
+      canonicalOrigin: "https://gateway.example", durableFingerprint: "posture", startedAt: 3,
+    });
+
+    expect(verifier.status(challenge.challengeId)).toEqual({ state: "not_found" });
+    verifier.close();
+    storage.close();
+  });
+
   it("normalizes literal default ports while preserving non-default ports", () => {
     expect(normalizeCanonicalOrigin("http://gateway.example:80")).toBe("http://gateway.example");
     expect(normalizeCanonicalOrigin("https://gateway.example:443")).toBe("https://gateway.example");

@@ -498,6 +498,7 @@ const PAUSE_COPY: Readonly<Record<string, string>> = {
   preference_change_denied: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
   no_up_physical_private_ipv4: "Connect this PC to trusted Wi-Fi or Ethernet, then resume.",
   multiple_up_physical_private_ipv4: "More than one physical network is active. Disconnect one or choose the intended adapter explicitly in Advanced settings, then resume.",
+  adapter_changed: "The previously selected network adapter is unavailable. Confirm the replacement adapter, then resume.",
   listener_changed: "The listener changed while setup was running. Review the intended adapter in Advanced settings, then resume.",
   mapping_conflict: "Tailscale port 443 is already in use. Keep that mapping and choose Same Wi-Fi, Later, or Advanced settings.",
   gateway_restarting: "Gateway is restarting. Wait for it to become ready, then resume; the prepared network route was preserved.",

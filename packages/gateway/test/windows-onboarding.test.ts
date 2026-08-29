@@ -13,6 +13,7 @@ import { openStorage, type OnboardingMode, type Storage } from "../src/storage.t
 import { createWindowsOnboardingController } from "../src/windows-onboarding.ts";
 import type { WindowsLanInventory } from "../src/lan.ts";
 import type { TailscaleCliRunner } from "../src/tailscale-cli.ts";
+import type { OperatorPhoneStatus } from "../src/operator-onboarding.ts";
 
 const roots: string[] = [];
 const tailscaleFixture = (name: string) => readFileSync(
@@ -79,7 +80,7 @@ function onboardingIo(mode: OnboardingMode): OnboardingIo {
   };
 }
 
-function phoneControl(storage: Storage, clock: () => number) {
+function phoneControl(storage: Storage, clock: () => number, namespace = "") {
   let sequence = 0;
   const live = new Map<string, { phrase: string; expiresAt: number }>();
   return {
@@ -91,9 +92,9 @@ function phoneControl(storage: Storage, clock: () => number) {
       storage.beginOperatorVerificationContext({
         ...endpoint, bootGeneration: context.bootGeneration, verificationEpoch, startedAt: now,
       });
-      const sessionId = `session-${sequence}`;
-      const challengeId = `challenge-${sequence}`;
-      const capability = String(sequence).padStart(43, "A").slice(-43);
+      const sessionId = `session-${namespace}${sequence}`;
+      const challengeId = `challenge-${namespace}${sequence}`;
+      const capability = createHash("sha256").update(`${namespace}:${sequence}`).digest("base64url");
       const capabilityHash = createHash("sha256").update(capability).digest("hex");
       const expiresAt = now + 600_000;
       const proof = {
@@ -113,7 +114,7 @@ function phoneControl(storage: Storage, clock: () => number) {
         verificationUrl: `${endpoint.canonicalOrigin}/cozy/onboarding/${capability}`, expiresAt,
       };
     }),
-    status: vi.fn(async (challengeId: string) => {
+    status: vi.fn(async (challengeId: string): Promise<OperatorPhoneStatus> => {
       const proof = live.get(challengeId);
       return proof === undefined
         ? { state: "not_found" as const }
@@ -247,6 +248,27 @@ describe("createWindowsOnboardingController composition", () => {
     });
     expect(resumedIo.question).not.toHaveBeenCalled();
     resumed.close();
+
+    const replacementStorage = openStorage(join(dirname(configPath), "gateway.sqlite"));
+    const replacementControl = phoneControl(replacementStorage, () => 20, "replacement-");
+    const replacementIo = cliIo(["invalid", "1"]);
+    const replacementDeps = {
+      ...dependencies(replacementStorage, oneLan, replacementControl, () => 20),
+      state: projection,
+      createSetupCode: vi.fn(() => "COZY-5678"),
+    };
+    const replacement = createWindowsOnboardingController(
+      configPath, replacementIo, runtime(), replacementDeps,
+    )!;
+    await expect(replacement.status()).resolves.toMatchObject({ stage: "changed", healthy: false, mode: "lan" });
+    await expect(replacement.resume(onboardingIo("lan"))).resolves.toMatchObject({
+      outcome: "complete", endpoint: { physicalAdapterId: "ethernet", dhcpAddress: "192.168.1.20" },
+    });
+    expect(replacementIo.question).toHaveBeenCalledTimes(2);
+    const selectionPath = join(dirname(configPath), "network-onboarding-lan-adapter");
+    expect(readFileSync(selectionPath, "utf8")).toBe("ethernet\n");
+    expect(replacementDeps.helper.protectPath).toHaveBeenCalledWith(dirname(dirname(configPath)), selectionPath, undefined);
+    replacement.close();
   });
 
   it("applies real advanced bind settings and restarts managed Hermes", async () => {
@@ -287,6 +309,46 @@ describe("createWindowsOnboardingController composition", () => {
     });
     expect(remote.rollbackOwned).not.toHaveBeenCalled();
     await expect(controller.resume(onboardingIo("tailscale"))).resolves.toMatchObject({ outcome: "complete" });
+    controller.close();
+  });
+
+  it("preserves the prepared route when the Gateway restarts entirely between post-begin polls", async () => {
+    const { configPath, storage } = fixture();
+    const control = phoneControl(storage, () => 10);
+    let polls = 0;
+    control.status.mockImplementation(async (challengeId: string) => {
+      polls += 1;
+      if (polls === 1) return { state: "pending" as const, expiresAt: 600_010 };
+      return storage.onboardingVerificationStatus(challengeId, 12);
+    });
+    const endpoint: PreparedEndpoint = {
+      mode: "tailscale", canonicalOrigin: "https://personal.example.ts.net", bindHost: "127.0.0.1",
+      port: 18787, durableFingerprint: "tailscale-posture", ready: true,
+    };
+    const remote: NetworkModeAdapter = {
+      mode: "tailscale", prepare: vi.fn(async () => endpoint), inspect: vi.fn(async () => endpoint),
+      rollbackOwned: vi.fn(async () => undefined),
+    };
+    const deps = {
+      ...dependencies(storage, oneLan, control, () => 12),
+      tailscaleAdapter: remote,
+      delay: vi.fn(async () => {
+        storage.beginGatewayBoot({
+          bootGeneration: "boot-2", verificationEpoch: "epoch-2",
+          canonicalOrigin: endpoint.canonicalOrigin, durableFingerprint: endpoint.durableFingerprint, startedAt: 11,
+        });
+      }),
+    };
+    const controller = createWindowsOnboardingController(configPath, cliIo(), runtime(), deps)!;
+
+    await expect(controller.run(onboardingIo("tailscale"))).resolves.toEqual({
+      outcome: "paused", mode: "tailscale", reason: "gateway_restarting",
+    });
+    expect(control.begin).toHaveBeenCalledOnce();
+    expect(control.status).toHaveBeenCalledTimes(2);
+    expect(remote.rollbackOwned).not.toHaveBeenCalled();
+    expect(deps.createSetupCode).not.toHaveBeenCalled();
+    expect(deps.writePairingOutput).not.toHaveBeenCalled();
     controller.close();
   });
 
@@ -340,6 +402,27 @@ describe("createWindowsOnboardingController composition", () => {
     });
     expect(readFileSync(configPath, "utf8")).toBe(concurrentText);
     expect(hostRuntime.restartHermesProfile).not.toHaveBeenCalled();
+    controller.close();
+  });
+
+  it("turns an actual live listener writer lock into a typed resumable pause", async () => {
+    const { configPath, storage } = fixture();
+    const lockPath = `${configPath}.listener.lock`;
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), `${JSON.stringify({
+      version: 1, pid: process.pid, nonce: "b".repeat(32),
+    })}\n`);
+    const control = phoneControl(storage, () => 10);
+    const hostRuntime = runtime();
+    const controller = createWindowsOnboardingController(
+      configPath, cliIo(), hostRuntime, dependencies(storage, oneLan, control, () => 10),
+    )!;
+
+    await expect(controller.run(onboardingIo("lan"))).resolves.toEqual({
+      outcome: "paused", mode: "lan", reason: "listener_changed",
+    });
+    expect(hostRuntime.restartHermesProfile).not.toHaveBeenCalled();
+    expect(control.begin).not.toHaveBeenCalled();
     controller.close();
   });
 });

@@ -596,6 +596,7 @@ describe("cozygateway terminal menu", () => {
     ["mapping_mutation_failed", "could not safely update Tailscale Serve"],
     ["no_up_physical_private_ipv4", "Connect this PC to trusted Wi-Fi or Ethernet"],
     ["multiple_up_physical_private_ipv4", "More than one physical network is active"],
+    ["adapter_changed", "previously selected network adapter is unavailable"],
     ["listener_changed", "listener changed while setup was running"],
     ["mapping_conflict", "Tailscale port 443 is already in use"],
     ["gateway_restarting", "Gateway is restarting"],

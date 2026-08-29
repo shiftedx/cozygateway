@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import {
-  chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync,
-  rmdirSync, statSync, unlinkSync, writeFileSync,
+  chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync,
+  renameSync, rmdirSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { isIP } from "node:net";
 import { dirname, join } from "node:path";
@@ -86,17 +87,151 @@ function writeAtomic(path: string, content: string, validate?: (temporary: strin
   }
 }
 
+export class ManagedListenerBusyError extends Error {
+  readonly retryable = true;
+  readonly reason = "listener_changed";
+
+  constructor() {
+    super("managed listener is being changed by another process");
+    this.name = "ManagedListenerBusyError";
+  }
+}
+
+const LISTENER_LOCK_OWNER = "owner.json";
+const LISTENER_LOCK_OWNER_MAX_BYTES = 256;
+const LISTENER_LOCK_NONCE = /^[0-9a-f]{32}$/;
+
+interface ListenerLockOwner {
+  version: 1;
+  pid: number;
+  nonce: string;
+}
+
+function listenerLockOwnerText(owner: ListenerLockOwner): string {
+  return `${JSON.stringify(owner)}\n`;
+}
+
+function readListenerLockOwner(lockPath: string): { owner: ListenerLockOwner; text: string } | undefined {
+  const path = join(lockPath, LISTENER_LOCK_OWNER);
+  try {
+    if (statSync(path).size > LISTENER_LOCK_OWNER_MAX_BYTES) return undefined;
+    const text = readFileSync(path, "utf8");
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const value = parsed as Record<string, unknown>;
+    if (Object.keys(value).sort().join(",") !== "nonce,pid,version"
+      || value.version !== 1
+      || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid < 1
+      || typeof value.nonce !== "string" || !LISTENER_LOCK_NONCE.test(value.nonce)) return undefined;
+    return { owner: value as unknown as ListenerLockOwner, text };
+  } catch {
+    return undefined;
+  }
+}
+
+function pidDefinitelyDead(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+function restoreQuarantinedLock(quarantinePath: string, lockPath: string): void {
+  if (!existsSync(lockPath) && existsSync(quarantinePath)) {
+    try { renameSync(quarantinePath, lockPath); } catch { /* Fail closed with the quarantine intact. */ }
+  }
+}
+
+/** A stale lock is reclaimed once, and only after the exact owner bytes observed before the atomic
+ * directory rename are observed inside quarantine. Unknown/malformed/live ownership fails closed. */
+function reclaimDeadListenerLockOnce(lockPath: string): boolean {
+  const observed = readListenerLockOwner(lockPath);
+  if (observed === undefined || !pidDefinitelyDead(observed.owner.pid)) return false;
+  const quarantinePath = `${lockPath}.stale.${randomUUID().replaceAll("-", "")}`;
+  try {
+    renameSync(lockPath, quarantinePath);
+  } catch {
+    return false;
+  }
+  try {
+    const quarantined = readListenerLockOwner(quarantinePath);
+    if (quarantined === undefined || quarantined.text !== observed.text) {
+      restoreQuarantinedLock(quarantinePath, lockPath);
+      return false;
+    }
+    const entries = readdirSync(quarantinePath);
+    if (entries.length !== 1 || entries[0] !== LISTENER_LOCK_OWNER) {
+      restoreQuarantinedLock(quarantinePath, lockPath);
+      return false;
+    }
+    unlinkSync(join(quarantinePath, LISTENER_LOCK_OWNER));
+    rmdirSync(quarantinePath);
+    return true;
+  } catch {
+    restoreQuarantinedLock(quarantinePath, lockPath);
+    return false;
+  }
+}
+
+function installListenerLock(lockPath: string, ownerText: string, nonce: string): boolean {
+  const stagingPath = `${lockPath}.acquire.${nonce}`;
+  const ownerPath = join(stagingPath, LISTENER_LOCK_OWNER);
+  try {
+    mkdirSync(stagingPath);
+    const descriptor = openSync(ownerPath, "wx", 0o600);
+    try {
+      writeFileSync(descriptor, ownerText, { encoding: "utf8" });
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    try {
+      renameSync(stagingPath, lockPath);
+      return true;
+    } catch {
+      return false;
+    }
+  } catch {
+    throw new ManagedListenerBusyError();
+  } finally {
+    if (existsSync(stagingPath)) {
+      try { unlinkSync(ownerPath); } catch { /* It may not have been created. */ }
+      try { rmdirSync(stagingPath); } catch { /* Never remove anything recursively. */ }
+    }
+  }
+}
+
+function acquireListenerLock(lockPath: string): string {
+  const nonce = randomUUID().replaceAll("-", "");
+  const ownerText = listenerLockOwnerText({
+    version: 1,
+    pid: process.pid,
+    nonce,
+  });
+  if (installListenerLock(lockPath, ownerText, nonce)) return ownerText;
+  if (!reclaimDeadListenerLockOnce(lockPath)) throw new ManagedListenerBusyError();
+  if (!installListenerLock(lockPath, ownerText, nonce)) throw new ManagedListenerBusyError();
+  return ownerText;
+}
+
+function releaseListenerLock(lockPath: string, ownerText: string): void {
+  const current = readListenerLockOwner(lockPath);
+  const entries = (() => { try { return readdirSync(lockPath); } catch { return []; } })();
+  if (current?.text !== ownerText || entries.length !== 1 || entries[0] !== LISTENER_LOCK_OWNER)
+    throw new ManagedListenerBusyError();
+  unlinkSync(join(lockPath, LISTENER_LOCK_OWNER));
+  rmdirSync(lockPath);
+}
+
 function withListenerLock<T>(configPath: string, operation: () => T): T {
   const lockPath = `${configPath}.listener.lock`;
-  try {
-    mkdirSync(lockPath);
-  } catch {
-    throw new Error("managed listener is being changed by another process");
-  }
+  const ownerText = acquireListenerLock(lockPath);
   try {
     return operation();
   } finally {
-    rmdirSync(lockPath);
+    releaseListenerLock(lockPath, ownerText);
   }
 }
 
