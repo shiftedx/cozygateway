@@ -6,6 +6,7 @@ import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runInNewContext } from "node:vm";
 
+import { SETUP_CODE_TTL_MS } from "../src/auth.ts";
 import { PHONE_VERIFICATION_SCRIPT, runPhoneProof } from "../src/phone-verification-page.ts";
 import { normalizeCanonicalOrigin, PhoneVerification } from "../src/phone-verification.ts";
 import { openStorage } from "../src/storage.ts";
@@ -95,6 +96,38 @@ describe("phone verification page", () => {
 
     restarted.close(); verifier.close(); reader.close(); writer.close();
     rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("replaces an expired operator challenge repeatedly without restarting the Gateway", () => {
+    const storage = openStorage(":memory:");
+    const now = 1;
+    let monotonicNow = 1;
+    storage.beginGatewayBoot({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: "https://gateway.example",
+      durableFingerprint: "posture", startedAt: now,
+    });
+    const verifier = new PhoneVerification({ storage, now: () => now, monotonicNow: () => monotonicNow });
+    verifier.activate({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: "https://gateway.example",
+      durableFingerprint: "posture",
+    });
+    const operatorContext = {
+      canonicalOrigin: "https://gateway.example",
+      durableFingerprint: "posture",
+    };
+
+    const first = verifier.begin("tailscale", operatorContext);
+    monotonicNow += SETUP_CODE_TTL_MS + 1;
+    const second = verifier.begin("tailscale", operatorContext);
+    monotonicNow += SETUP_CODE_TTL_MS + 1;
+    const third = verifier.begin("tailscale", operatorContext);
+
+    expect(new Set([first.challengeId, second.challengeId, third.challengeId]).size).toBe(3);
+    expect(new Set([first.verificationUrl, second.verificationUrl, third.verificationUrl]).size).toBe(3);
+    expect(verifier.status(first.challengeId)).toEqual({ state: "not_found" });
+    expect(verifier.status(second.challengeId)).toEqual({ state: "not_found" });
+    expect(verifier.status(third.challengeId)).toEqual({ state: "pending", expiresAt: third.expiresAt });
+    verifier.close(); storage.close();
   });
 
   it("distinguishes a challenge invalidated by a later Gateway boot", () => {

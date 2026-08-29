@@ -160,7 +160,7 @@ export type NetworkOnboardingStatusIssue =
   | {
       type: "readiness";
       mode: "tailscale";
-      reason: "status" | "loopback" | "mapping" | "tls" | "certificate" | "redirect" | "health" | "alpn" | "websocket" | "ownership";
+      reason: "status" | "account_changed" | "loopback" | "mapping" | "tls" | "certificate" | "redirect" | "health" | "alpn" | "websocket" | "ownership";
     }
   | {
       type: "readiness";
@@ -178,7 +178,7 @@ export type NetworkOnboardingStatusIssue =
     };
 
 const TAILSCALE_READINESS_REASONS = new Set([
-  "status", "loopback", "mapping", "tls", "certificate", "redirect", "health", "alpn", "websocket", "ownership",
+  "status", "account_changed", "loopback", "mapping", "tls", "certificate", "redirect", "health", "alpn", "websocket", "ownership",
 ] as const);
 const LAN_READINESS_REASONS = new Set(["health", "websocket", "attach", "posture"] as const);
 type TailscaleReadinessReason = Extract<NetworkOnboardingStatusIssue, {
@@ -375,7 +375,11 @@ export class NetworkOnboarding {
     const choice = await io.chooseNetworkMode(signal);
     if (choice === "later" || choice === "cancel") {
       if (current.mode !== undefined) {
-        const rollback = await this.#rollbackPriorRoute(current.mode, current.endpoint, signal);
+        const rollback = await this.#rollbackPriorRoute(
+          current.mode,
+          current.healthy ? current.endpoint : undefined,
+          signal,
+        );
         if (!rollback) return { outcome: "failed", reason: "rollback_failed" };
       }
       await this.#dependencies.state.write({ version: 1, stage: "pending_choice", updatedAt: this.#now() });
@@ -391,7 +395,11 @@ export class NetworkOnboarding {
       && current.healthy
       && current.endpoint?.ready === true;
     if (!reusable && current.mode !== undefined) {
-      const rollback = await this.#rollbackPriorRoute(current.mode, current.endpoint, signal);
+      const rollback = await this.#rollbackPriorRoute(
+        current.mode,
+        current.healthy ? current.endpoint : undefined,
+        signal,
+      );
       if (!rollback) return { outcome: "failed", reason: "rollback_failed" };
     }
     return this.#continue(choice, io, signal, !reusable, reusable ? current.endpoint : undefined);

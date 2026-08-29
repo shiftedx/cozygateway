@@ -233,6 +233,28 @@ describe("NetworkOnboarding", () => {
     },
   );
 
+  it.each(["later", "cancel"] as const)(
+    "reconciles durable ownership instead of trusting a changed live endpoint when choosing %s",
+    async (choice) => {
+      const changed = { ...endpoint, durableFingerprint: "posture-external" };
+      const { onboarding, adapter, io } = harness({
+        choice,
+        inspected: changed,
+        projection: {
+          version: 1, stage: "endpoint_ready", mode: "tailscale",
+          deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+        },
+      });
+
+      await expect(onboarding.resume(io)).resolves.toEqual({
+        outcome: choice === "later" ? "deferred" : "cancelled",
+      });
+
+      expect(adapter.reconcileOwned).toHaveBeenCalledWith(undefined);
+      expect(adapter.rollbackOwned).not.toHaveBeenCalled();
+    },
+  );
+
   it("reviews a healthy legacy route through the four-choice prompt before any phone check", async () => {
     const { onboarding, dependencies, io, calls } = harness({
       choice: "later",
@@ -284,7 +306,7 @@ describe("NetworkOnboarding", () => {
   });
 
   it.each([
-    ...(["status", "loopback", "mapping", "tls", "certificate", "redirect", "health", "alpn", "websocket", "ownership"] as const)
+    ...(["status", "account_changed", "loopback", "mapping", "tls", "certificate", "redirect", "health", "alpn", "websocket", "ownership"] as const)
       .map((reason) => ["tailscale", new TailscaleModeReadinessError(reason), reason] as const),
     ...(["health", "websocket", "attach", "posture"] as const)
       .map((reason) => ["lan", new LanModeReadinessError(reason), reason] as const),
@@ -394,6 +416,51 @@ describe("NetworkOnboarding", () => {
 
     expect(current.adapter.reconcileOwned).toHaveBeenCalledWith(undefined);
     expect(current.calls.indexOf("reconcile")).toBeLessThan(current.calls.indexOf("prepare-lan"));
+  });
+
+  it("reconciles a live route changed outside CozyGateway before switching modes", async () => {
+    const current = harness({
+      choice: "lan",
+      inspected: { ...endpoint, durableFingerprint: "posture-external", serveMappingFingerprint: "serve-external" },
+      projection: {
+        version: 1, stage: "endpoint_ready", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+    const lanEndpoint: PreparedEndpoint = {
+      mode: "lan", canonicalOrigin: "http://192.168.1.20:18787", bindHost: "0.0.0.0",
+      port: 18_787, durableFingerprint: "lan-posture", ready: true,
+    };
+    const lanAdapter: NetworkModeAdapter = {
+      mode: "lan",
+      prepare: vi.fn(async () => lanEndpoint),
+      inspect: vi.fn(async () => lanEndpoint),
+      rollbackOwned: vi.fn(async () => undefined),
+      reconcileOwned: vi.fn(async () => undefined),
+    };
+    current.dependencies.adapters = [current.adapter, lanAdapter];
+    current.onboarding = new NetworkOnboarding(current.dependencies);
+
+    await expect(current.onboarding.resume(current.io)).resolves.toMatchObject({ outcome: "not_confirmed" });
+
+    expect(current.adapter.reconcileOwned).toHaveBeenCalledWith(undefined);
+    expect(current.adapter.rollbackOwned).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when reconciliation cannot prove a changed endpoint is safe to remove", async () => {
+    const { onboarding, adapter, io } = harness({
+      choice: "later",
+      inspected: { ...endpoint, durableFingerprint: "posture-external" },
+      rollbackError: new Error("sensitive internal cleanup failure"),
+      projection: {
+        version: 1, stage: "endpoint_ready", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+
+    await expect(onboarding.resume(io)).resolves.toEqual({ outcome: "failed", reason: "rollback_failed" });
+    expect(adapter.reconcileOwned).toHaveBeenCalledWith(undefined);
+    expect(adapter.rollbackOwned).not.toHaveBeenCalled();
   });
 
   it.each(["later", "cancel"] as const)("emits no challenge or pairing material for %s", async (choice) => {

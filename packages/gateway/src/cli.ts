@@ -44,6 +44,7 @@ import {
 import {
   createWindowsOnboardingController,
   reconcileWindowsOwnedNetworkState,
+  WindowsOwnedNetworkCleanupError,
 } from "./windows-onboarding.ts";
 
 const USAGE = `usage: cozygateway [status|setup|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
@@ -542,6 +543,7 @@ const PAUSE_COPY: Readonly<Record<string, string>> = {
   install_failed: "Tailscale installation did not complete. Finish the official installer, then resume.",
   unsupported_install: "Remove the unsupported copy and install a supported official Tailscale installation, then resume.",
   unsupported_version: "Update Tailscale to a supported version, then resume.",
+  custom_control_server: "Sign in through the official Tailscale control server; custom control servers are not supported by this setup flow, then resume.",
   status_unavailable: "Start the Tailscale service and confirm the app is responsive, then resume.",
   login_pending: "Finish signing in to Tailscale in the browser, then resume.",
   login_failed: "Tailscale sign-in did not finish. Check the Tailscale app, then resume.",
@@ -561,11 +563,14 @@ const PAUSE_COPY: Readonly<Record<string, string>> = {
   mapping_mutation_failed: "Setup could not safely update Tailscale Serve. Review the existing port 443 mapping, then resume.",
   preference_cancelled: "The Tailscale preference change was cancelled. Nothing was paired; resume when ready.",
   preference_verification_failed: "Tailscale did not confirm the requested preference. Review it in the Tailscale app, then resume.",
+  preference_rollback_failed: "Open the Tailscale app and restore the prior Tailscale preferences before resuming setup.",
   preference_change_denied: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
   no_up_physical_private_ipv4: "Connect this PC to trusted Wi-Fi or Ethernet, then resume.",
   multiple_up_physical_private_ipv4: "More than one physical network is active. Disconnect one or choose the intended adapter explicitly in Advanced settings, then resume.",
   adapter_changed: "The previously selected network adapter is unavailable. Confirm the replacement adapter, then resume.",
   listener_changed: "The listener changed while setup was running. Review the intended adapter in Advanced settings, then resume.",
+  port_conflict: "Choose a different unused port in Advanced settings, then resume.",
+  phone_reachable_origin_required: "Choose a private network address that the phone can reach in Advanced settings, then resume.",
   mapping_conflict: "Tailscale port 443 is already in use. Keep that mapping and choose Same Wi-Fi, Later, or Advanced settings.",
   gateway_restarting: "Gateway is restarting. Wait for it to become ready, then resume; the prepared network route was preserved.",
   operator_busy: "Another setup window has an active phone check. Finish or cancel it there, then resume this window.",
@@ -580,6 +585,43 @@ const INSPECTION_COPY: Readonly<Record<Extract<NonNullable<NetworkOnboardingStat
   endpoint_not_ready: "The selected network endpoint is not ready. Restore network connectivity or choose another route.",
 };
 
+function ownedNetworkCleanupFailure(error: unknown): string {
+  if (!(error instanceof WindowsOwnedNetworkCleanupError))
+    return "Owned network cleanup could not verify a safe rollback. Run the CozyGateway installer Repair action, then retry uninstall.";
+  const code = error.code;
+  const prefix = `Owned network cleanup paused (${code}). `;
+  switch (code) {
+    case "tailscale_not_running":
+      return `${prefix}Start the Tailscale service, then retry uninstall.`;
+    case "old_version":
+      return `${prefix}Update the official Tailscale app, then retry uninstall.`;
+    case "logged_out":
+      return `${prefix}Sign in to the Tailscale account that owns this route, then retry uninstall.`;
+    case "custom_control":
+      return `${prefix}Reconnect Tailscale to its official control server, then retry uninstall.`;
+    case "account_changed":
+      return `${prefix}Sign back in to the tailnet account that created this route, then retry uninstall.`;
+    case "mapping_changed":
+      return `${prefix}Review the current Tailscale Serve port 443 mapping, then retry uninstall without deleting another owner's mapping.`;
+    case "elevation_required":
+      return `${prefix}Run the CozyGateway uninstaller as Administrator, then retry.`;
+    case "preference_changed":
+      return `${prefix}Open the Tailscale app and restore the prior Tailscale preferences, then retry uninstall.`;
+    case "authority_missing":
+      return `${prefix}Restore the configured CozyGateway database, then retry uninstall.`;
+    case "authority_unsafe":
+      return `${prefix}Restore the configured database path to its original regular file, then retry uninstall.`;
+    case "helper_invalid":
+      return `${prefix}Run the CozyGateway installer Repair action to restore the helper path and ACLs, then retry uninstall.`;
+    case "listener_changed":
+      return `${prefix}Restore the CozyGateway listener configuration recorded by setup, then retry uninstall.`;
+    case "timeout":
+      return `${prefix}Start CozyGateway and Tailscale, wait for both to respond, then retry uninstall.`;
+    default:
+      return code satisfies never;
+  }
+}
+
 type ReadinessIssue = Extract<NonNullable<NetworkOnboardingStatus["issue"]>, { type: "readiness" }>;
 type ReadinessKey = ReadinessIssue extends infer Issue
   ? Issue extends ReadinessIssue
@@ -589,6 +631,7 @@ type ReadinessKey = ReadinessIssue extends infer Issue
 
 const READINESS_COPY: Readonly<Record<ReadinessKey, string>> = {
   "tailscale:status": "Open Tailscale, start its service, confirm the intended account is connected, and restore the required preferences before resuming setup.",
+  "tailscale:account_changed": "Sign back in to the tailnet account that owns this CozyGateway route, or choose another phone access route in setup.",
   "tailscale:loopback": "Restart CozyGateway and confirm its local health and WebSocket endpoints work on loopback before resuming setup.",
   "tailscale:mapping": "Review the saved Tailscale Serve mapping on port 443, remove any conflicting mapping, then resume setup.",
   "tailscale:tls": "Confirm the Tailscale DNS name opens with a system-trusted HTTPS certificate, then resume setup.",
@@ -679,7 +722,7 @@ export async function runCli(
     parsed = parseOptions();
   } catch (error) {
     if (command !== "cleanup-owned-network") throw error;
-    console.error("Owned network cleanup failed.");
+    console.error("Owned network cleanup arguments are invalid. Pass --config <absolute-config-path> and retry.");
     suppliedIo?.close();
     onboarding?.close();
     return 1;
@@ -711,8 +754,8 @@ export async function runCli(
           undefined,
         );
         return 0;
-      } catch {
-        console.error("Owned network cleanup failed.");
+      } catch (error) {
+        console.error(ownedNetworkCleanupFailure(error));
         return 1;
       }
     } finally {

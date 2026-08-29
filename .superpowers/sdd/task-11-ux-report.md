@@ -100,12 +100,49 @@ conditional rollback or durable endpoint-independent reconciliation runs only af
 choice. This preserves concurrent and unowned network state while failing closed when ownership
 safety cannot be established.
 
+## Final diagnostics review
+
+The final review identified four additional boundary cases and one copy audit. Each behavior was
+reproduced before its implementation changed:
+
+- Later, Cancel, and route switching previously passed a live-but-changed endpoint into conditional
+  rollback. A changed deployment fingerprint now makes that snapshot untrusted, so the orchestrator
+  invokes endpoint-independent durable reconciliation and fails closed if reconciliation cannot
+  prove safety. Matching healthy snapshots still use conditional rollback.
+- Repeating setup after an in-memory operator challenge expired rotated SQLite's verification epoch
+  before trying to replace the old active row. The resulting `not_found` left setup unable to issue
+  a fresh QR until restart. SQLite now invalidates the prior proof first, the expired capability is
+  then removed from memory, and the new epoch uses the ordinary session/challenge creation path.
+  A regression expires and replaces the challenge twice in one Gateway process.
+- Authenticated operator JSON bodies now have a five-second bounded read. Timeout or caller abort
+  cancels the stream reader, returns the same uniform not-found response, removes the abort listener,
+  and clears its timer. Size, UTF-8, and exact-schema bounds remain unchanged.
+- The internal cleanup command renders only the exported typed safe code, using an exhaustive map
+  for all cleanup outcomes. Each code has one concrete operator repair step; unknown exceptions are
+  redacted to an installer-Repair action and raw exception messages are never emitted. Malformed
+  cleanup arguments likewise print the exact required config form instead of a generic failure.
+- Status/setup copy now covers `custom_control_server`, `preference_rollback_failed`,
+  `account_changed`, Advanced port conflicts and unreachable origins, in addition to the existing
+  mapping-conflict guidance.
+
+Focused RED evidence included: changed endpoints calling `rollbackOwned`, repeated expiry throwing
+`failed to replace expired phone verification challenge`, an incomplete authenticated body that
+remained pending beyond five seconds, `account_changed` collapsing to `inspection_failed`, and safe
+cleanup codes producing only the old generic error. The focused final-diagnostics GREEN run passed
+217/217 tests across orchestration, CLI, operator control, phone HTTP/WebSocket, and Gateway server
+integration.
+
+Independent read-only review reported no remaining Critical or Important findings in this slice.
+It specifically confirmed durable reconciliation for changed/unhealthy snapshots, SQLite-before-
+memory expiry replacement order, bounded reader cancellation and timer/listener cleanup, exhaustive
+safe cleanup diagnostics, and explicit readiness/pause copy.
+
 ## Verification
 
-- Focused second-review slice: PASS — 4 files, 174 tests.
+- Focused final-diagnostics slice: PASS — 6 files, 217 tests.
 - Gateway build: PASS.
 - Gateway typecheck: PASS.
-- Full Gateway suite: PASS — 100 files passed, 1 skipped; 1,157 tests passed, 2 skipped.
+- Full Gateway suite: PASS — 100 files passed, 1 skipped; 1,204 tests passed, 2 skipped.
 - Owned-path `git diff --check`: PASS (Git emitted only LF-to-CRLF working-copy notices).
 
 Full-suite attempts during concurrent shared-worktree edits that ended in an unrelated LAN rollback

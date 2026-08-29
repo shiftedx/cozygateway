@@ -149,7 +149,7 @@ export class PhoneVerification {
   ): PhoneVerificationChallenge {
     if (this.#closed || this.#context === undefined) throw new Error("phone verification is unavailable");
     const now = this.#now();
-    const existing = [...this.#records.values()].find((record) =>
+    let existing = [...this.#records.values()].find((record) =>
       record.state !== "phone_confirmed" && record.state !== "cancelled");
     if (existing !== undefined && this.#isUsable(existing))
       throw new Error("a phone verification session is already active");
@@ -171,6 +171,12 @@ export class PhoneVerification {
         canonicalOrigin,
         durableFingerprint: operatorContext.durableFingerprint,
       };
+      // SQLite invalidates the prior operator proof before its capability disappears from memory.
+      // The fresh epoch then starts through the ordinary session/challenge path below.
+      if (existing !== undefined) {
+        this.#records.delete(existing.capabilityHash);
+        existing = undefined;
+      }
     }
     const sessionId = randomUUID();
     const sessionInput = {

@@ -16,6 +16,7 @@ import {
 import type { NetworkOnboardingStatusIssue } from "../src/network-onboarding.ts";
 import { startGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
+import { WindowsOwnedNetworkCleanupError } from "../src/windows-onboarding.ts";
 import { generateSelfSigned } from "./helpers/self-signed.ts";
 
 function scriptedIo(answers: string[]) {
@@ -276,9 +277,44 @@ describe("cozygateway pair finale", () => {
 
     expect(io.close).toHaveBeenCalledOnce();
     expect(controller.close).toHaveBeenCalledOnce();
-    expect(lines.join("\n")).toContain("Owned network cleanup failed");
+    expect(lines).toHaveLength(1);
+    expect(lines.join("\n")).toContain("installer Repair action");
     expect(lines.join("\n")).not.toMatch(/secret\.invalid|do-not-print|authUrl|token/i);
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["tailscale_not_running", "Start the Tailscale service"],
+    ["old_version", "Update the official Tailscale app"],
+    ["logged_out", "Sign in to the Tailscale account"],
+    ["custom_control", "official control server"],
+    ["account_changed", "tailnet account that created this route"],
+    ["mapping_changed", "Tailscale Serve port 443 mapping"],
+    ["elevation_required", "as Administrator"],
+    ["preference_changed", "restore the prior Tailscale preferences"],
+    ["authority_missing", "Restore the configured CozyGateway database"],
+    ["authority_unsafe", "original regular file"],
+    ["helper_invalid", "helper path and ACLs"],
+    ["listener_changed", "Restore the CozyGateway listener configuration"],
+    ["timeout", "wait for both to respond"],
+  ] as const)("prints safe cleanup code %s with one concrete repair step", async (code, repair) => {
+    const { configPath } = tempConfig();
+    const cleanup = vi.fn(async () => {
+      throw new WindowsOwnedNetworkCleanupError(code);
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", configPath], undefined, undefined, undefined,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    vi.restoreAllMocks();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(code);
+    expect(lines[0]).toContain(repair);
+    expect(lines[0]).not.toMatch(/secret|authUrl|token/i);
   });
 
   it("refuses owned-network cleanup outside Windows without touching network state", async () => {
@@ -326,7 +362,7 @@ describe("cozygateway pair finale", () => {
     expect(cleanup).not.toHaveBeenCalled();
     expect(io.close).toHaveBeenCalledOnce();
     expect(controller.close).toHaveBeenCalledOnce();
-    expect(lines.join("\n")).toContain("Owned network cleanup failed");
+    expect(lines.join("\n")).toContain("Pass --config <absolute-config-path>");
     vi.restoreAllMocks();
   });
 
@@ -741,6 +777,7 @@ describe("cozygateway terminal menu", () => {
 
   it.each([
     ["tailscale", "mapping", "Review the saved Tailscale Serve mapping on port 443"],
+    ["tailscale", "account_changed", "Sign back in to the tailnet account that owns this CozyGateway route"],
     ["tailscale", "certificate", "Confirm the Tailscale HTTPS certificate covers"],
     ["lan", "posture", "Reconnect the intended private adapter"],
     ["lan", "websocket", "Allow CozyGateway WebSocket traffic through Windows Firewall"],
@@ -790,6 +827,7 @@ describe("cozygateway terminal menu", () => {
     ["install_failed", "Tailscale installation did not complete"],
     ["unsupported_install", "supported official Tailscale installation"],
     ["unsupported_version", "Update Tailscale"],
+    ["custom_control_server", "official Tailscale control server"],
     ["status_unavailable", "Start the Tailscale service"],
     ["login_pending", "Finish signing in to Tailscale"],
     ["login_failed", "Tailscale sign-in did not finish"],
@@ -801,6 +839,7 @@ describe("cozygateway terminal menu", () => {
     ["incoming_consent_required", "Approve incoming Tailscale connections"],
     ["preference_cancelled", "preference change was cancelled"],
     ["preference_verification_failed", "did not confirm the requested preference"],
+    ["preference_rollback_failed", "restore the prior Tailscale preferences"],
     ["managed_policy", "Tailscale policy blocked the requested setting"],
     ["https_consent_required", "Approve Tailscale HTTPS"],
     ["https_consent_failed", "HTTPS approval did not complete"],
@@ -812,6 +851,8 @@ describe("cozygateway terminal menu", () => {
     ["multiple_up_physical_private_ipv4", "More than one physical network is active"],
     ["adapter_changed", "previously selected network adapter is unavailable"],
     ["listener_changed", "listener changed while setup was running"],
+    ["port_conflict", "Choose a different unused port"],
+    ["phone_reachable_origin_required", "Choose a private network address that the phone can reach"],
     ["mapping_conflict", "Tailscale port 443 is already in use"],
     ["gateway_restarting", "Gateway is restarting"],
   ] as const)("prints actionable resumable copy for %s", async (reason, copy) => {
