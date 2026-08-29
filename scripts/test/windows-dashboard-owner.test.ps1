@@ -69,6 +69,9 @@ $normalizedHermes = Join-Path $root 'bin\..\bin\hermes'
 $exactHermesChild = New-TestProcess 203 299 $externalPython ('"{0}" "{1}" dashboard --port 9119' -f $externalPython, $normalizedHermes)
 Assert-Owner 'external Python carrying exact normalized ExpectedHermes without readable ancestry' 'Owned' $exactHermesChild @{ 203 = $exactHermesChild }
 
+$exactHermesGatewayChild = New-TestProcess 210 299 $externalPython ('"{0}" "{1}" gateway --port 9119' -f $externalPython, $normalizedHermes)
+Assert-Owner 'external Python carrying exact normalized ExpectedHermes with gateway subcommand' 'Foreign' $exactHermesGatewayChild @{ 210 = $exactHermesGatewayChild }
+
 $externalParent = New-TestProcess 204 0 'C:\Python311\pythonw.exe' '"C:\Python311\pythonw.exe" worker'
 $normalizedLauncher = Join-Path $root 'bin\..\bin\hermes.exe'
 $exactLauncherChild = New-TestProcess 205 204 $externalPython ('"{0}" "{1}" dashboard --port=9119' -f $externalPython, $normalizedLauncher)

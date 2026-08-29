@@ -128,8 +128,21 @@ if [ "$1" = "-p" ] && [ "$3" = "gateway" ]; then
       ;;
     start) [ "$(state)" = stopped ] || exit 2; log start; set_state running ;;
     install) [ "$(state)" = absent ] || exit 2; [ "$5" = --start-now ] && [ "$6" = --start-on-login ] || exit 2; log install; set_state running ;;
-    stop) [ "$(state)" = running ] || exit 2; log stop; set_state stopped ;;
-    uninstall) [ "$(state)" = running ] || exit 2; log uninstall; set_state absent ;;
+    stop)
+      [ "$(state)" = running ] || exit 2
+      log stop
+      set_state stopped
+      if [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:-}" ] && [ "$profile" = "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
+        : > "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked"
+      fi
+      ;;
+    uninstall)
+      [ "$(state)" = running ] || exit 2
+      log uninstall
+      if [ "${COZYGATEWAY_TEST_UNINSTALL_LEAVES_RUNNING:-}" != 1 ] || [ "$profile" != "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
+        set_state absent
+      fi
+      ;;
     *) exit 2 ;;
   esac
   exit 0
@@ -837,7 +850,7 @@ NODE
 mkdir -p "$tmp/locked-spool-bin"
 cat > "$tmp/locked-spool-bin/rm" <<'LOCKED_RM'
 #!/usr/bin/env bash
-if [[ "$*" == *attach-v1.sqlite* ]] && [ -f "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:?}" ] && [ ! -f "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked" ]; then
+if [[ "$*" == *attach-v1.sqlite* ]] && [ -f "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:?}" ] && { [ "${COZYGATEWAY_TEST_LOCKED_SPOOL_PERSISTS:-}" = 1 ] || [ ! -f "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked" ]; }; then
   printf 'Device or resource busy\n' >&2
   exit 1
 fi
@@ -977,6 +990,54 @@ test "$(cat "$tmp/hermes/profiles/unrelated/plugin-data/unrelated/sentinel")" = 
 ! grep -q '^unrelated:' "$tmp/windows-locked-commands"
 test ! -e "$tmp/gateway-windows-locked"
 test ! -e "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
+
+# Hermes can report a successful service uninstall while its directly spawned
+# gateway remains alive and keeps the SQLite spool locked. Recover only for the
+# exact installer-owned profile; unowned profiles remain untouched.
+mkdir -p "$tmp/hermes/profiles/locked-installed/plugins/cozygateway" "$tmp/hermes/profiles/locked-installed/plugin-data/cozygateway" "$tmp/hermes/profiles/unknown-windows/plugin-data/cozygateway" "$tmp/gateway-windows-installed-locked/local"
+: > "$tmp/hermes/profiles/locked-installed/plugins/cozygateway/.cozygateway-installer-owned"
+: > "$tmp/hermes/profiles/locked-installed/plugin-data/cozygateway/attach-v1.sqlite"
+printf 'running\n' > "$tmp/hermes/gateway-locked-installed.state"
+printf 'running\n' > "$tmp/hermes/gateway-unknown-windows.state"
+cat > "$tmp/gateway-windows-installed-locked/local/install-state" <<WINDOWS_INSTALLED_LOCKED_STATE
+profiles=locked-installed
+hermes_root=$tmp/hermes
+hermes_bin=$tmp/bin/hermes
+service_locked-installed=installed
+WINDOWS_INSTALLED_LOCKED_STATE
+windows_installed_spool_marker="$tmp/windows-installed-spool.locked"
+HOME="$tmp/windows-installed-locked-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/locked-spool-bin:$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$windows_installed_spool_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=locked-installed COZYGATEWAY_TEST_UNINSTALL_LEAVES_RUNNING=1 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-installed-locked-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-installed-locked-native-commands" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-installed-locked" >/dev/null
+test "$(grep -Fxc 'locked-installed:gateway:uninstall' "$tmp/windows-installed-locked-commands")" = 1
+test "$(grep -Fxc 'locked-installed:gateway:stop' "$tmp/windows-installed-locked-commands")" = 1
+test "$(sed -n '1p' "$tmp/windows-installed-locked-commands")" = 'locked-installed:gateway:uninstall'
+test "$(sed -n '2p' "$tmp/windows-installed-locked-commands")" = 'locked-installed:gateway:stop'
+! grep -q '^unknown-windows:gateway:' "$tmp/windows-installed-locked-commands"
+test "$(cat "$tmp/hermes/gateway-locked-installed.state")" = stopped
+test "$(cat "$tmp/hermes/gateway-unknown-windows.state")" = running
+test ! -e "$tmp/gateway-windows-installed-locked"
+test ! -e "$tmp/hermes/profiles/locked-installed/plugin-data/cozygateway/attach-v1.sqlite"
+
+mkdir -p "$tmp/hermes/profiles/locked-installed-stuck/plugins/cozygateway" "$tmp/hermes/profiles/locked-installed-stuck/plugin-data/cozygateway" "$tmp/gateway-windows-installed-stuck/local"
+: > "$tmp/hermes/profiles/locked-installed-stuck/plugins/cozygateway/.cozygateway-installer-owned"
+: > "$tmp/hermes/profiles/locked-installed-stuck/plugin-data/cozygateway/attach-v1.sqlite"
+printf 'running\n' > "$tmp/hermes/gateway-locked-installed-stuck.state"
+cat > "$tmp/gateway-windows-installed-stuck/local/install-state" <<WINDOWS_INSTALLED_STUCK_STATE
+profiles=locked-installed-stuck
+hermes_root=$tmp/hermes
+hermes_bin=$tmp/bin/hermes
+service_locked-installed-stuck=installed
+WINDOWS_INSTALLED_STUCK_STATE
+windows_installed_stuck_marker="$tmp/windows-installed-spool-stuck.locked"
+if windows_installed_stuck_output="$(HOME="$tmp/windows-installed-stuck-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/locked-spool-bin:$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$windows_installed_stuck_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=locked-installed-stuck COZYGATEWAY_TEST_LOCKED_SPOOL_PERSISTS=1 COZYGATEWAY_TEST_UNINSTALL_LEAVES_RUNNING=1 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-installed-stuck-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-installed-stuck-native-commands" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-installed-stuck" 2>&1)"; then
+  windows_installed_stuck_status=0
+else
+  windows_installed_stuck_status=$?
+fi
+test "$windows_installed_stuck_status" -ne 0
+grep -Fq 'Hermes stopped, but the CozyGateway spool for profile locked-installed-stuck is still in use' <<<"$windows_installed_stuck_output"
+test "$(grep -Fxc 'locked-installed-stuck:gateway:stop' "$tmp/windows-installed-stuck-commands")" = 1
+test -e "$tmp/gateway-windows-installed-stuck/local/install-state"
+test -e "$tmp/hermes/profiles/locked-installed-stuck/plugin-data/cozygateway/attach-v1.sqlite"
 
 # A machine with Hermes and Git Bash but no Node receives a private, checksum-
 # verified Windows Node 24 runtime and resumes installation in the same process.

@@ -1270,10 +1270,20 @@ uninstall() {
     if [ "$DRY_RUN" = 1 ]; then
       run rm -f "$spool" "$spool-wal" "$spool-shm"
     elif ! rm -f "$spool" "$spool-wal" "$spool-shm" 2>/dev/null; then
-      [ "$SERVICE_PLATFORM" = Windows ] && [ "$action" = preexisting ] && [ "$hermes_available" = 1 ] || die "could not remove the CozyGateway spool for profile $p"
-      say "INFO  restarting the pre-existing Hermes gateway for profile $p to release the disabled CozyGateway spool"
-      "$HERMES_RESOLVED" -p "$p" gateway restart >/dev/null || die "could not restart the pre-existing Hermes gateway for profile $p during cleanup"
-      rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes restarted, but the CozyGateway spool for profile $p is still in use"
+      [ "$SERVICE_PLATFORM" = Windows ] && [ "$hermes_available" = 1 ] || die "could not remove the CozyGateway spool for profile $p"
+      case "$action" in
+        preexisting)
+          say "INFO  restarting the pre-existing Hermes gateway for profile $p to release the disabled CozyGateway spool"
+          "$HERMES_RESOLVED" -p "$p" gateway restart >/dev/null || die "could not restart the pre-existing Hermes gateway for profile $p during cleanup"
+          rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes restarted, but the CozyGateway spool for profile $p is still in use"
+          ;;
+        installed|started)
+          say "INFO  stopping the installer-owned Hermes gateway for profile $p to release the disabled CozyGateway spool"
+          "$HERMES_RESOLVED" -p "$p" gateway stop >/dev/null || die "could not stop the installer-owned Hermes gateway for profile $p during cleanup"
+          rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes stopped, but the CozyGateway spool for profile $p is still in use"
+          ;;
+        *) die "could not remove the CozyGateway spool for profile $p" ;;
+      esac
     fi
   done
   run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
