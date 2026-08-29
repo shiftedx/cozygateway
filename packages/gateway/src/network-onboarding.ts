@@ -142,6 +142,16 @@ function isExactYes(answer: string | undefined): boolean {
   return answer === "y" || answer === "yes";
 }
 
+function matchesAuthoritativeStatus(
+  endpoint: PreparedEndpoint,
+  authority: Exclude<AuthoritativeOnboardingStatus, { state: "none" }>,
+): boolean {
+  return endpoint.ready
+    && endpoint.mode === authority.mode
+    && endpoint.canonicalOrigin === authority.canonicalOrigin
+    && endpoint.durableFingerprint === authority.durableFingerprint;
+}
+
 class ProofInvalidated extends Error {
   readonly reason: "posture" | "verification_epoch";
 
@@ -190,25 +200,33 @@ export class NetworkOnboarding {
       return { outcome: "already_complete", mode: current.mode, endpoint: current.endpoint };
     }
     const authority = await this.#dependencies.authority.status();
-    const projection = await this.#safeProjection();
+    const projection = authority.state === "none" ? await this.#safeProjection() : undefined;
     const mode = authority.state === "none" ? selectedMode(projection) : authority.mode;
     if (mode === undefined) return this.run(io, signal);
     const adapter = this.#adapters.get(mode);
     if (adapter === undefined) return { outcome: "failed", reason: "readiness" };
-    let inspected: PreparedEndpoint | undefined;
-    try {
-      inspected = await adapter.inspect(signal);
-    } catch {
-      // A failed live inspection does not make the sidecar true; preparation must establish a new
-      // validated endpoint before any challenge can exist.
-    }
-    return this.#continue(mode, io, signal, inspected === undefined || !inspected.ready, inspected);
+    const inspected = current.endpoint;
+    const authoritativeMatch = authority.state === "none"
+      || (inspected !== undefined && matchesAuthoritativeStatus(inspected, authority));
+    return this.#continue(
+      mode,
+      io,
+      signal,
+      inspected === undefined || !inspected.ready || !authoritativeMatch,
+      inspected,
+    );
   }
 
   async status(signal?: AbortSignal): Promise<NetworkOnboardingStatus> {
     const authority = await this.#dependencies.authority.status();
-    const projection = await this.#safeProjection();
-    const mode = authority.state === "none" ? selectedMode(projection) : authority.mode;
+    let projection: NetworkOnboardingState | undefined;
+    let mode: OnboardingMode | undefined;
+    if (authority.state === "none") {
+      projection = await this.#safeProjection();
+      mode = selectedMode(projection);
+    } else {
+      mode = authority.mode;
+    }
     if (mode === undefined) {
       return {
         stage: projection?.stage ?? "not_started",
@@ -225,36 +243,43 @@ export class NetworkOnboarding {
     } catch {
       return { stage: "changed", authority: authority.state, mode, healthy: false };
     }
-    if (authority.state === "complete") {
-      const healthy = endpoint.ready
-        && endpoint.mode === authority.mode
-        && endpoint.canonicalOrigin === authority.canonicalOrigin
-        && endpoint.durableFingerprint === authority.durableFingerprint;
-      if (healthy) {
-        await this.#writeProjectionBestEffort({
-          version: 1,
-          stage: "complete",
-          mode,
-          deploymentFingerprint: authority.durableFingerprint,
-          verifiedAt: authority.completedAt,
-          updatedAt: this.#now(),
-        });
-      }
+    if (authority.state !== "none" && !matchesAuthoritativeStatus(endpoint, authority)) {
       return {
-        stage: healthy ? "complete" : "changed",
+        stage: "changed",
         authority: authority.state,
         mode,
-        healthy,
+        healthy: false,
         endpoint,
       };
     }
+    if (authority.state === "complete") {
+      await this.#writeProjectionBestEffort({
+        version: 1,
+        stage: "complete",
+        mode,
+        deploymentFingerprint: authority.durableFingerprint,
+        verifiedAt: authority.completedAt,
+        updatedAt: this.#now(),
+      });
+      return {
+        stage: "complete",
+        authority: authority.state,
+        mode,
+        healthy: true,
+        endpoint,
+      };
+    }
+    projection = await this.#safeProjection();
     const projectionMatches = projection !== undefined
       && projection.stage !== "pending_choice"
       && projection.mode === mode
       && (!("deploymentFingerprint" in projection)
         || projection.deploymentFingerprint === endpoint.durableFingerprint);
+    const stage = endpoint.ready && projectionMatches && projection !== undefined
+      ? projection.stage
+      : "changed";
     return {
-      stage: endpoint.ready && projectionMatches ? projection.stage : "changed",
+      stage,
       authority: authority.state,
       mode,
       healthy: endpoint.ready && projectionMatches,
@@ -346,6 +371,7 @@ export class NetworkOnboarding {
         now: this.#now(),
       },
     };
+    let finalizedAt: number | undefined;
     const publicationDependencies: OnboardingPairingDependencies = {
       createSetupCode: this.#dependencies.createSetupCode,
       render: this.#dependencies.renderPairingOutput,
@@ -366,6 +392,10 @@ export class NetworkOnboarding {
           || finalRuntime.bootGeneration !== initialRuntime.bootGeneration
         ) throw new ProofInvalidated("verification_epoch");
       },
+      finalizationNow: () => {
+        finalizedAt = this.#now();
+        return finalizedAt;
+      },
       finalize: (input) => this.#dependencies.authority.finalizeVerifiedSetupCode(input),
       write: this.#dependencies.writePairingOutput,
       activate: (input) => this.#dependencies.authority.activatePendingSetupCode(input),
@@ -385,8 +415,8 @@ export class NetworkOnboarding {
       stage: "complete",
       mode,
       deploymentFingerprint: endpoint.durableFingerprint,
-      verifiedAt: request.finalizeContext.now,
-      updatedAt: request.finalizeContext.now,
+      verifiedAt: finalizedAt ?? request.finalizeContext.now,
+      updatedAt: finalizedAt ?? request.finalizeContext.now,
     };
     const projectionPersisted = await this.#writeProjectionBestEffort(complete);
     return { outcome: "complete", mode, endpoint, projectionPersisted };

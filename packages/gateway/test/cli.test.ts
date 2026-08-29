@@ -381,6 +381,29 @@ describe("verified onboarding pairing publication", () => {
     expect(calls).toEqual(["render", "inspect", "finalize"]);
   });
 
+  it("captures authoritative now after asynchronous posture inspection", async () => {
+    const deps = publicationDeps();
+    let clock = 200;
+    const withPostureCheck: OnboardingPairingDependencies = {
+      ...deps,
+      beforeFinalize: vi.fn(async () => {
+        clock = 601;
+      }),
+      finalizationNow: vi.fn(() => clock),
+      finalize: vi.fn((input) => {
+        expect(input.now).toBe(601);
+        expect(input.setupCodeExpiresAt).toBe(600_601);
+        return { outcome: "expired" as const };
+      }),
+    };
+
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "y" }, withPostureCheck))
+      .resolves.toBe("not_published");
+
+    expect(withPostureCheck.finalizationNow).toHaveBeenCalledOnce();
+    expect(withPostureCheck.finalize).toHaveBeenCalledOnce();
+  });
+
   it("revokes the pending code when the buffered write fails", async () => {
     const deps = publicationDeps();
     const writeError = new Error("terminal closed");

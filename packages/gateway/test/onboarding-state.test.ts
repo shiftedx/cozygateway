@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NetworkOnboardingStateFile,
   parseNetworkOnboardingState,
+  readBoundedNetworkOnboardingState,
 } from "../src/onboarding-state.ts";
 
 const roots: string[] = [];
@@ -133,5 +134,22 @@ describe("network onboarding resume projection", () => {
     await expect(store.read()).rejects.toThrow(/too large/i);
     writeFileSync(path, JSON.stringify({ version: 1, stage: "pending_choice", updatedAt: 1, capability: "raw" }));
     await expect(store.read()).rejects.toThrow(/schema/i);
+  });
+
+  it("reads no more than byte 4,097 even when the file grows or returns short reads", async () => {
+    const source = Buffer.from("x".repeat(8_192));
+    let largestPosition = 0;
+    const reader = {
+      async read(buffer: Buffer, offset: number, length: number, position: number) {
+        const bytesRead = Math.min(length, 37, source.length - position);
+        source.copy(buffer, offset, position, position + bytesRead);
+        largestPosition = Math.max(largestPosition, position + bytesRead);
+        return { bytesRead };
+      },
+    };
+
+    await expect(readBoundedNetworkOnboardingState(reader)).rejects.toThrow(/too large/i);
+
+    expect(largestPosition).toBe(4_097);
   });
 });

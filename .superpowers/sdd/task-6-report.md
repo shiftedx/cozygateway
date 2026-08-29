@@ -104,3 +104,68 @@ No Task 6 blocker remains. Task 10 must supply the concrete SQLite implementatio
 the LAN and Tailscale adapters with complete `PreparedEndpoint` coordinates. Task 8 must provide
 the fixed helper-backed Windows ACL protector. Until those wiring tasks, this module remains an
 inert, fully tested orchestration seam and performs no host/network mutation by itself.
+
+## Review-finding remediation
+
+All findings in `.superpowers/sdd/task-6-review-findings.md` were fixed test-first.
+
+### RED evidence
+
+The focused review cases failed in the intended ways:
+
+```text
+pnpm --filter cozygateway exec vitest run test/onboarding-state.test.ts test/network-onboarding.test.ts test/cli.test.ts -t "4,097|authoritative now|expiring during inspection|contradicts SQLite"
+Test Files  3 failed (3)
+Tests       5 failed | 74 skipped (79)
+```
+
+- The bounded-reader export did not exist.
+- Task 3 passed stale request time `200` instead of post-inspection time `601`.
+- A challenge that advanced from time `100` to `600001` during inspection completed instead of
+  losing finalization.
+- Active and abandoned SQLite authority both accepted a sidecar-matching live endpoint that
+  contradicted SQLite, reporting `complete/healthy` instead of `changed/unhealthy`.
+
+### GREEN changes
+
+- Task 3 now calls optional `finalizationNow()` only after strict render and awaited
+  `beforeFinalize()`, then uses that one value for SQLite finalization, setup-code expiry,
+  activation, and revocation coordinates. Network onboarding captures and persists that same final
+  time. Legacy callers that omit the hook retain their existing request time.
+- `readBoundedNetworkOnboardingState()` performs positional short-read-safe reads into one 4,097
+  byte buffer, rejects byte 4,097, and parses only at most 4 KiB. The no-follow file handle remains
+  open until the bounded read finishes; no unbounded `readFile` remains.
+- `status()` now branches on SQLite first. For active, abandoned, and complete authority it
+  inspects and compares mode, canonical origin, and durable fingerprint before reading or repairing
+  the sidecar. Contradiction returns `changed/unhealthy` without a sidecar read/write, and `resume()`
+  requires preparation rather than accepting the projection.
+
+### Post-review final verification
+
+```text
+pnpm --filter cozygateway exec vitest run test/onboarding-state.test.ts test/network-onboarding.test.ts test/onboarding-storage.test.ts
+Test Files  3 passed (3)
+Tests       55 passed (55)
+
+pnpm --filter cozygateway exec vitest run test/cli.test.ts test/pairing-output.test.ts test/qr.test.ts
+Test Files  3 passed (3)
+Tests       52 passed (52)
+
+pnpm --filter cozygateway typecheck
+tsc --noEmit (exit 0)
+```
+
+The Task 3 gate again emitted only the existing expected fake-Hermes reconnect diagnostics.
+
+### Post-review self-review
+
+- Time-of-check: the exact order is candidate generation -> strict render -> awaited adapter/live
+  epoch inspection -> authoritative `now` capture -> synchronous SQLite finalization. No stale
+  pre-render timestamp reaches the transaction.
+- Bounded IO: a growing file can cause at most 4,097 bytes of reads and allocation; short reads are
+  accumulated explicitly, and the handle is closed only after success or rejection settles.
+- Authority precedence: `none` is the sole state allowed to consult the sidecar to discover a mode.
+  Every other SQLite state establishes mode and required live coordinates first. Complete-state
+  repair happens only after that match.
+- Compatibility: all new Task 3 dependencies remain optional. Existing TTL, revocation,
+  activation, QR, CLI, and Task 2 storage regression suites remain green.

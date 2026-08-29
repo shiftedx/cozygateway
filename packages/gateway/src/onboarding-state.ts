@@ -48,6 +48,10 @@ export interface NetworkOnboardingStateFileOptions {
   protectWindowsAcl?: (path: string) => Promise<void>;
 }
 
+export interface NetworkOnboardingStateReader {
+  read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>;
+}
+
 const MODES = new Set<OnboardingMode>(["tailscale", "lan", "advanced"]);
 const FINGERPRINT_PATTERN = /^[\x21-\x7e]{1,128}$/;
 
@@ -108,6 +112,26 @@ export function parseNetworkOnboardingState(text: string): NetworkOnboardingStat
     && timestamp(value.verifiedAt)
   ) return value as unknown as NetworkOnboardingState;
   throw new Error("network onboarding state does not match the bounded schema");
+}
+
+/** Reads one byte beyond the schema cap and stops. The loop handles legal short reads without
+ * ever falling back to an unbounded `readFile`, so growth after open cannot allocate or parse more
+ * than 4,097 bytes. */
+export async function readBoundedNetworkOnboardingState(
+  reader: NetworkOnboardingStateReader,
+): Promise<NetworkOnboardingState> {
+  const buffer = Buffer.alloc(NETWORK_ONBOARDING_STATE_MAX_BYTES + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesRead } = await reader.read(buffer, offset, buffer.length - offset, offset);
+    if (!Number.isSafeInteger(bytesRead) || bytesRead < 0 || bytesRead > buffer.length - offset)
+      throw new Error("network onboarding state read was invalid");
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  if (offset > NETWORK_ONBOARDING_STATE_MAX_BYTES)
+    throw new Error("network onboarding state is too large");
+  return parseNetworkOnboardingState(buffer.subarray(0, offset).toString("utf8"));
 }
 
 function within(root: string, target: string, platform: NodeJS.Platform): boolean {
@@ -186,9 +210,7 @@ export class NetworkOnboardingStateFile implements NetworkOnboardingStateProject
     try {
       const info = await handle.stat();
       if (!info.isFile()) throw new Error("network onboarding state is not a regular file");
-      if (info.size > NETWORK_ONBOARDING_STATE_MAX_BYTES)
-        throw new Error("network onboarding state is too large");
-      return parseNetworkOnboardingState(await handle.readFile("utf8"));
+      return await readBoundedNetworkOnboardingState(handle);
     } finally {
       await handle.close();
     }

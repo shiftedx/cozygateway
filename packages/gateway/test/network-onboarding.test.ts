@@ -41,6 +41,7 @@ function harness(options: {
   authority?: AuthoritativeOnboardingStatus;
   publishResult?: "published" | "not_published";
   rollbackError?: Error;
+  now?: () => number;
 } = {}) {
   const calls: string[] = [];
   const projections: unknown[] = [];
@@ -108,16 +109,18 @@ function harness(options: {
         strictQr: true,
       });
       await publicationDependencies.beforeFinalize?.();
+      const finalizationNow = publicationDependencies.finalizationNow?.() ?? 100;
       calls.push("finalize");
-      publicationDependencies.finalize({
+      const finalized = publicationDependencies.finalize({
         sessionId: "session-1", challengeId: "challenge-1", setupCode: "COZY-1234",
-        setupCodeExpiresAt: 600_100, canonicalOrigin: endpoint.canonicalOrigin,
+        setupCodeExpiresAt: finalizationNow + 600_000, canonicalOrigin: endpoint.canonicalOrigin,
         durableFingerprint: endpoint.durableFingerprint, verificationEpoch: "epoch-1",
-        bootGeneration: "boot-1", now: 100,
+        bootGeneration: "boot-1", now: finalizationNow,
       });
+      if (finalized.outcome !== "published") return "not_published";
       return options.publishResult ?? "published";
     }),
-    now: () => 100,
+    now: options.now ?? (() => 100),
     color: false,
   };
   return { onboarding: new NetworkOnboarding(dependencies), dependencies, adapter, io, calls, projections };
@@ -217,6 +220,30 @@ describe("NetworkOnboarding", () => {
     expect(dependencies.writePairingOutput).not.toHaveBeenCalled();
   });
 
+  it("uses post-inspection time so a challenge expiring during inspection cannot finalize", async () => {
+    let clock = 100;
+    const { onboarding, dependencies, adapter, io } = harness({
+      proofPhrase: "amber otter",
+      answer: "y",
+      now: () => clock,
+    });
+    (adapter.inspect as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      clock = 600_001;
+      return endpoint;
+    });
+    (dependencies.authority.finalizeVerifiedSetupCode as ReturnType<typeof vi.fn>)
+      .mockImplementation((input: { now: number }) => input.now > 600_000
+        ? { outcome: "expired" as const }
+        : { outcome: "published" as const, setupCode: "COZY-1234" });
+
+    await expect(onboarding.run(io)).resolves.toMatchObject({ outcome: "lost_race" });
+
+    expect(dependencies.authority.finalizeVerifiedSetupCode).toHaveBeenCalledWith(
+      expect.objectContaining({ now: 600_001, setupCodeExpiresAt: 1_200_001 }),
+    );
+    expect(dependencies.writePairingOutput).not.toHaveBeenCalled();
+  });
+
   it("readiness and rollback failures emit no challenge or pairing material", async () => {
     const { onboarding, dependencies, adapter, io } = harness({ rollbackError: new Error("conditional rollback refused") });
     (adapter.prepare as ReturnType<typeof vi.fn>).mockResolvedValue({ ...endpoint, ready: false });
@@ -287,6 +314,68 @@ describe("NetworkOnboarding", () => {
 
     expect(io.chooseNetworkMode).not.toHaveBeenCalled();
     expect(dependencies.phoneVerification.begin).not.toHaveBeenCalled();
+  });
+
+  it.each(["active", "abandoned"] as const)(
+    "rejects a sidecar-matching live endpoint that contradicts SQLite %s posture",
+    async (state) => {
+      const authoritative: AuthoritativeOnboardingStatus = {
+        state,
+        mode: "tailscale",
+        canonicalOrigin: "https://authoritative.example.ts.net",
+        durableFingerprint: "posture-authoritative",
+      };
+      const { onboarding, dependencies, adapter, io } = harness({
+        authority: authoritative,
+        proofPhrase: undefined,
+      });
+      (dependencies.state.read as ReturnType<typeof vi.fn>).mockResolvedValue({
+        version: 1,
+        stage: "complete",
+        mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint,
+        verifiedAt: 50,
+        updatedAt: 50,
+      });
+
+      await expect(onboarding.status()).resolves.toMatchObject({
+        stage: "changed",
+        authority: state,
+        healthy: false,
+      });
+      expect(dependencies.state.read).not.toHaveBeenCalled();
+      expect(dependencies.state.write).not.toHaveBeenCalled();
+
+      await onboarding.resume(io);
+      expect(adapter.prepare).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("does not consult a matching sidecar when live state contradicts SQLite complete posture", async () => {
+    const authoritative: AuthoritativeOnboardingStatus = {
+      state: "complete",
+      mode: "tailscale",
+      canonicalOrigin: "https://authoritative.example.ts.net",
+      durableFingerprint: "posture-authoritative",
+      completedAt: 75,
+    };
+    const { onboarding, dependencies } = harness({ authority: authoritative });
+    (dependencies.state.read as ReturnType<typeof vi.fn>).mockResolvedValue({
+      version: 1,
+      stage: "complete",
+      mode: "tailscale",
+      deploymentFingerprint: endpoint.durableFingerprint,
+      verifiedAt: 50,
+      updatedAt: 50,
+    });
+
+    await expect(onboarding.status()).resolves.toMatchObject({
+      stage: "changed",
+      authority: "complete",
+      healthy: false,
+    });
+    expect(dependencies.state.read).not.toHaveBeenCalled();
+    expect(dependencies.state.write).not.toHaveBeenCalled();
   });
 
   it("allows only one publisher when two orchestrators reach the same authoritative finalization", async () => {

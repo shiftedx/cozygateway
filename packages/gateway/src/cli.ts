@@ -62,6 +62,9 @@ export interface OnboardingPairingDependencies {
   /** Optional live-posture gate used by network onboarding. It runs after the complete output has
    * rendered successfully and immediately before the authoritative SQLite transaction. */
   beforeFinalize?(): void | Promise<void>;
+  /** Supplies authoritative wall time after `beforeFinalize` completes. Legacy callers omit it
+   * and retain the request's already-captured time. */
+  finalizationNow?(): number;
   finalize(input: FinalizeInput): FinalizeResult;
   write(output: string): void | Promise<void>;
   activate(input: PublishedCode): TransitionResult<SetupCodeOutputState>;
@@ -84,16 +87,18 @@ export async function publishOnboardingPairing(
     strictQr: true,
   });
   await dependencies.beforeFinalize?.();
+  const finalizationNow = dependencies.finalizationNow?.() ?? request.finalizeContext.now;
   const finalized = dependencies.finalize({
     ...request.finalizeContext,
+    now: finalizationNow,
     setupCode,
-    setupCodeExpiresAt: request.finalizeContext.now + SETUP_CODE_TTL_MS,
+    setupCodeExpiresAt: finalizationNow + SETUP_CODE_TTL_MS,
   });
   if (finalized.outcome !== "published") return "not_published";
   const publishedCode = {
     challengeId: request.finalizeContext.challengeId,
     setupCode,
-    now: request.finalizeContext.now,
+    now: finalizationNow,
   };
   try {
     await dependencies.write(prepared.terminalOutput);
