@@ -312,6 +312,29 @@ describe("NetworkOnboarding", () => {
     expect(dependencies.publishPairing).not.toHaveBeenCalled();
   });
 
+  it.each(["begin", "poll"] as const)(
+    "pauses without rolling back or creating pairing material while the Gateway restarts during %s",
+    async (boundary) => {
+      const { onboarding, dependencies, adapter, io, projections } = harness();
+      const unavailable = Object.assign(new Error("local onboarding control is unavailable"), {
+        retryable: true as const,
+        reason: "gateway_restarting",
+      });
+      if (boundary === "begin")
+        (dependencies.phoneVerification.begin as ReturnType<typeof vi.fn>).mockRejectedValue(unavailable);
+      else
+        (dependencies.phoneVerification.waitForConfirmation as ReturnType<typeof vi.fn>).mockRejectedValue(unavailable);
+
+      await expect(onboarding.run(io)).resolves.toEqual({
+        outcome: "paused", mode: "tailscale", reason: "gateway_restarting",
+      });
+      expect(adapter.rollbackOwned).not.toHaveBeenCalled();
+      expect(dependencies.publishPairing).not.toHaveBeenCalled();
+      expect(dependencies.createSetupCode).not.toHaveBeenCalled();
+      expect(projections).toContainEqual(expect.objectContaining({ stage: "endpoint_ready" }));
+    },
+  );
+
   it("rolls back a prepared endpoint when automatic phone proof throws", async () => {
     const { onboarding, dependencies, adapter, io } = harness();
     (dependencies.phoneVerification.waitForConfirmation as ReturnType<typeof vi.fn>)

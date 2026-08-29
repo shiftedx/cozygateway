@@ -7,7 +7,7 @@ import {
   type LanModeRuntime,
   type LanProbeResult,
 } from "../src/lan-mode.ts";
-import type { WindowsLanAdapter, WindowsLanInventory } from "../src/lan.ts";
+import type { PhysicalLanCandidate, WindowsLanAdapter, WindowsLanInventory } from "../src/lan.ts";
 
 function physical(overrides: Partial<WindowsLanAdapter> = {}): WindowsLanAdapter {
   return {
@@ -49,6 +49,11 @@ class FakeLanRuntime implements LanModeRuntime {
   probeCalls = 0;
   failRestartCall?: number;
   beforeProbe?: () => void;
+  chooseAdapter?: (candidates: readonly PhysicalLanCandidate[]) => Promise<string | undefined>;
+  selectedAdapterId?: string;
+
+  async readSelectedAdapter(): Promise<string | undefined> { return this.selectedAdapterId; }
+  async writeSelectedAdapter(adapterId: string): Promise<void> { this.selectedAdapterId = adapterId; }
 
   async readAdapterInventory(): Promise<WindowsLanInventory> {
     return structuredClone(this.inventory);
@@ -144,6 +149,29 @@ describe("LanModeAdapter", () => {
     });
     expect(runtime.compareAndSwapCalls).toEqual([]);
     expect(runtime.restartCalls).toEqual([]);
+  });
+
+  it("prepares only the explicitly selected normalized candidate when physical adapters are ambiguous", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.inventory.adapters.push(physical({
+      id: "wifi", displayName: "Wireless", kind: "wifi", ipv4Addresses: ["10.0.0.5"],
+    }));
+    runtime.chooseAdapter = async (candidates) => {
+      expect(candidates).toEqual([
+        expect.objectContaining({ adapterId: "physical-ethernet", address: "192.168.1.23" }),
+        expect.objectContaining({ adapterId: "wifi", address: "10.0.0.5" }),
+      ]);
+      return "wifi";
+    };
+    const adapter = new LanModeAdapter(runtime);
+
+    await expect(adapter.prepare()).resolves.toMatchObject({
+      physicalAdapterId: "wifi", dhcpAddress: "10.0.0.5", canonicalOrigin: "http://10.0.0.5:18787",
+    });
+    runtime.chooseAdapter = async () => { throw new Error("must reuse explicit selection"); };
+    await expect(new LanModeAdapter(runtime).inspect()).resolves.toMatchObject({
+      physicalAdapterId: "wifi", dhcpAddress: "10.0.0.5",
+    });
   });
 
   it.each([

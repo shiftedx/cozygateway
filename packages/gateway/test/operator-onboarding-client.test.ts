@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { OperatorOnboardingClient } from "../src/operator-onboarding.ts";
+import {
+  OperatorOnboardingBusyError,
+  OperatorOnboardingClient,
+  OperatorOnboardingUnavailableError,
+} from "../src/operator-onboarding.ts";
 
 const TOKEN = "F".repeat(43);
 
@@ -71,5 +75,49 @@ describe("operator onboarding client", () => {
     });
     await expect(client.cancel("challenge-1")).resolves.toEqual({ state: "cancelled" });
     await expect(client.status("challenge-1")).rejects.toThrow("local onboarding control failed");
+  });
+
+  it("always composes a fixed deadline with caller cancellation and types endpoint absence as transient", async () => {
+    vi.useFakeTimers();
+    try {
+      const signals: AbortSignal[] = [];
+      const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        signals.push(init?.signal as AbortSignal);
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      });
+      const caller = new AbortController();
+      const client = new OperatorOnboardingClient({
+        localOrigin: "http://127.0.0.1:8787", token: TOKEN,
+        fetch: fetcher as typeof fetch, requestTimeoutMs: 25,
+      });
+      const timed = client.status("challenge-1");
+      const timedExpectation = expect(timed).rejects.toBeInstanceOf(OperatorOnboardingUnavailableError);
+      await vi.advanceTimersByTimeAsync(25);
+      await timedExpectation;
+      expect(signals[0]?.aborted).toBe(true);
+
+      const cancelled = client.status("challenge-1", caller.signal);
+      const cancelledExpectation = expect(cancelled).rejects.toBeInstanceOf(OperatorOnboardingUnavailableError);
+      caller.abort();
+      await cancelledExpectation;
+      expect(signals[1]?.aborted).toBe(true);
+
+      const absent = new OperatorOnboardingClient({
+        localOrigin: "http://127.0.0.1:8787", token: TOKEN,
+        fetch: vi.fn(async () => new Response('{"error":"not_found"}', { status: 404 })) as typeof fetch,
+      });
+      await expect(absent.status("challenge-1")).rejects.toBeInstanceOf(OperatorOnboardingUnavailableError);
+      const busy = new OperatorOnboardingClient({
+        localOrigin: "http://127.0.0.1:8787", token: TOKEN,
+        fetch: vi.fn(async () => new Response('{"state":"busy"}', { status: 409 })) as typeof fetch,
+      });
+      await expect(busy.begin("lan", {
+        canonicalOrigin: "http://192.168.1.20:8787", durableFingerprint: "posture-a",
+      })).rejects.toBeInstanceOf(OperatorOnboardingBusyError);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

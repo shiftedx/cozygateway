@@ -338,7 +338,9 @@ export class NetworkOnboarding {
     let challenge: OnboardingPhoneChallenge;
     try {
       challenge = await this.#dependencies.phoneVerification.begin(mode, endpoint);
-    } catch {
+    } catch (error) {
+      const pause = retryableAdapterPause(error);
+      if (pause !== undefined) return { outcome: "paused", mode, ...pause };
       return this.#rollbackFailure(adapter, endpoint, signal, "readiness");
     }
     const initialRuntime = this.#dependencies.runtimeContext();
@@ -358,7 +360,9 @@ export class NetworkOnboarding {
     let provenPhrase: string | undefined;
     try {
       provenPhrase = await this.#dependencies.phoneVerification.waitForConfirmation(challenge, signal);
-    } catch {
+    } catch (error) {
+      const pause = retryableAdapterPause(error);
+      if (pause !== undefined) return { outcome: "paused", mode, ...pause };
       return this.#rollbackFailure(adapter, endpoint, signal, "phone");
     }
     if (provenPhrase === undefined)

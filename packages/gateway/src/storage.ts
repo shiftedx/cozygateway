@@ -861,6 +861,57 @@ export class Storage {
         };
   }
 
+  onboardingVerificationStatus(challengeId: string, now: number):
+    | { state: "pending"; expiresAt: number }
+    | { state: "confirmed"; phrase: string; expiresAt: number }
+    | { state: "expired" | "not_found" } {
+    if (challengeId.length < 1 || challengeId.length > 128 || !Number.isSafeInteger(now) || now < 0)
+      return { state: "not_found" };
+    const row = this.#db.prepare(`
+      SELECT c.state, c.phrase, c.expires_at AS expiresAt, s.state AS sessionState
+      FROM onboarding_challenges c
+      JOIN onboarding_sessions s ON s.session_id = c.session_id
+      WHERE c.challenge_id = ?
+    `).get(challengeId) as {
+      state: ChallengeState;
+      phrase: string;
+      expiresAt: number;
+      sessionState: "active" | "complete" | "abandoned";
+    } | undefined;
+    if (row === undefined || row.sessionState !== "active"
+      || !["active", "ws_probed", "phone_confirmed"].includes(row.state))
+      return { state: "not_found" };
+    if (now > row.expiresAt) return { state: "expired" };
+    return row.state === "phone_confirmed"
+      ? { state: "confirmed", phrase: row.phrase, expiresAt: row.expiresAt }
+      : { state: "pending", expiresAt: row.expiresAt };
+  }
+
+  onboardingLiveVerification(now: number):
+    | { challengeId: string; state: "active" | "ws_probed"; expiresAt: number }
+    | { challengeId: string; state: "phone_confirmed"; phrase: string; expiresAt: number }
+    | undefined {
+    if (!Number.isSafeInteger(now) || now < 0) return undefined;
+    const row = this.#db.prepare(`
+      SELECT c.challenge_id AS challengeId, c.state, c.phrase, c.expires_at AS expiresAt
+      FROM onboarding_challenges c
+      JOIN onboarding_sessions s ON s.session_id = c.session_id
+      WHERE s.state = 'active'
+        AND c.state IN ('active', 'ws_probed', 'phone_confirmed')
+        AND c.expires_at >= ?
+      ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1
+    `).get(now) as {
+      challengeId: string;
+      state: "active" | "ws_probed" | "phone_confirmed";
+      phrase: string;
+      expiresAt: number;
+    } | undefined;
+    if (row === undefined) return undefined;
+    return row.state === "phone_confirmed"
+      ? { challengeId: row.challengeId, state: row.state, phrase: row.phrase, expiresAt: row.expiresAt }
+      : { challengeId: row.challengeId, state: row.state, expiresAt: row.expiresAt };
+  }
+
   onboardingRuntimeContext(): { verificationEpoch: string; bootGeneration: string } {
     const row = this.#db.prepare(`
       SELECT verification_epoch AS verificationEpoch, boot_generation AS bootGeneration

@@ -60,7 +60,7 @@ import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
 import type { PhoneVerification } from "./phone-verification.ts";
-import type { OperatorOnboardingControl } from "./operator-onboarding.ts";
+import { operatorOnboardingNotFound, type OperatorOnboardingControl } from "./operator-onboarding.ts";
 
 const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
 // The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
@@ -275,8 +275,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
   })();
   requestLiveActivityDeletionDrain();
 
-  app.post("/cozy/operator/onboarding", (c) => {
-    if (deps.operatorOnboarding === undefined) return c.notFound();
+  app.all("/cozy/operator/onboarding", (c) => {
+    if (deps.operatorOnboarding === undefined) return operatorOnboardingNotFound();
     const incoming = (c.env as { incoming?: IncomingMessage } | undefined)?.incoming;
     return deps.operatorOnboarding.handle(c.req.raw, incoming?.socket.remoteAddress);
   });

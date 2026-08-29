@@ -84,3 +84,77 @@ managed route switches could retain an advanced public URL. Separate legacy disc
 managed-route clearing now preserve the intended boundaries. The final review found no unresolved
 critical or important issue and confirmed that the production CLI/installer path uses the concrete
 running-Gateway bridge rather than an injected-only test seam.
+
+## Review-finding remediation
+
+Every finding in `task-10-review-findings.md` was reproduced and resolved test-first:
+
+1. Managed listener changes now snapshot the complete persisted config text, install state, and
+   actual Hermes environment-file targets. All production writers share an exclusive local writer
+   lock and use flushed temporary files plus rename. Forward changes and rollback compare the exact
+   snapshot; public URL, TLS, unknown future fields, Hermes contents, or another writer changing
+   any coordinate makes the CAS fail, and rollback never overwrites a later edit.
+2. Operator-control requests and production health/TLS/WebSocket probes always have fixed deadlines
+   composed with caller cancellation. An absent/restarting control endpoint is a typed
+   `gateway_restarting` pause; authoritative `not_found` and `expired` remain distinct live-Gateway
+   results. Restart pauses retain the prepared route and emit no setup code or pairing output.
+3. Advanced setup now configures and activates the basic bind address and port. Its second route
+   enters Same Wi-Fi adapter selection, shows only normalized physical candidates, rejects invalid
+   choices, and feeds the explicit adapter ID into LAN preparation. Ambiguous adapters are never
+   guessed.
+4. Operator challenge state and setup status now read SQLite on every call and across independent
+   storage/process handles. Only live active, WebSocket-probed, or phone-confirmed challenges expose
+   expiry; cancellation, completion, and expiry clear the live projection. The process-local expiry
+   cache was removed.
+5. The CLI now has concrete, resumable copy for every typed Tailscale, LAN, and operator pause,
+   including install/support/service, login/machine approval, account rejection, preference policy/
+   cancellation/verification, HTTPS consent/no safe port, mapping inspection/mutation/conflict,
+   listener races, adapter absence/ambiguity, operator concurrency, and Gateway restart. Copy and
+   safe LAN candidate display contain no token, capability, account identity, auth URL, or diagnostic
+   dump.
+6. `createWindowsOnboardingController` now exposes narrow injection boundaries for its helper,
+   storage, control client, state, CLI runner, probes, clock, delay, and output. Integration tests
+   exercise the actual factory composition with the real Tailscale adapter, explicit LAN selection,
+   real advanced config/Hermes synchronization, transient restart/resume, complete and expiring
+   SQLite status, the fresh pair gate, and concurrent CAS refusal. All boundaries are inert fakes or
+   disposable local files/databases.
+7. Disabled, wrong-method, and bad-auth operator-control requests now return the same status,
+   content type, cache policy, and body. Authenticated status can still return a bounded typed
+   `not_found`, which lets the CLI distinguish authority state from endpoint absence.
+
+The RED runs failed on stale process-local status, non-uniform route responses, absent request
+deadlines, rollback-on-restart, ambiguous LAN selection, missing advanced behavior, incomplete
+pause copy, and config/Hermes CAS gaps. Final GREEN gates passed:
+
+- Focused CLI/controller/control/storage/network suites: 8 files, 176 tests passed.
+- Full Gateway suite: 100 files passed, 1 skipped; 1,065 tests passed, 2 skipped.
+- Gateway build: passed.
+- Gateway typecheck: passed.
+- Full Hermes installer dry-run suite: passed.
+- Windows bootstrap regression suite: passed.
+- `git diff --check`: clean apart from Git's LF-to-CRLF working-copy notices.
+
+No test invoked a live installer, UAC prompt, browser, Tailscale service, preference, Serve/Funnel
+mutation, or external network. The only real listeners were bounded loopback/LAN-address test
+listeners created inside the test process.
+
+## Final durability closeout
+
+Self-review added one last red/green regression for ambiguous LAN selections across process
+boundaries. The chosen normalized adapter ID is now stored in a bounded, atomically replaced local
+state sidecar, protected by the Task 8 helper before and after rename. A newly constructed real
+Windows controller and newly opened SQLite handle reuse the explicit selection without guessing or
+prompting again; a missing or invalid selection still pauses.
+
+Fresh final verification after that change:
+
+- Focused remediation suites: 8 files, 176 tests passed.
+- Standalone full Gateway suite: 100 files passed, 1 skipped; 1,065 tests passed, 2 skipped.
+- Gateway build and typecheck: passed.
+- Windows bootstrap regression suite: passed.
+- Full Hermes installer dry-run suite: passed.
+- `git diff --check`: clean apart from Git's LF-to-CRLF working-copy notices.
+
+One earlier full-suite attempt run concurrently with build/typecheck ended in Vitest worker shutdown
+with `ERR_IPC_CHANNEL_CLOSED` and no assertion failure. The required standalone rerun completed with
+the counts above and exit status zero.

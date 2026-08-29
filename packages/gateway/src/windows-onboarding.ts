@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 
@@ -7,10 +8,13 @@ import { WebSocket } from "ws";
 import { newSetupCode } from "./auth.ts";
 import { loadConfig } from "./config.ts";
 import {
+  compareAndSwapManagedListener,
+  compareAndSwapManagedListenerSnapshot,
   listenerOrigin,
+  parseListenerPort,
+  readManagedListenerSnapshot,
   SqliteOnboardingAuthority,
-  syncManagedListenerTargets,
-  updateListenerConfig,
+  validateListenerHost,
 } from "./configure.ts";
 import type { CliIo, CliOnboardingController, CliRuntime } from "./cli.ts";
 import { LanModeAdapter, type LanListenerState, type LanModeRuntime } from "./lan-mode.ts";
@@ -20,43 +24,148 @@ import {
   type OnboardingIo,
   type PreparedEndpoint,
 } from "./network-onboarding.ts";
-import { NetworkOnboardingStateFile } from "./onboarding-state.ts";
-import { OperatorOnboardingClient, loadOperatorControlToken } from "./operator-onboarding.ts";
+import { NetworkOnboardingStateFile, type NetworkOnboardingStateProjection } from "./onboarding-state.ts";
+import {
+  OperatorOnboardingClient,
+  loadOperatorControlToken,
+  type OperatorBeginResult,
+  type OperatorPhoneStatus,
+} from "./operator-onboarding.ts";
 import { preparePairingOutput } from "./pairing-output.ts";
 import { gatewayPostureFingerprint } from "./phone-verification.ts";
-import { openStorage } from "./storage.ts";
+import { openStorage, type Storage } from "./storage.ts";
 import {
   SqliteTailscaleOwnershipStore,
   TailscaleModeAdapter,
   type TailscaleModeIo,
   type TailscaleModeProbes,
 } from "./tailscale-mode.ts";
+import type { TailscaleCliRunner } from "./tailscale-cli.ts";
 import { gatewayScheme } from "./tls.ts";
 import { WindowsHelperClient } from "./windows-helper.ts";
 
-function installState(configPath: string): Map<string, string> {
-  const values = new Map<string, string>();
-  const text = readFileSync(join(dirname(configPath), "install-state"), "utf8");
-  for (const line of text.split(/\r?\n/)) {
-    const separator = line.indexOf("=");
-    if (separator > 0) values.set(line.slice(0, separator), line.slice(separator + 1));
-  }
-  return values;
+type WindowsOnboardingHelper = Pick<WindowsHelperClient,
+  "protectPath" | "adapterInventory" | "discoverTailscale" | "installTailscale" | "setPreference" | "openBrowser">;
+
+interface OperatorClient {
+  begin(
+    mode: Parameters<OperatorOnboardingClient["begin"]>[0],
+    context: Parameters<OperatorOnboardingClient["begin"]>[1],
+    signal?: AbortSignal,
+  ): OperatorBeginResult | Promise<OperatorBeginResult>;
+  status(challengeId: string, signal?: AbortSignal): OperatorPhoneStatus | Promise<OperatorPhoneStatus>;
+  cancel(challengeId: string, signal?: AbortSignal): { state: "cancelled" } | Promise<{ state: "cancelled" }>;
+}
+
+export interface WindowsOnboardingControllerDependencies {
+  helper?: WindowsOnboardingHelper;
+  storage?: Storage;
+  control?: OperatorClient;
+  state?: NetworkOnboardingStateProjection;
+  tailscaleAdapter?: NetworkModeAdapter;
+  tailscaleCliRunner?: TailscaleCliRunner;
+  health?: typeof health;
+  websocket?: typeof websocket;
+  tlsProbe?: typeof tlsProbe;
+  now?: () => number;
+  delay?: typeof boundedDelay;
+  createSetupCode?: () => string;
+  renderPairingOutput?: typeof preparePairingOutput;
+  writePairingOutput?: (output: string) => void | Promise<void>;
+  beforeListenerCas?: () => void | Promise<void>;
 }
 
 function sameListener(left: LanListenerState, right: LanListenerState): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function managedRevision(snapshot: ReturnType<typeof readManagedListenerSnapshot>): string {
+  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+}
+
+const SELECTED_LAN_ADAPTER_MAX_BYTES = 256;
+const SELECTED_LAN_ADAPTER_FILE_MAX_BYTES = SELECTED_LAN_ADAPTER_MAX_BYTES + 2;
+const SELECTED_LAN_ADAPTER_PATTERN = /^[\x20-\x7e]{1,256}$/;
+
+function validSelectedLanAdapter(adapterId: string): boolean {
+  return SELECTED_LAN_ADAPTER_PATTERN.test(adapterId)
+    && Buffer.byteLength(adapterId, "utf8") <= SELECTED_LAN_ADAPTER_MAX_BYTES;
+}
+
+function readSelectedLanAdapter(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  if (statSync(path).size > SELECTED_LAN_ADAPTER_FILE_MAX_BYTES)
+    throw new Error("saved LAN adapter selection is invalid");
+  const adapterId = readFileSync(path, "utf8").replace(/\r?\n$/, "");
+  if (!validSelectedLanAdapter(adapterId)) throw new Error("saved LAN adapter selection is invalid");
+  return adapterId;
+}
+
+async function writeSelectedLanAdapter(
+  path: string,
+  adapterId: string,
+  installRoot: string,
+  helper: WindowsOnboardingHelper,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!validSelectedLanAdapter(adapterId)) throw new Error("LAN adapter selection is invalid");
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${adapterId}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await helper.protectPath(installRoot, temporary, signal);
+    renameSync(temporary, path);
+    await helper.protectPath(installRoot, path, signal);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
+  }
+}
+
+async function withDeadline<T>(
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  operation: (boundedSignal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const deadline = new AbortController();
+  const abort = () => deadline.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  const timer = setTimeout(() => deadline.abort(new Error("request timed out")), timeoutMs);
+  try {
+    return await operation(deadline.signal);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function boundedDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(done, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason ?? new Error("cancelled"));
+    };
+    function done() {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
 async function health(origin: string, signal?: AbortSignal): Promise<{ ok: boolean; attachReady: boolean }> {
-  const response = await fetch(`${origin}/health`, { redirect: "manual", signal: signal ?? AbortSignal.timeout(5_000) });
-  if (response.status !== 200) return { ok: false, attachReady: false };
-  const body = await response.json() as { attach?: { configured?: number; online?: number; deadLetters?: number } };
-  const configured = body.attach?.configured ?? 0;
-  return {
-    ok: true,
-    attachReady: configured > 0 && body.attach?.online === configured && body.attach?.deadLetters === 0,
-  };
+  return withDeadline(signal, 5_000, async (boundedSignal) => {
+    const response = await fetch(`${origin}/health`, { redirect: "manual", signal: boundedSignal });
+    if (response.status !== 200) return { ok: false, attachReady: false };
+    const body = await response.json() as { attach?: { configured?: number; online?: number; deadLetters?: number } };
+    const configured = body.attach?.configured ?? 0;
+    return {
+      ok: true,
+      attachReady: configured > 0 && body.attach?.online === configured && body.attach?.deadLetters === 0,
+    };
+  });
 }
 
 function websocket(origin: string, holdMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -76,6 +185,7 @@ function websocket(origin: string, holdMs: number, signal?: AbortSignal): Promis
     };
     const timer = setTimeout(() => finish(false), 5_000);
     signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     socket.once("open", () => { openedTimer = setTimeout(() => finish(true), holdMs); });
     socket.once("error", () => finish(false));
     socket.once("close", () => finish(false));
@@ -90,6 +200,7 @@ function tlsProbe(host: string, signal?: AbortSignal): Promise<{
     const timer = setTimeout(() => socket.destroy(new Error("timeout")), 5_000);
     const abort = () => socket.destroy(new Error("cancelled"));
     signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     socket.once("secureConnect", () => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
@@ -105,23 +216,96 @@ function tlsProbe(host: string, signal?: AbortSignal): Promise<{
       };
       socket.end(); resolve(result);
     });
-    socket.once("error", reject);
+    socket.once("error", (error) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(error);
+    });
   });
 }
 
 class AdvancedModeAdapter implements NetworkModeAdapter {
   readonly mode = "advanced" as const;
   readonly #configPath: string;
+  readonly #installRoot: string;
+  readonly #helper: WindowsOnboardingHelper;
+  readonly #io?: CliIo;
+  readonly #runtime: CliRuntime;
+  readonly #health: typeof health;
+  readonly #websocket: typeof websocket;
 
-  constructor(configPath: string) { this.#configPath = configPath; }
-  prepare(signal?: AbortSignal) { return this.inspect(signal); }
+  constructor(input: {
+    configPath: string;
+    installRoot: string;
+    helper: WindowsOnboardingHelper;
+    io?: CliIo;
+    runtime: CliRuntime;
+    health?: typeof health;
+    websocket?: typeof websocket;
+  }) {
+    this.#configPath = input.configPath;
+    this.#installRoot = input.installRoot;
+    this.#helper = input.helper;
+    this.#io = input.io;
+    this.#runtime = input.runtime;
+    this.#health = input.health ?? health;
+    this.#websocket = input.websocket ?? websocket;
+  }
+
+  async prepare(signal?: AbortSignal): Promise<PreparedEndpoint> {
+    if (this.#io === undefined)
+      throw Object.assign(new Error("advanced listener input required"), {
+        retryable: true as const, reason: "advanced_input_required",
+      });
+    const current = loadConfig(this.#configPath);
+    const currentHost = current.host ?? "127.0.0.1";
+    let host: string;
+    for (;;) {
+      const answer = await this.#io.question(`Bind address [${currentHost}]: `);
+      try {
+        host = validateListenerHost(answer.trim() === "" ? currentHost : answer);
+        break;
+      } catch {
+        console.log("Enter a bind hostname or IP address without a URL or whitespace.");
+      }
+    }
+    let port: number;
+    for (;;) {
+      const answer = await this.#io.question(`Port [${current.port}]: `);
+      try {
+        port = parseListenerPort(answer.trim() === "" ? String(current.port) : answer);
+        break;
+      } catch {
+        console.log("Enter a whole port number from 1 through 65535.");
+      }
+    }
+    if (host === currentHost && port === current.port) return this.inspect(signal);
+    const before = readManagedListenerSnapshot(this.#configPath);
+    if (!compareAndSwapManagedListener(this.#configPath, before, host, port))
+      throw Object.assign(new Error("listener changed"), { retryable: true as const, reason: "listener_changed" });
+    const after = readManagedListenerSnapshot(this.#configPath);
+    try {
+      await this.#helper.protectPath(this.#installRoot, this.#configPath, signal);
+      const results = await Promise.allSettled(after.profiles.map((profile) =>
+        this.#runtime.restartHermesProfile(profile.executable, profile.profile)));
+      if (results.some((result) => result.status === "rejected")) throw new Error("Hermes restart failed");
+      await this.#runtime.waitForGatewayReady(this.#configPath);
+      return await this.inspect(signal);
+    } catch (error) {
+      if (compareAndSwapManagedListenerSnapshot(this.#configPath, after, before)) {
+        await Promise.allSettled(before.profiles.map((profile) =>
+          this.#runtime.restartHermesProfile(profile.executable, profile.profile)));
+      }
+      throw error;
+    }
+  }
   async inspect(signal?: AbortSignal): Promise<PreparedEndpoint> {
     const config = loadConfig(this.#configPath);
     const bindHost = config.host ?? "127.0.0.1";
     const local = listenerOrigin(bindHost, config.port, gatewayScheme(config));
     const canonicalOrigin = config.publicUrl ?? local;
-    const checked = await health(canonicalOrigin, signal).catch(() => ({ ok: false, attachReady: false }));
-    const ws = checked.ok ? await websocket(canonicalOrigin, 0, signal) : false;
+    const checked = await this.#health(canonicalOrigin, signal).catch(() => ({ ok: false, attachReady: false }));
+    const ws = checked.ok ? await this.#websocket(canonicalOrigin, 0, signal) : false;
     return {
       mode: "advanced", canonicalOrigin, bindHost, port: config.port,
       durableFingerprint: gatewayPostureFingerprint({ host: bindHost, port: config.port, canonicalOrigin }),
@@ -133,17 +317,17 @@ class AdvancedModeAdapter implements NetworkModeAdapter {
 
 class WindowsTailscaleAdapter implements NetworkModeAdapter {
   readonly mode = "tailscale" as const;
-  readonly #delegate: TailscaleModeAdapter;
+  readonly #delegate: NetworkModeAdapter;
   readonly #configPath: string;
   readonly #installRoot: string;
-  readonly #helper: WindowsHelperClient;
+  readonly #helper: WindowsOnboardingHelper;
   readonly #runtime: CliRuntime;
 
   constructor(input: {
-    delegate: TailscaleModeAdapter;
+    delegate: NetworkModeAdapter;
     configPath: string;
     installRoot: string;
-    helper: WindowsHelperClient;
+    helper: WindowsOnboardingHelper;
     runtime: CliRuntime;
   }) {
     this.#delegate = input.delegate;
@@ -156,8 +340,11 @@ class WindowsTailscaleAdapter implements NetworkModeAdapter {
   async #ensureLoopback(): Promise<void> {
     const config = loadConfig(this.#configPath);
     if ((config.host ?? "127.0.0.1") === "127.0.0.1" && config.publicUrl === undefined) return;
-    updateListenerConfig(this.#configPath, "127.0.0.1", config.port, { clearPublicUrl: true });
-    const profiles = syncManagedListenerTargets(this.#configPath);
+    const snapshot = readManagedListenerSnapshot(this.#configPath);
+    if (!compareAndSwapManagedListener(
+      this.#configPath, snapshot, "127.0.0.1", config.port, { clearPublicUrl: true },
+    )) throw Object.assign(new Error("listener changed"), { retryable: true as const, reason: "listener_changed" });
+    const profiles = readManagedListenerSnapshot(this.#configPath).profiles;
     await this.#helper.protectPath(this.#installRoot, this.#configPath);
     await Promise.all(profiles.map((profile) =>
       this.#runtime.restartHermesProfile(profile.executable, profile.profile)));
@@ -205,88 +392,139 @@ export function createWindowsOnboardingController(
   configPath: string,
   io: CliIo | undefined,
   runtime: CliRuntime,
+  dependencies: WindowsOnboardingControllerDependencies = {},
 ): CliOnboardingController | undefined {
   const config = loadConfig(configPath);
   if (config.onboardingControlTokenFile === undefined) return undefined;
   const localRoot = dirname(configPath);
   const installRoot = dirname(localRoot);
-  const helper = new WindowsHelperClient({ helperPath: join(installRoot, "bin", "cozygateway-windows-helper.ps1") });
-  const storage = openStorage(config.dbPath);
+  const helper = dependencies.helper ?? new WindowsHelperClient({ helperPath: join(installRoot, "bin", "cozygateway-windows-helper.ps1") });
+  const storage = dependencies.storage ?? openStorage(config.dbPath);
   const authority = new SqliteOnboardingAuthority(storage);
-  const control = new OperatorOnboardingClient({
+  const control = dependencies.control ?? new OperatorOnboardingClient({
     localOrigin: listenerOrigin("127.0.0.1", config.port, gatewayScheme(config)),
     token: loadOperatorControlToken(config.onboardingControlTokenFile),
   });
-  const state = new NetworkOnboardingStateFile({
+  const state = dependencies.state ?? new NetworkOnboardingStateFile({
     localRoot,
     platform: "win32",
     protectWindowsAcl: (path) => helper.protectPath(installRoot, path),
   });
+  const selectedLanAdapterPath = join(localRoot, "network-onboarding-lan-adapter");
+  const listenerSnapshots = new Map<string, ReturnType<typeof readManagedListenerSnapshot>>();
 
   const readListener = (): LanListenerState => {
-    const current = loadConfig(configPath);
-    const values = installState(configPath);
-    const profiles = (values.get("profiles") ?? "").split(",").filter(Boolean);
+    const snapshot = readManagedListenerSnapshot(configPath);
+    const revision = managedRevision(snapshot);
+    listenerSnapshots.set(revision, snapshot);
+    const current = JSON.parse(snapshot.configText) as { host?: string; port: number };
     return {
       bindHost: current.host ?? "127.0.0.1",
       port: current.port,
-      hermesTargets: profiles.map((profile) => ({
+      hermesTargets: snapshot.profiles.map(({ profile, content }) => ({
         profile,
-        url: listenerOrigin("127.0.0.1", current.port, "http"),
+        url: /^COZYGATEWAY_URL=(.*)$/m.exec(content)?.[1] ?? "",
       })),
+      persistenceRevision: revision,
     };
   };
   const lanRuntime: LanModeRuntime = {
     readAdapterInventory: (signal) => helper.adapterInventory(signal),
+    readSelectedAdapter: async () => readSelectedLanAdapter(selectedLanAdapterPath),
+    writeSelectedAdapter: (adapterId, signal) =>
+      writeSelectedLanAdapter(selectedLanAdapterPath, adapterId, installRoot, helper, signal),
+    chooseAdapter: async (candidates) => {
+      if (io === undefined) return undefined;
+      for (;;) {
+        console.log("Choose the trusted physical adapter for Same Wi-Fi:");
+        for (let index = 0; index < candidates.length; index += 1) {
+          const candidate = candidates[index]!;
+          const name = candidate.displayName.replace(/[^\x20-\x7e]/g, "?").slice(0, 80);
+          console.log(`${index + 1}. ${name} (${candidate.kind}, ${candidate.address})`);
+        }
+        const answer = (await io.question(`Adapter [1-${candidates.length}]: `)).trim();
+        if (/^\d+$/.test(answer)) {
+          const selected = candidates[Number(answer) - 1];
+          if (selected !== undefined) return selected.adapterId;
+        }
+        console.log(`Choose a number from 1 through ${candidates.length}.`);
+      }
+    },
     readListenerState: async () => readListener(),
     compareAndSwapListener: async (expected, replacement) => {
+      await dependencies.beforeListenerCas?.();
       if (!sameListener(readListener(), expected)) return false;
-      updateListenerConfig(configPath, replacement.bindHost, replacement.port, { clearPublicUrl: true });
-      syncManagedListenerTargets(configPath);
+      const snapshot = readManagedListenerSnapshot(configPath);
+      if (managedRevision(snapshot) !== expected.persistenceRevision) return false;
+      const exactReplacement = replacement.persistenceRevision === undefined
+        ? undefined
+        : listenerSnapshots.get(replacement.persistenceRevision);
+      const applied = exactReplacement === undefined
+        ? compareAndSwapManagedListener(
+            configPath, snapshot, replacement.bindHost, replacement.port, { clearPublicUrl: true },
+          )
+        : compareAndSwapManagedListenerSnapshot(configPath, snapshot, exactReplacement);
+      if (!applied) return false;
+      replacement.persistenceRevision = managedRevision(readManagedListenerSnapshot(configPath));
       await helper.protectPath(installRoot, configPath);
       return true;
     },
     restartAndWait: async () => {
-      const profiles = syncManagedListenerTargets(configPath);
+      const profiles = readManagedListenerSnapshot(configPath).profiles;
       const results = await Promise.allSettled(profiles.map((profile) =>
         runtime.restartHermesProfile(profile.executable, profile.profile)));
       if (results.some((result) => result.status === "rejected")) throw new Error("Hermes restart failed");
       await runtime.waitForGatewayReady(configPath);
     },
     probeEndpoint: async (origin, signal) => {
-      const checked = await health(origin, signal).catch(() => ({ ok: false, attachReady: false }));
-      return { health: checked.ok, attachReady: checked.attachReady, webSocket: checked.ok && await websocket(origin, 0, signal) };
+      const checked = await (dependencies.health ?? health)(origin, signal).catch(() => ({ ok: false, attachReady: false }));
+      return {
+        health: checked.ok,
+        attachReady: checked.attachReady,
+        webSocket: checked.ok && await (dependencies.websocket ?? websocket)(origin, 0, signal),
+      };
     },
   };
   const probes: TailscaleModeProbes = {
     loopback: async (port, signal) => {
       const origin = `http://127.0.0.1:${port}`;
-      const checked = await health(origin, signal).catch(() => ({ ok: false, attachReady: false }));
-      return { bounded: true, health: checked.ok, attachReady: checked.attachReady, webSocket: checked.ok && await websocket(origin, 0, signal) };
+      const checked = await (dependencies.health ?? health)(origin, signal).catch(() => ({ ok: false, attachReady: false }));
+      return {
+        bounded: true,
+        health: checked.ok,
+        attachReady: checked.attachReady,
+        webSocket: checked.ok && await (dependencies.websocket ?? websocket)(origin, 0, signal),
+      };
     },
     remote: async (origin, expectedDnsName, signal) => {
-      const tls = await tlsProbe(expectedDnsName, signal).catch(() => ({ authorized: false, dnsNames: [], alpn: false as const }));
-      const response = await fetch(`${origin}/health`, { redirect: "manual", signal }).catch(() => undefined);
+      const tls = await (dependencies.tlsProbe ?? tlsProbe)(expectedDnsName, signal)
+        .catch(() => ({ authorized: false, dnsNames: [], alpn: false as const }));
+      const checked = await (dependencies.health ?? health)(origin, signal).catch(() => ({ ok: false, attachReady: false }));
       const openedAt = Date.now();
-      const ws = response?.status === 200 && await websocket(origin, 1_000, signal);
+      const ws = checked.ok && await (dependencies.websocket ?? websocket)(origin, 1_000, signal);
       return {
         bounded: true, requestedHost: expectedDnsName, tlsVerification: "system", tlsAuthorized: tls.authorized,
-        certificateDnsNames: tls.dnsNames, redirected: response !== undefined && response.status >= 300 && response.status < 400,
-        healthStatus: response?.status ?? 0, alpn: tls.alpn, webSocketEcho: ws, webSocketOpenMs: ws ? Math.max(1_000, Date.now() - openedAt) : 0,
+        certificateDnsNames: tls.dnsNames, redirected: false,
+        healthStatus: checked.ok ? 200 : 0, alpn: tls.alpn, webSocketEcho: ws,
+        webSocketOpenMs: ws ? Math.max(1_000, Date.now() - openedAt) : 0,
       };
     },
   };
-  const advanced = new AdvancedModeAdapter(configPath);
-  const tailscale = new TailscaleModeAdapter({
+  const advanced = new AdvancedModeAdapter({
+    configPath, installRoot, helper, io, runtime,
+    ...(dependencies.health === undefined ? {} : { health: dependencies.health }),
+    ...(dependencies.websocket === undefined ? {} : { websocket: dependencies.websocket }),
+  });
+  const tailscale = dependencies.tailscaleAdapter ?? new TailscaleModeAdapter({
     gatewayPort: config.port, helper, io: tailscaleIo(io), probes,
     ownership: new SqliteTailscaleOwnershipStore(storage),
+    ...(dependencies.tailscaleCliRunner === undefined ? {} : { cliRunner: dependencies.tailscaleCliRunner }),
   });
   const adapters: NetworkModeAdapter[] = [
     new WindowsTailscaleAdapter({ delegate: tailscale, configPath, installRoot, helper, runtime }),
     new LanModeAdapter(lanRuntime),
     advanced,
   ];
-  let activeExpiresAt: number | undefined;
   const onboarding = new NetworkOnboarding({
     adapters, state, authority,
     phoneVerification: {
@@ -295,27 +533,27 @@ export function createWindowsOnboardingController(
           canonicalOrigin: endpoint.canonicalOrigin,
           durableFingerprint: endpoint.durableFingerprint,
         });
-        activeExpiresAt = begun.expiresAt;
         return begun;
       },
       waitForConfirmation: async (challenge, signal) => {
         for (;;) {
           if (signal?.aborted) {
-            await control.cancel(challenge.challengeId).catch(() => undefined);
+            await Promise.resolve(control.cancel(challenge.challengeId)).catch(() => undefined);
             return undefined;
           }
-          const current = await control.status(challenge.challengeId, signal).catch(() => ({ state: "not_found" as const }));
+          const current = await control.status(challenge.challengeId, signal);
           if (current.state === "confirmed") return current.phrase;
-          if (current.state !== "pending" || Date.now() > current.expiresAt) return undefined;
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          if (current.state !== "pending" || (dependencies.now ?? Date.now)() > current.expiresAt) return undefined;
+          await (dependencies.delay ?? boundedDelay)(500, signal);
         }
       },
     },
     runtimeContext: () => authority.runtimeContext(),
-    createSetupCode: newSetupCode,
-    renderPairingOutput: preparePairingOutput,
-    writePairingOutput: (output) => { process.stdout.write(output); },
+    createSetupCode: dependencies.createSetupCode ?? newSetupCode,
+    renderPairingOutput: dependencies.renderPairingOutput ?? preparePairingOutput,
+    writePairingOutput: dependencies.writePairingOutput ?? ((output) => { process.stdout.write(output); }),
     color: process.stdout.isTTY === true,
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
   });
   let legacyChecked = false;
   const ensureLegacyProjection = async (): Promise<void> => {
@@ -335,7 +573,9 @@ export function createWindowsOnboardingController(
   return {
     status: async (signal) => {
       await ensureLegacyProjection();
-      return { ...await onboarding.status(signal), ...(activeExpiresAt === undefined ? {} : { expiresAt: activeExpiresAt }) };
+      const status = await onboarding.status(signal);
+      const verification = storage.onboardingLiveVerification((dependencies.now ?? Date.now)());
+      return { ...status, ...(verification === undefined ? {} : { expiresAt: verification.expiresAt }) };
     },
     run: async (onboardingIo: OnboardingIo, signal) => {
       await ensureLegacyProjection();

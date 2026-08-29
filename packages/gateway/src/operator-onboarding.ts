@@ -29,7 +29,7 @@ export interface OperatorOnboardingControlOptions {
   phoneVerification: OperatorPhoneVerification;
 }
 
-function notFound(): Response {
+export function operatorOnboardingNotFound(): Response {
   return new Response('{"error":"not_found"}', {
     status: 404,
     headers: { "content-type": "application/json", "cache-control": "no-store" },
@@ -137,11 +137,11 @@ export class OperatorOnboardingControl {
       : Buffer.alloc(0);
     const authenticated = candidate.length === this.#token.length
       && timingSafeEqual(candidate, this.#token);
-    if (!loopback(remoteAddress) || !authenticated || request.method !== "POST") return notFound();
+    if (!loopback(remoteAddress) || !authenticated || request.method !== "POST") return operatorOnboardingNotFound();
     if (request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json")
-      return notFound();
+      return operatorOnboardingNotFound();
     const body = await boundedJson(request);
-    if (!record(body) || typeof body.action !== "string") return notFound();
+    if (!record(body) || typeof body.action !== "string") return operatorOnboardingNotFound();
 
     if (
       body.action === "begin"
@@ -153,9 +153,9 @@ export class OperatorOnboardingControl {
     ) {
       try {
         const parsedOrigin = new URL(body.canonicalOrigin);
-        if (parsedOrigin.protocol !== "http:" && parsedOrigin.protocol !== "https:") return notFound();
+        if (parsedOrigin.protocol !== "http:" && parsedOrigin.protocol !== "https:") return operatorOnboardingNotFound();
         const canonicalOrigin = parsedOrigin.origin;
-        if (canonicalOrigin !== body.canonicalOrigin) return notFound();
+        if (canonicalOrigin !== body.canonicalOrigin) return operatorOnboardingNotFound();
         const challenge = this.#phoneVerification.begin(body.mode, {
           canonicalOrigin,
           durableFingerprint: body.durableFingerprint,
@@ -179,13 +179,13 @@ export class OperatorOnboardingControl {
     ) {
       if (body.action === "status") {
         const status = this.#phoneVerification.status(body.challengeId);
-        return status.state === "not_found" ? notFound() : json(status);
+        return json(status);
       }
       return this.#phoneVerification.cancel(body.challengeId)
         ? json({ state: "cancelled" })
-        : notFound();
+        : operatorOnboardingNotFound();
     }
-    return notFound();
+    return operatorOnboardingNotFound();
   }
 }
 
@@ -201,6 +201,27 @@ export interface OperatorOnboardingClientOptions {
   localOrigin: string;
   token: string;
   fetch?: typeof fetch;
+  requestTimeoutMs?: number;
+}
+
+export class OperatorOnboardingUnavailableError extends Error {
+  readonly retryable = true;
+  readonly reason = "gateway_restarting";
+
+  constructor() {
+    super("local onboarding control is unavailable");
+    this.name = "OperatorOnboardingUnavailableError";
+  }
+}
+
+export class OperatorOnboardingBusyError extends Error {
+  readonly retryable = true;
+  readonly reason = "operator_busy";
+
+  constructor() {
+    super("local onboarding control already has an active verification");
+    this.name = "OperatorOnboardingBusyError";
+  }
 }
 
 function timestamp(value: unknown): value is number {
@@ -212,6 +233,8 @@ function phrase(value: unknown): value is string {
 }
 
 async function boundedResponseJson(response: Response): Promise<unknown> {
+  if (response.status === 404) throw new OperatorOnboardingUnavailableError();
+  if (response.status === 409) throw new OperatorOnboardingBusyError();
   if (!response.ok) throw new Error("local onboarding control failed");
   const declared = response.headers.get("content-length");
   if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_RESPONSE_BYTES))
@@ -245,6 +268,7 @@ export class OperatorOnboardingClient {
   readonly #endpoint: string;
   readonly #token: string;
   readonly #fetch: typeof fetch;
+  readonly #requestTimeoutMs: number;
 
   constructor(options: OperatorOnboardingClientOptions) {
     if (!CONTROL_TOKEN.test(options.token)) throw new Error("invalid operator control token");
@@ -257,6 +281,9 @@ export class OperatorOnboardingClient {
     this.#endpoint = `${origin.origin}/cozy/operator/onboarding`;
     this.#token = options.token;
     this.#fetch = options.fetch ?? fetch;
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(this.#requestTimeoutMs) || this.#requestTimeoutMs < 1 || this.#requestTimeoutMs > 30_000)
+      throw new Error("invalid local onboarding control timeout");
   }
 
   begin(
@@ -286,7 +313,8 @@ export class OperatorOnboardingClient {
         return value as unknown as OperatorPhoneStatus;
       if (value.state === "confirmed" && exactKeys(value, ["state", "phrase", "expiresAt"])
         && phrase(value.phrase) && timestamp(value.expiresAt)) return value as unknown as OperatorPhoneStatus;
-      if ((value.state === "expired" || value.state === "cancelled") && exactKeys(value, ["state"]))
+      if ((value.state === "expired" || value.state === "cancelled" || value.state === "not_found")
+        && exactKeys(value, ["state"]))
         return value as unknown as OperatorPhoneStatus;
       throw new Error("local onboarding control failed");
     });
@@ -306,17 +334,28 @@ export class OperatorOnboardingClient {
   }
 
   async #call(body: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+    const deadline = new AbortController();
+    const abort = () => deadline.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    const timer = setTimeout(() => deadline.abort(new Error("local onboarding control timed out")), this.#requestTimeoutMs);
     let response: Response;
     try {
       response = await this.#fetch(this.#endpoint, {
         method: "POST",
         headers: { authorization: `Bearer ${this.#token}`, "content-type": "application/json" },
         body: JSON.stringify(body),
-        signal,
+        signal: deadline.signal,
       });
       return await boundedResponseJson(response);
-    } catch {
+    } catch (error) {
+      if (error instanceof OperatorOnboardingUnavailableError || error instanceof OperatorOnboardingBusyError)
+        throw error;
+      if (deadline.signal.aborted) throw new OperatorOnboardingUnavailableError();
       throw new Error("local onboarding control failed");
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
     }
   }
 }

@@ -208,23 +208,15 @@ export class PhoneVerification {
     | { state: "pending"; expiresAt: number }
     | { state: "confirmed"; phrase: string; expiresAt: number }
     | { state: "expired" | "cancelled" | "not_found" } {
-    const record = [...this.#records.values()].find((candidate) => candidate.challengeId === challengeId);
-    if (record === undefined) return { state: "not_found" };
-    if (record.state === "cancelled") return { state: "cancelled" };
-    if (!this.#isUsable(record)) return { state: "expired" };
-    return record.state === "phone_confirmed"
-      ? { state: "confirmed", phrase: record.phrase, expiresAt: record.expiresAt }
-      : { state: "pending", expiresAt: record.expiresAt };
+    return this.#storage.onboardingVerificationStatus(challengeId, this.#now());
   }
 
   /** Idempotent local cancellation. SQLite is transitioned first; only then is the in-memory
    * capability made unusable. A completed/finalized winner cannot be cancelled here. */
   cancel(challengeId: string): boolean {
     const record = [...this.#records.values()].find((candidate) => candidate.challengeId === challengeId);
-    if (record === undefined) return false;
-    if (record.state === "cancelled") return true;
     if (!this.#storage.cancelVerificationChallenge(challengeId, this.#now())) return false;
-    record.state = "cancelled";
+    if (record !== undefined) record.state = "cancelled";
     return true;
   }
 

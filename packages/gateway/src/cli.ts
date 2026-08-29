@@ -30,10 +30,11 @@ import {
 } from "./pairing-output.ts";
 import { gatewayScheme } from "./tls.ts";
 import {
+  compareAndSwapManagedListener,
+  compareAndSwapManagedListenerSnapshot,
   listenerOrigin,
   parseListenerPort,
-  syncManagedListenerTargets,
-  updateListenerConfig,
+  readManagedListenerSnapshot,
   validateListenerHost,
 } from "./configure.ts";
 import { createWindowsOnboardingController } from "./windows-onboarding.ts";
@@ -309,6 +310,7 @@ async function printStatus(configPath: string, onboarding?: CliOnboardingControl
 }
 
 async function configureListener(configPath: string, io: CliIo, runtime: CliRuntime): Promise<void> {
+  const before = readManagedListenerSnapshot(configPath);
   const current = loadConfig(configPath);
   const currentHost = current.host ?? "0.0.0.0";
   let host: string;
@@ -337,9 +339,11 @@ async function configureListener(configPath: string, io: CliIo, runtime: CliRunt
     console.log("No listener changes made.");
     return;
   }
-  updateListenerConfig(configPath, host, port);
+  if (!compareAndSwapManagedListener(configPath, before, host, port))
+    throw new Error("listener configuration changed in another window; review it and retry");
+  const after = readManagedListenerSnapshot(configPath);
   const activate = async (): Promise<number> => {
-    const managed = syncManagedListenerTargets(configPath);
+    const managed = readManagedListenerSnapshot(configPath).profiles;
     const results = await Promise.allSettled(
       managed.map((profile) => runtime.restartHermesProfile(profile.executable, profile.profile)),
     );
@@ -352,7 +356,8 @@ async function configureListener(configPath: string, io: CliIo, runtime: CliRunt
   try {
     managedCount = await activate();
   } catch (error) {
-    updateListenerConfig(configPath, currentHost, current.port);
+    if (!compareAndSwapManagedListenerSnapshot(configPath, after, before))
+      throw new Error(`listener change failed (${String(error)}); a concurrent edit was preserved`);
     try {
       await activate();
     } catch (rollbackError) {
@@ -436,7 +441,17 @@ function setupIo(io: CliIo): OnboardingIo {
         if (choice === "1") return "tailscale";
         if (choice === "2") return "lan";
         if (choice === "3") return "later";
-        if (choice === "4") return "advanced";
+        if (choice === "4") {
+          for (;;) {
+            console.log("1. Configure the basic bind address and port");
+            console.log("2. Choose a specific Same Wi-Fi adapter");
+            const advanced = (await io.question("Advanced setting [1-2]: ")).trim().toLowerCase();
+            if (advanced === "1") return "advanced";
+            if (advanced === "2") return "lan";
+            if (advanced === "q" || advanced === "cancel") return "cancel";
+            console.log("Choose 1 or 2.");
+          }
+        }
         if (choice === "q" || choice === "cancel") return "cancel";
         console.log("Choose 1, 2, 3, or 4.");
       }
@@ -454,15 +469,30 @@ function setupIo(io: CliIo): OnboardingIo {
 }
 
 const PAUSE_COPY: Readonly<Record<string, string>> = {
+  not_installed: "Install the official Tailscale app, then resume setup.",
   install_cancelled: "Tailscale installation was cancelled in Windows. Nothing was paired.",
   install_reboot_required: "Restart Windows, then resume this setup.",
+  install_verification_failed: "The Tailscale installer signature could not be verified. Download the current official installer, then resume.",
+  install_failed: "Tailscale installation did not complete. Finish the official installer, then resume.",
+  unsupported_install: "Remove the unsupported copy and install a supported official Tailscale installation, then resume.",
+  unsupported_version: "Update Tailscale to a supported version, then resume.",
+  status_unavailable: "Start the Tailscale service and confirm the app is responsive, then resume.",
   login_pending: "Finish signing in to Tailscale in the browser, then resume.",
   login_failed: "Tailscale sign-in did not finish. Check the Tailscale app, then resume.",
   login_browser_failed: "The Tailscale sign-in page could not be opened. Open the Tailscale app, finish signing in, then resume.",
-  account_not_confirmed: "The signed-in Tailscale account was not confirmed. Review the account in the Tailscale app, then resume.",
+  not_running: "Start Tailscale and wait until it is connected, then resume.",
+  account_not_confirmed: "Review the signed-in account in the Tailscale app, then explicitly approve it during setup.",
+  unattended_consent_required: "Approve reachability after logout if you want reliable remote access, then resume.",
+  incoming_consent_required: "Approve incoming Tailscale connections, then resume.",
   machine_auth_required: "Ask the tailnet administrator to approve this machine, then resume.",
   preference_policy: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
   managed_policy: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
+  https_consent_required: "Approve Tailscale HTTPS and its Certificate Transparency disclosure, then resume.",
+  https_consent_failed: "Tailscale HTTPS approval did not complete. Review the Tailscale app, then resume.",
+  https_consent_browser_failed: "The Tailscale HTTPS approval page could not be opened. Open the Tailscale admin page, approve HTTPS, then resume.",
+  no_safe_consent_port: "No unused local port is available for safe Tailscale HTTPS approval. Close the conflicting service, then resume.",
+  mapping_inspection_failed: "Setup could not safely inspect Tailscale Serve. Wait for Tailscale to become responsive, then resume.",
+  mapping_mutation_failed: "Setup could not safely update Tailscale Serve. Review the existing port 443 mapping, then resume.",
   preference_cancelled: "The Tailscale preference change was cancelled. Nothing was paired; resume when ready.",
   preference_verification_failed: "Tailscale did not confirm the requested preference. Review it in the Tailscale app, then resume.",
   preference_change_denied: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
@@ -470,6 +500,9 @@ const PAUSE_COPY: Readonly<Record<string, string>> = {
   multiple_up_physical_private_ipv4: "More than one physical network is active. Disconnect one or choose the intended adapter explicitly in Advanced settings, then resume.",
   listener_changed: "The listener changed while setup was running. Review the intended adapter in Advanced settings, then resume.",
   mapping_conflict: "Tailscale port 443 is already in use. Keep that mapping and choose Same Wi-Fi, Later, or Advanced settings.",
+  gateway_restarting: "Gateway is restarting. Wait for it to become ready, then resume; the prepared network route was preserved.",
+  operator_busy: "Another setup window has an active phone check. Finish or cancel it there, then resume this window.",
+  advanced_input_required: "Run setup in an interactive PowerShell window to enter the advanced bind address and port.",
 };
 
 async function runSetup(
@@ -526,10 +559,10 @@ export async function runCli(
   });
   const configPath = values.config;
   let ownedOnboarding: CliOnboardingController | undefined;
-  const resolvedOnboarding = (): CliOnboardingController | undefined => {
+  const resolvedOnboarding = (activeIo?: CliIo): CliOnboardingController | undefined => {
     if (onboarding !== undefined) return onboarding;
     if (process.platform !== "win32") return undefined;
-    ownedOnboarding ??= createWindowsOnboardingController(configPath, suppliedIo, runtime);
+    ownedOnboarding ??= createWindowsOnboardingController(configPath, activeIo ?? suppliedIo, runtime);
     return ownedOnboarding;
   };
 
@@ -542,7 +575,7 @@ export async function runCli(
       }
       return command === "configure"
         ? (await configureListener(configPath, io, runtime), 0)
-        : await runMenu(configPath, io, runtime, resolvedOnboarding());
+        : await runMenu(configPath, io, runtime, resolvedOnboarding(io));
     } finally {
       io.close();
       ownedOnboarding?.close();
@@ -561,7 +594,7 @@ export async function runCli(
   if (command === "setup") {
     const io = suppliedIo ?? terminalIo();
     try {
-      const controller = resolvedOnboarding();
+      const controller = resolvedOnboarding(io);
       if (controller === undefined) throw new Error("phone access setup is not initialized; rerun the Windows installer");
       return await runSetup(configPath, io, controller);
     } finally {

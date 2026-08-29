@@ -501,11 +501,12 @@ describe("verified onboarding pairing publication", () => {
 
 describe("cozygateway terminal menu", () => {
   it.each([
-    ["1", "tailscale"],
-    ["2", "lan"],
-    ["3", "later"],
-    ["4", "advanced"],
-  ] as const)("setup offers outcome-focused network choice %s", async (answer, expected) => {
+    [["1"], "tailscale"],
+    [["2"], "lan"],
+    [["3"], "later"],
+    [["4", "1"], "advanced"],
+    [["4", "2"], "lan"],
+  ] as const)("setup offers outcome-focused network choice %s", async (answers, expected) => {
     const { configPath } = tempConfig();
     let selected: string | undefined;
     const controller = onboardingController({
@@ -517,7 +518,7 @@ describe("cozygateway terminal menu", () => {
     const lines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
 
-    expect(await runCli(["setup", "--config", configPath], scriptedIo([answer]), undefined, controller)).toBe(0);
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([...answers]), undefined, controller)).toBe(0);
 
     vi.restoreAllMocks();
     expect(selected).toBe(expected);
@@ -525,6 +526,28 @@ describe("cozygateway terminal menu", () => {
     expect(lines.join("\n")).toContain("Same Wi-Fi");
     expect(lines.join("\n")).toContain("Set up later");
     expect(lines.join("\n")).toContain("Advanced settings");
+    if (answers[0] === "4") expect(lines.join("\n")).toContain("Choose a specific Same Wi-Fi adapter");
+  });
+
+  it("retries an invalid advanced choice without guessing a route", async () => {
+    const { configPath } = tempConfig();
+    let selected: string | undefined;
+    const controller = onboardingController({
+      resume: vi.fn(async (io) => {
+        selected = await io.chooseNetworkMode();
+        return { outcome: "cancelled" as const };
+      }),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["setup", "--config", configPath], scriptedIo(["4", "invalid", "2"]), undefined, controller,
+    )).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(selected).toBe("lan");
+    expect(lines.join("\n")).toContain("Choose 1 or 2");
   });
 
   it("noninteractive setup emits no QR/code and prints exactly one resume command", async () => {
@@ -546,14 +569,36 @@ describe("cozygateway terminal menu", () => {
   });
 
   it.each([
+    ["not_installed", "Install the official Tailscale app"],
     ["install_cancelled", "Tailscale installation was cancelled in Windows"],
     ["install_reboot_required", "Restart Windows, then resume"],
+    ["install_verification_failed", "Tailscale installer signature could not be verified"],
+    ["install_failed", "Tailscale installation did not complete"],
+    ["unsupported_install", "supported official Tailscale installation"],
+    ["unsupported_version", "Update Tailscale"],
+    ["status_unavailable", "Start the Tailscale service"],
     ["login_pending", "Finish signing in to Tailscale"],
+    ["login_failed", "Tailscale sign-in did not finish"],
+    ["login_browser_failed", "sign-in page could not be opened"],
+    ["not_running", "Start Tailscale"],
     ["machine_auth_required", "Ask the tailnet administrator to approve this machine"],
+    ["account_not_confirmed", "Review the signed-in account"],
+    ["unattended_consent_required", "Approve reachability after logout"],
+    ["incoming_consent_required", "Approve incoming Tailscale connections"],
+    ["preference_cancelled", "preference change was cancelled"],
+    ["preference_verification_failed", "did not confirm the requested preference"],
     ["managed_policy", "Tailscale policy blocked the requested setting"],
+    ["https_consent_required", "Approve Tailscale HTTPS"],
+    ["https_consent_failed", "HTTPS approval did not complete"],
+    ["https_consent_browser_failed", "HTTPS approval page could not be opened"],
+    ["no_safe_consent_port", "No unused local port is available"],
+    ["mapping_inspection_failed", "could not safely inspect Tailscale Serve"],
+    ["mapping_mutation_failed", "could not safely update Tailscale Serve"],
     ["no_up_physical_private_ipv4", "Connect this PC to trusted Wi-Fi or Ethernet"],
     ["multiple_up_physical_private_ipv4", "More than one physical network is active"],
+    ["listener_changed", "listener changed while setup was running"],
     ["mapping_conflict", "Tailscale port 443 is already in use"],
+    ["gateway_restarting", "Gateway is restarting"],
   ] as const)("prints actionable resumable copy for %s", async (reason, copy) => {
     const { configPath } = tempConfig();
     const controller = onboardingController({

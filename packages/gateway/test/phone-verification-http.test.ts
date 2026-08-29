@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runInNewContext } from "node:vm";
@@ -54,11 +58,43 @@ describe("phone verification page", () => {
     expect(verifier.status(challenge.challengeId)).toEqual({ state: "pending", expiresAt: challenge.expiresAt });
     expect(verifier.status(challenge.challengeId)).not.toHaveProperty("verificationUrl");
     expect(verifier.cancel(challenge.challengeId)).toBe(true);
-    expect(verifier.status(challenge.challengeId)).toEqual({ state: "cancelled" });
+    expect(verifier.status(challenge.challengeId)).toEqual({ state: "not_found" });
     expect(verifier.cancel(challenge.challengeId)).toBe(true);
     expect(() => verifier.begin("lan")).not.toThrow();
 
     verifier.close(); storage.close();
+  });
+
+  it("reads operator status from SQLite across processes and clears terminal or expired proof", () => {
+    const directory = mkdtempSync(join(tmpdir(), `phone-verification-${randomUUID()}-`));
+    const path = join(directory, "gateway.sqlite");
+    const writer = openStorage(path);
+    writer.beginGatewayBoot({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: "https://gateway.example",
+      durableFingerprint: "posture", startedAt: 1,
+    });
+    const verifier = new PhoneVerification({ storage: writer, now: () => 1, monotonicNow: () => 1 });
+    verifier.activate({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: "https://gateway.example",
+      durableFingerprint: "posture",
+    });
+    const challenge = verifier.begin("tailscale");
+    const reader = openStorage(path);
+    const restarted = new PhoneVerification({ storage: reader, now: () => 2, monotonicNow: () => 2 });
+
+    expect(restarted.status(challenge.challengeId)).toEqual({ state: "pending", expiresAt: challenge.expiresAt });
+    expect(reader.onboardingLiveVerification(2)).toEqual({
+      challengeId: challenge.challengeId,
+      state: "active",
+      expiresAt: challenge.expiresAt,
+    });
+    expect(reader.onboardingLiveVerification(challenge.expiresAt + 1)).toBeUndefined();
+    expect(restarted.cancel(challenge.challengeId)).toBe(true);
+    expect(verifier.status(challenge.challengeId)).toEqual({ state: "not_found" });
+    expect(reader.onboardingLiveVerification(2)).toBeUndefined();
+
+    restarted.close(); verifier.close(); reader.close(); writer.close();
+    rmSync(directory, { recursive: true, force: true });
   });
 
   it("normalizes literal default ports while preserving non-default ports", () => {

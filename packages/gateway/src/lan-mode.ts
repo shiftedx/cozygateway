@@ -20,6 +20,9 @@ export interface LanListenerState {
   bindHost: string;
   port: number;
   hermesTargets: LanHermesTarget[];
+  /** Opaque hash of the complete persisted config/install-state/Hermes files. It is used only by
+   * the concrete writer CAS and is deliberately excluded from endpoint fingerprints. */
+  persistenceRevision?: string;
 }
 
 export interface LanProbeResult {
@@ -31,6 +34,12 @@ export interface LanProbeResult {
 
 export interface LanModeRuntime {
   readAdapterInventory(signal?: AbortSignal): Promise<WindowsLanInventory>;
+  readSelectedAdapter?(signal?: AbortSignal): Promise<string | undefined>;
+  writeSelectedAdapter?(adapterId: string, signal?: AbortSignal): Promise<void>;
+  chooseAdapter?(
+    candidates: readonly PhysicalLanCandidate[],
+    signal?: AbortSignal,
+  ): Promise<string | undefined>;
   readListenerState(signal?: AbortSignal): Promise<LanListenerState>;
   compareAndSwapListener(
     expected: LanListenerState,
@@ -96,6 +105,7 @@ function copyState(state: LanListenerState): LanListenerState {
     bindHost: state.bindHost,
     port: state.port,
     hermesTargets: state.hermesTargets.map((target) => ({ ...target })),
+    ...(state.persistenceRevision === undefined ? {} : { persistenceRevision: state.persistenceRevision }),
   };
 }
 
@@ -179,6 +189,7 @@ export class LanModeAdapter implements NetworkModeAdapter {
   readonly mode = "lan" as const;
   readonly #runtime: LanModeRuntime;
   #owned?: OwnedListenerMutation;
+  #selectedAdapterId?: string;
 
   constructor(runtime: LanModeRuntime) {
     this.#runtime = runtime;
@@ -190,13 +201,12 @@ export class LanModeAdapter implements NetworkModeAdapter {
 
   async prepare(signal?: AbortSignal): Promise<LanPreparedEndpoint> {
     const inventory = await this.#runtime.readAdapterInventory(signal);
-    const selection = selectPhysicalLanCandidate(inventory);
-    if (selection.outcome === "paused") throw new LanModePause(selection.reason, selection.candidates);
+    const candidate = await this.#candidate(inventory, true, signal);
     const before = await this.#runtime.readListenerState(signal);
     const after = preparedState(before);
     if (!sameState(before, after)) {
       if (!await this.#runtime.compareAndSwapListener(before, after, signal)) {
-        throw new LanModePause("listener_changed", [selection.candidate]);
+        throw new LanModePause("listener_changed", [candidate]);
       }
       this.#owned = { before: copyState(before), after: copyState(after) };
       try {
@@ -209,7 +219,7 @@ export class LanModeAdapter implements NetworkModeAdapter {
 
     let endpoint: LanPreparedEndpoint;
     try {
-      const inspected = await this.#inspectCandidate(selection.candidate, signal);
+      const inspected = await this.#inspectCandidate(candidate, signal);
       endpoint = inspected.endpoint;
       if (!endpoint.ready) {
         const reason = !inspected.probe.health
@@ -231,9 +241,8 @@ export class LanModeAdapter implements NetworkModeAdapter {
 
   async inspect(signal?: AbortSignal): Promise<LanPreparedEndpoint> {
     const inventory = await this.#runtime.readAdapterInventory(signal);
-    const selection = selectPhysicalLanCandidate(inventory);
-    if (selection.outcome === "paused") throw new LanModePause(selection.reason, selection.candidates);
-    return (await this.#inspectCandidate(selection.candidate, signal, inventory)).endpoint;
+    const candidate = await this.#candidate(inventory, false, signal);
+    return (await this.#inspectCandidate(candidate, signal, inventory)).endpoint;
   }
 
   async verify(expected: PreparedEndpoint, signal?: AbortSignal): Promise<boolean> {
@@ -256,30 +265,26 @@ export class LanModeAdapter implements NetworkModeAdapter {
     knownInventory?: WindowsLanInventory,
   ): Promise<{ endpoint: LanPreparedEndpoint; probe: LanProbeResult }> {
     const inventory = knownInventory ?? await this.#runtime.readAdapterInventory(signal);
-    const selection = selectPhysicalLanCandidate(inventory);
-    if (selection.outcome === "paused") throw new LanModePause(selection.reason, selection.candidates);
+    const candidate = await this.#candidate(inventory, false, signal);
     if (
-      selection.candidate.adapterId !== expectedCandidate.adapterId
-      || selection.candidate.address !== expectedCandidate.address
+      candidate.adapterId !== expectedCandidate.adapterId
+      || candidate.address !== expectedCandidate.address
     ) throw new LanModeReadinessError("posture");
     const listener = await this.#runtime.readListenerState(signal);
-    const origin = `http://${selection.candidate.address}:${listener.port}`;
+    const origin = `http://${candidate.address}:${listener.port}`;
     const probe = await this.#runtime.probeEndpoint(origin, signal);
     const [finalInventory, finalListener] = await Promise.all([
       this.#runtime.readAdapterInventory(signal),
       this.#runtime.readListenerState(signal),
     ]);
-    const finalSelection = selectPhysicalLanCandidate(finalInventory);
-    if (finalSelection.outcome === "paused") {
-      throw new LanModePause(finalSelection.reason, finalSelection.candidates);
-    }
+    const finalCandidate = await this.#candidate(finalInventory, false, signal);
     if (
-      finalSelection.candidate.adapterId !== expectedCandidate.adapterId
-      || finalSelection.candidate.address !== expectedCandidate.address
+      finalCandidate.adapterId !== expectedCandidate.adapterId
+      || finalCandidate.address !== expectedCandidate.address
     ) throw new LanModeReadinessError("posture");
     return {
       endpoint: endpointOf(
-        finalSelection.candidate,
+        finalCandidate,
         finalInventory,
         finalListener,
         probe,
@@ -287,6 +292,35 @@ export class LanModeAdapter implements NetworkModeAdapter {
       ),
       probe,
     };
+  }
+
+  async #candidate(
+    inventory: WindowsLanInventory,
+    allowChoice: boolean,
+    signal?: AbortSignal,
+  ): Promise<PhysicalLanCandidate> {
+    const selection = selectPhysicalLanCandidate(inventory);
+    if (this.#selectedAdapterId === undefined && this.#runtime.readSelectedAdapter !== undefined)
+      this.#selectedAdapterId = await this.#runtime.readSelectedAdapter(signal);
+    if (selection.outcome === "selected") {
+      if (this.#selectedAdapterId !== undefined && selection.candidate.adapterId !== this.#selectedAdapterId)
+        throw new LanModeReadinessError("posture");
+      return selection.candidate;
+    }
+    if (selection.reason !== "multiple_up_physical_private_ipv4")
+      throw new LanModePause(selection.reason, selection.candidates);
+    let candidate = selection.candidates.find((item) => item.adapterId === this.#selectedAdapterId);
+    if (candidate === undefined && allowChoice && this.#runtime.chooseAdapter !== undefined) {
+      const adapterId = await this.#runtime.chooseAdapter(selection.candidates, signal);
+      candidate = selection.candidates.find((item) => item.adapterId === adapterId);
+      if (candidate !== undefined) {
+        await this.#runtime.writeSelectedAdapter?.(candidate.adapterId, signal);
+        this.#selectedAdapterId = candidate.adapterId;
+      }
+    }
+    if (candidate === undefined) throw new LanModePause(selection.reason, selection.candidates);
+    this.#selectedAdapterId = candidate.adapterId;
+    return candidate;
   }
 
   async #rollbackMutation(signal?: AbortSignal): Promise<void> {

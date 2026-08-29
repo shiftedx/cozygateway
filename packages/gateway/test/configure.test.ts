@@ -5,7 +5,9 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  compareAndSwapManagedListener,
   parseListenerPort,
+  readManagedListenerSnapshot,
   listenerOrigin,
   SqliteOnboardingAuthority,
   syncManagedListenerTargets,
@@ -158,6 +160,41 @@ describe("listener configuration", () => {
     expect(readFileSync(opsEnv, "utf8")).toBe(
       "COZYGATEWAY_TOKEN=ops-secret\nCOZYGATEWAY_URL=http://127.0.0.1:9000\n",
     );
+  });
+
+  it("CAS compares complete config and actual Hermes files before changing a managed listener", () => {
+    const path = configFile();
+    const localDir = dirname(path);
+    const hermesRoot = join(localDir, "hermes-cas");
+    mkdirSync(hermesRoot, { recursive: true });
+    writeFileSync(join(localDir, "install-state"), `profiles=default\nhermes_root=${hermesRoot}\nhermes_bin=${join(hermesRoot, "hermes")}\n`);
+    const envPath = join(hermesRoot, ".env");
+    writeFileSync(envPath, "COZYGATEWAY_URL=http://127.0.0.1:8787\nCOZYGATEWAY_TOKEN=secret\n");
+    const expected = readManagedListenerSnapshot(path);
+
+    const concurrent = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    concurrent.publicUrl = "https://gateway.example";
+    concurrent.tls = { certFile: "cert.pem", keyFile: "key.pem" };
+    concurrent.futureSetting = { preserved: true };
+    writeFileSync(path, JSON.stringify(concurrent));
+    expect(compareAndSwapManagedListener(path, expected, "0.0.0.0", 9000, { clearPublicUrl: true })).toBe(false);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(concurrent);
+
+    writeFileSync(path, expected.configText);
+    writeFileSync(envPath, "COZYGATEWAY_URL=http://127.0.0.1:9999\nCOZYGATEWAY_TOKEN=secret\n");
+    expect(compareAndSwapManagedListener(path, expected, "0.0.0.0", 9000, { clearPublicUrl: true })).toBe(false);
+    expect(readFileSync(envPath, "utf8")).toContain("127.0.0.1:9999");
+  });
+
+  it("serializes concurrent managed writers and rollback never deletes a later edit", () => {
+    const path = configFile();
+    const initial = readManagedListenerSnapshot(path);
+    expect(compareAndSwapManagedListener(path, initial, "0.0.0.0", 9000, { clearPublicUrl: true })).toBe(true);
+    expect(compareAndSwapManagedListener(path, initial, "127.0.0.1", 9443, { clearPublicUrl: true })).toBe(false);
+    const prepared = readManagedListenerSnapshot(path);
+    updateListenerConfig(path, "192.168.1.50", 9555, { clearPublicUrl: true });
+    expect(compareAndSwapManagedListener(path, prepared, "127.0.0.1", 8787, { clearPublicUrl: true })).toBe(false);
+    expect(loadConfig(path)).toMatchObject({ host: "192.168.1.50", port: 9555 });
   });
 
   it("uses https for managed Hermes targets when gateway-native TLS is configured", () => {

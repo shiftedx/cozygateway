@@ -97,6 +97,33 @@ describe("running Gateway operator onboarding control", () => {
     expect((await control(running, beginBody(running, "lan"))).status).toBe(404);
   });
 
+  it("makes disabled, wrong-method, and bad-auth failures externally identical", async () => {
+    const { dbPath, tokenPath } = fixture();
+    const disabled = await gateway({ dbPath });
+    const enabled = await gateway({ dbPath: `${dbPath}.enabled`, tokenPath });
+    const requests = [
+      control(disabled, beginBody(disabled, "lan")),
+      fetch(`${enabled.url}/cozy/operator/onboarding`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${TOKEN}` },
+      }),
+      control(enabled, beginBody(enabled, "lan"), "E".repeat(43)),
+    ];
+    const failures = await Promise.all(await Promise.all(requests).then((responses) => responses.map(async (response) => ({
+      status: response.status,
+      contentType: response.headers.get("content-type"),
+      cacheControl: response.headers.get("cache-control"),
+      body: await response.text(),
+    }))));
+
+    expect(failures).toEqual(Array.from({ length: 3 }, () => ({
+      status: 404,
+      contentType: "application/json",
+      cacheControl: "no-store",
+      body: '{"error":"not_found"}',
+    })));
+  });
+
   it("requires the token and returns only the connectivity URL until the phone confirms", async () => {
     const { dbPath, tokenPath } = fixture();
     const running = await gateway({ dbPath, tokenPath, host: "0.0.0.0" });
@@ -149,7 +176,9 @@ describe("running Gateway operator onboarding control", () => {
     gateways.splice(gateways.indexOf(first), 1);
 
     const second = await gateway({ dbPath, tokenPath });
-    expect((await control(second, { action: "status", challengeId })).status).toBe(404);
+    const stale = await control(second, { action: "status", challengeId });
+    expect(stale.status).toBe(200);
+    expect(await stale.json()).toEqual({ state: "not_found" });
     expect((await control(second, beginBody(second, "tailscale"))).status).toBe(200);
   });
 });
