@@ -814,7 +814,6 @@ fi
 if grep -Fq '/Create ' "$dashboard_occupied_log"; then echo 'Dashboard-port preflight registered a Scheduled Task' >&2; exit 1; fi
 
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE='C:\fixture\operator-control.token' COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
-powershell_native="$(cygpath -u "$SYSTEMROOT")/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 # Git Bash never owns Windows network onboarding, even when it has prompt input.
 printf 'maybe\ny\n' > "$tmp/windows-lan-answer"
@@ -838,9 +837,17 @@ if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   echo 'Windows command shim must allow an explicit --config override' >&2
   exit 1
 fi
-COZYGATEWAY_TEST_VBS="$(cygpath -w "$tmp/gateway-windows-live/local/run-gateway.vbs")" "$powershell_native" -NoProfile -NonInteractive -Command '$bytes=[IO.File]::ReadAllBytes($env:COZYGATEWAY_TEST_VBS); if($bytes.Length -lt 2 -or $bytes[0] -ne 0xff -or $bytes[1] -ne 0xfe){exit 2}; $text=[IO.File]::ReadAllText($env:COZYGATEWAY_TEST_VBS,[Text.Encoding]::Unicode); if($text -notmatch "shell.Run command, 0, False" -or $text -notmatch "command = `"`"`""){exit 3}' </dev/null
+"$real_node" - "$tmp/gateway-windows-live/local/run-gateway.vbs" <<'NODE'
+const { readFileSync } = require('node:fs');
+const bytes = readFileSync(process.argv[2]);
+if (bytes.length < 2 || bytes[0] !== 0xff || bytes[1] !== 0xfe) process.exit(2);
+const text = bytes.subarray(2).toString('utf16le');
+if (!text.includes('shell.Run command, 0, False') || !text.includes('command = """')) process.exit(3);
+NODE
 grep -Eq '^COZYGATEWAY_SPOOL_PATH=[A-Za-z]:\\' "$tmp/hermes/.env"
 
+if [ -n "${SYSTEMROOT:-}" ] && command -v cmd.exe >/dev/null 2>&1; then
+powershell_native="$(cygpath -u "$SYSTEMROOT")/System32/WindowsPowerShell/v1.0/powershell.exe"
 unicode_launcher_root="$tmp/Gateway ü 你好"
 unicode_launcher_log="$tmp/windows-unicode-launcher-commands"
 unicode_git_bash="$(/usr/bin/cygpath -w "$(command -v bash)")"
@@ -865,6 +872,7 @@ rm -f "$unicode_vbs_marker"
 COZYGATEWAY_TEST_UNICODE_VBS_MARKER="$unicode_vbs_marker" COZYGATEWAY_TEST_VBS="$(cygpath -w "$unicode_launcher_root/local/run-gateway.vbs")" "$powershell_native" -NoProfile -NonInteractive -Command '& "$env:SystemRoot\System32\wscript.exe" $env:COZYGATEWAY_TEST_VBS; exit $LASTEXITCODE' </dev/null
 for _ in {1..150}; do [ -f "$unicode_vbs_marker" ] && break; sleep 0.1; done
 test -f "$unicode_vbs_marker"
+fi
 # A native Windows Hermes child must receive a native HERMES_HOME. Git Bash's
 # /c/... form points native Hermes at the wrong root and makes credential login
 # fail after launch.
