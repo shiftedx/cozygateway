@@ -27,6 +27,8 @@ function Invoke-Spike {
         'COZYGATEWAY_TEST_PROBE_LOG' = $ProbeLog
         'COZYGATEWAY_TEST_STATE' = $StatePath
         'COZYGATEWAY_TEST_TARGET' = '127.0.0.1:18787'
+        'TEMP' = (Split-Path -Parent $StatePath)
+        'TMP' = (Split-Path -Parent $StatePath)
     }
     $old = @{}
     foreach ($key in $environment.Keys) {
@@ -57,6 +59,18 @@ function Read-Lines {
     return @(Get-Content -LiteralPath $Path)
 }
 
+function Assert-PortAvailable {
+    param([int] $Port, [string] $Message)
+    $listener = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback), $Port
+    try {
+        $listener.Start()
+    } catch {
+        throw "ASSERT: $Message ($($_.Exception.Message))"
+    } finally {
+        $listener.Stop()
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $spike = Join-Path $repoRoot 'scripts\native\windows-tailscale-transport-spike.ps1'
 $probe = Join-Path $repoRoot 'scripts\native\tailscale-transport-probe.mjs'
@@ -66,6 +80,9 @@ New-Item -ItemType Directory -Force -Path $temp | Out-Null
 try {
     Assert-True (Test-Path -LiteralPath $spike) 'missing scripts/native/windows-tailscale-transport-spike.ps1'
     Assert-True (Test-Path -LiteralPath $probe) 'missing scripts/native/tailscale-transport-probe.mjs'
+    $probeBehaviorTest = Join-Path $repoRoot 'scripts\test\tailscale-transport-probe.test.mjs'
+    & (Get-Command node.exe).Source $probeBehaviorTest
+    Assert-True ($LASTEXITCODE -eq 0) 'behavioral TLS/health/WSS probe tests must pass'
 
     $portReservation = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback), 0
     $portReservation.Start()
@@ -124,11 +141,26 @@ $state = if (Test-Path -LiteralPath $env:COZYGATEWAY_TEST_STATE) {
 } else { 'initial' }
 
 if ($command -eq 'status --json') {
-    '{"BackendState":"Running","CurrentTailnet":{"Name":"fixture-personal-tailnet"},"Self":{"DNSName":"cozy.fixture-tailnet.ts.net.","Online":true},"CertDomains":["cozy.fixture-tailnet.ts.net"]}'
+    if ($env:COZYGATEWAY_TEST_SCENARIO -eq 'online-missing') {
+        '{"BackendState":"Running","CurrentTailnet":{"Name":"fixture-personal-tailnet"},"Self":{"DNSName":"cozy.fixture-tailnet.ts.net."},"CertDomains":["cozy.fixture-tailnet.ts.net"]}'
+    } elseif ($env:COZYGATEWAY_TEST_SCENARIO -eq 'online-null') {
+        '{"BackendState":"Running","CurrentTailnet":{"Name":"fixture-personal-tailnet"},"Self":{"DNSName":"cozy.fixture-tailnet.ts.net.","Online":null},"CertDomains":["cozy.fixture-tailnet.ts.net"]}'
+    } elseif ($env:COZYGATEWAY_TEST_SCENARIO -eq 'online-string') {
+        '{"BackendState":"Running","CurrentTailnet":{"Name":"fixture-personal-tailnet"},"Self":{"DNSName":"cozy.fixture-tailnet.ts.net.","Online":"true"},"CertDomains":["cozy.fixture-tailnet.ts.net"]}'
+    } elseif ($env:COZYGATEWAY_TEST_SCENARIO -eq 'online-number') {
+        '{"BackendState":"Running","CurrentTailnet":{"Name":"fixture-personal-tailnet"},"Self":{"DNSName":"cozy.fixture-tailnet.ts.net.","Online":1},"CertDomains":["cozy.fixture-tailnet.ts.net"]}'
+    } elseif ($env:COZYGATEWAY_TEST_SCENARIO -eq 'online-false') {
+        '{"BackendState":"Running","CurrentTailnet":{"Name":"fixture-personal-tailnet"},"Self":{"DNSName":"cozy.fixture-tailnet.ts.net.","Online":false},"CertDomains":["cozy.fixture-tailnet.ts.net"]}'
+    } else {
+        '{"BackendState":"Running","CurrentTailnet":{"Name":"fixture-personal-tailnet"},"Self":{"DNSName":"cozy.fixture-tailnet.ts.net.","Online":true},"CertDomains":["cozy.fixture-tailnet.ts.net"]}'
+    }
     exit 0
 }
 if ($command -eq 'serve status --json') {
-    if ($state -eq 'created') {
+    if ($state -eq 'cleanup-reread-failure') {
+        [Console]::Error.WriteLine('fixture cleanup reread failure')
+        exit 65
+    } elseif ($state -eq 'created') {
         '{"TCP":{"443":{"TCPForward":"' + $env:COZYGATEWAY_TEST_TARGET + '","TerminateTLS":"cozy.fixture-tailnet.ts.net"}},"Web":{}}'
     } elseif ($state -eq 'concurrent') {
         '{"TCP":{"443":{"TCPForward":"127.0.0.1:29999","TerminateTLS":"cozy.fixture-tailnet.ts.net"}},"Web":{}}'
@@ -154,6 +186,10 @@ if ($command -eq ('serve --bg --tls-terminated-tcp=443 tcp://' + $env:COZYGATEWA
     exit 0
 }
 if ($command -eq 'serve --tls-terminated-tcp=443 off') {
+    if ($env:COZYGATEWAY_TEST_SCENARIO -eq 'cleanup-off-failure') {
+        [Console]::Error.WriteLine('fixture scoped off failure')
+        exit 65
+    }
     Set-Content -LiteralPath $env:COZYGATEWAY_TEST_STATE -Value 'removed' -NoNewline
     exit 0
 }
@@ -175,6 +211,9 @@ if (argv[0] === "serve") {
     process.stdout.write(`${JSON.stringify({ ready: true, host: "127.0.0.1", port })}\n`);
   });
 } else if (argv[0] === "verify") {
+  if (process.env.COZYGATEWAY_TEST_SCENARIO === "cleanup-reread-failure") {
+    writeFileSync(process.env.COZYGATEWAY_TEST_STATE, "cleanup-reread-failure");
+  }
   if (process.env.COZYGATEWAY_TEST_SCENARIO === "concurrent") {
     writeFileSync(process.env.COZYGATEWAY_TEST_STATE, "concurrent");
     process.exit(1);
@@ -204,6 +243,16 @@ if (argv[0] === "serve") {
     Assert-True ($unconfirmed.ExitCode -ne 0 -and $unconfirmed.Output -match 'Confirm') '-Apply must require the exact operator confirmation phrase'
     Assert-True (-not ((Read-Lines $unconfirmedCommandLog) -match '^serve --bg ')) 'missing confirmation must stop before mutation'
 
+    foreach ($scenario in @('online-missing', 'online-null', 'online-false', 'online-string', 'online-number')) {
+        $onlineCommandLog = Join-Path $temp "$scenario-commands.log"
+        $onlineProbeLog = Join-Path $temp "$scenario-probe.log"
+        $onlineState = Join-Path $temp "$scenario-state.txt"
+        $result = Invoke-Spike $spike $fakeTailscale $fakeProbe $scenario $onlineCommandLog $onlineProbeLog $onlineState
+        Assert-True ($result.ExitCode -ne 0) "$scenario must fail authenticated online inspection"
+        Assert-True ($result.Output -match 'online') "$scenario must report that Self.Online is invalid"
+        Assert-True (-not ((Read-Lines $onlineCommandLog) -match '^serve --bg ')) "$scenario must fail before mutation"
+    }
+
     foreach ($scenario in @('occupied', 'conflicting', 'funnel')) {
         $scenarioCommandLog = Join-Path $temp "$scenario-commands.log"
         $scenarioProbeLog = Join-Path $temp "$scenario-probe.log"
@@ -228,6 +277,18 @@ if (argv[0] === "serve") {
     $successProbe = Read-Lines $successProbeLog
     Assert-True (($successProbe | Where-Object { $_ -eq "serve`t--port`t18787" }).Count -eq 1) 'apply must start one disposable loopback probe'
     Assert-True (($successProbe | Where-Object { $_ -eq "verify`t--origin`thttps://cozy.fixture-tailnet.ts.net`t--expected-host`tcozy.fixture-tailnet.ts.net`t--timeout-ms`t5000`t--soak-seconds`t10" }).Count -eq 1) 'apply must run the exact bounded TLS/health/WSS verification'
+
+    foreach ($scenario in @('cleanup-reread-failure', 'cleanup-off-failure')) {
+        $cleanupCommandLog = Join-Path $temp "$scenario-commands.log"
+        $cleanupProbeLog = Join-Path $temp "$scenario-probe.log"
+        $cleanupState = Join-Path $temp "$scenario-state.txt"
+        $cleanupResult = Invoke-Spike $spike $fakeTailscale $fakeProbe $scenario $cleanupCommandLog $cleanupProbeLog $cleanupState $commonApply
+        Assert-True ($cleanupResult.ExitCode -ne 0) "$scenario must fail the spike"
+        Assert-True ($cleanupResult.Output -match 'cleanup') "$scenario must report the cleanup failure"
+        Assert-PortAvailable 18787 "$scenario must stop the disposable Node process"
+        $leftoverProbeTemps = @(Get-ChildItem -LiteralPath $temp -Directory -Filter 'cozygateway-tailscale-probe-*' -ErrorAction SilentlyContinue)
+        Assert-True ($leftoverProbeTemps.Count -eq 0) "$scenario must delete the disposable probe temp directory"
+    }
 
     $concurrentCommandLog = Join-Path $temp 'concurrent-commands.log'
     $concurrentProbeLog = Join-Path $temp 'concurrent-probe.log'

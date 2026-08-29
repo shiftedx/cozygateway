@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, X509Certificate } from "node:crypto";
 import { createServer } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { connect as tlsConnect } from "node:tls";
@@ -133,10 +133,10 @@ function withTimeout(timeoutMs, label, operation) {
   });
 }
 
-async function inspectTls(origin, expectedHost, timeoutMs) {
+async function inspectTls(origin, expectedHost, connectHost, timeoutMs) {
   return withTimeout(timeoutMs, "TLS probe", (resolve, reject) => {
     const socket = tlsConnect({
-      host: origin.hostname,
+      host: connectHost,
       port: Number(origin.port || 443),
       servername: expectedHost,
       rejectUnauthorized: true,
@@ -146,14 +146,25 @@ async function inspectTls(origin, expectedHost, timeoutMs) {
       try {
         if (!socket.authorized) fail(`TLS certificate is not trusted: ${socket.authorizationError}`);
         const certificate = socket.getPeerCertificate();
-        if (certificate === undefined || certificate.subjectaltname === undefined) {
+        if (certificate === undefined || certificate.raw === undefined) {
           fail("TLS certificate has no subjectAltName");
+        }
+        const x509 = new X509Certificate(certificate.raw);
+        const exactDnsSan = x509.checkHost(expectedHost, {
+          subject: "never",
+          wildcards: false,
+          partialWildcards: false,
+          multiLabelWildcards: false,
+          singleLabelSubdomains: false,
+        });
+        if (exactDnsSan !== expectedHost) {
+          fail(`TLS certificate does not contain an exact DNS SAN for ${expectedHost}`);
         }
         const alpn = socket.alpnProtocol || false;
         if (alpn === "h2") fail("TLS-terminated TCP unexpectedly negotiated h2");
         if (alpn !== false && alpn !== "http/1.1") fail(`unexpected ALPN protocol: ${alpn}`);
         socket.end();
-        resolve({ authorized: true, san: certificate.subjectaltname, alpn });
+        resolve({ authorized: true, san: x509.subjectAltName, alpn });
       } catch (error) {
         socket.destroy();
         reject(error);
@@ -164,12 +175,18 @@ async function inspectTls(origin, expectedHost, timeoutMs) {
   });
 }
 
-async function checkHealth(origin, timeoutMs) {
+async function checkHealth(origin, expectedHost, connectHost, timeoutMs) {
   return withTimeout(timeoutMs, "HTTPS health probe", (resolve, reject) => {
-    const url = new URL("/health", origin);
     const request = httpsRequest(
-      url,
-      { method: "GET", headers: { accept: "application/json" }, rejectUnauthorized: true },
+      {
+        host: connectHost,
+        port: Number(origin.port || 443),
+        servername: expectedHost,
+        path: "/health",
+        method: "GET",
+        headers: { accept: "application/json", host: origin.host },
+        rejectUnauthorized: true,
+      },
       (response) => {
         const chunks = [];
         let bytes = 0;
@@ -196,58 +213,113 @@ async function checkHealth(origin, timeoutMs) {
   });
 }
 
-function roundTripWebSocket(origin, timeoutMs, soakSeconds) {
-  if (typeof WebSocket !== "function") fail("this Node runtime does not provide WebSocket");
-  const url = new URL("/ws", origin);
-  url.protocol = "wss:";
+function maskedClientFrame(payload) {
+  const body = Buffer.from(payload);
+  if (body.length > 125) fail("probe WebSocket payload is too large");
+  const mask = randomBytes(4);
+  const masked = Buffer.from(body);
+  for (let index = 0; index < masked.length; index += 1) masked[index] ^= mask[index % 4];
+  return Buffer.concat([Buffer.from([0x81, 0x80 | body.length]), mask, masked]);
+}
+
+function decodeServerFrame(buffer) {
+  if (buffer.length < 2) return undefined;
+  const opcode = buffer[0] & 0x0f;
+  const masked = (buffer[1] & 0x80) !== 0;
+  const length = buffer[1] & 0x7f;
+  if (masked || length > 125 || buffer.length < 2 + length) return undefined;
+  if (opcode === 8) fail("WSS peer closed before the probe completed");
+  if (opcode !== 1) fail(`unexpected WSS frame opcode ${opcode}`);
+  return { payload: buffer.subarray(2, 2 + length).toString("utf8"), consumed: 2 + length };
+}
+
+function headerValue(lines, name) {
+  const prefix = `${name.toLowerCase()}:`;
+  const line = lines.find((candidate) => candidate.toLowerCase().startsWith(prefix));
+  return line?.slice(line.indexOf(":") + 1).trim();
+}
+
+function roundTripWebSocket(origin, expectedHost, connectHost, timeoutMs, soakSeconds) {
   return withTimeout(timeoutMs + soakSeconds * 1000, "WSS probe", (resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = tlsConnect({
+      host: connectHost,
+      port: Number(origin.port || 443),
+      servername: expectedHost,
+      rejectUnauthorized: true,
+      ALPNProtocols: ["http/1.1"],
+    });
     let timer;
     let sent = 0;
     let received = 0;
     let expected;
     let soakUntil;
+    let handshakeComplete = false;
+    let complete = false;
+    let pending = Buffer.alloc(0);
+    const handshakeKey = randomBytes(16).toString("base64");
+    const expectedAccept = websocketAccept(handshakeKey);
     const finish = () => {
       clearTimeout(timer);
-      socket.close(1000, "probe complete");
+      complete = true;
+      socket.end();
       resolve({ sent, received, soakSeconds });
     };
     const send = () => {
       expected = randomBytes(18).toString("base64url");
       sent += 1;
-      socket.send(expected);
+      socket.write(maskedClientFrame(expected));
     };
-    socket.addEventListener("open", () => {
+    socket.once("secureConnect", () => {
       soakUntil = Date.now() + soakSeconds * 1000;
-      send();
+      socket.write(
+        `GET /ws HTTP/1.1\r\n` +
+          `Host: ${origin.host}\r\n` +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          `Sec-WebSocket-Key: ${handshakeKey}\r\n` +
+          "Sec-WebSocket-Version: 13\r\n\r\n",
+      );
     });
-    socket.addEventListener("message", (event) => {
-      if (event.data !== expected) {
+    socket.on("data", (chunk) => {
+      try {
+        pending = Buffer.concat([pending, chunk]);
+        if (!handshakeComplete) {
+          const headerEnd = pending.indexOf("\r\n\r\n");
+          if (headerEnd === -1) {
+            if (pending.length > 16 * 1024) fail("WSS handshake headers exceeded 16 KiB");
+            return;
+          }
+          const lines = pending.subarray(0, headerEnd).toString("latin1").split("\r\n");
+          if (lines[0] !== "HTTP/1.1 101 Switching Protocols") fail(`WSS handshake failed: ${lines[0]}`);
+          if (headerValue(lines, "upgrade")?.toLowerCase() !== "websocket") fail("WSS handshake omitted Upgrade: websocket");
+          if (headerValue(lines, "sec-websocket-accept") !== expectedAccept) fail("WSS handshake accept value is invalid");
+          pending = pending.subarray(headerEnd + 4);
+          handshakeComplete = true;
+          send();
+        }
+        const frame = decodeServerFrame(pending);
+        if (frame === undefined) return;
+        pending = pending.subarray(frame.consumed);
+        if (frame.payload !== expected) fail("WSS echo payload mismatch");
+        received += 1;
+        if (soakSeconds === 0 || Date.now() >= soakUntil) finish();
+        else timer = setTimeout(send, Math.min(1000, Math.max(1, soakUntil - Date.now())));
+      } catch (error) {
         clearTimeout(timer);
-        reject(new Error("WSS echo payload mismatch"));
-        socket.close();
-        return;
+        socket.destroy();
+        reject(error);
       }
-      received += 1;
-      if (soakSeconds === 0 || Date.now() >= soakUntil) finish();
-      else timer = setTimeout(send, Math.min(1000, Math.max(1, soakUntil - Date.now())));
     });
-    socket.addEventListener("error", () => {
+    socket.on("error", (error) => {
       clearTimeout(timer);
-      reject(new Error("WSS connection failed"));
+      if (!complete) reject(new Error(`WSS connection failed: ${error.message}`));
     });
-    socket.addEventListener("close", (event) => {
-      if (received === 0 || soakUntil === undefined || Date.now() < soakUntil) {
-        reject(new Error(`WSS closed early (${event.code})`));
-      }
+    socket.on("close", () => {
+      if (!complete) reject(new Error("WSS closed early"));
     });
     return () => {
       clearTimeout(timer);
-      try {
-        socket.close();
-      } catch {
-        // The socket may still be in CONNECTING when the bounded probe expires.
-      }
+      socket.destroy();
     };
   });
 }
@@ -262,10 +334,11 @@ async function verify(argv) {
     fail("--origin must be a credential-free HTTPS origin");
   }
   if (origin.hostname !== expectedHost) fail("--expected-host must exactly match the origin hostname");
+  const connectHost = option(argv, "--connect-host", origin.hostname);
 
-  const tls = await inspectTls(origin, expectedHost, timeoutMs);
-  await checkHealth(origin, timeoutMs);
-  const wss = await roundTripWebSocket(origin, timeoutMs, soakSeconds);
+  const tls = await inspectTls(origin, expectedHost, connectHost, timeoutMs);
+  await checkHealth(origin, expectedHost, connectHost, timeoutMs);
+  const wss = await roundTripWebSocket(origin, expectedHost, connectHost, timeoutMs, soakSeconds);
   process.stdout.write(`${JSON.stringify({ ok: true, tls, health: true, wss })}\n`);
 }
 

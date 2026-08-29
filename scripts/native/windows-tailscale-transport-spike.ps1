@@ -75,7 +75,8 @@ function Get-CertDomain {
         throw 'Tailscale is not authenticated and running'
     }
     $self = Get-Property $Status 'Self'
-    if ($null -eq $self -or (Get-Property $self 'Online') -eq $false) {
+    $online = Get-Property $self 'Online'
+    if ($null -eq $self -or $online -isnot [bool] -or $online -ne $true) {
         throw 'Tailscale Self is not online'
     }
     $tailnet = Get-Property $Status 'CurrentTailnet'
@@ -170,6 +171,7 @@ function Invoke-Spike {
     $stderr = Join-Path $temp 'probe.stderr.log'
     $probeProcess = $null
     $mappingCreated = $false
+    $cleanupError = $null
     try {
         $probeProcess = Start-LoopbackProbe $stdout $stderr
         $health = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$ProbePort/health" -TimeoutSec 5
@@ -198,7 +200,7 @@ function Invoke-Spike {
                     Write-Warning 'Port 443 changed after creation; preserving the current mapping instead of removing it.'
                 }
             } catch {
-                throw "Could not complete exact cleanup safely; live state was preserved. $($_.Exception.Message)"
+                $cleanupError = $_.Exception
             }
         }
         if ($null -ne $probeProcess -and -not $probeProcess.HasExited) {
@@ -206,6 +208,9 @@ function Invoke-Spike {
             $probeProcess.WaitForExit()
         }
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        if ($null -ne $cleanupError) {
+            throw "Could not complete exact cleanup safely; live state was preserved. $($cleanupError.Message)"
+        }
     }
 }
 
