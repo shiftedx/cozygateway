@@ -228,6 +228,22 @@ authorized because ETag/`If-Match` provides local atomic compare-and-swap safety
 unrelated Serve/Funnel state; it does not imply a Tailscale partnership, partner API, special access,
 or vendor commitment. LocalAPI is not used for discovery, status, login, or preference mutation.
 
+Tailscale 1.102.1 and current source define that ETag as SHA-256 of Go's canonical JSON encoding of
+the complete ServeConfig. Before creation, CozyGateway verifies that both the exact GET bytes and
+its pinned 1.102.1 schema encoder reproduce the received ETag, computes the post-create ETag, and
+persists it in schema-v3 SQLite ownership before POST. Removal requires both the complete exact
+mapping state and a live ETag equal to that durable post-create ETag. All TCP, Web, AllowFunnel,
+Service, and Foreground uses of port 443 are conflicts at the same LocalAPI snapshot boundary.
+
+The ETag is a content hash, not a monotonic revision. It therefore cannot prove which actor wrote
+two byte-identical states or form an atomic transaction with SQLite. A definite HTTP 412 never
+triggers mapping rollback, even if the concurrent state is byte-identical. If the process disappears
+or loses the response after persisting provisional intent, later runs retain that row and any
+possible mapping as a safe orphan and require manual reconciliation; they never adopt or delete the
+ambiguous state. Active ownership rejects every non-identical replacement by ETag. Exact-content ABA
+after active promotion remains indistinguishable without adding an undocumented Tailscale marker,
+which CozyGateway deliberately does not do.
+
 ### Detection and installation
 
 Detection correlates the `Tailscale` Windows service image with the official Program Files binary
@@ -318,8 +334,9 @@ mapping, require:
 
 The mapping fingerprint records mode, port 443, no-PROXY, exact target, Funnel false, ownership,
 and account/tailnet hash. Conditional rollback removes only an exact live mapping with
-`createdByWizard=true`, using the same ETag/`If-Match` ServeConfig compare-and-swap. It never removes
-a reused compatible mapping or a concurrent user change.
+`createdByWizard=true`, whose complete live ServeConfig ETag still equals the schema-v3 durable
+post-create ETag, using the same `If-Match` compare-and-swap. It never removes a reused compatible
+mapping, a crash-uncertain provisional mapping, or a concurrent user change.
 
 ## LAN adapter
 
