@@ -29,9 +29,11 @@ Bind addresses, ports, MagicDNS, certificates, and `publicUrl` remain under adva
 - A valid phone proof for the exact current deployment precedes setup-code creation.
 - The first QR is clearly labelled **Phone connection check**. It contains a short-lived,
   high-entropy readiness capability, not a CozyChat setup code or device credential.
-- `GET`, `HEAD`, `OPTIONS`, link previews, and scanner prefetches never advance verification.
-- The phone must complete an explicit tap and a challenge-scoped WebSocket echo through the final
-  advertised origin.
+- `GET`, `HEAD`, `OPTIONS`, link previews, and scanner prefetches that do not execute the page never
+  advance verification.
+- The user's only phone action is scanning the Phone connection check QR. Its same-origin page
+  automatically checks health, completes a challenge-scoped WebSocket echo, and submits the
+  confirmation through the final advertised origin. No phone button or second tap is required.
 - Phone and desktop show the same random phrase. The desktop asks
   `Is this your phone? [y/N]`; Enter is No.
 - Only the phone proof plus affirmative desktop confirmation permits one atomic setup-code mint.
@@ -64,10 +66,11 @@ Before Tailscale changes, the user is told that:
 The user can choose **Not now** at every external consent boundary. Cancellation leaves no setup
 code and never silently falls back from remote access to LAN.
 
-Once the final route is healthy, the terminal prints the Phone connection check QR. The phone page
-checks `/health`, performs a bounded WebSocket echo, and enables **Verify this phone** only after
-both pass. After the tap, the matching phrase appears on phone and desktop. An affirmative desktop
-answer creates and prints the real CozyChat pairing QR.
+Once the final route is healthy, the terminal prints the Phone connection check QR. Scanning it
+opens a page that automatically checks `/health`, performs a bounded WebSocket echo, and submits
+confirmation only after both pass. It then displays the matching phrase and tells the user to
+return to the PC. No additional phone interaction is required. An affirmative desktop answer
+creates and prints the real CozyChat pairing QR.
 
 This proves that a phone browser permitted by the selected network reached the final origin. It
 does not cryptographically attest a physical device or bind that browser to the later CozyChat app.
@@ -146,7 +149,7 @@ Routes are:
 ```text
 GET  /cozy/onboarding/<capability>          inert verification page
 WS   /cozy/onboarding/<capability>/probe    bounded fixed-schema echo
-POST /cozy/onboarding/<capability>/confirm  explicit phone confirmation
+POST /cozy/onboarding/<capability>/confirm  page-submitted phone confirmation
 ```
 
 `http.ts` handles page and confirmation. `phone-verification.ts` owns challenge semantics and a
