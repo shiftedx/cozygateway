@@ -20,6 +20,14 @@ The Tailscale and Same-Wi-Fi adapters now use SQLite as the durable authority fo
 - Every Tailscale preference rollback obtains a fresh status and installation-keyed account/tailnet HMAC at each preference read, helper write, and verification boundary. An account switch is a typed `account_changed` failure: preference values are untouched and ownership is retained even when the new account happens to expose the same boolean values. Paired Serve/Funnel inspections await both subprocess settlements before propagating either failure, and post-removal recovery inherits the caller's cleanup signal.
 - Windows cleanup has a 120-second total cancellation budget and 30-second sequential budget per adapter. All Tailscale, LAN, and Advanced adapters are attempted, failures are collected, and a timed-out adapter is aborted and awaited to settlement before the next adapter starts. Hermes restart/readiness, helper, and Tailscale subprocess boundaries receive the signal. Production subprocess runners terminate and wait for `close`; SQLite closes only after adapter work has actually settled.
 - Unrelated Serve/Funnel entries, reused mappings, preferences changed by another actor, listener replacements, adapter selections, and other onboarding ownership keys are preserved.
+- Windows removal no longer issues port-scoped `tailscale serve ... off`. A bounded named-pipe LocalAPI client reads the full ServeConfig and ETag, verifies the exact non-Funnel TLS-terminated TCP handler, clones and removes only that entry, then POSTs with `If-Match`. HTTP 412 and exact-state conflicts retain ownership as `mapping_changed`; there is no unsafe CLI fallback. A real HTTP socket race proves a concurrently swapped replacement survives.
+- Cleanup preference restoration uses a dedicated helper command that refuses to launch UAC. It runs only in an already-elevated helper process or returns `preference_elevation_required`; helper cancellation kills the whole Windows process tree with `taskkill /T /F` and waits for the original process close. A real parent/descendant regression verifies neither process outlives settlement.
+- Relative SQLite paths are normalized once against the absolute config directory, independent of process CWD. Cleanup's second proof returns canonical path/device/inode identity and `openStorage(..., { mustExist: true, expectedFile })` compares it immediately after `mode=rw` open and before any PRAGMA/schema migration.
+- Cleanup exports `WindowsOwnedNetworkCleanupError` with a bounded code union and safe per-adapter `{adapter, code}` failures. It exposes no path, account, secret, raw helper output, or subprocess diagnostic.
+- LAN selection now persists `{adapterId,address}`. Legacy adapter-id-only files remain compatible only when that adapter has exactly one eligible address; multiple safe addresses on one adapter require and resume the exact chosen address.
+- Tailscale status accepts exactly one customary terminal dot on `Self.DNSName`, canonicalizes it away, and retains strict lowercase ASCII `.ts.net` validation. Embedded, multiple, suffix-boundary, and Unicode ambiguity remain rejected.
+- Advanced performs a real bind preflight before writing ownership or listener/config state. Local operator control derives its address from the actual configured bind (wildcard maps to loopback; concrete stays concrete); same-host concrete connections are checked by remote/local socket-address equality, and native TLS control requests trust and fingerprint only the exact configured certificate rather than disabling TLS globally.
+- Common loopback/wildcard legacy listeners receive the `legacy_unreviewed` classification when there is no fresh SQLite authority/projection; a fresh pending flow still cannot bypass phone-reachable inspection.
 
 ## Uninstall/recovery production seam
 
@@ -48,7 +56,7 @@ True atomicity across SQLite and a separate Tailscale daemon or filesystem/resta
 
 ## Tests and verification
 
-- Final focused storage/Tailscale/LAN/Windows/helper suite: 6 files and 133 tests passed.
+- Latest focused storage/Tailscale/LAN/Windows/helper suite: 9 files and 197 tests passed before the final exact-address additions; subsequent LAN/Windows rerun passed 56 tests.
 - Gateway typecheck: `pnpm typecheck`
 - Gateway build: `pnpm build`
 - Full Gateway suite: `pnpm test` — 100 files passed, 1 skipped; 1,170 tests passed, 2 skipped.
@@ -56,9 +64,11 @@ True atomicity across SQLite and a separate Tailscale daemon or filesystem/resta
 
 Focused regressions cover write-before-mutate ordering, crashes at both preference writes, provisional crash resume, exact/conflicting/reused cleanup, uncertain command completion, conditional preference restoration and external edits, switched-account rollback refusal, official/custom/missing control URL handling, per-install HMAC identity, secret absence from metadata, subtype fingerprints, exact planned listener revisions before CAS, rollback/restart authority, Advanced crash/rejection/switch/Later/uninstall recovery, safe existing/custom SQLite authority proof, sequential deadline settlement, real helper/Tailscale child termination, production cleanup construction, and ownership retention on typed failure.
 
+The LocalAPI behavior is verified against Tailscale primary source: `client/local/serve.go` returns the GET ETag and sends it as `If-Match`; `ipn/localapi/serve.go` maps an ETag mismatch to HTTP 412; `ipn/ipnlocal/serve.go` computes and compares the current ServeConfig ETag. Windows uses Tailscale's protected Administrators named pipe `\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled`.
+
 ## Owned files
 
-The Windows onboarding source/test commit also includes the already-reviewed phone-reachable host normalization and firewall-guidance hunks produced during the parallel Windows field-readiness pass. Root requested that the two shared files be committed atomically here so neither pass would lose partial hunks.
+The Windows onboarding source/test commit also includes the already-reviewed phone-reachable host normalization and firewall-guidance hunks produced during the parallel Windows field-readiness pass. The operator-control source/test contain the UX deadline integration, and the Windows helper script contains the field-readiness `inspect-dashboard-port` implementation alongside cleanup's no-UAC preference command. Root requested these shared files be committed atomically; the producing agents will commit their matching remaining client/installer/test work afterward.
 
 - `packages/gateway/src/lan-mode.ts`
 - `packages/gateway/src/storage.ts`

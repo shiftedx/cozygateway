@@ -3,8 +3,10 @@ import { createHash, createHmac } from "node:crypto";
 import {
   TailscaleCli,
   TailscaleCliError,
+  WindowsTailscaleLocalApi,
   type TailscaleCliErrorReason,
   type TailscaleCliRunner,
+  type TailscaleServeConfigClient,
   type TailscaleStatus,
 } from "./tailscale-cli.ts";
 import type { NetworkModeAdapter, PreparedEndpoint } from "./network-onboarding.ts";
@@ -319,6 +321,7 @@ export interface TailscaleModeDependencies {
   probes: TailscaleModeProbes;
   ownership: TailscaleOwnershipStore;
   cliRunner?: TailscaleCliRunner;
+  serveConfigClient?: TailscaleServeConfigClient;
   cliTimeoutMs?: number;
   loginPollAttempts?: number;
   loginPollDelayMs?: number;
@@ -514,6 +517,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
   readonly mode = "tailscale" as const;
   readonly #dependencies: TailscaleModeDependencies;
   readonly #now: () => number;
+  readonly #serveConfigClient: TailscaleServeConfigClient;
   #owned?: TailscaleMappingOwnership;
   #identityKey?: Uint8Array;
 
@@ -522,6 +526,9 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       throw new Error("invalid loopback Gateway port");
     this.#dependencies = dependencies;
     this.#now = dependencies.now ?? Date.now;
+    this.#serveConfigClient = dependencies.serveConfigClient ?? new WindowsTailscaleLocalApi({
+      timeoutMs: dependencies.cliTimeoutMs,
+    });
   }
 
   async prepare(signal?: AbortSignal): Promise<TailscalePreparedEndpoint> {
@@ -877,7 +884,9 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     }
     let removalError: unknown;
     try {
-      await cli.removeTlsTerminatedMapping(signal);
+      const result = await this.#removeExactMapping(cli, owned, signal);
+      if (result === "concurrent" || result === "conflict")
+        throw new TailscaleModeReadinessError("mapping");
     } catch (error) {
       removalError = error;
     }
@@ -889,6 +898,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
         await this.#removeOwnershipIdempotently(owned, recoverySignal);
         return;
       }
+      if (removalError instanceof TailscaleModeReadinessError) throw removalError;
       if (removalError !== undefined) throw cliPause("mapping_mutation_failed", removalError);
       throw new TailscaleModeReadinessError("mapping");
     }, signal);
@@ -1064,6 +1074,20 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       throw new TailscaleModeReadinessError("account_changed");
   }
 
+  async #removeExactMapping(
+    cli: TailscaleCli,
+    owned: TailscaleMappingOwnership,
+    signal?: AbortSignal,
+  ) {
+    await this.#assertOwnedAccount(cli, owned, signal);
+    const result = await this.#serveConfigClient.removeExactTlsTerminatedMapping({
+      dnsName: owned.dnsName,
+      target: owned.target,
+    }, signal);
+    await this.#assertOwnedAccount(cli, owned, signal);
+    return result;
+  }
+
   async #inject(boundary: TailscaleFailureBoundary): Promise<void> {
     await this.#dependencies.injectFailure?.(boundary);
   }
@@ -1131,12 +1155,15 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     }
     let removalError: unknown;
     try {
-      await cli.removeTlsTerminatedMapping(signal);
+      const result = await this.#removeExactMapping(cli, owned, signal);
+      if (result === "concurrent" || result === "conflict")
+        throw new TailscaleModeReadinessError("mapping");
     } catch (error) {
       removalError = error;
     }
     const after = await this.#mappingInspection(cli, owned.dnsName, signal);
     if (after.outcome !== "empty") {
+      if (removalError instanceof TailscaleModeReadinessError) throw removalError;
       if (removalError !== undefined) throw cliPause("mapping_mutation_failed", removalError);
       throw new TailscaleModeReadinessError("mapping");
     }

@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   TailscaleCli,
   TailscaleCliError,
+  WindowsTailscaleLocalApi,
   runTailscaleCliProcess,
   type TailscaleCliRunner,
 } from "../src/tailscale-cli.ts";
@@ -146,11 +149,16 @@ describe("TailscaleCli", () => {
       fixture("status-running.json").replaceAll("fixture-tailnet.ts.net", "fixture-tailnet.ts.net.evil"),
       fixture("status-running.json").replaceAll("cozy.fixture", "coz\u00ff.fixture"),
       fixture("status-running.json").replace('"cozy.fixture-tailnet.ts.net"]', '"cozy.fixture-tailnet.ts.net."]'),
-      fixture("status-running.json").replace('"DNSName":"cozy.fixture-tailnet.ts.net"', '"DNSName":"cozy.fixture-tailnet.ts.net."'),
     ]) {
       const cli = new TailscaleCli({ executable, runner: async () => ({ exitCode: 0, stdout: hostile, stderr: "" }) });
       await expect(cli.status()).rejects.toMatchObject({ reason: "invalid_status" } satisfies Partial<TailscaleCliError>);
     }
+    const customaryDot = new TailscaleCli({
+      executable,
+      runner: async () => ({ exitCode: 0, stdout: fixture("status-running.json")
+        .replace('"DNSName":"cozy.fixture-tailnet.ts.net"', '"DNSName":"cozy.fixture-tailnet.ts.net."'), stderr: "" }),
+    });
+    await expect(customaryDot.status()).resolves.toMatchObject({ dnsName: "cozy.fixture-tailnet.ts.net" });
     for (const hostile of [
       fixture("status-running.json").replace("1.102.1-tfixture", "1.100.0-tfixture"),
       fixture("status-running.json").replace('"Health": []', '"Health":["control connection unhealthy"]'),
@@ -259,7 +267,7 @@ describe("TailscaleCli", () => {
     await expect(cli.beginLogin()).rejects.toMatchObject({ reason: "output_too_large" });
   });
 
-  it("inspects complete Serve and Funnel JSON and exposes only scoped mapping mutations", async () => {
+  it("inspects complete Serve and Funnel JSON and exposes only the exact creation mutation", async () => {
     const runner = vi.fn<TailscaleCliRunner>()
       .mockResolvedValueOnce({ exitCode: 0, stdout: fixture("serve-empty.json"), stderr: "" })
       .mockResolvedValueOnce({ exitCode: 0, stdout: fixture("funnel-empty.json"), stderr: "" })
@@ -269,12 +277,10 @@ describe("TailscaleCli", () => {
     await expect(cli.serveState()).resolves.toMatchObject({ TCP: {}, Web: {} });
     await expect(cli.funnelState()).resolves.toMatchObject({ AllowFunnel: {} });
     await cli.createTlsTerminatedMapping(18787);
-    await cli.removeTlsTerminatedMapping();
     expect(runner.mock.calls.map((call) => call[1])).toEqual([
       ["serve", "status", "--json"],
       ["funnel", "status", "--json"],
       ["serve", "--bg", "--tls-terminated-tcp=443", "tcp://127.0.0.1:18787"],
-      ["serve", "--tls-terminated-tcp=443", "off"],
     ]);
   });
 
@@ -369,6 +375,90 @@ describe("TailscaleCli", () => {
         runner: async () => ({ exitCode: 0, stdout: output, stderr: "" }),
       });
       await expect(cli.version()).rejects.toMatchObject({ reason: "malformed_json" });
+    }
+  });
+});
+
+describe("WindowsTailscaleLocalApi", () => {
+  const socketPath = () => process.platform === "win32"
+    ? `\\\\.\\pipe\\cozy-tailscale-localapi-${randomUUID()}`
+    : join(tmpdir(), `cozy-tailscale-localapi-${randomUUID()}.sock`);
+
+  it("removes only the exact owned entry from the full ServeConfig with If-Match", async () => {
+    const pipe = socketPath();
+    const etag = "a".repeat(64);
+    let config: Record<string, unknown> = {
+      TCP: {
+        "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" },
+        "8443": { TCPForward: "127.0.0.1:9000" },
+      },
+      Web: {}, Services: {}, Foreground: {},
+      AllowFunnel: { "other.fixture.ts.net:443": true },
+    };
+    const server = createServer((request, response) => {
+      if (request.method === "GET") {
+        response.setHeader("ETag", etag);
+        response.end(JSON.stringify(config));
+        return;
+      }
+      expect(request.headers["if-match"]).toBe(etag);
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        config = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        response.statusCode = 200;
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
+    try {
+      const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      await expect(client.removeExactTlsTerminatedMapping({
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+      })).resolves.toBe("removed");
+      expect(config).toEqual({
+        TCP: { "8443": { TCPForward: "127.0.0.1:9000" } },
+        Web: {}, Services: {}, Foreground: {},
+        AllowFunnel: { "other.fixture.ts.net:443": true },
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") rmSync(pipe, { force: true });
+    }
+  });
+
+  it("retains a concurrently swapped unowned mapping when If-Match fails", async () => {
+    const pipe = socketPath();
+    const firstEtag = "a".repeat(64);
+    const replacement = {
+      TCP: { "443": { TCPForward: "127.0.0.1:9999", TerminateTLS: "cozy.fixture-tailnet.ts.net" } },
+      Web: {}, Services: {}, Foreground: {}, AllowFunnel: {},
+    };
+    let config: Record<string, unknown> = {
+      TCP: { "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" } },
+      Web: {}, Services: {}, Foreground: {}, AllowFunnel: {},
+    };
+    const server = createServer((request, response) => {
+      if (request.method === "GET") {
+        response.setHeader("ETag", firstEtag);
+        response.end(JSON.stringify(config));
+        config = replacement;
+        return;
+      }
+      expect(request.headers["if-match"]).toBe(firstEtag);
+      response.statusCode = 412;
+      response.end("etag mismatch");
+    });
+    await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
+    try {
+      const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      await expect(client.removeExactTlsTerminatedMapping({
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+      })).resolves.toBe("concurrent");
+      expect(config).toEqual(replacement);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") rmSync(pipe, { force: true });
     }
   });
 });

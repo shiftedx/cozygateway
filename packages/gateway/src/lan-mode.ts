@@ -39,12 +39,12 @@ export interface LanProbeResult {
 export interface LanModeRuntime {
   ownership: LanOwnershipStore;
   readAdapterInventory(signal?: AbortSignal): Promise<WindowsLanInventory>;
-  readSelectedAdapter?(signal?: AbortSignal): Promise<string | undefined>;
-  writeSelectedAdapter?(adapterId: string, signal?: AbortSignal): Promise<void>;
+  readSelectedAdapter?(signal?: AbortSignal): Promise<LanAdapterSelection | string | undefined>;
+  writeSelectedAdapter?(selection: LanAdapterSelection, signal?: AbortSignal): Promise<void>;
   chooseAdapter?(
     candidates: readonly PhysicalLanCandidate[],
     signal?: AbortSignal,
-  ): Promise<string | undefined>;
+  ): Promise<PhysicalLanCandidate | string | undefined>;
   readListenerState(signal?: AbortSignal): Promise<LanListenerState>;
   /** Produces the exact revision the concrete persistence CAS will apply before durable intent is
    * written. Generic runtimes may omit it when their CAS state has no opaque persistence revision. */
@@ -60,6 +60,12 @@ export interface LanModeRuntime {
   ): Promise<boolean>;
   restartAndWait(state: LanListenerState, signal?: AbortSignal): Promise<void>;
   probeEndpoint(canonicalOrigin: string, signal?: AbortSignal): Promise<LanProbeResult>;
+}
+
+export interface LanAdapterSelection {
+  adapterId: string;
+  /** Missing only for a legacy saved id; such a selection is usable only when unambiguous. */
+  address?: string;
 }
 
 export interface ExposedLanInterface {
@@ -334,7 +340,7 @@ export class LanModeAdapter implements NetworkModeAdapter {
   readonly mode = "lan" as const;
   readonly #runtime: LanModeRuntime;
   #owned?: LanListenerOwnership;
-  #selectedAdapterId?: string;
+  #selectedAdapter?: LanAdapterSelection;
 
   constructor(runtime: LanModeRuntime) {
     this.#runtime = runtime;
@@ -511,15 +517,23 @@ export class LanModeAdapter implements NetworkModeAdapter {
     signal?: AbortSignal,
   ): Promise<PhysicalLanCandidate> {
     const selection = selectPhysicalLanCandidate(inventory);
-    if (this.#selectedAdapterId === undefined && this.#runtime.readSelectedAdapter !== undefined)
-      this.#selectedAdapterId = await this.#runtime.readSelectedAdapter(signal);
+    if (this.#selectedAdapter === undefined && this.#runtime.readSelectedAdapter !== undefined) {
+      const saved = await this.#runtime.readSelectedAdapter(signal);
+      this.#selectedAdapter = typeof saved === "string" ? { adapterId: saved } : saved;
+    }
     if (selection.outcome === "selected") {
-      if (this.#selectedAdapterId !== undefined && selection.candidate.adapterId !== this.#selectedAdapterId) {
+      if (this.#selectedAdapter !== undefined
+        && (selection.candidate.adapterId !== this.#selectedAdapter.adapterId
+          || (this.#selectedAdapter.address !== undefined && selection.candidate.address !== this.#selectedAdapter.address))) {
         if (allowChoice && this.#runtime.chooseAdapter !== undefined) {
           const replacement = await this.#runtime.chooseAdapter([selection.candidate], signal);
-          if (replacement === selection.candidate.adapterId) {
-            await this.#runtime.writeSelectedAdapter?.(replacement, signal);
-            this.#selectedAdapterId = replacement;
+          const chosen = typeof replacement === "string"
+            ? selection.candidate.adapterId === replacement ? selection.candidate : undefined
+            : replacement;
+          if (chosen?.adapterId === selection.candidate.adapterId && chosen.address === selection.candidate.address) {
+            const exact = { adapterId: chosen.adapterId, address: chosen.address };
+            await this.#runtime.writeSelectedAdapter?.(exact, signal);
+            this.#selectedAdapter = exact;
             return selection.candidate;
           }
         }
@@ -530,17 +544,23 @@ export class LanModeAdapter implements NetworkModeAdapter {
     }
     if (selection.reason !== "multiple_up_physical_private_ipv4")
       throw new LanModePause(selection.reason, selection.candidates);
-    let candidate = selection.candidates.find((item) => item.adapterId === this.#selectedAdapterId);
+    let candidate = this.#selectedAdapter === undefined ? undefined : selection.candidates.find((item) =>
+      item.adapterId === this.#selectedAdapter!.adapterId
+      && (this.#selectedAdapter!.address === undefined || item.address === this.#selectedAdapter!.address));
+    if (candidate !== undefined && this.#selectedAdapter?.address === undefined
+      && selection.candidates.filter((item) => item.adapterId === candidate!.adapterId).length !== 1) candidate = undefined;
     if (candidate === undefined && allowChoice && this.#runtime.chooseAdapter !== undefined) {
-      const adapterId = await this.#runtime.chooseAdapter(selection.candidates, signal);
-      candidate = selection.candidates.find((item) => item.adapterId === adapterId);
+      const chosen = await this.#runtime.chooseAdapter(selection.candidates, signal);
+      candidate = typeof chosen === "string"
+        ? selection.candidates.find((item) => item.adapterId === chosen)
+        : chosen;
       if (candidate !== undefined) {
-        await this.#runtime.writeSelectedAdapter?.(candidate.adapterId, signal);
-        this.#selectedAdapterId = candidate.adapterId;
+        await this.#runtime.writeSelectedAdapter?.({ adapterId: candidate.adapterId, address: candidate.address }, signal);
+        this.#selectedAdapter = { adapterId: candidate.adapterId, address: candidate.address };
       }
     }
     if (candidate === undefined) throw new LanModePause(selection.reason, selection.candidates);
-    this.#selectedAdapterId = candidate.adapterId;
+    this.#selectedAdapter = { adapterId: candidate.adapterId, address: candidate.address };
     return candidate;
   }
 

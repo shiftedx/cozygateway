@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 import { ContractViolation } from "cozygateway-contract";
@@ -29,8 +29,20 @@ describe("loadConfig", () => {
     });
     const config = loadConfig(path);
     expect(config.port).toBe(8787);
-    expect(config.dbPath).toBe("cozygateway.db");
+    expect(config.dbPath).toBe(join(dirname(path), "cozygateway.db"));
     expect(config.hermes.profiles.sage?.tokenEnv).toBe("SAGE_ATTACH_TOKEN");
+  });
+
+  it("resolves a relative authority path against the config directory independent of CWD", () => {
+    const path = writeConfig({ name: "cwd-stable", dbPath: "state/authority.sqlite", hermes });
+    const original = process.cwd();
+    const other = mkdtempSync(join(tmpdir(), "cozygateway-other-cwd-"));
+    try {
+      process.chdir(other);
+      expect(loadConfig(path).dbPath).toBe(resolve(dirname(path), "state/authority.sqlite"));
+    } finally {
+      process.chdir(original);
+    }
   });
 
   it("accepts only an operator control token path, never an inline control token", () => {

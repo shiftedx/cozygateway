@@ -34,6 +34,24 @@ describe("WindowsHelperClient", () => {
     }
   });
 
+  it.skipIf(process.platform !== "win32")("kills a real spawned descendant before timeout settlement", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozy-helper-tree-"));
+    const childScript = join(directory, "child.js");
+    const parentScript = join(directory, "parent.js");
+    const childPidFile = join(directory, "child.pid");
+    writeFileSync(childScript, `require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid)); setInterval(() => {}, 1000);`);
+    writeFileSync(parentScript, `require("node:child_process").spawn(process.execPath, [${JSON.stringify(childScript)}], {stdio:"ignore"}); setInterval(() => {}, 1000);`);
+    try {
+      await expect(runWindowsHelperProcess(process.execPath, [parentScript], {
+        stdin: "", shell: false, windowsHide: true, timeoutMs: 750, maxOutputBytes: 1024,
+      })).rejects.toThrow(/timed out/i);
+      const descendantPid = Number(readFileSync(childPidFile, "utf8"));
+      expect(() => process.kill(descendantPid, 0)).toThrow();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("invokes the absolute fixed helper without a shell and parses its versioned envelope", async () => {
     const runner = vi.fn<WindowsHelperRunner>().mockResolvedValue({
       exitCode: 0,
@@ -130,9 +148,11 @@ describe("WindowsHelperClient", () => {
     };
     const client = new WindowsHelperClient({ helperPath: helper, powershellPath: powershell, runner });
     await client.setPreference("unattended", true);
+    await client.setPreferenceForCleanup("shields-up", false);
     await client.openBrowser("login", "https://login.tailscale.com/a/opaque");
     expect(calls).toEqual([
       { command: "set-preference", input: { preference: "unattended", enabled: true } },
+      { command: "set-preference-cleanup", input: { preference: "shields-up", enabled: false } },
       { command: "open-browser", input: { purpose: "login", url: "https://login.tailscale.com/a/opaque" } },
     ]);
   });

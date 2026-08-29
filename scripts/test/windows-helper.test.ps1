@@ -197,6 +197,9 @@ try {
     $prefCancel.uacExitCode = 1223
     Assert-Reason (Invoke-Helper -Command 'set-preference' -Input @{ preference = 'unattended'; enabled = $true } -Fixture $prefCancel) 'preference_cancelled'
     Assert-Reason (Invoke-Helper -Command 'set-preference' -Input @{ preference = 'accept-routes'; enabled = $true } -Fixture $prefFixture) 'invalid_request'
+    $cleanupUnelevated = @{} + $prefFixture
+    $cleanupUnelevated.elevated = $false
+    Assert-Reason (Invoke-Helper -Command 'set-preference-cleanup' -Input @{ preference = 'unattended'; enabled = $true } -Fixture $cleanupUnelevated) 'preference_elevation_required'
 
     $installer = Join-Path $script:Temp 'downloaded.exe'
     Write-Utf8NoBom $installer 'signed installer fixture'

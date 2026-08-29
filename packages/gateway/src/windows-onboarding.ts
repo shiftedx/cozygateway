@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, X509Certificate } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -12,8 +12,9 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { isIP } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { createServer, isIP } from "node:net";
+import { request as httpsRequest } from "node:https";
+import { dirname, join, resolve } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 
 import { WebSocket } from "ws";
@@ -31,7 +32,7 @@ import {
   validateListenerHost,
 } from "./configure.ts";
 import type { CliIo, CliOnboardingController, CliRuntime } from "./cli.ts";
-import { LanModeAdapter, SqliteLanOwnershipStore, type LanListenerState, type LanModeRuntime } from "./lan-mode.ts";
+import { LanModeAdapter, SqliteLanOwnershipStore, type LanAdapterSelection, type LanListenerState, type LanModeRuntime } from "./lan-mode.ts";
 import {
   NetworkOnboarding,
   type NetworkModeAdapter,
@@ -49,9 +50,11 @@ import {
 import { preparePairingOutput } from "./pairing-output.ts";
 import {
   openStorage,
+  storageFileIdentity,
   type OnboardingOwnershipInput,
   type OnboardingOwnershipWriteResult,
   type Storage,
+  type StorageFileIdentity,
 } from "./storage.ts";
 import {
   SqliteTailscaleOwnershipStore,
@@ -62,6 +65,53 @@ import {
 import type { TailscaleCliRunner } from "./tailscale-cli.ts";
 import { gatewayScheme } from "./tls.ts";
 import { WindowsHelperClient } from "./windows-helper.ts";
+
+export type WindowsOwnedNetworkCleanupErrorCode =
+  | "tailscale_not_running" | "old_version" | "logged_out" | "custom_control"
+  | "account_changed" | "mapping_changed" | "elevation_required"
+  | "preference_changed"
+  | "authority_missing" | "authority_unsafe" | "helper_invalid"
+  | "listener_changed" | "timeout";
+
+export class WindowsOwnedNetworkCleanupError extends Error {
+  readonly code: WindowsOwnedNetworkCleanupErrorCode;
+  readonly failures: ReadonlyArray<{ adapter: "Tailscale" | "LAN" | "Advanced" | "authority"; code: WindowsOwnedNetworkCleanupErrorCode }>;
+  constructor(
+    code: WindowsOwnedNetworkCleanupErrorCode,
+    failures: ReadonlyArray<{ adapter: "Tailscale" | "LAN" | "Advanced" | "authority"; code: WindowsOwnedNetworkCleanupErrorCode }> = [],
+  ) {
+    const first = failures[0]?.adapter;
+    const message = code === "timeout" ? "Owned network cleanup timed out"
+      : code === "authority_missing" || code === "authority_unsafe"
+        ? "Owned network cleanup requires the existing configured authority database"
+        : code === "helper_invalid"
+          ? "Owned network cleanup could not verify the installed helper; repair its path and permissions"
+          : `${first ?? "owned network"} cleanup failed (${code})`.replace(/^Tailscale/, "tailscale");
+    super(message);
+    this.name = "WindowsOwnedNetworkCleanupError";
+    this.code = code;
+    this.failures = failures;
+  }
+}
+
+function cleanupCode(error: unknown): WindowsOwnedNetworkCleanupErrorCode {
+  if (error instanceof WindowsOwnedNetworkCleanupError) return error.code;
+  const reason = typeof error === "object" && error !== null && "reason" in error
+    ? String((error as { reason: unknown }).reason) : "";
+  if (reason === "preference_elevation_required") return "elevation_required";
+  if (reason === "account_changed") return "account_changed";
+  if (reason.includes("custom_control")) return "custom_control";
+  if (reason.includes("version")) return "old_version";
+  if (reason.includes("logged_out")) return "logged_out";
+  if (reason.includes("not_running")) return "tailscale_not_running";
+  if (reason.includes("mapping")) return "mapping_changed";
+  if (reason.includes("preference") || reason === "status") return "preference_changed";
+  if (reason.includes("listener") || error instanceof AdvancedModeRollbackError) return "listener_changed";
+  const message = error instanceof Error ? error.message : "";
+  if (/timed out|timeout|aborted/i.test(message)) return "timeout";
+  if (/helper|protocol/i.test(message)) return "helper_invalid";
+  return "listener_changed";
+}
 
 type WindowsOnboardingHelper = Pick<WindowsHelperClient,
   "protectPath" | "adapterInventory" | "inspectNetworkSafety" | "discoverTailscale" | "installTailscale" | "setPreference" | "openBrowser">;
@@ -93,6 +143,7 @@ export interface WindowsOnboardingControllerDependencies {
   writePairingOutput?: (output: string) => void | Promise<void>;
   beforeListenerCas?: () => void | Promise<void>;
   afterAdvancedListenerCas?: () => void | Promise<void>;
+  preflightListener?: typeof preflightListener;
 }
 
 function sameListener(left: LanListenerState, right: LanListenerState): boolean {
@@ -107,7 +158,7 @@ function managedRevision(snapshot: ReturnType<typeof readManagedListenerSnapshot
 }
 
 const SELECTED_LAN_ADAPTER_MAX_BYTES = 256;
-const SELECTED_LAN_ADAPTER_FILE_MAX_BYTES = SELECTED_LAN_ADAPTER_MAX_BYTES + 2;
+const SELECTED_LAN_ADAPTER_FILE_MAX_BYTES = 512;
 const SELECTED_LAN_ADAPTER_PATTERN = /^[\x20-\x7e]{1,256}$/;
 
 function validSelectedLanAdapter(adapterId: string): boolean {
@@ -140,26 +191,39 @@ function hasPhoneReachableOrigin(bindHost: string, publicUrl?: string): boolean 
   try { return isPhoneReachableHost(new URL(publicUrl).hostname); } catch { return false; }
 }
 
-function readSelectedLanAdapter(path: string): string | undefined {
+function readSelectedLanAdapter(path: string): LanAdapterSelection | string | undefined {
   if (!existsSync(path)) return undefined;
   if (statSync(path).size > SELECTED_LAN_ADAPTER_FILE_MAX_BYTES)
     throw new Error("saved LAN adapter selection is invalid");
-  const adapterId = readFileSync(path, "utf8").replace(/\r?\n$/, "");
-  if (!validSelectedLanAdapter(adapterId)) throw new Error("saved LAN adapter selection is invalid");
-  return adapterId;
+  const text = readFileSync(path, "utf8").replace(/\r?\n$/, "");
+  if (!text.startsWith("{")) {
+    if (!validSelectedLanAdapter(text)) throw new Error("saved LAN adapter selection is invalid");
+    return text;
+  }
+  let selection: unknown;
+  try { selection = JSON.parse(text); } catch { throw new Error("saved LAN adapter selection is invalid"); }
+  if (typeof selection !== "object" || selection === null || Array.isArray(selection)
+    || Object.keys(selection).sort().join(",") !== "adapterId,address")
+    throw new Error("saved LAN adapter selection is invalid");
+  const value = selection as Record<string, unknown>;
+  if (typeof value.adapterId !== "string" || !validSelectedLanAdapter(value.adapterId)
+    || typeof value.address !== "string" || isIP(value.address) !== 4)
+    throw new Error("saved LAN adapter selection is invalid");
+  return { adapterId: value.adapterId, address: value.address };
 }
 
 async function writeSelectedLanAdapter(
   path: string,
-  adapterId: string,
+  selection: LanAdapterSelection,
   installRoot: string,
   helper: WindowsOnboardingHelper,
   signal?: AbortSignal,
 ): Promise<void> {
-  if (!validSelectedLanAdapter(adapterId)) throw new Error("LAN adapter selection is invalid");
+  if (!validSelectedLanAdapter(selection.adapterId) || selection.address === undefined || isIP(selection.address) !== 4)
+    throw new Error("LAN adapter selection is invalid");
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    writeFileSync(temporary, `${adapterId}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    writeFileSync(temporary, `${JSON.stringify(selection)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
     await helper.protectPath(installRoot, temporary, signal);
     renameSync(temporary, path);
     await helper.protectPath(installRoot, path, signal);
@@ -300,6 +364,47 @@ function tlsProbe(host: string, signal?: AbortSignal): Promise<{
       reject(error);
     });
   });
+}
+
+function pinnedLocalOperatorFetch(certFile: string): typeof fetch {
+  const certificate = readFileSync(certFile);
+  const expectedFingerprint = new X509Certificate(certificate).fingerprint256;
+  return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.protocol !== "https:" || init?.method !== "POST" || typeof init.body !== "string")
+      throw new Error("invalid pinned local control request");
+    return await new Promise<Response>((resolveResponse, reject) => {
+      const request = httpsRequest({
+        hostname: url.hostname,
+        port: url.port === "" ? 443 : Number(url.port),
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        headers: init.headers as Record<string, string>,
+        ca: certificate,
+        rejectUnauthorized: true,
+        checkServerIdentity: (_host, peer) => peer.fingerprint256 === expectedFingerprint
+          ? undefined : new Error("local Gateway TLS certificate changed"),
+      }, (incoming) => {
+        const chunks: Buffer[] = [];
+        let bytes = 0;
+        incoming.on("data", (chunk: Buffer) => {
+          bytes += chunk.byteLength;
+          if (bytes > 8_192) request.destroy(new Error("local control response exceeded bound"));
+          else chunks.push(chunk);
+        });
+        incoming.on("end", () => resolveResponse(new Response(Buffer.concat(chunks), {
+          status: incoming.statusCode ?? 500,
+          headers: incoming.headers as Record<string, string>,
+        })));
+      });
+      const abort = () => request.destroy(init?.signal?.reason ?? new Error("cancelled"));
+      init?.signal?.addEventListener("abort", abort, { once: true });
+      request.once("close", () => init?.signal?.removeEventListener("abort", abort));
+      request.once("error", reject);
+      request.end(init.body);
+      if (init.signal?.aborted) abort();
+    });
+  }) as typeof fetch;
 }
 
 interface AdvancedListenerOwnership {
@@ -449,6 +554,26 @@ function advancedEndpointFingerprint(endpoint: Omit<PreparedEndpoint, "durableFi
   })).digest("hex");
 }
 
+async function preflightListener(host: string, port: number, signal?: AbortSignal): Promise<void> {
+  await new Promise<void>((resolveReady, reject) => {
+    const server = createServer();
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      server.close(() => error === undefined ? resolveReady() : reject(error));
+    };
+    const abort = () => finish(signal?.reason ?? new Error("cancelled"));
+    server.once("error", () => finish(Object.assign(new Error("listener port is unavailable"), {
+      retryable: true as const, reason: "port_conflict",
+    })));
+    server.listen({ host, port, exclusive: true }, () => finish());
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
+
 export class AdvancedModeAdapter implements NetworkModeAdapter {
   readonly mode = "advanced" as const;
   readonly #configPath: string;
@@ -458,6 +583,7 @@ export class AdvancedModeAdapter implements NetworkModeAdapter {
   readonly #listener: LanModeRuntime;
   readonly #ownership: SqliteAdvancedOwnershipStore;
   readonly #afterListenerCas?: () => void | Promise<void>;
+  readonly #preflight: typeof preflightListener;
   #owned?: AdvancedListenerOwnership;
 
   constructor(input: {
@@ -470,6 +596,7 @@ export class AdvancedModeAdapter implements NetworkModeAdapter {
     health?: typeof health;
     websocket?: typeof websocket;
     afterListenerCas?: () => void | Promise<void>;
+    preflight?: typeof preflightListener;
   }) {
     this.#configPath = input.configPath;
     this.#io = input.io;
@@ -481,6 +608,7 @@ export class AdvancedModeAdapter implements NetworkModeAdapter {
       {}, { clearPublicUrlOnForward: false, persistReplacementConfig: true },
     );
     this.#afterListenerCas = input.afterListenerCas;
+    this.#preflight = input.preflight ?? preflightListener;
   }
 
   async prepare(signal?: AbortSignal): Promise<PreparedEndpoint> {
@@ -515,6 +643,7 @@ export class AdvancedModeAdapter implements NetworkModeAdapter {
       }
     }
     const before = await this.#listener.readListenerState(signal);
+    if (host !== before.bindHost || port !== before.port) await this.#preflight(host, port, signal);
     const afterIntent = advancedPreparedState(before, host, port, current);
     const after = this.#listener.planListenerState === undefined
       ? afterIntent
@@ -872,8 +1001,8 @@ function createWindowsLanRuntime(
     ownership: new SqliteLanOwnershipStore(storage),
     readAdapterInventory: (signal) => helper.adapterInventory(signal),
     readSelectedAdapter: async () => readSelectedLanAdapter(selectedLanAdapterPath),
-    writeSelectedAdapter: (adapterId, signal) =>
-      writeSelectedLanAdapter(selectedLanAdapterPath, adapterId, installRoot, helper, signal),
+    writeSelectedAdapter: (selection, signal) =>
+      writeSelectedLanAdapter(selectedLanAdapterPath, selection, installRoot, helper, signal),
     chooseAdapter: async (candidates) => {
       if (io === undefined) return undefined;
       for (;;) {
@@ -888,7 +1017,7 @@ function createWindowsLanRuntime(
         if (answer.toLowerCase() === "q" || answer.toLowerCase() === "cancel") return undefined;
         if (/^\d+$/.test(answer)) {
           const selected = candidates[Number(answer) - 1];
-          if (selected !== undefined) return selected.adapterId;
+          if (selected !== undefined) return selected;
         }
         console.log(`Choose a number from 1 through ${candidates.length}.`);
       }
@@ -961,23 +1090,28 @@ export async function reconcileWindowsOwnedNetworkState(
   const helper = new WindowsHelperClient({
     helperPath: join(installRoot, "bin", "cozygateway-windows-helper.ps1"),
   });
-  const dbPath = isAbsolute(config.dbPath) ? config.dbPath : resolve(localRoot, config.dbPath);
+  const dbPath = config.dbPath;
   await withDeadline(signal, NETWORK_CLEANUP_TOTAL_TIMEOUT_MS, async (boundedSignal) => {
     assertExistingAuthorityDatabase(dbPath);
     try {
       await helper.protectPath(installRoot, dbPath, boundedSignal);
     } catch {
-      throw new Error("Owned network cleanup could not verify the configured authority database; repair its installed path and permissions.");
+      throw new WindowsOwnedNetworkCleanupError("helper_invalid", [{ adapter: "authority", code: "helper_invalid" }]);
     }
-    assertExistingAuthorityDatabase(dbPath);
-    const storage = openStorage(dbPath, { mustExist: true });
+    const identity = assertExistingAuthorityDatabase(dbPath);
+    const storage = openStorage(dbPath, { mustExist: true, expectedFile: identity });
     try {
       const unavailableProbe = async (): Promise<never> => {
         throw new Error("cleanup does not perform readiness probes");
       };
       const tailscale = new TailscaleModeAdapter({
         gatewayPort: config.port,
-        helper,
+        helper: {
+          discoverTailscale: helper.discoverTailscale.bind(helper),
+          installTailscale: helper.installTailscale.bind(helper),
+          setPreference: helper.setPreferenceForCleanup.bind(helper),
+          openBrowser: helper.openBrowser.bind(helper),
+        },
         io: tailscaleIo(undefined),
         probes: { loopback: unavailableProbe, remote: unavailableProbe },
         ownership: new SqliteTailscaleOwnershipStore(storage),
@@ -988,26 +1122,30 @@ export async function reconcileWindowsOwnedNetworkState(
       const advanced = new AdvancedModeAdapter({
         configPath, installRoot, helper, runtime, storage,
       });
-      const failures: unknown[] = [];
+      const failures: Array<{ adapter: "Tailscale" | "LAN" | "Advanced"; error: unknown }> = [];
       for (const [name, operation] of [
         ["Tailscale", (adapterSignal: AbortSignal) => tailscale.reconcileOwned(adapterSignal)],
         ["LAN", (adapterSignal: AbortSignal) => lan.reconcileOwned(adapterSignal)],
         ["Advanced", (adapterSignal: AbortSignal) => advanced.reconcileOwned(adapterSignal)],
       ] as const) {
         try { await runBoundedCleanupAdapter(name, boundedSignal, operation); }
-        catch (error) { failures.push(error); }
+        catch (error) { failures.push({ adapter: name, error }); }
       }
-      if (failures.length === 1) throw failures[0];
-      if (failures.length > 1) throw new AggregateError(failures, "network ownership cleanup failed");
+      if (failures.length > 0) {
+        const safe = failures.map(({ adapter, error }) => ({ adapter, code: cleanupCode(error) }));
+        throw new WindowsOwnedNetworkCleanupError(safe[0]!.code, safe);
+      }
     } finally {
       storage.close();
     }
   });
 }
 
-function assertExistingAuthorityDatabase(dbPath: string): void {
+function assertExistingAuthorityDatabase(dbPath: string): StorageFileIdentity {
   const failed = (): never => {
-    throw new Error("Owned network cleanup requires the existing configured authority database; repair its installed path and permissions.");
+    throw new WindowsOwnedNetworkCleanupError(existsSync(dbPath) ? "authority_unsafe" : "authority_missing", [
+      { adapter: "authority", code: existsSync(dbPath) ? "authority_unsafe" : "authority_missing" },
+    ]);
   };
   let descriptor: number | undefined;
   try {
@@ -1020,11 +1158,13 @@ function assertExistingAuthorityDatabase(dbPath: string): void {
     descriptor = openSync(dbPath, "r");
     const opened = fstatSync(descriptor);
     if (!opened.isFile() || opened.dev !== pathState.dev || opened.ino !== pathState.ino) failed();
+    return storageFileIdentity(dbPath);
   } catch {
     failed();
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
+  return failed();
 }
 
 export function createWindowsOnboardingController(
@@ -1040,9 +1180,12 @@ export function createWindowsOnboardingController(
   const helper = dependencies.helper ?? new WindowsHelperClient({ helperPath: join(installRoot, "bin", "cozygateway-windows-helper.ps1") });
   const storage = dependencies.storage ?? openStorage(config.dbPath);
   const authority = new SqliteOnboardingAuthority(storage);
+  const configuredHost = config.host ?? "127.0.0.1";
+  const controlHost = configuredHost === "0.0.0.0" || configuredHost === "::" ? "127.0.0.1" : configuredHost;
   const control = dependencies.control ?? new OperatorOnboardingClient({
-    localOrigin: listenerOrigin("127.0.0.1", config.port, gatewayScheme(config)),
+    localOrigin: listenerOrigin(controlHost, config.port, gatewayScheme(config)),
     token: loadOperatorControlToken(config.onboardingControlTokenFile),
+    ...(config.tls === undefined ? {} : { fetch: pinnedLocalOperatorFetch(config.tls.certFile) }),
   });
   const state = dependencies.state ?? new NetworkOnboardingStateFile({
     localRoot,
@@ -1081,6 +1224,7 @@ export function createWindowsOnboardingController(
     ...(dependencies.websocket === undefined ? {} : { websocket: dependencies.websocket }),
     ...(dependencies.afterAdvancedListenerCas === undefined
       ? {} : { afterListenerCas: dependencies.afterAdvancedListenerCas }),
+    ...(dependencies.preflightListener === undefined ? {} : { preflight: dependencies.preflightListener }),
   });
   const tailscale = dependencies.tailscaleAdapter ?? new TailscaleModeAdapter({
     gatewayPort: config.port, helper, io: tailscaleIo(io), probes,
@@ -1128,8 +1272,15 @@ export function createWindowsOnboardingController(
     if (legacyChecked) return;
     legacyChecked = true;
     if ((await authority.status()).state !== "none" || await state.read() !== undefined) return;
-    const endpoint = await advanced.inspect().catch(() => undefined);
-    if (endpoint === undefined) return;
+    let endpoint = await advanced.inspect().catch(() => undefined);
+    if (endpoint === undefined) {
+      const legacy = loadConfig(configPath);
+      const bindHost = legacy.host ?? "127.0.0.1";
+      if (!new Set(["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"]).has(bindHost.toLowerCase())) return;
+      const canonicalOrigin = legacy.publicUrl ?? listenerOrigin(bindHost, legacy.port, gatewayScheme(legacy));
+      const base = { mode: "advanced" as const, canonicalOrigin, bindHost, port: legacy.port, ready: false };
+      endpoint = { ...base, durableFingerprint: advancedEndpointFingerprint(base, "legacy-unreviewed") };
+    }
     await state.write({
       version: 1,
       stage: "legacy_unreviewed",

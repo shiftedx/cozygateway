@@ -9,6 +9,7 @@ import {
   LanModePause,
   LanModeRollbackError,
   SqliteLanOwnershipStore,
+  type LanAdapterSelection,
   type LanListenerState,
   type LanListenerOwnership,
   type LanOwnershipStore,
@@ -61,8 +62,9 @@ class FakeLanRuntime implements LanModeRuntime {
   failRestartCall?: number;
   rejectCasCall?: number;
   beforeProbe?: () => void;
-  chooseAdapter?: (candidates: readonly PhysicalLanCandidate[]) => Promise<string | undefined>;
+  chooseAdapter?: (candidates: readonly PhysicalLanCandidate[]) => Promise<PhysicalLanCandidate | string | undefined>;
   selectedAdapterId?: string;
+  selectedAdapterAddress?: string;
   planListenerState?: (expected: LanListenerState, replacement: LanListenerState) => Promise<LanListenerState>;
 
   constructor() {
@@ -87,8 +89,16 @@ class FakeLanRuntime implements LanModeRuntime {
     };
   }
 
-  async readSelectedAdapter(): Promise<string | undefined> { return this.selectedAdapterId; }
-  async writeSelectedAdapter(adapterId: string): Promise<void> { this.selectedAdapterId = adapterId; }
+  async readSelectedAdapter(): Promise<LanAdapterSelection | undefined> {
+    return this.selectedAdapterId === undefined ? undefined : {
+      adapterId: this.selectedAdapterId,
+      ...(this.selectedAdapterAddress === undefined ? {} : { address: this.selectedAdapterAddress }),
+    };
+  }
+  async writeSelectedAdapter(selection: LanAdapterSelection): Promise<void> {
+    this.selectedAdapterId = selection.adapterId;
+    this.selectedAdapterAddress = selection.address;
+  }
 
   async readAdapterInventory(): Promise<WindowsLanInventory> {
     return structuredClone(this.inventory);
@@ -337,6 +347,26 @@ describe("LanModeAdapter", () => {
     runtime.chooseAdapter = async () => { throw new Error("must reuse explicit selection"); };
     await expect(new LanModeAdapter(runtime).inspect()).resolves.toMatchObject({
       physicalAdapterId: "wifi", dhcpAddress: "10.0.0.5",
+    });
+  });
+
+  it("persists and resumes the exact chosen address when one adapter has multiple safe addresses", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.inventory.adapters[0]!.ipv4Addresses = ["192.168.1.23", "192.168.1.24"];
+    runtime.chooseAdapter = async (candidates) => candidates[1];
+
+    await expect(new LanModeAdapter(runtime).prepare()).resolves.toMatchObject({ dhcpAddress: "192.168.1.24" });
+    expect(runtime.selectedAdapterAddress).toBe("192.168.1.24");
+    runtime.chooseAdapter = async () => { throw new Error("must resume exact address"); };
+    await expect(new LanModeAdapter(runtime).inspect()).resolves.toMatchObject({ dhcpAddress: "192.168.1.24" });
+  });
+
+  it("does not guess for a legacy adapter-id-only selection with multiple safe addresses", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.inventory.adapters[0]!.ipv4Addresses = ["192.168.1.23", "192.168.1.24"];
+    runtime.selectedAdapterId = "physical-ethernet";
+    await expect(new LanModeAdapter(runtime).inspect()).rejects.toMatchObject({
+      reason: "multiple_up_physical_private_ipv4",
     });
   });
 

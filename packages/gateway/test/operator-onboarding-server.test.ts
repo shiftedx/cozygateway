@@ -62,7 +62,7 @@ async function probe(running: RunningGateway, verificationUrl: string): Promise<
 }
 
 describe("running Gateway operator onboarding control", () => {
-  it("rejects a non-loopback control request even on a wildcard LAN listener", async ({ skip }) => {
+  it("accepts an authenticated same-host interface control request on a wildcard listener", async ({ skip }) => {
     const lanAddress = Object.values(networkInterfaces()).flat()
       .find((address) => address?.family === "IPv4" && !address.internal)?.address;
     if (lanAddress === undefined) skip();
@@ -73,7 +73,7 @@ describe("running Gateway operator onboarding control", () => {
       headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify(beginBody(running, "lan")),
     });
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(200);
   });
 
   it("rebases a new challenge to the adapter-proven final origin and posture", async () => {

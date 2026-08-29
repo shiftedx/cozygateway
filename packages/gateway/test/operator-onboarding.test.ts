@@ -100,6 +100,66 @@ describe("local operator onboarding control", () => {
     expect(phone.begin).not.toHaveBeenCalled();
   });
 
+  it("bounds an authenticated operator body read and cancels the incomplete stream", async () => {
+    vi.useFakeTimers();
+    const phone = verifier();
+    const control = new OperatorOnboardingControl({
+      token: TOKEN,
+      phoneVerification: phone,
+      bodyReadTimeoutMs: 5_000,
+    });
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { streamController = controller; },
+      cancel,
+    });
+    const slow = new Request("http://127.0.0.1/cozy/operator/onboarding", {
+      method: "POST",
+      headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+      body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    const pending = control.handle(slow, "127.0.0.1");
+    try {
+      await vi.advanceTimersByTimeAsync(5_000);
+      let settled = false;
+      void pending.then(() => { settled = true; });
+      await Promise.resolve();
+
+      expect(settled).toBe(true);
+      expect(cancel).toHaveBeenCalledOnce();
+      await expect(pending).resolves.toMatchObject({ status: 404 });
+      expect(phone.begin).not.toHaveBeenCalled();
+    } finally {
+      if (cancel.mock.calls.length === 0) streamController?.close();
+      await pending;
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels an authenticated operator body read when its request aborts", async () => {
+    const phone = verifier();
+    const control = new OperatorOnboardingControl({ token: TOKEN, phoneVerification: phone });
+    const cancel = vi.fn();
+    const abort = new AbortController();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const slow = new Request("http://127.0.0.1/cozy/operator/onboarding", {
+      method: "POST",
+      headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+      body,
+      duplex: "half",
+      signal: abort.signal,
+    } as RequestInit & { duplex: "half" });
+
+    const pending = control.handle(slow, "127.0.0.1");
+    abort.abort();
+
+    await expect(pending).resolves.toMatchObject({ status: 404 });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(phone.begin).not.toHaveBeenCalled();
+  });
+
   it("returns only bounded pending/confirmed state and supports exact cancel", async () => {
     const phone = verifier();
     phone.status

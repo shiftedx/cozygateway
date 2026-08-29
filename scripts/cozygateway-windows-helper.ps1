@@ -449,6 +449,34 @@ function Invoke-SetPreference {
     return [ordered]@{ applied = $true }
 }
 
+function Test-CurrentProcessElevated {
+    $fixture = Get-FixtureProperty 'elevated'
+    if ($null -ne $fixture) { return [bool]$fixture }
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Invoke-SetPreferenceCleanup {
+    param($Request)
+    if (-not (Test-ExactKeys $Request @('preference','enabled')) -or $Request.preference -notin @('unattended','shields-up') -or $Request.enabled -isnot [bool]) { Throw-Reason 'invalid_request' }
+    if (-not (Test-CurrentProcessElevated)) { Throw-Reason 'preference_elevation_required' }
+    $trusted = Get-TrustedTailscale
+    $flag = if ($Request.preference -eq 'unattended') { '--unattended=' } else { '--shields-up=' }
+    $flag += if ([bool]$Request.enabled) { 'true' } else { 'false' }
+    Write-TestEvent 'cli-cleanup' @($trusted.cliPath, 'set', $flag)
+    $run = [CozyGatewayBoundedProcess]::Run($trusted.cliPath, "set $flag", 15000, $script:MaxJsonBytes)
+    if ($run.TimedOut -or $run.ExceededBound -or $run.ExitCode -ne 0) { Throw-Reason 'preference_failed' }
+    $get = Invoke-CliGet $trusted.cliPath ([string]$Request.preference)
+    $propertyName = if ($Request.preference -eq 'unattended') { 'unattended' } else { 'shieldsUp' }
+    $verified = if ($get -is [bool]) { [bool]$get } else {
+        $property = $get.PSObject.Properties[$propertyName]
+        if ($null -eq $property -or $property.Value -isnot [bool]) { Throw-Reason 'preference_verification_failed' }
+        [bool]$property.Value
+    }
+    if ($verified -ne [bool]$Request.enabled) { Throw-Reason 'preference_verification_failed' }
+    return [ordered]@{ applied = $true }
+}
+
 function Invoke-OpenBrowser {
     param($Request)
     if (-not (Test-ExactKeys $Request @('purpose','url')) -or $Request.purpose -notin @('login','https-consent') -or $Request.url -isnot [string]) { Throw-Reason 'invalid_request' }
@@ -759,18 +787,75 @@ function Invoke-InspectNetworkSafety {
     }
 }
 
+function Test-CozyDashboardProcessOwner {
+    param($Process, [string]$ExpectedRoot, [string]$ExpectedHermes, [string]$ExpectedLauncher, [int]$ExpectedPort)
+    $root = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\') + '\'
+    $hermes = [IO.Path]::GetFullPath($ExpectedHermes)
+    $launcher = [IO.Path]::GetFullPath($ExpectedLauncher)
+    $tokens = @([regex]::Matches([string]$Process.CommandLine, '[^\s"]+|"[^"]*"') | ForEach-Object { $_.Value.Trim([char]34) })
+    $runtimeUnderRoot = $false
+    $candidate = $Process
+    for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
+        try {
+            if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $runtimeUnderRoot = $true; break }
+        } catch {}
+        if (-not $candidate.ParentProcessId) { break }
+        $candidate = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$candidate.ParentProcessId) -ErrorAction SilentlyContinue
+    }
+    $processExecutable = $null; $firstToken = $null; $secondToken = $null; $dashboardIndex = -1
+    try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch {}
+    if ($tokens.Count -gt 0) { try { $firstToken = [IO.Path]::GetFullPath($tokens[0]) } catch {} }
+    if ($tokens.Count -gt 1) { try { $secondToken = [IO.Path]::GetFullPath($tokens[1]) } catch {} }
+    $firstIsExecutable = $null -ne $processExecutable -and $null -ne $firstToken -and $firstToken.Equals($processExecutable, [StringComparison]::OrdinalIgnoreCase)
+    $pythonRuntime = $firstIsExecutable -and @('python.exe','pythonw.exe') -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
+    $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
+    $scriptSuffix = '\hermes_cli\main.py'
+    if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq 'dashboard') { $dashboardIndex = 1 }
+    elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq 'dashboard') { $dashboardIndex = 2 }
+    elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 3 -and $tokens[1] -eq '-m' -and $tokens[2] -eq 'hermes_cli.main' -and $tokens[3] -eq 'dashboard') { $dashboardIndex = 3 }
+    elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase) -and $tokens[2] -eq 'dashboard') { $dashboardIndex = 2 }
+    if ($dashboardIndex -lt 0) { return $false }
+    for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
+        if ($tokens[$index] -eq '--port' -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return $true }
+        if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return $true }
+    }
+    return $false
+}
+
+function Invoke-InspectDashboardPort {
+    param($Request)
+    if (-not (Test-ExactKeys $Request @('port','hermesRoot','hermesPath','launcherPath')) -or
+        $Request.port -isnot [int] -or $Request.port -lt 1 -or $Request.port -gt 65535 -or
+        @(@($Request.hermesRoot,$Request.hermesPath,$Request.launcherPath) | Where-Object { $_ -isnot [string] -or -not (Test-FullyQualifiedWindowsPath $_) }).Count -ne 0) { Throw-Reason 'invalid_request' }
+    try {
+        $fixturePort = Get-FixtureProperty 'dashboardPort'
+        if ($null -ne $fixturePort) {
+            if ([string]$fixturePort.status -eq 'free') { return [ordered]@{ available=$true; owned=$false } }
+            return [ordered]@{ available=$false; owned=([string]$fixturePort.status -eq 'owned'); processId=[int]$fixturePort.processId; processName=[string]$fixturePort.processName }
+        }
+        $connection = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$Request.port) -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($connection.Count -eq 0) { return [ordered]@{ available=$true; owned=$false } }
+        $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$connection[0].OwningProcess) -ErrorAction Stop
+        $owned = Test-CozyDashboardProcessOwner $process ([string]$Request.hermesRoot) ([string]$Request.hermesPath) ([string]$Request.launcherPath) ([int]$Request.port)
+        $name = if ([string]::IsNullOrWhiteSpace([string]$process.Name)) { 'unknown' } else { [string]$process.Name }
+        return [ordered]@{ available=$false; owned=$owned; processId=[int]$process.ProcessId; processName=$name }
+    } catch { Throw-Reason 'dashboard_inspection_failed' }
+}
+
 function Invoke-FixedHelperCommand {
     param([string]$Name, $Request)
     switch -CaseSensitive ($Name) {
         'discover-tailscale' { return Invoke-DiscoverTailscale $Request }
         'install-tailscale' { return Invoke-InstallTailscale $Request }
         'set-preference' { return Invoke-SetPreference $Request }
+        'set-preference-cleanup' { return Invoke-SetPreferenceCleanup $Request }
         'open-browser' { return Invoke-OpenBrowser $Request }
         'initialize-pending' { return Invoke-InitializePending $Request }
         'protect-path' { return Invoke-ProtectPath $Request }
         'prepare-install-root' { return Invoke-PrepareInstallRoot $Request }
         'adapter-inventory' { return Invoke-AdapterInventory $Request }
         'inspect-network-safety' { return Invoke-InspectNetworkSafety $Request }
+        'inspect-dashboard-port' { return Invoke-InspectDashboardPort $Request }
         default { Throw-Reason 'invalid_request' }
     }
 }
@@ -780,13 +865,13 @@ $knownReasons = @(
     'tailscale_not_installed','tailscale_legacy_unsupported','tailscale_service_mismatch','tailscale_signature_invalid',
     'tailscale_publisher_invalid','tailscale_prerequisite_disabled','download_failed','download_redirect_rejected',
     'download_too_large','installer_signature_invalid','installer_cancelled','installer_reboot_required','installer_failed','preference_failed','preference_cancelled',
-    'preference_verification_failed','browser_url_rejected','browser_open_failed','inventory_failed','network_inspection_failed','internal_error'
+    'preference_verification_failed','preference_elevation_required','browser_url_rejected','browser_open_failed','inventory_failed','network_inspection_failed','dashboard_inspection_failed','internal_error'
 )
 
 function Invoke-WindowsHelperMain {
     param([string]$Name, $InjectedFixture = $null)
     $script:Fixture = $InjectedFixture
-    $fixedCommands = @('discover-tailscale','install-tailscale','set-preference','open-browser','initialize-pending','protect-path','prepare-install-root','adapter-inventory','inspect-network-safety')
+    $fixedCommands = @('discover-tailscale','install-tailscale','set-preference','set-preference-cleanup','open-browser','initialize-pending','protect-path','prepare-install-root','adapter-inventory','inspect-network-safety','inspect-dashboard-port')
     $envelopeCommand = if ($fixedCommands -ccontains $Name) { $Name } else { 'invalid' }
     $ok = $false
     $result = $null

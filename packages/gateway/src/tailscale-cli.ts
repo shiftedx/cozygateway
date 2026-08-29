@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { request as httpRequest } from "node:http";
 
 export const TAILSCALE_CLI_MAX_OBJECT_BYTES = 64 * 1024;
 export const TAILSCALE_CLI_MAX_TOTAL_BYTES = 256 * 1024;
+export const TAILSCALE_LOCALAPI_PIPE = "\\\\.\\pipe\\ProtectedPrefix\\Administrators\\Tailscale\\tailscaled";
 
 export type TailscaleCliErrorReason =
   | "invalid_executable"
@@ -378,6 +380,166 @@ export const runTailscaleCliProcess: TailscaleCliRunner = (executable, argv, opt
   });
 });
 
+export type TailscaleServeConfigMutationResult = "removed" | "absent" | "concurrent" | "conflict";
+
+export interface TailscaleServeConfigClient {
+  removeExactTlsTerminatedMapping(
+    input: { dnsName: string; target: string },
+    signal?: AbortSignal,
+  ): Promise<TailscaleServeConfigMutationResult>;
+}
+
+export type TailscaleLocalApiErrorReason =
+  | "timeout"
+  | "cancelled"
+  | "unavailable"
+  | "invalid_response";
+
+export class TailscaleLocalApiError extends Error {
+  readonly reason: TailscaleLocalApiErrorReason;
+
+  constructor(reason: TailscaleLocalApiErrorReason) {
+    super(`Tailscale LocalAPI operation paused: ${reason}`);
+    this.name = "TailscaleLocalApiError";
+    this.reason = reason;
+  }
+}
+
+type LocalApiResponse = { statusCode: number; etag?: string; body: Buffer };
+
+function validateServeConfig(value: Record<string, unknown>): void {
+  const allowed = new Set(["TCP", "Web", "Services", "AllowFunnel", "Foreground"]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) throw new TailscaleLocalApiError("invalid_response");
+  for (const name of allowed) {
+    const member = value[name];
+    if (member !== undefined && !record(member)) throw new TailscaleLocalApiError("invalid_response");
+  }
+  let nodes = 0;
+  const visit = (member: unknown, depth: number): void => {
+    if (++nodes > 2_048 || depth > 8) throw new TailscaleLocalApiError("invalid_response");
+    if (Array.isArray(member)) {
+      for (const item of member) visit(item, depth + 1);
+      return;
+    }
+    if (!record(member)) return;
+    for (const [key, item] of Object.entries(member)) {
+      if (key === "__proto__" || key === "prototype" || key === "constructor")
+        throw new TailscaleLocalApiError("invalid_response");
+      visit(item, depth + 1);
+    }
+  };
+  visit(value, 0);
+}
+
+export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
+  readonly #socketPath: string;
+  readonly #timeoutMs: number;
+
+  constructor(options: { socketPath?: string; timeoutMs?: number } = {}) {
+    this.#socketPath = options.socketPath ?? TAILSCALE_LOCALAPI_PIPE;
+    this.#timeoutMs = Math.min(30_000, Math.max(1, options.timeoutMs ?? 15_000));
+  }
+
+  async #request(
+    method: "GET" | "POST",
+    body: Buffer | undefined,
+    etag: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<LocalApiResponse> {
+    if (signal?.aborted) throw new TailscaleLocalApiError("cancelled");
+    return await new Promise<LocalApiResponse>((resolve, reject) => {
+      let settled = false;
+      let timedOut = false;
+      const finish = (error?: Error, response?: LocalApiResponse) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        if (error !== undefined) reject(error);
+        else resolve(response!);
+      };
+      const request = httpRequest({
+        method,
+        path: "/localapi/v0/serve-config",
+        socketPath: this.#socketPath,
+        headers: {
+          Host: "local-tailscaled.sock",
+          Accept: "application/json",
+          Connection: "close",
+          ...(body === undefined ? {} : {
+            "Content-Type": "application/json",
+            "Content-Length": String(body.byteLength),
+          }),
+          ...(etag === undefined ? {} : { "If-Match": etag }),
+        },
+      }, (incoming) => {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        incoming.on("data", (chunk: Buffer) => {
+          total += chunk.byteLength;
+          if (total > TAILSCALE_CLI_MAX_TOTAL_BYTES) {
+            request.destroy(new TailscaleLocalApiError("invalid_response"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        incoming.on("end", () => finish(undefined, {
+          statusCode: incoming.statusCode ?? 0,
+          ...(incoming.headers.etag === undefined ? {} : { etag: incoming.headers.etag }),
+          body: Buffer.concat(chunks),
+        }));
+      });
+      const abort = () => request.destroy(new TailscaleLocalApiError("cancelled"));
+      signal?.addEventListener("abort", abort, { once: true });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        request.destroy(new TailscaleLocalApiError("timeout"));
+      }, this.#timeoutMs);
+      request.on("error", (error) => finish(
+        error instanceof TailscaleLocalApiError
+          ? error
+          : new TailscaleLocalApiError(timedOut ? "timeout" : "unavailable"),
+      ));
+      if (signal?.aborted) abort();
+      if (body !== undefined) request.end(body);
+      else request.end();
+    });
+  }
+
+  async removeExactTlsTerminatedMapping(
+    input: { dnsName: string; target: string },
+    signal?: AbortSignal,
+  ): Promise<TailscaleServeConfigMutationResult> {
+    const snapshot = await this.#request("GET", undefined, undefined, signal);
+    if (snapshot.statusCode !== 200 || snapshot.etag === undefined
+      || !/^[a-f0-9]{64}$/i.test(snapshot.etag)) throw new TailscaleLocalApiError("invalid_response");
+    let config: Record<string, unknown>;
+    try { config = parseSingleObject(snapshot.body); }
+    catch { throw new TailscaleLocalApiError("invalid_response"); }
+    validateServeConfig(config);
+    const tcp = config.TCP as Record<string, unknown> | undefined;
+    const handler = tcp?.["443"];
+    if (handler === undefined) return "absent";
+    if (!record(handler) || Object.keys(handler).length !== 2
+      || !Object.hasOwn(handler, "TCPForward") || !Object.hasOwn(handler, "TerminateTLS")
+      || handler.TCPForward !== input.target || handler.TerminateTLS !== input.dnsName)
+      return "conflict";
+    const allowFunnel = config.AllowFunnel as Record<string, unknown> | undefined;
+    if (allowFunnel?.[`${input.dnsName}:443`] === true) return "conflict";
+    const web = config.Web as Record<string, unknown> | undefined;
+    if (web?.[`${input.dnsName}:443`] !== undefined) return "conflict";
+    const replacement = structuredClone(config);
+    delete (replacement.TCP as Record<string, unknown>)["443"];
+    const encoded = Buffer.from(JSON.stringify(replacement), "utf8");
+    if (encoded.byteLength > TAILSCALE_CLI_MAX_TOTAL_BYTES)
+      throw new TailscaleLocalApiError("invalid_response");
+    const result = await this.#request("POST", encoded, snapshot.etag, signal);
+    if (result.statusCode === 412) return "concurrent";
+    if (result.statusCode !== 200) throw new TailscaleLocalApiError("unavailable");
+    return "removed";
+  }
+}
+
 export class TailscaleCli {
   readonly #executable: string;
   readonly #runner: TailscaleCliRunner;
@@ -525,7 +687,9 @@ export class TailscaleCli {
       throw new TailscaleCliError("invalid_status");
     if (typeof value.Self.DNSName !== "string" || value.Self.DNSName.trim() !== value.Self.DNSName)
       throw new TailscaleCliError("invalid_status");
-    const canonicalDns = value.Self.DNSName;
+    const canonicalDns = value.Self.DNSName.endsWith(".")
+      ? value.Self.DNSName.slice(0, -1)
+      : value.Self.DNSName;
     if (!dnsName(canonicalDns)) throw new TailscaleCliError("invalid_status");
     if (!record(value.CurrentTailnet) || typeof value.CurrentTailnet.Name !== "string"
       || value.CurrentTailnet.Name.trim().length === 0 || value.CurrentTailnet.Name.length > 255
@@ -622,10 +786,6 @@ export class TailscaleCli {
       "--tls-terminated-tcp=443",
       `tcp://127.0.0.1:${gatewayPort}`,
     ], signal);
-  }
-
-  removeTlsTerminatedMapping(signal?: AbortSignal): Promise<void> {
-    return this.#command(["serve", "--tls-terminated-tcp=443", "off"], signal);
   }
 
   async beginHttpsConsent(port: number, signal?: AbortSignal): Promise<string> {

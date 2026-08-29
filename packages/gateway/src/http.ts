@@ -278,7 +278,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
   app.all("/cozy/operator/onboarding", (c) => {
     if (deps.operatorOnboarding === undefined) return operatorOnboardingNotFound();
     const incoming = (c.env as { incoming?: IncomingMessage } | undefined)?.incoming;
-    return deps.operatorOnboarding.handle(c.req.raw, incoming?.socket.remoteAddress);
+    return deps.operatorOnboarding.handle(c.req.raw, incoming?.socket.remoteAddress, incoming?.socket.localAddress);
   });
 
   // This narrowly-scoped capability route precedes the normal device-token surface. All

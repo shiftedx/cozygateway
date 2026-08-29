@@ -13,7 +13,7 @@ import {
   type TailscaleMappingOwnership,
   type TailscaleModeProbes,
 } from "../src/tailscale-mode.ts";
-import { TailscaleCliError, type TailscaleCliRunner } from "../src/tailscale-cli.ts";
+import { TailscaleCliError, type TailscaleCliRunner, type TailscaleServeConfigClient } from "../src/tailscale-cli.ts";
 import { openStorage } from "../src/storage.ts";
 import { WindowsHelperError, type TailscaleDiscovery } from "../src/windows-helper.ts";
 
@@ -72,10 +72,6 @@ function happyDependencies(options: {
       serveState = fixture("serve-compatible.json");
       return { exitCode: 0, stdout: "", stderr: "" };
     }
-    if (command === "serve --tls-terminated-tcp=443 off") {
-      serveState = fixture("serve-empty.json");
-      return { exitCode: 0, stdout: "", stderr: "" };
-    }
     if (command === "serve --https=8443 text:CozyGateway HTTPS consent") return {
       exitCode: 0,
       stdout: "https://console.tailscale.com/admin/feature/fixture\n",
@@ -125,7 +121,19 @@ function happyDependencies(options: {
     replace: vi.fn(async (_expected: TailscaleMappingOwnership, _replacement: TailscaleMappingOwnership, _signal?: AbortSignal) => true),
     remove: vi.fn(async (_ownership: TailscaleMappingOwnership, _signal?: AbortSignal) => true),
   };
-  return { calls, runner, helper, io, probes, ownership, preferenceState };
+  const removeExactTlsTerminatedMapping = vi.fn<TailscaleServeConfigClient["removeExactTlsTerminatedMapping"]>(async (input) => {
+      calls.push("localapi remove exact mapping");
+      const config = JSON.parse(serveState) as { TCP?: Record<string, unknown> };
+      const handler = config.TCP?.["443"] as { TCPForward?: unknown; TerminateTLS?: unknown } | undefined;
+      if (handler === undefined) return "absent" as const;
+      if (handler.TCPForward !== input.target || handler.TerminateTLS !== input.dnsName)
+        return "conflict" as const;
+      delete config.TCP!["443"];
+      serveState = JSON.stringify(config);
+      return "removed" as const;
+    });
+  const serveConfigClient = { removeExactTlsTerminatedMapping };
+  return { calls, runner, helper, io, probes, ownership, preferenceState, serveConfigClient };
 }
 
 describe("TailscaleModeAdapter", () => {
@@ -141,7 +149,7 @@ describe("TailscaleModeAdapter", () => {
       helper: dependencies.helper,
       io: dependencies.io,
       probes: dependencies.probes,
-      ownership: dependencies.ownership,
+      ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).rejects.toMatchObject({
@@ -162,7 +170,7 @@ describe("TailscaleModeAdapter", () => {
       helper: dependencies.helper,
       io: dependencies.io,
       probes: dependencies.probes,
-      ownership: dependencies.ownership,
+      ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).resolves.toMatchObject({
@@ -190,11 +198,11 @@ describe("TailscaleModeAdapter", () => {
     second.ownership.identityHmacKey.mockResolvedValue(Buffer.alloc(32, 8));
     const firstEndpoint = await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: first.runner, helper: first.helper,
-      io: first.io, probes: first.probes, ownership: first.ownership,
+      io: first.io, probes: first.probes, ownership: first.ownership, serveConfigClient: first.serveConfigClient,
     }).prepare();
     const secondEndpoint = await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: second.runner, helper: second.helper,
-      io: second.io, probes: second.probes, ownership: second.ownership,
+      io: second.io, probes: second.probes, ownership: second.ownership, serveConfigClient: second.serveConfigClient,
     }).prepare();
     const plain = createHash("sha256").update(JSON.stringify({
       accountId: "42",
@@ -216,7 +224,7 @@ describe("TailscaleModeAdapter", () => {
       helper: dependencies.helper,
       io: dependencies.io,
       probes: dependencies.probes,
-      ownership: dependencies.ownership,
+      ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       now: () => 1_700_000_000_000,
     });
 
@@ -237,11 +245,11 @@ describe("TailscaleModeAdapter", () => {
     const reused = happyDependencies();
     const createdEndpoint = await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: created.runner, helper: created.helper,
-      io: created.io, probes: created.probes, ownership: created.ownership,
+      io: created.io, probes: created.probes, ownership: created.ownership, serveConfigClient: created.serveConfigClient,
     }).prepare();
     const reusedEndpoint = await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: reused.runner, helper: reused.helper,
-      io: reused.io, probes: reused.probes, ownership: reused.ownership,
+      io: reused.io, probes: reused.probes, ownership: reused.ownership, serveConfigClient: reused.serveConfigClient,
     }).prepare();
 
     expect(createdEndpoint.createdByWizard).toBe(true);
@@ -270,7 +278,7 @@ describe("TailscaleModeAdapter", () => {
         helper: dependencies.helper,
         io: dependencies.io,
         probes: dependencies.probes,
-        ownership: dependencies.ownership,
+        ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       });
 
       await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping_conflict", retryable: true });
@@ -283,7 +291,7 @@ describe("TailscaleModeAdapter", () => {
     const dependencies = happyDependencies({ funnel: fixture("serve-compatible.json") });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
     await expect(adapter.prepare()).resolves.toMatchObject({ ready: true, createdByWizard: false });
   });
@@ -309,7 +317,7 @@ describe("TailscaleModeAdapter", () => {
       helper: dependencies.helper,
       io: dependencies.io,
       probes: dependencies.probes,
-      ownership: dependencies.ownership,
+      ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       loginPollAttempts: 2,
       loginPollDelayMs: 0,
     });
@@ -328,7 +336,7 @@ describe("TailscaleModeAdapter", () => {
     unconfirmed.io.confirmCurrentAccount.mockResolvedValue(false);
     const accountAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: unconfirmed.runner, helper: unconfirmed.helper,
-      io: unconfirmed.io, probes: unconfirmed.probes, ownership: unconfirmed.ownership,
+      io: unconfirmed.io, probes: unconfirmed.probes, ownership: unconfirmed.ownership, serveConfigClient: unconfirmed.serveConfigClient,
     });
     await expect(accountAdapter.prepare()).rejects.toMatchObject({ reason: "account_not_confirmed" });
     expect(unconfirmed.calls).not.toContain("up --json --timeout=5s");
@@ -336,7 +344,7 @@ describe("TailscaleModeAdapter", () => {
     const machine = happyDependencies({ status: [fixture("status-machine-auth.json")] });
     const machineAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: machine.runner, helper: machine.helper,
-      io: machine.io, probes: machine.probes, ownership: machine.ownership,
+      io: machine.io, probes: machine.probes, ownership: machine.ownership, serveConfigClient: machine.serveConfigClient,
     });
     await expect(machineAdapter.prepare()).rejects.toMatchObject({ reason: "machine_auth_required" });
     expect(machine.calls.some((call) => call.startsWith("serve --bg "))).toBe(false);
@@ -347,7 +355,7 @@ describe("TailscaleModeAdapter", () => {
     cancelled.helper.discoverTailscale.mockResolvedValue({ state: "paused", reason: "tailscale_not_installed" });
     const cancelledAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: cancelled.runner, helper: cancelled.helper,
-      io: cancelled.io, probes: cancelled.probes, ownership: cancelled.ownership,
+      io: cancelled.io, probes: cancelled.probes, ownership: cancelled.ownership, serveConfigClient: cancelled.serveConfigClient,
     });
     await expect(cancelledAdapter.prepare()).rejects.toMatchObject({ reason: "not_installed" });
     expect(cancelled.helper.installTailscale).not.toHaveBeenCalled();
@@ -359,7 +367,7 @@ describe("TailscaleModeAdapter", () => {
       .mockResolvedValue({ state: "ready", cliPath: executable, daemonPath: "C:\\Program Files\\Tailscale\\tailscaled.exe" });
     const installedAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: installed.runner, helper: installed.helper,
-      io: installed.io, probes: installed.probes, ownership: installed.ownership,
+      io: installed.io, probes: installed.probes, ownership: installed.ownership, serveConfigClient: installed.serveConfigClient,
     });
     await expect(installedAdapter.prepare()).resolves.toMatchObject({ ready: true });
     expect(installed.helper.installTailscale).toHaveBeenCalledTimes(1);
@@ -369,7 +377,7 @@ describe("TailscaleModeAdapter", () => {
     const dependencies = happyDependencies({ preferences: { unattended: false, shieldsUp: true } });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
     await expect(adapter.prepare()).resolves.toMatchObject({ ready: true });
     expect(dependencies.helper.setPreference.mock.calls).toEqual([
@@ -417,7 +425,7 @@ describe("TailscaleModeAdapter", () => {
       });
       await expect(new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
         injectFailure: (boundary) => {
           if (boundary === `${scenario.name.replace("-", "_")}_write`) {
             journalAtFailure = structuredClone(stored);
@@ -438,7 +446,7 @@ describe("TailscaleModeAdapter", () => {
       recovered.ownership.remove.mockImplementation(async () => { recoveredStored = undefined; return true; });
       await new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: recovered.runner, helper: recovered.helper,
-        io: recovered.io, probes: recovered.probes, ownership: recovered.ownership,
+        io: recovered.io, probes: recovered.probes, ownership: recovered.ownership, serveConfigClient: recovered.serveConfigClient,
       }).reconcileOwned();
       expect(recovered.preferenceState).toEqual(scenario.restored);
       expect(recoveredStored).toBeUndefined();
@@ -461,11 +469,11 @@ describe("TailscaleModeAdapter", () => {
     dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping_conflict" });
-    expect(dependencies.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+    expect(dependencies.calls).not.toContain("localapi remove exact mapping");
     expect(dependencies.preferenceState.unattended).toBe(false);
     expect(stored).toBeUndefined();
   });
@@ -477,7 +485,7 @@ describe("TailscaleModeAdapter", () => {
       .mockResolvedValueOnce(false);
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).rejects.toMatchObject({ reason: "incoming_consent_required" });
@@ -499,7 +507,7 @@ describe("TailscaleModeAdapter", () => {
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).rejects.toThrow("remote probe failed");
@@ -530,7 +538,7 @@ describe("TailscaleModeAdapter", () => {
     dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).rejects.toMatchObject({ reason: "account_changed" });
@@ -571,7 +579,7 @@ describe("TailscaleModeAdapter", () => {
     dependencies.ownership.read.mockResolvedValue(owned);
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.reconcileOwned()).rejects.toMatchObject({ reason: "account_changed" });
@@ -594,7 +602,7 @@ describe("TailscaleModeAdapter", () => {
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     let settled = false;
@@ -618,7 +626,7 @@ describe("TailscaleModeAdapter", () => {
       });
       const adapter = new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       });
 
       await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping_conflict" });
@@ -633,7 +641,7 @@ describe("TailscaleModeAdapter", () => {
     declined.io.confirmPreference.mockResolvedValue(false);
     const declinedAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: declined.runner, helper: declined.helper,
-      io: declined.io, probes: declined.probes, ownership: declined.ownership,
+      io: declined.io, probes: declined.probes, ownership: declined.ownership, serveConfigClient: declined.serveConfigClient,
     });
     await expect(declinedAdapter.prepare()).rejects.toMatchObject({ reason: "unattended_consent_required" });
     expect(declined.helper.setPreference).not.toHaveBeenCalled();
@@ -642,7 +650,7 @@ describe("TailscaleModeAdapter", () => {
     managed.helper.setPreference.mockRejectedValue(new Error("fixture policy refusal"));
     const managedAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: managed.runner, helper: managed.helper,
-      io: managed.io, probes: managed.probes, ownership: managed.ownership,
+      io: managed.io, probes: managed.probes, ownership: managed.ownership, serveConfigClient: managed.serveConfigClient,
     });
     await expect(managedAdapter.prepare()).rejects.toMatchObject({ reason: "managed_policy" });
     expect(managed.calls.some((call) => call.startsWith("serve --bg "))).toBe(false);
@@ -654,7 +662,7 @@ describe("TailscaleModeAdapter", () => {
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       loginPollAttempts: 2, loginPollDelayMs: 0,
     });
 
@@ -686,10 +694,10 @@ describe("TailscaleModeAdapter", () => {
       dependencies.probes.remote.mockResolvedValue({ ...baseline, ...override } as never);
       const adapter = new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       });
       await expect(adapter.prepare()).rejects.toBeInstanceOf(Error);
-      expect(dependencies.calls).toContain("serve --tls-terminated-tcp=443 off");
+      expect(dependencies.calls).toContain("localapi remove exact mapping");
       expect(dependencies.ownership.write).toHaveBeenCalledTimes(1);
       expect(dependencies.ownership.remove).toHaveBeenCalledTimes(1);
     }
@@ -700,7 +708,7 @@ describe("TailscaleModeAdapter", () => {
       const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
       const adapter = new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
         injectFailure: (current) => {
           if (current === boundary) throw new Error(`fixture failure: ${boundary}`);
         },
@@ -708,7 +716,7 @@ describe("TailscaleModeAdapter", () => {
       await expect(adapter.prepare()).rejects.toThrow(`fixture failure: ${boundary}`);
       expect({
         boundary,
-        removals: dependencies.calls.filter((call) => call === "serve --tls-terminated-tcp=443 off").length,
+        removals: dependencies.calls.filter((call) => call === "localapi remove exact mapping").length,
         ownershipRemovals: dependencies.ownership.remove.mock.calls.length,
       }).toEqual({ boundary, removals: boundary === "ownership_write" ? 0 : 1, ownershipRemovals: 1 });
     }
@@ -718,21 +726,21 @@ describe("TailscaleModeAdapter", () => {
     const owned = happyDependencies({ serve: fixture("serve-empty.json") });
     const ownedAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: owned.runner, helper: owned.helper,
-      io: owned.io, probes: owned.probes, ownership: owned.ownership,
+      io: owned.io, probes: owned.probes, ownership: owned.ownership, serveConfigClient: owned.serveConfigClient,
     });
     const endpoint = await ownedAdapter.prepare();
     await ownedAdapter.rollbackOwned(endpoint);
-    expect(owned.calls.filter((call) => call === "serve --tls-terminated-tcp=443 off")).toHaveLength(1);
+    expect(owned.calls.filter((call) => call === "localapi remove exact mapping")).toHaveLength(1);
     expect(owned.ownership.remove).toHaveBeenCalledTimes(1);
 
     const reused = happyDependencies();
     const reusedAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: reused.runner, helper: reused.helper,
-      io: reused.io, probes: reused.probes, ownership: reused.ownership,
+      io: reused.io, probes: reused.probes, ownership: reused.ownership, serveConfigClient: reused.serveConfigClient,
     });
     const reusedEndpoint = await reusedAdapter.prepare();
     await reusedAdapter.rollbackOwned(reusedEndpoint);
-    expect(reused.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+    expect(reused.calls).not.toContain("localapi remove exact mapping");
 
     const concurrent = happyDependencies({
       serve: fixture("serve-empty.json"),
@@ -745,11 +753,11 @@ describe("TailscaleModeAdapter", () => {
     });
     const concurrentAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: concurrent.runner, helper: concurrent.helper,
-      io: concurrent.io, probes: concurrent.probes, ownership: concurrent.ownership,
+      io: concurrent.io, probes: concurrent.probes, ownership: concurrent.ownership, serveConfigClient: concurrent.serveConfigClient,
     });
     const concurrentEndpoint = await concurrentAdapter.prepare();
     await concurrentAdapter.rollbackOwned(concurrentEndpoint);
-    expect(concurrent.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+    expect(concurrent.calls).not.toContain("localapi remove exact mapping");
   });
 
   it("reconciles a timed-out create that applied and records exact ownership", async () => {
@@ -763,7 +771,7 @@ describe("TailscaleModeAdapter", () => {
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).resolves.toMatchObject({ createdByWizard: true });
@@ -792,7 +800,7 @@ describe("TailscaleModeAdapter", () => {
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
 
     await expect(adapter.prepare()).resolves.toMatchObject({ createdByWizard: true });
@@ -806,7 +814,7 @@ describe("TailscaleModeAdapter", () => {
     const source = happyDependencies({ serve: fixture("serve-empty.json") });
     await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: source.runner, helper: source.helper,
-      io: source.io, probes: source.probes, ownership: source.ownership,
+      io: source.io, probes: source.probes, ownership: source.ownership, serveConfigClient: source.serveConfigClient,
     }).prepare();
     const provisional = source.ownership.replace.mock.calls
       .find((call) => call[1].phase === "provisional")?.[1];
@@ -822,20 +830,20 @@ describe("TailscaleModeAdapter", () => {
     });
     const endpoint = await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: resumed.runner, helper: resumed.helper,
-      io: resumed.io, probes: resumed.probes, ownership: resumed.ownership,
+      io: resumed.io, probes: resumed.probes, ownership: resumed.ownership, serveConfigClient: resumed.serveConfigClient,
     }).prepare();
 
     expect(endpoint.createdByWizard).toBe(true);
     expect(stored).toMatchObject({ phase: "active" });
     expect(resumed.calls.some((call) => call.startsWith("serve --bg "))).toBe(false);
-    expect(resumed.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+    expect(resumed.calls).not.toContain("localapi remove exact mapping");
   });
 
   it("conditionally removes exact provisional Serve state during crash or uninstall recovery", async () => {
     const source = happyDependencies({ serve: fixture("serve-empty.json") });
     await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: source.runner, helper: source.helper,
-      io: source.io, probes: source.probes, ownership: source.ownership,
+      io: source.io, probes: source.probes, ownership: source.ownership, serveConfigClient: source.serveConfigClient,
     }).prepare();
     const provisional = source.ownership.replace.mock.calls
       .find((call) => call[1].phase === "provisional")![1];
@@ -850,10 +858,10 @@ describe("TailscaleModeAdapter", () => {
     });
     await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: recovered.runner, helper: recovered.helper,
-      io: recovered.io, probes: recovered.probes, ownership: recovered.ownership,
+      io: recovered.io, probes: recovered.probes, ownership: recovered.ownership, serveConfigClient: recovered.serveConfigClient,
     }).reconcileOwned();
 
-    expect(recovered.calls.filter((call) => call === "serve --tls-terminated-tcp=443 off")).toHaveLength(1);
+    expect(recovered.calls.filter((call) => call === "localapi remove exact mapping")).toHaveLength(1);
     expect(stored).toBeUndefined();
 
     const concurrent = happyDependencies({ serve: fixture("serve-conflicting-tcp.json") });
@@ -862,9 +870,9 @@ describe("TailscaleModeAdapter", () => {
     concurrent.ownership.remove.mockImplementation(async () => { concurrentStored = undefined; return true; });
     await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: concurrent.runner, helper: concurrent.helper,
-      io: concurrent.io, probes: concurrent.probes, ownership: concurrent.ownership,
+      io: concurrent.io, probes: concurrent.probes, ownership: concurrent.ownership, serveConfigClient: concurrent.serveConfigClient,
     }).reconcileOwned();
-    expect(concurrent.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+    expect(concurrent.calls).not.toContain("localapi remove exact mapping");
     expect(concurrentStored).toBeUndefined();
   });
 
@@ -881,7 +889,7 @@ describe("TailscaleModeAdapter", () => {
     initial.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
     await new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: initial.runner, helper: initial.helper,
-      io: initial.io, probes: initial.probes, ownership: initial.ownership,
+      io: initial.io, probes: initial.probes, ownership: initial.ownership, serveConfigClient: initial.serveConfigClient,
     }).prepare();
     expect(stored).toMatchObject({ phase: "active", preferenceRestorations: [] });
 
@@ -894,7 +902,7 @@ describe("TailscaleModeAdapter", () => {
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: repeated.runner, helper: repeated.helper,
-      io: repeated.io, probes: repeated.probes, ownership: repeated.ownership,
+      io: repeated.io, probes: repeated.probes, ownership: repeated.ownership, serveConfigClient: repeated.serveConfigClient,
     });
     const endpoint = await adapter.prepare();
 
@@ -917,12 +925,12 @@ describe("TailscaleModeAdapter", () => {
     });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       cliTimeoutMs: 100,
     });
 
     await expect(adapter.prepare(controller.signal)).rejects.toMatchObject({ retryable: true });
-    expect(dependencies.calls).toContain("serve --tls-terminated-tcp=443 off");
+    expect(dependencies.calls).toContain("localapi remove exact mapping");
     expect(dependencies.ownership.write).toHaveBeenCalledTimes(1);
     expect(dependencies.ownership.remove).toHaveBeenCalledTimes(1);
   });
@@ -936,7 +944,7 @@ describe("TailscaleModeAdapter", () => {
       dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
       const adapter = new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
         injectFailure: (current) => {
           if (current === boundary) throw new Error(`fixture failure: ${boundary}`);
         },
@@ -946,11 +954,11 @@ describe("TailscaleModeAdapter", () => {
 
       const resumed = new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       });
       await expect(resumed.rollbackOwned(endpoint)).resolves.toBeUndefined();
       expect(stored).toBeUndefined();
-      expect(dependencies.calls.filter((call) => call === "serve --tls-terminated-tcp=443 off")).toHaveLength(1);
+      expect(dependencies.calls.filter((call) => call === "localapi remove exact mapping")).toHaveLength(1);
     }
 
     const timedOut = happyDependencies({ serve: fixture("serve-empty.json") });
@@ -960,14 +968,13 @@ describe("TailscaleModeAdapter", () => {
     timedOut.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
     const timedOutAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: timedOut.runner, helper: timedOut.helper,
-      io: timedOut.io, probes: timedOut.probes, ownership: timedOut.ownership,
+      io: timedOut.io, probes: timedOut.probes, ownership: timedOut.ownership, serveConfigClient: timedOut.serveConfigClient,
     });
     const endpoint = await timedOutAdapter.prepare();
-    const original = timedOut.runner.getMockImplementation()!;
-    timedOut.runner.mockImplementation(async (...args) => {
-      const result = await original(...args);
-      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off") throw new TailscaleCliError("timeout");
-      return result;
+    const originalRemoval = timedOut.serveConfigClient.removeExactTlsTerminatedMapping.getMockImplementation()!;
+    timedOut.serveConfigClient.removeExactTlsTerminatedMapping.mockImplementation(async (...args) => {
+      await originalRemoval(...args);
+      throw new TailscaleCliError("timeout");
     });
     await expect(timedOutAdapter.rollbackOwned(endpoint)).resolves.toBeUndefined();
     expect(stored).toBeUndefined();
@@ -979,15 +986,15 @@ describe("TailscaleModeAdapter", () => {
     aborted.ownership.remove.mockImplementation(async () => { abortedStored = undefined; return true; });
     const abortedAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: aborted.runner, helper: aborted.helper,
-      io: aborted.io, probes: aborted.probes, ownership: aborted.ownership,
+      io: aborted.io, probes: aborted.probes, ownership: aborted.ownership, serveConfigClient: aborted.serveConfigClient,
       cliTimeoutMs: 100,
     });
     const abortedEndpoint = await abortedAdapter.prepare();
     const controller = new AbortController();
-    const abortedOriginal = aborted.runner.getMockImplementation()!;
-    aborted.runner.mockImplementation(async (...args) => {
+    const abortedOriginal = aborted.serveConfigClient.removeExactTlsTerminatedMapping.getMockImplementation()!;
+    aborted.serveConfigClient.removeExactTlsTerminatedMapping.mockImplementation(async (...args) => {
       const result = await abortedOriginal(...args);
-      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off") controller.abort();
+      controller.abort();
       return result;
     });
     await expect(abortedAdapter.rollbackOwned(abortedEndpoint, controller.signal)).rejects.toBeDefined();
@@ -1007,20 +1014,20 @@ describe("TailscaleModeAdapter", () => {
     dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
     await adapter.prepare();
     const controller = new AbortController();
-    const original = dependencies.runner.getMockImplementation()!;
-    dependencies.runner.mockImplementation(async (...args) => {
+    const original = dependencies.serveConfigClient.removeExactTlsTerminatedMapping.getMockImplementation()!;
+    dependencies.serveConfigClient.removeExactTlsTerminatedMapping.mockImplementation(async (...args) => {
       const result = await original(...args);
-      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off") controller.abort();
+      controller.abort();
       return result;
     });
 
     await expect(adapter.reconcileOwned(controller.signal)).rejects.toBeDefined();
     expect(stored).toBeDefined();
-    const removal = dependencies.calls.lastIndexOf("serve --tls-terminated-tcp=443 off");
+    const removal = dependencies.calls.lastIndexOf("localapi remove exact mapping");
     expect(dependencies.calls.slice(removal + 1)).not.toContain("serve status --json");
     expect(dependencies.calls.slice(removal + 1)).not.toContain("funnel status --json");
   });
@@ -1038,18 +1045,37 @@ describe("TailscaleModeAdapter", () => {
     dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
     const endpoint = await adapter.prepare();
-    const original = dependencies.runner.getMockImplementation()!;
-    dependencies.runner.mockImplementation(async (...args) => {
-      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off")
-        return { exitCode: 0, stdout: "", stderr: "" };
-      return original(...args);
-    });
+    dependencies.serveConfigClient.removeExactTlsTerminatedMapping.mockResolvedValue("removed");
 
     await expect(adapter.rollbackOwned(endpoint)).rejects.toMatchObject({ reason: "mapping" });
     expect(stored).toMatchObject({ phase: "active", ownershipSubtype: "wizard-created" });
+  });
+
+  it("retains ownership and never invokes CLI off when LocalAPI reports a concurrent ServeConfig swap", async () => {
+    const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
+    let stored: Awaited<ReturnType<typeof dependencies.ownership.read>>;
+    dependencies.ownership.read.mockImplementation(async () => stored);
+    dependencies.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+    dependencies.ownership.replace.mockImplementation(async (expected, replacement) => {
+      if (stored !== expected) return false;
+      stored = replacement;
+      return true;
+    });
+    dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      serveConfigClient: dependencies.serveConfigClient,
+    });
+    const endpoint = await adapter.prepare();
+    dependencies.serveConfigClient.removeExactTlsTerminatedMapping.mockResolvedValue("concurrent");
+
+    await expect(adapter.rollbackOwned(endpoint)).rejects.toMatchObject({ reason: "mapping" });
+    expect(stored).toMatchObject({ phase: "active", ownershipSubtype: "wizard-created" });
+    expect(dependencies.calls).not.toContain("serve --tls-terminated-tcp=443 off");
   });
 
   it("throws typed mapping failure immediately when prepare rollback cannot remove exact Serve state", async () => {
@@ -1062,15 +1088,10 @@ describe("TailscaleModeAdapter", () => {
       stored = replacement;
       return true;
     });
-    const original = dependencies.runner.getMockImplementation()!;
-    dependencies.runner.mockImplementation(async (...args) => {
-      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off")
-        return { exitCode: 0, stdout: "", stderr: "" };
-      return original(...args);
-    });
+    dependencies.serveConfigClient.removeExactTlsTerminatedMapping.mockResolvedValue("removed");
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       injectFailure: (boundary) => {
         if (boundary === "mapping_create") throw new Error("simulated post-create process loss");
       },
@@ -1092,7 +1113,7 @@ describe("TailscaleModeAdapter", () => {
       dependencies.helper.installTailscale.mockRejectedValue(new WindowsHelperError(helperReason));
       const adapter = new TailscaleModeAdapter({
         gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
       });
       await expect(adapter.prepare()).rejects.toMatchObject({
         retryable: true, reason: pauseReason, detail: helperReason,
@@ -1103,7 +1124,7 @@ describe("TailscaleModeAdapter", () => {
     browser.helper.openBrowser.mockRejectedValue(new WindowsHelperError("browser_open_failed"));
     const browserAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: browser.runner, helper: browser.helper,
-      io: browser.io, probes: browser.probes, ownership: browser.ownership,
+      io: browser.io, probes: browser.probes, ownership: browser.ownership, serveConfigClient: browser.serveConfigClient,
     });
     await expect(browserAdapter.prepare()).rejects.toMatchObject({
       reason: "login_browser_failed", detail: "browser_open_failed", retryable: true,
@@ -1113,7 +1134,7 @@ describe("TailscaleModeAdapter", () => {
     policy.helper.setPreference.mockRejectedValue(new WindowsHelperError("preference_cancelled"));
     const policyAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: policy.runner, helper: policy.helper,
-      io: policy.io, probes: policy.probes, ownership: policy.ownership,
+      io: policy.io, probes: policy.probes, ownership: policy.ownership, serveConfigClient: policy.serveConfigClient,
     });
     await expect(policyAdapter.prepare()).rejects.toMatchObject({
       reason: "preference_cancelled", detail: "preference_cancelled", retryable: true,
@@ -1123,7 +1144,7 @@ describe("TailscaleModeAdapter", () => {
     verification.helper.setPreference.mockResolvedValue(undefined);
     const verificationAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: verification.runner, helper: verification.helper,
-      io: verification.io, probes: verification.probes, ownership: verification.ownership,
+      io: verification.io, probes: verification.probes, ownership: verification.ownership, serveConfigClient: verification.serveConfigClient,
     });
     await expect(verificationAdapter.prepare()).rejects.toMatchObject({
       reason: "preference_verification_failed", detail: "preference_verification_failed", retryable: true,
@@ -1137,7 +1158,7 @@ describe("TailscaleModeAdapter", () => {
     });
     const loginAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: login.runner, helper: login.helper,
-      io: login.io, probes: login.probes, ownership: login.ownership,
+      io: login.io, probes: login.probes, ownership: login.ownership, serveConfigClient: login.serveConfigClient,
     });
     await expect(loginAdapter.prepare()).rejects.toMatchObject({
       reason: "login_failed", detail: "malformed_json", retryable: true,
@@ -1146,7 +1167,7 @@ describe("TailscaleModeAdapter", () => {
     const status = happyDependencies({ status: [fixture("status-unverifiable.json")] });
     const statusAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: status.runner, helper: status.helper,
-      io: status.io, probes: status.probes, ownership: status.ownership,
+      io: status.io, probes: status.probes, ownership: status.ownership, serveConfigClient: status.serveConfigClient,
     });
     await expect(statusAdapter.prepare()).rejects.toMatchObject({
       reason: "status_unavailable", detail: "invalid_status", retryable: true,
@@ -1159,7 +1180,7 @@ describe("TailscaleModeAdapter", () => {
       : original(...args));
     const consentAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: consent.runner, helper: consent.helper,
-      io: consent.io, probes: consent.probes, ownership: consent.ownership,
+      io: consent.io, probes: consent.probes, ownership: consent.ownership, serveConfigClient: consent.serveConfigClient,
     });
     const error = await consentAdapter.prepare().catch((caught: unknown) => caught);
     expect(error).toMatchObject({ reason: "https_consent_failed", detail: "unexpected_output", retryable: true });
@@ -1210,7 +1231,7 @@ describe("TailscaleModeAdapter", () => {
     absent.helper.discoverTailscale.mockResolvedValue({ state: "paused", reason: "tailscale_not_installed" });
     const absentAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: absent.runner, helper: absent.helper,
-      io: absent.io, probes: absent.probes, ownership: absent.ownership,
+      io: absent.io, probes: absent.probes, ownership: absent.ownership, serveConfigClient: absent.serveConfigClient,
     });
     await expect(absentAdapter.inspect()).rejects.toMatchObject({ reason: "not_installed" });
     expect(absent.io.offerInstall).not.toHaveBeenCalled();
@@ -1219,7 +1240,7 @@ describe("TailscaleModeAdapter", () => {
     const changed = happyDependencies({ preferences: { unattended: true, shieldsUp: true } });
     const changedAdapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: changed.runner, helper: changed.helper,
-      io: changed.io, probes: changed.probes, ownership: changed.ownership,
+      io: changed.io, probes: changed.probes, ownership: changed.ownership, serveConfigClient: changed.serveConfigClient,
     });
     await expect(changedAdapter.inspect()).rejects.toMatchObject({ reason: "status" });
     expect(changed.helper.setPreference).not.toHaveBeenCalled();
@@ -1229,10 +1250,10 @@ describe("TailscaleModeAdapter", () => {
     const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
     const adapter = new TailscaleModeAdapter({
       gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
-      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership, serveConfigClient: dependencies.serveConfigClient,
     });
     const endpoint = await adapter.prepare();
     await adapter.rollbackOwned({ ...endpoint, accountTailnetHash: "f".repeat(64) });
-    expect(dependencies.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+    expect(dependencies.calls).not.toContain("localapi remove exact mapping");
   });
 });

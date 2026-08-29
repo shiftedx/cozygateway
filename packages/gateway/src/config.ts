@@ -1,5 +1,5 @@
 import { chmodSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { type Static, Type } from "@sinclair/typebox";
@@ -241,7 +241,13 @@ export function loadConfig(path: string): GatewayConfig {
       seen.add(profile);
     }
   }
-  return config;
+  const configDirectory = dirname(resolve(path));
+  return {
+    ...config,
+    dbPath: config.dbPath === ":memory:" || isAbsolute(config.dbPath)
+      ? config.dbPath
+      : resolve(configDirectory, config.dbPath),
+  };
 }
 
 /** Atomic, permission-preserving whole-file replacement used by the authenticated management API. */

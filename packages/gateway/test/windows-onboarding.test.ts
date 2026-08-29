@@ -197,6 +197,7 @@ function dependencies(storage: Storage, inventory: WindowsLanInventory, control:
     health: vi.fn(async () => ({ ok: true, attachReady: true })),
     websocket: vi.fn(async () => true),
     tlsProbe: vi.fn(async (host: string) => ({ authorized: true, dnsNames: [host], alpn: "http/1.1" as const })),
+    preflightListener: vi.fn(async () => undefined),
     now: clock,
     delay: vi.fn(async () => undefined),
     createSetupCode: vi.fn(() => "COZY-1234"),
@@ -507,7 +508,8 @@ describe("createWindowsOnboardingController composition", () => {
       outcome: "complete", endpoint: { physicalAdapterId: "wifi", dhcpAddress: "10.0.0.8" },
     });
     expect(io.question).toHaveBeenCalledTimes(2);
-    expect(readFileSync(join(dirname(configPath), "network-onboarding-lan-adapter"), "utf8")).toBe("wifi\n");
+    expect(JSON.parse(readFileSync(join(dirname(configPath), "network-onboarding-lan-adapter"), "utf8")))
+      .toEqual({ adapterId: "wifi", address: "10.0.0.8" });
     controller.close();
 
     const resumedStorage = openStorage(join(dirname(configPath), "gateway.sqlite"));
@@ -539,7 +541,8 @@ describe("createWindowsOnboardingController composition", () => {
     });
     expect(replacementIo.question).toHaveBeenCalledTimes(2);
     const selectionPath = join(dirname(configPath), "network-onboarding-lan-adapter");
-    expect(readFileSync(selectionPath, "utf8")).toBe("ethernet\n");
+    expect(JSON.parse(readFileSync(selectionPath, "utf8")))
+      .toEqual({ adapterId: "ethernet", address: "192.168.1.20" });
     expect(replacementDeps.helper.protectPath).toHaveBeenCalledWith(dirname(dirname(configPath)), selectionPath, undefined);
     replacement.close();
   });
@@ -757,7 +760,7 @@ describe("createWindowsOnboardingController composition", () => {
 
     vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
     await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toMatchObject({
-      reason: "rollback_failed",
+      code: "listener_changed",
     });
     expect(readManagedListenerSnapshot(configPath)).toEqual(externalSnapshot);
     const reopened = openStorage(join(dirname(configPath), "gateway.sqlite"));

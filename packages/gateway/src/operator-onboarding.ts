@@ -7,6 +7,7 @@ const CONTROL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const CHALLENGE_ID = /^[A-Za-z0-9-]{1,128}$/;
 const MAX_BODY_BYTES = 512;
 const MAX_RESPONSE_BYTES = 4_096;
+const BODY_READ_TIMEOUT_MS = 5_000;
 
 export type OperatorPhoneStatus =
   | { state: "pending"; expiresAt: number }
@@ -27,6 +28,7 @@ export interface OperatorPhoneVerification {
 export interface OperatorOnboardingControlOptions {
   token: string;
   phoneVerification: OperatorPhoneVerification;
+  bodyReadTimeoutMs?: number;
 }
 
 export function operatorOnboardingNotFound(): Response {
@@ -60,13 +62,22 @@ function loopback(remoteAddress: string | undefined): boolean {
     || remoteAddress?.startsWith("::ffff:127.") === true;
 }
 
-async function boundedJson(request: Request): Promise<unknown | undefined> {
+async function boundedJson(request: Request, timeoutMs: number): Promise<unknown | undefined> {
   const length = request.headers.get("content-length");
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_BODY_BYTES)) return undefined;
   const reader = request.body?.getReader();
   if (reader === undefined) return undefined;
   const chunks: Uint8Array[] = [];
   let size = 0;
+  let interrupted = false;
+  const interrupt = () => {
+    interrupted = true;
+    void reader.cancel().catch(() => {});
+  };
+  request.signal.addEventListener("abort", interrupt, { once: true });
+  if (request.signal.aborted) interrupt();
+  const timer = setTimeout(interrupt, timeoutMs);
+  timer.unref?.();
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -80,7 +91,11 @@ async function boundedJson(request: Request): Promise<unknown | undefined> {
     }
   } catch {
     return undefined;
+  } finally {
+    clearTimeout(timer);
+    request.signal.removeEventListener("abort", interrupt);
   }
+  if (interrupted) return undefined;
   const bytes = new Uint8Array(size);
   let offset = 0;
   for (const chunk of chunks) {
@@ -123,24 +138,31 @@ export function loadOperatorControlToken(path: string): string {
 export class OperatorOnboardingControl {
   readonly #token: Buffer;
   readonly #phoneVerification: OperatorPhoneVerification;
+  readonly #bodyReadTimeoutMs: number;
 
   constructor(options: OperatorOnboardingControlOptions) {
     if (!CONTROL_TOKEN.test(options.token)) throw new Error("invalid operator control token");
+    const timeout = options.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 30_000)
+      throw new Error("invalid operator body timeout");
     this.#token = Buffer.from(options.token, "ascii");
     this.#phoneVerification = options.phoneVerification;
+    this.#bodyReadTimeoutMs = timeout;
   }
 
-  async handle(request: Request, remoteAddress: string | undefined): Promise<Response> {
+  async handle(request: Request, remoteAddress: string | undefined, localAddress?: string): Promise<Response> {
     const authorization = request.headers.get("authorization") ?? "";
     const candidate = authorization.startsWith("Bearer ")
       ? Buffer.from(authorization.slice(7), "ascii")
       : Buffer.alloc(0);
     const authenticated = candidate.length === this.#token.length
       && timingSafeEqual(candidate, this.#token);
-    if (!loopback(remoteAddress) || !authenticated || request.method !== "POST") return operatorOnboardingNotFound();
+    const sameMachineInterface = remoteAddress !== undefined && localAddress !== undefined
+      && remoteAddress.replace(/^::ffff:/, "") === localAddress.replace(/^::ffff:/, "");
+    if ((!loopback(remoteAddress) && !sameMachineInterface) || !authenticated || request.method !== "POST") return operatorOnboardingNotFound();
     if (request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json")
       return operatorOnboardingNotFound();
-    const body = await boundedJson(request);
+    const body = await boundedJson(request, this.#bodyReadTimeoutMs);
     if (!record(body) || typeof body.action !== "string") return operatorOnboardingNotFound();
 
     if (
@@ -274,7 +296,7 @@ export class OperatorOnboardingClient {
     if (!CONTROL_TOKEN.test(options.token)) throw new Error("invalid operator control token");
     const origin = new URL(options.localOrigin);
     if ((origin.protocol !== "http:" && origin.protocol !== "https:")
-      || !new Set(["127.0.0.1", "::1", "localhost"]).has(origin.hostname)
+      || origin.hostname.length === 0
       || origin.username !== "" || origin.password !== "" || origin.pathname !== "/"
       || origin.search !== "" || origin.hash !== "")
       throw new Error("local onboarding control requires a loopback origin");

@@ -8,6 +8,7 @@ export type WindowsHelperCommand =
   | "discover-tailscale"
   | "install-tailscale"
   | "set-preference"
+  | "set-preference-cleanup"
   | "open-browser"
   | "initialize-pending"
   | "protect-path"
@@ -37,6 +38,7 @@ export type WindowsHelperReason =
   | "preference_failed"
   | "preference_cancelled"
   | "preference_verification_failed"
+  | "preference_elevation_required"
   | "browser_url_rejected"
   | "browser_open_failed"
   | "inventory_failed"
@@ -126,7 +128,7 @@ function validReason(value: unknown): value is WindowsHelperReason {
     "tailscale_not_installed", "tailscale_legacy_unsupported", "tailscale_service_mismatch",
     "tailscale_signature_invalid", "tailscale_publisher_invalid", "tailscale_prerequisite_disabled",
     "download_failed", "download_redirect_rejected", "download_too_large", "installer_signature_invalid",
-    "installer_cancelled", "installer_reboot_required", "installer_failed", "preference_failed", "preference_cancelled", "preference_verification_failed",
+    "installer_cancelled", "installer_reboot_required", "installer_failed", "preference_failed", "preference_cancelled", "preference_verification_failed", "preference_elevation_required",
     "browser_url_rejected", "browser_open_failed", "inventory_failed", "internal_error",
     "network_inspection_failed",
   ]).has(value as WindowsHelperReason);
@@ -143,6 +145,12 @@ const COMMAND_FAILURE_REASONS: Record<WindowsHelperCommand, ReadonlySet<WindowsH
     ...COMMON_FAILURE_REASONS, "tailscale_not_installed", "tailscale_legacy_unsupported",
     "tailscale_service_mismatch", "tailscale_signature_invalid", "tailscale_publisher_invalid",
     "tailscale_prerequisite_disabled", "preference_failed", "preference_cancelled",
+    "preference_verification_failed",
+  ]),
+  "set-preference-cleanup": new Set([
+    ...COMMON_FAILURE_REASONS, "tailscale_not_installed", "tailscale_legacy_unsupported",
+    "tailscale_service_mismatch", "tailscale_signature_invalid", "tailscale_publisher_invalid",
+    "tailscale_prerequisite_disabled", "preference_failed", "preference_elevation_required",
     "preference_verification_failed",
   ]),
   "open-browser": new Set([...COMMON_FAILURE_REASONS, "browser_url_rejected", "browser_open_failed"]),
@@ -203,7 +211,6 @@ export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, o
     shell: options.shell,
     windowsHide: options.windowsHide,
     stdio: ["pipe", "pipe", "pipe"],
-    signal: options.signal,
   });
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
@@ -222,7 +229,13 @@ export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, o
     pendingError = error;
     clearTimeout(timer);
     if (child.pid === undefined) rejectNow(error);
-    else child.kill();
+    else if (process.platform === "win32" && process.env.SystemRoot !== undefined) {
+      const killer = spawn(`${process.env.SystemRoot}\\System32\\taskkill.exe`, ["/pid", String(child.pid), "/t", "/f"], {
+        shell: false, windowsHide: true, stdio: "ignore",
+      });
+      killer.once("error", () => child.kill());
+      killer.once("close", () => child.kill());
+    } else child.kill();
   };
   const timer = setTimeout(() => terminate(new WindowsHelperProtocolError("Windows helper timed out")), options.timeoutMs);
   child.on("error", (error) => {
@@ -230,6 +243,8 @@ export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, o
     else terminate(error);
   });
   child.stdin.on("error", terminate);
+  const abort = () => terminate(new WindowsHelperProtocolError("Windows helper aborted"));
+  options.signal?.addEventListener("abort", abort, { once: true });
   child.stdout.on("data", (chunk: Buffer) => {
     stdoutBytes += chunk.length;
     if (stdoutBytes > options.maxOutputBytes) return terminate(new WindowsHelperProtocolError("Windows helper response exceeded its bound"));
@@ -243,10 +258,12 @@ export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, o
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    options.signal?.removeEventListener("abort", abort);
     if (pendingError !== undefined) reject(pendingError);
     else resolve({ exitCode: code ?? 1, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
   });
   child.stdin.end(options.stdin, "utf8");
+  if (options.signal?.aborted) abort();
 });
 
 export class WindowsHelperClient {
@@ -303,6 +320,10 @@ export class WindowsHelperClient {
 
   async setPreference(preference: "unattended" | "shields-up", enabled: boolean, signal?: AbortSignal): Promise<void> {
     if (!applied(await this.#invoke("set-preference", { preference, enabled }, signal))) throw new WindowsHelperProtocolError();
+  }
+
+  async setPreferenceForCleanup(preference: "unattended" | "shields-up", enabled: boolean, signal?: AbortSignal): Promise<void> {
+    if (!applied(await this.#invoke("set-preference-cleanup", { preference, enabled }, signal))) throw new WindowsHelperProtocolError();
   }
 
   async openBrowser(purpose: "login" | "https-consent", url: string, signal?: AbortSignal): Promise<void> {

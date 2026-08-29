@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { lstatSync, realpathSync } from "node:fs";
 
 import type {
   AttachmentBlock,
@@ -4098,9 +4099,37 @@ function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
   };
 }
 
-export function openStorage(dbPath: string, options: { mustExist?: boolean } = {}): Storage {
+export interface StorageFileIdentity {
+  canonicalPath: string;
+  device: number;
+  inode: number;
+}
+
+export function storageFileIdentity(dbPath: string): StorageFileIdentity {
+  const state = lstatSync(dbPath);
+  if (!state.isFile() || state.isSymbolicLink()) throw new Error("SQLite authority is not a safe regular file");
+  return { canonicalPath: realpathSync.native(dbPath), device: state.dev, inode: state.ino };
+}
+
+export function openStorage(
+  dbPath: string,
+  options: { mustExist?: boolean; expectedFile?: StorageFileIdentity } = {},
+): Storage {
   const sqlitePath = options.mustExist ? `${pathToFileURL(dbPath).href}?mode=rw` : dbPath;
   const db = new DatabaseSync(sqlitePath);
+  if (options.expectedFile !== undefined) {
+    try {
+      const observed = storageFileIdentity(dbPath);
+      const samePath = process.platform === "win32"
+        ? observed.canonicalPath.toLowerCase() === options.expectedFile.canonicalPath.toLowerCase()
+        : observed.canonicalPath === options.expectedFile.canonicalPath;
+      if (!samePath || observed.device !== options.expectedFile.device || observed.inode !== options.expectedFile.inode)
+        throw new Error("SQLite authority changed while it was being opened");
+    } catch (error) {
+      db.close();
+      throw error;
+    }
+  }
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
