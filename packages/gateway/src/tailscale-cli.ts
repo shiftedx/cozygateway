@@ -331,7 +331,7 @@ class IncrementalJsonObjectBound {
   }
 }
 
-const defaultRunner: TailscaleCliRunner = (executable, argv, options) => new Promise((resolve, reject) => {
+export const runTailscaleCliProcess: TailscaleCliRunner = (executable, argv, options) => new Promise((resolve, reject) => {
   const child = spawn(executable, [...argv], {
     shell: options.shell,
     windowsHide: options.windowsHide,
@@ -342,11 +342,17 @@ const defaultRunner: TailscaleCliRunner = (executable, argv, options) => new Pro
   const stderr: Buffer[] = [];
   let total = 0;
   let settled = false;
-  const finishError = (error: Error) => {
+  let pendingError: Error | undefined;
+  const rejectNow = (error: Error) => {
     if (settled) return;
     settled = true;
-    child.kill();
     reject(error);
+  };
+  const finishError = (error: Error) => {
+    if (settled || pendingError !== undefined) return;
+    pendingError = error;
+    if (child.pid === undefined) rejectNow(error);
+    else child.kill();
   };
   const collect = (destination: Buffer[], observe?: (chunk: Uint8Array) => void) => (chunk: Buffer) => {
     total += chunk.byteLength;
@@ -367,7 +373,8 @@ const defaultRunner: TailscaleCliRunner = (executable, argv, options) => new Pro
   child.on("close", (code) => {
     if (settled) return;
     settled = true;
-    resolve({ exitCode: code ?? 1, stdout, stderr });
+    if (pendingError !== undefined) reject(pendingError);
+    else resolve({ exitCode: code ?? 1, stdout, stderr });
   });
 });
 
@@ -380,7 +387,7 @@ export class TailscaleCli {
     if (!isFullyQualifiedWindowsPath(options.executable))
       throw new Error("a fully qualified trusted Tailscale executable path is required");
     this.#executable = options.executable;
-    this.#runner = options.runner ?? defaultRunner;
+    this.#runner = options.runner ?? runTailscaleCliProcess;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
   }
 
@@ -410,28 +417,33 @@ export class TailscaleCli {
       controller.abort();
       rejectDeadline(new TailscaleCliError("timeout"));
     }, this.#timeoutMs);
+    const run = Promise.resolve().then(() => this.#runner(this.#executable, [...argv], {
+      shell: false,
+      windowsHide: true,
+      timeoutMs: this.#timeoutMs,
+      maxObjectBytes: TAILSCALE_CLI_MAX_OBJECT_BYTES,
+      maxTotalBytes: TAILSCALE_CLI_MAX_TOTAL_BYTES,
+      signal: controller.signal,
+      onStdoutChunk: onStdoutChunk === undefined ? undefined : (chunk) => {
+        onStdoutChunk(chunk);
+        if (stopAfterStdout?.() === true && !stopRequested) {
+          stopRequested = true;
+          controller.abort();
+        }
+      },
+    }));
     try {
-      const run = Promise.resolve().then(() => this.#runner(this.#executable, [...argv], {
-        shell: false,
-        windowsHide: true,
-        timeoutMs: this.#timeoutMs,
-        maxObjectBytes: TAILSCALE_CLI_MAX_OBJECT_BYTES,
-        maxTotalBytes: TAILSCALE_CLI_MAX_TOTAL_BYTES,
-        signal: controller.signal,
-        onStdoutChunk: onStdoutChunk === undefined ? undefined : (chunk) => {
-          onStdoutChunk(chunk);
-          if (stopAfterStdout?.() === true && !stopRequested) {
-            stopRequested = true;
-            controller.abort();
-          }
-        },
-      }));
       const result = await Promise.race([run, deadline, cancellation]);
       const total = chunks(result.stdout).reduce((sum, part) => sum + bytes(part).byteLength, 0)
         + chunks(result.stderr).reduce((sum, part) => sum + bytes(part).byteLength, 0);
       if (total > TAILSCALE_CLI_MAX_TOTAL_BYTES) throw new TailscaleCliError("output_too_large");
       return result;
     } catch (error) {
+      // The production runner rejects only from ChildProcess `close`, so awaiting it here
+      // prevents cleanup from closing SQLite while tailscale.exe is still terminating.
+      if ((timedOut || cancelled) && this.#runner === runTailscaleCliProcess) {
+        try { await run; } catch { /* Preserve the stable timeout/cancellation reason below. */ }
+      }
       if (stopRequested && !timedOut && !cancelled && !(error instanceof TailscaleCliError))
         return { exitCode: 0, stdout: "", stderr: "" };
       if (error instanceof TailscaleCliError) throw error;

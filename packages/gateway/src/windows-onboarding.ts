@@ -1,5 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { isIP } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { connect as tlsConnect } from "node:tls";
@@ -171,6 +183,36 @@ async function withDeadline<T>(
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
+  }
+}
+
+const NETWORK_CLEANUP_TOTAL_TIMEOUT_MS = 120_000;
+const NETWORK_CLEANUP_ADAPTER_TIMEOUT_MS = 30_000;
+
+async function runBoundedCleanupAdapter(
+  name: string,
+  parentSignal: AbortSignal,
+  operation: (signal: AbortSignal) => Promise<void>,
+): Promise<void> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abort = () => controller.abort(parentSignal.reason);
+  parentSignal.addEventListener("abort", abort, { once: true });
+  if (parentSignal.aborted) abort();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(`${name} cleanup timed out`));
+  }, NETWORK_CLEANUP_ADAPTER_TIMEOUT_MS);
+  try {
+    await operation(controller.signal);
+    if (timedOut) throw new Error(`${name} cleanup timed out`);
+    if (parentSignal.aborted) throw parentSignal.reason ?? new Error("network cleanup cancelled");
+  } catch (error) {
+    if (timedOut) throw new Error(`${name} cleanup timed out`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    parentSignal.removeEventListener("abort", abort);
   }
 }
 
@@ -645,7 +687,7 @@ export class WindowsTailscaleAdapter implements NetworkModeAdapter {
     this.#runtime = input.runtime;
   }
 
-  async #ensureLoopback(): Promise<void> {
+  async #ensureLoopback(signal?: AbortSignal): Promise<void> {
     const config = loadConfig(this.#configPath);
     if ((config.host ?? "127.0.0.1") === "127.0.0.1" && config.publicUrl === undefined) return;
     const snapshot = readManagedListenerSnapshot(this.#configPath);
@@ -653,14 +695,14 @@ export class WindowsTailscaleAdapter implements NetworkModeAdapter {
       this.#configPath, snapshot, "127.0.0.1", config.port, { clearPublicUrl: true },
     )) throw Object.assign(new Error("listener changed"), { retryable: true as const, reason: "listener_changed" });
     const profiles = readManagedListenerSnapshot(this.#configPath).profiles;
-    await this.#helper.protectPath(this.#installRoot, this.#configPath);
+    await this.#helper.protectPath(this.#installRoot, this.#configPath, signal);
     await Promise.all(profiles.map((profile) =>
-      this.#runtime.restartHermesProfile(profile.executable, profile.profile)));
-    await this.#runtime.waitForGatewayReady(this.#configPath);
+      this.#runtime.restartHermesProfile(profile.executable, profile.profile, signal)));
+    await this.#runtime.waitForGatewayReady(this.#configPath, signal);
   }
 
   async prepare(signal?: AbortSignal): Promise<PreparedEndpoint> {
-    await this.#ensureLoopback();
+    await this.#ensureLoopback(signal);
     return this.#delegate.prepare(signal);
   }
 
@@ -867,7 +909,7 @@ function createWindowsLanRuntime(
         ...(options.persistReplacementConfig === true ? { persistenceConfig: planned.configText } : {}),
       };
     },
-    compareAndSwapListener: async (expected, replacement) => {
+    compareAndSwapListener: async (expected, replacement, signal) => {
       await dependencies.beforeListenerCas?.();
       if (!sameListener(readListener(), expected)) return false;
       const snapshot = readManagedListenerSnapshot(configPath);
@@ -884,15 +926,15 @@ function createWindowsLanRuntime(
         : compareAndSwapManagedListenerSnapshot(configPath, snapshot, exactReplacement);
       if (!applied) return false;
       replacement.persistenceRevision = managedRevision(readManagedListenerSnapshot(configPath));
-      await helper.protectPath(installRoot, configPath);
+      await helper.protectPath(installRoot, configPath, signal);
       return true;
     },
-    restartAndWait: async () => {
+    restartAndWait: async (_state, signal) => {
       const profiles = readManagedListenerSnapshot(configPath).profiles;
       const results = await Promise.allSettled(profiles.map((profile) =>
-        runtime.restartHermesProfile(profile.executable, profile.profile)));
+        runtime.restartHermesProfile(profile.executable, profile.profile, signal)));
       if (results.some((result) => result.status === "rejected")) throw new Error("Hermes restart failed");
-      await runtime.waitForGatewayReady(configPath);
+      await runtime.waitForGatewayReady(configPath, signal);
     },
     probeEndpoint: async (origin, signal) => {
       const checked = await (dependencies.health ?? health)(origin, signal)
@@ -920,9 +962,16 @@ export async function reconcileWindowsOwnedNetworkState(
     helperPath: join(installRoot, "bin", "cozygateway-windows-helper.ps1"),
   });
   const dbPath = isAbsolute(config.dbPath) ? config.dbPath : resolve(localRoot, config.dbPath);
-  const storage = openStorage(dbPath);
-  try {
-    await withDeadline(signal, 120_000, async (boundedSignal) => {
+  await withDeadline(signal, NETWORK_CLEANUP_TOTAL_TIMEOUT_MS, async (boundedSignal) => {
+    assertExistingAuthorityDatabase(dbPath);
+    try {
+      await helper.protectPath(installRoot, dbPath, boundedSignal);
+    } catch {
+      throw new Error("Owned network cleanup could not verify the configured authority database; repair its installed path and permissions.");
+    }
+    assertExistingAuthorityDatabase(dbPath);
+    const storage = openStorage(dbPath, { mustExist: true });
+    try {
       const unavailableProbe = async (): Promise<never> => {
         throw new Error("cleanup does not perform readiness probes");
       };
@@ -940,14 +989,41 @@ export async function reconcileWindowsOwnedNetworkState(
         configPath, installRoot, helper, runtime, storage,
       });
       const failures: unknown[] = [];
-      try { await tailscale.reconcileOwned(boundedSignal); } catch (error) { failures.push(error); }
-      try { await lan.reconcileOwned(boundedSignal); } catch (error) { failures.push(error); }
-      try { await advanced.reconcileOwned(boundedSignal); } catch (error) { failures.push(error); }
+      for (const [name, operation] of [
+        ["Tailscale", (adapterSignal: AbortSignal) => tailscale.reconcileOwned(adapterSignal)],
+        ["LAN", (adapterSignal: AbortSignal) => lan.reconcileOwned(adapterSignal)],
+        ["Advanced", (adapterSignal: AbortSignal) => advanced.reconcileOwned(adapterSignal)],
+      ] as const) {
+        try { await runBoundedCleanupAdapter(name, boundedSignal, operation); }
+        catch (error) { failures.push(error); }
+      }
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) throw new AggregateError(failures, "network ownership cleanup failed");
-    });
+    } finally {
+      storage.close();
+    }
+  });
+}
+
+function assertExistingAuthorityDatabase(dbPath: string): void {
+  const failed = (): never => {
+    throw new Error("Owned network cleanup requires the existing configured authority database; repair its installed path and permissions.");
+  };
+  let descriptor: number | undefined;
+  try {
+    const pathState = lstatSync(dbPath);
+    if (!pathState.isFile() || pathState.isSymbolicLink()) failed();
+    const canonical = realpathSync.native(dbPath);
+    if (process.platform === "win32"
+      ? canonical.toLowerCase() !== resolve(dbPath).toLowerCase()
+      : canonical !== resolve(dbPath)) failed();
+    descriptor = openSync(dbPath, "r");
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== pathState.dev || opened.ino !== pathState.ino) failed();
+  } catch {
+    failed();
   } finally {
-    storage.close();
+    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 

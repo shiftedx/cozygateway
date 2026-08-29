@@ -79,6 +79,7 @@ function preferencePause(error: unknown): TailscaleModePause {
 
 export type TailscaleModeReadinessReason =
   | "status"
+  | "account_changed"
   | "loopback"
   | "mapping"
   | "tls"
@@ -777,9 +778,13 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
           rollbackError = caught;
         }
       }
+      if (rollbackError instanceof TailscaleModeReadinessError
+        && rollbackError.reason === "account_changed") throw rollbackError;
       try {
-        await this.#rollbackPreferences(cli, preferenceMutations);
-      } catch {
+        await this.#rollbackPreferences(cli, owned, preferenceMutations, signal);
+      } catch (caught) {
+        if (caught instanceof TailscaleModeReadinessError
+          && caught.reason === "account_changed") throw caught;
         throw new TailscaleModePause("preference_rollback_failed");
       }
       if (rollbackError !== undefined) throw rollbackError;
@@ -799,7 +804,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       throw new TailscaleModeReadinessError("status");
     const localProbe = await this.#dependencies.probes.loopback(this.#dependencies.gatewayPort, signal);
     verifyLoopback(localProbe);
-    const [serve, funnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
+    const [serve, funnel] = await this.#mappingStates(cli, signal);
     const mapping = inspectTailscaleMappings(serve, funnel, status.dnsName, this.#dependencies.gatewayPort);
     if (mapping.outcome !== "compatible") throw new TailscaleModeReadinessError("mapping");
     const remoteProbe = await this.#dependencies.probes.remote(`https://${status.dnsName}`, status.dnsName, signal);
@@ -846,26 +851,27 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     } catch (error) {
       throw cliPause("status_unavailable", error);
     }
-    if (status.state !== "running" || accountHash(status, identityKey) !== owned.accountTailnetHash)
-      throw new TailscaleModeReadinessError("status");
+    if (status.state !== "running") throw new TailscaleModeReadinessError("status");
+    if (accountHash(status, identityKey) !== owned.accountTailnetHash)
+      throw new TailscaleModeReadinessError("account_changed");
     if (owned.phase === "preferences") {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
     const mapping = await this.#mappingInspection(cli, owned.dnsName, signal);
     if (mapping.outcome === "empty") {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
     if (mapping.outcome !== "compatible" || mapping.mappingFingerprint !== owned.mappingStateFingerprint) {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
     if (owned.ownershipSubtype === "reused") {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
@@ -879,13 +885,13 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       const after = await this.#mappingInspection(cli, owned.dnsName, recoverySignal);
       if (after.outcome === "empty") {
         await this.#inject("mapping_remove");
-        await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+        await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, recoverySignal);
         await this.#removeOwnershipIdempotently(owned, recoverySignal);
         return;
       }
       if (removalError !== undefined) throw cliPause("mapping_mutation_failed", removalError);
       throw new TailscaleModeReadinessError("mapping");
-    });
+    }, signal);
   }
 
   async #cli(signal: AbortSignal | undefined, allowInstall: boolean): Promise<TailscaleCli> {
@@ -923,7 +929,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     signal?: AbortSignal,
   ): Promise<TailscaleMappingInspection> {
     try {
-      const [serve, funnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
+      const [serve, funnel] = await this.#mappingStates(cli, signal);
       return inspectTailscaleMappings(serve, funnel, dnsName, this.#dependencies.gatewayPort);
     } catch (error) {
       if (error instanceof TailscaleModePause) throw error;
@@ -931,17 +937,37 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
     }
   }
 
-  async #withRecoverySignal<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  async #mappingStates(
+    cli: TailscaleCli,
+    signal?: AbortSignal,
+  ): Promise<readonly [Record<string, unknown>, Record<string, unknown>]> {
+    const [serve, funnel] = await Promise.allSettled([
+      cli.serveState(signal),
+      cli.funnelState(signal),
+    ]);
+    if (serve.status === "rejected") throw serve.reason;
+    if (funnel.status === "rejected") throw funnel.reason;
+    return [serve.value, funnel.value];
+  }
+
+  async #withRecoverySignal<T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+    parentSignal?: AbortSignal,
+  ): Promise<T> {
     const controller = new AbortController();
     const configured = this.#dependencies.cliTimeoutMs ?? 15_000;
     const milliseconds = Number.isFinite(configured)
       ? Math.min(30_000, Math.max(1, configured))
       : 15_000;
     const timer = setTimeout(() => controller.abort(), milliseconds);
+    const abort = () => controller.abort(parentSignal?.reason);
+    parentSignal?.addEventListener("abort", abort, { once: true });
+    if (parentSignal?.aborted) abort();
     try {
       return await operation(controller.signal);
     } finally {
       clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", abort);
     }
   }
 
@@ -1007,17 +1033,35 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
 
   async #rollbackPreferences(
     cli: TailscaleCli,
+    owned: TailscaleMappingOwnership,
     mutations: readonly { name: "unattended" | "shields-up"; before: boolean; after: boolean }[],
+    outerSignal?: AbortSignal,
   ): Promise<void> {
     await this.#withRecoverySignal(async (signal) => {
+      await this.#assertOwnedAccount(cli, owned, signal);
       for (const mutation of [...mutations].reverse()) {
+        await this.#assertOwnedAccount(cli, owned, signal);
         const current = await cli.preference(mutation.name, signal);
         if (current !== mutation.after) continue;
+        await this.#assertOwnedAccount(cli, owned, signal);
         await this.#dependencies.helper.setPreference(mutation.name, mutation.before, signal);
+        await this.#assertOwnedAccount(cli, owned, signal);
         if (await cli.preference(mutation.name, signal) !== mutation.before)
           throw new TailscaleModeReadinessError("status");
       }
-    });
+    }, outerSignal);
+  }
+
+  async #assertOwnedAccount(
+    cli: TailscaleCli,
+    owned: TailscaleMappingOwnership,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const status = await cli.status(signal);
+    const identityKey = await this.#loadIdentityKey(signal);
+    if (status.state !== "running") throw new TailscaleModeReadinessError("status");
+    if (accountHash(status, identityKey) !== owned.accountTailnetHash)
+      throw new TailscaleModeReadinessError("account_changed");
   }
 
   async #inject(boundary: TailscaleFailureBoundary): Promise<void> {
@@ -1060,26 +1104,28 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
   ): Promise<void> {
     const status = await cli.status(signal);
     const identityKey = await this.#loadIdentityKey(signal);
-    if (status.state !== "running" || accountHash(status, identityKey) !== owned.accountTailnetHash) return;
+    if (status.state !== "running") throw new TailscaleModeReadinessError("status");
+    if (accountHash(status, identityKey) !== owned.accountTailnetHash)
+      throw new TailscaleModeReadinessError("account_changed");
     if (owned.phase === "preferences") {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
-    const [serve, funnel] = await Promise.all([cli.serveState(signal), cli.funnelState(signal)]);
+    const [serve, funnel] = await this.#mappingStates(cli, signal);
     const mapping = inspectTailscaleMappings(serve, funnel, owned.dnsName, this.#dependencies.gatewayPort);
     if (mapping.outcome === "empty") {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
     if (mapping.outcome !== "compatible" || mapping.mappingFingerprint !== owned.mappingStateFingerprint) {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
     if (owned.ownershipSubtype === "reused") {
-      await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+      await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
       await this.#removeOwnershipIdempotently(owned, signal);
       return;
     }
@@ -1095,7 +1141,7 @@ export class TailscaleModeAdapter implements NetworkModeAdapter {
       throw new TailscaleModeReadinessError("mapping");
     }
     await this.#inject("mapping_remove");
-    await this.#rollbackPreferences(cli, owned.preferenceRestorations);
+    await this.#rollbackPreferences(cli, owned, owned.preferenceRestorations, signal);
     await this.#removeOwnershipIdempotently(owned, signal);
   }
 }

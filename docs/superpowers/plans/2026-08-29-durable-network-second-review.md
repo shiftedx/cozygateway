@@ -112,10 +112,10 @@
 - Modify: `packages/gateway/src/windows-onboarding.ts`
 - Test: `packages/gateway/test/windows-onboarding.test.ts`
 
-- [ ] Add failing tests for missing, directory, symlink/reparse, unreadable, and outside-install-root database paths; assert no blank database is created.
-- [ ] Add a passing regression for an existing custom configured database path inside the protected install root.
-- [ ] Implement pre-open local regular-file/readability/canonical proof, helper `protectPath` proof, and a second local proof immediately before `openStorage`.
-- [ ] Run the Windows onboarding and cleanup CLI tests.
+- [x] Add failing tests for missing, directory, symlink/reparse, unreadable, and outside-install-root database paths; assert no blank database is created.
+- [x] Add a passing regression for an existing custom configured database path inside the protected install root.
+- [x] Implement pre-open local regular-file/readability/canonical proof, helper `protectPath` proof, and a second local proof immediately before `openStorage`.
+- [x] Run the Windows onboarding and cleanup CLI tests.
 
 ### Task 8: Account-scoped preference rollback
 
@@ -123,9 +123,9 @@
 - Modify: `packages/gateway/src/tailscale-mode.ts`
 - Test: `packages/gateway/test/tailscale-mode.test.ts`
 
-- [ ] Add a failing account-switch rollback test with preference values matching the old wizard state; assert no preference getter/helper mutation, typed `account_changed`, and retained ownership.
-- [ ] Route every preference rollback through a fresh keyed status/account guard.
-- [ ] Run all Tailscale mode tests.
+- [x] Add a failing account-switch rollback test with preference values matching the old wizard state; assert no preference getter/helper mutation, typed `account_changed`, and retained ownership.
+- [x] Route every preference rollback through a fresh keyed status/account guard.
+- [x] Run all Tailscale mode tests.
 
 ### Task 9: Settled cleanup deadlines
 
@@ -138,9 +138,9 @@
 - Test: `packages/gateway/test/windows-helper-client.test.ts`
 - Test: `packages/gateway/test/tailscale-cli.test.ts`
 
-- [ ] Add failing fake-runtime cleanup tests proving abort settlement precedes the next adapter and SQLite close while all three adapters are attempted.
-- [ ] Add real spawned-process tests proving timeout/abort waits for child close.
-- [ ] Add optional `AbortSignal` parameters to `CliRuntime` restart/readiness methods and pass them through production listener cleanup.
-- [ ] Implement a 120-second total deadline with bounded sequential per-adapter controllers and collected failures.
-- [ ] Make helper and Tailscale process runners kill then await child close before rejecting.
-- [ ] Run focused cleanup/runtime/process tests, full Gateway tests, typecheck, build, diff check, and update the security report.
+- [x] Add failing fake-runtime cleanup tests proving abort settlement precedes the next adapter and SQLite close while all three adapters are attempted.
+- [x] Add real spawned-process tests proving timeout/abort waits for child close.
+- [x] Add optional `AbortSignal` parameters to `CliRuntime` restart/readiness methods and pass them through production listener cleanup.
+- [x] Implement a 120-second total deadline with bounded sequential per-adapter controllers and collected failures.
+- [x] Make helper and Tailscale process runners kill then await child close before rejecting.
+- [x] Run focused cleanup/runtime/process tests, full Gateway tests, typecheck, build, diff check, and update the security report.

@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes, randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 import type {
   AttachmentBlock,
@@ -4097,8 +4098,9 @@ function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
   };
 }
 
-export function openStorage(dbPath: string): Storage {
-  const db = new DatabaseSync(dbPath);
+export function openStorage(dbPath: string, options: { mustExist?: boolean } = {}): Storage {
+  const sqlitePath = options.mustExist ? `${pathToFileURL(dbPath).href}?mode=rw` : dbPath;
+  const db = new DatabaseSync(sqlitePath);
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");

@@ -1,5 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -511,6 +511,104 @@ describe("TailscaleModeAdapter", () => {
     ]);
   });
 
+  it("retains ownership and never touches rollback preferences after an account switch", async () => {
+    const original = fixture("status-running.json");
+    const switched = original.replaceAll("fixture@example.com", "other@example.com");
+    const dependencies = happyDependencies({
+      status: [original, switched],
+      serve: fixture("serve-empty.json"),
+      preferences: { unattended: false, shieldsUp: true },
+    });
+    let stored: TailscaleMappingOwnership | undefined;
+    dependencies.ownership.read.mockImplementation(async () => stored);
+    dependencies.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+    dependencies.ownership.replace.mockImplementation(async (expected, replacement) => {
+      if (stored !== expected) return false;
+      stored = replacement;
+      return true;
+    });
+    dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+    });
+
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "account_changed" });
+    expect(dependencies.helper.setPreference.mock.calls).toEqual([
+      ["unattended", true, undefined],
+      ["shields-up", false, undefined],
+    ]);
+    expect(dependencies.preferenceState).toEqual({ unattended: true, shieldsUp: false });
+    expect(stored).toBeDefined();
+    expect(dependencies.ownership.remove).not.toHaveBeenCalled();
+  });
+
+  it("rechecks account ownership immediately before each rollback preference read", async () => {
+    const original = fixture("status-running.json");
+    const switched = original.replaceAll("fixture@example.com", "other@example.com");
+    const dependencies = happyDependencies({
+      status: [original, original, switched],
+      preferences: { unattended: true, shieldsUp: false },
+    });
+    const accountTailnetHash = createHmac("sha256", Buffer.alloc(32, 7)).update(JSON.stringify({
+      accountId: "42",
+      accountLabel: "fixture@example.com",
+      tailnetName: "fixture@example.com",
+      magicDnsSuffix: "fixture-tailnet.ts.net",
+    })).digest("hex");
+    const owned: TailscaleMappingOwnership = {
+      schemaVersion: 2,
+      phase: "preferences",
+      ownershipSubtype: "wizard-created",
+      mappingFingerprint: "a".repeat(64),
+      mappingStateFingerprint: "b".repeat(64),
+      accountTailnetHash,
+      dnsName: "cozy.fixture-tailnet.ts.net",
+      target: "127.0.0.1:18787",
+      preferenceRestorations: [{ name: "unattended", before: false, after: true }],
+      createdAt: 1,
+    };
+    dependencies.ownership.read.mockResolvedValue(owned);
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+    });
+
+    await expect(adapter.reconcileOwned()).rejects.toMatchObject({ reason: "account_changed" });
+    expect(dependencies.calls).not.toContain("get --json unattended");
+    expect(dependencies.helper.setPreference).not.toHaveBeenCalled();
+    expect(dependencies.ownership.remove).not.toHaveBeenCalled();
+  });
+
+  it("awaits both mapping-status commands before propagating either failure", async () => {
+    const dependencies = happyDependencies();
+    const defaultRun = dependencies.runner.getMockImplementation()!;
+    let releaseFunnel: (() => void) | undefined;
+    dependencies.runner.mockImplementation(async (...args) => {
+      const command = args[1].join(" ");
+      if (command === "serve status --json") throw new Error("serve status failed");
+      if (command === "funnel status --json") return await new Promise((resolve) => {
+        releaseFunnel = () => resolve({ exitCode: 0, stdout: fixture("funnel-empty.json"), stderr: "" });
+      });
+      return await defaultRun(...args);
+    });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+    });
+
+    let settled = false;
+    const outcome = adapter.inspect().then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    ).finally(() => { settled = true; });
+    await vi.waitFor(() => expect(releaseFunnel).toBeTypeOf("function"));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseFunnel!();
+    expect((await outcome).error).toBeDefined();
+  });
+
   it("refuses ready and certificate-missing port-443 conflicts before consent or preference mutation", async () => {
     for (const status of [[fixture("status-running.json")], [fixture("status-cert-unavailable.json")]]) {
       const dependencies = happyDependencies({
@@ -892,8 +990,39 @@ describe("TailscaleModeAdapter", () => {
       if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off") controller.abort();
       return result;
     });
-    await expect(abortedAdapter.rollbackOwned(abortedEndpoint, controller.signal)).resolves.toBeUndefined();
-    expect(abortedStored).toBeUndefined();
+    await expect(abortedAdapter.rollbackOwned(abortedEndpoint, controller.signal)).rejects.toBeDefined();
+    expect(abortedStored).toBeDefined();
+  });
+
+  it("does not start fresh recovery commands after cleanup cancellation during removal", async () => {
+    const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
+    let stored: Awaited<ReturnType<typeof dependencies.ownership.read>>;
+    dependencies.ownership.read.mockImplementation(async () => stored);
+    dependencies.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+    dependencies.ownership.replace.mockImplementation(async (expected, replacement) => {
+      if (stored !== expected) return false;
+      stored = replacement;
+      return true;
+    });
+    dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+    });
+    await adapter.prepare();
+    const controller = new AbortController();
+    const original = dependencies.runner.getMockImplementation()!;
+    dependencies.runner.mockImplementation(async (...args) => {
+      const result = await original(...args);
+      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off") controller.abort();
+      return result;
+    });
+
+    await expect(adapter.reconcileOwned(controller.signal)).rejects.toBeDefined();
+    expect(stored).toBeDefined();
+    const removal = dependencies.calls.lastIndexOf("serve --tls-terminated-tcp=443 off");
+    expect(dependencies.calls.slice(removal + 1)).not.toContain("serve status --json");
+    expect(dependencies.calls.slice(removal + 1)).not.toContain("funnel status --json");
   });
 
   it("fails closed and retains ownership when Serve reports removal success but exact state remains", async () => {

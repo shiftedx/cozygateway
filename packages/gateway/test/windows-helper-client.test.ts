@@ -1,5 +1,10 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 import {
+  runWindowsHelperProcess,
   WindowsHelperClient,
   WindowsHelperProtocolError,
   type WindowsHelperRunner,
@@ -13,6 +18,22 @@ function response(command: string, result: unknown): string {
 }
 
 describe("WindowsHelperClient", () => {
+  it("kills a timed-out real child and waits for close before rejecting", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozy-helper-child-"));
+    const script = join(directory, "hang.js");
+    const pidFile = join(directory, "pid");
+    writeFileSync(script, `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`);
+    try {
+      await expect(runWindowsHelperProcess(process.execPath, [script], {
+        stdin: "", shell: false, windowsHide: true, timeoutMs: 500, maxOutputBytes: 1024,
+      })).rejects.toThrow(/timed out/i);
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("invokes the absolute fixed helper without a shell and parses its versioned envelope", async () => {
     const runner = vi.fn<WindowsHelperRunner>().mockResolvedValue({
       exitCode: 0,

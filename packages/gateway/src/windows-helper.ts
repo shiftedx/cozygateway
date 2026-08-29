@@ -198,7 +198,7 @@ function applied(value: unknown): value is { applied: boolean } {
   return record(value) && exactKeys(value, ["applied"]) && value.applied === true;
 }
 
-const defaultRunner: WindowsHelperRunner = (executable, args, options) => new Promise((resolve, reject) => {
+export const runWindowsHelperProcess: WindowsHelperRunner = (executable, args, options) => new Promise((resolve, reject) => {
   const child = spawn(executable, args, {
     shell: options.shell,
     windowsHide: options.windowsHide,
@@ -210,18 +210,29 @@ const defaultRunner: WindowsHelperRunner = (executable, args, options) => new Pr
   let stdoutBytes = 0;
   let stderrBytes = 0;
   let settled = false;
-  const fail = (error: Error) => {
+  let pendingError: Error | undefined;
+  const rejectNow = (error: Error) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    child.kill();
     reject(error);
   };
-  const timer = setTimeout(() => fail(new WindowsHelperProtocolError("Windows helper timed out")), options.timeoutMs);
-  child.on("error", fail);
+  const terminate = (error: Error) => {
+    if (settled || pendingError !== undefined) return;
+    pendingError = error;
+    clearTimeout(timer);
+    if (child.pid === undefined) rejectNow(error);
+    else child.kill();
+  };
+  const timer = setTimeout(() => terminate(new WindowsHelperProtocolError("Windows helper timed out")), options.timeoutMs);
+  child.on("error", (error) => {
+    if (child.pid === undefined) rejectNow(error);
+    else terminate(error);
+  });
+  child.stdin.on("error", terminate);
   child.stdout.on("data", (chunk: Buffer) => {
     stdoutBytes += chunk.length;
-    if (stdoutBytes > options.maxOutputBytes) return fail(new WindowsHelperProtocolError("Windows helper response exceeded its bound"));
+    if (stdoutBytes > options.maxOutputBytes) return terminate(new WindowsHelperProtocolError("Windows helper response exceeded its bound"));
     stdout.push(chunk);
   });
   child.stderr.on("data", (chunk: Buffer) => {
@@ -232,7 +243,8 @@ const defaultRunner: WindowsHelperRunner = (executable, args, options) => new Pr
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    resolve({ exitCode: code ?? 1, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
+    if (pendingError !== undefined) reject(pendingError);
+    else resolve({ exitCode: code ?? 1, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
   });
   child.stdin.end(options.stdin, "utf8");
 });
@@ -252,7 +264,7 @@ export class WindowsHelperClient {
     if (!isFullyQualifiedWindowsPath(powershellPath)) throw new Error("a fully qualified PowerShell path is required");
     this.#helperPath = options.helperPath;
     this.#powershellPath = powershellPath;
-    this.#runner = options.runner ?? defaultRunner;
+    this.#runner = options.runner ?? runWindowsHelperProcess;
     this.#timeoutMs = options.timeoutMs ?? 30_000;
   }
 

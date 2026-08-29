@@ -1,6 +1,23 @@
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { openStorage } from "../src/storage.ts";
+
+describe("storage opening", () => {
+  it("can require an existing database without creating a blank replacement", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozy-storage-existing-"));
+    const dbPath = join(directory, "missing.sqlite");
+    try {
+      expect(() => openStorage(dbPath, { mustExist: true })).toThrow();
+      expect(existsSync(dbPath)).toBe(false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
 
 function seeded() {
   const storage = openStorage(":memory:");

@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
@@ -6,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   TailscaleCli,
   TailscaleCliError,
+  runTailscaleCliProcess,
   type TailscaleCliRunner,
 } from "../src/tailscale-cli.ts";
 
@@ -16,6 +19,27 @@ const fixture = (name: string) => readFileSync(
 );
 
 describe("TailscaleCli", () => {
+  it("aborts a real hanging child and settles only after the process closes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozy-tailscale-child-"));
+    const script = join(directory, "hang.js");
+    const pidFile = join(directory, "pid");
+    writeFileSync(script, `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`);
+    const controller = new AbortController();
+    try {
+      const run = runTailscaleCliProcess(process.execPath, [script], {
+        shell: false, windowsHide: true, timeoutMs: 1_000,
+        maxObjectBytes: 1024, maxTotalBytes: 1024, signal: controller.signal,
+      });
+      while (!existsSync(pidFile)) await new Promise((resolve) => setTimeout(resolve, 5));
+      controller.abort();
+      await expect(run).rejects.toThrow();
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("uses the trusted absolute executable with literal argv and bounded no-shell execution", async () => {
     const runner = vi.fn<TailscaleCliRunner>().mockResolvedValue({
       exitCode: 0,

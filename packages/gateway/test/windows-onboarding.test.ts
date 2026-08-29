@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +44,7 @@ const tailscaleFixture = (name: string) => readFileSync(
 );
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -240,6 +250,7 @@ describe("createWindowsOnboardingController composition", () => {
     const advanced = vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned")
       .mockImplementation(async () => { events.push("advanced"); });
     const close = vi.spyOn(Storage.prototype, "close");
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
 
     await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).resolves.toBeUndefined();
     expect(events).toEqual(["tailscale", "lan", "advanced"]);
@@ -250,6 +261,145 @@ describe("createWindowsOnboardingController composition", () => {
     expect(advanced).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledTimes(2);
     expect(tailscale).toHaveBeenCalledTimes(2);
+  });
+
+  it("settles each timed-out adapter before attempting the next and closing SQLite", async () => {
+    vi.useFakeTimers();
+    const { configPath, storage } = fixture();
+    storage.close();
+    const events: string[] = [];
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned").mockImplementation(async (signal) => {
+      events.push("tailscale:attempted");
+      await new Promise<void>((resolve) => {
+        const abort = () => {
+          events.push("tailscale:aborted");
+          setTimeout(() => { events.push("tailscale:settled"); resolve(); }, 1_000);
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+      });
+    });
+    vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
+      .mockImplementation(async () => { events.push("lan:attempted"); });
+    vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned")
+      .mockImplementation(async () => { events.push("advanced:attempted"); });
+    const originalClose = Storage.prototype.close;
+    vi.spyOn(Storage.prototype, "close").mockImplementation(function (this: Storage) {
+      events.push("storage:closed");
+      return originalClose.call(this);
+    });
+
+    const cleanup = reconcileWindowsOwnedNetworkState(configPath, runtime());
+    const rejection = expect(cleanup).rejects.toThrow(/timed out/i);
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(events).toEqual(["tailscale:attempted", "tailscale:aborted"]);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(events).not.toContain("lan:attempted");
+      await vi.advanceTimersByTimeAsync(1);
+      await rejection;
+      expect(events).toEqual([
+        "tailscale:attempted", "tailscale:aborted", "tailscale:settled",
+        "lan:attempted", "advanced:attempted", "storage:closed",
+      ]);
+    } finally {
+      await vi.advanceTimersByTimeAsync(121_000);
+      await cleanup.catch(() => undefined);
+    }
+  });
+
+  it("refuses missing authority without creating a blank SQLite database", async () => {
+    const { configPath, storage } = fixture();
+    const dbPath = join(dirname(configPath), "gateway.sqlite");
+    storage.close();
+    rmSync(dbPath, { force: true });
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+    vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
+      .mockResolvedValue(undefined);
+    vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow();
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("refuses a non-regular authority path before invoking the helper or opening SQLite", async () => {
+    const { configPath, storage } = fixture();
+    const dbPath = join(dirname(configPath), "gateway.sqlite");
+    storage.close();
+    rmSync(dbPath, { force: true });
+    mkdirSync(dbPath);
+    const protect = vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow(/existing.*database/i);
+    expect(protect).not.toHaveBeenCalled();
+  });
+
+  it("requires helper/DACL proof before opening an existing authority database", async () => {
+    const { configPath, storage } = fixture();
+    storage.close();
+    const protect = vi.spyOn(WindowsHelperClient.prototype, "protectPath")
+      .mockRejectedValue(new Error("authority path is unsafe or unreadable"));
+    vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+    vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
+      .mockResolvedValue(undefined);
+    vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow(/repair.*path.*permission/i);
+    expect(protect).toHaveBeenCalledWith(
+      dirname(dirname(configPath)), join(dirname(configPath), "gateway.sqlite"), expect.any(AbortSignal),
+    );
+  });
+
+  it("rejects authority path indirection and existing databases outside the protected install root", async () => {
+    const first = fixture();
+    first.storage.close();
+    const targetDirectory = dirname(first.configPath);
+    const linkDirectory = join(first.root, "authority-link");
+    symlinkSync(targetDirectory, linkDirectory, "junction");
+    const linkPath = join(linkDirectory, "gateway.sqlite");
+    const linkedConfig = JSON.parse(readFileSync(first.configPath, "utf8")) as Record<string, unknown>;
+    linkedConfig.dbPath = linkPath;
+    writeFileSync(first.configPath, `${JSON.stringify(linkedConfig, null, 2)}\n`);
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+    vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
+      .mockResolvedValue(undefined);
+    vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+    await expect(reconcileWindowsOwnedNetworkState(first.configPath, runtime())).rejects.toThrow();
+
+    vi.restoreAllMocks();
+    const second = fixture();
+    const outside = join(second.root, "outside-authority.sqlite");
+    second.storage.close();
+    renameSync(join(dirname(second.configPath), "gateway.sqlite"), outside);
+    const outsideConfig = JSON.parse(readFileSync(second.configPath, "utf8")) as Record<string, unknown>;
+    outsideConfig.dbPath = outside;
+    writeFileSync(second.configPath, `${JSON.stringify(outsideConfig, null, 2)}\n`);
+    const protect = vi.spyOn(WindowsHelperClient.prototype, "protectPath")
+      .mockRejectedValue(new Error("outside protected root"));
+    await expect(reconcileWindowsOwnedNetworkState(second.configPath, runtime())).rejects.toThrow(/repair.*path.*permission/i);
+    expect(protect).toHaveBeenCalled();
+  });
+
+  it("preserves a configured existing custom authority database inside the protected install root", async () => {
+    const { configPath, storage } = fixture();
+    storage.close();
+    const custom = join(dirname(configPath), "custom-authority.sqlite");
+    renameSync(join(dirname(configPath), "gateway.sqlite"), custom);
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    config.dbPath = custom;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+    const protect = vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+    vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
+      .mockResolvedValue(undefined);
+    vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned").mockResolvedValue(undefined);
+
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).resolves.toBeUndefined();
+    expect(protect).toHaveBeenCalledWith(dirname(dirname(configPath)), custom, expect.any(AbortSignal));
+    expect(existsSync(custom)).toBe(true);
   });
 
   it("recovers a real post-CAS crash from SQLite and restores the exact managed listener snapshot", async () => {

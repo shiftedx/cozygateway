@@ -8,7 +8,6 @@ import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
-import { promisify } from "node:util";
 
 import { applyEnvOverrides, loadConfig, validatePublicDeployment } from "./config.ts";
 import {
@@ -56,8 +55,8 @@ export interface CliIo {
 }
 
 export interface CliRuntime {
-  restartHermesProfile(executable: string, profile: string): Promise<void>;
-  waitForGatewayReady(configPath: string): Promise<void>;
+  restartHermesProfile(executable: string, profile: string, signal?: AbortSignal): Promise<void>;
+  waitForGatewayReady(configPath: string, signal?: AbortSignal): Promise<void>;
 }
 
 export interface CliInternalDependencies {
@@ -211,20 +210,43 @@ export function isGatewayReady(health: { attach?: { configured?: number; online?
   return configured > 0 && health.attach?.online === configured && health.attach?.deadLetters === 0;
 }
 
+async function runtimeDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(done, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason ?? new Error("cancelled"));
+    };
+    function done() {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
+
 const defaultRuntime: CliRuntime = {
-  restartHermesProfile: async (executable, profile) => {
-    await promisify(execFileCallback)(executable, ["-p", profile, "gateway", "restart"]);
+  restartHermesProfile: async (executable, profile, signal) => {
+    await new Promise<void>((resolve, reject) => {
+      execFileCallback(executable, ["-p", profile, "gateway", "restart"], { signal }, (error) => {
+        if (error === null) resolve();
+        else reject(error);
+      });
+    });
   },
-  waitForGatewayReady: async (configPath) => {
+  waitForGatewayReady: async (configPath, signal) => {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
+      if (signal?.aborted) throw signal.reason ?? new Error("cancelled");
       try {
         const health = await fetchHealth(configPath, 1_000);
         if (isGatewayReady(health)) return;
       } catch {
         // The managed supervisor and Hermes profiles may still be restarting.
       }
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await runtimeDelay(300, signal);
     }
     throw new Error("CozyGateway did not become ready within 30 seconds");
   },

@@ -16,6 +16,9 @@ The Tailscale and Same-Wi-Fi adapters now use SQLite as the durable authority fo
 - The production LAN runtime deterministically plans the exact post-CAS full-snapshot revision before persisting provisional ownership, while keeping token-bearing Hermes profile contents in memory only. Resume handles both pre-CAS and immediate post-CAS crashes without adopting a later same-shape external edit. Exact rollback CAS failure, restart failure, ownership-CAS failure, or concurrent listener replacement is a typed `LanModeRollbackError` with reason `rollback_failed`; it is never reported as success.
 - LAN and Advanced change ownership to `rollback-restart-required` before reverse CAS. If reverse CAS succeeds but Hermes restart fails, SQLite retains explicit restart authority; later reconciliation retries and verifies restart before deleting the row.
 - Advanced listener/public-origin changes now have independent SQLite authority (`advanced:listener`, subtype `advanced-listener-cas`). The record contains bounded exact before/after config text, exact full-snapshot revisions, and Hermes target URLs, but never token-bearing Hermes profile contents. Crash resume, phone rejection, mode switch, Later, and uninstall cleanup conditionally restore only the exact wizard-owned state and fail closed on external edits.
+- Uninstall cleanup resolves the configured database path exactly and refuses to call `openStorage` unless the authority already exists as a readable regular file with stable `lstat`/open/`fstat` identity and no canonical-path indirection. The installed helper must then prove the configured path is inside the protected install root with safe DACLs, followed by a second local proof. The actual SQLite boundary uses URI `mode=rw`, so even a removal race cannot create a replacement. Missing, directory, junction/reparse, unreadable/DACL-rejected, and outside-root authorities fail with a generic repair instruction and cannot create a blank replacement. A valid configured custom authority inside the protected root is preserved.
+- Every Tailscale preference rollback obtains a fresh status and installation-keyed account/tailnet HMAC at each preference read, helper write, and verification boundary. An account switch is a typed `account_changed` failure: preference values are untouched and ownership is retained even when the new account happens to expose the same boolean values. Paired Serve/Funnel inspections await both subprocess settlements before propagating either failure, and post-removal recovery inherits the caller's cleanup signal.
+- Windows cleanup has a 120-second total cancellation budget and 30-second sequential budget per adapter. All Tailscale, LAN, and Advanced adapters are attempted, failures are collected, and a timed-out adapter is aborted and awaited to settlement before the next adapter starts. Hermes restart/readiness, helper, and Tailscale subprocess boundaries receive the signal. Production subprocess runners terminate and wait for `close`; SQLite closes only after adapter work has actually settled.
 - Unrelated Serve/Funnel entries, reused mappings, preferences changed by another actor, listener replacements, adapter selections, and other onboarding ownership keys are preserved.
 
 ## Uninstall/recovery production seam
@@ -33,7 +36,7 @@ reconcileWindowsOwnedNetworkState(
 ): Promise<void>
 ```
 
-The bounded Windows operation loads installed config, derives the installed helper and SQLite paths, builds the real Tailscale, LAN, and Advanced adapters without operator token/control state, attempts all three reconciliations, aggregates multiple failures, and closes SQLite in `finally`. It never deletes SQLite. The uninstall caller must retain the database and exit nonzero on any rejection; deletion is safe only after this operation resolves. CLI/shell deletion wiring is handled by the sequential integration owner.
+The bounded Windows operation loads installed config, derives the installed helper and exact configured SQLite path, proves the existing authority locally and through the installed helper, builds the real Tailscale, LAN, and Advanced adapters without operator token/control state, attempts all three reconciliations, aggregates multiple failures, and closes SQLite in `finally` only after in-flight work settles. It never deletes SQLite. The committed CLI cleanup command treats rejection as nonzero so the uninstall caller retains the authority database; deletion is safe only after this operation resolves.
 
 ## Review-claim verification and pushback
 
@@ -45,13 +48,13 @@ True atomicity across SQLite and a separate Tailscale daemon or filesystem/resta
 
 ## Tests and verification
 
-- Focused storage/Tailscale/LAN/network/Windows suite: 7 files and 189 tests passed.
+- Final focused storage/Tailscale/LAN/Windows/helper suite: 6 files and 133 tests passed.
 - Gateway typecheck: `pnpm typecheck`
 - Gateway build: `pnpm build`
-- Full Gateway suite: `pnpm test` — 100 files passed, 1 skipped; 1,156 tests passed, 2 skipped.
+- Full Gateway suite: `pnpm test` — 100 files passed, 1 skipped; 1,170 tests passed, 2 skipped.
 - Diff hygiene: exact-path `git diff --check` and staged-path review.
 
-Focused regressions cover write-before-mutate ordering, crashes at both preference writes, provisional crash resume, exact/conflicting/reused cleanup, uncertain command completion, conditional preference restoration and external edits, official/custom/missing control URL handling, per-install HMAC identity, secret absence from metadata, subtype fingerprints, exact planned listener revisions before CAS, rollback/restart authority, Advanced crash/rejection/switch/Later/uninstall recovery, production cleanup construction, and ownership retention on typed failure.
+Focused regressions cover write-before-mutate ordering, crashes at both preference writes, provisional crash resume, exact/conflicting/reused cleanup, uncertain command completion, conditional preference restoration and external edits, switched-account rollback refusal, official/custom/missing control URL handling, per-install HMAC identity, secret absence from metadata, subtype fingerprints, exact planned listener revisions before CAS, rollback/restart authority, Advanced crash/rejection/switch/Later/uninstall recovery, safe existing/custom SQLite authority proof, sequential deadline settlement, real helper/Tailscale child termination, production cleanup construction, and ownership retention on typed failure.
 
 ## Owned files
 
@@ -59,10 +62,14 @@ The Windows onboarding source/test commit also includes the already-reviewed pho
 
 - `packages/gateway/src/lan-mode.ts`
 - `packages/gateway/src/storage.ts`
+- `packages/gateway/src/cli.ts`
+- `packages/gateway/src/windows-helper.ts`
 - `packages/gateway/src/tailscale-cli.ts`
 - `packages/gateway/src/tailscale-mode.ts`
 - `packages/gateway/src/windows-onboarding.ts`
 - `packages/gateway/test/lan-mode.test.ts`
+- `packages/gateway/test/storage.test.ts`
+- `packages/gateway/test/windows-helper-client.test.ts`
 - `packages/gateway/test/tailscale-cli.test.ts`
 - `packages/gateway/test/tailscale-mode.test.ts`
 - `packages/gateway/test/windows-onboarding.test.ts`
