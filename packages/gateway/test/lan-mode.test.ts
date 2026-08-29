@@ -1,13 +1,22 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
   LanModeAdapter,
   LanModePause,
+  LanModeRollbackError,
+  SqliteLanOwnershipStore,
   type LanListenerState,
+  type LanListenerOwnership,
+  type LanOwnershipStore,
   type LanModeRuntime,
   type LanProbeResult,
 } from "../src/lan-mode.ts";
 import type { PhysicalLanCandidate, WindowsLanAdapter, WindowsLanInventory } from "../src/lan.ts";
+import { openStorage } from "../src/storage.ts";
 
 function physical(overrides: Partial<WindowsLanAdapter> = {}): WindowsLanAdapter {
   return {
@@ -34,6 +43,7 @@ function sameState(left: LanListenerState, right: LanListenerState): boolean {
 }
 
 class FakeLanRuntime implements LanModeRuntime {
+  ownership: LanOwnershipStore;
   inventory: WindowsLanInventory = { schemaVersion: 1, adapters: [physical()] };
   listener: LanListenerState = {
     bindHost: "127.0.0.1",
@@ -48,9 +58,32 @@ class FakeLanRuntime implements LanModeRuntime {
   restartCalls: LanListenerState[] = [];
   probeCalls = 0;
   failRestartCall?: number;
+  rejectCasCall?: number;
   beforeProbe?: () => void;
   chooseAdapter?: (candidates: readonly PhysicalLanCandidate[]) => Promise<string | undefined>;
   selectedAdapterId?: string;
+
+  constructor() {
+    let stored: LanListenerOwnership | undefined;
+    this.ownership = {
+      read: async () => stored,
+      write: async (value) => {
+        if (stored !== undefined) return JSON.stringify(stored) === JSON.stringify(value) ? "existing" : "conflict";
+        stored = structuredClone(value);
+        return "written";
+      },
+      replace: async (expected, replacement) => {
+        if (JSON.stringify(stored) !== JSON.stringify(expected)) return false;
+        stored = structuredClone(replacement);
+        return true;
+      },
+      remove: async (expected) => {
+        if (JSON.stringify(stored) !== JSON.stringify(expected)) return false;
+        stored = undefined;
+        return true;
+      },
+    };
+  }
 
   async readSelectedAdapter(): Promise<string | undefined> { return this.selectedAdapterId; }
   async writeSelectedAdapter(adapterId: string): Promise<void> { this.selectedAdapterId = adapterId; }
@@ -63,8 +96,13 @@ class FakeLanRuntime implements LanModeRuntime {
     return copyState(this.listener);
   }
 
-  async compareAndSwapListener(expected: LanListenerState, replacement: LanListenerState): Promise<boolean> {
+  async compareAndSwapListener(
+    expected: LanListenerState,
+    replacement: LanListenerState,
+    _signal?: AbortSignal,
+  ): Promise<boolean> {
     this.compareAndSwapCalls.push({ expected: copyState(expected), replacement: copyState(replacement) });
+    if (this.compareAndSwapCalls.length === this.rejectCasCall) return false;
     if (!sameState(this.listener, expected)) return false;
     this.listener = copyState(replacement);
     return true;
@@ -83,6 +121,85 @@ class FakeLanRuntime implements LanModeRuntime {
 }
 
 describe("LanModeAdapter", () => {
+  it("persists LAN listener ownership with SQLite compare-and-swap authority", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-lan-ownership-"));
+    const storage = openStorage(join(directory, "gateway.sqlite"));
+    const ownership = new SqliteLanOwnershipStore(storage);
+    const before: LanListenerState = {
+      bindHost: "127.0.0.1", port: 18_787,
+      hermesTargets: [{ profile: "default", url: "http://127.0.0.1:18787" }],
+    };
+    const provisional: LanListenerOwnership = {
+      schemaVersion: 1,
+      phase: "provisional",
+      ownershipSubtype: "wizard-listener-cas",
+      before,
+      after: { ...before, bindHost: "0.0.0.0" },
+      createdAt: 123,
+    };
+    try {
+      await expect(ownership.write(provisional)).resolves.toBe("written");
+      await expect(ownership.read()).resolves.toEqual(provisional);
+      const active = { ...provisional, phase: "active" as const, endpointFingerprint: "a".repeat(64) };
+      await expect(ownership.replace(provisional, active)).resolves.toBe(true);
+      await expect(ownership.replace(provisional, active)).resolves.toBe(false);
+      await expect(ownership.remove(provisional)).resolves.toBe(false);
+      await expect(ownership.remove(active)).resolves.toBe(true);
+    } finally {
+      storage.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("persists provisional listener authority before CAS and promotes it only after readiness", async () => {
+    const runtime = new FakeLanRuntime();
+    const events: string[] = [];
+    const write = runtime.ownership.write.bind(runtime.ownership);
+    runtime.ownership.write = async (value, signal) => {
+      events.push(`ownership:${value.phase}`);
+      return write(value, signal);
+    };
+    const replace = runtime.ownership.replace.bind(runtime.ownership);
+    runtime.ownership.replace = async (expected, replacement, signal) => {
+      events.push(`ownership:${replacement.phase}`);
+      return replace(expected, replacement, signal);
+    };
+    const cas = runtime.compareAndSwapListener.bind(runtime);
+    runtime.compareAndSwapListener = async (expected, replacement, signal) => {
+      events.push("listener:cas");
+      return cas(expected, replacement, signal);
+    };
+
+    await expect(new LanModeAdapter(runtime).prepare()).resolves.toMatchObject({ ready: true });
+    expect(events).toEqual(["ownership:provisional", "listener:cas", "ownership:active"]);
+    await expect(runtime.ownership.read()).resolves.toMatchObject({
+      phase: "active",
+      ownershipSubtype: "wizard-listener-cas",
+    });
+  });
+
+  it("resumes a listener CAS that completed before process loss from SQLite authority", async () => {
+    const runtime = new FakeLanRuntime();
+    const before = copyState(runtime.listener);
+    const after = { ...before, bindHost: "0.0.0.0" };
+    const provisional: LanListenerOwnership = {
+      schemaVersion: 1,
+      phase: "provisional",
+      ownershipSubtype: "wizard-listener-cas",
+      before,
+      after,
+      createdAt: 123,
+    };
+    await runtime.ownership.write(provisional);
+    await runtime.compareAndSwapListener(before, after);
+
+    const endpoint = await new LanModeAdapter(runtime).prepare();
+
+    expect(endpoint).toMatchObject({ ready: true, bindHost: "0.0.0.0" });
+    expect(runtime.compareAndSwapCalls).toHaveLength(1);
+    await expect(runtime.ownership.read()).resolves.toMatchObject({ phase: "active" });
+  });
+
   it("prepares wildcard LAN state, synchronizes Hermes, and discloses every other Up interface", async () => {
     const runtime = new FakeLanRuntime();
     runtime.inventory.adapters.push(
@@ -227,7 +344,7 @@ describe("LanModeAdapter", () => {
     ]);
   });
 
-  it("preserves a concurrent listener edit when readiness fails", async () => {
+  it("preserves a concurrent listener edit and reports rollback_failed when readiness fails", async () => {
     const runtime = new FakeLanRuntime();
     runtime.probe = { health: false, webSocket: false, attachReady: true };
     runtime.beforeProbe = () => {
@@ -239,14 +356,14 @@ describe("LanModeAdapter", () => {
     };
     const adapter = new LanModeAdapter(runtime);
 
-    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "health" });
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "rollback_failed" });
 
     expect(runtime.listener).toEqual({
       bindHost: "192.168.1.99",
       port: 19999,
       hermesTargets: [{ profile: "default", url: "http://127.0.0.1:19999" }],
     });
-    expect(runtime.compareAndSwapCalls).toHaveLength(2);
+    expect(runtime.compareAndSwapCalls).toHaveLength(1);
     expect(runtime.restartCalls).toHaveLength(1);
   });
 
@@ -376,10 +493,23 @@ describe("LanModeAdapter", () => {
     };
     const concurrent = copyState(runtime.listener);
 
-    await adapter.rollbackOwned(endpoint);
+    await expect(adapter.rollbackOwned(endpoint)).rejects.toBeInstanceOf(LanModeRollbackError);
+    await expect(adapter.rollbackOwned(endpoint)).rejects.toMatchObject({ reason: "rollback_failed" });
 
     expect(runtime.listener).toEqual(concurrent);
     expect(runtime.restartCalls).toHaveLength(1);
+  });
+
+  it("reports rollback_failed when the listener rollback CAS loses a race", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.rejectCasCall = 2;
+    const adapter = new LanModeAdapter(runtime);
+    const endpoint = await adapter.prepare();
+
+    await expect(adapter.rollbackOwned(endpoint)).rejects.toMatchObject({ reason: "rollback_failed" });
+    expect(runtime.listener.bindHost).toBe("0.0.0.0");
+    expect(runtime.restartCalls).toHaveLength(1);
+    await expect(runtime.ownership.read()).resolves.toMatchObject({ phase: "active" });
   });
 
   it("reports a non-ready endpoint when health or WebSocket proof is later lost", async () => {

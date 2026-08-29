@@ -150,6 +150,38 @@ describe("TailscaleCli", () => {
     ]);
   });
 
+  it("accepts only the official control server from bounded debug prefs and fails closed", async () => {
+    const runner = vi.fn<TailscaleCliRunner>()
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({ ControlURL: "https://controlplane.tailscale.com", WantRunning: true }),
+        stderr: "",
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({ ControlURL: "https://login.tailscale.com" }),
+        stderr: "",
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({ ControlURL: "https://headscale.example.test" }),
+        stderr: "",
+      })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: JSON.stringify({ WantRunning: true }), stderr: "" });
+    const cli = new TailscaleCli({ executable, runner });
+
+    await expect(cli.requireOfficialControlServer()).resolves.toBeUndefined();
+    await expect(cli.requireOfficialControlServer()).resolves.toBeUndefined();
+    await expect(cli.requireOfficialControlServer()).rejects.toMatchObject({ reason: "custom_control_server" });
+    await expect(cli.requireOfficialControlServer()).rejects.toMatchObject({ reason: "invalid_preferences" });
+    expect(runner.mock.calls.map((call) => call[1])).toEqual([
+      ["debug", "prefs"],
+      ["debug", "prefs"],
+      ["debug", "prefs"],
+      ["debug", "prefs"],
+    ]);
+  });
+
   it("incrementally parses bounded login objects, validates the exact login host, and redacts failures", async () => {
     const login = fixture("login-incremental.txt");
     const runner = vi.fn<TailscaleCliRunner>()

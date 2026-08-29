@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 import type {
   AttachmentBlock,
@@ -117,6 +117,10 @@ CREATE TABLE IF NOT EXISTS onboarding_ownership (
   durable_fingerprint TEXT NOT NULL,
   owned_state_json TEXT NOT NULL,
   created_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS onboarding_local_secrets (
+  secret_key TEXT PRIMARY KEY CHECK (secret_key = 'tailscale-identity-hmac-v1'),
+  secret_value BLOB NOT NULL CHECK (length(secret_value) = 32)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY,
@@ -824,6 +828,28 @@ export class Storage {
     `).get(ownershipKey) as OnboardingOwnershipInput | undefined;
   }
 
+  /** Returns the installation-local HMAC key held by the ACL-protected SQLite authority. The key
+   * is intentionally absent from onboarding ownership JSON, projections, and logging surfaces. */
+  onboardingIdentityHmacKey(): Uint8Array {
+    return this.#immediate(() => {
+      let row = this.#db.prepare(`
+        SELECT secret_value AS secretValue FROM onboarding_local_secrets
+        WHERE secret_key = 'tailscale-identity-hmac-v1'
+      `).get() as { secretValue: Uint8Array } | undefined;
+      if (row === undefined) {
+        const secretValue = randomBytes(32);
+        this.#db.prepare(`
+          INSERT INTO onboarding_local_secrets (secret_key, secret_value)
+          VALUES ('tailscale-identity-hmac-v1', ?)
+        `).run(secretValue);
+        row = { secretValue };
+      }
+      if (!(row.secretValue instanceof Uint8Array) || row.secretValue.byteLength !== 32)
+        throw new Error("invalid onboarding identity key");
+      return Uint8Array.from(row.secretValue);
+    });
+  }
+
   onboardingAuthorityStatus():
     | { state: "none" }
     | {
@@ -958,6 +984,31 @@ export class Storage {
       input.durableFingerprint,
       input.ownedStateJson,
       input.createdAt,
+    ).changes === 1);
+  }
+
+  replaceOnboardingOwnership(
+    expected: OnboardingOwnershipInput,
+    replacement: OnboardingOwnershipInput,
+  ): boolean {
+    this.#validateOnboardingOwnership(expected);
+    this.#validateOnboardingOwnership(replacement);
+    if (expected.ownershipKey !== replacement.ownershipKey || expected.mode !== replacement.mode)
+      throw new Error("onboarding ownership identity changed");
+    return this.#immediate(() => this.#db.prepare(`
+      UPDATE onboarding_ownership
+      SET durable_fingerprint = ?, owned_state_json = ?, created_at = ?
+      WHERE ownership_key = ? AND mode = ? AND durable_fingerprint = ?
+        AND owned_state_json = ? AND created_at = ?
+    `).run(
+      replacement.durableFingerprint,
+      replacement.ownedStateJson,
+      replacement.createdAt,
+      expected.ownershipKey,
+      expected.mode,
+      expected.durableFingerprint,
+      expected.ownedStateJson,
+      expected.createdAt,
     ).changes === 1);
   }
 

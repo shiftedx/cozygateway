@@ -7,6 +7,7 @@ import {
   type WindowsLanInventory,
 } from "./lan.ts";
 import { samePreparedEndpoint, type NetworkModeAdapter, type PreparedEndpoint } from "./network-onboarding.ts";
+import type { OnboardingOwnershipInput, OnboardingOwnershipWriteResult } from "./storage.ts";
 
 export interface LanHermesTarget {
   profile: string;
@@ -14,8 +15,8 @@ export interface LanHermesTarget {
 }
 
 /** The listener and every installer-managed Hermes target form one compare-and-swap unit. The
- * concrete Windows runtime is responsible for persisting it atomically; Task 7 supplies only this
- * injectable boundary and tests it with an inert fake. */
+ * concrete Windows runtime persists it atomically; durable SQLite intent makes the external CAS
+ * recoverable across process loss. */
 export interface LanListenerState {
   bindHost: string;
   port: number;
@@ -33,6 +34,7 @@ export interface LanProbeResult {
 }
 
 export interface LanModeRuntime {
+  ownership: LanOwnershipStore;
   readAdapterInventory(signal?: AbortSignal): Promise<WindowsLanInventory>;
   readSelectedAdapter?(signal?: AbortSignal): Promise<string | undefined>;
   writeSelectedAdapter?(adapterId: string, signal?: AbortSignal): Promise<void>;
@@ -95,10 +97,37 @@ export class LanModeReadinessError extends Error {
   }
 }
 
-interface OwnedListenerMutation {
+export class LanModeRollbackError extends Error {
+  readonly reason = "rollback_failed" as const;
+
+  constructor() {
+    super("LAN listener rollback failed");
+    this.name = "LanModeRollbackError";
+  }
+}
+
+export interface LanListenerOwnership {
+  schemaVersion: 1;
+  phase: "provisional" | "active";
+  ownershipSubtype: "wizard-listener-cas";
   before: LanListenerState;
   after: LanListenerState;
   endpointFingerprint?: string;
+  createdAt: number;
+}
+
+export interface LanOwnershipStore {
+  read(signal?: AbortSignal): Promise<LanListenerOwnership | undefined>;
+  write(ownership: LanListenerOwnership, signal?: AbortSignal): Promise<"written" | "existing" | "conflict">;
+  replace(expected: LanListenerOwnership, replacement: LanListenerOwnership, signal?: AbortSignal): Promise<boolean>;
+  remove(ownership: LanListenerOwnership, signal?: AbortSignal): Promise<boolean>;
+}
+
+export interface LanOwnershipAuthority {
+  onboardingOwnership(ownershipKey: string): OnboardingOwnershipInput | undefined;
+  recordOnboardingOwnership(input: OnboardingOwnershipInput): OnboardingOwnershipWriteResult;
+  replaceOnboardingOwnership(expected: OnboardingOwnershipInput, replacement: OnboardingOwnershipInput): boolean;
+  removeOnboardingOwnership(input: OnboardingOwnershipInput): boolean;
 }
 
 function copyState(state: LanListenerState): LanListenerState {
@@ -108,6 +137,94 @@ function copyState(state: LanListenerState): LanListenerState {
     hermesTargets: state.hermesTargets.map((target) => ({ ...target })),
     ...(state.persistenceRevision === undefined ? {} : { persistenceRevision: state.persistenceRevision }),
   };
+}
+
+const LAN_OWNERSHIP_KEY = "lan:listener";
+
+function ownershipJson(ownership: LanListenerOwnership): string {
+  return JSON.stringify({
+    schemaVersion: ownership.schemaVersion,
+    phase: ownership.phase,
+    ownershipSubtype: ownership.ownershipSubtype,
+    before: copyState(ownership.before),
+    after: copyState(ownership.after),
+    ...(ownership.endpointFingerprint === undefined ? {} : { endpointFingerprint: ownership.endpointFingerprint }),
+    createdAt: ownership.createdAt,
+  });
+}
+
+function ownershipFingerprint(ownership: LanListenerOwnership): string {
+  return createHash("sha256").update(ownershipJson(ownership)).digest("hex");
+}
+
+function validListenerState(value: unknown): value is LanListenerState {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const state = value as Record<string, unknown>;
+  if (typeof state.bindHost !== "string" || !Number.isSafeInteger(state.port)
+    || (state.port as number) < 1 || (state.port as number) > 65_535 || !Array.isArray(state.hermesTargets)) return false;
+  if (state.persistenceRevision !== undefined && typeof state.persistenceRevision !== "string") return false;
+  return state.hermesTargets.every((target) => typeof target === "object" && target !== null && !Array.isArray(target)
+    && typeof (target as Record<string, unknown>).profile === "string"
+    && typeof (target as Record<string, unknown>).url === "string");
+}
+
+function validLanOwnership(value: unknown): value is LanListenerOwnership {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const owned = value as Record<string, unknown>;
+  return owned.schemaVersion === 1
+    && (owned.phase === "provisional" || owned.phase === "active")
+    && owned.ownershipSubtype === "wizard-listener-cas"
+    && validListenerState(owned.before)
+    && validListenerState(owned.after)
+    && (owned.endpointFingerprint === undefined
+      || (typeof owned.endpointFingerprint === "string" && /^[0-9a-f]{64}$/.test(owned.endpointFingerprint)))
+    && Number.isSafeInteger(owned.createdAt) && (owned.createdAt as number) >= 0;
+}
+
+export class SqliteLanOwnershipStore implements LanOwnershipStore {
+  readonly #authority: LanOwnershipAuthority;
+
+  constructor(authority: LanOwnershipAuthority) { this.#authority = authority; }
+
+  async read(_signal?: AbortSignal): Promise<LanListenerOwnership | undefined> {
+    const row = this.#authority.onboardingOwnership(LAN_OWNERSHIP_KEY);
+    if (row === undefined) return undefined;
+    if (row.mode !== "lan") throw new LanModeRollbackError();
+    let parsed: unknown;
+    try { parsed = JSON.parse(row.ownedStateJson); } catch { throw new LanModeRollbackError(); }
+    if (!validLanOwnership(parsed) || row.durableFingerprint !== ownershipFingerprint(parsed))
+      throw new LanModeRollbackError();
+    return parsed;
+  }
+
+  async write(ownership: LanListenerOwnership, _signal?: AbortSignal): Promise<"written" | "existing" | "conflict"> {
+    if (!validLanOwnership(ownership)) throw new LanModeRollbackError();
+    return this.#authority.recordOnboardingOwnership(this.#input(ownership));
+  }
+
+  async replace(
+    expected: LanListenerOwnership,
+    replacement: LanListenerOwnership,
+    _signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (!validLanOwnership(expected) || !validLanOwnership(replacement)) throw new LanModeRollbackError();
+    return this.#authority.replaceOnboardingOwnership(this.#input(expected), this.#input(replacement));
+  }
+
+  async remove(ownership: LanListenerOwnership, _signal?: AbortSignal): Promise<boolean> {
+    if (!validLanOwnership(ownership)) throw new LanModeRollbackError();
+    return this.#authority.removeOnboardingOwnership(this.#input(ownership));
+  }
+
+  #input(ownership: LanListenerOwnership): OnboardingOwnershipInput {
+    return {
+      ownershipKey: LAN_OWNERSHIP_KEY,
+      mode: "lan",
+      durableFingerprint: ownershipFingerprint(ownership),
+      ownedStateJson: ownershipJson(ownership),
+      createdAt: ownership.createdAt,
+    };
+  }
 }
 
 function stateFingerprint(state: LanListenerState): string {
@@ -148,13 +265,20 @@ function exposure(inventory: WindowsLanInventory, selected: PhysicalLanCandidate
   };
 }
 
-function endpointFingerprint(candidate: PhysicalLanCandidate, listener: LanListenerState): string {
+type LanOwnershipSubtype = "wizard-listener-cas" | "preexisting-listener";
+
+function endpointFingerprint(
+  candidate: PhysicalLanCandidate,
+  listener: LanListenerState,
+  ownershipSubtype: LanOwnershipSubtype,
+): string {
   return createHash("sha256")
     .update(JSON.stringify({
       mode: "lan",
       adapterId: candidate.adapterId,
       address: candidate.address,
       listener: JSON.parse(stateFingerprint(listener)) as unknown,
+      ownershipSubtype,
     }))
     .digest("hex");
 }
@@ -165,13 +289,14 @@ function endpointOf(
   listener: LanListenerState,
   probe: LanProbeResult,
   listenerStable = true,
+  ownershipSubtype: LanOwnershipSubtype = "preexisting-listener",
 ): LanPreparedEndpoint {
   return {
     mode: "lan",
     canonicalOrigin: `http://${candidate.address}:${listener.port}`,
     bindHost: listener.bindHost,
     port: listener.port,
-    durableFingerprint: endpointFingerprint(candidate, listener),
+    durableFingerprint: endpointFingerprint(candidate, listener, ownershipSubtype),
     physicalAdapterId: candidate.adapterId,
     dhcpAddress: candidate.address,
     ready: listenerStable
@@ -189,7 +314,7 @@ function endpointOf(
 export class LanModeAdapter implements NetworkModeAdapter {
   readonly mode = "lan" as const;
   readonly #runtime: LanModeRuntime;
-  #owned?: OwnedListenerMutation;
+  #owned?: LanListenerOwnership;
   #selectedAdapterId?: string;
 
   constructor(runtime: LanModeRuntime) {
@@ -205,13 +330,40 @@ export class LanModeAdapter implements NetworkModeAdapter {
     const candidate = await this.#candidate(inventory, true, signal);
     const before = await this.#runtime.readListenerState(signal);
     const after = preparedState(before);
-    if (!sameState(before, after)) {
+    let owned = await this.#runtime.ownership.read(signal);
+    let listenerMutated = false;
+    if (owned !== undefined) {
+      if (!sameState(owned.after, preparedState(owned.before)) || !sameState(after, owned.after))
+        throw new LanModeRollbackError();
+      if (sameState(before, owned.before)) {
+        if (!await this.#runtime.compareAndSwapListener(owned.before, owned.after, signal))
+          throw new LanModePause("listener_changed", [candidate]);
+        listenerMutated = true;
+      } else if (!sameState(before, owned.after)) {
+        throw new LanModeRollbackError();
+      }
+      this.#owned = owned;
+    } else if (!sameState(before, after)) {
+      owned = {
+        schemaVersion: 1,
+        phase: "provisional",
+        ownershipSubtype: "wizard-listener-cas",
+        before: copyState(before),
+        after: copyState(after),
+        createdAt: Date.now(),
+      };
+      const written = await this.#runtime.ownership.write(owned, signal);
+      if (written === "conflict") throw new LanModePause("listener_changed", [candidate]);
       if (!await this.#runtime.compareAndSwapListener(before, after, signal)) {
+        await this.#removeOwnership(owned, signal);
         throw new LanModePause("listener_changed", [candidate]);
       }
-      this.#owned = { before: copyState(before), after: copyState(after) };
+      listenerMutated = true;
+      this.#owned = owned;
+    }
+    if (owned !== undefined && (listenerMutated || owned.phase === "provisional")) {
       try {
-        await this.#runtime.restartAndWait(after, signal);
+        await this.#runtime.restartAndWait(owned.after, signal);
       } catch (error) {
         await this.#rollbackMutation(signal);
         throw error;
@@ -220,7 +372,7 @@ export class LanModeAdapter implements NetworkModeAdapter {
 
     let endpoint: LanPreparedEndpoint;
     try {
-      const inspected = await this.#inspectCandidate(candidate, signal);
+      const inspected = await this.#inspectCandidate(candidate, signal, undefined, owned);
       endpoint = inspected.endpoint;
       if (!endpoint.ready) {
         const reason = !inspected.probe.health
@@ -236,14 +388,31 @@ export class LanModeAdapter implements NetworkModeAdapter {
       await this.#rollbackMutation(signal);
       throw error;
     }
-    if (this.#owned !== undefined) this.#owned.endpointFingerprint = endpoint.durableFingerprint;
+    if (owned !== undefined && owned.phase === "provisional") {
+      const active: LanListenerOwnership = {
+        ...owned,
+        phase: "active",
+        endpointFingerprint: endpoint.durableFingerprint,
+      };
+      if (!await this.#runtime.ownership.replace(owned, active, signal)) {
+        await this.#rollbackMutation(signal);
+        throw new LanModeRollbackError();
+      }
+      owned = active;
+      this.#owned = active;
+    }
     return endpoint;
   }
 
   async inspect(signal?: AbortSignal): Promise<LanPreparedEndpoint> {
     const inventory = await this.#runtime.readAdapterInventory(signal);
     const candidate = await this.#candidate(inventory, false, signal);
-    return (await this.#inspectCandidate(candidate, signal, inventory)).endpoint;
+    return (await this.#inspectCandidate(
+      candidate,
+      signal,
+      inventory,
+      await this.#runtime.ownership.read(signal),
+    )).endpoint;
   }
 
   async verify(expected: PreparedEndpoint, signal?: AbortSignal): Promise<boolean> {
@@ -256,7 +425,13 @@ export class LanModeAdapter implements NetworkModeAdapter {
   }
 
   async rollbackOwned(endpoint: PreparedEndpoint, signal?: AbortSignal): Promise<void> {
-    if (this.#owned?.endpointFingerprint !== endpoint.durableFingerprint) return;
+    const owned = this.#owned ?? await this.#runtime.ownership.read(signal);
+    if (owned?.endpointFingerprint !== endpoint.durableFingerprint) return;
+    await this.reconcileOwned(signal);
+  }
+
+  /** SQLite-authoritative crash/uninstall recovery. Call before removing the database. */
+  async reconcileOwned(signal?: AbortSignal): Promise<void> {
     await this.#rollbackMutation(signal);
   }
 
@@ -264,6 +439,7 @@ export class LanModeAdapter implements NetworkModeAdapter {
     expectedCandidate: PhysicalLanCandidate,
     signal?: AbortSignal,
     knownInventory?: WindowsLanInventory,
+    owned?: LanListenerOwnership,
   ): Promise<{ endpoint: LanPreparedEndpoint; probe: LanProbeResult }> {
     const inventory = knownInventory ?? await this.#runtime.readAdapterInventory(signal);
     const candidate = await this.#candidate(inventory, false, signal);
@@ -290,6 +466,9 @@ export class LanModeAdapter implements NetworkModeAdapter {
         finalListener,
         probe,
         sameState(listener, finalListener),
+        owned !== undefined && sameState(finalListener, owned.after)
+          ? "wizard-listener-cas"
+          : "preexisting-listener",
       ),
       probe,
     };
@@ -335,10 +514,28 @@ export class LanModeAdapter implements NetworkModeAdapter {
   }
 
   async #rollbackMutation(signal?: AbortSignal): Promise<void> {
-    const owned = this.#owned;
-    this.#owned = undefined;
+    const owned = this.#owned ?? await this.#runtime.ownership.read(signal);
     if (owned === undefined) return;
-    const restored = await this.#runtime.compareAndSwapListener(owned.after, owned.before, signal);
-    if (restored) await this.#runtime.restartAndWait(owned.before, signal);
+    const current = await this.#runtime.readListenerState(signal);
+    if (sameState(current, owned.before)) {
+      await this.#removeOwnership(owned, signal);
+      this.#owned = undefined;
+      return;
+    }
+    if (!sameState(current, owned.after)) throw new LanModeRollbackError();
+    if (!await this.#runtime.compareAndSwapListener(owned.after, owned.before, signal))
+      throw new LanModeRollbackError();
+    try {
+      await this.#runtime.restartAndWait(owned.before, signal);
+    } catch {
+      throw new LanModeRollbackError();
+    }
+    await this.#removeOwnership(owned, signal);
+    this.#owned = undefined;
+  }
+
+  async #removeOwnership(owned: LanListenerOwnership, signal?: AbortSignal): Promise<void> {
+    if (await this.#runtime.ownership.remove(owned, signal)) return;
+    if (await this.#runtime.ownership.read(signal) !== undefined) throw new LanModeRollbackError();
   }
 }

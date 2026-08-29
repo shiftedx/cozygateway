@@ -13,6 +13,8 @@ export type TailscaleCliErrorReason =
   | "unexpected_output"
   | "command_failed"
   | "unsupported_version"
+  | "custom_control_server"
+  | "invalid_preferences"
   | "invalid_status"
   | "invalid_auth_url";
 
@@ -548,6 +550,17 @@ export class TailscaleCli {
     if (!record(value) || Object.keys(value).length !== 1 || typeof value[name] !== "boolean")
       throw new TailscaleCliError("unexpected_output");
     return value[name];
+  }
+
+  /** `debug prefs` is an official machine-readable, but explicitly unstable, boundary that
+   * exposes the effective login server even when it was configured outside this process.
+   * Missing or non-official values fail closed before CozyGateway mutates preferences or Serve. */
+  async requireOfficialControlServer(signal?: AbortSignal): Promise<void> {
+    const value = await this.#json(["debug", "prefs"], signal);
+    if (typeof value.ControlURL !== "string") throw new TailscaleCliError("invalid_preferences");
+    if (value.ControlURL !== "https://controlplane.tailscale.com"
+      && value.ControlURL !== "https://login.tailscale.com")
+      throw new TailscaleCliError("custom_control_server");
   }
 
   async beginLogin(signal?: AbortSignal): Promise<TailscaleLoginResult> {
