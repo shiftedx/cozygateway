@@ -50,6 +50,15 @@
    Hermes activity but retains the root with repair guidance. If a configured/located/default
    database or SQLite WAL/SHM sidecar remains, missing/corrupt bundle, runtime, or config fails closed
    with the entire install preserved.
+10. **Root ownership and bounded removal:** a first install into an explicit custom root now accepts
+    only a new/empty directory or an existing root with the exact private
+    `.cozygateway-install-owner.json` proof. Before installed assets land, the bootstrap creates the
+    marker with a cryptographically random nonce and records the same nonce in install state and the
+    protected database-authority locator. Uninstall validates that proof and removes only an explicit
+    CozyGateway file allowlist plus the owned private Node subtree. It never recursively removes the
+    root; unrelated files survive and a nonempty retained root is reported. Missing/damaged state uses
+    the same allowlist, while an unmarked private project/vault fails closed without file, Task,
+    process, or PATH mutation.
 
 The shared disclosure seam is integrated in the Windows tests and controller flow. Disclosure is
 awaited by the orchestrator before adapter preparation; the shipped CLI copy covers LAN plaintext
@@ -91,12 +100,24 @@ peers/tailnet administrators may reach or observe the device.
   The real PowerShell/helper listener regression and Bash fake-native regression now fail before
   model/runtime/state/env/config/plugin/persistence mutation, report exact port/PID/process/action,
   and verify an inspect-only pass never stops an exact-owned listener.
+- Final ownership regressions showed that a writable nonempty custom directory could be adopted and
+  uninstall used broad root recursion. The bootstrap now rejects an unmarked private-project fixture,
+  verifies a random marker nonce across marker/state/locator, and preserves byte-for-byte sentinels in
+  healthy, damaged, shell-only, and marker-missing uninstall paths. The initial Dashboard inspection
+  also now runs without resolving Hermes identity; only an occupied listener triggers exact-owner
+  classification.
+- Enforcing the same matrices under `pwsh` exposed that its inherited PS7-first `PSModulePath` broke
+  the intentionally PS5.1 helper subprocess, both during install ACL preparation and during bundled
+  owned-network cleanup. The bootstrap now pins the PS5.1 built-in module directory for those bounded
+  subprocesses; the product ACL checks themselves were not relaxed.
 
 ## Final verification
 
-- `scripts/test/windows-helper.test.ps1` — passed.
-- `scripts/test/windows-bootstrap.test.ps1` — passed, including the real non-ASCII bootstrap/helper
-  pipeline and disposable-root DACL assertions.
+- `scripts/test/windows-helper.test.ps1` — passed under Windows PowerShell 5.1 and PowerShell 7,
+  including engine-neutral JSON PID handling.
+- `scripts/test/windows-bootstrap.test.ps1` — passed under Windows PowerShell 5.1 and PowerShell 7,
+  including the real non-ASCII bootstrap/helper pipeline, a deterministic OneDrive-style temp path,
+  root ownership markers, sentinel preservation, and disposable-root DACL assertions.
 - `scripts/test/windows-dashboard-owner.test.ps1` — passed.
 - `scripts/test/hermes-installer.test.sh` — passed, including occupied Dashboard preflight,
   inspect-only exact-owner reuse, full shell uninstall, and repair-only deactivation fixtures.
@@ -105,6 +126,9 @@ peers/tailnet administrators may reach or observe the device.
 - Full workspace recursive build and typecheck plus the release bundle — passed.
 - Bash syntax and `git diff --check` — passed (Git reported only the repository's expected Windows
   LF-to-CRLF checkout warnings).
+
+The package installer gate and Windows CI job now run both PS5.1 and `pwsh` helper/bootstrap suites,
+so the PowerShell 7 evidence is enforced rather than relying on an ad hoc local invocation.
 
 ## Verification boundary
 

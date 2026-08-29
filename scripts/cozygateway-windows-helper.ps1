@@ -824,21 +824,28 @@ function Test-CozyDashboardProcessOwner {
 
 function Invoke-InspectDashboardPort {
     param($Request)
-    if (-not (Test-ExactKeys $Request @('port','hermesRoot','hermesPath','launcherPath')) -or
-        $Request.port -isnot [int] -or $Request.port -lt 1 -or $Request.port -gt 65535 -or
-        @(@($Request.hermesRoot,$Request.hermesPath,$Request.launcherPath) | Where-Object { $_ -isnot [string] -or -not (Test-FullyQualifiedWindowsPath $_) }).Count -ne 0) { Throw-Reason 'invalid_request' }
+    $portOnly = Test-ExactKeys $Request @('port')
+    $withIdentity = Test-ExactKeys $Request @('port','hermesRoot','hermesPath','launcherPath')
+    $portProperty = $Request.PSObject.Properties['port']
+    $rawPort = if ($null -eq $portProperty) { $null } else { $portProperty.Value }
+    $numericPort = $rawPort -is [int] -or $rawPort -is [long]
+    if ((-not $portOnly -and -not $withIdentity) -or -not $numericPort -or
+        [long]$rawPort -lt 1 -or [long]$rawPort -gt 65535 -or
+        ($withIdentity -and @(@($Request.hermesRoot,$Request.hermesPath,$Request.launcherPath) | Where-Object { $_ -isnot [string] -or -not (Test-FullyQualifiedWindowsPath $_) }).Count -ne 0)) { Throw-Reason 'invalid_request' }
     try {
+        $port = [int][long]$rawPort
         $fixturePort = Get-FixtureProperty 'dashboardPort'
         if ($null -ne $fixturePort) {
             if ([string]$fixturePort.status -eq 'free') { return [ordered]@{ available=$true; owned=$false } }
-            return [ordered]@{ available=$false; owned=([string]$fixturePort.status -eq 'owned'); processId=[int]$fixturePort.processId; processName=[string]$fixturePort.processName }
+            $owned = $withIdentity -and [string]$fixturePort.status -eq 'owned'
+            return [ordered]@{ available=$false; owned=$owned; processId=[long]$fixturePort.processId; processName=[string]$fixturePort.processName }
         }
-        $connection = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$Request.port) -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $connection = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1)
         if ($connection.Count -eq 0) { return [ordered]@{ available=$true; owned=$false } }
         $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$connection[0].OwningProcess) -ErrorAction Stop
-        $owned = Test-CozyDashboardProcessOwner $process ([string]$Request.hermesRoot) ([string]$Request.hermesPath) ([string]$Request.launcherPath) ([int]$Request.port)
+        $owned = $withIdentity -and (Test-CozyDashboardProcessOwner $process ([string]$Request.hermesRoot) ([string]$Request.hermesPath) ([string]$Request.launcherPath) $port)
         $name = if ([string]::IsNullOrWhiteSpace([string]$process.Name)) { 'unknown' } else { [string]$process.Name }
-        return [ordered]@{ available=$false; owned=$owned; processId=[int]$process.ProcessId; processName=$name }
+        return [ordered]@{ available=$false; owned=$owned; processId=[long]$process.ProcessId; processName=$name }
     } catch { Throw-Reason 'dashboard_inspection_failed' }
 }
 

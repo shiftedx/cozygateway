@@ -1,4 +1,10 @@
+param([string] $PowerShellEngine = '')
+
 $ErrorActionPreference = 'Stop'
+$bundledUtility = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1'
+Import-Module $bundledUtility -Force -ErrorAction Stop
+$bundledSecurity = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+Import-Module $bundledSecurity -Force -ErrorAction Stop
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw "ASSERT: $Message" } }
 function Write-Utf8NoBom { param([string]$Path, [string]$Content) [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false))) }
@@ -28,8 +34,10 @@ function Invoke-Helper {
         $stdout = Join-Path $script:Temp ("stdout-" + [guid]::NewGuid().ToString('N'))
         $stderr = Join-Path $script:Temp ("stderr-" + [guid]::NewGuid().ToString('N'))
         $process = New-Object Diagnostics.Process
-        $process.StartInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $process.StartInfo.FileName = $script:PowerShellEngine
         $process.StartInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script:Harness`" $Command"
+        $engineModules = Join-Path (Split-Path -Parent $script:PowerShellEngine) 'Modules'
+        $process.StartInfo.EnvironmentVariables['PSModulePath'] = "$engineModules;$env:PSModulePath"
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.RedirectStandardInput = $true
         $process.StartInfo.RedirectStandardOutput = $true
@@ -81,6 +89,11 @@ function Assert-PrivateDacl {
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $script:Helper = Join-Path $repoRoot 'scripts\cozygateway-windows-helper.ps1'
+$script:PowerShellEngine = if ([string]::IsNullOrWhiteSpace($PowerShellEngine)) {
+    Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+} else {
+    (Get-Command $PowerShellEngine -CommandType Application -ErrorAction Stop).Source
+}
 $script:TempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
 $script:Temp = Join-Path $script:TempBase ("cozygateway-windows-helper-" + [guid]::NewGuid().ToString('N'))
 $script:TempVerified = $false
@@ -199,7 +212,9 @@ try {
     Assert-Reason (Invoke-Helper -Command 'set-preference' -Input @{ preference = 'accept-routes'; enabled = $true } -Fixture $prefFixture) 'invalid_request'
     $cleanupUnelevated = @{} + $prefFixture
     $cleanupUnelevated.elevated = $false
+    $eventsBeforeCleanup = Get-Content -LiteralPath $events -Raw
     Assert-Reason (Invoke-Helper -Command 'set-preference-cleanup' -Input @{ preference = 'unattended'; enabled = $true } -Fixture $cleanupUnelevated) 'preference_elevation_required'
+    Assert-True ((Get-Content -LiteralPath $events -Raw) -eq $eventsBeforeCleanup) 'cleanup elevation refusal must occur before any CLI or RunAs event'
 
     $installer = Join-Path $script:Temp 'downloaded.exe'
     Write-Utf8NoBom $installer 'signed installer fixture'
@@ -443,6 +458,14 @@ try {
         dashboardPort = @{ status = 'unrelated'; processId = 5252; processName = 'python.exe' }
     }
     Assert-True (-not $dashboardUnrelated.Json.result.available -and -not $dashboardUnrelated.Json.result.owned -and $dashboardUnrelated.Json.result.processName -eq 'python.exe') 'unrelated Dashboard listener metadata must remain actionable'
+    $dashboardFreeWithoutHermes = Invoke-Helper -Command 'inspect-dashboard-port' -Input @{ port = 9119 } -Fixture @{
+        dashboardPort = @{ status = 'free' }
+    }
+    Assert-True ($dashboardFreeWithoutHermes.Json.ok -and $dashboardFreeWithoutHermes.Json.result.available) 'initial free-port inspection must not require resolving Hermes identity'
+    $dashboardOccupiedWithoutHermes = Invoke-Helper -Command 'inspect-dashboard-port' -Input @{ port = 9119 } -Fixture @{
+        dashboardPort = @{ status = 'unrelated'; processId = [long]5252; processName = 'python.exe' }
+    }
+    Assert-True (-not $dashboardOccupiedWithoutHermes.Json.result.available -and -not $dashboardOccupiedWithoutHermes.Json.result.owned -and [long]$dashboardOccupiedWithoutHermes.Json.result.processId -eq 5252) 'initial occupied-port inspection must return engine-neutral PID metadata without Hermes identity'
     $invalidDashboardRequest = @{} + $dashboardRequest
     $invalidDashboardRequest.port = 0
     Assert-Reason (Invoke-Helper -Command 'inspect-dashboard-port' -Input $invalidDashboardRequest -Fixture @{}) 'invalid_request'

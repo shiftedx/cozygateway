@@ -59,6 +59,11 @@ install-root, token, state, environment, config, plugin, runtime, Task, or Start
 exact expected Hermes Dashboard owner may be reused; another owner is reported with PID/process and
 an explicit free `--dashboard-port` action.
 
+For an explicit `COZYGATEWAY_HOME`, an existing directory must be empty or already carry the exact
+privately protected CozyGateway ownership marker. A random marker nonce is persisted in protected
+install state and the database-authority locator before installed assets land. The installer refuses
+to adopt a nonempty project, OneDrive vault, or other unrelated directory without that proof.
+
 On Linux the installer enables user lingering so the service survives logout
 and reboot. If your host policy blocks that authorization, run
 `sudo loginctl enable-linger "$USER"` once and repeat the installer.
@@ -92,6 +97,10 @@ guidance; it does not claim authority is absent. Repair must restore the checksu
 bundle, `runtime\node\node.exe`, readable config, protected `local\network-authority.json`, and the
 referenced SQLite database/sidecars. Native PowerShell file removal without Git Bash is used only
 when the shell payload is genuinely missing and the protected locator proves network authority absent.
+All native and shell uninstall fallbacks use an explicit CozyGateway file allowlist and the owned
+private `runtime\node` directory; none recursively deletes the install root. The ownership marker is
+validated before teardown, unrelated files are retained, and the root itself is removed only when it
+is empty. A missing or invalid marker fails closed with recovery guidance rather than deleting files.
 
 No firewall rule is created or changed. Same Wi-Fi setup reads the selected adapter's Windows
 network category and active firewall policy. For a trusted home network reported as `Public`, change

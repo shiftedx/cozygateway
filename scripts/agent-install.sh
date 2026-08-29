@@ -566,6 +566,10 @@ write_state() {
   {
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
+    if [ -n "${COZYGATEWAY_INSTALL_OWNERSHIP_NONCE:-}" ]; then
+      [[ "$COZYGATEWAY_INSTALL_OWNERSHIP_NONCE" =~ ^[A-Za-z0-9_-]{43}$ ]] || die "invalid install ownership nonce"
+      printf 'ownership_nonce=%s\n' "$COZYGATEWAY_INSTALL_OWNERSHIP_NONCE"
+    fi
     # Keep the exact executable that performed the install. `--uninstall` may
     # run long after PATH or COZYGATEWAY_HERMES_BIN changed, and must not tear
     # down the CozyGateway service before discovering it cannot reverse the
@@ -795,6 +799,35 @@ stop_owned_windows_gateway() {
   [ "$check_target_port" = 0 ] && return 0
   for _ in $(seq 1 10); do gateway_ready || return 0; sleep 1; done
   die "the previous CozyGateway process stayed listening on port $PORT"
+}
+
+remove_known_gateway_files() {
+  local path
+  if [ "$DRY_RUN" = 1 ]; then
+    say "DRY   remove only explicit CozyGateway files and the private runtime; retain unrelated files under $GATEWAY_DIR"
+    return
+  fi
+  rm -f \
+    "$GATEWAY_DIR/bin/agent-install.sh" "$GATEWAY_DIR/bin/cozygateway.mjs" \
+    "$GATEWAY_DIR/bin/cozygateway-hermes-attach-plugin.tar.gz" "$GATEWAY_DIR/bin/cozygateway-windows-helper.ps1" \
+    "$GATEWAY_DIR/bin/cozygateway" "$GATEWAY_DIR/bin/cozygateway.cmd" \
+    "$LOCAL_DIR/cozygateway.config.json" "$LOCAL_DIR/cozygateway.sqlite" "$LOCAL_DIR/cozygateway.sqlite-wal" "$LOCAL_DIR/cozygateway.sqlite-shm" \
+    "$GATEWAY_ENV" "$DASHBOARD_ENV" "$LOCAL_DIR/profiles.json" "$STATE_FILE" \
+    "$LOCAL_DIR/network-onboarding.json" "$LOCAL_DIR/network-authority.json" "$LOCAL_DIR/operator-control.token" \
+    "$WRAPPER" "$WINDOWS_VBS" "$GW_LOG" "$GW_LOG.old"
+  path="$GATEWAY_DIR/runtime/node"
+  if [ -L "$path" ]; then
+    say "INFO  retained untrusted runtime symlink at $path"
+  elif [ -d "$path" ]; then
+    rm -rf "$path"
+  fi
+  rmdir "$GATEWAY_DIR/bin" "$LOCAL_DIR" "$GATEWAY_DIR/runtime" 2>/dev/null || true
+  rm -f "$GATEWAY_DIR/.cozygateway-install-owner.json"
+  if rmdir "$GATEWAY_DIR" 2>/dev/null; then
+    say "OK    removed the empty CozyGateway install root"
+  else
+    say "INFO  retained nonempty install root $GATEWAY_DIR because it contains unrelated files"
+  fi
 }
 preflight_windows_gateway_port() {
   WINDOWS_PORT_PREFLIGHTED=1
@@ -1133,11 +1166,11 @@ uninstall() {
   if [ "$SERVICE_PLATFORM" = Windows ]; then remove_windows_persistence_and_process; fi
   if [ ! -f "$STATE_FILE" ]; then
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
-    if [ "$DRY_RUN" = 1 ]; then run rm -rf "$GATEWAY_DIR"; return; fi
+    if [ "$DRY_RUN" = 1 ]; then remove_known_gateway_files; return; fi
     if [ "$SERVICE_PLATFORM" = Darwin ]; then launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli
     elif [ "$SERVICE_PLATFORM" = Linux ]; then systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli
     fi
-    rm -rf "$GATEWAY_DIR"; say "OK    removed partial CozyGateway state; Hermes was not changed"
+    remove_known_gateway_files; say "OK    removed allowlisted partial CozyGateway state; Hermes was not changed"
     return
   fi
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
@@ -1149,7 +1182,7 @@ uninstall() {
   case "$hermes_bin" in /*) ;; *) damaged_state=1 ;; esac
   if [ "$damaged_state" = 1 ]; then
     say "WARN  CozyGateway install state is incomplete or unsafe; persistence is stopped and recoverable current-user files will be removed without changing Hermes"
-    run rm -rf "$GATEWAY_DIR"
+    remove_known_gateway_files
     return
   fi
   [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || hermes_available=0
@@ -1169,7 +1202,7 @@ uninstall() {
   done
   if [ "$damaged_state" = 1 ]; then
     say "WARN  CozyGateway profile ownership state is incomplete or unsafe; persistence is stopped and recoverable current-user files will be removed without changing Hermes"
-    run rm -rf "$GATEWAY_DIR"
+    remove_known_gateway_files
     return
   fi
   for p in "${SELECTED[@]}"; do
@@ -1196,7 +1229,7 @@ uninstall() {
       rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes restarted, but the CozyGateway spool for profile $p is still in use"
     fi
   done
-  run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
+  remove_known_gateway_files; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
 deactivate_for_repair() {
   local profiles root hermes_bin p plugin action damaged_state=0 hermes_available=1

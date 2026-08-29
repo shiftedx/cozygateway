@@ -669,24 +669,28 @@ damaged_root="$tmp/gateway-windows-damaged"
 damaged_startup="$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 mkdir -p "$damaged_root/local" "$(dirname "$damaged_startup")"
 printf '{not-json\n' > "$damaged_root/local/cozygateway.config.json"
+printf 'private vault sentinel\n' > "$damaged_root/private-vault.dat"
 printf 'startup\n' > "$damaged_startup"
 damaged_log="$tmp/windows-damaged-native-commands"
 HOME="$tmp/windows-damaged-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$damaged_log" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$damaged_root" >/dev/null
 grep -Fq '/Delete /F /TN CozyGateway' "$damaged_log"
 grep -Fq 'powershell ' "$damaged_log"
 test ! -e "$damaged_startup"
-test ! -e "$damaged_root"
+test "$(cat "$damaged_root/private-vault.dat")" = 'private vault sentinel'
+test ! -e "$damaged_root/local/cozygateway.config.json"
 
 corrupt_root="$tmp/gateway-windows-corrupt-state"
 mkdir -p "$corrupt_root/local" "$(dirname "$damaged_startup")"
 printf 'not-installer-state\n' > "$corrupt_root/local/install-state"
+printf 'private project sentinel\n' > "$corrupt_root/project-notes.txt"
 printf 'startup\n' > "$damaged_startup"
 corrupt_log="$tmp/windows-corrupt-native-commands"
 HOME="$tmp/windows-corrupt-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$corrupt_log" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$corrupt_root" >/dev/null
 grep -Fq '/Delete /F /TN CozyGateway' "$corrupt_log"
 grep -Fq 'powershell ' "$corrupt_log"
 test ! -e "$damaged_startup"
-test ! -e "$corrupt_root"
+test "$(cat "$corrupt_root/project-notes.txt")" = 'private project sentinel'
+test ! -e "$corrupt_root/local/install-state"
 
 # Legacy authority ambiguity uses this bounded recovery mode: persistence and
 # owned Hermes lifecycle are deactivated, but every repair artifact remains.
@@ -720,6 +724,7 @@ test -f "$deactivate_profile/.env"
 # After the installer-owned plugin is disabled, uninstall restarts exactly that
 # profile once, retries cleanup, and leaves its service running.
 mkdir -p "$tmp/hermes/profiles/locked-windows/plugins/cozygateway" "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway" "$tmp/gateway-windows-locked/local"
+printf 'unrelated root sentinel\n' > "$tmp/gateway-windows-locked/keep-me.txt"
 mkdir -p "$tmp/hermes/profiles/unrelated/plugin-data/unrelated"
 : > "$tmp/hermes/profiles/locked-windows/plugins/cozygateway/.cozygateway-installer-owned"
 : > "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
@@ -741,7 +746,7 @@ test "$(cat "$tmp/hermes/gateway-locked-windows.state")" = running
 test "$(cat "$tmp/hermes/gateway-unrelated.state")" = running
 test "$(cat "$tmp/hermes/profiles/unrelated/plugin-data/unrelated/sentinel")" = preserve-me
 ! grep -q '^unrelated:' "$tmp/windows-locked-commands"
-test ! -e "$tmp/gateway-windows-locked"
+test "$(cat "$tmp/gateway-windows-locked/keep-me.txt")" = 'unrelated root sentinel'
 test ! -e "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
 
 # A machine with Hermes and Git Bash but no Node receives a private, checksum-

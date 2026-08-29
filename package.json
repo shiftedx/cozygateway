@@ -13,7 +13,7 @@
     "build": "pnpm -r build",
     "bundle": "node scripts/build-bundle.mjs",
     "test:installer": "bash scripts/test/hermes-installer.test.sh",
-    "test:installer:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1",
+    "test:installer:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1 && pwsh.exe -NoProfile -File scripts/test/windows-bootstrap.test.ps1 -PowerShellEngine pwsh.exe && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-helper.test.ps1 && pwsh.exe -NoProfile -File scripts/test/windows-helper.test.ps1 -PowerShellEngine pwsh.exe",
     "check": "pnpm build && pnpm typecheck && pnpm test"
   },
   "devDependencies": {

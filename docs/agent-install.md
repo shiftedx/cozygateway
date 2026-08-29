@@ -54,6 +54,11 @@ replacement, permission-change, or ownership-takeover authority, and reparse poi
 dedicated root, `bin`, verified helper, installer payload, and private runtime with a
 current-user/SYSTEM-only DACL.
 This applies to `%LOCALAPPDATA%\cozygateway` and to an explicit `COZYGATEWAY_HOME` custom root.
+An explicit custom root must be new/empty or already contain the exact privately protected
+`.cozygateway-install-owner.json` marker. The bootstrap creates that marker before installed assets,
+using a random nonce that is also recorded in protected install state and the database-authority
+locator. It will not adopt a nonempty project, synced vault, or other existing directory merely
+because the current user can write it.
 The PowerShell bootstrap checks the selected Gateway port before Hermes/model setup, release assets,
 tokens, config, plugins, or login persistence. An occupied port stops installation with the owning
 PID/process name and instructions to stop it or choose a free `--port`; it does not leave a partial
@@ -176,7 +181,9 @@ private Node runtime, readable config, protected authority locator, and its refe
 database/sidecars before retrying. Native file removal without Git Bash is reserved for a genuinely
 missing shell payload with authority proven absent by the protected locator. Hermes profiles/services
 remain governed by the recorded ownership rules; unrelated processes and persistence entries are
-not stopped.
+not stopped. Every Windows removal path validates the private install marker first and deletes only
+an explicit allowlist of CozyGateway files plus the owned private Node runtime. It removes the install
+root only when empty; user-added files are retained in place and the retained root is reported.
 Linux service units honor `XDG_CONFIG_HOME` and otherwise use
 `~/.config/systemd/user`. An environment without a running systemd user manager,
 such as a container or WSL instance without systemd, fails before installation
