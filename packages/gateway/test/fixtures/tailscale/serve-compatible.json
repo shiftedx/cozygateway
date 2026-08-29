@@ -1,0 +1,1 @@
+{"TCP":{"443":{"TCPForward":"127.0.0.1:18787","TerminateTLS":"cozy.fixture-tailnet.ts.net"}},"Web":{},"AllowFunnel":{},"Foreground":{},"Services":{}}

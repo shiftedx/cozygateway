@@ -1,0 +1,1 @@
+{"TCP":{},"Web":{},"AllowFunnel":{},"Foreground":{"session-fixture":{"TCP":{"443":{"TCPForward":"127.0.0.1:29999","TerminateTLS":"cozy.fixture-tailnet.ts.net"}}}},"Services":{}}

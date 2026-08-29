@@ -1,0 +1,652 @@
+import { spawn } from "node:child_process";
+
+export const TAILSCALE_CLI_MAX_OBJECT_BYTES = 64 * 1024;
+export const TAILSCALE_CLI_MAX_TOTAL_BYTES = 256 * 1024;
+
+export type TailscaleCliErrorReason =
+  | "invalid_executable"
+  | "timeout"
+  | "cancelled"
+  | "output_too_large"
+  | "invalid_utf8"
+  | "malformed_json"
+  | "unexpected_output"
+  | "command_failed"
+  | "unsupported_version"
+  | "invalid_status"
+  | "invalid_auth_url";
+
+export class TailscaleCliError extends Error {
+  readonly reason: TailscaleCliErrorReason;
+
+  constructor(reason: TailscaleCliErrorReason) {
+    super(`Tailscale operation paused: ${reason}`);
+    this.name = "TailscaleCliError";
+    this.reason = reason;
+  }
+}
+
+export interface TailscaleCliRunOptions {
+  shell: false;
+  windowsHide: true;
+  timeoutMs: number;
+  maxObjectBytes: number;
+  maxTotalBytes: number;
+  signal: AbortSignal;
+  onStdoutChunk?: (chunk: Uint8Array) => void;
+}
+
+export type TailscaleCliOutput = string | Uint8Array | readonly (string | Uint8Array)[];
+
+export interface TailscaleCliRunResult {
+  exitCode: number;
+  stdout: TailscaleCliOutput;
+  stderr: TailscaleCliOutput;
+}
+
+export type TailscaleCliRunner = (
+  executable: string,
+  argv: readonly string[],
+  options: TailscaleCliRunOptions,
+) => Promise<TailscaleCliRunResult>;
+
+export interface TailscaleCliOptions {
+  executable: string;
+  runner?: TailscaleCliRunner;
+  timeoutMs?: number;
+}
+
+export interface TailscaleVersion {
+  major: number;
+  minor: number;
+  patch: number;
+  display: string;
+}
+
+export type TailscaleStatus =
+  | { state: "needs_login"; authUrl?: string }
+  | { state: "needs_machine_auth" }
+  | { state: "stopped" | "starting" }
+  | {
+      state: "running";
+      dnsName: string;
+      magicDnsSuffix: string;
+      accountLabel: string;
+      accountId: string;
+      tailnetName: string;
+      certificateReady: boolean;
+    };
+
+export type TailscaleLoginResult =
+  | { outcome: "running" }
+  | { outcome: "machine_auth_required" }
+  | { outcome: "auth_required"; authUrl: string };
+
+function isFullyQualifiedWindowsPath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+\\[^\\/]+(?:\\|$)/.test(value);
+}
+
+function chunks(value: TailscaleCliOutput): readonly (string | Uint8Array)[] {
+  return Array.isArray(value) ? value : [value as string | Uint8Array];
+}
+
+function bytes(value: string | Uint8Array): Uint8Array {
+  return typeof value === "string" ? Buffer.from(value, "utf8") : value;
+}
+
+function decodeBounded(value: TailscaleCliOutput, maxBytes: number): string {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const parts: string[] = [];
+  let total = 0;
+  try {
+    const values = chunks(value);
+    for (let index = 0; index < values.length; index += 1) {
+      const part = bytes(values[index]!);
+      total += part.byteLength;
+      if (total > maxBytes) throw new TailscaleCliError("output_too_large");
+      parts.push(decoder.decode(part, { stream: index + 1 < values.length }));
+    }
+  } catch (error) {
+    if (error instanceof TailscaleCliError) throw error;
+    throw new TailscaleCliError("invalid_utf8");
+  }
+  return parts.join("");
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** JSON.parse is last-key-wins. CLI security state must instead reject duplicate keys, including
+ * escaped spellings of the same key, at every nesting level. Syntax remains JSON.parse's job. */
+function assertNoDuplicateJsonKeys(text: string): void {
+  let index = 0;
+  const whitespace = () => {
+    while (index < text.length && /\s/.test(text[index]!)) index += 1;
+  };
+  const stringToken = (): string => {
+    if (text[index] !== '"') throw new Error("expected JSON string");
+    const start = index;
+    index += 1;
+    let escaped = false;
+    while (index < text.length) {
+      const character = text[index++]!;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') return JSON.parse(text.slice(start, index)) as string;
+    }
+    throw new Error("unterminated JSON string");
+  };
+  const value = (depth: number): void => {
+    if (depth > 128) throw new Error("JSON nesting exceeded its bound");
+    whitespace();
+    if (text[index] === "{") {
+      index += 1;
+      whitespace();
+      const keys = new Set<string>();
+      if (text[index] === "}") { index += 1; return; }
+      while (index < text.length) {
+        whitespace();
+        const key = stringToken();
+        if (keys.has(key)) throw new Error("duplicate JSON key");
+        keys.add(key);
+        whitespace();
+        if (text[index++] !== ":") throw new Error("missing JSON colon");
+        value(depth + 1);
+        whitespace();
+        const separator = text[index++];
+        if (separator === "}") return;
+        if (separator !== ",") throw new Error("invalid JSON object separator");
+      }
+      throw new Error("unterminated JSON object");
+    }
+    if (text[index] === "[") {
+      index += 1;
+      whitespace();
+      if (text[index] === "]") { index += 1; return; }
+      while (index < text.length) {
+        value(depth + 1);
+        whitespace();
+        const separator = text[index++];
+        if (separator === "]") return;
+        if (separator !== ",") throw new Error("invalid JSON array separator");
+      }
+      throw new Error("unterminated JSON array");
+    }
+    if (text[index] === '"') {
+      stringToken();
+      return;
+    }
+    const start = index;
+    while (index < text.length && !/[\s,}\]]/.test(text[index]!)) index += 1;
+    if (start === index) throw new Error("missing JSON value");
+  };
+  value(0);
+  whitespace();
+  if (index !== text.length) throw new Error("trailing JSON data");
+}
+
+function dnsName(value: string): boolean {
+  if (value.length === 0 || value.length > 253 || value !== value.toLowerCase() || !/^[\x00-\x7f]+$/.test(value))
+    return false;
+  if (!value.endsWith(".ts.net") || value === "ts.net") return false;
+  return value.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label));
+}
+
+function supportedVersionText(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/.exec(value);
+  if (match === null) return false;
+  const [major, minor, patch] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  return major > 1 || (major === 1 && (minor > 102 || (minor === 102 && patch >= 1)));
+}
+
+function exactHttpsUrl(value: unknown, hosts: readonly string[]): string | undefined {
+  if (typeof value !== "string" || value.length > 2_048) return undefined;
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { return undefined; }
+  if (
+    parsed.protocol !== "https:" || parsed.port !== "" || parsed.username !== "" || parsed.password !== ""
+    || parsed.hash !== "" || !hosts.includes(parsed.hostname) || parsed.hostname !== parsed.hostname.toLowerCase()
+  ) return undefined;
+  return parsed.href;
+}
+
+function consentUrl(text: string, complete: boolean): string | undefined {
+  const pattern = complete
+    ? /https:\/\/[^\s<>"']+/g
+    : /https:\/\/[^\s<>"']+(?=\s)/g;
+  for (const candidate of text.match(pattern) ?? []) {
+    const parsed = exactHttpsUrl(candidate.replace(/[),.;]+$/, ""), [
+      "login.tailscale.com",
+      "console.tailscale.com",
+    ]);
+    if (parsed !== undefined) return parsed;
+  }
+  return undefined;
+}
+
+function parseSingleValue(output: TailscaleCliOutput): unknown {
+  const text = decodeBounded(output, TAILSCALE_CLI_MAX_TOTAL_BYTES).trim();
+  if (Buffer.byteLength(text, "utf8") > TAILSCALE_CLI_MAX_OBJECT_BYTES)
+    throw new TailscaleCliError("output_too_large");
+  try {
+    assertNoDuplicateJsonKeys(text);
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new TailscaleCliError("malformed_json");
+  }
+}
+
+function parseSingleObject(output: TailscaleCliOutput): Record<string, unknown> {
+  const value = parseSingleValue(output);
+  if (!record(value)) throw new TailscaleCliError("unexpected_output");
+  return value;
+}
+
+function parseObjectSequence(output: TailscaleCliOutput): Record<string, unknown>[] {
+  const text = decodeBounded(output, TAILSCALE_CLI_MAX_TOTAL_BYTES);
+  const values: Record<string, unknown>[] = [];
+  let start = -1;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (start < 0) {
+      if (/\s/.test(character)) continue;
+      if (character !== "{") throw new TailscaleCliError("malformed_json");
+      start = index;
+      depth = 1;
+      continue;
+    }
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') quoted = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth < 0) throw new TailscaleCliError("malformed_json");
+      if (depth === 0) {
+        const objectText = text.slice(start, index + 1);
+        if (Buffer.byteLength(objectText, "utf8") > TAILSCALE_CLI_MAX_OBJECT_BYTES)
+          throw new TailscaleCliError("output_too_large");
+        let value: unknown;
+        try {
+          assertNoDuplicateJsonKeys(objectText);
+          value = JSON.parse(objectText);
+        } catch { throw new TailscaleCliError("malformed_json"); }
+        if (!record(value)) throw new TailscaleCliError("unexpected_output");
+        values.push(value);
+        start = -1;
+      }
+    }
+  }
+  if (start >= 0 || quoted || values.length === 0) throw new TailscaleCliError("malformed_json");
+  return values;
+}
+
+class IncrementalJsonObjectBound {
+  #started = false;
+  #depth = 0;
+  #quoted = false;
+  #escaped = false;
+  #bytes = 0;
+
+  push(chunk: Uint8Array): void {
+    for (const byte of chunk) {
+      if (!this.#started) {
+        if (byte === 0x09 || byte === 0x0a || byte === 0x0d || byte === 0x20) continue;
+        if (byte !== 0x7b) throw new TailscaleCliError("malformed_json");
+        this.#started = true;
+        this.#depth = 1;
+        this.#bytes = 1;
+        continue;
+      }
+      this.#bytes += 1;
+      if (this.#bytes > TAILSCALE_CLI_MAX_OBJECT_BYTES)
+        throw new TailscaleCliError("output_too_large");
+      if (this.#quoted) {
+        if (this.#escaped) this.#escaped = false;
+        else if (byte === 0x5c) this.#escaped = true;
+        else if (byte === 0x22) this.#quoted = false;
+        continue;
+      }
+      if (byte === 0x22) this.#quoted = true;
+      else if (byte === 0x7b) this.#depth += 1;
+      else if (byte === 0x7d) {
+        this.#depth -= 1;
+        if (this.#depth === 0) {
+          this.#started = false;
+          this.#bytes = 0;
+        }
+      }
+    }
+  }
+}
+
+const defaultRunner: TailscaleCliRunner = (executable, argv, options) => new Promise((resolve, reject) => {
+  const child = spawn(executable, [...argv], {
+    shell: options.shell,
+    windowsHide: options.windowsHide,
+    stdio: ["ignore", "pipe", "pipe"],
+    signal: options.signal,
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  let total = 0;
+  let settled = false;
+  const finishError = (error: Error) => {
+    if (settled) return;
+    settled = true;
+    child.kill();
+    reject(error);
+  };
+  const collect = (destination: Buffer[], observe?: (chunk: Uint8Array) => void) => (chunk: Buffer) => {
+    total += chunk.byteLength;
+    if (total > options.maxTotalBytes) {
+      finishError(new TailscaleCliError("output_too_large"));
+      return;
+    }
+    destination.push(chunk);
+    try {
+      observe?.(chunk);
+    } catch (error) {
+      finishError(error instanceof TailscaleCliError ? error : new TailscaleCliError("unexpected_output"));
+    }
+  };
+  child.on("error", finishError);
+  child.stdout.on("data", collect(stdout, options.onStdoutChunk));
+  child.stderr.on("data", collect(stderr));
+  child.on("close", (code) => {
+    if (settled) return;
+    settled = true;
+    resolve({ exitCode: code ?? 1, stdout, stderr });
+  });
+});
+
+export class TailscaleCli {
+  readonly #executable: string;
+  readonly #runner: TailscaleCliRunner;
+  readonly #timeoutMs: number;
+
+  constructor(options: TailscaleCliOptions) {
+    if (!isFullyQualifiedWindowsPath(options.executable))
+      throw new Error("a fully qualified trusted Tailscale executable path is required");
+    this.#executable = options.executable;
+    this.#runner = options.runner ?? defaultRunner;
+    this.#timeoutMs = options.timeoutMs ?? 15_000;
+  }
+
+  async #run(
+    argv: readonly string[],
+    signal?: AbortSignal,
+    onStdoutChunk?: (chunk: Uint8Array) => void,
+  ): Promise<TailscaleCliRunResult> {
+    const controller = new AbortController();
+    let timedOut = false;
+    const onAbort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.#timeoutMs);
+    try {
+      const run = this.#runner(this.#executable, [...argv], {
+        shell: false,
+        windowsHide: true,
+        timeoutMs: this.#timeoutMs,
+        maxObjectBytes: TAILSCALE_CLI_MAX_OBJECT_BYTES,
+        maxTotalBytes: TAILSCALE_CLI_MAX_TOTAL_BYTES,
+        signal: controller.signal,
+        onStdoutChunk,
+      });
+      const aborted = new Promise<never>((_resolve, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          reject(new TailscaleCliError(timedOut ? "timeout" : "cancelled"));
+        }, { once: true });
+      });
+      const result = await Promise.race([run, aborted]);
+      const total = chunks(result.stdout).reduce((sum, part) => sum + bytes(part).byteLength, 0)
+        + chunks(result.stderr).reduce((sum, part) => sum + bytes(part).byteLength, 0);
+      if (total > TAILSCALE_CLI_MAX_TOTAL_BYTES) throw new TailscaleCliError("output_too_large");
+      return result;
+    } catch (error) {
+      if (error instanceof TailscaleCliError) throw error;
+      if (controller.signal.aborted)
+        throw new TailscaleCliError(timedOut ? "timeout" : "cancelled");
+      throw new TailscaleCliError("command_failed");
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async #json(argv: readonly string[], signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const result = await this.#run(argv, signal);
+    if (result.exitCode !== 0) throw new TailscaleCliError("command_failed");
+    return parseSingleObject(result.stdout);
+  }
+
+  async #jsonValue(argv: readonly string[], signal?: AbortSignal): Promise<unknown> {
+    const result = await this.#run(argv, signal);
+    if (result.exitCode !== 0) throw new TailscaleCliError("command_failed");
+    return parseSingleValue(result.stdout);
+  }
+
+  async #command(argv: readonly string[], signal?: AbortSignal): Promise<void> {
+    const result = await this.#run(argv, signal);
+    if (result.exitCode !== 0) throw new TailscaleCliError("command_failed");
+  }
+
+  async version(signal?: AbortSignal): Promise<TailscaleVersion> {
+    const value = await this.#json(["version", "--json"], signal);
+    if (typeof value.majorMinorPatch !== "string") throw new TailscaleCliError("unexpected_output");
+    const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value.majorMinorPatch);
+    if (match === null) throw new TailscaleCliError("unexpected_output");
+    return {
+      major: Number(match[1]),
+      minor: Number(match[2]),
+      patch: Number(match[3]),
+      display: value.majorMinorPatch,
+    };
+  }
+
+  async requireSupportedVersion(signal?: AbortSignal): Promise<TailscaleVersion> {
+    const version = await this.version(signal);
+    const supported = version.major > 1
+      || (version.major === 1 && (version.minor > 102 || (version.minor === 102 && version.patch >= 1)));
+    if (!supported) throw new TailscaleCliError("unsupported_version");
+    return version;
+  }
+
+  async status(signal?: AbortSignal): Promise<TailscaleStatus> {
+    const value = await this.#json(["status", "--json"], signal);
+    if (!supportedVersionText(value.Version) || !Array.isArray(value.Health)
+      || !value.Health.every((entry) => typeof entry === "string" && entry.length <= 1_024))
+      throw new TailscaleCliError("invalid_status");
+    switch (value.BackendState) {
+      case "NeedsLogin": {
+        if (value.AuthURL === undefined || value.AuthURL === "") return { state: "needs_login" };
+        const authUrl = exactHttpsUrl(value.AuthURL, ["login.tailscale.com"]);
+        if (authUrl === undefined) throw new TailscaleCliError("invalid_auth_url");
+        return { state: "needs_login", authUrl };
+      }
+      case "NeedsMachineAuth":
+        return { state: "needs_machine_auth" };
+      case "Stopped":
+      case "NoState":
+        return { state: "stopped" };
+      case "Starting":
+        return { state: "starting" };
+      case "Running":
+        break;
+      default:
+        throw new TailscaleCliError("invalid_status");
+    }
+    if (value.Health.length !== 0) throw new TailscaleCliError("invalid_status");
+    if (!record(value.Self) || value.Self.Online !== true) throw new TailscaleCliError("invalid_status");
+    if (Array.isArray(value.Self.Tags) && value.Self.Tags.length > 0) throw new TailscaleCliError("invalid_status");
+    if (value.Self.Tags !== undefined && value.Self.Tags !== null && !Array.isArray(value.Self.Tags))
+      throw new TailscaleCliError("invalid_status");
+    if (typeof value.Self.DNSName !== "string" || value.Self.DNSName.trim() !== value.Self.DNSName)
+      throw new TailscaleCliError("invalid_status");
+    const canonicalDns = value.Self.DNSName.endsWith(".")
+      ? value.Self.DNSName.slice(0, -1)
+      : value.Self.DNSName;
+    if (!dnsName(canonicalDns)) throw new TailscaleCliError("invalid_status");
+    if (!record(value.CurrentTailnet) || typeof value.CurrentTailnet.Name !== "string"
+      || value.CurrentTailnet.Name.trim().length === 0 || value.CurrentTailnet.Name.length > 255
+      || typeof value.CurrentTailnet.MagicDNSSuffix !== "string"
+      || !dnsName(`host.${value.CurrentTailnet.MagicDNSSuffix}`)
+      || !canonicalDns.endsWith(`.${value.CurrentTailnet.MagicDNSSuffix}`))
+      throw new TailscaleCliError("invalid_status");
+    if (!Array.isArray(value.CertDomains)
+      || !value.CertDomains.every((domain) => typeof domain === "string" && dnsName(domain))
+      || (value.CertDomains.length > 0 && !value.CertDomains.includes(canonicalDns)))
+      throw new TailscaleCliError("invalid_status");
+    const userId = typeof value.Self.UserID === "string" || typeof value.Self.UserID === "number"
+      ? String(value.Self.UserID)
+      : undefined;
+    if (userId === undefined || !record(value.User) || !record(value.User[userId]))
+      throw new TailscaleCliError("invalid_status");
+    const profile = value.User[userId];
+    if (typeof profile.LoginName !== "string" || profile.LoginName.trim().length === 0 || profile.LoginName.length > 320)
+      throw new TailscaleCliError("invalid_status");
+    return {
+      state: "running",
+      dnsName: canonicalDns,
+      magicDnsSuffix: value.CurrentTailnet.MagicDNSSuffix,
+      accountLabel: profile.LoginName,
+      accountId: userId,
+      tailnetName: value.CurrentTailnet.Name,
+      certificateReady: value.CertDomains.includes(canonicalDns),
+    };
+  }
+
+  async preference(name: "unattended" | "shields-up", signal?: AbortSignal): Promise<boolean> {
+    const value = await this.#jsonValue(["get", "--json", name], signal);
+    if (typeof value === "boolean") return value;
+    if (!record(value) || Object.keys(value).length !== 1 || typeof value[name] !== "boolean")
+      throw new TailscaleCliError("unexpected_output");
+    return value[name];
+  }
+
+  async beginLogin(signal?: AbortSignal): Promise<TailscaleLoginResult> {
+    const objectBound = new IncrementalJsonObjectBound();
+    const result = await this.#run(
+      ["up", "--json", "--timeout=5s"],
+      signal,
+      (chunk) => objectBound.push(chunk),
+    );
+    const values = parseObjectSequence(result.stdout);
+    let authUrl: string | undefined;
+    let state: string | undefined;
+    for (const value of values) {
+      if (value.Error !== undefined && (typeof value.Error !== "string" || value.Error.length > 0))
+        throw new TailscaleCliError("command_failed");
+      if (value.BackendState !== undefined && typeof value.BackendState !== "string")
+        throw new TailscaleCliError("unexpected_output");
+      if (typeof value.BackendState === "string") state = value.BackendState;
+      if (value.AuthURL !== undefined) {
+        const parsed = exactHttpsUrl(value.AuthURL, ["login.tailscale.com"]);
+        if (parsed === undefined || !/^\/a\/[A-Za-z0-9_-]+$/.test(new URL(parsed).pathname))
+          throw new TailscaleCliError("invalid_auth_url");
+        authUrl = parsed;
+      }
+    }
+    if (state === "Running") return { outcome: "running" };
+    if (state === "NeedsMachineAuth") return { outcome: "machine_auth_required" };
+    if (authUrl !== undefined) return { outcome: "auth_required", authUrl };
+    if (result.exitCode !== 0) throw new TailscaleCliError("command_failed");
+    throw new TailscaleCliError("unexpected_output");
+  }
+
+  serveState(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.#json(["serve", "status", "--json"], signal);
+  }
+
+  funnelState(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.#json(["funnel", "status", "--json"], signal);
+  }
+
+  async createTlsTerminatedMapping(gatewayPort: number, signal?: AbortSignal): Promise<void> {
+    if (!Number.isSafeInteger(gatewayPort) || gatewayPort < 1 || gatewayPort > 65_535)
+      throw new Error("invalid loopback Gateway port");
+    await this.#command([
+      "serve",
+      "--bg",
+      "--tls-terminated-tcp=443",
+      `tcp://127.0.0.1:${gatewayPort}`,
+    ], signal);
+  }
+
+  removeTlsTerminatedMapping(signal?: AbortSignal): Promise<void> {
+    return this.#command(["serve", "--tls-terminated-tcp=443", "off"], signal);
+  }
+
+  async beginHttpsConsent(port: number, signal?: AbortSignal): Promise<string> {
+    if (!Number.isSafeInteger(port) || port < 1_024 || port > 65_535 || port === 443)
+      throw new Error("invalid HTTPS consent port");
+    const controller = new AbortController();
+    let timedOut = false;
+    const onAbort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    let observed = Buffer.alloc(0);
+    let resolveObserved!: (url: string) => void;
+    let rejectObserved!: (error: Error) => void;
+    const found = new Promise<string>((resolve, reject) => {
+      resolveObserved = resolve;
+      rejectObserved = reject;
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.#timeoutMs);
+    const argv = ["serve", `--https=${port}`, "text:CozyGateway HTTPS consent"] as const;
+    const run = this.#runner(this.#executable, argv, {
+      shell: false,
+      windowsHide: true,
+      timeoutMs: this.#timeoutMs,
+      maxObjectBytes: TAILSCALE_CLI_MAX_OBJECT_BYTES,
+      maxTotalBytes: TAILSCALE_CLI_MAX_TOTAL_BYTES,
+      signal: controller.signal,
+      onStdoutChunk: (chunk) => {
+        observed = Buffer.concat([observed, Buffer.from(chunk)]);
+        if (observed.byteLength > TAILSCALE_CLI_MAX_TOTAL_BYTES) {
+          rejectObserved(new TailscaleCliError("output_too_large"));
+          controller.abort();
+          return;
+        }
+        const url = consentUrl(observed.toString("utf8"), false);
+        if (url !== undefined) resolveObserved(url);
+      },
+    });
+    // A foreground Serve command is expected to keep running while consent is pending. Suppress
+    // the AbortError produced after a validated URL lets us terminate that disposable mapping.
+    void run.catch(() => undefined);
+    const completed = run.then((result) => {
+      if (result.exitCode !== 0) throw new TailscaleCliError("command_failed");
+      const url = consentUrl(decodeBounded(result.stdout, TAILSCALE_CLI_MAX_TOTAL_BYTES), true);
+      if (url === undefined) throw new TailscaleCliError("unexpected_output");
+      return url;
+    });
+    const aborted = new Promise<never>((_resolve, reject) => {
+      controller.signal.addEventListener("abort", () => {
+        reject(new TailscaleCliError(timedOut ? "timeout" : "cancelled"));
+      }, { once: true });
+    });
+    try {
+      const url = await Promise.race([found, completed, aborted]);
+      controller.abort();
+      return url;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+}

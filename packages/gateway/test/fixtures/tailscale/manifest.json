@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "sanitized": true,
+  "sourceSchema": "Tailscale public CLI and exported Go JSON types, inspected 2026-08-28",
+  "fixtures": [
+    {"file":"version-supported.json","label":"minimum supported client","kind":"synthetic"},
+    {"file":"version-old.json","label":"unsupported old client","kind":"synthetic"},
+    {"file":"status-running.json","label":"running personal user account","kind":"sanitized-captured-shape"},
+    {"file":"status-needs-login.json","label":"login required","kind":"synthetic"},
+    {"file":"status-machine-auth.json","label":"device approval required","kind":"synthetic"},
+    {"file":"status-cert-unavailable.json","label":"tailnet HTTPS consent required","kind":"synthetic"},
+    {"file":"status-cert-mismatch.json","label":"certificate domain mismatch","kind":"synthetic"},
+    {"file":"status-unverifiable.json","label":"custom or unverifiable DNS state","kind":"synthetic"},
+    {"file":"preferences-ready.json","label":"targeted preferences ready","kind":"synthetic"},
+    {"file":"preferences-needs-consent.json","label":"targeted preference consent required","kind":"synthetic"},
+    {"file":"serve-empty.json","label":"complete empty Serve state","kind":"sanitized-captured-shape"},
+    {"file":"serve-compatible.json","label":"exact no-PROXY L4 mapping","kind":"sanitized-captured-shape"},
+    {"file":"serve-conflicting-tcp.json","label":"conflicting TCP 443","kind":"synthetic"},
+    {"file":"serve-conflicting-web.json","label":"conflicting L7 HTTPS 443","kind":"synthetic"},
+    {"file":"serve-conflicting-foreground.json","label":"foreground session 443 conflict","kind":"synthetic"},
+    {"file":"serve-conflicting-service.json","label":"Tailscale Service 443 conflict","kind":"synthetic"},
+    {"file":"funnel-empty.json","label":"complete empty Funnel state","kind":"sanitized-captured-shape"},
+    {"file":"funnel-443.json","label":"public Funnel 443 conflict","kind":"synthetic"},
+    {"file":"login-incremental.txt","label":"two incremental up --json objects","kind":"sanitized-captured-shape"},
+    {"file":"login-malformed.txt","label":"truncated login object","kind":"synthetic"},
+    {"file":"login-oversized.json","label":"oversized login object recipe","kind":"synthetic"}
+  ]
+}

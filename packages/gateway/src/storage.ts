@@ -575,6 +575,15 @@ export type FinalizeResult =
         | "invalid_state"
         | "not_found";
     };
+export interface OnboardingOwnershipInput {
+  ownershipKey: string;
+  mode: OnboardingMode;
+  durableFingerprint: string;
+  ownedStateJson: string;
+  createdAt: number;
+}
+
+export type OnboardingOwnershipWriteResult = "written" | "existing" | "conflict";
 export interface AgentRow {
   id: string;
   name: string;
@@ -803,6 +812,67 @@ export class Storage {
       && runtime.verificationEpoch === input.verificationEpoch
       && runtime.canonicalOrigin === input.canonicalOrigin
       && runtime.durableFingerprint === input.durableFingerprint;
+  }
+
+  onboardingOwnership(ownershipKey: string): OnboardingOwnershipInput | undefined {
+    if (!/^[a-z][a-z0-9:-]{0,127}$/.test(ownershipKey)) throw new Error("invalid onboarding ownership key");
+    return this.#db.prepare(`
+      SELECT ownership_key AS ownershipKey, mode, durable_fingerprint AS durableFingerprint,
+        owned_state_json AS ownedStateJson, created_at AS createdAt
+      FROM onboarding_ownership WHERE ownership_key = ?
+    `).get(ownershipKey) as OnboardingOwnershipInput | undefined;
+  }
+
+  recordOnboardingOwnership(input: OnboardingOwnershipInput): OnboardingOwnershipWriteResult {
+    this.#validateOnboardingOwnership(input);
+    return this.#immediate(() => {
+      const existing = this.onboardingOwnership(input.ownershipKey);
+      if (existing !== undefined) {
+        return existing.mode === input.mode
+          && existing.durableFingerprint === input.durableFingerprint
+          && existing.ownedStateJson === input.ownedStateJson
+          && existing.createdAt === input.createdAt
+          ? "existing"
+          : "conflict";
+      }
+      this.#db.prepare(`
+        INSERT INTO onboarding_ownership
+          (ownership_key, mode, durable_fingerprint, owned_state_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(input.ownershipKey, input.mode, input.durableFingerprint, input.ownedStateJson, input.createdAt);
+      return "written";
+    });
+  }
+
+  removeOnboardingOwnership(input: OnboardingOwnershipInput): boolean {
+    this.#validateOnboardingOwnership(input);
+    return this.#immediate(() => this.#db.prepare(`
+      DELETE FROM onboarding_ownership
+      WHERE ownership_key = ? AND mode = ? AND durable_fingerprint = ?
+        AND owned_state_json = ? AND created_at = ?
+    `).run(
+      input.ownershipKey,
+      input.mode,
+      input.durableFingerprint,
+      input.ownedStateJson,
+      input.createdAt,
+    ).changes === 1);
+  }
+
+  #validateOnboardingOwnership(input: OnboardingOwnershipInput): void {
+    if (!/^[a-z][a-z0-9:-]{0,127}$/.test(input.ownershipKey)) throw new Error("invalid onboarding ownership key");
+    if (input.mode !== "tailscale" && input.mode !== "lan" && input.mode !== "advanced")
+      throw new Error("invalid onboarding ownership mode");
+    if (!/^[0-9a-f]{64}$/.test(input.durableFingerprint))
+      throw new Error("invalid onboarding ownership fingerprint");
+    if (!Number.isSafeInteger(input.createdAt) || input.createdAt < 0)
+      throw new Error("invalid onboarding ownership timestamp");
+    if (Buffer.byteLength(input.ownedStateJson, "utf8") > 64 * 1024)
+      throw new Error("onboarding ownership state exceeded its bound");
+    let state: unknown;
+    try { state = JSON.parse(input.ownedStateJson); } catch { throw new Error("invalid onboarding ownership state"); }
+    if (typeof state !== "object" || state === null || Array.isArray(state))
+      throw new Error("invalid onboarding ownership state");
   }
 
   /** Records an actual gateway boot. Merely opening the database is deliberately inert: callers
