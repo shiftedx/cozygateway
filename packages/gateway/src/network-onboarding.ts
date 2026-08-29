@@ -93,6 +93,9 @@ export interface OnboardingPhoneVerification {
 
 export interface OnboardingIo {
   chooseNetworkMode(signal?: AbortSignal): Promise<OnboardingMode | "later" | "cancel">;
+  /** Security and privacy disclosure for the selected route. The orchestrator awaits this before
+   * any old route is rolled back, a new adapter is prepared, or verification material is shown. */
+  showNetworkDisclosure(mode: OnboardingMode, signal?: AbortSignal): void | Promise<void>;
   /** The only QR payload parameter is the short-lived verification URL. */
   showPhoneConnectionCheck(verificationUrl: string, signal?: AbortSignal): void | Promise<void>;
   showAuthoritativePhrase(phrase: string, signal?: AbortSignal): void | Promise<void>;
@@ -145,7 +148,20 @@ export interface NetworkOnboardingStatus {
   mode?: OnboardingMode;
   healthy: boolean;
   endpoint?: PreparedEndpoint;
+  issue?: NetworkOnboardingStatusIssue;
 }
+
+export type NetworkOnboardingStatusIssue =
+  | { type: "pause"; reason: string; detail?: string }
+  | {
+      type: "inspection";
+      reason:
+        | "adapter_unavailable"
+        | "inspection_failed"
+        | "authoritative_posture_changed"
+        | "projection_posture_changed"
+        | "endpoint_not_ready";
+    };
 
 function selectedMode(state: NetworkOnboardingState | undefined): OnboardingMode | undefined {
   return state !== undefined && state.stage !== "pending_choice" ? state.mode : undefined;
@@ -200,11 +216,9 @@ export class NetworkOnboarding {
       && current.mode !== undefined
       && current.endpoint !== undefined
     ) return { outcome: "already_complete", mode: current.mode, endpoint: current.endpoint };
-    await this.#dependencies.state.write({ version: 1, stage: "pending_choice", updatedAt: this.#now() });
-    const choice = await io.chooseNetworkMode(signal);
-    if (choice === "later") return { outcome: "deferred" };
-    if (choice === "cancel") return { outcome: "cancelled" };
-    return this.#continue(choice, io, signal, true);
+    if (current.mode === undefined)
+      await this.#dependencies.state.write({ version: 1, stage: "pending_choice", updatedAt: this.#now() });
+    return this.#choose(current, io, signal);
   }
 
   async resume(io: OnboardingIo, signal?: AbortSignal): Promise<OnboardingOutcome> {
@@ -212,22 +226,7 @@ export class NetworkOnboarding {
     if (current.authority === "complete" && current.stage === "complete" && current.mode !== undefined && current.endpoint !== undefined) {
       return { outcome: "already_complete", mode: current.mode, endpoint: current.endpoint };
     }
-    const authority = await this.#dependencies.authority.status();
-    const projection = authority.state === "none" ? await this.#safeProjection() : undefined;
-    const mode = authority.state === "none" ? selectedMode(projection) : authority.mode;
-    if (mode === undefined) return this.run(io, signal);
-    const adapter = this.#adapters.get(mode);
-    if (adapter === undefined) return { outcome: "failed", reason: "readiness" };
-    const inspected = current.endpoint;
-    const authoritativeMatch = authority.state === "none"
-      || (inspected !== undefined && matchesAuthoritativeStatus(inspected, authority));
-    return this.#continue(
-      mode,
-      io,
-      signal,
-      inspected === undefined || !inspected.ready || !authoritativeMatch,
-      inspected,
-    );
+    return this.#choose(current, io, signal);
   }
 
   async status(signal?: AbortSignal): Promise<NetworkOnboardingStatus> {
@@ -249,12 +248,21 @@ export class NetworkOnboarding {
     }
     const adapter = this.#adapters.get(mode);
     if (adapter === undefined)
-      return { stage: "changed", authority: authority.state, mode, healthy: false };
+      return {
+        stage: "changed", authority: authority.state, mode, healthy: false,
+        issue: { type: "inspection", reason: "adapter_unavailable" },
+      };
     let endpoint: PreparedEndpoint;
     try {
       endpoint = await adapter.inspect(signal);
-    } catch {
-      return { stage: "changed", authority: authority.state, mode, healthy: false };
+    } catch (error) {
+      const pause = retryableAdapterPause(error);
+      return {
+        stage: "changed", authority: authority.state, mode, healthy: false,
+        issue: pause === undefined
+          ? { type: "inspection", reason: "inspection_failed" }
+          : { type: "pause", ...pause },
+      };
     }
     if (authority.state !== "none" && !matchesAuthoritativeStatus(endpoint, authority)) {
       return {
@@ -263,6 +271,7 @@ export class NetworkOnboarding {
         mode,
         healthy: false,
         endpoint,
+        issue: { type: "inspection", reason: "authoritative_posture_changed" },
       };
     }
     if (authority.state === "complete") {
@@ -294,13 +303,64 @@ export class NetworkOnboarding {
       : endpoint.ready && projectionMatches && projection !== undefined
         ? projection.stage
         : "changed";
+    const issue: NetworkOnboardingStatusIssue | undefined = !endpoint.ready
+      ? { type: "inspection", reason: "endpoint_not_ready" }
+      : !projectionMatches
+        ? { type: "inspection", reason: "projection_posture_changed" }
+        : undefined;
     return {
       stage,
       authority: authority.state,
       mode,
       healthy: endpoint.ready && projectionMatches,
       endpoint,
+      ...(issue === undefined ? {} : { issue }),
     };
+  }
+
+  async #choose(
+    current: NetworkOnboardingStatus,
+    io: OnboardingIo,
+    signal: AbortSignal | undefined,
+  ): Promise<OnboardingOutcome> {
+    const choice = await io.chooseNetworkMode(signal);
+    if (choice === "later" || choice === "cancel") {
+      if (current.mode !== undefined && current.endpoint !== undefined) {
+        const rollback = await this.#rollbackPriorRoute(current.mode, current.endpoint, signal);
+        if (!rollback) return { outcome: "failed", reason: "rollback_failed" };
+      }
+      await this.#dependencies.state.write({ version: 1, stage: "pending_choice", updatedAt: this.#now() });
+      return { outcome: choice === "later" ? "deferred" : "cancelled" };
+    }
+    try {
+      await io.showNetworkDisclosure(choice, signal);
+    } catch {
+      return { outcome: "failed", reason: "readiness" };
+    }
+    const reusable = current.stage !== "legacy_unreviewed"
+      && current.mode === choice
+      && current.healthy
+      && current.endpoint?.ready === true;
+    if (!reusable && current.mode !== undefined && current.endpoint !== undefined) {
+      const rollback = await this.#rollbackPriorRoute(current.mode, current.endpoint, signal);
+      if (!rollback) return { outcome: "failed", reason: "rollback_failed" };
+    }
+    return this.#continue(choice, io, signal, !reusable, reusable ? current.endpoint : undefined);
+  }
+
+  async #rollbackPriorRoute(
+    mode: OnboardingMode,
+    endpoint: PreparedEndpoint,
+    signal: AbortSignal | undefined,
+  ): Promise<boolean> {
+    const adapter = this.#adapters.get(mode);
+    if (adapter === undefined) return false;
+    try {
+      await adapter.rollbackOwned(endpoint, signal);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async #continue(

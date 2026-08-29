@@ -58,6 +58,9 @@ function harness(options: {
   };
   const io: OnboardingIo = {
     chooseNetworkMode: vi.fn(async () => (calls.push("choice"), options.choice ?? "tailscale")),
+    showNetworkDisclosure: vi.fn(async (mode) => {
+      calls.push(`disclosure:${mode}`);
+    }),
     showPhoneConnectionCheck: vi.fn(async (verificationUrl) => {
       calls.push(`phone-qr:${verificationUrl}`);
     }),
@@ -141,6 +144,7 @@ describe("NetworkOnboarding", () => {
 
     await expect(onboarding.status()).resolves.toEqual({
       stage: "legacy_unreviewed", authority: "none", mode: "tailscale", healthy: false, endpoint: inspected,
+      issue: { type: "inspection", reason: "endpoint_not_ready" },
     });
   });
 
@@ -149,7 +153,10 @@ describe("NetworkOnboarding", () => {
 
     await expect(onboarding.run(io)).resolves.toMatchObject({ outcome: "not_confirmed" });
 
+    expect(calls.indexOf("state:pending_choice")).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf("state:pending_choice")).toBeLessThan(calls.indexOf("choice"));
     expect(calls.indexOf("choice")).toBeLessThan(calls.indexOf("prepare"));
+    expect(calls.indexOf("disclosure:tailscale")).toBeLessThan(calls.indexOf("prepare"));
     expect(calls.indexOf("prepare")).toBeLessThan(calls.findIndex((entry) => entry.startsWith("phone-qr:")));
     expect(dependencies.phoneVerification.begin).toHaveBeenCalledWith("tailscale", endpoint);
     expect(io.showPhoneConnectionCheck).toHaveBeenCalledWith(
@@ -159,6 +166,109 @@ describe("NetworkOnboarding", () => {
     expect(JSON.stringify((io.showPhoneConnectionCheck as ReturnType<typeof vi.fn>).mock.calls))
       .not.toMatch(/amber otter|COZY-1234|account-hash-a/);
     expect(dependencies.createSetupCode).not.toHaveBeenCalled();
+  });
+
+  it("lets a resumed prepared route be replaced after disclosure and conditionally rolls it back first", async () => {
+    const lanEndpoint: PreparedEndpoint = {
+      mode: "lan", canonicalOrigin: "http://192.168.1.20:18787", bindHost: "0.0.0.0",
+      port: 18787, durableFingerprint: "lan-posture", physicalAdapterId: "wifi-a",
+      dhcpAddress: "192.168.1.20", ready: true,
+    };
+    const resumed = harness({
+      choice: "lan",
+      projection: {
+        version: 1, stage: "endpoint_ready", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+    const lanAdapter: NetworkModeAdapter = {
+      mode: "lan",
+      prepare: vi.fn(async () => (resumed.calls.push("prepare-lan"), lanEndpoint)),
+      inspect: vi.fn(async () => lanEndpoint),
+      rollbackOwned: vi.fn(async () => undefined),
+    };
+    resumed.dependencies.adapters = [resumed.adapter, lanAdapter];
+    resumed.onboarding = new NetworkOnboarding(resumed.dependencies);
+
+    await expect(resumed.onboarding.resume(resumed.io)).resolves.toMatchObject({ outcome: "not_confirmed" });
+
+    expect(resumed.io.chooseNetworkMode).toHaveBeenCalledOnce();
+    expect(resumed.io.showNetworkDisclosure).toHaveBeenCalledWith("lan", undefined);
+    expect(resumed.adapter.rollbackOwned).toHaveBeenCalledWith(endpoint, undefined);
+    expect(resumed.calls.indexOf("disclosure:lan")).toBeLessThan(resumed.calls.indexOf("rollback"));
+    expect(resumed.calls.indexOf("rollback")).toBeLessThan(resumed.calls.indexOf("prepare-lan"));
+  });
+
+  it.each(["later", "cancel"] as const)(
+    "rolls back a resumable prepared route when the user chooses %s",
+    async (choice) => {
+      const { onboarding, dependencies, adapter, io } = harness({
+        choice,
+        projection: {
+          version: 1, stage: "endpoint_ready", mode: "tailscale",
+          deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+        },
+      });
+
+      await expect(onboarding.resume(io)).resolves.toMatchObject({
+        outcome: choice === "later" ? "deferred" : "cancelled",
+      });
+
+      expect(io.chooseNetworkMode).toHaveBeenCalledOnce();
+      expect(adapter.rollbackOwned).toHaveBeenCalledWith(endpoint, undefined);
+      expect(dependencies.phoneVerification.begin).not.toHaveBeenCalled();
+      expect(dependencies.publishPairing).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reviews a healthy legacy route through the four-choice prompt before any phone check", async () => {
+    const { onboarding, dependencies, io, calls } = harness({
+      choice: "later",
+      projection: {
+        version: 1, stage: "legacy_unreviewed", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+
+    await expect(onboarding.resume(io)).resolves.toEqual({ outcome: "deferred" });
+
+    expect(io.chooseNetworkMode).toHaveBeenCalledOnce();
+    expect(calls).not.toEqual(expect.arrayContaining([expect.stringMatching(/^phone-qr:/)]));
+    expect(dependencies.phoneVerification.begin).not.toHaveBeenCalled();
+    expect(dependencies.publishPairing).not.toHaveBeenCalled();
+  });
+
+  it("prepares the selected route after legacy review instead of reusing the legacy endpoint", async () => {
+    const { onboarding, adapter, io } = harness({
+      choice: "tailscale",
+      projection: {
+        version: 1, stage: "legacy_unreviewed", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+
+    await expect(onboarding.resume(io)).resolves.toMatchObject({ outcome: "not_confirmed" });
+
+    expect(io.chooseNetworkMode).toHaveBeenCalledOnce();
+    expect(adapter.prepare).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a typed retryable inspection pause in status", async () => {
+    const { onboarding, adapter } = harness({
+      projection: {
+        version: 1, stage: "network_selected", mode: "tailscale", updatedAt: 50,
+      },
+    });
+    (adapter.inspect as ReturnType<typeof vi.fn>).mockRejectedValue(Object.assign(
+      new Error("Tailscale is waiting for machine approval"),
+      { retryable: true as const, reason: "machine_auth_required", detail: "needs_admin" },
+    ));
+
+    await expect(onboarding.status()).resolves.toMatchObject({
+      stage: "changed",
+      healthy: false,
+      issue: { type: "pause", reason: "machine_auth_required", detail: "needs_admin" },
+    });
   });
 
   it.each(["later", "cancel"] as const)("emits no challenge or pairing material for %s", async (choice) => {
@@ -417,6 +527,7 @@ describe("NetworkOnboarding", () => {
       expect(dependencies.state.write).not.toHaveBeenCalled();
 
       await onboarding.resume(io);
+      expect(io.chooseNetworkMode).toHaveBeenCalledOnce();
       expect(adapter.prepare).toHaveBeenCalledOnce();
     },
   );
@@ -532,6 +643,7 @@ describe("NetworkOnboarding", () => {
     });
     const io: OnboardingIo = {
       chooseNetworkMode: async () => "tailscale",
+      showNetworkDisclosure: async () => undefined,
       showPhoneConnectionCheck: async () => undefined,
       showAuthoritativePhrase: async () => undefined,
       confirmPhone: async () => "y",

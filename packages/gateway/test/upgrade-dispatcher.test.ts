@@ -1,10 +1,14 @@
+import { once } from "node:events";
+import { createServer, type IncomingMessage } from "node:http";
+import { createConnection } from "node:net";
 import { Duplex } from "node:stream";
-import type { IncomingMessage } from "node:http";
 
 import { describe, expect, it, vi } from "vitest";
 
 import {
   createUpgradeDispatcher,
+  installPreUpgradeDeadline,
+  PRE_UPGRADE_AUTH_TIMEOUT_MS,
   type UpgradeHandler,
   type UpgradeResolver,
 } from "../src/upgrade-dispatcher.ts";
@@ -133,5 +137,52 @@ describe("createUpgradeDispatcher", () => {
     expect(wsHandler).not.toHaveBeenCalled();
     expect(socket.writes.join("")).toMatch(/^HTTP\/1\.1 404/);
     expect(socket.destroyed).toBe(true);
+  });
+});
+
+describe("installPreUpgradeDeadline", () => {
+  it("pins the protocol pre-upgrade deadline to five seconds", () => {
+    expect(PRE_UPGRADE_AUTH_TIMEOUT_MS).toBe(5_000);
+  });
+
+  it("closes a slowloris connection that never completes its HTTP upgrade headers", async () => {
+    const server = createServer();
+    const removeDeadline = installPreUpgradeDeadline(server, 35);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("missing test listener");
+    const socket = createConnection({ host: "127.0.0.1", port: address.port });
+    socket.on("error", () => {});
+    await once(socket, "connect");
+    const startedAt = Date.now();
+    const request = "GET /cozy/onboarding/capability/probe HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n";
+    let offset = 0;
+    const drip = setInterval(() => {
+      if (offset < request.length) socket.write(request[offset++]!);
+    }, 5);
+
+    await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+
+    clearInterval(drip);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+    removeDeadline();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  });
+
+  it("clears the pre-upgrade deadline after complete headers so ordinary responses may take longer", async () => {
+    const server = createServer((_request, response) => {
+      setTimeout(() => response.end("ok"), 70);
+    });
+    const removeDeadline = installPreUpgradeDeadline(server, 25);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("missing test listener");
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/health`);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("ok");
+    removeDeadline();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   });
 });

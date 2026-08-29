@@ -10,13 +10,13 @@ import {
   PHONE_VERIFICATION_PAGE,
 } from "./phone-verification-page.ts";
 import type { OnboardingMode, Storage } from "./storage.ts";
-import type { UpgradeHandler } from "./upgrade-dispatcher.ts";
+import { PRE_UPGRADE_AUTH_TIMEOUT_MS, type UpgradeHandler } from "./upgrade-dispatcher.ts";
 
 export const PHONE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 export const PHONE_CONFIRM_MAX_BYTES = 256;
 export const PHONE_PROBE_MAX_BYTES = 256;
 export const PHONE_MAX_SOCKETS = 4;
-export const PHONE_AUTH_TIMEOUT_MS = 5_000;
+export const PHONE_AUTH_TIMEOUT_MS = PRE_UPGRADE_AUTH_TIMEOUT_MS;
 export const PHONE_SOCKET_LIFETIME_MS = 60_000;
 export const PHONE_CONFIRM_ATTEMPTS_PER_MINUTE = 5;
 export const PHONE_GLOBAL_CONFIRMS_PER_MINUTE = 60;
@@ -277,6 +277,12 @@ export class PhoneVerification {
     const reader = request.body.getReader();
     const chunks: Uint8Array[] = [];
     let length = 0;
+    let timedOut = false;
+    const authTimer = setTimeout(() => {
+      timedOut = true;
+      void reader.cancel().catch(() => {});
+    }, this.#authTimeoutMs);
+    authTimer.unref?.();
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -287,7 +293,10 @@ export class PhoneVerification {
       }
     } catch {
       return undefined;
+    } finally {
+      clearTimeout(authTimer);
     }
+    if (timedOut) return undefined;
     const bytes = new Uint8Array(length);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }

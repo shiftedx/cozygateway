@@ -304,6 +304,7 @@ async function printStatus(configPath: string, onboarding?: CliOnboardingControl
     const network = await onboarding.status();
     console.log(`Phone access mode: ${network.mode ?? "not selected"}`);
     console.log(`Phone access:      ${network.healthy ? "ready" : network.stage}`);
+    if (network.issue !== undefined) printNetworkIssue(network.issue);
     if (network.expiresAt !== undefined) console.log(`Connection check expires: ${new Date(network.expiresAt).toISOString()}`);
     if (!network.healthy) console.log(`Resume: cozygateway setup --config "${configPath}"`);
   }
@@ -456,6 +457,25 @@ function setupIo(io: CliIo): OnboardingIo {
         console.log("Choose 1, 2, 3, or 4.");
       }
     },
+    showNetworkDisclosure: (mode) => {
+      if (mode === "tailscale") {
+        console.log("Personal Tailscale security and privacy notice");
+        console.log("- Tailscale must be active on this PC and the phone, signed in to the intended tailnet.");
+        console.log("- Authorized or shared tailnet peers may reach CozyGateway when tailnet policy permits it.");
+        console.log("- Tailnet administrators can observe and manage this device and its connectivity policy.");
+        console.log("- Windows UAC and browser sign-in or HTTPS consent may appear before the phone check.");
+        console.log("- Enabling Tailscale HTTPS publishes the machine and tailnet DNS name in Certificate Transparency.");
+      } else if (mode === "lan") {
+        console.log("Same Wi-Fi security notice");
+        console.log("- LAN mode uses plaintext HTTP. Use it only on a trusted private network.");
+        console.log("- CozyGateway may bind to 0.0.0.0 (all interfaces), not only the selected Wi-Fi or Ethernet adapter.");
+        console.log("- Phone verification proves reachability but cannot prevent passive same-LAN interception of later pairing traffic.");
+      } else {
+        console.log("Advanced network security notice");
+        console.log("- Review the final bind address, transport security, and exposed interfaces before continuing.");
+        console.log("- A non-loopback plaintext listener must be limited to a trusted private network.");
+      }
+    },
     showPhoneConnectionCheck: (verificationUrl) => {
       console.log("Phone connection check");
       console.log(renderQrHalfBlocks(encodeQr(verificationUrl), { color: process.stdout.isTTY === true }));
@@ -505,6 +525,24 @@ const PAUSE_COPY: Readonly<Record<string, string>> = {
   operator_busy: "Another setup window has an active phone check. Finish or cancel it there, then resume this window.",
   advanced_input_required: "Run setup in an interactive PowerShell window to enter the advanced bind address and port.",
 };
+
+const INSPECTION_COPY: Readonly<Record<Extract<NonNullable<NetworkOnboardingStatus["issue"]>, { type: "inspection" }>["reason"], string>> = {
+  adapter_unavailable: "The saved phone access mode is unavailable in this installation. Choose another route in setup.",
+  inspection_failed: "CozyGateway could not inspect the saved network route. Check the network service, then resume setup.",
+  authoritative_posture_changed: "The verified network origin or deployment fingerprint changed. Review and verify the current route again.",
+  projection_posture_changed: "The saved setup projection no longer matches the live network route. Review the current route again.",
+  endpoint_not_ready: "The selected network endpoint is not ready. Restore network connectivity or choose another route.",
+};
+
+function printNetworkIssue(issue: NonNullable<NetworkOnboardingStatus["issue"]>): void {
+  if (issue.type === "pause") {
+    console.log(`Phone access reason: ${issue.reason}${issue.detail === undefined ? "" : ` (${issue.detail})`}`);
+    console.log(`Repair: ${PAUSE_COPY[issue.reason] ?? "Resolve the paused network step, then resume setup."}`);
+    return;
+  }
+  console.log(`Phone access reason: ${issue.reason}`);
+  console.log(`Repair: ${INSPECTION_COPY[issue.reason]}`);
+}
 
 async function runSetup(
   configPath: string,

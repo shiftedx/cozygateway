@@ -45,6 +45,7 @@ import type { ApprovalPushPayload } from "./push-crypto.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import {
   createUpgradeDispatcher,
+  installPreUpgradeDeadline,
   type UpgradeHandler,
 } from "./upgrade-dispatcher.ts";
 import { createHermesClient } from "./hermes-bridge/client.ts";
@@ -166,6 +167,8 @@ export interface StartGatewayOptions {
   pairingAdmission?: PairingAttemptLimiter;
   /** Test-only timing seam; production always uses the protocol's fixed timeout defaults. */
   phoneVerification?: Omit<PhoneVerificationDeps, "storage">;
+  /** Test-only pre-header timing seam. Production uses the fixed five-second protocol deadline. */
+  preUpgradeTimeoutMs?: number;
 }
 
 /** The assembly seam between Hermes' settled-chat event and the relay notifier. Kept pure so the
@@ -602,6 +605,7 @@ export async function startGateway(
     now: () => Date.now(),
   });
 
+  let removePreUpgradeDeadline = () => {};
   const server = await new Promise<Server>((resolve) => {
     // The TLS branch swaps only the factory and its options; the fetch handler, the port, the
     // hostname, and the upgrade dispatcher below are identical either way. https.Server extends
@@ -623,6 +627,7 @@ export async function startGateway(
         resolve(s as Server);
       },
     );
+    removePreUpgradeDeadline = installPreUpgradeDeadline(s as Server, options.preUpgradeTimeoutMs);
   });
   const address = server.address();
   const port =
@@ -708,6 +713,7 @@ export async function startGateway(
       nativeBotPlane.close();
       mobileNode?.close();
       phoneVerification.close();
+      removePreUpgradeDeadline();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });

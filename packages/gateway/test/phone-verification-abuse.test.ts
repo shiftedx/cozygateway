@@ -58,6 +58,34 @@ describe("phone verification abuse bounds", () => {
     const source = readFileSync(new URL("../src/phone-verification.ts", import.meta.url), "utf8");
     expect(source).not.toMatch(/#records\.set\(capability|#records\.get\(capability/);
   });
+
+  it("bounds a confirmation body that declares bytes but never finishes sending them", async () => {
+    await gateway.close();
+    gateway = await startGateway(
+      { name: "phone-slow-confirm", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes() },
+      { phoneVerification: { authTimeoutMs: 35 }, preUpgradeTimeoutMs: 35 },
+    );
+    const challenge = gateway.beginPhoneVerification();
+    await probe(challenge.verificationUrl);
+    const path = `${new URL(challenge.verificationUrl).pathname}/confirm`;
+    const authority = `127.0.0.1:${gateway.port}`;
+    const socket = connect(gateway.port, "127.0.0.1");
+    socket.on("error", () => {});
+    socket.on("connect", () => socket.write([
+      `POST ${path} HTTP/1.1`,
+      `Host: ${authority}`,
+      `Origin: ${gateway.url}`,
+      "Content-Type: application/json",
+      "Content-Length: 18",
+      "Connection: close",
+      "",
+      "{",
+    ].join("\r\n")));
+
+    await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+
+    expect(socket.destroyed).toBe(true);
+  });
   it("rejects missing, duplicate, and trailing-dot Host and Origin authorities", async () => {
     const challenge = gateway.beginPhoneVerification();
     const path = new URL(challenge.verificationUrl).pathname;

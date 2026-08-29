@@ -550,6 +550,62 @@ describe("cozygateway terminal menu", () => {
     expect(lines.join("\n")).toContain("Choose 1 or 2");
   });
 
+  it.each([
+    ["1", "tailscale", /phone.*intended tailnet/i, /authorized or shared tailnet peers/i, /tailnet administrators/i],
+    ["2", "lan", /plaintext HTTP/i, /0\.0\.0\.0.*all interfaces/i, /trusted private network/i],
+  ] as const)(
+    "renders the %s route disclosure before the controller may mutate",
+    async (answer, expectedMode, first, second, third) => {
+      const { configPath } = tempConfig();
+      const calls: string[] = [];
+      const controller = onboardingController({
+        resume: vi.fn(async (io) => {
+          const mode = await io.chooseNetworkMode();
+          if (mode === "later" || mode === "cancel") return { outcome: "cancelled" as const };
+          await io.showNetworkDisclosure(mode);
+          calls.push(`mutate:${mode}`);
+          return { outcome: "cancelled" as const };
+        }),
+      });
+      const lines: string[] = [];
+      vi.spyOn(console, "log").mockImplementation((line: unknown = "") => {
+        appendLoggedLines(lines, line);
+        calls.push(`line:${String(line)}`);
+      });
+
+      expect(await runCli(["setup", "--config", configPath], scriptedIo([answer]), undefined, controller)).toBe(0);
+
+      vi.restoreAllMocks();
+      const output = lines.join("\n");
+      expect(output).toMatch(first);
+      expect(output).toMatch(second);
+      expect(output).toMatch(third);
+      if (expectedMode === "tailscale") expect(output).toMatch(/Certificate Transparency/i);
+      const disclosureIndex = calls.findIndex((call) => call.startsWith("line:") && first.test(call));
+      expect(disclosureIndex).toBeGreaterThanOrEqual(0);
+      expect(calls.findIndex((call) => call === `mutate:${expectedMode}`)).toBeGreaterThan(disclosureIndex);
+    },
+  );
+
+  it("status renders a typed inspection pause and its concrete repair action", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "changed" as const, authority: "none" as const, mode: "tailscale" as const,
+        healthy: false,
+        issue: { type: "pause" as const, reason: "machine_auth_required", detail: "needs_admin" },
+      })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["status", "--config", configPath], undefined, undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain("machine_auth_required (needs_admin)");
+    expect(lines.join("\n")).toContain("Ask the tailnet administrator to approve this machine");
+  });
+
   it("noninteractive setup emits no QR/code and prints exactly one resume command", async () => {
     const { configPath } = tempConfig();
     const controller = onboardingController();

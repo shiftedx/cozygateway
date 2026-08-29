@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import { createConnection } from "node:net";
 
 import { WebSocket, type ClientOptions } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -27,6 +28,22 @@ const rejection = (url: string, options?: ClientOptions) => new Promise<number>(
 });
 
 describe("phone verification WebSocket", () => {
+  it("bounds incomplete upgrade headers from the moment Gateway accepts the connection", async () => {
+    await gateway.close();
+    gateway = await startGateway(
+      { name: "phone-pre-upgrade", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes() },
+      { preUpgradeTimeoutMs: 35 },
+    );
+    const socket = createConnection({ host: "127.0.0.1", port: gateway.port });
+    socket.on("error", () => {});
+    await once(socket, "connect");
+    socket.write("GET /cozy/onboarding/incomplete/probe HTTP/1.1\r\nHost: 127.0.0.1");
+
+    await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+
+    expect(socket.destroyed).toBe(true);
+  });
+
   it("enforces the five-second first-frame and sixty-second total-lifetime timers", async () => {
     expect(PHONE_AUTH_TIMEOUT_MS).toBe(5_000);
     expect(PHONE_SOCKET_LIFETIME_MS).toBe(60_000);
