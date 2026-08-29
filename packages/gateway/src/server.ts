@@ -67,7 +67,7 @@ import {
 } from "./phone-verification.ts";
 import { loadOperatorControlToken, OperatorOnboardingControl } from "./operator-onboarding.ts";
 
-export const GATEWAY_VERSION = "0.3.7";
+export const GATEWAY_VERSION = "0.4.0";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
