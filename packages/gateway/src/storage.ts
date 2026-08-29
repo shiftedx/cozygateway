@@ -823,6 +823,53 @@ export class Storage {
     `).get(ownershipKey) as OnboardingOwnershipInput | undefined;
   }
 
+  onboardingAuthorityStatus():
+    | { state: "none" }
+    | {
+        state: "active" | "abandoned" | "complete";
+        mode: OnboardingMode;
+        canonicalOrigin: string;
+        durableFingerprint: string;
+        completedAt?: number;
+      } {
+    const row = this.#db.prepare(`
+      SELECT state, mode, canonical_origin AS canonicalOrigin,
+        durable_fingerprint AS durableFingerprint, completed_at AS completedAt
+      FROM onboarding_sessions
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get() as {
+      state: "active" | "abandoned" | "complete";
+      mode: OnboardingMode;
+      canonicalOrigin: string;
+      durableFingerprint: string;
+      completedAt: number | null;
+    } | undefined;
+    if (row === undefined) return { state: "none" };
+    return row.state === "complete"
+      ? {
+          state: row.state,
+          mode: row.mode,
+          canonicalOrigin: row.canonicalOrigin,
+          durableFingerprint: row.durableFingerprint,
+          completedAt: row.completedAt!,
+        }
+      : {
+          state: row.state,
+          mode: row.mode,
+          canonicalOrigin: row.canonicalOrigin,
+          durableFingerprint: row.durableFingerprint,
+        };
+  }
+
+  onboardingRuntimeContext(): { verificationEpoch: string; bootGeneration: string } {
+    const row = this.#db.prepare(`
+      SELECT verification_epoch AS verificationEpoch, boot_generation AS bootGeneration
+      FROM onboarding_runtime WHERE singleton = 1
+    `).get() as { verificationEpoch: string; bootGeneration: string } | undefined;
+    if (row === undefined) throw new Error("Gateway onboarding runtime is unavailable");
+    return row;
+  }
+
   recordOnboardingOwnership(input: OnboardingOwnershipInput): OnboardingOwnershipWriteResult {
     this.#validateOnboardingOwnership(input);
     return this.#immediate(() => {
@@ -923,6 +970,36 @@ export class Storage {
         input.canonicalOrigin,
         input.durableFingerprint,
         input.startedAt,
+      );
+    });
+  }
+
+  /** Starts a locally authenticated operator verification context inside the current Gateway
+   * process. The boot identity cannot change; a fresh epoch invalidates any prior incomplete proof
+   * before the adapter-proven final origin becomes authoritative. */
+  beginOperatorVerificationContext(input: GatewayBoot): void {
+    this.#immediate(() => {
+      const current = this.#db.prepare(`
+        SELECT boot_generation AS bootGeneration FROM onboarding_runtime WHERE singleton = 1
+      `).get() as { bootGeneration: string } | undefined;
+      if (current?.bootGeneration !== input.bootGeneration)
+        throw new Error("Gateway onboarding runtime changed");
+      this.#db.prepare(`
+        UPDATE onboarding_challenges SET state = 'consumed', invalidated_at = ?
+        WHERE state IN ('active', 'ws_probed', 'phone_confirmed')
+      `).run(input.startedAt);
+      this.#db.prepare(`
+        UPDATE onboarding_sessions SET state = 'abandoned' WHERE state = 'active'
+      `).run();
+      this.#db.prepare(`
+        UPDATE onboarding_runtime SET verification_epoch = ?, canonical_origin = ?,
+          durable_fingerprint = ?, started_at = ? WHERE singleton = 1 AND boot_generation = ?
+      `).run(
+        input.verificationEpoch,
+        input.canonicalOrigin,
+        input.durableFingerprint,
+        input.startedAt,
+        input.bootGeneration,
       );
     });
   }
@@ -1042,6 +1119,40 @@ export class Storage {
         input.expiresAt,
       );
       return { outcome: "created", challengeId: input.challengeId };
+    });
+  }
+
+  /** Cancels one operator-owned verification session without minting or revoking any unrelated
+   * setup code. The transition is idempotent for an already-abandoned session and refuses a
+   * completed winner. */
+  cancelVerificationChallenge(challengeId: string, cancelledAt: number): boolean {
+    if (challengeId.length < 1 || challengeId.length > 128 || !Number.isSafeInteger(cancelledAt) || cancelledAt < 0)
+      return false;
+    return this.#immediate(() => {
+      const row = this.#db.prepare(`
+        SELECT c.state AS challengeState, s.session_id AS sessionId, s.state AS sessionState,
+          s.winning_challenge_id AS winningChallengeId
+        FROM onboarding_challenges c
+        JOIN onboarding_sessions s ON s.session_id = c.session_id
+        WHERE c.challenge_id = ?
+      `).get(challengeId) as {
+        challengeState: ChallengeState;
+        sessionId: string;
+        sessionState: "active" | "complete" | "abandoned";
+        winningChallengeId: string | null;
+      } | undefined;
+      if (row === undefined || row.sessionState === "complete" || row.winningChallengeId !== null) return false;
+      if (row.challengeState !== "consumed") {
+        this.#db.prepare(`
+          UPDATE onboarding_challenges SET state = 'consumed', invalidated_at = ?
+          WHERE challenge_id = ? AND state IN ('active', 'ws_probed', 'phone_confirmed')
+        `).run(cancelledAt, challengeId);
+      }
+      this.#db.prepare(`
+        UPDATE onboarding_sessions SET state = 'abandoned'
+        WHERE session_id = ? AND state = 'active'
+      `).run(row.sessionId);
+      return true;
     });
   }
 

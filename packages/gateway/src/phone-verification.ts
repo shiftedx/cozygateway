@@ -39,7 +39,7 @@ export interface PhoneVerificationChallenge {
 
 interface ChallengeRecord extends Omit<PhoneVerificationChallenge, "verificationUrl"> {
   capabilityHash: string;
-  state: "active" | "ws_probed" | "phone_confirmed";
+  state: "active" | "ws_probed" | "phone_confirmed" | "cancelled";
   monotonicExpiresAt: number;
   confirmAttempts: number[];
 }
@@ -135,12 +135,35 @@ export class PhoneVerification {
     this.#context = { ...context, canonicalOrigin: normalizeCanonicalOrigin(context.canonicalOrigin) };
   }
 
-  begin(mode: OnboardingMode = "advanced"): PhoneVerificationChallenge {
+  begin(
+    mode: OnboardingMode = "advanced",
+    operatorContext?: { canonicalOrigin: string; durableFingerprint: string },
+  ): PhoneVerificationChallenge {
     if (this.#closed || this.#context === undefined) throw new Error("phone verification is unavailable");
     const now = this.#now();
-    const existing = [...this.#records.values()].find((record) => record.state !== "phone_confirmed");
+    const existing = [...this.#records.values()].find((record) =>
+      record.state !== "phone_confirmed" && record.state !== "cancelled");
     if (existing !== undefined && this.#isUsable(existing))
       throw new Error("a phone verification session is already active");
+    if (operatorContext !== undefined) {
+      const canonicalOrigin = normalizeCanonicalOrigin(operatorContext.canonicalOrigin);
+      if (operatorContext.durableFingerprint.length < 1 || operatorContext.durableFingerprint.length > 128)
+        throw new Error("invalid operator verification posture");
+      const verificationEpoch = randomUUID();
+      this.#storage.beginOperatorVerificationContext({
+        bootGeneration: this.#context.bootGeneration,
+        verificationEpoch,
+        canonicalOrigin,
+        durableFingerprint: operatorContext.durableFingerprint,
+        startedAt: now,
+      });
+      this.#context = {
+        ...this.#context,
+        verificationEpoch,
+        canonicalOrigin,
+        durableFingerprint: operatorContext.durableFingerprint,
+      };
+    }
     const sessionId = randomUUID();
     const sessionInput = {
       sessionId, mode, ...this.#context, createdAt: now,
@@ -179,6 +202,32 @@ export class PhoneVerification {
     return this.#publicChallenge(record, capability);
   }
 
+  /** Local operator projection. It deliberately omits the capability URL and returns the phrase
+   * only after the phone confirmation transition is authoritative. */
+  status(challengeId: string):
+    | { state: "pending"; expiresAt: number }
+    | { state: "confirmed"; phrase: string; expiresAt: number }
+    | { state: "expired" | "cancelled" | "not_found" } {
+    const record = [...this.#records.values()].find((candidate) => candidate.challengeId === challengeId);
+    if (record === undefined) return { state: "not_found" };
+    if (record.state === "cancelled") return { state: "cancelled" };
+    if (!this.#isUsable(record)) return { state: "expired" };
+    return record.state === "phone_confirmed"
+      ? { state: "confirmed", phrase: record.phrase, expiresAt: record.expiresAt }
+      : { state: "pending", expiresAt: record.expiresAt };
+  }
+
+  /** Idempotent local cancellation. SQLite is transitioned first; only then is the in-memory
+   * capability made unusable. A completed/finalized winner cannot be cancelled here. */
+  cancel(challengeId: string): boolean {
+    const record = [...this.#records.values()].find((candidate) => candidate.challengeId === challengeId);
+    if (record === undefined) return false;
+    if (record.state === "cancelled") return true;
+    if (!this.#storage.cancelVerificationChallenge(challengeId, this.#now())) return false;
+    record.state = "cancelled";
+    return true;
+  }
+
   #publicChallenge(record: ChallengeRecord, capability: string): PhoneVerificationChallenge {
     return { challengeId: record.challengeId, sessionId: record.sessionId, verificationUrl: `${this.#context!.canonicalOrigin}/cozy/onboarding/${capability}`, phrase: record.phrase, expiresAt: record.expiresAt };
   }
@@ -190,7 +239,8 @@ export class PhoneVerification {
   #record(capability: string, expected?: ChallengeRecord["state"]): ChallengeRecord | undefined {
     if (!PHONE_CAPABILITY_PATTERN.test(capability)) return undefined;
     const record = this.#records.get(sha256(capability));
-    if (record === undefined || !this.#isUsable(record) || (expected !== undefined && record.state !== expected)) return undefined;
+    if (record === undefined || record.state === "cancelled" || !this.#isUsable(record)
+      || (expected !== undefined && record.state !== expected)) return undefined;
     return record;
   }
 

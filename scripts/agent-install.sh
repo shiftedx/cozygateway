@@ -164,6 +164,9 @@ NODE
 }
 choose_fresh_listener() {
   local input answer
+  # The original PowerShell process owns the resumable Windows network setup. Git Bash keeps the
+  # fresh listener private and must never race it with a second prompt.
+  is_windows && return 0
   [ ! -f "$CONFIG_JSON" ] || return 0
   [ "$BIND_HOST_EXPLICIT" = 0 ] || return 0
   [ "$PUBLIC_URL_EXPLICIT" = 0 ] || return 0
@@ -458,18 +461,19 @@ install_plugin() {
   rm -rf "$stage"; trap - RETURN
 }
 write_gateway_config() {
-  local map="$LOCAL_DIR/profiles.json" p env_name comma=""
+  local map="$LOCAL_DIR/profiles.json" p env_name comma="" operator_token_file="${COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE:-}"
   [ "$DRY_RUN" = 1 ] && { say "DRY   write Hermes-only gateway config at $CONFIG_JSON (no secret values)"; return; }
   umask 077; printf '{' > "$map"
   for p in "${SELECTED[@]}"; do env_name="$(token_env_name "$p")"; printf '%s\n' "$comma\"$p\":{\"tokenEnv\":\"$env_name\"}" >> "$map"; comma=,; done
   printf '}\n' >> "$map"
-  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$DASHBOARD_USER" "$PUBLIC_URL" <<'NODE'
+  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$DASHBOARD_USER" "$PUBLIC_URL" "$operator_token_file" <<'NODE'
 const fs = require('node:fs');
-const [mapPath, output, host, port, dbPath, dashboardPort, dashboardUser, publicUrl] = process.argv.slice(2);
+const [mapPath, output, host, port, dbPath, dashboardPort, dashboardUser, publicUrl, operatorTokenFile] = process.argv.slice(2);
 const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
 const baseUrl = `http://127.0.0.1:${dashboardPort}`;
 fs.writeFileSync(output, JSON.stringify({
   name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
+  ...(operatorTokenFile === '' ? {} : { onboardingControlTokenFile: operatorTokenFile }),
   hermes: { url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'password', username: dashboardUser, passwordEnv: 'COZYGATEWAY_HERMES_PASSWORD', baseUrl, profile: 'default', profiles },
 }, null, 2) + '\n', { mode: 0o600 });
 NODE
@@ -1171,10 +1175,14 @@ main() {
   else
     say "OK    CozyGateway listens on $BIND_HOST:$PORT. External exposure is user-managed and requires HTTPS."
   fi
-  # The finale: mint a pairing code and print the QR so install -> scan -> chatting needs no
-  # further commands. A rerun on an installed gateway lands here too, with a fresh code.
-  if [ "$DRY_RUN" = 0 ]; then "$CLI_WRAPPER" pair --config "$CONFIG_JSON"; else say "DRY   mint pairing code and QR with $CLI_WRAPPER pair"; fi
-  say "INFO  codes expire after 10 minutes; mint a fresh QR and code with: $CLI_WRAPPER pair"
+  # Windows returns to the original PowerShell process, which alone owns the resumable setup UI.
+  # POSIX retains the established automatic pairing finale byte-for-byte.
+  if is_windows; then
+    say "INFO  return to the original PowerShell installer for phone access setup"
+  else
+    if [ "$DRY_RUN" = 0 ]; then "$CLI_WRAPPER" pair --config "$CONFIG_JSON"; else say "DRY   mint pairing code and QR with $CLI_WRAPPER pair"; fi
+    say "INFO  codes expire after 10 minutes; mint a fresh QR and code with: $CLI_WRAPPER pair"
+  fi
   say "INFO  for a tunnel, rerun the installer with: --public-url https://gateway.example.com"
 }
 main

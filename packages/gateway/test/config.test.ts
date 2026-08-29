@@ -33,6 +33,20 @@ describe("loadConfig", () => {
     expect(config.hermes.profiles.sage?.tokenEnv).toBe("SAGE_ATTACH_TOKEN");
   });
 
+  it("accepts only an operator control token path, never an inline control token", () => {
+    const path = writeConfig({
+      name: "operator-control",
+      hermes,
+      onboardingControlTokenFile: "C:\\Cozy\\operator-control.token",
+    });
+    expect(loadConfig(path).onboardingControlTokenFile).toBe("C:\\Cozy\\operator-control.token");
+    expect(() => loadConfig(writeConfig({
+      name: "operator-control",
+      hermes,
+      onboardingControlToken: "secret",
+    }))).toThrow(ContractViolation);
+  });
+
   it("requires Hermes and at least one attach profile", () => {
     expect(() => loadConfig(writeConfig({ name: "g" }))).toThrow(ContractViolation);
     expect(() => loadConfig(writeConfig({ name: "g", hermes: { url: hermes.url, profiles: {} } }))).toThrow(

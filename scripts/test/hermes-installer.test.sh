@@ -193,7 +193,12 @@ for platform in Darwin Linux Windows; do
   grep -q 'Profiles: default active ops' <<<"$output"
   grep -q "one CozyGateway $platform service" <<<"$output"
   grep -q 'Hermes Dashboard as local control plane' <<<"$output"
-  grep -q 'mint pairing code and QR' <<<"$output"
+  if [ "$platform" = Windows ]; then
+    grep -Fq 'return to the original PowerShell installer for phone access setup' <<<"$output"
+    if grep -Fq 'mint pairing code and QR' <<<"$output"; then echo 'Windows dry run attempted pairing' >&2; exit 1; fi
+  else
+    grep -q 'mint pairing code and QR' <<<"$output"
+  fi
   grep -Fq -- '--public-url https://gateway.example.com' <<<"$output"
   grep -Fq "gateway install --start-now --start-on-login" <<<"$output"
   grep -Fq "gateway start" <<<"$output"
@@ -687,21 +692,19 @@ grep -Fq 'installed checksum-verified Node.js' <<<"$windows_node_output"
 grep -Fq '[IO.Compression.ZipFile]::ExtractToDirectory' "$tmp/windows-node-commands"
 grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <<<"$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-node")"
 
-windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
+windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE='C:\fixture\operator-control.token' COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
 
-# A fresh interactive install can opt into same-LAN access. Invalid input repeats
-# the one question; the affirmative answer persists the wildcard listener and
-# prints the temporary/private-network guidance before pairing.
+# Git Bash never owns Windows network onboarding, even when it has prompt input.
 printf 'maybe\ny\n' > "$tmp/windows-lan-answer"
 windows_lan_output="$(HOME="$tmp/windows-lan-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/windows-lan-answer" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-lan-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-lan-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-lan-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-lan" 2>&1)"
-grep -Fq 'Please answer y or n.' <<<"$windows_lan_output"
-grep -Fq 'trusted private network' <<<"$windows_lan_output"
-grep -Fq 'Tailscale' <<<"$windows_lan_output"
-grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-windows-lan/local/cozygateway.config.json"
+if grep -Fq 'Allow CozyChat to access' <<<"$windows_lan_output"; then echo 'Git Bash prompted for Windows network access' >&2; exit 1; fi
+grep -Fq '"host": "127.0.0.1"' "$tmp/gateway-windows-lan/local/cozygateway.config.json"
 
 grep -Fq '/Create /F /SC ONLOGON /RL LIMITED /TN CozyGateway' "$tmp/windows-commands"
 grep -Fq 'wscript ' "$tmp/windows-commands"
-grep -Fq 'fake-qr' <<<"$windows_output"
+if grep -Fq 'fake-qr' <<<"$windows_output"; then echo 'Windows Git Bash printed pairing material' >&2; exit 1; fi
+grep -Fq 'return to the original PowerShell installer for phone access setup' <<<"$windows_output"
+grep -Fq '"onboardingControlTokenFile": "C:\\fixture\\operator-control.token"' "$tmp/gateway-windows-live/local/cozygateway.config.json"
 test -f "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'gateway.mjs' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then

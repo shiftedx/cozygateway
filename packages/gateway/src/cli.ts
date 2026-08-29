@@ -3,6 +3,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
+import { networkInterfaces } from "node:os";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { rootCertificates } from "node:tls";
@@ -20,7 +21,8 @@ import {
 } from "./storage.ts";
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
-import { primaryLanAddress } from "./lan.ts";
+import { encodeQr, renderQrHalfBlocks } from "./qr.ts";
+import type { NetworkOnboardingStatus, OnboardingIo, OnboardingOutcome } from "./network-onboarding.ts";
 import {
   preparePairingOutput,
   type PairingOutputInput,
@@ -34,8 +36,9 @@ import {
   updateListenerConfig,
   validateListenerHost,
 } from "./configure.ts";
+import { createWindowsOnboardingController } from "./windows-onboarding.ts";
 
-const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
+const USAGE = `usage: cozygateway [status|setup|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
 
 export interface CliIo {
   interactive: boolean;
@@ -46,6 +49,13 @@ export interface CliIo {
 export interface CliRuntime {
   restartHermesProfile(executable: string, profile: string): Promise<void>;
   waitForGatewayReady(configPath: string): Promise<void>;
+}
+
+export interface CliOnboardingController {
+  status(signal?: AbortSignal): Promise<NetworkOnboardingStatus & { expiresAt?: number }>;
+  run(io: OnboardingIo, signal?: AbortSignal): Promise<OnboardingOutcome>;
+  resume(io: OnboardingIo, signal?: AbortSignal): Promise<OnboardingOutcome>;
+  close(): void;
 }
 
 export interface OnboardingPairingRequest {
@@ -220,10 +230,26 @@ function terminalIo(): CliIo {
  *  every interface, so the payload prefers the machine's LAN address; `127.0.0.1` would send
  *  every scan at the phone itself. Loopback remains the honest fallback on a machine with no
  *  external interface at all. */
+export function legacyPairingLanAddress(interfaces = networkInterfaces()): string | undefined {
+  // Compatibility only: new Windows LAN onboarding uses helper-proven physical inventory. Older
+  // POSIX/explicit wildcard pairing keeps its established best-effort address advertisement.
+  const candidates = Object.values(interfaces).flat()
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined)
+    .filter((entry) => entry.family === "IPv4"
+      && !entry.internal && !entry.address.startsWith("169.254."))
+    .map((entry) => entry.address);
+  const privateAddress = candidates.find((address) => {
+    if (address.startsWith("10.") || address.startsWith("192.168.")) return true;
+    const parts = address.split(".");
+    return parts[0] === "172" && Number(parts[1]) >= 16 && Number(parts[1]) <= 31;
+  });
+  return privateAddress ?? candidates[0];
+}
+
 function pairingHost(config: ReturnType<typeof loadConfig>): string {
   const host = config.host;
   if (host !== undefined && host !== "0.0.0.0" && host !== "::") return host;
-  return primaryLanAddress() ?? "127.0.0.1";
+  return legacyPairingLanAddress() ?? "127.0.0.1";
 }
 
 function pairingUrl(config: ReturnType<typeof loadConfig>, advertised: string | undefined): string {
@@ -261,7 +287,7 @@ function parsedTtlMs(raw: string): number {
   return minutes * 60 * 1000;
 }
 
-async function printStatus(configPath: string): Promise<void> {
+async function printStatus(configPath: string, onboarding?: CliOnboardingController): Promise<void> {
   const config = loadConfig(configPath);
   const host = config.host ?? "0.0.0.0";
   let status = "offline";
@@ -273,6 +299,13 @@ async function printStatus(configPath: string): Promise<void> {
   }
   console.log(`Listener: ${host}:${config.port}`);
   console.log(`Status:   ${status}`);
+  if (onboarding !== undefined) {
+    const network = await onboarding.status();
+    console.log(`Phone access mode: ${network.mode ?? "not selected"}`);
+    console.log(`Phone access:      ${network.healthy ? "ready" : network.stage}`);
+    if (network.expiresAt !== undefined) console.log(`Connection check expires: ${new Date(network.expiresAt).toISOString()}`);
+    if (!network.healthy) console.log(`Resume: cozygateway setup --config "${configPath}"`);
+  }
 }
 
 async function configureListener(configPath: string, io: CliIo, runtime: CliRuntime): Promise<void> {
@@ -352,9 +385,14 @@ async function runPair(configPath: string, advertised: string | undefined, ttl: 
   console.log(prepared.terminalOutput.slice(0, -1));
 }
 
-async function runMenu(configPath: string, io: CliIo, runtime: CliRuntime): Promise<number> {
+async function runMenu(
+  configPath: string,
+  io: CliIo,
+  runtime: CliRuntime,
+  onboarding?: CliOnboardingController,
+): Promise<number> {
   console.log("CozyGateway");
-  await printStatus(configPath);
+  await printStatus(configPath, onboarding);
   for (;;) {
     console.log("");
     console.log("1. Pair a device");
@@ -362,17 +400,120 @@ async function runMenu(configPath: string, io: CliIo, runtime: CliRuntime): Prom
     console.log("3. Refresh status");
     console.log("4. Exit");
     const choice = (await io.question("Choice [1-4]: ")).trim().toLowerCase();
-    if (choice === "1") await runPair(configPath, undefined, undefined);
+    if (choice === "1") {
+      if (onboarding !== undefined) {
+        const status = await onboarding.status();
+        const legacyExplicitPair = status.stage === "legacy_unreviewed" && status.authority === "none";
+        if ((status.stage !== "complete" || !status.healthy) && !legacyExplicitPair) {
+          await runSetup(configPath, io, onboarding);
+          continue;
+        }
+      }
+      await runPair(configPath, undefined, undefined);
+    }
     else if (choice === "2") {
       await configureListener(configPath, io, runtime);
-      await printStatus(configPath);
-    } else if (choice === "3") await printStatus(configPath);
+      await printStatus(configPath, onboarding);
+    } else if (choice === "3") await printStatus(configPath, onboarding);
     else if (choice === "4" || choice === "q" || choice === "quit" || choice === "exit") return 0;
     else console.log("Choose 1, 2, 3, or 4.");
   }
 }
 
-export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRuntime = defaultRuntime): Promise<number> {
+function resumeSetupCommand(configPath: string): string {
+  return `cozygateway setup --config "${configPath}"`;
+}
+
+function setupIo(io: CliIo): OnboardingIo {
+  return {
+    chooseNetworkMode: async () => {
+      for (;;) {
+        console.log("1. Remote via personal Tailscale (recommended)");
+        console.log("2. Same Wi-Fi");
+        console.log("3. Set up later");
+        console.log("4. Advanced settings");
+        const choice = (await io.question("Phone access [1-4]: ")).trim().toLowerCase();
+        if (choice === "1") return "tailscale";
+        if (choice === "2") return "lan";
+        if (choice === "3") return "later";
+        if (choice === "4") return "advanced";
+        if (choice === "q" || choice === "cancel") return "cancel";
+        console.log("Choose 1, 2, 3, or 4.");
+      }
+    },
+    showPhoneConnectionCheck: (verificationUrl) => {
+      console.log("Phone connection check");
+      console.log(renderQrHalfBlocks(encodeQr(verificationUrl), { color: process.stdout.isTTY === true }));
+      console.log("Scan this check with the phone that will use CozyChat. No setup code has been created yet.");
+    },
+    showAuthoritativePhrase: (phrase) => {
+      console.log(`Your phone shows: ${phrase}`);
+    },
+    confirmPhone: (phrase) => io.question(`Is this your phone (${phrase})? [y/N] `),
+  };
+}
+
+const PAUSE_COPY: Readonly<Record<string, string>> = {
+  install_cancelled: "Tailscale installation was cancelled in Windows. Nothing was paired.",
+  install_reboot_required: "Restart Windows, then resume this setup.",
+  login_pending: "Finish signing in to Tailscale in the browser, then resume.",
+  login_failed: "Tailscale sign-in did not finish. Check the Tailscale app, then resume.",
+  login_browser_failed: "The Tailscale sign-in page could not be opened. Open the Tailscale app, finish signing in, then resume.",
+  account_not_confirmed: "The signed-in Tailscale account was not confirmed. Review the account in the Tailscale app, then resume.",
+  machine_auth_required: "Ask the tailnet administrator to approve this machine, then resume.",
+  preference_policy: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
+  managed_policy: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
+  preference_cancelled: "The Tailscale preference change was cancelled. Nothing was paired; resume when ready.",
+  preference_verification_failed: "Tailscale did not confirm the requested preference. Review it in the Tailscale app, then resume.",
+  preference_change_denied: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
+  no_up_physical_private_ipv4: "Connect this PC to trusted Wi-Fi or Ethernet, then resume.",
+  multiple_up_physical_private_ipv4: "More than one physical network is active. Disconnect one or choose the intended adapter explicitly in Advanced settings, then resume.",
+  listener_changed: "The listener changed while setup was running. Review the intended adapter in Advanced settings, then resume.",
+  mapping_conflict: "Tailscale port 443 is already in use. Keep that mapping and choose Same Wi-Fi, Later, or Advanced settings.",
+};
+
+async function runSetup(
+  configPath: string,
+  io: CliIo,
+  onboarding: CliOnboardingController,
+): Promise<number> {
+  if (!io.interactive) {
+    console.log(`Resume phone access setup with: ${resumeSetupCommand(configPath)}`);
+    return 0;
+  }
+  const outcome = await onboarding.resume(setupIo(io));
+  if (outcome.outcome === "paused") {
+    console.log(PAUSE_COPY[outcome.reason] ?? "Phone access setup paused before pairing. Resolve the requested external step, then resume.");
+    console.log(`Resume: ${resumeSetupCommand(configPath)}`);
+  } else if (outcome.outcome === "deferred" || outcome.outcome === "cancelled") {
+    console.log("Phone access was left on loopback. No pairing material was created.");
+    console.log(`Resume: ${resumeSetupCommand(configPath)}`);
+  } else if (outcome.outcome === "not_confirmed") {
+    console.log("The phone connection check was not confirmed. No pairing material was created.");
+    console.log(`Resume: ${resumeSetupCommand(configPath)}`);
+  } else if (outcome.outcome === "invalidated") {
+    console.log("The network changed during verification. Run setup again for the current route.");
+    console.log(`Resume: ${resumeSetupCommand(configPath)}`);
+  } else if (outcome.outcome === "failed") {
+    console.log(outcome.reason === "rollback_failed"
+      ? "Setup could not safely restore the prior network state. Review the listener or Tailscale mapping, then resume."
+      : "Phone access is not ready. Resolve the network step, then resume.");
+    console.log(`Resume: ${resumeSetupCommand(configPath)}`);
+  } else if (outcome.outcome === "lost_race") {
+    console.log("Another setup window completed this step first. Run status to review it.");
+  } else if (outcome.outcome === "already_complete") {
+    console.log("Phone access is already verified for the current network posture.");
+  }
+  return 0;
+}
+
+export async function runCli(
+  argv: string[],
+  suppliedIo?: CliIo,
+  suppliedRuntime?: CliRuntime,
+  onboarding?: CliOnboardingController,
+): Promise<number> {
+  const runtime = suppliedRuntime ?? defaultRuntime;
   const command = argv[0] !== undefined && !argv[0].startsWith("-") ? argv[0] : undefined;
   const optionArgs = command === undefined ? argv : argv.slice(1);
   const { values } = parseArgs({
@@ -384,6 +525,13 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
     },
   });
   const configPath = values.config;
+  let ownedOnboarding: CliOnboardingController | undefined;
+  const resolvedOnboarding = (): CliOnboardingController | undefined => {
+    if (onboarding !== undefined) return onboarding;
+    if (process.platform !== "win32") return undefined;
+    ownedOnboarding ??= createWindowsOnboardingController(configPath, suppliedIo, runtime);
+    return ownedOnboarding;
+  };
 
   if (command === undefined || command === "configure") {
     const io = suppliedIo ?? terminalIo();
@@ -394,15 +542,32 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
       }
       return command === "configure"
         ? (await configureListener(configPath, io, runtime), 0)
-        : await runMenu(configPath, io, runtime);
+        : await runMenu(configPath, io, runtime, resolvedOnboarding());
     } finally {
       io.close();
+      ownedOnboarding?.close();
     }
   }
 
   if (command === "status") {
-    await printStatus(configPath);
-    return 0;
+    try {
+      await printStatus(configPath, resolvedOnboarding());
+      return 0;
+    } finally {
+      ownedOnboarding?.close();
+    }
+  }
+
+  if (command === "setup") {
+    const io = suppliedIo ?? terminalIo();
+    try {
+      const controller = resolvedOnboarding();
+      if (controller === undefined) throw new Error("phone access setup is not initialized; rerun the Windows installer");
+      return await runSetup(configPath, io, controller);
+    } finally {
+      io.close();
+      (ownedOnboarding ?? onboarding)?.close();
+    }
   }
 
   if (command === "serve") {
@@ -418,8 +583,19 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
   }
 
   if (command === "pair") {
-    await runPair(configPath, values.url, values.ttl);
-    return 0;
+    const controller = resolvedOnboarding();
+    try {
+      if (controller !== undefined) {
+        const status = await controller.status();
+        const legacyExplicitPair = status.stage === "legacy_unreviewed" && status.authority === "none";
+        if ((status.authority !== "complete" || status.stage !== "complete" || !status.healthy) && !legacyExplicitPair)
+          throw new Error(`phone access is not verified for the current network; run ${resumeSetupCommand(configPath)}`);
+      }
+      await runPair(configPath, values.url, values.ttl);
+      return 0;
+    } finally {
+      ownedOnboarding?.close();
+    }
   }
 
   console.error(USAGE);

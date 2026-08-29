@@ -17,7 +17,18 @@ function New-ReleaseFixtures {
         'cozygateway.mjs' = "console.log('fixture');`n"
         'cozygateway-hermes-attach-plugin.tar.gz' = 'plugin-fixture'
         'cozygateway-installer.sh' = "#!/usr/bin/env bash`nexit 0`n"
-        'cozygateway-windows-helper.ps1' = "param([string]`$Command)`n"
+        'cozygateway-windows-helper.ps1' = @'
+param([string]$Command)
+$request = ([Console]::In.ReadToEnd() | ConvertFrom-Json)
+if ($env:COZYGATEWAY_TEST_HELPER_EVENT_LOG) { Add-Content -LiteralPath $env:COZYGATEWAY_TEST_HELPER_EVENT_LOG -Value "helper:$Command" }
+if ($Command -eq 'initialize-pending') {
+  $local = Join-Path ([string]$request.root) 'local'
+  New-Item -ItemType Directory -Force -Path $local | Out-Null
+  $state = Join-Path $local 'network-onboarding.json'
+  if (-not (Test-Path -LiteralPath $state)) { [IO.File]::WriteAllText($state, '{"version":1,"stage":"pending_choice","updatedAt":1}') }
+}
+[Console]::Out.Write((@{ schemaVersion=1; ok=$true; command=$Command; result=@{ applied=$true } } | ConvertTo-Json -Compress))
+'@
     }
     foreach ($entry in $assets.GetEnumerator()) {
         $path = Join-Path $Directory $entry.Key
@@ -60,7 +71,7 @@ exit /b 0
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho onboarding-token:%COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE%>>`"$EventLog`"`nif not exist `"%COZYGATEWAY_HOME%\local`" mkdir `"%COZYGATEWAY_HOME%\local`"`necho {}>`"%COZYGATEWAY_HOME%\local\cozygateway.config.json`"`necho fixture>`"%COZYGATEWAY_HOME%\local\cozygateway.sqlite`"`necho fixture>`"%COZYGATEWAY_HOME%\local\gateway.env`"`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -112,6 +123,7 @@ try {
         'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
         'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
         'COZYGATEWAY_TEST_USER_PATH_LOG' = $pathLog
+        'COZYGATEWAY_TEST_HELPER_EVENT_LOG' = $eventLog
     }
     Assert-True ($result.ExitCode -eq 0) "existing-Hermes bootstrap failed: $($result.Output)"
     $events = Get-Content -LiteralPath $eventLog
@@ -126,10 +138,48 @@ try {
     Assert-True (($events -join "`n") -match 'Cozy Gateway') 'paths containing spaces must survive the handoff'
     $installedHelper = Join-Path $temp 'Cozy Gateway\bin\cozygateway-windows-helper.ps1'
     Assert-True (Test-Path -LiteralPath $installedHelper) 'bootstrap must checksum-verify and install the Windows helper beside the bundle'
-    Assert-True ((Get-Content -LiteralPath $installedHelper -Raw) -eq "param([string]`$Command)`n") 'installed Windows helper bytes must match the verified release asset'
+    Assert-True ((Get-FileHash -LiteralPath $installedHelper -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath (Join-Path $fixtures 'cozygateway-windows-helper.ps1') -Algorithm SHA256).Hash) 'installed Windows helper bytes must match the verified release asset'
+    $localState = Join-Path $temp 'Cozy Gateway\local'
+    $pending = Get-Content -LiteralPath (Join-Path $localState 'network-onboarding.json') -Raw | ConvertFrom-Json
+    Assert-True ($pending.stage -eq 'pending_choice') 'fresh bootstrap must create the pending marker before shared config work'
+    $tokenPath = Join-Path $localState 'operator-control.token'
+    Assert-True ((Get-Content -LiteralPath $tokenPath -Raw) -match '^[A-Za-z0-9_-]{43}$') 'fresh bootstrap must create a 256-bit operator-control token outside config'
+    $initializeIndex = [Array]::IndexOf($events, 'helper:initialize-pending')
+    $protectTokenIndex = [Array]::IndexOf($events, 'helper:protect-path')
+    Assert-True ($initializeIndex -ge 0 -and $initializeIndex -lt $bashIndex) 'pending marker must be initialized before Bash can write config'
+    Assert-True ($protectTokenIndex -gt $initializeIndex -and $protectTokenIndex -lt $bashIndex) 'operator token must be ACL-protected before Bash can write config'
+    Assert-True (($events | Select-Object -Skip ($bashIndex + 1)) -contains 'helper:protect-path') 'config, SQLite, environment, and resume state must be helper-ACL-protected after Bash creates them'
+    Assert-True (($events -join "`n") -match ('onboarding-token:' + [regex]::Escape($tokenPath))) 'shared config handoff must receive only the operator token path'
+    Assert-True (([regex]::Matches($result.Output, 'Resume phone access setup with:')).Count -eq 1) 'noninteractive bootstrap must print exactly one resume command'
+    Assert-True ($result.Output -notmatch 'setup code|fake-qr') 'noninteractive bootstrap must not print pairing material'
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
     Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
     Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'
+
+    $interactiveHome = Join-Path $temp 'Interactive Gateway'
+    $interactiveBin = Join-Path $interactiveHome 'bin'
+    $interactivePathLog = Join-Path $temp 'interactive-user-path.txt'
+    New-Item -ItemType Directory -Force -Path $interactiveBin | Out-Null
+    Write-Utf8NoBom (Join-Path $interactiveBin 'cozygateway.cmd') "@echo off`necho setup:%*>>`"$eventLog`"`nexit /b 0`n"
+    Remove-Item -LiteralPath $eventLog -Force
+    $interactive = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = $interactiveHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_INTERACTIVE' = '1'
+        'COZYGATEWAY_TEST_HELPER_EVENT_LOG' = $eventLog
+        'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $interactivePathLog
+    }
+    Assert-True ($interactive.ExitCode -eq 0) "interactive bootstrap failed: $($interactive.Output)"
+    $interactiveEvents = Get-Content -LiteralPath $eventLog
+    $interactiveBash = ($interactiveEvents | Select-String '^bash:' | Select-Object -First 1).LineNumber - 1
+    $interactiveSetup = ($interactiveEvents | Select-String '^setup:' | Select-Object -First 1).LineNumber - 1
+    Assert-True ($interactiveSetup -gt $interactiveBash) 'the original PowerShell process must invoke setup after the Bash handoff'
+    Assert-True ($interactiveEvents[$interactiveSetup] -match '^setup:setup --config ' -and $interactiveEvents[$interactiveSetup] -match [regex]::Escape((Join-Path $interactiveHome 'local\cozygateway.config.json'))) 'PowerShell must invoke setup with the native config path'
+    Assert-True (($interactiveEvents -join "`n") -notmatch 'setup:pair') 'PowerShell must never fall back to unconditional pair'
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'

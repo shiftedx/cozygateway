@@ -38,6 +38,29 @@ async function completeProbe(url: string): Promise<void> {
 }
 
 describe("phone verification page", () => {
+  it("exposes bounded operator status and cancellation without returning a capability", () => {
+    const storage = openStorage(":memory:");
+    storage.beginGatewayBoot({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: "https://gateway.example",
+      durableFingerprint: "posture", startedAt: 1,
+    });
+    const verifier = new PhoneVerification({ storage, now: () => 1, monotonicNow: () => 1 });
+    verifier.activate({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: "https://gateway.example",
+      durableFingerprint: "posture",
+    });
+    const challenge = verifier.begin("tailscale");
+
+    expect(verifier.status(challenge.challengeId)).toEqual({ state: "pending", expiresAt: challenge.expiresAt });
+    expect(verifier.status(challenge.challengeId)).not.toHaveProperty("verificationUrl");
+    expect(verifier.cancel(challenge.challengeId)).toBe(true);
+    expect(verifier.status(challenge.challengeId)).toEqual({ state: "cancelled" });
+    expect(verifier.cancel(challenge.challengeId)).toBe(true);
+    expect(() => verifier.begin("lan")).not.toThrow();
+
+    verifier.close(); storage.close();
+  });
+
   it("normalizes literal default ports while preserving non-default ports", () => {
     expect(normalizeCanonicalOrigin("http://gateway.example:80")).toBe("http://gateway.example");
     expect(normalizeCanonicalOrigin("https://gateway.example:443")).toBe("https://gateway.example");

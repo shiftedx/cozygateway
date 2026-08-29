@@ -191,6 +191,20 @@ The local Windows account and administrators are trusted. A process already runn
 user can alter the database or forge loopback traffic and is outside this network-onboarding threat
 model.
 
+### Local operator bridge
+
+The standalone Windows CLI reaches the verifier in the already-running Gateway through one local
+operator route, `POST /cozy/operator/onboarding`. The route is absent unless config names a private
+token file. Fresh Windows bootstrap generates a 256-bit base64url token outside config, protects it
+with the fixed Windows helper, and stores only its path in config. The route accepts only loopback
+socket peers (including IPv4-mapped loopback), constant-time Bearer authentication, and exact JSON
+no larger than 512 bytes. It exposes only `begin`, `status`, and `cancel`; failures are uniform and
+neither capabilities nor tokens are logged. `begin` receives the adapter-proven canonical origin
+and durable fingerprint, advances the SQLite runtime context for that final route, and returns only
+the connectivity verification URL and bounded status metadata. The CLI polls for the authoritative
+phrase; setup-code finalization remains the SQLite transaction described above. Gateway restart
+invalidates an outstanding bridge challenge, so a resumed CLI begins a fresh proof.
+
 ## Windows Tailscale adapter
 
 The adapter uses only public, local Tailscale CLI behavior and a user-confirmed account. It invokes

@@ -104,6 +104,9 @@ const GatewayConfigSchema = Type.Object({
   port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
   host: Type.Optional(Type.String({ minLength: 1 })),
   dbPath: Type.String({ minLength: 1, default: "cozygateway.db" }),
+  /** Path to the installer-created 256-bit local operator control token. The credential itself is
+   * never valid configuration and this optional path is absent on legacy/non-Windows installs. */
+  onboardingControlTokenFile: Type.Optional(Type.String({ minLength: 1 })),
   /** Optional operator-enforced wall-clock bound in seconds. The default is disabled because
    *  active agent turns can legitimately run longer than ten minutes while using tools or
    *  compacting context. A positive value interrupts through the same path as a manual stop.
@@ -205,6 +208,9 @@ export function validatePublicDeployment(config: GatewayConfig): GatewayConfig {
 
 export function loadConfig(path: string): GatewayConfig {
   const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (typeof raw === "object" && raw !== null && Object.hasOwn(raw, "onboardingControlToken")) {
+    throw new ContractViolation("the operator control credential must be stored in its protected token file", "/onboardingControlToken");
+  }
   const withDefaults =
     typeof raw === "object" && raw !== null
       ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 0, ...raw }

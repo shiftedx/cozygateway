@@ -15,6 +15,7 @@ import {
   type PreparedEndpoint,
 } from "../src/network-onboarding.ts";
 import { openStorage } from "../src/storage.ts";
+import type { NetworkOnboardingState } from "../src/onboarding-state.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -42,6 +43,7 @@ function harness(options: {
   publishResult?: "published" | "not_published";
   rollbackError?: Error;
   now?: () => number;
+  projection?: NetworkOnboardingState;
 } = {}) {
   const calls: string[] = [];
   const projections: unknown[] = [];
@@ -67,7 +69,7 @@ function harness(options: {
   const dependencies: NetworkOnboardingDependencies = {
     adapters: [adapter],
     state: {
-      read: vi.fn(async () => undefined),
+      read: vi.fn(async () => options.projection),
       write: vi.fn(async (projection) => {
         projections.push(projection);
         calls.push(`state:${projection.stage}`);
@@ -127,6 +129,21 @@ function harness(options: {
 }
 
 describe("NetworkOnboarding", () => {
+  it("preserves legacy_unreviewed as a compatibility stage even while its old endpoint is offline", async () => {
+    const inspected = { ...endpoint, ready: false };
+    const { onboarding } = harness({
+      inspected,
+      projection: {
+        version: 1, stage: "legacy_unreviewed", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+
+    await expect(onboarding.status()).resolves.toEqual({
+      stage: "legacy_unreviewed", authority: "none", mode: "tailscale", healthy: false, endpoint: inspected,
+    });
+  });
+
   it("chooses a network before creating a readiness challenge and gives the QR only its URL", async () => {
     const { onboarding, dependencies, io, calls } = harness({ proofPhrase: undefined });
 
@@ -134,7 +151,7 @@ describe("NetworkOnboarding", () => {
 
     expect(calls.indexOf("choice")).toBeLessThan(calls.indexOf("prepare"));
     expect(calls.indexOf("prepare")).toBeLessThan(calls.findIndex((entry) => entry.startsWith("phone-qr:")));
-    expect(dependencies.phoneVerification.begin).toHaveBeenCalledWith("tailscale");
+    expect(dependencies.phoneVerification.begin).toHaveBeenCalledWith("tailscale", endpoint);
     expect(io.showPhoneConnectionCheck).toHaveBeenCalledWith(
       "https://cozy.example.ts.net/cozy/onboarding/readiness-only",
       undefined,
@@ -161,6 +178,19 @@ describe("NetworkOnboarding", () => {
     expect(io.confirmPhone).toHaveBeenCalledWith("amber otter", undefined);
     expect(dependencies.createSetupCode).not.toHaveBeenCalled();
     expect(dependencies.publishPairing).not.toHaveBeenCalled();
+  });
+
+  it("accepts an asynchronous cross-process challenge whose phrase arrives only after phone proof", async () => {
+    const { onboarding, dependencies, io } = harness({ proofPhrase: "silver maple", answer: "y" });
+    (dependencies.phoneVerification.begin as ReturnType<typeof vi.fn>).mockResolvedValue({
+      challengeId: "challenge-1",
+      sessionId: "session-1",
+      verificationUrl: "https://cozy.example.ts.net/cozy/onboarding/readiness-only",
+      expiresAt: 600_000,
+    });
+
+    await expect(onboarding.run(io)).resolves.toMatchObject({ outcome: "complete" });
+    expect(io.showAuthoritativePhrase).toHaveBeenCalledWith("silver maple", undefined);
   });
 
   it.each(["Y", "YES", " y", "yes ", "n", "no", ""])("rejects non-exact desktop answer %j", async (answer) => {

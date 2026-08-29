@@ -64,6 +64,7 @@ import {
   type PhoneVerificationDeps,
   type PhoneVerificationChallenge,
 } from "./phone-verification.ts";
+import { loadOperatorControlToken, OperatorOnboardingControl } from "./operator-onboarding.ts";
 
 export const GATEWAY_VERSION = "0.3.6";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
@@ -227,6 +228,12 @@ export async function startGateway(
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
   const phoneVerification = new PhoneVerification({ storage, ...options.phoneVerification });
+  const operatorOnboarding = config.onboardingControlTokenFile === undefined
+    ? undefined
+    : new OperatorOnboardingControl({
+        token: loadOperatorControlToken(config.onboardingControlTokenFile),
+        phoneVerification,
+      });
   const endpoints = hermesEndpoints(config);
   const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
     ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,
@@ -553,6 +560,7 @@ export async function startGateway(
   const app = createApp({
     storage,
     phoneVerification,
+    ...(operatorOnboarding === undefined ? {} : { operatorOnboarding }),
     config,
     gatewayInfo,
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),

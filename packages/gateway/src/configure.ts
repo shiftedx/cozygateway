@@ -3,6 +3,37 @@ import { isIP } from "node:net";
 import { dirname, join } from "node:path";
 
 import { loadConfig } from "./config.ts";
+import type { AuthoritativeOnboardingStatus, OnboardingAuthority, OnboardingRuntimeContext } from "./network-onboarding.ts";
+import type { FinalizeInput, FinalizeResult, PublishedCode, SetupCodeOutputState, Storage, TransitionResult } from "./storage.ts";
+
+/** Concrete Task 10 bridge: status and publication transitions share the same SQLite handle. */
+export class SqliteOnboardingAuthority implements OnboardingAuthority {
+  readonly #storage: Storage;
+
+  constructor(storage: Storage) {
+    this.#storage = storage;
+  }
+
+  status(): AuthoritativeOnboardingStatus {
+    return this.#storage.onboardingAuthorityStatus() as AuthoritativeOnboardingStatus;
+  }
+
+  runtimeContext(): OnboardingRuntimeContext {
+    return this.#storage.onboardingRuntimeContext();
+  }
+
+  finalizeVerifiedSetupCode(input: FinalizeInput): FinalizeResult {
+    return this.#storage.finalizeVerifiedSetupCode(input);
+  }
+
+  activatePendingSetupCode(input: PublishedCode): TransitionResult<SetupCodeOutputState> {
+    return this.#storage.activatePendingSetupCode(input);
+  }
+
+  revokePendingSetupCode(input: PublishedCode): TransitionResult<SetupCodeOutputState> {
+    return this.#storage.revokePendingSetupCode(input);
+  }
+}
 
 const LISTENER_PORT_ERROR = "listener port must be a whole number from 1 through 65535";
 const LISTENER_HOST_ERROR = "bind address must be a hostname or IP address, not a URL or whitespace";
@@ -46,7 +77,12 @@ function writeAtomic(path: string, content: string, validate?: (temporary: strin
   }
 }
 
-export function updateListenerConfig(path: string, requestedHost: string, requestedPort: number): void {
+export function updateListenerConfig(
+  path: string,
+  requestedHost: string,
+  requestedPort: number,
+  options: { clearPublicUrl?: boolean } = {},
+): void {
   const host = validateListenerHost(requestedHost);
   const port = parseListenerPort(String(requestedPort));
   const existing: unknown = JSON.parse(readFileSync(path, "utf8"));
@@ -54,7 +90,9 @@ export function updateListenerConfig(path: string, requestedHost: string, reques
     throw new Error("gateway configuration must be a JSON object");
   }
 
-  writeAtomic(path, `${JSON.stringify({ ...existing, host, port }, null, 2)}\n`, loadConfig);
+  const replacement = { ...existing, host, port } as Record<string, unknown>;
+  if (options.clearPublicUrl === true) delete replacement.publicUrl;
+  writeAtomic(path, `${JSON.stringify(replacement, null, 2)}\n`, loadConfig);
 }
 
 export interface ManagedHermesProfile {

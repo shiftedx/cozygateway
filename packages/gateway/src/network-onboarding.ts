@@ -79,12 +79,14 @@ export interface OnboardingAuthority {
   revokePendingSetupCode(input: PublishedCode): TransitionResult<SetupCodeOutputState>;
 }
 
+export type OnboardingPhoneChallenge = Omit<PhoneVerificationChallenge, "phrase"> & { phrase?: string };
+
 export interface OnboardingPhoneVerification {
-  begin(mode: OnboardingMode): PhoneVerificationChallenge;
+  begin(mode: OnboardingMode, endpoint: PreparedEndpoint): OnboardingPhoneChallenge | Promise<OnboardingPhoneChallenge>;
   /** Resolves only from Task 5's authoritative confirmation POST. Undefined means the automatic
    * proof failed, expired, or was cancelled; it never authorizes publication by itself. */
   waitForConfirmation(
-    challenge: PhoneVerificationChallenge,
+    challenge: OnboardingPhoneChallenge,
     signal?: AbortSignal,
   ): Promise<string | undefined>;
 }
@@ -286,9 +288,12 @@ export class NetworkOnboarding {
       && projection.mode === mode
       && (!("deploymentFingerprint" in projection)
         || projection.deploymentFingerprint === endpoint.durableFingerprint);
-    const stage = endpoint.ready && projectionMatches && projection !== undefined
-      ? projection.stage
-      : "changed";
+    const legacyCompatibility = projectionMatches && projection?.stage === "legacy_unreviewed";
+    const stage = legacyCompatibility
+      ? "legacy_unreviewed"
+      : endpoint.ready && projectionMatches && projection !== undefined
+        ? projection.stage
+        : "changed";
     return {
       stage,
       authority: authority.state,
@@ -330,13 +335,13 @@ export class NetworkOnboarding {
       updatedAt: this.#now(),
     });
 
-    const initialRuntime = this.#dependencies.runtimeContext();
-    let challenge: PhoneVerificationChallenge;
+    let challenge: OnboardingPhoneChallenge;
     try {
-      challenge = this.#dependencies.phoneVerification.begin(mode);
+      challenge = await this.#dependencies.phoneVerification.begin(mode, endpoint);
     } catch {
       return this.#rollbackFailure(adapter, endpoint, signal, "readiness");
     }
+    const initialRuntime = this.#dependencies.runtimeContext();
     try {
       await io.showPhoneConnectionCheck(challenge.verificationUrl, signal);
       await this.#dependencies.state.write({
@@ -358,7 +363,7 @@ export class NetworkOnboarding {
     }
     if (provenPhrase === undefined)
       return this.#rollbackFailure(adapter, endpoint, signal, "phone");
-    if (provenPhrase !== challenge.phrase)
+    if (challenge.phrase !== undefined && provenPhrase !== challenge.phrase)
       return this.#rollbackFailure(adapter, endpoint, signal, "phrase");
     let answer: string | undefined;
     try {

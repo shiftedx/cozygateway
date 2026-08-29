@@ -187,6 +187,72 @@ function Invoke-CozyGatewayInstaller {
     if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
 }
 
+function Invoke-OnboardingHelper {
+    param([string] $Command, [hashtable] $Request)
+    $json = $Request | ConvertTo-Json -Compress
+    $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $raw = ($json | & $powerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:WindowsHelperPath $Command | Out-String).Trim()
+    $exit = $LASTEXITCODE
+    try { $response = $raw | ConvertFrom-Json } catch { Fail "Windows onboarding helper returned an invalid response for $Command" }
+    if ($exit -ne 0 -or $null -eq $response -or $response.schemaVersion -ne 1 -or $response.ok -ne $true -or $response.command -cne $Command -or $response.result.applied -ne $true) {
+        Fail "Windows onboarding helper could not complete $Command"
+    }
+}
+
+function Initialize-OnboardingBootstrap {
+    param([bool] $FreshInstall)
+    if ($FreshInstall) { Invoke-OnboardingHelper 'initialize-pending' @{ root = $script:InstallHome } }
+    $local = Join-Path $script:InstallHome 'local'
+    if (-not (Test-Path -LiteralPath $local -PathType Container)) { New-Item -ItemType Directory -Force -Path $local | Out-Null }
+    $tokenPath = Join-Path $local 'operator-control.token'
+    if (Test-Path -LiteralPath $tokenPath) {
+        $token = [IO.File]::ReadAllText($tokenPath)
+        if ($token -cnotmatch '^[A-Za-z0-9_-]{43}$') { Fail 'the local onboarding control token is invalid; restore it or remove it and rerun setup' }
+    } else {
+        $bytes = New-Object byte[] 32
+        $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
+        $token = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+        [IO.File]::WriteAllText($tokenPath, $token, (New-Object Text.UTF8Encoding($false)))
+    }
+    Invoke-OnboardingHelper 'protect-path' @{ root = $script:InstallHome; path = $tokenPath }
+    $env:COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE = $tokenPath
+    return $tokenPath
+}
+
+function Protect-CozyGatewayLocalState {
+    $local = Join-Path $script:InstallHome 'local'
+    $paths = @(
+        $local,
+        (Join-Path $local 'cozygateway.config.json'),
+        (Join-Path $local 'cozygateway.sqlite'),
+        (Join-Path $local 'cozygateway.sqlite-wal'),
+        (Join-Path $local 'cozygateway.sqlite-shm'),
+        (Join-Path $local 'gateway.env'),
+        (Join-Path $local 'dashboard.env'),
+        (Join-Path $local 'profiles.json'),
+        (Join-Path $local 'install-state'),
+        (Join-Path $local 'network-onboarding.json'),
+        (Join-Path $local 'operator-control.token')
+    )
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path) { Invoke-OnboardingHelper 'protect-path' @{ root = $script:InstallHome; path = $path } }
+    }
+}
+
+function Invoke-PhoneAccessSetup {
+    $command = Join-Path $script:InstallHome 'bin\cozygateway.cmd'
+    $config = Join-Path $script:InstallHome 'local\cozygateway.config.json'
+    $interactive = ($env:COZYGATEWAY_TEST_INTERACTIVE -eq '1') -or (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected)
+    if (-not $interactive) {
+        Write-Info "Resume phone access setup with: `"$command`" setup --config `"$config`""
+        return
+    }
+    if (-not (Test-Path -LiteralPath $command)) { Fail 'the CozyGateway command was not installed; rerun this installer' }
+    & $command setup --config $config
+    if ($LASTEXITCODE -ne 0) { Fail 'phone access setup paused or failed; rerun the displayed resume command' }
+}
+
 function Set-CozyGatewayCommandPath {
     param([string] $BinPath, [bool] $Present)
     $full = [IO.Path]::GetFullPath($BinPath).TrimEnd('\')
@@ -218,6 +284,8 @@ if ($PSVersionTable.PSVersion.Major -lt 5) { Fail 'Windows PowerShell 5.1 or new
 $script:InstallHome = Resolve-InstallHome $env:COZYGATEWAY_HOME
 $bin = Join-Path $script:InstallHome 'bin'
 $installerPath = Join-Path $bin 'agent-install.sh'
+$configPath = Join-Path $script:InstallHome 'local\cozygateway.config.json'
+$isFreshInstall = -not (Test-Path -LiteralPath $configPath)
 $isUninstall = $InstallerArguments -contains '--uninstall'
 $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
 
@@ -240,6 +308,7 @@ if ($isDryRun) {
     }
     Write-Info 'dry run: would resolve and checksum-verify the CozyGateway release assets'
     Write-Info "dry run: would install CozyGateway under $script:InstallHome without administrator rights"
+    Write-Info 'dry run: would initialize private resumable phone access state and return to this PowerShell for setup'
     return
 }
 
@@ -263,5 +332,8 @@ Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
 Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
 Get-VerifiedAsset 'cozygateway-windows-helper.ps1' $script:WindowsHelperPath $base
 Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
+[void](Initialize-OnboardingBootstrap $isFreshInstall)
 Invoke-CozyGatewayInstaller $bash $installerPath $InstallerArguments
+Protect-CozyGatewayLocalState
 if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }
+Invoke-PhoneAccessSetup

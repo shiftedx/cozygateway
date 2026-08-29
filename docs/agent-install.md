@@ -70,15 +70,15 @@ curl -fsSL https://cozylabs.ai/install.sh | bash
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
 
-Near the end of a fresh interactive install, the installer asks one networking question:
-`Allow CozyChat to access this Gateway over your local network? [y/N]`. Yes binds CozyGateway to
-all local interfaces and makes the pairing QR advertise the machine's detected LAN address. No,
-an empty answer, or a non-interactive install keeps the listener on `127.0.0.1`. An explicit
-`--bind-host` skips the question, and updates preserve the listener already saved in the config.
+On Windows, the original PowerShell process next opens the resumable phone-access setup. It offers
+personal Tailscale, same-Wi-Fi, later, and advanced choices. A fresh pending marker blocks pairing
+until the selected final route has passed the phone connection check and the matching phrase is
+confirmed on the PC. Noninteractive installation stays healthy on loopback, prints one
+`cozygateway setup` resume command, and emits no QR or setup code. Updates retain completed matching
+posture; older installs keep their explicit pairing compatibility while setup offers a review.
 
-The install (and every re-run) then finishes by minting a pairing code and printing a terminal QR
-plus the gateway URL and setup code in plain text, so a fresh device goes install, scan, chatting
-with no further commands when the selected listener is reachable from that device. The QR encodes
+On macOS and Linux, the established install finale still mints a pairing code and prints a terminal
+QR plus the gateway URL and setup code. The final pairing QR encodes
 the `{"gatewayUrl":...,"setupCode":...}` payload from contract section 4; the
 URL uses the configured listener unless `publicUrl` records a user-managed HTTPS origin. Codes
 expire after 10 minutes; mint another with `~/.cozygateway/bin/cozygateway pair`. A configured
@@ -91,8 +91,7 @@ Local CLI health checks also pin the configured leaf certificate while allowing
 the bind address to differ from its DNS name.
 
 LAN mode is plaintext and is appropriate only on a trusted private network. Explicit
-listener/public URL options, saved installs, dry runs, and noninteractive installs bypass the
-question; power users can still choose directly with `--bind-host`.
+listener/public URL options remain available as advanced intent.
 For a tunnel, pass `--public-url https://gateway.example.com`; the installer persists the canonical
 origin and requires/sets loopback. Network reachability outside the machine is deliberately not
 automated; see `docs/connectivity.md`.
@@ -114,7 +113,7 @@ health checks. If a managed listener replacement cannot become ready, the CLI
 restores the previous working listener automatically.
 Readiness requires at least one configured attach profile, every configured
 profile online, and zero dead letters. Pairing material is not printed first.
-The non-interactive `cozygateway status`, `cozygateway pair`, and
+The non-interactive `cozygateway status`, `cozygateway setup`, `cozygateway pair`, and
 `cozygateway configure` commands expose the same focused operations directly.
 
 On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the

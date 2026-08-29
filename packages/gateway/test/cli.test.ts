@@ -7,8 +7,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   isExpectedCertificate,
   isGatewayReady,
+  legacyPairingLanAddress,
   publishOnboardingPairing,
   runCli,
+  type CliOnboardingController,
   type OnboardingPairingDependencies,
 } from "../src/cli.ts";
 import { startGateway } from "../src/server.ts";
@@ -20,6 +22,23 @@ function scriptedIo(answers: string[]) {
     interactive: true,
     question: async (_prompt: string): Promise<string> => answers.shift() ?? "",
     close: (): void => undefined,
+  };
+}
+
+function onboardingController(
+  overrides: Partial<CliOnboardingController> = {},
+): CliOnboardingController {
+  return {
+    status: vi.fn(async () => ({
+      stage: "pending_choice" as const,
+      authority: "none" as const,
+      healthy: false,
+      expiresAt: 600_000,
+    })),
+    run: vi.fn(async () => ({ outcome: "deferred" as const })),
+    resume: vi.fn(async () => ({ outcome: "deferred" as const })),
+    close: vi.fn(),
+    ...overrides,
   };
 }
 
@@ -237,8 +256,7 @@ describe("cozygateway pair finale", () => {
   });
 
   it("prefers the machine's LAN address over loopback for a wildcard bind", async () => {
-    const { primaryLanAddress } = await import("../src/lan.ts");
-    const expectedHost = primaryLanAddress() ?? "127.0.0.1";
+    const expectedHost = legacyPairingLanAddress() ?? "127.0.0.1";
     const { configPath } = tempConfig({ host: "0.0.0.0" });
     const lines = await pairLines(configPath);
     const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as { gatewayUrl: string };
@@ -482,6 +500,107 @@ describe("verified onboarding pairing publication", () => {
 });
 
 describe("cozygateway terminal menu", () => {
+  it.each([
+    ["1", "tailscale"],
+    ["2", "lan"],
+    ["3", "later"],
+    ["4", "advanced"],
+  ] as const)("setup offers outcome-focused network choice %s", async (answer, expected) => {
+    const { configPath } = tempConfig();
+    let selected: string | undefined;
+    const controller = onboardingController({
+      resume: vi.fn(async (io) => {
+        selected = await io.chooseNetworkMode();
+        return selected === "later" ? { outcome: "deferred" as const } : { outcome: "cancelled" as const };
+      }),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([answer]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(selected).toBe(expected);
+    expect(lines.join("\n")).toContain("Remote via personal Tailscale");
+    expect(lines.join("\n")).toContain("Same Wi-Fi");
+    expect(lines.join("\n")).toContain("Set up later");
+    expect(lines.join("\n")).toContain("Advanced settings");
+  });
+
+  it("noninteractive setup emits no QR/code and prints exactly one resume command", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+    const io = { ...scriptedIo([]), interactive: false };
+
+    expect(await runCli(["setup", "--config", configPath], io, undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(controller.run).not.toHaveBeenCalled();
+    expect(controller.resume).not.toHaveBeenCalled();
+    expect(lines.join("\n")).not.toMatch(/setupCode|Setup code|█/);
+    expect(lines.filter((line) => line.includes("cozygateway setup"))).toEqual([
+      `Resume phone access setup with: cozygateway setup --config "${configPath}"`,
+    ]);
+  });
+
+  it.each([
+    ["install_cancelled", "Tailscale installation was cancelled in Windows"],
+    ["install_reboot_required", "Restart Windows, then resume"],
+    ["login_pending", "Finish signing in to Tailscale"],
+    ["machine_auth_required", "Ask the tailnet administrator to approve this machine"],
+    ["managed_policy", "Tailscale policy blocked the requested setting"],
+    ["no_up_physical_private_ipv4", "Connect this PC to trusted Wi-Fi or Ethernet"],
+    ["multiple_up_physical_private_ipv4", "More than one physical network is active"],
+    ["mapping_conflict", "Tailscale port 443 is already in use"],
+  ] as const)("prints actionable resumable copy for %s", async (reason, copy) => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      resume: vi.fn(async () => ({ outcome: "paused" as const, mode: "tailscale" as const, reason })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain(copy);
+    expect(lines.join("\n")).toContain("cozygateway setup");
+    expect(lines.join("\n")).not.toMatch(/diagnostic dump|authUrl|token/i);
+  });
+
+  it("blocks fresh/changed pairing, allows matching complete pairing, and preserves legacy pairing", async () => {
+    const pending = tempConfig();
+    const pendingController = onboardingController();
+    await expect(runCli(["pair", "--config", pending.configPath], undefined, undefined, pendingController))
+      .rejects.toThrow(/cozygateway setup/);
+    expect(existsSync(pending.dbPath)).toBe(false);
+
+    const complete = tempConfig();
+    const completeController = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "complete" as const, authority: "complete" as const, mode: "lan" as const, healthy: true,
+        endpoint: {
+          mode: "lan" as const, canonicalOrigin: "http://192.168.1.20:18787", bindHost: "0.0.0.0",
+          port: 18787, durableFingerprint: "posture", ready: true,
+        },
+      })),
+    });
+    expect(await runCli(["pair", "--config", complete.configPath], undefined, undefined, completeController)).toBe(0);
+
+    const legacy = tempConfig();
+    expect(await runCli(["pair", "--config", legacy.configPath])).toBe(0);
+
+    const reviewedLegacy = tempConfig();
+    const reviewedLegacyController = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "legacy_unreviewed" as const, authority: "none" as const,
+        mode: "advanced" as const, healthy: false,
+      })),
+    });
+    expect(await runCli(["pair", "--config", reviewedLegacy.configPath], undefined, undefined, reviewedLegacyController)).toBe(0);
+  });
   it("requires zero dead letters before a managed listener is ready", () => {
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 1 } })).toBe(false);
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 0 } })).toBe(true);

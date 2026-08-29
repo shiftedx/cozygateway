@@ -60,6 +60,7 @@ import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
 import type { PhoneVerification } from "./phone-verification.ts";
+import type { OperatorOnboardingControl } from "./operator-onboarding.ts";
 
 const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
 // The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
@@ -107,6 +108,8 @@ export interface AppDeps {
   storage: Storage;
   /** Separate low-authority onboarding ingress. It never passes through device authentication. */
   phoneVerification?: PhoneVerification;
+  /** Fixed-token, loopback-only bridge used solely by the local Windows setup CLI. */
+  operatorOnboarding?: OperatorOnboardingControl;
   /** Test-only override for the gateway-wide `/pair` bucket. Production leaves this absent and
    *  builds its limiter from `now`; a long-lived black-box harness supplies one with virtual time. */
   pairingAdmission?: PairingAttemptLimiter;
@@ -271,6 +274,12 @@ export function createApp(deps: AppDeps): Hono<Env> {
     };
   })();
   requestLiveActivityDeletionDrain();
+
+  app.post("/cozy/operator/onboarding", (c) => {
+    if (deps.operatorOnboarding === undefined) return c.notFound();
+    const incoming = (c.env as { incoming?: IncomingMessage } | undefined)?.incoming;
+    return deps.operatorOnboarding.handle(c.req.raw, incoming?.socket.remoteAddress);
+  });
 
   // This narrowly-scoped capability route precedes the normal device-token surface. All
   // authority, method, body, state, and response rules remain owned by PhoneVerification.

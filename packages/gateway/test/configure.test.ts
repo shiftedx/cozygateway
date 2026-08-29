@@ -7,11 +7,13 @@ import { describe, expect, it } from "vitest";
 import {
   parseListenerPort,
   listenerOrigin,
+  SqliteOnboardingAuthority,
   syncManagedListenerTargets,
   updateListenerConfig,
   validateListenerHost,
 } from "../src/configure.ts";
 import { loadConfig } from "../src/config.ts";
+import { openStorage } from "../src/storage.ts";
 
 function configFile(): string {
   const dir = mkdtempSync(join(tmpdir(), "cozygateway-configure-"));
@@ -34,6 +36,36 @@ function configFile(): string {
 }
 
 describe("listener configuration", () => {
+  it("reads onboarding authority and runtime context from the same SQLite storage", async () => {
+    const storage = openStorage(":memory:");
+    const authority = new SqliteOnboardingAuthority(storage);
+    expect(await authority.status()).toEqual({ state: "none" });
+    storage.beginGatewayBoot({
+      bootGeneration: "boot-1",
+      verificationEpoch: "epoch-1",
+      canonicalOrigin: "https://cozy.example.ts.net",
+      durableFingerprint: "posture-1",
+      startedAt: 10,
+    });
+    expect(authority.runtimeContext()).toEqual({ verificationEpoch: "epoch-1", bootGeneration: "boot-1" });
+    storage.beginSetupSession({
+      sessionId: "session-1",
+      mode: "tailscale",
+      canonicalOrigin: "https://cozy.example.ts.net",
+      durableFingerprint: "posture-1",
+      verificationEpoch: "epoch-1",
+      bootGeneration: "boot-1",
+      createdAt: 11,
+    });
+    expect(await authority.status()).toEqual({
+      state: "active",
+      mode: "tailscale",
+      canonicalOrigin: "https://cozy.example.ts.net",
+      durableFingerprint: "posture-1",
+    });
+    storage.close();
+  });
+
   it("accepts bind addresses and ports supported by the gateway", () => {
     expect(validateListenerHost("0.0.0.0")).toBe("0.0.0.0");
     expect(validateListenerHost("::")).toBe("::");
@@ -89,6 +121,19 @@ describe("listener configuration", () => {
 
     expect(() => updateListenerConfig(path, "0.0.0.0", 8787)).toThrow(/publicUrl.*loopback/i);
     expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  it("lets an explicitly selected managed route retire an old advanced public origin", () => {
+    const path = configFile();
+    const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    config.host = "127.0.0.1";
+    config.publicUrl = "https://gateway.example";
+    writeFileSync(path, JSON.stringify(config));
+
+    updateListenerConfig(path, "0.0.0.0", 8787, { clearPublicUrl: true });
+
+    expect(loadConfig(path).host).toBe("0.0.0.0");
+    expect(loadConfig(path).publicUrl).toBeUndefined();
   });
 
   it("updates every installer-managed Hermes profile target without exposing or changing tokens", () => {
