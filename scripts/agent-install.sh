@@ -25,7 +25,9 @@ PREVIOUS_PORT=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
 DRY_RUN=0
 UNINSTALL=0
+DEACTIVATE_FOR_REPAIR=0
 STATUS=0
+WINDOWS_DASHBOARD_PREFLIGHTED=0
 SERVICE_PLATFORM="${COZYGATEWAY_SERVICE_PLATFORM:-}"
 WINDOWS_PORT_PREFLIGHTED=0
 TOKENS=()
@@ -58,6 +60,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --service-platform OS   override service platform (Darwin, Linux, Windows)
   --status                report persistence and live gateway health
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
+  --deactivate-for-repair stop owned lifecycle without deleting recovery files (internal recovery)
 
 The gateway and attach plugin both stay on this machine. This installer never
 configures remote networking, DNS, routers, or firewalls.
@@ -79,6 +82,7 @@ while [ "$#" -gt 0 ]; do
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
     --status) STATUS=1 ;;
     --uninstall) UNINSTALL=1 ;;
+    --deactivate-for-repair) DEACTIVATE_FOR_REPAIR=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
@@ -87,6 +91,7 @@ done
 
 [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$CLEAR_PUBLIC_URL" = 0 ] || \
   die "--public-url and --clear-public-url are mutually exclusive"
+[ "$UNINSTALL" = 0 ] || [ "$DEACTIVATE_FOR_REPAIR" = 0 ] || die "--uninstall and --deactivate-for-repair are mutually exclusive"
 
 normalize_service_platform() {
   [ -n "$SERVICE_PLATFORM" ] || SERVICE_PLATFORM="$(uname -s)"
@@ -998,13 +1003,13 @@ const child = spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashb
 child.unref();
 NODE
 }
-stop_stubborn_windows_dashboard() {
-  local hermes_native launcher_native root_native code
+inspect_windows_dashboard_owner() {
+  local stop_owned="${1:-0}" hermes_native launcher_native root_native code
   hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
   launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
   root_native="$(to_windows_path "$HERMES_ROOT")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_DASHBOARD_ROOT="$root_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_DASHBOARD_PREFLIGHT_ONLY=1 COZYGATEWAY_DASHBOARD_STOP_OWNED="$stop_owned" COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_DASHBOARD_ROOT="$root_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     $port = [int]$env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT
     $connection = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1067,12 +1072,32 @@ stop_stubborn_windows_dashboard() {
     }
     # COZYGATEWAY_DASHBOARD_OWNER_END
     $resolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
-    if (-not (Test-CozyDashboardOwner -Process $process -ExpectedRoot $env:COZYGATEWAY_EXPECTED_DASHBOARD_ROOT -ExpectedHermes $env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES -ExpectedLauncher $env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER -ExpectedPort $port -ResolveProcess $resolver)) { exit 42 }
-    Stop-Process -Id $process.ProcessId -Force
-  ' >/dev/null 2>&1
+    if (-not (Test-CozyDashboardOwner -Process $process -ExpectedRoot $env:COZYGATEWAY_EXPECTED_DASHBOARD_ROOT -ExpectedHermes $env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES -ExpectedLauncher $env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER -ExpectedPort $port -ResolveProcess $resolver)) {
+      $name = try { (Get-Process -Id $process.ProcessId -ErrorAction Stop).ProcessName } catch { "unknown" }
+      [Console]::Out.Write("$($process.ProcessId)|$name")
+      exit 42
+    }
+    if ($env:COZYGATEWAY_DASHBOARD_STOP_OWNED -eq "1") { Stop-Process -Id $process.ProcessId -Force }
+  ' 2>/dev/null
   code=$?
   set -e
-  [ "$code" -eq 0 ] || die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop"
+  return "$code"
+}
+preflight_windows_dashboard_port() {
+  [ "$DRY_RUN" = 1 ] && { say "DRY   verify Dashboard port $DASHBOARD_PORT is free or owned by this exact Hermes installation"; return; }
+  local owner code pid process_name
+  set +e; owner="$(inspect_windows_dashboard_owner 0)"; code=$?; set -e
+  [ "$code" -eq 0 ] && return
+  if [ "$code" -eq 42 ]; then
+    pid="${owner%%|*}"; process_name="${owner#*|}"
+    case "$pid" in ''|*[!0-9]*) pid=unknown ;; esac
+    [ "$process_name" != "$owner" ] || process_name=unknown
+    die "Dashboard port $DASHBOARD_PORT is already in use by PID $pid ($process_name). Stop that process or choose a free --dashboard-port. No CozyGateway or Hermes state was changed."
+  fi
+  die "could not inspect Dashboard port $DASHBOARD_PORT before installation; no CozyGateway or Hermes state was changed"
+}
+stop_stubborn_windows_dashboard() {
+  inspect_windows_dashboard_owner 1 >/dev/null || die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop"
 }
 start_dashboard() {
   local hermes_root_arg="$HERMES_ROOT" code
@@ -1173,6 +1198,51 @@ uninstall() {
   done
   run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
+deactivate_for_repair() {
+  local profiles root hermes_bin p plugin action damaged_state=0 hermes_available=1
+  resolve_platform
+  [ "$SERVICE_PLATFORM" = Windows ] && remove_windows_persistence_and_process
+  if [ ! -f "$STATE_FILE" ]; then
+    say "WARN  install-state is missing; Windows persistence is deactivated and recovery files are retained"
+    return
+  fi
+  root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
+  hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
+  profiles="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"
+  [ -n "$root" ] && [ -n "$hermes_bin" ] && [ -n "$profiles" ] || damaged_state=1
+  case "$root" in /*) ;; *) damaged_state=1 ;; esac
+  case "$hermes_bin" in /*) ;; *) damaged_state=1 ;; esac
+  if [ "$damaged_state" = 1 ]; then
+    say "WARN  install-state is incomplete; Windows persistence is deactivated and recovery files are retained"
+    return
+  fi
+  [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || hermes_available=0
+  HERMES_RESOLVED="$hermes_bin"; HERMES_ROOT="$root"
+  IFS=',' read -r -a SELECTED <<<"$profiles"
+  for p in "${SELECTED[@]}"; do
+    valid_profile "$p" || damaged_state=1
+    action="$(prior_service_action "$p")"
+    case "$action" in installed|started|preexisting|unknown) ;; *) damaged_state=1 ;; esac
+  done
+  if [ "$damaged_state" = 1 ]; then
+    say "WARN  profile ownership is incomplete; Windows persistence is deactivated and recovery files are retained"
+    return
+  fi
+  for p in "${SELECTED[@]}"; do
+    action="$(prior_service_action "$p")"; plugin="$(profile_home "$p")/plugins/cozygateway"
+    if [ "$hermes_available" = 1 ]; then
+      case "$action" in
+        installed) run "$HERMES_RESOLVED" -p "$p" gateway uninstall ;;
+        started) run "$HERMES_RESOLVED" -p "$p" gateway stop ;;
+        preexisting|unknown) ;;
+      esac
+      [ -f "$plugin/.cozygateway-installer-owned" ] && run "$HERMES_RESOLVED" -p "$p" plugins disable cozygateway
+    else
+      say "WARN  Hermes is unavailable; its lifecycle could not be deactivated until the install is repaired"
+    fi
+  done
+  say "OK    deactivated owned CozyGateway/Hermes lifecycle and retained all recovery files"
+}
 status_install() {
   local persisted=0 live=0 startup_entry code
   resolve_platform
@@ -1194,11 +1264,20 @@ status_install() {
 main() {
   local prerequisite_missing=0 profile action
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
+  if [ "$DEACTIVATE_FOR_REPAIR" = 1 ]; then deactivate_for_repair; return; fi
   preflight_service_manager
   if is_windows && [ ! -f "$CONFIG_JSON" ]; then
     case "$PORT" in ''|*[!0-9]*) die "--port must be 1-65535" ;; esac
     [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be 1-65535"
     preflight_windows_gateway_port
+  fi
+  if is_windows && [ "$STATUS" = 0 ]; then
+    HERMES_RESOLVED="$(find_hermes)" || die "Hermes must already be installed"
+    HERMES_BIN="$HERMES_RESOLVED"
+    HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"
+    discover_profiles
+    preflight_windows_dashboard_port
+    WINDOWS_DASHBOARD_PREFLIGHTED=1
   fi
   if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
@@ -1222,7 +1301,9 @@ main() {
   validate_listener_settings
   if is_windows && [ "$WINDOWS_PORT_PREFLIGHTED" = 0 ]; then preflight_windows_gateway_port; fi
   HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
-  say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
+  say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"
+  if is_windows && [ "$WINDOWS_DASHBOARD_PREFLIGHTED" = 0 ]; then preflight_windows_dashboard_port; fi
+  [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done

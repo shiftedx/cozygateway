@@ -27,22 +27,29 @@
    loopback/mapped-loopback, and URL-normalized IPv4 forms such as `127.1`, integer, octal, and hex
    loopback unless a separate concrete public origin exists. Inspection also fails closed
    on a non-phone-reachable origin, preventing it from reaching verification or pairing QR output.
-7. **Gateway port:** Windows PowerShell inspects the target port before Hermes/model setup, release
+7. **Gateway and Dashboard ports:** Windows PowerShell inspects the Gateway target port before Hermes/model setup, release
    assets, tokens, or install-state mutation. Existing installs use the saved port unless explicitly
    overridden. Conflicts report PID, process name, stop/process-or-`--port`
    action, and an explicit no-state-changed statement.
-8. **Damaged uninstall:** missing/corrupt install state now follows the Windows recovery teardown:
-   delete the exact `CozyGateway` Task, remove its exact Startup entry, stop only a process whose
-   command line names this install's exact config path, remove the user PATH entry, then remove the
-   root. Healthy Windows uninstall is also platform-guarded so it never invokes Linux `systemctl`.
-   The public Windows PowerShell uninstall command is documented.
+   The checksum-verified temporary helper also inspects the Hermes Dashboard port before model,
+   install-root, Node runtime, token, state, env, config, plugin, or persistence mutation. It permits
+   only a free port or the exact expected Hermes owner. The Bash payload repeats this preflight for
+   direct/recovery use and preserves its exact-owned listener restart behavior.
+8. **Damaged uninstall and shell cleanup:** database absence skips only network reconcile. When the
+   installed shell payload remains, PowerShell still runs its full uninstall to remove plugins,
+   profile variables, spools, recorded Hermes lifecycle changes, Task/Startup persistence, exact
+   process, PATH, and safe files. Native file removal is limited to a genuinely missing shell
+   payload with authority proven absent.
 9. **Owned network teardown:** healthy PowerShell uninstall now runs the installed internal
    `cleanup-owned-network` command before any Bash/native persistence, process, PATH, database, or
    file deletion. A nonzero result aborts with the full authority intact. The command reconciles
    exact recorded LAN/Tailscale ownership and preserves unrelated Tailscale state. Native damaged
-   fallback is limited to definitely absent database authority and warns that missing authority
-   cannot be reconstructed. If a configured/default database or SQLite WAL/SHM sidecar remains,
-   missing/corrupt bundle, runtime, or config fails closed with the entire install preserved.
+   fallback is limited to definitely absent database authority. New installs persist a protected
+   `network-authority.json` with the exact database path. If config/locator damage makes a legacy
+   external path unknowable, uninstall deactivates exact CozyGateway persistence/process and recorded
+   Hermes activity but retains the root with repair guidance. If a configured/located/default
+   database or SQLite WAL/SHM sidecar remains, missing/corrupt bundle, runtime, or config fails closed
+   with the entire install preserved.
 
 The shared disclosure seam is integrated in the Windows tests and controller flow. Disclosure is
 awaited by the orchestrator before adapter preparation; the shipped CLI copy covers LAN plaintext
@@ -76,6 +83,14 @@ peers/tailnet administrators may reach or observe the device.
   surviving database as authority-absent. The matrix now covers missing bundle, missing/unreadable
   config, default database, and sidecar-only authority, plus a real bootstrap-to-release-bundle
   cleanup command against a real SQLite database without the cleanup-log seam.
+- Final uninstall regressions proved that known-absent network authority incorrectly bypassed the
+  healthy shell uninstaller, leaving plugin/profile/spool/Hermes ownership behind. The matrix now
+  distinguishes healthy-shell cleanup, protected-locator absence, legacy ambiguous external paths,
+  and genuinely missing-shell native recovery.
+- The Bash installer initially accepted an unrelated Dashboard listener until after Node/state work.
+  The real PowerShell/helper listener regression and Bash fake-native regression now fail before
+  model/runtime/state/env/config/plugin/persistence mutation, report exact port/PID/process/action,
+  and verify an inspect-only pass never stops an exact-owned listener.
 
 ## Final verification
 
@@ -83,11 +98,11 @@ peers/tailnet administrators may reach or observe the device.
 - `scripts/test/windows-bootstrap.test.ps1` — passed, including the real non-ASCII bootstrap/helper
   pipeline and disposable-root DACL assertions.
 - `scripts/test/windows-dashboard-owner.test.ps1` — passed.
-- `scripts/test/hermes-installer.test.sh` — passed after the final uninstall platform guard.
-- Windows onboarding/helper/Tailscale Vitest focus — 86/86 passed without unhandled rejections.
-- CLI/network-onboarding/phone-verification/upgrade-dispatcher Vitest focus — 174/174 passed.
-- Gateway package typecheck — passed as part of the workspace gate.
-- Full workspace recursive build, typecheck, and release bundle — passed.
+- `scripts/test/hermes-installer.test.sh` — passed, including occupied Dashboard preflight,
+  inspect-only exact-owner reuse, full shell uninstall, and repair-only deactivation fixtures.
+- Windows onboarding/helper/Tailscale Vitest focus — 94/94 passed without unhandled rejections.
+- Full workspace recursive test suite — passed.
+- Full workspace recursive build and typecheck plus the release bundle — passed.
 - Bash syntax and `git diff --check` — passed (Git reported only the repository's expected Windows
   LF-to-CRLF checkout warnings).
 

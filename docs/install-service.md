@@ -17,7 +17,8 @@ It also makes `cozygateway` available in new terminal sessions without a global
 package installation.
 
 On Windows, macOS, and Linux, missing Node.js 24+ is installed as a private,
-checksum-verified runtime under the CozyGateway home. Missing Hermes is
+checksum-verified runtime under the CozyGateway home (`runtime\node\node.exe` on Windows). It runs
+both the installed Gateway and bounded owned-network cleanup; it is not a system Node installation. Missing Hermes is
 installed with the verified official tagged NousResearch installer. Setup then
 runs `hermes model` interactively only when the active provider/model is
 incomplete, then verifies it
@@ -53,6 +54,10 @@ schtasks /Query /TN CozyGateway /V /FO LIST
 Before Hermes/model setup or release-asset download, Windows PowerShell verifies that the selected
 Gateway port is free or belongs to the same install's exact config path. A conflict reports the PID
 and process name and stops before tokens, config, plugin, Scheduled Task, or Startup mutation.
+The checksum-verified temporary helper then verifies the Hermes Dashboard port before model or any
+install-root, token, state, environment, config, plugin, runtime, Task, or Startup mutation. Only the
+exact expected Hermes Dashboard owner may be reused; another owner is reported with PID/process and
+an explicit free `--dashboard-port` action.
 
 On Linux the installer enables user lingering so the service survives logout
 and reboot. If your host policy blocks that authorization, run
@@ -74,14 +79,19 @@ $installer = irm https://cozylabs.ai/install.ps1
 & ([scriptblock]::Create($installer)) --uninstall
 ```
 
-Set `$env:COZYGATEWAY_HOME` first when uninstalling a custom root. Healthy uninstall first runs the
-installed bounded owned-network cleanup; any failure preserves persistence, config, SQLite, and
-files for retry. Only after successful cleanup does it remove the `CozyGateway` current-user Task,
-Startup fallback, exact managed process, PATH entry, and files. If bundle/config/runtime damage
-prevents cleanup while a configured/default SQLite database or SQLite sidecar remains, uninstall
-fails closed and asks you to repair the payload before retrying. Native PowerShell recovery works
-without Git Bash or the installed shell payload only when ownership authority is definitely absent,
-and warns that missing network authority cannot be reconstructed.
+Set `$env:COZYGATEWAY_HOME` first when uninstalling a custom root. Healthy uninstall reads the
+protected database-authority locator and uses the installed bundle plus private Node runtime for
+bounded owned-network cleanup. If the located database is absent, it skips only that reconcile and
+still runs the healthy shell uninstaller to remove owned plugins/profile variables/spools, reverse
+recorded Hermes lifecycle changes, remove Task/Startup persistence and PATH, and delete safe files.
+Any reconcile failure preserves the complete install for retry.
+
+If config/locator damage makes a legacy external database path unknowable, uninstall deactivates the
+exact CozyGateway persistence/process and recorded Hermes activity but retains the root with repair
+guidance; it does not claim authority is absent. Repair must restore the checksum-verified helper and
+bundle, `runtime\node\node.exe`, readable config, protected `local\network-authority.json`, and the
+referenced SQLite database/sidecars. Native PowerShell file removal without Git Bash is used only
+when the shell payload is genuinely missing and the protected locator proves network authority absent.
 
 No firewall rule is created or changed. Same Wi-Fi setup reads the selected adapter's Windows
 network category and active firewall policy. For a trusted home network reported as `Public`, change

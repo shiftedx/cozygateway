@@ -425,6 +425,28 @@ try {
     Assert-True ($safety.Json.result.firewallEnabled -eq $true -and $safety.Json.result.defaultInboundAction -eq 'block') 'active firewall posture must be normalized'
     Assert-Reason (Invoke-Helper -Command 'inspect-network-safety' -Input @{ adapterId = '' } -Fixture @{}) 'invalid_request'
 
+    $dashboardRequest = @{
+        port = 9119
+        hermesRoot = (Join-Path $script:Temp 'Hermes Root')
+        hermesPath = (Join-Path $script:Temp 'Hermes Root\bin\hermes.cmd')
+        launcherPath = (Join-Path $script:Temp 'Hermes Root\bin\hermes.exe')
+    }
+    $dashboardFree = Invoke-Helper -Command 'inspect-dashboard-port' -Input $dashboardRequest -Fixture @{
+        dashboardPort = @{ status = 'free' }
+    }
+    Assert-True ($dashboardFree.Json.ok -and $dashboardFree.Json.result.available -and -not $dashboardFree.Json.result.owned) 'free Dashboard port must be reported without an owner'
+    $dashboardOwned = Invoke-Helper -Command 'inspect-dashboard-port' -Input $dashboardRequest -Fixture @{
+        dashboardPort = @{ status = 'owned'; processId = 4242; processName = 'python.exe' }
+    }
+    Assert-True (-not $dashboardOwned.Json.result.available -and $dashboardOwned.Json.result.owned -and $dashboardOwned.Json.result.processId -eq 4242) 'exact Hermes Dashboard owner must be reusable'
+    $dashboardUnrelated = Invoke-Helper -Command 'inspect-dashboard-port' -Input $dashboardRequest -Fixture @{
+        dashboardPort = @{ status = 'unrelated'; processId = 5252; processName = 'python.exe' }
+    }
+    Assert-True (-not $dashboardUnrelated.Json.result.available -and -not $dashboardUnrelated.Json.result.owned -and $dashboardUnrelated.Json.result.processName -eq 'python.exe') 'unrelated Dashboard listener metadata must remain actionable'
+    $invalidDashboardRequest = @{} + $dashboardRequest
+    $invalidDashboardRequest.port = 0
+    Assert-Reason (Invoke-Helper -Command 'inspect-dashboard-port' -Input $invalidDashboardRequest -Fixture @{}) 'invalid_request'
+
     Assert-Reason (Invoke-Helper -Command 'adapter-inventory' -Input @{ unexpected = $true } -Fixture @{ adapters = @() }) 'invalid_request'
     Assert-Reason (Invoke-Helper -Command 'set-preference' -RawRequest '{"preference":"unattended","preference":"shields-up","enabled":true}' -Fixture $prefFixture) 'invalid_request'
     Assert-Reason (Invoke-Helper -Command 'set-preference' -RawRequest '{"preference":"unattended","Preference":"shields-up","enabled":true}' -Fixture $prefFixture) 'invalid_request'

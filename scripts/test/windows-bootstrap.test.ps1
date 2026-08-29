@@ -46,7 +46,8 @@ if ($Command -eq 'initialize-pending') {
   $state = Join-Path $local 'network-onboarding.json'
   if (-not (Test-Path -LiteralPath $state)) { [IO.File]::WriteAllText($state, '{"version":1,"stage":"pending_choice","updatedAt":1}') }
 }
-[Console]::Out.Write((@{ schemaVersion=1; ok=$true; command=$Command; result=@{ applied=$true } } | ConvertTo-Json -Compress))
+$result = if ($Command -eq 'inspect-dashboard-port') { @{ available=$true; owned=$false } } else { @{ applied=$true } }
+[Console]::Out.Write((@{ schemaVersion=1; ok=$true; command=$Command; result=$result } | ConvertTo-Json -Compress))
 '@
         } else { [IO.File]::ReadAllText($HelperSource) }
     }
@@ -91,7 +92,7 @@ exit /b 0
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho onboarding-token:%COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE%>>`"$EventLog`"`nfor %%A in (%*) do if `"%%~A`"==`"--uninstall`" exit /b 0`nif not exist `"%COZYGATEWAY_HOME%\local`" mkdir `"%COZYGATEWAY_HOME%\local`"`nif not exist `"%COZYGATEWAY_HOME%\runtime\node`" mkdir `"%COZYGATEWAY_HOME%\runtime\node`"`necho {}>`"%COZYGATEWAY_HOME%\local\cozygateway.config.json`"`necho fixture>`"%COZYGATEWAY_HOME%\local\cozygateway.sqlite`"`necho fixture>`"%COZYGATEWAY_HOME%\local\gateway.env`"`necho runtime>`"%COZYGATEWAY_HOME%\runtime\node\node.exe`"`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho onboarding-token:%COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE%>>`"$EventLog`"`nfor %%A in (%*) do if `"%%~A`"==`"--uninstall`" exit /b 0`nif not exist `"%COZYGATEWAY_HOME%\local`" mkdir `"%COZYGATEWAY_HOME%\local`"`nif not exist `"%COZYGATEWAY_HOME%\runtime\node`" mkdir `"%COZYGATEWAY_HOME%\runtime\node`"`necho {`"name`":`"cozygateway`",`"host`":`"127.0.0.1`",`"port`":8787,`"dbPath`":`"%COZYGATEWAY_HOME:\=\\%\\local\\cozygateway.sqlite`"}>`"%COZYGATEWAY_HOME%\local\cozygateway.config.json`"`necho fixture>`"%COZYGATEWAY_HOME%\local\cozygateway.sqlite`"`necho fixture>`"%COZYGATEWAY_HOME%\local\gateway.env`"`necho runtime>`"%COZYGATEWAY_HOME%\runtime\node\node.exe`"`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -108,7 +109,8 @@ function Invoke-Bootstrap {
     try {
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer @Arguments 2>&1
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $output = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $Installer @Arguments 2>&1
         return @{ ExitCode = $LASTEXITCODE; Output = ($output -join "`n") }
     } finally {
         $ErrorActionPreference = $previousPreference
@@ -169,9 +171,15 @@ function Assert-AuthorityPreservingUninstallRefusal {
     Assert-True ($result.Output -match 'ownership.*database.*preserved|repair.*retry') "$Name must print actionable authority recovery guidance: $($result.Output)"
     Assert-True (Test-Path -LiteralPath $installFixtureHome) "$Name must preserve the entire install root"
     Assert-True (Test-Path -LiteralPath $authorityArtifact) "$Name must preserve the plausible ownership database or sidecar"
-    Assert-True (Test-Path -LiteralPath $startup) "$Name must preserve persistence before authority cleanup can run"
-    Assert-True (-not (Test-Path -LiteralPath $nativeLog)) "$Name must not delete Task or stop the managed process"
-    Assert-True (-not (Test-Path -LiteralPath $pathLog)) "$Name must not change PATH"
+    if ($Damage -eq 'missing-bundle') {
+        Assert-True (Test-Path -LiteralPath $startup) "$Name must preserve persistence before known authority cleanup can run"
+        Assert-True (-not (Test-Path -LiteralPath $nativeLog)) "$Name must not delete Task or stop the managed process"
+        Assert-True (-not (Test-Path -LiteralPath $pathLog)) "$Name must not change PATH"
+    } else {
+        Assert-True (-not (Test-Path -LiteralPath $startup)) "$Name must deactivate the exact Startup entry while retaining recovery files"
+        Assert-True (Test-Path -LiteralPath $nativeLog) "$Name must deactivate Task/process persistence for legacy ambiguity"
+        Assert-True (Test-Path -LiteralPath $pathLog) "$Name must deactivate the managed command PATH entry"
+    }
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -248,6 +256,10 @@ try {
     Assert-True ($initializeIndex -ge 0 -and $initializeIndex -lt $bashIndex) 'pending marker must be initialized before Bash can write config'
     Assert-True ($protectTokenIndex -gt $initializeIndex -and $protectTokenIndex -lt $bashIndex) 'operator token must be ACL-protected before Bash can write config'
     Assert-True (($events | Select-Object -Skip ($bashIndex + 1)) -contains 'helper:protect-path') 'config, SQLite, environment, and resume state must be helper-ACL-protected after Bash creates them'
+    $authorityLocator = Join-Path $localState 'network-authority.json'
+    Assert-True (Test-Path -LiteralPath $authorityLocator -PathType Leaf) 'install must persist a protected database authority locator'
+    $locatedAuthority = Get-Content -LiteralPath $authorityLocator -Raw | ConvertFrom-Json
+    Assert-True ($locatedAuthority.schemaVersion -eq 1 -and $locatedAuthority.dbPath -eq (Join-Path $localState 'cozygateway.sqlite')) 'authority locator must record the exact installed database path'
     Assert-True (($events -join "`n") -match ('onboarding-token:' + [regex]::Escape($tokenPath))) 'shared config handoff must receive only the operator token path'
     Assert-True (([regex]::Matches($result.Output, 'Resume phone access setup with:')).Count -eq 1) 'noninteractive bootstrap must print exactly one resume command'
     Assert-True ($result.Output -notmatch 'setup code|fake-qr') 'noninteractive bootstrap must not print pairing material'
@@ -259,6 +271,32 @@ try {
     # pipeline uses the active OEM code page and corrupts this custom root before JSON parsing.
     $realHelperFixtures = Join-Path $temp 'real helper release assets'
     New-ReleaseFixtures $realHelperFixtures (Join-Path $repoRoot 'scripts\cozygateway-windows-helper.ps1')
+
+    $dashboardEventLog = Join-Path $temp 'dashboard occupied events.log'
+    $dashboardHermesBin = Join-Path $temp 'dashboard occupied hermes bin'
+    $dashboardHermesConfig = Join-Path $temp 'dashboard occupied Hermes Home\config.yaml'
+    $dashboardBash = Join-Path $temp 'dashboard occupied Git\bash.cmd'
+    $dashboardHome = Join-Path $temp 'Dashboard Occupied Gateway'
+    New-FakeHermes $dashboardHermesBin $dashboardHermesConfig $dashboardEventLog
+    New-FakeBash $dashboardBash $dashboardEventLog
+    $dashboardListener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $dashboardListener.Start()
+    try {
+        $occupiedDashboardPort = ([Net.IPEndPoint]$dashboardListener.LocalEndpoint).Port
+        $dashboardOccupied = Invoke-Bootstrap $installer @{
+            'PATH' = "$dashboardHermesBin;$env:PATH"
+            'COZYGATEWAY_INSTALL_ASSET_BASE' = $realHelperFixtures
+            'COZYGATEWAY_HOME' = $dashboardHome
+            'COZYGATEWAY_GIT_BASH' = $dashboardBash
+            'COZYGATEWAY_TEST_HERMES' = (Join-Path $dashboardHermesBin 'hermes.cmd')
+        } @('--dashboard-port', [string]$occupiedDashboardPort)
+    } finally { $dashboardListener.Stop() }
+    Assert-True ($dashboardOccupied.ExitCode -ne 0) 'real PowerShell/helper pipeline must reject an unrelated Dashboard listener'
+    Assert-True ($dashboardOccupied.Output -match "(?s)Dashboard port $occupiedDashboardPort.*PID.*Stop that process.*No CozyGateway or Hermes state was changed") "Dashboard occupied-port failure must identify the listener and actionable safe next step: $($dashboardOccupied.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $dashboardHome)) 'Dashboard port preflight must precede install-root, token, state, env, config, plugin, and runtime mutation'
+    $dashboardEvents = @(Get-Content -LiteralPath $dashboardEventLog -ErrorAction SilentlyContinue)
+    Assert-True (-not ($dashboardEvents -match '^bash:|hermes:model|hermes:status')) 'Dashboard port preflight must run before the Bash installer and Hermes model mutation'
+
     $unicodeLeaf = 'Cozy G' + [char]0x00E4 + 'teway ' + [char]0x4F60 + [char]0x597D
     $unicodeHome = Join-Path $temp $unicodeLeaf
     $unicodePathLog = Join-Path $temp 'unicode-user-path.txt'
@@ -323,6 +361,58 @@ try {
     Assert-True ($interactiveSetup -gt $interactiveBash) 'the original PowerShell process must invoke setup after the Bash handoff'
     Assert-True ($interactiveEvents[$interactiveSetup] -match '^setup:setup --config ' -and $interactiveEvents[$interactiveSetup] -match [regex]::Escape((Join-Path $interactiveHome 'local\cozygateway.config.json'))) 'PowerShell must invoke setup with the native config path'
     Assert-True (($interactiveEvents -join "`n") -notmatch 'setup:pair') 'PowerShell must never fall back to unconditional pair'
+
+    $shellOnlyHome = Join-Path $temp 'shell cleanup without network database'
+    $shellOnlyBin = Join-Path $shellOnlyHome 'bin'
+    $shellOnlyLocal = Join-Path $shellOnlyHome 'local'
+    $shellOnlyConfig = Join-Path $shellOnlyLocal 'cozygateway.config.json'
+    $shellOnlyDatabase = Join-Path $shellOnlyLocal 'cozygateway.sqlite'
+    $shellOnlyLog = Join-Path $temp 'shell-only-uninstall.log'
+    $shellOnlyBash = Join-Path $temp 'Shell Only Bash\bash.cmd'
+    $emptyProcesses = Join-Path $temp 'empty-processes.json'
+    Write-Utf8NoBom $emptyProcesses '[]'
+    New-Item -ItemType Directory -Force -Path $shellOnlyBin, $shellOnlyLocal | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\agent-install.sh') -Destination (Join-Path $shellOnlyBin 'agent-install.sh')
+    Write-Utf8NoBom (Join-Path $shellOnlyLocal 'install-state') "profiles=default`nhermes_root=C:\fixture\hermes`nhermes_bin=C:\fixture\hermes\hermes.exe`nservice_default=installed`n"
+    Write-Utf8NoBom $shellOnlyConfig (@{ name='cozygateway'; host='127.0.0.1'; port=8787; dbPath=$shellOnlyDatabase } | ConvertTo-Json -Compress)
+    New-FakeBash $shellOnlyBash $shellOnlyLog
+    $shellOnlyUninstall = Invoke-Bootstrap $installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = (Join-Path $temp 'shell-only-appdata')
+        'LOCALAPPDATA' = (Join-Path $temp 'shell-only-localappdata')
+        'COZYGATEWAY_HOME' = $shellOnlyHome
+        'COZYGATEWAY_GIT_BASH' = $shellOnlyBash
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = $shellOnlyLog
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $emptyProcesses
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$shellOnlyBin"
+    } @('--uninstall')
+    Assert-True ($shellOnlyUninstall.ExitCode -eq 0) "database-absent uninstall must still run shell-owned Hermes cleanup: $($shellOnlyUninstall.Output)"
+    Assert-True ((Get-Content -LiteralPath $shellOnlyLog -Raw) -match 'bash:.*agent-install\.sh.*--uninstall') 'database absence must skip only network reconcile, not agent-install.sh uninstall'
+    Assert-True (-not ((Get-Content -LiteralPath $shellOnlyLog -Raw) -match 'network-cleanup:')) 'database absence must not pretend to reconcile network ownership'
+
+    $legacyAmbiguousHome = Join-Path $temp 'legacy ambiguous authority'
+    $legacyAmbiguousBin = Join-Path $legacyAmbiguousHome 'bin'
+    $legacyAmbiguousLocal = Join-Path $legacyAmbiguousHome 'local'
+    $legacyAmbiguousLog = Join-Path $temp 'legacy-ambiguous-uninstall.log'
+    $legacyAmbiguousBash = Join-Path $temp 'Legacy Ambiguous Bash\bash.cmd'
+    New-Item -ItemType Directory -Force -Path $legacyAmbiguousBin, $legacyAmbiguousLocal | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\agent-install.sh') -Destination (Join-Path $legacyAmbiguousBin 'agent-install.sh')
+    Write-Utf8NoBom (Join-Path $legacyAmbiguousLocal 'install-state') "profiles=default`nhermes_root=C:\fixture\hermes`nhermes_bin=C:\fixture\hermes\hermes.exe`nservice_default=installed`n"
+    New-FakeBash $legacyAmbiguousBash $legacyAmbiguousLog
+    $legacyAmbiguous = Invoke-Bootstrap $installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = (Join-Path $temp 'legacy-ambiguous-appdata')
+        'LOCALAPPDATA' = (Join-Path $temp 'legacy-ambiguous-localappdata')
+        'COZYGATEWAY_HOME' = $legacyAmbiguousHome
+        'COZYGATEWAY_GIT_BASH' = $legacyAmbiguousBash
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = $legacyAmbiguousLog
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $emptyProcesses
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$legacyAmbiguousBin"
+    } @('--uninstall')
+    Assert-True ($legacyAmbiguous.ExitCode -ne 0 -and $legacyAmbiguous.Output -match 'authority.*locator|repair.*retry') 'legacy config loss must retain recovery state with actionable locator guidance'
+    Assert-True (Test-Path -LiteralPath $legacyAmbiguousHome) 'legacy ambiguous authority must preserve the install root'
+    Assert-True ((Get-Content -LiteralPath $legacyAmbiguousLog -Raw) -match 'task-delete:CozyGateway') 'legacy ambiguity must deactivate Windows persistence'
+    Assert-True ((Get-Content -LiteralPath $legacyAmbiguousLog -Raw) -match 'bash:.*--deactivate-for-repair') 'legacy ambiguity must ask the shell payload to deactivate owned Hermes lifecycle'
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
@@ -433,6 +523,9 @@ try {
     $damagedNativeStartup = Join-Path $damagedNativeAppData 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $damagedNativeConfig), (Split-Path -Parent $damagedNativeStartup) | Out-Null
     Write-Utf8NoBom $damagedNativeConfig '{not-json'
+    Write-Utf8NoBom (Join-Path $damagedNativeHome 'local\network-authority.json') (@{
+        schemaVersion = 1; dbPath = (Join-Path $damagedNativeHome 'local\cozygateway.sqlite')
+    } | ConvertTo-Json -Compress)
     Write-Utf8NoBom $damagedNativeStartup 'owned startup fixture'
     $damagedNativeLog = Join-Path $temp 'damaged-native-events.log'
     $damagedNativePathLog = Join-Path $temp 'damaged-native-path.txt'
@@ -449,7 +542,7 @@ try {
         'COZYGATEWAY_TEST_NETWORK_CLEANUP_LOG' = $damagedNativeLog
     } @('--uninstall')
     Assert-True ($damagedNative.ExitCode -eq 0) "damaged native uninstall must not require Git Bash or the installed shell payload: $($damagedNative.Output)"
-    Assert-True ($damagedNative.Output -match 'authority.*missing or corrupt.*cannot be reconstructed') 'damaged fallback must disclose that missing network authority cannot be reconstructed'
+    Assert-True ($damagedNative.Output -match 'locator proves no SQLite ownership authority remains.*shell payload is missing') 'damaged fallback must disclose the exact proof that permits native file removal'
     Assert-True (-not (Test-Path -LiteralPath $damagedNativeHome)) 'damaged native fallback must remove the recoverable install root'
     Assert-True (-not (Test-Path -LiteralPath $damagedNativeStartup)) 'damaged native fallback must remove the exact Startup entry'
     Assert-True (-not ((Get-Content -LiteralPath $damagedNativeLog -Raw) -match 'network-cleanup:')) 'damaged fallback must not pretend to reconcile absent/corrupt authority'
