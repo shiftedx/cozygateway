@@ -1,6 +1,42 @@
+import { existsSync, mkdtempSync, renameSync, rmSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { openStorage } from "../src/storage.ts";
+import { openStorage, storageFileIdentity } from "../src/storage.ts";
+
+describe("storage opening", () => {
+  it("can require an existing database without creating a blank replacement", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozy-storage-existing-"));
+    const dbPath = join(directory, "missing.sqlite");
+    try {
+      expect(() => openStorage(dbPath, { mustExist: true })).toThrow();
+      expect(existsSync(dbPath)).toBe(false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a pathname replacement before migrating the replacement database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozy-storage-race-"));
+    const dbPath = join(directory, "authority.sqlite");
+    try {
+      openStorage(dbPath).close();
+      const expectedFile = storageFileIdentity(dbPath);
+      renameSync(dbPath, join(directory, "owned.sqlite"));
+      new DatabaseSync(dbPath).close();
+
+      expect(() => openStorage(dbPath, { mustExist: true, expectedFile })).toThrow(/changed/);
+      const replacement = new DatabaseSync(dbPath, { readOnly: true });
+      expect(replacement.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all()).toEqual([]);
+      replacement.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
 
 function seeded() {
   const storage = openStorage(":memory:");

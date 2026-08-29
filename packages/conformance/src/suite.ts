@@ -54,6 +54,9 @@ export interface ConformanceEnv {
   baseUrl: () => string;
   /** Mint a fresh single-use setup code on the gateway under test. */
   issueSetupCode: () => Promise<string>;
+  /** OPTIONAL operator hook for the additive phone-readiness exception. The hook exposes the
+   * public QR URL and desktop phrase, never a setup code or device credential. */
+  beginPhoneVerification?: () => Promise<{ verificationUrl: string; phrase: string }>;
   /** Hermes profile id of the reference attach echo peer on the gateway under test. */
   echoAgentId: string;
   /** OPTIONAL stall hook (issue #21). Agent id of a stall-capable, interruptible backend on the
@@ -243,6 +246,34 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
   // =====================================================================================
 
   describe("cozygateway wire contract v1 conformance", () => {
+    describe.skipIf(env.beginPhoneVerification === undefined)("phone readiness capability", () => {
+      it("serves an inert, hardened page whose URL contains no pairing or phrase material", async () => {
+        const challenge = await env.beginPhoneVerification!();
+        expect(challenge.verificationUrl.startsWith(`${env.baseUrl()}/cozy/onboarding/`)).toBe(true);
+        expect(challenge.verificationUrl).not.toContain(challenge.phrase);
+
+        const get = await fetch(challenge.verificationUrl);
+        const page = await get.text();
+        expect(get.status).toBe(200);
+        expect(get.headers.get("cache-control")).toBe("no-store");
+        expect(get.headers.get("referrer-policy")).toBe("no-referrer");
+        expect(get.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(get.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+        expect(page).toContain("history.replaceState");
+        expect(page).not.toContain(challenge.phrase);
+        expect(page).not.toMatch(/<button/i);
+
+        expect((await fetch(challenge.verificationUrl, { method: "HEAD" })).status).toBe(200);
+        expect((await fetch(challenge.verificationUrl, { method: "OPTIONS" })).status).toBe(204);
+        const premature = await fetch(`${challenge.verificationUrl}/confirm`, {
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: '{"type":"confirm"}',
+        });
+        expect(premature.status).toBe(404);
+      }, TEST_TIMEOUT_MS);
+    });
+
     // Spec section 1 / 5: GET /health is unauthenticated and returns GatewayInfo.
     describe("health", () => {
       it(

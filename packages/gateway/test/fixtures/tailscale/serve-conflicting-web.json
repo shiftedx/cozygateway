@@ -1,0 +1,1 @@
+{"TCP":{"443":{"HTTPS":true}},"Web":{"cozy.fixture-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:29999"}}}},"AllowFunnel":{},"Foreground":{},"Services":{}}

@@ -4,9 +4,19 @@ import { dirname, join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { isExpectedCertificate, isGatewayReady, runCli } from "../src/cli.ts";
+import {
+  isExpectedCertificate,
+  isGatewayReady,
+  legacyPairingLanAddress,
+  publishOnboardingPairing,
+  runCli,
+  type CliOnboardingController,
+  type OnboardingPairingDependencies,
+} from "../src/cli.ts";
+import type { NetworkOnboardingStatusIssue } from "../src/network-onboarding.ts";
 import { startGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
+import { WindowsOwnedNetworkCleanupError } from "../src/windows-onboarding.ts";
 import { generateSelfSigned } from "./helpers/self-signed.ts";
 
 function scriptedIo(answers: string[]) {
@@ -15,6 +25,27 @@ function scriptedIo(answers: string[]) {
     question: async (_prompt: string): Promise<string> => answers.shift() ?? "",
     close: (): void => undefined,
   };
+}
+
+function onboardingController(
+  overrides: Partial<CliOnboardingController> = {},
+): CliOnboardingController {
+  return {
+    status: vi.fn(async () => ({
+      stage: "pending_choice" as const,
+      authority: "none" as const,
+      healthy: false,
+      expiresAt: 600_000,
+    })),
+    run: vi.fn(async () => ({ outcome: "deferred" as const })),
+    resume: vi.fn(async () => ({ outcome: "deferred" as const })),
+    close: vi.fn(),
+    ...overrides,
+  };
+}
+
+function appendLoggedLines(lines: string[], line: unknown): void {
+  lines.push(...String(line).split("\n"));
 }
 
 function tempConfig(extra: Record<string, unknown> = {}): { configPath: string; dbPath: string } {
@@ -41,7 +72,7 @@ function tempConfig(extra: Record<string, unknown> = {}): { configPath: string; 
 async function pairPayload(configPath: string): Promise<{ gatewayUrl: string; setupCode: string }> {
   const lines: string[] = [];
   vi.spyOn(console, "log").mockImplementation((line: unknown) => {
-    lines.push(String(line));
+    appendLoggedLines(lines, line);
   });
   const exitCode = await runCli(["pair", "--config", configPath]);
   vi.restoreAllMocks();
@@ -56,7 +87,7 @@ describe("cozygateway pair", () => {
     const { configPath, dbPath } = tempConfig();
     const lines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((line: unknown) => {
-      lines.push(String(line));
+      appendLoggedLines(lines, line);
     });
     const exitCode = await runCli(["pair", "--config", configPath]);
     vi.restoreAllMocks();
@@ -76,7 +107,7 @@ describe("cozygateway pair", () => {
     const { configPath, dbPath } = tempConfig();
     const lines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((line: unknown) => {
-      lines.push(String(line));
+      appendLoggedLines(lines, line);
     });
     const exitCode = await runCli(["pair", "--config", configPath, "--ttl", "20160"]);
     vi.restoreAllMocks();
@@ -115,7 +146,7 @@ describe("cozygateway pair", () => {
   it("uses an explicit externally reachable URL verbatim", async () => {
     const { configPath } = tempConfig();
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown) => lines.push(String(line)));
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => appendLoggedLines(lines, line));
     expect(await runCli(["pair", "--config", configPath, "--url", "https://gateway.example.com"])).toBe(0);
     vi.restoreAllMocks();
     const payload = JSON.parse(lines.find((line) => line.startsWith("{")) ?? "{}") as { gatewayUrl: string };
@@ -130,7 +161,7 @@ describe("cozygateway pair", () => {
     expect((await pairPayload(configPath)).gatewayUrl).toBe("https://gateway.example");
 
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown) => lines.push(String(line)));
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => appendLoggedLines(lines, line));
     expect(await runCli([
       "pair", "--config", configPath, "--url", "https://gateway.example/",
     ])).toBe(0);
@@ -184,12 +215,160 @@ describe("cozygateway pair", () => {
 describe("cozygateway pair finale", () => {
   async function pairLines(configPath: string, extraArgs: string[] = []): Promise<string[]> {
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown) => lines.push(String(line)));
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => appendLoggedLines(lines, line));
     const exitCode = await runCli(["pair", "--config", configPath, ...extraArgs]);
     vi.restoreAllMocks();
     expect(exitCode).toBe(0);
     return lines;
   }
+
+  it("publishes the legacy finale as one buffered output", async () => {
+    const { configPath } = tempConfig();
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await runCli(["pair", "--config", configPath])).toBe(0);
+
+    expect(log).toHaveBeenCalledOnce();
+    expect(String(log.mock.calls[0]?.[0])).toContain("Gateway URL:");
+    vi.restoreAllMocks();
+  });
+
+  it("runs the Windows-only owned-network cleanup with the injected runtime and closes CLI resources", async () => {
+    const { configPath } = tempConfig();
+    const runtime = {
+      restartHermesProfile: vi.fn(async () => undefined),
+      waitForGatewayReady: vi.fn(async () => undefined),
+    };
+    const cleanup = vi.fn(async () => undefined);
+    const io = { ...scriptedIo([]), close: vi.fn() };
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", configPath], io, runtime, controller,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(0);
+
+    expect(cleanup).toHaveBeenCalledWith(configPath, runtime, undefined);
+    expect(io.close).toHaveBeenCalledOnce();
+    expect(controller.close).toHaveBeenCalledOnce();
+    expect(lines.join("\n")).not.toMatch(/token|secret|authUrl|setup code/i);
+    vi.restoreAllMocks();
+  });
+
+  it("returns nonzero, closes resources, and redacts an owned-network cleanup failure", async () => {
+    const { configPath } = tempConfig();
+    const runtime = {
+      restartHermesProfile: vi.fn(async () => undefined),
+      waitForGatewayReady: vi.fn(async () => undefined),
+    };
+    const cleanup = vi.fn(async () => { throw new Error("authUrl=https://secret.invalid?token=do-not-print"); });
+    const io = { ...scriptedIo([]), close: vi.fn() };
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", configPath], io, runtime, controller,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    expect(io.close).toHaveBeenCalledOnce();
+    expect(controller.close).toHaveBeenCalledOnce();
+    expect(lines).toHaveLength(1);
+    expect(lines.join("\n")).toContain("irm https://cozylabs.ai/setup | iex");
+    expect(lines.join("\n")).not.toMatch(/secret\.invalid|do-not-print|authUrl|token/i);
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["tailscale_not_running", "Start the Tailscale service"],
+    ["old_version", "Update the official Tailscale app"],
+    ["tailscale_legacy_unsupported", "legacy Tailscale client"],
+    ["tailscale_service_mismatch", "Tailscale Windows service does not match"],
+    ["tailscale_signature_invalid", "installed Tailscale signature or publisher"],
+    ["tailscale_prerequisite_disabled", "service is disabled"],
+    ["logged_out", "Sign in to the Tailscale account"],
+    ["custom_control", "official control server"],
+    ["account_changed", "tailnet account that created this route"],
+    ["mapping_changed", "Tailscale Serve port 443 mapping"],
+    ["elevation_required", "as Administrator"],
+    ["preference_changed", "restore the prior Tailscale preferences"],
+    ["authority_missing", "Restore the configured CozyGateway database"],
+    ["authority_unsafe", "original regular file"],
+    ["helper_invalid", "irm https://cozylabs.ai/setup | iex"],
+    ["listener_changed", "Restore the CozyGateway listener configuration"],
+    ["timeout", "wait for both to respond"],
+  ] as const)("prints safe cleanup code %s with one concrete repair step", async (code, repair) => {
+    const { configPath } = tempConfig();
+    const cleanup = vi.fn(async () => {
+      throw new WindowsOwnedNetworkCleanupError(code);
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", configPath], undefined, undefined, undefined,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    vi.restoreAllMocks();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(code);
+    expect(lines[0]).toContain(repair);
+    expect(lines[0]).not.toMatch(/secret|authUrl|token/i);
+  });
+
+  it("refuses owned-network cleanup outside Windows without touching network state", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", "unused.json"], undefined, undefined, undefined,
+      { platform: "linux", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(lines.join("\n")).toContain("Windows only");
+    vi.restoreAllMocks();
+  });
+
+  it("requires an explicit config path for owned-network cleanup", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network"], undefined, undefined, undefined,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(lines.join("\n")).toContain("explicit --config path");
+    vi.restoreAllMocks();
+  });
+
+  it("returns nonzero and closes resources when cleanup arguments are malformed", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const io = { ...scriptedIo([]), close: vi.fn() };
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    await expect(runCli(
+      ["cleanup-owned-network", "--config"], io, undefined, controller,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).resolves.toBe(1);
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(io.close).toHaveBeenCalledOnce();
+    expect(controller.close).toHaveBeenCalledOnce();
+    expect(lines.join("\n")).toContain("Pass --config <absolute-config-path>");
+    vi.restoreAllMocks();
+  });
 
   it("prints the QR block, the exact payload JSON, and the labeled URL and code", async () => {
     const { configPath } = tempConfig();
@@ -201,7 +380,7 @@ describe("cozygateway pair finale", () => {
     expect(payloadLine).toBe(`{"gatewayUrl":"${payload.gatewayUrl}","setupCode":"${payload.setupCode}"}`);
     const qrBlock = lines.find((l) => l.includes("█"));
     expect(qrBlock).toBeDefined();
-    expect((qrBlock ?? "").split("\n").length).toBeGreaterThan(10);
+    expect(lines.filter((line) => line.includes("█")).length).toBeGreaterThan(10);
     expect(lines).toContain(`Gateway URL: ${payload.gatewayUrl}`);
     expect(lines).toContain(`Setup code:  ${payload.setupCode}`);
     expect(lines.some((l) => l.includes("Mint a fresh one with: cozygateway pair"))).toBe(true);
@@ -216,8 +395,7 @@ describe("cozygateway pair finale", () => {
   });
 
   it("prefers the machine's LAN address over loopback for a wildcard bind", async () => {
-    const { primaryLanAddress } = await import("../src/lan.ts");
-    const expectedHost = primaryLanAddress() ?? "127.0.0.1";
+    const expectedHost = legacyPairingLanAddress() ?? "127.0.0.1";
     const { configPath } = tempConfig({ host: "0.0.0.0" });
     const lines = await pairLines(configPath);
     const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as { gatewayUrl: string };
@@ -233,7 +411,530 @@ describe("cozygateway pair finale", () => {
   });
 });
 
+describe("verified onboarding pairing publication", () => {
+  const request = {
+    phoneConfirmed: true,
+    desktopAnswer: undefined,
+    gatewayUrl: "https://cozy.example.ts.net",
+    color: false,
+    finalizeContext: {
+      sessionId: "session-1",
+      challengeId: "challenge-1",
+      canonicalOrigin: "https://cozy.example.ts.net",
+      durableFingerprint: "posture-a",
+      verificationEpoch: "epoch-1",
+      bootGeneration: "boot-1",
+      now: 200,
+    },
+  };
+
+  function publicationDeps() {
+    return {
+      createSetupCode: vi.fn<OnboardingPairingDependencies["createSetupCode"]>(() => "COZY-1234"),
+      render: vi.fn<OnboardingPairingDependencies["render"]>(() => ({
+        setupCode: "COZY-1234",
+        payloadJson: "payload",
+        terminalOutput: "complete output\n",
+      })),
+      finalize: vi.fn<OnboardingPairingDependencies["finalize"]>(
+        () => ({ outcome: "published", setupCode: "COZY-1234" }),
+      ),
+      write: vi.fn<OnboardingPairingDependencies["write"]>(async () => undefined),
+      activate: vi.fn<OnboardingPairingDependencies["activate"]>(
+        () => ({ outcome: "advanced", state: "active" }),
+      ),
+      revoke: vi.fn<OnboardingPairingDependencies["revoke"]>(
+        () => ({ outcome: "advanced", state: "revoked" }),
+      ),
+    };
+  }
+
+  it("does nothing when automatic phone proof arrives before a desktop answer", async () => {
+    const deps = publicationDeps();
+
+    await expect(publishOnboardingPairing(request, deps)).resolves.toBe("not_published");
+
+    for (const dependency of Object.values(deps)) expect(dependency).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "n", "no", " Y ", "YES", " yes "])(
+    "does nothing for the nonaffirmative answer %j",
+    async (desktopAnswer) => {
+      const deps = publicationDeps();
+
+      await expect(publishOnboardingPairing({ ...request, desktopAnswer }, deps))
+        .resolves.toBe("not_published");
+
+      for (const dependency of Object.values(deps)) expect(dependency).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does nothing when desktop confirmation is premature", async () => {
+    const deps = publicationDeps();
+
+    await expect(publishOnboardingPairing({
+      ...request,
+      phoneConfirmed: false,
+      desktopAnswer: "y",
+    }, deps)).resolves.toBe("not_published");
+
+    for (const dependency of Object.values(deps)) expect(dependency).not.toHaveBeenCalled();
+  });
+
+  it("creates and strictly renders one confirmed code before database finalization", async () => {
+    const deps = publicationDeps();
+    const calls: string[] = [];
+    deps.createSetupCode.mockImplementation(() => (calls.push("create"), "COZY-1234"));
+    deps.render.mockImplementation((input) => {
+      calls.push("render");
+      expect(input).toEqual({
+        gatewayUrl: "https://cozy.example.ts.net",
+        setupCode: "COZY-1234",
+        ttlMs: 10 * 60_000,
+        color: false,
+        strictQr: true,
+      });
+      return { setupCode: "COZY-1234", payloadJson: "payload", terminalOutput: "complete output\n" };
+    });
+    deps.finalize.mockImplementation((input) => {
+      calls.push("finalize");
+      expect(input).toEqual({
+        ...request.finalizeContext,
+        setupCode: "COZY-1234",
+        setupCodeExpiresAt: 600_200,
+      });
+      return { outcome: "invalid_state" };
+    });
+
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "y" }, deps))
+      .resolves.toBe("not_published");
+
+    expect(calls).toEqual(["create", "render", "finalize"]);
+    expect(deps.write).not.toHaveBeenCalled();
+    expect(deps.activate).not.toHaveBeenCalled();
+  });
+
+  it("permits an asynchronous live-posture check after rendering and immediately before finalization", async () => {
+    const deps = publicationDeps();
+    const calls: string[] = [];
+    deps.render.mockImplementation((input) => {
+      calls.push("render");
+      return { setupCode: input.setupCode, payloadJson: "payload", terminalOutput: "complete output\n" };
+    });
+    const withPostureCheck: OnboardingPairingDependencies = {
+      ...deps,
+      beforeFinalize: vi.fn(async () => {
+        calls.push("inspect");
+      }),
+      finalize: vi.fn(() => {
+        calls.push("finalize");
+        return { outcome: "invalid_state" as const };
+      }),
+    };
+
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "y" }, withPostureCheck))
+      .resolves.toBe("not_published");
+
+    expect(calls).toEqual(["render", "inspect", "finalize"]);
+  });
+
+  it("captures authoritative now after asynchronous posture inspection", async () => {
+    const deps = publicationDeps();
+    let clock = 200;
+    const withPostureCheck: OnboardingPairingDependencies = {
+      ...deps,
+      beforeFinalize: vi.fn(async () => {
+        clock = 601;
+      }),
+      finalizationNow: vi.fn(() => clock),
+      finalize: vi.fn((input) => {
+        expect(input.now).toBe(601);
+        expect(input.setupCodeExpiresAt).toBe(600_601);
+        return { outcome: "expired" as const };
+      }),
+    };
+
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "y" }, withPostureCheck))
+      .resolves.toBe("not_published");
+
+    expect(withPostureCheck.finalizationNow).toHaveBeenCalledOnce();
+    expect(withPostureCheck.finalize).toHaveBeenCalledOnce();
+  });
+
+  it("revokes the pending code when the buffered write fails", async () => {
+    const deps = publicationDeps();
+    const writeError = new Error("terminal closed");
+    deps.write.mockRejectedValue(writeError);
+
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "yes" }, deps))
+      .rejects.toBe(writeError);
+
+    expect(deps.write).toHaveBeenCalledOnce();
+    expect(deps.write).toHaveBeenCalledWith("complete output\n");
+    expect(deps.revoke).toHaveBeenCalledWith({
+      challengeId: "challenge-1",
+      setupCode: "COZY-1234",
+      now: 200,
+    });
+    expect(deps.activate).not.toHaveBeenCalled();
+  });
+
+  it("combines the write error with an unsuccessful revocation result", async () => {
+    const deps = publicationDeps();
+    const writeError = new Error("terminal closed");
+    deps.write.mockRejectedValue(writeError);
+    deps.revoke.mockReturnValue({ outcome: "invalid_state", state: "active" });
+
+    const error = await publishOnboardingPairing({ ...request, desktopAnswer: "yes" }, deps)
+      .then(() => undefined, (caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors[0]).toBe(writeError);
+    expect((error as AggregateError).errors[1]).toMatchObject({
+      message: expect.stringMatching(/revocation.*invalid_state.*active/i),
+    });
+    expect(deps.activate).not.toHaveBeenCalled();
+  });
+
+  it("combines the write error with a thrown revocation failure", async () => {
+    const deps = publicationDeps();
+    const writeError = new Error("terminal closed");
+    const revocationError = new Error("database unavailable");
+    deps.write.mockRejectedValue(writeError);
+    deps.revoke.mockImplementation(() => {
+      throw revocationError;
+    });
+
+    const error = await publishOnboardingPairing({ ...request, desktopAnswer: "yes" }, deps)
+      .then(() => undefined, (caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([writeError, revocationError]);
+    expect(deps.activate).not.toHaveBeenCalled();
+  });
+
+  it("writes one complete buffer and activates only after successful output", async () => {
+    const deps = publicationDeps();
+    const calls: string[] = [];
+    deps.write.mockImplementation(async (output) => {
+      calls.push(`write:${output}`);
+    });
+    deps.activate.mockImplementation((input) => {
+      calls.push(`activate:${input.setupCode}`);
+      return { outcome: "advanced", state: "active" };
+    });
+
+    await expect(publishOnboardingPairing({ ...request, desktopAnswer: "y" }, deps))
+      .resolves.toBe("published");
+
+    expect(calls).toEqual(["write:complete output\n", "activate:COZY-1234"]);
+    expect(deps.write).toHaveBeenCalledOnce();
+    expect(deps.activate).toHaveBeenCalledWith({
+      challengeId: "challenge-1",
+      setupCode: "COZY-1234",
+      now: 200,
+    });
+    expect(deps.revoke).not.toHaveBeenCalled();
+  });
+});
+
 describe("cozygateway terminal menu", () => {
+  it.each([
+    [["1"], "tailscale"],
+    [["2"], "lan"],
+    [["3"], "later"],
+    [["4", "1"], "advanced"],
+    [["4", "2"], "lan"],
+  ] as const)("setup offers outcome-focused network choice %s", async (answers, expected) => {
+    const { configPath } = tempConfig();
+    let selected: string | undefined;
+    const controller = onboardingController({
+      resume: vi.fn(async (io) => {
+        selected = await io.chooseNetworkMode();
+        return selected === "later" ? { outcome: "deferred" as const } : { outcome: "cancelled" as const };
+      }),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([...answers]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(selected).toBe(expected);
+    expect(lines.join("\n")).toContain("Remote via personal Tailscale");
+    expect(lines.join("\n")).toContain("Same Wi-Fi");
+    expect(lines.join("\n")).toContain("Set up later");
+    expect(lines.join("\n")).toContain("Advanced settings");
+    if (answers[0] === "4") expect(lines.join("\n")).toContain("Choose a specific Same Wi-Fi adapter");
+  });
+
+  it("retries an invalid advanced choice without guessing a route", async () => {
+    const { configPath } = tempConfig();
+    let selected: string | undefined;
+    const controller = onboardingController({
+      resume: vi.fn(async (io) => {
+        selected = await io.chooseNetworkMode();
+        return { outcome: "cancelled" as const };
+      }),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["setup", "--config", configPath], scriptedIo(["4", "invalid", "2"]), undefined, controller,
+    )).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(selected).toBe("lan");
+    expect(lines.join("\n")).toContain("Choose 1 or 2");
+  });
+
+  it.each([
+    ["1", "tailscale", /phone.*intended tailnet/i, /authorized or shared tailnet peers/i, /tailnet administrators/i],
+    ["2", "lan", /plaintext HTTP/i, /0\.0\.0\.0.*all interfaces/i, /trusted private network/i],
+  ] as const)(
+    "renders the %s route disclosure before the controller may mutate",
+    async (answer, expectedMode, first, second, third) => {
+      const { configPath } = tempConfig();
+      const calls: string[] = [];
+      const controller = onboardingController({
+        resume: vi.fn(async (io) => {
+          const mode = await io.chooseNetworkMode();
+          if (mode === "later" || mode === "cancel") return { outcome: "cancelled" as const };
+          await io.showNetworkDisclosure(mode);
+          calls.push(`mutate:${mode}`);
+          return { outcome: "cancelled" as const };
+        }),
+      });
+      const lines: string[] = [];
+      vi.spyOn(console, "log").mockImplementation((line: unknown = "") => {
+        appendLoggedLines(lines, line);
+        calls.push(`line:${String(line)}`);
+      });
+
+      expect(await runCli(["setup", "--config", configPath], scriptedIo([answer]), undefined, controller)).toBe(0);
+
+      vi.restoreAllMocks();
+      const output = lines.join("\n");
+      expect(output).toMatch(first);
+      expect(output).toMatch(second);
+      expect(output).toMatch(third);
+      if (expectedMode === "tailscale") expect(output).toMatch(/Certificate Transparency/i);
+      const disclosureIndex = calls.findIndex((call) => call.startsWith("line:") && first.test(call));
+      expect(disclosureIndex).toBeGreaterThanOrEqual(0);
+      expect(calls.findIndex((call) => call === `mutate:${expectedMode}`)).toBeGreaterThan(disclosureIndex);
+    },
+  );
+
+  it("renders sleep, wildcard-interface, and short-lived browser-history warnings before the phone QR", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      resume: vi.fn(async (io) => {
+        await io.showNetworkDisclosure("tailscale");
+        await io.showNetworkDisclosure("lan");
+        await io.showPreparedEndpointDisclosure?.({
+          mode: "lan", canonicalOrigin: "http://192.168.1.20:18787", bindHost: "0.0.0.0",
+          port: 18_787, durableFingerprint: "lan-posture", ready: true,
+          wildcardExposure: {
+            selectedInterface: "Home Wi-Fi", otherInterfaces: [],
+            message: "0.0.0.0 also exposes CozyGateway through New VPN.",
+          },
+        });
+        await io.showPhoneConnectionCheck("http://127.0.0.1/cozy/onboarding/test-only");
+        return { outcome: "cancelled" as const };
+      }),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    const output = lines.join("\n");
+    expect(output).toMatch(/PC.*awake|sleep.*remote/i);
+    expect(output).toMatch(/0\.0\.0\.0.*Wi-Fi.*Ethernet.*VPN/i);
+    expect(output).toContain("0.0.0.0 also exposes CozyGateway through New VPN.");
+    expect(output).toMatch(/short-lived.*one-time/i);
+    expect(output).toMatch(/browser history/i);
+    expect(lines.findIndex((line) => /short-lived.*one-time/i.test(line)))
+      .toBeLessThan(lines.findIndex((line) => line.includes("█")));
+  });
+
+  it("status renders a typed inspection pause and its concrete repair action", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "changed" as const, authority: "none" as const, mode: "tailscale" as const,
+        healthy: false,
+        issue: { type: "pause" as const, reason: "machine_auth_required", detail: "needs_admin" },
+      })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["status", "--config", configPath], undefined, undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain("machine_auth_required (needs_admin)");
+    expect(lines.join("\n")).toContain("Ask the tailnet administrator to approve this machine");
+  });
+
+  it.each([
+    ["tailscale", "mapping", "Review the saved Tailscale Serve mapping on port 443"],
+    ["tailscale", "account_changed", "Sign back in to the tailnet account that owns this CozyGateway route"],
+    ["tailscale", "certificate", "Confirm the Tailscale HTTPS certificate covers"],
+    ["lan", "posture", "Reconnect the intended private adapter"],
+    ["lan", "websocket", "Allow CozyGateway WebSocket traffic through Windows Firewall"],
+  ] as const)("status renders exact actionable %s readiness guidance for %s", async (mode, reason, repair) => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "changed" as const, authority: "none" as const, mode,
+        healthy: false,
+        issue: { type: "readiness", mode, reason } as NetworkOnboardingStatusIssue,
+      })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["status", "--config", configPath], undefined, undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain(`Phone access reason: ${mode}:${reason}`);
+    expect(lines.join("\n")).toContain(`Repair: ${repair}`);
+    expect(lines.join("\n")).not.toContain("inspection_failed");
+  });
+
+  it("noninteractive setup emits no QR/code and prints exactly one resume command", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+    const io = { ...scriptedIo([]), interactive: false };
+
+    expect(await runCli(["setup", "--config", configPath], io, undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(controller.run).not.toHaveBeenCalled();
+    expect(controller.resume).not.toHaveBeenCalled();
+    expect(lines.join("\n")).not.toMatch(/setupCode|Setup code|█/);
+    expect(lines.filter((line) => line.includes("cozygateway setup"))).toEqual([
+      `Resume phone access setup with: cozygateway setup --config "${configPath}"`,
+    ]);
+  });
+
+  it.each([
+    ["not_installed", "Install the official Tailscale app"],
+    ["install_cancelled", "Tailscale installation was cancelled in Windows"],
+    ["install_reboot_required", "Restart Windows, then resume"],
+    ["install_verification_failed", "Tailscale installer signature could not be verified"],
+    ["install_failed", "Tailscale installation did not complete"],
+    ["unsupported_install", "Keep its account and tailnet state"],
+    ["unsupported_version", "Update Tailscale"],
+    ["tailscale_legacy_unsupported", "legacy Tailscale client"],
+    ["tailscale_service_mismatch", "Tailscale Windows service does not match"],
+    ["tailscale_signature_invalid", "signature is invalid"],
+    ["tailscale_publisher_invalid", "publisher could not be verified"],
+    ["tailscale_prerequisite_disabled", "service is disabled"],
+    ["custom_control_server", "official Tailscale control server"],
+    ["status_unavailable", "Start the Tailscale service"],
+    ["login_pending", "Finish signing in to Tailscale"],
+    ["login_failed", "Tailscale sign-in did not finish"],
+    ["login_browser_failed", "sign-in page could not be opened"],
+    ["not_running", "Start Tailscale"],
+    ["machine_auth_required", "Ask the tailnet administrator to approve this machine"],
+    ["account_not_confirmed", "Review the signed-in account"],
+    ["unattended_consent_required", "Approve Tailscale background connectivity; the PC and Gateway must stay awake and the Windows user session must remain running"],
+    ["incoming_consent_required", "Approve incoming Tailscale connections"],
+    ["preference_cancelled", "preference change was cancelled"],
+    ["preference_verification_failed", "did not confirm the requested preference"],
+    ["preference_rollback_failed", "restore the prior Tailscale preferences"],
+    ["managed_policy", "Tailscale policy blocked the requested setting"],
+    ["https_consent_required", "Approve Tailscale HTTPS"],
+    ["https_consent_failed", "HTTPS approval did not complete"],
+    ["https_consent_browser_failed", "HTTPS approval page could not be opened"],
+    ["no_safe_consent_port", "No unused local port is available"],
+    ["mapping_inspection_failed", "could not safely inspect Tailscale Serve"],
+    ["mapping_mutation_failed", "could not safely update Tailscale Serve"],
+    ["no_up_physical_private_ipv4", "Connect this PC to trusted Wi-Fi or Ethernet"],
+    ["multiple_up_physical_private_ipv4", "More than one physical network is active"],
+    ["adapter_changed", "previously selected network adapter is unavailable"],
+    ["listener_changed", "listener changed while setup was running"],
+    ["port_conflict", "Choose a different unused port"],
+    ["phone_reachable_origin_required", "Choose a private network address that the phone can reach"],
+    ["mapping_conflict", "Tailscale port 443 is already in use"],
+    ["gateway_restarting", "Gateway is restarting"],
+  ] as const)("prints actionable resumable copy for %s", async (reason, copy) => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      resume: vi.fn(async () => ({ outcome: "paused" as const, mode: "tailscale" as const, reason })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain(copy);
+    expect(lines.join("\n")).toContain("cozygateway setup");
+    expect(lines.join("\n")).not.toMatch(/diagnostic dump|authUrl|token/i);
+  });
+
+  it("gives a failed personal-Tailscale phone check a complete phone-side checklist and exact resume command", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      resume: vi.fn(async () => ({
+        outcome: "not_confirmed" as const,
+        reason: "phone" as const,
+        mode: "tailscale" as const,
+      })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    const output = lines.join("\n");
+    expect(output).toContain("Tailscale is signed in and its VPN is active on the phone");
+    expect(output).toContain("same intended tailnet");
+    expect(output).toContain("tailnet policy permits the phone to reach this PC");
+    expect(lines.filter((line) => line.startsWith("Resume:"))).toEqual([
+      `Resume: cozygateway setup --config "${configPath}"`,
+    ]);
+  });
+
+  it("blocks fresh/changed pairing, allows matching complete pairing, and preserves legacy pairing", async () => {
+    const pending = tempConfig();
+    const pendingController = onboardingController();
+    await expect(runCli(["pair", "--config", pending.configPath], undefined, undefined, pendingController))
+      .rejects.toThrow(/cozygateway setup/);
+    expect(existsSync(pending.dbPath)).toBe(false);
+
+    const complete = tempConfig();
+    const completeController = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "complete" as const, authority: "complete" as const, mode: "lan" as const, healthy: true,
+        endpoint: {
+          mode: "lan" as const, canonicalOrigin: "http://192.168.1.20:18787", bindHost: "0.0.0.0",
+          port: 18787, durableFingerprint: "posture", ready: true,
+        },
+      })),
+    });
+    expect(await runCli(["pair", "--config", complete.configPath], undefined, undefined, completeController)).toBe(0);
+
+    const legacy = tempConfig();
+    expect(await runCli(["pair", "--config", legacy.configPath])).toBe(0);
+
+    const reviewedLegacy = tempConfig();
+    const reviewedLegacyController = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "legacy_unreviewed" as const, authority: "none" as const,
+        mode: "advanced" as const, healthy: false,
+      })),
+    });
+    expect(await runCli(["pair", "--config", reviewedLegacy.configPath], undefined, undefined, reviewedLegacyController)).toBe(0);
+  });
   it("requires zero dead letters before a managed listener is ready", () => {
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 1 } })).toBe(false);
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 0 } })).toBe(true);
@@ -270,7 +971,7 @@ describe("cozygateway terminal menu", () => {
     config.tls = { certFile: pair.certFile, keyFile: pair.keyFile };
     writeFileSync(configPath, JSON.stringify(config));
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
     try {
       expect(await runCli(["status", "--config", configPath])).toBe(0);
     } finally {
@@ -285,7 +986,7 @@ describe("cozygateway terminal menu", () => {
   it("opens the basic menu when no command is supplied", async () => {
     const { configPath } = tempConfig({ host: "0.0.0.0", port: 18787 });
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
 
     expect(await runCli(["--config", configPath], scriptedIo(["4"]))).toBe(0);
 
@@ -406,7 +1107,7 @@ describe("cozygateway terminal menu", () => {
   it("runs pairing from the menu and returns to it", async () => {
     const { configPath, dbPath } = tempConfig();
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
 
     expect(await runCli(["--config", configPath], scriptedIo(["1", "4"]))).toBe(0);
 
@@ -420,7 +1121,7 @@ describe("cozygateway terminal menu", () => {
   it("prints listener and offline health through the status command", async () => {
     const { configPath } = tempConfig({ host: "127.0.0.1", port: 18787 });
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
 
     expect(await runCli(["status", "--config", configPath])).toBe(0);
 

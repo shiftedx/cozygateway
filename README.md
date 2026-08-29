@@ -29,15 +29,14 @@ No Docker, git, or build tools. It requires an existing Hermes installation and 
 bootstrap verifies versioned release checksums for the gateway bundle, complete Hermes attach-plugin
 archive, and installer payload. It discovers Hermes profile homes through the Hermes CLI, installs
 one attach identity per selected profile, and supervises one shared gateway service. Existing Hermes
-profile gateway services stay Hermes-owned. Fresh interactive installs ask once whether CozyChat
-may connect over the local network; No (the default) keeps loopback (`127.0.0.1:8787`), while Yes
-binds all local interfaces and puts the detected LAN address in the pairing QR. The
-installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. See
+profile gateway services stay Hermes-owned. On Windows, the original PowerShell continues into a
+resumable choice of personal Tailscale, same-Wi-Fi, later, or advanced phone access. See
 `docs/install-service.md` and `docs/connectivity.md`.
 
 Windows installs under `%LOCALAPPDATA%\cozygateway`, registers a current-user
 `CozyGateway` Scheduled Task with a Startup-folder fallback, and requires no
-administrator prompt. The final screen contains a QR and plain-text setup code.
+administrator prompt except for a signed Tailscale installer or explicitly accepted targeted
+preference change. Pairing material appears only after the selected route passes the phone check.
 Open a new PowerShell or Terminal window and type `cozygateway` for a small menu
 that shows status, prints a fresh pairing QR, or changes the bind address and
 port. Existing installs retain their saved listener; `--bind-host` remains the non-interactive

@@ -1,37 +1,93 @@
-/** Picks the address a phone on the same network should dial.
+/** A normalized, versioned projection produced by CozyGateway's fixed Windows helper.
  *
- *  The pairing QR is scanned by a phone, so `127.0.0.1` in the payload sends every scan at the
- *  phone itself. When the gateway listens beyond loopback, the payload should carry the LAN
- *  address of the machine the install just bound. Preference order: RFC1918 private IPv4 (the
- *  home-network case the simple install track exists for), then any other external IPv4 (a
- *  tailnet or public address is still phone-reachable). Link-local addresses never qualify.
+ * Node deliberately does not classify adapters from `os.networkInterfaces()`: that API exposes
+ * addresses but cannot prove that an interface is physical Ethernet/Wi-Fi, Up, or a software
+ * adapter. Display names are retained only so a later interactive flow can identify choices to a
+ * person; selection never interprets or regexes localized names.
  */
+export interface WindowsLanInventory {
+  schemaVersion: 1;
+  adapters: WindowsLanAdapter[];
+}
 
-import { networkInterfaces } from "node:os";
+export interface WindowsLanAdapter {
+  /** Stable helper-provided interface identifier, not a localized display name. */
+  id: string;
+  displayName: string;
+  /** Machine-normalized media classification from the helper. */
+  kind: "ethernet" | "wifi" | "other";
+  hardwareInterface: boolean;
+  /** Machine-normalized operational status from the helper. */
+  status: "up" | "down" | "disabled" | "unknown";
+  ipv4Addresses: string[];
+}
 
-export interface LanCandidate {
+export interface PhysicalLanCandidate {
+  adapterId: string;
+  displayName: string;
+  kind: "ethernet" | "wifi";
   address: string;
-  family: string | number;
-  internal: boolean;
 }
 
-export type InterfaceMap = Record<string, LanCandidate[] | undefined>;
+export type PhysicalLanSelection =
+  | { outcome: "selected"; candidate: PhysicalLanCandidate }
+  | {
+      outcome: "paused";
+      reason: "no_up_physical_private_ipv4" | "multiple_up_physical_private_ipv4";
+      candidates: PhysicalLanCandidate[];
+    };
 
-function isPrivateIpv4(address: string): boolean {
-  if (address.startsWith("10.") || address.startsWith("192.168.")) return true;
-  const octets = address.split(".");
-  return octets[0] === "172" && Number(octets[1]) >= 16 && Number(octets[1]) <= 31;
+function ipv4Octets(address: string): [number, number, number, number] | undefined {
+  const parts = address.split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^(?:0|[1-9]\d{0,2})$/.test(part))) return undefined;
+  const octets = parts.map(Number);
+  if (octets.some((octet) => octet > 255)) return undefined;
+  return octets as [number, number, number, number];
 }
 
-/** The primary LAN IPv4 address, or `undefined` when the machine has none. */
-export function primaryLanAddress(interfaces: InterfaceMap = networkInterfaces()): string | undefined {
-  const candidates: string[] = [];
-  for (const name of Object.keys(interfaces)) {
-    for (const entry of interfaces[name] ?? []) {
-      const ipv4 = entry.family === "IPv4" || entry.family === 4;
-      if (!ipv4 || entry.internal || entry.address.startsWith("169.254.")) continue;
-      candidates.push(entry.address);
+/** Exact RFC1918 IPv4 classification. Public, loopback, 169.254/16, and Tailscale's
+ * 100.64/10 range fail closed because none belongs to the three private ranges. */
+export function isRfc1918Ipv4(address: string): boolean {
+  const octets = ipv4Octets(address);
+  if (octets === undefined) return false;
+  const [first, second] = octets;
+  return first === 10
+    || (first === 172 && second >= 16 && second <= 31)
+    || (first === 192 && second === 168);
+}
+
+/** Selects only when the helper proves there is exactly one eligible address. Ambiguity and lack
+ * of a candidate are resumable outcomes: callers can wait for network state to settle or present
+ * the bounded candidate list for an explicit advanced choice. */
+export function selectPhysicalLanCandidate(inventory: WindowsLanInventory): PhysicalLanSelection {
+  const candidates: PhysicalLanCandidate[] = [];
+  for (const adapter of inventory.adapters) {
+    if (
+      adapter.status !== "up"
+      || !adapter.hardwareInterface
+      || (adapter.kind !== "ethernet" && adapter.kind !== "wifi")
+    ) continue;
+    for (const address of adapter.ipv4Addresses) {
+      if (!isRfc1918Ipv4(address)) continue;
+      candidates.push({
+        adapterId: adapter.id,
+        displayName: adapter.displayName,
+        kind: adapter.kind,
+        address,
+      });
     }
   }
-  return candidates.find(isPrivateIpv4) ?? candidates[0];
+  if (candidates.length === 1) return { outcome: "selected", candidate: candidates[0]! };
+  if (candidates.length === 0) {
+    return { outcome: "paused", reason: "no_up_physical_private_ipv4", candidates };
+  }
+  return { outcome: "paused", reason: "multiple_up_physical_private_ipv4", candidates };
+}
+
+/** Compatibility-shaped convenience for pairing callers. Without fixed helper inventory there is
+ * intentionally no answer; CozyGateway never guesses a physical LAN from Node's address list. */
+export function primaryLanAddress(inventory?: WindowsLanInventory): string | undefined {
+  if (inventory === undefined) return undefined;
+  const selection = selectPhysicalLanCandidate(inventory);
+  return selection.outcome === "selected" ? selection.candidate.address : undefined;
 }

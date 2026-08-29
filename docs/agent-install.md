@@ -24,7 +24,8 @@ curl -fsSL https://cozylabs.ai/install.sh | bash
 If Node.js 24+ is unavailable, the Windows/macOS/Linux installer downloads the current
 Node.js 24 archive from nodejs.org, verifies it against that release's official
 `SHASUMS256.txt`, and installs it privately under
-the CozyGateway home's `runtime/node` directory. It does not use elevation,
+the CozyGateway home's `runtime/node` directory (`runtime\node\node.exe` on Windows). That private
+runtime executes the installed Gateway and the bounded owned-network cleanup during uninstall. It does not use elevation,
 replace the system Node,
 or change the shell PATH. If Hermes is unavailable, it verifies and runs the
 official installer from the latest tagged NousResearch/hermes-agent release,
@@ -45,6 +46,26 @@ rely on nodejs.org TLS plus the release checksum manifest. The Hermes bootstrap
 matches the tagged script's Git blob identity from the GitHub Contents API
 before execution; downloads performed by that official installer remain under
 the NousResearch installer trust boundary.
+
+On Windows, the helper is first verified in a temporary location. It rejects an install root or
+immediate parent with an untrusted owner, a parent that grants an untrusted principal child
+replacement, permission-change, or ownership-takeover authority, and reparse points at the root,
+`bin`, runtime, or helper boundary. It then replaces inherited permissions on the
+dedicated root, `bin`, verified helper, installer payload, and private runtime with a
+current-user/SYSTEM-only DACL.
+This applies to `%LOCALAPPDATA%\cozygateway` and to an explicit `COZYGATEWAY_HOME` custom root.
+An explicit custom root must be new/empty or already contain the exact privately protected
+`.cozygateway-install-owner.json` marker. The bootstrap creates that marker before installed assets,
+using a random nonce that is also recorded in protected install state and the database-authority
+locator. It will not adopt a nonempty project, synced vault, or other existing directory merely
+because the current user can write it.
+The PowerShell bootstrap checks the selected Gateway port before Hermes/model setup, release assets,
+tokens, config, plugins, or login persistence. An occupied port stops installation with the owning
+PID/process name and instructions to stop it or choose a free `--port`; it does not leave a partial
+CozyGateway install. After verifying the temporary Windows helper, it also checks the exact Hermes
+Dashboard port before model, install-root, token, state, environment, config, plugin, runtime, or
+persistence mutation. It reuses only a listener proven to belong to this Hermes installation;
+otherwise it reports the port, PID, process name, and a free `--dashboard-port` action.
 
 For each selected profile it installs and enables the archive, writes only the
 four CozyGateway variables to that profile's mode-600 `.env`, creates a distinct
@@ -70,15 +91,37 @@ curl -fsSL https://cozylabs.ai/install.sh | bash
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
 
-Near the end of a fresh interactive install, the installer asks one networking question:
-`Allow CozyChat to access this Gateway over your local network? [y/N]`. Yes binds CozyGateway to
-all local interfaces and makes the pairing QR advertise the machine's detected LAN address. No,
-an empty answer, or a non-interactive install keeps the listener on `127.0.0.1`. An explicit
-`--bind-host` skips the question, and updates preserve the listener already saved in the config.
+On Windows, the original PowerShell process next opens the resumable phone-access setup. It offers
+personal Tailscale, same-Wi-Fi, later, and advanced choices. A fresh pending marker blocks pairing
+until the selected final route has passed the phone connection check and the matching phrase is
+confirmed on the PC. Noninteractive installation stays healthy on loopback, prints one
+`cozygateway setup` resume command, and emits no QR or setup code. Updates retain completed matching
+posture; older installs keep their explicit pairing compatibility while setup offers a review.
 
-The install (and every re-run) then finishes by minting a pairing code and printing a terminal QR
-plus the gateway URL and setup code in plain text, so a fresh device goes install, scan, chatting
-with no further commands when the selected listener is reachable from that device. The QR encodes
+Same Wi-Fi setup keeps localized/Unicode adapter names intact and reads the selected adapter's
+Windows network category plus the active firewall profile. It does not change a firewall rule. If
+Windows reports `Public`, use **Settings > Network & internet > the active connection > Network
+profile type > Private** only when this is a trusted home/private network. If the phone check is
+blocked, keep Windows Firewall enabled and authorize only the exact CozyGateway TCP port on the
+Private profile (the setup message prints the number). Use **Windows Security > Firewall & network
+protection > Advanced settings > Inbound Rules**, or choose personal Tailscale; do not disable the
+firewall or add an all-ports rule.
+Personal Tailscale must remain active on both PC and phone. Authorized/shared tailnet peers may
+reach the service when policy permits, and tailnet administrators can observe/manage the device.
+If the phone connection check cannot complete, first confirm the phone is signed in with Tailscale,
+its VPN is active, the phone and PC are on the intended tailnet, and tailnet policy permits the
+phone to reach the PC. The terminal then prints the exact `cozygateway setup --config "..."` command
+that resumes the same deterministic flow; it does not create pairing material on a failed check.
+An old but correctly signed official Tailscale client is offered one explicit-consent update through
+the same signed official installer path used for a fresh install. Declining leaves the existing
+client and tailnet untouched and prints a manual update command. Disabled-service/policy,
+service/binary mismatch, invalid signature/publisher, and legacy-client discoveries remain distinct
+diagnostics; setup does not collapse them into an instruction to uninstall Tailscale.
+Advanced setup requires a concrete hostname or IP address reachable from the phone. Loopback and
+wildcard addresses are never placed in a pairing or verification QR.
+
+On macOS and Linux, the established install finale still mints a pairing code and prints a terminal
+QR plus the gateway URL and setup code. The final pairing QR encodes
 the `{"gatewayUrl":...,"setupCode":...}` payload from contract section 4; the
 URL uses the configured listener unless `publicUrl` records a user-managed HTTPS origin. Codes
 expire after 10 minutes; mint another with `~/.cozygateway/bin/cozygateway pair`. A configured
@@ -91,8 +134,7 @@ Local CLI health checks also pin the configured leaf certificate while allowing
 the bind address to differ from its DNS name.
 
 LAN mode is plaintext and is appropriate only on a trusted private network. Explicit
-listener/public URL options, saved installs, dry runs, and noninteractive installs bypass the
-question; power users can still choose directly with `--bind-host`.
+listener/public URL options remain available as advanced intent.
 For a tunnel, pass `--public-url https://gateway.example.com`; the installer persists the canonical
 origin and requires/sets loopback. Network reachability outside the machine is deliberately not
 automated; see `docs/connectivity.md`.
@@ -114,7 +156,7 @@ health checks. If a managed listener replacement cannot become ready, the CLI
 restores the previous working listener automatically.
 Readiness requires at least one configured attach profile, every configured
 profile online, and zero dead letters. Pairing material is not printed first.
-The non-interactive `cozygateway status`, `cozygateway pair`, and
+The non-interactive `cozygateway status`, `cozygateway setup`, `cozygateway pair`, and
 `cozygateway configure` commands expose the same focused operations directly.
 
 On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the
@@ -122,11 +164,42 @@ current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
 when policy blocks task registration. Phone-created bot auto-provisioning is not
 part of the Windows installer.
 
-Uninstall is deliberately independent of model selection, downloads, Node,
-listener-config parsing, and the continued presence of Hermes, so a damaged
-install remains removable. On macOS and
+Uninstall never performs model selection or downloads. On macOS and
 Linux the installer also exposes `cozygateway` through `~/.local/bin` in new
 terminal sessions; uninstall removes only its own command entry and profile line.
+On Windows, use the same bootstrap recovery path from PowerShell 5.1+:
+
+```powershell
+$installer = irm https://cozylabs.ai/install.ps1
+& ([scriptblock]::Create($installer)) --uninstall
+```
+
+For a custom root, set `$env:COZYGATEWAY_HOME` to that exact directory first. A healthy install uses
+its protected `local\network-authority.json` locator, config, SQLite database, bundle, and private
+`runtime\node\node.exe` to reconcile only owned network state. When that locator proves the database
+is absent, only network reconciliation is skipped: the installed `agent-install.sh --uninstall`
+still removes owned plugins, profile environment keys, spools, lifecycle changes, Task/Startup
+persistence, process, PATH entry, and safe files. A reconcile failure preserves Task, process, PATH,
+config, SQLite, and files for retry.
+
+If config or locator damage makes a prior external database path unknowable, PowerShell deactivates
+the exact CozyGateway persistence/process and asks the healthy shell payload to deactivate recorded
+Hermes lifecycle/plugin activity, but retains the entire root for recovery. It never infers that
+network authority is absent. Repair requires restoring the checksum-verified bundle and helper, the
+private Node runtime, readable config, protected authority locator, and its referenced SQLite
+database/sidecars before retrying. Native file removal without Git Bash is reserved for a genuinely
+missing shell payload with authority proven absent by the protected locator. Hermes profiles/services
+remain governed by the recorded ownership rules; unrelated processes and persistence entries are
+not stopped. Every Windows removal path validates the private install marker first and deletes only
+an explicit allowlist of CozyGateway files plus the owned private Node runtime. It removes the install
+root only when empty; user-added files are retained in place and the retained root is reported.
+There is no separate installer Repair action. Re-run the one-paste installer from PowerShell to
+restore the verified CozyGateway helper and bundle while preserving owned state:
+
+```powershell
+irm https://cozylabs.ai/setup | iex
+```
+
 Linux service units honor `XDG_CONFIG_HOME` and otherwise use
 `~/.config/systemd/user`. An environment without a running systemd user manager,
 such as a container or WSL instance without systemd, fails before installation

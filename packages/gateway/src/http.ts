@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { IncomingMessage } from "node:http";
 
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -58,6 +59,8 @@ import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
+import type { PhoneVerification } from "./phone-verification.ts";
+import { operatorOnboardingNotFound, type OperatorOnboardingControl } from "./operator-onboarding.ts";
 
 const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
 // The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
@@ -103,6 +106,10 @@ const LiveActivityRegisterRequestSchema = Type.Object(
 
 export interface AppDeps {
   storage: Storage;
+  /** Separate low-authority onboarding ingress. It never passes through device authentication. */
+  phoneVerification?: PhoneVerification;
+  /** Fixed-token, loopback-only bridge used solely by the local Windows setup CLI. */
+  operatorOnboarding?: OperatorOnboardingControl;
   /** Test-only override for the gateway-wide `/pair` bucket. Production leaves this absent and
    *  builds its limiter from `now`; a long-lived black-box harness supplies one with virtual time. */
   pairingAdmission?: PairingAttemptLimiter;
@@ -267,6 +274,22 @@ export function createApp(deps: AppDeps): Hono<Env> {
     };
   })();
   requestLiveActivityDeletionDrain();
+
+  app.all("/cozy/operator/onboarding", (c) => {
+    if (deps.operatorOnboarding === undefined) return operatorOnboardingNotFound();
+    const incoming = (c.env as { incoming?: IncomingMessage } | undefined)?.incoming;
+    return deps.operatorOnboarding.handle(c.req.raw, incoming?.socket.remoteAddress, incoming?.socket.localAddress);
+  });
+
+  // This narrowly-scoped capability route precedes the normal device-token surface. All
+  // authority, method, body, state, and response rules remain owned by PhoneVerification.
+  app.all("/cozy/onboarding/*", (c) =>
+    deps.phoneVerification === undefined
+      ? c.notFound()
+      : deps.phoneVerification.handleHttp(
+          c.req.raw,
+          (c.env as { incoming?: IncomingMessage } | undefined)?.incoming?.rawHeaders,
+        ));
 
   const requireDevice = createMiddleware<Env>(async (c, next) => {
     const header = c.req.header("authorization") ?? "";
