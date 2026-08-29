@@ -136,6 +136,149 @@ function Invoke-Bootstrap {
     }
 }
 
+function ConvertTo-BashSingleQuotedLiteral {
+    param([string] $Value)
+    $embeddedApostrophe = "'" + '"' + "'" + '"' + "'"
+    return "'" + $Value.Replace("'", $embeddedApostrophe) + "'"
+}
+
+function New-FakePowerShell {
+    param([string] $Path, [string] $EventLog)
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    $className = 'FakePowerShell' + [guid]::NewGuid().ToString('N')
+    $eventLiteral = $EventLog.Replace('"', '""')
+    $source = @"
+using System;
+using System.IO;
+using System.Text;
+public static class $className {
+    public static int Main(string[] args) {
+        File.AppendAllText(@"$eventLiteral", Convert.ToBase64String(Encoding.UTF8.GetBytes(string.Join("\0", args))) + Environment.NewLine);
+        string elevationHelper = Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_ELEVATION_HELPER");
+        bool elevated = Array.IndexOf(args, elevationHelper) >= 0;
+        string code = Environment.GetEnvironmentVariable(elevated ? "COZYGATEWAY_TEST_ELEVATED_CODE" : "COZYGATEWAY_TEST_NORMAL_CODE");
+        return Int32.Parse(code);
+    }
+}
+"@
+    Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $Path -OutputType ConsoleApplication
+}
+
+function Read-FakePowerShellCalls {
+    param([string] $Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    return @(Get-Content -LiteralPath $Path | ForEach-Object {
+        ,([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)).Split([char]0))
+    })
+}
+
+function Invoke-DashboardStopHarness {
+    param(
+        [string] $FunctionText,
+        [string] $Bash,
+        [string] $FakePowerShellDirectory,
+        [string] $CallLog,
+        [string] $ScriptPath,
+        [hashtable] $Paths,
+        [int] $NormalCode,
+        [int] $ElevatedCode
+    )
+    $script = @"
+#!/usr/bin/env bash
+set -euo pipefail
+say() { printf '%s\n' "`$*"; }
+die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+to_windows_path() { printf '%s' "`$1"; }
+HERMES_ROOT=$(ConvertTo-BashSingleQuotedLiteral $Paths.Root)
+HERMES_RESOLVED=$(ConvertTo-BashSingleQuotedLiteral $Paths.Hermes)
+DASHBOARD_OWNER_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.Helper)
+DASHBOARD_ELEVATION_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.ElevationHelper)
+DASHBOARD_PORT=9119
+$FunctionText
+stop_stubborn_windows_dashboard
+printf 'continued\n'
+"@
+    Write-Utf8NoBom $ScriptPath $script
+    Remove-Item -LiteralPath $CallLog -Force -ErrorAction SilentlyContinue
+    $keys = @('PATH', 'COZYGATEWAY_TEST_NORMAL_CODE', 'COZYGATEWAY_TEST_ELEVATED_CODE', 'COZYGATEWAY_TEST_ELEVATION_HELPER', 'DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY')
+    $old = @{}
+    foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
+    try {
+        $env:PATH = "$FakePowerShellDirectory;$env:PATH"
+        $env:COZYGATEWAY_TEST_NORMAL_CODE = [string]$NormalCode
+        $env:COZYGATEWAY_TEST_ELEVATED_CODE = [string]$ElevatedCode
+        $env:COZYGATEWAY_TEST_ELEVATION_HELPER = $Paths.ElevationHelper
+        $env:DASHBOARD_SESSION_TOKEN = 'task-2-secret-token'
+        $env:PROVIDER_API_KEY = 'task-2-provider-secret'
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $output = & $Bash $ScriptPath 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousPreference
+        return @{ ExitCode = $exitCode; Output = ($output -join "`n"); Calls = @(Read-FakePowerShellCalls $CallLog) }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, $old[$key], 'Process') }
+    }
+}
+
+function Invoke-ElevationWrapperHarness {
+    param(
+        [string] $Wrapper,
+        [string] $Harness,
+        [string] $CapturePath,
+        [string] $ChildCapturePath,
+        [hashtable] $Paths,
+        [int] $ChildCode,
+        [switch] $Cancel
+    )
+    $harnessBody = @'
+param([string]$Wrapper, [string]$Root, [string]$Hermes, [string]$Launcher, [int]$Port, [string]$Helper)
+function Start-Process {
+    param([string]$FilePath, [string]$Verb, [switch]$Wait, [switch]$PassThru, [string[]]$ArgumentList)
+    [pscustomobject]@{
+        FilePath = $FilePath
+        Verb = $Verb
+        Wait = $Wait.IsPresent
+        PassThru = $PassThru.IsPresent
+        ArgumentList = @($ArgumentList)
+    } | Export-Clixml -LiteralPath $env:COZYGATEWAY_TEST_START_CAPTURE
+    if ($env:COZYGATEWAY_TEST_CANCEL -eq '1') { throw 'The operation was canceled by the user.' }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $FilePath
+    $info.Arguments = $ArgumentList -join ' '
+    $info.UseShellExecute = $false
+    $process = [Diagnostics.Process]::Start($info)
+    $process.WaitForExit()
+    return [pscustomobject]@{ ExitCode = $process.ExitCode }
+}
+& $Wrapper $Root $Hermes $Launcher $Port $Helper
+exit $LASTEXITCODE
+'@
+    Write-Utf8NoBom $Harness $harnessBody
+    Remove-Item -LiteralPath $CapturePath, $ChildCapturePath -Force -ErrorAction SilentlyContinue
+    $keys = @('COZYGATEWAY_TEST_START_CAPTURE', 'COZYGATEWAY_TEST_CHILD_CAPTURE', 'COZYGATEWAY_TEST_CHILD_CODE', 'COZYGATEWAY_TEST_CANCEL', 'DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY')
+    $old = @{}
+    foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
+    try {
+        $env:COZYGATEWAY_TEST_START_CAPTURE = $CapturePath
+        $env:COZYGATEWAY_TEST_CHILD_CAPTURE = $ChildCapturePath
+        $env:COZYGATEWAY_TEST_CHILD_CODE = [string]$ChildCode
+        $env:COZYGATEWAY_TEST_CANCEL = if ($Cancel) { '1' } else { '0' }
+        $env:DASHBOARD_SESSION_TOKEN = 'task-2-secret-token'
+        $env:PROVIDER_API_KEY = 'task-2-provider-secret'
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Harness $Wrapper $Paths.Root $Paths.Hermes $Paths.Launcher 9119 $Paths.Helper 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousPreference
+        return @{ ExitCode = $exitCode; Output = ($output -join "`n") }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, $old[$key], 'Process') }
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $installer = Join-Path $repoRoot 'scripts\install.ps1'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-bootstrap-" + [guid]::NewGuid().ToString('N'))
@@ -318,6 +461,116 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     $incompleteEvents = Get-Content -LiteralPath $eventLog
     Assert-True (($incompleteEvents -join "`n") -match '(?m)^hermes:model$') 'incomplete Hermes setup must open model selection'
     Assert-True (-not (($incompleteEvents -join "`n") -match '^bash:')) 'incomplete Hermes model selection must not invoke Bash'
+
+    $agentInstallerPath = Join-Path $repoRoot 'scripts\agent-install.sh'
+    $agentInstaller = Get-Content -LiteralPath $agentInstallerPath -Raw
+    $stopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_stubborn_windows_dashboard\(\) \{.*?^\}')
+    Assert-True $stopFunctionMatch.Success 'shared installer must define stop_stubborn_windows_dashboard'
+    $gitCommand = Get-Command git.exe -ErrorAction Stop
+    $gitRoot = Split-Path -Parent (Split-Path -Parent $gitCommand.Source)
+    $bashPath = Join-Path $gitRoot 'bin\bash.exe'
+    Assert-True (Test-Path -LiteralPath $bashPath) 'Git for Windows bash.exe must be available for the shared-installer harness'
+    $fakePowerShellDirectory = Join-Path $temp 'fake PowerShell'
+    $fakePowerShell = Join-Path $fakePowerShellDirectory 'powershell.exe'
+    $powerShellCallLog = Join-Path $temp 'powershell-calls.log'
+    New-FakePowerShell $fakePowerShell $powerShellCallLog
+    $stopHarnessPath = Join-Path $temp 'dashboard stop harness.sh'
+    $dashboardPaths = @{
+        Root = "C:\Users\O'Brien\Hermes Root"
+        Hermes = "C:\Users\O'Brien\Hermes Root\bin\hermes agent.exe"
+        Helper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner.ps1"
+        Launcher = "C:\Users\O'Brien\Hermes Root\bin\hermes.exe"
+        ElevationHelper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner elevate.ps1"
+    }
+
+    $normal43 = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 43 0
+    Assert-True ($normal43.ExitCode -eq 0) "normal 43 followed by elevated 0 must continue: $($normal43.Output)"
+    Assert-True ($normal43.Output -match 'continued') 'successful elevated recovery must return to the non-elevated installer'
+    Assert-True (([regex]::Matches($normal43.Output, '(?m)^INFO  ')).Count -eq 1) 'normal 43 must print exactly one elevation informational line'
+    Assert-True ($normal43.Calls.Count -eq 2) 'normal 43 must invoke one normal helper and exactly one elevation wrapper'
+    Assert-True ($normal43.Calls[0] -contains $dashboardPaths.Helper) 'normal helper invocation must use the ownership helper path'
+    Assert-True ($normal43.Calls[1] -contains $dashboardPaths.ElevationHelper) 'normal 43 must invoke the generated elevation wrapper exactly once'
+
+    $normal0 = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 0 99
+    Assert-True ($normal0.ExitCode -eq 0 -and $normal0.Calls.Count -eq 1) 'normal 0 must continue without elevation'
+    $normal42 = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 42 0
+    Assert-True ($normal42.ExitCode -ne 0 -and $normal42.Calls.Count -eq 1) 'normal 42 must fail without elevation'
+    Assert-True ($normal42.Output -match 'cannot safely stop') 'normal 42 must preserve the ownership-safety failure'
+    foreach ($normalFailureCode in @(45, 99)) {
+        $normalFailure = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths $normalFailureCode 0
+        Assert-True ($normalFailure.ExitCode -ne 0 -and $normalFailure.Calls.Count -eq 1) "normal $normalFailureCode must fail without elevation"
+        Assert-True ($normalFailure.Output -match 'verified Dashboard') "normal $normalFailureCode must report a verified-owner recovery failure"
+    }
+    foreach ($elevatedFailureCode in @(42, 43, 45, 99)) {
+        $elevatedFailure = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 43 $elevatedFailureCode
+        Assert-True ($elevatedFailure.ExitCode -ne 0 -and $elevatedFailure.Calls.Count -eq 2) "elevated $elevatedFailureCode must fail after exactly one elevation attempt"
+        Assert-True (-not ($elevatedFailure.Output -match 'continued')) "elevated $elevatedFailureCode must not continue"
+    }
+    $launchFailure = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 43 46
+    Assert-True ($launchFailure.ExitCode -ne 0 -and $launchFailure.Calls.Count -eq 2) 'UAC cancellation or launch failure must stop after one elevation attempt'
+    Assert-True ($launchFailure.Output -match 'scoped Dashboard recovery helper') 'UAC cancellation or launch failure must identify the scoped helper'
+    Assert-True ($launchFailure.Output -match 'close .* Dashboard manually' -and $launchFailure.Output -match 'rerun') 'UAC cancellation or launch failure must explain manual close and rerun recovery'
+    $allShellEvidence = @($normal43, $normal0, $normal42, $launchFailure) | ForEach-Object { $_.Output; $_.Calls | ForEach-Object { $_ -join "`n" } }
+    Assert-True (-not (($allShellEvidence -join "`n") -match 'task-2-secret-token|task-2-provider-secret')) 'shell elevation arguments and logs must not expose token or provider secrets'
+
+    $elevationMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_ELEVATION'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_ELEVATION")
+    Assert-True $elevationMatch.Success 'shared installer must generate a PowerShell elevation wrapper'
+    $elevationWrapper = Join-Path $temp 'dashboard owner elevate.ps1'
+    Write-Utf8NoBom $elevationWrapper $elevationMatch.Groups['Body'].Value
+    $elevatedChild = Join-Path $temp "O'Brien Cozy Gateway\dashboard owner.ps1"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $elevatedChild) | Out-Null
+    Write-Utf8NoBom $elevatedChild @'
+param(
+    [Parameter(Position = 0)][string]$ExpectedRoot,
+    [Parameter(Position = 1)][string]$ExpectedHermes,
+    [Parameter(Position = 2)][string]$ExpectedLauncher,
+    [Parameter(Position = 3)][int]$ExpectedPort,
+    [switch]$ElevatedChild
+)
+[pscustomobject]@{
+    ExpectedRoot = $ExpectedRoot
+    ExpectedHermes = $ExpectedHermes
+    ExpectedLauncher = $ExpectedLauncher
+    ExpectedPort = $ExpectedPort
+    ElevatedChild = $ElevatedChild.IsPresent
+    ExtraArguments = @($args)
+} | Export-Clixml -LiteralPath $env:COZYGATEWAY_TEST_CHILD_CAPTURE
+exit ([int]$env:COZYGATEWAY_TEST_CHILD_CODE)
+'@
+    $wrapperPaths = @{
+        Root = $dashboardPaths.Root
+        Hermes = $dashboardPaths.Hermes
+        Launcher = $dashboardPaths.Launcher
+        Helper = $elevatedChild
+    }
+    $startCapture = Join-Path $temp 'start-process.xml'
+    $childCapture = Join-Path $temp 'elevated-child.xml'
+    $wrapperHarness = Join-Path $temp 'elevation wrapper harness.ps1'
+    $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
+    Assert-True ($wrapperResult.ExitCode -eq 0) "elevation wrapper must return elevated child 0: $($wrapperResult.Output)"
+    $startInvocation = Import-Clixml -LiteralPath $startCapture
+    Assert-True ($startInvocation.FilePath -eq 'powershell.exe') 'elevation wrapper must launch powershell.exe'
+    Assert-True ($startInvocation.Verb -eq 'RunAs' -and $startInvocation.Wait -and $startInvocation.PassThru) 'elevation wrapper must use -Verb RunAs -Wait -PassThru'
+    $childInvocation = Import-Clixml -LiteralPath $childCapture
+    Assert-True ($childInvocation.ExpectedRoot -ceq $wrapperPaths.Root) 'PS5.1 parsing must preserve expected root as one argument'
+    Assert-True ($childInvocation.ExpectedHermes -ceq $wrapperPaths.Hermes) 'PS5.1 parsing must preserve Hermes executable as one argument'
+    Assert-True ($childInvocation.ExpectedLauncher -ceq $wrapperPaths.Launcher) 'PS5.1 parsing must preserve launcher path as one argument'
+    Assert-True ($childInvocation.ExpectedPort -eq 9119) 'PS5.1 parsing must preserve Dashboard port as one argument'
+    Assert-True $childInvocation.ElevatedChild 'elevated helper must receive the elevated-child marker'
+    Assert-True ($childInvocation.ExtraArguments.Count -eq 0) 'elevated helper must receive no merged or extra arguments'
+    $startArguments = $startInvocation.ArgumentList -join "`n"
+    Assert-True ($startArguments -match '(?m)^-NoProfile$' -and $startArguments -match '(?m)^-NonInteractive$' -and $startArguments -match '(?m)^-ExecutionPolicy$' -and $startArguments -match '(?m)^Bypass$' -and $startArguments -match '(?m)^-File$') 'elevation wrapper must carry the required PowerShell argument array'
+    $wrapperEvidence = $wrapperResult.Output + "`n" + (Get-Content -LiteralPath $startCapture -Raw) + "`n" + (Get-Content -LiteralPath $childCapture -Raw)
+    Assert-True (-not ($wrapperEvidence -match 'task-2-secret-token|task-2-provider-secret')) 'elevation wrapper arguments and logs must not expose token or provider secrets'
+
+    foreach ($childCode in @(42, 43, 45, 99)) {
+        $childFailure = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths $childCode
+        Assert-True ($childFailure.ExitCode -eq $childCode) "elevation wrapper must preserve elevated child exit code $childCode"
+    }
+
+    $cancelResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0 -Cancel
+    Assert-True ($cancelResult.ExitCode -eq 46) "UAC cancellation or Start-Process failure must return the launch-failure code (actual $($cancelResult.ExitCode)): $($cancelResult.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $childCapture)) 'UAC cancellation must not run the elevated child'
 
     Write-Utf8NoBom (Join-Path $fixtures 'cozygateway.mjs.sha256') (('0' * 64) + "  cozygateway.mjs`n")
     $bad = Invoke-Bootstrap $installer @{
