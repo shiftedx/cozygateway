@@ -20,10 +20,38 @@ function Assert-PrivateDacl {
     param([string] $Path)
     $acl = Get-Acl -LiteralPath $Path
     Assert-True $acl.AreAccessRulesProtected "protected path must disable inheritance: $Path"
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $ownerSid = if ([string]$acl.Owner -match '^S-') { [string]$acl.Owner } else {
+        ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+    }
+    Assert-True ($ownerSid -eq $currentSid) "protected path owner must be the current user: $Path (owner=$ownerSid current=$currentSid)"
     $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
-    $expected = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18') | Sort-Object
+    $expected = @($currentSid, 'S-1-5-18') | Sort-Object
     $actual = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
     Assert-True (($actual -join ',') -eq ($expected -join ',')) "protected path has unexpected identities: $Path ($($actual -join ','))"
+}
+
+function Get-OwnershipMarkerDiagnostic {
+    param([string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'marker=missing' }
+    $schemaKeys = '<unreadable>'
+    try {
+        $parsed = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+        $schemaKeys = @($parsed.PSObject.Properties.Name | Sort-Object) -join ','
+    } catch {}
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $ownerSid = if ([string]$acl.Owner -match '^S-') { [string]$acl.Owner } else {
+            ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+        }
+        $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
+            '{0}:{1}:{2}:inherited={3}' -f $_.IdentityReference.Value, $_.AccessControlType, ([int64]$_.FileSystemRights), $_.IsInherited
+        }) -join ';'
+        return "schemaKeys=$schemaKeys ownerSid=$ownerSid currentSid=$currentSid protected=$($acl.AreAccessRulesProtected) explicitRules=[$rules]"
+    } catch {
+        return "schemaKeys=$schemaKeys acl=<unreadable:$($_.Exception.GetType().Name)>"
+    }
 }
 
 function Set-PrivateTestDacl {
@@ -112,6 +140,7 @@ if ($Command -eq 'protect-path') {
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($current, $rights, $type)))
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, $rights, $type)))
   }
+  $acl.SetOwner($current)
   if ($item.PSIsContainer) {
     (New-Object IO.DirectoryInfo($path)).SetAccessControl($acl)
   } else {
@@ -300,6 +329,8 @@ try {
     $fakeBash = Join-Path $temp 'Git With Spaces\bash.cmd'
     $pathLog = Join-Path $temp 'user-path.txt'
     New-ReleaseFixtures $fixtures
+    $fixtureHelperText = [IO.File]::ReadAllText((Join-Path $fixtures 'cozygateway-windows-helper.ps1'))
+    Assert-True ($fixtureHelperText -match '\$acl\.SetOwner\(\$current\)') 'fixture protect-path must assign the current user as owner like the production helper'
     New-FakeHermes $fakeBin $configPath $eventLog
     New-FakeBash $fakeBash $eventLog
 
@@ -375,7 +406,10 @@ try {
         'COZYGATEWAY_TEST_USER_PATH_LOG' = $pathLog
         'COZYGATEWAY_TEST_HELPER_EVENT_LOG' = $eventLog
     }
-    Assert-True ($result.ExitCode -eq 0) "existing-Hermes bootstrap failed: $($result.Output)"
+    $ownershipDiagnostic = if ($result.ExitCode -eq 0) { 'not-needed' } else {
+        Get-OwnershipMarkerDiagnostic (Join-Path $temp 'Cozy Gateway\.cozygateway-install-owner.json')
+    }
+    Assert-True ($result.ExitCode -eq 0) "existing-Hermes bootstrap failed: $($result.Output) / bounded marker diagnostic: $ownershipDiagnostic"
     $events = Get-Content -LiteralPath $eventLog
     $modelIndex = [Array]::IndexOf($events, 'hermes:model')
     $statusIndex = [Array]::IndexOf($events, 'hermes:status')
