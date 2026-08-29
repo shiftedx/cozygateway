@@ -10,11 +10,22 @@ import { parseArgs } from "node:util";
 import { promisify } from "node:util";
 
 import { applyEnvOverrides, loadConfig, validatePublicDeployment } from "./config.ts";
-import { openStorage } from "./storage.ts";
+import {
+  openStorage,
+  type FinalizeInput,
+  type FinalizeResult,
+  type PublishedCode,
+  type TransitionResult,
+  type SetupCodeOutputState,
+} from "./storage.ts";
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { primaryLanAddress } from "./lan.ts";
-import { QrCapacityError, encodeQr, renderQrHalfBlocks } from "./qr.ts";
+import {
+  preparePairingOutput,
+  type PairingOutputInput,
+  type PreparedPairingOutput,
+} from "./pairing-output.ts";
 import { gatewayScheme } from "./tls.ts";
 import {
   listenerOrigin,
@@ -35,6 +46,63 @@ export interface CliIo {
 export interface CliRuntime {
   restartHermesProfile(executable: string, profile: string): Promise<void>;
   waitForGatewayReady(configPath: string): Promise<void>;
+}
+
+export interface OnboardingPairingRequest {
+  phoneConfirmed: boolean;
+  desktopAnswer: string | undefined;
+  gatewayUrl: string;
+  color: boolean;
+  finalizeContext: Omit<FinalizeInput, "setupCode" | "setupCodeExpiresAt">;
+}
+
+export interface OnboardingPairingDependencies {
+  createSetupCode(): string;
+  render(input: PairingOutputInput): PreparedPairingOutput;
+  finalize(input: FinalizeInput): FinalizeResult;
+  write(output: string): void | Promise<void>;
+  activate(input: PublishedCode): TransitionResult<SetupCodeOutputState>;
+  revoke(input: PublishedCode): TransitionResult<SetupCodeOutputState>;
+}
+
+export async function publishOnboardingPairing(
+  request: OnboardingPairingRequest,
+  dependencies: OnboardingPairingDependencies,
+): Promise<"published" | "not_published"> {
+  const answer = request.desktopAnswer?.trim().toLowerCase();
+  if (answer !== "y" && answer !== "yes") return "not_published";
+  if (!request.phoneConfirmed) return "not_published";
+  const setupCode = dependencies.createSetupCode();
+  const prepared = dependencies.render({
+    gatewayUrl: request.gatewayUrl,
+    setupCode,
+    ttlMs: SETUP_CODE_TTL_MS,
+    color: request.color,
+    strictQr: true,
+  });
+  const finalized = dependencies.finalize({
+    ...request.finalizeContext,
+    setupCode,
+    setupCodeExpiresAt: request.finalizeContext.now + SETUP_CODE_TTL_MS,
+  });
+  if (finalized.outcome !== "published") return "not_published";
+  const publishedCode = {
+    challengeId: request.finalizeContext.challengeId,
+    setupCode,
+    now: request.finalizeContext.now,
+  };
+  try {
+    await dependencies.write(prepared.terminalOutput);
+  } catch (error) {
+    dependencies.revoke(publishedCode);
+    throw error;
+  }
+  const activated = dependencies.activate(publishedCode);
+  if (
+    (activated.outcome === "advanced" || activated.outcome === "already")
+    && activated.state === "active"
+  ) return "published";
+  throw new Error(`failed to activate published setup code: ${activated.outcome}`);
 }
 
 function healthOrigin(config: ReturnType<typeof loadConfig>): string {
@@ -129,11 +197,6 @@ function pairingHost(config: ReturnType<typeof loadConfig>): string {
   return primaryLanAddress() ?? "127.0.0.1";
 }
 
-function isLoopbackUrl(url: string): boolean {
-  const hostname = new URL(url).hostname;
-  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
-}
-
 function pairingUrl(config: ReturnType<typeof loadConfig>, advertised: string | undefined): string {
   if (config.publicUrl !== undefined) {
     if (advertised === undefined) return config.publicUrl;
@@ -167,13 +230,6 @@ function parsedTtlMs(raw: string): number {
     throw new Error(`--ttl must be a whole number of minutes between 1 and ${TTL_MAX_MINUTES} (14 days)`);
   }
   return minutes * 60 * 1000;
-}
-
-function describeTtl(ms: number): string {
-  const minutes = Math.round(ms / 60_000);
-  if (minutes % (24 * 60) === 0) { const d = minutes / (24 * 60); return d === 1 ? "1 day" : `${d} days`; }
-  if (minutes % 60 === 0) { const h = minutes / 60; return h === 1 ? "1 hour" : `${h} hours`; }
-  return minutes === 1 ? "1 minute" : `${minutes} minutes`;
 }
 
 async function printStatus(configPath: string): Promise<void> {
@@ -253,28 +309,18 @@ async function runPair(configPath: string, advertised: string | undefined, ttl: 
   const config = validatePublicDeployment(applyEnvOverrides(loadConfig(configPath), process.env));
   const gatewayUrl = pairingUrl(config, advertised);
   const ttlMs = ttl === undefined ? SETUP_CODE_TTL_MS : parsedTtlMs(ttl);
-  const storage = openStorage(config.dbPath);
   const code = newSetupCode();
+  const prepared = preparePairingOutput({
+    gatewayUrl,
+    setupCode: code,
+    ttlMs,
+    color: process.stdout.isTTY === true,
+    strictQr: false,
+  });
+  const storage = openStorage(config.dbPath);
   storage.createSetupCode(code, Date.now() + ttlMs);
   storage.close();
-  const payload = { gatewayUrl, setupCode: code };
-  const payloadJson = JSON.stringify(payload);
-  try {
-    console.log(renderQrHalfBlocks(encodeQr(payloadJson), { color: process.stdout.isTTY === true }));
-  } catch (err) {
-    if (!(err instanceof QrCapacityError)) throw err;
-    console.log("QR omitted: the pairing payload is too large to encode. Use the URL and code below.");
-  }
-  console.log(payloadJson);
-  console.log(`Gateway URL: ${payload.gatewayUrl}`);
-  console.log(`Setup code:  ${code}`);
-  console.log("Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.");
-  console.log(`Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`);
-  if (isLoopbackUrl(payload.gatewayUrl)) {
-    console.log(
-      "This URL is loopback, so only this machine can reach it. Remote access (Tailscale and friends) is documented at https://cozylabs.ai/docs/access/.",
-    );
-  }
+  console.log(prepared.terminalOutput.slice(0, -1));
 }
 
 async function runMenu(configPath: string, io: CliIo, runtime: CliRuntime): Promise<number> {
