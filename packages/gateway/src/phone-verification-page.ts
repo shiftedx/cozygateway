@@ -38,14 +38,9 @@ export const PHONE_VERIFICATION_SCRIPT = String.raw`(() => {
     const fail = () => { try { socket.close(); } catch {} reject(new Error("probe")); };
     const timer = setTimeout(fail, 5000);
     socket.addEventListener("open", () => socket.send(challenge), { once: true });
-    let echoed = false;
     socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string" || new TextEncoder().encode(event.data).length > 256) return fail();
-      if (!echoed) {
-        if (event.data !== challenge) return fail();
-        echoed = true; return;
-      }
-      if (event.data !== '{"type":"cozy_onboarding_probed"}') return fail();
+      if (event.data !== challenge) return fail();
       clearTimeout(timer); socket.close(); resolve();
     });
     socket.addEventListener("error", fail, { once: true });

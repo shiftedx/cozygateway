@@ -53,7 +53,7 @@ describe("phone verification WebSocket", () => {
     const closed = once(live, "close");
     live.send('{"type":"cozy_onboarding_probe"}');
     await closed;
-    expect(received).toHaveLength(2);
+    expect(received).toEqual(['{"type":"cozy_onboarding_probe"}']);
   });
 
   it("terminates a socket that sends an actual second client frame", async () => {
@@ -66,23 +66,18 @@ describe("phone verification WebSocket", () => {
     await closed;
   });
 
-  it("accepts an exact 256-byte fixed-schema probe and rejects 257 bytes", async () => {
+  it("accepts only the canonical closed-schema frame and rejects a noncanonical 256-byte frame", async () => {
     const challenge = gateway.beginPhoneVerification();
     const base = JSON.stringify({ type: "cozy_onboarding_probe", padding: "" });
     const exact = JSON.stringify({ type: "cozy_onboarding_probe", padding: "x".repeat(256 - Buffer.byteLength(base)) });
     expect(Buffer.byteLength(exact)).toBe(256);
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
-      const messages: string[] = [];
       ws.on("open", () => ws.send(exact));
-      ws.on("message", (data) => {
-        messages.push(String(data));
-        if (messages.length === 2) {
-          expect(messages).toEqual([exact, '{"type":"cozy_onboarding_probed"}']);
-          ws.close(); resolve();
-        }
-      });
+      ws.on("message", () => reject(new Error("noncanonical frame was echoed")));
+      ws.on("close", () => resolve());
       ws.on("error", reject);
+      setTimeout(() => reject(new Error("noncanonical frame was not rejected")), 2_000).unref?.();
     });
   });
 
@@ -94,14 +89,10 @@ describe("phone verification WebSocket", () => {
       const ws = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
       const frame = '{"type":"cozy_onboarding_probe"}';
       ws.on("open", () => ws.send(frame));
-      const messages: string[] = [];
       ws.on("message", (data) => {
         expect(Buffer.byteLength(frame)).toBeLessThanOrEqual(256);
-        messages.push(String(data));
-        if (messages.length === 2) {
-          expect(messages).toEqual([frame, '{"type":"cozy_onboarding_probed"}']);
-          ws.close(); resolve();
-        }
+        expect(String(data)).toBe(frame);
+        ws.close(); resolve();
       });
       ws.on("error", reject);
     });

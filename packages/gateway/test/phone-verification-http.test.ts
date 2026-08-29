@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runInNewContext } from "node:vm";
 
 import { PHONE_VERIFICATION_SCRIPT, runPhoneProof } from "../src/phone-verification-page.ts";
-import { normalizeCanonicalOrigin } from "../src/phone-verification.ts";
+import { normalizeCanonicalOrigin, PhoneVerification } from "../src/phone-verification.ts";
+import { openStorage } from "../src/storage.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { testHermes } from "./support/test-config.ts";
 
@@ -28,13 +29,9 @@ async function completeProbe(url: string): Promise<void> {
     const ws = new WebSocket(`${url.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
     const challenge = '{"type":"cozy_onboarding_probe"}';
     ws.on("open", () => ws.send(challenge));
-    const messages: string[] = [];
     ws.on("message", (data) => {
-      messages.push(String(data));
-      if (messages.length === 2) {
-        expect(messages).toEqual([challenge, '{"type":"cozy_onboarding_probed"}']);
-        ws.close(); resolve();
-      }
+      expect(String(data)).toBe(challenge);
+      ws.close(); resolve();
     });
     ws.on("error", reject);
   });
@@ -47,8 +44,31 @@ describe("phone verification page", () => {
     expect(normalizeCanonicalOrigin("https://gateway.example:8443")).toBe("https://gateway.example:8443");
   });
 
+  it.each([
+    ["http://gateway.example:80", "http://gateway.example"],
+    ["https://gateway.example:443", "https://gateway.example"],
+  ])("serves a verifier activated with default-port origin %s at browser authority", async (configured, canonical) => {
+    const storage = openStorage(":memory:");
+    storage.beginGatewayBoot({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: canonical,
+      durableFingerprint: "posture", startedAt: 1,
+    });
+    const verifier = new PhoneVerification({ storage, now: () => 1, monotonicNow: () => 1 });
+    verifier.activate({
+      bootGeneration: "boot", verificationEpoch: "epoch", canonicalOrigin: configured,
+      durableFingerprint: "posture",
+    });
+    const challenge = verifier.begin();
+    const response = await verifier.handleHttp(new Request(challenge.verificationUrl, {
+      headers: { host: new URL(canonical).host },
+    }), ["Host", new URL(canonical).host]);
+    expect(response.status).toBe(200);
+    verifier.close(); storage.close();
+  });
+
   it("executes the emitted page workflow itself exactly once in a browser-like harness", async () => {
     expect(PHONE_VERIFICATION_SCRIPT).toContain("runPhoneProof");
+    expect(PHONE_VERIFICATION_SCRIPT).not.toContain("cozy_onboarding_probed");
     const calls: string[] = [];
     const elements = { status: { textContent: "" }, phrase: { textContent: "", hidden: true } };
     class FakeWebSocket {
@@ -60,7 +80,6 @@ describe("phone verification page", () => {
       send(frame: string) {
         calls.push("probe");
         queueMicrotask(() => this.emit("message", { data: frame }));
-        queueMicrotask(() => this.emit("message", { data: '{"type":"cozy_onboarding_probed"}' }));
       }
       close() {}
       emit(name: string, event: { data?: string }) { for (const fn of this.listeners.get(name) ?? []) fn(event); }

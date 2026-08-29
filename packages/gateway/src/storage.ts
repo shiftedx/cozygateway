@@ -516,16 +516,18 @@ export type ChallengeResult =
   | { outcome: "conflict"; challengeId: string }
   | { outcome: "invalid_capability" | "invalid_expiry" | "invalid_session" | "stale_boot" };
 
-export interface ReplaceExpiredVerificationInput {
+export interface ReplaceLocallyExpiredVerificationInput {
   expiredSessionId: string;
+  expiredChallengeId: string;
+  expiredCapabilityHash: string;
   now: number;
   session: SetupSessionInput;
   challenge: VerificationChallengeInput;
 }
 
-export type ReplaceExpiredVerificationResult =
+export type ReplaceLocallyExpiredVerificationResult =
   | { outcome: "created"; sessionId: string; challengeId: string }
-  | { outcome: "not_found" | "not_expired" | "invalid_context" | "invalid_capability" | "invalid_expiry" | "conflict" };
+  | { outcome: "not_found" | "invalid_context" | "invalid_capability" | "invalid_expiry" | "conflict" };
 
 export interface CapabilityTransition {
   capabilityHash: string;
@@ -974,7 +976,7 @@ export class Storage {
   }
 
   /** Replaces an expired live proof without exposing a gap in the one-active-session invariant. */
-  replaceExpiredVerification(input: ReplaceExpiredVerificationInput): ReplaceExpiredVerificationResult {
+  replaceLocallyExpiredVerification(input: ReplaceLocallyExpiredVerificationInput): ReplaceLocallyExpiredVerificationResult {
     const { session, challenge } = input;
     if (!/^[0-9a-f]{64}$/.test(challenge.capabilityHash)) return { outcome: "invalid_capability" };
     if (challenge.expiresAt < challenge.createdAt || challenge.expiresAt > challenge.createdAt + SETUP_CODE_TTL_MS)
@@ -992,16 +994,16 @@ export class Storage {
       const prior = this.#db.prepare(`
         SELECT s.mode, s.canonical_origin AS canonicalOrigin,
           s.durable_fingerprint AS durableFingerprint, s.verification_epoch AS verificationEpoch,
-          s.boot_generation AS bootGeneration, c.expires_at AS expiresAt
+          s.boot_generation AS bootGeneration
         FROM onboarding_sessions s JOIN onboarding_challenges c ON c.session_id = s.session_id
-        WHERE s.session_id = ? AND s.state = 'active'
+        WHERE s.session_id = ? AND c.challenge_id = ? AND c.capability_hash = ?
+          AND s.state = 'active'
           AND c.state IN ('active', 'ws_probed', 'phone_confirmed')
-      `).get(input.expiredSessionId) as {
+      `).get(input.expiredSessionId, input.expiredChallengeId, input.expiredCapabilityHash) as {
         mode: OnboardingMode; canonicalOrigin: string; durableFingerprint: string;
-        verificationEpoch: string; bootGeneration: string; expiresAt: number;
+        verificationEpoch: string; bootGeneration: string;
       } | undefined;
       if (prior === undefined) return { outcome: "not_found" };
-      if (input.now <= prior.expiresAt) return { outcome: "not_expired" };
       if (
         prior.mode !== session.mode || prior.canonicalOrigin !== session.canonicalOrigin
         || prior.durableFingerprint !== session.durableFingerprint

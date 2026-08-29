@@ -24,10 +24,8 @@ async function probe(url: string, origin = gateway.url): Promise<void> {
     const ws = new WebSocket(`${url.replace(/^http/, "ws")}/probe`, { origin });
     const frame = '{"type":"cozy_onboarding_probe"}';
     ws.on("open", () => ws.send(frame));
-    let messages = 0;
     ws.on("message", () => {
-      messages += 1;
-      if (messages === 2) { ws.close(); resolve(); }
+      ws.close(); resolve();
     });
     ws.on("error", reject);
   });
@@ -115,7 +113,8 @@ describe("phone verification abuse bounds", () => {
       { phoneVerification: { now: () => wall, monotonicNow: () => monotonic } },
     );
     const expired = gateway.beginPhoneVerification();
-    wall = expired.expiresAt + 1;
+    // A monotonic deadline remains authoritative when wall time stalls or moves backward.
+    wall -= 1;
     monotonic += 600_001;
     expect((await fetch(expired.verificationUrl)).status).toBe(404);
     const replacement = gateway.beginPhoneVerification();

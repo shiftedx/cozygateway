@@ -161,8 +161,11 @@ export class PhoneVerification {
       const result = this.#storage.createVerificationChallenge(challengeInput);
       if (result.outcome !== "created") throw new Error("failed to create phone verification challenge");
     } else {
-      const result = this.#storage.replaceExpiredVerification({
-        expiredSessionId: existing.sessionId, now, session: sessionInput, challenge: challengeInput,
+      const result = this.#storage.replaceLocallyExpiredVerification({
+        expiredSessionId: existing.sessionId,
+        expiredChallengeId: existing.challengeId,
+        expiredCapabilityHash: existing.capabilityHash,
+        now, session: sessionInput, challenge: challengeInput,
       });
       if (result.outcome !== "created") throw new Error("failed to replace expired phone verification challenge");
       this.#records.delete(existing.capabilityHash);
@@ -312,19 +315,12 @@ export class PhoneVerification {
     let seen = false;
     const authTimer = setTimeout(() => ws.terminate(), this.#authTimeoutMs);
     const lifetimeTimer = setTimeout(() => ws.terminate(), this.#socketLifetimeMs);
-    const challengeType = "cozy_onboarding_probe";
-    const ack = '{"type":"cozy_onboarding_probed"}';
+    const challenge = '{"type":"cozy_onboarding_probe"}';
     ws.on("error", () => {});
     ws.once("close", () => { clearTimeout(authTimer); clearTimeout(lifetimeTimer); release(); });
     ws.on("message", (data, isBinary) => {
       const frame = String(data);
-      let parsed: unknown;
-      try { parsed = JSON.parse(frame); } catch { parsed = undefined; }
-      const valid = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-        && Object.keys(parsed).every((key) => key === "type" || key === "padding")
-        && (parsed as { type?: unknown }).type === challengeType
-        && ((parsed as { padding?: unknown }).padding === undefined || typeof (parsed as { padding?: unknown }).padding === "string");
-      if (seen || isBinary || Buffer.byteLength(frame) > PHONE_PROBE_MAX_BYTES || !valid || record.state !== "active" || !this.#isUsable(record)) { ws.terminate(); return; }
+      if (seen || isBinary || Buffer.byteLength(frame) > PHONE_PROBE_MAX_BYTES || frame !== challenge || record.state !== "active" || !this.#isUsable(record)) { ws.terminate(); return; }
       seen = true;
       ws.send(frame, (error) => {
         if (error) { ws.terminate(); return; }
@@ -335,7 +331,6 @@ export class PhoneVerification {
         if (result.outcome !== "advanced") { ws.terminate(); return; }
         record.state = "ws_probed";
         clearTimeout(authTimer);
-        ws.send(ack, (ackError) => { if (ackError) ws.terminate(); });
       });
     });
   }

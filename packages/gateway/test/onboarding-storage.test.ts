@@ -332,8 +332,10 @@ describe("onboarding state transitions", () => {
     storage.beginSetupSession(session());
     storage.createVerificationChallenge(challenge({ expiresAt: 200 }));
 
-    expect(storage.replaceExpiredVerification({
+    expect(storage.replaceLocallyExpiredVerification({
       expiredSessionId: "session-1",
+      expiredChallengeId: "challenge-1",
+      expiredCapabilityHash: "a".repeat(64),
       now: 201,
       session: session({ sessionId: "session-2", createdAt: 201 }),
       challenge: challenge({
@@ -347,6 +349,33 @@ describe("onboarding state transitions", () => {
     expect(storage.beginSetupSession(session({ sessionId: "session-3", createdAt: 202 }))).toEqual({
       outcome: "conflict", sessionId: "session-2",
     });
+    storage.close();
+  });
+
+  it("CAS-replaces a locally expired challenge even when wall time has not expired", () => {
+    const storage = openStorage(":memory:");
+    storage.beginGatewayBoot(boot());
+    storage.beginSetupSession(session());
+    storage.createVerificationChallenge(challenge({ expiresAt: 700 }));
+    const replacement = {
+      expiredSessionId: "session-1",
+      expiredChallengeId: "challenge-1",
+      expiredCapabilityHash: "a".repeat(64),
+      now: 99,
+      session: session({ sessionId: "session-2", createdAt: 99 }),
+      challenge: challenge({
+        sessionId: "session-2", challengeId: "challenge-2", capabilityHash: "b".repeat(64),
+        createdAt: 99, expiresAt: 699,
+      }),
+    };
+    expect(storage.replaceLocallyExpiredVerification({
+      ...replacement, expiredCapabilityHash: "f".repeat(64),
+    })).toEqual({ outcome: "not_found" });
+    expect(storage.replaceLocallyExpiredVerification(replacement)).toEqual({
+      outcome: "created", sessionId: "session-2", challengeId: "challenge-2",
+    });
+    expect(storage.recordVerificationProbe(transition({ capabilityHash: "a".repeat(64), now: 99 })))
+      .toEqual({ outcome: "invalid_state", state: "consumed" });
     storage.close();
   });
 

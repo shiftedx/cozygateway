@@ -141,6 +141,9 @@ Test Files 2 passed (2); Tests 65 passed, 16 skipped
 pnpm --filter cozygateway typecheck
 pnpm --filter cozygateway-conformance typecheck
 both exit 0
+
+git diff --check
+exit 0 (repository line-ending warnings only)
 ```
 
 ### Repair self-review
@@ -153,3 +156,68 @@ scoped atomic expired-verification replacement, with direct transaction regressi
 
 One wording correction to the original report: SQLite now advances after the echo send callback
 succeeds, not merely after the echo is queued.
+
+## Second review-finding repair (2026-08-28)
+
+The second review made the documented one-echo wire contract authoritative. The prior repair's
+extra acknowledgement and padded probe extension were removed.
+
+### Second repair RED
+
+```text
+pnpm --filter cozygateway exec vitest run test/onboarding-storage.test.ts test/phone-verification-http.test.ts test/phone-verification-ws.test.ts test/phone-verification-abuse.test.ts --testTimeout=10000
+Test Files 4 failed (4); Tests 5 failed, 34 passed; 3 follow-on errors from the unwanted second frame
+```
+
+The failures directly demonstrated that the emitted script still named/waited for the extra ACK,
+the server emitted that second frame, a noncanonical padded 256-byte frame was echoed, the storage
+replacement ignored its desired CAS identity and required wall expiry, and verifier replacement
+failed when only the monotonic deadline expired.
+
+### Second repair GREEN
+
+- WSS now emits exactly one frame: the byte-for-byte canonical echo. SQLite advances to
+  `ws_probed` only inside that echo's successful `ws.send(frame, callback)` callback. The browser
+  starts its single POST when it receives the echo; no acknowledgement type exists in production.
+- The only accepted client frame is exactly `{"type":"cozy_onboarding_probe"}`. Padded/extra-key
+  256-byte frames, 257-byte frames, binary frames, and second frames terminate the socket.
+- `replaceLocallyExpiredVerification` is a single `BEGIN IMMEDIATE` CAS/replacement transaction
+  bound to the prior session ID, challenge ID, capability hash, active/live state, mode, canonical
+  origin, posture fingerprint, verification epoch, and boot generation. This lets the verifier's
+  authoritative monotonic deadline replace a challenge even if wall time stalls or rolls backward,
+  without weakening any other transition.
+- Handler-level tests activate verifiers with literal `http://...:80` and `https://...:443`, then
+  serve their generated page using browser-normalized Host authority.
+
+### Fresh second-repair final evidence
+
+```text
+pnpm --filter cozygateway exec vitest run test/phone-verification-http.test.ts test/phone-verification-ws.test.ts test/phone-verification-abuse.test.ts test/server.test.ts test/pairing.test.ts test/ws-hub.test.ts test/onboarding-storage.test.ts
+Test Files 7 passed (7); Tests 82 passed (82)
+
+pnpm --filter cozygateway-contract exec vitest run
+Test Files 11 passed (11); Tests 123 passed (123)
+
+pnpm --filter cozygateway-conformance exec vitest run
+Test Files 2 passed (2); Tests 65 passed, 16 skipped
+
+pnpm --filter cozygateway typecheck
+pnpm --filter cozygateway-conformance typecheck
+both exit 0
+
+git diff --check
+exit 0 (repository line-ending warnings only)
+```
+
+The first full Gateway gate attempt encountered a Vitest worker `ERR_IPC_CHANNEL_CLOSED` without a
+test assertion failure. Re-running the identical command completed with the 82/82 result above;
+no product or test change was made in response to the transient worker failure.
+
+### Second repair self-review
+
+Searched production for the removed ACK and padded-schema extension: neither remains. Re-read the
+send path to confirm storage is called only from the echo callback, and the page's emitted workflow
+resolves its probe on that sole echo before POST. The local-expiry CAS matches every prior authority
+coordinate before consuming/abandoning and inserting the same-mode replacement atomically. Plain
+fetch methods, capability redaction/hash-only retention, resource limits, process-wide admission,
+and `/ws`, `/attach/v1`, `/pair`, and `/auth` routing remain unchanged.
