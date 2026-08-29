@@ -77,9 +77,11 @@ $installer = irm https://cozylabs.ai/install.ps1
 Set `$env:COZYGATEWAY_HOME` first when uninstalling a custom root. Healthy uninstall first runs the
 installed bounded owned-network cleanup; any failure preserves persistence, config, SQLite, and
 files for retry. Only after successful cleanup does it remove the `CozyGateway` current-user Task,
-Startup fallback, exact managed process, PATH entry, and files. When bundle/config/database
-authority is already absent or unreadable, native PowerShell recovery works without Git Bash or the
-installed shell payload and warns that missing network authority cannot be reconstructed.
+Startup fallback, exact managed process, PATH entry, and files. If bundle/config/runtime damage
+prevents cleanup while a configured/default SQLite database or SQLite sidecar remains, uninstall
+fails closed and asks you to repair the payload before retrying. Native PowerShell recovery works
+without Git Bash or the installed shell payload only when ownership authority is definitely absent,
+and warns that missing network authority cannot be reconstructed.
 
 No firewall rule is created or changed. Same Wi-Fi setup reads the selected adapter's Windows
 network category and active firewall policy. For a trusted home network reported as `Public`, change

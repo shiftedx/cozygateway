@@ -331,16 +331,49 @@ try {
         unsafeInstallRootOwner = $true
     }) 'unsafe_install_root'
 
-    $sharedParent = Join-Path $script:Temp 'shared replace parent'
-    New-Item -ItemType Directory -Path $sharedParent | Out-Null
-    $sharedAcl = Get-Acl -LiteralPath $sharedParent
-    $sharedAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
-        (New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),
+    $hostileOwnerParent = Join-Path $script:Temp 'hostile owner parent'
+    New-Item -ItemType Directory -Path $hostileOwnerParent | Out-Null
+    Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = (Join-Path $hostileOwnerParent 'cozygateway') } -Fixture @{
+        unsafeInstallParentOwner = $true
+    }) 'unsafe_install_root'
+
+    foreach ($dangerousParentRight in @(
         [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+        [Security.AccessControl.FileSystemRights]::ChangePermissions,
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    )) {
+        $sharedParent = Join-Path $script:Temp ("shared parent right " + [int64]$dangerousParentRight)
+        New-Item -ItemType Directory -Path $sharedParent | Out-Null
+        $sharedAcl = Get-Acl -LiteralPath $sharedParent
+        $sharedAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),
+            $dangerousParentRight,
+            [Security.AccessControl.AccessControlType]::Allow
+        )))
+        Set-Acl -LiteralPath $sharedParent -AclObject $sharedAcl
+        Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = (Join-Path $sharedParent 'cozygateway') } -Fixture @{}) 'unsafe_install_root'
+    }
+
+    $inheritedControlGrandparent = Join-Path $script:Temp 'inherited control grandparent'
+    $inheritedControlParent = Join-Path $inheritedControlGrandparent 'parent'
+    New-Item -ItemType Directory -Path $inheritedControlGrandparent | Out-Null
+    $inheritedControlAcl = Get-Acl -LiteralPath $inheritedControlGrandparent
+    $inheritedControlAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),
+        [Security.AccessControl.FileSystemRights]::ChangePermissions,
+        [Security.AccessControl.InheritanceFlags]::ContainerInherit,
+        [Security.AccessControl.PropagationFlags]::None,
         [Security.AccessControl.AccessControlType]::Allow
     )))
-    Set-Acl -LiteralPath $sharedParent -AclObject $sharedAcl
-    Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = (Join-Path $sharedParent 'cozygateway') } -Fixture @{}) 'unsafe_install_root'
+    Set-Acl -LiteralPath $inheritedControlGrandparent -AclObject $inheritedControlAcl
+    New-Item -ItemType Directory -Path $inheritedControlParent | Out-Null
+    $inheritedControlRules = @(Get-Acl -LiteralPath $inheritedControlParent | ForEach-Object {
+        $_.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+    })
+    Assert-True (@($inheritedControlRules | Where-Object {
+        $_.IsInherited -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ChangePermissions) -ne 0
+    }).Count -gt 0) 'parent-control fixture must exercise an inherited effective ACE'
+    Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = (Join-Path $inheritedControlParent 'cozygateway') } -Fixture @{}) 'unsafe_install_root'
 
     foreach ($boundaryChild in @('bin', 'runtime', 'bin\cozygateway-windows-helper.ps1')) {
         $reparseRoot = Join-Path $script:Temp ("reparse boundary " + ($boundaryChild -replace '[\\.]', '-'))

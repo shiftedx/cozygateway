@@ -375,19 +375,64 @@ function Set-CozyGatewayCommandPath {
     Write-Ok $(if ($Present) { 'the cozygateway command is available in new PowerShell and Terminal windows' } else { 'removed the cozygateway command from the user PATH' })
 }
 
-function Test-OwnedNetworkAuthorityReady {
+function Get-OwnedNetworkAuthorityStatus {
     param([string] $InstallHome)
     $bundle = Join-Path $InstallHome 'bin\cozygateway.mjs'
     $config = Join-Path $InstallHome 'local\cozygateway.config.json'
-    $database = Join-Path $InstallHome 'local\cozygateway.sqlite'
-    foreach ($path in @($bundle, $config, $database)) {
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    $node = Join-Path $InstallHome 'runtime\node\node.exe'
+    $local = Join-Path $InstallHome 'local'
+    $defaultDatabase = Join-Path $local 'cozygateway.sqlite'
+    $configuredDatabase = $null
+    $configReadable = $false
+    if (Test-Path -LiteralPath $config -PathType Leaf) {
+        try {
+            $parsed = [IO.File]::ReadAllText($config) | ConvertFrom-Json
+            if ($parsed.dbPath -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$parsed.dbPath)) { throw 'missing database path' }
+            if ([string]$parsed.dbPath -ne ':memory:') {
+                $configuredDatabase = if ([IO.Path]::IsPathRooted([string]$parsed.dbPath)) {
+                    [IO.Path]::GetFullPath([string]$parsed.dbPath)
+                } else {
+                    [IO.Path]::GetFullPath((Join-Path $local ([string]$parsed.dbPath)))
+                }
+            }
+            $configReadable = $true
+        } catch { $configReadable = $false }
     }
-    try {
-        $parsed = [IO.File]::ReadAllText($config) | ConvertFrom-Json
-        if ($null -eq $parsed -or (Get-Item -LiteralPath $database).Length -le 0) { return $false }
-    } catch { return $false }
-    return $true
+
+    $artifactPaths = New-Object System.Collections.Generic.List[string]
+    $databaseCandidates = @($defaultDatabase)
+    if ($null -ne $configuredDatabase) { $databaseCandidates += $configuredDatabase }
+    foreach ($database in $databaseCandidates) {
+        foreach ($candidate in @($database, "$database-wal", "$database-shm")) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $artifactPaths.Add([IO.Path]::GetFullPath($candidate))
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $local -PathType Container) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $local -File -ErrorAction SilentlyContinue)) {
+            if ($item.Name -match '\.sqlite(?:-wal|-shm)?$') { $artifactPaths.Add($item.FullName) }
+        }
+    }
+    [array]$artifacts = @($artifactPaths | Sort-Object -Unique)
+    if ($artifacts.Count -eq 0) { return 'absent' }
+    if (-not $configReadable -or $null -eq $configuredDatabase) { return 'present_unavailable' }
+
+    $allowedArtifacts = @(
+        [IO.Path]::GetFullPath($configuredDatabase),
+        [IO.Path]::GetFullPath("$configuredDatabase-wal"),
+        [IO.Path]::GetFullPath("$configuredDatabase-shm")
+    )
+    foreach ($artifact in $artifacts) {
+        if (-not @($allowedArtifacts | Where-Object { $_.Equals($artifact, [StringComparison]::OrdinalIgnoreCase) }).Count) {
+            return 'present_unavailable'
+        }
+    }
+    if (-not (Test-Path -LiteralPath $configuredDatabase -PathType Leaf) -or
+        (Get-Item -LiteralPath $configuredDatabase).Length -le 0 -or
+        -not (Test-Path -LiteralPath $bundle -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $node -PathType Leaf)) { return 'present_unavailable' }
+    return 'ready'
 }
 
 function Invoke-OwnedNetworkCleanup {
@@ -476,7 +521,11 @@ $isUninstall = $InstallerArguments -contains '--uninstall'
 $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
 
 if ($isUninstall) {
-    $authorityReady = Test-OwnedNetworkAuthorityReady $script:InstallHome
+    $authorityStatus = Get-OwnedNetworkAuthorityStatus $script:InstallHome
+    if ($authorityStatus -eq 'present_unavailable') {
+        Fail 'a plausible owned-network SQLite database remains, but cleanup cannot run. The entire install was preserved. Restore or repair the installed bundle, config, and Node.js runtime, then retry uninstall.'
+    }
+    $authorityReady = $authorityStatus -eq 'ready'
     if ($authorityReady) { Invoke-OwnedNetworkCleanup $script:InstallHome $isDryRun }
     Invoke-NativeWindowsTeardown $script:InstallHome $isDryRun
     if (-not $authorityReady) {

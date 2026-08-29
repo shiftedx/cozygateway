@@ -489,8 +489,8 @@ function Normalize-FullyQualifiedPath {
 }
 
 function Get-AclOwnerSid {
-    param($Acl)
-    if ([bool](Get-FixtureProperty 'unsafeInstallRootOwner')) { return 'S-1-5-21-0-0-0-9999' }
+    param($Acl, [string]$FixtureProperty = 'unsafeInstallRootOwner')
+    if ([bool](Get-FixtureProperty $FixtureProperty)) { return 'S-1-5-21-0-0-0-9999' }
     try {
         if ([string]$Acl.Owner -match '^S-\d-(?:\d+-)+\d+$') { return [string]$Acl.Owner }
         return ([Security.Principal.NTAccount]$Acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
@@ -575,10 +575,13 @@ function Test-UnsafeParentReplacementAcl {
         if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent -PathType Container)) { return $true }
         $acl = Get-Acl -LiteralPath $parent
         $allowed = @(Get-TrustedInstallOwnerSids)
+        if ((Get-AclOwnerSid $acl 'unsafeInstallParentOwner') -notin $allowed) { return $true }
         $localAppData = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { '' } else { Normalize-FullyQualifiedPath $env:LOCALAPPDATA }
         $replaceRights = [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
             [Security.AccessControl.FileSystemRights]::CreateDirectories -bor
-            [Security.AccessControl.FileSystemRights]::WriteData
+            [Security.AccessControl.FileSystemRights]::WriteData -bor
+            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [Security.AccessControl.FileSystemRights]::TakeOwnership
         $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
         foreach ($rule in $rules) {
             if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or

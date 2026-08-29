@@ -7,7 +7,8 @@
    bytes on redirected standard input and strict UTF-8 output decoding. The regression runs the
    release/bootstrap/helper pipeline, not a direct helper-only shortcut.
 2. **Installer trust boundary:** the verified helper is staged outside the install root, validates
-   the dedicated root, rejects untrusted owners, parent replace/DeleteChild authority, reparse
+   the dedicated root, rejects untrusted root/parent owners, parent replace/DeleteChild,
+   ChangePermissions, and TakeOwnership authority (including effective inherited ACEs), reparse
    points at root/bin/runtime/helper, and existing roots writable by an untrusted SID, and
    establishes current-user/SYSTEM-only protected DACLs before executable assets land in `bin`.
    Helper, installer, bundle, and present private runtime paths are protected idempotently. Custom
@@ -39,8 +40,9 @@
    `cleanup-owned-network` command before any Bash/native persistence, process, PATH, database, or
    file deletion. A nonzero result aborts with the full authority intact. The command reconciles
    exact recorded LAN/Tailscale ownership and preserves unrelated Tailscale state. Native damaged
-   fallback is limited to already-absent/unreadable bundle/config/database authority and warns that
-   missing authority cannot be reconstructed.
+   fallback is limited to definitely absent database authority and warns that missing authority
+   cannot be reconstructed. If a configured/default database or SQLite WAL/SHM sidecar remains,
+   missing/corrupt bundle, runtime, or config fails closed with the entire install preserved.
 
 The shared disclosure seam is integrated in the Windows tests and controller flow. Disclosure is
 awaited by the orchestrator before adapter preparation; the shipped CLI copy covers LAN plaintext
@@ -68,6 +70,12 @@ peers/tailnet administrators may reach or observe the device.
 - Healthy uninstall lacked pre-network ordering, while damaged uninstall required Git Bash. The
   bootstrap suite now covers cleanup failure preserving all authority, successful cleanup ordering,
   exact process ownership, and missing-shell native recovery.
+- Follow-up parent regressions failed for an untrusted parent owner and effective explicit/inherited
+  permission-control rights before the parent owner and full replacement-authority checks landed.
+- Follow-up uninstall regressions proved a missing bundle/config could incorrectly classify a
+  surviving database as authority-absent. The matrix now covers missing bundle, missing/unreadable
+  config, default database, and sidecar-only authority, plus a real bootstrap-to-release-bundle
+  cleanup command against a real SQLite database without the cleanup-log seam.
 
 ## Final verification
 
@@ -76,10 +84,10 @@ peers/tailnet administrators may reach or observe the device.
   pipeline and disposable-root DACL assertions.
 - `scripts/test/windows-dashboard-owner.test.ps1` — passed.
 - `scripts/test/hermes-installer.test.sh` — passed after the final uninstall platform guard.
-- Windows onboarding/helper-client Vitest focus — 28/28 passed.
+- Windows onboarding/helper/Tailscale Vitest focus — 86/86 passed without unhandled rejections.
 - CLI/network-onboarding/phone-verification/upgrade-dispatcher Vitest focus — 174/174 passed.
 - Gateway package typecheck — passed as part of the workspace gate.
-- Full workspace recursive build and typecheck — passed.
+- Full workspace recursive build, typecheck, and release bundle — passed.
 - Bash syntax and `git diff --check` — passed (Git reported only the repository's expected Windows
   LF-to-CRLF checkout warnings).
 

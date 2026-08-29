@@ -46,9 +46,10 @@ matches the tagged script's Git blob identity from the GitHub Contents API
 before execution; downloads performed by that official installer remain under
 the NousResearch installer trust boundary.
 
-On Windows, the helper is first verified in a temporary location. It rejects an install root with
-an untrusted owner, a parent that lets an untrusted principal replace children, and reparse points
-at the root, `bin`, runtime, or helper boundary. It then replaces inherited permissions on the
+On Windows, the helper is first verified in a temporary location. It rejects an install root or
+immediate parent with an untrusted owner, a parent that grants an untrusted principal child
+replacement, permission-change, or ownership-takeover authority, and reparse points at the root,
+`bin`, runtime, or helper boundary. It then replaces inherited permissions on the
 dedicated root, `bin`, verified helper, installer payload, and private runtime with a
 current-user/SYSTEM-only DACL.
 This applies to `%LOCALAPPDATA%\cozygateway` and to an explicit `COZYGATEWAY_HOME` custom root.
@@ -161,10 +162,12 @@ For a custom root, set `$env:COZYGATEWAY_HOME` to that exact directory first. Re
 current-user `CozyGateway` Scheduled Task and Startup fallback, stops only the process whose command
 line names this install's exact config path, and then removes owned files. A healthy install first
 runs the bounded `cleanup-owned-network` command; failure preserves Task, process, PATH, config,
-SQLite, and files for retry. If bundle/config/database authority is already absent or unreadable,
-native PowerShell recovery works without Git Bash or the installed shell payload and warns that
-missing network authority cannot be reconstructed. Hermes profiles/services remain governed by the
-recorded ownership rules; unrelated processes and persistence entries are not stopped.
+SQLite, and files for retry. A missing/corrupt bundle or config never authorizes deletion while a
+configured/default SQLite database or SQLite sidecar remains: repair the installed payload and
+retry. Only when ownership authority is definitely absent does native PowerShell recovery work
+without Git Bash or the installed shell payload; it warns that the missing authority cannot be
+reconstructed. Hermes profiles/services remain governed by the recorded ownership rules; unrelated
+processes and persistence entries are not stopped.
 Linux service units honor `XDG_CONFIG_HOME` and otherwise use
 `~/.config/systemd/user`. An environment without a running systemd user manager,
 such as a container or WSL instance without systemd, fails before installation

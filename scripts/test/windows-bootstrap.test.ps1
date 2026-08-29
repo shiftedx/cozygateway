@@ -91,7 +91,7 @@ exit /b 0
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho onboarding-token:%COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE%>>`"$EventLog`"`nif not exist `"%COZYGATEWAY_HOME%\local`" mkdir `"%COZYGATEWAY_HOME%\local`"`nif not exist `"%COZYGATEWAY_HOME%\runtime\node`" mkdir `"%COZYGATEWAY_HOME%\runtime\node`"`necho {}>`"%COZYGATEWAY_HOME%\local\cozygateway.config.json`"`necho fixture>`"%COZYGATEWAY_HOME%\local\cozygateway.sqlite`"`necho fixture>`"%COZYGATEWAY_HOME%\local\gateway.env`"`necho runtime>`"%COZYGATEWAY_HOME%\runtime\node\node.exe`"`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho onboarding-token:%COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE%>>`"$EventLog`"`nfor %%A in (%*) do if `"%%~A`"==`"--uninstall`" exit /b 0`nif not exist `"%COZYGATEWAY_HOME%\local`" mkdir `"%COZYGATEWAY_HOME%\local`"`nif not exist `"%COZYGATEWAY_HOME%\runtime\node`" mkdir `"%COZYGATEWAY_HOME%\runtime\node`"`necho {}>`"%COZYGATEWAY_HOME%\local\cozygateway.config.json`"`necho fixture>`"%COZYGATEWAY_HOME%\local\cozygateway.sqlite`"`necho fixture>`"%COZYGATEWAY_HOME%\local\gateway.env`"`necho runtime>`"%COZYGATEWAY_HOME%\runtime\node\node.exe`"`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -118,13 +118,74 @@ function Invoke-Bootstrap {
     }
 }
 
+function Assert-AuthorityPreservingUninstallRefusal {
+    param(
+        [string] $Installer,
+        [string] $Temp,
+        [string] $Name,
+        [ValidateSet('missing-bundle','missing-config','unreadable-config','sidecar-only')] [string] $Damage
+    )
+    $installFixtureHome = Join-Path $Temp ("authority refusal " + $Name)
+    $local = Join-Path $installFixtureHome 'local'
+    $bin = Join-Path $installFixtureHome 'bin'
+    $runtime = Join-Path $installFixtureHome 'runtime\node'
+    $config = Join-Path $local 'cozygateway.config.json'
+    $database = Join-Path $local 'cozygateway.sqlite'
+    New-Item -ItemType Directory -Force -Path $local, $bin, $runtime | Out-Null
+    if ($Damage -ne 'missing-bundle') { Write-Utf8NoBom (Join-Path $bin 'cozygateway.mjs') 'bundle fixture' }
+    Write-Utf8NoBom (Join-Path $runtime 'node.exe') 'node fixture'
+    $authorityArtifact = if ($Damage -eq 'sidecar-only') { "$database-wal" } else { $database }
+    Write-Utf8NoBom $authorityArtifact 'plausible ownership database'
+    if ($Damage -eq 'unreadable-config') {
+        Write-Utf8NoBom $config '{not-readable-as-config'
+    } elseif ($Damage -notin @('missing-config','sidecar-only')) {
+        Write-Utf8NoBom $config (@{ name='cozygateway'; host='127.0.0.1'; port=8787; dbPath=$database } | ConvertTo-Json -Compress)
+    }
+
+    $appData = Join-Path $Temp ("authority refusal appdata " + $Name)
+    $startup = Join-Path $appData 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $startup) | Out-Null
+    Write-Utf8NoBom $startup 'owned startup fixture'
+    $processFixture = Join-Path $Temp ("authority refusal processes " + $Name + '.json')
+    Write-Utf8NoBom $processFixture (@(
+        @{ ProcessId = 5101; Name = 'node.exe'; CommandLine = "node cozygateway.mjs serve --config `"$config`"" }
+    ) | ConvertTo-Json -Compress)
+    $nativeLog = Join-Path $Temp ("authority refusal native " + $Name + '.log')
+    $pathLog = Join-Path $Temp ("authority refusal path " + $Name + '.log')
+
+    $result = Invoke-Bootstrap $Installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = $appData
+        'LOCALAPPDATA' = (Join-Path $Temp ("authority refusal localappdata " + $Name))
+        'COZYGATEWAY_HOME' = $installFixtureHome
+        'COZYGATEWAY_GIT_BASH' = (Join-Path $Temp 'missing-git-bash.exe')
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$(Join-Path $installFixtureHome 'bin')"
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $pathLog
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = $nativeLog
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $processFixture
+    } @('--uninstall')
+
+    Assert-True ($result.ExitCode -ne 0) "$Name must fail closed while plausible SQLite authority remains"
+    Assert-True ($result.Output -match 'ownership.*database.*preserved|repair.*retry') "$Name must print actionable authority recovery guidance: $($result.Output)"
+    Assert-True (Test-Path -LiteralPath $installFixtureHome) "$Name must preserve the entire install root"
+    Assert-True (Test-Path -LiteralPath $authorityArtifact) "$Name must preserve the plausible ownership database or sidecar"
+    Assert-True (Test-Path -LiteralPath $startup) "$Name must preserve persistence before authority cleanup can run"
+    Assert-True (-not (Test-Path -LiteralPath $nativeLog)) "$Name must not delete Task or stop the managed process"
+    Assert-True (-not (Test-Path -LiteralPath $pathLog)) "$Name must not change PATH"
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $installer = Join-Path $repoRoot 'scripts\install.ps1'
+$bundle = Join-Path $repoRoot 'dist-bundle\cozygateway.mjs'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-bootstrap-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
 
 try {
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
+    & cmd.exe /d /s /c "pnpm.cmd build >nul 2>&1"
+    Assert-True ($LASTEXITCODE -eq 0) 'workspace build must succeed before the bundled cleanup integration'
+    & cmd.exe /d /s /c "pnpm.cmd bundle >nul 2>&1"
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $bundle -PathType Leaf)) 'release bundle must build for the bundled cleanup integration'
     $fixtures = Join-Path $temp 'release assets'
     $eventLog = Join-Path $temp 'events.log'
     $fakeBin = Join-Path $temp 'fake bin'
@@ -266,6 +327,8 @@ try {
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
     $managedConfig = Join-Path $temp 'Cozy Gateway\local\cozygateway.config.json'
+    $managedDatabase = Join-Path $temp 'Cozy Gateway\local\cozygateway.sqlite'
+    Write-Utf8NoBom $managedConfig (@{ name='cozygateway'; host='127.0.0.1'; port=8787; dbPath=$managedDatabase } | ConvertTo-Json -Compress)
     $uninstallAppData = Join-Path $temp 'uninstall-appdata'
     $uninstallStartup = Join-Path $uninstallAppData 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uninstallStartup) | Out-Null
@@ -319,6 +382,50 @@ try {
     Assert-True ($cleanupIndex -ge 0 -and $cleanupIndex -lt $taskIndex -and $taskIndex -lt $uninstallBashIndex) 'owned network cleanup must succeed before native persistence or Bash teardown'
     Assert-True ($processIndex -gt $cleanupIndex -and -not (($uninstallEvents -join "`n") -match 'process-stop:4102')) 'native teardown must stop only the exact config-owned process'
     Assert-True (-not (Test-Path -LiteralPath $uninstallStartup)) 'native teardown must remove only the exact CozyGateway Startup entry'
+
+    $bundledCleanupHome = Join-Path $temp 'bundled cleanup integration'
+    $bundledCleanupBin = Join-Path $bundledCleanupHome 'bin'
+    $bundledCleanupRuntime = Join-Path $bundledCleanupHome 'runtime\node'
+    $bundledCleanupLocal = Join-Path $bundledCleanupHome 'local'
+    $bundledCleanupConfig = Join-Path $bundledCleanupLocal 'cozygateway.config.json'
+    $bundledCleanupDatabase = Join-Path $bundledCleanupLocal 'cozygateway.sqlite'
+    New-Item -ItemType Directory -Force -Path $bundledCleanupBin, $bundledCleanupRuntime, $bundledCleanupLocal | Out-Null
+    Copy-Item -LiteralPath $bundle -Destination (Join-Path $bundledCleanupBin 'cozygateway.mjs')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\cozygateway-windows-helper.ps1') -Destination (Join-Path $bundledCleanupBin 'cozygateway-windows-helper.ps1')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\agent-install.sh') -Destination (Join-Path $bundledCleanupBin 'agent-install.sh')
+    $systemNode = (Get-Command node.exe -ErrorAction Stop).Source
+    $bundledCleanupNode = Join-Path $bundledCleanupRuntime 'node.exe'
+    Copy-Item -LiteralPath $systemNode -Destination $bundledCleanupNode
+    & $bundledCleanupNode -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1]);db.exec('CREATE TABLE fixture(value TEXT)');db.close()" $bundledCleanupDatabase
+    Assert-True ($LASTEXITCODE -eq 0 -and (Get-Item -LiteralPath $bundledCleanupDatabase).Length -gt 0) 'bundled cleanup fixture must contain a real SQLite database'
+    Write-Utf8NoBom $bundledCleanupConfig (@{
+        name = 'cozygateway'; host = '127.0.0.1'; port = 8787; dbPath = $bundledCleanupDatabase
+        hermes = @{
+            url = 'ws://127.0.0.1:19119/api/ws'; tokenEnv = 'HERMES_TOKEN'
+            profiles = @{ default = @{ tokenEnv = 'HERMES_DEFAULT_TOKEN' } }
+        }
+    } | ConvertTo-Json -Depth 6)
+    $bundledCleanupNativeLog = Join-Path $temp 'bundled-cleanup-native.log'
+    $bundledCleanupProcesses = Join-Path $temp 'bundled-cleanup-processes.json'
+    Write-Utf8NoBom $bundledCleanupProcesses '[]'
+    $bundledCleanup = Invoke-Bootstrap $installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = (Join-Path $temp 'bundled-cleanup-appdata')
+        'LOCALAPPDATA' = (Join-Path $temp 'bundled-cleanup-localappdata')
+        'COZYGATEWAY_HOME' = $bundledCleanupHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = $bundledCleanupNativeLog
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $bundledCleanupProcesses
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$(Join-Path $bundledCleanupHome 'bin')"
+        'COZYGATEWAY_TEST_NETWORK_CLEANUP_LOG' = ''
+    } @('--uninstall')
+    Assert-True ($bundledCleanup.ExitCode -eq 0) "PowerShell bootstrap must execute the real bundled cleanup command: $($bundledCleanup.Output)"
+    Assert-True (Test-Path -LiteralPath $bundledCleanupNativeLog) 'native teardown must begin only after the real bundled cleanup command returns zero'
+
+    Assert-AuthorityPreservingUninstallRefusal $installer $temp 'missing bundle with database' 'missing-bundle'
+    Assert-AuthorityPreservingUninstallRefusal $installer $temp 'missing config with default database' 'missing-config'
+    Assert-AuthorityPreservingUninstallRefusal $installer $temp 'unreadable config with database' 'unreadable-config'
+    Assert-AuthorityPreservingUninstallRefusal $installer $temp 'missing config with database sidecar' 'sidecar-only'
 
     $damagedNativeHome = Join-Path $temp 'damaged native uninstall'
     $damagedNativeConfig = Join-Path $damagedNativeHome 'local\cozygateway.config.json'
