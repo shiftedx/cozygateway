@@ -132,7 +132,6 @@ GATEWAY_ENV="$LOCAL_DIR/gateway.env"
 DASHBOARD_ENV="$LOCAL_DIR/dashboard.env"
 DASHBOARD_OWNER_PS1="$LOCAL_DIR/dashboard-owner.ps1"
 DASHBOARD_ELEVATION_PS1="$LOCAL_DIR/dashboard-owner-elevate.ps1"
-DASHBOARD_RUNAS_PS1="$LOCAL_DIR/dashboard-owner-runas.ps1"
 STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
 CLI_WRAPPER="$GATEWAY_DIR/bin/cozygateway"
@@ -802,43 +801,6 @@ param(
   [Parameter(Mandatory = $true, Position = 1)][string]$ExpectedHermes,
   [Parameter(Mandatory = $true, Position = 2)][string]$ExpectedLauncher,
   [Parameter(Mandatory = $true, Position = 3)][ValidateRange(1, 65535)][int]$ExpectedPort,
-  [Parameter(Mandatory = $true, Position = 4)][string]$OwnerHelper,
-  [Parameter(Mandatory = $true, Position = 5)][string]$RunAsHelper
-)
-$ErrorActionPreference = "Stop"
-function ConvertTo-CozyNativeArgument {
-  param([string]$Value)
-  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
-  $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
-  $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
-  return '"' + $escaped + '"'
-}
-$childArguments = @(
-  "-NoProfile",
-  "-NonInteractive",
-  "-ExecutionPolicy",
-  "Bypass",
-  "-File",
-  (ConvertTo-CozyNativeArgument $RunAsHelper),
-  (ConvertTo-CozyNativeArgument $ExpectedRoot),
-  (ConvertTo-CozyNativeArgument $ExpectedHermes),
-  (ConvertTo-CozyNativeArgument $ExpectedLauncher),
-  [string]$ExpectedPort,
-  (ConvertTo-CozyNativeArgument $OwnerHelper)
-)
-try {
-  $child = Start-Process powershell.exe -UseNewEnvironment -Wait -PassThru -ArgumentList $childArguments
-  exit ([int]$child.ExitCode)
-} catch {
-  exit 46
-}
-POWERSHELL_ELEVATION
-  umask 077; cat > "$DASHBOARD_RUNAS_PS1" <<'POWERSHELL_RUNAS'
-param(
-  [Parameter(Mandatory = $true, Position = 0)][string]$ExpectedRoot,
-  [Parameter(Mandatory = $true, Position = 1)][string]$ExpectedHermes,
-  [Parameter(Mandatory = $true, Position = 2)][string]$ExpectedLauncher,
-  [Parameter(Mandatory = $true, Position = 3)][ValidateRange(1, 65535)][int]$ExpectedPort,
   [Parameter(Mandatory = $true, Position = 4)][string]$OwnerHelper
 )
 $ErrorActionPreference = "Stop"
@@ -848,6 +810,27 @@ function ConvertTo-CozyNativeArgument {
   $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
   $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
   return '"' + $escaped + '"'
+}
+function Clear-CozyProcessEnvironment {
+  foreach ($name in @([Environment]::GetEnvironmentVariables("Process").Keys)) {
+    if (-not $setEnvironmentVariable.Invoke($null, @([string]$name, $null))) {
+      throw "could not remove a Process-scope environment entry"
+    }
+  }
+}
+$powerShellExecutable = [IO.Path]::GetFullPath([IO.Path]::Combine($PSHOME, "powershell.exe"))
+$setEnvironmentVariable = [Environment].Assembly.GetType("Microsoft.Win32.Win32Native").GetMethod(
+  "SetEnvironmentVariable",
+  [Reflection.BindingFlags] "Static,NonPublic"
+)
+if ($null -eq $setEnvironmentVariable) { exit 46 }
+$originalEnvironment = @{}
+foreach ($entry in [Environment]::GetEnvironmentVariables("Process").GetEnumerator()) {
+  $originalEnvironment[[string]$entry.Key] = [string]$entry.Value
+}
+$launchEnvironment = @{}
+foreach ($name in @("SystemRoot", "WINDIR", "COMSPEC", "TEMP", "TMP")) {
+  if ($originalEnvironment.ContainsKey($name)) { $launchEnvironment[$name] = $originalEnvironment[$name] }
 }
 $childArguments = @(
   "-NoProfile",
@@ -863,13 +846,26 @@ $childArguments = @(
   "-ElevatedChild"
 )
 try {
-  $child = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList $childArguments
+  Clear-CozyProcessEnvironment
+  foreach ($name in $launchEnvironment.Keys) {
+    if (-not $setEnvironmentVariable.Invoke($null, @([string]$name, [string]$launchEnvironment[$name]))) {
+      throw "could not prepare the sanitized Process environment"
+    }
+  }
+  $child = Start-Process $powerShellExecutable -Verb RunAs -Wait -PassThru -ArgumentList $childArguments
   exit ([int]$child.ExitCode)
 } catch {
   exit 46
+} finally {
+  Clear-CozyProcessEnvironment
+  foreach ($name in $originalEnvironment.Keys) {
+    if (-not $setEnvironmentVariable.Invoke($null, @([string]$name, [string]$originalEnvironment[$name]))) {
+      throw "could not restore the original Process environment"
+    }
+  }
 }
-POWERSHELL_RUNAS
-  chmod 600 "$DASHBOARD_ELEVATION_PS1" "$DASHBOARD_RUNAS_PS1"
+POWERSHELL_ELEVATION
+  chmod 600 "$DASHBOARD_ELEVATION_PS1"
 }
 write_wrapper() {
   local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg launcher_arg owner_helper_arg bundle_arg config_arg
@@ -1164,12 +1160,11 @@ child.unref();
 NODE
 }
 stop_stubborn_windows_dashboard() {
-  local hermes_native launcher_native owner_helper_native elevation_helper_native runas_helper_native root_native code
+  local hermes_native launcher_native owner_helper_native elevation_helper_native root_native code
   hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
   launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
   owner_helper_native="$(to_windows_path "$DASHBOARD_OWNER_PS1")"
   elevation_helper_native="$(to_windows_path "$DASHBOARD_ELEVATION_PS1")"
-  runas_helper_native="$(to_windows_path "$DASHBOARD_RUNAS_PS1")"
   root_native="$(to_windows_path "$HERMES_ROOT")"
   set +e
   MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$owner_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" >/dev/null 2>&1
@@ -1182,7 +1177,7 @@ stop_stubborn_windows_dashboard() {
     *) die "Dashboard recovery could not safely stop a verified Dashboard on port $DASHBOARD_PORT" ;;
   esac
   set +e
-  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$elevation_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" "$owner_helper_native" "$runas_helper_native" >/dev/null 2>&1
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$elevation_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" "$owner_helper_native" >/dev/null 2>&1
   code=$?
   set -e
   case "$code" in
