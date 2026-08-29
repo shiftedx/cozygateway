@@ -17,11 +17,29 @@ function Resolve-InstallHome {
         $RequestedHome = Join-Path $env:LOCALAPPDATA 'cozygateway'
     }
     $full = [IO.Path]::GetFullPath($RequestedHome)
+    if ($full.StartsWith('\\', [StringComparison]::Ordinal)) {
+        Fail 'UNC install roots are not supported; choose a dedicated local NTFS directory so SQLite and Windows login startup remain reliable'
+    }
     $local = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\')
     if ($full.TrimEnd('\') -eq $local) { Fail 'COZYGATEWAY_HOME must name a dedicated directory' }
     $volumeRoot = [IO.Path]::GetPathRoot($full)
     if ($full.TrimEnd('\') -eq $volumeRoot.TrimEnd('\')) { Fail 'COZYGATEWAY_HOME must not be a drive or share root' }
     return $full.TrimEnd('\')
+}
+
+function Write-SyncedRootWarning {
+    param([string] $InstallHome)
+    foreach ($name in @('OneDrive','OneDriveConsumer','OneDriveCommercial')) {
+        $candidate = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        try { $root = [IO.Path]::GetFullPath($candidate).TrimEnd('\') } catch { continue }
+        $prefix = "$root\"
+        if ($InstallHome.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+            $InstallHome.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Info 'the selected install root is inside a synced OneDrive directory; active SQLite files should not be synchronized. Prefer the default local AppData location.'
+            return
+        }
+    }
 }
 
 function New-OwnershipNonce {
@@ -41,8 +59,11 @@ function Get-InstallOwnershipMarker {
     try {
         if (([IO.File]::GetAttributes($marker) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'marker is a reparse point' }
         $parsed = [IO.File]::ReadAllText($marker) | ConvertFrom-Json
-        if ((@($parsed.PSObject.Properties.Name | Sort-Object) -join ',') -ne 'nonce,owner,schemaVersion' -or
-            $parsed.schemaVersion -ne 1 -or $parsed.owner -cne 'cozygateway-windows-installer' -or
+        $keys = @($parsed.PSObject.Properties.Name | Sort-Object) -join ','
+        $legacy = $parsed.schemaVersion -eq 1 -and $keys -eq 'nonce,owner,schemaVersion'
+        $phased = $parsed.schemaVersion -eq 2 -and $keys -eq 'nonce,owner,phase,schemaVersion' -and
+            $parsed.phase -in @('pre-network','network-authority')
+        if ((-not $legacy -and -not $phased) -or $parsed.owner -cne 'cozygateway-windows-installer' -or
             $parsed.nonce -isnot [string] -or $parsed.nonce -cnotmatch '^[A-Za-z0-9_-]{43}$') { throw 'invalid marker schema' }
         $acl = Get-Acl -LiteralPath $marker
         $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -57,7 +78,11 @@ function Get-InstallOwnershipMarker {
             $_.IsInherited -or $_.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
             ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl
         }).Count -ne 0) { throw 'marker ACL is not exact' }
-        return [pscustomobject]@{ Path = $marker; Nonce = [string]$parsed.nonce }
+        return [pscustomobject]@{
+            Path = $marker
+            Nonce = [string]$parsed.nonce
+            Phase = if ($legacy) { 'legacy' } else { [string]$parsed.phase }
+        }
     } catch {
         Fail 'the install root ownership marker is invalid or not privately protected; no files were removed'
     }
@@ -70,7 +95,20 @@ function Initialize-InstallOwnershipMarker {
     $marker = Join-Path $InstallHome '.cozygateway-install-owner.json'
     $temporary = "$marker.new"
     $nonce = New-OwnershipNonce
-    $body = [ordered]@{ schemaVersion = 1; owner = 'cozygateway-windows-installer'; nonce = $nonce } | ConvertTo-Json -Compress
+    $body = [ordered]@{ schemaVersion = 2; owner = 'cozygateway-windows-installer'; nonce = $nonce; phase = 'pre-network' } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($temporary, "$body`n", (New-Object Text.UTF8Encoding($false)))
+    Invoke-OnboardingHelper 'protect-path' @{ root = $InstallHome; path = $temporary } $HelperPath
+    Move-Item -LiteralPath $temporary -Destination $marker -Force
+    Invoke-OnboardingHelper 'protect-path' @{ root = $InstallHome; path = $marker } $HelperPath
+    return Get-InstallOwnershipMarker $InstallHome $true
+}
+
+function Set-InstallOwnershipPhase {
+    param([string] $InstallHome, [string] $Nonce, [string] $Phase, [string] $HelperPath)
+    if ($Phase -notin @('pre-network','network-authority')) { Fail 'invalid install ownership phase' }
+    $marker = Join-Path $InstallHome '.cozygateway-install-owner.json'
+    $temporary = "$marker.new"
+    $body = [ordered]@{ schemaVersion = 2; owner = 'cozygateway-windows-installer'; nonce = $Nonce; phase = $Phase } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($temporary, "$body`n", (New-Object Text.UTF8Encoding($false)))
     Invoke-OnboardingHelper 'protect-path' @{ root = $InstallHome; path = $temporary } $HelperPath
     Move-Item -LiteralPath $temporary -Destination $marker -Force
@@ -139,6 +177,12 @@ function Find-Hermes {
     }
     $command = Get-Command hermes.exe, hermes.cmd, hermes -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) { return $command.Source }
+    if (-not [string]::IsNullOrWhiteSpace($env:HERMES_HOME)) {
+        foreach ($name in @('hermes.exe','hermes.cmd','hermes')) {
+            $configured = Join-Path $env:HERMES_HOME "bin\$name"
+            if (Test-Path -LiteralPath $configured -PathType Leaf) { return [IO.Path]::GetFullPath($configured) }
+        }
+    }
     $candidate = Join-Path $env:LOCALAPPDATA 'hermes\bin\hermes.exe'
     if (Test-Path -LiteralPath $candidate) { return $candidate }
     return $null
@@ -270,6 +314,9 @@ function Resolve-RequestedGatewayPort {
             if ($null -ne $saved.port) { $port = [int]$saved.port }
         } catch { Fail 'the existing Gateway config is invalid; repair or remove it before reinstalling' }
     }
+    if (-not [string]::IsNullOrWhiteSpace($env:COZYGATEWAY_PORT)) {
+        if (-not [int]::TryParse($env:COZYGATEWAY_PORT, [ref]$port)) { Fail 'COZYGATEWAY_PORT must be 1-65535' }
+    }
     for ($index = 0; $index -lt $argumentCount; $index++) {
         if ($ForwardedArguments[$index] -eq '--port') {
             if ($index + 1 -ge $argumentCount) { Fail '--port needs a value' }
@@ -292,7 +339,7 @@ function Assert-GatewayPortAvailable {
         [array]$owner = @(Get-CimInstance Win32_Process -Filter "ProcessId = $ownerPid" -ErrorAction SilentlyContinue | Select-Object -First 1)
         if ($owner.Count -eq 1 -and (Test-CozyGatewayProcessOwnsConfig $owner[0] $ConfigPath)) { return }
         $processName = try { (Get-Process -Id $ownerPid -ErrorAction Stop).ProcessName } catch { 'unknown' }
-        Fail "Gateway port $Port is already in use by PID $ownerPid ($processName). Stop that process, or rerun with --port and a free port. No CozyGateway state was changed."
+        Fail "Gateway port $Port is already in use by PID $ownerPid ($processName). Stop that process, or replace <free-port> and paste: `$env:COZYGATEWAY_PORT='<free-port>'; irm https://cozylabs.ai/install.ps1 | iex. No CozyGateway state was changed."
     } catch {
         if ($_.Exception.Message -like 'FAIL  Gateway port *') { throw }
         Fail "could not inspect Gateway port $Port before installation; no CozyGateway state was changed"
@@ -348,7 +395,7 @@ function Fail-DashboardPortOccupied {
     param([int] $Port, $Inspection)
     $ownerPid = [long]$Inspection.processId
     $processName = if ([string]::IsNullOrWhiteSpace([string]$Inspection.processName)) { 'unknown' } else { [string]$Inspection.processName }
-    Fail "Dashboard port $Port is already in use by PID $ownerPid ($processName). Stop that process or rerun with --dashboard-port and a free port. No CozyGateway install state was changed."
+    Fail "Dashboard port $Port is already in use by PID $ownerPid ($processName). Stop that process, or replace <free-port> and paste: `$env:COZYGATEWAY_DASHBOARD_PORT='<free-port>'; irm https://cozylabs.ai/install.ps1 | iex. No CozyGateway install state was changed."
 }
 
 function Invoke-CozyGatewayInstaller {
@@ -515,10 +562,15 @@ function Set-CozyGatewayCommandPath {
     $next = $parts -join ';'
 
     $testLog = [Environment]::GetEnvironmentVariable('COZYGATEWAY_TEST_USER_PATH_LOG', 'Process')
-    if (-not [string]::IsNullOrWhiteSpace($testLog)) {
-        [IO.File]::WriteAllText($testLog, $next, (New-Object Text.UTF8Encoding($false)))
-    } else {
-        [Environment]::SetEnvironmentVariable('PATH', $next, 'User')
+    $persistent = $true
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($testLog)) {
+            [IO.File]::WriteAllText($testLog, $next, (New-Object Text.UTF8Encoding($false)))
+        } else {
+            [Environment]::SetEnvironmentVariable('PATH', $next, 'User')
+        }
+    } catch {
+        $persistent = $false
     }
 
     $processParts = @($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_.TrimEnd('\') -ine $full })
@@ -527,7 +579,14 @@ function Set-CozyGatewayCommandPath {
     } else {
         $env:PATH = $processParts -join ';'
     }
-    Write-Ok $(if ($Present) { 'the cozygateway command is available in new PowerShell and Terminal windows' } else { 'removed the cozygateway command from the user PATH' })
+    if ($persistent) {
+        Write-Ok $(if ($Present) { 'the cozygateway command is available in new PowerShell and Terminal windows' } else { 'removed the cozygateway command from the user PATH' })
+    } elseif ($Present) {
+        $command = Join-Path $BinPath 'cozygateway.cmd'
+        Write-Info "could not update the user PATH; setup will continue. Use this absolute command: `"$command`""
+    } else {
+        Write-Info 'could not update the user PATH; the install files are still being removed safely'
+    }
 }
 
 function Get-OwnedNetworkAuthorityStatus {
@@ -716,6 +775,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) { Fail 'Windows PowerShell 5.1 or new
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $script:InstallHome = Resolve-InstallHome $env:COZYGATEWAY_HOME
+Write-SyncedRootWarning $script:InstallHome
 $bin = Join-Path $script:InstallHome 'bin'
 $installerPath = Join-Path $bin 'agent-install.sh'
 $configPath = Join-Path $script:InstallHome 'local\cozygateway.config.json'
@@ -726,6 +786,21 @@ $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -con
 if ($isUninstall) {
     $ownership = Get-InstallOwnershipMarker $script:InstallHome $true
     $env:COZYGATEWAY_INSTALL_OWNERSHIP_NONCE = $ownership.Nonce
+    if ($ownership.Phase -eq 'pre-network') {
+        $shellPayloadPresent = Test-Path -LiteralPath $installerPath -PathType Leaf
+        $bash = if ($shellPayloadPresent) { Resolve-GitBash $env:COZYGATEWAY_GIT_BASH } else { $null }
+        Invoke-NativeWindowsTeardown $script:InstallHome $isDryRun
+        if ($shellPayloadPresent) {
+            $uninstallArguments = @($installerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome) + @($InstallerArguments)
+            if ($isDryRun -and -not ($uninstallArguments -contains '--dry-run')) { $uninstallArguments += '--dry-run' }
+            & $bash @uninstallArguments
+            if ($LASTEXITCODE -ne 0) { Fail "CozyGateway partial-install cleanup exited $LASTEXITCODE" }
+        }
+        if (-not $isDryRun -and (Test-Path -LiteralPath $script:InstallHome -PathType Container)) {
+            Remove-KnownCozyGatewayFiles $script:InstallHome
+        }
+        return
+    }
     $authorityStatus = Get-OwnedNetworkAuthorityStatus $script:InstallHome $ownership.Nonce
     $shellPayloadPresent = Test-Path -LiteralPath $installerPath -PathType Leaf
     if ($authorityStatus -eq 'ambiguous') {
@@ -774,6 +849,9 @@ if ($isDryRun) {
 }
 
 $requestedPort = Resolve-RequestedGatewayPort $configPath $InstallerArguments
+if (-not [string]::IsNullOrWhiteSpace($env:COZYGATEWAY_PORT) -and -not ($InstallerArguments -contains '--port')) {
+    $InstallerArguments = @($InstallerArguments) + @('--port', [string]$requestedPort)
+}
 Assert-GatewayPortAvailable $requestedPort $configPath
 $requestedDashboardPort = Resolve-RequestedDashboardPort $InstallerArguments
 Assert-CustomInstallRootOwnership $script:InstallHome
@@ -821,6 +899,7 @@ try {
 [void](Initialize-OnboardingBootstrap $isFreshInstall)
 Invoke-CozyGatewayInstaller $bash $installerPath $InstallerArguments
 Write-NetworkAuthorityLocator $configPath $ownership.Nonce
+$ownership = Set-InstallOwnershipPhase $script:InstallHome $ownership.Nonce 'network-authority' $script:WindowsHelperPath
 Protect-InstallBoundary
 Protect-CozyGatewayLocalState
 if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }

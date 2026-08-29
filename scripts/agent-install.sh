@@ -592,20 +592,17 @@ preflight_service_manager() {
   fi
 }
 write_cli_wrapper() {
-  local node_native bundle_native local_native
   [ "$DRY_RUN" = 1 ] && { say "DRY   write executable gateway CLI at $CLI_WRAPPER"; return; }
   mkdir -p "$GATEWAY_DIR/bin"
   umask 022
   printf '#!/usr/bin/env bash\nset -euo pipefail\ncd %q\nexec %q %q "$@"\n' "$LOCAL_DIR" "$NODE_RESOLVED" "$BUNDLE_PATH" > "$CLI_WRAPPER"
   chmod 755 "$CLI_WRAPPER"
   if is_windows; then
-    node_native="$(to_windows_path "$NODE_RESOLVED")"
-    bundle_native="$(to_windows_path "$BUNDLE_PATH")"
-    local_native="$(to_windows_path "$LOCAL_DIR")"
     {
       printf '@echo off\r\n'
-      printf 'cd /d "%s"\r\n' "$local_native"
-      printf '"%s" "%s" %%*\r\n' "$node_native" "$bundle_native"
+      printf 'set "PATH=%%~dp0..\\runtime\\node;%%PATH%%"\r\n'
+      printf 'cd /d "%%~dp0..\\local"\r\n'
+      printf 'node.exe "%%~dp0cozygateway.mjs" %%*\r\n'
     } > "$CLI_WINDOWS"
     chmod 755 "$CLI_WINDOWS" 2>/dev/null || true
   fi
@@ -757,11 +754,14 @@ write_windows_launcher() {
   wrapper_native="$(to_windows_path "$WRAPPER")"
   command="$(vbs_quote "\"$bash_native\" \"$wrapper_native\"")"
   [ "$DRY_RUN" = 1 ] && { say "DRY   write hidden Windows launcher at $WINDOWS_VBS"; return; }
-  {
-    printf 'Set shell = CreateObject("WScript.Shell")\r\n'
-    printf 'command = %s\r\n' "$command"
-    printf 'shell.Run command, 0, False\r\n'
-  } > "$WINDOWS_VBS"
+  "$NODE_RESOLVED" -e '
+    const { writeFileSync } = require("node:fs");
+    const [path, command] = process.argv.slice(1);
+    const body = "\ufeffSet shell = CreateObject(\"WScript.Shell\")\r\n"
+      + "command = " + command + "\r\n"
+      + "shell.Run command, 0, False\r\n";
+    writeFileSync(path, Buffer.from(body, "utf16le"));
+  ' "$WINDOWS_VBS" "$command"
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
 stop_owned_windows_gateway() {

@@ -1,4 +1,4 @@
-param([string] $PowerShellEngine = '')
+param([string] $PowerShellEngine = '', [switch] $SkipBuild)
 
 $ErrorActionPreference = 'Stop'
 $bundledUtility = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1'
@@ -35,10 +35,15 @@ function Set-PrivateTestDacl {
 }
 
 function New-OwnershipFixture {
-    param([string] $InstallHome, [string] $Nonce = ('A' * 43))
+    param([string] $InstallHome, [string] $Nonce = ('A' * 43), [string] $Phase = '')
     New-Item -ItemType Directory -Force -Path $InstallHome | Out-Null
     $marker = Join-Path $InstallHome '.cozygateway-install-owner.json'
-    Write-Utf8NoBom $marker (@{ schemaVersion = 1; owner = 'cozygateway-windows-installer'; nonce = $Nonce } | ConvertTo-Json -Compress)
+    $body = if ([string]::IsNullOrWhiteSpace($Phase)) {
+        @{ schemaVersion = 1; owner = 'cozygateway-windows-installer'; nonce = $Nonce }
+    } else {
+        @{ schemaVersion = 2; owner = 'cozygateway-windows-installer'; nonce = $Nonce; phase = $Phase }
+    }
+    Write-Utf8NoBom $marker ($body | ConvertTo-Json -Compress)
     Set-PrivateTestDacl $marker
     return $Nonce
 }
@@ -230,10 +235,12 @@ New-Item -ItemType Directory -Force -Path $temp | Out-Null
 
 try {
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
-    & cmd.exe /d /s /c "pnpm.cmd build >nul 2>&1"
-    Assert-True ($LASTEXITCODE -eq 0) 'workspace build must succeed before the bundled cleanup integration'
-    & cmd.exe /d /s /c "pnpm.cmd bundle >nul 2>&1"
-    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $bundle -PathType Leaf)) 'release bundle must build for the bundled cleanup integration'
+    if (-not $SkipBuild) {
+        & cmd.exe /d /s /c "pnpm.cmd build >nul 2>&1"
+        Assert-True ($LASTEXITCODE -eq 0) 'workspace build must succeed before the bundled cleanup integration'
+        & cmd.exe /d /s /c "pnpm.cmd bundle >nul 2>&1"
+        Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $bundle -PathType Leaf)) 'release bundle must build for the bundled cleanup integration'
+    }
     $fixtures = Join-Path $temp 'release assets'
     $eventLog = Join-Path $temp 'events.log'
     $fakeBin = Join-Path $temp 'fake bin'
@@ -259,6 +266,20 @@ try {
     Assert-True ((Get-Content -LiteralPath $vaultSentinel -Raw) -eq 'must survive') 'custom-root rejection must preserve the private project sentinel byte-for-byte'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $vaultHome 'bin'))) 'custom-root rejection must happen before install assets or directories are created'
 
+    $unc = Invoke-Bootstrap $installer @{
+        'COZYGATEWAY_HOME' = '\\fixture-server\fixture-share\cozygateway'
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+    }
+    Assert-True ($unc.ExitCode -ne 0 -and $unc.Output -match 'local.*NTFS|UNC.*not supported') 'UNC install roots must fail early with a local-filesystem recovery message'
+
+    $syncedRoot = Join-Path $temp 'OneDrive Sync Root'
+    $syncedDryRun = Invoke-Bootstrap $installer @{
+        'OneDrive' = $syncedRoot
+        'COZYGATEWAY_HOME' = (Join-Path $syncedRoot 'CozyGateway')
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+    }
+    Assert-True ($syncedDryRun.ExitCode -eq 0 -and $syncedDryRun.Output -match 'synced.*OneDrive|OneDrive.*SQLite') 'OneDrive custom roots must receive a precise SQLite synchronization warning'
+
     $vaultUninstall = Invoke-Bootstrap $installer @{
         'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
         'COZYGATEWAY_HOME' = $vaultHome
@@ -281,7 +302,14 @@ try {
         } @('--port', [string]$occupiedPort)
     } finally { $listener.Stop() }
     Assert-True ($occupied.ExitCode -ne 0) 'PowerShell bootstrap must reject an occupied Gateway port'
-    Assert-True ($occupied.Output -match "(?s)Gateway port $occupiedPort.*PID.*Stop that process.*No CozyGateway state was changed") "occupied-port failure must name the port, PID, process, action, and no-partial-install guarantee: $($occupied.Output)"
+    Assert-True (
+        $occupied.Output -match "Gateway port $occupiedPort" -and
+        $occupied.Output -match 'PID' -and
+        $occupied.Output -match 'Stop that process' -and
+        $occupied.Output -match 'No CozyGateway state was' -and
+        $occupied.Output -match 'changed'
+    ) "occupied-port failure must name the port, PID, process, action, and no-partial-install guarantee: $($occupied.Output)"
+    Assert-True ($occupied.Output -match 'COZYGATEWAY_PORT.*irm https://cozylabs\.ai/install\.ps1 \| iex') 'occupied-port recovery must print a one-paste retry compatible with the advertised installer'
     Assert-True (-not (Test-Path -LiteralPath $occupiedHome)) 'occupied-port preflight must run before install-root or asset mutation'
     Assert-True (-not (Test-Path -LiteralPath $eventLog)) 'occupied-port preflight must run before Hermes/model mutation'
 
@@ -326,7 +354,7 @@ try {
     $ownershipMarkerPath = Join-Path $temp 'Cozy Gateway\.cozygateway-install-owner.json'
     $ownershipMarker = Get-Content -LiteralPath $ownershipMarkerPath -Raw | ConvertFrom-Json
     $stateNonce = ((Get-Content -LiteralPath (Join-Path $localState 'install-state')) | Where-Object { $_ -like 'ownership_nonce=*' } | Select-Object -Last 1).Substring('ownership_nonce='.Length)
-    Assert-True ($ownershipMarker.schemaVersion -eq 1 -and $ownershipMarker.owner -eq 'cozygateway-windows-installer' -and $ownershipMarker.nonce -match '^[A-Za-z0-9_-]{43}$') 'install must create an exact random ownership marker before executable assets'
+    Assert-True ($ownershipMarker.schemaVersion -eq 2 -and $ownershipMarker.phase -eq 'network-authority' -and $ownershipMarker.owner -eq 'cozygateway-windows-installer' -and $ownershipMarker.nonce -match '^[A-Za-z0-9_-]{43}$') 'install must promote its protected ownership marker only after creating network authority'
     Assert-True ($locatedAuthority.ownershipNonce -eq $ownershipMarker.nonce -and $stateNonce -eq $ownershipMarker.nonce) 'marker nonce must be recorded identically in install-state and network authority locator'
     Assert-PrivateDacl $ownershipMarkerPath
     Assert-True (($events -join "`n") -match ('onboarding-token:' + [regex]::Escape($tokenPath))) 'shared config handoff must receive only the operator token path'
@@ -364,7 +392,15 @@ try {
         } @('--dashboard-port', [string]$occupiedDashboardPort)
     } finally { $dashboardListener.Stop() }
     Assert-True ($dashboardOccupied.ExitCode -ne 0) 'real PowerShell/helper pipeline must reject an unrelated Dashboard listener'
-    Assert-True ($dashboardOccupied.Output -match "(?s)Dashboard port $occupiedDashboardPort.*PID.*Stop that process.*No CozyGateway install state was changed") "Dashboard occupied-port failure must identify the listener and actionable safe next step: $($dashboardOccupied.Output)"
+    Assert-True (
+        $dashboardOccupied.Output -match "Dashboard port $occupiedDashboardPort" -and
+        $dashboardOccupied.Output -match 'PID' -and
+        $dashboardOccupied.Output -match 'Stop that' -and
+        $dashboardOccupied.Output -match 'process' -and
+        $dashboardOccupied.Output -match 'CozyGateway install state was' -and
+        $dashboardOccupied.Output -match 'changed'
+    ) "Dashboard occupied-port failure must identify the listener and actionable safe next step: $($dashboardOccupied.Output)"
+    Assert-True ($dashboardOccupied.Output -match 'COZYGATEWAY_DASHBOARD_PORT.*irm https://cozylabs\.ai/install\.ps1 \| iex') 'Dashboard conflict must print an exact one-paste environment override'
     Assert-True (-not (Test-Path -LiteralPath $dashboardHome)) 'Dashboard port preflight must precede install-root, token, state, env, config, plugin, and runtime mutation'
     Assert-True (-not (Test-Path -LiteralPath $hermesInstallerMarker)) 'initial Dashboard free/occupied inspection must run before resolving or installing Hermes'
     $dashboardEvents = @(Get-Content -LiteralPath $dashboardEventLog -ErrorAction SilentlyContinue)
@@ -387,6 +423,34 @@ try {
     foreach ($protected in @($unicodeHome, (Join-Path $unicodeHome 'bin'), (Join-Path $unicodeHome 'bin\cozygateway-windows-helper.ps1'), (Join-Path $unicodeHome 'runtime'))) {
         Assert-PrivateDacl $protected
     }
+
+    $customHermesRoot = Join-Path $temp 'Custom Hermes Root'
+    $customHermesBin = Join-Path $customHermesRoot 'bin'
+    $customHermesConfig = Join-Path $customHermesRoot 'config.yaml'
+    $customHermesLog = Join-Path $temp 'custom-hermes-events.log'
+    New-FakeHermes $customHermesBin $customHermesConfig $customHermesLog
+    $customHermesInstall = Invoke-Bootstrap $installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'HERMES_HOME' = $customHermesRoot
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Custom Hermes Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_HERMES_INSTALL_URL' = (Join-Path $temp 'must-not-run-hermes-installer.ps1')
+    }
+    Assert-True ($customHermesInstall.ExitCode -eq 0) "custom HERMES_HOME absent from PATH must be reused: $($customHermesInstall.Output)"
+    Assert-True ((Get-Content -LiteralPath $customHermesLog -Raw) -match 'hermes:status') 'custom HERMES_HOME launcher must be inspected before default installation discovery'
+
+    $envPortHome = Join-Path $temp 'Environment Port Gateway'
+    $envPort = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = $envPortHome
+        'COZYGATEWAY_PORT' = '18887'
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+    }
+    Assert-True ($envPort.ExitCode -eq 0) "COZYGATEWAY_PORT install failed: $($envPort.Output)"
+    Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match 'bash:.*--port 18887') 'one-paste COZYGATEWAY_PORT override must be forwarded to the shell installer'
 
     $unsafeHome = Join-Path $temp 'unsafe existing root'
     New-Item -ItemType Directory -Path $unsafeHome | Out-Null
@@ -435,6 +499,49 @@ try {
     Assert-True ($interactiveSetup -gt $interactiveBash) 'the original PowerShell process must invoke setup after the Bash handoff'
     Assert-True ($interactiveEvents[$interactiveSetup] -match '^setup:setup --config ' -and $interactiveEvents[$interactiveSetup] -match [regex]::Escape((Join-Path $interactiveHome 'local\cozygateway.config.json'))) 'PowerShell must invoke setup with the native config path'
     Assert-True (($interactiveEvents -join "`n") -notmatch 'setup:pair') 'PowerShell must never fall back to unconditional pair'
+
+    $pathFailureHome = Join-Path $temp 'PATH Failure Gateway'
+    $pathFailureBin = Join-Path $pathFailureHome 'bin'
+    $pathFailureLog = Join-Path $temp 'path-failure-events.log'
+    $pathFailureTarget = Join-Path $temp 'path-write-target-is-directory'
+    New-Item -ItemType Directory -Force -Path $pathFailureBin, $pathFailureTarget | Out-Null
+    [void](New-OwnershipFixture $pathFailureHome -Phase 'pre-network')
+    Write-Utf8NoBom (Join-Path $pathFailureBin 'cozygateway.cmd') "@echo off`necho setup:%*>>`"$pathFailureLog`"`nexit /b 0`n"
+    $pathFailure = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = $pathFailureHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_INTERACTIVE' = '1'
+        'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $pathFailureTarget
+    }
+    Assert-True ($pathFailure.ExitCode -eq 0) "user PATH persistence failure must not abort setup: $($pathFailure.Output)"
+    Assert-True ($pathFailure.Output -match 'could not update the user PATH.*absolute command') 'PATH failure must print a bounded actionable warning'
+    Assert-True ((Get-Content -LiteralPath $pathFailureLog -Raw) -match '^setup:setup ') 'phone setup must continue after user PATH persistence fails'
+
+    $interruptedHome = Join-Path $temp 'Interrupted Pre-Network Install'
+    $interruptedBin = Join-Path $interruptedHome 'bin'
+    $interruptedLocal = Join-Path $interruptedHome 'local'
+    New-Item -ItemType Directory -Force -Path $interruptedBin, $interruptedLocal | Out-Null
+    [void](New-OwnershipFixture $interruptedHome -Phase 'pre-network')
+    Write-Utf8NoBom (Join-Path $interruptedBin 'cozygateway.mjs') 'partial bundle'
+    Write-Utf8NoBom (Join-Path $interruptedLocal 'operator-control.token') ('B' * 43)
+    $interruptedProcesses = Join-Path $temp 'interrupted-processes.json'
+    Write-Utf8NoBom $interruptedProcesses '[]'
+    $interruptedUninstall = Invoke-Bootstrap $installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = (Join-Path $temp 'interrupted-appdata')
+        'LOCALAPPDATA' = (Join-Path $temp 'interrupted-localappdata')
+        'COZYGATEWAY_HOME' = $interruptedHome
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$interruptedBin"
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = (Join-Path $temp 'interrupted-path.log')
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = (Join-Path $temp 'interrupted-native.log')
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $interruptedProcesses
+    } @('--uninstall')
+    Assert-True ($interruptedUninstall.ExitCode -eq 0) "protected pre-network partial install must be allowlist-uninstallable: $($interruptedUninstall.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $interruptedHome)) 'pre-network teardown must remove the empty owned root without requiring a nonexistent authority locator'
 
     $shellOnlyHome = Join-Path $temp 'shell cleanup without network database'
     $shellOnlyBin = Join-Path $shellOnlyHome 'bin'
@@ -680,6 +787,7 @@ Copy-Item -LiteralPath '$preparedHermes' -Destination '$missingHermes' -Force
     $missing = Invoke-Bootstrap $installer @{
         'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
         'LOCALAPPDATA' = $missingRoot
+        'HERMES_HOME' = (Join-Path $missingRoot 'hermes')
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
         'COZYGATEWAY_HOME' = (Join-Path $temp 'Fresh Cozy Gateway')
         'COZYGATEWAY_GIT_BASH' = $fakeBash

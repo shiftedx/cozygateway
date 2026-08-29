@@ -165,6 +165,14 @@ if (args[0] === 'pair') {
   process.stdout.write('Gateway URL: ' + gatewayUrl + '\n');
   process.stdout.write('Setup code:  TEST-CODE\n');
 }
+if (args[0] === 'unicode-launcher-test') {
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(process.env.COZYGATEWAY_TEST_UNICODE_CMD_MARKER, process.argv[1] + '\n');
+}
+if ((args.length === 0 || args[0] === 'serve') && process.env.COZYGATEWAY_TEST_UNICODE_VBS_MARKER) {
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(process.env.COZYGATEWAY_TEST_UNICODE_VBS_MARKER, process.argv[1] + '\n');
+}
 BUNDLE
 
 # The curl bootstrap still verifies all release assets in dry-run mode, but it
@@ -798,6 +806,7 @@ fi
 if grep -Fq '/Create ' "$dashboard_occupied_log"; then echo 'Dashboard-port preflight registered a Scheduled Task' >&2; exit 1; fi
 
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE='C:\fixture\operator-control.token' COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
+powershell_native="$(cygpath -u "$SYSTEMROOT")/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 # Git Bash never owns Windows network onboarding, even when it has prompt input.
 printf 'maybe\ny\n' > "$tmp/windows-lan-answer"
@@ -812,14 +821,42 @@ grep -Fq 'return to the original PowerShell installer for phone access setup' <<
 grep -Fq '"onboardingControlTokenFile": "C:\\fixture\\operator-control.token"' "$tmp/gateway-windows-live/local/cozygateway.config.json"
 test -f "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'gateway.mjs' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq '%~dp0' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+if grep -Fq "$tmp/gateway-windows-live" "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
+  echo 'Windows command shim must be ASCII and location-relative' >&2
+  exit 1
+fi
 if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   echo 'Windows command shim must allow an explicit --config override' >&2
   exit 1
 fi
-grep -Fq 'shell.Run command, 0, False' "$tmp/gateway-windows-live/local/run-gateway.vbs"
-grep -Fq 'command = """' "$tmp/gateway-windows-live/local/run-gateway.vbs"
+COZYGATEWAY_TEST_VBS="$(cygpath -w "$tmp/gateway-windows-live/local/run-gateway.vbs")" "$powershell_native" -NoProfile -NonInteractive -Command '$bytes=[IO.File]::ReadAllBytes($env:COZYGATEWAY_TEST_VBS); if($bytes.Length -lt 2 -or $bytes[0] -ne 0xff -or $bytes[1] -ne 0xfe){exit 2}; $text=[IO.File]::ReadAllText($env:COZYGATEWAY_TEST_VBS,[Text.Encoding]::Unicode); if($text -notmatch "shell.Run command, 0, False" -or $text -notmatch "command = `"`"`""){exit 3}' </dev/null
 grep -Eq '^COZYGATEWAY_SPOOL_PATH=[A-Za-z]:\\' "$tmp/hermes/.env"
-file "$tmp/gateway-windows-live/local/run-gateway.vbs" | grep -Fq 'CRLF'
+
+unicode_launcher_root="$tmp/Gateway ü 你好"
+unicode_launcher_log="$tmp/windows-unicode-launcher-commands"
+unicode_git_bash="$(/usr/bin/cygpath -w "$(command -v bash)")"
+mkdir -p "$unicode_launcher_root/bin"
+cp "$tmp/gateway.mjs" "$unicode_launcher_root/bin/cozygateway.mjs"
+HOME="$tmp/windows-unicode-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:/usr/bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-unicode-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$unicode_launcher_log" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-unicode-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$real_node" COZYGATEWAY_GIT_BASH="$unicode_git_bash" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$unicode_launcher_root/bin/cozygateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$unicode_launcher_root" >/dev/null
+unicode_cmd_marker="$tmp/windows-unicode-cmd.marker"
+COZYGATEWAY_TEST_UNICODE_CMD_MARKER="$(cygpath -w "$unicode_cmd_marker")" COZYGATEWAY_TEST_UNICODE_CMD="\"$(cygpath -w "$unicode_launcher_root/bin/cozygateway.cmd")\"" MSYS_NO_PATHCONV=1 cmd.exe /d /s /c 'call %COZYGATEWAY_TEST_UNICODE_CMD% unicode-launcher-test'
+test -f "$unicode_cmd_marker"
+unicode_vbs_marker="$tmp/windows-unicode-vbs.marker"
+cat > "$unicode_launcher_root/local/run-gateway.sh" <<'UNICODE_WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${COZYGATEWAY_TEST_UNICODE_VBS_MARKER:?}"
+printf 'started\n' > "$COZYGATEWAY_TEST_UNICODE_VBS_MARKER"
+UNICODE_WRAPPER
+chmod 700 "$unicode_launcher_root/local/run-gateway.sh"
+COZYGATEWAY_TEST_UNICODE_VBS_MARKER="$unicode_vbs_marker" COZYGATEWAY_TEST_VBS="$(cygpath -w "$unicode_launcher_root/local/run-gateway.vbs")" "$powershell_native" -NoProfile -NonInteractive -Command '$bytes=[IO.File]::ReadAllBytes($env:COZYGATEWAY_TEST_VBS); if($bytes[0] -ne 0xff -or $bytes[1] -ne 0xfe){exit 2}; & "$env:SystemRoot\System32\cscript.exe" //nologo $env:COZYGATEWAY_TEST_VBS; exit $LASTEXITCODE' </dev/null
+for _ in {1..150}; do [ -f "$unicode_vbs_marker" ] && break; sleep 0.1; done
+test -f "$unicode_vbs_marker"
+rm -f "$unicode_vbs_marker"
+COZYGATEWAY_TEST_UNICODE_VBS_MARKER="$unicode_vbs_marker" COZYGATEWAY_TEST_VBS="$(cygpath -w "$unicode_launcher_root/local/run-gateway.vbs")" "$powershell_native" -NoProfile -NonInteractive -Command '& "$env:SystemRoot\System32\wscript.exe" $env:COZYGATEWAY_TEST_VBS; exit $LASTEXITCODE' </dev/null
+for _ in {1..150}; do [ -f "$unicode_vbs_marker" ] && break; sleep 0.1; done
+test -f "$unicode_vbs_marker"
 # A native Windows Hermes child must receive a native HERMES_HOME. Git Bash's
 # /c/... form points native Hermes at the wrong root and makes credential login
 # fail after launch.
