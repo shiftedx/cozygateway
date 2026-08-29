@@ -252,3 +252,142 @@ working-copy LF-to-CRLF warning.
   UAC-approved end-to-end run on the target host remains the acceptance
   boundary; launch failure continues to fail closed with manual recovery
   instructions.
+
+## Task 2 clarified re-review fixes
+
+This section supersedes the rejected two-stage `-UseNewEnvironment` design and
+its validation boundary above.
+
+### Clarified design implemented
+
+- Removed the generated `dashboard-owner-runas.ps1` stage and every use of
+  `-UseNewEnvironment`.
+- The already-loaded non-elevated wrapper captures the absolute Windows
+  PowerShell executable path from `$PSHOME` before changing its environment.
+- It snapshots every Process-scope environment entry, removes every current
+  entry, and restores only the documented launch allowlist: `SystemRoot`,
+  `WINDIR`, `COMSPEC`, `TEMP`, and `TMP`. It does not preserve `PATH` or read
+  User/Machine-scope environment blocks.
+- It makes exactly one `Start-Process` call using the captured full executable
+  path with `-Verb RunAs -Wait -PassThru` and the existing explicit non-secret
+  helper arguments.
+- A `finally` block clears the temporary launch block and restores the exact
+  original Process environment after child success, child failure, or launch
+  exception. Restoration uses the already-loaded .NET Framework internal
+  Win32 environment setter so an originally present empty-valued entry remains
+  present rather than being converted into a missing entry by
+  `Environment.SetEnvironmentVariable`.
+- Launch/loader exceptions and UAC cancellation map to helper exit `46` and the
+  existing manual-recovery path. The elevation-helper writer retains its
+  internal Windows guard, and `main` invokes it only on Windows.
+
+### Clarified re-review RED evidence
+
+The new regression was first run against commit `72a7657`, before changing the
+two-stage implementation:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
+```
+
+Exit `1`:
+
+```text
+ASSERT: shared installer must not generate a second PowerShell elevation stage
+```
+
+This demonstrates that the regression rejects the prior
+`-UseNewEnvironment`/second-wrapper implementation.
+
+### Clarified re-review GREEN evidence
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
+```
+
+Exit `0`:
+
+```text
+windows bootstrap tests passed
+```
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1
+```
+
+Exit `0`:
+
+```text
+windows dashboard ownership tests passed
+```
+
+The default `bash` command on this Windows host routes through an unavailable
+WSL `/bin/bash` and exited `1` with `execvpe(/bin/bash) failed`. The required
+syntax check was therefore run with the installed native Git Bash executable:
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' -n scripts/agent-install.sh
+```
+
+Exit `0`, no output.
+
+```powershell
+git diff --check
+```
+
+Exit `0`; Git emitted only LF-to-CRLF working-copy warnings and reported no
+whitespace errors.
+
+### Regression coverage and secret hygiene
+
+- The harness places `DASHBOARD_SESSION_TOKEN`, `PROVIDER_API_KEY`, and the
+  unrelated `TASK2_REVIEW_ARBITRARY_SECRET` sentinel in Process scope.
+- Under the same sanitized block captured at the production `RunAs` boundary,
+  the test double launches the exact full-path `powershell.exe` without UAC.
+  That real Windows PowerShell process loads successfully, binds root, Hermes,
+  launcher, helper, port, and `-ElevatedChild` correctly despite spaces and
+  apostrophes, receives no extra arguments, and sees none of the three
+  sentinels.
+- Fixture controls are embedded in generated scripts or passed through files
+  and arguments; none depend on inherited environment values.
+- The old compiled environment-probe substitution was removed. The generated
+  owner-helper fixture itself runs in the real PowerShell child and records its
+  bindings and environment.
+- Static assertions require production to enumerate and clear all current
+  Process entries, reject a known-secret denylist, reject User/Machine
+  environment reads, reject `UseNewEnvironment`, and retain the Windows-only
+  guard. No persistent User/Machine environment was mutated by the tests.
+- Captures prove exactly one `Start-Process` call, the full executable path,
+  `RunAs`/`Wait`/`PassThru`, the documented allowlist only, and explicit
+  non-secret arguments.
+- Full before/after Process-environment snapshots prove exact restoration after
+  success, each propagated helper result (`42`, `43`, `45`, and `99`), and a
+  simulated launch exception that maps to `46`.
+
+### Clarified re-review self-review
+
+- Rechecked the final diff against every clarified finding and the original
+  Task 2 scope. Only `scripts/agent-install.sh`,
+  `scripts/test/windows-bootstrap.test.ps1`, and this report changed.
+- Confirmed there is no generated second-stage helper, no
+  `UseNewEnvironment`, no retained `PATH`, and no User/Machine environment
+  reconstruction.
+- Confirmed the wrapper is already loaded before sanitization and invokes one
+  full-path Windows PowerShell process at the UAC boundary.
+- Confirmed all required paths remain explicit arguments and pass Windows
+  PowerShell 5.1 quoting tests with spaces and apostrophes.
+- Confirmed all Process variables are removed generically, sentinel secrets
+  are absent inside the actual child, and the wrapper's exact environment is
+  restored in `finally` on success and exception.
+- Confirmed helper exit propagation, launch-exception mapping to `46`, Bash
+  syntax, both Windows suites, diff hygiene, and no release-version edits.
+- No Critical, Important, or minor correctness findings remain.
+
+### Clarified re-review concern
+
+The deterministic regression exercises the exact production sanitization and a
+real full-path Windows PowerShell 5.1 child, but substitutes the UAC operation
+itself to avoid an interactive elevation prompt. A real approved UAC launch
+against a higher-integrity stale Dashboard remains the host acceptance boundary.
+
+Clarified re-review implementation commit: `4c2c99a`.
