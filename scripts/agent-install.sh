@@ -748,11 +748,13 @@ const { parseEnv } = require('node:util');
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 async function stopOwnedDashboard(child, dashboardPort, hermesRoot, hermes, launcher, ownerHelper) {
   if (process.platform === 'win32') {
-    const taskkill = (process.env.SystemRoot || process.env.WINDIR) + '\\System32\\taskkill.exe';
-    const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-    await new Promise((resolve) => { killer.once('error', resolve); killer.once('exit', resolve); });
-    if (child.exitCode === null) child.kill();
-    await wait(100);
+    if (child.exitCode === null && child.signalCode === null) {
+      const taskkill = (process.env.SystemRoot || process.env.WINDIR) + '\\System32\\taskkill.exe';
+      const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      await new Promise((resolve) => { killer.once('error', resolve); killer.once('exit', resolve); });
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await wait(100);
+    }
     const cleanupPort = Number(dashboardPort);
     if (!Number.isInteger(cleanupPort) || cleanupPort < 1 || cleanupPort > 65535) throw new Error('invalid Hermes Dashboard cleanup port');
     const listenerCleanup = spawn('powershell.exe', [

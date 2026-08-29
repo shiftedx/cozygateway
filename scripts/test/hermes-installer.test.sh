@@ -540,10 +540,18 @@ server.listen(Number(args[portAt + 1]), '127.0.0.1', () => writeFileSync(process
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 OWNED_DASHBOARD
 cat > "$tmp/hermes-stub.cjs" <<'HERMES_STUB'
-const { readFileSync, writeFileSync } = require('node:fs');
-const { spawn } = require('node:child_process');
+const { appendFileSync, readFileSync, writeFileSync } = require('node:fs');
+const childProcess = require('node:child_process');
 const { basename, resolve } = require('node:path');
 const { parseEnv } = require('node:util');
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  if (process.env.COZYGATEWAY_TEST_TASKKILL_LOG && args?.[0] === '/PID') {
+    appendFileSync(process.env.COZYGATEWAY_TEST_TASKKILL_LOG, `${JSON.stringify(args)}\n`);
+  }
+  return originalSpawn.call(this, command, args, options);
+};
+const { spawn } = childProcess;
 const hermesArgs = [basename(process.argv[1] || ''), ...process.argv.slice(2)];
 if (hermesArgs[0] === 'dashboard') {
   const expectedArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
@@ -587,6 +595,7 @@ case "$(uname -s)" in
     hermes_stub_arg="$(cygpath -w "$hermes_stub")"
     expected_launcher="$(cygpath -w "$tmp/hermes/bin/hermes.exe")"
     owner_helper="$(cygpath -w "$tmp/gateway-live/local/dashboard-owner.ps1")"
+    taskkill_log="$(cygpath -w "$tmp/supervisor-taskkill.log")"
     ;;
   *)
     reload_log="$tmp/reload.log"
@@ -602,6 +611,7 @@ case "$(uname -s)" in
     hermes_stub_arg="$hermes_stub"
     expected_launcher="$tmp/hermes/bin/hermes.exe"
     owner_helper="$tmp/gateway-live/local/dashboard-owner.ps1"
+    taskkill_log="$tmp/supervisor-taskkill.log"
     ;;
 esac
 NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" \
@@ -695,15 +705,17 @@ foreign_dashboard_pid=
 # readiness. Rejection must stop its detached process tree before the
 # supervisor exits; the successful cold start above remains detached.
 failed_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
-rm -f "$tmp/mock-dashboard.pid"
+rm -f "$tmp/mock-dashboard.pid" "$tmp/supervisor-taskkill.log"
 set +e
 failed_supervisor_status=0
-(trap - ERR; NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_DASHBOARD_REJECT=1 COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" \
+(trap - ERR; NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_DASHBOARD_READY_DELAY_MS=1000 \
+  COZYGATEWAY_TEST_DASHBOARD_REJECT=1 COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" \
   COZYGATEWAY_TEST_DASHBOARD_RUNTIME="$dashboard_runtime" \
   COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" \
   COZYGATEWAY_TEST_DASHBOARD_SCRIPT="$dashboard_script" COZYGATEWAY_TEST_DASHBOARD_PID_FILE="$dashboard_pid_file" \
   COZYGATEWAY_TEST_DASHBOARD_PORT="$failed_dashboard_port" COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" \
   COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
+  COZYGATEWAY_TEST_TASKKILL_LOG="$taskkill_log" \
   "$real_node" "$tmp/supervisor.cjs" \
   "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
   "$hermes_stub_arg" "$expected_launcher" "$owner_helper" "$failed_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
@@ -729,6 +741,10 @@ for _ in $(seq 1 50); do
 done
 if "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$failed_dashboard_pid"; then
   echo 'failed authenticated readiness left the spawned Dashboard running' >&2
+  exit 1
+fi
+if [ -s "$tmp/supervisor-taskkill.log" ]; then
+  echo 'exited Hermes launcher PID was passed to taskkill' >&2
   exit 1
 fi
 failed_dashboard_pid=
