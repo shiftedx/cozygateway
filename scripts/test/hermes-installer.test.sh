@@ -557,9 +557,11 @@ if (hermesArgs[0] === 'dashboard') {
   const expectedArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
   const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
   const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
+  const windowsLauncher = process.platform === 'win32';
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
     args: hermesArgs,
     launcherPid: process.pid,
+    launcherMode: windowsLauncher ? 'exited-descendant' : 'live-process-group',
     tokenMatches: process.env.HERMES_DASHBOARD_SESSION_TOKEN === expectedToken,
     homeMatches,
   }) + '\n');
@@ -567,11 +569,16 @@ if (hermesArgs[0] === 'dashboard') {
   if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
   if (!homeMatches) process.exit(43);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
-  spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, [
+  const dashboardChild = spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, [
     process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
     'dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build',
-  ], { detached: true, stdio: 'ignore', env: process.env }).unref();
-  process.exit(0);
+  ], { detached: windowsLauncher, stdio: 'ignore', env: process.env });
+  if (windowsLauncher) {
+    dashboardChild.unref();
+    process.exit(0);
+  }
+  dashboardChild.once('error', () => process.exit(44));
+  dashboardChild.once('exit', (code) => process.exit(code ?? 1));
 }
 HERMES_STUB
 dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
@@ -637,6 +644,15 @@ if [ ! -s "$tmp/hermes-stub-invoked" ]; then
   exit 1
 fi
 grep -Fxq "dashboard --host 127.0.0.1 --port $mock_dashboard_port --no-open --skip-build" "$tmp/hermes-stub-invoked"
+"$real_node" - "$tmp/hermes-stub-trace" <<'NODE'
+const { readFileSync } = require('node:fs');
+const trace = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const expected = process.platform === 'win32' ? 'exited-descendant' : 'live-process-group';
+if (trace.launcherMode !== expected) {
+  console.error(`Hermes launcher fixture mode was ${String(trace.launcherMode)}; expected ${expected}`);
+  process.exit(1);
+}
+NODE
 test -s "$tmp/mock-dashboard.pid"
 mock_dashboard_pid="$(cat "$tmp/mock-dashboard.pid")"
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
