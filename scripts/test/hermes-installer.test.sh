@@ -375,7 +375,15 @@ if script --version 2>&1 | grep -qi util-linux; then
 
   # Keep a real controlling terminal present for the explicit-bind case too;
   # otherwise the no-TTY guard could hide a regression in explicit suppression.
-  pty_explicit_output="$({ sleep 1; printf 'yes\n'; } | script -qec "env HOME='$tmp/pty-explicit-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-explicit-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bind-host 127.0.0.1 --port 9000 --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty-explicit'" /dev/null)"
+  #
+  # Do not feed this one an answer. The case asserts that an explicit bind host
+  # SKIPS the prompt, so the installer never reads the terminal, `script` exits as
+  # soon as the install finishes, and the writer then takes SIGPIPE on a closed
+  # pipe. Under `pipefail` that surfaced as exit 141 and failed the whole run.
+  # It raced the install: slower machines wrote before `script` exited and passed,
+  # CI runners finished in under a second and failed every time. `script` still
+  # allocates the pty, which is the only thing this case needs from it.
+  pty_explicit_output="$(script -qec "env HOME='$tmp/pty-explicit-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-explicit-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bind-host 127.0.0.1 --port 9000 --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty-explicit'" /dev/null </dev/null)"
   grep -Fq 'CozyGateway listens on 127.0.0.1:9000' <<<"$pty_explicit_output"
   if grep -Fq 'Allow CozyChat to access this Gateway' <<<"$pty_explicit_output"; then
     echo 'an explicit bind host must skip the LAN prompt' >&2
