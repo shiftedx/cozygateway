@@ -6,7 +6,7 @@ fake_node="$repo_root/scripts/test/fake-node24.sh"
 real_node="$(command -v node)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-installer-test.XXXXXX")"
 tmp="$(cd -P "$tmp" && pwd)"
-trap 'rm -rf "$tmp"' EXIT
+trap '[ -z "${supervisor_pid:-}" ] || kill "$supervisor_pid" 2>/dev/null || true; [ -z "${mock_dashboard_pid:-}" ] || kill "$mock_dashboard_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 # Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
 # reach reads as "it stopped somewhere". Name the line and the command that failed.
 trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
@@ -49,6 +49,15 @@ if [ "$1" = model ]; then
   exit 0
 fi
 if [ "$1" = status ]; then
+  if [ -n "${COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE:-}" ] && [ ! -f "$COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE" ]; then
+    : > "$COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE"
+    printf 'Current model: \nActive provider: \n'
+    exit 0
+  fi
+  if [ "${COZYGATEWAY_TEST_MODEL_UNCONFIGURED:-}" = 1 ]; then
+    printf 'Current model: \nActive provider: \n'
+    exit 0
+  fi
   printf 'Current model: test/model\nActive provider: test-provider\n'
   exit 0
 fi
@@ -90,7 +99,7 @@ if [ "$1" = "-p" ] && [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
     exit 0
   fi
   case "$(state)" in
-    absent) printf 'Gateway is not installed\n' ;;
+    absent) printf '✗ Gateway is not running\n\nTo start:\n  hermes gateway run      # Run in foreground\n  hermes gateway install  # Install as user service\n' ;;
     stopped) printf 'Gateway is not running\n' ;;
     running) printf 'Gateway is supervised\n' ;;
   esac
@@ -250,7 +259,7 @@ chmod 700 "$tmp/service-bin/launchctl"
 
 # Declining or aborting `hermes model` stops before CozyGateway mutation and
 # never prints pairing material.
-if declined_output="$(HOME="$tmp/model-declined-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/model-declined-commands" COZYGATEWAY_TEST_MODEL_DECLINE=1 COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-model-declined" 2>&1)"; then
+if declined_output="$(HOME="$tmp/model-declined-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/model-declined-commands" COZYGATEWAY_TEST_MODEL_UNCONFIGURED=1 COZYGATEWAY_TEST_MODEL_DECLINE=1 COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-model-declined" 2>&1)"; then
   echo 'expected a declined Hermes model selection to fail' >&2
   exit 1
 fi
@@ -272,6 +281,11 @@ case "$*" in
     ;;
   *api/health*)
     if [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER" ]; then printf '000'; else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_HEALTH_CODE:-401}"; fi
+    ;;
+  *api/config*)
+    cat >/dev/null
+    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER" ]; then printf '401'
+    else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE:-200}"; fi
     ;;
   *password-login*)
     cat >/dev/null
@@ -306,7 +320,7 @@ HERMES_INSTALLER
 chmod 700 "$tmp/hermes-official-installer.sh"
 if command -v shasum >/dev/null 2>&1; then hermes_installer_sha="$(shasum -a 256 "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; else hermes_installer_sha="$(sha256sum "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; fi
 printf 'yes\n' > "$tmp/lan-yes"
-live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE="$tmp/model-status-probed" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
 test -x "$tmp/gateway-live/runtime/node/bin/node"
 grep -Fq 'installed checksum-verified Node.js' <<<"$live_output"
 grep -Fq 'Hermes Agent is not installed; starting the official installer.' <<<"$live_output"
@@ -314,6 +328,14 @@ grep -Fq 'Hermes provider and model are configured' <<<"$live_output"
 grep -Fq 'Allow CozyChat to access this Gateway over your local network? [y/N]' <<<"$live_output"
 grep -Fq 'for devices on your local network' <<<"$live_output"
 grep -q '^model$' "$tmp/commands"
+
+# A one-paste rerun with an already-configured Hermes provider/model must not
+# reopen the interactive picker. Its stdin is the curl pipe in production, so
+# invoking `hermes model` here would make the documented one-line command fail
+# even though no model choice is needed.
+configured_rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/configured-rerun-commands" COZYGATEWAY_TEST_MODEL_DECLINE=1 COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+grep -Fq 'Hermes provider and model are already configured' <<<"$configured_rerun_output"
+! grep -q '^model$' "$tmp/configured-rerun-commands"
 private_rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq "using Node.js 24 at $tmp/gateway-live/runtime/node/bin/node" <<<"$private_rerun_output"
 
@@ -346,6 +368,8 @@ grep -Fq '"setupCode":"TEST-CODE"' <<<"$live_output"
 grep -Fq "mint a fresh QR and code with: $tmp/gateway-live/bin/cozygateway pair" <<<"$live_output"
 grep -q '"profiles"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
+grep -Fq '"authMode": "token"' "$tmp/gateway-live/local/cozygateway.config.json"
+grep -Fq '"tokenEnv": "COZYGATEWAY_HERMES_TOKEN"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -Fq 'COZYGATEWAY_URL=http://127.0.0.1:8787' "$tmp/hermes/.env"
 grep -Fq 'http://127.0.0.1:8787/health' "$tmp/curl.log"
@@ -391,11 +415,12 @@ const { parseEnv } = require('node:util');
 const [dashboardPath, gatewayPath] = process.argv.slice(2);
 const dashboard = parseEnv(readFileSync(dashboardPath, 'utf8'));
 const gateway = parseEnv(readFileSync(gatewayPath, 'utf8'));
-if (dashboard.DASHBOARD_USERNAME !== 'cozygateway' ||
-    !/^[A-Za-z0-9_-]{32,128}$/.test(dashboard.DASHBOARD_PASSWORD) ||
-    gateway.COZYGATEWAY_HERMES_PASSWORD !== dashboard.DASHBOARD_PASSWORD) process.exit(1);
+if (!/^[A-Za-z0-9_-]{32,128}$/.test(dashboard.DASHBOARD_SESSION_TOKEN) ||
+    gateway.COZYGATEWAY_HERMES_TOKEN !== dashboard.DASHBOARD_SESSION_TOKEN ||
+    dashboard.DASHBOARD_USERNAME !== undefined || dashboard.DASHBOARD_PASSWORD !== undefined ||
+    gateway.COZYGATEWAY_HERMES_PASSWORD !== undefined) process.exit(1);
 NODE
-grep -q '^default:basic$' "$tmp/commands"
+! grep -q '^default:basic$' "$tmp/commands"
 grep -q '^default:gateway:install$' "$tmp/commands"
 grep -q '^ops:gateway:start$' "$tmp/commands"
 grep -q '^active:gateway:restart$' "$tmp/commands"
@@ -412,7 +437,7 @@ else
 fi
 grep -Fqx 'export PATH="$HOME/.local/bin:$PATH" # CozyGateway CLI' "$tmp/darwin-home/.profile"
 grep -Fqx 'export PATH="$HOME/.local/bin:$PATH" # CozyGateway CLI' "$tmp/darwin-home/.zprofile"
-if grep -Eq 'COZYGATEWAY_(HERMES_PASSWORD|ATTACH_TOKEN)' "$tmp/gateway-live/bin/cozygateway"; then
+if grep -Eq 'COZYGATEWAY_(HERMES_PASSWORD|HERMES_TOKEN|ATTACH_TOKEN)' "$tmp/gateway-live/bin/cozygateway"; then
   echo 'gateway CLI wrapper must not contain secrets' >&2
   exit 1
 fi
@@ -421,7 +446,12 @@ grep -Fq 'restartGateway' "$tmp/gateway-live/local/run-gateway.sh"
 remote_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/cozygateway" pair --url https://gateway.example.com)"
 grep -q '"gatewayUrl":"https://gateway.example.com"' <<<"$remote_pair"
 grep -Fq 'parseEnv(readFileSync(gatewayEnvPath' "$tmp/gateway-live/local/run-gateway.sh"
-grep -Fq '/auth/password-login' "$tmp/gateway-live/local/run-gateway.sh"
+grep -Fq 'HERMES_DASHBOARD_SESSION_TOKEN' "$tmp/gateway-live/local/run-gateway.sh"
+grep -Fq "'x-hermes-session-token'" "$tmp/gateway-live/local/run-gateway.sh"
+if grep -Fq '/auth/password-login' "$tmp/gateway-live/local/run-gateway.sh"; then
+  echo 'loopback Dashboard wrapper must use Hermes session-token auth, not password auth' >&2
+  exit 1
+fi
 grep -Fq 'spawn(process.execPath, [bundle' "$tmp/gateway-live/local/run-gateway.sh"
 sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' | "$real_node" --check -
 if grep -Fq '. "' "$tmp/gateway-live/local/run-gateway.sh"; then
@@ -441,17 +471,37 @@ appendFileSync(process.env.COZYGATEWAY_TEST_RELOAD_LOG, `${process.pid}:${config
 process.on('SIGTERM', () => process.exit(0));
 setTimeout(() => process.exit(0), 5000);
 RELOAD_GATEWAY
+cat > "$tmp/mock-dashboard.mjs" <<'MOCK_DASHBOARD'
+import { writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+const server = createServer((request, response) => {
+  const authenticated = request.url === '/api/config' && request.headers['x-hermes-session-token'];
+  response.writeHead(authenticated ? 200 : 401, { 'content-type': 'application/json' });
+  response.end(authenticated ? '{}\n' : '{"detail":"unauthorized"}\n');
+});
+server.listen(0, '127.0.0.1', () => writeFileSync(process.argv[2], String(server.address().port)));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+MOCK_DASHBOARD
+"$real_node" "$tmp/mock-dashboard.mjs" "$tmp/mock-dashboard.port" >"$tmp/mock-dashboard.log" 2>&1 &
+mock_dashboard_pid=$!
+for _ in $(seq 1 50); do [ -s "$tmp/mock-dashboard.port" ] && break; sleep 0.1; done
+test -s "$tmp/mock-dashboard.port"
+mock_dashboard_port="$(cat "$tmp/mock-dashboard.port")"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) reload_log="$(cygpath -w "$tmp/reload.log")"; spawnable_hermes="$(command -v cmd.exe)" ;;
   *) reload_log="$tmp/reload.log"; spawnable_hermes="$(command -v true)" ;;
 esac
 COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" "$real_node" "$tmp/supervisor.cjs" \
   "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
-  "$spawnable_hermes" 19119 "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  "$spawnable_hermes" "$mock_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
   >"$tmp/supervisor.log" 2>&1 &
 supervisor_pid=$!
 for _ in $(seq 1 50); do [ -s "$tmp/reload.log" ] && break; sleep 0.1; done
-test -s "$tmp/reload.log"
+if [ ! -s "$tmp/reload.log" ]; then
+  printf '%s\n' 'generated supervisor did not launch its gateway child' >&2
+  cat "$tmp/supervisor.log" >&2
+  exit 1
+fi
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
 const { readFileSync, renameSync, writeFileSync } = require('node:fs');
 const path = process.argv[2];
@@ -464,6 +514,10 @@ NODE
 for _ in $(seq 1 50); do [ "$(wc -l < "$tmp/reload.log")" -ge 2 ] && break; sleep 0.1; done
 kill "$supervisor_pid" 2>/dev/null || true
 wait "$supervisor_pid" 2>/dev/null || true
+supervisor_pid=
+kill "$mock_dashboard_pid" 2>/dev/null || true
+wait "$mock_dashboard_pid" 2>/dev/null || true
+mock_dashboard_pid=
 test "$(wc -l < "$tmp/reload.log")" -ge 2
 sed -n '1p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8787$'
 sed -n '2p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8998$'
@@ -545,7 +599,7 @@ if [[ "$*" == *attach-v1.sqlite* ]] && [ -f "${COZYGATEWAY_TEST_LOCKED_SPOOL_MAR
   printf 'Device or resource busy\n' >&2
   exit 1
 fi
-exec /usr/bin/rm "$@"
+exec /bin/rm "$@"
 LOCKED_RM
 chmod 700 "$tmp/locked-spool-bin/rm"
 mkdir -p "$tmp/hermes/profiles/locked-nonwindows/plugins/cozygateway" "$tmp/hermes/profiles/locked-nonwindows/plugin-data/cozygateway" "$tmp/gateway-nonwindows-locked/local"
@@ -730,29 +784,26 @@ expected_windows_hermes_home="$("$tmp/bin/cygpath" -w "$tmp/hermes")"
 COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_home_log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_stopped_marker" HOME="$tmp/windows-native-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-native-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-native-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-native-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-native" >/dev/null
 grep -Fxq "$expected_windows_hermes_home" "$dashboard_home_log"
 
-# Hermes releases before the upstream alias fix can report success from
-# `plugins enable basic` while a legacy deny-list entry still prevents the
-# provider from loading. Repair only those aliases and preserve every other
-# disabled plugin.
+# Loopback session-token auth is built into Hermes and must not mutate the
+# operator's dashboard-auth plugin allow/deny configuration.
 dashboard_stale_disabled_marker="$tmp/windows-dashboard-stale-disabled-stopped"
 dashboard_disabled_plugins="$tmp/windows-dashboard-disabled-plugins.json"
 : > "$dashboard_stale_disabled_marker"
 printf '["basic","dashboard_auth/basic","keep-disabled"]\n' > "$dashboard_disabled_plugins"
 COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$tmp/windows-dashboard-stale-disabled-home.log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_stale_disabled_marker" COZYGATEWAY_TEST_DISABLED_PLUGINS_FILE="$dashboard_disabled_plugins" HOME="$tmp/windows-stale-disabled-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-stale-disabled-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-stale-disabled-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-stale-disabled-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-stale-disabled" >/dev/null
-grep -Fxq '["keep-disabled"]' "$dashboard_disabled_plugins"
+grep -Fxq '["basic","dashboard_auth/basic","keep-disabled"]' "$dashboard_disabled_plugins"
 
-# Once a newly launched Dashboard is healthy, a missing password provider is
-# configuration/version failure, not a reason to hammer the login endpoint and
-# eventually misreport a generic credential timeout.
+# A newly launched Dashboard must accept the exact loopback session token the
+# installer supplied; a healthy public endpoint alone is not enough.
 dashboard_missing_provider_marker="$tmp/windows-dashboard-missing-provider-stopped"
 dashboard_missing_provider_auth_marker="$tmp/windows-dashboard-missing-provider-auth"
 : > "$dashboard_missing_provider_marker"
 : > "$dashboard_missing_provider_auth_marker"
-if dashboard_missing_provider_output="$(COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$tmp/windows-dashboard-missing-provider-home.log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_missing_provider_marker" COZYGATEWAY_TEST_DASHBOARD_MISSING_PROVIDER_MARKER="$dashboard_missing_provider_auth_marker" HOME="$tmp/windows-missing-provider-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-missing-provider-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-missing-provider-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-missing-provider-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-missing-provider" 2>&1)"; then
-  echo 'expected missing Dashboard basic auth provider to fail' >&2
+if dashboard_missing_provider_output="$(COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$tmp/windows-dashboard-missing-provider-home.log" COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$dashboard_missing_provider_marker" COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 HOME="$tmp/windows-missing-provider-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-missing-provider-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-missing-provider-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-missing-provider-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-missing-provider" 2>&1)"; then
+  echo 'expected rejected Dashboard session token to fail' >&2
   exit 1
 fi
-expect_contains "$dashboard_missing_provider_output" 'basic auth provider is unavailable (HTTP 404)'
+expect_contains "$dashboard_missing_provider_output" 'rejected the installer-owned local session token (HTTP 401)'
 # A rerun stops only the validated listener and starts the newly installed bundle.
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live"
 grep -Fq 'powershell -NoProfile -NonInteractive -Command' "$tmp/windows-commands"
@@ -809,7 +860,7 @@ test ! -e "$tmp/gateway-windows-fallback"
 
 # A listener alone is not sufficient: an existing Dashboard that rejects the
 # credential must be stopped/restarted or fail loudly, never silently accepted.
-if wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_LOGIN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"; then
+if wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"; then
   echo 'expected wrong Dashboard credential to fail' >&2
   exit 1
 fi

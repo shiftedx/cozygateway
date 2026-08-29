@@ -340,7 +340,13 @@ install_hermes() {
 }
 confirm_hermes_model() {
   local status
-  if [ "$DRY_RUN" = 1 ]; then say "DRY   open hermes model, then verify its active provider and model"; return; fi
+  if [ "$DRY_RUN" = 1 ]; then say "DRY   verify the active Hermes provider and model; open hermes model only when either is missing"; return; fi
+  status="$("$HERMES_RESOLVED" status 2>&1 || true)"
+  if printf '%s\n' "$status" | grep -Eq '^[[:space:]]*(Current model|Model):[[:space:]]*[^[:space:]]' &&
+     printf '%s\n' "$status" | grep -Eq '^[[:space:]]*(Active provider|Provider):[[:space:]]*[^[:space:]]'; then
+    say "OK    Hermes provider and model are already configured"
+    return
+  fi
   say "INFO  Choose or confirm the Hermes inference provider and model."
   "$HERMES_RESOLVED" model || die "Hermes model selection did not complete successfully"
   status="$("$HERMES_RESOLVED" status 2>&1)" || die "Hermes needs an active provider and model before CozyGateway can be installed"
@@ -434,7 +440,7 @@ gateway_state() {
   local status
   status="$($HERMES_BIN -p "$1" gateway status 2>&1 || true)"
   case "$status" in
-    *"not installed"*|*"not configured"*|*"No gateway service"*|*"Gateway service not found"*) printf 'absent' ;;
+    *"not installed"*|*"not configured"*|*"No gateway service"*|*"Gateway service not found"*|*"hermes gateway install"*) printf 'absent' ;;
     *"Gateway is not running"*|*"Gateway is stopped"*|*"Gateway is inactive"*|*"No gateway process detected"*) printf 'stopped' ;;
     *"Gateway is supervised"*|*"Gateway is running"*|*"Gateway is active"*|*"Gateway process running"*) printf 'running' ;;
     *) die "could not determine Hermes gateway service state for profile $1: $status" ;;
@@ -463,27 +469,27 @@ write_gateway_config() {
   umask 077; printf '{' > "$map"
   for p in "${SELECTED[@]}"; do env_name="$(token_env_name "$p")"; printf '%s\n' "$comma\"$p\":{\"tokenEnv\":\"$env_name\"}" >> "$map"; comma=,; done
   printf '}\n' >> "$map"
-  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$DASHBOARD_USER" "$PUBLIC_URL" <<'NODE'
+  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$PUBLIC_URL" <<'NODE'
 const fs = require('node:fs');
-const [mapPath, output, host, port, dbPath, dashboardPort, dashboardUser, publicUrl] = process.argv.slice(2);
+const [mapPath, output, host, port, dbPath, dashboardPort, publicUrl] = process.argv.slice(2);
 const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
-const baseUrl = `http://127.0.0.1:${dashboardPort}`;
 fs.writeFileSync(output, JSON.stringify({
   name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
-  hermes: { url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'password', username: dashboardUser, passwordEnv: 'COZYGATEWAY_HERMES_PASSWORD', baseUrl, profile: 'default', profiles },
+  hermes: { url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles },
 }, null, 2) + '\n', { mode: 0o600 });
 NODE
   chmod 600 "$CONFIG_JSON" "$map"
 }
 prepare_dashboard_credential() {
-  DASHBOARD_USER=cozygateway
-  DASHBOARD_PASSWORD="$(env_get "$DASHBOARD_ENV" DASHBOARD_PASSWORD)"
-  safe_secret "$DASHBOARD_PASSWORD" || DASHBOARD_PASSWORD="$(new_token)"
+  DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
+  # v0.3.7 called the same installer-owned random value a password. Reuse it on upgrade so a
+  # running Dashboard and CozyGateway can switch auth modes without needless credential churn.
+  [ -n "$DASHBOARD_SESSION_TOKEN" ] || DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_PASSWORD)"
+  safe_secret "$DASHBOARD_SESSION_TOKEN" || DASHBOARD_SESSION_TOKEN="$(new_token)"
   [ "$DRY_RUN" = 1 ] && { say "DRY   reuse or mint local Hermes Dashboard credential in $DASHBOARD_ENV (value redacted)"; return; }
   umask 077
   : > "$DASHBOARD_ENV"
-  env_write "$DASHBOARD_ENV" DASHBOARD_USERNAME "$DASHBOARD_USER"
-  env_write "$DASHBOARD_ENV" DASHBOARD_PASSWORD "$DASHBOARD_PASSWORD"
+  env_write "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN "$DASHBOARD_SESSION_TOKEN"
   chmod 600 "$DASHBOARD_ENV"
 }
 write_gateway_env() {
@@ -491,7 +497,7 @@ write_gateway_env() {
   prepare_dashboard_credential
   [ "$DRY_RUN" = 1 ] && { say "DRY   write gateway token environment at $GATEWAY_ENV (values redacted)"; return; }
   umask 077; : > "$GATEWAY_ENV"
-  env_write "$GATEWAY_ENV" COZYGATEWAY_HERMES_PASSWORD "$DASHBOARD_PASSWORD"
+  env_write "$GATEWAY_ENV" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
   for p in "${SELECTED[@]}"; do
     profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; safe_secret "$token" || token="$(new_token)"; env_name="$(token_env_name "$p")"
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
@@ -669,21 +675,18 @@ const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
 const dashboardEnv = {
   ...process.env,
   HERMES_HOME: hermesRoot,
-  HERMES_DASHBOARD_BASIC_AUTH_USERNAME: dashboard.DASHBOARD_USERNAME,
-  HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: dashboard.DASHBOARD_PASSWORD,
+  HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN,
 };
 const health = await fetch('http://127.0.0.1:' + dashboardPort + '/api/health', { signal: AbortSignal.timeout(2000) })
   .then((response) => response.status === 200 || response.status === 401)
   .catch(() => false);
 if (!health) spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'], { detached: true, stdio: 'ignore', env: dashboardEnv }).unref();
 if (health) {
-  const login = await fetch('http://127.0.0.1:' + dashboardPort + '/auth/password-login', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ provider: 'basic', username: dashboard.DASHBOARD_USERNAME, password: dashboard.DASHBOARD_PASSWORD }),
+  const probe = await fetch('http://127.0.0.1:' + dashboardPort + '/api/config', {
+    headers: { 'x-hermes-session-token': dashboard.DASHBOARD_SESSION_TOKEN },
     signal: AbortSignal.timeout(5000),
   }).catch(() => undefined);
-  if (login?.status !== 200) throw new Error('Hermes Dashboard rejected the configured local credential');
+  if (probe?.status !== 200) throw new Error('Hermes Dashboard rejected the configured local session token');
 }
 let child;
 let restarting = false;
@@ -871,57 +874,13 @@ dashboard_ready() {
 dashboard_credentials_status() {
   local code
   code="$(
-    DASHBOARD_USERNAME="$DASHBOARD_USER" DASHBOARD_PASSWORD="$DASHBOARD_PASSWORD" "$NODE_RESOLVED" -e 'process.stdout.write(JSON.stringify({provider:"basic", username:process.env.DASHBOARD_USERNAME, password:process.env.DASHBOARD_PASSWORD}))' |
-      curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "http://127.0.0.1:$DASHBOARD_PORT/auth/password-login" -H 'content-type: application/json' --data-binary @- 2>/dev/null || true
+    printf 'X-Hermes-Session-Token: %s\n' "$DASHBOARD_SESSION_TOKEN" |
+      curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$DASHBOARD_PORT/api/config" -H @- 2>/dev/null || true
   )"
   printf '%s' "$code"
 }
 dashboard_credentials_work() {
   [ "$(dashboard_credentials_status)" = 200 ]
-}
-enable_dashboard_basic_plugin() {
-  [ "$DRY_RUN" = 1 ] && { say "DRY   enable bundled Hermes dashboard_auth/basic for the root Dashboard profile"; return; }
-  "$HERMES_RESOLVED" -p default plugins enable basic --no-allow-tool-override >/dev/null
-  local disabled repair_plan expected actual code index
-  disabled="$("$HERMES_RESOLVED" -p default config get plugins.disabled --json 2>/dev/null)" || return
-  set +e
-  repair_plan="$(printf '%s' "$disabled" | "$NODE_RESOLVED" -e '
-let input = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => { input += chunk; });
-process.stdin.on("end", () => {
-  let disabled;
-  try { disabled = JSON.parse(input); } catch { process.exit(2); }
-  if (!Array.isArray(disabled) || disabled.some((name) => typeof name !== "string")) process.exit(2);
-  const blocked = new Set(["basic", "dashboard_auth/basic"]);
-  const indices = disabled.flatMap((name, index) => blocked.has(name) ? [index] : []).reverse();
-  if (indices.length === 0) process.exit(3);
-  process.stdout.write(JSON.stringify(disabled.filter((name) => !blocked.has(name))) + "\n" + indices.join("\n"));
-});
-')"
-  code=$?
-  set -e
-  case "$code" in
-    0) ;;
-    3) return ;;
-    *) die "Hermes returned an invalid plugins.disabled value; refusing to rewrite plugin configuration" ;;
-  esac
-  expected="$(printf '%s\n' "$repair_plan" | sed -n '1p')"
-  while IFS= read -r index; do
-    [ -n "$index" ] || continue
-    "$HERMES_RESOLVED" -p default config unset "plugins.disabled.$index" >/dev/null || die "Hermes could not remove a stale Dashboard basic auth plugin block"
-  done <<EOF
-$(printf '%s\n' "$repair_plan" | sed '1d')
-EOF
-  actual="$("$HERMES_RESOLVED" -p default config get plugins.disabled --json 2>/dev/null)" || die "Hermes could not verify the repaired plugin configuration"
-  EXPECTED_DISABLED="$expected" ACTUAL_DISABLED="$actual" "$NODE_RESOLVED" -e '
-let expected, actual;
-try {
-  expected = JSON.parse(process.env.EXPECTED_DISABLED);
-  actual = JSON.parse(process.env.ACTUAL_DISABLED);
-} catch { process.exit(2); }
-if (!Array.isArray(actual) || JSON.stringify(actual) !== JSON.stringify(expected)) process.exit(2);
-' || die "Hermes did not preserve plugins.disabled as the expected list after repair"
 }
 launch_dashboard() {
   local hermes_root_arg="$HERMES_ROOT"
@@ -936,7 +895,7 @@ const child = spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashb
   detached: true,
   windowsHide: process.platform === 'win32',
   stdio: 'ignore',
-  env: { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_BASIC_AUTH_USERNAME: dashboard.DASHBOARD_USERNAME, HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: dashboard.DASHBOARD_PASSWORD },
+  env: { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN },
 });
 child.unref();
 NODE
@@ -1020,11 +979,10 @@ stop_stubborn_windows_dashboard() {
 start_dashboard() {
   local hermes_root_arg="$HERMES_ROOT" code
   is_windows && hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
-  enable_dashboard_basic_plugin
   [ "$DRY_RUN" = 1 ] && { say "DRY   start/reuse Hermes Dashboard at 127.0.0.1:$DASHBOARD_PORT as the control/read plane"; return; }
   if dashboard_ready; then
     dashboard_credentials_work && return
-    say "INFO  existing Hermes Dashboard rejected the configured local credential; restarting it with the installer-owned runtime credential"
+    say "INFO  existing Hermes Dashboard rejected the configured local session token; restarting it with the installer-owned token"
     HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
     for _ in $(seq 1 5); do dashboard_ready || break; sleep 1; done
     if dashboard_ready && is_windows; then
@@ -1039,10 +997,8 @@ start_dashboard() {
   code="$(dashboard_credentials_status)"
   case "$code" in
     200) return ;;
-    404) die "Hermes Dashboard started, but its basic auth provider is unavailable (HTTP 404); update Hermes Agent and retry" ;;
-    401) die "Hermes Dashboard rejected the installer-owned local credential (HTTP 401)" ;;
-    429) die "Hermes Dashboard rate-limited local credential verification (HTTP 429); stop the Dashboard and retry after one minute" ;;
-    *) die "Hermes Dashboard credential verification failed with HTTP ${code:-000} on 127.0.0.1:$DASHBOARD_PORT" ;;
+    401|403) die "Hermes Dashboard rejected the installer-owned local session token (HTTP $code)" ;;
+    *) die "Hermes Dashboard session-token verification failed with HTTP ${code:-000} on 127.0.0.1:$DASHBOARD_PORT" ;;
   esac
 }
 uninstall() {
