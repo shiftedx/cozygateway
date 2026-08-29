@@ -382,6 +382,52 @@ describe("WindowsTailscaleLocalApi", () => {
     ? `\\\\.\\pipe\\cozy-tailscale-localapi-${randomUUID()}`
     : join(tmpdir(), `cozy-tailscale-localapi-${randomUUID()}.sock`);
 
+  it("creates the first mapping from Tailscale's exact null ServeConfig and journals before POST", async () => {
+    const pipe = socketPath();
+    const body = "null";
+    const etag = createHash("sha256").update(body).digest("hex");
+    const sequence: string[] = [];
+    let posted: Record<string, unknown> | undefined;
+    const server = createServer((request, response) => {
+      if (request.method === "GET") {
+        sequence.push("get");
+        response.setHeader("ETag", etag);
+        response.end(body);
+        return;
+      }
+      sequence.push("post");
+      expect(request.headers["if-match"]).toBe(etag);
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        posted = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        response.statusCode = 200;
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve, reject) => server.listen(pipe, resolve).once("error", reject));
+    try {
+      const client = new WindowsTailscaleLocalApi({ socketPath: pipe, timeoutMs: 1_000 });
+      await expect(client.createExactTlsTerminatedMapping({
+        dnsName: "cozy.fixture-tailnet.ts.net", target: "127.0.0.1:18787",
+      }, async (expectedPostEtag) => {
+        sequence.push(`journal:${expectedPostEtag}`);
+        expect(expectedPostEtag).toBe(createHash("sha256").update(JSON.stringify({
+          TCP: { "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" } },
+        })).digest("hex"));
+      })).resolves.toBe("created");
+      expect(sequence[0]).toBe("get");
+      expect(sequence[1]).toMatch(/^journal:/);
+      expect(sequence[2]).toBe("post");
+      expect(posted).toEqual({
+        TCP: { "443": { TCPForward: "127.0.0.1:18787", TerminateTLS: "cozy.fixture-tailnet.ts.net" } },
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") rmSync(pipe, { force: true });
+    }
+  });
+
   it("creates only the exact mapping in an empty ServeConfig with If-Match", async () => {
     const pipe = socketPath();
     const etag = "5f01816dc8d8cf90862c9f4dba30f53689ce9f5fe773bfd0782b172b7f65adbb";

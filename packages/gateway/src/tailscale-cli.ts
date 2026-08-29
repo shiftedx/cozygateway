@@ -705,9 +705,15 @@ export class WindowsTailscaleLocalApi implements TailscaleServeConfigClient {
     if (snapshot.statusCode !== 200 || snapshot.etag === undefined
       || !/^[a-f0-9]{64}$/i.test(snapshot.etag)) throw new TailscaleLocalApiError("invalid_response");
     let config: Record<string, unknown>;
-    try { config = parseSingleObject(snapshot.body); }
-    catch { throw new TailscaleLocalApiError("invalid_response"); }
-    validateSnapshot(config, snapshot.body, snapshot.etag);
+    if (snapshot.body.equals(Buffer.from("null", "utf8"))) {
+      if (serveConfigEtag(snapshot.body) !== snapshot.etag.toLowerCase())
+        throw new TailscaleLocalApiError("invalid_response");
+      config = {};
+    } else {
+      try { config = parseSingleObject(snapshot.body); }
+      catch { throw new TailscaleLocalApiError("invalid_response"); }
+      validateSnapshot(config, snapshot.body, snapshot.etag);
+    }
     if (serveConfigUsesPort443(config)) return "conflict";
     const replacement = structuredClone(config);
     const replacementTcp = (replacement.TCP ??= {}) as Record<string, unknown>;
