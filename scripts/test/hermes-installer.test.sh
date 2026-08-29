@@ -638,7 +638,10 @@ if [ -n "${COZYGATEWAY_NODE_EXPAND_DESTINATION:-}" ]; then
   chmod 700 "$destination/$COZYGATEWAY_TEST_NODE_DIRECTORY/node.exe"
   exit 0
 fi
-if [ "${COZYGATEWAY_TEST_UNRELATED_LISTENER:-}" = 1 ] && [ "${COZYGATEWAY_CHECK_TARGET_PORT:-}" = 1 ]; then exit 42; fi
+if [ "${COZYGATEWAY_PREFLIGHT_ONLY:-}" = 1 ]; then
+  if [ "${COZYGATEWAY_TEST_UNRELATED_LISTENER:-}" = 1 ]; then printf '4242|node.exe\n'; exit 42; fi
+  exit 0
+fi
 if [ "${COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER:-}" = 1 ] && [ -n "${COZYGATEWAY_EXPECTED_DASHBOARD_PORT:-}" ]; then
   [ -n "${COZYGATEWAY_EXPECTED_DASHBOARD_ROOT:-}" ] || exit 42
   [[ "$*" == *'Test-CozyDashboardOwner'* ]] || exit 42
@@ -648,7 +651,36 @@ rm -f "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}"
 [ -z "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER"
 exit 0
 POWERSHELL
-chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/windows-bin/powershell.exe"
+cat > "$tmp/windows-bin/systemctl" <<'SYSTEMCTL_WINDOWS'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+SYSTEMCTL_WINDOWS
+chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/windows-bin/powershell.exe" "$tmp/windows-bin/systemctl"
+
+# Even without install-state, Windows removal must first delete both persistence forms and stop
+# the exact managed config process before removing recoverable files.
+damaged_root="$tmp/gateway-windows-damaged"
+damaged_startup="$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+mkdir -p "$damaged_root/local" "$(dirname "$damaged_startup")"
+printf '{not-json\n' > "$damaged_root/local/cozygateway.config.json"
+printf 'startup\n' > "$damaged_startup"
+damaged_log="$tmp/windows-damaged-native-commands"
+HOME="$tmp/windows-damaged-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$damaged_log" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$damaged_root" >/dev/null
+grep -Fq '/Delete /F /TN CozyGateway' "$damaged_log"
+grep -Fq 'powershell ' "$damaged_log"
+test ! -e "$damaged_startup"
+test ! -e "$damaged_root"
+
+corrupt_root="$tmp/gateway-windows-corrupt-state"
+mkdir -p "$corrupt_root/local" "$(dirname "$damaged_startup")"
+printf 'not-installer-state\n' > "$corrupt_root/local/install-state"
+printf 'startup\n' > "$damaged_startup"
+corrupt_log="$tmp/windows-corrupt-native-commands"
+HOME="$tmp/windows-corrupt-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$corrupt_log" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$corrupt_root" >/dev/null
+grep -Fq '/Delete /F /TN CozyGateway' "$corrupt_log"
+grep -Fq 'powershell ' "$corrupt_log"
+test ! -e "$damaged_startup"
+test ! -e "$corrupt_root"
 
 # Windows cannot unlink SQLite files held by a pre-existing Hermes gateway.
 # After the installer-owned plugin is disabled, uninstall restarts exactly that
@@ -668,6 +700,7 @@ service_locked-windows=preexisting
 WINDOWS_LOCKED_STATE
 windows_spool_marker="$tmp/windows-spool.locked"
 HOME="$tmp/windows-locked-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/locked-spool-bin:$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$windows_spool_marker" COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE=locked-windows COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-locked-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-locked-native-commands" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-locked" >/dev/null
+! grep -Fq 'systemctl ' "$tmp/windows-locked-native-commands"
 test "$(grep -Fxc 'locked-windows:gateway:restart' "$tmp/windows-locked-commands")" = 1
 ! grep -q '^locked-windows:gateway:\(stop\|uninstall\)$' "$tmp/windows-locked-commands"
 test "$(cat "$tmp/hermes/gateway-locked-windows.state")" = running
@@ -691,6 +724,19 @@ test -x "$tmp/gateway-windows-node/runtime/node/node.exe"
 grep -Fq 'installed checksum-verified Node.js' <<<"$windows_node_output"
 grep -Fq '[IO.Compression.ZipFile]::ExtractToDirectory' "$tmp/windows-node-commands"
 grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <<<"$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-node")"
+
+occupied_root="$tmp/gateway-windows-occupied"
+occupied_log="$tmp/windows-occupied-native-commands"
+if occupied_output="$(HOME="$tmp/windows-occupied-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_UNRELATED_LISTENER=1 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-occupied-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$occupied_log" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$occupied_root" 2>&1)"; then
+  echo 'expected an unrelated Gateway-port owner to fail preflight' >&2
+  exit 1
+fi
+expect_contains "$occupied_output" 'Gateway port 8787'
+expect_contains "$occupied_output" 'PID 4242'
+expect_contains "$occupied_output" 'node.exe'
+expect_contains "$occupied_output" 'rerun with --port and a free port'
+test ! -e "$occupied_root"
+if grep -Fq '/Create ' "$occupied_log"; then echo 'occupied-port preflight registered a Scheduled Task' >&2; exit 1; fi
 
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE='C:\fixture\operator-control.token' COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
 

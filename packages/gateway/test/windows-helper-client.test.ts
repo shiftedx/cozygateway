@@ -29,6 +29,26 @@ describe("WindowsHelperClient", () => {
     );
   });
 
+  it("parses bounded read-only Windows network profile and firewall posture", async () => {
+    const runner = vi.fn<WindowsHelperRunner>().mockResolvedValue({
+      exitCode: 0,
+      stdout: response("inspect-network-safety", {
+        networkCategory: "public", firewallEnabled: true, defaultInboundAction: "block",
+      }),
+      stderr: "",
+    });
+    const client = new WindowsHelperClient({ helperPath: helper, powershellPath: powershell, runner });
+
+    await expect(client.inspectNetworkSafety("{ADAPTER-ID}")).resolves.toEqual({
+      networkCategory: "public", firewallEnabled: true, defaultInboundAction: "block",
+    });
+    expect(runner).toHaveBeenCalledWith(
+      powershell,
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "inspect-network-safety"],
+      expect.objectContaining({ stdin: JSON.stringify({ adapterId: "{ADAPTER-ID}" }) }),
+    );
+  });
+
   it("rejects relative helper and PowerShell paths before spawning", () => {
     expect(() => new WindowsHelperClient({ helperPath: ".\\helper.ps1", powershellPath: powershell }))
       .toThrow(/fully qualified helper path/i);

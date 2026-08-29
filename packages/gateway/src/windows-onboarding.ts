@@ -17,7 +17,7 @@ import {
   validateListenerHost,
 } from "./configure.ts";
 import type { CliIo, CliOnboardingController, CliRuntime } from "./cli.ts";
-import { LanModeAdapter, type LanListenerState, type LanModeRuntime } from "./lan-mode.ts";
+import { LanModeAdapter, SqliteLanOwnershipStore, type LanListenerState, type LanModeRuntime } from "./lan-mode.ts";
 import {
   NetworkOnboarding,
   type NetworkModeAdapter,
@@ -46,7 +46,7 @@ import { gatewayScheme } from "./tls.ts";
 import { WindowsHelperClient } from "./windows-helper.ts";
 
 type WindowsOnboardingHelper = Pick<WindowsHelperClient,
-  "protectPath" | "adapterInventory" | "discoverTailscale" | "installTailscale" | "setPreference" | "openBrowser">;
+  "protectPath" | "adapterInventory" | "inspectNetworkSafety" | "discoverTailscale" | "installTailscale" | "setPreference" | "openBrowser">;
 
 interface OperatorClient {
   begin(
@@ -91,6 +91,18 @@ const SELECTED_LAN_ADAPTER_PATTERN = /^[\x20-\x7e]{1,256}$/;
 function validSelectedLanAdapter(adapterId: string): boolean {
   return SELECTED_LAN_ADAPTER_PATTERN.test(adapterId)
     && Buffer.byteLength(adapterId, "utf8") <= SELECTED_LAN_ADAPTER_MAX_BYTES;
+}
+
+function isPhoneReachableHost(host: string): boolean {
+  const normalized = host.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  if (normalized === "" || normalized === "localhost" || normalized === "0.0.0.0"
+    || normalized === "::" || normalized === "::1") return false;
+  return !/^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
+function hasPhoneReachableOrigin(bindHost: string, publicUrl?: string): boolean {
+  if (publicUrl === undefined) return isPhoneReachableHost(bindHost);
+  try { return isPhoneReachableHost(new URL(publicUrl).hostname); } catch { return false; }
 }
 
 function readSelectedLanAdapter(path: string): string | undefined {
@@ -265,6 +277,10 @@ class AdvancedModeAdapter implements NetworkModeAdapter {
       const answer = await this.#io.question(`Bind address [${currentHost}]: `);
       try {
         host = validateListenerHost(answer.trim() === "" ? currentHost : answer);
+        if (!hasPhoneReachableOrigin(host, current.publicUrl)) {
+          console.log("Advanced setup requires a concrete hostname or IP address that the phone can reach; loopback and wildcard addresses cannot be used in a QR.");
+          continue;
+        }
         break;
       } catch {
         console.log("Enter a bind hostname or IP address without a URL or whitespace.");
@@ -305,6 +321,11 @@ class AdvancedModeAdapter implements NetworkModeAdapter {
     const bindHost = config.host ?? "127.0.0.1";
     const local = listenerOrigin(bindHost, config.port, gatewayScheme(config));
     const canonicalOrigin = config.publicUrl ?? local;
+    if (!hasPhoneReachableOrigin(bindHost, config.publicUrl)) {
+      throw Object.assign(new Error("advanced phone-reachable origin required"), {
+        retryable: true as const, reason: "phone_reachable_origin_required",
+      });
+    }
     const checked = await this.#health(canonicalOrigin, signal).catch(() => ({ ok: false, attachReady: false }));
     const ws = checked.ok ? await this.#websocket(canonicalOrigin, 0, signal) : false;
     return {
@@ -368,6 +389,46 @@ class WindowsTailscaleAdapter implements NetworkModeAdapter {
   }
 }
 
+class WindowsLanSafetyAdapter implements NetworkModeAdapter {
+  readonly mode = "lan" as const;
+  readonly #delegate: NetworkModeAdapter;
+  readonly #helper: WindowsOnboardingHelper;
+
+  constructor(delegate: NetworkModeAdapter, helper: WindowsOnboardingHelper) {
+    this.#delegate = delegate;
+    this.#helper = helper;
+  }
+
+  async prepare(signal?: AbortSignal): Promise<PreparedEndpoint> {
+    const endpoint = await this.#delegate.prepare(signal);
+    if (endpoint.physicalAdapterId === undefined) return endpoint;
+    try {
+      const safety = await this.#helper.inspectNetworkSafety(endpoint.physicalAdapterId, signal);
+      if (safety.networkCategory === "public") {
+        console.log("Windows reports the selected adapter as a Public network. If this is your trusted home network, open Settings > Network & internet, open that connection, and set Network profile type to Private.");
+      } else if (safety.networkCategory === "unknown") {
+        console.log("Windows could not classify the selected connection. Confirm it is a trusted private network before continuing.");
+      }
+      if (!safety.firewallEnabled) {
+        console.log("Windows Firewall is disabled for this network profile. Re-enable it in Windows Security before using LAN mode.");
+      } else if (safety.defaultInboundAction === "block") {
+        console.log("Windows Firewall blocks unsolicited inbound traffic by default. If the phone check fails, allow only CozyGateway's exact port on the Private profile; do not disable Windows Firewall or create a broad rule.");
+      }
+    } catch {
+      console.log("Windows network profile/firewall inspection was unavailable. Review the active profile in Settings and Windows Security; use Private only for a trusted network and do not disable the firewall.");
+    }
+    return endpoint;
+  }
+
+  inspect(signal?: AbortSignal): Promise<PreparedEndpoint> {
+    return this.#delegate.inspect(signal);
+  }
+
+  rollbackOwned(endpoint: PreparedEndpoint, signal?: AbortSignal): Promise<void> {
+    return this.#delegate.rollbackOwned(endpoint, signal);
+  }
+}
+
 function tailscaleIo(io?: CliIo): TailscaleModeIo {
   const yes = async (prompt: string) => io !== undefined && /^(?:y|yes)$/i.test((await io.question(prompt)).trim());
   return {
@@ -376,7 +437,7 @@ function tailscaleIo(io?: CliIo): TailscaleModeIo {
       yes(`Use the currently signed-in Tailscale account ${accountLabel} on ${tailnetName}? [y/N] `),
     confirmPreference: (preference, desired) => yes(
       preference === "unattended"
-        ? "Keep this PC reachable after logout (sleep still disconnects it)? [y/N] "
+        ? "Allow Tailscale to run unattended in the background (sleep still disconnects it)? [y/N] "
         : `${desired ? "Enable" : "Allow"} incoming Tailscale connections? [y/N] `,
     ),
     confirmCertificateTransparency: () => yes(
@@ -430,6 +491,7 @@ export function createWindowsOnboardingController(
     };
   };
   const lanRuntime: LanModeRuntime = {
+    ownership: new SqliteLanOwnershipStore(storage),
     readAdapterInventory: (signal) => helper.adapterInventory(signal),
     readSelectedAdapter: async () => readSelectedLanAdapter(selectedLanAdapterPath),
     writeSelectedAdapter: (adapterId, signal) =>
@@ -440,7 +502,8 @@ export function createWindowsOnboardingController(
         console.log("Choose the trusted physical adapter for Same Wi-Fi:");
         for (let index = 0; index < candidates.length; index += 1) {
           const candidate = candidates[index]!;
-          const name = candidate.displayName.replace(/[^\x20-\x7e]/g, "?").slice(0, 80);
+          const name = Array.from(candidate.displayName.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "?"))
+            .slice(0, 80).join("");
           console.log(`${index + 1}. ${name} (${candidate.kind}, ${candidate.address})`);
         }
         const answer = (await io.question(`Adapter [1-${candidates.length}]: `)).trim();
@@ -524,7 +587,7 @@ export function createWindowsOnboardingController(
   });
   const adapters: NetworkModeAdapter[] = [
     new WindowsTailscaleAdapter({ delegate: tailscale, configPath, installRoot, helper, runtime }),
-    new LanModeAdapter(lanRuntime),
+    new WindowsLanSafetyAdapter(new LanModeAdapter(lanRuntime), helper),
     advanced,
   ];
   const onboarding = new NetworkOnboarding({

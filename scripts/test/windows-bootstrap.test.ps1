@@ -10,17 +10,36 @@ function Write-Utf8NoBom {
     [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Assert-PrivateDacl {
+    param([string] $Path)
+    $acl = Get-Acl -LiteralPath $Path
+    Assert-True $acl.AreAccessRulesProtected "protected path must disable inheritance: $Path"
+    $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
+    $expected = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18') | Sort-Object
+    $actual = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
+    Assert-True (($actual -join ',') -eq ($expected -join ',')) "protected path has unexpected identities: $Path ($($actual -join ','))"
+}
+
 function New-ReleaseFixtures {
-    param([string] $Directory)
+    param([string] $Directory, [string] $HelperSource)
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null
     $assets = @{
         'cozygateway.mjs' = "console.log('fixture');`n"
         'cozygateway-hermes-attach-plugin.tar.gz' = 'plugin-fixture'
         'cozygateway-installer.sh' = "#!/usr/bin/env bash`nexit 0`n"
-        'cozygateway-windows-helper.ps1' = @'
+        'cozygateway-windows-helper.ps1' = if ([string]::IsNullOrWhiteSpace($HelperSource)) { @'
 param([string]$Command)
-$request = ([Console]::In.ReadToEnd() | ConvertFrom-Json)
+$ErrorActionPreference = 'Stop'
+$stream = [Console]::OpenStandardInput()
+$memory = New-Object IO.MemoryStream
+$stream.CopyTo($memory)
+$inputText = [Text.Encoding]::UTF8.GetString($memory.ToArray()).TrimStart([char]0xFEFF)
+$request = ($inputText | ConvertFrom-Json)
 if ($env:COZYGATEWAY_TEST_HELPER_EVENT_LOG) { Add-Content -LiteralPath $env:COZYGATEWAY_TEST_HELPER_EVENT_LOG -Value "helper:$Command" }
+if ($Command -eq 'prepare-install-root') {
+  [void][IO.Directory]::CreateDirectory((Join-Path ([string]$request.root) 'bin'))
+  if (-not (Test-Path -LiteralPath (Join-Path ([string]$request.root) 'bin') -PathType Container)) { throw "fixture failed to create $($request.root)\bin" }
+}
 if ($Command -eq 'initialize-pending') {
   $local = Join-Path ([string]$request.root) 'local'
   New-Item -ItemType Directory -Force -Path $local | Out-Null
@@ -29,6 +48,7 @@ if ($Command -eq 'initialize-pending') {
 }
 [Console]::Out.Write((@{ schemaVersion=1; ok=$true; command=$Command; result=@{ applied=$true } } | ConvertTo-Json -Compress))
 '@
+        } else { [IO.File]::ReadAllText($HelperSource) }
     }
     foreach ($entry in $assets.GetEnumerator()) {
         $path = Join-Path $Directory $entry.Key
@@ -71,7 +91,7 @@ exit /b 0
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho onboarding-token:%COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE%>>`"$EventLog`"`nif not exist `"%COZYGATEWAY_HOME%\local`" mkdir `"%COZYGATEWAY_HOME%\local`"`necho {}>`"%COZYGATEWAY_HOME%\local\cozygateway.config.json`"`necho fixture>`"%COZYGATEWAY_HOME%\local\cozygateway.sqlite`"`necho fixture>`"%COZYGATEWAY_HOME%\local\gateway.env`"`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho onboarding-token:%COZYGATEWAY_ONBOARDING_CONTROL_TOKEN_FILE%>>`"$EventLog`"`nif not exist `"%COZYGATEWAY_HOME%\local`" mkdir `"%COZYGATEWAY_HOME%\local`"`nif not exist `"%COZYGATEWAY_HOME%\runtime\node`" mkdir `"%COZYGATEWAY_HOME%\runtime\node`"`necho {}>`"%COZYGATEWAY_HOME%\local\cozygateway.config.json`"`necho fixture>`"%COZYGATEWAY_HOME%\local\cozygateway.sqlite`"`necho fixture>`"%COZYGATEWAY_HOME%\local\gateway.env`"`necho runtime>`"%COZYGATEWAY_HOME%\runtime\node\node.exe`"`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -145,7 +165,7 @@ try {
     $tokenPath = Join-Path $localState 'operator-control.token'
     Assert-True ((Get-Content -LiteralPath $tokenPath -Raw) -match '^[A-Za-z0-9_-]{43}$') 'fresh bootstrap must create a 256-bit operator-control token outside config'
     $initializeIndex = [Array]::IndexOf($events, 'helper:initialize-pending')
-    $protectTokenIndex = [Array]::IndexOf($events, 'helper:protect-path')
+    $protectTokenIndex = [Array]::IndexOf($events, 'helper:protect-path', $initializeIndex + 1)
     Assert-True ($initializeIndex -ge 0 -and $initializeIndex -lt $bashIndex) 'pending marker must be initialized before Bash can write config'
     Assert-True ($protectTokenIndex -gt $initializeIndex -and $protectTokenIndex -lt $bashIndex) 'operator token must be ACL-protected before Bash can write config'
     Assert-True (($events | Select-Object -Skip ($bashIndex + 1)) -contains 'helper:protect-path') 'config, SQLite, environment, and resume state must be helper-ACL-protected after Bash creates them'
@@ -155,6 +175,50 @@ try {
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
     Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
     Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'
+
+    # Exercise the real PowerShell 5.1 bootstrap -> fixed helper stdin/stdout boundary. A text
+    # pipeline uses the active OEM code page and corrupts this custom root before JSON parsing.
+    $realHelperFixtures = Join-Path $temp 'real helper release assets'
+    New-ReleaseFixtures $realHelperFixtures (Join-Path $repoRoot 'scripts\cozygateway-windows-helper.ps1')
+    $unicodeLeaf = 'Cozy G' + [char]0x00E4 + 'teway ' + [char]0x4F60 + [char]0x597D
+    $unicodeHome = Join-Path $temp $unicodeLeaf
+    $unicodePathLog = Join-Path $temp 'unicode-user-path.txt'
+    $unicode = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $realHelperFixtures
+        'COZYGATEWAY_HOME' = $unicodeHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $unicodePathLog
+    }
+    Assert-True ($unicode.ExitCode -eq 0) "PowerShell 5.1 UTF-8 bootstrap/helper pipeline failed for a non-ASCII root: $($unicode.Output)"
+    Assert-True (Test-Path -LiteralPath (Join-Path $unicodeHome 'local\network-onboarding.json')) 'real helper must receive the exact non-ASCII root'
+    foreach ($protected in @($unicodeHome, (Join-Path $unicodeHome 'bin'), (Join-Path $unicodeHome 'bin\cozygateway-windows-helper.ps1'), (Join-Path $unicodeHome 'runtime'))) {
+        Assert-PrivateDacl $protected
+    }
+
+    $unsafeHome = Join-Path $temp 'unsafe existing root'
+    New-Item -ItemType Directory -Path $unsafeHome | Out-Null
+    $unsafeAcl = Get-Acl -LiteralPath $unsafeHome
+    $unsafeAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),
+        [Security.AccessControl.FileSystemRights]::Modify,
+        [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )))
+    Set-Acl -LiteralPath $unsafeHome -AclObject $unsafeAcl
+    $unsafe = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $realHelperFixtures
+        'COZYGATEWAY_HOME' = $unsafeHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+    }
+    Assert-True ($unsafe.ExitCode -ne 0) 'bootstrap must fail closed on an existing install root writable by Everyone'
+    Assert-True ($unsafe.Output -match 'unsafe_install_root') 'unsafe install root failure must identify the trust-boundary problem'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $unsafeHome 'bin\cozygateway.mjs'))) 'unsafe existing root must fail before executable assets are installed'
 
     $interactiveHome = Join-Path $temp 'Interactive Gateway'
     $interactiveBin = Join-Path $interactiveHome 'bin'

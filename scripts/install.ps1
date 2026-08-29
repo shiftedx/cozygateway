@@ -188,14 +188,54 @@ function Invoke-CozyGatewayInstaller {
 }
 
 function Invoke-OnboardingHelper {
-    param([string] $Command, [hashtable] $Request)
+    param([string] $Command, [hashtable] $Request, [string] $HelperPath = $script:WindowsHelperPath)
     $json = $Request | ConvertTo-Json -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
     $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $raw = ($json | & $powerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:WindowsHelperPath $Command | Out-String).Trim()
-    $exit = $LASTEXITCODE
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo.FileName = $powerShell
+    $process.StartInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$HelperPath`" $Command"
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardInput = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    $process.StartInfo.StandardOutputEncoding = $utf8
+    $process.StartInfo.StandardErrorEncoding = $utf8
+    [void]$process.Start()
+    $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+    $process.StandardInput.Close()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(30000)) {
+        $process.Kill()
+        Fail "Windows onboarding helper timed out for $Command"
+    }
+    $raw = $stdoutTask.Result.Trim()
+    $stderr = $stderrTask.Result
+    $exit = $process.ExitCode
     try { $response = $raw | ConvertFrom-Json } catch { Fail "Windows onboarding helper returned an invalid response for $Command" }
     if ($exit -ne 0 -or $null -eq $response -or $response.schemaVersion -ne 1 -or $response.ok -ne $true -or $response.command -cne $Command -or $response.result.applied -ne $true) {
-        Fail "Windows onboarding helper could not complete $Command"
+        $reason = if ($null -ne $response -and $null -ne $response.reason) { ": $($response.reason)" } else { '' }
+        if ([string]::IsNullOrWhiteSpace($reason) -and -not [string]::IsNullOrWhiteSpace($stderr)) { $reason = ": $($stderr.Trim())" }
+        Fail "Windows onboarding helper could not complete $Command$reason"
+    }
+}
+
+function Protect-InstallBoundary {
+    foreach ($path in @(
+        $script:WindowsHelperPath,
+        (Join-Path $script:InstallHome 'bin\agent-install.sh'),
+        (Join-Path $script:InstallHome 'bin\cozygateway.mjs'),
+        (Join-Path $script:InstallHome 'runtime'),
+        (Join-Path $script:InstallHome 'runtime\node'),
+        (Join-Path $script:InstallHome 'runtime\node\node.exe')
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path)) {
+            try { Invoke-OnboardingHelper 'protect-path' @{ root = $script:InstallHome; path = $path } }
+            catch { Fail "could not protect installer trust-boundary path $path ($($_.Exception.Message))" }
+        }
     }
 }
 
@@ -324,16 +364,26 @@ if ([string]::IsNullOrWhiteSpace($base)) {
     $base = "https://github.com/$repo/releases/download/$tag"
 }
 
-New-Item -ItemType Directory -Force -Path $bin | Out-Null
 $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
 $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
 $script:WindowsHelperPath = Join-Path $bin 'cozygateway-windows-helper.ps1'
-Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
-Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
-Get-VerifiedAsset 'cozygateway-windows-helper.ps1' $script:WindowsHelperPath $base
-Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
+[string]$verifiedHelper = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-helper-" + [guid]::NewGuid().ToString('N') + '.ps1')
+try {
+    Get-VerifiedAsset 'cozygateway-windows-helper.ps1' $verifiedHelper $base
+    Invoke-OnboardingHelper 'prepare-install-root' @{ root = $script:InstallHome } $verifiedHelper
+    if (-not (Test-Path -LiteralPath $bin -PathType Container)) { Fail "verified helper did not create the protected install bin at $bin" }
+    Move-Item -LiteralPath $verifiedHelper -Destination $script:WindowsHelperPath -Force
+    Protect-InstallBoundary
+    Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
+    Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
+    Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
+    Protect-InstallBoundary
+} finally {
+    Remove-Item -LiteralPath $verifiedHelper, "$verifiedHelper.new", "$verifiedHelper.sha256" -Force -ErrorAction SilentlyContinue
+}
 [void](Initialize-OnboardingBootstrap $isFreshInstall)
 Invoke-CozyGatewayInstaller $bash $installerPath $InstallerArguments
+Protect-InstallBoundary
 Protect-CozyGatewayLocalState
 if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }
 Invoke-PhoneAccessSetup

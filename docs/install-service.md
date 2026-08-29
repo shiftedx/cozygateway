@@ -50,6 +50,10 @@ Windows PowerShell:
 schtasks /Query /TN CozyGateway /V /FO LIST
 ```
 
+Before service registration, Windows installation verifies that the selected Gateway port is free
+or belongs to the same install's exact config path. A conflict reports the PID and process name and
+stops before config, plugin, Scheduled Task, or Startup mutation.
+
 On Linux the installer enables user lingering so the service survives logout
 and reboot. If your host policy blocks that authorization, run
 `sudo loginctl enable-linger "$USER"` once and repeat the installer.
@@ -63,4 +67,19 @@ Update by repeating the one-paste line. Remove only installer-owned state:
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
 
-No network overlay, tunnel, DNS record, or firewall rule is created or changed.
+Windows PowerShell 5.1+:
+
+```powershell
+$installer = irm https://cozylabs.ai/install.ps1
+& ([scriptblock]::Create($installer)) --uninstall
+```
+
+Set `$env:COZYGATEWAY_HOME` first when uninstalling a custom root. The recovery path removes the
+`CozyGateway` current-user Task, Startup fallback, and exact managed process before deleting files,
+even when install state is damaged.
+
+No firewall rule is created or changed. Same Wi-Fi setup reads the selected adapter's Windows
+network category and active firewall policy. For a trusted home network reported as `Public`, change
+only that connection to `Private` in Windows Settings. Keep Windows Firewall enabled; if reachability
+is blocked, authorize only CozyGateway's exact TCP port on the Private profile or use Tailscale—never
+disable the firewall or create an all-ports/all-profiles rule.

@@ -11,6 +11,7 @@ export type WindowsHelperCommand =
   | "open-browser"
   | "initialize-pending"
   | "protect-path"
+  | "inspect-network-safety"
   | "adapter-inventory";
 
 export type WindowsHelperReason =
@@ -19,6 +20,7 @@ export type WindowsHelperReason =
   | "path_rejected"
   | "path_reparse_point"
   | "acl_failed"
+  | "network_inspection_failed"
   | "tailscale_not_installed"
   | "tailscale_legacy_unsupported"
   | "tailscale_service_mismatch"
@@ -53,6 +55,12 @@ export interface WindowsHelperRunResult {
   exitCode: number;
   stdout: string | Uint8Array;
   stderr: string | Uint8Array;
+}
+
+export interface WindowsNetworkSafety {
+  networkCategory: "private" | "public" | "domain" | "unknown";
+  firewallEnabled: boolean;
+  defaultInboundAction: "allow" | "block" | "not_configured" | "unknown";
 }
 
 export type WindowsHelperRunner = (
@@ -120,6 +128,7 @@ function validReason(value: unknown): value is WindowsHelperReason {
     "download_failed", "download_redirect_rejected", "download_too_large", "installer_signature_invalid",
     "installer_cancelled", "installer_reboot_required", "installer_failed", "preference_failed", "preference_cancelled", "preference_verification_failed",
     "browser_url_rejected", "browser_open_failed", "inventory_failed", "internal_error",
+    "network_inspection_failed",
   ]).has(value as WindowsHelperReason);
 }
 
@@ -139,6 +148,7 @@ const COMMAND_FAILURE_REASONS: Record<WindowsHelperCommand, ReadonlySet<WindowsH
   "open-browser": new Set([...COMMON_FAILURE_REASONS, "browser_url_rejected", "browser_open_failed"]),
   "initialize-pending": new Set([...COMMON_FAILURE_REASONS, "path_rejected", "path_reparse_point", "acl_failed"]),
   "protect-path": new Set([...COMMON_FAILURE_REASONS, "path_rejected", "path_reparse_point", "acl_failed"]),
+  "inspect-network-safety": new Set([...COMMON_FAILURE_REASONS, "network_inspection_failed"]),
   "adapter-inventory": new Set([...COMMON_FAILURE_REASONS, "inventory_failed"]),
 };
 
@@ -162,6 +172,15 @@ function inventory(value: unknown): value is WindowsLanInventory {
   return record(value) && exactKeys(value, ["schemaVersion", "adapters"])
     && value.schemaVersion === 1 && Array.isArray(value.adapters) && value.adapters.length <= 256
     && value.adapters.every(adapter);
+}
+
+function networkSafety(value: unknown): value is WindowsNetworkSafety {
+  return record(value) && exactKeys(value, ["networkCategory", "firewallEnabled", "defaultInboundAction"])
+    && (value.networkCategory === "private" || value.networkCategory === "public"
+      || value.networkCategory === "domain" || value.networkCategory === "unknown")
+    && typeof value.firewallEnabled === "boolean"
+    && (value.defaultInboundAction === "allow" || value.defaultInboundAction === "block"
+      || value.defaultInboundAction === "not_configured" || value.defaultInboundAction === "unknown");
 }
 
 function discovery(value: unknown): value is TailscaleDiscovery {
@@ -284,6 +303,12 @@ export class WindowsHelperClient {
 
   async protectPath(root: string, path: string, signal?: AbortSignal): Promise<void> {
     if (!applied(await this.#invoke("protect-path", { root, path }, signal))) throw new WindowsHelperProtocolError();
+  }
+
+  async inspectNetworkSafety(adapterId: string, signal?: AbortSignal): Promise<WindowsNetworkSafety> {
+    const result = await this.#invoke("inspect-network-safety", { adapterId }, signal);
+    if (!networkSafety(result)) throw new WindowsHelperProtocolError();
+    return result;
   }
 
   async adapterInventory(signal?: AbortSignal): Promise<WindowsLanInventory> {

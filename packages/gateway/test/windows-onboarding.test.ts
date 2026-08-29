@@ -11,6 +11,7 @@ import type { NetworkModeAdapter, OnboardingIo, PreparedEndpoint } from "../src/
 import type { NetworkOnboardingState, NetworkOnboardingStateProjection } from "../src/onboarding-state.ts";
 import { openStorage, type OnboardingMode, type Storage } from "../src/storage.ts";
 import { createWindowsOnboardingController } from "../src/windows-onboarding.ts";
+import type { WindowsNetworkSafety } from "../src/windows-helper.ts";
 import type { WindowsLanInventory } from "../src/lan.ts";
 import type { TailscaleCliRunner } from "../src/tailscale-cli.ts";
 import type { OperatorPhoneStatus } from "../src/operator-onboarding.ts";
@@ -74,6 +75,7 @@ function cliIo(answers: string[] = []): CliIo {
 function onboardingIo(mode: OnboardingMode): OnboardingIo {
   return {
     chooseNetworkMode: vi.fn(async () => mode),
+    showNetworkDisclosure: vi.fn(async () => undefined),
     showPhoneConnectionCheck: vi.fn(),
     showAuthoritativePhrase: vi.fn(),
     confirmPhone: vi.fn(async () => "yes"),
@@ -140,6 +142,11 @@ function helper(inventory: WindowsLanInventory) {
   return {
     protectPath: vi.fn(async () => undefined),
     adapterInventory: vi.fn(async () => structuredClone(inventory)),
+    inspectNetworkSafety: vi.fn(async (): Promise<WindowsNetworkSafety> => ({
+      networkCategory: "private" as const,
+      firewallEnabled: true,
+      defaultInboundAction: "block" as const,
+    })),
     discoverTailscale: vi.fn(async () => ({
       state: "ready" as const, cliPath: "C:\\Program Files\\Tailscale\\tailscale.exe",
       daemonPath: "C:\\Program Files\\Tailscale\\tailscaled.exe",
@@ -181,15 +188,18 @@ describe("createWindowsOnboardingController composition", () => {
   it("completes the remote route through the live control boundary and SQLite gate", async () => {
     const { configPath, storage } = fixture();
     let now = 10;
+    let unattendedReads = 0;
     const control = phoneControl(storage, () => now);
     const runner = vi.fn<TailscaleCliRunner>(async (_file, argv) => {
       const command = argv.join(" ");
       if (command === "version --json")
         return { exitCode: 0, stdout: tailscaleFixture("version-supported.json"), stderr: "" };
+      if (command === "debug prefs")
+        return { exitCode: 0, stdout: '{"ControlURL":"https://controlplane.tailscale.com"}', stderr: "" };
       if (command === "status --json")
         return { exitCode: 0, stdout: tailscaleFixture("status-running.json"), stderr: "" };
       if (command === "get --json unattended")
-        return { exitCode: 0, stdout: '{"unattended":true}', stderr: "" };
+        return { exitCode: 0, stdout: JSON.stringify({ unattended: unattendedReads++ > 0 }), stderr: "" };
       if (command === "get --json shields-up")
         return { exitCode: 0, stdout: '{"shields-up":false}', stderr: "" };
       if (command === "serve status --json")
@@ -199,13 +209,17 @@ describe("createWindowsOnboardingController composition", () => {
       return { exitCode: 64, stdout: "", stderr: "unexpected test command" };
     });
     const deps = { ...dependencies(storage, oneLan, control, () => now), tailscaleCliRunner: runner };
-    const controller = createWindowsOnboardingController(configPath, cliIo(["yes"]), runtime(), deps)!;
+    const io = cliIo(["yes", "yes"]);
+    const controller = createWindowsOnboardingController(configPath, io, runtime(), deps)!;
 
-    await expect(controller.run(onboardingIo("tailscale"))).resolves.toMatchObject({ outcome: "complete" });
+    const outcome = await controller.run(onboardingIo("tailscale"));
+    expect(outcome).toMatchObject({ outcome: "complete" });
     expect(control.begin).toHaveBeenCalledWith("tailscale", {
       canonicalOrigin: "https://cozy.fixture-tailnet.ts.net", durableFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(deps.writePairingOutput).toHaveBeenCalledWith("pairing\n");
+    expect(vi.mocked(io.question).mock.calls.flat().join(" ")).not.toMatch(/after logout/i);
+    expect(vi.mocked(io.question).mock.calls.flat().join(" ")).toMatch(/background/i);
     await expect(controller.status()).resolves.toMatchObject({
       stage: "complete", authority: "complete", mode: "tailscale", healthy: true,
     });
@@ -271,6 +285,44 @@ describe("createWindowsOnboardingController composition", () => {
     replacement.close();
   });
 
+  it("preserves Unicode adapter names in selection output", async () => {
+    const { configPath, storage } = fixture();
+    const unicodeName = "Café 网络";
+    const inventory: WindowsLanInventory = {
+      schemaVersion: 1,
+      adapters: [
+        { ...oneLan.adapters[0]!, displayName: unicodeName },
+        { ...oneLan.adapters[0]!, id: "wifi", displayName: "Wi-Fi", kind: "wifi", ipv4Addresses: ["10.0.0.8"] },
+      ],
+    };
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const controller = createWindowsOnboardingController(
+      configPath, cliIo(["1"]), runtime(), dependencies(storage, inventory, phoneControl(storage, () => 10), () => 10),
+    )!;
+
+    await expect(controller.run(onboardingIo("lan"))).resolves.toMatchObject({ outcome: "complete" });
+    expect(log.mock.calls.flat().join("\n")).toContain(unicodeName);
+    controller.close();
+  });
+
+  it("inspects Windows profile/firewall posture and gives bounded LAN guidance without mutating it", async () => {
+    const { configPath, storage } = fixture();
+    const deps = dependencies(storage, oneLan, phoneControl(storage, () => 10), () => 10);
+    deps.helper.inspectNetworkSafety.mockResolvedValue({
+      networkCategory: "public", firewallEnabled: true, defaultInboundAction: "block",
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const controller = createWindowsOnboardingController(configPath, cliIo(), runtime(), deps)!;
+
+    await expect(controller.run(onboardingIo("lan"))).resolves.toMatchObject({ outcome: "complete" });
+    expect(deps.helper.inspectNetworkSafety).toHaveBeenCalledWith("ethernet", undefined);
+    const copy = log.mock.calls.flat().join("\n");
+    expect(copy).toMatch(/Windows.*Public/i);
+    expect(copy).toMatch(/Settings.*Private/i);
+    expect(copy).toMatch(/do not disable.*firewall/i);
+    controller.close();
+  });
+
   it("applies real advanced bind settings and restarts managed Hermes", async () => {
     const { configPath, storage } = fixture();
     const control = phoneControl(storage, () => 10);
@@ -284,6 +336,22 @@ describe("createWindowsOnboardingController composition", () => {
       outcome: "complete", endpoint: { bindHost: "192.168.1.50", port: 19000 },
     });
     expect(hostRuntime.restartHermesProfile).toHaveBeenCalledOnce();
+    controller.close();
+  });
+
+  it("requires a concrete phone-reachable Advanced origin instead of loopback or wildcard", async () => {
+    const { configPath, storage } = fixture();
+    const io = cliIo(["127.0.0.1", "0.0.0.0", "192.168.1.50", "19000"]);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const controller = createWindowsOnboardingController(
+      configPath, io, runtime(), dependencies(storage, oneLan, phoneControl(storage, () => 10), () => 10),
+    )!;
+
+    await expect(controller.run(onboardingIo("advanced"))).resolves.toMatchObject({
+      outcome: "complete",
+      endpoint: { canonicalOrigin: "http://192.168.1.50:19000" },
+    });
+    expect(io.question).toHaveBeenCalledTimes(4);
     controller.close();
   });
 

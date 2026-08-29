@@ -283,6 +283,34 @@ try {
     Assert-True ($realProtection.Json.ok) "real disposable DACL protection failed: $($realProtection.Raw)"
     Assert-PrivateDacl $aclFile
 
+    $preparedRoot = Join-Path $script:Temp 'prepared install root'
+    $prepared = Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $preparedRoot } -Fixture @{}
+    Assert-True $prepared.Json.ok "safe install-root preparation failed: $($prepared.Raw)"
+    Assert-PrivateDacl $preparedRoot
+    Assert-PrivateDacl (Join-Path $preparedRoot 'bin')
+
+    $unicodeRoot = Join-Path $script:Temp 'Gäteway 你好'
+    $unicodePrepared = Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $unicodeRoot } -Fixture @{}
+    Assert-True $unicodePrepared.Json.ok "Unicode install-root preparation failed: $($unicodePrepared.Raw)"
+    $unicodeFile = Join-Path $unicodeRoot 'bin\helper.ps1'
+    Write-Utf8NoBom $unicodeFile 'fixture'
+    $unicodeProtected = Invoke-Helper -Command 'protect-path' -Input @{ root = $unicodeRoot; path = $unicodeFile } -Fixture @{}
+    Assert-True $unicodeProtected.Json.ok "Unicode boundary-file protection failed: $($unicodeProtected.Raw)"
+    Assert-PrivateDacl $unicodeFile
+
+    $unsafeRoot = Join-Path $script:Temp 'unsafe install root'
+    New-Item -ItemType Directory -Path $unsafeRoot | Out-Null
+    $unsafeAcl = Get-Acl -LiteralPath $unsafeRoot
+    $unsafeAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),
+        [Security.AccessControl.FileSystemRights]::Modify,
+        [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )))
+    Set-Acl -LiteralPath $unsafeRoot -AclObject $unsafeAcl
+    Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $unsafeRoot } -Fixture @{}) 'unsafe_install_root'
+
     $volumeRoot = [IO.Path]::GetPathRoot($script:Temp)
     . $script:Helper
     $script:Fixture = [pscustomobject]@{ programFiles = $volumeRoot }
@@ -306,6 +334,19 @@ try {
     Assert-True ($inventory.Json.result.adapters[0].kind -eq 'ethernet' -and $inventory.Json.result.adapters[0].status -eq 'up') 'numeric Ethernet mapping failed'
     Assert-True ($inventory.Json.result.adapters[1].kind -eq 'wifi' -and $inventory.Json.result.adapters[1].status -eq 'down') 'numeric Wi-Fi mapping failed'
     Assert-True ($inventory.Json.result.adapters[2].kind -eq 'other') 'software adapters must stay other'
+
+    $safety = Invoke-Helper -Command 'inspect-network-safety' -Input @{ adapterId = '{A}' } -Fixture @{
+        networkSafety = @{ networkCategory = 'Public'; firewallEnabled = $true; defaultInboundAction = 'Block' }
+    }
+    Assert-True $safety.Json.ok "network-safety inspection failed: $($safety.Raw)"
+    Assert-True ($safety.Json.result.networkCategory -eq 'public') 'network category must be normalized'
+    $domainSafety = Invoke-Helper -Command 'inspect-network-safety' -Input @{ adapterId = '{A}' } -Fixture @{
+        networkSafety = @{ networkCategory = 'DomainAuthenticated'; firewallEnabled = $true; defaultInboundAction = 'NotConfigured' }
+    }
+    Assert-True ($domainSafety.Json.result.networkCategory -eq 'domain') 'DomainAuthenticated must normalize to the Domain firewall profile'
+    Assert-True ($domainSafety.Json.result.defaultInboundAction -eq 'not_configured') 'firewall action must be normalized'
+    Assert-True ($safety.Json.result.firewallEnabled -eq $true -and $safety.Json.result.defaultInboundAction -eq 'block') 'active firewall posture must be normalized'
+    Assert-Reason (Invoke-Helper -Command 'inspect-network-safety' -Input @{ adapterId = '' } -Fixture @{}) 'invalid_request'
 
     Assert-Reason (Invoke-Helper -Command 'adapter-inventory' -Input @{ unexpected = $true } -Fixture @{ adapters = @() }) 'invalid_request'
     Assert-Reason (Invoke-Helper -Command 'set-preference' -RawRequest '{"preference":"unattended","preference":"shields-up","enabled":true}' -Fixture $prefFixture) 'invalid_request'

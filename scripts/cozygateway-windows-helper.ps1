@@ -493,9 +493,20 @@ function Set-PrivateAcl {
     if ([bool](Get-FixtureProperty 'skipAcl')) { Write-TestEvent 'protect-acl' @($Path); return }
     try {
         $item = Get-Item -LiteralPath $Path
+        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $existing = Get-Acl -LiteralPath $Path
+        $existingRules = @($existing.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
+        $expectedIdentities = @($current.Value, 'S-1-5-18') | Sort-Object
+        $actualIdentities = @($existingRules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
+        $alreadyPrivate = $existing.AreAccessRulesProtected -and
+            (($actualIdentities -join ',') -eq ($expectedIdentities -join ',')) -and
+            (@($existingRules | Where-Object {
+                $_.IsInherited -or $_.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+                (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl)
+            }).Count -eq 0)
+        if ($alreadyPrivate) { return }
         $acl = if ($item.PSIsContainer) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
         $acl.SetAccessRuleProtection($true, $false)
-        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
         $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
         $rights = [Security.AccessControl.FileSystemRights]::FullControl
         $type = [Security.AccessControl.AccessControlType]::Allow
@@ -511,6 +522,53 @@ function Set-PrivateAcl {
         $acl.SetOwner($current)
         Set-Acl -LiteralPath $Path -AclObject $acl
     } catch { Throw-Reason 'acl_failed' }
+}
+
+function Test-UnsafeInstallRootAcl {
+    param([string]$Path)
+    if ([bool](Get-FixtureProperty 'unsafeInstallRoot')) { return $true }
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $allowed = @($current, 'S-1-5-18', 'S-1-5-32-544')
+        $writeRights = [Security.AccessControl.FileSystemRights]::WriteData -bor
+            [Security.AccessControl.FileSystemRights]::CreateFiles -bor
+            [Security.AccessControl.FileSystemRights]::CreateDirectories -bor
+            [Security.AccessControl.FileSystemRights]::AppendData -bor
+            [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+            [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+            [Security.AccessControl.FileSystemRights]::Delete -bor
+            [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [Security.AccessControl.FileSystemRights]::TakeOwnership
+        foreach ($rule in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+            if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                (($rule.FileSystemRights -band $writeRights) -ne 0) -and
+                $rule.IdentityReference.Value -notin $allowed) { return $true }
+        }
+        return $false
+    } catch { Throw-Reason 'acl_failed' }
+}
+
+function Invoke-PrepareInstallRoot {
+    param($Request)
+    if (-not (Test-ExactKeys $Request @('root')) -or $Request.root -isnot [string] -or
+        -not (Test-FullyQualifiedWindowsPath ([string]$Request.root))) { Throw-Reason 'invalid_request' }
+    $root = Normalize-FullyQualifiedPath ([string]$Request.root)
+    $volumeRoot = [IO.Path]::GetPathRoot($root)
+    if ([string]::Equals($root.TrimEnd('\'), $volumeRoot.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { Throw-Reason 'path_rejected' }
+    if (Test-ReparsePath $root) { Throw-Reason 'path_reparse_point' }
+    $bin = Join-Path $root 'bin'
+    $runtime = Join-Path $root 'runtime'
+    foreach ($existing in @($root, $bin, $runtime)) {
+        if ((Test-Path -LiteralPath $existing) -and (Test-UnsafeInstallRootAcl $existing)) { Throw-Reason 'unsafe_install_root' }
+    }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { New-Item -ItemType Directory -Path $root | Out-Null }
+    Set-PrivateAcl $root
+    if (-not (Test-Path -LiteralPath $bin -PathType Container)) { New-Item -ItemType Directory -Path $bin | Out-Null }
+    Set-PrivateAcl $bin
+    if (Test-Path -LiteralPath $runtime -PathType Container) { Set-PrivateAcl $runtime }
+    return [ordered]@{ applied = $true }
 }
 
 function Invoke-ProtectPath {
@@ -596,6 +654,48 @@ function Invoke-AdapterInventory {
     } catch { if ($_.Exception.Message -eq 'invalid_request') { throw }; Throw-Reason 'inventory_failed' }
 }
 
+function Invoke-InspectNetworkSafety {
+    param($Request)
+    if (-not (Test-ExactKeys $Request @('adapterId')) -or $Request.adapterId -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$Request.adapterId) -or ([string]$Request.adapterId).Length -gt 128) { Throw-Reason 'invalid_request' }
+    try {
+        $fixtureSafety = Get-FixtureProperty 'networkSafety'
+        if ($null -ne $fixtureSafety) {
+            $categoryRaw = [string]$fixtureSafety.networkCategory
+            $enabled = [bool]$fixtureSafety.firewallEnabled
+            $inboundRaw = [string]$fixtureSafety.defaultInboundAction
+        } else {
+            $adapter = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -ErrorAction Stop |
+                Where-Object { [string]$_.InterfaceGuid -eq [string]$Request.adapterId } | Select-Object -First 1)
+            if ($adapter.Count -ne 1) { Throw-Reason 'network_inspection_failed' }
+            $profile = @(Get-NetConnectionProfile -InterfaceIndex $adapter[0].InterfaceIndex -ErrorAction Stop | Select-Object -First 1)
+            if ($profile.Count -ne 1) { Throw-Reason 'network_inspection_failed' }
+            $categoryRaw = [string]$profile[0].NetworkCategory
+            $firewallProfileName = if ($categoryRaw -match '^(?i:domain(?:authenticated)?)$') { 'Domain' } else { $categoryRaw }
+            $firewall = @(Get-NetFirewallProfile -PolicyStore ActiveStore -Name $firewallProfileName -ErrorAction Stop | Select-Object -First 1)
+            if ($firewall.Count -ne 1) { Throw-Reason 'network_inspection_failed' }
+            $enabled = [bool]$firewall[0].Enabled
+            $inboundRaw = [string]$firewall[0].DefaultInboundAction
+        }
+        $category = switch -Regex ($categoryRaw) {
+            '^(?i:private)$' { 'private'; break }
+            '^(?i:public)$' { 'public'; break }
+            '^(?i:domain(?:authenticated)?)$' { 'domain'; break }
+            default { 'unknown' }
+        }
+        $inbound = switch -Regex ($inboundRaw) {
+            '^(?i:allow)$' { 'allow'; break }
+            '^(?i:block)$' { 'block'; break }
+            '^(?i:notconfigured)$' { 'not_configured'; break }
+            default { 'unknown' }
+        }
+        return [ordered]@{ networkCategory = $category; firewallEnabled = $enabled; defaultInboundAction = $inbound }
+    } catch {
+        if ($_.Exception.Message -eq 'network_inspection_failed') { throw }
+        Throw-Reason 'network_inspection_failed'
+    }
+}
+
 function Invoke-FixedHelperCommand {
     param([string]$Name, $Request)
     switch -CaseSensitive ($Name) {
@@ -605,23 +705,25 @@ function Invoke-FixedHelperCommand {
         'open-browser' { return Invoke-OpenBrowser $Request }
         'initialize-pending' { return Invoke-InitializePending $Request }
         'protect-path' { return Invoke-ProtectPath $Request }
+        'prepare-install-root' { return Invoke-PrepareInstallRoot $Request }
         'adapter-inventory' { return Invoke-AdapterInventory $Request }
+        'inspect-network-safety' { return Invoke-InspectNetworkSafety $Request }
         default { Throw-Reason 'invalid_request' }
     }
 }
 
 $knownReasons = @(
-    'invalid_request','request_too_large','path_rejected','path_reparse_point','acl_failed',
+    'invalid_request','request_too_large','path_rejected','path_reparse_point','acl_failed','unsafe_install_root',
     'tailscale_not_installed','tailscale_legacy_unsupported','tailscale_service_mismatch','tailscale_signature_invalid',
     'tailscale_publisher_invalid','tailscale_prerequisite_disabled','download_failed','download_redirect_rejected',
     'download_too_large','installer_signature_invalid','installer_cancelled','installer_reboot_required','installer_failed','preference_failed','preference_cancelled',
-    'preference_verification_failed','browser_url_rejected','browser_open_failed','inventory_failed','internal_error'
+    'preference_verification_failed','browser_url_rejected','browser_open_failed','inventory_failed','network_inspection_failed','internal_error'
 )
 
 function Invoke-WindowsHelperMain {
     param([string]$Name, $InjectedFixture = $null)
     $script:Fixture = $InjectedFixture
-    $fixedCommands = @('discover-tailscale','install-tailscale','set-preference','open-browser','initialize-pending','protect-path','adapter-inventory')
+    $fixedCommands = @('discover-tailscale','install-tailscale','set-preference','open-browser','initialize-pending','protect-path','prepare-install-root','adapter-inventory','inspect-network-safety')
     $envelopeCommand = if ($fixedCommands -ccontains $Name) { $Name } else { 'invalid' }
     $ok = $false
     $result = $null
