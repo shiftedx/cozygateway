@@ -190,6 +190,108 @@ describe("LanModeAdapter", () => {
     expect(runtime.restartCalls).toHaveLength(1);
   });
 
+  it("rolls back and reports posture drift when DHCP changes during the final probe", async () => {
+    const runtime = new FakeLanRuntime();
+    const before = copyState(runtime.listener);
+    runtime.beforeProbe = () => {
+      runtime.inventory.adapters[0] = physical({ ipv4Addresses: ["192.168.1.24"] });
+    };
+    const adapter = new LanModeAdapter(runtime);
+
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "posture" });
+
+    expect(runtime.listener).toEqual(before);
+    expect(runtime.compareAndSwapCalls).toHaveLength(2);
+  });
+
+  it("rolls back and reports posture drift when the selected adapter is replaced during the final probe", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.beforeProbe = () => {
+      runtime.inventory.adapters[0] = physical({ id: "replacement-wifi", kind: "wifi" });
+    };
+    const adapter = new LanModeAdapter(runtime);
+
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "posture" });
+
+    expect(runtime.listener.bindHost).toBe("127.0.0.1");
+  });
+
+  it.each([
+    [
+      "no candidate",
+      [physical({ status: "down" })],
+      "no_up_physical_private_ipv4",
+      [],
+    ],
+    [
+      "ambiguous candidates",
+      [
+        physical(),
+        physical({ id: "wifi", displayName: "Wireless", kind: "wifi", ipv4Addresses: ["10.0.0.5"] }),
+      ],
+      "multiple_up_physical_private_ipv4",
+      [{ adapterId: "physical-ethernet" }, { adapterId: "wifi" }],
+    ],
+  ] as const)("keeps a %s observation during the final probe typed and retryable", async (
+    _label,
+    adapters,
+    reason,
+    candidates,
+  ) => {
+    const runtime = new FakeLanRuntime();
+    runtime.beforeProbe = () => {
+      runtime.inventory.adapters = structuredClone([...adapters]);
+    };
+    const adapter = new LanModeAdapter(runtime);
+
+    const error = await adapter.prepare().catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(LanModePause);
+    expect(error).toMatchObject({ retryable: true, reason, candidates });
+    expect(runtime.listener.bindHost).toBe("127.0.0.1");
+  });
+
+  it("builds wildcard disclosure from the verified post-probe inventory", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.beforeProbe = () => {
+      runtime.inventory.adapters.push(physical({
+        id: "new-software-interface",
+        displayName: "New VPN",
+        kind: "other",
+        hardwareInterface: false,
+        ipv4Addresses: ["100.64.20.30"],
+      }));
+    };
+    const adapter = new LanModeAdapter(runtime);
+
+    const endpoint = await adapter.prepare();
+
+    expect(endpoint.wildcardExposure).toMatchObject({
+      otherInterfaces: [{ id: "new-software-interface", displayName: "New VPN", kind: "other" }],
+      message: expect.stringContaining("New VPN"),
+    });
+  });
+
+  it("keeps ambiguity discovered by inspect after its probe typed and retryable", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.listener.bindHost = "0.0.0.0";
+    runtime.beforeProbe = () => {
+      runtime.inventory.adapters.push(physical({
+        id: "second-physical",
+        displayName: "Second physical adapter",
+        kind: "wifi",
+        ipv4Addresses: ["10.0.0.6"],
+      }));
+    };
+    const adapter = new LanModeAdapter(runtime);
+
+    await expect(adapter.inspect()).rejects.toMatchObject({
+      retryable: true,
+      reason: "multiple_up_physical_private_ipv4",
+      candidates: [{ adapterId: "physical-ethernet" }, { adapterId: "second-physical" }],
+    });
+  });
+
   it("invalidates a DHCP address change before pairing and conditionally restores owned state", async () => {
     const runtime = new FakeLanRuntime();
     const before = copyState(runtime.listener);

@@ -257,19 +257,30 @@ export class LanModeAdapter implements NetworkModeAdapter {
   ): Promise<{ endpoint: LanPreparedEndpoint; probe: LanProbeResult }> {
     const inventory = knownInventory ?? await this.#runtime.readAdapterInventory(signal);
     const selection = selectPhysicalLanCandidate(inventory);
+    if (selection.outcome === "paused") throw new LanModePause(selection.reason, selection.candidates);
     if (
-      selection.outcome !== "selected"
-      || selection.candidate.adapterId !== expectedCandidate.adapterId
+      selection.candidate.adapterId !== expectedCandidate.adapterId
       || selection.candidate.address !== expectedCandidate.address
     ) throw new LanModeReadinessError("posture");
     const listener = await this.#runtime.readListenerState(signal);
     const origin = `http://${selection.candidate.address}:${listener.port}`;
     const probe = await this.#runtime.probeEndpoint(origin, signal);
-    const finalListener = await this.#runtime.readListenerState(signal);
+    const [finalInventory, finalListener] = await Promise.all([
+      this.#runtime.readAdapterInventory(signal),
+      this.#runtime.readListenerState(signal),
+    ]);
+    const finalSelection = selectPhysicalLanCandidate(finalInventory);
+    if (finalSelection.outcome === "paused") {
+      throw new LanModePause(finalSelection.reason, finalSelection.candidates);
+    }
+    if (
+      finalSelection.candidate.adapterId !== expectedCandidate.adapterId
+      || finalSelection.candidate.address !== expectedCandidate.address
+    ) throw new LanModeReadinessError("posture");
     return {
       endpoint: endpointOf(
-        selection.candidate,
-        inventory,
+        finalSelection.candidate,
+        finalInventory,
         finalListener,
         probe,
         sameState(listener, finalListener),

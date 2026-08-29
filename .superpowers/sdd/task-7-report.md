@@ -78,3 +78,74 @@ skipped. Existing fake-Hermes reconnect diagnostics remained noisy but no test f
 Task 8's Windows helper should emit `WindowsLanInventory` exactly as normalized here. Task 10 should
 surface `LanModePause.reason/candidates` as a resumable adapter-choice step and provide the concrete
 atomic runtime implementation; Task 7 intentionally leaves both operations inert.
+
+## Review-finding remediation
+
+All findings in `.superpowers/sdd/task-7-review-findings.md` were addressed test-first.
+
+### RED evidence
+
+Five new final-probe regressions failed against `d3a63ff`:
+
+```text
+pnpm --filter cozygateway exec vitest run test/lan-mode.test.ts
+Test Files  1 failed (1)
+Tests       5 failed | 11 passed (16)
+```
+
+- A DHCP address changed inside `beforeProbe`, but prepare returned the stale address as ready.
+- The physical adapter ID changed inside `beforeProbe`, but prepare returned the stale adapter.
+- No-candidate and two-candidate post-probe snapshots both resolved stale-ready rather than
+  returning typed retryable pauses.
+- Wildcard disclosure omitted an active software interface added during the probe because it was
+  built from the pre-probe inventory.
+
+### GREEN changes
+
+- The final inspection now validates helper inventory immediately before the probe and reads it
+  again after health/WebSocket/attach proof, alongside the final listener read.
+- A final single candidate must retain the expected stable adapter ID and address. A different
+  single candidate is posture drift and causes conditional rollback.
+- None or multiple candidates observed at initial prepare/inspect, immediately pre-probe, or
+  post-probe remain `LanModePause` with their original stable reason and safe candidate rows.
+- Endpoint identity, DHCP coordinate, durable fingerprint, and wildcard disclosure now come only
+  from the verified final helper snapshot.
+- A direct `inspect()` regression proves post-probe ambiguity remains retryable as well as the
+  prepare path. The Task 7 focused suites instantiate no Hermes client and emit no fake-Hermes
+  diagnostics to capture; all fake restart/attach behavior is captured through asserted runtime
+  call arrays. Existing expected fake-Hermes diagnostics remain confined to the full package run.
+
+### Post-review verification
+
+```text
+pnpm --filter cozygateway exec vitest run test/lan.test.ts test/lan-mode.test.ts
+Test Files  2 passed (2)
+Tests       27 passed (27)
+
+pnpm --filter cozygateway exec vitest run --reporter=dot
+Test Files  93 passed | 1 skipped (94)
+Tests       947 passed | 2 skipped (949)
+
+pnpm --filter cozygateway typecheck
+tsc --noEmit (exit 0)
+
+pnpm --filter cozygateway build
+tsc -p tsconfig.build.json (exit 0)
+
+git diff --check
+exit 0
+```
+
+The first full-suite attempt, run concurrently with the other gates, hit the already recorded
+Vitest worker `ERR_IPC_CHANNEL_CLOSED` without a test assertion. An immediate isolated rerun passed
+all 947 runnable tests.
+
+### Post-review self-review
+
+- Both mutable coordinates that matter across a network proof are now bracketed: listener/Hermes
+  transaction and fixed-helper physical inventory. The final endpoint never uses the earlier
+  inventory object.
+- Pause semantics are preserved at all three inventory observations; only a unique-but-different
+  candidate is classified as posture drift.
+- Conditional rollback behavior is unchanged: transient inventory failure restores only the exact
+  wizard-created listener/Hermes state, and concurrent listener edits still survive.
