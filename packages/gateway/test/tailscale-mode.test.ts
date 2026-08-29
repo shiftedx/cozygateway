@@ -180,7 +180,7 @@ describe("TailscaleModeAdapter", () => {
     expect(dependencies.calls).not.toContain("serve --bg --tls-terminated-tcp=443 tcp://127.0.0.1:18787");
     expect(dependencies.ownership.write).toHaveBeenCalledWith(expect.objectContaining({
       ownershipSubtype: "reused",
-      phase: "provisional",
+      phase: "preferences",
     }), undefined);
   });
 
@@ -224,7 +224,7 @@ describe("TailscaleModeAdapter", () => {
     expect(dependencies.calls).toContain("serve --bg --tls-terminated-tcp=443 tcp://127.0.0.1:18787");
     expect(dependencies.ownership.write).toHaveBeenCalledWith(expect.objectContaining({
       schemaVersion: 2,
-      phase: "provisional",
+      phase: "preferences",
       ownershipSubtype: "wizard-created",
       dnsName: "cozy.fixture-tailnet.ts.net",
       target: "127.0.0.1:18787",
@@ -382,6 +382,92 @@ describe("TailscaleModeAdapter", () => {
     ]);
     expect(dependencies.calls.some((call) => call.startsWith("up --unattended"))).toBe(false);
     expect(dependencies.calls.some((call) => call === "logout")).toBe(false);
+  });
+
+  it("journals each preference restoration before mutation so process-loss recovery is conditional", async () => {
+    for (const scenario of [
+      {
+        name: "unattended" as const,
+        initial: { unattended: false, shieldsUp: false },
+        changed: { unattended: true, shieldsUp: false },
+        restored: { unattended: false, shieldsUp: false },
+      },
+      {
+        name: "shields-up" as const,
+        initial: { unattended: true, shieldsUp: true },
+        changed: { unattended: true, shieldsUp: false },
+        restored: { unattended: true, shieldsUp: true },
+      },
+    ]) {
+      const dependencies = happyDependencies({ preferences: scenario.initial });
+      let stored: TailscaleMappingOwnership | undefined;
+      let journalAtMutation: TailscaleMappingOwnership | undefined;
+      let journalAtFailure: TailscaleMappingOwnership | undefined;
+      dependencies.ownership.read.mockImplementation(async () => stored);
+      dependencies.ownership.write.mockImplementation(async (value) => { stored = structuredClone(value); return "written"; });
+      dependencies.ownership.replace.mockImplementation(async (expected, replacement) => {
+        if (JSON.stringify(stored) !== JSON.stringify(expected)) return false;
+        stored = structuredClone(replacement);
+        return true;
+      });
+      const setPreference = dependencies.helper.setPreference.getMockImplementation()!;
+      dependencies.helper.setPreference.mockImplementation(async (...args) => {
+        if (args[0] === scenario.name) journalAtMutation = structuredClone(stored);
+        await setPreference(...args);
+      });
+      await expect(new TailscaleModeAdapter({
+        gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+        io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+        injectFailure: (boundary) => {
+          if (boundary === `${scenario.name.replace("-", "_")}_write`) {
+            journalAtFailure = structuredClone(stored);
+            throw new Error(`simulated process loss at ${scenario.name}`);
+          }
+        },
+      }).prepare()).rejects.toThrow(`simulated process loss at ${scenario.name}`);
+
+      expect(journalAtMutation).toMatchObject({
+        phase: "preferences",
+        preferenceRestorations: [expect.objectContaining({ name: scenario.name })],
+      });
+      expect(journalAtFailure).toEqual(journalAtMutation);
+
+      const recovered = happyDependencies({ preferences: scenario.changed });
+      let recoveredStored = journalAtFailure;
+      recovered.ownership.read.mockImplementation(async () => recoveredStored);
+      recovered.ownership.remove.mockImplementation(async () => { recoveredStored = undefined; return true; });
+      await new TailscaleModeAdapter({
+        gatewayPort: 18_787, cliRunner: recovered.runner, helper: recovered.helper,
+        io: recovered.io, probes: recovered.probes, ownership: recovered.ownership,
+      }).reconcileOwned();
+      expect(recovered.preferenceState).toEqual(scenario.restored);
+      expect(recoveredStored).toBeUndefined();
+    }
+  });
+
+  it("does not claim a compatible mapping created externally while preferences are being changed", async () => {
+    const dependencies = happyDependencies({
+      preferences: { unattended: false, shieldsUp: false },
+      serveSequence: [fixture("serve-empty.json"), fixture("serve-compatible.json"), fixture("serve-compatible.json")],
+    });
+    let stored: TailscaleMappingOwnership | undefined;
+    dependencies.ownership.read.mockImplementation(async () => stored);
+    dependencies.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+    dependencies.ownership.replace.mockImplementation(async (expected, replacement) => {
+      if (stored !== expected) return false;
+      stored = replacement;
+      return true;
+    });
+    dependencies.ownership.remove.mockImplementation(async () => { stored = undefined; return true; });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+    });
+
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping_conflict" });
+    expect(dependencies.calls).not.toContain("serve --tls-terminated-tcp=443 off");
+    expect(dependencies.preferenceState.unattended).toBe(false);
+    expect(stored).toBeUndefined();
   });
 
   it("conditionally restores a wizard-changed preference when a later preference is rejected", async () => {
@@ -612,7 +698,9 @@ describe("TailscaleModeAdapter", () => {
     });
 
     await expect(adapter.prepare()).resolves.toMatchObject({ createdByWizard: true });
-    expect(sequence).toEqual(["ownership:provisional", "serve:create", "ownership:active"]);
+    expect(sequence).toEqual([
+      "ownership:preferences", "ownership:provisional", "serve:create", "ownership:active",
+    ]);
     expect(stored).toMatchObject({ phase: "active", ownershipSubtype: "wizard-created" });
   });
 
@@ -622,7 +710,8 @@ describe("TailscaleModeAdapter", () => {
       gatewayPort: 18_787, cliRunner: source.runner, helper: source.helper,
       io: source.io, probes: source.probes, ownership: source.ownership,
     }).prepare();
-    const provisional = source.ownership.write.mock.calls[0]?.[0];
+    const provisional = source.ownership.replace.mock.calls
+      .find((call) => call[1].phase === "provisional")?.[1];
     expect(provisional).toMatchObject({ phase: "provisional", ownershipSubtype: "wizard-created" });
 
     const resumed = happyDependencies();
@@ -650,7 +739,8 @@ describe("TailscaleModeAdapter", () => {
       gatewayPort: 18_787, cliRunner: source.runner, helper: source.helper,
       io: source.io, probes: source.probes, ownership: source.ownership,
     }).prepare();
-    const provisional = source.ownership.write.mock.calls[0]![0];
+    const provisional = source.ownership.replace.mock.calls
+      .find((call) => call[1].phase === "provisional")![1];
 
     const recovered = happyDependencies();
     let stored: TailscaleMappingOwnership | undefined = provisional;
@@ -831,6 +921,34 @@ describe("TailscaleModeAdapter", () => {
 
     await expect(adapter.rollbackOwned(endpoint)).rejects.toMatchObject({ reason: "mapping" });
     expect(stored).toMatchObject({ phase: "active", ownershipSubtype: "wizard-created" });
+  });
+
+  it("throws typed mapping failure immediately when prepare rollback cannot remove exact Serve state", async () => {
+    const dependencies = happyDependencies({ serve: fixture("serve-empty.json") });
+    let stored: TailscaleMappingOwnership | undefined;
+    dependencies.ownership.read.mockImplementation(async () => stored);
+    dependencies.ownership.write.mockImplementation(async (value) => { stored = value; return "written"; });
+    dependencies.ownership.replace.mockImplementation(async (expected, replacement) => {
+      if (stored !== expected) return false;
+      stored = replacement;
+      return true;
+    });
+    const original = dependencies.runner.getMockImplementation()!;
+    dependencies.runner.mockImplementation(async (...args) => {
+      if (args[1].join(" ") === "serve --tls-terminated-tcp=443 off")
+        return { exitCode: 0, stdout: "", stderr: "" };
+      return original(...args);
+    });
+    const adapter = new TailscaleModeAdapter({
+      gatewayPort: 18_787, cliRunner: dependencies.runner, helper: dependencies.helper,
+      io: dependencies.io, probes: dependencies.probes, ownership: dependencies.ownership,
+      injectFailure: (boundary) => {
+        if (boundary === "mapping_create") throw new Error("simulated post-create process loss");
+      },
+    });
+
+    await expect(adapter.prepare()).rejects.toMatchObject({ reason: "mapping" });
+    expect(stored).toMatchObject({ phase: "provisional", ownershipSubtype: "wizard-created" });
   });
 
   it("maps helper failures to precise typed retryable pauses", async () => {

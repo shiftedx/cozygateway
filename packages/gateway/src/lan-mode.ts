@@ -24,6 +24,9 @@ export interface LanListenerState {
   /** Opaque hash of the complete persisted config/install-state/Hermes files. It is used only by
    * the concrete writer CAS and is deliberately excluded from endpoint fingerprints. */
   persistenceRevision?: string;
+  /** Bounded pre-mutation config text needed for exact process-restart rollback. Hermes targets
+   * are already modeled above, so token-bearing profile contents are never copied into SQLite. */
+  persistenceConfig?: string;
 }
 
 export interface LanProbeResult {
@@ -43,6 +46,13 @@ export interface LanModeRuntime {
     signal?: AbortSignal,
   ): Promise<string | undefined>;
   readListenerState(signal?: AbortSignal): Promise<LanListenerState>;
+  /** Produces the exact revision the concrete persistence CAS will apply before durable intent is
+   * written. Generic runtimes may omit it when their CAS state has no opaque persistence revision. */
+  planListenerState?(
+    expected: LanListenerState,
+    replacement: LanListenerState,
+    signal?: AbortSignal,
+  ): Promise<LanListenerState>;
   compareAndSwapListener(
     expected: LanListenerState,
     replacement: LanListenerState,
@@ -108,7 +118,7 @@ export class LanModeRollbackError extends Error {
 
 export interface LanListenerOwnership {
   schemaVersion: 1;
-  phase: "provisional" | "active";
+  phase: "provisional" | "active" | "rollback-restart-required";
   ownershipSubtype: "wizard-listener-cas";
   before: LanListenerState;
   after: LanListenerState;
@@ -136,6 +146,7 @@ function copyState(state: LanListenerState): LanListenerState {
     port: state.port,
     hermesTargets: state.hermesTargets.map((target) => ({ ...target })),
     ...(state.persistenceRevision === undefined ? {} : { persistenceRevision: state.persistenceRevision }),
+    ...(state.persistenceConfig === undefined ? {} : { persistenceConfig: state.persistenceConfig }),
   };
 }
 
@@ -163,6 +174,10 @@ function validListenerState(value: unknown): value is LanListenerState {
   if (typeof state.bindHost !== "string" || !Number.isSafeInteger(state.port)
     || (state.port as number) < 1 || (state.port as number) > 65_535 || !Array.isArray(state.hermesTargets)) return false;
   if (state.persistenceRevision !== undefined && typeof state.persistenceRevision !== "string") return false;
+  if (state.persistenceConfig !== undefined && (
+    typeof state.persistenceConfig !== "string"
+    || Buffer.byteLength(state.persistenceConfig, "utf8") > 16 * 1024
+  )) return false;
   return state.hermesTargets.every((target) => typeof target === "object" && target !== null && !Array.isArray(target)
     && typeof (target as Record<string, unknown>).profile === "string"
     && typeof (target as Record<string, unknown>).url === "string");
@@ -172,7 +187,7 @@ function validLanOwnership(value: unknown): value is LanListenerOwnership {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const owned = value as Record<string, unknown>;
   return owned.schemaVersion === 1
-    && (owned.phase === "provisional" || owned.phase === "active")
+    && (owned.phase === "provisional" || owned.phase === "active" || owned.phase === "rollback-restart-required")
     && owned.ownershipSubtype === "wizard-listener-cas"
     && validListenerState(owned.before)
     && validListenerState(owned.after)
@@ -240,6 +255,10 @@ function stateFingerprint(state: LanListenerState): string {
 
 function sameState(left: LanListenerState, right: LanListenerState): boolean {
   return stateFingerprint(left) === stateFingerprint(right);
+}
+
+function sameExactState(left: LanListenerState, right: LanListenerState): boolean {
+  return JSON.stringify(copyState(left)) === JSON.stringify(copyState(right));
 }
 
 function preparedState(before: LanListenerState): LanListenerState {
@@ -329,18 +348,29 @@ export class LanModeAdapter implements NetworkModeAdapter {
     const inventory = await this.#runtime.readAdapterInventory(signal);
     const candidate = await this.#candidate(inventory, true, signal);
     const before = await this.#runtime.readListenerState(signal);
-    const after = preparedState(before);
+    const afterIntent = preparedState(before);
+    const after = this.#runtime.planListenerState === undefined
+      ? afterIntent
+      : await this.#runtime.planListenerState(before, afterIntent, signal);
     let owned = await this.#runtime.ownership.read(signal);
     let listenerMutated = false;
     if (owned !== undefined) {
+      if (owned.phase === "rollback-restart-required") {
+        this.#owned = owned;
+        await this.#rollbackMutation(signal);
+        return this.prepare(signal);
+      }
       if (!sameState(owned.after, preparedState(owned.before)) || !sameState(after, owned.after))
         throw new LanModeRollbackError();
       if (sameState(before, owned.before)) {
         if (!await this.#runtime.compareAndSwapListener(owned.before, owned.after, signal))
           throw new LanModePause("listener_changed", [candidate]);
+        owned = await this.#adoptExactState(owned, "after", await this.#runtime.readListenerState(signal), signal);
         listenerMutated = true;
       } else if (!sameState(before, owned.after)) {
         throw new LanModeRollbackError();
+      } else {
+        owned = await this.#adoptExactState(owned, "after", before, signal);
       }
       this.#owned = owned;
     } else if (!sameState(before, after)) {
@@ -358,6 +388,7 @@ export class LanModeAdapter implements NetworkModeAdapter {
         await this.#removeOwnership(owned, signal);
         throw new LanModePause("listener_changed", [candidate]);
       }
+      owned = await this.#adoptExactState(owned, "after", await this.#runtime.readListenerState(signal), signal);
       listenerMutated = true;
       this.#owned = owned;
     }
@@ -514,17 +545,24 @@ export class LanModeAdapter implements NetworkModeAdapter {
   }
 
   async #rollbackMutation(signal?: AbortSignal): Promise<void> {
-    const owned = this.#owned ?? await this.#runtime.ownership.read(signal);
+    let owned = this.#owned ?? await this.#runtime.ownership.read(signal);
     if (owned === undefined) return;
+    if (owned.phase !== "rollback-restart-required") {
+      const pending: LanListenerOwnership = { ...owned, phase: "rollback-restart-required" };
+      if (!await this.#runtime.ownership.replace(owned, pending, signal)) throw new LanModeRollbackError();
+      owned = pending;
+      this.#owned = pending;
+    }
     const current = await this.#runtime.readListenerState(signal);
     if (sameState(current, owned.before)) {
-      await this.#removeOwnership(owned, signal);
-      this.#owned = undefined;
-      return;
+      owned = await this.#adoptExactState(owned, "before", current, signal);
+    } else {
+      if (!sameState(current, owned.after)) throw new LanModeRollbackError();
+      owned = await this.#adoptExactState(owned, "after", current, signal);
+      if (!await this.#runtime.compareAndSwapListener(owned.after, owned.before, signal))
+        throw new LanModeRollbackError();
+      owned = await this.#adoptExactState(owned, "before", await this.#runtime.readListenerState(signal), signal);
     }
-    if (!sameState(current, owned.after)) throw new LanModeRollbackError();
-    if (!await this.#runtime.compareAndSwapListener(owned.after, owned.before, signal))
-      throw new LanModeRollbackError();
     try {
       await this.#runtime.restartAndWait(owned.before, signal);
     } catch {
@@ -532,6 +570,26 @@ export class LanModeAdapter implements NetworkModeAdapter {
     }
     await this.#removeOwnership(owned, signal);
     this.#owned = undefined;
+  }
+
+  async #adoptExactState(
+    owned: LanListenerOwnership,
+    side: "before" | "after",
+    observed: LanListenerState,
+    signal?: AbortSignal,
+  ): Promise<LanListenerOwnership> {
+    if (!sameState(owned[side], observed)) throw new LanModeRollbackError();
+    const expectedRevision = owned[side].persistenceRevision;
+    if (expectedRevision !== undefined && observed.persistenceRevision !== expectedRevision)
+      throw new LanModeRollbackError();
+    const exact = copyState(observed);
+    if (side === "after") delete exact.persistenceConfig;
+    else if (owned.before.persistenceConfig !== undefined) exact.persistenceConfig = owned.before.persistenceConfig;
+    if (sameExactState(owned[side], exact)) return owned;
+    const replacement: LanListenerOwnership = { ...owned, [side]: exact };
+    if (!await this.#runtime.ownership.replace(owned, replacement, signal)) throw new LanModeRollbackError();
+    this.#owned = replacement;
+    return replacement;
   }
 
   async #removeOwnership(owned: LanListenerOwnership, signal?: AbortSignal): Promise<void> {

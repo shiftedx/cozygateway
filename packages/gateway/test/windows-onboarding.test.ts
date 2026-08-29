@@ -9,12 +9,25 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCli, type CliIo, type CliRuntime } from "../src/cli.ts";
 import type { NetworkModeAdapter, OnboardingIo, PreparedEndpoint } from "../src/network-onboarding.ts";
 import type { NetworkOnboardingState, NetworkOnboardingStateProjection } from "../src/onboarding-state.ts";
-import { openStorage, type OnboardingMode, type Storage } from "../src/storage.ts";
-import { createWindowsOnboardingController } from "../src/windows-onboarding.ts";
+import { openStorage, Storage, type OnboardingMode } from "../src/storage.ts";
+import {
+  AdvancedModeAdapter,
+  WindowsLanSafetyAdapter,
+  WindowsTailscaleAdapter,
+  createWindowsOnboardingController,
+  reconcileWindowsOwnedNetworkState,
+} from "../src/windows-onboarding.ts";
 import type { WindowsNetworkSafety } from "../src/windows-helper.ts";
 import type { WindowsLanInventory } from "../src/lan.ts";
 import type { TailscaleCliRunner } from "../src/tailscale-cli.ts";
 import type { OperatorPhoneStatus } from "../src/operator-onboarding.ts";
+import { SqliteLanOwnershipStore, type LanListenerOwnership } from "../src/lan-mode.ts";
+import {
+  compareAndSwapManagedListener,
+  readManagedListenerSnapshot,
+} from "../src/configure.ts";
+import { TailscaleModeAdapter } from "../src/tailscale-mode.ts";
+import { WindowsHelperClient } from "../src/windows-helper.ts";
 
 const roots: string[] = [];
 const tailscaleFixture = (name: string) => readFileSync(
@@ -185,6 +198,102 @@ function dependencies(storage: Storage, inventory: WindowsLanInventory, control:
 }
 
 describe("createWindowsOnboardingController composition", () => {
+  it("forwards durable reconciliation through Windows wrappers", async () => {
+    const { configPath, storage } = fixture();
+    const delegate: NetworkModeAdapter = {
+      mode: "tailscale",
+      prepare: vi.fn(),
+      inspect: vi.fn(),
+      rollbackOwned: vi.fn(async () => undefined),
+      reconcileOwned: vi.fn(async () => undefined),
+    };
+    const hostRuntime = runtime();
+    const hostHelper = helper(oneLan);
+    const signal = new AbortController().signal;
+    const tailscale = new WindowsTailscaleAdapter({
+      delegate, configPath, installRoot: dirname(dirname(configPath)), helper: hostHelper, runtime: hostRuntime,
+    });
+    const lan = new WindowsLanSafetyAdapter({ ...delegate, mode: "lan" }, hostHelper);
+    const advanced = new AdvancedModeAdapter({
+      configPath, installRoot: dirname(dirname(configPath)), helper: hostHelper, runtime: hostRuntime, storage,
+    });
+
+    await tailscale.reconcileOwned(signal);
+    await lan.reconcileOwned(signal);
+    await advanced.reconcileOwned(signal);
+
+    expect(delegate.reconcileOwned).toHaveBeenNthCalledWith(1, signal);
+    expect(delegate.reconcileOwned).toHaveBeenNthCalledWith(2, signal);
+    expect(readFileSync(configPath, "utf8")).toContain('"host": "127.0.0.1"');
+    storage.close();
+  });
+
+  it("constructs real installed adapters for bounded cleanup, closes SQLite, and propagates failure", async () => {
+    const { configPath, storage } = fixture();
+    storage.close();
+    const events: string[] = [];
+    const tailscale = vi.spyOn(TailscaleModeAdapter.prototype, "reconcileOwned")
+      .mockImplementationOnce(async () => { events.push("tailscale"); })
+      .mockImplementationOnce(async () => { throw new Error("tailscale cleanup failed"); });
+    const lan = vi.spyOn((await import("../src/lan-mode.ts")).LanModeAdapter.prototype, "reconcileOwned")
+      .mockImplementation(async () => { events.push("lan"); });
+    const advanced = vi.spyOn(AdvancedModeAdapter.prototype, "reconcileOwned")
+      .mockImplementation(async () => { events.push("advanced"); });
+    const close = vi.spyOn(Storage.prototype, "close");
+
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).resolves.toBeUndefined();
+    expect(events).toEqual(["tailscale", "lan", "advanced"]);
+    expect(close).toHaveBeenCalledTimes(1);
+
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toThrow("tailscale cleanup failed");
+    expect(lan).toHaveBeenCalledTimes(2);
+    expect(advanced).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(tailscale).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers a real post-CAS crash from SQLite and restores the exact managed listener snapshot", async () => {
+    const { configPath, storage } = fixture();
+    const originalConfig = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    originalConfig.publicUrl = "https://remote.example.com";
+    writeFileSync(configPath, `${JSON.stringify(originalConfig, null, 2)}\n`);
+    const beforeSnapshot = readManagedListenerSnapshot(configPath);
+    const beforeRevision = createHash("sha256").update(JSON.stringify(beforeSnapshot)).digest("hex");
+    const before = {
+      bindHost: "127.0.0.1",
+      port: 18_787,
+      hermesTargets: [{ profile: "default", url: "http://127.0.0.1:18787" }],
+      persistenceRevision: beforeRevision,
+      persistenceConfig: beforeSnapshot.configText,
+    };
+    const ownership: LanListenerOwnership = {
+      schemaVersion: 1,
+      phase: "provisional",
+      ownershipSubtype: "wizard-listener-cas",
+      before,
+      after: {
+        bindHost: "0.0.0.0", port: 18_787,
+        hermesTargets: [{ profile: "default", url: "http://127.0.0.1:18787" }],
+      },
+      createdAt: 123,
+    };
+    await new SqliteLanOwnershipStore(storage).write(ownership);
+    expect(storage.onboardingOwnership("lan:listener")?.ownedStateJson).not.toContain("do-not-print");
+    expect(compareAndSwapManagedListener(configPath, beforeSnapshot, "0.0.0.0", 18_787, { clearPublicUrl: true }))
+      .toBe(true);
+    storage.close();
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    const hostRuntime = runtime();
+
+    await reconcileWindowsOwnedNetworkState(configPath, hostRuntime);
+
+    expect(readManagedListenerSnapshot(configPath)).toEqual(beforeSnapshot);
+    expect(hostRuntime.restartHermesProfile).toHaveBeenCalledTimes(1);
+    const reopened = openStorage(join(dirname(configPath), "gateway.sqlite"));
+    expect(reopened.onboardingOwnership("lan:listener")).toBeUndefined();
+    reopened.close();
+  });
+
   it("completes the remote route through the live control boundary and SQLite gate", async () => {
     const { configPath, storage } = fixture();
     let now = 10;
@@ -320,6 +429,8 @@ describe("createWindowsOnboardingController composition", () => {
     expect(copy).toMatch(/Windows.*Public/i);
     expect(copy).toMatch(/Settings.*Private/i);
     expect(copy).toMatch(/do not disable.*firewall/i);
+    expect(copy).toMatch(/Windows Security.*Firewall & network protection.*Advanced settings.*Inbound Rules/i);
+    expect(copy).toContain("TCP port 18787");
     controller.close();
   });
 
@@ -336,12 +447,183 @@ describe("createWindowsOnboardingController composition", () => {
       outcome: "complete", endpoint: { bindHost: "192.168.1.50", port: 19000 },
     });
     expect(hostRuntime.restartHermesProfile).toHaveBeenCalledOnce();
+    expect(storage.onboardingOwnership("advanced:listener")).toBeDefined();
     controller.close();
+  });
+
+  it("durably recovers Advanced when the process is lost after listener CAS", async () => {
+    const { configPath, storage } = fixture();
+    const before = readManagedListenerSnapshot(configPath);
+    const deps = {
+      ...dependencies(storage, oneLan, phoneControl(storage, () => 10), () => 10),
+      afterAdvancedListenerCas: vi.fn(async () => { throw new Error("simulated process loss"); }),
+    };
+    const controller = createWindowsOnboardingController(
+      configPath, cliIo(["192.168.1.50", "19000"]), runtime(), deps,
+    )!;
+
+    await expect(controller.run(onboardingIo("advanced"))).resolves.toEqual({
+      outcome: "failed", reason: "readiness",
+    });
+    expect(readManagedListenerSnapshot(configPath)).not.toEqual(before);
+    const durable = storage.onboardingOwnership("advanced:listener")!;
+    expect(durable.ownedStateJson).not.toContain("do-not-print");
+    expect(JSON.parse(durable.ownedStateJson)).toMatchObject({
+      phase: "provisional",
+      after: { persistenceRevision: expect.stringMatching(/^[0-9a-f]{64}$/) },
+    });
+    controller.close();
+
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    const recovery = runtime();
+    await reconcileWindowsOwnedNetworkState(configPath, recovery);
+    expect(readManagedListenerSnapshot(configPath)).toEqual(before);
+    expect(recovery.restartHermesProfile).toHaveBeenCalledOnce();
+    const reopened = openStorage(join(dirname(configPath), "gateway.sqlite"));
+    expect(reopened.onboardingOwnership("advanced:listener")).toBeUndefined();
+    reopened.close();
+  });
+
+  it("conditionally restores Advanced listener state after phone rejection", async () => {
+    const { configPath, storage } = fixture();
+    const before = readManagedListenerSnapshot(configPath);
+    const control = phoneControl(storage, () => 10);
+    control.status.mockResolvedValue({ state: "cancelled" });
+    const controller = createWindowsOnboardingController(
+      configPath,
+      cliIo(["192.168.1.50", "19000"]),
+      runtime(),
+      dependencies(storage, oneLan, control, () => 10),
+    )!;
+
+    await expect(controller.run(onboardingIo("advanced"))).resolves.toEqual({
+      outcome: "not_confirmed", reason: "phone",
+    });
+    expect(readManagedListenerSnapshot(configPath)).toEqual(before);
+    expect(storage.onboardingOwnership("advanced:listener")).toBeUndefined();
+    controller.close();
+  });
+
+  it("retains Advanced restart authority when reverse CAS succeeds but restart fails", async () => {
+    const { configPath, storage } = fixture();
+    const before = readManagedListenerSnapshot(configPath);
+    const control = phoneControl(storage, () => 10);
+    control.status.mockResolvedValue({ state: "cancelled" });
+    const failingRuntime = runtime();
+    vi.mocked(failingRuntime.restartHermesProfile)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("restart failed"));
+    const controller = createWindowsOnboardingController(
+      configPath,
+      cliIo(["192.168.1.50", "19000"]),
+      failingRuntime,
+      dependencies(storage, oneLan, control, () => 10),
+    )!;
+
+    await expect(controller.run(onboardingIo("advanced"))).resolves.toEqual({
+      outcome: "failed", reason: "rollback_failed",
+    });
+    expect(readManagedListenerSnapshot(configPath)).toEqual(before);
+    expect(JSON.parse(storage.onboardingOwnership("advanced:listener")!.ownedStateJson)).toMatchObject({
+      phase: "rollback-restart-required",
+    });
+    controller.close();
+
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    const recovery = runtime();
+    await reconcileWindowsOwnedNetworkState(configPath, recovery);
+    expect(recovery.restartHermesProfile).toHaveBeenCalledOnce();
+    const reopened = openStorage(join(dirname(configPath), "gateway.sqlite"));
+    expect(reopened.onboardingOwnership("advanced:listener")).toBeUndefined();
+    reopened.close();
+  });
+
+  it("restores a paused Advanced route when choosing Later", async () => {
+    const { configPath, storage } = fixture();
+    const before = readManagedListenerSnapshot(configPath);
+    const projection = stateProjection();
+    const control = phoneControl(storage, () => 10);
+    control.begin.mockRejectedValueOnce(Object.assign(new Error("restart"), {
+      retryable: true as const, reason: "gateway_restarting",
+    }));
+    const deps = {
+      ...dependencies(storage, oneLan, control, () => 10),
+      state: projection,
+    };
+    const controller = createWindowsOnboardingController(
+      configPath, cliIo(["192.168.1.50", "19000"]), runtime(), deps,
+    )!;
+    await expect(controller.run(onboardingIo("advanced"))).resolves.toMatchObject({ outcome: "paused" });
+
+    await expect(controller.resume({
+      ...onboardingIo("advanced"),
+      chooseNetworkMode: vi.fn(async () => "later" as const),
+    })).resolves.toEqual({ outcome: "deferred" });
+    expect(readManagedListenerSnapshot(configPath)).toEqual(before);
+    expect(storage.onboardingOwnership("advanced:listener")).toBeUndefined();
+    controller.close();
+  });
+
+  it("restores a paused Advanced route before switching to LAN", async () => {
+    const { configPath, storage } = fixture();
+    const control = phoneControl(storage, () => 10);
+    control.begin.mockRejectedValueOnce(Object.assign(new Error("restart"), {
+      retryable: true as const, reason: "gateway_restarting",
+    }));
+    const projection = stateProjection();
+    const controller = createWindowsOnboardingController(
+      configPath,
+      cliIo(["192.168.1.50", "19000"]),
+      runtime(),
+      { ...dependencies(storage, oneLan, control, () => 10), state: projection },
+    )!;
+    await expect(controller.run(onboardingIo("advanced"))).resolves.toMatchObject({ outcome: "paused" });
+    await expect(controller.resume(onboardingIo("lan"))).resolves.toMatchObject({
+      outcome: "complete", mode: "lan",
+    });
+    expect(storage.onboardingOwnership("advanced:listener")).toBeUndefined();
+    expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({ host: "0.0.0.0", port: 18787 });
+    controller.close();
+  });
+
+  it("fails closed without overwriting an external Advanced config change", async () => {
+    const { configPath, storage } = fixture();
+    const control = phoneControl(storage, () => 10);
+    control.begin.mockRejectedValueOnce(Object.assign(new Error("restart"), {
+      retryable: true as const, reason: "gateway_restarting",
+    }));
+    const controller = createWindowsOnboardingController(
+      configPath,
+      cliIo(["192.168.1.50", "19000"]),
+      runtime(),
+      dependencies(storage, oneLan, control, () => 10),
+    )!;
+    await expect(controller.run(onboardingIo("advanced"))).resolves.toMatchObject({ outcome: "paused" });
+    const external = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    external.turnTimeoutSeconds = 1;
+    writeFileSync(configPath, `${JSON.stringify(external, null, 2)}\n`);
+    const externalSnapshot = readManagedListenerSnapshot(configPath);
+    controller.close();
+
+    vi.spyOn(WindowsHelperClient.prototype, "protectPath").mockResolvedValue(undefined);
+    await expect(reconcileWindowsOwnedNetworkState(configPath, runtime())).rejects.toMatchObject({
+      reason: "rollback_failed",
+    });
+    expect(readManagedListenerSnapshot(configPath)).toEqual(externalSnapshot);
+    const reopened = openStorage(join(dirname(configPath), "gateway.sqlite"));
+    expect(JSON.parse(reopened.onboardingOwnership("advanced:listener")!.ownedStateJson)).toMatchObject({
+      phase: "rollback-restart-required",
+    });
+    reopened.close();
   });
 
   it("requires a concrete phone-reachable Advanced origin instead of loopback or wildcard", async () => {
     const { configPath, storage } = fixture();
-    const io = cliIo(["127.0.0.1", "0.0.0.0", "192.168.1.50", "19000"]);
+    const rejected = [
+      "127.0.0.1", "127.1", "2130706433", "0x7f000001", "localhost.",
+      "0.0.0.0", "0:0:0:0:0:0:0:1", "::ffff:127.0.0.1",
+    ];
+    const io = cliIo([...rejected, "192.168.1.50", "19000"]);
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     const controller = createWindowsOnboardingController(
       configPath, io, runtime(), dependencies(storage, oneLan, phoneControl(storage, () => 10), () => 10),
@@ -351,7 +633,7 @@ describe("createWindowsOnboardingController composition", () => {
       outcome: "complete",
       endpoint: { canonicalOrigin: "http://192.168.1.50:19000" },
     });
-    expect(io.question).toHaveBeenCalledTimes(4);
+    expect(io.question).toHaveBeenCalledTimes(rejected.length + 2);
     controller.close();
   });
 
@@ -368,6 +650,7 @@ describe("createWindowsOnboardingController composition", () => {
     const remote: NetworkModeAdapter = {
       mode: "tailscale", prepare: vi.fn(async () => endpoint), inspect: vi.fn(async () => endpoint),
       rollbackOwned: vi.fn(async () => undefined),
+      reconcileOwned: vi.fn(async () => undefined),
     };
     const deps = { ...dependencies(storage, oneLan, stable, () => 10), tailscaleAdapter: remote };
     const controller = createWindowsOnboardingController(configPath, cliIo(), runtime(), deps)!;
@@ -396,6 +679,7 @@ describe("createWindowsOnboardingController composition", () => {
     const remote: NetworkModeAdapter = {
       mode: "tailscale", prepare: vi.fn(async () => endpoint), inspect: vi.fn(async () => endpoint),
       rollbackOwned: vi.fn(async () => undefined),
+      reconcileOwned: vi.fn(async () => undefined),
     };
     const deps = {
       ...dependencies(storage, oneLan, control, () => 12),

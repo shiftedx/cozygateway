@@ -35,6 +35,7 @@ function copyState(state: LanListenerState): LanListenerState {
     bindHost: state.bindHost,
     port: state.port,
     hermesTargets: state.hermesTargets.map((target) => ({ ...target })),
+    ...(state.persistenceRevision === undefined ? {} : { persistenceRevision: state.persistenceRevision }),
   };
 }
 
@@ -62,6 +63,7 @@ class FakeLanRuntime implements LanModeRuntime {
   beforeProbe?: () => void;
   chooseAdapter?: (candidates: readonly PhysicalLanCandidate[]) => Promise<string | undefined>;
   selectedAdapterId?: string;
+  planListenerState?: (expected: LanListenerState, replacement: LanListenerState) => Promise<LanListenerState>;
 
   constructor() {
     let stored: LanListenerOwnership | undefined;
@@ -178,6 +180,25 @@ describe("LanModeAdapter", () => {
     });
   });
 
+  it("persists the exact planned revision before the production listener CAS", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.listener.persistenceRevision = "before-revision";
+    runtime.planListenerState = async (_expected, replacement) => ({
+      ...copyState(replacement), persistenceRevision: "planned-applied-revision",
+    });
+    let provisional: LanListenerOwnership | undefined;
+    const write = runtime.ownership.write.bind(runtime.ownership);
+    runtime.ownership.write = async (value, signal) => {
+      provisional = structuredClone(value);
+      return write(value, signal);
+    };
+
+    await new LanModeAdapter(runtime).prepare();
+
+    expect(provisional?.after.persistenceRevision).toBe("planned-applied-revision");
+    expect(runtime.compareAndSwapCalls[0]?.replacement.persistenceRevision).toBe("planned-applied-revision");
+  });
+
   it("resumes a listener CAS that completed before process loss from SQLite authority", async () => {
     const runtime = new FakeLanRuntime();
     const before = copyState(runtime.listener);
@@ -198,6 +219,34 @@ describe("LanModeAdapter", () => {
     expect(endpoint).toMatchObject({ ready: true, bindHost: "0.0.0.0" });
     expect(runtime.compareAndSwapCalls).toHaveLength(1);
     await expect(runtime.ownership.read()).resolves.toMatchObject({ phase: "active" });
+  });
+
+  it("adopts the exact applied listener revision after a post-CAS process loss", async () => {
+    const runtime = new FakeLanRuntime();
+    runtime.listener.persistenceRevision = "before-revision";
+    const before = copyState(runtime.listener);
+    const afterIntent: LanListenerState = {
+      bindHost: "0.0.0.0", port: before.port, hermesTargets: before.hermesTargets.map((target) => ({ ...target })),
+    };
+    const provisional: LanListenerOwnership = {
+      schemaVersion: 1,
+      phase: "provisional",
+      ownershipSubtype: "wizard-listener-cas",
+      before,
+      after: afterIntent,
+      createdAt: 123,
+    };
+    await runtime.ownership.write(provisional);
+    runtime.listener = { ...afterIntent, persistenceRevision: "applied-revision" };
+
+    await expect(new LanModeAdapter(runtime).prepare()).resolves.toMatchObject({ ready: true });
+
+    expect(runtime.compareAndSwapCalls).toEqual([]);
+    expect(runtime.restartCalls).toEqual([{ ...afterIntent, persistenceRevision: "applied-revision" }]);
+    await expect(runtime.ownership.read()).resolves.toMatchObject({
+      phase: "active",
+      after: { persistenceRevision: "applied-revision" },
+    });
   });
 
   it("prepares wildcard LAN state, synchronizes Hermes, and discloses every other Up interface", async () => {
@@ -509,7 +558,23 @@ describe("LanModeAdapter", () => {
     await expect(adapter.rollbackOwned(endpoint)).rejects.toMatchObject({ reason: "rollback_failed" });
     expect(runtime.listener.bindHost).toBe("0.0.0.0");
     expect(runtime.restartCalls).toHaveLength(1);
-    await expect(runtime.ownership.read()).resolves.toMatchObject({ phase: "active" });
+    await expect(runtime.ownership.read()).resolves.toMatchObject({ phase: "rollback-restart-required" });
+  });
+
+  it("retains restart-required authority and retries restart after rollback CAS succeeds", async () => {
+    const runtime = new FakeLanRuntime();
+    const adapter = new LanModeAdapter(runtime);
+    const endpoint = await adapter.prepare();
+    runtime.failRestartCall = 2;
+
+    await expect(adapter.rollbackOwned(endpoint)).rejects.toMatchObject({ reason: "rollback_failed" });
+    expect(runtime.listener.bindHost).toBe("127.0.0.1");
+    await expect(runtime.ownership.read()).resolves.toMatchObject({ phase: "rollback-restart-required" });
+
+    runtime.failRestartCall = undefined;
+    await expect(new LanModeAdapter(runtime).reconcileOwned()).resolves.toBeUndefined();
+    expect(runtime.restartCalls).toHaveLength(3);
+    await expect(runtime.ownership.read()).resolves.toBeUndefined();
   });
 
   it("reports a non-ready endpoint when health or WebSocket proof is later lost", async () => {
