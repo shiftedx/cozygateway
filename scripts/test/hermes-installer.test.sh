@@ -6,7 +6,18 @@ fake_node="$repo_root/scripts/test/fake-node24.sh"
 real_node="$(command -v node)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-installer-test.XXXXXX")"
 tmp="$(cd -P "$tmp" && pwd)"
-trap '[ -z "${supervisor_pid:-}" ] || kill "$supervisor_pid" 2>/dev/null || true; [ -z "${mock_dashboard_pid:-}" ] || kill "$mock_dashboard_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+stop_test_pid() {
+  local pid="${1:-}" taskkill
+  [ -n "$pid" ] || return 0
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      taskkill="$(cygpath -u "$WINDIR/System32/taskkill.exe")"
+      MSYS2_ARG_CONV_EXCL='*' "$taskkill" /PID "$pid" /T /F >/dev/null 2>&1 || true
+      ;;
+    *) kill "$pid" 2>/dev/null || true ;;
+  esac
+}
+trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
 # Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
 # reach reads as "it stopped somewhere". Name the line and the command that failed.
 trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
@@ -456,6 +467,10 @@ if grep -Fq '/auth/password-login' "$tmp/gateway-live/local/run-gateway.sh"; the
   echo 'loopback Dashboard wrapper must use Hermes session-token auth, not password auth' >&2
   exit 1
 fi
+if grep -Fq '/auth/password-login' "$repo_root/scripts/agent-install.sh"; then
+  echo 'installer source must not contain /auth/password-login' >&2
+  exit 1
+fi
 grep -Fq 'spawn(process.execPath, [bundle' "$tmp/gateway-live/local/run-gateway.sh"
 sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' | "$real_node" --check -
 if grep -Fq '. "' "$tmp/gateway-live/local/run-gateway.sh"; then
@@ -463,9 +478,12 @@ if grep -Fq '. "' "$tmp/gateway-live/local/run-gateway.sh"; then
   exit 1
 fi
 
-# Exercise the generated supervisor rather than only checking its source. An
-# atomic config replacement must terminate the first gateway child and launch
-# a second child that reads the new listener port.
+# Exercise the generated supervisor rather than only checking its source. This
+# is a true cold start: the supervisor must spawn Hermes with the exact
+# Dashboard arguments and token environment, Hermes launches a delayed
+# Dashboard, and Gateway cannot start until authenticated /api/config succeeds.
+# An atomic config replacement must then terminate the first gateway child and
+# launch a second child that reads the new listener port.
 sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' > "$tmp/supervisor.cjs"
 cat > "$tmp/reload-gateway.mjs" <<'RELOAD_GATEWAY'
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
@@ -477,47 +495,108 @@ process.on('SIGTERM', () => process.exit(0));
 setTimeout(() => process.exit(0), 5000);
 RELOAD_GATEWAY
 cat > "$tmp/mock-dashboard.mjs" <<'MOCK_DASHBOARD'
-import { readFileSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { parseEnv } from 'node:util';
-const expectedToken = parseEnv(readFileSync(process.argv[2], 'utf8')).DASHBOARD_SESSION_TOKEN;
-let readyAt;
+const expectedToken = process.env.HERMES_DASHBOARD_SESSION_TOKEN;
+const [port, authMarker, pidFile] = process.argv.slice(2);
+const readyAt = Date.now() + 750;
 const server = createServer((request, response) => {
-  if (request.url === '/api/health' && readyAt === undefined) readyAt = Date.now() + 750;
-  if (readyAt === undefined || Date.now() < readyAt) {
+  if (Date.now() < readyAt) {
     response.writeHead(503, { 'content-type': 'application/json' });
     response.end('{"detail":"starting"}\n');
     return;
   }
   const authenticated = request.url === '/api/config' && request.headers['x-hermes-session-token'] === expectedToken;
-  if (authenticated) writeFileSync(process.argv[4], `${expectedToken}\n`);
+  if (authenticated) writeFileSync(authMarker, `${expectedToken}\n`);
   response.writeHead(authenticated ? 200 : 401, { 'content-type': 'application/json' });
   response.end(authenticated ? '{}\n' : '{"detail":"unauthorized"}\n');
 });
-server.listen(0, '127.0.0.1', () => writeFileSync(process.argv[3], String(server.address().port)));
+server.listen(Number(port), '127.0.0.1', () => writeFileSync(pidFile, String(process.pid)));
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 MOCK_DASHBOARD
+cat > "$tmp/hermes-stub.cjs" <<'HERMES_STUB'
+const { readFileSync, writeFileSync } = require('node:fs');
+const { spawn } = require('node:child_process');
+const { basename, resolve } = require('node:path');
+const { parseEnv } = require('node:util');
+const hermesArgs = [basename(process.argv[1] || ''), ...process.argv.slice(2)];
+if (hermesArgs[0] === 'dashboard') {
+  const expectedArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
+  const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
+  writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
+    args: hermesArgs,
+    tokenMatches: process.env.HERMES_DASHBOARD_SESSION_TOKEN === expectedToken,
+    homeMatches,
+  }) + '\n');
+  if (JSON.stringify(hermesArgs) !== JSON.stringify(expectedArgs)) process.exit(41);
+  if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
+  if (!homeMatches) process.exit(43);
+  writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
+  spawn(process.execPath, [
+    process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
+    process.env.COZYGATEWAY_TEST_DASHBOARD_PORT,
+    process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER,
+    process.env.COZYGATEWAY_TEST_DASHBOARD_PID_FILE,
+  ], { detached: true, stdio: 'ignore', env: process.env }).unref();
+  process.exit(0);
+}
+HERMES_STUB
 dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
-"$real_node" "$tmp/mock-dashboard.mjs" "$tmp/gateway-live/local/dashboard.env" "$tmp/mock-dashboard.port" "$dashboard_auth_marker" >"$tmp/mock-dashboard.log" 2>&1 &
-mock_dashboard_pid=$!
-for _ in $(seq 1 50); do [ -s "$tmp/mock-dashboard.port" ] && break; sleep 0.1; done
-test -s "$tmp/mock-dashboard.port"
-mock_dashboard_port="$(cat "$tmp/mock-dashboard.port")"
+mock_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) hermes_stub="$tmp/hermes-stub.exe" ;; *) hermes_stub="$tmp/hermes-stub" ;; esac
+cp "$real_node" "$hermes_stub"
+chmod 700 "$hermes_stub"
 case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) reload_log="$(cygpath -w "$tmp/reload.log")"; spawnable_hermes="$(command -v cmd.exe)" ;;
-  *) reload_log="$tmp/reload.log"; spawnable_hermes="$(command -v true)" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    reload_log="$(cygpath -w "$tmp/reload.log")"
+    dashboard_auth_marker_env="$(cygpath -w "$dashboard_auth_marker")"
+    dashboard_env="$(cygpath -w "$tmp/gateway-live/local/dashboard.env")"
+    dashboard_script="$(cygpath -w "$tmp/mock-dashboard.mjs")"
+    dashboard_pid_file="$(cygpath -w "$tmp/mock-dashboard.pid")"
+    hermes_stub_marker="$(cygpath -w "$tmp/hermes-stub-invoked")"
+    hermes_stub_trace="$(cygpath -w "$tmp/hermes-stub-trace")"
+    expected_hermes_home="$(cygpath -w "$tmp/hermes")"
+    node_options_preload="$(cygpath -w "$tmp/hermes-stub.cjs")"
+    hermes_stub_arg="$(cygpath -w "$hermes_stub")"
+    ;;
+  *)
+    reload_log="$tmp/reload.log"
+    dashboard_auth_marker_env="$dashboard_auth_marker"
+    dashboard_env="$tmp/gateway-live/local/dashboard.env"
+    dashboard_script="$tmp/mock-dashboard.mjs"
+    dashboard_pid_file="$tmp/mock-dashboard.pid"
+    hermes_stub_marker="$tmp/hermes-stub-invoked"
+    hermes_stub_trace="$tmp/hermes-stub-trace"
+    expected_hermes_home="$tmp/hermes"
+    node_options_preload="$tmp/hermes-stub.cjs"
+    hermes_stub_arg="$hermes_stub"
+    ;;
 esac
-COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker" "$real_node" "$tmp/supervisor.cjs" \
+NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$reload_log" COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" \
+  COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" COZYGATEWAY_TEST_DASHBOARD_SCRIPT="$dashboard_script" \
+  COZYGATEWAY_TEST_DASHBOARD_PID_FILE="$dashboard_pid_file" COZYGATEWAY_TEST_DASHBOARD_PORT="$mock_dashboard_port" \
+  COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" \
+  COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
+  "$real_node" "$tmp/supervisor.cjs" \
   "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
-  "$spawnable_hermes" "$mock_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  "$hermes_stub_arg" "$mock_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
   >"$tmp/supervisor.log" 2>&1 &
 supervisor_pid=$!
 for _ in $(seq 1 50); do [ -s "$tmp/reload.log" ] && break; sleep 0.1; done
 if [ ! -s "$tmp/reload.log" ]; then
   printf '%s\n' 'generated supervisor did not launch its gateway child' >&2
   cat "$tmp/supervisor.log" >&2
+  [ ! -f "$tmp/hermes-stub-trace" ] || cat "$tmp/hermes-stub-trace" >&2
   exit 1
 fi
+if [ ! -s "$tmp/hermes-stub-invoked" ]; then
+  printf '%s\n' 'generated supervisor did not spawn Hermes during a cold Dashboard start' >&2
+  exit 1
+fi
+grep -Fxq "dashboard --host 127.0.0.1 --port $mock_dashboard_port --no-open --skip-build" "$tmp/hermes-stub-invoked"
+test -s "$tmp/mock-dashboard.pid"
+mock_dashboard_pid="$(cat "$tmp/mock-dashboard.pid")"
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
 const { readFileSync, renameSync, writeFileSync } = require('node:fs');
 const path = process.argv[2];
@@ -531,8 +610,7 @@ for _ in $(seq 1 50); do [ "$(wc -l < "$tmp/reload.log")" -ge 2 ] && break; slee
 kill "$supervisor_pid" 2>/dev/null || true
 wait "$supervisor_pid" 2>/dev/null || true
 supervisor_pid=
-kill "$mock_dashboard_pid" 2>/dev/null || true
-wait "$mock_dashboard_pid" 2>/dev/null || true
+stop_test_pid "$mock_dashboard_pid"
 mock_dashboard_pid=
 test "$(wc -l < "$tmp/reload.log")" -ge 2
 "$real_node" - "$tmp/gateway-live/local/dashboard.env" "$dashboard_auth_marker" <<'NODE'
