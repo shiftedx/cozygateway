@@ -130,6 +130,7 @@ LOCAL_DIR="$GATEWAY_DIR/local"
 CONFIG_JSON="$LOCAL_DIR/cozygateway.config.json"
 GATEWAY_ENV="$LOCAL_DIR/gateway.env"
 DASHBOARD_ENV="$LOCAL_DIR/dashboard.env"
+DASHBOARD_OWNER_PS1="$LOCAL_DIR/dashboard-owner.ps1"
 STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
 CLI_WRAPPER="$GATEWAY_DIR/bin/cozygateway"
@@ -645,16 +646,94 @@ remove_windows_cli_path() {
     [Environment]::SetEnvironmentVariable("PATH", ($parts -join ";"), "User")
   '
 }
+write_dashboard_owner_helper() {
+  [ "$DRY_RUN" = 1 ] && return
+  umask 077; cat > "$DASHBOARD_OWNER_PS1" <<'POWERSHELL_OWNER'
+param(
+  [Parameter(Mandatory = $true, Position = 0)][string]$ExpectedRoot,
+  [Parameter(Mandatory = $true, Position = 1)][string]$ExpectedHermes,
+  [Parameter(Mandatory = $true, Position = 2)][string]$ExpectedLauncher,
+  [Parameter(Mandatory = $true, Position = 3)][ValidateRange(1, 65535)][int]$ExpectedPort
+)
+$ErrorActionPreference = "Stop"
+$connection = Get-NetTCPConnection -State Listen -LocalAddress "127.0.0.1" -LocalPort $ExpectedPort -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $connection) { exit 0 }
+$process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
+# COZYGATEWAY_DASHBOARD_OWNER_BEGIN
+function Test-CozyDashboardOwner {
+  param(
+    $Process,
+    [string]$ExpectedRoot,
+    [string]$ExpectedHermes,
+    [string]$ExpectedLauncher,
+    [int]$ExpectedPort,
+    [scriptblock]$ResolveProcess
+  )
+  $root = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+  $hermes = [IO.Path]::GetFullPath($ExpectedHermes)
+  $launcher = [IO.Path]::GetFullPath($ExpectedLauncher)
+  $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
+
+  $runtimeUnderRoot = $false
+  $candidate = $Process
+  for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
+    try {
+      if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        $runtimeUnderRoot = $true
+        break
+      }
+    } catch {}
+    if (-not $candidate.ParentProcessId) { break }
+    $candidate = & $ResolveProcess ([int]$candidate.ParentProcessId)
+  }
+
+  $dashboardIndex = -1
+  $scriptSuffix = [IO.Path]::DirectorySeparatorChar + "hermes_cli" + [IO.Path]::DirectorySeparatorChar + "main.py"
+  $processExecutable = $null
+  $firstToken = $null
+  $secondToken = $null
+  try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch {}
+  if ($tokens.Count -gt 0) { try { $firstToken = [IO.Path]::GetFullPath($tokens[0]) } catch {} }
+  if ($tokens.Count -gt 1) { try { $secondToken = [IO.Path]::GetFullPath($tokens[1]) } catch {} }
+  $firstIsExecutable = $null -ne $processExecutable -and $null -ne $firstToken -and $firstToken.Equals($processExecutable, [StringComparison]::OrdinalIgnoreCase)
+  $pythonRuntime = $firstIsExecutable -and @("python.exe", "pythonw.exe") -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
+  $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
+  if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq "dashboard") {
+    $dashboardIndex = 1
+  } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
+    $dashboardIndex = 2
+  } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
+    $dashboardIndex = 3
+  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase) -and $tokens[2] -eq "dashboard") {
+    $dashboardIndex = 2
+  }
+  if ($dashboardIndex -lt 0) { return $false }
+  for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
+    if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return $true }
+    if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return $true }
+  }
+  return $false
+}
+# COZYGATEWAY_DASHBOARD_OWNER_END
+$resolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
+if (-not (Test-CozyDashboardOwner -Process $process -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $resolver)) { exit 42 }
+& ([IO.Path]::Combine($env:SystemRoot, "System32", "taskkill.exe")) /PID ([string]$process.ProcessId) /T /F | Out-Null
+exit $LASTEXITCODE
+POWERSHELL_OWNER
+  chmod 600 "$DASHBOARD_OWNER_PS1"
+}
 write_wrapper() {
-  local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg bundle_arg config_arg
+  local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg launcher_arg owner_helper_arg bundle_arg config_arg
   [ "$DRY_RUN" = 1 ] && { say "DRY   write 0700 gateway wrapper that reads $GATEWAY_ENV at runtime"; return; }
   gateway_env_arg="$GATEWAY_ENV"; dashboard_env_arg="$DASHBOARD_ENV"; hermes_root_arg="$HERMES_ROOT"
-  hermes_arg="$HERMES_RESOLVED"; bundle_arg="$BUNDLE_PATH"; config_arg="$CONFIG_JSON"
+  hermes_arg="$HERMES_RESOLVED"; launcher_arg="$HERMES_ROOT/bin/hermes.exe"; owner_helper_arg="$DASHBOARD_OWNER_PS1"; bundle_arg="$BUNDLE_PATH"; config_arg="$CONFIG_JSON"
   if is_windows; then
     gateway_env_arg="$(to_windows_path "$gateway_env_arg")"
     dashboard_env_arg="$(to_windows_path "$dashboard_env_arg")"
     hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
     hermes_arg="$(to_windows_path "$hermes_arg")"
+    launcher_arg="$(to_windows_path "$launcher_arg")"
+    owner_helper_arg="$(to_windows_path "$owner_helper_arg")"
     bundle_arg="$(to_windows_path "$bundle_arg")"
     config_arg="$(to_windows_path "$config_arg")"
   fi
@@ -662,12 +741,12 @@ write_wrapper() {
   umask 077; cat > "$WRAPPER" <<WRAPPER
 #!/usr/bin/env bash
 set -euo pipefail
-exec "$NODE_RESOLVED" - "$gateway_env_arg" "$dashboard_env_arg" "$hermes_root_arg" "$hermes_arg" "$DASHBOARD_PORT" "$bundle_arg" "$config_arg" <<'NODE'
+exec "$NODE_RESOLVED" - "$gateway_env_arg" "$dashboard_env_arg" "$hermes_root_arg" "$hermes_arg" "$launcher_arg" "$owner_helper_arg" "$DASHBOARD_PORT" "$bundle_arg" "$config_arg" <<'NODE'
 const { readFileSync, unwatchFile, watchFile } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-async function stopOwnedDashboard(child, dashboardPort) {
+async function stopOwnedDashboard(child, dashboardPort, hermesRoot, hermes, launcher, ownerHelper) {
   if (process.platform === 'win32') {
     const taskkill = (process.env.SystemRoot || process.env.WINDIR) + '\\System32\\taskkill.exe';
     const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
@@ -677,9 +756,8 @@ async function stopOwnedDashboard(child, dashboardPort) {
     const cleanupPort = Number(dashboardPort);
     if (!Number.isInteger(cleanupPort) || cleanupPort < 1 || cleanupPort > 65535) throw new Error('invalid Hermes Dashboard cleanup port');
     const listenerCleanup = spawn('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-Command',
-      '& { param([string]\$rawPort) \$port = 0; if (-not [int]::TryParse(\$rawPort, [ref]\$port) -or \$port -lt 1 -or \$port -gt 65535) { exit 2 }; \$listener = Get-NetTCPConnection -State Listen -LocalAddress "127.0.0.1" -LocalPort \$port -ErrorAction SilentlyContinue | Select-Object -First 1; if (\$null -eq \$listener) { exit 0 }; & ([IO.Path]::Combine(\$env:SystemRoot, "System32", "taskkill.exe")) /PID ([string]\$listener.OwningProcess) /T /F | Out-Null; exit \$LASTEXITCODE }',
-      String(cleanupPort),
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ownerHelper,
+      hermesRoot, hermes, launcher, String(cleanupPort),
     ], { stdio: 'ignore', windowsHide: true });
     await new Promise((resolve) => { listenerCleanup.once('error', resolve); listenerCleanup.once('exit', resolve); });
     return;
@@ -689,7 +767,7 @@ async function stopOwnedDashboard(child, dashboardPort) {
   try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
 }
 async function main() {
-const [gatewayEnvPath, dashboardEnvPath, hermesRoot, hermes, dashboardPort, bundle, config] = process.argv.slice(2);
+const [gatewayEnvPath, dashboardEnvPath, hermesRoot, hermes, launcher, ownerHelper, dashboardPort, bundle, config] = process.argv.slice(2);
 const gatewayEnv = parseEnv(readFileSync(gatewayEnvPath, 'utf8'));
 const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
 const dashboardEnv = {
@@ -718,7 +796,7 @@ try {
   }
   if (probe?.status !== 200) throw new Error('Hermes Dashboard did not become ready for authenticated local access');
 } catch (error) {
-  if (dashboardChild) await stopOwnedDashboard(dashboardChild, dashboardPort);
+  if (dashboardChild) await stopOwnedDashboard(dashboardChild, dashboardPort, hermesRoot, hermes, launcher, ownerHelper);
   throw error;
 }
 if (dashboardChild) dashboardChild.unref();
@@ -935,77 +1013,13 @@ child.unref();
 NODE
 }
 stop_stubborn_windows_dashboard() {
-  local hermes_native launcher_native root_native code
+  local hermes_native launcher_native owner_helper_native root_native code
   hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
   launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
+  owner_helper_native="$(to_windows_path "$DASHBOARD_OWNER_PS1")"
   root_native="$(to_windows_path "$HERMES_ROOT")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_DASHBOARD_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_DASHBOARD_ROOT="$root_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
-    $ErrorActionPreference = "Stop"
-    $port = [int]$env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT
-    $connection = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $connection) { exit 0 }
-    $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
-    # COZYGATEWAY_DASHBOARD_OWNER_BEGIN
-    function Test-CozyDashboardOwner {
-      param(
-        $Process,
-        [string]$ExpectedRoot,
-        [string]$ExpectedHermes,
-        [string]$ExpectedLauncher,
-        [int]$ExpectedPort,
-        [scriptblock]$ResolveProcess
-      )
-      $root = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-      $hermes = [IO.Path]::GetFullPath($ExpectedHermes)
-      $launcher = [IO.Path]::GetFullPath($ExpectedLauncher)
-      $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
-
-      $runtimeUnderRoot = $false
-      $candidate = $Process
-      for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
-        try {
-          if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-            $runtimeUnderRoot = $true
-            break
-          }
-        } catch {}
-        if (-not $candidate.ParentProcessId) { break }
-        $candidate = & $ResolveProcess ([int]$candidate.ParentProcessId)
-      }
-
-      $dashboardIndex = -1
-      $scriptSuffix = [IO.Path]::DirectorySeparatorChar + "hermes_cli" + [IO.Path]::DirectorySeparatorChar + "main.py"
-      $processExecutable = $null
-      $firstToken = $null
-      $secondToken = $null
-      try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch {}
-      if ($tokens.Count -gt 0) { try { $firstToken = [IO.Path]::GetFullPath($tokens[0]) } catch {} }
-      if ($tokens.Count -gt 1) { try { $secondToken = [IO.Path]::GetFullPath($tokens[1]) } catch {} }
-      $firstIsExecutable = $null -ne $processExecutable -and $null -ne $firstToken -and $firstToken.Equals($processExecutable, [StringComparison]::OrdinalIgnoreCase)
-      $pythonRuntime = $firstIsExecutable -and @("python.exe", "pythonw.exe") -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
-      $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
-      if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq "dashboard") {
-        $dashboardIndex = 1
-      } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
-        $dashboardIndex = 2
-      } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
-        $dashboardIndex = 3
-      } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase) -and $tokens[2] -eq "dashboard") {
-        $dashboardIndex = 2
-      }
-      if ($dashboardIndex -lt 0) { return $false }
-      for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
-        if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return $true }
-        if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return $true }
-      }
-      return $false
-    }
-    # COZYGATEWAY_DASHBOARD_OWNER_END
-    $resolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
-    if (-not (Test-CozyDashboardOwner -Process $process -ExpectedRoot $env:COZYGATEWAY_EXPECTED_DASHBOARD_ROOT -ExpectedHermes $env:COZYGATEWAY_EXPECTED_DASHBOARD_HERMES -ExpectedLauncher $env:COZYGATEWAY_EXPECTED_DASHBOARD_LAUNCHER -ExpectedPort $port -ResolveProcess $resolver)) { exit 42 }
-    Stop-Process -Id $process.ProcessId -Force
-  ' >/dev/null 2>&1
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$owner_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" >/dev/null 2>&1
   code=$?
   set -e
   [ "$code" -eq 0 ] || die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop"
@@ -1149,7 +1163,7 @@ main() {
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
-  write_gateway_config; write_cli_wrapper; start_dashboard; install_service; wait_gateway_ready
+  write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli
   if [ -n "$PUBLIC_URL" ]; then
