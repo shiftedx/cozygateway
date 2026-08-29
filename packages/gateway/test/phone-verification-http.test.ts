@@ -1,0 +1,101 @@
+import { WebSocket } from "ws";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { runPhoneProof } from "../src/phone-verification-page.ts";
+import { startGateway, type RunningGateway } from "../src/server.ts";
+import { testHermes } from "./support/test-config.ts";
+
+let gateway: RunningGateway;
+
+beforeEach(async () => {
+  process.env.TEST_HERMES_CONTROL_TOKEN = "control-secret";
+  process.env.TEST_ATTACH_TOKEN = "attach-secret";
+  gateway = await startGateway({
+    name: "phone-http", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes(),
+  });
+});
+
+afterEach(async () => {
+  await gateway.close();
+  delete process.env.TEST_HERMES_CONTROL_TOKEN;
+  delete process.env.TEST_ATTACH_TOKEN;
+});
+
+async function completeProbe(url: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(`${url.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
+    const challenge = '{"type":"cozy_onboarding_probe"}';
+    ws.on("open", () => ws.send(challenge));
+    ws.on("message", (data) => {
+      expect(String(data)).toBe(challenge); ws.close(); resolve();
+    });
+    ws.on("error", reject);
+  });
+}
+
+describe("phone verification page", () => {
+  it("is inert, self-contained, and strips the capability before automatically running proof", async () => {
+    const challenge = gateway.beginPhoneVerification();
+    expect(challenge.verificationUrl).not.toContain(challenge.phrase);
+    expect(challenge).not.toHaveProperty("setupCode");
+    const response = await fetch(challenge.verificationUrl);
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    expect(html).toContain("history.replaceState");
+    expect(html).not.toContain(challenge.phrase);
+    expect(html).not.toMatch(/<button|https?:\/\/(?!127\.0\.0\.1)/i);
+
+    await completeProbe(challenge.verificationUrl);
+    const confirmed = await fetch(`${challenge.verificationUrl}/confirm`, {
+      method: "POST",
+      headers: { origin: gateway.url, "content-type": "application/json" },
+      body: JSON.stringify({ type: "confirm" }),
+    });
+    expect(await confirmed.json()).toEqual({ phrase: challenge.phrase });
+  });
+
+  it("keeps HEAD, OPTIONS, and repeated GET inert", async () => {
+    const challenge = gateway.beginPhoneVerification();
+    expect((await fetch(challenge.verificationUrl, { method: "HEAD" })).status).toBe(200);
+    expect((await fetch(challenge.verificationUrl, { method: "OPTIONS" })).status).toBe(204);
+    expect((await fetch(challenge.verificationUrl)).status).toBe(200);
+    expect((await fetch(challenge.verificationUrl)).status).toBe(200);
+    await completeProbe(challenge.verificationUrl);
+  });
+});
+
+describe("runPhoneProof", () => {
+  it("runs health, probe, confirm, and phrase display exactly once in order", async () => {
+    const calls: string[] = [];
+    const result = await runPhoneProof({
+      health: async () => { calls.push("health"); },
+      openProbe: async () => { calls.push("probe"); },
+      confirm: async () => { calls.push("confirm"); return { phrase: "amber kite" }; },
+      showPhrase: (phrase) => { calls.push(`show:${phrase}`); },
+    });
+    expect(result).toBe("confirmed");
+    expect(calls).toEqual(["health", "probe", "confirm", "show:amber kite"]);
+  });
+
+  it.each(["health", "probe", "confirm"] as const)("stops after a failed %s step", async (failed) => {
+    const calls: string[] = [];
+    const step = (name: string) => async () => {
+      calls.push(name);
+      if (name === failed) throw new Error("offline");
+    };
+    const showPhrase = vi.fn();
+    expect(await runPhoneProof({
+      health: step("health"),
+      openProbe: step("probe"),
+      confirm: async () => { await step("confirm")(); return { phrase: "never" }; },
+      showPhrase,
+    })).toBe("failed");
+    expect(calls).toEqual(failed === "health" ? ["health"] : failed === "probe" ? ["health", "probe"] : ["health", "probe", "confirm"]);
+    expect(showPhrase).not.toHaveBeenCalled();
+  });
+});

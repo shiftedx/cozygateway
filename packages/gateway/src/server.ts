@@ -1,5 +1,6 @@
 import type { Server } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
+import { randomUUID } from "node:crypto";
 
 import { serve } from "@hono/node-server";
 import {
@@ -19,7 +20,7 @@ import {
 
 import { hermesEndpoints, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { fileGatewaySettings } from "./gateway-settings.ts";
-import { openStorage, type Storage } from "./storage.ts";
+import { openStorage, type OnboardingMode, type Storage } from "./storage.ts";
 import {
   ATTACH_V1_CAPABILITIES,
   AttachV1Ingress,
@@ -56,6 +57,11 @@ import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
+import {
+  gatewayPostureFingerprint,
+  PhoneVerification,
+  type PhoneVerificationChallenge,
+} from "./phone-verification.ts";
 
 export const GATEWAY_VERSION = "0.3.6";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
@@ -65,6 +71,11 @@ export const PUSH_PROXY_CAPABILITY_VERSION = 1;
  *  so the plane keeps ownership of its own defaults instead of having them restated here. */
 function millis(seconds: number | undefined): number | undefined {
   return seconds === undefined ? undefined : seconds * 1000;
+}
+
+function listenerOrigin(scheme: "http" | "https", host: string, port: number): string {
+  const authorityHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `${scheme}://${authorityHost}:${port}`;
 }
 
 /** Last stop of the attach apply chain. An event no projection claims is either transiently
@@ -123,6 +134,9 @@ export interface RunningGateway {
   port: number;
   storage: Storage;
   issueSetupCode(): string;
+  /** Starts (or returns) the current low-authority phone reachability challenge. It never mints a
+   * setup code; the onboarding orchestrator remains responsible for desktop confirmation. */
+  beginPhoneVerification(mode?: OnboardingMode): PhoneVerificationChallenge;
   close(): Promise<void>;
 }
 
@@ -208,6 +222,7 @@ export async function startGateway(
   const scheme = tls === undefined ? "http" : "https";
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
+  const phoneVerification = new PhoneVerification({ storage });
   const endpoints = hermesEndpoints(config);
   const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
     ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,
@@ -533,6 +548,7 @@ export async function startGateway(
 
   const app = createApp({
     storage,
+    phoneVerification,
     config,
     gatewayInfo,
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
@@ -596,6 +612,35 @@ export async function startGateway(
       },
     );
   });
+  const address = server.address();
+  const port =
+    address !== null && typeof address === "object"
+      ? address.port
+      : config.port;
+  const localOrigin = listenerOrigin(scheme, config.host ?? "127.0.0.1", port);
+  const canonicalOrigin = config.publicUrl ?? localOrigin;
+  const bootGeneration = randomUUID();
+  const verificationEpoch = randomUUID();
+  const durableFingerprint = gatewayPostureFingerprint({
+    host: config.host ?? "127.0.0.1",
+    port,
+    canonicalOrigin,
+  });
+  // A database open is inert. Only a listener that actually reached the running Gateway boundary
+  // creates a boot epoch and invalidates incomplete challenges from the previous process.
+  storage.beginGatewayBoot({
+    bootGeneration,
+    verificationEpoch,
+    canonicalOrigin,
+    durableFingerprint,
+    startedAt: Date.now(),
+  });
+  phoneVerification.activate({
+    bootGeneration,
+    verificationEpoch,
+    canonicalOrigin,
+    durableFingerprint,
+  });
   // Two ws WebSocketServer instances constructed with {server, path} on the SAME http.Server
   // would each attach their own 'upgrade' listener, and Node invokes both for every request; the
   // non-matching one's default path check fails and it aborts the handshake, corrupting the
@@ -608,7 +653,8 @@ export async function startGateway(
   routes.set("/attach/v1", (req, socket, head) =>
     attachV1Ingress.handleUpgrade(req, socket, head),
   );
-  server.on("upgrade", createUpgradeDispatcher(routes));
+  server.on("upgrade", createUpgradeDispatcher(routes, (pathname) =>
+    phoneVerification.resolveUpgrade(pathname)));
   // Started after the listener is up so the first roster refresh cannot race the hub it
   // broadcasts through.
   for (const member of bridgeMembers) member.bridge.start();
@@ -625,14 +671,8 @@ export async function startGateway(
     }
   }, PHOTO_SWEEP_MS);
   attachMediaSweep.unref?.();
-  const address = server.address();
-  const port =
-    address !== null && typeof address === "object"
-      ? address.port
-      : config.port;
-
   return {
-    url: `${scheme}://${config.host ?? "127.0.0.1"}:${port}`,
+    url: localOrigin,
     port,
     storage,
     issueSetupCode: () => {
@@ -640,6 +680,7 @@ export async function startGateway(
       storage.createSetupCode(code, Date.now() + SETUP_CODE_TTL_MS);
       return code;
     },
+    beginPhoneVerification: (mode) => phoneVerification.begin(mode),
     close: async () => {
       clearInterval(attachMediaSweep);
       const durableAttachShutdown = profileEntries.some(([profileId]) =>
@@ -654,6 +695,7 @@ export async function startGateway(
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
       nativeBotPlane.close();
       mobileNode?.close();
+      phoneVerification.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });

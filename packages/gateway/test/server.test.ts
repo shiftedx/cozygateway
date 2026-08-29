@@ -34,6 +34,26 @@ afterEach(async () => {
 });
 
 describe("startGateway end to end", () => {
+  it("owns the verification boot epoch without exposing pairing material", async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "cozygateway-phone-boot-")), "gateway.sqlite");
+    const gw = await startGateway({
+      name: "phone-boot", port: 0, dbPath, turnTimeoutSeconds: 0, hermes: testHermes(),
+    });
+    try {
+      const challenge = gw.beginPhoneVerification();
+      expect(challenge.verificationUrl).toMatch(/\/cozy\/onboarding\/[A-Za-z0-9_-]{43}$/);
+      expect(challenge).not.toHaveProperty("setupCode");
+      const pair = await fetch(`${gw.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: challenge.phrase, deviceName: "not paired" }),
+      });
+      expect(pair.status).toBe(401);
+    } finally {
+      await gw.close();
+    }
+  });
+
   it("prunes explicitly expired attachment bytes at startup while preserving NULL-expiry plugin media", async () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), "cozygateway-attachment-prune-")), "gateway.sqlite");
     const bytes = new Uint8Array([137, 80, 78, 71]);
