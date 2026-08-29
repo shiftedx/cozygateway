@@ -135,7 +135,7 @@ git commit -m "fix: elevate stale Dashboard recovery helper"
 **Files:**
 - Modify: `packages/gateway/package.json`
 - Modify: `integrations/attach-plugin/plugin.yaml`
-- Modify: `packages/gateway/src/cli.ts`
+- Modify: `packages/gateway/src/server.ts`
 - Modify only if current release convention requires it: `pnpm-lock.yaml`
 
 **Interfaces:**
@@ -173,7 +173,7 @@ Use disposable CozyGateway/Hermes homes and the local vLLM 27B provider. Validat
 - [ ] **Step 5: Commit release metadata**
 
 ```powershell
-git add packages/gateway/package.json integrations/attach-plugin/plugin.yaml packages/gateway/src/cli.ts pnpm-lock.yaml
+git add packages/gateway/package.json integrations/attach-plugin/plugin.yaml packages/gateway/src/server.ts pnpm-lock.yaml
 git commit -m "chore: release v0.4.0"
 ```
 
