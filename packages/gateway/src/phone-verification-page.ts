@@ -21,7 +21,8 @@ export async function runPhoneProof(deps: PhoneProofDeps): Promise<"confirmed" |
   }
 }
 
-const SCRIPT = String.raw`(() => {
+export const PHONE_VERIFICATION_SCRIPT = String.raw`(() => {
+  const runPhoneProof = ${runPhoneProof.toString()};
   const proofPath = location.pathname;
   history.replaceState(null, "", "/");
   const status = document.getElementById("status");
@@ -37,9 +38,14 @@ const SCRIPT = String.raw`(() => {
     const fail = () => { try { socket.close(); } catch {} reject(new Error("probe")); };
     const timer = setTimeout(fail, 5000);
     socket.addEventListener("open", () => socket.send(challenge), { once: true });
+    let echoed = false;
     socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string" || new TextEncoder().encode(event.data).length > 256) return fail();
-      if (event.data !== challenge) return fail();
+      if (!echoed) {
+        if (event.data !== challenge) return fail();
+        echoed = true; return;
+      }
+      if (event.data !== '{"type":"cozy_onboarding_probed"}') return fail();
       clearTimeout(timer); socket.close(); resolve();
     });
     socket.addEventListener("error", fail, { once: true });
@@ -59,13 +65,12 @@ const SCRIPT = String.raw`(() => {
     phrase.textContent = value; phrase.hidden = false;
     status.textContent = "Return to your PC and confirm this phrase.";
   };
-  (async () => {
-    try { await health(); await openProbe(); showPhrase((await confirm()).phrase); }
-    catch { status.textContent = "Phone connection check failed. Return to your PC to try again."; }
-  })();
+  void runPhoneProof({ health, openProbe, confirm, showPhrase }).then((result) => {
+    if (result === "failed") status.textContent = "Phone connection check failed. Return to your PC to try again.";
+  });
 })();`;
 
-const SCRIPT_HASH = createHash("sha256").update(SCRIPT).digest("base64");
+const SCRIPT_HASH = createHash("sha256").update(PHONE_VERIFICATION_SCRIPT).digest("base64");
 const STYLE = "body{font:18px system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#252525}#phrase{font-size:2rem;font-weight:700;letter-spacing:.04em}";
 const STYLE_HASH = createHash("sha256").update(STYLE).digest("base64");
 
@@ -79,4 +84,4 @@ export const PHONE_VERIFICATION_HEADERS = Object.freeze({
 export const PHONE_VERIFICATION_PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CozyGateway phone connection check</title><style>${STYLE}</style></head>
-<body><main><h1>Phone connection check</h1><p id="status">Checking this connection…</p><p id="phrase" hidden></p></main><script>${SCRIPT}</script></body></html>`;
+<body><main><h1>Phone connection check</h1><p id="status">Checking this connection…</p><p id="phrase" hidden></p></main><script>${PHONE_VERIFICATION_SCRIPT}</script></body></html>`;

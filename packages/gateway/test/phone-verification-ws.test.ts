@@ -4,6 +4,7 @@ import { WebSocket, type ClientOptions } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
+import { PHONE_AUTH_TIMEOUT_MS, PHONE_SOCKET_LIFETIME_MS } from "../src/phone-verification.ts";
 import { testHermes } from "./support/test-config.ts";
 
 let gateway: RunningGateway;
@@ -26,6 +27,65 @@ const rejection = (url: string, options?: ClientOptions) => new Promise<number>(
 });
 
 describe("phone verification WebSocket", () => {
+  it("enforces the five-second first-frame and sixty-second total-lifetime timers", async () => {
+    expect(PHONE_AUTH_TIMEOUT_MS).toBe(5_000);
+    expect(PHONE_SOCKET_LIFETIME_MS).toBe(60_000);
+    await gateway.close();
+    gateway = await startGateway(
+      { name: "phone-timers", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes() },
+      { phoneVerification: { authTimeoutMs: 25, socketLifetimeMs: 70 } },
+    );
+    const first = gateway.beginPhoneVerification();
+    const idle = new WebSocket(`${first.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
+    await once(idle, "open");
+    await once(idle, "close");
+
+    await gateway.close();
+    gateway = await startGateway(
+      { name: "phone-lifetime", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes() },
+      { phoneVerification: { authTimeoutMs: 25, socketLifetimeMs: 70 } },
+    );
+    const second = gateway.beginPhoneVerification();
+    const live = new WebSocket(`${second.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
+    await once(live, "open");
+    const received: string[] = [];
+    live.on("message", (data) => received.push(String(data)));
+    const closed = once(live, "close");
+    live.send('{"type":"cozy_onboarding_probe"}');
+    await closed;
+    expect(received).toHaveLength(2);
+  });
+
+  it("terminates a socket that sends an actual second client frame", async () => {
+    const challenge = gateway.beginPhoneVerification();
+    const ws = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
+    await once(ws, "open");
+    const closed = once(ws, "close");
+    ws.send('{"type":"cozy_onboarding_probe"}');
+    ws.send('{"type":"cozy_onboarding_probe"}');
+    await closed;
+  });
+
+  it("accepts an exact 256-byte fixed-schema probe and rejects 257 bytes", async () => {
+    const challenge = gateway.beginPhoneVerification();
+    const base = JSON.stringify({ type: "cozy_onboarding_probe", padding: "" });
+    const exact = JSON.stringify({ type: "cozy_onboarding_probe", padding: "x".repeat(256 - Buffer.byteLength(base)) });
+    expect(Buffer.byteLength(exact)).toBe(256);
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
+      const messages: string[] = [];
+      ws.on("open", () => ws.send(exact));
+      ws.on("message", (data) => {
+        messages.push(String(data));
+        if (messages.length === 2) {
+          expect(messages).toEqual([exact, '{"type":"cozy_onboarding_probed"}']);
+          ws.close(); resolve();
+        }
+      });
+      ws.on("error", reject);
+    });
+  });
+
   it("requires exact same-origin authority and echoes one challenge before confirmation", async () => {
     const challenge = gateway.beginPhoneVerification();
     expect(await rejection(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: `${gateway.url}.evil` })).toBe(404);
@@ -34,9 +94,14 @@ describe("phone verification WebSocket", () => {
       const ws = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
       const frame = '{"type":"cozy_onboarding_probe"}';
       ws.on("open", () => ws.send(frame));
+      const messages: string[] = [];
       ws.on("message", (data) => {
         expect(Buffer.byteLength(frame)).toBeLessThanOrEqual(256);
-        expect(String(data)).toBe(frame); ws.close(); resolve();
+        messages.push(String(data));
+        if (messages.length === 2) {
+          expect(messages).toEqual([frame, '{"type":"cozy_onboarding_probed"}']);
+          ws.close(); resolve();
+        }
       });
       ws.on("error", reject);
     });
@@ -57,21 +122,21 @@ describe("phone verification WebSocket", () => {
     await gateway.close();
     gateway = await startGateway({ name: "phone-ws", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes() });
 
-    const challenges = Array.from({ length: 5 }, () => gateway.beginPhoneVerification());
+    const challenge = gateway.beginPhoneVerification();
     await new Promise<void>((resolve, reject) => {
-      const oversized = new WebSocket(`${challenges[0]!.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
+      const oversized = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
       oversized.on("open", () => oversized.send("x".repeat(257)));
       oversized.on("close", () => resolve());
       oversized.on("error", () => {});
       setTimeout(() => reject(new Error("oversized probe was not closed")), 2_000).unref?.();
     });
     const sockets: WebSocket[] = [];
-    for (const challenge of challenges.slice(0, 4)) {
+    for (let index = 0; index < 4; index += 1) {
       const ws = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
       await once(ws, "open");
       sockets.push(ws);
     }
-    expect(await rejection(`${challenges[4]!.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url })).toBe(404);
+    expect(await rejection(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url })).toBe(404);
     for (const ws of sockets) ws.close();
   });
 });

@@ -1,7 +1,9 @@
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runInNewContext } from "node:vm";
 
-import { runPhoneProof } from "../src/phone-verification-page.ts";
+import { PHONE_VERIFICATION_SCRIPT, runPhoneProof } from "../src/phone-verification-page.ts";
+import { normalizeCanonicalOrigin } from "../src/phone-verification.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { testHermes } from "./support/test-config.ts";
 
@@ -26,14 +28,57 @@ async function completeProbe(url: string): Promise<void> {
     const ws = new WebSocket(`${url.replace(/^http/, "ws")}/probe`, { origin: gateway.url });
     const challenge = '{"type":"cozy_onboarding_probe"}';
     ws.on("open", () => ws.send(challenge));
+    const messages: string[] = [];
     ws.on("message", (data) => {
-      expect(String(data)).toBe(challenge); ws.close(); resolve();
+      messages.push(String(data));
+      if (messages.length === 2) {
+        expect(messages).toEqual([challenge, '{"type":"cozy_onboarding_probed"}']);
+        ws.close(); resolve();
+      }
     });
     ws.on("error", reject);
   });
 }
 
 describe("phone verification page", () => {
+  it("normalizes literal default ports while preserving non-default ports", () => {
+    expect(normalizeCanonicalOrigin("http://gateway.example:80")).toBe("http://gateway.example");
+    expect(normalizeCanonicalOrigin("https://gateway.example:443")).toBe("https://gateway.example");
+    expect(normalizeCanonicalOrigin("https://gateway.example:8443")).toBe("https://gateway.example:8443");
+  });
+
+  it("executes the emitted page workflow itself exactly once in a browser-like harness", async () => {
+    expect(PHONE_VERIFICATION_SCRIPT).toContain("runPhoneProof");
+    const calls: string[] = [];
+    const elements = { status: { textContent: "" }, phrase: { textContent: "", hidden: true } };
+    class FakeWebSocket {
+      listeners = new Map<string, Array<(event: { data?: string }) => void>>();
+      constructor() { queueMicrotask(() => this.emit("open", {})); }
+      addEventListener(name: string, fn: (event: { data?: string }) => void) {
+        this.listeners.set(name, [...(this.listeners.get(name) ?? []), fn]);
+      }
+      send(frame: string) {
+        calls.push("probe");
+        queueMicrotask(() => this.emit("message", { data: frame }));
+        queueMicrotask(() => this.emit("message", { data: '{"type":"cozy_onboarding_probed"}' }));
+      }
+      close() {}
+      emit(name: string, event: { data?: string }) { for (const fn of this.listeners.get(name) ?? []) fn(event); }
+    }
+    runInNewContext(PHONE_VERIFICATION_SCRIPT, {
+      location: { pathname: "/cozy/onboarding/cap", protocol: "https:", host: "gateway.example" },
+      history: { replaceState: () => calls.push("history") },
+      document: { getElementById: (id: "status" | "phrase") => elements[id] },
+      fetch: async (path: string) => {
+        calls.push(path === "/health" ? "health" : "confirm");
+        return { ok: true, json: async () => ({ phrase: "amber kite" }) };
+      },
+      WebSocket: FakeWebSocket, TextEncoder, setTimeout, clearTimeout, queueMicrotask,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(calls).toEqual(["history", "health", "probe", "confirm"]);
+    expect(elements.phrase).toMatchObject({ textContent: "amber kite", hidden: false });
+  });
   it("is inert, self-contained, and strips the capability before automatically running proof", async () => {
     const challenge = gateway.beginPhoneVerification();
     expect(challenge.verificationUrl).not.toContain(challenge.phrase);

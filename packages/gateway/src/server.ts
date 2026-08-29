@@ -59,7 +59,9 @@ import type { TraceLog } from "./trace.ts";
 import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
 import {
   gatewayPostureFingerprint,
+  normalizeCanonicalOrigin,
   PhoneVerification,
+  type PhoneVerificationDeps,
   type PhoneVerificationChallenge,
 } from "./phone-verification.ts";
 
@@ -75,7 +77,7 @@ function millis(seconds: number | undefined): number | undefined {
 
 function listenerOrigin(scheme: "http" | "https", host: string, port: number): string {
   const authorityHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  return `${scheme}://${authorityHost}:${port}`;
+  return normalizeCanonicalOrigin(`${scheme}://${authorityHost}:${port}`);
 }
 
 /** Last stop of the attach apply chain. An event no projection claims is either transiently
@@ -134,7 +136,7 @@ export interface RunningGateway {
   port: number;
   storage: Storage;
   issueSetupCode(): string;
-  /** Starts (or returns) the current low-authority phone reachability challenge. It never mints a
+  /** Starts a low-authority phone reachability challenge. It never mints a
    * setup code; the onboarding orchestrator remains responsible for desktop confirmation. */
   beginPhoneVerification(mode?: OnboardingMode): PhoneVerificationChallenge;
   close(): Promise<void>;
@@ -161,6 +163,8 @@ export interface StartGatewayOptions {
   /** Test-only `/pair` admission seam. The production path always uses the default bucket built
    *  from its wall clock; a long-running black-box harness may supply a virtual-clock bucket. */
   pairingAdmission?: PairingAttemptLimiter;
+  /** Test-only timing seam; production always uses the protocol's fixed timeout defaults. */
+  phoneVerification?: Omit<PhoneVerificationDeps, "storage">;
 }
 
 /** The assembly seam between Hermes' settled-chat event and the relay notifier. Kept pure so the
@@ -222,7 +226,7 @@ export async function startGateway(
   const scheme = tls === undefined ? "http" : "https";
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
-  const phoneVerification = new PhoneVerification({ storage });
+  const phoneVerification = new PhoneVerification({ storage, ...options.phoneVerification });
   const endpoints = hermesEndpoints(config);
   const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
     ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,

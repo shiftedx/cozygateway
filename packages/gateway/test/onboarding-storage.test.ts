@@ -326,6 +326,30 @@ describe("onboarding state transitions", () => {
     storage.close();
   });
 
+  it("atomically abandons an expired session and installs its replacement in the same boot", () => {
+    const storage = openStorage(":memory:");
+    storage.beginGatewayBoot(boot());
+    storage.beginSetupSession(session());
+    storage.createVerificationChallenge(challenge({ expiresAt: 200 }));
+
+    expect(storage.replaceExpiredVerification({
+      expiredSessionId: "session-1",
+      now: 201,
+      session: session({ sessionId: "session-2", createdAt: 201 }),
+      challenge: challenge({
+        sessionId: "session-2", challengeId: "challenge-2",
+        capabilityHash: "b".repeat(64), createdAt: 201, expiresAt: 801,
+      }),
+    })).toEqual({ outcome: "created", sessionId: "session-2", challengeId: "challenge-2" });
+    expect(storage.recordVerificationProbe(transition({
+      capabilityHash: "b".repeat(64), now: 201,
+    }))).toEqual({ outcome: "advanced", state: "ws_probed" });
+    expect(storage.beginSetupSession(session({ sessionId: "session-3", createdAt: 202 }))).toEqual({
+      outcome: "conflict", sessionId: "session-2",
+    });
+    storage.close();
+  });
+
   it("finalization rechecks phone state, origin, posture, epoch, generation, and expiry", () => {
     const path = makeDatabase();
     const storage = openStorage(path);

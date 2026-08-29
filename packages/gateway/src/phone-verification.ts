@@ -20,6 +20,7 @@ export const PHONE_AUTH_TIMEOUT_MS = 5_000;
 export const PHONE_SOCKET_LIFETIME_MS = 60_000;
 export const PHONE_CONFIRM_ATTEMPTS_PER_MINUTE = 5;
 export const PHONE_GLOBAL_CONFIRMS_PER_MINUTE = 60;
+const PROCESS_CONFIRM_ATTEMPTS: number[] = [];
 
 export interface PhoneVerificationContext {
   canonicalOrigin: string;
@@ -36,11 +37,18 @@ export interface PhoneVerificationChallenge {
   expiresAt: number;
 }
 
-interface ChallengeRecord extends PhoneVerificationChallenge {
+interface ChallengeRecord extends Omit<PhoneVerificationChallenge, "verificationUrl"> {
   capabilityHash: string;
   state: "active" | "ws_probed" | "phone_confirmed";
   monotonicExpiresAt: number;
   confirmAttempts: number[];
+}
+
+export function normalizeCanonicalOrigin(value: string): string {
+  const url = new URL(value);
+  if (url.origin === "null" || (url.protocol !== "http:" && url.protocol !== "https:"))
+    throw new Error("phone verification requires an HTTP origin");
+  return url.origin;
 }
 
 export interface PhoneVerificationDeps {
@@ -48,6 +56,8 @@ export interface PhoneVerificationDeps {
   now?: () => number;
   monotonicNow?: () => number;
   randomBytes?: (size: number) => Buffer;
+  authTimeoutMs?: number;
+  socketLifetimeMs?: number;
 }
 
 const PHRASE_LEFT = ["amber", "brisk", "cobalt", "gentle", "silver", "sunny", "velvet", "winter"];
@@ -95,9 +105,10 @@ export class PhoneVerification {
   readonly #now: () => number;
   readonly #monotonicNow: () => number;
   readonly #randomBytes: (size: number) => Buffer;
+  readonly #authTimeoutMs: number;
+  readonly #socketLifetimeMs: number;
   readonly #wss = new WebSocketServer({ noServer: true, maxPayload: PHONE_PROBE_MAX_BYTES, perMessageDeflate: false });
   readonly #records = new Map<string, ChallengeRecord>();
-  readonly #globalConfirmAttempts: number[] = [];
   readonly #pendingUpgrades = new WeakMap<IncomingMessage, { record: ChallengeRecord; release(): void }>();
   #context: PhoneVerificationContext | undefined;
   #activeSockets = 0;
@@ -108,6 +119,8 @@ export class PhoneVerification {
     this.#now = deps.now ?? Date.now;
     this.#monotonicNow = deps.monotonicNow ?? (() => performance.now());
     this.#randomBytes = deps.randomBytes ?? randomBytes;
+    this.#authTimeoutMs = deps.authTimeoutMs ?? PHONE_AUTH_TIMEOUT_MS;
+    this.#socketLifetimeMs = deps.socketLifetimeMs ?? PHONE_SOCKET_LIFETIME_MS;
     this.#wss.on("error", () => {});
     this.#wss.on("connection", (ws, request) => {
       const pending = this.#pendingUpgrades.get(request);
@@ -119,45 +132,52 @@ export class PhoneVerification {
 
   activate(context: PhoneVerificationContext): void {
     if (this.#context !== undefined) throw new Error("phone verification was already activated");
-    const origin = new URL(context.canonicalOrigin).origin;
-    if (origin !== context.canonicalOrigin) throw new Error("phone verification requires a canonical origin");
-    this.#context = { ...context };
+    this.#context = { ...context, canonicalOrigin: normalizeCanonicalOrigin(context.canonicalOrigin) };
   }
 
   begin(mode: OnboardingMode = "advanced"): PhoneVerificationChallenge {
     if (this.#closed || this.#context === undefined) throw new Error("phone verification is unavailable");
-    const existing = [...this.#records.values()].find((record) => this.#isUsable(record) && record.state !== "phone_confirmed");
-    if (existing !== undefined) return this.#publicChallenge(existing);
-
     const now = this.#now();
+    const existing = [...this.#records.values()].find((record) => record.state !== "phone_confirmed");
+    if (existing !== undefined && this.#isUsable(existing))
+      throw new Error("a phone verification session is already active");
     const sessionId = randomUUID();
-    const session = this.#storage.beginSetupSession({
+    const sessionInput = {
       sessionId, mode, ...this.#context, createdAt: now,
-    });
-    if (session.outcome !== "created") throw new Error("a phone verification session is already active");
+    };
 
     const capability = this.#randomBytes(32).toString("base64url");
     if (!PHONE_CAPABILITY_PATTERN.test(capability)) throw new Error("failed to create phone capability");
     const challengeId = randomUUID();
     const phrase = `${PHRASE_LEFT[this.#randomBytes(1)[0]! % PHRASE_LEFT.length]} ${PHRASE_RIGHT[this.#randomBytes(1)[0]! % PHRASE_RIGHT.length]}`;
     const expiresAt = now + SETUP_CODE_TTL_MS;
-    const result = this.#storage.createVerificationChallenge({
+    const challengeInput = {
       challengeId, sessionId, capabilityHash: sha256(capability), phrase,
       ...this.#context, createdAt: now, expiresAt,
-    });
-    if (result.outcome !== "created") throw new Error("failed to create phone verification challenge");
+    };
+    if (existing === undefined) {
+      const session = this.#storage.beginSetupSession(sessionInput);
+      if (session.outcome !== "created") throw new Error("a phone verification session is already active");
+      const result = this.#storage.createVerificationChallenge(challengeInput);
+      if (result.outcome !== "created") throw new Error("failed to create phone verification challenge");
+    } else {
+      const result = this.#storage.replaceExpiredVerification({
+        expiredSessionId: existing.sessionId, now, session: sessionInput, challenge: challengeInput,
+      });
+      if (result.outcome !== "created") throw new Error("failed to replace expired phone verification challenge");
+      this.#records.delete(existing.capabilityHash);
+    }
     const record: ChallengeRecord = {
       challengeId, sessionId, capabilityHash: sha256(capability), phrase, expiresAt,
-      verificationUrl: `${this.#context.canonicalOrigin}/cozy/onboarding/${capability}`,
       state: "active", monotonicExpiresAt: this.#monotonicNow() + SETUP_CODE_TTL_MS,
       confirmAttempts: [],
     };
-    this.#records.set(capability, record);
-    return this.#publicChallenge(record);
+    this.#records.set(record.capabilityHash, record);
+    return this.#publicChallenge(record, capability);
   }
 
-  #publicChallenge(record: ChallengeRecord): PhoneVerificationChallenge {
-    return { challengeId: record.challengeId, sessionId: record.sessionId, verificationUrl: record.verificationUrl, phrase: record.phrase, expiresAt: record.expiresAt };
+  #publicChallenge(record: ChallengeRecord, capability: string): PhoneVerificationChallenge {
+    return { challengeId: record.challengeId, sessionId: record.sessionId, verificationUrl: `${this.#context!.canonicalOrigin}/cozy/onboarding/${capability}`, phrase: record.phrase, expiresAt: record.expiresAt };
   }
 
   #isUsable(record: ChallengeRecord): boolean {
@@ -166,7 +186,7 @@ export class PhoneVerification {
 
   #record(capability: string, expected?: ChallengeRecord["state"]): ChallengeRecord | undefined {
     if (!PHONE_CAPABILITY_PATTERN.test(capability)) return undefined;
-    const record = this.#records.get(capability);
+    const record = this.#records.get(sha256(capability));
     if (record === undefined || !this.#isUsable(record) || (expected !== undefined && record.state !== expected)) return undefined;
     return record;
   }
@@ -232,11 +252,11 @@ export class PhoneVerification {
   #allowConfirm(record: ChallengeRecord): boolean {
     const floor = this.#now() - 60_000;
     while ((record.confirmAttempts[0] ?? Infinity) < floor) record.confirmAttempts.shift();
-    while ((this.#globalConfirmAttempts[0] ?? Infinity) < floor) this.#globalConfirmAttempts.shift();
-    if (record.confirmAttempts.length >= PHONE_CONFIRM_ATTEMPTS_PER_MINUTE || this.#globalConfirmAttempts.length >= PHONE_GLOBAL_CONFIRMS_PER_MINUTE) return false;
+    while ((PROCESS_CONFIRM_ATTEMPTS[0] ?? Infinity) < floor) PROCESS_CONFIRM_ATTEMPTS.shift();
+    if (record.confirmAttempts.length >= PHONE_CONFIRM_ATTEMPTS_PER_MINUTE || PROCESS_CONFIRM_ATTEMPTS.length >= PHONE_GLOBAL_CONFIRMS_PER_MINUTE) return false;
     const now = this.#now();
     record.confirmAttempts.push(now);
-    this.#globalConfirmAttempts.push(now);
+    PROCESS_CONFIRM_ATTEMPTS.push(now);
     return true;
   }
 
@@ -290,26 +310,33 @@ export class PhoneVerification {
 
   #runProbe(ws: WebSocket, record: ChallengeRecord, release: () => void): void {
     let seen = false;
-    const authTimer = setTimeout(() => ws.terminate(), PHONE_AUTH_TIMEOUT_MS);
-    const lifetimeTimer = setTimeout(() => ws.terminate(), PHONE_SOCKET_LIFETIME_MS);
-    const challenge = '{"type":"cozy_onboarding_probe"}';
+    const authTimer = setTimeout(() => ws.terminate(), this.#authTimeoutMs);
+    const lifetimeTimer = setTimeout(() => ws.terminate(), this.#socketLifetimeMs);
+    const challengeType = "cozy_onboarding_probe";
+    const ack = '{"type":"cozy_onboarding_probed"}';
     ws.on("error", () => {});
     ws.once("close", () => { clearTimeout(authTimer); clearTimeout(lifetimeTimer); release(); });
     ws.on("message", (data, isBinary) => {
-      if (seen || isBinary || Buffer.byteLength(String(data)) > PHONE_PROBE_MAX_BYTES || String(data) !== challenge || record.state !== "active" || !this.#isUsable(record)) { ws.terminate(); return; }
+      const frame = String(data);
+      let parsed: unknown;
+      try { parsed = JSON.parse(frame); } catch { parsed = undefined; }
+      const valid = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        && Object.keys(parsed).every((key) => key === "type" || key === "padding")
+        && (parsed as { type?: unknown }).type === challengeType
+        && ((parsed as { padding?: unknown }).padding === undefined || typeof (parsed as { padding?: unknown }).padding === "string");
+      if (seen || isBinary || Buffer.byteLength(frame) > PHONE_PROBE_MAX_BYTES || !valid || record.state !== "active" || !this.#isUsable(record)) { ws.terminate(); return; }
       seen = true;
-      try { ws.send(challenge); } catch { ws.terminate(); return; }
-      // Queue the echo first, then commit ws_probed in the same turn. Waiting for ws's flush
-      // callback races a fast browser that receives the echo and immediately POSTs confirmation.
-      let result;
-      try {
-        result = this.#storage.recordVerificationProbe({ capabilityHash: record.capabilityHash, ...this.#context!, now: this.#now() });
-      } catch {
-        ws.terminate(); return;
-      }
-      if (result.outcome === "advanced") record.state = "ws_probed";
-      else ws.terminate();
-      clearTimeout(authTimer);
+      ws.send(frame, (error) => {
+        if (error) { ws.terminate(); return; }
+        let result;
+        try {
+          result = this.#storage.recordVerificationProbe({ capabilityHash: record.capabilityHash, ...this.#context!, now: this.#now() });
+        } catch { ws.terminate(); return; }
+        if (result.outcome !== "advanced") { ws.terminate(); return; }
+        record.state = "ws_probed";
+        clearTimeout(authTimer);
+        ws.send(ack, (ackError) => { if (ackError) ws.terminate(); });
+      });
     });
   }
 
