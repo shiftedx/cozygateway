@@ -10,7 +10,11 @@ import {
   PHONE_VERIFICATION_PAGE,
 } from "./phone-verification-page.ts";
 import type { OnboardingMode, Storage } from "./storage.ts";
-import { PRE_UPGRADE_AUTH_TIMEOUT_MS, type UpgradeHandler } from "./upgrade-dispatcher.ts";
+import {
+  PRE_UPGRADE_AUTH_TIMEOUT_MS,
+  preUpgradeAuthRemainingMs,
+  type UpgradeHandler,
+} from "./upgrade-dispatcher.ts";
 
 export const PHONE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 export const PHONE_CONFIRM_MAX_BYTES = 256;
@@ -109,7 +113,11 @@ export class PhoneVerification {
   readonly #socketLifetimeMs: number;
   readonly #wss = new WebSocketServer({ noServer: true, maxPayload: PHONE_PROBE_MAX_BYTES, perMessageDeflate: false });
   readonly #records = new Map<string, ChallengeRecord>();
-  readonly #pendingUpgrades = new WeakMap<IncomingMessage, { record: ChallengeRecord; release(): void }>();
+  readonly #pendingUpgrades = new WeakMap<IncomingMessage, {
+    record: ChallengeRecord;
+    authDeadline: number;
+    release(): void;
+  }>();
   #context: PhoneVerificationContext | undefined;
   #activeSockets = 0;
   #closed = false;
@@ -126,7 +134,7 @@ export class PhoneVerification {
       const pending = this.#pendingUpgrades.get(request);
       this.#pendingUpgrades.delete(request);
       if (pending === undefined) { ws.terminate(); return; }
-      this.#runProbe(ws, pending.record, pending.release);
+      this.#runProbe(ws, pending.record, pending.authDeadline, pending.release);
     });
   }
 
@@ -350,11 +358,14 @@ export class PhoneVerification {
       rejectUpgrade(socket); return;
     }
     this.#activeSockets += 1;
+    const now = this.#monotonicNow();
+    const inheritedRemainingMs = preUpgradeAuthRemainingMs(request);
+    const authDeadline = now + Math.min(inheritedRemainingMs ?? this.#authTimeoutMs, this.#authTimeoutMs);
     let released = false;
     const release = () => { if (!released) { released = true; this.#activeSockets -= 1; } };
     try {
       this.#wss.handleUpgrade(request, socket, head, (ws) => {
-        this.#pendingUpgrades.set(request, { record, release });
+        this.#pendingUpgrades.set(request, { record, authDeadline, release });
         this.#wss.emit("connection", ws, request);
       });
     } catch {
@@ -362,9 +373,9 @@ export class PhoneVerification {
     }
   }
 
-  #runProbe(ws: WebSocket, record: ChallengeRecord, release: () => void): void {
+  #runProbe(ws: WebSocket, record: ChallengeRecord, authDeadline: number, release: () => void): void {
     let seen = false;
-    const authTimer = setTimeout(() => ws.terminate(), this.#authTimeoutMs);
+    const authTimer = setTimeout(() => ws.terminate(), Math.max(0, authDeadline - this.#monotonicNow()));
     const lifetimeTimer = setTimeout(() => ws.terminate(), this.#socketLifetimeMs);
     const challenge = '{"type":"cozy_onboarding_probe"}';
     ws.on("error", () => {});

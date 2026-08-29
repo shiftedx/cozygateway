@@ -73,6 +73,40 @@ describe("phone verification WebSocket", () => {
     expect(received).toEqual(['{"type":"cozy_onboarding_probe"}']);
   });
 
+  it("shares one cumulative deadline between slow upgrade headers and the first auth frame", async () => {
+    await gateway.close();
+    const budgetMs = 240;
+    gateway = await startGateway(
+      { name: "phone-cumulative-auth", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes() },
+      { preUpgradeTimeoutMs: budgetMs, phoneVerification: { authTimeoutMs: budgetMs } },
+    );
+    const challenge = gateway.beginPhoneVerification();
+    const path = `${new URL(challenge.verificationUrl).pathname}/probe`;
+    const authority = `127.0.0.1:${gateway.port}`;
+    const socket = createConnection({ host: "127.0.0.1", port: gateway.port });
+    socket.on("error", () => {});
+    let response = "";
+    socket.on("data", (chunk) => { response += String(chunk); });
+    await once(socket, "connect");
+    const startedAt = Date.now();
+    socket.write([
+      `GET ${path} HTTP/1.1`,
+      `Host: ${authority}`,
+      `Origin: ${gateway.url}`,
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      "Sec-WebSocket-Version: 13",
+      "",
+    ].join("\r\n"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 160));
+    socket.write("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+
+    await once(socket, "close");
+
+    expect(response).toContain("101 Switching Protocols");
+    expect(Date.now() - startedAt).toBeLessThan(330);
+  });
+
   it("terminates a socket that sends an actual second client frame", async () => {
     const challenge = gateway.beginPhoneVerification();
     const ws = new WebSocket(`${challenge.verificationUrl.replace(/^http/, "ws")}/probe`, { origin: gateway.url });

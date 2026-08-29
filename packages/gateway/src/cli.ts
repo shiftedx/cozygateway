@@ -22,7 +22,12 @@ import {
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { encodeQr, renderQrHalfBlocks } from "./qr.ts";
-import type { NetworkOnboardingStatus, OnboardingIo, OnboardingOutcome } from "./network-onboarding.ts";
+import type {
+  NetworkOnboardingStatus,
+  OnboardingIo,
+  OnboardingOutcome,
+  PreparedEndpoint,
+} from "./network-onboarding.ts";
 import {
   preparePairingOutput,
   type PairingOutputInput,
@@ -37,7 +42,10 @@ import {
   readManagedListenerSnapshot,
   validateListenerHost,
 } from "./configure.ts";
-import { createWindowsOnboardingController } from "./windows-onboarding.ts";
+import {
+  createWindowsOnboardingController,
+  reconcileWindowsOwnedNetworkState,
+} from "./windows-onboarding.ts";
 
 const USAGE = `usage: cozygateway [status|setup|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
 
@@ -50,6 +58,11 @@ export interface CliIo {
 export interface CliRuntime {
   restartHermesProfile(executable: string, profile: string): Promise<void>;
   waitForGatewayReady(configPath: string): Promise<void>;
+}
+
+export interface CliInternalDependencies {
+  platform?: NodeJS.Platform;
+  reconcileOwnedNetworkState?: typeof reconcileWindowsOwnedNetworkState;
 }
 
 export interface CliOnboardingController {
@@ -465,10 +478,11 @@ function setupIo(io: CliIo): OnboardingIo {
         console.log("- Tailnet administrators can observe and manage this device and its connectivity policy.");
         console.log("- Windows UAC and browser sign-in or HTTPS consent may appear before the phone check.");
         console.log("- Enabling Tailscale HTTPS publishes the machine and tailnet DNS name in Certificate Transparency.");
+        console.log("- Keep this PC awake while using remote access; Windows sleep interrupts remote reachability.");
       } else if (mode === "lan") {
         console.log("Same Wi-Fi security notice");
         console.log("- LAN mode uses plaintext HTTP. Use it only on a trusted private network.");
-        console.log("- CozyGateway may bind to 0.0.0.0 (all interfaces), not only the selected Wi-Fi or Ethernet adapter.");
+        console.log("- A 0.0.0.0 wildcard bind listens on all interfaces: every active Wi-Fi, Ethernet, VPN, and virtual interface, not only the selected adapter.");
         console.log("- Phone verification proves reachability but cannot prevent passive same-LAN interception of later pairing traffic.");
       } else {
         console.log("Advanced network security notice");
@@ -476,8 +490,18 @@ function setupIo(io: CliIo): OnboardingIo {
         console.log("- A non-loopback plaintext listener must be limited to a trusted private network.");
       }
     },
+    showPreparedEndpointDisclosure: (endpoint) => {
+      if (endpoint.mode !== "lan") return;
+      const exposure = (endpoint as PreparedEndpoint & {
+        wildcardExposure?: { message?: unknown };
+      }).wildcardExposure;
+      if (typeof exposure?.message !== "string" || exposure.message.length === 0 || exposure.message.length > 512)
+        return;
+      console.log(exposure.message.replace(/[\u0000-\u001f\u007f-\u009f]/g, " "));
+    },
     showPhoneConnectionCheck: (verificationUrl) => {
       console.log("Phone connection check");
+      console.log("This short-lived check is one-time. Browser history may retain its private URL, so do not share it.");
       console.log(renderQrHalfBlocks(encodeQr(verificationUrl), { color: process.stdout.isTTY === true }));
       console.log("Scan this check with the phone that will use CozyChat. No setup code has been created yet.");
     },
@@ -502,7 +526,7 @@ const PAUSE_COPY: Readonly<Record<string, string>> = {
   login_browser_failed: "The Tailscale sign-in page could not be opened. Open the Tailscale app, finish signing in, then resume.",
   not_running: "Start Tailscale and wait until it is connected, then resume.",
   account_not_confirmed: "Review the signed-in account in the Tailscale app, then explicitly approve it during setup.",
-  unattended_consent_required: "Approve reachability after logout if you want reliable remote access, then resume.",
+  unattended_consent_required: "Approve Tailscale background connectivity; the PC and Gateway must stay awake and the Windows user session must remain running, then resume.",
   incoming_consent_required: "Approve incoming Tailscale connections, then resume.",
   machine_auth_required: "Ask the tailnet administrator to approve this machine, then resume.",
   preference_policy: "Tailscale policy blocked the requested setting. Ask the tailnet administrator, then resume.",
@@ -534,10 +558,40 @@ const INSPECTION_COPY: Readonly<Record<Extract<NonNullable<NetworkOnboardingStat
   endpoint_not_ready: "The selected network endpoint is not ready. Restore network connectivity or choose another route.",
 };
 
+type ReadinessIssue = Extract<NonNullable<NetworkOnboardingStatus["issue"]>, { type: "readiness" }>;
+type ReadinessKey = ReadinessIssue extends infer Issue
+  ? Issue extends ReadinessIssue
+    ? `${Issue["mode"]}:${Issue["reason"]}`
+    : never
+  : never;
+
+const READINESS_COPY: Readonly<Record<ReadinessKey, string>> = {
+  "tailscale:status": "Open Tailscale, start its service, confirm the intended account is connected, and restore the required preferences before resuming setup.",
+  "tailscale:loopback": "Restart CozyGateway and confirm its local health and WebSocket endpoints work on loopback before resuming setup.",
+  "tailscale:mapping": "Review the saved Tailscale Serve mapping on port 443, remove any conflicting mapping, then resume setup.",
+  "tailscale:tls": "Confirm the Tailscale DNS name opens with a system-trusted HTTPS certificate, then resume setup.",
+  "tailscale:certificate": "Confirm the Tailscale HTTPS certificate covers this device's exact tailnet DNS name, then resume setup.",
+  "tailscale:redirect": "Remove the redirect from the Tailscale HTTPS origin so CozyGateway answers directly, then resume setup.",
+  "tailscale:health": "Restore a direct HTTP 200 health response through Tailscale Serve, then resume setup.",
+  "tailscale:alpn": "Configure the Tailscale HTTPS route to negotiate HTTP/1.1 for CozyGateway, then resume setup.",
+  "tailscale:websocket": "Allow CozyGateway WebSocket traffic through Tailscale Serve and tailnet policy, then resume setup.",
+  "tailscale:ownership": "Keep the CozyGateway database in place and resume setup so the saved Tailscale ownership record can be reconciled safely.",
+  "lan:health": "Restart CozyGateway and verify its health endpoint on the selected private LAN address, then resume setup.",
+  "lan:websocket": "Allow CozyGateway WebSocket traffic through Windows Firewall on the trusted private network, then resume setup.",
+  "lan:attach": "Restore the configured attachment services and wait until Gateway readiness is healthy, then resume setup.",
+  "lan:posture": "Reconnect the intended private adapter, restore its expected DHCP address, or explicitly choose the replacement adapter in Advanced settings.",
+};
+
 function printNetworkIssue(issue: NonNullable<NetworkOnboardingStatus["issue"]>): void {
   if (issue.type === "pause") {
     console.log(`Phone access reason: ${issue.reason}${issue.detail === undefined ? "" : ` (${issue.detail})`}`);
     console.log(`Repair: ${PAUSE_COPY[issue.reason] ?? "Resolve the paused network step, then resume setup."}`);
+    return;
+  }
+  if (issue.type === "readiness") {
+    const key = `${issue.mode}:${issue.reason}` as ReadinessKey;
+    console.log(`Phone access reason: ${key}`);
+    console.log(`Repair: ${READINESS_COPY[key]}`);
     return;
   }
   console.log(`Phone access reason: ${issue.reason}`);
@@ -584,11 +638,13 @@ export async function runCli(
   suppliedIo?: CliIo,
   suppliedRuntime?: CliRuntime,
   onboarding?: CliOnboardingController,
+  internal: CliInternalDependencies = {},
 ): Promise<number> {
   const runtime = suppliedRuntime ?? defaultRuntime;
+  const platform = internal.platform ?? process.platform;
   const command = argv[0] !== undefined && !argv[0].startsWith("-") ? argv[0] : undefined;
   const optionArgs = command === undefined ? argv : argv.slice(1);
-  const { values } = parseArgs({
+  const parseOptions = () => parseArgs({
     args: optionArgs,
     options: {
       config: { type: "string", default: "cozygateway.config.json" },
@@ -596,14 +652,52 @@ export async function runCli(
       ttl: { type: "string" },
     },
   });
+  let parsed: ReturnType<typeof parseOptions>;
+  try {
+    parsed = parseOptions();
+  } catch (error) {
+    if (command !== "cleanup-owned-network") throw error;
+    console.error("Owned network cleanup failed.");
+    suppliedIo?.close();
+    onboarding?.close();
+    return 1;
+  }
+  const { values } = parsed;
   const configPath = values.config;
   let ownedOnboarding: CliOnboardingController | undefined;
   const resolvedOnboarding = (activeIo?: CliIo): CliOnboardingController | undefined => {
     if (onboarding !== undefined) return onboarding;
-    if (process.platform !== "win32") return undefined;
+    if (platform !== "win32") return undefined;
     ownedOnboarding ??= createWindowsOnboardingController(configPath, activeIo ?? suppliedIo, runtime);
     return ownedOnboarding;
   };
+
+  if (command === "cleanup-owned-network") {
+    try {
+      if (platform !== "win32") {
+        console.error("Owned network cleanup is Windows only.");
+        return 1;
+      }
+      if (!optionArgs.some((argument) => argument === "--config" || argument.startsWith("--config="))) {
+        console.error("Owned network cleanup requires an explicit --config path.");
+        return 1;
+      }
+      try {
+        await (internal.reconcileOwnedNetworkState ?? reconcileWindowsOwnedNetworkState)(
+          configPath,
+          runtime,
+          undefined,
+        );
+        return 0;
+      } catch {
+        console.error("Owned network cleanup failed.");
+        return 1;
+      }
+    } finally {
+      suppliedIo?.close();
+      (ownedOnboarding ?? onboarding)?.close();
+    }
+  }
 
   if (command === undefined || command === "configure") {
     const io = suppliedIo ?? terminalIo();

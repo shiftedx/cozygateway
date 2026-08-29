@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createUpgradeDispatcher,
   installPreUpgradeDeadline,
+  preUpgradeAuthRemainingMs,
   PRE_UPGRADE_AUTH_TIMEOUT_MS,
   type UpgradeHandler,
   type UpgradeResolver,
@@ -182,6 +183,81 @@ describe("installPreUpgradeDeadline", () => {
 
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("ok");
+    removeDeadline();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  });
+
+  it("re-arms the deadline for an incomplete second upgrade on a reused keep-alive connection", async () => {
+    const server = createServer((_request, response) => {
+      response.setHeader("Connection", "keep-alive");
+      response.end("ok");
+    });
+    const removeDeadline = installPreUpgradeDeadline(server, 45);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("missing test listener");
+    const socket = createConnection({ host: "127.0.0.1", port: address.port });
+    socket.on("error", () => {});
+    await once(socket, "connect");
+    socket.write("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
+    let response = "";
+    await new Promise<void>((resolve) => {
+      const onData = (chunk: Buffer) => {
+        response += String(chunk);
+        if (!response.includes("\r\n\r\n") || !response.includes("ok")) return;
+        socket.off("data", onData);
+        resolve();
+      };
+      socket.on("data", onData);
+    });
+
+    socket.write("GET /cozy/onboarding/incomplete/probe HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n");
+    let escapeTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        once(socket, "close"),
+        new Promise<never>((_resolve, reject) => {
+          escapeTimer = setTimeout(() => reject(new Error("second upgrade escaped deadline")), 400);
+        }),
+      ]);
+    } finally {
+      clearTimeout(escapeTimer);
+    }
+
+    expect(socket.destroyed).toBe(true);
+    removeDeadline();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  });
+
+  it("charges synchronous delay between upgrade listeners to the inherited auth budget", async () => {
+    const server = createServer();
+    const removeDeadline = installPreUpgradeDeadline(server, 90);
+    let remainingMs: number | undefined;
+    server.on("upgrade", (request, socket) => {
+      const releaseAt = performance.now() + 35;
+      while (performance.now() < releaseAt) { /* model synchronous listener work */ }
+      remainingMs = preUpgradeAuthRemainingMs(request);
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("missing test listener");
+    const socket = createConnection({ host: "127.0.0.1", port: address.port });
+    socket.on("error", () => {});
+    await once(socket, "connect");
+    socket.write([
+      "GET /cozy/onboarding/test/probe HTTP/1.1",
+      "Host: 127.0.0.1",
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      "",
+      "",
+    ].join("\r\n"));
+
+    await once(socket, "close");
+
+    expect(remainingMs).toBeGreaterThan(0);
+    expect(remainingMs).toBeLessThan(70);
     removeDeadline();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   });

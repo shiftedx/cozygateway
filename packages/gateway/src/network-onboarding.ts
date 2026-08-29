@@ -22,6 +22,8 @@ export interface NetworkModeAdapter {
   prepare(signal?: AbortSignal): Promise<PreparedEndpoint>;
   inspect(signal?: AbortSignal): Promise<PreparedEndpoint>;
   rollbackOwned(endpoint: PreparedEndpoint, signal?: AbortSignal): Promise<void>;
+  /** Reconciles durable ownership when live inspection cannot produce an endpoint snapshot. */
+  reconcileOwned(signal?: AbortSignal): Promise<void>;
 }
 
 /** A security-relevant, already-validated endpoint snapshot. Adapters must change the durable
@@ -96,6 +98,8 @@ export interface OnboardingIo {
   /** Security and privacy disclosure for the selected route. The orchestrator awaits this before
    * any old route is rolled back, a new adapter is prepared, or verification material is shown. */
   showNetworkDisclosure(mode: OnboardingMode, signal?: AbortSignal): void | Promise<void>;
+  /** Adapter-verified exposure details, when available. This always runs before phone material. */
+  showPreparedEndpointDisclosure?(endpoint: PreparedEndpoint, signal?: AbortSignal): void | Promise<void>;
   /** The only QR payload parameter is the short-lived verification URL. */
   showPhoneConnectionCheck(verificationUrl: string, signal?: AbortSignal): void | Promise<void>;
   showAuthoritativePhrase(phrase: string, signal?: AbortSignal): void | Promise<void>;
@@ -154,6 +158,16 @@ export interface NetworkOnboardingStatus {
 export type NetworkOnboardingStatusIssue =
   | { type: "pause"; reason: string; detail?: string }
   | {
+      type: "readiness";
+      mode: "tailscale";
+      reason: "status" | "loopback" | "mapping" | "tls" | "certificate" | "redirect" | "health" | "alpn" | "websocket" | "ownership";
+    }
+  | {
+      type: "readiness";
+      mode: "lan";
+      reason: "health" | "websocket" | "attach" | "posture";
+    }
+  | {
       type: "inspection";
       reason:
         | "adapter_unavailable"
@@ -162,6 +176,40 @@ export type NetworkOnboardingStatusIssue =
         | "projection_posture_changed"
         | "endpoint_not_ready";
     };
+
+const TAILSCALE_READINESS_REASONS = new Set([
+  "status", "loopback", "mapping", "tls", "certificate", "redirect", "health", "alpn", "websocket", "ownership",
+] as const);
+const LAN_READINESS_REASONS = new Set(["health", "websocket", "attach", "posture"] as const);
+type TailscaleReadinessReason = Extract<NetworkOnboardingStatusIssue, {
+  type: "readiness"; mode: "tailscale";
+}>["reason"];
+type LanReadinessReason = Extract<NetworkOnboardingStatusIssue, {
+  type: "readiness"; mode: "lan";
+}>["reason"];
+
+function isTailscaleReadinessReason(reason: string): reason is TailscaleReadinessReason {
+  return (TAILSCALE_READINESS_REASONS as ReadonlySet<string>).has(reason);
+}
+
+function isLanReadinessReason(reason: string): reason is LanReadinessReason {
+  return (LAN_READINESS_REASONS as ReadonlySet<string>).has(reason);
+}
+
+function readinessIssue(error: unknown, mode: OnboardingMode): NetworkOnboardingStatusIssue | undefined {
+  if (typeof error !== "object" || error === null
+    || !("name" in error) || typeof error.name !== "string"
+    || !("reason" in error) || typeof error.reason !== "string") return undefined;
+  if (mode === "tailscale" && error.name === "TailscaleModeReadinessError"
+    && isTailscaleReadinessReason(error.reason)) {
+    return { type: "readiness", mode, reason: error.reason };
+  }
+  if (mode === "lan" && error.name === "LanModeReadinessError"
+    && isLanReadinessReason(error.reason)) {
+    return { type: "readiness", mode, reason: error.reason };
+  }
+  return undefined;
+}
 
 function selectedMode(state: NetworkOnboardingState | undefined): OnboardingMode | undefined {
   return state !== undefined && state.stage !== "pending_choice" ? state.mode : undefined;
@@ -257,10 +305,11 @@ export class NetworkOnboarding {
       endpoint = await adapter.inspect(signal);
     } catch (error) {
       const pause = retryableAdapterPause(error);
+      const readiness = readinessIssue(error, mode);
       return {
         stage: "changed", authority: authority.state, mode, healthy: false,
         issue: pause === undefined
-          ? { type: "inspection", reason: "inspection_failed" }
+          ? readiness ?? { type: "inspection", reason: "inspection_failed" }
           : { type: "pause", ...pause },
       };
     }
@@ -325,7 +374,7 @@ export class NetworkOnboarding {
   ): Promise<OnboardingOutcome> {
     const choice = await io.chooseNetworkMode(signal);
     if (choice === "later" || choice === "cancel") {
-      if (current.mode !== undefined && current.endpoint !== undefined) {
+      if (current.mode !== undefined) {
         const rollback = await this.#rollbackPriorRoute(current.mode, current.endpoint, signal);
         if (!rollback) return { outcome: "failed", reason: "rollback_failed" };
       }
@@ -341,7 +390,7 @@ export class NetworkOnboarding {
       && current.mode === choice
       && current.healthy
       && current.endpoint?.ready === true;
-    if (!reusable && current.mode !== undefined && current.endpoint !== undefined) {
+    if (!reusable && current.mode !== undefined) {
       const rollback = await this.#rollbackPriorRoute(current.mode, current.endpoint, signal);
       if (!rollback) return { outcome: "failed", reason: "rollback_failed" };
     }
@@ -350,13 +399,14 @@ export class NetworkOnboarding {
 
   async #rollbackPriorRoute(
     mode: OnboardingMode,
-    endpoint: PreparedEndpoint,
+    endpoint: PreparedEndpoint | undefined,
     signal: AbortSignal | undefined,
   ): Promise<boolean> {
     const adapter = this.#adapters.get(mode);
     if (adapter === undefined) return false;
     try {
-      await adapter.rollbackOwned(endpoint, signal);
+      if (endpoint === undefined) await adapter.reconcileOwned(signal);
+      else await adapter.rollbackOwned(endpoint, signal);
       return true;
     } catch {
       return false;
@@ -397,6 +447,7 @@ export class NetworkOnboarding {
 
     let challenge: OnboardingPhoneChallenge;
     try {
+      await io.showPreparedEndpointDisclosure?.(endpoint, signal);
       challenge = await this.#dependencies.phoneVerification.begin(mode, endpoint);
     } catch (error) {
       const pause = retryableAdapterPause(error);

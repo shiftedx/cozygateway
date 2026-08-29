@@ -14,7 +14,9 @@ import {
   type OnboardingIo,
   type PreparedEndpoint,
 } from "../src/network-onboarding.ts";
+import { LanModeReadinessError } from "../src/lan-mode.ts";
 import { openStorage } from "../src/storage.ts";
+import { TailscaleModeReadinessError } from "../src/tailscale-mode.ts";
 import type { NetworkOnboardingState } from "../src/onboarding-state.ts";
 
 const temporaryRoots: string[] = [];
@@ -55,11 +57,18 @@ function harness(options: {
       calls.push("rollback");
       if (options.rollbackError !== undefined) throw options.rollbackError;
     }),
+    reconcileOwned: vi.fn(async () => {
+      calls.push("reconcile");
+      if (options.rollbackError !== undefined) throw options.rollbackError;
+    }),
   };
   const io: OnboardingIo = {
     chooseNetworkMode: vi.fn(async () => (calls.push("choice"), options.choice ?? "tailscale")),
     showNetworkDisclosure: vi.fn(async (mode) => {
       calls.push(`disclosure:${mode}`);
+    }),
+    showPreparedEndpointDisclosure: vi.fn(async (prepared) => {
+      calls.push(`endpoint-disclosure:${prepared.mode}`);
     }),
     showPhoneConnectionCheck: vi.fn(async (verificationUrl) => {
       calls.push(`phone-qr:${verificationUrl}`);
@@ -158,6 +167,8 @@ describe("NetworkOnboarding", () => {
     expect(calls.indexOf("choice")).toBeLessThan(calls.indexOf("prepare"));
     expect(calls.indexOf("disclosure:tailscale")).toBeLessThan(calls.indexOf("prepare"));
     expect(calls.indexOf("prepare")).toBeLessThan(calls.findIndex((entry) => entry.startsWith("phone-qr:")));
+    expect(calls.indexOf("prepare")).toBeLessThan(calls.indexOf("endpoint-disclosure:tailscale"));
+    expect(calls.indexOf("endpoint-disclosure:tailscale")).toBeLessThan(calls.findIndex((entry) => entry.startsWith("phone-qr:")));
     expect(dependencies.phoneVerification.begin).toHaveBeenCalledWith("tailscale", endpoint);
     expect(io.showPhoneConnectionCheck).toHaveBeenCalledWith(
       "https://cozy.example.ts.net/cozy/onboarding/readiness-only",
@@ -186,6 +197,7 @@ describe("NetworkOnboarding", () => {
       prepare: vi.fn(async () => (resumed.calls.push("prepare-lan"), lanEndpoint)),
       inspect: vi.fn(async () => lanEndpoint),
       rollbackOwned: vi.fn(async () => undefined),
+      reconcileOwned: vi.fn(async () => undefined),
     };
     resumed.dependencies.adapters = [resumed.adapter, lanAdapter];
     resumed.onboarding = new NetworkOnboarding(resumed.dependencies);
@@ -269,6 +281,119 @@ describe("NetworkOnboarding", () => {
       healthy: false,
       issue: { type: "pause", reason: "machine_auth_required", detail: "needs_admin" },
     });
+  });
+
+  it.each([
+    ...(["status", "loopback", "mapping", "tls", "certificate", "redirect", "health", "alpn", "websocket", "ownership"] as const)
+      .map((reason) => ["tailscale", new TailscaleModeReadinessError(reason), reason] as const),
+    ...(["health", "websocket", "attach", "posture"] as const)
+      .map((reason) => ["lan", new LanModeReadinessError(reason), reason] as const),
+  ] as const)("preserves a real %s readiness error and its exact reason", async (mode, error, reason) => {
+    const current = harness({
+      projection: {
+        version: 1, stage: "network_selected", mode, updatedAt: 50,
+      },
+    });
+    const adapter: NetworkModeAdapter = {
+      mode,
+      prepare: vi.fn(async () => ({ ...endpoint, mode })),
+      inspect: vi.fn(async () => { throw error; }),
+      rollbackOwned: vi.fn(async () => undefined),
+      reconcileOwned: vi.fn(async () => undefined),
+    };
+    current.dependencies.adapters = [adapter];
+    current.onboarding = new NetworkOnboarding(current.dependencies);
+
+    await expect(current.onboarding.status()).resolves.toMatchObject({
+      stage: "changed",
+      mode,
+      healthy: false,
+      issue: { type: "readiness", mode, reason },
+    });
+  });
+
+  it.each(["later", "cancel"] as const)(
+    "reconciles durable LAN ownership after process recreation and failed inspection before %s",
+    async (choice) => {
+      const current = harness({
+        choice,
+        projection: {
+          version: 1, stage: "endpoint_ready", mode: "lan",
+          deploymentFingerprint: "durable-lan-posture", updatedAt: 50,
+        },
+      });
+      const recreatedLan: NetworkModeAdapter = {
+        mode: "lan",
+        prepare: vi.fn(async () => { throw new Error("not selected"); }),
+        inspect: vi.fn(async () => { throw new LanModeReadinessError("posture"); }),
+        rollbackOwned: vi.fn(async () => { throw new Error("no endpoint is available"); }),
+        reconcileOwned: vi.fn(async () => undefined),
+      };
+      current.dependencies.adapters = [recreatedLan];
+      current.onboarding = new NetworkOnboarding(current.dependencies);
+
+      await expect(current.onboarding.resume(current.io)).resolves.toEqual({
+        outcome: choice === "later" ? "deferred" : "cancelled",
+      });
+
+      expect(recreatedLan.reconcileOwned).toHaveBeenCalledWith(undefined);
+      expect(recreatedLan.rollbackOwned).not.toHaveBeenCalled();
+      expect(current.dependencies.phoneVerification.begin).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails closed when endpoint-independent reconciliation cannot prove rollback safety", async () => {
+    const current = harness({
+      choice: "later",
+      projection: {
+        version: 1, stage: "endpoint_ready", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+    (current.adapter.inspect as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new TailscaleModeReadinessError("ownership"),
+    );
+    (current.adapter.reconcileOwned as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("ownership changed concurrently"),
+    );
+
+    await expect(current.onboarding.resume(current.io)).resolves.toEqual({
+      outcome: "failed", reason: "rollback_failed",
+    });
+
+    expect(current.dependencies.phoneVerification.begin).not.toHaveBeenCalled();
+    expect(current.projections).not.toContainEqual(expect.objectContaining({ stage: "pending_choice" }));
+  });
+
+  it("reconciles an uninspectable saved route before switching modes", async () => {
+    const current = harness({
+      choice: "lan",
+      projection: {
+        version: 1, stage: "endpoint_ready", mode: "tailscale",
+        deploymentFingerprint: endpoint.durableFingerprint, updatedAt: 50,
+      },
+    });
+    (current.adapter.inspect as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new TailscaleModeReadinessError("status"),
+    );
+    const lanEndpoint: PreparedEndpoint = {
+      mode: "lan", canonicalOrigin: "http://192.168.1.20:18787", bindHost: "0.0.0.0",
+      port: 18_787, durableFingerprint: "lan-posture", ready: true,
+    };
+    const lanAdapter: NetworkModeAdapter = {
+      mode: "lan",
+      prepare: vi.fn(async () => (current.calls.push("prepare-lan"), lanEndpoint)),
+      inspect: vi.fn(async () => lanEndpoint),
+      rollbackOwned: vi.fn(async () => undefined),
+      reconcileOwned: vi.fn(async () => undefined),
+    };
+    current.dependencies.adapters = [current.adapter, lanAdapter];
+    current.onboarding = new NetworkOnboarding(current.dependencies);
+
+    await expect(current.onboarding.resume(current.io)).resolves.toMatchObject({ outcome: "not_confirmed" });
+
+    expect(current.adapter.reconcileOwned).toHaveBeenCalledWith(undefined);
+    expect(current.calls.indexOf("reconcile")).toBeLessThan(current.calls.indexOf("prepare-lan"));
   });
 
   it.each(["later", "cancel"] as const)("emits no challenge or pairing material for %s", async (choice) => {
@@ -615,6 +740,7 @@ describe("NetworkOnboarding", () => {
       prepare: async () => endpoint,
       inspect: async () => endpoint,
       rollbackOwned: async () => undefined,
+      reconcileOwned: async () => undefined,
     };
     const make = () => new NetworkOnboarding({
       adapters: [adapter],

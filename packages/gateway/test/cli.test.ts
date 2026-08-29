@@ -13,6 +13,7 @@ import {
   type CliOnboardingController,
   type OnboardingPairingDependencies,
 } from "../src/cli.ts";
+import type { NetworkOnboardingStatusIssue } from "../src/network-onboarding.ts";
 import { startGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
 import { generateSelfSigned } from "./helpers/self-signed.ts";
@@ -228,6 +229,104 @@ describe("cozygateway pair finale", () => {
 
     expect(log).toHaveBeenCalledOnce();
     expect(String(log.mock.calls[0]?.[0])).toContain("Gateway URL:");
+    vi.restoreAllMocks();
+  });
+
+  it("runs the Windows-only owned-network cleanup with the injected runtime and closes CLI resources", async () => {
+    const { configPath } = tempConfig();
+    const runtime = {
+      restartHermesProfile: vi.fn(async () => undefined),
+      waitForGatewayReady: vi.fn(async () => undefined),
+    };
+    const cleanup = vi.fn(async () => undefined);
+    const io = { ...scriptedIo([]), close: vi.fn() };
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", configPath], io, runtime, controller,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(0);
+
+    expect(cleanup).toHaveBeenCalledWith(configPath, runtime, undefined);
+    expect(io.close).toHaveBeenCalledOnce();
+    expect(controller.close).toHaveBeenCalledOnce();
+    expect(lines.join("\n")).not.toMatch(/token|secret|authUrl|setup code/i);
+    vi.restoreAllMocks();
+  });
+
+  it("returns nonzero, closes resources, and redacts an owned-network cleanup failure", async () => {
+    const { configPath } = tempConfig();
+    const runtime = {
+      restartHermesProfile: vi.fn(async () => undefined),
+      waitForGatewayReady: vi.fn(async () => undefined),
+    };
+    const cleanup = vi.fn(async () => { throw new Error("authUrl=https://secret.invalid?token=do-not-print"); });
+    const io = { ...scriptedIo([]), close: vi.fn() };
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", configPath], io, runtime, controller,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    expect(io.close).toHaveBeenCalledOnce();
+    expect(controller.close).toHaveBeenCalledOnce();
+    expect(lines.join("\n")).toContain("Owned network cleanup failed");
+    expect(lines.join("\n")).not.toMatch(/secret\.invalid|do-not-print|authUrl|token/i);
+    vi.restoreAllMocks();
+  });
+
+  it("refuses owned-network cleanup outside Windows without touching network state", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network", "--config", "unused.json"], undefined, undefined, undefined,
+      { platform: "linux", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(lines.join("\n")).toContain("Windows only");
+    vi.restoreAllMocks();
+  });
+
+  it("requires an explicit config path for owned-network cleanup", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(
+      ["cleanup-owned-network"], undefined, undefined, undefined,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).toBe(1);
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(lines.join("\n")).toContain("explicit --config path");
+    vi.restoreAllMocks();
+  });
+
+  it("returns nonzero and closes resources when cleanup arguments are malformed", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const io = { ...scriptedIo([]), close: vi.fn() };
+    const controller = onboardingController();
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    await expect(runCli(
+      ["cleanup-owned-network", "--config"], io, undefined, controller,
+      { platform: "win32", reconcileOwnedNetworkState: cleanup },
+    )).resolves.toBe(1);
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(io.close).toHaveBeenCalledOnce();
+    expect(controller.close).toHaveBeenCalledOnce();
+    expect(lines.join("\n")).toContain("Owned network cleanup failed");
     vi.restoreAllMocks();
   });
 
@@ -587,6 +686,40 @@ describe("cozygateway terminal menu", () => {
     },
   );
 
+  it("renders sleep, wildcard-interface, and short-lived browser-history warnings before the phone QR", async () => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      resume: vi.fn(async (io) => {
+        await io.showNetworkDisclosure("tailscale");
+        await io.showNetworkDisclosure("lan");
+        await io.showPreparedEndpointDisclosure?.({
+          mode: "lan", canonicalOrigin: "http://192.168.1.20:18787", bindHost: "0.0.0.0",
+          port: 18_787, durableFingerprint: "lan-posture", ready: true,
+          wildcardExposure: {
+            selectedInterface: "Home Wi-Fi", otherInterfaces: [],
+            message: "0.0.0.0 also exposes CozyGateway through New VPN.",
+          },
+        });
+        await io.showPhoneConnectionCheck("http://127.0.0.1/cozy/onboarding/test-only");
+        return { outcome: "cancelled" as const };
+      }),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["setup", "--config", configPath], scriptedIo([]), undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    const output = lines.join("\n");
+    expect(output).toMatch(/PC.*awake|sleep.*remote/i);
+    expect(output).toMatch(/0\.0\.0\.0.*Wi-Fi.*Ethernet.*VPN/i);
+    expect(output).toContain("0.0.0.0 also exposes CozyGateway through New VPN.");
+    expect(output).toMatch(/short-lived.*one-time/i);
+    expect(output).toMatch(/browser history/i);
+    expect(lines.findIndex((line) => /short-lived.*one-time/i.test(line)))
+      .toBeLessThan(lines.findIndex((line) => line.includes("█")));
+  });
+
   it("status renders a typed inspection pause and its concrete repair action", async () => {
     const { configPath } = tempConfig();
     const controller = onboardingController({
@@ -604,6 +737,31 @@ describe("cozygateway terminal menu", () => {
     vi.restoreAllMocks();
     expect(lines.join("\n")).toContain("machine_auth_required (needs_admin)");
     expect(lines.join("\n")).toContain("Ask the tailnet administrator to approve this machine");
+  });
+
+  it.each([
+    ["tailscale", "mapping", "Review the saved Tailscale Serve mapping on port 443"],
+    ["tailscale", "certificate", "Confirm the Tailscale HTTPS certificate covers"],
+    ["lan", "posture", "Reconnect the intended private adapter"],
+    ["lan", "websocket", "Allow CozyGateway WebSocket traffic through Windows Firewall"],
+  ] as const)("status renders exact actionable %s readiness guidance for %s", async (mode, reason, repair) => {
+    const { configPath } = tempConfig();
+    const controller = onboardingController({
+      status: vi.fn(async () => ({
+        stage: "changed" as const, authority: "none" as const, mode,
+        healthy: false,
+        issue: { type: "readiness", mode, reason } as NetworkOnboardingStatusIssue,
+      })),
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => appendLoggedLines(lines, line));
+
+    expect(await runCli(["status", "--config", configPath], undefined, undefined, controller)).toBe(0);
+
+    vi.restoreAllMocks();
+    expect(lines.join("\n")).toContain(`Phone access reason: ${mode}:${reason}`);
+    expect(lines.join("\n")).toContain(`Repair: ${repair}`);
+    expect(lines.join("\n")).not.toContain("inspection_failed");
   });
 
   it("noninteractive setup emits no QR/code and prints exactly one resume command", async () => {
@@ -639,7 +797,7 @@ describe("cozygateway terminal menu", () => {
     ["not_running", "Start Tailscale"],
     ["machine_auth_required", "Ask the tailnet administrator to approve this machine"],
     ["account_not_confirmed", "Review the signed-in account"],
-    ["unattended_consent_required", "Approve reachability after logout"],
+    ["unattended_consent_required", "Approve Tailscale background connectivity; the PC and Gateway must stay awake and the Windows user session must remain running"],
     ["incoming_consent_required", "Approve incoming Tailscale connections"],
     ["preference_cancelled", "preference change was cancelled"],
     ["preference_verification_failed", "did not confirm the requested preference"],
