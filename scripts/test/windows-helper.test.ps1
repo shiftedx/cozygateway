@@ -3,6 +3,19 @@ $ErrorActionPreference = 'Stop'
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw "ASSERT: $Message" } }
 function Write-Utf8NoBom { param([string]$Path, [string]$Content) [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false))) }
 
+function New-TestJunction {
+    param([string]$Path, [string]$Target)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $fullTarget = [IO.Path]::GetFullPath($Target)
+    foreach ($candidate in @($fullPath, $fullTarget)) {
+        if (-not $candidate.StartsWith($script:Temp + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "junction escaped verified temp root: $candidate" }
+    }
+    New-Item -ItemType Junction -Path $fullPath -Target $fullTarget | Out-Null
+    Assert-True (([IO.File]::GetAttributes($fullPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) "test junction was not a reparse point: $fullPath"
+    $script:Junctions.Add($fullPath)
+    return $fullPath
+}
+
 function Invoke-Helper {
     param([string]$Command, [Alias('Input')]$RequestBody = @{}, $Fixture = @{}, [string]$RawRequest)
     $fixturePath = Join-Path $script:Temp ("fixture-" + [guid]::NewGuid().ToString('N') + '.json')
@@ -47,10 +60,34 @@ function Invoke-Helper {
 function Assert-Reason { param($Result, [string]$Reason) Assert-True (-not $Result.Json.ok) "expected failure $Reason"; Assert-True ($Result.Json.reason -eq $Reason) "expected $Reason, got $($Result.Raw)" }
 function Assert-Paused { param($Result, [string]$Reason) Assert-True ($Result.Json.ok -and $Result.Json.result.state -eq 'paused') "expected paused $Reason"; Assert-True ($Result.Json.result.reason -eq $Reason) "expected $Reason, got $($Result.Raw)" }
 
+function Assert-PrivateDacl {
+    param([string]$Path)
+    $acl = Get-Acl -LiteralPath $Path
+    Assert-True $acl.AreAccessRulesProtected 'protected path must disable inherited access rules'
+    $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
+    $expected = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18') | Sort-Object
+    $actual = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
+    Assert-True (($actual -join ',') -eq ($expected -join ',')) "protected path has unexpected explicit identities: $($actual -join ',')"
+    foreach ($rule in $rules) {
+        Assert-True (-not $rule.IsInherited) 'protected path rules must be explicit'
+        Assert-True ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) 'protected path rules must be allow rules'
+        Assert-True (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl) 'protected path identities need full control'
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $script:Helper = Join-Path $repoRoot 'scripts\cozygateway-windows-helper.ps1'
-$script:Temp = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-helper-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $script:Temp | Out-Null
+$script:TempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+$script:Temp = Join-Path $script:TempBase ("cozygateway-windows-helper-" + [guid]::NewGuid().ToString('N'))
+$script:TempVerified = $false
+New-Item -ItemType Directory -Path $script:Temp | Out-Null
+$script:Temp = (Resolve-Path -LiteralPath $script:Temp).Path
+$tempLeaf = Split-Path -Leaf $script:Temp
+if (-not $script:Temp.StartsWith($script:TempBase + '\', [StringComparison]::OrdinalIgnoreCase) -or $tempLeaf -notmatch '^cozygateway-windows-helper-[0-9a-f]{32}$') {
+    throw "refusing unverified disposable temp path: $script:Temp"
+}
+$script:TempVerified = $true
+$script:Junctions = New-Object System.Collections.Generic.List[string]
 $script:Harness = Join-Path $script:Temp 'fixture-harness.ps1'
 $quotedHelper = $script:Helper.Replace("'", "''")
 Write-Utf8NoBom $script:Harness @"
@@ -59,6 +96,8 @@ param([string]`$Command)
 . '$quotedHelper'
 `$fixturePath = [Environment]::GetEnvironmentVariable('COZYGATEWAY_WINDOWS_HELPER_TEST_FIXTURE', 'Process')
 `$fixture = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText(`$fixturePath))
+`$testCommand = `$fixture.PSObject.Properties['testCommand']
+if (`$null -ne `$testCommand) { `$requestedCommand = [string]`$testCommand.Value }
 `$code = Invoke-WindowsHelperMain `$requestedCommand `$fixture
 exit `$code
 "@
@@ -200,9 +239,63 @@ try {
     Assert-Reason (Invoke-Helper -Command 'initialize-pending' -Input @{ root = '.' } -Fixture @{ skipAcl = $true }) 'path_rejected'
     Assert-Reason (Invoke-Helper -Command 'initialize-pending' -Input @{ root = 'C:relative' } -Fixture @{ skipAcl = $true }) 'path_rejected'
     Assert-Reason (Invoke-Helper -Command 'initialize-pending' -Input @{ root = '\relative' } -Fixture @{ skipAcl = $true }) 'path_rejected'
+
+    $tempReparseRoot = Join-Path $script:Temp 'pending temp reparse root'
+    $tempReparseLocal = Join-Path $tempReparseRoot 'local'
+    $tempReparseTarget = Join-Path $script:Temp 'pending temp reparse target'
+    New-Item -ItemType Directory -Path $tempReparseLocal, $tempReparseTarget | Out-Null
+    $tempReparse = New-TestJunction (Join-Path $tempReparseLocal 'controlled-temp') $tempReparseTarget
+    Assert-Reason (Invoke-Helper -Command 'initialize-pending' -Input @{ root = $tempReparseRoot } -Fixture @{ skipAcl = $true; pendingTemporaryPath = $tempReparse }) 'path_reparse_point'
+
+    $rootReparseTarget = Join-Path $script:Temp 'root reparse target'
+    New-Item -ItemType Directory -Path $rootReparseTarget | Out-Null
+    $rootReparseFile = Join-Path $rootReparseTarget 'state.json'
+    Write-Utf8NoBom $rootReparseFile '{}'
+    $rootReparse = New-TestJunction (Join-Path $script:Temp 'root reparse link') $rootReparseTarget
+    Assert-Reason (Invoke-Helper -Command 'protect-path' -Input @{ root = $rootReparse; path = (Join-Path $rootReparse 'state.json') } -Fixture @{ skipAcl = $true }) 'path_reparse_point'
+
+    $ancestorRoot = Join-Path $script:Temp 'ancestor reparse root'
+    $ancestorTarget = Join-Path $script:Temp 'ancestor reparse target'
+    New-Item -ItemType Directory -Path $ancestorRoot, $ancestorTarget | Out-Null
+    $ancestorFile = Join-Path $ancestorTarget 'state.json'
+    Write-Utf8NoBom $ancestorFile '{}'
+    $ancestorLink = New-TestJunction (Join-Path $ancestorRoot 'linked') $ancestorTarget
+    Assert-Reason (Invoke-Helper -Command 'protect-path' -Input @{ root = $ancestorRoot; path = (Join-Path $ancestorLink 'state.json') } -Fixture @{ skipAcl = $true }) 'path_reparse_point'
+
+    $destinationRoot = Join-Path $script:Temp 'destination reparse root'
+    $destinationLocal = Join-Path $destinationRoot 'local'
+    $destinationTarget = Join-Path $script:Temp 'destination reparse target'
+    New-Item -ItemType Directory -Path $destinationLocal, $destinationTarget | Out-Null
+    [void](New-TestJunction (Join-Path $destinationLocal 'network-onboarding.json') $destinationTarget)
+    Assert-Reason (Invoke-Helper -Command 'initialize-pending' -Input @{ root = $destinationRoot } -Fixture @{ skipAcl = $true }) 'path_reparse_point'
     $outside = Join-Path $script:Temp 'outside.txt'
     Write-Utf8NoBom $outside 'outside'
     Assert-Reason (Invoke-Helper -Command 'protect-path' -Input @{ root = $root; path = $outside } -Fixture @{ skipAcl = $true }) 'path_rejected'
+
+    $aclRoot = Join-Path $script:Temp 'real acl root'
+    $aclFile = Join-Path $aclRoot 'protected.json'
+    New-Item -ItemType Directory -Path $aclRoot | Out-Null
+    Write-Utf8NoBom $aclFile '{}'
+    $realDirectoryProtection = Invoke-Helper -Command 'protect-path' -Input @{ root = $aclRoot; path = $aclRoot } -Fixture @{}
+    Assert-True ($realDirectoryProtection.Json.ok) "real disposable directory DACL protection failed: $($realDirectoryProtection.Raw)"
+    Assert-PrivateDacl $aclRoot
+    $realProtection = Invoke-Helper -Command 'protect-path' -Input @{ root = $aclRoot; path = $aclFile } -Fixture @{}
+    Assert-True ($realProtection.Json.ok) "real disposable DACL protection failed: $($realProtection.Raw)"
+    Assert-PrivateDacl $aclFile
+
+    $volumeRoot = [IO.Path]::GetPathRoot($script:Temp)
+    . $script:Helper
+    $script:Fixture = [pscustomobject]@{ programFiles = $volumeRoot }
+    Assert-True ((Get-ProgramFilesRoot) -eq $volumeRoot) 'Program Files canonicalization must preserve a volume-root separator'
+    Assert-True ((Normalize-FullyQualifiedPath '\\server\share\') -eq '\\server\share\') 'canonicalization must preserve a UNC share-root separator'
+    $volumeEvents = Join-Path $script:Temp 'volume-boundary-events.jsonl'
+    $volumeFixture = @{ skipAcl = $true; eventLog = $volumeEvents }
+    $rootBoundary = Invoke-Helper -Command 'protect-path' -Input @{ root = $volumeRoot; path = $volumeRoot } -Fixture $volumeFixture
+    Assert-True ($rootBoundary.Json.ok) "volume-root protection boundary failed: $($rootBoundary.Raw)"
+    $volumeEvent = Get-Content -LiteralPath $volumeEvents -Raw | ConvertFrom-Json
+    Assert-True ($volumeEvent.arguments[0] -eq $volumeRoot) 'canonical containment must preserve the volume-root separator'
+    $insideBoundary = Invoke-Helper -Command 'protect-path' -Input @{ root = $volumeRoot; path = $outside } -Fixture $volumeFixture
+    Assert-True ($insideBoundary.Json.ok) 'a disposable path inside a volume-root boundary must remain contained'
 
     $inventory = Invoke-Helper -Command 'adapter-inventory' -Input @{} -Fixture @{ adapters = @(
         @{ id = '{A}'; displayName = 'Ethernet localized'; ndisMedium = 0; physicalMedium = 14; hardwareInterface = $true; operationalStatus = 1; adminStatus = 1; ipv4Addresses = @('192.168.1.20') },
@@ -220,7 +313,24 @@ try {
     Assert-Reason (Invoke-Helper -Command 'set-preference' -RawRequest '{"preference":"unattended","\u0070reference":"shields-up","enabled":true}' -Fixture $prefFixture) 'invalid_request'
     Assert-Reason (Invoke-Helper -Command 'open-browser' -RawRequest ('{"purpose":"login","url":"' + ('a' * 65536) + '"}') -Fixture $browserFixture) 'request_too_large'
     Assert-Reason (Invoke-Helper -Command 'made-up-command' -Input @{} -Fixture @{}) 'invalid_request'
+    $hugeCommand = Invoke-Helper -Command 'fixture-command' -Input @{} -Fixture @{ testCommand = ('x' * 70000) }
+    Assert-Reason $hugeCommand 'invalid_request'
+    Assert-True ($hugeCommand.Json.command -eq 'invalid') 'invalid commands must use a fixed bounded envelope sentinel'
+    $multibyteCommand = Invoke-Helper -Command 'fixture-command' -Input @{} -Fixture @{ testCommand = (([string][char]0x20ac) * 25000) }
+    Assert-Reason $multibyteCommand 'invalid_request'
+    Assert-True ($multibyteCommand.Json.command -eq 'invalid') 'multibyte invalid commands must use the same bounded sentinel'
     Write-Host 'windows helper tests passed'
 } finally {
-    Remove-Item -LiteralPath $script:Temp -Recurse -Force -ErrorAction SilentlyContinue
+    if ($script:TempVerified) {
+        $cleanupPath = [IO.Path]::GetFullPath($script:Temp)
+        if ($cleanupPath.StartsWith($script:TempBase + '\', [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $cleanupPath) -match '^cozygateway-windows-helper-[0-9a-f]{32}$') {
+            for ($index = $script:Junctions.Count - 1; $index -ge 0; $index--) {
+                $junction = $script:Junctions[$index]
+                if ($junction.StartsWith($cleanupPath + '\', [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $junction)) {
+                    [IO.Directory]::Delete($junction)
+                }
+            }
+            Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }

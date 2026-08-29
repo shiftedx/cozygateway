@@ -31,9 +31,38 @@ describe("WindowsHelperClient", () => {
 
   it("rejects relative helper and PowerShell paths before spawning", () => {
     expect(() => new WindowsHelperClient({ helperPath: ".\\helper.ps1", powershellPath: powershell }))
-      .toThrow(/absolute helper path/i);
+      .toThrow(/fully qualified helper path/i);
     expect(() => new WindowsHelperClient({ helperPath: helper, powershellPath: "powershell.exe" }))
-      .toThrow(/absolute PowerShell path/i);
+      .toThrow(/fully qualified PowerShell path/i);
+  });
+
+  it("rejects rooted-but-not-fully-qualified Windows executable paths everywhere", async () => {
+    for (const path of ["\\helper.ps1", "/helper.ps1", "C:relative.ps1"]) {
+      expect(() => new WindowsHelperClient({ helperPath: path, powershellPath: powershell }))
+        .toThrow(/fully qualified helper path/i);
+      expect(() => new WindowsHelperClient({ helperPath: helper, powershellPath: path }))
+        .toThrow(/fully qualified PowerShell path/i);
+    }
+
+    for (const path of ["\\tailscale.exe", "/tailscale.exe", "C:tailscale.exe"]) {
+      for (const result of [
+        { state: "ready", cliPath: path, daemonPath: "C:\\Program Files\\Tailscale\\tailscaled.exe" },
+        { state: "ready", cliPath: "C:\\Program Files\\Tailscale\\tailscale.exe", daemonPath: path },
+      ]) {
+        const runner = vi.fn<WindowsHelperRunner>().mockResolvedValue({
+          exitCode: 0,
+          stdout: response("discover-tailscale", result),
+          stderr: "",
+        });
+        const client = new WindowsHelperClient({ helperPath: helper, powershellPath: powershell, runner });
+        await expect(client.discoverTailscale()).rejects.toBeInstanceOf(WindowsHelperProtocolError);
+      }
+    }
+
+    expect(() => new WindowsHelperClient({
+      helperPath: "\\\\server\\share\\helper.ps1",
+      powershellPath: "\\\\server\\share\\powershell.exe",
+    })).not.toThrow();
   });
 
   it("rejects oversized, non-UTF-8, extra-key, wrong-command, and malformed command results", async () => {

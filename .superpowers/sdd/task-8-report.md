@@ -27,7 +27,8 @@ asset/checksum plumbing, bootstrap verification/install, and Windows/TypeScript 
   rejects reparse ancestors before applying a current-user/SYSTEM-only protected DACL.
 - Adapter inventory uses stable interface GUIDs, numeric CIM media/state fields, hardware-interface
   metadata, and IPv4 rows. Localized names are presentation-only.
-- Added `WindowsHelperClient`, which requires absolute Windows helper/PowerShell paths, invokes with
+- Added `WindowsHelperClient`, which requires fully-qualified drive-rooted or UNC Windows
+  helper/PowerShell paths, invokes with
   `shell:false` and a hidden window, bounds stdin/stdout/time, decodes strict UTF-8, and rejects
   schema versions, commands, keys, reason codes, or command results outside the fixed contract.
 - The bundle now copies and checksums `cozygateway-windows-helper.ps1`; releases upload both files.
@@ -103,3 +104,46 @@ six important issues. All were handled before commit:
 - The focused re-review cleared those items and found one final Windows-path issue: `IsPathRooted`
   accepts `C:relative` and `\relative`. Both pending and path protection now require an explicitly
   fully-qualified drive-rooted or UNC path, with regressions for both context-dependent forms.
+
+## Task 8 review-finding remediation
+
+The four follow-up findings in `task-8-review-findings.md` were resolved test-first:
+
+1. Added client regressions for `\helper.ps1`, `/helper.ps1`, and `C:relative.ps1` in both
+   executable slots and independently in discovered CLI and daemon output. They failed against
+   `win32.isAbsolute`. One explicit validator now accepts only drive-rooted or UNC paths everywhere;
+   a positive UNC case guards the intended network-path form.
+2. Added volume-boundary tests for Program Files and path protection. The initial protection event
+   exposed the old `C:` canonical form. `Normalize-FullyQualifiedPath` now preserves `C:\` and UNC
+   share roots, while descendant containment uses exactly one separator. The real volume-root test
+   uses `skipAcl`; it observes but never mutates the root. The UNC assertion performs no I/O.
+3. Added 70,000-character ASCII and 25,000-character multibyte invalid commands through the
+   dot-sourced fixture seam. The old envelope exceeded the response cap and stalled the harness.
+   Command validation now happens before envelope construction and unknown input is represented by
+   the fixed `invalid` sentinel, including the bounded fallback. Every harness response remains
+   valid JSON at or below 64 KiB.
+4. Added real DACL assertions for a directory and file created beneath a verified disposable temp
+   root: inheritance is disabled and the only explicit full-control allow ACE identities are the
+   current-user SID and SYSTEM. Real junction tests reject reparse points at the root, ancestor,
+   pending temporary path, and pending destination boundaries. Junction paths and targets must
+   remain inside the verified temp root; cleanup revalidates the generated root and deletes tracked
+   junctions before conditional recursive removal. No live Tailscale, installer, UAC, service,
+   preference, browser, adapter, or network mutation is exercised.
+
+The independent remediation review found no Critical or Important issues and rated the work ready.
+Its two minor test-isolation suggestions were also applied before the final rerun.
+
+### Fresh remediation verification
+
+- Windows helper harness: passed, including real disposable DACL and four reparse boundaries.
+- Windows bootstrap harness: passed.
+- Focused helper/release Vitest suites: 2 files, 10 tests passed.
+- Gateway typecheck and build: exit 0.
+- Bundle: completed with helper/checksum assets.
+- Full isolated Gateway suite: 94 files passed, 1 skipped; 954 tests passed, 2 skipped.
+- `git diff --check`: clean (line-ending notices only).
+
+One preceding identical isolated-suite run ended mid-stream with Windows process status
+`0xC0000409` and no Vitest assertion report. With no source change, the immediate reproduction ran
+all 95 files to completion with the counts above, matching the repository's intermittent native
+Vitest worker/process instability rather than a Task 8 test failure.

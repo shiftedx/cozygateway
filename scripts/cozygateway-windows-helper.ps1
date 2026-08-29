@@ -214,7 +214,7 @@ function Get-ProgramFilesRoot {
     $fixtureRoot = Get-FixtureProperty 'programFiles'
     $root = if (-not [string]::IsNullOrWhiteSpace([string]$fixtureRoot)) { [string]$fixtureRoot } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles) }
     if ([string]::IsNullOrWhiteSpace($root)) { Throw-Reason 'tailscale_not_installed' }
-    return [IO.Path]::GetFullPath($root).TrimEnd('\')
+    return Normalize-FullyQualifiedPath $root
 }
 
 function Get-ServiceRecord {
@@ -466,9 +466,10 @@ function Invoke-OpenBrowser {
 function Resolve-ContainedPath {
     param([string]$Root, [string]$Path)
     if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Path) -or -not (Test-FullyQualifiedWindowsPath $Root) -or -not (Test-FullyQualifiedWindowsPath $Path)) { Throw-Reason 'path_rejected' }
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
-    $pathFull = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    if ($pathFull -ne $rootFull -and -not $pathFull.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { Throw-Reason 'path_rejected' }
+    $rootFull = Normalize-FullyQualifiedPath $Root
+    $pathFull = Normalize-FullyQualifiedPath $Path
+    $rootPrefix = if ($rootFull.EndsWith('\')) { $rootFull } else { $rootFull + '\' }
+    if ($pathFull -ne $rootFull -and -not $pathFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) { Throw-Reason 'path_rejected' }
     if ((Test-ReparsePath $rootFull) -or (Test-ReparsePath $pathFull)) { Throw-Reason 'path_reparse_point' }
     return $pathFull
 }
@@ -477,6 +478,14 @@ function Test-FullyQualifiedWindowsPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     return ($Path -match '^[A-Za-z]:\\' -or $Path -match '^\\\\[^\\]+\\[^\\]+(?:\\|$)')
+}
+
+function Normalize-FullyQualifiedPath {
+    param([string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $volumeRoot = [IO.Path]::GetPathRoot($full)
+    if ([string]::Equals($full.TrimEnd('\'), $volumeRoot.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { return $volumeRoot.TrimEnd('\') + '\' }
+    return $full.TrimEnd('\')
 }
 
 function Set-PrivateAcl {
@@ -517,7 +526,7 @@ function Invoke-InitializePending {
     param($Request)
     if (-not (Test-ExactKeys $Request @('root')) -or $Request.root -isnot [string]) { Throw-Reason 'invalid_request' }
     if (-not (Test-FullyQualifiedWindowsPath ([string]$Request.root))) { Throw-Reason 'path_rejected' }
-    $root = [IO.Path]::GetFullPath([string]$Request.root).TrimEnd('\')
+    $root = Normalize-FullyQualifiedPath ([string]$Request.root)
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { Throw-Reason 'path_rejected' }
     if (Test-ReparsePath $root) { Throw-Reason 'path_reparse_point' }
     $local = Resolve-ContainedPath $root (Join-Path $root 'local')
@@ -525,14 +534,18 @@ function Invoke-InitializePending {
     Set-PrivateAcl $local
     $destination = Resolve-ContainedPath $root (Join-Path $local 'network-onboarding.json')
     if (-not (Test-Path -LiteralPath $destination)) {
-        $temporary = "$destination.new-$([guid]::NewGuid().ToString('N'))"
+        $injectedTemporary = Get-FixtureProperty 'pendingTemporaryPath'
+        $temporaryCandidate = if ([string]::IsNullOrWhiteSpace([string]$injectedTemporary)) { "$destination.new-$([guid]::NewGuid().ToString('N'))" } else { [string]$injectedTemporary }
+        $temporary = Resolve-ContainedPath $root $temporaryCandidate
         try {
             $updatedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
             $body = [ordered]@{ version = 1; stage = 'pending_choice'; updatedAt = $updatedAt } | ConvertTo-Json -Compress
             $stream = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
             try { $bytes = [Text.Encoding]::UTF8.GetBytes($body); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+            if (Test-ReparsePath $temporary) { Throw-Reason 'path_reparse_point' }
             Set-PrivateAcl $temporary
             [IO.File]::Move($temporary, $destination)
+            if (Test-ReparsePath $destination) { Throw-Reason 'path_reparse_point' }
             Set-PrivateAcl $destination
         } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
     }
@@ -608,6 +621,8 @@ $knownReasons = @(
 function Invoke-WindowsHelperMain {
     param([string]$Name, $InjectedFixture = $null)
     $script:Fixture = $InjectedFixture
+    $fixedCommands = @('discover-tailscale','install-tailscale','set-preference','open-browser','initialize-pending','protect-path','adapter-inventory')
+    $envelopeCommand = if ($fixedCommands -ccontains $Name) { $Name } else { 'invalid' }
     $ok = $false
     $result = $null
     $reason = 'internal_error'
@@ -640,13 +655,13 @@ function Invoke-WindowsHelperMain {
     }
 
     $envelope = if ($ok) {
-        [ordered]@{ schemaVersion = $script:SchemaVersion; ok = $true; command = [string]$Name; result = $result }
+        [ordered]@{ schemaVersion = $script:SchemaVersion; ok = $true; command = $envelopeCommand; result = $result }
     } else {
-        [ordered]@{ schemaVersion = $script:SchemaVersion; ok = $false; command = [string]$Name; reason = $reason }
+        [ordered]@{ schemaVersion = $script:SchemaVersion; ok = $false; command = $envelopeCommand; reason = $reason }
     }
     $json = $envelope | ConvertTo-Json -Depth 20 -Compress
     if ([Text.Encoding]::UTF8.GetByteCount($json) -gt $script:MaxJsonBytes) {
-        $json = ([ordered]@{ schemaVersion = 1; ok = $false; command = [string]$Name; reason = 'internal_error' } | ConvertTo-Json -Compress)
+        $json = ([ordered]@{ schemaVersion = 1; ok = $false; command = $envelopeCommand; reason = 'internal_error' } | ConvertTo-Json -Compress)
         $ok = $false
     }
     [Console]::Out.Write($json)

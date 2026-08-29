@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { win32 } from "node:path";
 import type { WindowsLanAdapter, WindowsLanInventory } from "./lan.ts";
 
 export const WINDOWS_HELPER_SCHEMA_VERSION = 1 as const;
@@ -90,6 +89,10 @@ export class WindowsHelperError extends Error {
   }
 }
 
+function isFullyQualifiedWindowsPath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+\\[^\\/]+(?:\\|$)/.test(value);
+}
+
 function exactKeys(value: Record<string, unknown>, expected: string[]): boolean {
   const actual = Object.keys(value).sort();
   return actual.length === expected.length && actual.every((key, index) => key === [...expected].sort()[index]);
@@ -165,8 +168,8 @@ function discovery(value: unknown): value is TailscaleDiscovery {
   if (!record(value)) return false;
   if (value.state === "ready") {
     return exactKeys(value, ["state", "cliPath", "daemonPath"])
-      && typeof value.cliPath === "string" && win32.isAbsolute(value.cliPath)
-      && typeof value.daemonPath === "string" && win32.isAbsolute(value.daemonPath);
+      && typeof value.cliPath === "string" && isFullyQualifiedWindowsPath(value.cliPath)
+      && typeof value.daemonPath === "string" && isFullyQualifiedWindowsPath(value.daemonPath);
   }
   return value.state === "paused" && exactKeys(value, ["state", "reason"])
     && validReason(value.reason) && DISCOVERY_PAUSE_REASONS.has(value.reason);
@@ -222,12 +225,12 @@ export class WindowsHelperClient {
   readonly #timeoutMs: number;
 
   constructor(options: WindowsHelperClientOptions) {
-    if (!win32.isAbsolute(options.helperPath)) throw new Error("an absolute helper path is required");
+    if (!isFullyQualifiedWindowsPath(options.helperPath)) throw new Error("a fully qualified helper path is required");
     const defaultPowerShell = process.env.SystemRoot === undefined
       ? ""
       : `${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
     const powershellPath = options.powershellPath ?? defaultPowerShell;
-    if (!win32.isAbsolute(powershellPath)) throw new Error("an absolute PowerShell path is required");
+    if (!isFullyQualifiedWindowsPath(powershellPath)) throw new Error("a fully qualified PowerShell path is required");
     this.#helperPath = options.helperPath;
     this.#powershellPath = powershellPath;
     this.#runner = options.runner ?? defaultRunner;
