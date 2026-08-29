@@ -28,10 +28,27 @@ function Assert-PrivateDacl {
 
 function Set-PrivateTestDacl {
     param([string] $Path)
-    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $suffix = if (Test-Path -LiteralPath $Path -PathType Container) { ':(OI)(CI)(F)' } else { ':(F)' }
-    $output = & "$env:SystemRoot\System32\icacls.exe" $Path '/inheritance:r' '/grant:r' ("*$currentSid$suffix") ("*S-1-5-18$suffix") 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "failed to prepare private fixture ACL for ${Path}: $($output -join ' ')" }
+    $item = Get-Item -LiteralPath $Path
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($identity in @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference } | Select-Object -Unique)) {
+        $acl.PurgeAccessRules($identity)
+    }
+    $rights = [Security.AccessControl.FileSystemRights]::FullControl
+    $type = [Security.AccessControl.AccessControlType]::Allow
+    if ($item.PSIsContainer) {
+        $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $propagation = [Security.AccessControl.PropagationFlags]::None
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($current, $rights, $inheritance, $propagation, $type)))
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, $rights, $inheritance, $propagation, $type)))
+    } else {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($current, $rights, $type)))
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, $rights, $type)))
+    }
+    $acl.SetOwner($current)
+    Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
 function New-OwnershipFixture {
@@ -76,10 +93,30 @@ if ($Command -eq 'initialize-pending') {
 }
 if ($Command -eq 'protect-path') {
   $path = [string]$request.path
-  $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  $suffix = if (Test-Path -LiteralPath $path -PathType Container) { ':(OI)(CI)(F)' } else { ':(F)' }
-  $output = & "$env:SystemRoot\System32\icacls.exe" $path '/inheritance:r' '/grant:r' ("*$currentSid$suffix") ("*S-1-5-18$suffix") 2>&1
-  if ($LASTEXITCODE -ne 0) { throw "fixture failed to protect path: $($output -join ' ')" }
+  $item = Get-Item -LiteralPath $path
+  $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+  $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+  $acl = Get-Acl -LiteralPath $path
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($identity in @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference } | Select-Object -Unique)) {
+    $acl.PurgeAccessRules($identity)
+  }
+  $rights = [Security.AccessControl.FileSystemRights]::FullControl
+  $type = [Security.AccessControl.AccessControlType]::Allow
+  if ($item.PSIsContainer) {
+    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($current, $rights, $inheritance, $propagation, $type)))
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, $rights, $inheritance, $propagation, $type)))
+  } else {
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($current, $rights, $type)))
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, $rights, $type)))
+  }
+  if ($item.PSIsContainer) {
+    (New-Object IO.DirectoryInfo($path)).SetAccessControl($acl)
+  } else {
+    (New-Object IO.FileInfo($path)).SetAccessControl($acl)
+  }
 }
 $result = if ($Command -eq 'inspect-dashboard-port') { @{ available=$true; owned=$false } } else { @{ applied=$true } }
 [Console]::Out.Write((@{ schemaVersion=1; ok=$true; command=$Command; result=$result } | ConvertTo-Json -Compress))
@@ -234,6 +271,21 @@ Assert-True ($temp -match '[\\/]OneDrive installer regression[\\/]') 'bootstrap 
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
 
 try {
+    # GitHub's Windows runner can create temp files with an explicit Administrators ACE.
+    # Private fixture protection must replace that DACL, not merely replace grants for
+    # the two desired principals while retaining the runner-specific explicit ACE.
+    $runnerAclFixture = Join-Path $temp 'runner-explicit-administrators.json'
+    Write-Utf8NoBom $runnerAclFixture '{}'
+    $runnerAcl = Get-Acl -LiteralPath $runnerAclFixture
+    $runnerAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')),
+        [Security.AccessControl.FileSystemRights]::Modify,
+        [Security.AccessControl.AccessControlType]::Allow
+    )))
+    Set-Acl -LiteralPath $runnerAclFixture -AclObject $runnerAcl
+    Set-PrivateTestDacl $runnerAclFixture
+    Assert-PrivateDacl $runnerAclFixture
+
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
     if (-not $SkipBuild) {
         & cmd.exe /d /s /c "pnpm.cmd build >nul 2>&1"

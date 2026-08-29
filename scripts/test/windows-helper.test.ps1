@@ -307,6 +307,13 @@ try {
     $aclFile = Join-Path $aclRoot 'protected.json'
     New-Item -ItemType Directory -Path $aclRoot | Out-Null
     Write-Utf8NoBom $aclFile '{}'
+    $runnerStyleAcl = Get-Acl -LiteralPath $aclFile
+    $runnerStyleAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')),
+        [Security.AccessControl.FileSystemRights]::Modify,
+        [Security.AccessControl.AccessControlType]::Allow
+    )))
+    Set-Acl -LiteralPath $aclFile -AclObject $runnerStyleAcl
     $realDirectoryProtection = Invoke-Helper -Command 'protect-path' -Input @{ root = $aclRoot; path = $aclRoot } -Fixture @{}
     Assert-True ($realDirectoryProtection.Json.ok) "real disposable directory DACL protection failed: $($realDirectoryProtection.Raw)"
     Assert-PrivateDacl $aclRoot
