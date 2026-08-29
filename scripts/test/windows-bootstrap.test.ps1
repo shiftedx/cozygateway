@@ -17,6 +17,7 @@ function New-ReleaseFixtures {
         'cozygateway.mjs' = "console.log('fixture');`n"
         'cozygateway-hermes-attach-plugin.tar.gz' = 'plugin-fixture'
         'cozygateway-installer.sh' = "#!/usr/bin/env bash`nexit 0`n"
+        'cozygateway-windows-helper.ps1' = "param([string]`$Command)`n"
     }
     foreach ($entry in $assets.GetEnumerator()) {
         $path = Join-Path $Directory $entry.Key
@@ -123,6 +124,9 @@ try {
     Assert-True ($result.Output -match 'already configured') 'configured Hermes should report that model selection was skipped'
     Assert-True (($events -join "`n") -match '--service-platform Windows') 'handoff must select the Windows service platform'
     Assert-True (($events -join "`n") -match 'Cozy Gateway') 'paths containing spaces must survive the handoff'
+    $installedHelper = Join-Path $temp 'Cozy Gateway\bin\cozygateway-windows-helper.ps1'
+    Assert-True (Test-Path -LiteralPath $installedHelper) 'bootstrap must checksum-verify and install the Windows helper beside the bundle'
+    Assert-True ((Get-Content -LiteralPath $installedHelper -Raw) -eq "param([string]`$Command)`n") 'installed Windows helper bytes must match the verified release asset'
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
     Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
     Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'

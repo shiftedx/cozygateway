@@ -22,6 +22,7 @@ const REQUIRED = [
   "cozygateway-installer.sh",
   "install.ps1",
   "install.sh",
+  "cozygateway-windows-helper.ps1",
 ];
 
 describe("what a release publishes", () => {
@@ -35,6 +36,7 @@ describe("what a release publishes", () => {
   it("builds both one-liner bootstraps, not just the Windows one", () => {
     expect(BUNDLER).toContain('"dist-bundle/install.ps1"');
     expect(BUNDLER).toContain('"dist-bundle/install.sh"');
+    expect(BUNDLER).toContain('"dist-bundle/cozygateway-windows-helper.ps1"');
   });
 
   it("checksums whatever it built, if a bundle is present", () => {

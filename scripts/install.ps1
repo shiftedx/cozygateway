@@ -258,8 +258,10 @@ if ([string]::IsNullOrWhiteSpace($base)) {
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
 $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
+$script:WindowsHelperPath = Join-Path $bin 'cozygateway-windows-helper.ps1'
 Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
 Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
+Get-VerifiedAsset 'cozygateway-windows-helper.ps1' $script:WindowsHelperPath $base
 Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
 Invoke-CozyGatewayInstaller $bash $installerPath $InstallerArguments
 if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }
