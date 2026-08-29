@@ -7,12 +7,13 @@
    bytes on redirected standard input and strict UTF-8 output decoding. The regression runs the
    release/bootstrap/helper pipeline, not a direct helper-only shortcut.
 2. **Installer trust boundary:** the verified helper is staged outside the install root, validates
-   the dedicated root, rejects reparse points and existing roots writable by an untrusted SID, and
+   the dedicated root, rejects untrusted owners, parent replace/DeleteChild authority, reparse
+   points at root/bin/runtime/helper, and existing roots writable by an untrusted SID, and
    establishes current-user/SYSTEM-only protected DACLs before executable assets land in `bin`.
    Helper, installer, bundle, and present private runtime paths are protected idempotently. Custom
    roots use the same exact-root checks.
 3. **Logout promise:** removed the unsupported “reachable after logout” wording. Consent now says
-   only that Tailscale may run unattended in the background and that sleep disconnects it.
+   the PC and Gateway must remain awake and the Windows user session must remain running.
 4. **Windows network/firewall:** implemented read-only selected-adapter network-category and active
    firewall-profile inspection. Public/unknown/disabled/default-block postures produce specific
    Windows Settings/Windows Security guidance. The installer creates no firewall rule. This is the
@@ -21,22 +22,25 @@
    make the review finding worse.
 5. **Unicode adapters:** removed ASCII scrubbing. Control characters are neutralized, while Unicode
    display names are preserved and code-point bounded in the selection UI.
-6. **Advanced origin:** Advanced input rejects wildcard, localhost, IPv6 loopback, and all IPv4
-   loopback addresses unless a separate concrete public origin exists. Inspection also fails closed
+6. **Advanced origin:** Advanced input rejects wildcard, localhost (including a trailing dot), IPv6
+   loopback/mapped-loopback, and URL-normalized IPv4 forms such as `127.1`, integer, octal, and hex
+   loopback unless a separate concrete public origin exists. Inspection also fails closed
    on a non-phone-reachable origin, preventing it from reaching verification or pairing QR output.
-7. **Gateway port:** new Windows installs inspect the target port before Node bootstrap or install
-   state mutation. Existing installs inspect after their saved port is parsed but before config,
-   plugin, Task, or Startup mutation. Conflicts report PID, process name, stop/process-or-`--port`
+7. **Gateway port:** Windows PowerShell inspects the target port before Hermes/model setup, release
+   assets, tokens, or install-state mutation. Existing installs use the saved port unless explicitly
+   overridden. Conflicts report PID, process name, stop/process-or-`--port`
    action, and an explicit no-state-changed statement.
 8. **Damaged uninstall:** missing/corrupt install state now follows the Windows recovery teardown:
    delete the exact `CozyGateway` Task, remove its exact Startup entry, stop only a process whose
    command line names this install's exact config path, remove the user PATH entry, then remove the
    root. Healthy Windows uninstall is also platform-guarded so it never invokes Linux `systemctl`.
    The public Windows PowerShell uninstall command is documented.
-9. **Owned Tailscale mapping teardown:** intentionally deferred on root-agent direction. No
-   speculative/no-op seam was added. The durable-network slice now exposes exact
-   `reconcileOwned()` APIs; root will wire the sequential pre-uninstall integration after both
-   slices, preserving unrelated Tailscale state.
+9. **Owned network teardown:** healthy PowerShell uninstall now runs the installed internal
+   `cleanup-owned-network` command before any Bash/native persistence, process, PATH, database, or
+   file deletion. A nonzero result aborts with the full authority intact. The command reconciles
+   exact recorded LAN/Tailscale ownership and preserves unrelated Tailscale state. Native damaged
+   fallback is limited to already-absent/unreadable bundle/config/database authority and warns that
+   missing authority cannot be reconstructed.
 
 The shared disclosure seam is integrated in the Windows tests and controller flow. Disclosure is
 awaited by the orchestrator before adapter preparation; the shipped CLI copy covers LAN plaintext
@@ -55,6 +59,15 @@ peers/tailnet administrators may reach or observe the device.
 - TypeScript tests first failed because `inspectNetworkSafety` did not exist, Unicode selection was
   scrubbed, and Advanced reused/advertised loopback. Focused Windows onboarding/helper-client tests
   now exercise those exact behaviors.
+- Second-review helper regressions failed on hostile ownership, parent replacement authority, and
+  child reparse boundaries before the owner-aware DACL and parent checks were added.
+- The real PowerShell bootstrap accepted a live occupied port and proceeded into Hermes/assets
+  before the native early preflight was added.
+- Advanced accepted `127.1` and mapped IPv6 before URL canonicalization; LAN guidance omitted the
+  exact port and Defender navigation before the focused copy regression.
+- Healthy uninstall lacked pre-network ordering, while damaged uninstall required Git Bash. The
+  bootstrap suite now covers cleanup failure preserving all authority, successful cleanup ordering,
+  exact process ownership, and missing-shell native recovery.
 
 ## Final verification
 
@@ -63,8 +76,9 @@ peers/tailnet administrators may reach or observe the device.
   pipeline and disposable-root DACL assertions.
 - `scripts/test/windows-dashboard-owner.test.ps1` — passed.
 - `scripts/test/hermes-installer.test.sh` — passed after the final uninstall platform guard.
-- Windows onboarding/helper-client Vitest focus — 19/19 passed.
-- Gateway package build and typecheck — passed.
+- Windows onboarding/helper-client Vitest focus — 28/28 passed.
+- CLI/network-onboarding/phone-verification/upgrade-dispatcher Vitest focus — 174/174 passed.
+- Gateway package typecheck — passed as part of the workspace gate.
 - Full workspace recursive build and typecheck — passed.
 - Bash syntax and `git diff --check` — passed (Git reported only the repository's expected Windows
   LF-to-CRLF checkout warnings).

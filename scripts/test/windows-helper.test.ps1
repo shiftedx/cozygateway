@@ -64,6 +64,10 @@ function Assert-PrivateDacl {
     param([string]$Path)
     $acl = Get-Acl -LiteralPath $Path
     Assert-True $acl.AreAccessRulesProtected 'protected path must disable inherited access rules'
+    $owner = if ([string]$acl.Owner -match '^S-') { [string]$acl.Owner } else {
+        ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+    }
+    Assert-True ($owner -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) 'protected path owner must be the current user'
     $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
     $expected = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18') | Sort-Object
     $actual = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
@@ -88,6 +92,7 @@ if (-not $script:Temp.StartsWith($script:TempBase + '\', [StringComparison]::Ord
 }
 $script:TempVerified = $true
 $script:Junctions = New-Object System.Collections.Generic.List[string]
+$script:ExternalRoots = New-Object System.Collections.Generic.List[string]
 $script:Harness = Join-Path $script:Temp 'fixture-harness.ps1'
 $quotedHelper = $script:Helper.Replace("'", "''")
 Write-Utf8NoBom $script:Harness @"
@@ -289,6 +294,15 @@ try {
     Assert-PrivateDacl $preparedRoot
     Assert-PrivateDacl (Join-Path $preparedRoot 'bin')
 
+    foreach ($normalParent in @($env:LOCALAPPDATA, $env:OneDrive)) {
+        if ([string]::IsNullOrWhiteSpace($normalParent) -or -not (Test-Path -LiteralPath $normalParent -PathType Container)) { continue }
+        $normalRoot = Join-Path $normalParent ("cozygateway-helper-path-test-" + [guid]::NewGuid().ToString('N'))
+        $script:ExternalRoots.Add($normalRoot)
+        $normalPrepared = Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $normalRoot } -Fixture @{}
+        Assert-True $normalPrepared.Json.ok "normal user-owned install parent must remain supported: $normalParent / $($normalPrepared.Raw)"
+        Assert-PrivateDacl $normalRoot
+    }
+
     $unicodeRoot = Join-Path $script:Temp 'Gäteway 你好'
     $unicodePrepared = Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $unicodeRoot } -Fixture @{}
     Assert-True $unicodePrepared.Json.ok "Unicode install-root preparation failed: $($unicodePrepared.Raw)"
@@ -310,6 +324,33 @@ try {
     )))
     Set-Acl -LiteralPath $unsafeRoot -AclObject $unsafeAcl
     Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $unsafeRoot } -Fixture @{}) 'unsafe_install_root'
+
+    $hostileOwnerRoot = Join-Path $script:Temp 'hostile owner install root'
+    New-Item -ItemType Directory -Path $hostileOwnerRoot | Out-Null
+    Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $hostileOwnerRoot } -Fixture @{
+        unsafeInstallRootOwner = $true
+    }) 'unsafe_install_root'
+
+    $sharedParent = Join-Path $script:Temp 'shared replace parent'
+    New-Item -ItemType Directory -Path $sharedParent | Out-Null
+    $sharedAcl = Get-Acl -LiteralPath $sharedParent
+    $sharedAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+        [Security.AccessControl.AccessControlType]::Allow
+    )))
+    Set-Acl -LiteralPath $sharedParent -AclObject $sharedAcl
+    Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = (Join-Path $sharedParent 'cozygateway') } -Fixture @{}) 'unsafe_install_root'
+
+    foreach ($boundaryChild in @('bin', 'runtime', 'bin\cozygateway-windows-helper.ps1')) {
+        $reparseRoot = Join-Path $script:Temp ("reparse boundary " + ($boundaryChild -replace '[\\.]', '-'))
+        $reparseTarget = Join-Path $script:Temp ("reparse target " + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $reparseRoot, $reparseTarget | Out-Null
+        $childPath = Join-Path $reparseRoot $boundaryChild
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $childPath) | Out-Null
+        [void](New-TestJunction $childPath $reparseTarget)
+        Assert-Reason (Invoke-Helper -Command 'prepare-install-root' -Input @{ root = $reparseRoot } -Fixture @{}) 'path_reparse_point'
+    }
 
     $volumeRoot = [IO.Path]::GetPathRoot($script:Temp)
     . $script:Helper
@@ -362,6 +403,13 @@ try {
     Assert-True ($multibyteCommand.Json.command -eq 'invalid') 'multibyte invalid commands must use the same bounded sentinel'
     Write-Host 'windows helper tests passed'
 } finally {
+    foreach ($externalRoot in $script:ExternalRoots) {
+        $parent = Split-Path -Parent $externalRoot
+        $leaf = Split-Path -Leaf $externalRoot
+        if ($parent -in @($env:LOCALAPPDATA, $env:OneDrive) -and $leaf -match '^cozygateway-helper-path-test-[0-9a-f]{32}$' -and (Test-Path -LiteralPath $externalRoot)) {
+            Remove-Item -LiteralPath $externalRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     if ($script:TempVerified) {
         $cleanupPath = [IO.Path]::GetFullPath($script:Temp)
         if ($cleanupPath.StartsWith($script:TempBase + '\', [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $cleanupPath) -match '^cozygateway-windows-helper-[0-9a-f]{32}$') {

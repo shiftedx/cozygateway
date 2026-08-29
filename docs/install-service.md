@@ -50,9 +50,9 @@ Windows PowerShell:
 schtasks /Query /TN CozyGateway /V /FO LIST
 ```
 
-Before service registration, Windows installation verifies that the selected Gateway port is free
-or belongs to the same install's exact config path. A conflict reports the PID and process name and
-stops before config, plugin, Scheduled Task, or Startup mutation.
+Before Hermes/model setup or release-asset download, Windows PowerShell verifies that the selected
+Gateway port is free or belongs to the same install's exact config path. A conflict reports the PID
+and process name and stops before tokens, config, plugin, Scheduled Task, or Startup mutation.
 
 On Linux the installer enables user lingering so the service survives logout
 and reboot. If your host policy blocks that authorization, run
@@ -74,12 +74,16 @@ $installer = irm https://cozylabs.ai/install.ps1
 & ([scriptblock]::Create($installer)) --uninstall
 ```
 
-Set `$env:COZYGATEWAY_HOME` first when uninstalling a custom root. The recovery path removes the
-`CozyGateway` current-user Task, Startup fallback, and exact managed process before deleting files,
-even when install state is damaged.
+Set `$env:COZYGATEWAY_HOME` first when uninstalling a custom root. Healthy uninstall first runs the
+installed bounded owned-network cleanup; any failure preserves persistence, config, SQLite, and
+files for retry. Only after successful cleanup does it remove the `CozyGateway` current-user Task,
+Startup fallback, exact managed process, PATH entry, and files. When bundle/config/database
+authority is already absent or unreadable, native PowerShell recovery works without Git Bash or the
+installed shell payload and warns that missing network authority cannot be reconstructed.
 
 No firewall rule is created or changed. Same Wi-Fi setup reads the selected adapter's Windows
 network category and active firewall policy. For a trusted home network reported as `Public`, change
 only that connection to `Private` in Windows Settings. Keep Windows Firewall enabled; if reachability
-is blocked, authorize only CozyGateway's exact TCP port on the Private profile or use Tailscale—never
-disable the firewall or create an all-ports/all-profiles rule.
+is blocked, follow the setup message's exact port through **Windows Security > Firewall & network
+protection > Advanced settings > Inbound Rules** and authorize only that TCP port on the Private
+profile, or use Tailscale—never disable the firewall or create an all-ports/all-profiles rule.

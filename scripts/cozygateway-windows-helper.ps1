@@ -488,6 +488,23 @@ function Normalize-FullyQualifiedPath {
     return $full.TrimEnd('\')
 }
 
+function Get-AclOwnerSid {
+    param($Acl)
+    if ([bool](Get-FixtureProperty 'unsafeInstallRootOwner')) { return 'S-1-5-21-0-0-0-9999' }
+    try {
+        if ([string]$Acl.Owner -match '^S-\d-(?:\d+-)+\d+$') { return [string]$Acl.Owner }
+        return ([Security.Principal.NTAccount]$Acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch { Throw-Reason 'acl_failed' }
+}
+
+function Get-TrustedInstallOwnerSids {
+    return @(
+        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        'S-1-5-18',
+        'S-1-5-32-544'
+    )
+}
+
 function Set-PrivateAcl {
     param([string]$Path)
     if ([bool](Get-FixtureProperty 'skipAcl')) { Write-TestEvent 'protect-acl' @($Path); return }
@@ -499,6 +516,7 @@ function Set-PrivateAcl {
         $expectedIdentities = @($current.Value, 'S-1-5-18') | Sort-Object
         $actualIdentities = @($existingRules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
         $alreadyPrivate = $existing.AreAccessRulesProtected -and
+            (Get-AclOwnerSid $existing) -eq $current.Value -and
             (($actualIdentities -join ',') -eq ($expectedIdentities -join ',')) -and
             (@($existingRules | Where-Object {
                 $_.IsInherited -or $_.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
@@ -529,8 +547,8 @@ function Test-UnsafeInstallRootAcl {
     if ([bool](Get-FixtureProperty 'unsafeInstallRoot')) { return $true }
     try {
         $acl = Get-Acl -LiteralPath $Path
-        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $allowed = @($current, 'S-1-5-18', 'S-1-5-32-544')
+        $allowed = @(Get-TrustedInstallOwnerSids)
+        if ((Get-AclOwnerSid $acl) -notin $allowed) { return $true }
         $writeRights = [Security.AccessControl.FileSystemRights]::WriteData -bor
             [Security.AccessControl.FileSystemRights]::CreateFiles -bor
             [Security.AccessControl.FileSystemRights]::CreateDirectories -bor
@@ -550,6 +568,43 @@ function Test-UnsafeInstallRootAcl {
     } catch { Throw-Reason 'acl_failed' }
 }
 
+function Test-UnsafeParentReplacementAcl {
+    param([string]$Root)
+    try {
+        $parent = Split-Path -Parent $Root
+        if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent -PathType Container)) { return $true }
+        $acl = Get-Acl -LiteralPath $parent
+        $allowed = @(Get-TrustedInstallOwnerSids)
+        $localAppData = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { '' } else { Normalize-FullyQualifiedPath $env:LOCALAPPDATA }
+        $replaceRights = [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+            [Security.AccessControl.FileSystemRights]::CreateDirectories -bor
+            [Security.AccessControl.FileSystemRights]::WriteData
+        $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        foreach ($rule in $rules) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+                $rule.PropagationFlags -eq [Security.AccessControl.PropagationFlags]::InheritOnly -or
+                (($rule.FileSystemRights -band $replaceRights) -eq 0)) { continue }
+            $sid = $rule.IdentityReference.Value
+            if ($sid -in $allowed) { continue }
+            # Standard LOCALAPPDATA may grant a Windows app capability direct access while keeping
+            # descendants protected. Preserve the default install location, then replace inheritance
+            # with the private root DACL immediately after creation.
+            if ($parent -eq $localAppData -and $sid.StartsWith('S-1-15-3-', [StringComparison]::Ordinal)) { continue }
+            [int64]$denied = 0
+            foreach ($denyRule in $rules) {
+                if ($denyRule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny -and
+                    $denyRule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::InheritOnly -and
+                    $denyRule.IdentityReference.Value -in @('S-1-1-0', $sid)) {
+                    $denied = $denied -bor ([int64]$denyRule.FileSystemRights -band [int64]$replaceRights)
+                }
+            }
+            [int64]$granted = [int64]$rule.FileSystemRights -band [int64]$replaceRights
+            if (($granted -band (-bnot $denied)) -ne 0) { return $true }
+        }
+        return $false
+    } catch { Throw-Reason 'acl_failed' }
+}
+
 function Invoke-PrepareInstallRoot {
     param($Request)
     if (-not (Test-ExactKeys $Request @('root')) -or $Request.root -isnot [string] -or
@@ -560,7 +615,12 @@ function Invoke-PrepareInstallRoot {
     if (Test-ReparsePath $root) { Throw-Reason 'path_reparse_point' }
     $bin = Join-Path $root 'bin'
     $runtime = Join-Path $root 'runtime'
-    foreach ($existing in @($root, $bin, $runtime)) {
+    $helper = Join-Path $bin 'cozygateway-windows-helper.ps1'
+    foreach ($existing in @($bin, $runtime, $helper)) {
+        if ((Test-Path -LiteralPath $existing) -and (Test-ReparsePath $existing)) { Throw-Reason 'path_reparse_point' }
+    }
+    if (Test-UnsafeParentReplacementAcl $root) { Throw-Reason 'unsafe_install_root' }
+    foreach ($existing in @($root, $bin, $runtime, $helper)) {
         if ((Test-Path -LiteralPath $existing) -and (Test-UnsafeInstallRootAcl $existing)) { Throw-Reason 'unsafe_install_root' }
     }
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { New-Item -ItemType Directory -Path $root | Out-Null }

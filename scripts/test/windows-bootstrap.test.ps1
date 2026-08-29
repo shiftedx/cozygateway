@@ -135,6 +135,24 @@ try {
     New-FakeHermes $fakeBin $configPath $eventLog
     New-FakeBash $fakeBash $eventLog
 
+    $occupiedHome = Join-Path $temp 'Occupied Port Gateway'
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $occupiedPort = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+        $occupied = Invoke-Bootstrap $installer @{
+            'PATH' = "$fakeBin;$env:PATH"
+            'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+            'COZYGATEWAY_HOME' = $occupiedHome
+            'COZYGATEWAY_GIT_BASH' = $fakeBash
+            'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        } @('--port', [string]$occupiedPort)
+    } finally { $listener.Stop() }
+    Assert-True ($occupied.ExitCode -ne 0) 'PowerShell bootstrap must reject an occupied Gateway port'
+    Assert-True ($occupied.Output -match "(?s)Gateway port $occupiedPort.*PID.*Stop that process.*No CozyGateway state was changed") "occupied-port failure must name the port, PID, process, action, and no-partial-install guarantee: $($occupied.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $occupiedHome)) 'occupied-port preflight must run before install-root or asset mutation'
+    Assert-True (-not (Test-Path -LiteralPath $eventLog)) 'occupied-port preflight must run before Hermes/model mutation'
+
     $result = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
@@ -247,11 +265,37 @@ try {
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
+    $managedConfig = Join-Path $temp 'Cozy Gateway\local\cozygateway.config.json'
+    $uninstallAppData = Join-Path $temp 'uninstall-appdata'
+    $uninstallStartup = Join-Path $uninstallAppData 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uninstallStartup) | Out-Null
+    Write-Utf8NoBom $uninstallStartup 'owned startup fixture'
+    $processFixture = Join-Path $temp 'uninstall-processes.json'
+    Write-Utf8NoBom $processFixture (@(
+        @{ ProcessId = 4101; Name = 'node.exe'; CommandLine = "node cozygateway.mjs serve --config `"$managedConfig`"" },
+        @{ ProcessId = 4102; Name = 'node.exe'; CommandLine = 'node cozygateway.mjs serve --config "C:\Other\cozygateway.config.json"' }
+    ) | ConvertTo-Json -Compress)
+    $failedCleanupNativeLog = Join-Path $temp 'failed-cleanup-native-events.log'
+    $failedCleanup = Invoke-Bootstrap $installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = $uninstallAppData
+        'LOCALAPPDATA' = (Join-Path $temp 'failed-cleanup-localappdata')
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = $failedCleanupNativeLog
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $processFixture
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$managedBin"
+    } @('--uninstall')
+    Assert-True ($failedCleanup.ExitCode -ne 0 -and $failedCleanup.Output -match 'owned network cleanup failed') 'failed owned-network reconciliation must abort uninstall'
+    Assert-True (Test-Path -LiteralPath $managedConfig) 'failed owned-network reconciliation must preserve config and install files'
+    Assert-True (-not (Test-Path -LiteralPath $failedCleanupNativeLog)) 'failed owned-network reconciliation must happen before Task/process/PATH teardown'
+    Assert-True (Test-Path -LiteralPath $uninstallStartup) 'failed owned-network reconciliation must preserve persistence for a retry'
     $mustNotRunHermesInstaller = Join-Path $temp 'must-not-run-hermes-installer.ps1'
     Write-Utf8NoBom $mustNotRunHermesInstaller "throw 'uninstall must not install Hermes'`n"
     Remove-Item -LiteralPath $eventLog -Force
     $uninstall = Invoke-Bootstrap $installer @{
         'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = $uninstallAppData
         'LOCALAPPDATA' = (Join-Path $temp 'uninstall without prerequisites')
         'COZYGATEWAY_INSTALL_ASSET_BASE' = (Join-Path $temp 'missing release assets')
         'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
@@ -259,11 +303,49 @@ try {
         'COZYGATEWAY_HERMES_INSTALL_URL' = $mustNotRunHermesInstaller
         'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$managedBin"
         'COZYGATEWAY_TEST_USER_PATH_LOG' = $uninstallPathLog
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = $eventLog
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $processFixture
+        'COZYGATEWAY_TEST_NETWORK_CLEANUP_LOG' = $eventLog
     } @('--uninstall')
     Assert-True ($uninstall.ExitCode -eq 0) "bootstrap uninstall failed: $($uninstall.Output)"
     $uninstalledPath = Get-Content -LiteralPath $uninstallPathLog -Raw
     Assert-True (-not ($uninstalledPath -match [regex]::Escape($managedBin))) 'uninstall must remove the managed command directory from the user PATH'
     Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw) -match 'hermes:model')) 'uninstall must not open Hermes model selection'
+    $uninstallEvents = Get-Content -LiteralPath $eventLog
+    $cleanupIndex = ($uninstallEvents | Select-String '^network-cleanup:' | Select-Object -First 1).LineNumber - 1
+    $taskIndex = ($uninstallEvents | Select-String '^task-delete:' | Select-Object -First 1).LineNumber - 1
+    $processIndex = ($uninstallEvents | Select-String '^process-stop:4101$' | Select-Object -First 1).LineNumber - 1
+    $uninstallBashIndex = ($uninstallEvents | Select-String '^bash:.*--uninstall' | Select-Object -First 1).LineNumber - 1
+    Assert-True ($cleanupIndex -ge 0 -and $cleanupIndex -lt $taskIndex -and $taskIndex -lt $uninstallBashIndex) 'owned network cleanup must succeed before native persistence or Bash teardown'
+    Assert-True ($processIndex -gt $cleanupIndex -and -not (($uninstallEvents -join "`n") -match 'process-stop:4102')) 'native teardown must stop only the exact config-owned process'
+    Assert-True (-not (Test-Path -LiteralPath $uninstallStartup)) 'native teardown must remove only the exact CozyGateway Startup entry'
+
+    $damagedNativeHome = Join-Path $temp 'damaged native uninstall'
+    $damagedNativeConfig = Join-Path $damagedNativeHome 'local\cozygateway.config.json'
+    $damagedNativeAppData = Join-Path $temp 'damaged-native-appdata'
+    $damagedNativeStartup = Join-Path $damagedNativeAppData 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $damagedNativeConfig), (Split-Path -Parent $damagedNativeStartup) | Out-Null
+    Write-Utf8NoBom $damagedNativeConfig '{not-json'
+    Write-Utf8NoBom $damagedNativeStartup 'owned startup fixture'
+    $damagedNativeLog = Join-Path $temp 'damaged-native-events.log'
+    $damagedNativePathLog = Join-Path $temp 'damaged-native-path.txt'
+    $damagedNative = Invoke-Bootstrap $installer @{
+        'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        'APPDATA' = $damagedNativeAppData
+        'LOCALAPPDATA' = (Join-Path $temp 'damaged-native-localappdata')
+        'COZYGATEWAY_HOME' = $damagedNativeHome
+        'COZYGATEWAY_GIT_BASH' = (Join-Path $temp 'missing-git-bash.exe')
+        'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$(Join-Path $damagedNativeHome 'bin')"
+        'COZYGATEWAY_TEST_USER_PATH_LOG' = $damagedNativePathLog
+        'COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG' = $damagedNativeLog
+        'COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE' = $processFixture
+        'COZYGATEWAY_TEST_NETWORK_CLEANUP_LOG' = $damagedNativeLog
+    } @('--uninstall')
+    Assert-True ($damagedNative.ExitCode -eq 0) "damaged native uninstall must not require Git Bash or the installed shell payload: $($damagedNative.Output)"
+    Assert-True ($damagedNative.Output -match 'authority.*missing or corrupt.*cannot be reconstructed') 'damaged fallback must disclose that missing network authority cannot be reconstructed'
+    Assert-True (-not (Test-Path -LiteralPath $damagedNativeHome)) 'damaged native fallback must remove the recoverable install root'
+    Assert-True (-not (Test-Path -LiteralPath $damagedNativeStartup)) 'damaged native fallback must remove the exact Startup entry'
+    Assert-True (-not ((Get-Content -LiteralPath $damagedNativeLog -Raw) -match 'network-cleanup:')) 'damaged fallback must not pretend to reconcile absent/corrupt authority'
 
     $dryUninstallPathLog = Join-Path $temp 'dry-uninstall-user-path.txt'
     Remove-Item -LiteralPath $eventLog -Force

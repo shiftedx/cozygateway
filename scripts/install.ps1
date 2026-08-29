@@ -19,6 +19,8 @@ function Resolve-InstallHome {
     $full = [IO.Path]::GetFullPath($RequestedHome)
     $local = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\')
     if ($full.TrimEnd('\') -eq $local) { Fail 'COZYGATEWAY_HOME must name a dedicated directory' }
+    $volumeRoot = [IO.Path]::GetPathRoot($full)
+    if ($full.TrimEnd('\') -eq $volumeRoot.TrimEnd('\')) { Fail 'COZYGATEWAY_HOME must not be a drive or share root' }
     return $full.TrimEnd('\')
 }
 
@@ -178,6 +180,61 @@ function Resolve-GitBash {
     Fail 'Git Bash was not found. Re-run the Hermes Windows installer, then paste this command again.'
 }
 
+function Test-CozyGatewayProcessOwnsConfig {
+    param($ProcessRecord, [string] $ExpectedConfig)
+    $command = [string]$ProcessRecord.CommandLine
+    if (-not $command.Contains('cozygateway.mjs') -or -not $command.Contains(' serve ')) { return $false }
+    $tokens = @([regex]::Matches($command, '[^\s"]+|"[^"]*"') | ForEach-Object { $_.Value.Trim([char]34) })
+    $candidate = $null
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        if ($tokens[$index] -eq '--config' -and $index + 1 -lt $tokens.Count) { $candidate = $tokens[$index + 1]; break }
+        if ($tokens[$index].StartsWith('--config=')) { $candidate = $tokens[$index].Substring(9); break }
+    }
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $false }
+    try {
+        return [IO.Path]::GetFullPath($candidate).Equals([IO.Path]::GetFullPath($ExpectedConfig), [StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Resolve-RequestedGatewayPort {
+    param([string] $ConfigPath, [string[]] $ForwardedArguments)
+    $port = 8787
+    $argumentCount = if ($null -eq $ForwardedArguments) { 0 } else { $ForwardedArguments.Length }
+    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+        try {
+            $saved = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json
+            if ($null -ne $saved.port) { $port = [int]$saved.port }
+        } catch { Fail 'the existing Gateway config is invalid; repair or remove it before reinstalling' }
+    }
+    for ($index = 0; $index -lt $argumentCount; $index++) {
+        if ($ForwardedArguments[$index] -eq '--port') {
+            if ($index + 1 -ge $argumentCount) { Fail '--port needs a value' }
+            $candidate = 0
+            if (-not [int]::TryParse($ForwardedArguments[$index + 1], [ref]$candidate)) { Fail '--port must be 1-65535' }
+            $port = $candidate
+            $index++
+        }
+    }
+    if ($port -lt 1 -or $port -gt 65535) { Fail '--port must be 1-65535' }
+    return $port
+}
+
+function Assert-GatewayPortAvailable {
+    param([int] $Port, [string] $ConfigPath)
+    try {
+        [array]$connection = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($connection.Count -eq 0) { return }
+        $ownerPid = [int]$connection[0].OwningProcess
+        [array]$owner = @(Get-CimInstance Win32_Process -Filter "ProcessId = $ownerPid" -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($owner.Count -eq 1 -and (Test-CozyGatewayProcessOwnsConfig $owner[0] $ConfigPath)) { return }
+        $processName = try { (Get-Process -Id $ownerPid -ErrorAction Stop).ProcessName } catch { 'unknown' }
+        Fail "Gateway port $Port is already in use by PID $ownerPid ($processName). Stop that process, or rerun with --port and a free port. No CozyGateway state was changed."
+    } catch {
+        if ($_.Exception.Message -like 'FAIL  Gateway port *') { throw }
+        Fail "could not inspect Gateway port $Port before installation; no CozyGateway state was changed"
+    }
+}
+
 function Invoke-CozyGatewayInstaller {
     param([string] $BashPath, [string] $InstallerPath, [string[]] $ForwardedArguments)
     $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome, '--bundle', $script:BundlePath, '--plugin-archive', $script:PluginPath)
@@ -318,6 +375,95 @@ function Set-CozyGatewayCommandPath {
     Write-Ok $(if ($Present) { 'the cozygateway command is available in new PowerShell and Terminal windows' } else { 'removed the cozygateway command from the user PATH' })
 }
 
+function Test-OwnedNetworkAuthorityReady {
+    param([string] $InstallHome)
+    $bundle = Join-Path $InstallHome 'bin\cozygateway.mjs'
+    $config = Join-Path $InstallHome 'local\cozygateway.config.json'
+    $database = Join-Path $InstallHome 'local\cozygateway.sqlite'
+    foreach ($path in @($bundle, $config, $database)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    }
+    try {
+        $parsed = [IO.File]::ReadAllText($config) | ConvertFrom-Json
+        if ($null -eq $parsed -or (Get-Item -LiteralPath $database).Length -le 0) { return $false }
+    } catch { return $false }
+    return $true
+}
+
+function Invoke-OwnedNetworkCleanup {
+    param([string] $InstallHome, [bool] $DryRun)
+    $node = Join-Path $InstallHome 'runtime\node\node.exe'
+    $bundle = Join-Path $InstallHome 'bin\cozygateway.mjs'
+    $config = Join-Path $InstallHome 'local\cozygateway.config.json'
+    if (-not (Test-Path -LiteralPath $node -PathType Leaf)) {
+        Fail 'owned network cleanup cannot run because the installed Node.js runtime is missing; repair the install and retry uninstall'
+    }
+    if ($DryRun) {
+        Write-Info "dry run: would reconcile only installer-owned network state with $node before persistence or file teardown"
+        return
+    }
+    $testLog = [Environment]::GetEnvironmentVariable('COZYGATEWAY_TEST_NETWORK_CLEANUP_LOG', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($testLog)) {
+        Add-Content -LiteralPath $testLog -Value "network-cleanup:$node $bundle cleanup-owned-network --config $config"
+        return
+    }
+    try {
+        & $node $bundle cleanup-owned-network --config $config
+        if ($LASTEXITCODE -ne 0) { Fail 'owned network cleanup failed; uninstall stopped before changing persistence or files' }
+    } catch {
+        if ($_.Exception.Message -like 'FAIL  owned network cleanup failed*') { throw }
+        Fail 'owned network cleanup failed; uninstall stopped before changing persistence or files'
+    }
+}
+
+function Get-WindowsProcessRecords {
+    $fixturePath = [Environment]::GetEnvironmentVariable('COZYGATEWAY_TEST_WINDOWS_PROCESS_FIXTURE', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($fixturePath)) {
+        $parsed = [IO.File]::ReadAllText($fixturePath) | ConvertFrom-Json
+        foreach ($record in $parsed) { Write-Output $record }
+        return
+    }
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+}
+
+function Invoke-NativeWindowsTeardown {
+    param([string] $InstallHome, [bool] $DryRun)
+    $config = Join-Path $InstallHome 'local\cozygateway.config.json'
+    $startup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
+    $testLog = [Environment]::GetEnvironmentVariable('COZYGATEWAY_TEST_NATIVE_UNINSTALL_LOG', 'Process')
+    if ($DryRun) {
+        Write-Info "dry run: would delete the exact CozyGateway Task and Startup entry, stop only the process owned by $config, and remove the managed PATH entry"
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($testLog)) {
+        Add-Content -LiteralPath $testLog -Value 'task-delete:CozyGateway'
+    } else {
+        $schtasks = Join-Path $env:WINDIR 'System32\schtasks.exe'
+        if (Test-Path -LiteralPath $schtasks -PathType Leaf) { & $schtasks /Delete /F /TN CozyGateway 2>$null | Out-Null }
+    }
+    Remove-Item -LiteralPath $startup -Force -ErrorAction SilentlyContinue
+    [array]$processes = @(Get-WindowsProcessRecords)
+    foreach ($process in $processes) {
+        if (-not (Test-CozyGatewayProcessOwnsConfig $process $config)) { continue }
+        $pidToStop = [int]$process.ProcessId
+        if (-not [string]::IsNullOrWhiteSpace($testLog)) {
+            Add-Content -LiteralPath $testLog -Value "process-stop:$pidToStop"
+        } else {
+            Stop-Process -Id $pidToStop -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Set-CozyGatewayCommandPath (Join-Path $InstallHome 'bin') $false
+}
+
+function Remove-DamagedInstallRoot {
+    param([string] $InstallHome)
+    if (-not (Test-Path -LiteralPath $InstallHome)) { return }
+    if (([IO.File]::GetAttributes($InstallHome) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'refusing to recursively remove a reparse-point install root'
+    }
+    Remove-Item -LiteralPath $InstallHome -Recurse -Force
+}
+
 if ($PSVersionTable.PSVersion.Major -lt 5) { Fail 'Windows PowerShell 5.1 or newer is required' }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -330,13 +476,20 @@ $isUninstall = $InstallerArguments -contains '--uninstall'
 $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
 
 if ($isUninstall) {
+    $authorityReady = Test-OwnedNetworkAuthorityReady $script:InstallHome
+    if ($authorityReady) { Invoke-OwnedNetworkCleanup $script:InstallHome $isDryRun }
+    Invoke-NativeWindowsTeardown $script:InstallHome $isDryRun
+    if (-not $authorityReady) {
+        Write-Info 'owned network authority is missing or corrupt and cannot be reconstructed; removing only recoverable local install state'
+        if (-not $isDryRun) { Remove-DamagedInstallRoot $script:InstallHome }
+        return
+    }
     $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
-    if (-not (Test-Path -LiteralPath $installerPath)) { Fail "no CozyGateway installer was found at $installerPath" }
+    if (-not (Test-Path -LiteralPath $installerPath)) { Fail "no CozyGateway installer was found at $installerPath; network state is reconciled but Hermes cleanup still requires a repaired installer" }
     $uninstallArguments = @($installerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome) + @($InstallerArguments)
     if ($isDryRun -and -not ($uninstallArguments -contains '--dry-run')) { $uninstallArguments += '--dry-run' }
     & $bash @uninstallArguments
     if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
-    if (-not $isDryRun) { Set-CozyGatewayCommandPath $bin $false }
     return
 }
 
@@ -351,6 +504,9 @@ if ($isDryRun) {
     Write-Info 'dry run: would initialize private resumable phone access state and return to this PowerShell for setup'
     return
 }
+
+$requestedPort = Resolve-RequestedGatewayPort $configPath $InstallerArguments
+Assert-GatewayPortAvailable $requestedPort $configPath
 
 $hermes = Resolve-Hermes $env:COZYGATEWAY_HERMES_INSTALL_URL
 Confirm-HermesModel $hermes
