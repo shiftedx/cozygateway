@@ -656,9 +656,6 @@ param(
   [Parameter(Mandatory = $true, Position = 3)][ValidateRange(1, 65535)][int]$ExpectedPort
 )
 $ErrorActionPreference = "Stop"
-$connection = Get-NetTCPConnection -State Listen -LocalAddress "127.0.0.1" -LocalPort $ExpectedPort -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($null -eq $connection) { exit 0 }
-$process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
 # COZYGATEWAY_DASHBOARD_OWNER_BEGIN
 function Test-CozyDashboardOwner {
   param(
@@ -672,53 +669,114 @@ function Test-CozyDashboardOwner {
   $root = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
   $hermes = [IO.Path]::GetFullPath($ExpectedHermes)
   $launcher = [IO.Path]::GetFullPath($ExpectedLauncher)
-  $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
-
-  $runtimeUnderRoot = $false
-  $candidate = $Process
-  for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
-    try {
-      if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-        $runtimeUnderRoot = $true
-        break
-      }
-    } catch {}
-    if (-not $candidate.ParentProcessId) { break }
-    $candidate = & $ResolveProcess ([int]$candidate.ParentProcessId)
+  if ($null -eq $Process -or [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath) -or [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)) {
+    return "Indeterminate"
   }
-
+  $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
   $dashboardIndex = -1
+  $requiresRootAncestry = $false
   $scriptSuffix = [IO.Path]::DirectorySeparatorChar + "hermes_cli" + [IO.Path]::DirectorySeparatorChar + "main.py"
   $processExecutable = $null
   $firstToken = $null
   $secondToken = $null
-  try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch {}
+  try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch { return "Foreign" }
   if ($tokens.Count -gt 0) { try { $firstToken = [IO.Path]::GetFullPath($tokens[0]) } catch {} }
   if ($tokens.Count -gt 1) { try { $secondToken = [IO.Path]::GetFullPath($tokens[1]) } catch {} }
   $firstIsExecutable = $null -ne $processExecutable -and $null -ne $firstToken -and $firstToken.Equals($processExecutable, [StringComparison]::OrdinalIgnoreCase)
+  if (-not $firstIsExecutable) { return "Foreign" }
   $pythonRuntime = $firstIsExecutable -and @("python.exe", "pythonw.exe") -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
   $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
   if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq "dashboard") {
     $dashboardIndex = 1
-  } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
+  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
     $dashboardIndex = 2
-  } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
+    $requiresRootAncestry = $true
+  } elseif ($pythonRuntime -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
     $dashboardIndex = 3
+    $requiresRootAncestry = $true
   } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase) -and $tokens[2] -eq "dashboard") {
     $dashboardIndex = 2
   }
-  if ($dashboardIndex -lt 0) { return $false }
-  for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
-    if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return $true }
-    if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return $true }
+  if ($dashboardIndex -lt 0) { return "Foreign" }
+
+  if ($requiresRootAncestry) {
+    $runtimeUnderRoot = $false
+    $runtimeMetadataMissing = $false
+    $candidate = $Process
+    for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
+      if ([string]::IsNullOrWhiteSpace([string]$candidate.ExecutablePath)) {
+        $runtimeMetadataMissing = $true
+      } else {
+        try {
+          if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+            $runtimeUnderRoot = $true
+            break
+          }
+        } catch { return "Foreign" }
+      }
+      if (-not $candidate.ParentProcessId) { break }
+      $candidate = & $ResolveProcess ([int]$candidate.ParentProcessId)
+      if ($null -eq $candidate) { $runtimeMetadataMissing = $true; break }
+    }
+    if (-not $runtimeUnderRoot) {
+      if ($runtimeMetadataMissing) { return "Indeterminate" }
+      return "Foreign"
+    }
   }
-  return $false
+
+  for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
+    if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return "Owned" }
+    if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return "Owned" }
+  }
+  return "Foreign"
+}
+
+function Stop-CozyDashboardOwner {
+  param(
+    [string]$ExpectedRoot,
+    [string]$ExpectedHermes,
+    [string]$ExpectedLauncher,
+    [int]$ExpectedPort,
+    [scriptblock]$ResolveListener,
+    [scriptblock]$ResolveProcess,
+    [scriptblock]$KillTree,
+    [scriptblock]$Sleep
+  )
+  try { $firstListener = & $ResolveListener } catch { return 45 }
+  if ($null -eq $firstListener) { return 0 }
+  try { $firstProcess = & $ResolveProcess ([int]$firstListener.OwningProcess) } catch { return 43 }
+  if ($null -eq $firstProcess -or [int]$firstProcess.ProcessId -ne [int]$firstListener.OwningProcess) { return 43 }
+  $firstOwner = Test-CozyDashboardOwner -Process $firstProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  if ($firstOwner -eq "Foreign") { return 42 }
+  if ($firstOwner -ne "Owned" -or [string]::IsNullOrWhiteSpace([string]$firstProcess.CreationDate)) { return 43 }
+
+  try { $secondListener = & $ResolveListener } catch { return 45 }
+  if ($null -eq $secondListener -or [int]$secondListener.OwningProcess -ne [int]$firstListener.OwningProcess) { return 45 }
+  try { $secondProcess = & $ResolveProcess ([int]$secondListener.OwningProcess) } catch { return 45 }
+  if ($null -eq $secondProcess -or [int]$secondProcess.ProcessId -ne [int]$secondListener.OwningProcess -or [string]::IsNullOrWhiteSpace([string]$secondProcess.CreationDate) -or
+      -not ([string]$secondProcess.CreationDate).Equals([string]$firstProcess.CreationDate, [StringComparison]::Ordinal)) { return 45 }
+  $secondOwner = Test-CozyDashboardOwner -Process $secondProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  if ($secondOwner -ne "Owned") { return 45 }
+
+  try { $killCode = & $KillTree ([int]$secondProcess.ProcessId) } catch { return 45 }
+  if ([int]$killCode -ne 0) { return 45 }
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    try { $remaining = & $ResolveListener } catch { return 45 }
+    if ($null -eq $remaining) { return 0 }
+    & $Sleep 100
+  }
+  return 45
 }
 # COZYGATEWAY_DASHBOARD_OWNER_END
-$resolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
-if (-not (Test-CozyDashboardOwner -Process $process -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $resolver)) { exit 42 }
-& ([IO.Path]::Combine($env:SystemRoot, "System32", "taskkill.exe")) /PID ([string]$process.ProcessId) /T /F | Out-Null
-exit $LASTEXITCODE
+$listenerResolver = { Get-NetTCPConnection -State Listen -LocalAddress "127.0.0.1" -LocalPort $ExpectedPort -ErrorAction SilentlyContinue | Select-Object -First 1 }
+$processResolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
+$treeKiller = {
+  param([int]$processId)
+  & ([IO.Path]::Combine($env:SystemRoot, "System32", "taskkill.exe")) /PID ([string]$processId) /T /F | Out-Null
+  return $LASTEXITCODE
+}
+$sleeper = { param([int]$milliseconds) Start-Sleep -Milliseconds $milliseconds }
+exit (Stop-CozyDashboardOwner -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveListener $listenerResolver -ResolveProcess $processResolver -KillTree $treeKiller -Sleep $sleeper)
 POWERSHELL_OWNER
   chmod 600 "$DASHBOARD_OWNER_PS1"
 }
