@@ -694,7 +694,6 @@ function Test-CozyDashboardOwner {
     $dashboardIndex = 1
   } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
     $dashboardIndex = 2
-    $requiresRootAncestry = $true
   } elseif ($pythonRuntime -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
     $dashboardIndex = 3
     $requiresRootAncestry = $true

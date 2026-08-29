@@ -64,6 +64,28 @@ Assert-Owner 'UV child with Hermes ancestor' 'Owned' $moduleListener @{ 200 = $m
 $launcherChild = New-TestProcess 202 201 $uvPython ('"{0}" "{1}" dashboard --port 9119' -f $uvPython, $launcher)
 Assert-Owner 'UV child carrying Hermes launcher' 'Owned' $launcherChild @{ 202 = $launcherChild; 201 = $moduleParent }
 
+$externalPython = 'C:\Python311\python.exe'
+$normalizedHermes = Join-Path $root 'bin\..\bin\hermes'
+$exactHermesChild = New-TestProcess 203 299 $externalPython ('"{0}" "{1}" dashboard --port 9119' -f $externalPython, $normalizedHermes)
+Assert-Owner 'external Python carrying exact normalized ExpectedHermes without readable ancestry' 'Owned' $exactHermesChild @{ 203 = $exactHermesChild }
+
+$externalParent = New-TestProcess 204 0 'C:\Python311\pythonw.exe' '"C:\Python311\pythonw.exe" worker'
+$normalizedLauncher = Join-Path $root 'bin\..\bin\hermes.exe'
+$exactLauncherChild = New-TestProcess 205 204 $externalPython ('"{0}" "{1}" dashboard --port=9119' -f $externalPython, $normalizedLauncher)
+Assert-Owner 'external Python carrying exact normalized ExpectedLauncher with external ancestry' 'Owned' $exactLauncherChild @{ 204 = $externalParent; 205 = $exactLauncherChild }
+
+$externalModuleChild = New-TestProcess 206 204 $externalPython ('"{0}" -m hermes_cli.main dashboard --port 9119' -f $externalPython)
+Assert-Owner 'external Python module form still requires trusted under-root ancestry' 'Foreign' $externalModuleChild @{ 204 = $externalParent; 206 = $externalModuleChild }
+
+$exactScriptForeignCases = @(
+    @{ Name = 'external Python carrying wrong Hermes script path'; Process = New-TestProcess 207 0 $externalPython ('"{0}" "C:\Other\hermes.exe" dashboard --port 9119' -f $externalPython) },
+    @{ Name = 'external Python carrying right script with wrong port'; Process = New-TestProcess 208 0 $externalPython ('"{0}" "{1}" dashboard --port 9120' -f $externalPython, $launcher) },
+    @{ Name = 'external Python carrying main.py from wrong root'; Process = New-TestProcess 209 0 $externalPython ('"{0}" "C:\Other\hermes-agent\hermes_cli\main.py" dashboard --port 9119' -f $externalPython) }
+)
+foreach ($case in $exactScriptForeignCases) {
+    Assert-Owner $case.Name 'Foreign' $case.Process @{ ($case.Process.ProcessId) = $case.Process }
+}
+
 $mainScript = Join-Path $root 'hermes-agent\hermes_cli\main.py'
 $scriptProcess = New-TestProcess 300 0 $uvPython ('"{0}" "{1}" dashboard --port=9119' -f $uvPython, $mainScript)
 Assert-Owner 'orphaned in-root main.py' 'Owned' $scriptProcess @{ 300 = $scriptProcess }
