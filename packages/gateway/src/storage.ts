@@ -21,6 +21,7 @@ import type {
   AttachV1MediaDescriptor,
   AttachV1Telemetry,
 } from "./adapters/attach/protocol-v1.ts";
+import { SETUP_CODE_TTL_MS } from "./auth.ts";
 
 /** Result of atomically recording a device decision and enqueueing its attach command. This is
  * deliberately internal: only the bot plane derives the outward REST/frame state. */
@@ -65,7 +66,56 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS setup_codes (
   code TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL,
-  used_at INTEGER
+  used_at INTEGER,
+  challenge_id TEXT REFERENCES onboarding_challenges(challenge_id),
+  output_state TEXT NOT NULL DEFAULT 'active'
+    CHECK (output_state IN ('pending_output', 'active', 'revoked'))
+) STRICT;
+CREATE TABLE IF NOT EXISTS onboarding_runtime (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  boot_generation TEXT NOT NULL,
+  verification_epoch TEXT NOT NULL,
+  canonical_origin TEXT NOT NULL,
+  durable_fingerprint TEXT NOT NULL,
+  started_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS onboarding_sessions (
+  session_id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL CHECK (mode IN ('tailscale', 'lan', 'advanced')),
+  canonical_origin TEXT NOT NULL,
+  durable_fingerprint TEXT NOT NULL,
+  verification_epoch TEXT NOT NULL,
+  boot_generation TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'complete', 'abandoned')),
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  winning_challenge_id TEXT
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS onboarding_one_active_session
+  ON onboarding_sessions ((1)) WHERE state = 'active';
+CREATE TABLE IF NOT EXISTS onboarding_challenges (
+  challenge_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES onboarding_sessions(session_id),
+  capability_hash TEXT NOT NULL UNIQUE,
+  phrase TEXT NOT NULL,
+  canonical_origin TEXT NOT NULL,
+  durable_fingerprint TEXT NOT NULL,
+  verification_epoch TEXT NOT NULL,
+  boot_generation TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'ws_probed', 'phone_confirmed', 'consumed')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  invalidated_at INTEGER
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS onboarding_one_live_challenge
+  ON onboarding_challenges (session_id)
+  WHERE state IN ('active', 'ws_probed', 'phone_confirmed');
+CREATE TABLE IF NOT EXISTS onboarding_ownership (
+  ownership_key TEXT PRIMARY KEY,
+  mode TEXT NOT NULL CHECK (mode IN ('tailscale', 'lan', 'advanced')),
+  durable_fingerprint TEXT NOT NULL,
+  owned_state_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY,
@@ -420,6 +470,98 @@ export interface DeviceRow {
   createdAt: number;
   lastSeenAt: number | null;
 }
+
+export type OnboardingMode = "tailscale" | "lan" | "advanced";
+export type ChallengeState = "active" | "ws_probed" | "phone_confirmed" | "consumed";
+export type SetupCodeOutputState = "pending_output" | "active" | "revoked";
+
+export interface GatewayBoot {
+  bootGeneration: string;
+  verificationEpoch: string;
+  canonicalOrigin: string;
+  durableFingerprint: string;
+  startedAt: number;
+}
+
+export interface SetupSessionInput {
+  sessionId: string;
+  mode: OnboardingMode;
+  canonicalOrigin: string;
+  durableFingerprint: string;
+  verificationEpoch: string;
+  bootGeneration: string;
+  createdAt: number;
+}
+
+export type SetupSessionResult =
+  | { outcome: "created" | "existing"; sessionId: string }
+  | { outcome: "conflict"; sessionId: string }
+  | { outcome: "stale_boot" };
+
+export interface VerificationChallengeInput {
+  challengeId: string;
+  sessionId: string;
+  capabilityHash: string;
+  phrase: string;
+  canonicalOrigin: string;
+  durableFingerprint: string;
+  verificationEpoch: string;
+  bootGeneration: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export type ChallengeResult =
+  | { outcome: "created" | "existing"; challengeId: string }
+  | { outcome: "conflict"; challengeId: string }
+  | { outcome: "invalid_capability" | "invalid_expiry" | "invalid_session" | "stale_boot" };
+
+export interface CapabilityTransition {
+  capabilityHash: string;
+  canonicalOrigin: string;
+  durableFingerprint: string;
+  verificationEpoch: string;
+  bootGeneration: string;
+  now: number;
+}
+
+export interface PublishedCode {
+  challengeId: string;
+  setupCode: string;
+  now: number;
+}
+
+export type TransitionResult<
+  State extends ChallengeState | SetupCodeOutputState = ChallengeState | SetupCodeOutputState,
+> =
+  | { outcome: "advanced" | "already"; state: State }
+  | { outcome: "invalid_state" | "expired" | "invalid_context"; state: State }
+  | { outcome: "not_found" };
+
+export interface FinalizeInput {
+  sessionId: string;
+  challengeId: string;
+  setupCode: string;
+  setupCodeExpiresAt: number;
+  canonicalOrigin: string;
+  durableFingerprint: string;
+  verificationEpoch: string;
+  bootGeneration: string;
+  now: number;
+}
+
+export type FinalizeResult =
+  | { outcome: "published"; setupCode: string }
+  | { outcome: "already_published" }
+  | {
+      outcome:
+        | "code_conflict"
+        | "expired"
+        | "invalid_expiry"
+        | "invalid_context"
+        | "invalid_state"
+        | "not_found";
+    };
 export interface AgentRow {
   id: string;
   name: string;
@@ -615,13 +757,417 @@ export class Storage {
     this.#db = db;
   }
 
+  #immediate<T>(operation: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.#db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #runtimeMatches(input: {
+    bootGeneration: string;
+    verificationEpoch: string;
+    canonicalOrigin: string;
+    durableFingerprint: string;
+  }): boolean {
+    const runtime = this.#db.prepare(`
+      SELECT boot_generation AS bootGeneration, verification_epoch AS verificationEpoch,
+        canonical_origin AS canonicalOrigin, durable_fingerprint AS durableFingerprint
+      FROM onboarding_runtime WHERE singleton = 1
+    `).get() as {
+      bootGeneration: string;
+      verificationEpoch: string;
+      canonicalOrigin: string;
+      durableFingerprint: string;
+    } | undefined;
+    return runtime !== undefined
+      && runtime.bootGeneration === input.bootGeneration
+      && runtime.verificationEpoch === input.verificationEpoch
+      && runtime.canonicalOrigin === input.canonicalOrigin
+      && runtime.durableFingerprint === input.durableFingerprint;
+  }
+
+  /** Records an actual gateway boot. Merely opening the database is deliberately inert: callers
+   * invoke this once from the gateway startup boundary after deriving the current posture. */
+  beginGatewayBoot(input: GatewayBoot): void {
+    this.#immediate(() => {
+      const current = this.#db.prepare(`
+        SELECT boot_generation AS bootGeneration, verification_epoch AS verificationEpoch,
+          canonical_origin AS canonicalOrigin, durable_fingerprint AS durableFingerprint,
+          started_at AS startedAt
+        FROM onboarding_runtime WHERE singleton = 1
+      `).get() as GatewayBoot | undefined;
+      if (current?.bootGeneration === input.bootGeneration) {
+        if (
+          current.verificationEpoch !== input.verificationEpoch
+          || current.canonicalOrigin !== input.canonicalOrigin
+          || current.durableFingerprint !== input.durableFingerprint
+          || current.startedAt !== input.startedAt
+        ) throw new Error("onboarding boot generation was reused with different posture");
+        return;
+      }
+      this.#db.prepare(`
+        UPDATE setup_codes SET output_state = 'revoked'
+        WHERE output_state = 'pending_output'
+      `).run();
+      this.#db.prepare(`
+        UPDATE onboarding_challenges SET state = 'consumed', invalidated_at = ?
+        WHERE state IN ('active', 'ws_probed', 'phone_confirmed')
+      `).run(input.startedAt);
+      this.#db.prepare(`
+        UPDATE onboarding_sessions SET state = 'abandoned'
+        WHERE state = 'active'
+      `).run();
+      this.#db.prepare(`
+        INSERT INTO onboarding_runtime
+          (singleton, boot_generation, verification_epoch, canonical_origin,
+           durable_fingerprint, started_at)
+        VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton) DO UPDATE SET
+          boot_generation = excluded.boot_generation,
+          verification_epoch = excluded.verification_epoch,
+          canonical_origin = excluded.canonical_origin,
+          durable_fingerprint = excluded.durable_fingerprint,
+          started_at = excluded.started_at
+      `).run(
+        input.bootGeneration,
+        input.verificationEpoch,
+        input.canonicalOrigin,
+        input.durableFingerprint,
+        input.startedAt,
+      );
+    });
+  }
+
+  beginSetupSession(input: SetupSessionInput): SetupSessionResult {
+    return this.#immediate(() => {
+      if (!this.#runtimeMatches(input)) return { outcome: "stale_boot" };
+      const active = this.#db.prepare(`
+        SELECT session_id AS sessionId, mode, canonical_origin AS canonicalOrigin,
+          durable_fingerprint AS durableFingerprint, verification_epoch AS verificationEpoch,
+          boot_generation AS bootGeneration, created_at AS createdAt
+        FROM onboarding_sessions WHERE state = 'active'
+      `).get() as SetupSessionInput | undefined;
+      if (active !== undefined) {
+        const same = active.sessionId === input.sessionId
+          && active.mode === input.mode
+          && active.canonicalOrigin === input.canonicalOrigin
+          && active.durableFingerprint === input.durableFingerprint
+          && active.verificationEpoch === input.verificationEpoch
+          && active.bootGeneration === input.bootGeneration
+          && active.createdAt === input.createdAt;
+        return same
+          ? { outcome: "existing", sessionId: active.sessionId }
+          : { outcome: "conflict", sessionId: active.sessionId };
+      }
+      const reused = this.#db.prepare(
+        "SELECT session_id AS sessionId FROM onboarding_sessions WHERE session_id = ?",
+      ).get(input.sessionId) as { sessionId: string } | undefined;
+      if (reused !== undefined) return { outcome: "conflict", sessionId: reused.sessionId };
+      this.#db.prepare(`
+        INSERT INTO onboarding_sessions
+          (session_id, mode, canonical_origin, durable_fingerprint, verification_epoch,
+           boot_generation, state, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+      `).run(
+        input.sessionId,
+        input.mode,
+        input.canonicalOrigin,
+        input.durableFingerprint,
+        input.verificationEpoch,
+        input.bootGeneration,
+        input.createdAt,
+      );
+      return { outcome: "created", sessionId: input.sessionId };
+    });
+  }
+
+  createVerificationChallenge(input: VerificationChallengeInput): ChallengeResult {
+    if (!/^[0-9a-f]{64}$/.test(input.capabilityHash))
+      return { outcome: "invalid_capability" };
+    if (input.expiresAt < input.createdAt || input.expiresAt > input.createdAt + SETUP_CODE_TTL_MS)
+      return { outcome: "invalid_expiry" };
+    return this.#immediate(() => {
+      if (!this.#runtimeMatches(input)) return { outcome: "stale_boot" };
+      const owner = this.#db.prepare(`
+        SELECT session_id AS sessionId, canonical_origin AS canonicalOrigin,
+          durable_fingerprint AS durableFingerprint, verification_epoch AS verificationEpoch,
+          boot_generation AS bootGeneration
+        FROM onboarding_sessions WHERE session_id = ? AND state = 'active'
+      `).get(input.sessionId) as {
+        sessionId: string;
+        canonicalOrigin: string;
+        durableFingerprint: string;
+        verificationEpoch: string;
+        bootGeneration: string;
+      } | undefined;
+      if (
+        owner === undefined
+        || owner.canonicalOrigin !== input.canonicalOrigin
+        || owner.durableFingerprint !== input.durableFingerprint
+        || owner.verificationEpoch !== input.verificationEpoch
+        || owner.bootGeneration !== input.bootGeneration
+      ) return { outcome: "invalid_session" };
+      const live = this.#db.prepare(`
+        SELECT challenge_id AS challengeId, capability_hash AS capabilityHash, phrase,
+          created_at AS createdAt, expires_at AS expiresAt
+        FROM onboarding_challenges
+        WHERE session_id = ? AND state IN ('active', 'ws_probed', 'phone_confirmed')
+      `).get(input.sessionId) as {
+        challengeId: string;
+        capabilityHash: string;
+        phrase: string;
+        createdAt: number;
+        expiresAt: number;
+      } | undefined;
+      if (live !== undefined) {
+        const same = live.challengeId === input.challengeId
+          && live.capabilityHash === input.capabilityHash
+          && live.phrase === input.phrase
+          && live.createdAt === input.createdAt
+          && live.expiresAt === input.expiresAt;
+        return same
+          ? { outcome: "existing", challengeId: live.challengeId }
+          : { outcome: "conflict", challengeId: live.challengeId };
+      }
+      const collision = this.#db.prepare(`
+        SELECT challenge_id AS challengeId FROM onboarding_challenges
+        WHERE challenge_id = ? OR capability_hash = ? LIMIT 1
+      `).get(input.challengeId, input.capabilityHash) as { challengeId: string } | undefined;
+      if (collision !== undefined)
+        return { outcome: "conflict", challengeId: collision.challengeId };
+      this.#db.prepare(`
+        INSERT INTO onboarding_challenges
+          (challenge_id, session_id, capability_hash, phrase, canonical_origin,
+           durable_fingerprint, verification_epoch, boot_generation, state, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+      `).run(
+        input.challengeId,
+        input.sessionId,
+        input.capabilityHash,
+        input.phrase,
+        input.canonicalOrigin,
+        input.durableFingerprint,
+        input.verificationEpoch,
+        input.bootGeneration,
+        input.createdAt,
+        input.expiresAt,
+      );
+      return { outcome: "created", challengeId: input.challengeId };
+    });
+  }
+
+  recordVerificationProbe(input: CapabilityTransition): TransitionResult<ChallengeState> {
+    return this.#transitionChallenge(input, "active", "ws_probed");
+  }
+
+  recordPhoneConfirmation(input: CapabilityTransition): TransitionResult<ChallengeState> {
+    return this.#transitionChallenge(input, "ws_probed", "phone_confirmed");
+  }
+
+  #transitionChallenge(
+    input: CapabilityTransition,
+    expected: "active" | "ws_probed",
+    next: "ws_probed" | "phone_confirmed",
+  ): TransitionResult<ChallengeState> {
+    return this.#immediate(() => {
+      const row = this.#db.prepare(`
+        SELECT state, expires_at AS expiresAt, canonical_origin AS canonicalOrigin,
+          durable_fingerprint AS durableFingerprint, verification_epoch AS verificationEpoch,
+          boot_generation AS bootGeneration
+        FROM onboarding_challenges WHERE capability_hash = ?
+      `).get(input.capabilityHash) as {
+        state: ChallengeState;
+        expiresAt: number;
+        canonicalOrigin: string;
+        durableFingerprint: string;
+        verificationEpoch: string;
+        bootGeneration: string;
+      } | undefined;
+      if (row === undefined) return { outcome: "not_found" };
+      if (input.now > row.expiresAt) return { outcome: "expired", state: row.state };
+      if (
+        !this.#runtimeMatches(input)
+        || row.canonicalOrigin !== input.canonicalOrigin
+        || row.durableFingerprint !== input.durableFingerprint
+        || row.verificationEpoch !== input.verificationEpoch
+        || row.bootGeneration !== input.bootGeneration
+      ) return { outcome: "invalid_context", state: row.state };
+      if (row.state === next) return { outcome: "already", state: row.state };
+      if (row.state !== expected) return { outcome: "invalid_state", state: row.state };
+      const changed = this.#db.prepare(`
+        UPDATE onboarding_challenges SET state = ?
+        WHERE capability_hash = ? AND state = ? AND expires_at >= ?
+      `).run(next, input.capabilityHash, expected, input.now).changes;
+      return changed === 1
+        ? { outcome: "advanced", state: next }
+        : { outcome: "invalid_state", state: row.state };
+    });
+  }
+
+  finalizeVerifiedSetupCode(input: FinalizeInput): FinalizeResult {
+    return this.#immediate(() => {
+      if (input.setupCodeExpiresAt !== input.now + SETUP_CODE_TTL_MS)
+        return { outcome: "invalid_expiry" };
+      const challenge = this.#db.prepare(`
+        SELECT session_id AS sessionId, state, expires_at AS expiresAt,
+          canonical_origin AS canonicalOrigin, durable_fingerprint AS durableFingerprint,
+          verification_epoch AS verificationEpoch, boot_generation AS bootGeneration
+        FROM onboarding_challenges WHERE challenge_id = ?
+      `).get(input.challengeId) as {
+        sessionId: string;
+        state: ChallengeState;
+        expiresAt: number;
+        canonicalOrigin: string;
+        durableFingerprint: string;
+        verificationEpoch: string;
+        bootGeneration: string;
+      } | undefined;
+      if (challenge === undefined) return { outcome: "not_found" };
+      if (
+        challenge.sessionId !== input.sessionId
+        || !this.#runtimeMatches(input)
+        || challenge.canonicalOrigin !== input.canonicalOrigin
+        || challenge.durableFingerprint !== input.durableFingerprint
+        || challenge.verificationEpoch !== input.verificationEpoch
+        || challenge.bootGeneration !== input.bootGeneration
+      ) return { outcome: "invalid_context" };
+      const owner = this.#db.prepare(`
+        SELECT state, canonical_origin AS canonicalOrigin,
+          durable_fingerprint AS durableFingerprint, verification_epoch AS verificationEpoch,
+          boot_generation AS bootGeneration, winning_challenge_id AS winningChallengeId
+        FROM onboarding_sessions WHERE session_id = ?
+      `).get(input.sessionId) as {
+        state: "active" | "complete" | "abandoned";
+        canonicalOrigin: string;
+        durableFingerprint: string;
+        verificationEpoch: string;
+        bootGeneration: string;
+        winningChallengeId: string | null;
+      } | undefined;
+      if (
+        owner === undefined
+        || owner.canonicalOrigin !== input.canonicalOrigin
+        || owner.durableFingerprint !== input.durableFingerprint
+        || owner.verificationEpoch !== input.verificationEpoch
+        || owner.bootGeneration !== input.bootGeneration
+      ) return { outcome: "invalid_context" };
+      const prior = this.#db.prepare(
+        "SELECT code FROM setup_codes WHERE challenge_id = ?",
+      ).get(input.challengeId) as { code: string } | undefined;
+      if (
+        challenge.state === "consumed"
+        && owner.state === "complete"
+        && owner.winningChallengeId === input.challengeId
+        && prior !== undefined
+      ) return { outcome: "already_published" };
+      if (input.now > challenge.expiresAt || input.setupCodeExpiresAt < input.now)
+        return { outcome: "expired" };
+      if (challenge.state !== "phone_confirmed" || owner.state !== "active")
+        return { outcome: "invalid_state" };
+      if (this.#db.prepare("SELECT 1 FROM setup_codes WHERE code = ?").get(input.setupCode) !== undefined)
+        return { outcome: "code_conflict" };
+      const consumed = this.#db.prepare(`
+        UPDATE onboarding_challenges SET state = 'consumed'
+        WHERE challenge_id = ? AND session_id = ? AND state = 'phone_confirmed'
+          AND expires_at >= ? AND canonical_origin = ? AND durable_fingerprint = ?
+          AND verification_epoch = ? AND boot_generation = ?
+      `).run(
+        input.challengeId,
+        input.sessionId,
+        input.now,
+        input.canonicalOrigin,
+        input.durableFingerprint,
+        input.verificationEpoch,
+        input.bootGeneration,
+      ).changes;
+      if (consumed !== 1) return { outcome: "invalid_state" };
+      this.#db.prepare(`
+        INSERT INTO setup_codes (code, expires_at, challenge_id, output_state)
+        VALUES (?, ?, ?, 'pending_output')
+      `).run(input.setupCode, input.setupCodeExpiresAt, input.challengeId);
+      const completed = this.#db.prepare(`
+        UPDATE onboarding_sessions
+        SET state = 'complete', completed_at = ?, winning_challenge_id = ?
+        WHERE session_id = ? AND state = 'active' AND canonical_origin = ?
+          AND durable_fingerprint = ? AND verification_epoch = ? AND boot_generation = ?
+      `).run(
+        input.now,
+        input.challengeId,
+        input.sessionId,
+        input.canonicalOrigin,
+        input.durableFingerprint,
+        input.verificationEpoch,
+        input.bootGeneration,
+      ).changes;
+      if (completed !== 1) throw new Error("onboarding session changed during finalization");
+      return { outcome: "published", setupCode: input.setupCode };
+    });
+  }
+
+  activatePendingSetupCode(input: PublishedCode): TransitionResult<SetupCodeOutputState> {
+    return this.#immediate(() => {
+      const row = this.#db.prepare(`
+        SELECT output_state AS outputState, expires_at AS expiresAt FROM setup_codes
+        WHERE code = ? AND challenge_id = ?
+      `).get(input.setupCode, input.challengeId) as {
+        outputState: SetupCodeOutputState;
+        expiresAt: number;
+      } | undefined;
+      if (row === undefined) return { outcome: "not_found" };
+      if (row.outputState === "active") return { outcome: "already", state: "active" };
+      if (row.outputState !== "pending_output")
+        return { outcome: "invalid_state", state: row.outputState };
+      if (input.now > row.expiresAt) {
+        this.#db.prepare(`
+          UPDATE setup_codes SET output_state = 'revoked'
+          WHERE code = ? AND challenge_id = ? AND output_state = 'pending_output'
+        `).run(input.setupCode, input.challengeId);
+        return { outcome: "expired", state: "revoked" };
+      }
+      this.#db.prepare(`
+        UPDATE setup_codes SET output_state = 'active'
+        WHERE code = ? AND challenge_id = ? AND output_state = 'pending_output'
+      `).run(input.setupCode, input.challengeId);
+      return { outcome: "advanced", state: "active" };
+    });
+  }
+
+  revokePendingSetupCode(input: PublishedCode): TransitionResult<SetupCodeOutputState> {
+    return this.#immediate(() => {
+      const row = this.#db.prepare(`
+        SELECT output_state AS outputState FROM setup_codes
+        WHERE code = ? AND challenge_id = ?
+      `).get(input.setupCode, input.challengeId) as { outputState: SetupCodeOutputState } | undefined;
+      if (row === undefined) return { outcome: "not_found" };
+      if (row.outputState === "revoked") return { outcome: "already", state: "revoked" };
+      if (row.outputState !== "pending_output")
+        return { outcome: "invalid_state", state: row.outputState };
+      this.#db.prepare(`
+        UPDATE setup_codes SET output_state = 'revoked'
+        WHERE code = ? AND challenge_id = ? AND output_state = 'pending_output'
+      `).run(input.setupCode, input.challengeId);
+      return { outcome: "advanced", state: "revoked" };
+    });
+  }
+
   createSetupCode(code: string, expiresAt: number): void {
-    this.#db.prepare("INSERT INTO setup_codes (code, expires_at) VALUES (?, ?)").run(code, expiresAt);
+    this.#db.prepare(
+      "INSERT INTO setup_codes (code, expires_at, output_state) VALUES (?, ?, 'active')",
+    ).run(code, expiresAt);
   }
 
   consumeSetupCode(code: string, now: number): "ok" | "invalid" {
     const result = this.#db
-      .prepare("UPDATE setup_codes SET used_at = ? WHERE code = ? AND used_at IS NULL AND expires_at >= ?")
+      .prepare(`
+        UPDATE setup_codes SET used_at = ?
+        WHERE code = ? AND used_at IS NULL AND expires_at >= ? AND output_state = 'active'
+      `)
       .run(now, code, now);
     return result.changes === 1 ? "ok" : "invalid";
   }
@@ -3190,9 +3736,39 @@ function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
 
 export function openStorage(dbPath: string): Storage {
   const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // Setup codes predate onboarding. Add publication authority in place so App Review, Docker,
+  // conformance, and operator-created legacy codes keep their existing active behavior. The
+  // challenge index must come after both columns exist: CREATE TABLE IF NOT EXISTS does not add
+  // columns to an older table.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const setupCodeColumns = db
+      .prepare("SELECT name FROM pragma_table_info('setup_codes')")
+      .all() as Array<{ name: string }>;
+    if (!setupCodeColumns.some(({ name }) => name === "challenge_id"))
+      db.exec(`
+        ALTER TABLE setup_codes ADD COLUMN challenge_id TEXT
+          REFERENCES onboarding_challenges(challenge_id)
+      `);
+    if (!setupCodeColumns.some(({ name }) => name === "output_state")) {
+      db.exec(`
+        ALTER TABLE setup_codes ADD COLUMN output_state TEXT NOT NULL DEFAULT 'active'
+          CHECK (output_state IN ('pending_output', 'active', 'revoked'))
+      `);
+    }
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS setup_codes_one_per_challenge
+        ON setup_codes (challenge_id) WHERE challenge_id IS NOT NULL
+    `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
   // The first outbox build keyed only by push id. Rebuild once with an AUTOINCREMENT sequence so
   // a drain can capture a stable high-water snapshot that new enqueue traffic can never enter.
   const outboxColumns = db
