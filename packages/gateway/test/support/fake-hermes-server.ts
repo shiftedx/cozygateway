@@ -55,7 +55,8 @@ export interface FakeHermesBehavior {
     query: URLSearchParams;
     body: unknown;
     headers: import("node:http").IncomingHttpHeaders;
-  }) => { status?: number; body: unknown } | Promise<{ status?: number; body: unknown }>;
+  }) => { status?: number; body: unknown; headers?: Record<string, string | string[]> }
+    | Promise<{ status?: number; body: unknown; headers?: Record<string, string | string[]> }>;
 }
 
 /** Upstream's TTL for a minted ws ticket (ws_tickets.TTL_SECONDS). */
@@ -161,7 +162,7 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
             body,
             headers: req.headers,
           });
-          send(result.status ?? 200, result.body);
+          send(result.status ?? 200, result.body, result.headers);
         })
         .catch((err: unknown) => send(500, { detail: err instanceof Error ? err.message : "dashboard handler failed" }));
       return;

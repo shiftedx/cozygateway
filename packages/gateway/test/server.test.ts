@@ -258,6 +258,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         if (path === "/api/hermes/update" && method === "OPTIONS") return {
           status: 405,
           body: { detail: "Method Not Allowed" },
+          headers: { allow: "POST" },
         };
         return { status: 404, body: { detail: "Not Found" } };
       },

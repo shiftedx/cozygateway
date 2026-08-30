@@ -7,7 +7,7 @@ import type {
   HarnessUpdateStatus,
 } from "cozygateway-contract";
 
-import { HermesTimeout, type HermesClient } from "./client.ts";
+import type { HermesClient } from "./client.ts";
 import { HarnessSettingsInvalid } from "../harness-settings.ts";
 
 const POLL_AFTER_MS = 1_000;
@@ -15,6 +15,13 @@ export const UPDATE_JSON_MAX_BYTES = 64 * 1024;
 const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$/;
 const ACTION_ID_RE = /^[0-9a-f]{32}$/;
 const NO_RECEIPT_DETAIL = "No update receipt found (no `hermes update` run recorded).";
+const REFUSAL_CODES = new Set([
+  "dashboard_update_managed_externally",
+  "docker_update_unsupported",
+  "apt_update_required",
+  "nix_update_unsupported",
+  "update_not_in_place",
+]);
 
 export class HarnessUpdateStale extends Error {
   readonly currentVersion: string;
@@ -116,13 +123,6 @@ export function updateGuidance(method: HarnessInstallMethod): string {
   }
 }
 
-function isAmbiguousTimeout(error: unknown): boolean {
-  if (error instanceof HermesTimeout) return true;
-  if (typeof error !== "object" || error === null) return false;
-  const name = (error as { name?: unknown }).name;
-  return name === "TimeoutError" || name === "AbortError";
-}
-
 async function updateJson(
   client: HermesClient,
   path: string,
@@ -222,6 +222,18 @@ function parseStatus(value: unknown): StatusSnapshot | undefined {
   };
 }
 
+function isValidatedRefusal(status: number, value: unknown): boolean {
+  const raw = record(value);
+  return status === 200
+    && raw?.["ok"] === false
+    && raw["name"] === "hermes-update"
+    && raw["pid"] === null
+    && typeof raw["error"] === "string"
+    && REFUSAL_CODES.has(raw["error"])
+    && typeof raw["message"] === "string"
+    && typeof raw["update_command"] === "string";
+}
+
 function projectReceipt(
   harnessId: string,
   evidence: ReceiptEvidence,
@@ -250,6 +262,7 @@ export class HermesHarnessUpdateAdapter {
   readonly #harness: GatewayHarness;
   readonly #now: () => number;
   #startTail: Promise<void> = Promise.resolve();
+  readonly #startFlights = new Map<string, Promise<HarnessUpdateStart>>();
   #active: ActiveUpdate | undefined;
 
   constructor(client: HermesClient, harness: GatewayHarness, now: () => number = Date.now) {
@@ -332,13 +345,20 @@ export class HermesHarnessUpdateAdapter {
       throw new HarnessUpdateUnavailable();
     }
     await response.body?.cancel().catch(() => {});
-    if (response.status !== 405) throw new HarnessUpdateUnavailable();
+    const allowsPost = response.headers.get("allow")
+      ?.split(",")
+      .some((method) => method.trim().toUpperCase() === "POST") === true;
+    if (response.status !== 405 || !allowsPost) throw new HarnessUpdateUnavailable();
   }
 
   start(expectedCurrentVersion: string): Promise<HarnessUpdateStart> {
     if (!VERSION_RE.test(expectedCurrentVersion))
       return Promise.reject(new HarnessSettingsInvalid("expectedCurrentVersion is invalid"));
-    return this.#serialize(async () => {
+    const arrivalFlight = this.#startFlights.get(expectedCurrentVersion);
+    if (arrivalFlight !== undefined) {
+      return arrivalFlight.then((result) => ({ ...result, coalesced: true }));
+    }
+    const result = this.#serialize<HarnessUpdateStart>(async () => {
       let confirmed = await this.check();
       if (confirmed.currentVersion !== expectedCurrentVersion)
         throw new HarnessUpdateStale(confirmed.currentVersion);
@@ -370,14 +390,18 @@ export class HermesHarnessUpdateAdapter {
 
       const baseline = await this.#readStatus();
       try {
-        const result = await updateJson(this.#client, "/api/hermes/update", { method: "POST" });
-        const response = record(result.body);
-        if (result.status !== 200) throw new HarnessUpdateUnavailable();
-        if (!response || response["ok"] !== true) {
+        const attempted = await updateJson(this.#client, "/api/hermes/update", { method: "POST" });
+        if (isValidatedRefusal(attempted.status, attempted.body)) {
           throw new HarnessUpdateBlocked("Hermes cannot apply this update in place. Check again for current guidance.");
         }
+        const response = record(attempted.body);
+        if (attempted.status !== 200 || response?.["ok"] !== true
+          || response["name"] !== "hermes-update"
+          || (response["already_running"] !== undefined && response["already_running"] !== true))
+          throw new Error("non-authoritative Hermes update response");
         const id = actionId(response["action_id"]);
-        if (response["action_id"] !== undefined && id === undefined) throw new HarnessUpdateUnavailable();
+        if (response["action_id"] !== undefined && id === undefined)
+          throw new Error("non-authoritative Hermes update identity");
         const coalesced = response["already_running"] === true;
         this.#active = {
           expectedVersion: expectedCurrentVersion,
@@ -393,8 +417,10 @@ export class HermesHarnessUpdateAdapter {
           pollAfterMs: POLL_AFTER_MS,
         };
       } catch (error) {
-        if (error instanceof HarnessUpdateBlocked || error instanceof HarnessUpdateUnavailable) throw error;
-        if (!isAmbiguousTimeout(error)) throw new HarnessUpdateUnavailable();
+        if (error instanceof HarnessUpdateBlocked) throw error;
+        // Once the mutative request is attempted, a disconnect, non-2xx reply, oversized or
+        // malformed body, and invalid success shape are indistinguishable from "Hermes accepted
+        // it but the acknowledgement was lost." Only the exact pinned refusal above is definite.
         this.#active = {
           expectedVersion: expectedCurrentVersion,
           ...(baseline.receipt === undefined
@@ -408,6 +434,13 @@ export class HermesHarnessUpdateAdapter {
         };
       }
     });
+    this.#startFlights.set(expectedCurrentVersion, result);
+    const clear = (): void => {
+      if (this.#startFlights.get(expectedCurrentVersion) === result)
+        this.#startFlights.delete(expectedCurrentVersion);
+    };
+    void result.then(clear, clear);
+    return result;
   }
 
   async status(): Promise<HarnessUpdateStatus> {

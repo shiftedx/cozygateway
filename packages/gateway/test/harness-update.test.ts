@@ -229,6 +229,34 @@ describe("Hermes harness update adapter", () => {
     expect(b).toMatchObject({ actionId: ACTION_ID, coalesced: true });
   });
 
+  it("coalesces simultaneous confirmations to the arrival generation even when its action is already terminal", async () => {
+    const oldReceipt = receipt("success");
+    const newReceipt = receipt("success");
+    newReceipt["finished_at"] = "2026-08-30T12:02:00.000Z";
+    let starts = 0;
+    const updates = surface((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus(starts === 0
+        ? { action_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", receipt: oldReceipt }
+        : { action_id: ACTION_ID, receipt: newReceipt });
+      starts += 1;
+      return {
+        ok: true,
+        name: "hermes-update",
+        action_id: starts === 1 ? ACTION_ID : "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      };
+    });
+
+    const [first, queued] = await Promise.all([
+      updates.adapter("home").start("0.20.3"),
+      updates.adapter("home").start("0.20.3"),
+    ]);
+
+    expect(starts).toBe(1);
+    expect(first).toMatchObject({ actionId: ACTION_ID, coalesced: false });
+    expect(queued).toMatchObject({ actionId: ACTION_ID, coalesced: true });
+  });
+
   it("treats a timed-out start as ambiguous and only polls status", async () => {
     let starts = 0;
     let statusCalls = 0;
@@ -419,7 +447,7 @@ describe("Hermes harness update adapter", () => {
       if (path.includes("/check")) return check();
       if (path.includes("/status")) return upstreamStatus();
       if (path === "/api/hermes/update" && init?.method === "OPTIONS")
-        return new Response("Method Not Allowed", { status: 405 });
+        return new Response("Method Not Allowed", { status: 405, headers: { allow: "GET, pOsT" } });
       return new Response(JSON.stringify({
         detail: "No update receipt found (no `hermes update` run recorded).",
       }), { status: 404, headers: { "content-type": "application/json" } });
@@ -445,21 +473,23 @@ describe("Hermes harness update adapter", () => {
       return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 });
     });
     await expect(discoverHermesUpdates(missingAction, HARNESS)).resolves.toBeUndefined();
+
+    const getOnlyAction = client((path, init) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus();
+      if (path.includes("/receipt")) return new Response(JSON.stringify({ detail: NO_RECEIPT_DETAIL }), { status: 404 });
+      if (path === "/api/hermes/update" && init?.method === "OPTIONS")
+        return new Response("Method Not Allowed", { status: 405, headers: { allow: "GET" } });
+      return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 });
+    });
+    await expect(discoverHermesUpdates(getOnlyAction, HARNESS)).resolves.toBeUndefined();
   });
 
-  it("bounds check, start, status, and discovery receipt JSON before parsing", async () => {
+  it("bounds check, status, and discovery receipt JSON before parsing", async () => {
     const oversized = (declared: boolean) => new Response("x".repeat(UPDATE_JSON_MAX_BYTES + 1), {
       headers: declared ? { "content-length": String(UPDATE_JSON_MAX_BYTES + 1) } : {},
     });
     await expect(new HermesHarnessUpdateAdapter(client(() => oversized(true)), HARNESS).check())
-      .rejects.toMatchObject({ name: "HarnessUpdateUnavailable" });
-
-    const startAdapter = new HermesHarnessUpdateAdapter(client((path) => {
-      if (path.includes("/check")) return check();
-      if (path.includes("/status")) return upstreamStatus();
-      return oversized(true);
-    }), HARNESS);
-    await expect(startAdapter.start("0.20.3"))
       .rejects.toMatchObject({ name: "HarnessUpdateUnavailable" });
 
     await expect(new HermesHarnessUpdateAdapter(client(() => oversized(false)), HARNESS).status())
@@ -471,6 +501,55 @@ describe("Hermes harness update adapter", () => {
       return oversized(true);
     });
     await expect(discoverHermesUpdates(discoveryClient, HARNESS)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ["declared oversize", () => new Response("x", {
+      headers: { "content-length": String(UPDATE_JSON_MAX_BYTES + 1) },
+    })],
+    ["malformed JSON", () => new Response("{")],
+    ["invalid UTF-8", () => new Response(new Uint8Array([0xff]))],
+    ["HTTP failure", () => new Response(JSON.stringify({ detail: "failed" }), { status: 500 })],
+    ["transport disconnect", () => { throw new TypeError("connection terminated"); }],
+    ["malformed success", () => ({ ok: true, name: "hermes-update", action_id: "invalid" })],
+    ["unvalidated refusal", () => ({ ok: false, name: "hermes-update", error: "unknown_refusal" })],
+  ] as const)("treats a %s after POST begins as ambiguous and pollable", async (_name, postResult) => {
+    let statusCalls = 0;
+    let starts = 0;
+    const updates = surface((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) {
+        statusCalls += 1;
+        return upstreamStatus({ running: statusCalls > 1 });
+      }
+      starts += 1;
+      return postResult();
+    });
+
+    await expect(updates.adapter("home").start("0.20.3")).resolves.toMatchObject({
+      state: "ambiguous",
+      coalesced: false,
+    });
+    await expect(updates.adapter("home").status()).resolves.toMatchObject({ state: "running" });
+    expect(starts).toBe(1);
+  });
+
+  it("treats only Hermes' pinned refusal shape as a definite blocked start", async () => {
+    const updates = surface((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus();
+      return {
+        ok: false,
+        pid: null,
+        name: "hermes-update",
+        error: "apt_update_required",
+        message: "private upstream guidance",
+        update_command: "private command",
+      };
+    });
+
+    await expect(updates.adapter("home").start("0.20.3"))
+      .rejects.toMatchObject({ name: "HarnessUpdateBlocked" });
   });
 
   it("never calls process exit or liveness a success without a durable receipt", async () => {
@@ -500,7 +579,7 @@ describe("paired harness update routes", () => {
     const { request } = appFor(surface((path) => {
       if (path.includes("/check")) return check({ current_version: current });
       if (path.includes("/status")) return upstreamStatus();
-      return { ok: true, action_id: ACTION_ID };
+      return { ok: true, name: "hermes-update", action_id: ACTION_ID };
     }));
     const stale = await request("/gateway/harnesses/home/update/start", {
       method: "POST",
