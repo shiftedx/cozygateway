@@ -74,7 +74,7 @@ HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts",
-    "delegation", "thinking", "mobile_failure_details",
+    "delegation", "thinking", "mobile_failure_details", "desktop_session_sync",
     "desktop_session_resume",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
@@ -439,6 +439,44 @@ class AttachV1Client:
             "hermesSessionId": hermes_session_id,
             "resumeId": resume_id,
         })
+
+    @property
+    def desktop_session_sync_available(self) -> bool:
+        """Whether the peer negotiated durable desktop-session mirror rows."""
+        return self._negotiated and "desktop_session_sync" in self._capabilities
+
+    async def send_desktop_session_message(
+        self,
+        *,
+        thread_id: str,
+        current_hermes_session_id: str,
+        source: str,
+        desktop_session_id: Optional[str],
+        expected_current_hermes_session_id: Optional[str] = None,
+        message_row_id: int,
+        role: str,
+        text: str,
+        at: int,
+    ) -> bool:
+        """Atomically journal one external Hermes transcript row when sync was negotiated."""
+        if not self.desktop_session_sync_available:
+            return False
+        try:
+            self._spool.journal_desktop_session_message(
+                thread_id=thread_id,
+                current_hermes_session_id=current_hermes_session_id,
+                source=source,
+                desktop_session_id=desktop_session_id,
+                expected_current_hermes_session_id=expected_current_hermes_session_id,
+                message_row_id=message_row_id,
+                role=role,
+                text=text,
+                at=at,
+            )
+        except (ValueError, TerminalSealed):
+            return False
+        await self._drain_events()
+        return True
 
     async def send_tool(self, thread_id: str, turn_id: str, call_id: str, name: str, status: str, detail: Optional[str] = None) -> None:
         event: Dict[str, Any] = {"kind": "tool", "threadId": thread_id, "turnId": turn_id, "callId": call_id, "name": name[:128], "status": status}
@@ -1301,4 +1339,6 @@ def _event_capabilities(event: Dict[str, Any]) -> List[str]:
         return []
     if kind == "desktop_session_resumed":
         return ["desktop_session_resume"]
+    if kind == "desktop_session_message":
+        return ["desktop_session_sync"]
     return ["draft"] + (["media"] if kind == "commit" and event.get("mediaIds") else [])

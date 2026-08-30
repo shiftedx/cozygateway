@@ -133,6 +133,17 @@ CREATE TABLE IF NOT EXISTS delivery_receipts (
   reason TEXT,
   at_ms INTEGER NOT NULL
 ) STRICT;
+-- One gateway-owned chat lane may be linked to one exact Hermes session lineage.  The row cursor
+-- is a SQLite message id, not a timestamp/text fingerprint, so replay is deterministic across
+-- clocks and identical messages.  ``desktop_session_id`` retains the originally selected TUI row
+-- while ``current_hermes_session_id`` follows a compression continuation.
+CREATE TABLE IF NOT EXISTS desktop_session_links (
+  thread_id TEXT PRIMARY KEY,
+  current_hermes_session_id TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('cozygateway', 'tui')),
+  desktop_session_id TEXT,
+  last_message_row_id INTEGER NOT NULL CHECK (last_message_row_id >= 0)
+) STRICT;
 """
 
 _TRANSPORT_LEASES: set[str] = set()
@@ -292,6 +303,179 @@ class AttachSpool:
                 )
             self._db.execute("UPDATE state SET next_event_sequence = ? WHERE id = 1", (sequence + 1,))
         return frame
+
+    def desktop_session_links(self) -> List[Dict[str, Any]]:
+        """Return durable mirror cursors without exposing Hermes transcript contents."""
+        rows = self._db.execute(
+            "SELECT thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id "
+            "FROM desktop_session_links ORDER BY thread_id"
+        ).fetchall()
+        return [{
+            "threadId": str(thread_id),
+            "currentHermesSessionId": str(current_id),
+            "source": str(source),
+            **({"desktopSessionId": str(desktop_id)} if desktop_id is not None else {}),
+            "lastMessageRowId": int(last_row_id),
+        } for thread_id, current_id, source, desktop_id, last_row_id in rows]
+
+    def upsert_desktop_session_link(
+        self,
+        *,
+        thread_id: str,
+        current_hermes_session_id: str,
+        source: str,
+        desktop_session_id: Optional[str],
+        last_message_row_id: int,
+    ) -> bool:
+        """Establish an exact source-qualified mirror link without retargeting an existing lane."""
+        self._validate_desktop_session_link(
+            thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id,
+        )
+        with self._db:
+            changed = self._db.execute(
+                "INSERT INTO desktop_session_links "
+                "(thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO NOTHING",
+                (thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id),
+            ).rowcount
+        return bool(changed)
+
+    def reset_desktop_session_link(
+        self,
+        *,
+        thread_id: str,
+        current_hermes_session_id: str,
+        source: str,
+        desktop_session_id: Optional[str],
+        last_message_row_id: int,
+    ) -> None:
+        """Replace a link only for an explicit serialized resume/adoption command."""
+        self._validate_desktop_session_link(
+            thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id,
+        )
+        with self._db:
+            self._db.execute(
+                "INSERT INTO desktop_session_links "
+                "(thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(thread_id) DO UPDATE SET current_hermes_session_id = excluded.current_hermes_session_id, "
+                "source = excluded.source, desktop_session_id = excluded.desktop_session_id, "
+                "last_message_row_id = excluded.last_message_row_id",
+                (thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id),
+            )
+
+    def advance_desktop_session_link(
+        self, *, thread_id: str, expected_current_hermes_session_id: str, current_hermes_session_id: str,
+        expected_source: str, expected_desktop_session_id: Optional[str], last_message_row_id: int,
+    ) -> bool:
+        """Advance a link cursor, never moving it backward after a stale mirror tick."""
+        if (not isinstance(thread_id, str) or not thread_id or len(thread_id) > 256
+                or not isinstance(current_hermes_session_id, str) or not current_hermes_session_id
+                or len(current_hermes_session_id) > 256
+                or not isinstance(expected_current_hermes_session_id, str)
+                or not expected_current_hermes_session_id or len(expected_current_hermes_session_id) > 256
+                or expected_source not in {"cozygateway", "tui"}
+                or (expected_desktop_session_id is not None and (
+                    not isinstance(expected_desktop_session_id, str) or len(expected_desktop_session_id) > 256))):
+            return False
+        if not isinstance(last_message_row_id, int) or last_message_row_id < 0:
+            return False
+        with self._db:
+            changed = self._db.execute(
+                "UPDATE desktop_session_links SET current_hermes_session_id = ?, "
+                "last_message_row_id = MAX(last_message_row_id, ?) "
+                "WHERE thread_id = ? AND current_hermes_session_id = ? AND source = ? "
+                "AND desktop_session_id IS ?",
+                (current_hermes_session_id, last_message_row_id, thread_id,
+                 expected_current_hermes_session_id, expected_source, expected_desktop_session_id),
+            ).rowcount
+        return bool(changed)
+
+    def journal_desktop_session_message(
+        self,
+        *,
+        thread_id: str,
+        current_hermes_session_id: str,
+        source: str,
+        desktop_session_id: Optional[str],
+        expected_current_hermes_session_id: Optional[str] = None,
+        message_row_id: int,
+        role: str,
+        text: str,
+        at: int,
+    ) -> Dict[str, Any]:
+        """Atomically journal one mirror row and advance its exact SQLite cursor.
+
+        If process death lands between those writes, a restart must either replay the exact outbox
+        frame or read the same row again.  A single SQLite transaction is the only honest boundary.
+        """
+        self._validate_desktop_session_link(
+            thread_id, current_hermes_session_id, source, desktop_session_id, message_row_id,
+        )
+        if (role not in {"user", "assistant"} or not isinstance(text, str)
+                or not text.strip() or len(text) > 32_000):
+            raise ValueError("desktop mirror event must contain a non-empty user or assistant message")
+        if not isinstance(at, int) or at < 0:
+            raise ValueError("desktop mirror event timestamp is invalid")
+        event: Dict[str, Any] = {
+            "kind": "desktop_session_message",
+            "threadId": thread_id,
+            "hermesSessionId": current_hermes_session_id,
+            "source": source,
+            "rowId": str(message_row_id),
+            "role": role,
+            "text": text,
+            "at": at,
+        }
+        if desktop_session_id is not None:
+            event["desktopSessionId"] = desktop_session_id
+        with self._db:
+            row = self._db.execute(
+                "SELECT current_hermes_session_id, source, desktop_session_id, last_message_row_id "
+                "FROM desktop_session_links WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("desktop mirror link is not established")
+            expected_current = expected_current_hermes_session_id or current_hermes_session_id
+            if (str(row[0]) != expected_current or str(row[1]) != source
+                    or row[2] != desktop_session_id or int(row[3]) >= message_row_id):
+                raise ValueError("desktop mirror cursor cannot journal a duplicate or stale row")
+            sequence = int(self._db.execute("SELECT next_event_sequence FROM state WHERE id = 1").fetchone()[0])
+            event_id = str(uuid.uuid4())
+            frame = {"kind": "event", "sequence": sequence, "eventId": event_id, "event": event}
+            encoded = json.dumps(frame, separators=(",", ":"))
+            self._db.execute(
+                "INSERT INTO event_outbox (sequence, event_id, frame_json, byte_count, created_at, acked) "
+                "VALUES (?, ?, ?, ?, ?, 0)",
+                (sequence, event_id, encoded, len(encoded.encode("utf-8")), self._now_ms()),
+            )
+            self._db.execute(
+                "UPDATE desktop_session_links SET current_hermes_session_id = ?, "
+                "last_message_row_id = ? WHERE thread_id = ?",
+                (current_hermes_session_id, message_row_id, thread_id),
+            )
+            self._db.execute("UPDATE state SET next_event_sequence = ? WHERE id = 1", (sequence + 1,))
+        return frame
+
+    @staticmethod
+    def _validate_desktop_session_link(
+        thread_id: str,
+        current_hermes_session_id: str,
+        source: str,
+        desktop_session_id: Optional[str],
+        last_message_row_id: int,
+    ) -> None:
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > 256:
+            raise ValueError("desktop mirror thread id is required")
+        if (not isinstance(current_hermes_session_id, str) or not current_hermes_session_id
+                or len(current_hermes_session_id) > 256):
+            raise ValueError("desktop mirror Hermes session id is required")
+        if source not in {"cozygateway", "tui"}:
+            raise ValueError("desktop mirror source is invalid")
+        if desktop_session_id is not None and (not isinstance(desktop_session_id, str) or not desktop_session_id or len(desktop_session_id) > 256):
+            raise ValueError("desktop mirror desktop session id is invalid")
+        if not isinstance(last_message_row_id, int) or last_message_row_id < 0:
+            raise ValueError("desktop mirror cursor is invalid")
 
     def pending_events(self, max_events: int, max_bytes: int) -> List[Dict[str, Any]]:
         rows = self._db.execute(
