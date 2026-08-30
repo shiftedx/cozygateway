@@ -572,12 +572,15 @@ childProcess.spawn = function (command, args, options) {
 const { spawn } = childProcess;
 const hermesArgs = [basename(process.argv[1] || ''), ...process.argv.slice(2)];
 if (hermesArgs[0] === 'dashboard') {
-  const expectedArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const windowsLauncher = process.platform === 'win32';
+  const profileArgs = windowsLauncher ? ['-p', 'default'] : [];
+  const expectedArgs = ['dashboard', ...profileArgs, '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, ...expectedArgs];
   const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
   const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
-  const windowsLauncher = process.platform === 'win32';
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
     args: hermesArgs,
+    descendantArgs,
     launcherPid: process.pid,
     launcherMode: windowsLauncher ? 'exited-descendant' : 'live-process-group',
     tokenMatches: process.env.HERMES_DASHBOARD_SESSION_TOKEN === expectedToken,
@@ -587,10 +590,7 @@ if (hermesArgs[0] === 'dashboard') {
   if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
   if (!homeMatches) process.exit(43);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
-  const dashboardChild = spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, [
-    process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
-    'dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build',
-  ], { detached: windowsLauncher, stdio: 'ignore', env: process.env });
+  const dashboardChild = spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, descendantArgs, { detached: windowsLauncher, stdio: 'ignore', env: process.env });
   if (windowsLauncher) {
     dashboardChild.unref();
     process.exit(0);
@@ -661,10 +661,20 @@ if [ ! -s "$tmp/hermes-stub-invoked" ]; then
   printf '%s\n' 'generated supervisor did not spawn Hermes during a cold Dashboard start' >&2
   exit 1
 fi
-grep -Fxq "dashboard --host 127.0.0.1 --port $mock_dashboard_port --no-open --skip-build" "$tmp/hermes-stub-invoked"
-"$real_node" - "$tmp/hermes-stub-trace" <<'NODE'
+"$real_node" - "$tmp/hermes-stub-trace" "$mock_dashboard_port" <<'NODE'
 const { readFileSync } = require('node:fs');
 const trace = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const profileArgs = process.platform === 'win32' ? ['-p', 'default'] : [];
+const expectedArgs = ['dashboard', ...profileArgs, '--host', '127.0.0.1', '--port', process.argv[3], '--no-open', '--skip-build'];
+const expectedDescendantArgs = [trace.descendantArgs[0], ...expectedArgs];
+if (JSON.stringify(trace.args) !== JSON.stringify(expectedArgs)) {
+  console.error(`Hermes launcher fixture argv was ${JSON.stringify(trace.args)}; expected ${JSON.stringify(expectedArgs)}`);
+  process.exit(1);
+}
+if (JSON.stringify(trace.descendantArgs) !== JSON.stringify(expectedDescendantArgs)) {
+  console.error(`Dashboard descendant fixture argv was ${JSON.stringify(trace.descendantArgs)}; expected ${JSON.stringify(expectedDescendantArgs)}`);
+  process.exit(1);
+}
 const expected = process.platform === 'win32' ? 'exited-descendant' : 'live-process-group';
 if (trace.launcherMode !== expected) {
   console.error(`Hermes launcher fixture mode was ${String(trace.launcherMode)}; expected ${expected}`);
