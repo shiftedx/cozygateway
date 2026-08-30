@@ -77,6 +77,8 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             bundle.writestr("note.txt", "a real archive, delivered as a file")
         # Markup, not a raster image: still refused by policy before any network call.
         self.vector = self._write("diagram.svg", b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+        self.markdown = self._write("release-notes.md", b"# Release notes\n\n- Ready to share.\n")
+        self.binary_markdown = self._write("renamed.md", PNG_1X1)
         # Bytes that identify nothing, named as something the policy supports: the
         # fail-open case, where the gateway is the authority on the type.
         self.opaque = self._write("clip.mp4", b"not really a container at all")
@@ -335,6 +337,35 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("media_errors", result)
         self.assertEqual(self.gateway.upload_content_types, ["application/zip"])
         self.assertEqual(list(self._rows(result["deliveryId"]).values()), ["journaled"])
+
+    async def test_valid_markdown_uploads_as_a_downloadable_file(self):
+        result = await self._proactive([self.markdown])
+
+        self.assertEqual(result["state"], "journaled")
+        self.assertNotIn("media_errors", result)
+        self.assertEqual(self.gateway.upload_content_types, ["text/markdown"])
+        self.assertEqual(self.gateway.uploads[0].filename, "release-notes.md")
+        self.assertEqual(list(self._rows(result["deliveryId"]).values()), ["journaled"])
+
+    async def test_reply_media_path_commits_valid_markdown_with_the_turn(self):
+        result = await self._reply("Here are the release notes.", [self.markdown])
+        await self.gateway.wait_for_event_kind("commit")
+
+        self.assertTrue(result.success)
+        self.assertEqual(self.gateway.upload_content_types, ["text/markdown"])
+        media_id = self.gateway.upload_media_ids[0]
+        self.assertEqual(self.gateway.events_of_kind("commit")[0]["mediaIds"], [media_id])
+        self.assertEqual(self._rows("turn:" + TURN), {media_id: "journaled"})
+
+    async def test_binary_media_renamed_to_markdown_fails_before_upload(self):
+        result = await self._proactive([self.binary_markdown])
+
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["media_errors"], [
+            "renamed.md (application/octet-stream, family=file): unsupported_media_type",
+        ])
+        self.assertEqual(self.gateway.uploads, [])
+        self.assertEqual(list(self._rows(result["deliveryId"]).values()), ["blocked"])
 
     async def test_an_unidentifiable_file_fails_open_and_the_gateway_415_decides(self):
         self.gateway.script_upload(upload_unsupported_mime("video/mp4"))

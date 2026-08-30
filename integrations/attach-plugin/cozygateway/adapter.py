@@ -397,6 +397,11 @@ def _policy_block_reason(descriptor: MediaDescriptor) -> Optional[str]:
     """
     if descriptor.compatibility != "unsupported":
         return None
+    if (
+        descriptor.declared_mime == "text/markdown"
+        and descriptor.mime != descriptor.declared_mime
+    ):
+        return descriptor.incompatibility_reason or "The Markdown attachment is not valid UTF-8 text."
     if descriptor.detected_mime == "application/octet-stream":
         rule = MEDIA_COMPATIBILITY_POLICY.get(descriptor.declared_mime)
         if rule is not None and rule["status"] == "supported":

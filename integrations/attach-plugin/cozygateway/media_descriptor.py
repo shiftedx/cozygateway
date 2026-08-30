@@ -14,6 +14,7 @@ subprocess, no new dependency.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import mimetypes
 import os
@@ -118,6 +119,8 @@ MEDIA_COMPATIBILITY_POLICY: Dict[str, Dict[str, Any]] = {
     "audio/mpeg": _rule("audio", "supported"),
     "audio/wav": _rule("audio", "supported"),
     "application/pdf": _rule("file", "supported"),
+    # UTF-8 Markdown is delivered as a generic file: no inline HTML or Markdown render.
+    "text/markdown": _rule("file", "supported"),
     # A bare archive is delivered as a generic file: no inline render, download and share only.
     # OOXML packages are a different mime (see detect_mime) and stay off this list.
     "application/zip": _rule("file", "supported"),
@@ -485,9 +488,14 @@ class MediaDescriptor:
 
 
 _MIME_ALIASES = {"audio/x-wav": "audio/wav", "audio/wave": "audio/wav", "audio/vnd.wave": "audio/wav", "audio/x-m4a": "audio/mp4"}
+_PROJECT_MIME_BY_EXTENSION = {".md": "text/markdown"}
+_UTF8_TEXT_MIME_TYPES = frozenset(_PROJECT_MIME_BY_EXTENSION.values())
 
 
 def _declared_mime(path: str) -> str:
+    owned = _PROJECT_MIME_BY_EXTENSION.get(os.path.splitext(path)[1].lower())
+    if owned is not None:
+        return owned
     guess = mimetypes.guess_type(path)[0] or "application/octet-stream"
     return _MIME_ALIASES.get(guess, guess)
 
@@ -530,17 +538,34 @@ def _check_readiness(path: str, allowed_roots: Optional[Iterable[str]], stabilit
     return expanded, realpath, size_bytes
 
 
-def _read_head_and_hash(realpath: str, label: str) -> Tuple[bytes, str]:
+def _read_head_and_hash(
+    realpath: str, label: str, *, validate_utf8_text: bool = False
+) -> Tuple[bytes, str, Optional[str]]:
     digest, head = hashlib.sha256(), b""
+    decoder = codecs.getincrementaldecoder("utf-8")("strict") if validate_utf8_text else None
+    text_error = None
     try:
         with open(realpath, "rb") as handle:
             for chunk in iter(lambda: handle.read(HASH_CHUNK), b""):
                 if len(head) < SNIFF_BYTES:
                     head += chunk[: SNIFF_BYTES - len(head)]
+                if decoder is not None and text_error is None:
+                    if b"\x00" in chunk:
+                        text_error = "Markdown attachments cannot contain NUL bytes."
+                    else:
+                        try:
+                            decoder.decode(chunk, final=False)
+                        except UnicodeDecodeError:
+                            text_error = "Markdown attachments must be valid UTF-8 text."
                 digest.update(chunk)
+        if decoder is not None and text_error is None:
+            try:
+                decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                text_error = "Markdown attachments must be valid UTF-8 text."
     except OSError as err:
         raise MediaProbeError("read_failed", "%s could not be read: %s" % (label, err), path=label) from err
-    return head, digest.hexdigest()
+    return head, digest.hexdigest(), text_error
 
 
 def probe(
@@ -568,8 +593,13 @@ def probe(
         cached = _cache_get(key)
         if cached is not None:
             return cached
-    head, sha256 = _read_head_and_hash(realpath, expanded)
-    declared, detected = _declared_mime(expanded), detect_mime(head)
+    declared = _declared_mime(expanded)
+    head, sha256, text_error = _read_head_and_hash(
+        realpath,
+        expanded,
+        validate_utf8_text=declared in _UTF8_TEXT_MIME_TYPES,
+    )
+    detected = detect_mime(head)
 
     container, facts, codecs_known = None, {}, True
     if detected in ("video/mp4", "audio/mp4", "video/quicktime", "image/heic", "image/avif"):
@@ -587,7 +617,12 @@ def probe(
 
     # The bytes decide. The extension only votes when detection is inconclusive,
     # and then only when what it claims is something the policy supports.
-    if detected != "application/octet-stream":
+    if declared in _UTF8_TEXT_MIME_TYPES:
+        # Text has no reliable magic number, so its project-owned extension may vote
+        # only after the entire file passes bounded validation. A positive binary
+        # signature always wins as a rejection, never as permission to relabel bytes.
+        mime = declared if text_error is None and detected == "application/octet-stream" else "application/octet-stream"
+    elif detected != "application/octet-stream":
         mime = detected
     elif MEDIA_COMPATIBILITY_POLICY.get(declared, {}).get("status") == "supported":
         mime = declared
@@ -600,6 +635,14 @@ def probe(
         audio_codec=facts.get("audio_codec"),
         codecs_known=codecs_known,
     )
+    if declared in _UTF8_TEXT_MIME_TYPES:
+        if text_error is not None:
+            compatibility, reason = "unsupported", text_error
+        elif detected != "application/octet-stream":
+            compatibility, reason = "unsupported", (
+                "Markdown attachment bytes identify as %s instead of UTF-8 Markdown text."
+                % detected
+            )
     descriptor = MediaDescriptor(
         path=expanded,
         realpath=realpath,
