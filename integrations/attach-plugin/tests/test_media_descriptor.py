@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from cozygateway.media_descriptor import (
     DESCRIPTOR_CACHE_MAX,
@@ -316,6 +317,40 @@ class DetectionTests(MediaDescriptorTestCase):
         self.assertEqual(descriptor.family, "image")
         self.assertEqual(descriptor.compatibility, "supported")
 
+    def test_valid_utf8_markdown_is_supported_without_host_mime_registration(self):
+        with patch("cozygateway.media_descriptor.mimetypes.guess_type", return_value=(None, None)):
+            descriptor = probe(
+                self.write("notes.md", b"# Notes\n\n- A downloadable Markdown file.\n")
+            )
+
+        self.assertEqual(descriptor.declared_mime, "text/markdown")
+        self.assertEqual(descriptor.detected_mime, "application/octet-stream")
+        self.assertEqual(descriptor.mime, "text/markdown")
+        self.assertEqual(descriptor.family, "file")
+        self.assertEqual(descriptor.compatibility, "supported")
+
+    def test_markdown_with_invalid_utf8_is_unsupported(self):
+        descriptor = probe(self.write("binary.md", b"# title\n\xff\xfe\x80"))
+
+        self.assertEqual(descriptor.mime, "application/octet-stream")
+        self.assertEqual(descriptor.compatibility, "unsupported")
+        self.assertIn("valid UTF-8", descriptor.incompatibility_reason)
+
+    def test_markdown_with_nul_bytes_is_unsupported(self):
+        descriptor = probe(self.write("nul.md", b"# title\n\x00hidden"))
+
+        self.assertEqual(descriptor.mime, "application/octet-stream")
+        self.assertEqual(descriptor.compatibility, "unsupported")
+        self.assertIn("NUL", descriptor.incompatibility_reason)
+
+    def test_binary_media_renamed_to_markdown_is_unsupported(self):
+        descriptor = probe(self.write("image.md", png_bytes()))
+
+        self.assertEqual(descriptor.declared_mime, "text/markdown")
+        self.assertEqual(descriptor.detected_mime, "image/png")
+        self.assertEqual(descriptor.mime, "application/octet-stream")
+        self.assertEqual(descriptor.compatibility, "unsupported")
+
     def test_inconclusive_bytes_with_an_unsupported_extension_fail_closed(self):
         descriptor = probe(self.write("claimed.bin", b"\x00\x01\x02\x03" * 32))
         self.assertEqual(descriptor.mime, "application/octet-stream")
@@ -557,6 +592,7 @@ class PolicyTableTests(unittest.TestCase):
                 "audio/wav",
                 "application/pdf",
                 "application/zip",
+                "text/markdown",
             },
         )
 
