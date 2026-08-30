@@ -731,17 +731,114 @@ function Resolve-CozySystemExecutable {
   if (-not [IO.File]::Exists($path)) { throw "trusted system executable is unavailable: $Name" }
   return $path
 }
-function Find-CozyDashboardSubcommand {
+function Get-CozyDashboardProfileEvidence {
   param([object[]]$Tokens, [int]$StartIndex)
+  # Keep this snapshot aligned with Hermes v2026.8.27's
+  # hermes_cli._parser.top_level_value_flag_sets(). The profile pre-parser
+  # skips these values before looking for -p/--profile anywhere in argv.
+  $requiredValueFlags = @(
+    "-z", "--oneshot", "-m", "--model", "--provider", "--reasoning",
+    "-t", "--toolsets", "-r", "--resume", "-s", "--skills",
+    "--usage-file", "--in"
+  )
+  $optionalValueFlags = @("-c", "--continue")
+  $profileIndexes = New-Object 'System.Collections.Generic.HashSet[int]'
+  $valueIndexes = New-Object 'System.Collections.Generic.HashSet[int]'
+  $profileValue = $null
+  $selectorCount = 0
+  $boundaryIndex = $Tokens.Count
+  $invalidSelector = $false
+  $isolated = $false
   $index = $StartIndex
-  if ($index -lt $Tokens.Count -and @("-p", "--profile") -contains $Tokens[$index]) {
-    if ($index + 1 -ge $Tokens.Count -or -not ([string]$Tokens[$index + 1]).Equals("default", [StringComparison]::Ordinal)) { return -1 }
-    $index += 2
-  } elseif ($index -lt $Tokens.Count -and $Tokens[$index].StartsWith("--profile=", [StringComparison]::Ordinal)) {
-    if (-not $Tokens[$index].Substring("--profile=".Length).Equals("default", [StringComparison]::Ordinal)) { return -1 }
-    $index += 1
+  while ($index -lt $Tokens.Count) {
+    $token = [string]$Tokens[$index]
+    if ($token -eq "--") { $boundaryIndex = $index; break }
+    if ($token -in @("-p", "--profile")) {
+      $selectorCount++
+      [void]$profileIndexes.Add($index)
+      if ($index + 1 -ge $Tokens.Count) { $invalidSelector = $true; break }
+      [void]$profileIndexes.Add($index + 1)
+      $candidate = [string]$Tokens[$index + 1]
+      if ($candidate -notmatch '^[a-z0-9][a-z0-9_-]{0,63}$') { $invalidSelector = $true }
+      if ($selectorCount -eq 1) { $profileValue = $candidate }
+      $index += 2
+      continue
+    }
+    if ($token.StartsWith("--profile=", [StringComparison]::Ordinal)) {
+      $selectorCount++
+      [void]$profileIndexes.Add($index)
+      $candidate = $token.Substring("--profile=".Length)
+      if ($candidate -notmatch '^[a-z0-9][a-z0-9_-]{0,63}$') { $invalidSelector = $true }
+      if ($selectorCount -eq 1) { $profileValue = $candidate }
+      $index++
+      continue
+    }
+    if ($token -in $requiredValueFlags -and -not $token.Contains("=")) {
+      [void]$valueIndexes.Add($index)
+      if ($index + 1 -ge $Tokens.Count) { $index++; continue }
+      [void]$valueIndexes.Add($index + 1)
+      $index += 2
+      continue
+    }
+    if ($token -in $optionalValueFlags -and -not $token.Contains("=")) {
+      [void]$valueIndexes.Add($index)
+      if ($index + 1 -lt $Tokens.Count -and -not ([string]$Tokens[$index + 1]).StartsWith("-", [StringComparison]::Ordinal)) {
+        [void]$valueIndexes.Add($index + 1)
+        $index += 2
+      } else {
+        $index++
+      }
+      continue
+    }
+    if ($token -eq "--isolated") { $isolated = $true }
+    $index++
   }
-  if ($index -lt $Tokens.Count -and $Tokens[$index] -eq "dashboard") { return $index }
+  $state = if ($invalidSelector -or $selectorCount -ne 1) {
+    "Ambiguous"
+  } elseif ($profileValue -ceq "default") {
+    "Default"
+  } else {
+    "Named"
+  }
+  return [pscustomobject]@{
+    State = $state
+    BoundaryIndex = $boundaryIndex
+    Isolated = $isolated
+    ProfileIndexes = $profileIndexes
+    ValueIndexes = $valueIndexes
+  }
+}
+function Find-CozyDashboardSubcommand {
+  param([object[]]$Tokens, [int]$StartIndex, $ProfileEvidence)
+  $requiredValueFlags = @(
+    "-z", "--oneshot", "-m", "--model", "--provider", "--reasoning",
+    "-t", "--toolsets", "-r", "--resume", "-s", "--skills",
+    "--usage-file", "--in"
+  )
+  $optionalValueFlags = @("-c", "--continue")
+  $booleanFlags = @(
+    "--version", "-V", "--no-restore-cwd", "--worktree", "-w",
+    "--accept-hooks", "--yolo", "--pass-session-id", "--ignore-user-config",
+    "--ignore-rules", "--safe-mode", "--tui", "--cli", "--quiet", "-q",
+    "--verbose", "-v", "--dev"
+  )
+  for ($index = $StartIndex; $index -lt $ProfileEvidence.BoundaryIndex; $index++) {
+    $token = [string]$Tokens[$index]
+    if ($ProfileEvidence.ProfileIndexes.Contains($index)) { continue }
+    if ($ProfileEvidence.ValueIndexes.Contains($index)) {
+      if ($token -in $requiredValueFlags -and ($index + 1 -ge $ProfileEvidence.BoundaryIndex -or ([string]$Tokens[$index + 1]).StartsWith("-", [StringComparison]::Ordinal))) { return -1 }
+      continue
+    }
+    if ($token -in $booleanFlags) { continue }
+    $inlineValueFlag = $false
+    foreach ($flag in @($requiredValueFlags + $optionalValueFlags)) {
+      if ($token.StartsWith(($flag + "="), [StringComparison]::Ordinal) -and $token.Length -gt $flag.Length + 1) { $inlineValueFlag = $true; break }
+    }
+    if ($inlineValueFlag) { continue }
+    if ($token.StartsWith("-", [StringComparison]::Ordinal)) { return -1 }
+    if ($token -ceq "dashboard") { return $index }
+    return -1
+  }
   return -1
 }
 function Test-CozyDashboardOwner {
@@ -762,6 +859,7 @@ function Test-CozyDashboardOwner {
   }
   $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
   $dashboardIndex = -1
+  $profileEvidence = $null
   $requiresRootAncestry = $false
   $scriptSuffix = [IO.Path]::DirectorySeparatorChar + "hermes_cli" + [IO.Path]::DirectorySeparatorChar + "main.py"
   $processExecutable = $null
@@ -775,16 +873,21 @@ function Test-CozyDashboardOwner {
   $pythonRuntime = $firstIsExecutable -and @("python.exe", "pythonw.exe") -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
   $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
   if ($directLauncher) {
-    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 1
+    $profileEvidence = Get-CozyDashboardProfileEvidence $tokens 1
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 1 $profileEvidence
   } elseif ($pythonRuntime -and $tokens.Count -gt 1 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($venvLauncher, [StringComparison]::OrdinalIgnoreCase))) {
-    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 2
+    $profileEvidence = Get-CozyDashboardProfileEvidence $tokens 2
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 2 $profileEvidence
   } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main") {
-    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 3
+    $profileEvidence = Get-CozyDashboardProfileEvidence $tokens 3
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 3 $profileEvidence
     if ($dashboardIndex -ge 0) { $requiresRootAncestry = $true }
   } elseif ($pythonRuntime -and $tokens.Count -gt 1 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase)) {
-    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 2
+    $profileEvidence = Get-CozyDashboardProfileEvidence $tokens 2
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 2 $profileEvidence
   }
   if ($dashboardIndex -lt 0) { return "Foreign" }
+  if ($profileEvidence.State -ne "Default" -or $profileEvidence.Isolated -or $profileEvidence.BoundaryIndex -lt $tokens.Count) { return "Foreign" }
 
   if ($requiresRootAncestry) {
     $runtimeUnderRoot = $false
@@ -811,13 +914,37 @@ function Test-CozyDashboardOwner {
     }
   }
 
+  # Validate the complete Dashboard option grammar relevant to ownership.
+  # Profile tokens are removed by Hermes before argparse; other top-level
+  # value flags are invalid after the subcommand and therefore fail closed.
+  $portCount = 0
+  $portMatches = $false
   for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
-    if (@("-p", "--profile") -contains $tokens[$index] -or $tokens[$index].StartsWith("--profile=", [StringComparison]::Ordinal)) { return "Foreign" }
+    if ($profileEvidence.ProfileIndexes.Contains($index)) { continue }
+    if ($profileEvidence.ValueIndexes.Contains($index)) { return "Foreign" }
+    $token = [string]$tokens[$index]
+    if ($token -eq "--port") {
+      if ($index + 1 -ge $tokens.Count -or $profileEvidence.ProfileIndexes.Contains($index + 1) -or ([string]$tokens[$index + 1]).StartsWith("-", [StringComparison]::Ordinal)) { return "Foreign" }
+      $portCount++
+      $portMatches = ([string]$tokens[$index + 1] -ceq [string]$ExpectedPort)
+      $index++
+      continue
+    }
+    if ($token.StartsWith("--port=", [StringComparison]::Ordinal)) {
+      $portCount++
+      $portMatches = ($token.Substring("--port=".Length) -ceq [string]$ExpectedPort)
+      continue
+    }
+    if ($token -in @("--host", "--open-profile")) {
+      if ($index + 1 -ge $tokens.Count -or $profileEvidence.ProfileIndexes.Contains($index + 1) -or ([string]$tokens[$index + 1]).StartsWith("-", [StringComparison]::Ordinal)) { return "Foreign" }
+      $index++
+      continue
+    }
+    if ($token.StartsWith("--host=", [StringComparison]::Ordinal) -or $token.StartsWith("--open-profile=", [StringComparison]::Ordinal)) { continue }
+    if ($token -in @("--insecure", "--skip-build", "--no-open", "--tui")) { continue }
+    return "Foreign"
   }
-  for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
-    if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return "Owned" }
-    if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return "Owned" }
-  }
+  if ($portCount -eq 1 -and $portMatches) { return "Owned" }
   return "Foreign"
 }
 
@@ -1042,11 +1169,12 @@ POWERSHELL_ELEVATION
   chmod 600 "$DASHBOARD_ELEVATION_PS1"
 }
 write_wrapper() {
-  local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg launcher_arg owner_helper_arg bundle_arg config_arg
+  local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg launcher_arg owner_helper_arg bundle_arg config_arg windows_dashboard_profile=0
   [ "$DRY_RUN" = 1 ] && { say "DRY   write 0700 gateway wrapper that reads $GATEWAY_ENV at runtime"; return; }
   gateway_env_arg="$GATEWAY_ENV"; dashboard_env_arg="$DASHBOARD_ENV"; hermes_root_arg="$HERMES_ROOT"
   hermes_arg="$HERMES_RESOLVED"; launcher_arg="$HERMES_ROOT/bin/hermes.exe"; owner_helper_arg="$DASHBOARD_OWNER_PS1"; bundle_arg="$BUNDLE_PATH"; config_arg="$CONFIG_JSON"
   if is_windows; then
+    windows_dashboard_profile=1
     gateway_env_arg="$(to_windows_path "$gateway_env_arg")"
     dashboard_env_arg="$(to_windows_path "$dashboard_env_arg")"
     hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
@@ -1101,7 +1229,8 @@ const health = await fetch('http://127.0.0.1:' + dashboardPort + '/api/health', 
   .catch(() => false);
 let dashboardChild;
 if (!health) {
-  dashboardChild = spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'], { detached: true, stdio: 'ignore', env: dashboardEnv });
+  const dashboardArgs = ['dashboard', ...($windows_dashboard_profile === 1 ? ['-p', 'default'] : []), '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'];
+  dashboardChild = spawn(hermes, dashboardArgs, { detached: true, stdio: 'ignore', env: dashboardEnv });
   await new Promise((resolve, reject) => { dashboardChild.once('spawn', resolve); dashboardChild.once('error', reject); });
 }
 try {
@@ -1316,15 +1445,16 @@ dashboard_credentials_work() {
   [ "$(dashboard_credentials_status)" = 200 ]
 }
 launch_dashboard() {
-  local hermes_root_arg="$HERMES_ROOT"
-  is_windows && hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
-  "$NODE_RESOLVED" - "$DASHBOARD_ENV" "$hermes_root_arg" "$HERMES_RESOLVED" "$DASHBOARD_PORT" <<'NODE'
+  local hermes_root_arg="$HERMES_ROOT" windows_dashboard_profile=0
+  if is_windows; then hermes_root_arg="$(to_windows_path "$hermes_root_arg")"; windows_dashboard_profile=1; fi
+  "$NODE_RESOLVED" - "$DASHBOARD_ENV" "$hermes_root_arg" "$HERMES_RESOLVED" "$DASHBOARD_PORT" "$windows_dashboard_profile" <<'NODE'
 const { readFileSync } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
-const [dashboardEnvPath, hermesRoot, hermes, dashboardPort] = process.argv.slice(2);
+const [dashboardEnvPath, hermesRoot, hermes, dashboardPort, windowsDashboardProfile] = process.argv.slice(2);
 const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
-const child = spawn(hermes, ['dashboard', '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'], {
+const dashboardArgs = ['dashboard', ...(windowsDashboardProfile === '1' ? ['-p', 'default'] : []), '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'];
+const child = spawn(hermes, dashboardArgs, {
   detached: true,
   windowsHide: process.platform === 'win32',
   stdio: 'ignore',
@@ -1414,7 +1544,11 @@ start_dashboard() {
   if dashboard_ready; then
     dashboard_credentials_work && return
     say "INFO  existing Hermes Dashboard rejected the configured local session token; restarting it with the installer-owned token"
-    HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
+    if is_windows; then
+      HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard -p default --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
+    else
+      HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
+    fi
     for _ in $(seq 1 5); do dashboard_ready || break; sleep 1; done
     if dashboard_ready && is_windows; then
       stop_stubborn_windows_dashboard

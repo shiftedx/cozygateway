@@ -50,7 +50,8 @@ state_file="$root/gateway-$profile.state"
 state() { [ -f "$state_file" ] && cat "$state_file" || printf 'absent'; }
 set_state() { printf '%s\n' "$1" > "$state_file"; }
 log() { printf '%s\n' "$profile:gateway:$1" >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"; }
-if [ "$1" = dashboard ] && [ "${2:-}" = --stop ] && [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG:-}" ]; then
+if { [ "$1" = dashboard ] && [ "${2:-}" = --stop ]; } || { [ "$1" = dashboard ] && [ "${2:-}" = -p ] && [ "${3:-}" = default ] && [ "${4:-}" = --stop ]; }; then
+  [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG:-}" ] || exit 0
   printf '%s\n' "${HERMES_HOME:-}" > "$COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG"
   [ "${HERMES_HOME:-}" = "${COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME:?}" ] || exit 42
 fi
@@ -1129,6 +1130,8 @@ grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <
 windows_native_hermes="$("$tmp/bin/cygpath" -w "$tmp/bin/hermes")"
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
 grep -Fqx "hermes_bin=$tmp/bin/hermes" "$tmp/gateway-windows-live/local/install-state"
+grep -Fq "const dashboardArgs = ['dashboard', ...(1 === 1 ? ['-p', 'default'] : [])" "$tmp/gateway-windows-live/local/run-gateway.sh"
+grep -Fq "windowsDashboardProfile === '1' ? ['-p', 'default'] : []" "$repo_root/scripts/agent-install.sh"
 
 # A fresh interactive install can opt into same-LAN access. Invalid input repeats
 # the one question; the affirmative answer persists the wildcard listener and
