@@ -50,7 +50,8 @@ state_file="$root/gateway-$profile.state"
 state() { [ -f "$state_file" ] && cat "$state_file" || printf 'absent'; }
 set_state() { printf '%s\n' "$1" > "$state_file"; }
 log() { printf '%s\n' "$profile:gateway:$1" >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"; }
-if [ "$1" = dashboard ] && [ "${2:-}" = --stop ] && [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG:-}" ]; then
+if { [ "$1" = dashboard ] && [ "${2:-}" = --stop ]; } || { [ "$1" = dashboard ] && [ "${2:-}" = -p ] && [ "${3:-}" = default ] && [ "${4:-}" = --stop ]; }; then
+  [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG:-}" ] || exit 0
   printf '%s\n' "${HERMES_HOME:-}" > "$COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG"
   [ "${HERMES_HOME:-}" = "${COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME:?}" ] || exit 42
 fi
@@ -571,25 +572,27 @@ childProcess.spawn = function (command, args, options) {
 const { spawn } = childProcess;
 const hermesArgs = [basename(process.argv[1] || ''), ...process.argv.slice(2)];
 if (hermesArgs[0] === 'dashboard') {
-  const expectedArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const windowsLauncher = process.platform === 'win32';
+  // gateway-live is intentionally generated with service platform Darwin,
+  // even when this fixture itself runs on Windows.
+  const expectedLauncherArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const descendantProfileArgs = windowsLauncher ? ['-p', 'default'] : [];
+  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
   const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
   const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
-  const windowsLauncher = process.platform === 'win32';
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
     args: hermesArgs,
+    descendantArgs,
     launcherPid: process.pid,
     launcherMode: windowsLauncher ? 'exited-descendant' : 'live-process-group',
     tokenMatches: process.env.HERMES_DASHBOARD_SESSION_TOKEN === expectedToken,
     homeMatches,
   }) + '\n');
-  if (JSON.stringify(hermesArgs) !== JSON.stringify(expectedArgs)) process.exit(41);
+  if (JSON.stringify(hermesArgs) !== JSON.stringify(expectedLauncherArgs)) process.exit(41);
   if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
   if (!homeMatches) process.exit(43);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
-  const dashboardChild = spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, [
-    process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT,
-    'dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build',
-  ], { detached: windowsLauncher, stdio: 'ignore', env: process.env });
+  const dashboardChild = spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, descendantArgs, { detached: windowsLauncher, stdio: 'ignore', env: process.env });
   if (windowsLauncher) {
     dashboardChild.unref();
     process.exit(0);
@@ -660,10 +663,20 @@ if [ ! -s "$tmp/hermes-stub-invoked" ]; then
   printf '%s\n' 'generated supervisor did not spawn Hermes during a cold Dashboard start' >&2
   exit 1
 fi
-grep -Fxq "dashboard --host 127.0.0.1 --port $mock_dashboard_port --no-open --skip-build" "$tmp/hermes-stub-invoked"
-"$real_node" - "$tmp/hermes-stub-trace" <<'NODE'
+"$real_node" - "$tmp/hermes-stub-trace" "$mock_dashboard_port" <<'NODE'
 const { readFileSync } = require('node:fs');
 const trace = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const expectedLauncherArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.argv[3], '--no-open', '--skip-build'];
+const descendantProfileArgs = process.platform === 'win32' ? ['-p', 'default'] : [];
+const expectedDescendantArgs = [trace.descendantArgs[0], 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', process.argv[3], '--no-open', '--skip-build'];
+if (JSON.stringify(trace.args) !== JSON.stringify(expectedLauncherArgs)) {
+  console.error(`Hermes launcher fixture argv was ${JSON.stringify(trace.args)}; expected ${JSON.stringify(expectedLauncherArgs)}`);
+  process.exit(1);
+}
+if (JSON.stringify(trace.descendantArgs) !== JSON.stringify(expectedDescendantArgs)) {
+  console.error(`Dashboard descendant fixture argv was ${JSON.stringify(trace.descendantArgs)}; expected ${JSON.stringify(expectedDescendantArgs)}`);
+  process.exit(1);
+}
 const expected = process.platform === 'win32' ? 'exited-descendant' : 'live-process-group';
 if (trace.launcherMode !== expected) {
   console.error(`Hermes launcher fixture mode was ${String(trace.launcherMode)}; expected ${expected}`);
@@ -1129,6 +1142,8 @@ grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <
 windows_native_hermes="$("$tmp/bin/cygpath" -w "$tmp/bin/hermes")"
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
 grep -Fqx "hermes_bin=$tmp/bin/hermes" "$tmp/gateway-windows-live/local/install-state"
+grep -Fq "const dashboardArgs = ['dashboard', ...(1 === 1 ? ['-p', 'default'] : [])" "$tmp/gateway-windows-live/local/run-gateway.sh"
+grep -Fq "windowsDashboardProfile === '1' ? ['-p', 'default'] : []" "$repo_root/scripts/agent-install.sh"
 
 # A fresh interactive install can opt into same-LAN access. Invalid input repeats
 # the one question; the affirmative answer persists the wildcard listener and
