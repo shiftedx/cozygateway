@@ -10,6 +10,7 @@ import {
   HermesWorkspaceAdapter,
   WorkspaceBusy,
   WorkspaceForbidden,
+  WorkspaceUnavailable,
   WorkspaceTooLarge,
   WorkspaceRateLimited,
   WORKSPACE_LIST_MAX_BYTES,
@@ -151,6 +152,11 @@ describe("locked-root discovery and privacy", () => {
     await expect(discoverHermesWorkspace(client({ json: () => upstreamList([]) }), HARNESS)).resolves.toBeInstanceOf(HermesWorkspaceAdapter);
     await expect(discoverHermesWorkspace(client({ json: () => upstreamList([], { locked_root: null }) }), HARNESS)).resolves.toBeUndefined();
     await expect(discoverHermesWorkspace(client({ json: () => upstreamList([], { can_change_path: true }) }), HARNESS)).resolves.toBeUndefined();
+    for (const root of ["/srv/secrets", "/srv/hermes/config"]) {
+      await expect(discoverHermesWorkspace(client({
+        json: () => upstreamList([], { path: root, root, locked_root: root }),
+      }), HARNESS)).resolves.toBeUndefined();
+    }
     await expect(discoverHermesWorkspace(client({ json: () => { throw new Error("timeout /private/root"); } }), HARNESS)).resolves.toBeUndefined();
   });
 
@@ -178,6 +184,46 @@ describe("locked-root discovery and privacy", () => {
       .list("home", "sage", undefined, "device")).rejects.toBeInstanceOf(WorkspaceForbidden);
     await expect(workspace({ json: () => upstreamList([], { locked_root: "/srv/other", root: "/srv/other" }) })
       .list("home", "sage", undefined, "device")).rejects.toThrow(/lock proof/i);
+  });
+
+  it("rejects invalid names and paths projected beyond the full relative-path bound", async () => {
+    await expect(workspace({ json: () => upstreamList([
+      fileEntry("", 1, ROOT),
+    ]) }).list("home", "sage", undefined, "device"))
+      .rejects.toBeInstanceOf(WorkspaceUnavailable);
+
+    const segment = "a".repeat(255);
+    const parent = Array.from({ length: 16 }, () => segment).join("/");
+    expect(Buffer.byteLength(parent)).toBe(4095);
+    await expect(workspace({ json: () => upstreamList([
+      fileEntry("b", 1, `${ROOT}/${parent}/b`),
+    ]) }).list("home", "sage", parent, "device"))
+      .rejects.toBeInstanceOf(WorkspaceTooLarge);
+  });
+
+  it("propagates request cancellation through directory reads", async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    let upstreamAborts = 0;
+    const surface = workspace({
+      response: (_path, init) => {
+        upstreamSignal = init?.signal;
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            init?.signal?.addEventListener("abort", () => {
+              upstreamAborts += 1;
+              controller.error(new DOMException("cancelled", "AbortError"));
+            }, { once: true });
+          },
+        }));
+      },
+    });
+    const requestAbort = new AbortController();
+    const pending = surface.list("home", "sage", undefined, "device", requestAbort.signal);
+    requestAbort.abort();
+    requestAbort.abort();
+    await expect(pending).rejects.toBeInstanceOf(WorkspaceUnavailable);
+    expect(upstreamSignal?.aborted).toBe(true);
+    expect(upstreamAborts).toBe(1);
   });
 
   it("caps the upstream JSON body before parsing it", async () => {
@@ -247,6 +293,29 @@ describe("paired workspace routes", () => {
     expect(response.headers.get("content-range")).toBe("bytes 1-3/6");
   });
 
+  it("cancels an opened body when the locked root or entry changes during download", async () => {
+    for (const mutate of [
+      () => upstreamList([fileEntry()], { root: "/srv/other", locked_root: "/srv/other" }),
+      () => upstreamList([fileEntry("report.txt", 5)]),
+    ]) {
+      let listings = 0;
+      let cancelled = false;
+      const surface = workspace({
+        json: () => listings++ === 0 ? upstreamList([fileEntry()]) : mutate(),
+        response: (path) => {
+          expect(path).toContain(`path=${encodeURIComponent(`${ROOT}/report.txt`)}`);
+          return new Response(new ReadableStream<Uint8Array>({
+            cancel() { cancelled = true; },
+          }), { headers: { "content-length": "6" } });
+        },
+      });
+      await expect(surface.download(
+        "home", "sage", "report.txt", undefined, "device", new AbortController().signal,
+      )).rejects.toBeInstanceOf(WorkspaceUnavailable);
+      expect(cancelled).toBe(true);
+    }
+  });
+
   it("rejects oversized files and ranges before opening an upstream body", async () => {
     let downloads = 0;
     const { request } = appFor(workspace({
@@ -288,8 +357,12 @@ describe("stream resource bounds", () => {
     expect(upstreamSignal?.aborted).toBe(true);
   });
 
-  it("bounds concurrent streams and rate-limits each paired device", async () => {
-    const never = () => new ReadableStream<Uint8Array>({ pull() {} });
+  it("holds concurrent slots through repeated aborts until upstream cancellation settles", async () => {
+    const pendingCancels: Array<() => void> = [];
+    const never = () => new ReadableStream<Uint8Array>({
+      pull() {},
+      cancel: () => new Promise<void>((resolve) => pendingCancels.push(resolve)),
+    });
     const surface = workspace({
       json: () => upstreamList([fileEntry()]),
       response: () => new Response(never(), { headers: { "content-length": "6" } }),
@@ -299,12 +372,30 @@ describe("stream resource bounds", () => {
       surface.download("home", "sage", "report.txt", undefined, "device", controller.signal)));
     await expect(surface.download("home", "sage", "report.txt", undefined, "device", new AbortController().signal))
       .rejects.toBeInstanceOf(WorkspaceBusy);
-    requestAborts[0]!.abort();
+    for (const controller of requestAborts) {
+      controller.abort();
+      controller.abort();
+    }
+    await expect(surface.download("home", "sage", "report.txt", undefined, "device", new AbortController().signal))
+      .rejects.toBeInstanceOf(WorkspaceBusy);
+    const cancellations = Promise.all(streams.map((stream) => stream.body.cancel()));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pendingCancels).toHaveLength(4);
+    await expect(surface.download("home", "sage", "report.txt", undefined, "device", new AbortController().signal))
+      .rejects.toBeInstanceOf(WorkspaceBusy);
+    for (const settle of pendingCancels.splice(0)) settle();
+    await cancellations;
     const replacement = await surface.download(
       "home", "sage", "report.txt", undefined, "device", new AbortController().signal,
     );
-    await Promise.all([...streams.map((stream) => stream.body.cancel()), replacement.body.cancel()]);
+    const replacementCancellation = replacement.body.cancel();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pendingCancels).toHaveLength(1);
+    pendingCancels.pop()!();
+    await replacementCancellation;
+  });
 
+  it("rate-limits each paired device independently", async () => {
     const rate = workspace(
       { json: () => upstreamList([]) },
       { rate: createWorkspaceRateLimiter({ capacity: 1, refillMs: 10_000 }), now: () => 0 },

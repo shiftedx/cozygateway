@@ -416,6 +416,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
         c.req.param("scopeId"),
         c.req.query("path"),
         c.get("deviceId"),
+        c.req.raw.signal,
       ));
     } catch (error) { return workspaceFailure(c, error); }
   });

@@ -107,6 +107,12 @@ function externalPath(value: string): { text: string; windows: boolean } | undef
   return { text: windows ? text.toLowerCase() : text, windows };
 }
 
+function externalPathHasSensitiveComponent(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).some((part, index) =>
+    !(index === 0 && /^[A-Za-z]:$/.test(part)) && isSensitiveName(part));
+}
+
 function exactExternalPath(root: string, relative: string): string | undefined {
   const normalized = externalPath(root);
   if (!normalized) return undefined;
@@ -122,6 +128,7 @@ function lockedProof(raw: unknown, expectedRoot?: string): string | undefined {
   const a = root ? externalPath(root) : undefined;
   const b = locked ? externalPath(locked) : undefined;
   if (!a || !b || a.windows !== b.windows || a.text !== b.text) return undefined;
+  if (externalPathHasSensitiveComponent(b.text)) return undefined;
   if (expectedRoot !== undefined) {
     const expected = externalPath(expectedRoot);
     if (!expected || expected.windows !== a.windows || expected.text !== a.text) return undefined;
@@ -144,11 +151,13 @@ function entryFromUpstream(
   const row = record(raw);
   if (!row || typeof row["name"] !== "string") throw new WorkspaceUnavailable("invalid workspace response");
   const name = row["name"];
-  if (name === "." || name === ".." || name.includes("/") || name.includes("\\")
+  if (name === "" || name === "." || name === ".." || name.includes("/") || name.includes("\\")
     || name.includes("\0") || utf8Bytes(name) > WORKSPACE_SEGMENT_MAX_BYTES)
     throw new WorkspaceUnavailable("invalid workspace response");
   if (isSensitiveName(name)) return undefined;
   const relative = directory === "" ? name : `${directory}/${name}`;
+  if (utf8Bytes(relative) > WORKSPACE_PATH_MAX_BYTES)
+    throw new WorkspaceTooLarge("projected workspace path is too long");
   const upstreamPath = typeof row["path"] === "string" ? externalPath(row["path"]) : undefined;
   const expectedPath = exactExternalPath(root, relative);
   if (!upstreamPath || expectedPath === undefined || upstreamPath.text !== expectedPath)
@@ -179,11 +188,12 @@ function mapUpstreamStatus(status: number): never {
   throw new WorkspaceUnavailable("workspace upstream is unavailable");
 }
 
-async function workspaceJson(client: HermesClient, path: string): Promise<unknown> {
+async function workspaceJson(client: HermesClient, path: string, signal?: AbortSignal): Promise<unknown> {
   let response: Response;
   try {
     response = await client.dashboardResponse(path, {
       headers: { accept: "application/json" },
+      ...(signal === undefined ? {} : { signal }),
       timeoutMs: WORKSPACE_LIST_TIMEOUT_MS,
     });
   } catch {
@@ -256,13 +266,14 @@ export class HermesWorkspaceAdapter {
     return scopeId;
   }
 
-  async list(scopeId: string, rawPath?: string): Promise<HarnessWorkspaceList> {
+  async list(scopeId: string, rawPath?: string, signal?: AbortSignal): Promise<HarnessWorkspaceList> {
     const scope = this.#scope(scopeId);
     const path = workspacePath(rawPath);
     let raw: unknown;
     try {
       raw = await workspaceJson(this.#client,
         `/api/files?path=${encodeURIComponent(path || ".")}&${profileQuery(scope)}`,
+        signal,
       );
     } catch (error) {
       if (error instanceof WorkspaceInvalid || error instanceof WorkspaceForbidden
@@ -294,7 +305,7 @@ export class HermesWorkspaceAdapter {
     const path = workspacePath(rawPath, { file: true });
     const slash = path.lastIndexOf("/");
     const parent = slash < 0 ? "" : path.slice(0, slash);
-    const listing = await this.list(scope, parent);
+    const listing = await this.list(scope, parent, signal);
     const entry = listing.entries.find((candidate) => candidate.path === path);
     if (!entry || entry.kind !== "file" || entry.size === undefined)
       throw new WorkspaceNotFound("workspace file not found");
@@ -304,10 +315,15 @@ export class HermesWorkspaceAdapter {
     if (range === null) throw new WorkspaceRangeInvalid(entry.size);
     if (range && range.end - range.start + 1 > WORKSPACE_RANGE_MAX_BYTES)
       throw new WorkspaceTooLarge("workspace byte range is over the size cap");
+    const provenTarget = exactExternalPath(this.#root, path);
+    if (provenTarget === undefined) throw new WorkspaceUnavailable("workspace lock proof changed");
     let response: Response;
     try {
       response = await this.#client.dashboardResponse(
-        `/api/files/download?path=${encodeURIComponent(path)}&${profileQuery(scope)}`,
+        // This absolute target is derived only from the trusted locked root and admitted relative
+        // path. It binds Hermes to the preflight root instead of re-resolving the same name under
+        // a root that might have changed; it is never returned to the paired device.
+        `/api/files/download?path=${encodeURIComponent(provenTarget)}&${profileQuery(scope)}`,
         {
           headers: {
             accept: "application/octet-stream",
@@ -320,7 +336,10 @@ export class HermesWorkspaceAdapter {
     } catch {
       throw new WorkspaceUnavailable("workspace upstream is unavailable");
     }
-    if (response.status === 416) throw new WorkspaceRangeInvalid(entry.size);
+    if (response.status === 416) {
+      await response.body?.cancel().catch(() => {});
+      throw new WorkspaceRangeInvalid(entry.size);
+    }
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});
       mapUpstreamStatus(response.status);
@@ -344,6 +363,23 @@ export class HermesWorkspaceAdapter {
         await response.body.cancel().catch(() => {});
         throw new WorkspaceUnavailable("workspace upstream returned an invalid stream");
       }
+    }
+    try {
+      // Re-prove the root and entry while the absolute-target response is held, before exposing
+      // any of its bytes downstream.
+      const verified = (await this.list(scope, parent, signal)).entries
+        .find((candidate) => candidate.path === path);
+      if (!verified || verified.kind !== "file"
+        || verified.name !== entry.name || verified.path !== entry.path
+        || verified.size !== entry.size || verified.modifiedAt !== entry.modifiedAt
+        || verified.mimeType !== entry.mimeType)
+        throw new WorkspaceUnavailable("workspace entry changed during download");
+    } catch (error) {
+      await response.body.cancel().catch(() => {});
+      if (error instanceof WorkspaceUnavailable || error instanceof WorkspaceInvalid
+        || error instanceof WorkspaceForbidden || error instanceof WorkspaceNotFound
+        || error instanceof WorkspaceTooLarge) throw error;
+      throw new WorkspaceUnavailable("workspace upstream is unavailable");
     }
     return {
       body: response.body,
@@ -426,10 +462,16 @@ export class GatewayHarnessWorkspace {
     return adapter;
   }
 
-  async list(harnessId: string, scopeId: string, path: string | undefined, deviceId: string): Promise<HarnessWorkspaceList> {
+  async list(
+    harnessId: string,
+    scopeId: string,
+    path: string | undefined,
+    deviceId: string,
+    requestSignal?: AbortSignal,
+  ): Promise<HarnessWorkspaceList> {
     const rate = this.#rate.take(deviceId, this.#now());
     if (!rate.ok) throw new WorkspaceRateLimited(rate.retryAfterMs);
-    return this.#adapter(harnessId).list(scopeId, path);
+    return this.#adapter(harnessId).list(scopeId, path, requestSignal);
   }
 
   async download(
@@ -455,7 +497,6 @@ export class GatewayHarnessWorkspace {
     };
     onAbort = () => {
       abort.abort(requestSignal.reason);
-      release();
     };
     requestSignal.addEventListener("abort", onAbort, { once: true });
     if (requestSignal.aborted) onAbort();
@@ -480,11 +521,25 @@ function boundedWorkspaceStream(
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
   let delivered = 0;
+  let cancellation: Promise<void> | undefined;
+  const cancelSource = (reason?: unknown): Promise<void> => {
+    if (cancellation === undefined) {
+      abort.abort(reason);
+      cancellation = reader.cancel(reason).catch(() => {}).then(release);
+    }
+    return cancellation;
+  };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const { done, value } = await reader.read();
         if (done) {
+          // A pending read resolves done as soon as cancellation starts, before an async
+          // underlying cancel settles. The cancellation promise owns release in that case.
+          if (abort.signal.aborted) {
+            await cancelSource(abort.signal.reason);
+            return;
+          }
           if (delivered !== expectedBytes) throw new WorkspaceUnavailable("workspace stream ended early");
           release();
           controller.close();
@@ -494,17 +549,13 @@ function boundedWorkspaceStream(
         if (delivered > expectedBytes) throw new WorkspaceUnavailable("workspace stream exceeded its size");
         controller.enqueue(value);
       } catch (error) {
-        abort.abort();
-        await reader.cancel().catch(() => {});
-        release();
+        await cancelSource(error);
         controller.error(error instanceof WorkspaceUnavailable
           ? error : new WorkspaceUnavailable("workspace stream failed"));
       }
     },
     async cancel(reason) {
-      abort.abort(reason);
-      await reader.cancel(reason).catch(() => {});
-      release();
+      await cancelSource(reason);
     },
   });
 }

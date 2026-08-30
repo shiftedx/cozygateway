@@ -16,17 +16,17 @@ afterEach(async () => {
   delete process.env.TEST_ATTACH_TOKEN;
 });
 
-async function start(locked: boolean): Promise<RunningGateway> {
+async function start(root: string | null): Promise<RunningGateway> {
   const hermes = await startFakeHermesServer({
     dashboard: ({ path }) => path === "/api/files"
       ? {
           body: {
-            path: locked ? ROOT : "/Users/operator",
+            path: root ?? "/Users/operator",
             parent: null,
             entries: [],
-            root: locked ? ROOT : null,
-            locked_root: locked ? ROOT : null,
-            can_change_path: !locked,
+            root,
+            locked_root: root,
+            can_change_path: root === null,
           },
         }
       : { status: 404, body: { detail: "Not Found" } },
@@ -47,7 +47,7 @@ async function start(locked: boolean): Promise<RunningGateway> {
 
 describe("workspace startup capability proof", () => {
   it("advertises and serves the extension only after Hermes reports a locked root", async () => {
-    const gateway = await start(true);
+    const gateway = await start(ROOT);
     const health = await (await fetch(`${gateway.url}/health`)).json() as { capabilities?: Record<string, number> };
     expect(health.capabilities?.[HARNESS_WORKSPACE_CAPABILITY_ID]).toBe(1);
     expect(JSON.stringify(health)).not.toContain(ROOT);
@@ -66,7 +66,7 @@ describe("workspace startup capability proof", () => {
   });
 
   it("keeps the capability and route absent for a changeable or null root", async () => {
-    const gateway = await start(false);
+    const gateway = await start(null);
     const health = await (await fetch(`${gateway.url}/health`)).json() as { capabilities?: Record<string, number> };
     expect(health.capabilities?.[HARNESS_WORKSPACE_CAPABILITY_ID]).toBeUndefined();
 
@@ -80,5 +80,16 @@ describe("workspace startup capability proof", () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(list.status).toBe(404);
+  });
+
+  it("keeps the capability absent when the locked root itself is sensitive", async () => {
+    for (const root of ["/srv/secrets", "/srv/hermes/config"]) {
+      const gateway = await start(root);
+      const health = await (await fetch(`${gateway.url}/health`)).json() as {
+        capabilities?: Record<string, number>;
+      };
+      expect(health.capabilities?.[HARNESS_WORKSPACE_CAPABILITY_ID]).toBeUndefined();
+      expect(JSON.stringify(health)).not.toContain(root);
+    }
   });
 });
