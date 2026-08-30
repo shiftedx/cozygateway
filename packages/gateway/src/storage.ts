@@ -340,6 +340,21 @@ CREATE TABLE IF NOT EXISTS bot_native_sessions (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_native_sessions_recent
   ON bot_native_sessions (bot, updated_at DESC, created_at DESC);
+-- A separately source-qualified, explicitly adopted Hermes desktop session. The raw Hermes id is
+-- never substituted for its local session id: this row is the only durable bridge between the two
+-- namespaces, and remains pending until the plugin positively confirms switch_session().
+CREATE TABLE IF NOT EXISTS bot_desktop_resume_bindings (
+  bot TEXT NOT NULL,
+  hermes_session_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  resume_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'resumed')),
+  created_at INTEGER NOT NULL,
+  confirmed_at INTEGER,
+  PRIMARY KEY (bot, hermes_session_id),
+  UNIQUE (bot, session_id),
+  UNIQUE (bot, resume_id)
+) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS bot_native_messages (
   bot TEXT NOT NULL,
   session_id TEXT NOT NULL,
@@ -2452,6 +2467,77 @@ export class Storage {
       )
       .run(bot, sessionId, now);
     return sessionId;
+  }
+
+  /** Stage an explicit Hermes desktop adoption. This does NOT select the local chat: selection
+   * follows only the plugin's source/profile-checked confirmation event. A previously confirmed
+   * binding is deliberately re-staged with a fresh proof nonce: the plugin's raw-session mapping
+   * is process-local, so a later explicit adoption cannot trust an old confirmation after that
+   * plugin reconnects or restarts. */
+  stageNativeDesktopResume(bot: string, hermesSessionId: string, now: number): {
+    sessionId: string; resumeId: string; status: "pending" | "resumed";
+  } {
+    const prior = this.#db.prepare(
+      `SELECT session_id AS sessionId, resume_id AS resumeId, status
+       FROM bot_desktop_resume_bindings WHERE bot = ? AND hermes_session_id = ?`,
+    ).get(bot, hermesSessionId) as {
+      sessionId: string; resumeId: string; status: "pending" | "resumed";
+    } | undefined;
+    if (prior !== undefined) {
+      // Keep an in-flight proof stable so a retry observes the same command, but never treat a
+      // persisted positive proof as evidence about the currently attached plugin process.
+      if (prior.status === "pending") return prior;
+      const resumeId = randomUUID();
+      this.#db.prepare(
+        `UPDATE bot_desktop_resume_bindings
+         SET resume_id = ?, status = 'pending', confirmed_at = NULL
+         WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND status = 'resumed'`,
+      ).run(resumeId, bot, hermesSessionId, prior.sessionId);
+      return { sessionId: prior.sessionId, resumeId, status: "pending" };
+    }
+    const sessionId = this.#insertNativeBotSession(bot, now);
+    const resumeId = randomUUID();
+    this.#db.prepare(
+      `INSERT INTO bot_desktop_resume_bindings
+       (bot, hermes_session_id, session_id, resume_id, status, created_at, confirmed_at)
+       VALUES (?, ?, ?, ?, 'pending', ?, NULL)`,
+    ).run(bot, hermesSessionId, sessionId, resumeId, now);
+    return { sessionId, resumeId, status: "pending" };
+  }
+
+  /** Confirm an exact plugin-side switch. The full triple makes stale/replayed confirmations
+   * harmless and prevents a raw Hermes id from being rebound to a different local session. */
+  confirmNativeDesktopResume(input: {
+    bot: string; hermesSessionId: string; sessionId: string; resumeId: string; now: number;
+  }): { previousSessionId: string; alreadyResumed: boolean } | undefined {
+    const row = this.#db.prepare(
+      `SELECT status FROM bot_desktop_resume_bindings
+       WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND resume_id = ?`,
+    ).get(input.bot, input.hermesSessionId, input.sessionId, input.resumeId) as {
+      status: "pending" | "resumed";
+    } | undefined;
+    if (row === undefined) return undefined;
+    const current = this.nativeBotChat(input.bot, input.now);
+    if (row.status === "resumed") {
+      return { previousSessionId: current.sessionId, alreadyResumed: true };
+    }
+    if (current.activeTurnId !== undefined) return undefined;
+    this.#db.prepare(
+      `UPDATE bot_desktop_resume_bindings SET status = 'resumed', confirmed_at = ?
+       WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND resume_id = ? AND status = 'pending'`,
+    ).run(input.now, input.bot, input.hermesSessionId, input.sessionId, input.resumeId);
+    this.#db.prepare(
+      `INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)
+       ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, active_turn_id = NULL, updated_at = excluded.updated_at`,
+    ).run(input.bot, input.sessionId, input.now);
+    return { previousSessionId: current.sessionId, alreadyResumed: false };
+  }
+
+  nativeDesktopResumeAt(bot: string, hermesSessionId: string): number | undefined {
+    return (this.#db.prepare(
+      `SELECT confirmed_at AS confirmedAt FROM bot_desktop_resume_bindings
+       WHERE bot = ? AND hermes_session_id = ? AND status = 'resumed'`,
+    ).get(bot, hermesSessionId) as { confirmedAt: number | null } | undefined)?.confirmedAt ?? undefined;
   }
 
   nativeBotSessions(bot: string, limit: number): Array<{

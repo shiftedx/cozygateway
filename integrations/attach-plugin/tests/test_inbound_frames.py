@@ -55,12 +55,13 @@ class _FakeMessageEvent:
     assert the injected text, source addressing, and (absence of) a reply anchor.
     """
 
-    def __init__(self, text, source, message_id=None, media_urls=None, media_types=None):
+    def __init__(self, text, source, message_id=None, media_urls=None, media_types=None, metadata=None):
         self.text = text
         self.source = source
         self.message_id = message_id
         self.media_urls = media_urls or []
         self.media_types = media_types or []
+        self.metadata = metadata or {}
 
 
 class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):

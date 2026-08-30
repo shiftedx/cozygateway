@@ -29,6 +29,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("delegation"),
   Type.Literal("thinking"),
   Type.Literal("mobile_failure_details"),
+  Type.Literal("desktop_session_resume"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -106,6 +107,11 @@ const ResolveApprovalCommand = Type.Object({
 const ResolveClarifyCommand = Type.Object({
   kind: Type.Literal("resolve_clarify"), threadId: Id, turnId: Id, clarifyId: Id, optionId: Id,
 });
+/** A source-qualified handoff, not a turn. The gateway-owned thread id stays the attach lane;
+ * the plugin verifies and switches the profile-local raw Hermes id before acknowledging it. */
+const DesktopSessionResumeCommand = Type.Object({
+  kind: Type.Literal("desktop_session_resume"), threadId: Id, hermesSessionId: Id, resumeId: Id,
+});
 export const AttachV1MemoryRequestSchema = Type.Object({
   kind: Type.Literal("memory_request"), requestId: Id,
   operation: Type.Union([Type.Literal("overview"), Type.Literal("items"), Type.Literal("item"), Type.Literal("create"), Type.Literal("update"), Type.Literal("delete"), Type.Literal("graph")]),
@@ -140,14 +146,14 @@ const DiscardCommand = Type.Object({
   originalKind: Type.Union([
     Type.Literal("turn"), Type.Literal("steer"), Type.Literal("interrupt"),
     Type.Literal("resolve_approval"), Type.Literal("resolve_clarify"),
-    Type.Literal("delivery_receipt"),
+    Type.Literal("desktop_session_resume"), Type.Literal("delivery_receipt"),
   ]),
   reason: Type.String({ minLength: 1, maxLength: 512 }),
 });
 
 export const AttachV1CommandSchema = Type.Union([
   TurnCommand, SteerCommand, InterruptCommand, ResolveApprovalCommand, ResolveClarifyCommand,
-  DeliveryReceiptCommand, DiscardCommand,
+  DesktopSessionResumeCommand, DeliveryReceiptCommand, DiscardCommand,
 ]);
 export type AttachV1Command = Static<typeof AttachV1CommandSchema>;
 
@@ -277,6 +283,11 @@ const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1Med
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
 });
+/** Positive proof that the plugin switched this gateway-owned lane to the exact profile-local
+ * Hermes resume target. No title, transcript, tool data, or host path crosses this receipt. */
+const DesktopSessionResumedEvent = Type.Object({
+  kind: Type.Literal("desktop_session_resumed"), threadId: Id, hermesSessionId: Id, resumeId: Id,
+});
 export const AttachV1MemoryResultSchema = Type.Object({
   kind: Type.Literal("memory_result"), requestId: Id,
   status: Type.Union([Type.Literal("ok"), Type.Literal("conflict"), Type.Literal("not_found"), Type.Literal("invalid_request"), Type.Literal("unavailable")]),
@@ -346,6 +357,7 @@ export const AttachV1EventSchema = Type.Union([
   DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent, DelegationEvent,
   ThinkingEvent,
   ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, PresenceEvent,
+  DesktopSessionResumedEvent,
 ]);
 export type AttachV1Event = Static<typeof AttachV1EventSchema>;
 

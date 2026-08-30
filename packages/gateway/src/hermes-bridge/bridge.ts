@@ -4,6 +4,8 @@ import type {
   BotCreateRequest,
   BotCreateResponse,
   BotDeleteResponse,
+  BotDesktopHermesSession,
+  BotDesktopHermesResumeResponse,
   BotChatMessage,
   BotChatStateCause,
   BotMobileReceipt,
@@ -41,7 +43,11 @@ import {
 } from "./client.ts";
 import {
   sessionKind,
+  isDesktopHermesSession,
+  listBotSessions,
 } from "./sessions.ts";
+import { parseChatSnapshot } from "./chat-messages.ts";
+import { redactHostPaths } from "./photos.ts";
 import {
   botDisplayName,
   botHandle,
@@ -232,6 +238,10 @@ export interface BotControlSurface {
   ): Promise<BotModelProviderOAuthSession>;
   cancelModelProviderOAuth(name: string, provider: string, sessionId: string): Promise<void>;
   catalog(query: string): Promise<BotCatalog>;
+  /** Source-qualified discovery only. These ids are raw Hermes ids and never enter native Bot
+   * Mode session identity; the data plane asks for explicit adoption separately. */
+  desktopSessions(name: string): Promise<BotDesktopHermesSession[]>;
+  desktopSessionTranscript(name: string, hermesSessionId: string): Promise<BotChatMessage[]>;
   routines(name: string): Promise<BotRoutineList>;
   createRoutine(
     name: string,
@@ -327,6 +337,8 @@ export interface BotsSurface extends BotControlSurface {
     messageIds: readonly string[],
     deviceId: string,
   ): { recorded: number };
+  desktopSessions(name: string): Promise<BotDesktopHermesSession[]>;
+  resumeDesktopSession(name: string, hermesSessionId: string): Promise<BotDesktopHermesResumeResponse>;
 }
 
 export interface HermesBridgeOptions {
@@ -824,6 +836,44 @@ export class HermesBridge implements BotControlSurface {
       .finally(() => this.#catalogInflight.delete(query));
     this.#catalogInflight.set(query, run);
     return run;
+  }
+  async desktopSessions(name: string): Promise<BotDesktopHermesSession[]> {
+    await this.#assertBotKnown(name);
+    // Never project Dashboard text into this seam. A title/preview can contain a prompt, a host
+    // path, tool output, or a private desktop-only label. Source + opaque id + timestamps are
+    // sufficient for an explicit resume picker.
+    return (await listBotSessions(this.#client, name, 200))
+      .filter(isDesktopHermesSession)
+      .map((row) => {
+        const lastResumedAt = this.#storage.nativeDesktopResumeAt(name, row.id);
+        return {
+          source: "hermes_desktop" as const,
+          hermesSessionId: row.id,
+          // Do not forward a host-authored title: it can be a prompt, a path, or a private desktop
+          // label. The stable generic label still lets a client render an accessible picker row.
+          title: "Desktop session",
+          startedAt: row.startedAt,
+          lastActiveAt: row.lastActiveAt,
+          ...(lastResumedAt === undefined ? {} : { lastResumedAt }),
+        };
+      })
+      .sort((a, b) =>
+        b.lastActiveAt - a.lastActiveAt ||
+        b.startedAt - a.startedAt ||
+        a.hermesSessionId.localeCompare(b.hermesSessionId));
+  }
+  async desktopSessionTranscript(name: string, hermesSessionId: string): Promise<BotChatMessage[]> {
+    await this.#assertBotKnown(name);
+    const snapshot = parseChatSnapshot(
+      await this.#client.request("session.resume", { profile: name, session_id: hermesSessionId }),
+      hermesSessionId,
+    );
+    // parseChatSnapshot drops system/tool rows and Hermes media directives. Strip any remaining
+    // disk paths in ordinary rendered text as a defense-in-depth boundary before persistence.
+    return snapshot.messages.map((message) => ({
+      ...message,
+      text: redactHostPaths(message.text),
+    }));
   }
   async routines(name: string): Promise<BotRoutineList> {
     await this.#assertBotKnown(name);

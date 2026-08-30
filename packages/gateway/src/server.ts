@@ -7,6 +7,8 @@ import {
   APPROVALS_CAPABILITY_VERSION,
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
+  HERMES_DESKTOP_SESSIONS_CAPABILITY_ID,
+  HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
   MOBILE_NODE_CAPABILITY_ID,
   MOBILE_NODE_CAPABILITY_VERSION,
   GATEWAY_MANAGEMENT_CAPABILITY_ID,
@@ -57,7 +59,7 @@ import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
 
-export const GATEWAY_VERSION = "0.4.1";
+export const GATEWAY_VERSION = "0.4.2";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -179,6 +181,7 @@ export function gatewayInfoForConfig(config: GatewayConfig, management = false):
         ? {}
         : {
             [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
+            [HERMES_DESKTOP_SESSIONS_CAPABILITY_ID]: HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
             [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
             [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
           }),

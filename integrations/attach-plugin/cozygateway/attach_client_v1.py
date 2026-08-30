@@ -75,6 +75,7 @@ HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts",
     "delegation", "thinking", "mobile_failure_details",
+    "desktop_session_resume",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
@@ -138,6 +139,7 @@ class AttachV1ClientConfig:
     on_interrupt: Optional[Callable[[InterruptFrame], None]] = None
     on_approval: Optional[Callable[[Dict[str, Any]], None]] = None
     on_clarify: Optional[Callable[[Dict[str, Any]], None]] = None
+    on_desktop_resume: Optional[Callable[[Dict[str, Any]], None]] = None
     on_memory: Optional[Callable[[Dict[str, Any]], None]] = None
     on_ready: Optional[Callable[[], None]] = None
     connect_factory: Optional[Callable[..., Any]] = None
@@ -421,6 +423,21 @@ class AttachV1Client:
         await self._queue_event({
             "kind": "interrupted", "threadId": thread_id, "turnId": turn_id,
             "messageId": str(uuid.uuid4()),
+        })
+
+    async def send_desktop_session_resumed(
+        self, thread_id: str, hermes_session_id: str, resume_id: str,
+    ) -> None:
+        """Durable positive proof of an exact local profile session switch.
+
+        This is intentionally emitted only after `switch_session` returned the resolved raw id;
+        command ACK merely proves our spool accepted the request and cannot select a phone chat.
+        """
+        await self._queue_event({
+            "kind": "desktop_session_resumed",
+            "threadId": thread_id,
+            "hermesSessionId": hermes_session_id,
+            "resumeId": resume_id,
         })
 
     async def send_tool(self, thread_id: str, turn_id: str, call_id: str, name: str, status: str, detail: Optional[str] = None) -> None:
@@ -974,6 +991,8 @@ class AttachV1Client:
             handler, parsed = self._config.on_approval, command
         elif command.get("kind") == "resolve_clarify" and self._config.on_clarify is not None:
             handler, parsed = self._config.on_clarify, command
+        elif command.get("kind") == "desktop_session_resume" and self._config.on_desktop_resume is not None:
+            handler, parsed = self._config.on_desktop_resume, command
         elif command.get("kind") == "delivery_receipt":
             # Receipts have no handler callback: the durable record IS the effect. The ACK has
             # already been sent by the command-inbox machinery above.
@@ -1280,4 +1299,6 @@ def _event_capabilities(event: Dict[str, Any]) -> List[str]:
         return ["scheduled"] + (["media"] if event.get("mediaIds") else [])
     if kind == "presence":
         return []
+    if kind == "desktop_session_resumed":
+        return ["desktop_session_resume"]
     return ["draft"] + (["media"] if kind == "commit" and event.get("mediaIds") else [])

@@ -495,6 +495,25 @@ second request arriving while one is in flight is answered `unavailable` rather 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
 that exists but is not configured as a native identity must not fall through to Dashboard chat.
 
+## Hermes desktop session continuation
+
+`com.cozylabs.hermes-desktop-sessions: 1` is deliberately separate from Bot Mode. It exposes
+source-qualified TUI sessions without placing their raw Hermes ids in native session history:
+
+| Route | Response | Rule |
+| --- | --- | --- |
+| `GET /bots/:name/desktop-sessions` | `{ name, source: "hermes_desktop", sessions }` | Lists only Hermes `source: "tui"` conversation rows for that exact profile. Each row has `hermesSessionId`, `startedAt`, `lastActiveAt`, optional sanitized `title`, and optional `lastResumedAt`; no preview, transcript, tool row, media, host path, or private Dashboard metadata is exposed. |
+| `POST /bots/:name/desktop-sessions/:hermesSessionId/resume` | `202 BotDesktopHermesResumeResponse` | Explicit-only adoption. Normally waits briefly for a positive plugin confirmation and answers `status: "resumed"` + a distinct gateway `sessionId`; a bounded timeout answers `status: "pending"` with no session id. |
+
+The request re-lists the profile's eligible desktop rows, stages a new gateway-owned session id,
+and imports the selected `session.resume` snapshot through the existing rendered-role, compaction,
+media-directive, and path-redaction filters. Imported row ids are source-qualified and idempotent.
+The staged chat is not selected until the attached profile confirms it switched its stable attach
+lane to the exact profile-local Hermes target. A confirmation mismatch, a running lane, a foreign
+profile, a cron/routine/group/machine row, an unavailable capability, or any unproven switch fails
+closed. Normal subsequent sends keep the gateway session id as `threadId`; the plugin holds the
+private raw Hermes mapping and strict runner metadata proves it still targets that same context.
+
 ## Server frames
 
 All frames travel on the existing authenticated `/ws` and are members of the closed core

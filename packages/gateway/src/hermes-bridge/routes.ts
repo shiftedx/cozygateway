@@ -1629,6 +1629,37 @@ export function registerBotRoutes(
     }
   });
 
+  // Separately capability-gated desktop/TUI seam. It never extends the native `/sessions`
+  // history and it is not an implicit fallback: only this explicit action can request the
+  // plugin's exact, profile-local Hermes resume primitive.
+  app.get("/bots/:name/desktop-sessions", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      return c.json({
+        name: resolved.name,
+        source: "hermes_desktop" as const,
+        sessions: await chat.desktopSessions(resolved.name),
+      });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  app.post("/bots/:name/desktop-sessions/:hermesSessionId/resume", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const hermesSessionId = c.req.param("hermesSessionId") ?? "";
+    if (hermesSessionId.length === 0 || hermesSessionId.length > 256) {
+      return c.json(errorBody("invalid_request", "Hermes desktop session id is required"), 400);
+    }
+    try {
+      return c.json(await chat.resumeDesktopSession(resolved.name, hermesSessionId), 202);
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
   // Capability 19. Mint and adopt a fresh conversation without retiring the previous one. The
   // existing adoption frame is the cross-device reload signal, and the automatic pin written by
   // this action releases any capability-16 manual selection so follow-latest can resume.

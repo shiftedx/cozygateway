@@ -5,6 +5,11 @@ harness side of the gateway's attach-v1 protocol (`contract/attach-v1.md`). It d
 `/attach/v1` with durable replay, native Bot Mode events, media, approvals, structured
 clarification, and scheduled delivery. There is no legacy fallback.
 
+When both ends advertise `desktop_session_resume`, an explicit phone adoption can bind a
+gateway-owned conversation lane to one exact profile-local Hermes TUI session. The plugin verifies
+the raw id in that profile's session DB, switches the resident runner, evicts its cached agent, and
+confirms only then; it never treats a gateway `threadId` as a Hermes session id.
+
 Outbound-only: nothing listens on the agent host, so it works from behind NAT with no
 port forwarding.
 

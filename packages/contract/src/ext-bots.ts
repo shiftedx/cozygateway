@@ -157,6 +157,39 @@ export const BotNewSessionResponseSchema = Type.Object({
 });
 export type BotNewSessionResponse = Static<typeof BotNewSessionResponseSchema>;
 
+/** A desktop/TUI session discovered from the Hermes profile's own session index. This is
+ * deliberately NOT a Bot Mode session: `hermesSessionId` is meaningful only to Hermes and is
+ * never interchangeable with a gateway-owned `sessionId`. The gateway intentionally withholds
+ * titles, previews, transcripts, tool activity, paths, and any other desktop-private data. */
+export const BotDesktopHermesSessionSchema = Type.Object({
+  source: Type.Literal("hermes_desktop"),
+  hermesSessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  /** Sanitized, optional display label. Preview/transcript/tool data never appears in discovery. */
+  title: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  startedAt: Type.Integer({ minimum: 0 }),
+  lastActiveAt: Type.Integer({ minimum: 0 }),
+  lastResumedAt: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+export type BotDesktopHermesSession = Static<typeof BotDesktopHermesSessionSchema>;
+
+export const BotDesktopHermesSessionsResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  source: Type.Literal("hermes_desktop"),
+  sessions: Type.Array(BotDesktopHermesSessionSchema, { maxItems: 200 }),
+}, { additionalProperties: false });
+export type BotDesktopHermesSessionsResponse = Static<typeof BotDesktopHermesSessionsResponseSchema>;
+
+/** An explicit desktop adoption. `pending` is not an adopted chat: no gateway session is selected
+ * until the attached Hermes process confirms it switched the exact profile-local raw id. */
+export const BotDesktopHermesResumeResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  source: Type.Literal("hermes_desktop"),
+  hermesSessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  status: Type.Union([Type.Literal("pending"), Type.Literal("resumed")]),
+  sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+}, { additionalProperties: false });
+export type BotDesktopHermesResumeResponse = Static<typeof BotDesktopHermesResumeResponseSchema>;
+
 /** Full-replace roster snapshot. Sent whenever the bridge's cached roster changes. */
 export const BotRosterFrameSchema = Type.Object({
   type: Type.Literal("bot_roster"),
@@ -1474,6 +1507,11 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    `>= 32`. An out-of-range value clamps into `0...blocks.length`; it never drops the
  *    attachment. */
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
+/** Separately versioned because Hermes desktop discovery/adoption is neither a Dashboard fallback
+ * nor native Bot Mode history. A client must gate this picker and its resume action on this id,
+ * never on a later scalar value of `com.cozylabs.bots`. */
+export const HERMES_DESKTOP_SESSIONS_CAPABILITY_ID = "com.cozylabs.hermes-desktop-sessions";
+export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 1;
 /** Reserved future A2A inbox seam. This is the sole future advertisement for the withdrawn
  * surface and has no version until Hermes exposes durable structured A2A identity, delivery/reply
  * metadata, and bounded replay. It is separate from `com.cozylabs.bots` because no later value

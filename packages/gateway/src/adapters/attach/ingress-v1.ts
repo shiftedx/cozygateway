@@ -50,7 +50,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts", "delegation", "thinking", "mobile_failure_details"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts", "delegation", "thinking", "mobile_failure_details", "desktop_session_resume"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -488,6 +488,19 @@ export class AttachV1Ingress implements TurnEndpoint {
     return this.#enqueue(agentId, { kind: "interrupt", ...input });
   }
 
+  /** Enqueue an explicit desktop adoption. The idempotency key is the gateway-owned resume id;
+   * command ACK is transport-only, while the later `desktop_session_resumed` event is the sole
+   * proof that the plugin switched the exact profile-local Hermes context. */
+  sendNativeDesktopResume(agentId: string, input: {
+    threadId: string; hermesSessionId: string; resumeId: string;
+  }): boolean {
+    return this.#enqueue(
+      agentId,
+      { kind: "desktop_session_resume", ...input },
+      `desktop-resume:${agentId}:${input.resumeId}`,
+    );
+  }
+
   sendClarifyResolution(agentId: string, input: { threadId: string; turnId: string; clarifyId: string; optionId: string }, commandId?: string): boolean {
     return this.#enqueue(agentId, { kind: "resolve_clarify", ...input }, commandId);
   }
@@ -840,6 +853,7 @@ function commandCapabilities(command: AttachV1Command): AttachV1Capability[] {
   if (command.kind === "delivery_receipt") return ["delivery_receipts"];
   if (command.kind === "resolve_approval") return ["approvals"];
   if (command.kind === "resolve_clarify") return ["clarify"];
+  if (command.kind === "desktop_session_resume") return ["desktop_session_resume"];
   if (command.kind === "turn" && (command.mediaIds?.length ?? 0) > 0) return ["draft", "media"];
   return ["draft"];
 }
