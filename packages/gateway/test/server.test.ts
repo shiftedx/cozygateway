@@ -6,7 +6,12 @@ import { join } from "node:path";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MOBILE_NODE_CAPABILITY_VERSION, type GatewayInfo, type ServerFrame } from "cozygateway-contract";
+import {
+  HARNESS_UPDATE_CAPABILITY_VERSION,
+  MOBILE_NODE_CAPABILITY_VERSION,
+  type GatewayInfo,
+  type ServerFrame,
+} from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
@@ -195,6 +200,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.bots": expect.any(Number),
         "com.cozylabs.hermes-desktop-sessions": 2,
         "com.cozylabs.harness-settings": 1,
+        "com.cozylabs.harness-update": HARNESS_UPDATE_CAPABILITY_VERSION,
         "com.cozylabs.mobile-node": MOBILE_NODE_CAPABILITY_VERSION,
       });
 

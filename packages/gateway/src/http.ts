@@ -19,6 +19,7 @@ import {
   SendMessageRequestSchema,
   assertValid,
   GatewaySettingsSchema,
+  HarnessUpdateStartRequestSchema,
   ModelProviderFieldUpdateSchema,
   ModelProviderOAuthCodeSchema,
 } from "cozygateway-contract";
@@ -65,6 +66,12 @@ import {
   WorkspaceTooLarge,
   WorkspaceUnavailable,
 } from "./hermes-bridge/workspace.ts";
+import {
+  GatewayHarnessUpdates,
+  HarnessUpdateBlocked,
+  HarnessUpdateStale,
+  HarnessUpdateUnavailable,
+} from "./hermes-bridge/update.ts";
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
@@ -165,6 +172,8 @@ export interface AppDeps {
   harnessSettings?: GatewayHarnessSettings;
   /** Present only after Hermes proved a non-null immutable managed-files root. */
   harnessWorkspace?: GatewayHarnessWorkspace;
+  /** Harness-level Hermes update normalization. Never exposes action logs or full receipts. */
+  harnessUpdates?: GatewayHarnessUpdates;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
@@ -371,6 +380,50 @@ export function createApp(deps: AppDeps): Hono<Env> {
     if (deps.harnessSettings === undefined)
       return c.json(errorBody("invalid_request", "agent harness settings are unavailable"), 404);
     return c.json(deps.harnessSettings.catalog());
+  });
+
+  const harnessUpdateFailure = (c: Context<Env>, error: unknown) => {
+    if (error instanceof HarnessUpdateStale)
+      return c.json({
+        ...errorBody("invalid_request", error.message),
+        currentVersion: error.currentVersion,
+      }, 409);
+    if (error instanceof HarnessUpdateBlocked)
+      return c.json({
+        ...errorBody("invalid_request", error.message),
+        guidance: error.guidance,
+      }, 409);
+    if (error instanceof HarnessSettingsInvalid)
+      return c.json(errorBody("invalid_request", error.message), 404);
+    if (error instanceof HarnessUpdateUnavailable)
+      return c.json(errorBody("backend_unavailable", error.message), 503);
+    if (error instanceof ContractViolation)
+      return c.json(errorBody("invalid_request", error.message), 400);
+    throw error;
+  };
+
+  app.get("/gateway/harnesses/:harnessId/update/check", requireDevice, async (c) => {
+    try {
+      if (deps.harnessUpdates === undefined) throw new HarnessSettingsInvalid("agent harness updates are unavailable");
+      return c.json(await deps.harnessUpdates.adapter(c.req.param("harnessId")).check());
+    } catch (error) { return harnessUpdateFailure(c, error); }
+  });
+
+  app.post("/gateway/harnesses/:harnessId/update/start", requireDevice, async (c) => {
+    try {
+      if (deps.harnessUpdates === undefined) throw new HarnessSettingsInvalid("agent harness updates are unavailable");
+      const input = assertValid(HarnessUpdateStartRequestSchema, await readBody(c));
+      const body = await deps.harnessUpdates.adapter(c.req.param("harnessId"))
+        .start(input.expectedCurrentVersion);
+      return c.json(body, 202);
+    } catch (error) { return harnessUpdateFailure(c, error); }
+  });
+
+  app.get("/gateway/harnesses/:harnessId/update/status", requireDevice, async (c) => {
+    try {
+      if (deps.harnessUpdates === undefined) throw new HarnessSettingsInvalid("agent harness updates are unavailable");
+      return c.json(await deps.harnessUpdates.adapter(c.req.param("harnessId")).status());
+    } catch (error) { return harnessUpdateFailure(c, error); }
   });
 
   const workspaceFailure = (c: Context<Env>, error: unknown) => {

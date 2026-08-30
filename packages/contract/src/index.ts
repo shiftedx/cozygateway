@@ -15,3 +15,4 @@ export * from "./gateway-management.ts";
 export * from "./model-provider-setup.ts";
 export * from "./harness-settings.ts";
 export * from "./harness-workspace.ts";
+export * from "./harness-update.ts";

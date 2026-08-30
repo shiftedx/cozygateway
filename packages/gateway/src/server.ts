@@ -17,6 +17,8 @@ import {
   HARNESS_SETTINGS_CAPABILITY_VERSION,
   HARNESS_WORKSPACE_CAPABILITY_ID,
   HARNESS_WORKSPACE_CAPABILITY_VERSION,
+  HARNESS_UPDATE_CAPABILITY_ID,
+  HARNESS_UPDATE_CAPABILITY_VERSION,
   type GatewayInfo,
   type ServerFrame,
 } from "cozygateway-contract";
@@ -61,6 +63,7 @@ import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
 import { GatewayHarnessWorkspace, discoverHermesWorkspace } from "./hermes-bridge/workspace.ts";
+import { GatewayHarnessUpdates, HermesHarnessUpdateAdapter } from "./hermes-bridge/update.ts";
 
 export const GATEWAY_VERSION = "0.4.3";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
@@ -191,6 +194,7 @@ export function gatewayInfoForConfig(
             [HERMES_DESKTOP_SESSIONS_CAPABILITY_ID]: HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
             [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
             [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
+            [HARNESS_UPDATE_CAPABILITY_ID]: HARNESS_UPDATE_CAPABILITY_VERSION,
           }),
       ...(config.pushRelayUrl === undefined
         ? {}
@@ -349,6 +353,10 @@ export async function startGateway(
       ));
   const harnessSettings = new GatewayHarnessSettings(
     harnessModelAdapters,
+  );
+  const harnessUpdates = new GatewayHarnessUpdates(
+    clientMembers.map(({ client }, index) =>
+      new HermesHarnessUpdateAdapter(client, harnessModelAdapters[index]!.descriptor())),
   );
 
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
@@ -569,6 +577,7 @@ export async function startGateway(
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
     ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
     harnessSettings,
+    harnessUpdates,
     ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),

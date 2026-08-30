@@ -1,0 +1,37 @@
+{
+  "capability": {
+    "id": "com.cozylabs.harness-update",
+    "version": 1
+  },
+  "check": {
+    "harnessId": "home",
+    "currentVersion": "0.20.3",
+    "installMethod": "git",
+    "behind": 2,
+    "updateAvailable": true,
+    "canApply": true,
+    "guidance": null,
+    "checkedAt": 1700000000000
+  },
+  "startRequest": {
+    "expectedCurrentVersion": "0.20.3"
+  },
+  "start": {
+    "harnessId": "home",
+    "state": "running",
+    "actionId": "0123456789abcdef0123456789abcdef",
+    "coalesced": false,
+    "pollAfterMs": 1000
+  },
+  "status": {
+    "harnessId": "home",
+    "state": "success",
+    "actionId": "0123456789abcdef0123456789abcdef",
+    "receipt": {
+      "outcome": "success",
+      "startedAt": 1700000000000,
+      "finishedAt": 1700000001000,
+      "postVersion": "0.20.4"
+    }
+  }
+}
