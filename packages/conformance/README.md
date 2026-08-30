@@ -28,6 +28,11 @@ one fake `com.cozylabs.*` vendor capability travels end to end (see "Running the
 gateway's own conformance" below); that check is specific to the reference gateway's fixture and
 intentionally lives outside the portable suite.
 
+`test/fixtures/harness-workspace-v1.json` is the client fixture for the optional locked-workspace
+extension. It pins the capability id/version, root-relative list projection, and the required safe
+headers for a partial download without requiring every core-conformance target to expose Hermes
+managed files.
+
 ## The reference Hermes/attach echo peer
 
 The suite drives a Hermes profile through an attach-v1 peer, whose observable semantics are frozen

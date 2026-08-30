@@ -54,6 +54,17 @@ import {
 } from "./hermes-bridge/assistant-media.ts";
 
 import { attachmentDisposition, safeFilename } from "./hermes-bridge/documents.ts";
+import {
+  GatewayHarnessWorkspace,
+  WorkspaceBusy,
+  WorkspaceForbidden,
+  WorkspaceInvalid,
+  WorkspaceNotFound,
+  WorkspaceRangeInvalid,
+  WorkspaceRateLimited,
+  WorkspaceTooLarge,
+  WorkspaceUnavailable,
+} from "./hermes-bridge/workspace.ts";
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
@@ -152,6 +163,8 @@ export interface AppDeps {
   };
   /** Gateway-owned inventory of agent harnesses and their harness-native model settings. */
   harnessSettings?: GatewayHarnessSettings;
+  /** Present only after Hermes proved a non-null immutable managed-files root. */
+  harnessWorkspace?: GatewayHarnessWorkspace;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
@@ -358,6 +371,83 @@ export function createApp(deps: AppDeps): Hono<Env> {
     if (deps.harnessSettings === undefined)
       return c.json(errorBody("invalid_request", "agent harness settings are unavailable"), 404);
     return c.json(deps.harnessSettings.catalog());
+  });
+
+  const workspaceFailure = (c: Context<Env>, error: unknown) => {
+    if (error instanceof WorkspaceRangeInvalid)
+      return new Response(null, {
+        status: 416,
+        headers: {
+          "accept-ranges": "bytes",
+          ...(error.size === undefined ? {} : { "content-range": `bytes */${error.size}` }),
+        },
+      });
+    if (error instanceof WorkspaceInvalid)
+      return c.json(errorBody("invalid_request", "workspace path or request is invalid"), 400);
+    if (error instanceof WorkspaceForbidden)
+      return c.json(errorBody("not_found", "workspace item is not available"), 403);
+    if (error instanceof WorkspaceNotFound)
+      return c.json(errorBody("not_found", "workspace item was not found"), 404);
+    if (error instanceof WorkspaceTooLarge)
+      return c.json(errorBody("invalid_request", "workspace result is over its configured bound"), 413);
+    if (error instanceof WorkspaceRateLimited)
+      return c.json(
+        errorBody("invalid_request", "too many workspace requests; try again later"),
+        429,
+        { "retry-after": String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))) },
+      );
+    if (error instanceof WorkspaceBusy)
+      return c.json(
+        errorBody("backend_unavailable", "workspace downloads are busy; try again later"),
+        503,
+        { "retry-after": "1" },
+      );
+    if (error instanceof WorkspaceUnavailable)
+      return c.json(errorBody("backend_unavailable", "workspace upstream is unavailable"), 503);
+    throw error;
+  };
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/workspace", requireDevice, async (c) => {
+    try {
+      if (deps.harnessWorkspace === undefined)
+        throw new WorkspaceNotFound("workspace capability unavailable");
+      return c.json(await deps.harnessWorkspace.list(
+        c.req.param("harnessId"),
+        c.req.param("scopeId"),
+        c.req.query("path"),
+        c.get("deviceId"),
+      ));
+    } catch (error) { return workspaceFailure(c, error); }
+  });
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/workspace/download", requireDevice, async (c) => {
+    try {
+      if (deps.harnessWorkspace === undefined)
+        throw new WorkspaceNotFound("workspace capability unavailable");
+      const download = await deps.harnessWorkspace.download(
+        c.req.param("harnessId"),
+        c.req.param("scopeId"),
+        c.req.query("path"),
+        c.req.header("range"),
+        c.get("deviceId"),
+        c.req.raw.signal,
+      );
+      const length = download.size === 0 ? 0 : download.end - download.start + 1;
+      return new Response(download.body, {
+        status: download.status,
+        headers: {
+          "content-type": download.mimeType,
+          "content-length": String(length),
+          "accept-ranges": "bytes",
+          "cache-control": "private, no-store",
+          "x-content-type-options": "nosniff",
+          "content-disposition": attachmentDisposition(download.filename),
+          ...(download.status === 206
+            ? { "content-range": `bytes ${download.start}-${download.end}/${download.size}` }
+            : {}),
+        },
+      });
+    } catch (error) { return workspaceFailure(c, error); }
   });
 
   const harnessFailure = (c: Context<Env>, error: unknown) => {
