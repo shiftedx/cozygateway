@@ -573,9 +573,11 @@ const { spawn } = childProcess;
 const hermesArgs = [basename(process.argv[1] || ''), ...process.argv.slice(2)];
 if (hermesArgs[0] === 'dashboard') {
   const windowsLauncher = process.platform === 'win32';
-  const profileArgs = windowsLauncher ? ['-p', 'default'] : [];
-  const expectedArgs = ['dashboard', ...profileArgs, '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
-  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, ...expectedArgs];
+  // gateway-live is intentionally generated with service platform Darwin,
+  // even when this fixture itself runs on Windows.
+  const expectedLauncherArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const descendantProfileArgs = windowsLauncher ? ['-p', 'default'] : [];
+  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
   const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
   const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
@@ -586,7 +588,7 @@ if (hermesArgs[0] === 'dashboard') {
     tokenMatches: process.env.HERMES_DASHBOARD_SESSION_TOKEN === expectedToken,
     homeMatches,
   }) + '\n');
-  if (JSON.stringify(hermesArgs) !== JSON.stringify(expectedArgs)) process.exit(41);
+  if (JSON.stringify(hermesArgs) !== JSON.stringify(expectedLauncherArgs)) process.exit(41);
   if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
   if (!homeMatches) process.exit(43);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
@@ -664,11 +666,11 @@ fi
 "$real_node" - "$tmp/hermes-stub-trace" "$mock_dashboard_port" <<'NODE'
 const { readFileSync } = require('node:fs');
 const trace = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-const profileArgs = process.platform === 'win32' ? ['-p', 'default'] : [];
-const expectedArgs = ['dashboard', ...profileArgs, '--host', '127.0.0.1', '--port', process.argv[3], '--no-open', '--skip-build'];
-const expectedDescendantArgs = [trace.descendantArgs[0], ...expectedArgs];
-if (JSON.stringify(trace.args) !== JSON.stringify(expectedArgs)) {
-  console.error(`Hermes launcher fixture argv was ${JSON.stringify(trace.args)}; expected ${JSON.stringify(expectedArgs)}`);
+const expectedLauncherArgs = ['dashboard', '--host', '127.0.0.1', '--port', process.argv[3], '--no-open', '--skip-build'];
+const descendantProfileArgs = process.platform === 'win32' ? ['-p', 'default'] : [];
+const expectedDescendantArgs = [trace.descendantArgs[0], 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', process.argv[3], '--no-open', '--skip-build'];
+if (JSON.stringify(trace.args) !== JSON.stringify(expectedLauncherArgs)) {
+  console.error(`Hermes launcher fixture argv was ${JSON.stringify(trace.args)}; expected ${JSON.stringify(expectedLauncherArgs)}`);
   process.exit(1);
 }
 if (JSON.stringify(trace.descendantArgs) !== JSON.stringify(expectedDescendantArgs)) {
