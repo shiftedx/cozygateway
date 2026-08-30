@@ -136,10 +136,372 @@ function Invoke-Bootstrap {
     }
 }
 
+function ConvertTo-BashSingleQuotedLiteral {
+    param([string] $Value)
+    $embeddedApostrophe = "'" + '"' + "'" + '"' + "'"
+    return "'" + $Value.Replace("'", $embeddedApostrophe) + "'"
+}
+
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param([string] $Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function New-FakeUserNetTCPIPModule {
+    param([string] $MarkerPath)
+    $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    Assert-True (-not [string]::IsNullOrWhiteSpace($documents)) 'Windows must expose the current user Documents directory for the PSModulePath regression test'
+    $windowsPowerShellRoot = Join-Path $documents 'WindowsPowerShell'
+    $modulesRoot = Join-Path $windowsPowerShellRoot 'Modules'
+    $moduleRoot = Join-Path $modulesRoot 'NetTCPIP'
+    Assert-True (-not (Test-Path -LiteralPath $moduleRoot)) "PSModulePath regression test refuses to replace an existing user NetTCPIP module at $moduleRoot"
+    $module = [pscustomobject]@{
+        ModuleRoot = $moduleRoot
+        ModulesRoot = $modulesRoot
+        WindowsPowerShellRoot = $windowsPowerShellRoot
+        OwnsModuleRoot = $false
+        CreatedModulesRoot = $false
+        CreatedWindowsPowerShellRoot = $false
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $windowsPowerShellRoot)) {
+            try {
+                New-Item -ItemType Directory -Path $windowsPowerShellRoot -ErrorAction Stop | Out-Null
+                $module.CreatedWindowsPowerShellRoot = $true
+            } catch {
+                if (-not (Test-Path -LiteralPath $windowsPowerShellRoot -PathType Container)) { throw }
+            }
+        }
+        if (-not (Test-Path -LiteralPath $modulesRoot)) {
+            try {
+                New-Item -ItemType Directory -Path $modulesRoot -ErrorAction Stop | Out-Null
+                $module.CreatedModulesRoot = $true
+            } catch {
+                if (-not (Test-Path -LiteralPath $modulesRoot -PathType Container)) { throw }
+            }
+        }
+        New-Item -ItemType Directory -Path $moduleRoot -ErrorAction Stop | Out-Null
+        $module.OwnsModuleRoot = $true
+        $markerLiteral = ConvertTo-PowerShellSingleQuotedLiteral $MarkerPath
+        $body = @"
+[IO.File]::AppendAllText($markerLiteral, "fake-user-NetTCPIP-executed``r``n")
+function Get-NetTCPConnection {
+    [CmdletBinding()]
+    param([string]`$State)
+    return @()
+}
+Export-ModuleMember -Function Get-NetTCPConnection
+"@
+        Write-Utf8NoBom (Join-Path $moduleRoot 'NetTCPIP.psm1') $body
+        return $module
+    } catch {
+        Remove-FakeUserNetTCPIPModule $module
+        throw
+    }
+}
+
+function Remove-FakeUserNetTCPIPModule {
+    param($Module)
+    if ($null -eq $Module) { return }
+    if ($Module.OwnsModuleRoot -and (Test-Path -LiteralPath $Module.ModuleRoot)) {
+        Remove-Item -LiteralPath $Module.ModuleRoot -Recurse -Force -ErrorAction Stop
+    }
+    if ($Module.OwnsModuleRoot -and (Test-Path -LiteralPath $Module.ModuleRoot)) { throw "failed to remove temporary user NetTCPIP module: $($Module.ModuleRoot)" }
+    if ($Module.CreatedModulesRoot -and (Test-Path -LiteralPath $Module.ModulesRoot) -and @((Get-ChildItem -LiteralPath $Module.ModulesRoot -Force)).Count -eq 0) {
+        Remove-Item -LiteralPath $Module.ModulesRoot -Force -ErrorAction Stop
+    }
+    if ($Module.CreatedWindowsPowerShellRoot -and (Test-Path -LiteralPath $Module.WindowsPowerShellRoot) -and @((Get-ChildItem -LiteralPath $Module.WindowsPowerShellRoot -Force)).Count -eq 0) {
+        Remove-Item -LiteralPath $Module.WindowsPowerShellRoot -Force -ErrorAction Stop
+    }
+}
+
+function Invoke-OwnerHelperScript {
+    param([string] $ScriptPath, [int] $Port)
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ScriptPath 'C:\Expected Hermes Root' 'C:\Expected Hermes Root\bin\hermes.exe' 'C:\Expected Hermes Root\bin\hermes.exe' $Port 2>&1
+        return @{ ExitCode = $LASTEXITCODE; Output = ($output -join "`n") }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function New-FakePowerShell {
+    param([string] $Path, [string] $EventLog)
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    $className = 'FakePowerShell' + [guid]::NewGuid().ToString('N')
+    $eventLiteral = $EventLog.Replace('"', '""')
+    $source = @"
+using System;
+using System.IO;
+using System.Text;
+public static class $className {
+    public static int Main(string[] args) {
+        File.AppendAllText(@"$eventLiteral", Convert.ToBase64String(Encoding.UTF8.GetBytes(string.Join("\0", args))) + Environment.NewLine);
+        string elevationHelper = Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_ELEVATION_HELPER");
+        bool elevated = Array.IndexOf(args, elevationHelper) >= 0;
+        string code = Environment.GetEnvironmentVariable(elevated ? "COZYGATEWAY_TEST_ELEVATED_CODE" : "COZYGATEWAY_TEST_NORMAL_CODE");
+        return Int32.Parse(code);
+    }
+}
+"@
+    Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $Path -OutputType ConsoleApplication
+}
+
+function Read-FakePowerShellCalls {
+    param([string] $Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    return @(Get-Content -LiteralPath $Path | ForEach-Object {
+        ,([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)).Split([char]0))
+    })
+}
+
+function Read-ElevationChildCapture {
+    param([string] $Path)
+    $values = @{}
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        $separatorIndex = $line.IndexOf('=')
+        $name = $line.Substring(0, $separatorIndex)
+        $encodedValue = $line.Substring($separatorIndex + 1)
+        if ($encodedValue -eq '<null>') {
+            $values[$name] = $null
+        } else {
+            try { $values[$name] = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedValue)) }
+            catch { throw "invalid child capture value for $name`: $encodedValue" }
+        }
+    }
+    $extraArguments = @()
+    if ([int]$values.ExtraArgumentCount -gt 0) { $extraArguments = @(1..([int]$values.ExtraArgumentCount)) }
+    return [pscustomobject]@{
+        ExpectedRoot = $values.ExpectedRoot
+        ExpectedHermes = $values.ExpectedHermes
+        ExpectedLauncher = $values.ExpectedLauncher
+        ExpectedPort = [int]$values.ExpectedPort
+        ElevatedChild = $values.ElevatedChild -eq 'True'
+        ExtraArguments = $extraArguments
+        DashboardSessionToken = $values.DashboardSessionToken
+        ProviderApiKey = $values.ProviderApiKey
+        ArbitrarySecret = $values.ArbitrarySecret
+        PathValue = $values.PathValue
+        PSHomeValue = $values.PSHomeValue
+        PSModulePathValue = $values.PSModulePathValue
+        SystemRootValue = $values.SystemRootValue
+        WindirValue = $values.WindirValue
+        ComSpecValue = $values.ComSpecValue
+        TempValue = $values.TempValue
+        TmpValue = $values.TmpValue
+        BoundarySentinel = $values.BoundarySentinel
+        NetTCPIPModulePath = $values.NetTCPIPModulePath
+        CimCmdletsModuleBase = $values.CimCmdletsModuleBase
+        CimCmdletsAssemblyLocation = $values.CimCmdletsAssemblyLocation
+    }
+}
+
+function Invoke-DashboardStopHarness {
+    param(
+        [string] $FunctionText,
+        [string] $Bash,
+        [string] $FakePowerShellDirectory,
+        [string] $CallLog,
+        [string] $ScriptPath,
+        [hashtable] $Paths,
+        [int] $NormalCode,
+        [int] $ElevatedCode
+    )
+    $script = @"
+#!/usr/bin/env bash
+set -euo pipefail
+say() { printf '%s\n' "`$*"; }
+die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+to_windows_path() { printf '%s' "`$1"; }
+HERMES_ROOT=$(ConvertTo-BashSingleQuotedLiteral $Paths.Root)
+HERMES_RESOLVED=$(ConvertTo-BashSingleQuotedLiteral $Paths.Hermes)
+DASHBOARD_OWNER_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.Helper)
+DASHBOARD_ELEVATION_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.ElevationHelper)
+DASHBOARD_RUNAS_PS1=$(ConvertTo-BashSingleQuotedLiteral $Paths.RunAsHelper)
+DASHBOARD_PORT=9119
+$FunctionText
+stop_stubborn_windows_dashboard
+printf 'continued\n'
+"@
+    Write-Utf8NoBom $ScriptPath $script
+    Remove-Item -LiteralPath $CallLog -Force -ErrorAction SilentlyContinue
+    $keys = @('PATH', 'COZYGATEWAY_TEST_NORMAL_CODE', 'COZYGATEWAY_TEST_ELEVATED_CODE', 'COZYGATEWAY_TEST_ELEVATION_HELPER', 'DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY')
+    $old = @{}
+    foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
+    try {
+        $env:PATH = "$FakePowerShellDirectory;$env:PATH"
+        $env:COZYGATEWAY_TEST_NORMAL_CODE = [string]$NormalCode
+        $env:COZYGATEWAY_TEST_ELEVATED_CODE = [string]$ElevatedCode
+        $env:COZYGATEWAY_TEST_ELEVATION_HELPER = $Paths.ElevationHelper
+        $env:DASHBOARD_SESSION_TOKEN = 'task-2-secret-token'
+        $env:PROVIDER_API_KEY = 'task-2-provider-secret'
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $output = & $Bash $ScriptPath 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousPreference
+        return @{ ExitCode = $exitCode; Output = ($output -join "`n"); Calls = @(Read-FakePowerShellCalls $CallLog) }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, $old[$key], 'Process') }
+    }
+}
+
+function Invoke-ElevationWrapperHarness {
+    param(
+        [string] $Wrapper,
+        [string] $Harness,
+        [string] $CapturePath,
+        [string] $ChildCapturePath,
+        [hashtable] $Paths,
+        [int] $ChildCode,
+        [switch] $Cancel
+    )
+    $startCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $CapturePath
+    $resultPath = $Harness + '.result.xml'
+    $resultPathLiteral = ConvertTo-PowerShellSingleQuotedLiteral $resultPath
+    $cancelLiteral = if ($Cancel) { '$true' } else { '$false' }
+    $childCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $ChildCapturePath
+    $poisonPrefix = Join-Path (Split-Path -Parent $Harness) 'poisoned-installer-environment'
+    $poisonPrefixLiteral = ConvertTo-PowerShellSingleQuotedLiteral $poisonPrefix
+    $childBody = @'
+$ExpectedRoot = [string]$args[0]
+$ExpectedHermes = [string]$args[1]
+$ExpectedLauncher = [string]$args[2]
+$ExpectedPort = [int]$args[3]
+$ElevatedChild = [string]$args[4] -ceq '-ElevatedChild'
+$extraArgumentCount = [Math]::Max(0, $args.Count - 5)
+$null = Get-NetTCPConnection -State Listen -ErrorAction Stop
+$null = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID) -ErrorAction Stop
+$netTCPIPCommand = Get-Command Get-NetTCPConnection -CommandType Function,Cmdlet -ErrorAction Stop
+$cimCmdletsCommand = Get-Command Get-CimInstance -CommandType Function,Cmdlet -ErrorAction Stop
+function ConvertTo-CaptureValue {
+    param($Value)
+    if ($null -eq $Value) { return '<null>' }
+    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Value))
+}
+$captureLines = @(
+    ('ExpectedRoot=' + (ConvertTo-CaptureValue $ExpectedRoot))
+    ('ExpectedHermes=' + (ConvertTo-CaptureValue $ExpectedHermes))
+    ('ExpectedLauncher=' + (ConvertTo-CaptureValue $ExpectedLauncher))
+    ('ExpectedPort=' + (ConvertTo-CaptureValue ([string]$ExpectedPort)))
+    ('ElevatedChild=' + (ConvertTo-CaptureValue ([string]$ElevatedChild)))
+    ('ExtraArgumentCount=' + (ConvertTo-CaptureValue ([string]$extraArgumentCount)))
+    ('DashboardSessionToken=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('DASHBOARD_SESSION_TOKEN', 'Process'))))
+    ('ProviderApiKey=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PROVIDER_API_KEY', 'Process'))))
+    ('ArbitrarySecret=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TASK2_REVIEW_ARBITRARY_SECRET', 'Process'))))
+    ('PathValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PATH', 'Process'))))
+    ('PSHomeValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PSHOME', 'Process'))))
+    ('PSModulePathValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('PSModulePath', 'Process'))))
+    ('SystemRootValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('SystemRoot', 'Process'))))
+    ('WindirValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('WINDIR', 'Process'))))
+    ('ComSpecValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('COMSPEC', 'Process'))))
+    ('TempValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TEMP', 'Process'))))
+    ('TmpValue=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('TMP', 'Process'))))
+    ('BoundarySentinel=' + (ConvertTo-CaptureValue ([Environment]::GetEnvironmentVariable('COZYGATEWAY_UAC_BOUNDARY_SENTINEL', 'Process'))))
+    ('NetTCPIPModulePath=' + (ConvertTo-CaptureValue $netTCPIPCommand.Module.Path))
+    ('CimCmdletsModuleBase=' + (ConvertTo-CaptureValue $cimCmdletsCommand.Module.ModuleBase))
+    ('CimCmdletsAssemblyLocation=' + (ConvertTo-CaptureValue $cimCmdletsCommand.ImplementingType.Assembly.Location))
+)
+[IO.File]::WriteAllLines(__CHILD_CAPTURE__, [string[]]$captureLines, [Text.UTF8Encoding]::new($false))
+exit __CHILD_CODE__
+'@
+    $childBody = $childBody.Replace('__CHILD_CAPTURE__', $childCaptureLiteral).Replace('__CHILD_CODE__', [string]$ChildCode)
+    Write-Utf8NoBom $Paths.Helper $childBody
+    $harnessBody = @'
+param([string]$Wrapper, [string]$Root, [string]$Hermes, [string]$Launcher, [int]$Port, [string]$Helper)
+function Get-ProcessEnvironment {
+    $snapshot = @{}
+    foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
+        $snapshot[[string]$entry.Key] = [string]$entry.Value
+    }
+    return $snapshot
+}
+function Start-Process {
+    param([string]$FilePath, [string]$WorkingDirectory, [string]$Verb, [switch]$Wait, [switch]$PassThru, [switch]$UseNewEnvironment, [string[]]$ArgumentList)
+    $script:StartCount++
+    [pscustomobject]@{
+        Count = $script:StartCount
+        FilePath = $FilePath
+        WorkingDirectory = $WorkingDirectory
+        Verb = $Verb
+        Wait = $Wait.IsPresent
+        PassThru = $PassThru.IsPresent
+        UseNewEnvironment = $UseNewEnvironment.IsPresent
+        ArgumentList = @($ArgumentList)
+        Environment = Get-ProcessEnvironment
+    } | Export-Clixml -LiteralPath __START_CAPTURE__
+    if (__CANCEL__) { throw 'The operation was canceled by the user.' }
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $FilePath
+    $info.WorkingDirectory = $WorkingDirectory
+    $info.Arguments = $ArgumentList -join ' '
+    $info.UseShellExecute = $false
+    $process = [Diagnostics.Process]::Start($info)
+    $process.WaitForExit()
+    return [pscustomobject]@{ ExitCode = $process.ExitCode }
+}
+$script:StartCount = 0
+[pscustomobject]@{ Warm = $true } | Export-Clixml -LiteralPath __START_CAPTURE__
+Remove-Item -LiteralPath __START_CAPTURE__ -Force
+$poisonPrefix = __POISON_PREFIX__
+$env:PATH = Join-Path $poisonPrefix 'PATH'
+$env:PSHOME = Join-Path $poisonPrefix 'PSHOME'
+$env:PSModulePath = Join-Path $poisonPrefix 'PSModulePath'
+$env:SystemRoot = Join-Path $poisonPrefix 'SystemRoot'
+$env:WINDIR = Join-Path $poisonPrefix 'WINDIR'
+$env:COMSPEC = Join-Path $poisonPrefix 'COMSPEC\cmd.exe'
+$env:TEMP = Join-Path $poisonPrefix 'TEMP'
+$env:TMP = Join-Path $poisonPrefix 'TMP'
+$env:COZYGATEWAY_UAC_BOUNDARY_SENTINEL = Join-Path $poisonPrefix 'sentinel'
+$before = Get-ProcessEnvironment
+& $Wrapper $Root $Hermes $Launcher $Port $Helper
+$wrapperExitCode = $LASTEXITCODE
+$after = Get-ProcessEnvironment
+$restored = $before.Count -eq $after.Count
+foreach ($key in $before.Keys) {
+    if (-not $after.ContainsKey($key) -or $after[$key] -cne $before[$key]) { $restored = $false }
+}
+[pscustomobject]@{
+    WrapperExitCode = $wrapperExitCode
+    EnvironmentRestored = $restored
+    StartCount = $script:StartCount
+    Before = $before
+    After = $after
+} | Export-Clixml -LiteralPath __RESULT_PATH__
+exit 0
+'@
+    $harnessBody = $harnessBody.Replace('__START_CAPTURE__', $startCaptureLiteral).Replace('__CANCEL__', $cancelLiteral).Replace('__RESULT_PATH__', $resultPathLiteral).Replace('__POISON_PREFIX__', $poisonPrefixLiteral)
+    Write-Utf8NoBom $Harness $harnessBody
+    Remove-Item -LiteralPath $CapturePath, $ChildCapturePath, $resultPath -Force -ErrorAction SilentlyContinue
+    $keys = @('DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY', 'TASK2_REVIEW_ARBITRARY_SECRET')
+    $old = @{}
+    foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
+    try {
+        $env:DASHBOARD_SESSION_TOKEN = 'task-2-secret-token'
+        $env:PROVIDER_API_KEY = 'task-2-provider-secret'
+        $env:TASK2_REVIEW_ARBITRARY_SECRET = 'task-2-arbitrary-secret'
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Harness $Wrapper $Paths.Root $Paths.Hermes $Paths.Launcher 9119 $Paths.Helper 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousPreference
+        Assert-True ($exitCode -eq 0) "elevation harness process failed with $exitCode`: $($output -join "`n")"
+        $result = Import-Clixml -LiteralPath $resultPath
+        return @{ ExitCode = $result.WrapperExitCode; Output = ($output -join "`n"); EnvironmentRestored = $result.EnvironmentRestored; StartCount = $result.StartCount; Before = $result.Before; After = $result.After }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, $old[$key], 'Process') }
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $installer = Join-Path $repoRoot 'scripts\install.ps1'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-bootstrap-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
+$fakeUserNetTCPIP = $null
 
 try {
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
@@ -319,6 +681,201 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True (($incompleteEvents -join "`n") -match '(?m)^hermes:model$') 'incomplete Hermes setup must open model selection'
     Assert-True (-not (($incompleteEvents -join "`n") -match '^bash:')) 'incomplete Hermes model selection must not invoke Bash'
 
+    $agentInstallerPath = Join-Path $repoRoot 'scripts\agent-install.sh'
+    $agentInstaller = Get-Content -LiteralPath $agentInstallerPath -Raw
+    $elevationWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_dashboard_elevation_helper\(\) \{.*?^\}')
+    Assert-True $elevationWriterMatch.Success 'shared installer must define write_dashboard_elevation_helper'
+    $stopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_stubborn_windows_dashboard\(\) \{.*?^\}')
+    Assert-True $stopFunctionMatch.Success 'shared installer must define stop_stubborn_windows_dashboard'
+    $gitCommand = Get-Command git.exe -ErrorAction Stop
+    $gitRoot = Split-Path -Parent (Split-Path -Parent $gitCommand.Source)
+    $bashPath = Join-Path $gitRoot 'bin\bash.exe'
+    Assert-True (Test-Path -LiteralPath $bashPath) 'Git for Windows bash.exe must be available for the shared-installer harness'
+    $fakePowerShellDirectory = Join-Path $temp 'fake PowerShell'
+    $fakePowerShell = Join-Path $fakePowerShellDirectory 'powershell.exe'
+    $powerShellCallLog = Join-Path $temp 'powershell-calls.log'
+    New-FakePowerShell $fakePowerShell $powerShellCallLog
+    $stopHarnessPath = Join-Path $temp 'dashboard stop harness.sh'
+    $dashboardPaths = @{
+        Root = "C:\Users\O'Brien\Hermes Root"
+        Hermes = "C:\Users\O'Brien\Hermes Root\bin\hermes agent.exe"
+        Helper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner.ps1"
+        Launcher = "C:\Users\O'Brien\Hermes Root\bin\hermes.exe"
+        ElevationHelper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner elevate.ps1"
+        RunAsHelper = "C:\Users\O'Brien\Cozy Gateway\local\dashboard owner runas.ps1"
+    }
+
+    $normal43 = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 43 0
+    Assert-True ($normal43.ExitCode -eq 0) "normal 43 followed by elevated 0 must continue: $($normal43.Output)"
+    Assert-True ($normal43.Output -match 'continued') 'successful elevated recovery must return to the non-elevated installer'
+    Assert-True (([regex]::Matches($normal43.Output, '(?m)^INFO  ')).Count -eq 1) 'normal 43 must print exactly one elevation informational line'
+    Assert-True ($normal43.Calls.Count -eq 2) 'normal 43 must invoke one normal helper and exactly one elevation wrapper'
+    Assert-True ($normal43.Calls[0] -contains $dashboardPaths.Helper) 'normal helper invocation must use the ownership helper path'
+    Assert-True ($normal43.Calls[1] -contains $dashboardPaths.ElevationHelper) 'normal 43 must invoke the generated elevation wrapper exactly once'
+
+    $normal0 = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 0 99
+    Assert-True ($normal0.ExitCode -eq 0 -and $normal0.Calls.Count -eq 1) 'normal 0 must continue without elevation'
+    $normal42 = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 42 0
+    Assert-True ($normal42.ExitCode -ne 0 -and $normal42.Calls.Count -eq 1) 'normal 42 must fail without elevation'
+    Assert-True ($normal42.Output -match 'cannot safely stop') 'normal 42 must preserve the ownership-safety failure'
+    foreach ($normalFailureCode in @(45, 99)) {
+        $normalFailure = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths $normalFailureCode 0
+        Assert-True ($normalFailure.ExitCode -ne 0 -and $normalFailure.Calls.Count -eq 1) "normal $normalFailureCode must fail without elevation"
+        Assert-True ($normalFailure.Output -match 'verified Dashboard') "normal $normalFailureCode must report a verified-owner recovery failure"
+    }
+    foreach ($elevatedFailureCode in @(42, 43, 45, 99)) {
+        $elevatedFailure = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 43 $elevatedFailureCode
+        Assert-True ($elevatedFailure.ExitCode -ne 0 -and $elevatedFailure.Calls.Count -eq 2) "elevated $elevatedFailureCode must fail after exactly one elevation attempt"
+        Assert-True (-not ($elevatedFailure.Output -match 'continued')) "elevated $elevatedFailureCode must not continue"
+    }
+    $launchFailure = Invoke-DashboardStopHarness $stopFunctionMatch.Value $bashPath $fakePowerShellDirectory $powerShellCallLog $stopHarnessPath $dashboardPaths 43 46
+    Assert-True ($launchFailure.ExitCode -ne 0 -and $launchFailure.Calls.Count -eq 2) 'UAC cancellation or launch failure must stop after one elevation attempt'
+    Assert-True ($launchFailure.Output -match 'scoped Dashboard recovery helper') 'UAC cancellation or launch failure must identify the scoped helper'
+    Assert-True ($launchFailure.Output -match 'close .* Dashboard manually' -and $launchFailure.Output -match 'rerun') 'UAC cancellation or launch failure must explain manual close and rerun recovery'
+    $allShellEvidence = @($normal43, $normal0, $normal42, $launchFailure) | ForEach-Object { $_.Output; $_.Calls | ForEach-Object { $_ -join "`n" } }
+    Assert-True (-not (($allShellEvidence -join "`n") -match 'task-2-secret-token|task-2-provider-secret')) 'shell elevation arguments and logs must not expose token or provider secrets'
+
+    $elevationMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_ELEVATION'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_ELEVATION")
+    Assert-True $elevationMatch.Success 'shared installer must generate a PowerShell elevation wrapper'
+    $ownerMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_OWNER'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_OWNER")
+    Assert-True $ownerMatch.Success 'shared installer must generate a PowerShell Dashboard owner helper'
+    $runAsMatch = [regex]::Match($agentInstaller, "(?ms)<<'POWERSHELL_RUNAS'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_RUNAS")
+    Assert-True (-not $runAsMatch.Success) 'shared installer must not generate a second PowerShell elevation stage'
+    $elevationWrapper = Join-Path $temp 'dashboard owner elevate.ps1'
+    Write-Utf8NoBom $elevationWrapper $elevationMatch.Groups['Body'].Value
+    $elevatedChild = Join-Path $temp "O'Brien Cozy Gateway\dashboard owner.ps1"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $elevatedChild) | Out-Null
+    $wrapperPaths = @{
+        Root = $dashboardPaths.Root
+        Hermes = $dashboardPaths.Hermes
+        Launcher = $dashboardPaths.Launcher
+        Helper = $elevatedChild
+    }
+    $startCapture = Join-Path $temp 'start-process.xml'
+    $childCapture = Join-Path $temp 'elevated-child.xml'
+    $wrapperHarness = Join-Path $temp 'elevation wrapper harness.ps1'
+    $elevationBody = $elevationMatch.Groups['Body'].Value
+    Assert-True (-not ($elevationBody -match 'UseNewEnvironment')) 'elevation wrapper must not use -UseNewEnvironment'
+    Assert-True ($elevationBody -match 'GetEnvironmentVariables\("Process"\)') 'elevation wrapper must snapshot and enumerate every Process-scope environment entry'
+    Assert-True ($elevationBody -match 'Set-CozyProcessEnvironmentVariable \(\[string\]\$name\) \$null') 'elevation wrapper must clear every enumerated Process-scope entry rather than use a secret-name denylist'
+    Assert-True (-not ($elevationBody -match 'DASHBOARD_SESSION_TOKEN|PROVIDER_API_KEY|TASK2_REVIEW_ARBITRARY_SECRET')) 'production sanitization must not depend on known secret names'
+    Assert-True (-not ($elevationBody -match 'GetEnvironmentVariables\("(?:User|Machine)"\)')) 'elevation wrapper must not source User or Machine environment blocks'
+    Assert-True ($elevationBody -match 'GetSystemDirectoryW' -and $elevationBody -match 'GetWindowsDirectoryW' -and $elevationBody -match 'kernel32\.dll') 'elevation wrapper must resolve native Windows directories through kernel32 KnownDLL'
+    Assert-True ($elevationBody -match 'SetLastError' -and $elevationBody -match '\[Runtime\.InteropServices\.Marshal\]::GetLastWin32Error\(\)') 'elevation wrapper must preserve and check errors from each native call'
+    Assert-True ($elevationWriterMatch.Value -match 'is_windows \|\| return 0') 'elevation helper files must be generated only on Windows'
+    Assert-True ($agentInstaller -match 'is_windows && write_dashboard_elevation_helper') 'non-Windows install flow must not invoke elevation-helper generation'
+
+    $fakeModuleMarker = Join-Path $temp 'fake-user-module-executed.txt'
+    $ownerProbeCapture = Join-Path $temp 'owner-module-probe.xml'
+    $ownerProbeCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $ownerProbeCapture
+    $ownerProbe = @"
+`$netTCPIPCommand = Get-Command Get-NetTCPConnection -CommandType Function,Cmdlet -ErrorAction Stop
+`$cimCmdletsCommand = Get-Command Get-CimInstance -CommandType Function,Cmdlet -ErrorAction Stop
+[pscustomobject]@{
+  PSModulePath = `$env:PSModulePath
+  AutoLoading = [string]`$PSModuleAutoLoadingPreference
+  NetTCPIPModulePath = `$netTCPIPCommand.Module.Path
+  CimCmdletsModuleBase = `$cimCmdletsCommand.Module.ModuleBase
+  CimCmdletsAssemblyLocation = `$cimCmdletsCommand.ImplementingType.Assembly.Location
+} | Export-Clixml -LiteralPath $ownerProbeCaptureLiteral
+"@
+    $taskkillNeedle = '$taskkillExecutable = Resolve-CozySystemExecutable "taskkill.exe"'
+    $instrumentedOwnerBody = $ownerMatch.Groups['Body'].Value.Replace($taskkillNeedle, $ownerProbe + "`r`n" + $taskkillNeedle)
+    Assert-True ($instrumentedOwnerBody -cne $ownerMatch.Groups['Body'].Value) 'owner helper test must instrument the production module initialization boundary'
+    $instrumentedOwner = Join-Path $temp 'instrumented dashboard owner.ps1'
+    Write-Utf8NoBom $instrumentedOwner $instrumentedOwnerBody
+    $failedImportOwner = Join-Path $temp 'failed-import dashboard owner.ps1'
+    $failedImportBody = $ownerMatch.Groups['Body'].Value.Replace('Import-Module -Name $trustedNetTCPIPManifest -Force -ErrorAction Stop', 'throw "forced trusted module import failure"')
+    Assert-True ($failedImportBody -cne $ownerMatch.Groups['Body'].Value) 'owner helper failure test must replace the production trusted module import'
+    Write-Utf8NoBom $failedImportOwner $failedImportBody
+    $portReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $portReservation.Start()
+    $ownerProbePort = ([Net.IPEndPoint]$portReservation.LocalEndpoint).Port
+    $portReservation.Stop()
+    $fakeUserNetTCPIP = New-FakeUserNetTCPIPModule $fakeModuleMarker
+    try {
+        $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
+        $ownerProbeResult = Invoke-OwnerHelperScript $instrumentedOwner $ownerProbePort
+        $failedImportResult = Invoke-OwnerHelperScript $failedImportOwner $ownerProbePort
+    } finally {
+        Remove-FakeUserNetTCPIPModule $fakeUserNetTCPIP
+        $fakeUserNetTCPIP = $null
+    }
+    Assert-True ($wrapperResult.ExitCode -eq 0) "elevation wrapper must return elevated child 0: $($wrapperResult.Output)"
+    $fakeModuleEvidence = if (Test-Path -LiteralPath $fakeModuleMarker) { Get-Content -LiteralPath $fakeModuleMarker -Raw } else { '<none>' }
+    Assert-True (-not (Test-Path -LiteralPath $fakeModuleMarker)) "fake user-scope NetTCPIP module must never execute in the elevated PS5.1 child; marker: $fakeModuleEvidence"
+    Assert-True ($ownerProbeResult.ExitCode -eq 0) "instrumented production owner helper must succeed on an absent listener: $($ownerProbeResult.Output)"
+    Assert-True ($failedImportResult.ExitCode -eq 43) "trusted module setup failure must remain an indeterminate pre-inspection result (actual $($failedImportResult.ExitCode)): $($failedImportResult.Output)"
+    $ownerProbeResult = Import-Clixml -LiteralPath $ownerProbeCapture
+    $environmentDifference = @(@($wrapperResult.Before.Keys) + @($wrapperResult.After.Keys) | Sort-Object -Unique | Where-Object {
+        -not $wrapperResult.Before.ContainsKey($_) -or -not $wrapperResult.After.ContainsKey($_) -or $wrapperResult.Before[$_] -cne $wrapperResult.After[$_]
+    })
+    Assert-True $wrapperResult.EnvironmentRestored "elevation wrapper must exactly restore its parent Process environment after success; differences: $($environmentDifference -join ', ')"
+    $startInvocation = Import-Clixml -LiteralPath $startCapture
+    Assert-True ($startInvocation.Count -eq 1) 'elevation wrapper must make exactly one Start-Process call'
+    $trustedSystemDirectory = [Environment]::SystemDirectory
+    $trustedWindowsDirectory = [IO.Directory]::GetParent($trustedSystemDirectory).FullName
+    $expectedPowerShell = [IO.Path]::Combine($trustedSystemDirectory, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    Assert-True ($startInvocation.FilePath -ceq $expectedPowerShell) 'elevation wrapper must launch absolute Windows PowerShell from the native system directory'
+    Assert-True ($startInvocation.WorkingDirectory -ceq $trustedSystemDirectory) 'elevation wrapper must launch from the native system directory'
+    Assert-True (-not ($elevationBody -match '\$PSHOME')) 'elevation wrapper must not select an executable through PSHOME'
+    Assert-True ($startInvocation.Verb -eq 'RunAs' -and $startInvocation.Wait -and $startInvocation.PassThru -and -not $startInvocation.UseNewEnvironment) 'elevation wrapper must use one -Verb RunAs -Wait -PassThru call without -UseNewEnvironment'
+    $startEnvironmentNames = @($startInvocation.Environment.Keys | ForEach-Object { [string]$_ })
+    Assert-True (($startEnvironmentNames | Where-Object { $_ -notin @('SystemRoot', 'WINDIR', 'PSModulePath') }).Count -eq 0 -and $startEnvironmentNames.Count -eq 3) 'RunAs environment must contain only OS-derived SystemRoot, WINDIR, and PSModulePath'
+    Assert-True ($startInvocation.Environment.SystemRoot -ceq $trustedWindowsDirectory -and $startInvocation.Environment.WINDIR -ceq $trustedWindowsDirectory) 'RunAs environment must derive SystemRoot and WINDIR from the native Windows directory'
+    $trustedModuleRoot = [IO.Path]::Combine($trustedSystemDirectory, 'WindowsPowerShell', 'v1.0', 'Modules')
+    Assert-True ($startInvocation.Environment.PSModulePath.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase)) 'RunAs PSModulePath must contain only the native system Windows PowerShell module root'
+    $childInvocation = Read-ElevationChildCapture $childCapture
+    Assert-True ($childInvocation.ExpectedRoot -ceq $wrapperPaths.Root) 'PS5.1 parsing must preserve expected root as one argument'
+    Assert-True ($childInvocation.ExpectedHermes -ceq $wrapperPaths.Hermes) 'PS5.1 parsing must preserve Hermes executable as one argument'
+    Assert-True ($childInvocation.ExpectedLauncher -ceq $wrapperPaths.Launcher) 'PS5.1 parsing must preserve launcher path as one argument'
+    Assert-True ($childInvocation.ExpectedPort -eq 9119) 'PS5.1 parsing must preserve Dashboard port as one argument'
+    Assert-True $childInvocation.ElevatedChild 'elevated helper must receive the elevated-child marker'
+    Assert-True ($childInvocation.ExtraArguments.Count -eq 0) 'elevated helper must receive no merged or extra arguments'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.DashboardSessionToken)) 'actual PowerShell child must not inherit the Dashboard session token'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.ProviderApiKey)) 'actual PowerShell child must not inherit provider credentials'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.ArbitrarySecret)) 'actual PowerShell child must not inherit an unrelated Process-scope sentinel'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.PathValue)) 'actual PowerShell 5.1 child must not inherit PATH'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.PSHomeValue)) 'actual PowerShell 5.1 child must not inherit PSHOME'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.ComSpecValue)) 'actual PowerShell 5.1 child must not inherit COMSPEC'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.TempValue)) 'actual PowerShell 5.1 child must not inherit TEMP'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.TmpValue)) 'actual PowerShell 5.1 child must not inherit TMP'
+    Assert-True ([string]::IsNullOrWhiteSpace($childInvocation.BoundarySentinel)) 'actual PowerShell 5.1 child must not inherit the UAC-boundary sentinel'
+    $poisonedPathPrefix = Join-Path $temp 'poisoned-installer-environment'
+    $trustedAllUsersModuleRoot = [IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles), 'WindowsPowerShell', 'Modules')
+    $effectiveModuleRoots = @($childInvocation.PSModulePathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $unexpectedModuleRoots = @($effectiveModuleRoots | Where-Object { -not $_.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase) -and -not $_.Equals($trustedAllUsersModuleRoot, [StringComparison]::OrdinalIgnoreCase) })
+    Assert-True (($effectiveModuleRoots | Where-Object { $_.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 -and $unexpectedModuleRoots.Count -eq 0) "actual PowerShell 5.1 child must expose only protected system/all-users module roots (actual: $($childInvocation.PSModulePathValue))"
+    Assert-True ($childInvocation.SystemRootValue -ceq $trustedWindowsDirectory -and $childInvocation.WindirValue -ceq $trustedWindowsDirectory) 'actual PowerShell 5.1 child must receive only native-derived Windows roots'
+    $trustedNetTCPIPManifest = [IO.Path]::Combine($trustedModuleRoot, 'NetTCPIP', 'NetTCPIP.psd1')
+    $trustedCimCmdletsBase = [IO.Path]::Combine($trustedModuleRoot, 'CimCmdlets')
+    $trustedCimCmdletsGacRoot = [IO.Path]::Combine($trustedWindowsDirectory, 'Microsoft.Net', 'assembly', 'GAC_MSIL', 'Microsoft.Management.Infrastructure.CimCmdlets') + [IO.Path]::DirectorySeparatorChar
+    Assert-True ($childInvocation.NetTCPIPModulePath.Equals($trustedNetTCPIPManifest, [StringComparison]::OrdinalIgnoreCase)) 'Get-NetTCPConnection must resolve from the trusted inbox NetTCPIP manifest'
+    Assert-True ($childInvocation.CimCmdletsModuleBase.Equals($trustedCimCmdletsBase, [StringComparison]::OrdinalIgnoreCase)) 'Get-CimInstance must resolve from the trusted inbox CimCmdlets module base'
+    Assert-True ($childInvocation.CimCmdletsAssemblyLocation.StartsWith($trustedCimCmdletsGacRoot, [StringComparison]::OrdinalIgnoreCase)) 'Get-CimInstance must execute from the OS GAC CimCmdlets assembly'
+    Assert-True ($ownerProbeResult.PSModulePath.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must reset PSModulePath to the native system module root'
+    Assert-True ($ownerProbeResult.AutoLoading -ceq 'None') 'production owner helper must disable module autoload after trusted imports'
+    Assert-True ($ownerProbeResult.NetTCPIPModulePath.Equals($trustedNetTCPIPManifest, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must import Get-NetTCPConnection from the trusted inbox manifest'
+    Assert-True ($ownerProbeResult.CimCmdletsModuleBase.Equals($trustedCimCmdletsBase, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must import Get-CimInstance from the trusted inbox module base'
+    Assert-True ($ownerProbeResult.CimCmdletsAssemblyLocation.StartsWith($trustedCimCmdletsGacRoot, [StringComparison]::OrdinalIgnoreCase)) 'production owner helper must execute Get-CimInstance from the OS GAC assembly'
+    $startArguments = $startInvocation.ArgumentList -join "`n"
+    Assert-True ($startArguments -match '(?m)^-NoProfile$' -and $startArguments -match '(?m)^-NonInteractive$' -and $startArguments -match '(?m)^-ExecutionPolicy$' -and $startArguments -match '(?m)^Bypass$' -and $startArguments -match '(?m)^-File$') 'elevation wrapper must carry the required PowerShell argument array'
+    $wrapperEvidence = $wrapperResult.Output + "`n" + (Get-Content -LiteralPath $startCapture -Raw)
+    Assert-True (-not ($wrapperEvidence -match 'task-2-secret-token|task-2-provider-secret|task-2-arbitrary-secret|poisoned-installer-environment')) 'elevation wrapper FilePath, arguments, and logs must not expose Process-scope or poisoned path values'
+
+    foreach ($childCode in @(42, 43, 45, 99)) {
+        $childFailure = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths $childCode
+        Assert-True ($childFailure.ExitCode -eq $childCode) "elevation wrapper must preserve elevated child exit code $childCode"
+        $childFailureStart = Import-Clixml -LiteralPath $startCapture
+        Assert-True ($childFailure.EnvironmentRestored -and $childFailureStart.Count -eq 1) "elevation wrapper must restore the exact environment after elevated child code $childCode"
+    }
+
+    $cancelResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0 -Cancel
+    Assert-True ($cancelResult.ExitCode -eq 46) "UAC cancellation or Start-Process failure must return the launch-failure code (actual $($cancelResult.ExitCode)): $($cancelResult.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $childCapture)) 'UAC cancellation must not run the elevated child'
+    $cancelStart = Import-Clixml -LiteralPath $startCapture
+    Assert-True ($cancelResult.EnvironmentRestored -and $cancelStart.Count -eq 1) 'elevation wrapper must exactly restore its parent Process environment after launch exception'
+
     Write-Utf8NoBom (Join-Path $fixtures 'cozygateway.mjs.sha256') (('0' * 64) + "  cozygateway.mjs`n")
     $bad = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
@@ -332,5 +889,6 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 
     Write-Host 'windows bootstrap tests passed'
 } finally {
+    Remove-FakeUserNetTCPIPModule $fakeUserNetTCPIP
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }

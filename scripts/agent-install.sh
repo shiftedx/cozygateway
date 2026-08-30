@@ -131,6 +131,7 @@ CONFIG_JSON="$LOCAL_DIR/cozygateway.config.json"
 GATEWAY_ENV="$LOCAL_DIR/gateway.env"
 DASHBOARD_ENV="$LOCAL_DIR/dashboard.env"
 DASHBOARD_OWNER_PS1="$LOCAL_DIR/dashboard-owner.ps1"
+DASHBOARD_ELEVATION_PS1="$LOCAL_DIR/dashboard-owner-elevate.ps1"
 STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
 CLI_WRAPPER="$GATEWAY_DIR/bin/cozygateway"
@@ -561,6 +562,7 @@ write_state() {
   {
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
+    printf 'dashboard_port=%s\n' "$DASHBOARD_PORT"
     # Keep the exact executable that performed the install. `--uninstall` may
     # run long after PATH or COZYGATEWAY_HERMES_BIN changed, and must not tear
     # down the CozyGateway service before discovering it cannot reverse the
@@ -653,13 +655,82 @@ param(
   [Parameter(Mandatory = $true, Position = 0)][string]$ExpectedRoot,
   [Parameter(Mandatory = $true, Position = 1)][string]$ExpectedHermes,
   [Parameter(Mandatory = $true, Position = 2)][string]$ExpectedLauncher,
-  [Parameter(Mandatory = $true, Position = 3)][ValidateRange(1, 65535)][int]$ExpectedPort
+  [Parameter(Mandatory = $true, Position = 3)][ValidateRange(1, 65535)][int]$ExpectedPort,
+  [switch]$ElevatedChild
 )
 $ErrorActionPreference = "Stop"
-$connection = Get-NetTCPConnection -State Listen -LocalAddress "127.0.0.1" -LocalPort $ExpectedPort -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($null -eq $connection) { exit 0 }
-$process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess)
+# ElevatedChild marks the terminal scoped-UAC invocation. This ownership helper
+# never launches another process or requests elevation itself.
 # COZYGATEWAY_DASHBOARD_OWNER_BEGIN
+function Initialize-CozyNativeDirectoryApi {
+  if ($null -ne $script:CozyNativeDirectoryApi) { return }
+  $assemblyName = [Reflection.AssemblyName]::new("CozyGateway.NativeDirectory." + [guid]::NewGuid().ToString("N"))
+  $assemblyBuilder = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+  $moduleBuilder = $assemblyBuilder.DefineDynamicModule("NativeDirectory")
+  $typeBuilder = $moduleBuilder.DefineType("CozyGatewayNativeDirectory", [Reflection.TypeAttributes] "Public, Sealed, Abstract")
+  $dllImportConstructor = [Runtime.InteropServices.DllImportAttribute].GetConstructor([Type[]] @([string]))
+  $dllImportFields = [Reflection.FieldInfo[]] @(
+    [Runtime.InteropServices.DllImportAttribute].GetField("EntryPoint"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CharSet"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CallingConvention"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("SetLastError"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("PreserveSig")
+  )
+  foreach ($definition in @(
+    @{ Name = "GetSystemDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) },
+    @{ Name = "GetWindowsDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) }
+  )) {
+    $method = $typeBuilder.DefineMethod(
+      [string]$definition.Name, [Reflection.MethodAttributes] "Public, Static, PinvokeImpl",
+      [Type]$definition.ReturnType, [Type[]]$definition.Parameters
+    )
+    $dllImportValues = [object[]] @(
+      [string]$definition.Name,
+      [Runtime.InteropServices.CharSet]::Unicode,
+      [Runtime.InteropServices.CallingConvention]::Winapi,
+      $true,
+      $true
+    )
+    $dllImport = [Reflection.Emit.CustomAttributeBuilder]::new(
+      $dllImportConstructor, [object[]] @("kernel32.dll"), $dllImportFields, $dllImportValues
+    )
+    $method.SetCustomAttribute($dllImport)
+  }
+  $script:CozyNativeDirectoryApi = $typeBuilder.CreateType()
+}
+function Get-CozyNativeDirectory {
+  param([ValidateSet("System", "Windows")][string]$Kind)
+  Initialize-CozyNativeDirectoryApi
+  $methodName = if ($Kind -eq "System") { "GetSystemDirectoryW" } else { "GetWindowsDirectoryW" }
+  $method = $script:CozyNativeDirectoryApi.GetMethod($methodName)
+  $capacity = 260
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    $buffer = [Text.StringBuilder]::new($capacity)
+    $arguments = [object[]] @($buffer, [uint32]$capacity)
+    $length = [uint32]$method.Invoke($null, $arguments)
+    if ($length -eq 0) {
+      $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      throw "$methodName failed with Win32 error $errorCode"
+    }
+    if ($length -lt [uint32]$capacity) {
+      $value = $buffer.ToString()
+      if ($value.Length -ne [int]$length -or -not [IO.Path]::IsPathRooted($value) -or -not [IO.Directory]::Exists($value)) {
+        throw "$methodName returned an invalid directory"
+      }
+      return [IO.Path]::GetFullPath($value)
+    }
+    if ($length -gt 32768) { throw "$methodName returned an invalid buffer length" }
+    $capacity = [int]$length
+  }
+  throw "$methodName did not fit within the validated buffer limit"
+}
+function Resolve-CozySystemExecutable {
+  param([string]$Name)
+  if ([string]::IsNullOrWhiteSpace($Name) -or [IO.Path]::GetFileName($Name) -cne $Name) { throw "invalid system executable name" }
+  $path = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-CozyNativeDirectory "System"), $Name))
+  if (-not [IO.File]::Exists($path)) { throw "trusted system executable is unavailable: $Name" }
+  return $path
+}
 function Test-CozyDashboardOwner {
   param(
     $Process,
@@ -672,55 +743,286 @@ function Test-CozyDashboardOwner {
   $root = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
   $hermes = [IO.Path]::GetFullPath($ExpectedHermes)
   $launcher = [IO.Path]::GetFullPath($ExpectedLauncher)
-  $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
-
-  $runtimeUnderRoot = $false
-  $candidate = $Process
-  for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
-    try {
-      if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-        $runtimeUnderRoot = $true
-        break
-      }
-    } catch {}
-    if (-not $candidate.ParentProcessId) { break }
-    $candidate = & $ResolveProcess ([int]$candidate.ParentProcessId)
+  if ($null -eq $Process -or [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath) -or [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)) {
+    return "Indeterminate"
   }
-
+  $tokens = @([regex]::Matches([string]$Process.CommandLine, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
   $dashboardIndex = -1
+  $requiresRootAncestry = $false
   $scriptSuffix = [IO.Path]::DirectorySeparatorChar + "hermes_cli" + [IO.Path]::DirectorySeparatorChar + "main.py"
   $processExecutable = $null
   $firstToken = $null
   $secondToken = $null
-  try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch {}
+  try { $processExecutable = [IO.Path]::GetFullPath([string]$Process.ExecutablePath) } catch { return "Foreign" }
   if ($tokens.Count -gt 0) { try { $firstToken = [IO.Path]::GetFullPath($tokens[0]) } catch {} }
   if ($tokens.Count -gt 1) { try { $secondToken = [IO.Path]::GetFullPath($tokens[1]) } catch {} }
   $firstIsExecutable = $null -ne $processExecutable -and $null -ne $firstToken -and $firstToken.Equals($processExecutable, [StringComparison]::OrdinalIgnoreCase)
+  if (-not $firstIsExecutable) { return "Foreign" }
   $pythonRuntime = $firstIsExecutable -and @("python.exe", "pythonw.exe") -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
   $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
   if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq "dashboard") {
     $dashboardIndex = 1
-  } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
+  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
     $dashboardIndex = 2
-  } elseif ($pythonRuntime -and $runtimeUnderRoot -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
+  } elseif ($pythonRuntime -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
     $dashboardIndex = 3
+    $requiresRootAncestry = $true
   } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase) -and $tokens[2] -eq "dashboard") {
     $dashboardIndex = 2
   }
-  if ($dashboardIndex -lt 0) { return $false }
-  for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
-    if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return $true }
-    if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return $true }
+  if ($dashboardIndex -lt 0) { return "Foreign" }
+
+  if ($requiresRootAncestry) {
+    $runtimeUnderRoot = $false
+    $runtimeMetadataMissing = $false
+    $candidate = $Process
+    for ($depth = 0; $depth -lt 6 -and $null -ne $candidate; $depth++) {
+      if ([string]::IsNullOrWhiteSpace([string]$candidate.ExecutablePath)) {
+        $runtimeMetadataMissing = $true
+      } else {
+        try {
+          if ([IO.Path]::GetFullPath([string]$candidate.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+            $runtimeUnderRoot = $true
+            break
+          }
+        } catch { return "Foreign" }
+      }
+      if (-not $candidate.ParentProcessId) { break }
+      $candidate = & $ResolveProcess ([int]$candidate.ParentProcessId)
+      if ($null -eq $candidate) { $runtimeMetadataMissing = $true; break }
+    }
+    if (-not $runtimeUnderRoot) {
+      if ($runtimeMetadataMissing) { return "Indeterminate" }
+      return "Foreign"
+    }
   }
-  return $false
+
+  for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
+    if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return "Owned" }
+    if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return "Owned" }
+  }
+  return "Foreign"
+}
+
+function Stop-CozyDashboardOwner {
+  param(
+    [string]$ExpectedRoot,
+    [string]$ExpectedHermes,
+    [string]$ExpectedLauncher,
+    [int]$ExpectedPort,
+    [scriptblock]$ResolveListener,
+    [scriptblock]$ResolveProcess,
+    [scriptblock]$KillTree,
+    [scriptblock]$Sleep
+  )
+  try { $firstListener = & $ResolveListener } catch { return 43 }
+  if ($null -eq $firstListener) { return 0 }
+  try { $firstProcess = & $ResolveProcess ([int]$firstListener.OwningProcess) } catch { return 43 }
+  if ($null -eq $firstProcess -or [int]$firstProcess.ProcessId -ne [int]$firstListener.OwningProcess) { return 43 }
+  try {
+    $firstOwner = Test-CozyDashboardOwner -Process $firstProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  } catch { return 43 }
+  if ($firstOwner -eq "Foreign") { return 42 }
+  if ($firstOwner -ne "Owned" -or [string]::IsNullOrWhiteSpace([string]$firstProcess.CreationDate)) { return 43 }
+
+  try { $secondListener = & $ResolveListener } catch { return 45 }
+  if ($null -eq $secondListener -or [int]$secondListener.OwningProcess -ne [int]$firstListener.OwningProcess) { return 45 }
+  try { $secondProcess = & $ResolveProcess ([int]$secondListener.OwningProcess) } catch { return 45 }
+  if ($null -eq $secondProcess -or [int]$secondProcess.ProcessId -ne [int]$secondListener.OwningProcess -or [string]::IsNullOrWhiteSpace([string]$secondProcess.CreationDate) -or
+      -not ([string]$secondProcess.CreationDate).Equals([string]$firstProcess.CreationDate, [StringComparison]::Ordinal)) { return 45 }
+  try {
+    $secondOwner = Test-CozyDashboardOwner -Process $secondProcess -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $ResolveProcess
+  } catch { return 45 }
+  if ($secondOwner -ne "Owned") { return 45 }
+
+  try { $killCode = & $KillTree ([int]$secondProcess.ProcessId) } catch { return 45 }
+  if ([int]$killCode -ne 0) { return 45 }
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    try { $remaining = & $ResolveListener } catch { return 45 }
+    if ($null -eq $remaining) { return 0 }
+    & $Sleep 100
+  }
+  return 45
 }
 # COZYGATEWAY_DASHBOARD_OWNER_END
-$resolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
-if (-not (Test-CozyDashboardOwner -Process $process -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveProcess $resolver)) { exit 42 }
-& ([IO.Path]::Combine($env:SystemRoot, "System32", "taskkill.exe")) /PID ([string]$process.ProcessId) /T /F | Out-Null
-exit $LASTEXITCODE
+$listenerResolver = {
+  Get-NetTCPConnection -State Listen -ErrorAction Stop |
+    Where-Object { $_.LocalAddress -eq "127.0.0.1" -and $_.LocalPort -eq $ExpectedPort } |
+    Select-Object -First 1
+}
+$processResolver = { param([int]$processId) Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction SilentlyContinue }
+$trustedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-CozyNativeDirectory "System"), "WindowsPowerShell", "v1.0", "Modules"))
+$trustedNetTCPIPManifest = [IO.Path]::Combine($trustedModuleRoot, "NetTCPIP", "NetTCPIP.psd1")
+$trustedCimCmdletsManifest = [IO.Path]::Combine($trustedModuleRoot, "CimCmdlets", "CimCmdlets.psd1")
+if (-not [IO.File]::Exists($trustedNetTCPIPManifest) -or -not [IO.File]::Exists($trustedCimCmdletsManifest)) {
+  exit 43
+}
+$env:PSModulePath = $trustedModuleRoot
+try {
+  Import-Module -Name $trustedNetTCPIPManifest -Force -ErrorAction Stop
+  Import-Module -Name $trustedCimCmdletsManifest -Force -ErrorAction Stop
+  $PSModuleAutoLoadingPreference = "None"
+} catch {
+  exit 43
+}
+$taskkillExecutable = Resolve-CozySystemExecutable "taskkill.exe"
+$treeKiller = {
+  param([int]$processId)
+  & $taskkillExecutable /PID ([string]$processId) /T /F | Out-Null
+  return $LASTEXITCODE
+}
+$sleeper = { param([int]$milliseconds) Start-Sleep -Milliseconds $milliseconds }
+exit (Stop-CozyDashboardOwner -ExpectedRoot $ExpectedRoot -ExpectedHermes $ExpectedHermes -ExpectedLauncher $ExpectedLauncher -ExpectedPort $ExpectedPort -ResolveListener $listenerResolver -ResolveProcess $processResolver -KillTree $treeKiller -Sleep $sleeper)
 POWERSHELL_OWNER
   chmod 600 "$DASHBOARD_OWNER_PS1"
+}
+write_dashboard_elevation_helper() {
+  is_windows || return 0
+  [ "$DRY_RUN" = 1 ] && return
+  umask 077; cat > "$DASHBOARD_ELEVATION_PS1" <<'POWERSHELL_ELEVATION'
+param(
+  [Parameter(Mandatory = $true, Position = 0)][string]$ExpectedRoot,
+  [Parameter(Mandatory = $true, Position = 1)][string]$ExpectedHermes,
+  [Parameter(Mandatory = $true, Position = 2)][string]$ExpectedLauncher,
+  [Parameter(Mandatory = $true, Position = 3)][ValidateRange(1, 65535)][int]$ExpectedPort,
+  [Parameter(Mandatory = $true, Position = 4)][string]$OwnerHelper
+)
+$ErrorActionPreference = "Stop"
+function Initialize-CozyNativeDirectoryApi {
+  if ($null -ne $script:CozyNativeDirectoryApi) { return }
+  $assemblyName = [Reflection.AssemblyName]::new("CozyGateway.NativeDirectory." + [guid]::NewGuid().ToString("N"))
+  $assemblyBuilder = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+  $moduleBuilder = $assemblyBuilder.DefineDynamicModule("NativeDirectory")
+  $typeBuilder = $moduleBuilder.DefineType("CozyGatewayNativeDirectory", [Reflection.TypeAttributes] "Public, Sealed, Abstract")
+  $dllImportConstructor = [Runtime.InteropServices.DllImportAttribute].GetConstructor([Type[]] @([string]))
+  $dllImportFields = [Reflection.FieldInfo[]] @(
+    [Runtime.InteropServices.DllImportAttribute].GetField("EntryPoint"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CharSet"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("CallingConvention"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("SetLastError"),
+    [Runtime.InteropServices.DllImportAttribute].GetField("PreserveSig")
+  )
+  foreach ($definition in @(
+    @{ Name = "GetSystemDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) },
+    @{ Name = "GetWindowsDirectoryW"; ReturnType = [uint32]; Parameters = [Type[]] @([Text.StringBuilder], [uint32]) },
+    @{ Name = "SetEnvironmentVariableW"; ReturnType = [bool]; Parameters = [Type[]] @([string], [string]) }
+  )) {
+    $method = $typeBuilder.DefineMethod(
+      [string]$definition.Name, [Reflection.MethodAttributes] "Public, Static, PinvokeImpl",
+      [Type]$definition.ReturnType, [Type[]]$definition.Parameters
+    )
+    $dllImportValues = [object[]] @(
+      [string]$definition.Name,
+      [Runtime.InteropServices.CharSet]::Unicode,
+      [Runtime.InteropServices.CallingConvention]::Winapi,
+      $true,
+      $true
+    )
+    $dllImport = [Reflection.Emit.CustomAttributeBuilder]::new(
+      $dllImportConstructor, [object[]] @("kernel32.dll"), $dllImportFields, $dllImportValues
+    )
+    $method.SetCustomAttribute($dllImport)
+  }
+  $script:CozyNativeDirectoryApi = $typeBuilder.CreateType()
+}
+function Get-CozyNativeDirectory {
+  param([ValidateSet("System", "Windows")][string]$Kind)
+  Initialize-CozyNativeDirectoryApi
+  $methodName = if ($Kind -eq "System") { "GetSystemDirectoryW" } else { "GetWindowsDirectoryW" }
+  $method = $script:CozyNativeDirectoryApi.GetMethod($methodName)
+  $capacity = 260
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    $buffer = [Text.StringBuilder]::new($capacity)
+    $arguments = [object[]] @($buffer, [uint32]$capacity)
+    $length = [uint32]$method.Invoke($null, $arguments)
+    if ($length -eq 0) {
+      $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      throw "$methodName failed with Win32 error $errorCode"
+    }
+    if ($length -lt [uint32]$capacity) {
+      $value = $buffer.ToString()
+      if ($value.Length -ne [int]$length -or -not [IO.Path]::IsPathRooted($value) -or -not [IO.Directory]::Exists($value)) {
+        throw "$methodName returned an invalid directory"
+      }
+      return [IO.Path]::GetFullPath($value)
+    }
+    if ($length -gt 32768) { throw "$methodName returned an invalid buffer length" }
+    $capacity = [int]$length
+  }
+  throw "$methodName did not fit within the validated buffer limit"
+}
+function ConvertTo-CozyNativeArgument {
+  param([string]$Value)
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+  $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+  $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+  return '"' + $escaped + '"'
+}
+function Set-CozyProcessEnvironmentVariable {
+  param([string]$Name, $Value)
+  Initialize-CozyNativeDirectoryApi
+  $method = $script:CozyNativeDirectoryApi.GetMethod("SetEnvironmentVariableW")
+  if (-not [bool]$method.Invoke($null, [object[]] @($Name, $Value))) {
+    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    throw "SetEnvironmentVariableW failed with Win32 error $errorCode"
+  }
+}
+function Clear-CozyProcessEnvironment {
+  foreach ($name in @([Environment]::GetEnvironmentVariables("Process").Keys)) {
+    Set-CozyProcessEnvironmentVariable ([string]$name) $null
+  }
+}
+try {
+  $trustedSystemDirectory = Get-CozyNativeDirectory "System"
+  $trustedWindowsDirectory = Get-CozyNativeDirectory "Windows"
+  $trustedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($trustedSystemDirectory, "WindowsPowerShell", "v1.0", "Modules"))
+  $powerShellExecutable = [IO.Path]::GetFullPath([IO.Path]::Combine($trustedSystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"))
+  if (-not [IO.File]::Exists($powerShellExecutable) -or -not [IO.Directory]::Exists($trustedModuleRoot)) {
+    throw "trusted Windows PowerShell runtime is unavailable"
+  }
+} catch {
+  exit 46
+}
+$originalEnvironment = @{}
+foreach ($entry in [Environment]::GetEnvironmentVariables("Process").GetEnumerator()) {
+  $originalEnvironment[[string]$entry.Key] = [string]$entry.Value
+}
+$startProcessCommand = Get-Command Start-Process -ErrorAction Stop
+$launchEnvironment = @{
+  "SystemRoot" = $trustedWindowsDirectory
+  "WINDIR" = $trustedWindowsDirectory
+  "PSModulePath" = $trustedModuleRoot
+}
+$childArguments = @(
+  "-NoProfile",
+  "-NonInteractive",
+  "-ExecutionPolicy",
+  "Bypass",
+  "-File",
+  (ConvertTo-CozyNativeArgument $OwnerHelper),
+  (ConvertTo-CozyNativeArgument $ExpectedRoot),
+  (ConvertTo-CozyNativeArgument $ExpectedHermes),
+  (ConvertTo-CozyNativeArgument $ExpectedLauncher),
+  [string]$ExpectedPort,
+  "-ElevatedChild"
+)
+try {
+  Clear-CozyProcessEnvironment
+  foreach ($name in $launchEnvironment.Keys) {
+    Set-CozyProcessEnvironmentVariable ([string]$name) ([string]$launchEnvironment[$name])
+  }
+  $child = & $startProcessCommand $powerShellExecutable -WorkingDirectory $trustedSystemDirectory -Verb RunAs -Wait -PassThru -ArgumentList $childArguments
+  exit ([int]$child.ExitCode)
+} catch {
+  exit 46
+} finally {
+  Clear-CozyProcessEnvironment
+  foreach ($name in $originalEnvironment.Keys) {
+    Set-CozyProcessEnvironmentVariable ([string]$name) ([string]$originalEnvironment[$name])
+  }
+}
+POWERSHELL_ELEVATION
+  chmod 600 "$DASHBOARD_ELEVATION_PS1"
 }
 write_wrapper() {
   local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg launcher_arg owner_helper_arg bundle_arg config_arg
@@ -1015,16 +1317,78 @@ child.unref();
 NODE
 }
 stop_stubborn_windows_dashboard() {
-  local hermes_native launcher_native owner_helper_native root_native code
+  local hermes_native launcher_native owner_helper_native elevation_helper_native root_native code
   hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
   launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
   owner_helper_native="$(to_windows_path "$DASHBOARD_OWNER_PS1")"
+  elevation_helper_native="$(to_windows_path "$DASHBOARD_ELEVATION_PS1")"
   root_native="$(to_windows_path "$HERMES_ROOT")"
   set +e
   MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$owner_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" >/dev/null 2>&1
   code=$?
   set -e
-  [ "$code" -eq 0 ] || die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop"
+  case "$code" in
+    0) return ;;
+    42) die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop" ;;
+    43) say "INFO  Dashboard ownership metadata requires one scoped UAC recovery helper" ;;
+    *) die "Dashboard recovery could not safely stop a verified Dashboard on port $DASHBOARD_PORT" ;;
+  esac
+  set +e
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$elevation_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" "$owner_helper_native" >/dev/null 2>&1
+  code=$?
+  set -e
+  case "$code" in
+    0) return ;;
+    42) die "Dashboard port $DASHBOARD_PORT is owned by a process this installer cannot safely stop" ;;
+    43|46) die "the scoped Dashboard recovery helper could not inspect or stop the elevated Dashboard; close the Hermes Dashboard manually and rerun this installer" ;;
+    *) die "Dashboard recovery could not safely stop a verified Dashboard on port $DASHBOARD_PORT" ;;
+  esac
+}
+stop_owned_windows_dashboard_for_uninstall() {
+  [ "$SERVICE_PLATFORM" = Windows ] || return 0
+  [ "$DRY_RUN" = 1 ] && { say "DRY   stop only a verified Hermes Dashboard on 127.0.0.1:$DASHBOARD_PORT before removing its owner helper"; return; }
+  if [ ! -f "$DASHBOARD_OWNER_PS1" ]; then
+    local listener_code
+    set +e
+    MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_PORT="$DASHBOARD_PORT" COZYGATEWAY_CHECK_TARGET_PORT=1 powershell.exe -NoProfile -NonInteractive -Command '
+      $listener = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -eq "127.0.0.1" -and $_.LocalPort -eq [int]$env:COZYGATEWAY_EXPECTED_PORT } |
+        Select-Object -First 1
+      if ($null -eq $listener) { exit 0 }; exit 42
+    ' >/dev/null 2>&1
+    listener_code=$?
+    set -e
+    [ "$listener_code" -eq 0 ] && { say "INFO  Dashboard owner helper is missing, but no listener is present on port $DASHBOARD_PORT"; return; }
+    die "Dashboard owner helper is missing; refusing to remove recovery state while port $DASHBOARD_PORT may still be owned"
+  fi
+  local root_native hermes_native launcher_native owner_helper_native elevation_helper_native code
+  root_native="$(to_windows_path "$HERMES_ROOT")"
+  hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
+  launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
+  owner_helper_native="$(to_windows_path "$DASHBOARD_OWNER_PS1")"
+  elevation_helper_native="$(to_windows_path "$DASHBOARD_ELEVATION_PS1")"
+  set +e
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$owner_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" >/dev/null 2>&1
+  code=$?
+  set -e
+  case "$code" in
+    0) say "OK    stopped the verified Hermes Dashboard started for CozyGateway"; return ;;
+    42) say "INFO  Dashboard port $DASHBOARD_PORT is foreign; leaving it untouched"; return ;;
+    43) ;;
+    *) die "could not safely stop the verified Hermes Dashboard during uninstall" ;;
+  esac
+  [ -f "$DASHBOARD_ELEVATION_PS1" ] || die "Dashboard ownership needs elevated inspection, but its scoped helper is missing"
+  say "INFO  Dashboard ownership metadata requires one scoped UAC cleanup helper"
+  set +e
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$elevation_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" "$owner_helper_native" >/dev/null 2>&1
+  code=$?
+  set -e
+  case "$code" in
+    0) say "OK    stopped the verified elevated Hermes Dashboard started for CozyGateway" ;;
+    42) say "INFO  Dashboard port $DASHBOARD_PORT is foreign; leaving it untouched" ;;
+    43|46) die "the scoped Dashboard cleanup helper could not inspect or stop the elevated Dashboard" ;;
+    *) die "could not safely stop the verified elevated Hermes Dashboard during uninstall" ;;
+  esac
 }
 start_dashboard() {
   local hermes_root_arg="$HERMES_ROOT" code
@@ -1052,7 +1416,7 @@ start_dashboard() {
   esac
 }
 uninstall() {
-  local profiles root hermes_bin p home plugin spool action hermes_available=1
+  local profiles root hermes_bin dashboard_port p home plugin spool action hermes_available=1
   if [ ! -f "$STATE_FILE" ]; then
     resolve_platform
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
@@ -1066,11 +1430,20 @@ uninstall() {
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
   hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
+  if grep -q '^dashboard_port=' "$STATE_FILE"; then
+    dashboard_port="$(sed -n 's/^dashboard_port=//p' "$STATE_FILE" | tail -1)"
+    [ -n "$dashboard_port" ] || die "installer state has an unsafe Dashboard port"
+  else
+    dashboard_port="$DASHBOARD_PORT"
+  fi
   profiles="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"
   [ -n "$root" ] && [ -n "$hermes_bin" ] && [ -n "$profiles" ] || die "install state is incomplete"
   case "$hermes_bin" in /*) ;; *) die "installer state has an unsafe Hermes executable path" ;; esac
   [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || hermes_available=0
-  HERMES_RESOLVED="$hermes_bin"
+  HERMES_RESOLVED="$hermes_bin"; HERMES_ROOT="$root"
+  case "$dashboard_port" in ''|*[!0-9]*) die "installer state has an unsafe Dashboard port" ;; esac
+  [ "$dashboard_port" -ge 1 ] && [ "$dashboard_port" -le 65535 ] || die "installer state has an unsafe Dashboard port"
+  DASHBOARD_PORT="$dashboard_port"
   resolve_platform
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     local startup_entry
@@ -1082,6 +1455,7 @@ uninstall() {
       rm -f "$startup_entry"
       stop_owned_windows_gateway 0 || true
     fi
+    stop_owned_windows_dashboard_for_uninstall
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
@@ -1090,7 +1464,7 @@ uninstall() {
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
     else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
   fi
-  IFS=',' read -r -a SELECTED <<<"$profiles"; HERMES_ROOT="$root"
+  IFS=',' read -r -a SELECTED <<<"$profiles"
   for p in "${SELECTED[@]}"; do
     valid_profile "$p" || die "unsafe profile in installer state"; home="$(profile_home "$p")"; plugin="$home/plugins/cozygateway"; spool="$home/plugin-data/cozygateway/attach-v1.sqlite"
     action="$(prior_service_action "$p")"
@@ -1110,10 +1484,20 @@ uninstall() {
     if [ "$DRY_RUN" = 1 ]; then
       run rm -f "$spool" "$spool-wal" "$spool-shm"
     elif ! rm -f "$spool" "$spool-wal" "$spool-shm" 2>/dev/null; then
-      [ "$SERVICE_PLATFORM" = Windows ] && [ "$action" = preexisting ] && [ "$hermes_available" = 1 ] || die "could not remove the CozyGateway spool for profile $p"
-      say "INFO  restarting the pre-existing Hermes gateway for profile $p to release the disabled CozyGateway spool"
-      "$HERMES_RESOLVED" -p "$p" gateway restart >/dev/null || die "could not restart the pre-existing Hermes gateway for profile $p during cleanup"
-      rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes restarted, but the CozyGateway spool for profile $p is still in use"
+      [ "$SERVICE_PLATFORM" = Windows ] && [ "$hermes_available" = 1 ] || die "could not remove the CozyGateway spool for profile $p"
+      case "$action" in
+        preexisting)
+          say "INFO  restarting the pre-existing Hermes gateway for profile $p to release the disabled CozyGateway spool"
+          "$HERMES_RESOLVED" -p "$p" gateway restart >/dev/null || die "could not restart the pre-existing Hermes gateway for profile $p during cleanup"
+          rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes restarted, but the CozyGateway spool for profile $p is still in use"
+          ;;
+        installed|started)
+          say "INFO  stopping the installer-owned Hermes gateway for profile $p to release the disabled CozyGateway spool"
+          "$HERMES_RESOLVED" -p "$p" gateway stop >/dev/null || die "could not stop the installer-owned Hermes gateway for profile $p during cleanup"
+          rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes stopped, but the CozyGateway spool for profile $p is still in use"
+          ;;
+        *) die "could not remove the CozyGateway spool for profile $p" ;;
+      esac
     fi
   done
   run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
@@ -1165,7 +1549,7 @@ main() {
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
-  write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; start_dashboard; install_service; wait_gateway_ready
+  write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli
   if [ -n "$PUBLIC_URL" ]; then

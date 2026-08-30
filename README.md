@@ -36,8 +36,10 @@ installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. Se
 `docs/install-service.md` and `docs/connectivity.md`.
 
 Windows installs under `%LOCALAPPDATA%\cozygateway`, registers a current-user
-`CozyGateway` Scheduled Task with a Startup-folder fallback, and requires no
-administrator prompt. The final screen contains a QR and plain-text setup code.
+`CozyGateway` Scheduled Task with a Startup-folder fallback, and normally stays
+non-elevated. One scoped administrator prompt can appear only when an existing
+higher-integrity Hermes Dashboard cannot be classified safely without elevated
+process metadata. The final screen contains a QR and plain-text setup code.
 Open a new PowerShell or Terminal window and type `cozygateway` for a small menu
 that shows status, prints a fresh pairing QR, or changes the bind address and
 port. Existing installs retain their saved listener; `--bind-host` remains the non-interactive
