@@ -731,6 +731,19 @@ function Resolve-CozySystemExecutable {
   if (-not [IO.File]::Exists($path)) { throw "trusted system executable is unavailable: $Name" }
   return $path
 }
+function Find-CozyDashboardSubcommand {
+  param([object[]]$Tokens, [int]$StartIndex)
+  $index = $StartIndex
+  if ($index -lt $Tokens.Count -and @("-p", "--profile") -contains $Tokens[$index]) {
+    if ($index + 1 -ge $Tokens.Count -or -not ([string]$Tokens[$index + 1]).Equals("default", [StringComparison]::Ordinal)) { return -1 }
+    $index += 2
+  } elseif ($index -lt $Tokens.Count -and $Tokens[$index].StartsWith("--profile=", [StringComparison]::Ordinal)) {
+    if (-not $Tokens[$index].Substring("--profile=".Length).Equals("default", [StringComparison]::Ordinal)) { return -1 }
+    $index += 1
+  }
+  if ($index -lt $Tokens.Count -and $Tokens[$index] -eq "dashboard") { return $index }
+  return -1
+}
 function Test-CozyDashboardOwner {
   param(
     $Process,
@@ -761,15 +774,15 @@ function Test-CozyDashboardOwner {
   if (-not $firstIsExecutable) { return "Foreign" }
   $pythonRuntime = $firstIsExecutable -and @("python.exe", "pythonw.exe") -contains [IO.Path]::GetFileName($processExecutable).ToLowerInvariant()
   $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
-  if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq "dashboard") {
-    $dashboardIndex = 1
-  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($venvLauncher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
-    $dashboardIndex = 2
-  } elseif ($pythonRuntime -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
-    $dashboardIndex = 3
-    $requiresRootAncestry = $true
-  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase) -and $tokens[2] -eq "dashboard") {
-    $dashboardIndex = 2
+  if ($directLauncher) {
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 1
+  } elseif ($pythonRuntime -and $tokens.Count -gt 1 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($venvLauncher, [StringComparison]::OrdinalIgnoreCase))) {
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 2
+  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main") {
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 3
+    if ($dashboardIndex -ge 0) { $requiresRootAncestry = $true }
+  } elseif ($pythonRuntime -and $tokens.Count -gt 1 -and $null -ne $secondToken -and $secondToken.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $secondToken.EndsWith($scriptSuffix, [StringComparison]::OrdinalIgnoreCase)) {
+    $dashboardIndex = Find-CozyDashboardSubcommand $tokens 2
   }
   if ($dashboardIndex -lt 0) { return "Foreign" }
 
@@ -798,6 +811,9 @@ function Test-CozyDashboardOwner {
     }
   }
 
+  for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
+    if (@("-p", "--profile") -contains $tokens[$index] -or $tokens[$index].StartsWith("--profile=", [StringComparison]::Ordinal)) { return "Foreign" }
+  }
   for ($index = $dashboardIndex + 1; $index -lt $tokens.Count; $index++) {
     if ($tokens[$index] -eq "--port" -and $index + 1 -lt $tokens.Count -and $tokens[$index + 1] -eq [string]$ExpectedPort) { return "Owned" }
     if ($tokens[$index] -eq ("--port=" + $ExpectedPort)) { return "Owned" }

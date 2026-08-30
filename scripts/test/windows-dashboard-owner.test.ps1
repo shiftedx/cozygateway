@@ -103,6 +103,20 @@ $moduleParent = New-TestProcess 201 0 $venvPython ('"{0}" -m hermes_cli.main das
 $moduleListener = New-TestProcess 200 201 $uvPython ('"{0}" -m hermes_cli.main dashboard --host 127.0.0.1 --port 9119 --no-open' -f $uvPython)
 Assert-Owner 'UV child with Hermes ancestor' 'Owned' $moduleListener @{ 200 = $moduleListener; 201 = $moduleParent }
 
+# A named-profile launch is routed back to the machine Dashboard by inserting
+# the global default-profile option between the module and subcommand.
+$profileRoutedListener = New-TestProcess 212 201 $uvPython ('"{0}" -m hermes_cli.main -p default dashboard --host 127.0.0.1 --port 9119 --no-open' -f $uvPython)
+Assert-Owner 'profile-routed machine Dashboard with Hermes ancestor' 'Owned' $profileRoutedListener @{ 212 = $profileRoutedListener; 201 = $moduleParent }
+
+$isolatedProfileListener = New-TestProcess 213 201 $uvPython ('"{0}" -m hermes_cli.main -p other dashboard --host 127.0.0.1 --port 9119 --no-open' -f $uvPython)
+Assert-Owner 'isolated named-profile Dashboard is not the machine Dashboard' 'Foreign' $isolatedProfileListener @{ 213 = $isolatedProfileListener; 201 = $moduleParent }
+
+$postSubcommandProfileListener = New-TestProcess 214 201 $uvPython ('"{0}" -m hermes_cli.main dashboard -p other --host 127.0.0.1 --port 9119 --no-open' -f $uvPython)
+Assert-Owner 'post-subcommand profile cannot retarget the machine Dashboard' 'Foreign' $postSubcommandProfileListener @{ 214 = $postSubcommandProfileListener; 201 = $moduleParent }
+
+$postPortProfileListener = New-TestProcess 215 201 $uvPython ('"{0}" -m hermes_cli.main dashboard --host 127.0.0.1 --port 9119 -p other --no-open' -f $uvPython)
+Assert-Owner 'profile after the matching port cannot retarget the machine Dashboard' 'Foreign' $postPortProfileListener @{ 215 = $postPortProfileListener; 201 = $moduleParent }
+
 $launcherChild = New-TestProcess 202 201 $uvPython ('"{0}" "{1}" dashboard --port 9119' -f $uvPython, $launcher)
 Assert-Owner 'UV child carrying Hermes launcher' 'Owned' $launcherChild @{ 202 = $launcherChild; 201 = $moduleParent }
 
