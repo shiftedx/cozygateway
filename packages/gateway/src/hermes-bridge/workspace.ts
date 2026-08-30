@@ -98,13 +98,25 @@ export function workspacePath(raw: string | undefined, opts: { file?: boolean } 
   return parts.join("/");
 }
 
-function externalPath(value: string): { text: string; windows: boolean } | undefined {
+function externalPath(value: string): {
+  text: string;
+  comparison: string;
+  windows: boolean;
+} | undefined {
   if (!value || value.includes("\0")) return undefined;
   let text = value.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
   const windows = /^[A-Za-z]:\//.test(text);
   if (!text.startsWith("/") && !windows) return undefined;
   while (text.length > (windows ? 3 : 1) && text.endsWith("/")) text = text.slice(0, -1);
-  return { text: windows ? text.toLowerCase() : text, windows };
+  return { text, comparison: windows ? text.toLowerCase() : text, windows };
+}
+
+function sameExternalPath(
+  left: ReturnType<typeof externalPath>,
+  right: ReturnType<typeof externalPath>,
+): boolean {
+  return left !== undefined && right !== undefined
+    && left.windows === right.windows && left.comparison === right.comparison;
 }
 
 function externalPathHasSensitiveComponent(value: string): boolean {
@@ -116,7 +128,7 @@ function externalPathHasSensitiveComponent(value: string): boolean {
 function exactExternalPath(root: string, relative: string): string | undefined {
   const normalized = externalPath(root);
   if (!normalized) return undefined;
-  const suffix = relative === "" ? "" : `/${normalized.windows ? relative.toLowerCase() : relative}`;
+  const suffix = relative === "" ? "" : `/${relative}`;
   return `${normalized.text}${suffix}`;
 }
 
@@ -127,11 +139,11 @@ function lockedProof(raw: unknown, expectedRoot?: string): string | undefined {
   const locked = typeof row["locked_root"] === "string" ? row["locked_root"] : undefined;
   const a = root ? externalPath(root) : undefined;
   const b = locked ? externalPath(locked) : undefined;
-  if (!a || !b || a.windows !== b.windows || a.text !== b.text) return undefined;
+  if (!a || !b || !sameExternalPath(a, b)) return undefined;
   if (externalPathHasSensitiveComponent(b.text)) return undefined;
   if (expectedRoot !== undefined) {
     const expected = externalPath(expectedRoot);
-    if (!expected || expected.windows !== a.windows || expected.text !== a.text) return undefined;
+    if (!sameExternalPath(expected, a)) return undefined;
   }
   return locked;
 }
@@ -160,7 +172,8 @@ function entryFromUpstream(
     throw new WorkspaceTooLarge("projected workspace path is too long");
   const upstreamPath = typeof row["path"] === "string" ? externalPath(row["path"]) : undefined;
   const expectedPath = exactExternalPath(root, relative);
-  if (!upstreamPath || expectedPath === undefined || upstreamPath.text !== expectedPath)
+  const expectedExternalPath = expectedPath === undefined ? undefined : externalPath(expectedPath);
+  if (!sameExternalPath(upstreamPath, expectedExternalPath))
     throw new WorkspaceForbidden("workspace path escaped its locked root");
   const directoryFlag = row["is_directory"];
   if (typeof directoryFlag !== "boolean") throw new WorkspaceUnavailable("invalid workspace response");

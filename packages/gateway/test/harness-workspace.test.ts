@@ -293,6 +293,32 @@ describe("paired workspace routes", () => {
     expect(response.headers.get("content-range")).toBe("bytes 1-3/6");
   });
 
+  it("preserves Windows path casing in the proven upstream download target", async () => {
+    const root = "C:\\Data\\Workspace";
+    let target: string | null = null;
+    const surface = new GatewayHarnessWorkspace([
+      new HermesWorkspaceAdapter(client({
+        json: () => upstreamList([
+          fileEntry("Report.txt", 6, "c:\\DATA\\WORKSPACE\\REPORT.TXT"),
+        ], {
+          path: "c:\\data\\workspace",
+          root: "c:\\data\\workspace",
+          locked_root: "C:\\DATA\\WORKSPACE",
+        }),
+        response: (path) => {
+          target = new URL(path, "http://hermes.invalid").searchParams.get("path");
+          return new Response("abcdef", { headers: { "content-length": "6" } });
+        },
+      }), HARNESS, root),
+    ]);
+
+    const opened = await surface.download(
+      "home", "sage", "Report.txt", undefined, "device", new AbortController().signal,
+    );
+    expect(target).toBe("C:/Data/Workspace/Report.txt");
+    await opened.body.cancel();
+  });
+
   it("cancels an opened body when the locked root or entry changes during download", async () => {
     for (const mutate of [
       () => upstreamList([fileEntry()], { root: "/srv/other", locked_root: "/srv/other" }),
