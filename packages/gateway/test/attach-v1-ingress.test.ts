@@ -264,6 +264,23 @@ describe("attach-v1 ingress", () => {
     ws.close();
   });
 
+  it("quarantines desktop session sync rows unless that capability was negotiated", async () => {
+    const { ws, frames } = await dial(undefined, ["draft"]);
+    ws.send(JSON.stringify({
+      kind: "event", sequence: 1, eventId: "desktop-sync-disabled",
+      event: {
+        kind: "desktop_session_message", threadId: "native-chat", hermesSessionId: "raw-current",
+        source: "cozygateway", rowId: "row-1", role: "assistant", text: "must not project", at: 1,
+      },
+    }));
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.id === "desktop-sync-disabled"));
+    expect(frames.find((frame) => frame.kind === "ack" && frame.id === "desktop-sync-disabled")).toMatchObject({
+      discarded: true, reason: "capability_not_negotiated",
+    });
+    expect(accepted).toEqual([]);
+    ws.close();
+  });
+
   it("quarantines an unauthorized target and continues with the next valid event", async () => {
     const { ws, frames } = await dial(undefined, ["draft"]);
     acceptsTarget = false;

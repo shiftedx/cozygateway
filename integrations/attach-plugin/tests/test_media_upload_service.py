@@ -315,9 +315,12 @@ class MediaUploadServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.script_upload(upload_too_large(8 * 1024 * 1024))
         result = await self._proactive([self.png])
 
-        self.assertEqual(result["media_errors"], [
-            "shot.png (image/png, family=image): http_413 Content Too Large",
-        ])
+        self.assertEqual(len(result["media_errors"]), 1)
+        self.assertRegex(
+            result["media_errors"][0],
+            r"^shot\.png \(image/png, family=image\): http_413 "
+            r"(?:Content Too Large|Request Entity Too Large)$",
+        )
         self.assertEqual(self.gateway.events_of_kind("scheduled"), [])
 
     async def test_bytes_that_prove_an_unsupported_type_fail_before_any_network_call(self):

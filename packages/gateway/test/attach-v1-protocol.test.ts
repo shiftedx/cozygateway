@@ -84,6 +84,31 @@ describe("attach-v1 protocol", () => {
     })).toBe(true));
   });
 
+  it("models bounded source-qualified desktop session rows", () => {
+    const event = {
+      kind: "event", sequence: 1, eventId: "desktop-row",
+      event: {
+        kind: "desktop_session_message", threadId: "native-chat", hermesSessionId: "raw-current",
+        desktopSessionId: "raw-selected", source: "tui", rowId: "row-1", role: "assistant",
+        text: "continued on desktop", at: 1_800_000_000_000,
+      },
+    };
+    expect(check(AttachV1EventFrameSchema, event)).toBe(true);
+    const { desktopSessionId: _desktopSessionId, ...mobileRow } = event.event;
+    expect(check(AttachV1EventFrameSchema, {
+      ...event,
+      event: { ...mobileRow, source: "cozygateway" },
+    })).toBe(true);
+    expect(check(AttachV1EventFrameSchema, {
+      ...event,
+      event: { ...event.event, source: "tui", desktopSessionId: undefined },
+    })).toBe(false);
+    expect(check(AttachV1EventFrameSchema, {
+      ...event,
+      event: { ...event.event, role: "tool" },
+    })).toBe(false);
+  });
+
   it("has replay, ack, gap and heartbeat control frames but no reasoning event", () => {
     expect(check(AttachV1ClientFrameSchema, { kind: "ack", channel: "command", sequence: 7, id: "cmd-7" })).toBe(true);
     expect(check(AttachV1ServerFrameSchema, { kind: "ack", channel: "event", sequence: 4, id: "event-4", duplicate: true })).toBe(true);

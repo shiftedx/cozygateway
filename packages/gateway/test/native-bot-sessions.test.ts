@@ -174,6 +174,83 @@ describe("attach-v1 native Bot Mode sessions", () => {
     h.storage.close();
   });
 
+  it("projects a source-qualified desktop row once without changing the selected chat or turn", async () => {
+    const h = nativePlane(["sage"]);
+    h.desktopSessions.mockResolvedValue([{
+      source: "hermes_desktop", hermesSessionId: "desktop-original", startedAt: 1, lastActiveAt: 2,
+    }]);
+    const before = (await h.surface.canonicalChat("sage")).sessionId;
+    const resume = h.surface.resumeDesktopSession("sage", "desktop-original");
+    await vi.waitFor(() => expect(h.desktopResumeCommands).toHaveLength(1));
+    const command = h.desktopResumeCommands[0];
+    if (command === undefined) throw new Error("desktop resume command was not queued");
+    expect(h.plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "desktop-confirm",
+      event: {
+        kind: "desktop_session_resumed", threadId: command.threadId,
+        hermesSessionId: command.hermesSessionId, resumeId: command.resumeId,
+      },
+    } as AttachV1EventFrame)).toBe(true);
+    await resume;
+    const adopted = (await h.surface.canonicalChat("sage")).sessionId;
+    expect(adopted).toBe(command.threadId);
+    const framesBefore = h.frames.length;
+
+    const row = {
+      kind: "desktop_session_message", threadId: adopted,
+      hermesSessionId: "desktop-current", desktopSessionId: "desktop-original",
+      source: "tui", rowId: "row-17", role: "assistant", text: "continued on desktop", at: 2_000,
+    } as const;
+    expect(h.plane.handle("sage", {
+      kind: "event", sequence: 2, eventId: "desktop-row-1", event: row,
+    } as AttachV1EventFrame)).toBe(true);
+    expect(await h.surface.chatHistory("sage")).toMatchObject({
+      sessionId: adopted,
+      messages: [{ role: "assistant", text: "continued on desktop" }],
+    });
+    expect(h.frames.slice(framesBefore)).toContainEqual(expect.objectContaining({
+      type: "bot_chat", bot: "sage", sessionId: adopted,
+      messages: [expect.objectContaining({ role: "assistant", text: "continued on desktop" })],
+    }));
+
+    // At-least-once replay is accepted but cannot append or broadcast a second row.
+    const afterFirst = h.frames.length;
+    expect(h.plane.handle("sage", {
+      kind: "event", sequence: 3, eventId: "desktop-row-replay", event: row,
+    } as AttachV1EventFrame)).toBe(true);
+    expect((await h.surface.chatHistory("sage")).messages.filter((message) => message.text === "continued on desktop")).toHaveLength(1);
+    expect(h.frames).toHaveLength(afterFirst);
+    h.plane.close();
+    h.storage.close();
+  });
+
+  it("fails closed for desktop sync rows with a wrong binding, while cozygateway rows stay in their owned native session", async () => {
+    const h = nativePlane(["sage", "luna"]);
+    const sage = (await h.surface.canonicalChat("sage")).sessionId;
+    const luna = (await h.surface.canonicalChat("luna")).sessionId;
+    const bad = {
+      kind: "desktop_session_message", threadId: sage,
+      hermesSessionId: "current", desktopSessionId: "unconfirmed",
+      source: "tui", rowId: "row-1", role: "user", text: "must not land", at: 1,
+    } as const;
+    expect(h.plane.canAccept("sage", { kind: "event", sequence: 1, eventId: "bad", event: bad } as AttachV1EventFrame)).toBe(false);
+    expect(h.plane.handle("sage", { kind: "event", sequence: 1, eventId: "bad", event: bad } as AttachV1EventFrame)).toBe(false);
+    expect((await h.surface.chatHistory("sage")).messages).toEqual([]);
+
+    const mobile = {
+      kind: "desktop_session_message", threadId: sage,
+      hermesSessionId: "native-raw", source: "cozygateway",
+      rowId: "row-2", role: "user", text: "visible mobile lane row", at: 2,
+    } as const;
+    expect(h.plane.handle("sage", { kind: "event", sequence: 2, eventId: "mobile-row", event: mobile } as AttachV1EventFrame)).toBe(true);
+    expect((await h.surface.chatHistory("sage")).messages).toMatchObject([{ text: "visible mobile lane row" }]);
+    expect(h.plane.handle("sage", {
+      kind: "event", sequence: 3, eventId: "foreign-row", event: { ...mobile, threadId: luna },
+    } as AttachV1EventFrame)).toBe(false);
+    h.plane.close();
+    h.storage.close();
+  });
+
   it("re-proves a persisted desktop binding after a plugin restart and rejects every non-exact confirmation", async () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), "native-desktop-resume-")), "gateway.sqlite");
     let h = nativePlane(["sage"], openStorage(dbPath));

@@ -1511,7 +1511,7 @@ export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
  * nor native Bot Mode history. A client must gate this picker and its resume action on this id,
  * never on a later scalar value of `com.cozylabs.bots`. */
 export const HERMES_DESKTOP_SESSIONS_CAPABILITY_ID = "com.cozylabs.hermes-desktop-sessions";
-export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 1;
+export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 2;
 /** Reserved future A2A inbox seam. This is the sole future advertisement for the withdrawn
  * surface and has no version until Hermes exposes durable structured A2A identity, delivery/reply
  * metadata, and bounded replay. It is separate from `com.cozylabs.bots` because no later value

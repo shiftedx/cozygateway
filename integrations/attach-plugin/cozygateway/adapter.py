@@ -856,6 +856,7 @@ class AttachAdapter:
         self._spool: Optional[AttachSpool] = None
         self._client: Optional[Any] = None
         self._watcher: Optional[asyncio.Task] = None
+        self._desktop_mirror_task: Optional[asyncio.Task] = None
         self._closing: bool = False
         self._ready = asyncio.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -879,6 +880,12 @@ class AttachAdapter:
         # Gateway-owned attach lane -> exact Hermes raw session target. This is populated only
         # after the resident runner confirms `switch_session`; it is never inferred from chat_id.
         self._desktop_session_bindings: Dict[str, Tuple[str, str]] = {}
+        # The only window in which this adapter itself is writing a mobile-originated row. The
+        # separate mirror worker skips it, then advances its durable cursor once the inject ends.
+        self._desktop_mirror_injections: Set[str] = set()
+        self._desktop_mirror_interval = _env_float(
+            "COZYGATEWAY_DESKTOP_SESSION_SYNC_INTERVAL_SECONDS", 1.0,
+        )
         # Delegation batch id -> the turn that dispatched it, pinned at the batch's first
         # event and bounded oldest-first. An async ``delegate_task`` batch outlives its turn,
         # and a late finish leg must land on the ORIGINAL turn id (the gateway's post-seal
@@ -1222,6 +1229,10 @@ class AttachAdapter:
         self._ready.set()
         self._mark_connected()  # type: ignore[attr-defined]
         _register_active_adapter(self)
+        client = self._client
+        if (getattr(client, "desktop_session_sync_available", False)
+                and (self._desktop_mirror_task is None or self._desktop_mirror_task.done())):
+            self._desktop_mirror_task = asyncio.create_task(self._mirror_desktop_sessions())
         logger.info("attach-v1: connected and writable at %s", self.gateway_url)
 
     async def _watch_loop(self) -> None:
@@ -1292,6 +1303,14 @@ class AttachAdapter:
         self._ready.clear()
         _unregister_active_adapter(self)
         self._mark_disconnected()  # type: ignore[attr-defined]
+        mirror_task = self._desktop_mirror_task
+        self._desktop_mirror_task = None
+        if mirror_task is not None and mirror_task is not asyncio.current_task():
+            mirror_task.cancel()
+            try:
+                await mirror_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - teardown is best effort
+                pass
         watcher = self._watcher
         self._watcher = None
         # The watch loop itself calls disconnect() on a fatal close; cancelling and
@@ -1395,6 +1414,198 @@ class AttachAdapter:
             source.profile = self._profile
         return source
 
+    @staticmethod
+    def _sync_session_db(runner: Any, store: Any = None) -> Any:
+        """Find Hermes' synchronous SessionDB beneath version-specific async wrappers."""
+        candidates = (
+            getattr(store, "session_db", None), getattr(store, "_session_db", None),
+            getattr(store, "store", None), getattr(store, "_store", None),
+            getattr(runner, "session_db", None), getattr(runner, "_session_db", None),
+        )
+        for candidate in candidates:
+            db = getattr(candidate, "_db", candidate)
+            if callable(getattr(db, "get_session", None)) and callable(getattr(db, "resolve_resume_session_id", None)):
+                return db
+        return None
+
+    @staticmethod
+    def _latest_message_row_id(session_db: Any, session_id: str) -> int:
+        rows = session_db.get_messages(session_id, limit=1, latest=True)
+        if not rows:
+            return 0
+        try:
+            return max(0, int(rows[0].get("id", 0)))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    async def _baseline_mobile_mirror_link(self, thread_id: str, source: Any) -> None:
+        """Record the just-injected phone turn so it can never be mirrored back to its origin."""
+        spool = self._spool
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if spool is None or runner is None or store is None:
+            return
+        try:
+            session_key = runner._session_key_for_source(source)
+            entry = await store.lookup_by_session_key(session_key)
+            session_id = getattr(entry, "session_id", None)
+            if not isinstance(session_id, str) or not session_id:
+                return
+            db = self._sync_session_db(runner, store)
+            if db is None:
+                return
+            row = await asyncio.to_thread(db.get_session, session_id)
+            if not isinstance(row, dict):
+                return
+            # A fresh native lane is safe to establish only when it is exactly the synthetic
+            # CozyGateway row. Resumed TUI lanes already have a link and retain their TUI source.
+            if (str(row.get("source") or "").strip().lower() == PLATFORM_NAME
+                    and not bool(row.get("hidden"))
+                    and str(row.get("chat_id") or "") == thread_id):
+                cursor = await asyncio.to_thread(self._latest_message_row_id, db, session_id)
+                spool.upsert_desktop_session_link(
+                    thread_id=thread_id,
+                    current_hermes_session_id=session_id,
+                    source=PLATFORM_NAME,
+                    desktop_session_id=None,
+                    last_message_row_id=cursor,
+                )
+                return
+            # An exact prior TUI adoption keeps its source identity but must advance beyond mobile
+            # rows written on that shared raw session before the mirror worker next polls.
+            binding = self._desktop_session_bindings.get(thread_id)
+            link = next((item for item in spool.desktop_session_links() if item["threadId"] == thread_id), None)
+            if binding is not None and binding[0] == session_key and link is not None and link["source"] == "tui":
+                # Compression can rotate the active SessionEntry after adoption.  The durable
+                # link's root remains the proof; resolve it before accepting the new active tip.
+                linked_tip = await asyncio.to_thread(
+                    db.resolve_resume_session_id, str(link["currentHermesSessionId"]),
+                )
+                if linked_tip != session_id:
+                    return
+                cursor = await asyncio.to_thread(self._latest_message_row_id, db, session_id)
+                spool.advance_desktop_session_link(
+                    thread_id=thread_id,
+                    expected_current_hermes_session_id=str(link["currentHermesSessionId"]),
+                    current_hermes_session_id=session_id, expected_source="tui",
+                    expected_desktop_session_id=link.get("desktopSessionId"), last_message_row_id=cursor,
+                )
+        except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
+            logger.debug("attach: could not baseline desktop session mirror", exc_info=True)
+
+    async def _mirror_desktop_session_link(
+        self, client: Any, spool: Any, db: Any, link: Dict[str, Any], *, allow_active: bool = False,
+    ) -> None:
+        """Journal one linked session's unseen rows, preserving its durable identity.
+
+        This is deliberately a serialized-continuation primitive, not a concurrent merge.  A
+        caller that is about to inject a mobile turn uses ``allow_active`` to flush the preceding
+        desktop segment before the injection guard begins.
+        """
+        thread_id = str(link["threadId"])
+        if not allow_active and (
+            thread_id in self._desktop_mirror_injections
+            or self._active_turn.get(thread_id) is not None
+        ):
+            return
+        source = str(link.get("source") or "")
+        if source not in {PLATFORM_NAME, "tui"}:
+            return
+        try:
+            current = await asyncio.to_thread(
+                db.resolve_resume_session_id, str(link["currentHermesSessionId"]),
+            )
+            if not isinstance(current, str) or not current:
+                return
+            session = await asyncio.to_thread(db.get_session, current)
+            if not isinstance(session, dict):
+                return
+            session_source = str(session.get("source") or "").strip().lower()
+            if source == PLATFORM_NAME:
+                if (session_source != PLATFORM_NAME or bool(session.get("hidden"))
+                        or str(session.get("chat_id") or "") != thread_id):
+                    return
+            elif session_source != "tui" or not link.get("desktopSessionId"):
+                return
+
+            after = int(link["lastMessageRowId"])
+            rows = await asyncio.to_thread(db.get_messages, current, limit=100, after_id=after)
+            for message in rows:
+                row_id = int(message.get("id", 0))
+                if row_id <= after:
+                    continue
+                expected_current = str(link["currentHermesSessionId"])
+                role = str(message.get("role") or "")
+                text = message.get("content")
+                if role not in {"user", "assistant"} or not isinstance(text, str) or not text.strip():
+                    if not spool.advance_desktop_session_link(
+                        thread_id=thread_id,
+                        expected_current_hermes_session_id=expected_current,
+                        current_hermes_session_id=current,
+                        expected_source=source,
+                        expected_desktop_session_id=link.get("desktopSessionId"),
+                        last_message_row_id=row_id,
+                    ):
+                        return
+                    link["currentHermesSessionId"] = current
+                    after = row_id
+                    continue
+                raw_at = message.get("timestamp", 0)
+                try:
+                    at = int(float(raw_at) * 1000) if float(raw_at) < 1_000_000_000_000 else int(float(raw_at))
+                except (TypeError, ValueError):
+                    at = 0
+                sent = await client.send_desktop_session_message(
+                    thread_id=thread_id,
+                    current_hermes_session_id=current,
+                    source=source,
+                    desktop_session_id=link.get("desktopSessionId"),
+                    expected_current_hermes_session_id=expected_current,
+                    message_row_id=row_id,
+                    role=role,
+                    text=text,
+                    at=max(0, at),
+                )
+                if not sent:
+                    return
+                link["currentHermesSessionId"] = current
+                after = row_id
+        except Exception:  # noqa: BLE001 - one row cannot kill a long-lived mirror
+            logger.debug("attach: desktop session mirror poll failed", exc_info=True)
+
+    async def _flush_desktop_session_before_injection(self, thread_id: str) -> None:
+        """Flush the prior Desktop segment before a serialized mobile continuation begins."""
+        client = self._client
+        spool = self._spool
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if (client is None or spool is None or runner is None or store is None
+                or not getattr(client, "desktop_session_sync_available", False)):
+            return
+        db = self._sync_session_db(runner, store)
+        if db is None:
+            return
+        link = next((item for item in spool.desktop_session_links() if item["threadId"] == thread_id), None)
+        if link is not None:
+            await self._mirror_desktop_session_link(client, spool, db, link, allow_active=True)
+
+    async def _mirror_desktop_sessions(self) -> None:
+        """Poll durable linked rows off the socket watch loop and journal unseen transcript rows."""
+        while not self._closing:
+            client = self._client
+            spool = self._spool
+            runner = getattr(self, "gateway_runner", None)
+            store = getattr(runner, "async_session_store", None)
+            if client is not None and spool is not None and runner is not None and store is not None and getattr(client, "desktop_session_sync_available", False):
+                db = self._sync_session_db(runner, store)
+                if db is not None:
+                    for link in spool.desktop_session_links():
+                        await self._mirror_desktop_session_link(client, spool, db, link)
+            try:
+                await asyncio.sleep(self._desktop_mirror_interval)
+            except asyncio.CancelledError:
+                return
+
     # -- inbound turn ---------------------------------------------------------
     def _on_turn(self, turn: TurnFrame) -> None:
         """Bound to the client's ``on_turn``: schedule the inject as a task.
@@ -1432,6 +1643,11 @@ class AttachAdapter:
         # not MessageEvent.message_id. Carry the gateway-issued turn id on the
         # trusted source so worker/deferred ContextVar copies retain it.
         source = self._inbound_source(turn.thread_id, message_id=turn.turn_id)
+        # The persisted link represents the prior serialized Desktop segment. Drain it before
+        # any mobile write starts; text/time dedupe would lose legitimate repeated turns. Hermes
+        # 0.20.5's cross-process ``session_turn_leases`` serializes this session lineage, so this
+        # high-water baseline is safe for handoff (but is intentionally not a concurrent merge).
+        await self._flush_desktop_session_before_injection(turn.thread_id)
         media_urls: List[str] = []
         media_types: List[str] = []
         client = self._client
@@ -1463,12 +1679,19 @@ class AttachAdapter:
             media_types=media_types,
             metadata=metadata,
         )
+        # Session sync supports serialized handoff, not concurrent two-writer merges.  Keep this
+        # guard across the entire injected turn and baseline before releasing it, so a poller can
+        # never reflect the phone's own rows back while this lane is being written.
+        self._desktop_mirror_injections.add(turn.thread_id)
         try:
             await self.handle_message(event)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - best-effort failed, then clean up
             logger.debug("attach: handle_message raised", exc_info=True)
             await self._safe_failed(turn.thread_id, turn.turn_id, "turn error")
             self._cleanup_turn(turn.thread_id, turn.turn_id)
+        finally:
+            await self._baseline_mobile_mirror_link(turn.thread_id, source)
+            self._desktop_mirror_injections.discard(turn.thread_id)
 
     def _on_desktop_resume_command(self, command: Dict[str, Any]) -> None:
         """Schedule one explicit, source-qualified Desktop/TUI session adoption."""
@@ -1507,24 +1730,41 @@ class AttachAdapter:
             # Hermes has changed the async wrapper's private field spelling across releases. The
             # underlying SessionDB contract is stable; require both exact lookup and compression
             # resolution rather than guessing if this running Hermes does not expose either.
-            session_db = next((candidate for candidate in (
-                getattr(store, "session_db", None), getattr(store, "_session_db", None),
-                getattr(store, "store", None), getattr(store, "_store", None),
-                getattr(runner, "session_db", None), getattr(runner, "_session_db", None),
-            ) if callable(getattr(candidate, "get_session", None)) and callable(getattr(candidate, "resolve_resume_session_id", None))), None)
-            if session_db is None or session_db.get_session(raw_id) is None:
+            # GatewayRunner exposes an AsyncSessionDB whose methods are coroutines.  This command
+            # runs on the event loop but needs the underlying synchronous SessionDB for the two
+            # exact, side-effect-free checks below; calling the wrapper without await silently
+            # treats coroutine objects as rows.  Keep the candidate spelling compatibility, then
+            # unwrap only the documented wrapper field before checking the stable SessionDB API.
+            session_db = self._sync_session_db(runner, store)
+            raw = session_db.get_session(raw_id) if session_db is not None else None
+            if (not isinstance(raw, dict)
+                    or str(raw.get("source") or "").strip().lower() != "tui"):
                 return
             target = session_db.resolve_resume_session_id(raw_id)
-            if not isinstance(target, str) or not target or session_db.get_session(target) is None:
+            target_row = session_db.get_session(target) if isinstance(target, str) and target else None
+            if (not isinstance(target, str) or not target or not isinstance(target_row, dict)
+                    or str(target_row.get("source") or "").strip().lower() != "tui"):
                 return
             await store.get_or_create_session(source)
             switched = await store.switch_session(session_key, target)
-            if switched != target:
+            # Hermes 0.20.x returns SessionEntry; older wrapper seams returned the id directly.
+            # Accept the latter only when it is an exact string match, never arbitrary equality.
+            switched_id = getattr(switched, "session_id", switched)
+            if not isinstance(switched_id, str) or switched_id != target:
                 return
             runner._evict_cached_agent(session_key)
             if not runner._is_session_running(session_key):
                 runner._release_running_agent_state(session_key)
             self._desktop_session_bindings[thread_id] = (session_key, target)
+            spool = self._spool
+            if spool is not None:
+                baseline = await asyncio.to_thread(self._latest_message_row_id, session_db, target)
+                # This is the only intentional retarget: an explicit, idle, serialized desktop
+                # adoption. Ordinary retries use insert-only links and cannot discard an outbox tail.
+                spool.reset_desktop_session_link(
+                    thread_id=thread_id, current_hermes_session_id=target, source="tui",
+                    desktop_session_id=raw_id, last_message_row_id=baseline,
+                )
             client = self._client
             if client is not None:
                 await client.send_desktop_session_resumed(thread_id, raw_id, resume_id)
