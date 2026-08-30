@@ -654,9 +654,9 @@ export class NativeBotDataPlane {
         at: message.at ?? this.#now() + index,
       });
     }
-    if (staged.status === "resumed") {
-      return { name: bot, source: "hermes_desktop", hermesSessionId, status: "resumed", sessionId: staged.sessionId };
-    }
+    // A durable `resumed` binding only proves a past plugin process switched its private raw
+    // session map. Every explicit adoption therefore queues a fresh command/proof before this
+    // gateway may report it resumed or (re)select the local chat.
     const confirmed = new Promise<string>((resolve) => this.#desktopResumeWaiters.set(staged.resumeId, resolve));
     if (!this.#ingress.sendNativeDesktopResume(bot, {
       threadId: staged.sessionId,

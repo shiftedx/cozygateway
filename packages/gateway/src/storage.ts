@@ -2470,8 +2470,10 @@ export class Storage {
   }
 
   /** Stage an explicit Hermes desktop adoption. This does NOT select the local chat: selection
-   * follows only the plugin's source/profile-checked confirmation event. Repeating the same
-   * request is idempotent and returns the original stable command identity. */
+   * follows only the plugin's source/profile-checked confirmation event. A previously confirmed
+   * binding is deliberately re-staged with a fresh proof nonce: the plugin's raw-session mapping
+   * is process-local, so a later explicit adoption cannot trust an old confirmation after that
+   * plugin reconnects or restarts. */
   stageNativeDesktopResume(bot: string, hermesSessionId: string, now: number): {
     sessionId: string; resumeId: string; status: "pending" | "resumed";
   } {
@@ -2481,7 +2483,18 @@ export class Storage {
     ).get(bot, hermesSessionId) as {
       sessionId: string; resumeId: string; status: "pending" | "resumed";
     } | undefined;
-    if (prior !== undefined) return prior;
+    if (prior !== undefined) {
+      // Keep an in-flight proof stable so a retry observes the same command, but never treat a
+      // persisted positive proof as evidence about the currently attached plugin process.
+      if (prior.status === "pending") return prior;
+      const resumeId = randomUUID();
+      this.#db.prepare(
+        `UPDATE bot_desktop_resume_bindings
+         SET resume_id = ?, status = 'pending', confirmed_at = NULL
+         WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND status = 'resumed'`,
+      ).run(resumeId, bot, hermesSessionId, prior.sessionId);
+      return { sessionId: prior.sessionId, resumeId, status: "pending" };
+    }
     const sessionId = this.#insertNativeBotSession(bot, now);
     const resumeId = randomUUID();
     this.#db.prepare(
