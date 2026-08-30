@@ -743,6 +743,7 @@ function Test-CozyDashboardOwner {
   $root = [IO.Path]::GetFullPath($ExpectedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
   $hermes = [IO.Path]::GetFullPath($ExpectedHermes)
   $launcher = [IO.Path]::GetFullPath($ExpectedLauncher)
+  $venvLauncher = [IO.Path]::GetFullPath([IO.Path]::Combine($root, "hermes-agent", "venv", "Scripts", "hermes.exe"))
   if ($null -eq $Process -or [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath) -or [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)) {
     return "Indeterminate"
   }
@@ -762,7 +763,7 @@ function Test-CozyDashboardOwner {
   $directLauncher = $firstIsExecutable -and ($firstToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $firstToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase))
   if ($directLauncher -and $tokens.Count -gt 1 -and $tokens[1] -eq "dashboard") {
     $dashboardIndex = 1
-  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
+  } elseif ($pythonRuntime -and $tokens.Count -gt 2 -and $null -ne $secondToken -and ($secondToken.Equals($hermes, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($launcher, [StringComparison]::OrdinalIgnoreCase) -or $secondToken.Equals($venvLauncher, [StringComparison]::OrdinalIgnoreCase)) -and $tokens[2] -eq "dashboard") {
     $dashboardIndex = 2
   } elseif ($pythonRuntime -and $tokens.Count -gt 3 -and $tokens[1] -eq "-m" -and $tokens[2] -eq "hermes_cli.main" -and $tokens[3] -eq "dashboard") {
     $dashboardIndex = 3

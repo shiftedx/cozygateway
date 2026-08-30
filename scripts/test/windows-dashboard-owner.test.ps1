@@ -52,6 +52,7 @@ $root = 'C:\Users\Alex\AppData\Local\hermes'
 $hermes = Join-Path $root 'bin\hermes'
 $launcher = Join-Path $root 'bin\hermes.exe'
 $venvPython = Join-Path $root 'hermes-agent\venv\Scripts\python.exe'
+$venvHermes = Join-Path $root 'hermes-agent\venv\Scripts\hermes.exe'
 $uvPython = 'C:\Users\Alex\AppData\Roaming\uv\python\cpython-3.11\python.exe'
 
 $ownerHelper = [regex]::Match($installer, "(?ms)<<'POWERSHELL_OWNER'\r?\n(?<Body>.*?)\r?\nPOWERSHELL_OWNER")
@@ -109,6 +110,12 @@ $externalPython = 'C:\Python311\python.exe'
 $normalizedHermes = Join-Path $root 'bin\..\bin\hermes'
 $exactHermesChild = New-TestProcess 203 299 $externalPython ('"{0}" "{1}" dashboard --port 9119' -f $externalPython, $normalizedHermes)
 Assert-Owner 'external Python carrying exact normalized ExpectedHermes without readable ancestry' 'Owned' $exactHermesChild @{ 203 = $exactHermesChild }
+
+# Hermes' Windows bin launcher delegates through the installed virtualenv
+# launcher. The listener therefore names this canonical under-root executable,
+# not the bin path originally resolved by the installer.
+$venvHermesChild = New-TestProcess 211 299 $uvPython ('"{0}" "{1}" dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build' -f $uvPython, $venvHermes)
+Assert-Owner 'external UV Python carrying canonical installed Hermes venv launcher' 'Owned' $venvHermesChild @{ 211 = $venvHermesChild }
 
 $exactHermesGatewayChild = New-TestProcess 210 299 $externalPython ('"{0}" "{1}" gateway --port 9119' -f $externalPython, $normalizedHermes)
 Assert-Owner 'external Python carrying exact normalized ExpectedHermes with gateway subcommand' 'Foreign' $exactHermesGatewayChild @{ 210 = $exactHermesGatewayChild }
