@@ -210,9 +210,11 @@ export interface HermesClient {
   /** Calls the authenticated dashboard REST surface on the same Hermes connection. `path` is
    *  origin-relative and may include a query string. */
   dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown }): Promise<T>;
-  /** Authenticated streaming GET for the one Hermes surface whose body must not be JSON-buffered:
-   *  locked managed-file downloads. Callers still own strict path admission and response bounds. */
+  /** Authenticated response access for Hermes surfaces whose bodies must be streamed or bounded
+   *  before parsing. Callers own strict path admission and response bounds. */
   dashboardResponse(path: string, init?: {
+    method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+    body?: unknown;
     headers?: Readonly<Record<string, string>>;
     signal?: AbortSignal;
     timeoutMs?: number;
@@ -543,7 +545,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   async function dashboardRequest(
     path: string,
     init: {
-      method?: "GET" | "POST" | "PUT" | "DELETE";
+      method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
       body?: unknown;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;
@@ -607,6 +609,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   function dashboardResponse(
     path: string,
     init: {
+      method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+      body?: unknown;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;
       timeoutMs?: number;

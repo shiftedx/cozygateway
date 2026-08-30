@@ -33,5 +33,16 @@
       "finishedAt": 1700000001000,
       "postVersion": "0.20.4"
     }
+  },
+  "partialStatus": {
+    "harnessId": "home",
+    "state": "partial",
+    "receipt": {
+      "outcome": "partial",
+      "startedAt": 1700000002000,
+      "finishedAt": 1700000003000,
+      "postVersion": "0.20.4"
+    },
+    "guidance": "Hermes updated only partially. Review Hermes locally before trying another update."
   }
 }

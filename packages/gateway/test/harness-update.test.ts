@@ -8,12 +8,15 @@ import { createHermesClient, type HermesClient } from "../src/hermes-bridge/clie
 import {
   GatewayHarnessUpdates,
   HermesHarnessUpdateAdapter,
+  UPDATE_JSON_MAX_BYTES,
+  discoverHermesUpdates,
 } from "../src/hermes-bridge/update.ts";
 import { openStorage } from "../src/storage.ts";
 import { startFakeHermesServer } from "./support/fake-hermes-server.ts";
 
 const TOKEN = "paired-device-token";
 const ACTION_ID = "0123456789abcdef0123456789abcdef";
+const NO_RECEIPT_DETAIL = "No update receipt found (no `hermes update` run recorded).";
 const HARNESS: GatewayHarness = {
   id: "home",
   vendor: { id: "hermes-agent", name: "Hermes Agent", logoAsset: "hermes-agent" },
@@ -31,11 +34,30 @@ const CONFIG: GatewayConfig = {
   },
 };
 
-type DashboardInit = { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown };
+type DashboardInit = {
+  method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+  body?: unknown;
+  headers?: Readonly<Record<string, string>>;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
 type DashboardHandler = (path: string, init?: DashboardInit) => unknown | Promise<unknown>;
 
 function client(handler: DashboardHandler): HermesClient {
-  return { dashboardJson: handler } as HermesClient;
+  return {
+    dashboardJson: handler,
+    dashboardResponse: async (path, init) => {
+      const value = await handler(path, init);
+      if (value instanceof Response) return value;
+      const body = JSON.stringify(value);
+      return new Response(body, {
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body)),
+        },
+      });
+    },
+  } as HermesClient;
 }
 
 function check(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -61,6 +83,17 @@ function receipt(outcome: string = "success"): Record<string, unknown> {
     post_sha: "private-post-sha",
     post_version: "0.20.4",
     fleet_states: ["current"],
+  };
+}
+
+function upstreamStatus(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: "hermes-update",
+    running: false,
+    exit_code: null,
+    pid: null,
+    lines: [],
+    ...overrides,
   };
 }
 
@@ -97,6 +130,7 @@ function appFor(updates: GatewayHarnessUpdates) {
 describe("Hermes harness update adapter", () => {
   it("uses Hermes' authenticated check, action, and durable-status APIs exactly", async () => {
     const calls: Array<{ method: string; path: string; query: string; token: string | undefined }> = [];
+    let started = false;
     const upstream = await startFakeHermesServer({
       dashboard: (request) => {
         calls.push({
@@ -108,12 +142,13 @@ describe("Hermes harness update adapter", () => {
         if (request.headers["x-hermes-session-token"] !== "control-secret")
           return { status: 401, body: { detail: "Unauthorized /private/auth/path" } };
         if (request.path === "/api/hermes/update/check") return { body: check() };
-        if (request.path === "/api/hermes/update")
+        if (request.path === "/api/hermes/update") {
+          started = true;
           return { body: { ok: true, name: "hermes-update", action_id: ACTION_ID } };
-        if (request.path === "/api/actions/hermes-update/status") return { body: {
-          name: "hermes-update", running: false, exit_code: null,
-          action_id: ACTION_ID, receipt: receipt(),
-        } };
+        }
+        if (request.path === "/api/actions/hermes-update/status") return { body: upstreamStatus(started
+          ? { action_id: ACTION_ID, receipt: receipt() }
+          : {}) };
         return { status: 404, body: { detail: "Not Found" } };
       },
     });
@@ -129,6 +164,7 @@ describe("Hermes harness update adapter", () => {
       expect(calls).toEqual([
         { method: "GET", path: "/api/hermes/update/check", query: "force=true", token: "control-secret" },
         { method: "GET", path: "/api/hermes/update/check", query: "force=true", token: "control-secret" },
+        { method: "GET", path: "/api/actions/hermes-update/status", query: "lines=1", token: "control-secret" },
         { method: "POST", path: "/api/hermes/update", query: "", token: "control-secret" },
         { method: "GET", path: "/api/actions/hermes-update/status", query: "lines=1", token: "control-secret" },
       ]);
@@ -177,6 +213,7 @@ describe("Hermes harness update adapter", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const updates = surface(async (path) => {
       if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus({ running: starts > 0 });
       starts += 1;
       await gate;
       return { ok: true, name: "hermes-update", action_id: ACTION_ID };
@@ -199,7 +236,7 @@ describe("Hermes harness update adapter", () => {
       if (path.includes("/check")) return check();
       if (path.includes("/status")) {
         statusCalls += 1;
-        return { name: "hermes-update", running: true, exit_code: null, pid: 99, lines: ["TOKEN=secret"] };
+        return upstreamStatus({ running: statusCalls > 1, pid: statusCalls > 1 ? 99 : null, lines: ["TOKEN=secret"] });
       }
       starts += 1;
       throw new DOMException("request timed out /private/path", "TimeoutError");
@@ -207,10 +244,10 @@ describe("Hermes harness update adapter", () => {
     await expect(updates.adapter("home").start("0.20.3")).resolves.toMatchObject({ state: "ambiguous" });
     await expect(updates.adapter("home").status()).resolves.toMatchObject({ state: "running" });
     expect(starts).toBe(1);
-    expect(statusCalls).toBe(1);
+    expect(statusCalls).toBe(2);
   });
 
-  it("recovers success and partial outcomes from the durable receipt after restart", async () => {
+  it("recovers success and real partial outcomes from the durable receipt after restart", async () => {
     const handler: DashboardHandler = () => ({
       name: "hermes-update",
       running: false,
@@ -236,9 +273,204 @@ describe("Hermes harness update adapter", () => {
 
     const partial = surface(() => ({
       name: "hermes-update", running: false, exit_code: 1,
-      action_id: ACTION_ID, receipt: receipt("partial"),
+      lines: [], receipt: receipt("partial"),
     }));
-    await expect(partial.adapter("home").status()).resolves.toMatchObject({ state: "partial" });
+    await expect(partial.adapter("home").status()).resolves.toEqual({
+      harnessId: "home",
+      state: "partial",
+      receipt: {
+        outcome: "partial",
+        startedAt: 1_788_091_200_000,
+        finishedAt: 1_788_091_260_000,
+        postVersion: "0.20.4",
+      },
+      guidance: "Hermes updated only partially. Review Hermes locally before trying another update.",
+    });
+  });
+
+  it.each(["partial", "failed"] as const)(
+    "terminates an active %s update from a changed receipt even though Hermes exposes only an older success action id",
+    async (outcome) => {
+      const oldReceipt = receipt("success");
+      const newReceipt = receipt(outcome);
+      newReceipt["started_at"] = "2026-08-30T12:02:00.000Z";
+      newReceipt["finished_at"] = "2026-08-30T12:03:00.000Z";
+      let statusCalls = 0;
+      const updates = surface((path) => {
+        if (path.includes("/check")) return check();
+        if (path.includes("/status")) {
+          statusCalls += 1;
+          return upstreamStatus({
+            exit_code: statusCalls === 1 ? null : outcome === "partial" ? 1 : null,
+            // Hermes' durable action id comes from a success-only log marker, so a failed
+            // run can leave the prior success id beside the new non-success receipt.
+            action_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            receipt: statusCalls === 1 ? oldReceipt : newReceipt,
+          });
+        }
+        return { ok: true, name: "hermes-update", action_id: ACTION_ID };
+      });
+
+      await updates.adapter("home").start("0.20.3");
+      const terminal = await updates.adapter("home").status();
+      expect(terminal).toMatchObject({
+        state: outcome === "partial" ? "partial" : "failed",
+        receipt: { outcome },
+      });
+      expect(terminal).not.toHaveProperty("actionId");
+    },
+  );
+
+  it("requires a changed durable receipt after an ambiguous POST instead of accepting a recent old success", async () => {
+    const oldReceipt = receipt("success");
+    const newReceipt = receipt("success");
+    newReceipt["finished_at"] = "2026-08-30T12:02:00.000Z";
+    let statusCalls = 0;
+    let starts = 0;
+    const updates = surface((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) {
+        statusCalls += 1;
+        return upstreamStatus({
+          action_id: statusCalls < 3 ? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" : ACTION_ID,
+          receipt: statusCalls < 3 ? oldReceipt : newReceipt,
+        });
+      }
+      starts += 1;
+      throw new DOMException("request timed out", "TimeoutError");
+    }, () => Date.parse("2026-08-30T12:00:30.000Z"));
+
+    await expect(updates.adapter("home").start("0.20.3")).resolves.toMatchObject({ state: "ambiguous" });
+    await expect(updates.adapter("home").status()).resolves.toMatchObject({ state: "unknown" });
+    await expect(updates.adapter("home").status()).resolves.toMatchObject({ state: "success" });
+    expect(starts).toBe(1);
+  });
+
+  it("reports an uncorrelated success candidly before refreshing to latest durable harness state", async () => {
+    const oldReceipt = receipt("success");
+    const newReceipt = receipt("success");
+    newReceipt["finished_at"] = "2026-08-30T12:02:00.000Z";
+    let statusCalls = 0;
+    const updates = surface((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) {
+        statusCalls += 1;
+        return upstreamStatus({ receipt: statusCalls === 1 ? oldReceipt : newReceipt });
+      }
+      return { ok: true, name: "hermes-update", action_id: ACTION_ID };
+    });
+
+    await updates.adapter("home").start("0.20.3");
+    await expect(updates.adapter("home").status()).resolves.toMatchObject({
+      state: "unknown",
+      guidance: expect.stringContaining("without matching action identity"),
+    });
+    await expect(updates.adapter("home").status()).resolves.toMatchObject({
+      state: "success",
+      receipt: { outcome: "success" },
+    });
+  });
+
+  it("performs a fresh version check before considering an active start for coalescing", async () => {
+    let checks = 0;
+    let starts = 0;
+    const updates = surface((path) => {
+      if (path.includes("/check")) {
+        checks += 1;
+        return check({ current_version: checks === 1 ? "0.20.3" : "0.20.4" });
+      }
+      if (path.includes("/status")) return upstreamStatus({ running: starts > 0 });
+      starts += 1;
+      return { ok: true, name: "hermes-update", action_id: ACTION_ID };
+    });
+
+    await updates.adapter("home").start("0.20.3");
+    await expect(updates.adapter("home").start("0.20.3")).rejects.toMatchObject({
+      name: "HarnessUpdateStale",
+      currentVersion: "0.20.4",
+    });
+    expect(starts).toBe(1);
+  });
+
+  it("does not coalesce onto an active record after Hermes reports its changed terminal receipt", async () => {
+    const oldReceipt = receipt("success");
+    const partialReceipt = receipt("partial");
+    partialReceipt["finished_at"] = "2026-08-30T12:02:00.000Z";
+    let starts = 0;
+    let statusCalls = 0;
+    const updates = surface((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) {
+        statusCalls += 1;
+        if (statusCalls === 1) return upstreamStatus({ receipt: oldReceipt });
+        return upstreamStatus({ exit_code: 1, receipt: partialReceipt });
+      }
+      starts += 1;
+      return { ok: true, name: "hermes-update", action_id: starts === 1 ? ACTION_ID : "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+    });
+
+    await updates.adapter("home").start("0.20.3");
+    await expect(updates.adapter("home").start("0.20.3")).resolves.toMatchObject({ coalesced: false });
+    expect(starts).toBe(2);
+  });
+
+  it("omits discovery when any pinned read API or shape is unavailable", async () => {
+    const supported = client((path, init) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus();
+      if (path === "/api/hermes/update" && init?.method === "OPTIONS")
+        return new Response("Method Not Allowed", { status: 405 });
+      return new Response(JSON.stringify({
+        detail: "No update receipt found (no `hermes update` run recorded).",
+      }), { status: 404, headers: { "content-type": "application/json" } });
+    });
+    await expect(discoverHermesUpdates(supported, HARNESS)).resolves.toBeInstanceOf(HermesHarnessUpdateAdapter);
+
+    const missingReceipt = client((path, init) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus();
+      if (path === "/api/hermes/update" && init?.method === "OPTIONS")
+        return new Response("Method Not Allowed", { status: 405 });
+      return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 });
+    });
+    await expect(discoverHermesUpdates(missingReceipt, HARNESS)).resolves.toBeUndefined();
+
+    const malformedStatus = client((path) => path.includes("/check") ? check() : { running: false });
+    await expect(discoverHermesUpdates(malformedStatus, HARNESS)).resolves.toBeUndefined();
+
+    const missingAction = client((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus();
+      if (path.includes("/receipt")) return new Response(JSON.stringify({ detail: NO_RECEIPT_DETAIL }), { status: 404 });
+      return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 });
+    });
+    await expect(discoverHermesUpdates(missingAction, HARNESS)).resolves.toBeUndefined();
+  });
+
+  it("bounds check, start, status, and discovery receipt JSON before parsing", async () => {
+    const oversized = (declared: boolean) => new Response("x".repeat(UPDATE_JSON_MAX_BYTES + 1), {
+      headers: declared ? { "content-length": String(UPDATE_JSON_MAX_BYTES + 1) } : {},
+    });
+    await expect(new HermesHarnessUpdateAdapter(client(() => oversized(true)), HARNESS).check())
+      .rejects.toMatchObject({ name: "HarnessUpdateUnavailable" });
+
+    const startAdapter = new HermesHarnessUpdateAdapter(client((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus();
+      return oversized(true);
+    }), HARNESS);
+    await expect(startAdapter.start("0.20.3"))
+      .rejects.toMatchObject({ name: "HarnessUpdateUnavailable" });
+
+    await expect(new HermesHarnessUpdateAdapter(client(() => oversized(false)), HARNESS).status())
+      .rejects.toMatchObject({ name: "HarnessUpdateUnavailable" });
+
+    const discoveryClient = client((path) => {
+      if (path.includes("/check")) return check();
+      if (path.includes("/status")) return upstreamStatus();
+      return oversized(true);
+    });
+    await expect(discoverHermesUpdates(discoveryClient, HARNESS)).resolves.toBeUndefined();
   });
 
   it("never calls process exit or liveness a success without a durable receipt", async () => {
@@ -267,6 +499,7 @@ describe("paired harness update routes", () => {
     let current = "0.20.4";
     const { request } = appFor(surface((path) => {
       if (path.includes("/check")) return check({ current_version: current });
+      if (path.includes("/status")) return upstreamStatus();
       return { ok: true, action_id: ACTION_ID };
     }));
     const stale = await request("/gateway/harnesses/home/update/start", {

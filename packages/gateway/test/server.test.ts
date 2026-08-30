@@ -14,6 +14,7 @@ import {
 } from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
+import { startFakeHermesServer } from "./support/fake-hermes-server.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
 import { PHOTO_SWEEP_MS } from "../src/hermes-bridge/photos.ts";
@@ -189,7 +190,12 @@ describe("GatewayInfo.capabilities wiring", () => {
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
       hermes: testHermes(),
-      capabilities: { "com.cozylabs.test": 1, "com.cozylabs.some-unrecognized-thing": 7 },
+      capabilities: {
+        "com.cozylabs.test": 1,
+        "com.cozylabs.some-unrecognized-thing": 7,
+        // Built-in evidence-gated capabilities cannot be forced on through free-form config.
+        "com.cozylabs.harness-update": 99,
+      },
     });
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
@@ -200,7 +206,6 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.bots": expect.any(Number),
         "com.cozylabs.hermes-desktop-sessions": 2,
         "com.cozylabs.harness-settings": 1,
-        "com.cozylabs.harness-update": HARNESS_UPDATE_CAPABILITY_VERSION,
         "com.cozylabs.mobile-node": MOBILE_NODE_CAPABILITY_VERSION,
       });
 
@@ -228,6 +233,49 @@ describe("GatewayInfo.capabilities wiring", () => {
       expect(ready?.type === "ready" ? ready.gateway.capabilities : undefined).toEqual(health.capabilities);
     } finally {
       await gw.close();
+    }
+  });
+
+  it("advertises harness update only after the pinned Hermes read APIs pass discovery", async () => {
+    const upstream = await startFakeHermesServer({
+      dashboard: ({ method, path }) => {
+        if (path === "/api/hermes/update/check") return { body: {
+          install_method: "git",
+          current_version: "0.20.3",
+          behind: 1,
+          update_available: true,
+          can_apply: true,
+          update_command: "hermes update",
+          message: null,
+        } };
+        if (path === "/api/actions/hermes-update/status") return { body: {
+          name: "hermes-update", running: false, exit_code: null, pid: null, lines: [],
+        } };
+        if (path === "/api/hermes/update/receipt") return {
+          status: 404,
+          body: { detail: "No update receipt found (no `hermes update` run recorded)." },
+        };
+        if (path === "/api/hermes/update" && method === "OPTIONS") return {
+          status: 405,
+          body: { detail: "Method Not Allowed" },
+        };
+        return { status: 404, body: { detail: "Not Found" } };
+      },
+    });
+    const gw = await startGateway({
+      name: "update-capability",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermes: testHermes(upstream.url),
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.["com.cozylabs.harness-update"])
+        .toBe(HARNESS_UPDATE_CAPABILITY_VERSION);
+    } finally {
+      await gw.close();
+      await upstream.close();
     }
   });
 });

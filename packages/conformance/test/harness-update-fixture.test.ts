@@ -26,6 +26,8 @@ describe("harness update v1 client fixture", () => {
     assertValid(HarnessUpdateStartRequestSchema, fixture["startRequest"]);
     assertValid(HarnessUpdateStartSchema, fixture["start"]);
     assertValid(HarnessUpdateStatusSchema, fixture["status"]);
+    assertValid(HarnessUpdateStatusSchema, fixture["partialStatus"]);
+    expect(fixture["partialStatus"]).not.toHaveProperty("actionId");
     expect(JSON.stringify(fixture)).not.toMatch(
       /\/Users\/|[A-Za-z]:\\|\bpid\b|\blines\b|\bargv\b|\benv(?:ironment)?\b|token|secret/i,
     );

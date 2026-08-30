@@ -11,8 +11,10 @@ import { HermesTimeout, type HermesClient } from "./client.ts";
 import { HarnessSettingsInvalid } from "../harness-settings.ts";
 
 const POLL_AFTER_MS = 1_000;
+export const UPDATE_JSON_MAX_BYTES = 64 * 1024;
 const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$/;
 const ACTION_ID_RE = /^[0-9a-f]{32}$/;
+const NO_RECEIPT_DETAIL = "No update receipt found (no `hermes update` run recorded).";
 
 export class HarnessUpdateStale extends Error {
   readonly currentVersion: string;
@@ -41,12 +43,28 @@ export class HarnessUpdateUnavailable extends Error {
   }
 }
 
+interface ReceiptEvidence {
+  public: HarnessUpdateReceipt;
+  fingerprint: string;
+}
+
+interface StatusSnapshot {
+  running: boolean;
+  exitCode: number | null;
+  actionId?: string;
+  receipt?: ReceiptEvidence;
+}
+
 interface ActiveUpdate {
   expectedVersion: string;
   actionId?: string;
-  ambiguous: boolean;
-  startedAt: number;
+  baselineReceiptFingerprint?: string;
 }
+
+type UpdateRequestInit = {
+  method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+  body?: unknown;
+};
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -105,7 +123,50 @@ function isAmbiguousTimeout(error: unknown): boolean {
   return name === "TimeoutError" || name === "AbortError";
 }
 
-function receipt(value: unknown): HarnessUpdateReceipt | undefined {
+async function updateJson(
+  client: HermesClient,
+  path: string,
+  init: UpdateRequestInit = {},
+): Promise<{ status: number; body: unknown }> {
+  const response = await client.dashboardResponse(path, {
+    ...init,
+    headers: { accept: "application/json" },
+  });
+  const declared = response.headers.get("content-length");
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > UPDATE_JSON_MAX_BYTES)) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error("oversized Hermes update response");
+  }
+  if (response.body === null) throw new Error("empty Hermes update response");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > UPDATE_JSON_MAX_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new Error("oversized Hermes update response");
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  return { status: response.status, body: JSON.parse(text) as unknown };
+}
+
+function receiptEvidence(value: unknown): ReceiptEvidence | undefined {
   const raw = record(value);
   if (!raw) return undefined;
   const outcome = raw["outcome"];
@@ -115,11 +176,72 @@ function receipt(value: unknown): HarnessUpdateReceipt | undefined {
   const finishedAt = millis(raw["finished_at"]);
   if (startedAt === undefined || finishedAt === undefined || finishedAt < startedAt) return undefined;
   const postVersion = version(raw["post_version"]);
+  if (raw["post_version"] !== null && raw["post_version"] !== undefined && postVersion === undefined)
+    return undefined;
+  const preSha = raw["pre_sha"];
+  const postSha = raw["post_sha"];
+  const fleetStates = raw["fleet_states"];
+  if ((preSha !== null && preSha !== undefined && typeof preSha !== "string")
+    || (postSha !== null && postSha !== undefined && typeof postSha !== "string")
+    || !Array.isArray(fleetStates) || !fleetStates.every((state) => typeof state === "string"))
+    return undefined;
   return {
-    outcome,
-    startedAt,
-    finishedAt,
-    ...(postVersion === undefined ? {} : { postVersion }),
+    public: {
+      outcome,
+      startedAt,
+      finishedAt,
+      ...(postVersion === undefined ? {} : { postVersion }),
+    },
+    fingerprint: JSON.stringify([
+      outcome,
+      raw["started_at"],
+      raw["finished_at"],
+      preSha ?? null,
+      postSha ?? null,
+      raw["post_version"] ?? null,
+      [...fleetStates].sort(),
+    ]),
+  };
+}
+
+function parseStatus(value: unknown): StatusSnapshot | undefined {
+  const raw = record(value);
+  if (!raw || raw["name"] !== "hermes-update" || typeof raw["running"] !== "boolean"
+    || !Array.isArray(raw["lines"])) return undefined;
+  const exitCode = raw["exit_code"];
+  if (exitCode !== null && (!Number.isSafeInteger(exitCode) || typeof exitCode !== "number")) return undefined;
+  const durableActionId = actionId(raw["action_id"]);
+  if (raw["action_id"] !== undefined && durableActionId === undefined) return undefined;
+  const durableReceipt = receiptEvidence(raw["receipt"]);
+  if (raw["receipt"] !== undefined && durableReceipt === undefined) return undefined;
+  return {
+    running: raw["running"],
+    exitCode,
+    ...(durableActionId === undefined ? {} : { actionId: durableActionId }),
+    ...(durableReceipt === undefined ? {} : { receipt: durableReceipt }),
+  };
+}
+
+function projectReceipt(
+  harnessId: string,
+  evidence: ReceiptEvidence,
+  correlatedActionId?: string,
+): HarnessUpdateStatus {
+  const state = evidence.public.outcome === "success"
+    ? "success"
+    : evidence.public.outcome === "partial"
+      ? "partial"
+      : "failed";
+  return {
+    harnessId,
+    state,
+    ...(correlatedActionId === undefined ? {} : { actionId: correlatedActionId }),
+    receipt: evidence.public,
+    ...(state === "partial"
+      ? { guidance: "Hermes updated only partially. Review Hermes locally before trying another update." }
+      : state === "failed"
+        ? { guidance: "Hermes did not complete the update. Review Hermes locally before trying again." }
+        : {}),
   };
 }
 
@@ -138,71 +260,130 @@ export class HermesHarnessUpdateAdapter {
 
   descriptor(): GatewayHarness { return this.#harness; }
 
-  async check(): Promise<HarnessUpdateCheck> {
-    let result: unknown;
+  async #readCheck(force: boolean): Promise<HarnessUpdateCheck> {
+    let result: { status: number; body: unknown };
     try {
-      result = await this.#client.dashboardJson("/api/hermes/update/check?force=true");
+      result = await updateJson(this.#client, `/api/hermes/update/check${force ? "?force=true" : ""}`);
     } catch {
       throw new HarnessUpdateUnavailable();
     }
-    const raw = record(result);
+    const raw = record(result.body);
     const currentVersion = version(raw?.["current_version"]);
-    if (!raw || currentVersion === undefined) throw new HarnessUpdateUnavailable();
+    const rawBehind = raw?.["behind"];
+    if (result.status !== 200 || !raw || currentVersion === undefined
+      || typeof raw["install_method"] !== "string"
+      || (rawBehind !== null && (!Number.isSafeInteger(rawBehind) || typeof rawBehind !== "number" || rawBehind < -1))
+      || typeof raw["update_available"] !== "boolean" || typeof raw["can_apply"] !== "boolean")
+      throw new HarnessUpdateUnavailable();
     const method = installMethod(raw["install_method"]);
-    const rawBehind = raw["behind"];
-    const behind = typeof rawBehind === "number" && Number.isSafeInteger(rawBehind) && rawBehind >= 0
-      ? rawBehind
-      : null;
+    const behind = typeof rawBehind === "number" && rawBehind >= 0 ? rawBehind : null;
     const canApply = method === "git" && raw["can_apply"] === true;
     return {
       harnessId: this.#harness.id,
       currentVersion,
       installMethod: method,
       behind,
-      updateAvailable: raw["update_available"] === true,
+      updateAvailable: raw["update_available"],
       canApply,
       guidance: canApply ? null : updateGuidance(method),
       checkedAt: this.#now(),
     };
   }
 
+  check(): Promise<HarnessUpdateCheck> {
+    return this.#readCheck(true);
+  }
+
+  async #readStatus(): Promise<StatusSnapshot> {
+    let result: { status: number; body: unknown };
+    try {
+      result = await updateJson(this.#client, "/api/actions/hermes-update/status?lines=1");
+    } catch {
+      throw new HarnessUpdateUnavailable();
+    }
+    const parsed = result.status === 200 ? parseStatus(result.body) : undefined;
+    if (parsed === undefined) throw new HarnessUpdateUnavailable();
+    return parsed;
+  }
+
+  async probe(): Promise<void> {
+    await this.#readCheck(false);
+    await this.#readStatus();
+    const result = await updateJson(this.#client, "/api/hermes/update/receipt");
+    if (result.status === 404) {
+      if (record(result.body)?.["detail"] !== NO_RECEIPT_DETAIL) throw new HarnessUpdateUnavailable();
+      await this.#probeAction();
+      return;
+    }
+    const summary = record(result.body)?.["summary"];
+    if (result.status !== 200 || receiptEvidence(summary) === undefined)
+      throw new HarnessUpdateUnavailable();
+
+    await this.#probeAction();
+  }
+
+  async #probeAction(): Promise<void> {
+    let response: Response;
+    try {
+      // The POST is mutative, so Starlette's route-specific 405 to OPTIONS is the pinned,
+      // side-effect-free proof that the action route exists.
+      response = await this.#client.dashboardResponse("/api/hermes/update", { method: "OPTIONS" });
+    } catch {
+      throw new HarnessUpdateUnavailable();
+    }
+    await response.body?.cancel().catch(() => {});
+    if (response.status !== 405) throw new HarnessUpdateUnavailable();
+  }
+
   start(expectedCurrentVersion: string): Promise<HarnessUpdateStart> {
     if (!VERSION_RE.test(expectedCurrentVersion))
       return Promise.reject(new HarnessSettingsInvalid("expectedCurrentVersion is invalid"));
     return this.#serialize(async () => {
+      let confirmed = await this.check();
+      if (confirmed.currentVersion !== expectedCurrentVersion)
+        throw new HarnessUpdateStale(confirmed.currentVersion);
+
       const active = this.#active;
-      if (active?.expectedVersion === expectedCurrentVersion) {
-        return {
-          harnessId: this.#harness.id,
-          state: active.ambiguous ? "ambiguous" : "running",
-          ...(active.actionId === undefined ? {} : { actionId: active.actionId }),
-          coalesced: true,
-          pollAfterMs: POLL_AFTER_MS,
-        };
+      if (active !== undefined) {
+        const activeStatus = await this.status();
+        if (this.#active !== undefined) {
+          if (active.expectedVersion !== expectedCurrentVersion)
+            throw new HarnessUpdateBlocked("A Hermes update is already in progress. Poll its status before trying again.");
+          return {
+            harnessId: this.#harness.id,
+            state: activeStatus.state === "running" ? "running" : "ambiguous",
+            ...(active.actionId === undefined ? {} : { actionId: active.actionId }),
+            coalesced: true,
+            pollAfterMs: POLL_AFTER_MS,
+          };
+        }
+        // The prior action became terminal while validating it. Its update may have changed the
+        // installed version, so the confirmation must be checked again before a new POST.
+        confirmed = await this.check();
+        if (confirmed.currentVersion !== expectedCurrentVersion)
+          throw new HarnessUpdateStale(confirmed.currentVersion);
       }
 
-      const check = await this.check();
-      if (check.currentVersion !== expectedCurrentVersion)
-        throw new HarnessUpdateStale(check.currentVersion);
-      if (!check.canApply) throw new HarnessUpdateBlocked(check.guidance!);
-      if (!check.updateAvailable)
+      if (!confirmed.canApply) throw new HarnessUpdateBlocked(confirmed.guidance!);
+      if (!confirmed.updateAvailable)
         throw new HarnessUpdateBlocked("Hermes is already up to date. Check again before confirming another update.");
-      if (this.#active !== undefined)
-        throw new HarnessUpdateBlocked("A Hermes update is already in progress. Poll its status before trying again.");
 
-      const startedAt = this.#now();
+      const baseline = await this.#readStatus();
       try {
-        const response = record(await this.#client.dashboardJson("/api/hermes/update", { method: "POST" }));
+        const result = await updateJson(this.#client, "/api/hermes/update", { method: "POST" });
+        const response = record(result.body);
+        if (result.status !== 200) throw new HarnessUpdateUnavailable();
         if (!response || response["ok"] !== true) {
           throw new HarnessUpdateBlocked("Hermes cannot apply this update in place. Check again for current guidance.");
         }
         const id = actionId(response["action_id"]);
+        if (response["action_id"] !== undefined && id === undefined) throw new HarnessUpdateUnavailable();
         const coalesced = response["already_running"] === true;
         this.#active = {
           expectedVersion: expectedCurrentVersion,
           ...(id === undefined ? {} : { actionId: id }),
-          ambiguous: false,
-          startedAt,
+          ...(baseline.receipt === undefined
+            ? {} : { baselineReceiptFingerprint: baseline.receipt.fingerprint }),
         };
         return {
           harnessId: this.#harness.id,
@@ -212,12 +393,12 @@ export class HermesHarnessUpdateAdapter {
           pollAfterMs: POLL_AFTER_MS,
         };
       } catch (error) {
-        if (error instanceof HarnessUpdateBlocked) throw error;
+        if (error instanceof HarnessUpdateBlocked || error instanceof HarnessUpdateUnavailable) throw error;
         if (!isAmbiguousTimeout(error)) throw new HarnessUpdateUnavailable();
         this.#active = {
           expectedVersion: expectedCurrentVersion,
-          ambiguous: true,
-          startedAt,
+          ...(baseline.receipt === undefined
+            ? {} : { baselineReceiptFingerprint: baseline.receipt.fingerprint }),
         };
         return {
           harnessId: this.#harness.id,
@@ -230,16 +411,9 @@ export class HermesHarnessUpdateAdapter {
   }
 
   async status(): Promise<HarnessUpdateStatus> {
-    let result: unknown;
-    try {
-      result = await this.#client.dashboardJson("/api/actions/hermes-update/status?lines=1");
-    } catch {
-      throw new HarnessUpdateUnavailable();
-    }
-    const raw = record(result);
-    if (!raw || typeof raw["running"] !== "boolean") throw new HarnessUpdateUnavailable();
+    const snapshot = await this.#readStatus();
     const active = this.#active;
-    if (raw["running"]) {
+    if (snapshot.running) {
       return {
         harnessId: this.#harness.id,
         state: "running",
@@ -248,45 +422,46 @@ export class HermesHarnessUpdateAdapter {
       };
     }
 
-    const durableActionId = actionId(raw["action_id"]);
-    let durableReceipt = receipt(raw["receipt"]);
-    if (active?.actionId !== undefined && durableActionId !== active.actionId)
-      durableReceipt = undefined;
-    if (active?.actionId === undefined && active !== undefined && durableReceipt !== undefined &&
-        durableReceipt.startedAt < active.startedAt - 60_000)
-      durableReceipt = undefined;
-
-    if (durableReceipt !== undefined) {
-      this.#active = undefined;
-      const state = durableReceipt.outcome === "success"
-        ? "success"
-        : durableReceipt.outcome === "partial"
-          ? "partial"
-          : "failed";
-      return {
-        harnessId: this.#harness.id,
-        state,
-        ...(durableActionId === undefined ? {} : { actionId: durableActionId }),
-        receipt: durableReceipt,
-        ...(state === "partial"
-          ? { guidance: "Hermes updated only partially. Review Hermes locally before trying another update." }
-          : state === "failed"
-            ? { guidance: "Hermes did not complete the update. Review Hermes locally before trying again." }
-            : {}),
-      };
-    }
-
     if (active !== undefined) {
+      const durableReceipt = snapshot.receipt;
+      const changed = durableReceipt !== undefined
+        && durableReceipt.fingerprint !== active.baselineReceiptFingerprint;
+      if (changed) {
+        if (durableReceipt.public.outcome === "success" && active.actionId !== undefined
+          && snapshot.actionId !== active.actionId) {
+          this.#active = undefined;
+          return {
+            harnessId: this.#harness.id,
+            state: "unknown",
+            guidance: "Hermes wrote a new success receipt without matching action identity. Refresh status; do not retry the update.",
+            pollAfterMs: POLL_AFTER_MS,
+          };
+        }
+        this.#active = undefined;
+        // Non-success receipts do not carry an action id in pinned Hermes. The exact pre-POST
+        // fingerprint establishes that this is newer durable harness state; never echo the stale
+        // success-marker id that Hermes may place beside it.
+        const correlatedActionId = durableReceipt.public.outcome === "success"
+          ? active.actionId ?? snapshot.actionId
+          : undefined;
+        return projectReceipt(this.#harness.id, durableReceipt, correlatedActionId);
+      }
       return {
         harnessId: this.#harness.id,
         state: "unknown",
         ...(active.actionId === undefined ? {} : { actionId: active.actionId }),
         pollAfterMs: POLL_AFTER_MS,
-        guidance: "The update outcome is not yet durable. Keep polling status; do not start it again.",
+        guidance: "The update outcome is not yet a new durable receipt. Keep polling status; do not start it again.",
       };
     }
 
-    if (typeof raw["exit_code"] === "number") {
+    if (snapshot.receipt !== undefined) {
+      const receiptActionId = snapshot.receipt.public.outcome === "success"
+        ? snapshot.actionId
+        : undefined;
+      return projectReceipt(this.#harness.id, snapshot.receipt, receiptActionId);
+    }
+    if (snapshot.exitCode !== null) {
       return {
         harnessId: this.#harness.id,
         state: "failed",
@@ -303,6 +478,19 @@ export class HermesHarnessUpdateAdapter {
   }
 }
 
+export async function discoverHermesUpdates(
+  client: HermesClient,
+  harness: GatewayHarness,
+): Promise<HermesHarnessUpdateAdapter | undefined> {
+  const adapter = new HermesHarnessUpdateAdapter(client, harness);
+  try {
+    await adapter.probe();
+    return adapter;
+  } catch {
+    return undefined;
+  }
+}
+
 export class GatewayHarnessUpdates {
   readonly #adapters: ReadonlyMap<string, HermesHarnessUpdateAdapter>;
 
@@ -310,6 +498,8 @@ export class GatewayHarnessUpdates {
     this.#adapters = new Map(adapters.map((adapter) => [adapter.descriptor().id, adapter]));
     if (this.#adapters.size !== adapters.length) throw new Error("duplicate gateway harness update id");
   }
+
+  get available(): boolean { return this.#adapters.size > 0; }
 
   adapter(harnessId: string): HermesHarnessUpdateAdapter {
     const adapter = this.#adapters.get(harnessId);
