@@ -1,0 +1,60 @@
+{
+  "capability": {
+    "id": "com.cozylabs.hermes-session-management",
+    "version": 1
+  },
+  "harnessId": "home",
+  "scopeId": "sage",
+  "list": {
+    "sessions": [
+      {
+        "hermesSessionId": "compression-tip",
+        "hermesLineageId": "compression-root",
+        "title": "Release notes",
+        "startedAt": 1700000000000,
+        "lastActiveAt": 1700000100000,
+        "messageCount": 2,
+        "archived": false,
+        "pinned": true
+      }
+    ],
+    "pagination": { "limit": 50, "offset": 0, "returned": 1, "total": 1 }
+  },
+  "search": {
+    "results": [
+      {
+        "hermesSessionId": "compression-tip",
+        "hermesLineageId": "compression-root",
+        "title": "Release notes",
+        "startedAt": 1700000000000,
+        "lastActiveAt": 1700000100000,
+        "messageCount": 2,
+        "archived": false,
+        "pinned": true,
+        "snippet": "Matching assistant message",
+        "matchedRole": "assistant"
+      }
+    ]
+  },
+  "messages": {
+    "hermesSessionId": "compression-tip",
+    "messages": [
+      { "role": "user", "text": "Ship the release", "hermesMessageId": "10", "createdAt": 1700000000000 },
+      { "role": "assistant", "text": "Release completed", "hermesMessageId": "11", "createdAt": 1700000100000 }
+    ],
+    "pagination": { "limit": 100, "offset": 0, "order": "latest", "returned": 2, "nextOffset": null }
+  },
+  "mutation": {
+    "status": "updated",
+    "session": {
+      "hermesSessionId": "compression-tip",
+      "hermesLineageId": "compression-root",
+      "title": "Release notes",
+      "startedAt": 1700000000000,
+      "lastActiveAt": 1700000100000,
+      "messageCount": 2,
+      "archived": true,
+      "pinned": true
+    }
+  }
+}

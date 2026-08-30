@@ -209,11 +209,11 @@ export interface HermesClient {
   request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   /** Calls the authenticated dashboard REST surface on the same Hermes connection. `path` is
    *  origin-relative and may include a query string. */
-  dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown }): Promise<T>;
+  dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown }): Promise<T>;
   /** Authenticated response access for Hermes surfaces whose bodies must be streamed or bounded
    *  before parsing. Callers own strict path admission and response bounds. */
   dashboardResponse(path: string, init?: {
-    method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+    method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
     body?: unknown;
     headers?: Readonly<Record<string, string>>;
     signal?: AbortSignal;
@@ -545,7 +545,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   async function dashboardRequest(
     path: string,
     init: {
-      method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+      method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
       body?: unknown;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;
@@ -592,7 +592,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
   async function dashboardJson<T>(
     path: string,
-    init: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown } = {},
+    init: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown } = {},
   ): Promise<T> {
     const response = await dashboardRequest(path, init);
     const body: unknown = await response.json().catch(() => undefined);
@@ -609,7 +609,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   function dashboardResponse(
     path: string,
     init: {
-      method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+      method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
       body?: unknown;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;

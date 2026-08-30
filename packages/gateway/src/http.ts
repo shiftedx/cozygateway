@@ -20,6 +20,12 @@ import {
   assertValid,
   GatewaySettingsSchema,
   HarnessUpdateStartRequestSchema,
+  HERMES_SESSION_LIST_MAX,
+  HERMES_SESSION_MESSAGES_MAX,
+  HERMES_SESSION_OFFSET_MAX,
+  HERMES_SESSION_QUERY_MAX_LENGTH,
+  HERMES_SESSION_SEARCH_MAX,
+  HermesSessionPatchSchema,
   ModelProviderFieldUpdateSchema,
   ModelProviderOAuthCodeSchema,
 } from "cozygateway-contract";
@@ -72,6 +78,14 @@ import {
   HarnessUpdateStale,
   HarnessUpdateUnavailable,
 } from "./hermes-bridge/update.ts";
+import {
+  GatewayHermesSessionManagement,
+  HermesSessionInvalid,
+  HermesSessionMutationAmbiguous,
+  HermesSessionNotFound,
+  HermesSessionTooLarge,
+  HermesSessionUnavailable,
+} from "./hermes-bridge/session-management.ts";
 import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
@@ -174,6 +188,8 @@ export interface AppDeps {
   harnessWorkspace?: GatewayHarnessWorkspace;
   /** Harness-level Hermes update normalization. Never exposes action logs or full receipts. */
   harnessUpdates?: GatewayHarnessUpdates;
+  /** Privacy-projected Hermes-owned session administration, scoped by visible harness/profile. */
+  hermesSessions?: GatewayHermesSessionManagement;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
@@ -502,6 +518,129 @@ export function createApp(deps: AppDeps): Hono<Env> {
         },
       });
     } catch (error) { return workspaceFailure(c, error); }
+  });
+
+  const sessionFailure = (c: Context<Env>, error: unknown) => {
+    if (error instanceof ContractViolation || error instanceof HermesSessionInvalid)
+      return c.json(errorBody("invalid_request", "Hermes session request is invalid"), 400);
+    if (error instanceof HermesSessionNotFound)
+      return c.json(errorBody("not_found", "Hermes session, harness, or profile was not found"), 404);
+    if (error instanceof HermesSessionTooLarge)
+      return c.json(errorBody("invalid_request", "Hermes session result is over its configured bound"), 413);
+    if (error instanceof HermesSessionMutationAmbiguous)
+      return c.json({
+        ...errorBody("backend_unavailable", "Hermes session state is uncertain; refresh before another change"),
+        refreshRequired: true as const,
+      }, 503);
+    if (error instanceof HermesSessionUnavailable)
+      return c.json(errorBody("backend_unavailable", "Hermes session upstream is unavailable"), 503);
+    throw error;
+  };
+  const boundedInteger = (
+    raw: string | undefined,
+    fallback: number,
+    min: number,
+    max: number,
+  ): number => {
+    if (raw === undefined) return fallback;
+    if (!/^\d+$/.test(raw)) throw new HermesSessionInvalid("invalid integer query");
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < min || value > max)
+      throw new HermesSessionInvalid("integer query is out of bounds");
+    return value;
+  };
+  const hermesSessionId = (raw: string | undefined): string => {
+    const value = raw ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value))
+      throw new HermesSessionInvalid("Hermes session id is invalid");
+    return value;
+  };
+  const sessionAdapter = (c: Context<Env>) => {
+    if (deps.hermesSessions === undefined)
+      throw new HermesSessionNotFound("Hermes session management is unavailable");
+    return deps.hermesSessions.adapter(c.req.param("harnessId") ?? "");
+  };
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions", requireDevice, async (c) => {
+    try {
+      const archived = c.req.query("archived") ?? "exclude";
+      if (archived !== "exclude" && archived !== "include" && archived !== "only")
+        throw new HermesSessionInvalid("archived query is invalid");
+      return c.json(await sessionAdapter(c).list(c.req.param("scopeId"), {
+        limit: boundedInteger(c.req.query("limit"), 50, 1, HERMES_SESSION_LIST_MAX),
+        offset: boundedInteger(c.req.query("offset"), 0, 0, HERMES_SESSION_OFFSET_MAX),
+        archived,
+      }, c.req.raw.signal));
+    } catch (error) { return sessionFailure(c, error); }
+  });
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions/search", requireDevice, async (c) => {
+    try {
+      const query = (c.req.query("q") ?? "").trim();
+      if (!query || query.length > HERMES_SESSION_QUERY_MAX_LENGTH)
+        throw new HermesSessionInvalid("search query is invalid");
+      return c.json(await sessionAdapter(c).search(
+        c.req.param("scopeId"),
+        query,
+        boundedInteger(c.req.query("limit"), 20, 1, HERMES_SESSION_SEARCH_MAX),
+        c.req.raw.signal,
+      ));
+    } catch (error) { return sessionFailure(c, error); }
+  });
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions/:sessionId/messages", requireDevice, async (c) => {
+    try {
+      const order = c.req.query("order") ?? "latest";
+      if (order !== "oldest" && order !== "latest")
+        throw new HermesSessionInvalid("message order is invalid");
+      return c.json(await sessionAdapter(c).messages(
+        c.req.param("scopeId"),
+        hermesSessionId(c.req.param("sessionId")),
+        {
+          limit: boundedInteger(c.req.query("limit"), 100, 1, HERMES_SESSION_MESSAGES_MAX),
+          offset: boundedInteger(c.req.query("offset"), 0, 0, HERMES_SESSION_OFFSET_MAX),
+          order,
+        },
+        c.req.raw.signal,
+      ));
+    } catch (error) { return sessionFailure(c, error); }
+  });
+
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions/:sessionId/export", requireDevice, async (c) => {
+    try {
+      const sessionId = hermesSessionId(c.req.param("sessionId"));
+      const exported = await sessionAdapter(c).export(
+        c.req.param("scopeId"), sessionId, c.req.raw.signal,
+      );
+      return new Response(exported.body, {
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "content-disposition": attachmentDisposition(exported.filename),
+          "cache-control": "private, no-store",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    } catch (error) { return sessionFailure(c, error); }
+  });
+
+  app.patch("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions/:sessionId", requireDevice, async (c) => {
+    try {
+      const patch = assertValid(HermesSessionPatchSchema, await readBody(c));
+      if (patch.title === undefined && patch.archived === undefined && patch.pinned === undefined)
+        throw new HermesSessionInvalid("session patch is empty");
+      return c.json(await sessionAdapter(c).patch(
+        c.req.param("scopeId"), hermesSessionId(c.req.param("sessionId")), patch,
+      ));
+    } catch (error) { return sessionFailure(c, error); }
+  });
+
+  app.delete("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions/:sessionId", requireDevice, async (c) => {
+    try {
+      await sessionAdapter(c).delete(
+        c.req.param("scopeId"), hermesSessionId(c.req.param("sessionId")),
+      );
+      return c.body(null, 204);
+    } catch (error) { return sessionFailure(c, error); }
   });
 
   const harnessFailure = (c: Context<Env>, error: unknown) => {

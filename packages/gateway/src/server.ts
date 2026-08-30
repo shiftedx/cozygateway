@@ -9,6 +9,8 @@ import {
   BOTS_CAPABILITY_VERSION,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_ID,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
   MOBILE_NODE_CAPABILITY_ID,
   MOBILE_NODE_CAPABILITY_VERSION,
   GATEWAY_MANAGEMENT_CAPABILITY_ID,
@@ -64,6 +66,10 @@ import type { TraceLog } from "./trace.ts";
 import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
 import { GatewayHarnessWorkspace, discoverHermesWorkspace } from "./hermes-bridge/workspace.ts";
 import { GatewayHarnessUpdates, discoverHermesUpdates } from "./hermes-bridge/update.ts";
+import {
+  GatewayHermesSessionManagement,
+  HermesSessionManagementAdapter,
+} from "./hermes-bridge/session-management.ts";
 
 export const GATEWAY_VERSION = "0.4.3";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
@@ -197,6 +203,7 @@ export function gatewayInfoForConfig(
         : {
             [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
             [HERMES_DESKTOP_SESSIONS_CAPABILITY_ID]: HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
+            [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
             [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
             [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
           }),
@@ -260,6 +267,11 @@ export async function startGateway(
   const harnessModelAdapters = clientMembers.map(
     ({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client),
   );
+  const hermesSessions = new GatewayHermesSessionManagement(clientMembers.map(
+    ({ client }, index) => new HermesSessionManagementAdapter(
+      client, harnessModelAdapters[index]!.descriptor(),
+    ),
+  ));
   // Both optional harness surfaces are evidence-gated, not configuration-gated. A missing,
   // malformed, or unreachable pinned response yields no adapter and no advertised route.
   const [workspaceResults, updateResults] = await Promise.all([
@@ -587,6 +599,7 @@ export async function startGateway(
     ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
     harnessSettings,
     ...(harnessUpdates.available ? { harnessUpdates } : {}),
+    hermesSessions,
     ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),

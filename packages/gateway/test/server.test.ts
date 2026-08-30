@@ -205,6 +205,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         approvals: 1,
         "com.cozylabs.bots": expect.any(Number),
         "com.cozylabs.hermes-desktop-sessions": 2,
+        "com.cozylabs.hermes-session-management": 1,
         "com.cozylabs.harness-settings": 1,
         "com.cozylabs.mobile-node": MOBILE_NODE_CAPABILITY_VERSION,
       });
