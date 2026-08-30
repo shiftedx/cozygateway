@@ -958,12 +958,23 @@ if [ -n "${COZYGATEWAY_NODE_EXPAND_DESTINATION:-}" ]; then
   exit 0
 fi
 if [ "${COZYGATEWAY_TEST_UNRELATED_LISTENER:-}" = 1 ] && [ "${COZYGATEWAY_CHECK_TARGET_PORT:-}" = 1 ]; then exit 42; fi
-if [ "${COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER:-}" = 1 ] && [[ "$*" == *dashboard-owner.ps1* ]]; then
+if [ "${COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER:-}" = 1 ] && [[ "${6:-}" == *dashboard-owner.ps1 ]]; then
   [ "$5" = -File ] || exit 42
   helper="$(cygpath -u "$6")"
   grep -Fq 'Test-CozyDashboardOwner' "$helper" || exit 42
   [ -n "${7:-}" ] && [ -n "${8:-}" ] && [ -n "${9:-}" ] && [ -n "${10:-}" ] || exit 42
 fi
+if [ -n "${COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT:-}" ] && [[ "${6:-}" == *dashboard-owner*.ps1 ]]; then
+  [ "${10:-}" = "$COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT" ] || exit 42
+fi
+if [ -n "${COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE:-}" ] && [[ "${6:-}" == *dashboard-owner*.ps1 ]]; then
+  code="$(sed -n '1p' "$COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE")"
+  sed '1d' "$COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE" > "$COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE.next"
+  mv "$COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE.next" "$COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE"
+  exit "${code:-99}"
+fi
+if [ "${COZYGATEWAY_TEST_DASHBOARD_FOREIGN:-}" = 1 ] && [[ "${6:-}" == *dashboard-owner.ps1 ]]; then exit 42; fi
+if [ -n "${COZYGATEWAY_TEST_OWNER_STOP_MARKER:-}" ] && [[ "${6:-}" == *dashboard-owner.ps1 ]]; then : > "$COZYGATEWAY_TEST_OWNER_STOP_MARKER"; fi
 rm -f "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}"
 [ -z "${COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER:-}" ] || rm -f "$COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER"
 [ -z "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER"
@@ -1195,7 +1206,7 @@ test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/Cozy
 dashboard_stop_home_log="$tmp/windows-dashboard-stop-home.log"
 dashboard_relaunch_home_log="$tmp/windows-dashboard-relaunch-home.log"
 set +e
-dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-dashboard-gateway-ready" COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER="$tmp/windows-dashboard-wrong" COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER=1 COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$tmp/windows-dashboard-stopped" COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG="$dashboard_stop_home_log" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_relaunch_home_log" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-dashboard" 2>&1)"
+dashboard_fallback_output="$(PATH="$tmp/windows-bin:$tmp/bin:$PATH" HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_EXPECT_WINDOWS_HIDE=1 COZYGATEWAY_TEST_EXPECTED_DASHBOARD_HOME="$expected_windows_hermes_home" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-dashboard-gateway-ready" COZYGATEWAY_TEST_DASHBOARD_WRONG_MARKER="$tmp/windows-dashboard-wrong" COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER=1 COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT=19119 COZYGATEWAY_TEST_EXPECT_DASHBOARD_LAUNCH_PORT=19119 COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER="$tmp/windows-dashboard-stopped" COZYGATEWAY_TEST_DASHBOARD_STOP_HOME_LOG="$dashboard_stop_home_log" COZYGATEWAY_TEST_DASHBOARD_HOME_LOG="$dashboard_relaunch_home_log" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --dashboard-port 19119 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-dashboard" 2>&1)"
 dashboard_fallback_status=$?
 set -e
 if [ "$dashboard_fallback_status" -ne 0 ]; then
@@ -1214,6 +1225,60 @@ if grep -Fq 'Dashboard stayed listening after stop' <<<"$dashboard_fallback_outp
   exit 1
 fi
 
+# Windows uninstall must stop a Dashboard started by the managed wrapper before
+# removing the strict owner helper, while preserving the persisted install port.
+grep -Fxq 'dashboard_port=19119' "$tmp/gateway-windows-dashboard/local/install-state"
+dashboard_owner_calls_before_uninstall="$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands")"
+owner_stop_marker="$tmp/windows-dashboard-uninstall-owner-stopped"
+HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER=1 COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT=19119 COZYGATEWAY_TEST_OWNER_STOP_MARKER="$owner_stop_marker" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-dashboard" >/dev/null
+test "$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands")" -gt "$dashboard_owner_calls_before_uninstall"
+test -f "$owner_stop_marker"
+test ! -e "$tmp/gateway-windows-dashboard"
+
+# Indeterminate uninstall ownership gets exactly one scoped elevation. A failed
+# elevated inspection and a missing helper both preserve state for recovery.
+for case_name in elevated-success elevated-failure missing-helper empty-port; do
+  case_dir="$tmp/gateway-windows-uninstall-$case_name"
+  mkdir -p "$case_dir/local"
+  [ "$case_name" = missing-helper ] || {
+    printf '# owner helper fixture\n' > "$case_dir/local/dashboard-owner.ps1"
+    printf '# elevation helper fixture\n' > "$case_dir/local/dashboard-owner-elevate.ps1"
+  }
+  persisted_port=19220
+  [ "$case_name" = empty-port ] && persisted_port=
+  cat > "$case_dir/local/install-state" <<WINDOWS_DASHBOARD_UNINSTALL_STATE
+profiles=uac-cleanup
+hermes_root=$tmp/hermes
+dashboard_port=$persisted_port
+hermes_bin=$tmp/bin/hermes
+service_uac-cleanup=preexisting
+WINDOWS_DASHBOARD_UNINSTALL_STATE
+done
+printf '43\n0\n' > "$tmp/windows-uninstall-elevated-success.codes"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-uninstall-elevated-success-hermes.log" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-uninstall-elevated-success.log" COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE="$tmp/windows-uninstall-elevated-success.codes" COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT=19220 COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-uninstall-elevated-success" >/dev/null
+test "$(grep -Ec -- '-File .*dashboard-owner\.ps1 ' "$tmp/windows-uninstall-elevated-success.log")" = 1
+test "$(grep -Ec -- '-File .*dashboard-owner-elevate\.ps1 ' "$tmp/windows-uninstall-elevated-success.log")" = 1
+test ! -s "$tmp/windows-uninstall-elevated-success.codes"
+test ! -e "$tmp/gateway-windows-uninstall-elevated-success"
+
+printf '43\n46\n' > "$tmp/windows-uninstall-elevated-failure.codes"
+if HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-uninstall-elevated-failure-hermes.log" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-uninstall-elevated-failure.log" COZYGATEWAY_TEST_DASHBOARD_OWNER_CODE_FILE="$tmp/windows-uninstall-elevated-failure.codes" COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT=19220 COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-uninstall-elevated-failure" >/dev/null 2>&1; then
+  echo 'expected failed elevated Dashboard cleanup to abort uninstall' >&2
+  exit 1
+fi
+test -f "$tmp/gateway-windows-uninstall-elevated-failure/local/install-state"
+test "$(grep -Ec -- '-File .*dashboard-owner\.ps1 ' "$tmp/windows-uninstall-elevated-failure.log")" = 1
+test "$(grep -Ec -- '-File .*dashboard-owner-elevate\.ps1 ' "$tmp/windows-uninstall-elevated-failure.log")" = 1
+
+for fail_case in missing-helper empty-port; do
+  unrelated_listener=; [ "$fail_case" = missing-helper ] && unrelated_listener=1
+  if HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-uninstall-$fail_case-hermes.log" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-uninstall-$fail_case.log" COZYGATEWAY_TEST_UNRELATED_LISTENER="$unrelated_listener" COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-uninstall-$fail_case" >/dev/null 2>&1; then
+    echo "expected $fail_case Dashboard cleanup state to abort uninstall" >&2
+    exit 1
+  fi
+  test -f "$tmp/gateway-windows-uninstall-$fail_case/local/install-state"
+done
+
 # Removal is a recovery path: it must work from persisted install state even
 # when the listener config is corrupt and Node cannot be resolved.
 printf '{not-json\n' > "$tmp/gateway-windows-fallback/local/cozygateway.config.json"
@@ -1222,8 +1287,10 @@ printf '{not-json\n' > "$tmp/gateway-windows-fallback/local/cozygateway.config.j
 sed "s|^hermes_bin=.*|hermes_bin=$tmp/missing-hermes|" "$tmp/gateway-windows-fallback/local/install-state" > "$tmp/install-state.rewritten"
 mv "$tmp/install-state.rewritten" "$tmp/gateway-windows-fallback/local/install-state"
 curl_count_before_uninstall="$(wc -l < "$tmp/curl.log")"
-HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_UNRELATED_LISTENER=1 COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+fallback_owner_calls_before_uninstall="$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-fallback-commands" || true)"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_UNRELATED_LISTENER=1 COZYGATEWAY_TEST_DASHBOARD_FOREIGN=1 COZYGATEWAY_NODE=false COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test "$(wc -l < "$tmp/curl.log")" = "$curl_count_before_uninstall"
+test "$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-fallback-commands")" -gt "$fallback_owner_calls_before_uninstall"
 test ! -e "$tmp/gateway-windows-fallback"
 
 # A listener alone is not sufficient: an existing Dashboard that rejects the

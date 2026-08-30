@@ -562,6 +562,7 @@ write_state() {
   {
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
+    printf 'dashboard_port=%s\n' "$DASHBOARD_PORT"
     # Keep the exact executable that performed the install. `--uninstall` may
     # run long after PATH or COZYGATEWAY_HERMES_BIN changed, and must not tear
     # down the CozyGateway service before discovering it cannot reverse the
@@ -1343,6 +1344,52 @@ stop_stubborn_windows_dashboard() {
     *) die "Dashboard recovery could not safely stop a verified Dashboard on port $DASHBOARD_PORT" ;;
   esac
 }
+stop_owned_windows_dashboard_for_uninstall() {
+  [ "$SERVICE_PLATFORM" = Windows ] || return 0
+  [ "$DRY_RUN" = 1 ] && { say "DRY   stop only a verified Hermes Dashboard on 127.0.0.1:$DASHBOARD_PORT before removing its owner helper"; return; }
+  if [ ! -f "$DASHBOARD_OWNER_PS1" ]; then
+    local listener_code
+    set +e
+    MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_PORT="$DASHBOARD_PORT" COZYGATEWAY_CHECK_TARGET_PORT=1 powershell.exe -NoProfile -NonInteractive -Command '
+      $listener = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -eq "127.0.0.1" -and $_.LocalPort -eq [int]$env:COZYGATEWAY_EXPECTED_PORT } |
+        Select-Object -First 1
+      if ($null -eq $listener) { exit 0 }; exit 42
+    ' >/dev/null 2>&1
+    listener_code=$?
+    set -e
+    [ "$listener_code" -eq 0 ] && { say "INFO  Dashboard owner helper is missing, but no listener is present on port $DASHBOARD_PORT"; return; }
+    die "Dashboard owner helper is missing; refusing to remove recovery state while port $DASHBOARD_PORT may still be owned"
+  fi
+  local root_native hermes_native launcher_native owner_helper_native elevation_helper_native code
+  root_native="$(to_windows_path "$HERMES_ROOT")"
+  hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
+  launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
+  owner_helper_native="$(to_windows_path "$DASHBOARD_OWNER_PS1")"
+  elevation_helper_native="$(to_windows_path "$DASHBOARD_ELEVATION_PS1")"
+  set +e
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$owner_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" >/dev/null 2>&1
+  code=$?
+  set -e
+  case "$code" in
+    0) say "OK    stopped the verified Hermes Dashboard started for CozyGateway"; return ;;
+    42) say "INFO  Dashboard port $DASHBOARD_PORT is foreign; leaving it untouched"; return ;;
+    43) ;;
+    *) die "could not safely stop the verified Hermes Dashboard during uninstall" ;;
+  esac
+  [ -f "$DASHBOARD_ELEVATION_PS1" ] || die "Dashboard ownership needs elevated inspection, but its scoped helper is missing"
+  say "INFO  Dashboard ownership metadata requires one scoped UAC cleanup helper"
+  set +e
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$elevation_helper_native" "$root_native" "$hermes_native" "$launcher_native" "$DASHBOARD_PORT" "$owner_helper_native" >/dev/null 2>&1
+  code=$?
+  set -e
+  case "$code" in
+    0) say "OK    stopped the verified elevated Hermes Dashboard started for CozyGateway" ;;
+    42) say "INFO  Dashboard port $DASHBOARD_PORT is foreign; leaving it untouched" ;;
+    43|46) die "the scoped Dashboard cleanup helper could not inspect or stop the elevated Dashboard" ;;
+    *) die "could not safely stop the verified elevated Hermes Dashboard during uninstall" ;;
+  esac
+}
 start_dashboard() {
   local hermes_root_arg="$HERMES_ROOT" code
   is_windows && hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
@@ -1369,7 +1416,7 @@ start_dashboard() {
   esac
 }
 uninstall() {
-  local profiles root hermes_bin p home plugin spool action hermes_available=1
+  local profiles root hermes_bin dashboard_port p home plugin spool action hermes_available=1
   if [ ! -f "$STATE_FILE" ]; then
     resolve_platform
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
@@ -1383,11 +1430,20 @@ uninstall() {
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
   hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
+  if grep -q '^dashboard_port=' "$STATE_FILE"; then
+    dashboard_port="$(sed -n 's/^dashboard_port=//p' "$STATE_FILE" | tail -1)"
+    [ -n "$dashboard_port" ] || die "installer state has an unsafe Dashboard port"
+  else
+    dashboard_port="$DASHBOARD_PORT"
+  fi
   profiles="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"
   [ -n "$root" ] && [ -n "$hermes_bin" ] && [ -n "$profiles" ] || die "install state is incomplete"
   case "$hermes_bin" in /*) ;; *) die "installer state has an unsafe Hermes executable path" ;; esac
   [ -f "$hermes_bin" ] && [ -x "$hermes_bin" ] || hermes_available=0
-  HERMES_RESOLVED="$hermes_bin"
+  HERMES_RESOLVED="$hermes_bin"; HERMES_ROOT="$root"
+  case "$dashboard_port" in ''|*[!0-9]*) die "installer state has an unsafe Dashboard port" ;; esac
+  [ "$dashboard_port" -ge 1 ] && [ "$dashboard_port" -le 65535 ] || die "installer state has an unsafe Dashboard port"
+  DASHBOARD_PORT="$dashboard_port"
   resolve_platform
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     local startup_entry
@@ -1399,6 +1455,7 @@ uninstall() {
       rm -f "$startup_entry"
       stop_owned_windows_gateway 0 || true
     fi
+    stop_owned_windows_dashboard_for_uninstall
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
@@ -1407,7 +1464,7 @@ uninstall() {
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
     else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
   fi
-  IFS=',' read -r -a SELECTED <<<"$profiles"; HERMES_ROOT="$root"
+  IFS=',' read -r -a SELECTED <<<"$profiles"
   for p in "${SELECTED[@]}"; do
     valid_profile "$p" || die "unsafe profile in installer state"; home="$(profile_home "$p")"; plugin="$home/plugins/cozygateway"; spool="$home/plugin-data/cozygateway/attach-v1.sqlite"
     action="$(prior_service_action "$p")"
