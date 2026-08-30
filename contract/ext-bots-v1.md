@@ -497,7 +497,7 @@ that exists but is not configured as a native identity must not fall through to 
 
 ## Hermes desktop session continuation
 
-`com.cozylabs.hermes-desktop-sessions: 1` is deliberately separate from Bot Mode. It exposes
+`com.cozylabs.hermes-desktop-sessions: 2` is deliberately separate from Bot Mode. It exposes
 source-qualified TUI sessions without placing their raw Hermes ids in native session history:
 
 | Route | Response | Rule |
@@ -513,6 +513,13 @@ lane to the exact profile-local Hermes target. A confirmation mismatch, a runnin
 profile, a cron/routine/group/machine row, an unavailable capability, or any unproven switch fails
 closed. Normal subsequent sends keep the gateway session id as `threadId`; the plugin holds the
 private raw Hermes mapping and strict runner metadata proves it still targets that same context.
+
+Version 2 additionally permits the attached profile, after negotiated `desktop_session_sync`, to
+project a newly observed rendered `user` or `assistant` SessionDB row into its already-owned native
+chat. The row carries the source-qualified current raw id and stable row id; a `tui` row also carries
+the original selected desktop id and is accepted only when that exact persisted desktop-resume
+binding is confirmed. Replays are idempotent, and this projection never selects a chat or changes a
+turn state.
 
 ## Server frames
 

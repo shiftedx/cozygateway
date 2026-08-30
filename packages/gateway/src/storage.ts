@@ -2540,6 +2540,16 @@ export class Storage {
     ).get(bot, hermesSessionId) as { confirmedAt: number | null } | undefined)?.confirmedAt ?? undefined;
   }
 
+  /** A sync row from a TUI-origin lane is accepted only after this exact, durable adoption proof.
+   * It deliberately does not consult the active-session pointer: mirroring history must never
+   * select a chat or disturb an in-flight turn. */
+  hasConfirmedNativeDesktopResume(bot: string, hermesSessionId: string, sessionId: string): boolean {
+    return this.#db.prepare(
+      `SELECT 1 AS found FROM bot_desktop_resume_bindings
+       WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND status = 'resumed'`,
+    ).get(bot, hermesSessionId, sessionId) !== undefined;
+  }
+
   nativeBotSessions(bot: string, limit: number): Array<{
     id: string; startedAt: number; lastActiveAt: number; title?: string; preview?: string;
   }> {

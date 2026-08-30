@@ -30,6 +30,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("thinking"),
   Type.Literal("mobile_failure_details"),
   Type.Literal("desktop_session_resume"),
+  Type.Literal("desktop_session_sync"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -288,6 +289,23 @@ const PresenceEvent = Type.Object({
 const DesktopSessionResumedEvent = Type.Object({
   kind: Type.Literal("desktop_session_resumed"), threadId: Id, hermesSessionId: Id, resumeId: Id,
 });
+/** One rendered SessionDB row observed after an explicitly linked desktop-capable session. The
+ * original TUI selection and current raw id are separate because compaction can resolve one raw
+ * id onto another. The gateway never treats either id as its native chat identity. */
+const DesktopSessionMessageEvent = Type.Union([
+  Type.Object({
+    kind: Type.Literal("desktop_session_message"), threadId: Id, hermesSessionId: Id,
+    source: Type.Literal("cozygateway"), rowId: Id,
+    role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
+    text: Type.String({ minLength: 1, maxLength: 32_000 }), at: Type.Integer({ minimum: 0 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    kind: Type.Literal("desktop_session_message"), threadId: Id, hermesSessionId: Id,
+    desktopSessionId: Id, source: Type.Literal("tui"), rowId: Id,
+    role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
+    text: Type.String({ minLength: 1, maxLength: 32_000 }), at: Type.Integer({ minimum: 0 }),
+  }, { additionalProperties: false }),
+]);
 export const AttachV1MemoryResultSchema = Type.Object({
   kind: Type.Literal("memory_result"), requestId: Id,
   status: Type.Union([Type.Literal("ok"), Type.Literal("conflict"), Type.Literal("not_found"), Type.Literal("invalid_request"), Type.Literal("unavailable")]),
@@ -357,7 +375,7 @@ export const AttachV1EventSchema = Type.Union([
   DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent, DelegationEvent,
   ThinkingEvent,
   ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, PresenceEvent,
-  DesktopSessionResumedEvent,
+  DesktopSessionResumedEvent, DesktopSessionMessageEvent,
 ]);
 export type AttachV1Event = Static<typeof AttachV1EventSchema>;
 

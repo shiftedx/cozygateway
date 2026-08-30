@@ -355,6 +355,12 @@ export class NativeBotDataPlane {
     if (frame.event.kind === "desktop_session_resumed") {
       return this.#storage.nativeBotHasSession(key, frame.event.threadId);
     }
+    if (frame.event.kind === "desktop_session_message") {
+      if (!this.#storage.nativeBotHasSession(key, frame.event.threadId)) return false;
+      return frame.event.source !== "tui" || this.#storage.hasConfirmedNativeDesktopResume(
+        key, frame.event.desktopSessionId, frame.event.threadId,
+      );
+    }
     return (
       "threadId" in frame.event &&
       this.#storage.nativeBotHasSession(key, frame.event.threadId)
@@ -451,6 +457,23 @@ export class NativeBotDataPlane {
       }
       this.#desktopResumeWaiters.get(event.resumeId)?.(event.threadId);
       this.#desktopResumeWaiters.delete(event.resumeId);
+      return true;
+    }
+    if (event.kind === "desktop_session_message") {
+      if (!this.canAccept(key, frame)) return false;
+      const messageId = desktopSessionMessageId(event.source, event.hermesSessionId, event.rowId);
+      // Attach is at-least-once. The storage uniqueness guard is authoritative, but read first so
+      // a replay is acknowledged without emitting another `bot_chat` frame.
+      if (this.#storage.nativeBotMessage(key, messageId) !== undefined) return true;
+      const message = this.#storage.appendNativeBotMessage({
+        bot: key,
+        sessionId: event.threadId,
+        messageId,
+        role: event.role,
+        text: event.text,
+        at: event.at,
+      });
+      this.#broadcastMessage(key, event.threadId, message, this.#now());
       return true;
     }
     if (event.kind === "scheduled") {
@@ -2506,6 +2529,19 @@ export function deliveryFailureText(bot: string, at: number, reason: string): st
   const name = bot.charAt(0).toUpperCase() + bot.slice(1);
   const time = new Date(at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
   return `${name} tried to deliver a scheduled message at ${time} and it could not be delivered: ${reason.slice(0, 256)}.`;
+}
+
+/** Stable, bounded native transcript identity for one SessionDB row. The digest makes the three
+ * source-qualified components unambiguous even when a Hermes id itself contains a delimiter. */
+function desktopSessionMessageId(source: "cozygateway" | "tui", hermesSessionId: string, rowId: string): string {
+  const digest = createHash("sha256")
+    .update(source)
+    .update("\0")
+    .update(hermesSessionId)
+    .update("\0")
+    .update(rowId)
+    .digest("hex");
+  return `desktop:${source}:${digest}`;
 }
 
 function normalize(value: string): string {
