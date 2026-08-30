@@ -14,6 +14,11 @@ function nativePlane(bots = ["sage", "luna"]) {
   const storage = openStorage(":memory:");
   const frames: unknown[] = [];
   const commands: Array<{ bot: string; threadId: string }> = [];
+  const desktopResumeCommands: Array<{
+    bot: string; threadId: string; hermesSessionId: string; resumeId: string;
+  }> = [];
+  const desktopSessions = vi.fn().mockResolvedValue([]);
+  const desktopSessionTranscript = vi.fn().mockResolvedValue([]);
   const control = {
     newSession: vi.fn(),
     sessions: vi.fn(),
@@ -21,6 +26,8 @@ function nativePlane(bots = ["sage", "luna"]) {
     canonicalChat: vi.fn(),
     chatHistory: vi.fn(),
     sendChatMessage: vi.fn(),
+    desktopSessions,
+    desktopSessionTranscript,
   } as unknown as BotsSurface;
   const ingress = {
     sendNativeTurn: (bot: string, turn: { threadId: string }) => {
@@ -28,6 +35,12 @@ function nativePlane(bots = ["sage", "luna"]) {
       return true;
     },
     sendNativeInterrupt: () => true,
+    sendNativeDesktopResume: (bot: string, input: {
+      threadId: string; hermesSessionId: string; resumeId: string;
+    }) => {
+      desktopResumeCommands.push({ bot, ...input });
+      return true;
+    },
   } as unknown as AttachV1Ingress;
   let now = 1_000;
   const plane = new NativeBotDataPlane({
@@ -39,7 +52,7 @@ function nativePlane(bots = ["sage", "luna"]) {
     broadcast: (frame) => frames.push(frame),
     now: () => now++,
   });
-  return { storage, frames, commands, control, plane, surface: plane.surface() };
+  return { storage, frames, commands, desktopResumeCommands, desktopSessions, desktopSessionTranscript, control, plane, surface: plane.surface() };
 }
 
 describe("attach-v1 native Bot Mode sessions", () => {
@@ -116,6 +129,54 @@ describe("attach-v1 native Bot Mode sessions", () => {
     };
     expect(h.plane.canAccept("sage", coreCommit)).toBe(false);
     expect(h.plane.handle("sage", coreCommit)).toBe(false);
+    h.plane.close();
+    h.storage.close();
+  });
+
+  it("only selects a distinct local session after an exact desktop-switch confirmation, then sends on that lane", async () => {
+    const h = nativePlane(["sage"]);
+    h.desktopSessions.mockResolvedValue([{
+      source: "hermes_desktop", hermesSessionId: "desktop-raw-1", startedAt: 1, lastActiveAt: 2,
+    }]);
+    const before = (await h.surface.canonicalChat("sage")).sessionId;
+    h.desktopSessionTranscript.mockResolvedValue([
+      { id: "u1", role: "user", text: "old hello", at: 1_000 },
+      { id: "a1", role: "assistant", text: "old answer", at: 2_000 },
+    ]);
+    const resume = h.surface.resumeDesktopSession("sage", "desktop-raw-1");
+    await Promise.resolve();
+    expect((await h.surface.canonicalChat("sage")).sessionId).toBe(before);
+    const command = h.desktopResumeCommands[0];
+    if (command === undefined) throw new Error("desktop resume command was not queued");
+    expect(command).toMatchObject({ bot: "sage", hermesSessionId: "desktop-raw-1" });
+
+    expect(h.plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "desktop-confirm-1",
+      event: {
+        kind: "desktop_session_resumed", threadId: command.threadId,
+        hermesSessionId: command.hermesSessionId, resumeId: command.resumeId,
+      },
+    } as AttachV1EventFrame)).toBe(true);
+    const staged = await resume;
+    expect(staged).toMatchObject({ status: "resumed", sessionId: command.threadId });
+    expect((await h.surface.canonicalChat("sage")).sessionId).toBe(command.threadId);
+    expect((await h.surface.chatHistory("sage")).messages.map((message) => [message.role, message.text])).toEqual([
+      ["user", "old hello"], ["assistant", "old answer"],
+    ]);
+    await h.surface.sendChatMessage("sage", "continue desktop context");
+    expect(h.commands.at(-1)).toEqual({ bot: "sage", threadId: command.threadId });
+    expect(h.frames.findLast((frame) => (frame as { type?: string }).type === "bot_chat_adopted")).toMatchObject({
+      bot: "sage", sessionId: command.threadId, previousSessionId: before,
+    });
+    h.plane.close();
+    h.storage.close();
+  });
+
+  it("refuses desktop ids absent from the freshly source-qualified profile index", async () => {
+    const h = nativePlane(["sage"]);
+    h.desktopSessions.mockResolvedValue([]);
+    await expect(h.surface.resumeDesktopSession("sage", "cron_or_foreign")).rejects.toBeInstanceOf(BotSessionNotFound);
+    expect(h.desktopResumeCommands).toEqual([]);
     h.plane.close();
     h.storage.close();
   });

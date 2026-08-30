@@ -24,6 +24,7 @@ import type {
   BotTurnDelegations,
   BotThinkingActivityFrame,
   BotSummary,
+  BotDesktopHermesResumeResponse,
   BotPendingClarification,
   BotPendingApproval,
   RichBlock,
@@ -132,6 +133,7 @@ function liveTurnFrameKey(frame: LiveTurnFrame): string {
 }
 
 const LIVE_TURN_FLUSH_MS = 100;
+const DESKTOP_RESUME_CONFIRM_MS = 2_000;
 
 interface NativeTurnState {
   status: BotChatStatus;
@@ -165,6 +167,7 @@ export class NativeBotDataPlane {
   readonly #delegationFrames = new Map<string, Map<string, DelegationFrameState>>();
   readonly #tracedTurnStates = new Map<string, string>();
   readonly #attachPresence = new Map<string, "online" | "degraded" | "absent">();
+  readonly #desktopResumeWaiters = new Map<string, (sessionId: string) => void>();
   readonly #interactionTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
@@ -227,6 +230,9 @@ export class NativeBotDataPlane {
       pendingClarifications: () => this.#pendingClarifications(),
       terminalSettlements: () => this.#terminalSettlements(),
       attachmentHistory: (input) => this.#attachmentHistory(input),
+      desktopSessions: (name) => this.#desktopSessions(name),
+      resumeDesktopSession: (name, hermesSessionId) =>
+        this.#resumeDesktopSession(name, hermesSessionId),
       canonicalChat: (name) => this.#canonical(name),
       newSession: (name) => this.#newSession(name),
       sessions: (name, limit) => this.#sessions(name, limit),
@@ -346,6 +352,9 @@ export class NativeBotDataPlane {
       if ("target" in frame.event) return frame.event.target.kind === "canonical_home";
       return frame.event.threadId === this.#storage.nativeBotChat(key, this.#now()).sessionId;
     }
+    if (frame.event.kind === "desktop_session_resumed") {
+      return this.#storage.nativeBotHasSession(key, frame.event.threadId);
+    }
     return (
       "threadId" in frame.event &&
       this.#storage.nativeBotHasSession(key, frame.event.threadId)
@@ -422,6 +431,28 @@ export class NativeBotDataPlane {
     if (!this.handles(key)) return false;
     const event = frame.event;
     if (event.kind === "presence" || event.kind === "media") return true;
+    if (event.kind === "desktop_session_resumed") {
+      const confirmed = this.#storage.confirmNativeDesktopResume({
+        bot: key,
+        hermesSessionId: event.hermesSessionId,
+        sessionId: event.threadId,
+        resumeId: event.resumeId,
+        now: this.#now(),
+      });
+      if (confirmed === undefined) return false;
+      if (!confirmed.alreadyResumed) {
+        this.#broadcast({
+          type: "bot_chat_adopted",
+          bot: key,
+          sessionId: event.threadId,
+          previousSessionId: confirmed.previousSessionId,
+          updatedAt: this.#now(),
+        });
+      }
+      this.#desktopResumeWaiters.get(event.resumeId)?.(event.threadId);
+      this.#desktopResumeWaiters.delete(event.resumeId);
+      return true;
+    }
     if (event.kind === "scheduled") {
       const delivery = this.#storage.attachScheduledDelivery(
         key,
@@ -587,6 +618,66 @@ export class NativeBotDataPlane {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     return this.#ingress.commandCatalog(bot);
+  }
+
+  async #desktopSessions(name: string) {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    return this.#control.desktopSessions(bot);
+  }
+
+  async #resumeDesktopSession(
+    name: string,
+    hermesSessionId: string,
+  ): Promise<BotDesktopHermesResumeResponse> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    // Re-read the source-qualified dashboard index at action time. A row shown earlier is no
+    // authorization to resume after it was deleted, reclassified, or moved to another profile.
+    const eligible = await this.#control.desktopSessions(bot);
+    if (!eligible.some((row) => row.hermesSessionId === hermesSessionId))
+      throw new BotSessionNotFound(hermesSessionId);
+    const current = this.#storage.nativeBotChat(bot, this.#now());
+    if (current.activeTurnId !== undefined)
+      throw new BackendUnavailable("cannot resume a desktop session while this bot has a running native turn");
+    const staged = this.#storage.stageNativeDesktopResume(bot, hermesSessionId, this.#now());
+    // Read and sanitize the desktop transcript before the plugin can confirm. The staged local
+    // session is not selected yet, so a failed/slow source read cannot redirect a normal send.
+    const imported = await this.#control.desktopSessionTranscript(bot, hermesSessionId);
+    for (const [index, message] of imported.entries()) {
+      this.#storage.appendNativeBotMessage({
+        bot,
+        sessionId: staged.sessionId,
+        messageId: `desktop:${hermesSessionId}:${message.id}`,
+        role: message.role,
+        text: message.text,
+        at: message.at ?? this.#now() + index,
+      });
+    }
+    if (staged.status === "resumed") {
+      return { name: bot, source: "hermes_desktop", hermesSessionId, status: "resumed", sessionId: staged.sessionId };
+    }
+    const confirmed = new Promise<string>((resolve) => this.#desktopResumeWaiters.set(staged.resumeId, resolve));
+    if (!this.#ingress.sendNativeDesktopResume(bot, {
+      threadId: staged.sessionId,
+      hermesSessionId,
+      resumeId: staged.resumeId,
+    })) {
+      this.#desktopResumeWaiters.delete(staged.resumeId);
+      throw new BackendUnavailable("the attached Hermes plugin does not support exact desktop-session resume");
+    }
+    const sessionId = await Promise.race([
+      confirmed,
+      new Promise<undefined>((resolve) => setTimeout(resolve, DESKTOP_RESUME_CONFIRM_MS)),
+    ]);
+    this.#desktopResumeWaiters.delete(staged.resumeId);
+    return {
+      name: bot,
+      source: "hermes_desktop",
+      hermesSessionId,
+      status: sessionId === undefined ? "pending" : "resumed",
+      ...(sessionId === undefined ? {} : { sessionId }),
+    };
   }
 
   #attachmentHistory(input: {

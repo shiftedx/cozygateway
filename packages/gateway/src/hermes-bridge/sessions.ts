@@ -10,6 +10,13 @@ export interface SessionRow {
 
 export type BotSessionKind = "conversation" | "cron" | "routine" | "group";
 
+/** The only Dashboard rows eligible for the separate desktop-resume seam. `tui` is Hermes'
+ * source-qualified desktop/TUI origin; everything else is deliberately excluded, including
+ * cron/routine/group/machine and ordinary gateway-created rows. */
+export function isDesktopHermesSession(row: SessionRow): boolean {
+  return row.source?.trim().toLowerCase() === "tui" && sessionKind(row) === "conversation";
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)

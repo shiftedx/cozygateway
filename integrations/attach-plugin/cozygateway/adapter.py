@@ -871,6 +871,9 @@ class AttachAdapter:
         # Per-thread active turn id: set on inject, read by the draft / terminal
         # surfaces, dropped when the turn ends.
         self._active_turn: Dict[str, str] = {}
+        # Gateway-owned attach lane -> exact Hermes raw session target. This is populated only
+        # after the resident runner confirms `switch_session`; it is never inferred from chat_id.
+        self._desktop_session_bindings: Dict[str, Tuple[str, str]] = {}
         # Delegation batch id -> the turn that dispatched it, pinned at the batch's first
         # event and bounded oldest-first. An async ``delegate_task`` batch outlives its turn,
         # and a late finish leg must land on the ORIGINAL turn id (the gateway's post-seal
@@ -1166,6 +1169,7 @@ class AttachAdapter:
                 on_interrupt=self._on_interrupt,
                 on_approval=self._dispatch_approval_command,
                 on_clarify=self._dispatch_clarify_command,
+                on_desktop_resume=self._on_desktop_resume_command,
                 on_memory=self._on_memory_command,
                 on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
@@ -1436,12 +1440,23 @@ class AttachAdapter:
                         media_types.append(cached.media_type)
                 except Exception:  # noqa: BLE001 - one bad attachment must not drop the turn
                     logger.debug("attach: could not materialize inbound media %s", media_id, exc_info=True)
+        binding = self._desktop_session_bindings.get(turn.thread_id)
+        metadata: Dict[str, Any] = {}
+        if binding is not None:
+            # The runner validates this strict binding immediately before dispatch, so a stale
+            # replay cannot fall through to get_or_create_session and land in a new context.
+            metadata = {
+                "gateway_session_key": binding[0],
+                "gateway_session_id": binding[1],
+                "gateway_session_strict": True,
+            }
         event = MessageEvent(
             text=turn.text,
             source=source,
             message_id=turn.turn_id,
             media_urls=media_urls,
             media_types=media_types,
+            metadata=metadata,
         )
         try:
             await self.handle_message(event)  # type: ignore[attr-defined]
@@ -1449,6 +1464,67 @@ class AttachAdapter:
             logger.debug("attach: handle_message raised", exc_info=True)
             await self._safe_failed(turn.thread_id, turn.turn_id, "turn error")
             self._cleanup_turn(turn.thread_id, turn.turn_id)
+
+    def _on_desktop_resume_command(self, command: Dict[str, Any]) -> None:
+        """Schedule one explicit, source-qualified Desktop/TUI session adoption."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_desktop_resume_command(command))
+
+    async def _handle_desktop_resume_command(self, command: Dict[str, Any]) -> None:
+        """Switch the stable attach lane to an exact profile-local Hermes session.
+
+        The command ACK says only that the plugin spool received it. The sole success proof is the
+        durable `desktop_session_resumed` event emitted after every verification and switch below.
+        Any unavailable internal API or failed check is intentionally a silent refusal: the gateway
+        leaves its staged mapping pending and never routes a later user turn by approximation.
+        """
+        thread_id = command.get("threadId")
+        raw_id = command.get("hermesSessionId")
+        resume_id = command.get("resumeId")
+        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in (thread_id, raw_id, resume_id)):
+            return
+        if any(marker in raw_id for marker in ("\x00", "\r", "\n", "..", "/", "\\")):
+            return
+        if self._active_turn.get(thread_id) is not None:
+            return
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if runner is None or store is None:
+            return
+        try:
+            source = self._inbound_source(thread_id)
+            session_key = runner._session_key_for_source(source)
+            if runner._is_session_running(session_key):
+                return
+            # Hermes has changed the async wrapper's private field spelling across releases. The
+            # underlying SessionDB contract is stable; require both exact lookup and compression
+            # resolution rather than guessing if this running Hermes does not expose either.
+            session_db = next((candidate for candidate in (
+                getattr(store, "session_db", None), getattr(store, "_session_db", None),
+                getattr(store, "store", None), getattr(store, "_store", None),
+                getattr(runner, "session_db", None), getattr(runner, "_session_db", None),
+            ) if callable(getattr(candidate, "get_session", None)) and callable(getattr(candidate, "resolve_resume_session_id", None))), None)
+            if session_db is None or session_db.get_session(raw_id) is None:
+                return
+            target = session_db.resolve_resume_session_id(raw_id)
+            if not isinstance(target, str) or not target or session_db.get_session(target) is None:
+                return
+            await store.get_or_create_session(source)
+            switched = await store.switch_session(session_key, target)
+            if switched != target:
+                return
+            runner._evict_cached_agent(session_key)
+            if not runner._is_session_running(session_key):
+                runner._release_running_agent_state(session_key)
+            self._desktop_session_bindings[thread_id] = (session_key, target)
+            client = self._client
+            if client is not None:
+                await client.send_desktop_session_resumed(thread_id, raw_id, resume_id)
+        except Exception:  # noqa: BLE001 - no exact proof means no resume
+            logger.debug("attach: desktop session resume refused", exc_info=True)
 
     # -- mid-turn steer -------------------------------------------------------
     def _on_steer(self, frame: SteerFrame) -> None:

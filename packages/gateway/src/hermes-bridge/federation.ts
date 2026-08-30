@@ -3,6 +3,7 @@ import type {
   BotGroupDetail, BotGroupMessage, BotModelConfig, BotModelConfigPatch, BotProfile,
   BotModelProviderOAuthSession, BotModelProviderSetupCatalog, BotProfilePatch,
   BotRoutineCreateRequest, BotRoutinePatch, BotSummary, BridgeLiveness,
+  BotDesktopHermesSession,
 } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -114,6 +115,14 @@ export class FederatedBotControlSurface implements BotControlSurface {
     const member = [...this.#members.values()].find((item) => item.bridge.health().online) ?? [...this.#members.values()][0];
     if (member === undefined) throw new BackendUnavailable("no Hermes endpoint is configured");
     return member.bridge.catalog(query);
+  }
+  async desktopSessions(name: string): Promise<BotDesktopHermesSession[]> {
+    const r = this.#route(name);
+    return r.member.bridge.desktopSessions(r.profile);
+  }
+  async desktopSessionTranscript(name: string, hermesSessionId: string) {
+    const r = this.#route(name);
+    return r.member.bridge.desktopSessionTranscript(r.profile, hermesSessionId);
   }
   async routines(name: string): Promise<BotRoutineList> { const r = this.#route(name); const result = await r.member.bridge.routines(r.profile); return { ...result, name }; }
   async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.createRoutine(r.profile, input); }
