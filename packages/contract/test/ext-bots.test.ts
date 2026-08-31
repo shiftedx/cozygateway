@@ -60,7 +60,7 @@ const bot: BotSummary = {
   active: true,
   lastActiveAt: 1_800_000_000_000,
   chatSessionId: "sess-1",
-  preview: { kind: "a2a", text: "the build is green", sender: "luna" },
+  preview: { kind: "plain", text: "the build is green" },
   meta: { title: "Scout", created: 1_799_000_000_000 },
 };
 
@@ -95,6 +95,13 @@ describe("bot summary", () => {
         preview: { kind: "empty", text: "" },
       }),
     ).toBe(true);
+  });
+
+  it("does not accept transcript-derived A2A preview provenance", () => {
+    expect(check(BotSummarySchema, {
+      ...bot,
+      preview: { kind: "a2a", text: "done", sender: "luna" },
+    })).toBe(false);
   });
 
   it("rejects an unknown preview kind", () => {
@@ -575,8 +582,9 @@ describe("capability advertisement", () => {
     // simplest possible way, since a client below 37 simply never calls the route.
     // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts;
     // 40 distinguishes a created profile from an attached, writable bot; 41 wraps Hermes' model
-    // provider setup catalog, credential lifecycle, and OAuth sessions for the phone.
-    expect(BOTS_CAPABILITY_VERSION).toBe(41);
+    // provider setup catalog, credential lifecycle, and OAuth sessions for the phone; 42 removes
+    // transcript-derived A2A previews and adds bounded structured child terminal enrichment.
+    expect(BOTS_CAPABILITY_VERSION).toBe(42);
   });
 
   it("keeps mobile receipts closed and metadata-only", () => {
