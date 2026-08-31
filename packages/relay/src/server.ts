@@ -2,7 +2,7 @@ import type { Server } from "node:http";
 
 import { serve } from "@hono/node-server";
 
-import { apnsTransport, type ApnsConfig } from "./apns.ts";
+import { apnsTransport, type ApnsCredentials } from "./apns.ts";
 import { createRelayApp } from "./http.ts";
 import { openRelayStorage, type RelayStorage } from "./storage.ts";
 import { webhookTransport } from "./transports.ts";
@@ -29,7 +29,7 @@ export interface RelayConfig {
   /** Honor the rightmost X-Forwarded-For hop. Enable only behind a trusted proxy. */
   trustForwarded?: boolean;
   /** When set, the relay serves the "apns" platform; unset means webhook-only. */
-  apns?: ApnsConfig;
+  apns?: ApnsCredentials;
 }
 
 export interface RunningRelay {
@@ -45,12 +45,8 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
     webhook: webhookTransport({ restrictEgress: config.restrictEgress }),
   };
   if (config.apns !== undefined) {
-    // Keep the configured environment as the legacy default for clients that predate explicit
-    // APNs routing, while allowing one public relay to serve development and production tokens.
-    transports.apns = apnsTransport(config.apns);
     transports["apns:development"] = apnsTransport({ ...config.apns, environment: "development" });
     transports["apns:production"] = apnsTransport({ ...config.apns, environment: "production" });
-    transports["apns-liveactivity"] = apnsTransport(config.apns);
     transports["apns-liveactivity:development"] = apnsTransport({ ...config.apns, environment: "development" });
     transports["apns-liveactivity:production"] = apnsTransport({ ...config.apns, environment: "production" });
   }

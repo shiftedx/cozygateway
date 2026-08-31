@@ -19,13 +19,23 @@ export function relayError(code: RelayErrorCode, message: string): RelayErrorBod
   return { error: { code, message } };
 }
 
-export const RegisterRequestSchema = Type.Object({
-  platform: Type.Union([Type.Literal("webhook"), Type.Literal("apns"), Type.Literal("apns-liveactivity")]),
-  token: Type.String({ minLength: 1, maxLength: 2048 }),
-  /** APNs device tokens are scoped to Apple's sandbox or production service. Older clients omit
-   * this and retain the relay's configured APNS_ENVIRONMENT for backwards compatibility. */
-  environment: Type.Optional(Type.Union([Type.Literal("development"), Type.Literal("production")])),
-});
+const PushTokenSchema = Type.String({ minLength: 1, maxLength: 2048 });
+const ApnsEnvironmentSchema = Type.Union([
+  Type.Literal("development"),
+  Type.Literal("production"),
+]);
+
+export const RegisterRequestSchema = Type.Union([
+  Type.Object(
+    { platform: Type.Literal("webhook"), token: PushTokenSchema },
+    { additionalProperties: false },
+  ),
+  Type.Object({
+    platform: Type.Union([Type.Literal("apns"), Type.Literal("apns-liveactivity")]),
+    token: PushTokenSchema,
+    environment: ApnsEnvironmentSchema,
+  }, { additionalProperties: false }),
+]);
 export type RegisterRequest = Static<typeof RegisterRequestSchema>;
 
 /** Far above any real payload; bounds abuse (design spec, section 3). */

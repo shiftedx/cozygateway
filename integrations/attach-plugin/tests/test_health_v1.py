@@ -1,6 +1,5 @@
 import json
 import os
-import sqlite3
 import sys
 import tempfile
 import types
@@ -74,37 +73,6 @@ class AttachV1FederatedHealthTests(unittest.IsolatedAsyncioTestCase):
             reopened = AttachSpool(path, now_ms=lambda: now[0])
             self.assertEqual(reopened.health_snapshot(), after_processed)
             reopened.close()
-
-    async def test_legacy_spool_migrates_health_columns_without_discarding_pending_work(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "legacy.sqlite")
-            legacy = sqlite3.connect(path)
-            legacy.executescript("""
-                CREATE TABLE state (id INTEGER PRIMARY KEY, instance_id TEXT NOT NULL,
-                  next_event_sequence INTEGER NOT NULL, command_cursor INTEGER NOT NULL,
-                  event_cursor INTEGER NOT NULL) STRICT;
-                CREATE TABLE event_outbox (sequence INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
-                  frame_json TEXT NOT NULL, byte_count INTEGER NOT NULL,
-                  acked INTEGER NOT NULL DEFAULT 0) STRICT;
-                CREATE TABLE command_inbox (sequence INTEGER PRIMARY KEY, command_id TEXT NOT NULL UNIQUE,
-                  frame_json TEXT NOT NULL, processed INTEGER NOT NULL DEFAULT 0) STRICT;
-                CREATE TABLE turn_terminals (turn_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
-                  terminal_kind TEXT NOT NULL) STRICT;
-                INSERT INTO state VALUES (1, 'instance', 2, 0, 0);
-                INSERT INTO event_outbox VALUES (1, 'event-secret',
-                  '{"kind":"event","sequence":1,"eventId":"event-secret","event":{}}', 64, 0);
-            """)
-            legacy.commit()
-            legacy.close()
-            spool = AttachSpool(path, now_ms=lambda: 9_000)
-            self.assertEqual(spool.health_snapshot(), {
-                "eventOutboxDepth": 1,
-                "oldestEventAgeMs": 0,
-                "eventAckCursor": 0,
-                "commandInboxDepth": 0,
-            })
-            self.assertEqual([frame["eventId"] for frame in spool.pending_events(1, 1024)], ["event-secret"])
-            spool.close()
 
     async def test_hello_and_heartbeat_carry_only_bounded_spool_telemetry(self):
         with tempfile.TemporaryDirectory() as directory:

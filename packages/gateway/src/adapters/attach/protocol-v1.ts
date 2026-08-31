@@ -28,7 +28,6 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("delivery_receipts"),
   Type.Literal("delegation"),
   Type.Literal("thinking"),
-  Type.Literal("mobile_failure_details"),
   Type.Literal("desktop_session_resume"),
   Type.Literal("desktop_session_sync"),
 ]);

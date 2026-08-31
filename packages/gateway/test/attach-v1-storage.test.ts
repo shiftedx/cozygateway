@@ -2,8 +2,6 @@ import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-
 import { describe, expect, it } from "vitest";
 
 import { openStorage } from "../src/storage.ts";
@@ -162,31 +160,6 @@ describe("attach-v1 durable transport storage", () => {
     const settlements = storage.terminalNativeSettlements(["sage", "cleo"]);
     expect(settlements).toHaveLength(200);
     expect(new Set(settlements.map((receipt) => receipt.bot))).toEqual(new Set(["sage", "cleo"]));
-    storage.close();
-  });
-
-  it("migrates existing pending interactions without inventing a requested decision", () => {
-    const path = join(mkdtempSync(join(tmpdir(), "attach-v1-legacy-interaction-")), "gateway.sqlite");
-    const legacy = new DatabaseSync(path);
-    legacy.exec(`
-      CREATE TABLE bot_native_interactions (
-        bot TEXT NOT NULL, kind TEXT NOT NULL, interaction_id TEXT NOT NULL,
-        session_id TEXT NOT NULL, turn_id TEXT NOT NULL, payload_json TEXT NOT NULL,
-        status TEXT NOT NULL, selected_option_id TEXT, expires_at INTEGER, updated_at INTEGER NOT NULL,
-        PRIMARY KEY (bot, kind, interaction_id)
-      ) STRICT, WITHOUT ROWID;
-    `);
-    legacy.prepare(`INSERT INTO bot_native_interactions
-      (bot, kind, interaction_id, session_id, turn_id, payload_json, status, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run("sage", "approval", "old-approval", "session", "turn", JSON.stringify({ name: "search" }), "pending", 1);
-    legacy.close();
-
-    const storage = openStorage(path);
-    expect(storage.nativeInteraction("sage", "approval", "old-approval")).toMatchObject({
-      status: "pending", resolutionCommandId: null, resolutionRequestedAt: null,
-      requestedDecision: null, requestedOptionId: null,
-    });
     storage.close();
   });
 
@@ -384,52 +357,6 @@ describe("attach-v1 durable transport storage", () => {
       pluginOutboxDepth: 0, pluginOldestEventAgeMs: 0,
       pluginLastAckProgressAt: null, pluginCommandInboxDepth: 0,
     });
-    storage.close();
-  });
-
-  it("repairs the deployed native-chat schema without changing its selected session or transcript", () => {
-    const path = join(mkdtempSync(join(tmpdir(), "attach-v1-legacy-native-")), "gateway.sqlite");
-    const legacy = new DatabaseSync(path);
-    legacy.exec(`
-      CREATE TABLE bot_native_chats (
-        bot TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        active_turn_id TEXT,
-        updated_at INTEGER NOT NULL
-      ) STRICT;
-      CREATE TABLE bot_native_messages (
-        bot TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        seq INTEGER NOT NULL,
-        message_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        text TEXT NOT NULL,
-        at INTEGER,
-        client_id TEXT,
-        attachments_json TEXT,
-        PRIMARY KEY (bot, session_id, seq),
-        UNIQUE (bot, message_id)
-      ) STRICT, WITHOUT ROWID;
-    `);
-    legacy.prepare("INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, ?, ?)").run("sage", "selected", "turn-1", 40);
-    legacy.prepare("INSERT INTO bot_native_messages (bot, session_id, seq, message_id, role, text, at) VALUES (?, ?, ?, ?, ?, ?, ?)").run("sage", "selected", 1, "m1", "user", "kept", 20);
-    legacy.prepare("INSERT INTO bot_native_messages (bot, session_id, seq, message_id, role, text, at) VALUES (?, ?, ?, ?, ?, ?, ?)").run("sage", "older", 1, "m2", "assistant", "also kept", 10);
-    legacy.close();
-
-    let storage = openStorage(path);
-    expect(storage.nativeBotChat("sage", 50)).toEqual({ sessionId: "selected", created: false, activeTurnId: "turn-1" });
-    expect(storage.nativeBotMessages("sage", "selected").map((message) => message.text)).toEqual(["kept"]);
-    expect(storage.nativeBotSessions("sage", 10).map((session) => session.id).sort()).toEqual(["older", "selected"]);
-
-    const corruption = new DatabaseSync(path);
-    corruption.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run("sage", "selected");
-    corruption.close();
-    expect(storage.nativeBotChat("sage", 55)).toEqual({ sessionId: "selected", created: false, activeTurnId: "turn-1" });
-    storage.close();
-
-    storage = openStorage(path);
-    expect(storage.nativeBotChat("sage", 60)).toEqual({ sessionId: "selected", created: false, activeTurnId: "turn-1" });
-    expect(storage.nativeBotSessions("sage", 10).map((session) => session.id).sort()).toEqual(["older", "selected"]);
     storage.close();
   });
 

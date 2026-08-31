@@ -24,10 +24,10 @@ function configFile(): string {
       port: 8787,
       dbPath: join(dir, "gateway.db"),
       capabilities: { "com.cozylabs.test": 7 },
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: "ws://127.0.0.1:9119/api/ws",
         profiles: { default: { tokenEnv: "COZYGATEWAY_TOKEN" } },
-      },
+      }],
     }),
   );
   return path;
@@ -69,7 +69,7 @@ describe("listener configuration", () => {
     expect(raw.host).toBe("127.0.0.1");
     expect(raw.port).toBe(9000);
     expect(raw.capabilities).toEqual({ "com.cozylabs.test": 7 });
-    expect(loadConfig(path).hermes.profiles.default?.tokenEnv).toBe("COZYGATEWAY_TOKEN");
+    expect(loadConfig(path).hermesEndpoints[0]?.profiles.default?.tokenEnv).toBe("COZYGATEWAY_TOKEN");
   });
 
   it("does not modify the file when the requested listener is invalid", () => {

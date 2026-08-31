@@ -128,7 +128,11 @@ describe("POST /register", () => {
 
   it("501s the recognized-but-unimplemented apns platform", async () => {
     const { app } = harness();
-    const res = await register(app, { platform: "apns", token: "device-token" });
+    const res = await register(app, {
+      platform: "apns",
+      token: "device-token",
+      environment: "development",
+    });
     expect(res.status).toBe(501);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("unsupported_platform");

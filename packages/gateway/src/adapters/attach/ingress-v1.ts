@@ -50,7 +50,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts", "delegation", "thinking", "mobile_failure_details", "desktop_session_resume", "desktop_session_sync"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -546,9 +546,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     const connection = this.#current.get(agentId);
     const detailed = { kind: "mobile_result" as const, ...frame };
     if (!check(AttachV1MobileResultSchema, detailed)) return false;
-    const outbound = (connection?.capabilities.has("mobile_failure_details") === true
-      ? detailed
-      : stripMobileFailureDetails(detailed)) as AttachV1ServerFrame;
+    const outbound = detailed as AttachV1ServerFrame;
     const required = "result" in frame && isLocationResult(frame.result) ? "mobile_location"
       : "result" in frame && isMediaResult(frame.result) ? "mobile_media"
       : "result" in frame && isNotificationResult(frame.result) ? "mobile_notifications" : "mobile_node";
@@ -770,11 +768,6 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#current.clear();
     this.#wss.close();
   }
-}
-
-function stripMobileFailureDetails<T extends object>(frame: T): Omit<T, "stage" | "reason"> {
-  const { stage: _stage, reason: _reason, ...legacy } = frame as T & { stage?: unknown; reason?: unknown };
-  return legacy;
 }
 
 /** The peer's claimed frame kind, constrained to the known set. An unknown or absent kind is

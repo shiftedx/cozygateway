@@ -3,7 +3,8 @@
   "host": "0.0.0.0",
   "port": 8787,
   "dbPath": "/data/cozygateway.db",
-  "hermes": {
+  "hermesEndpoints": [{
+    "id": "default",
     "url": "ws://host.docker.internal:9119/api/ws",
     "authMode": "password",
     "username": "cozybridge",
@@ -17,5 +18,5 @@
         "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_SAGE"
       }
     }
-  }
+  }]
 }

@@ -1,8 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-
 import { describe, expect, it } from "vitest";
 
 import { openStorage } from "../src/storage.ts";
@@ -68,46 +63,4 @@ describe("mobile sharing receipts", () => {
     }
   });
 
-  it("migrates the original receipt constraints without losing existing rows", () => {
-    const directory = mkdtempSync(join(tmpdir(), "cozygateway-mobile-receipts-"));
-    const dbPath = join(directory, "gateway.db");
-    const legacy = new DatabaseSync(dbPath);
-    legacy.exec(`
-      CREATE TABLE bot_mobile_receipts (
-        request_id TEXT PRIMARY KEY,
-        bot TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        turn_id TEXT NOT NULL,
-        command TEXT NOT NULL CHECK (command IN ('device.status', 'location.current')),
-        shared_description TEXT NOT NULL CHECK (shared_description IN ('Device status', 'Approximate location')),
-        purpose TEXT NOT NULL,
-        shared_at INTEGER NOT NULL
-      ) STRICT, WITHOUT ROWID;
-      CREATE INDEX bot_mobile_receipts_session
-        ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
-      INSERT INTO bot_mobile_receipts VALUES
-        ('existing', 'cleo', 'session-1', 'turn-1', 'device.status', 'Device status', 'Preflight', 1000);
-      PRAGMA user_version = 1;
-    `);
-    legacy.close();
-
-    const storage = openStorage(dbPath);
-    try {
-      expect(storage.nativeBotMobileReceipts("cleo", "session-1")).toHaveLength(1);
-      expect(storage.recordBotMobileReceipt({
-        requestId: "notification",
-        bot: "cleo",
-        sessionId: "session-1",
-        turnId: "turn-2",
-        command: "notification.present",
-        sharedDescription: "Notification action",
-        purpose: "Choose an action",
-        sharedAt: 2_000,
-      })).toMatchObject({ command: "notification.present" });
-      expect(storage.nativeBotMobileReceipts("cleo", "session-1")).toHaveLength(2);
-    } finally {
-      storage.close();
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
 });

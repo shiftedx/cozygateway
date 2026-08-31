@@ -59,12 +59,11 @@ services:
     command:
       ["node", "dist/cli.js", "--host", "0.0.0.0", "--port", "${COZY_RELAY_PORT:-8788}", "--db", "/data/relay.db"]
     environment:
-      # Optional APNs (set all five to enable real push; leave empty for webhook-only).
+      # Optional APNs (set all four to enable real push; leave empty for webhook-only).
       APNS_KEY_P8_PATH: "${APNS_KEY_P8_PATH:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
       APNS_TOPIC: "${APNS_TOPIC:-}"
-      APNS_ENVIRONMENT: "${APNS_ENVIRONMENT:-}"
     expose:
       - "${COZY_RELAY_PORT:-8788}"
     volumes:

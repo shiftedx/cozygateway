@@ -316,10 +316,8 @@ and is dropped on reconnect. Terminal
 statuses are `denied`, `expired`, `cancelled`, `device_unavailable`, `foreground_required`, and
 `policy_blocked`.
 
-`mobile_failure_details` is an optional attach capability for truthful terminal diagnostics. A
-gateway MUST send the historical `{ kind, requestId, status }` terminal shape when the plugin did
-not negotiate it. When it is negotiated, a non-`ok` result MAY additionally carry both `stage` and
-`reason` (never only one). Successful results are unchanged.
+A non-`ok` result MAY carry both `stage` and `reason` (never only one) for truthful terminal
+diagnostics. Successful results are unchanged.
 
 Stages are the closed set `policy`, `routing`, `dispatch`, `response`, `media`, `receipt`, and
 `lifecycle`. Reasons are the closed set `no_selected_device`, `command_not_advertised`,

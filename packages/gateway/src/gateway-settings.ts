@@ -13,9 +13,8 @@ function endpointSetting(id: string, label: string | undefined, config: HermesBr
 }
 
 export function settingsForConfig(config: GatewayConfig): GatewaySettings {
-  const endpoints = config.hermesEndpoints?.map(({ id, label, ...endpoint }) =>
-    endpointSetting(id, label, endpoint)) ??
-    (config.hermes === undefined ? [] : [endpointSetting("default", "Hermes", config.hermes)]);
+  const endpoints = config.hermesEndpoints.map(({ id, label, ...endpoint }) =>
+    endpointSetting(id, label, endpoint));
   return { name: config.name, hermesEndpoints: endpoints };
 }
 
@@ -57,9 +56,8 @@ export function fileGatewaySettings(configPath: string): {
       const next = {
         ...current,
         name: settings.name,
-        hermes: undefined,
         hermesEndpoints: settings.hermesEndpoints,
-      } as unknown as GatewayConfig;
+      } as GatewayConfig;
       saveConfig(configPath, next);
       // Prove the exact bytes now on disk are accepted before acknowledging the mutation.
       const persisted = settingsForConfig(loadConfig(configPath));

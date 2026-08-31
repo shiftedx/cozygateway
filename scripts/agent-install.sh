@@ -478,7 +478,7 @@ const [mapPath, output, host, port, dbPath, dashboardPort, publicUrl] = process.
 const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
 fs.writeFileSync(output, JSON.stringify({
   name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
-  hermes: { url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles },
+  hermesEndpoints: [{ id: 'default', url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles }],
 }, null, 2) + '\n', { mode: 0o600 });
 NODE
   chmod 600 "$CONFIG_JSON" "$map"

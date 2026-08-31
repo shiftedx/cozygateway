@@ -30,7 +30,7 @@ function baseConfig(): Parameters<typeof startGateway>[0] {
     host: "127.0.0.1",
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    hermes: testHermes(),
+    hermesEndpoints: [{ id: "default", ...testHermes() }],
   };
 }
 

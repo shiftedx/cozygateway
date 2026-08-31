@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ContractViolation } from "cozygateway-contract";
 
-import { applyEnvOverrides, hermesEndpoints, loadConfig, publicProfileId, type GatewayConfig } from "../src/config.ts";
+import { applyEnvOverrides, hermesEndpoints, loadConfig, publicProfileId,
+  type GatewayConfig, type HermesBridgeConfig } from "../src/config.ts";
 import { parseHermesOptions } from "../src/hermes-bridge/config.ts";
 
 function writeConfig(value: unknown): string {
@@ -20,54 +21,55 @@ const hermes = {
   tokenEnv: "HERMES_TOKEN",
   profiles: { sage: { tokenEnv: "SAGE_ATTACH_TOKEN", name: "Sage" } },
 };
+const oneEndpoint = (config: HermesBridgeConfig = hermes) => [{ id: "default", ...config }];
 
 describe("loadConfig", () => {
   it("loads a valid config and applies defaults", () => {
     const path = writeConfig({
       name: "test-gateway",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
     });
     const config = loadConfig(path);
     expect(config.port).toBe(8787);
     expect(config.dbPath).toBe("cozygateway.db");
-    expect(config.hermes.profiles.sage?.tokenEnv).toBe("SAGE_ATTACH_TOKEN");
+    expect(config.hermesEndpoints[0]?.profiles.sage?.tokenEnv).toBe("SAGE_ATTACH_TOKEN");
   });
 
   it("requires Hermes and at least one attach profile", () => {
     expect(() => loadConfig(writeConfig({ name: "g" }))).toThrow(ContractViolation);
-    expect(() => loadConfig(writeConfig({ name: "g", hermes: { url: hermes.url, profiles: {} } }))).toThrow(
+    expect(() => loadConfig(writeConfig({ name: "g", hermesEndpoints: oneEndpoint({ url: hermes.url, profiles: {} }) }))).toThrow(
       ContractViolation,
     );
 
     const path = writeConfig({
       name: "bots-only",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
     });
     const config = loadConfig(path);
-    expect(config.hermes.url).toBe(hermes.url);
+    expect(config.hermesEndpoints[0]?.url).toBe(hermes.url);
   });
 
   it("carries the bridge's optional roster hide list through", () => {
     const path = writeConfig({
       name: "bots-only",
-      hermes: { ...hermes, hiddenProfiles: ["ops-runner"] },
+      hermesEndpoints: oneEndpoint({ ...hermes, hiddenProfiles: ["ops-runner"] }),
     });
-    expect(loadConfig(path).hermes?.hiddenProfiles).toEqual(["ops-runner"]);
+    expect(loadConfig(path).hermesEndpoints[0]?.hiddenProfiles).toEqual(["ops-runner"]);
   });
 
   it("accepts one direct attach identity per Hermes profile", () => {
     const path = writeConfig({
       name: "native-bots",
-      hermes: {
+      hermesEndpoints: oneEndpoint({
         url: "ws://homelab:8790/api/ws",
         tokenEnv: "HERMES_TOKEN",
         profiles: {
           sage: { tokenEnv: "SAGE_ATTACH_TOKEN", name: "Sage" },
           pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", avatar: "pixel.png" },
         },
-      },
+      }),
     });
-    expect(loadConfig(path).hermes.profiles).toEqual({
+    expect(loadConfig(path).hermesEndpoints[0]?.profiles).toEqual({
       sage: { tokenEnv: "SAGE_ATTACH_TOKEN", name: "Sage" },
       pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", avatar: "pixel.png" },
     });
@@ -76,22 +78,22 @@ describe("loadConfig", () => {
   it("normalizes the bridge's own profile name, which DELETE then refuses", () => {
     const path = writeConfig({
       name: "bots-only",
-      hermes: { ...hermes, profile: "  Ops-Host  " },
+      hermesEndpoints: oneEndpoint({ ...hermes, profile: "  Ops-Host  " }),
     });
-    const parsed = parseHermesOptions(loadConfig(path).hermes!, { HERMES_TOKEN: "t" });
+    const parsed = parseHermesOptions(loadConfig(path).hermesEndpoints[0]!, { HERMES_TOKEN: "t" });
     expect(parsed.bridgeProfile).toBe("ops-host");
     // Absent by default: the guard is opt-in because the profile cannot be detected.
     const bare = writeConfig({
       name: "bots-only",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
     });
-    expect(parseHermesOptions(loadConfig(bare).hermes!, { HERMES_TOKEN: "t" }).bridgeProfile).toBeUndefined();
+    expect(parseHermesOptions(loadConfig(bare).hermesEndpoints[0]!, { HERMES_TOKEN: "t" }).bridgeProfile).toBeUndefined();
   });
 
   it("rejects duplicate normalized profile ids", () => {
     const path = writeConfig({
       name: "g",
-      hermes: { ...hermes, profiles: { Sage: { tokenEnv: "A" }, sage: { tokenEnv: "B" } } },
+      hermesEndpoints: oneEndpoint({ ...hermes, profiles: { Sage: { tokenEnv: "A" }, sage: { tokenEnv: "B" } } }),
     });
     expect(() => loadConfig(path)).toThrow(/duplicate Hermes profile id/i);
   });
@@ -108,7 +110,7 @@ describe("loadConfig", () => {
       publicProfileId(endpoint, "sage"))).toEqual(["home:sage", "studio:sage"]);
   });
 
-  it("rejects duplicate endpoint ids and mixed legacy/federated configuration", () => {
+  it("rejects duplicate endpoint ids and the removed single-endpoint shape", () => {
     expect(() => loadConfig(writeConfig({
       name: "duplicate",
       hermesEndpoints: [
@@ -116,19 +118,15 @@ describe("loadConfig", () => {
         { id: "home", ...hermes },
       ],
     }))).toThrow(/duplicate Hermes endpoint id/i);
-    expect(() => loadConfig(writeConfig({
-      name: "mixed",
-      hermes,
-      hermesEndpoints: [{ id: "home", ...hermes }],
-    }))).toThrow(/exactly one/i);
+    expect(() => loadConfig(writeConfig({ name: "removed", hermes }))).toThrow(ContractViolation);
   });
 
   // Issue #16: capabilities is an optional gateway-level config field, surfaced as
   // GatewayInfo.capabilities.
-  it("loads a config with no capabilities field (older-shape config keeps working)", () => {
+  it("loads a config with no capabilities field", () => {
     const path = writeConfig({
       name: "test-gateway",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
     });
     expect(loadConfig(path).capabilities).toBeUndefined();
   });
@@ -136,7 +134,7 @@ describe("loadConfig", () => {
   it("loads a populated capabilities map, preserving vendor ids verbatim", () => {
     const path = writeConfig({
       name: "test-gateway",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
       capabilities: { "com.cozylabs.test": 1 },
     });
     expect(loadConfig(path).capabilities).toEqual({ "com.cozylabs.test": 1 });
@@ -145,7 +143,7 @@ describe("loadConfig", () => {
   it("loads the private push relay target", () => {
     const path = writeConfig({
       name: "test-gateway",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
       pushRelayUrl: "http://relay:8788",
     });
     expect(loadConfig(path).pushRelayUrl).toBe("http://relay:8788");
@@ -156,7 +154,7 @@ describe("loadConfig", () => {
       name: "public-gateway",
       host: "127.0.0.1",
       publicUrl: "HTTPS://Gateway.Example:443/",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
     });
     expect(loadConfig(path).publicUrl).toBe("https://gateway.example");
   });
@@ -180,7 +178,7 @@ describe("loadConfig", () => {
       name: "public-gateway",
       host: "127.0.0.1",
       publicUrl,
-      hermes,
+      hermesEndpoints: oneEndpoint(),
     }))).toThrow(/publicUrl.*HTTPS origin/i);
   });
 
@@ -191,7 +189,7 @@ describe("loadConfig", () => {
         name: "public-gateway",
         host,
         publicUrl: "https://gateway.example",
-        hermes,
+        hermesEndpoints: oneEndpoint(),
       }))).toThrow(/publicUrl.*loopback/i);
     },
   );
@@ -199,7 +197,7 @@ describe("loadConfig", () => {
   it("rejects a non-integer capability version", () => {
     const path = writeConfig({
       name: "g",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
       capabilities: { "com.cozylabs.test": "one" },
     });
     expect(() => loadConfig(path)).toThrow(ContractViolation);
@@ -210,7 +208,7 @@ describe("loadConfig", () => {
   it("does not impose a turn timeout when turnTimeoutSeconds is absent", () => {
     const path = writeConfig({
       name: "test-gateway",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
     });
     expect(loadConfig(path).turnTimeoutSeconds).toBe(0);
   });
@@ -218,7 +216,7 @@ describe("loadConfig", () => {
   it("accepts an explicit turnTimeoutSeconds from the config file", () => {
     const path = writeConfig({
       name: "test-gateway",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
       turnTimeoutSeconds: 120,
     });
     expect(loadConfig(path).turnTimeoutSeconds).toBe(120);
@@ -227,7 +225,7 @@ describe("loadConfig", () => {
   it("accepts turnTimeoutSeconds of 0 (disables the bound)", () => {
     const path = writeConfig({
       name: "test-gateway",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
       turnTimeoutSeconds: 0,
     });
     expect(loadConfig(path).turnTimeoutSeconds).toBe(0);
@@ -236,7 +234,7 @@ describe("loadConfig", () => {
   it("rejects a negative turnTimeoutSeconds", () => {
     const path = writeConfig({
       name: "g",
-      hermes,
+      hermesEndpoints: oneEndpoint(),
       turnTimeoutSeconds: -1,
     });
     expect(() => loadConfig(path)).toThrow(ContractViolation);
@@ -261,7 +259,7 @@ const base: GatewayConfig = {
   port: 8787,
   dbPath: "cozygateway.db",
   turnTimeoutSeconds: 600,
-  hermes,
+  hermesEndpoints: oneEndpoint(),
 };
 
 describe("applyEnvOverrides", () => {

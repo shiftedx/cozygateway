@@ -651,7 +651,7 @@ export class HermesBridge implements BotControlSurface {
       purged,
       tokenRevoked,
       residue: [
-        `the box gateway config still maps hermes.profiles.${canon} to its token env var`,
+        `the box gateway config still maps profile ${canon} to its token env var`,
         `the box .env still carries this bot's attach token line (it can no longer authenticate)`,
         `the Hermes host may still have the launchd service ai.hermes.gateway-${canon} installed`,
         `run scripts/deprovision-bot.sh ${canon} to sweep all of these and restart the box gateway`,

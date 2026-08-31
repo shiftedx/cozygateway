@@ -39,10 +39,10 @@ async function runMobileToolE2E(tool: "status" | "location"): Promise<void> {
     });
     gateway = await startGateway({
       name: "mobile-node-hermes-e2e", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: hermes.url, tokenEnv: "MOBILE_HERMES_DASHBOARD_TOKEN",
         profiles: { sage: { tokenEnv: "MOBILE_HERMES_SAGE_TOKEN", name: "Sage" } },
-      },
+      }],
     });
     const tokenA = await pair(gateway);
     const tokenB = await pair(gateway);

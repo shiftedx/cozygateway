@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { MobileNodePhoneStatusResult } from "cozygateway-contract";
 
-import { MobileNodeBroker } from "../src/mobile-node.ts";
+import { MobileNodeBroker, type MobileNodeRoute } from "../src/mobile-node.ts";
 
 const purpose = "Report phone readiness";
 const phoneStatus: MobileNodePhoneStatusResult = {
@@ -15,6 +15,18 @@ const phoneStatus: MobileNodePhoneStatusResult = {
     { command: "notification.present" as const, permission: "not_required" as const },
   ],
 };
+
+function route(available: boolean): MobileNodeRoute {
+  return available
+    ? {
+        status: "available", selectedSocketPresent: true, selectedSocketOpen: true,
+        commandAdvertised: true, connectedSocketCount: 1, foreground: true,
+      }
+    : {
+        status: "command_not_advertised", selectedSocketPresent: false, selectedSocketOpen: false,
+        commandAdvertised: false, connectedSocketCount: 0, foreground: false,
+      };
+}
 
 function leaseFor(send: ReturnType<typeof vi.fn>, requestId: string): string {
   const frame = send.mock.calls
@@ -156,7 +168,7 @@ describe("MobileNodeBroker", () => {
     const result = vi.fn();
     const broker = new MobileNodeBroker({
       receipt: () => true,
-      available: () => true,
+      route: () => route(true),
       send,
       result,
       now: () => 1_000,
@@ -188,7 +200,7 @@ describe("MobileNodeBroker", () => {
   it("keeps query deadlines short and rejects overlong interaction deadlines", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(true), send, result, now: () => 1_000 });
 
     broker.invoke({
       requestId: "long-status", command: "device.status", bot: "cleo", threadId: "thread", turnId: "turn",
@@ -287,7 +299,7 @@ describe("MobileNodeBroker", () => {
   it("delivers one closed status request and ignores a duplicate request id", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(true), send, result, now: () => 1_000 });
     const request = { requestId: "request-1", command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "device-1", agentId: "sage" };
 
     broker.invoke(request);
@@ -305,7 +317,7 @@ describe("MobileNodeBroker", () => {
     let now = 1_000;
     const send = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => now });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(true), send, result, now: () => now });
     broker.invoke({
       requestId: "status-v2", command: "device.status", bot: "sage", threadId: "thread-1",
       turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "device-1", agentId: "sage",
@@ -323,7 +335,7 @@ describe("MobileNodeBroker", () => {
   it("delivers one normalized approximate location and rejects malformed purpose or coordinates", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: (_device, command) => command === "location.current", send, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: (_device, command) => route(command === "location.current"), send, result, now: () => 1_000 });
     const base = { command: "location.current" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, deviceId: "origin", agentId: "sage" };
 
     broker.invoke({ ...base, requestId: "location", purpose: "Find nearby coffee" });
@@ -347,7 +359,7 @@ describe("MobileNodeBroker", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();
     const broker = new MobileNodeBroker({ receipt: () => true,
-      available: (_device, command) => command === "device.status" || foreground,
+      route: (_device, command) => route(command === "device.status" || foreground),
       send, result, now: () => 1_000,
     });
     broker.invoke({
@@ -372,7 +384,7 @@ describe("MobileNodeBroker", () => {
   it("settles an agent cancellation once and drops the late phone result", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(true), send, result, now: () => 1_000 });
     broker.invoke({ requestId: "request-1", command: "device.status", bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "device-1", agentId: "sage" });
 
     broker.cancelRequest("sage", "request-1");
@@ -389,7 +401,7 @@ describe("MobileNodeBroker", () => {
     let now = 1_000;
     const send = vi.fn(() => true);
     const broker = new MobileNodeBroker({ receipt: () => true,
-      available: () => true, send, result: vi.fn(), now: () => now,
+      route: () => route(true), send, result: vi.fn(), now: () => now,
       terminalTtlMs: 10, terminalLimit: 1,
     });
     const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", purpose, deviceId: "device-1", agentId: "sage" };
@@ -406,7 +418,7 @@ describe("MobileNodeBroker", () => {
   it("does not admit a burst beyond the bounded pending and terminal capacity", () => {
     const send = vi.fn(() => true);
     const broker = new MobileNodeBroker({ receipt: () => true,
-      available: () => true, send, result: vi.fn(), now: () => 1_000,
+      route: () => route(true), send, result: vi.fn(), now: () => 1_000,
       terminalLimit: 1,
     });
     const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "device-1", agentId: "sage" };
@@ -421,7 +433,7 @@ describe("MobileNodeBroker", () => {
 
   it("fails closed for missing origin, unavailable node, and an out-of-policy deadline", () => {
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => false, send: () => true, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(false), send: () => true, result, now: () => 1_000 });
     const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose, agentId: "sage" };
 
     broker.invoke({ ...base, requestId: "missing" });
@@ -437,7 +449,7 @@ describe("MobileNodeBroker", () => {
 
   it("tombstones every pre-dispatch terminal and explicit reject before emitting it", () => {
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => false, send: () => true, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(false), send: () => true, result, now: () => 1_000 });
     const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose, agentId: "sage" };
     broker.invoke({ ...base, requestId: "missing" });
     broker.invoke({ ...base, requestId: "missing" });
@@ -461,7 +473,7 @@ describe("MobileNodeBroker", () => {
     try {
       const send = vi.fn(() => true);
       const result = vi.fn();
-      const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => 1_000 });
+      const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(true), send, result, now: () => 1_000 });
       const request = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_010, purpose, deviceId: "origin", agentId: "sage" };
       broker.invoke({ ...request, requestId: "expiry" });
       const expiryLease = leaseFor(send, "expiry");
@@ -497,7 +509,7 @@ describe("MobileNodeBroker", () => {
     let now = 1_000;
     const send = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => now });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(true), send, result, now: () => now });
     broker.invoke({
       requestId: "late-result", command: "device.status", bot: "sage", threadId: "thread-1",
       turnId: "turn-1", expiresAt: 1_010, purpose, deviceId: "origin", agentId: "sage",
@@ -520,7 +532,7 @@ describe("MobileNodeBroker", () => {
   it("refuses a consumed lease when profile, turn, or command scope changes", () => {
     const send = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: () => true, available: () => true, send, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: () => true, route: () => route(true), send, result, now: () => 1_000 });
     const base = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "origin", agentId: "sage" };
     broker.invoke({ ...base, requestId: "original" });
     const consumed = leaseFor(send, "original");
@@ -544,7 +556,7 @@ describe("MobileNodeBroker", () => {
     const send = vi.fn(() => true);
     const recordReceipt = vi.fn(() => true);
     const result = vi.fn();
-    const broker = new MobileNodeBroker({ receipt: recordReceipt, available: () => true, send, result, now: () => 1_000 });
+    const broker = new MobileNodeBroker({ receipt: recordReceipt, route: () => route(true), send, result, now: () => 1_000 });
     const request = { command: "device.status" as const, bot: "sage", threadId: "thread-1", turnId: "turn-1", expiresAt: 2_000, purpose, deviceId: "origin", agentId: "sage" };
     broker.invoke({ ...request, requestId: "shared" });
     broker.result("origin", { type: "mobile_node_result", requestId: "shared", lease: leaseFor(send, "shared"), status: "ok", result: phoneStatus });

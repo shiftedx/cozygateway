@@ -68,7 +68,7 @@ async function start(mode: "v2" | "v1" | "older" | "unreachable"): Promise<Runni
     port: 0,
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    hermes: testHermes(hermes.url),
+    hermesEndpoints: [{ id: "default", ...testHermes(hermes.url) }],
   });
   gateways.push(gateway);
   return gateway;

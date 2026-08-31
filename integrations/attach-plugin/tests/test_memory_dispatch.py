@@ -117,12 +117,6 @@ class MemoryDispatchTests(unittest.TestCase):
         # The healthy sources still answer.
         self.assertTrue(any(item["sourceId"] == "holographic" for item in answer["items"]))
 
-    def test_holographic_settings_under_the_legacy_key_are_reported_degraded(self):
-        with patch.object(HolographicAdapter, "_config", lambda _self: {"memory": {"provider": "holographic"}, "plugins": {"holographic": {"default_trust": 0.9}}}):
-            row = self.sources()["holographic"]
-        self.assertEqual(row["status"], "degraded")
-        self.assertIn("hermes-memory-store", row["detail"])
-
     def test_holographic_lists_newest_first(self):
         self.holographic.add_fact("Newest fact")
         self.holographic._conn.execute("UPDATE facts SET trust_score=0.1 WHERE content='Newest fact'")

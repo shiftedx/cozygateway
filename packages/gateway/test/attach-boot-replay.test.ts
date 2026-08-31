@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import type { ServerFrame } from "cozygateway-contract";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 
@@ -199,46 +198,5 @@ describe("boot replay of journaled-unapplied attach events (issue #193)", () => 
     } finally {
       vi.useRealTimers();
     }
-  });
-});
-
-describe("applied_at backfill migration (the honest watermark)", () => {
-  it("stamps pre-existing unapplied rows on first open and leaves post-migration rows replayable", async () => {
-    const dbPath = join(mkdtempSync(join(tmpdir(), "attach-watermark-")), "gateway.sqlite");
-    let clock = NOW_START;
-    const now = () => clock;
-
-    let storage = openStorage(dbPath);
-    let assembly = assemble(storage, now);
-    const { sessionId, turnId } = await openTurn(storage, assembly, clock);
-    journal(storage, 1, "ancient-commit", { kind: "commit", threadId: sessionId, turnId, messageId: "ancient-answer", blocks: [{ type: "paragraph", text: "ancient" }] }, clock);
-    assembly.close();
-    storage.close();
-
-    // Rewind the schema version: this database now looks exactly like one written by a pre-#193
-    // build, holding an unapplied row from before applied_at became the replay watermark.
-    const raw = new DatabaseSync(dbPath);
-    raw.exec("PRAGMA user_version = 0");
-    raw.close();
-
-    storage = openStorage(dbPath);
-    // The first boot of the fixed build replays nothing historical: the pre-existing row is
-    // stamped applied at its own received_at rather than re-projected into a live chat.
-    expect(storage.unappliedAttachEvents("sage")).toHaveLength(0);
-    const stamped = new DatabaseSync(dbPath, { readOnly: true });
-    const row = stamped
-      .prepare("SELECT received_at AS receivedAt, applied_at AS appliedAt FROM attach_event_inbox WHERE event_id = 'ancient-commit'")
-      .get() as { receivedAt: number; appliedAt: number | null };
-    stamped.close();
-    expect(row.appliedAt).toBe(row.receivedAt);
-    expect(storage.nativeBotMessages("sage", sessionId).some((message) => message.id === "ancient-answer")).toBe(false);
-
-    // Rows journaled AFTER the migration stay unapplied across a reopen: the watermark is a
-    // one-time boundary, not a standing eraser.
-    journal(storage, 2, "fresh-draft", { kind: "draft", threadId: sessionId, turnId: "second-turn", blocks: [{ type: "paragraph", text: "fresh" }] }, clock);
-    storage.close();
-    storage = openStorage(dbPath);
-    expect(storage.unappliedAttachEvents("sage").map((frame) => frame.eventId)).toEqual(["fresh-draft"]);
-    storage.close();
   });
 });

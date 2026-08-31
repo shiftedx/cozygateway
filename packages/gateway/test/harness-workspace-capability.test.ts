@@ -39,7 +39,7 @@ async function start(root: string | null): Promise<RunningGateway> {
     port: 0,
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    hermes: testHermes(hermes.url),
+    hermesEndpoints: [{ id: "default", ...testHermes(hermes.url) }],
   });
   gateways.push(gateway);
   return gateway;

@@ -39,12 +39,10 @@ GET never resolves or returns environment values.
 
 ## Stable bot identity
 
-Every profile from `hermesEndpoints` is app-facing as `<endpoint-id>:<normalized-profile-id>`.
-The colon is part of the opaque bot id and is percent-encoded when necessary in URL paths. This
-always-on namespace means adding a second endpoint or a duplicate profile later cannot rename an
-existing bot. Legacy files with one `hermes` object retain their historical bare profile ids. The
-first successful PUT migrates that legacy object to endpoint id `default` and therefore returns
-`default:<profile-id>` after the required restart.
+Profiles keep their normalized id when exactly one endpoint is configured. With multiple endpoints,
+every profile is app-facing as `<endpoint-id>:<normalized-profile-id>` so duplicate profile names
+remain unambiguous. The colon is part of the opaque bot id and is percent-encoded when necessary in
+URL paths.
 
 Roster reads are best-effort across endpoints: an unavailable endpoint makes `/ready` fail and the
 aggregate roster stale, while healthy endpoint rows and the failed endpoint's last cached rows

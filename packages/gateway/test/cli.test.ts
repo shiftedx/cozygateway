@@ -27,11 +27,11 @@ function tempConfig(extra: Record<string, unknown> = {}): { configPath: string; 
       name: "cli-gw",
       port: 18787,
       dbPath,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: "ws://127.0.0.1:1/api/ws",
         tokenEnv: "TEST_HERMES_CONTROL_TOKEN",
         profiles: { sage: { tokenEnv: "TEST_ATTACH_TOKEN", name: "Sage" } },
-      },
+      }],
       ...extra,
     }),
   );
@@ -257,11 +257,11 @@ describe("cozygateway terminal menu", () => {
       port: 0,
       dbPath,
       turnTimeoutSeconds: 30,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: "ws://127.0.0.1:1/api/ws",
         tokenEnv: "TEST_HERMES_CONTROL_TOKEN",
         profiles: { sage: { tokenEnv: "TEST_ATTACH_TOKEN" } },
-      },
+      }],
       tls: { certFile: pair.certFile, keyFile: pair.keyFile },
     });
     const config = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;

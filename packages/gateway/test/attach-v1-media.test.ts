@@ -16,11 +16,11 @@ describe("attach-v1 authenticated media side channel", () => {
     process.env[controlEnv] = "control-secret";
     gateway = await startGateway({
       name: "media", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: "ws://127.0.0.1:1/api/ws",
         tokenEnv: controlEnv,
         profiles: { sage: { tokenEnv: env, name: "Sage" } },
-      },
+      }],
     });
   });
   afterEach(async () => { await gateway.close(); delete process.env[env]; delete process.env[controlEnv]; });

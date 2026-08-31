@@ -34,7 +34,7 @@ const config: GatewayConfig = {
   port: 8787,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  hermes: testHermes(),
+  hermesEndpoints: [{ id: "default", ...testHermes() }],
 };
 
 const servers: FakeHermesServer[] = [];

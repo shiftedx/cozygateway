@@ -163,8 +163,7 @@ export class MobileNodeBroker {
   readonly #terminalLimit: number;
 
   constructor(deps: {
-    available?: (deviceId: string, command: MobileNodeCommand) => boolean;
-    route?: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
+    route: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
     wake?: (deviceId: string) => boolean;
     send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
     result: (agentId: string, frame: MobileNodeResult) => void;
@@ -174,9 +173,7 @@ export class MobileNodeBroker {
     terminalTtlMs?: number;
     terminalLimit?: number;
   }) {
-    if (deps.route === undefined && deps.available === undefined)
-      throw new Error("mobile-node route dependency is required");
-    this.#route = deps.route ?? ((deviceId, command) => legacyRoute(deps.available!(deviceId, command)));
+    this.#route = deps.route;
     this.#wake = deps.wake;
     this.#send = deps.send;
     this.#result = deps.result;
@@ -565,20 +562,6 @@ function noRoute(): MobileNodeRoute {
     foreground: false,
     connectedSocketCount: 0,
   };
-}
-
-function legacyRoute(available: boolean): MobileNodeRoute {
-  return available
-    ? {
-        status: "available", selectedSocketPresent: true, selectedSocketOpen: true,
-        commandAdvertised: true, connectedSocketCount: 1,
-        foreground: true,
-      }
-    : {
-        status: "command_not_advertised", selectedSocketPresent: false, selectedSocketOpen: false,
-        commandAdvertised: false, connectedSocketCount: 0,
-        foreground: false,
-      };
 }
 
 function normalizeSendOutcome(outcome: boolean | MobileNodeSendOutcome): MobileNodeSendOutcome {

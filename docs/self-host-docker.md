@@ -29,7 +29,8 @@ credential values.
   "host": "0.0.0.0",
   "port": 8787,
   "dbPath": "/data/cozygateway.db",
-  "hermes": {
+  "hermesEndpoints": [{
+    "id": "default",
     "url": "ws://hermes:9119/api/ws",
     "authMode": "password",
     "username": "cozybridge",
@@ -38,7 +39,7 @@ credential values.
     "profiles": {
       "sage": { "name": "Sage", "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_SAGE" }
     }
-  }
+  }]
 }
 ```
 

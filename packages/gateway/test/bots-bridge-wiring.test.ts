@@ -207,13 +207,13 @@ describe("hermes bridge options", () => {
       port: 8787,
       dbPath: "db",
       turnTimeoutSeconds: 0,
-      hermes: { url: "ws://old/api/ws", tokenEnv: "HERMES_TOKEN", profiles },
+      hermesEndpoints: [{ id: "default", url: "ws://old/api/ws", tokenEnv: "HERMES_TOKEN", profiles }],
     };
     const withBridge = applyEnvOverrides(
       base,
       { COZYGATEWAY_HERMES_URL: "ws://new/api/ws" },
     );
-    expect(withBridge.hermes.url).toBe("ws://new/api/ws");
+    expect(withBridge.hermesEndpoints[0]?.url).toBe("ws://new/api/ws");
   });
 });
 
@@ -244,7 +244,7 @@ describe("startGateway with a hermes bridge", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
+      hermesEndpoints: [{ id: "default", url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles }],
     });
     gateways.push(gateway);
 
@@ -300,7 +300,7 @@ describe("startGateway with a hermes bridge", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
+      hermesEndpoints: [{ id: "default", url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles }],
     });
     gateways.push(gateway);
 
@@ -328,7 +328,7 @@ describe("startGateway with a hermes bridge", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
+      hermesEndpoints: [{ id: "default", url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles }],
     });
     gateways.push(gateway);
 
@@ -376,7 +376,7 @@ describe("startGateway with a hermes bridge", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: { url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles },
+      hermesEndpoints: [{ id: "default", url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles }],
     });
     gateways.push(gateway);
 
@@ -416,7 +416,7 @@ describe("startGateway with a hermes bridge", () => {
         port: 0,
         dbPath: ":memory:",
         turnTimeoutSeconds: 0,
-        hermes: { url: "ws://127.0.0.1:1/api/ws", tokenEnv: "MISSING_HERMES_TOKEN", profiles },
+        hermesEndpoints: [{ id: "default", url: "ws://127.0.0.1:1/api/ws", tokenEnv: "MISSING_HERMES_TOKEN", profiles }],
       }),
     ).rejects.toThrow(/MISSING_HERMES_TOKEN/);
   });
@@ -429,7 +429,7 @@ describe("startGateway with a hermes bridge", () => {
         port: 0,
         dbPath: ":memory:",
         turnTimeoutSeconds: 0,
-        hermes: { url: "homelab:8790/api/ws", tokenEnv: "TEST_HERMES_TOKEN", profiles },
+        hermesEndpoints: [{ id: "default", url: "homelab:8790/api/ws", tokenEnv: "TEST_HERMES_TOKEN", profiles }],
       }),
     ).rejects.toThrow(/ws:\/\/ or wss:\/\//);
     delete process.env["TEST_HERMES_TOKEN"];

@@ -45,7 +45,7 @@ async function setup(liveActivityPushIds: readonly string[] = ["relay-push-id"])
     port: 8787,
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    hermes: testHermes(),
+    hermesEndpoints: [{ id: "default", ...testHermes() }],
     pushRelayUrl: "http://relay.internal:8788/",
   };
   const storage = openStorage(":memory:");
@@ -200,7 +200,7 @@ describe("authenticated push relay proxy", () => {
     const failedCalls: RelayCall[] = [];
     const logs: string[] = [];
     const config: GatewayConfig = { name: "retry", port: 8787, dbPath: path, turnTimeoutSeconds: 0,
-      hermes: testHermes(), pushRelayUrl: "http://relay.internal:8788/" };
+      hermesEndpoints: [{ id: "default", ...testHermes() }], pushRelayUrl: "http://relay.internal:8788/" };
     createApp({
       storage, config, gatewayInfo: gatewayInfoForConfig(config),
       pushRelayFetch: async (input, init) => {
@@ -288,7 +288,7 @@ describe("authenticated push relay proxy", () => {
       return new Response(null, { status: 204 });
     };
     const config: GatewayConfig = { name: "timeout", port: 8787, dbPath: ":memory:",
-      turnTimeoutSeconds: 0, hermes: testHermes(), pushRelayUrl: "http://relay.internal:8788/" };
+      turnTimeoutSeconds: 0, hermesEndpoints: [{ id: "default", ...testHermes() }], pushRelayUrl: "http://relay.internal:8788/" };
     const app = createApp({
       storage, config, pushRelayFetch: relayFetch,
       pushRelayDeleteTimeoutMs: 50, pushRelayLog: (line) => logs.push(line),
@@ -321,7 +321,7 @@ describe("authenticated push relay proxy", () => {
 
   it("walks a fixed outbox snapshot once despite failed head rows", async () => {
     const config: GatewayConfig = { name: "pages", port: 8787, dbPath: ":memory:",
-      turnTimeoutSeconds: 0, hermes: testHermes(), pushRelayUrl: "http://relay.internal:8788/" };
+      turnTimeoutSeconds: 0, hermesEndpoints: [{ id: "default", ...testHermes() }], pushRelayUrl: "http://relay.internal:8788/" };
     const seed = (storage: ReturnType<typeof openStorage>, count = 51) => {
       for (let index = 0; index < count; index += 1) {
         const deviceId = `device-${index}`;
