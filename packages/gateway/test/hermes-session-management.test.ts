@@ -8,6 +8,7 @@ import type { HermesClient } from "../src/hermes-bridge/client.ts";
 import {
   GatewayHermesSessionManagement,
   HermesSessionManagementAdapter,
+  projectHermesSessionText,
 } from "../src/hermes-bridge/session-management.ts";
 import { openStorage } from "../src/storage.ts";
 
@@ -131,6 +132,33 @@ describe("paired scope and bounds", () => {
 });
 
 describe("privacy projection", () => {
+  it.each([
+    ["root", "/root"],
+    ["tmp", "written to /tmp"],
+    ["POSIX plus", "written to /tmp/build+release/output.json"],
+    ["Windows backslash", String.raw`written to C:\secret\token.txt`],
+    ["Windows slash", "written to C:/secret/build+release/token.txt"],
+    ["UNC backslash", String.raw`written to \\server\share\build+release\token.txt`],
+    ["UNC slash", "written to //server/share/build+release/token.txt"],
+    ["file POSIX", "written to file:///tmp/build+release/token.txt"],
+    ["file Windows", "written to file://C:/secret/build+release/token.txt"],
+    ["quoted spaces", 'written to "/Users/operator/My Project/secret.txt"'],
+  ])("redacts %s absolute paths", (_name, input) => {
+    const projected = projectHermesSessionText(input);
+    expect(projected).toContain("<path>");
+    expect(projected).not.toMatch(/root|tmp|secret|operator|server|build\+release/i);
+  });
+
+  it.each([
+    "Choose yes/no before continuing",
+    "Read https://example.com/docs/v1/session-management",
+    "The ratio is 1 / 2",
+    "release+notes and ordinary words stay intact",
+    "Relative paths like docs/api.md are ordinary prose",
+  ])("does not redact ordinary text: %s", (input) => {
+    expect(projectHermesSessionText(input)).toBe(input);
+  });
+
   it("list exposes only approved fields and redacts host paths", async () => {
     const { request } = appFor(() => json({
       sessions: [row({
@@ -181,6 +209,52 @@ describe("privacy projection", () => {
       { role: "assistant", text: "saved at <path>", hermesMessageId: "4" },
     ]);
     expect(JSON.stringify(body)).not.toMatch(/SECRET|reasoning|command|operator|tool/);
+  });
+
+  it("honors Hermes compaction display projections and never falls back to hidden carriers", async () => {
+    const handoff = "[CONTEXT COMPACTION]\n## Historical Task Overview\nSECRET HISTORY\n[/CONTEXT COMPACTION]";
+    const { request } = appFor((path) => path.includes("/messages?")
+      ? json({
+          session_id: "hermes-1",
+          messages: [
+            { id: 10, role: "user", content: `${handoff}\n\nREAL ASK`, display_content: "REAL ASK" },
+            { id: 11, role: "user", content: handoff, display_kind: "hidden" },
+            {
+              id: 12,
+              role: "assistant",
+              content: `real completed answer\n\nPRIOR CONTEXT\n${handoff}`,
+              display_content: "real completed answer",
+            },
+            {
+              id: 13,
+              role: "assistant",
+              content: "SECRET RAW FALLBACK",
+              display_content: [{ type: "tool_result", content: "SECRET TOOL RESULT" }],
+            },
+          ],
+        })
+      : json(row()));
+    const response = await request(`${BASE}/hermes-1/messages?limit=20&order=oldest`);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.messages).toEqual([
+      { role: "user", text: "REAL ASK", hermesMessageId: "10" },
+      { role: "assistant", text: "real completed answer", hermesMessageId: "12" },
+    ]);
+    expect(JSON.stringify(body)).not.toMatch(/SECRET|CONTEXT COMPACTION|PRIOR CONTEXT|tool_result/);
+  });
+
+  it("rejects a messages envelope larger than its requested page", async () => {
+    const { request } = appFor((path) => path.includes("/messages?")
+      ? json({ session_id: "hermes-1", messages: [
+          { role: "user", content: "one" },
+          { role: "assistant", content: "two" },
+          { role: "assistant", content: "overflow" },
+        ] })
+      : json(row()));
+    const response = await request(`${BASE}/hermes-1/messages?limit=2`);
+    expect(response.status).toBe(503);
+    expect(JSON.stringify(await response.json())).not.toContain("overflow");
   });
 });
 
@@ -325,5 +399,17 @@ describe("streamed export", () => {
     const exported = await adapter.export("sage", "hermes-1", new AbortController().signal);
     const reader = exported.body.getReader();
     await expect(reader.read()).rejects.toThrow(/size cap/i);
+  });
+
+  it("rejects an export page above the requested 200-row wire cap", async () => {
+    const { adapter } = surface((path) => path.includes("/messages?")
+      ? json({ session_id: "hermes-1", messages: Array.from({ length: 201 }, (_, index) => ({
+          role: "assistant", content: `row ${index}`,
+        })) })
+      : json(row()));
+    const exported = await adapter.export("sage", "hermes-1", new AbortController().signal);
+    const reader = exported.body.getReader();
+    expect((await reader.read()).done).toBe(false);
+    await expect(reader.read()).rejects.toThrow(/oversized session page/i);
   });
 });

@@ -67,8 +67,8 @@ import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./har
 import { GatewayHarnessWorkspace, discoverHermesWorkspace } from "./hermes-bridge/workspace.ts";
 import { GatewayHarnessUpdates, discoverHermesUpdates } from "./hermes-bridge/update.ts";
 import {
+  discoverHermesSessionManagement,
   GatewayHermesSessionManagement,
-  HermesSessionManagementAdapter,
 } from "./hermes-bridge/session-management.ts";
 
 export const GATEWAY_VERSION = "0.4.3";
@@ -185,10 +185,12 @@ export function gatewayInfoForConfig(
   management = false,
   harnessWorkspace = false,
   harnessUpdates = false,
+  hermesSessionManagement = false,
 ): GatewayInfo {
   const configuredCapabilities = Object.fromEntries(
     Object.entries(config.capabilities ?? {})
-      .filter(([id]) => id !== HARNESS_UPDATE_CAPABILITY_ID),
+      .filter(([id]) => id !== HARNESS_UPDATE_CAPABILITY_ID
+        && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID),
   );
   return {
     name: config.name,
@@ -203,7 +205,6 @@ export function gatewayInfoForConfig(
         : {
             [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
             [HERMES_DESKTOP_SESSIONS_CAPABILITY_ID]: HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
-            [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
             [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
             [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
           }),
@@ -215,6 +216,9 @@ export function gatewayInfoForConfig(
         : {}),
       ...(harnessUpdates
         ? { [HARNESS_UPDATE_CAPABILITY_ID]: HARNESS_UPDATE_CAPABILITY_VERSION }
+        : {}),
+      ...(hermesSessionManagement
+        ? { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION }
         : {}),
     },
   };
@@ -267,20 +271,19 @@ export async function startGateway(
   const harnessModelAdapters = clientMembers.map(
     ({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client),
   );
-  const hermesSessions = new GatewayHermesSessionManagement(clientMembers.map(
-    ({ client }, index) => new HermesSessionManagementAdapter(
-      client, harnessModelAdapters[index]!.descriptor(),
-    ),
-  ));
-  // Both optional harness surfaces are evidence-gated, not configuration-gated. A missing,
+  // Optional Hermes surfaces are evidence-gated, not configuration-gated. A missing,
   // malformed, or unreachable pinned response yields no adapter and no advertised route.
-  const [workspaceResults, updateResults] = await Promise.all([
+  const [workspaceResults, updateResults, sessionResults] = await Promise.all([
     Promise.all(clientMembers.map(({ client }, index) =>
       discoverHermesWorkspace(client, harnessModelAdapters[index]!.descriptor()))),
     Promise.all(clientMembers.map(({ client }, index) =>
       discoverHermesUpdates(client, harnessModelAdapters[index]!.descriptor()))),
+    Promise.all(clientMembers.map(({ client }, index) =>
+      discoverHermesSessionManagement(client, harnessModelAdapters[index]!.descriptor()))),
   ]);
   const discoveredWorkspaceAdapters = workspaceResults.filter((adapter) => adapter !== undefined);
+  const discoveredSessionAdapters = sessionResults.filter((adapter) => adapter !== undefined);
+  const hermesSessions = new GatewayHermesSessionManagement(discoveredSessionAdapters);
   const harnessWorkspace = new GatewayHarnessWorkspace(discoveredWorkspaceAdapters);
   const harnessUpdates = new GatewayHarnessUpdates(
     updateResults.filter((adapter) => adapter !== undefined),
@@ -290,6 +293,7 @@ export async function startGateway(
     options.configPath !== undefined,
     harnessWorkspace.available,
     harnessUpdates.available,
+    hermesSessions.available,
   );
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({
@@ -599,7 +603,7 @@ export async function startGateway(
     ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
     harnessSettings,
     ...(harnessUpdates.available ? { harnessUpdates } : {}),
-    hermesSessions,
+    ...(hermesSessions.available ? { hermesSessions } : {}),
     ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),

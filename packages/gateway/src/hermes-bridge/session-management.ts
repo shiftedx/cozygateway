@@ -17,7 +17,6 @@ import {
 
 import { normalizeTimestamp, stripImageDirectives } from "./chat-messages.ts";
 import { HermesRpcError, HermesTimeout, type HermesClient } from "./client.ts";
-import { redactHostPaths } from "./photos.ts";
 
 const SESSION_JSON_MAX_BYTES = 8 * 1024 * 1024;
 const EXPORT_PAGE_SIZE = HERMES_SESSION_MESSAGES_MAX;
@@ -28,6 +27,8 @@ export class HermesSessionTooLarge extends Error {}
 export class HermesSessionUnavailable extends Error {}
 /** The write may have landed. A client must refresh instead of retrying or rolling back locally. */
 export class HermesSessionMutationAmbiguous extends Error {}
+
+const HAS_OWN = Object.prototype.hasOwnProperty;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -57,11 +58,22 @@ function time(row: Record<string, unknown>, fields: readonly string[]): number {
  * directives, and host paths are removed before a string enters any response shape. */
 export function projectHermesSessionText(value: unknown, maxLength = HERMES_SESSION_TEXT_MAX_LENGTH): string {
   if (typeof value !== "string") return "";
-  const clean = redactHostPaths(stripImageDirectives(value))
-    .replace(/file:\/\/\/?[^\s"'<>]+/gi, "<path>")
+  const clean = redactHermesSessionPaths(stripImageDirectives(value))
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
     .trim();
   return clean.slice(0, maxLength);
+}
+
+/** Session transcript text is a privacy boundary, so every absolute host-path family is removed,
+ * including roots with one segment. HTTP(S) URLs and embedded ordinary slashes are left alone. */
+export function redactHermesSessionPaths(value: string): string {
+  return value
+    // Quoted paths may contain spaces; consume through the matching quote before token rules run.
+    .replace(/(["'])(?:file:(?:\/\/)?|[A-Za-z]:[\\/]|\\\\|\/\/|\/(?!\/))[^"'\r\n]*\1/gi, "$1<path>$1")
+    .replace(/\bfile:(?:\/\/)?(?:[A-Za-z]:)?[\\/]+[^\s"'<>]*/gi, "<path>")
+    .replace(/(^|[^A-Za-z0-9])(?:[A-Za-z]:[\\/])[^\s"'<>]*/g, "$1<path>")
+    .replace(/(^|[^A-Za-z0-9:])(?:\\\\|\/\/)[^\s"'<>]*/g, "$1<path>")
+    .replace(/(^|[^A-Za-z0-9:/])\/(?![\/\s])[^\s"'<>]*/g, "$1<path>");
 }
 
 function summary(raw: unknown): HermesSessionSummary | undefined {
@@ -85,9 +97,8 @@ function summary(raw: unknown): HermesSessionSummary | undefined {
 
 /** Accept only ordinary text content parts. Tool calls/results, images, reasoning and every
  * unknown structured part contribute nothing even when they carry a tempting `content` string. */
-function approvedMessageText(row: Record<string, unknown>): string {
+function approvedContentText(content: unknown): string {
   const parts: string[] = [];
-  const content = row["content"];
   if (typeof content === "string") parts.push(content);
   else if (Array.isArray(content)) {
     for (const part of content) {
@@ -101,13 +112,22 @@ function approvedMessageText(row: Record<string, unknown>): string {
       if (typeof text === "string") parts.push(text);
     }
   }
-  if (parts.length === 0 && typeof row["text"] === "string") parts.push(row["text"]);
   return parts.join("").trim();
+}
+
+function approvedMessageText(row: Record<string, unknown>): string {
+  // Hermes pins this display-only projection on compaction carriers. Presence is authoritative:
+  // malformed/empty display content drops the row instead of falling back to model-only content.
+  if (HAS_OWN.call(row, "display_content")) return approvedContentText(row["display_content"]);
+  const content = approvedContentText(row["content"]);
+  return content || (typeof row["text"] === "string" ? row["text"].trim() : "");
 }
 
 function message(raw: unknown): HermesSessionMessage | undefined {
   const row = record(raw);
   if (!row) return undefined;
+  if (typeof row["display_kind"] === "string"
+    && row["display_kind"].trim().toLowerCase() === "hidden") return undefined;
   const role = typeof row["role"] === "string" ? row["role"].trim().toLowerCase() : "";
   if (role !== "user" && role !== "assistant") return undefined;
   const text = projectHermesSessionText(approvedMessageText(row));
@@ -136,6 +156,34 @@ function timeout(error: unknown): boolean {
 
 function status(error: unknown): number | undefined {
   return error instanceof HermesRpcError ? error.code : undefined;
+}
+
+function openApiOperation(
+  document: Record<string, unknown>, path: string, method: string,
+): Record<string, unknown> | undefined {
+  return record(record(record(document["paths"])?.[path])?.[method]);
+}
+
+function hasQueryParameters(operation: Record<string, unknown>, required: readonly string[]): boolean {
+  const parameters = operation["parameters"];
+  if (!Array.isArray(parameters)) return false;
+  const names = new Set(parameters.flatMap((parameter) => {
+    const item = record(parameter);
+    return item?.["in"] === "query" && typeof item["name"] === "string" ? [item["name"]] : [];
+  }));
+  return required.every((name) => names.has(name));
+}
+
+function hasPatchShape(document: Record<string, unknown>, operation: Record<string, unknown>): boolean {
+  const schema = record(record(record(operation["requestBody"])?.["content"])?.["application/json"]);
+  const reference = record(schema?.["schema"])?.["$ref"];
+  if (typeof reference !== "string") return false;
+  const schemaName = reference.split("/").at(-1);
+  if (!schemaName) return false;
+  const components = record(record(document["components"])?.["schemas"]);
+  const properties = record(record(components?.[schemaName])?.["properties"]);
+  return properties !== undefined
+    && ["title", "archived", "pinned", "profile"].every((field) => field in properties);
 }
 
 async function readJsonBody(response: Response, maxBytes: number): Promise<unknown> {
@@ -330,6 +378,8 @@ export class HermesSessionManagementAdapter {
       ));
       if (!raw || !Array.isArray(raw["messages"]))
         throw new HermesSessionUnavailable("Hermes returned invalid session data");
+      if (raw["messages"].length > input.limit || raw["messages"].length > HERMES_SESSION_MESSAGES_MAX)
+        throw new HermesSessionUnavailable("Hermes returned an oversized session page");
       const resolvedId = id(raw["session_id"]);
       if (!resolvedId) throw new HermesSessionUnavailable("Hermes returned invalid session data");
       const messages = raw["messages"].flatMap((row) => {
@@ -462,6 +512,8 @@ export class HermesSessionManagementAdapter {
               if (!raw || !Array.isArray(raw["messages"]))
                 throw new HermesSessionUnavailable("Hermes returned invalid session data");
               const physical = raw["messages"];
+              if (physical.length > requestLimit || physical.length > HERMES_SESSION_MESSAGES_MAX)
+                throw new HermesSessionUnavailable("Hermes returned an oversized session page");
               if (physical.length > remaining)
                 throw new HermesSessionTooLarge("Hermes session export exceeded its message cap");
               offset += physical.length;
@@ -504,6 +556,52 @@ export class HermesSessionManagementAdapter {
   }
 }
 
+/** Pins the current Dashboard contract before exposing device routes. OpenAPI proves all
+ * mutation/read route methods without changing state; bounded live reads prove the serving
+ * profile and response envelopes. Older, unreachable, or shape-incompatible Hermes is omitted. */
+export async function discoverHermesSessionManagement(
+  client: HermesClient,
+  harness: GatewayHarness,
+): Promise<HermesSessionManagementAdapter | undefined> {
+  const scope = harness.scopes[0]?.id;
+  if (scope === undefined) return undefined;
+  try {
+    const document = record(await dashboardJson(client, "/openapi.json"));
+    if (!document) return undefined;
+    const list = openApiOperation(document, "/api/sessions", "get");
+    const search = openApiOperation(document, "/api/sessions/search", "get");
+    const detail = openApiOperation(document, "/api/sessions/{session_id}", "get");
+    const patch = openApiOperation(document, "/api/sessions/{session_id}", "patch");
+    const remove = openApiOperation(document, "/api/sessions/{session_id}", "delete");
+    const messages = openApiOperation(document, "/api/sessions/{session_id}/messages", "get");
+    if (!list || !search || !detail || !patch || !remove || !messages
+      || !hasQueryParameters(list, ["limit", "offset", "archived", "order", "profile"])
+      || !hasQueryParameters(search, ["q", "limit", "profile"])
+      || !hasQueryParameters(messages, ["limit", "offset", "order", "include_compacted", "profile"])
+      || !hasPatchShape(document, patch)) return undefined;
+
+    const liveList = record(await dashboardJson(
+      client,
+      `/api/sessions?limit=1&offset=0&archived=include&order=recent&${profileQuery(scope)}`,
+    ));
+    const liveSearch = record(await dashboardJson(
+      client,
+      `/api/sessions/search?q=${encodeURIComponent("__cozygateway_route_probe__")}`
+        + `&limit=1&${profileQuery(scope)}`,
+    ));
+    const liveSessions = liveList?.["sessions"];
+    const liveResults = liveSearch?.["results"];
+    if (!liveList || !Array.isArray(liveSessions) || liveSessions.length > 1
+      || liveSessions.some((row) => summary(row) === undefined)
+      || !Number.isSafeInteger(liveList["total"]) || Number(liveList["total"]) < 0
+      || !liveSearch || !Array.isArray(liveResults) || liveResults.length > 1
+      || liveResults.some((row) => summary(row) === undefined)) return undefined;
+    return new HermesSessionManagementAdapter(client, harness);
+  } catch {
+    return undefined;
+  }
+}
+
 export class GatewayHermesSessionManagement {
   readonly #adapters: ReadonlyMap<string, HermesSessionManagementAdapter>;
 
@@ -511,6 +609,8 @@ export class GatewayHermesSessionManagement {
     this.#adapters = new Map(adapters.map((adapter) => [adapter.descriptor().id, adapter]));
     if (this.#adapters.size !== adapters.length) throw new Error("duplicate session-management harness id");
   }
+
+  get available(): boolean { return this.#adapters.size > 0; }
 
   adapter(harnessId: string): HermesSessionManagementAdapter {
     const adapter = this.#adapters.get(harnessId);

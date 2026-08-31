@@ -145,7 +145,7 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
       res.writeHead(status, { "content-type": "application/json", ...headers });
       res.end(JSON.stringify(body));
     };
-    if (cfg.dashboard !== undefined && path.startsWith("/api/")) {
+    if (cfg.dashboard !== undefined && (path.startsWith("/api/") || path === "/openapi.json")) {
       void readBody(req)
         .then(async (raw) => {
           let body: unknown;

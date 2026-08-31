@@ -12,7 +12,9 @@ MUST NOT be accepted by a Bot Mode route or returned in a Bot Mode `sessionId` f
 The gateway implementation maps these operations to Hermes' authoritative, profile-scoped
 Dashboard session routes (`GET /api/sessions`, `GET /api/sessions/search`, detail/messages,
 `PATCH /api/sessions/{id}`, and idempotent `DELETE /api/sessions/{id}`). It does not read Hermes'
-SQLite database or introduce a generic session backend.
+SQLite database or introduce a generic session backend. The capability and device routes remain
+absent until startup discovery verifies the pinned OpenAPI operations/query/body fields and bounded
+live list/search envelopes; unreachable and older Hermes versions fail closed.
 
 ## Routes
 
@@ -43,13 +45,17 @@ rendered `user`/`assistant` text plus optional bounded row identity and timestam
 
 The gateway MUST strip system rows, tool rows, tool arguments/results, reasoning/model blobs,
 system prompts, working directories, absolute host paths, attachment path directives, and every
-upstream field not named by these schemas. Search results whose matched role is `system`, `tool`, or
-unknown are omitted. Errors are fixed gateway prose and never include upstream messages or paths.
+upstream field not named by these schemas. A transcript row marked `display_kind=hidden` is omitted.
+When Hermes provides `display_content` for a compaction carrier, only that display projection is
+eligible for sanitization; the raw carrier is never a fallback. Search results whose matched role is
+`system`, `tool`, or unknown are omitted. Errors are fixed gateway prose and never include upstream
+messages or paths.
 Message pagination returns a physical-row `nextOffset`; omitted system/tool rows still advance it,
 so a client neither duplicates visible rows nor loops over a privacy-filtered page.
 
 List/search/message counts and offsets are bounded before Hermes is called. Each upstream JSON body
-is capped before parsing. Export is assembled from bounded, oldest-first projected message pages;
+is capped before parsing, and any messages envelope larger than its requested limit or 200 physical
+rows is rejected. Export is assembled from bounded, oldest-first projected message pages;
 it never forwards Hermes' raw export. The stream is capped at 10,000 physical messages and 25 MiB,
 propagates cancellation upstream, and uses `Cache-Control: private, no-store` plus
 `X-Content-Type-Options: nosniff`.

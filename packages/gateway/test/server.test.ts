@@ -8,6 +8,7 @@ import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HARNESS_UPDATE_CAPABILITY_VERSION,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
   MOBILE_NODE_CAPABILITY_VERSION,
   type GatewayInfo,
   type ServerFrame,
@@ -183,6 +184,23 @@ describe("GatewayInfo.capabilities wiring", () => {
     }
   });
 
+  it("does not let config bypass Hermes session-management discovery", async () => {
+    const gw = await startGateway({
+      name: "unproven-session-cap",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermes: testHermes(),
+      capabilities: { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: 1 },
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.[HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]).toBeUndefined();
+    } finally {
+      await gw.close();
+    }
+  });
+
   it("surfaces a configured com.cozylabs.* vendor capability identically in health, pair, and ready", async () => {
     const gw = await startGateway({
       name: "with-caps",
@@ -205,7 +223,6 @@ describe("GatewayInfo.capabilities wiring", () => {
         approvals: 1,
         "com.cozylabs.bots": expect.any(Number),
         "com.cozylabs.hermes-desktop-sessions": 2,
-        "com.cozylabs.hermes-session-management": 1,
         "com.cozylabs.harness-settings": 1,
         "com.cozylabs.mobile-node": MOBILE_NODE_CAPABILITY_VERSION,
       });
