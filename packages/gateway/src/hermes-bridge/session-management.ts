@@ -264,6 +264,7 @@ export interface HermesSessionExportStream {
 export class HermesSessionManagementAdapter {
   readonly #client: HermesClient;
   readonly #harness: GatewayHarness;
+  readonly #exactDetail: boolean;
   readonly #exportMaxBytes: number;
   readonly #exportMaxMessages: number;
   readonly #writeTails = new Map<string, Promise<void>>();
@@ -271,15 +272,17 @@ export class HermesSessionManagementAdapter {
   constructor(
     client: HermesClient,
     harness: GatewayHarness,
-    opts: { exportMaxBytes?: number; exportMaxMessages?: number } = {},
+    opts: { exportMaxBytes?: number; exportMaxMessages?: number; exactDetail?: boolean } = {},
   ) {
     this.#client = client;
     this.#harness = harness;
+    this.#exactDetail = opts.exactDetail ?? true;
     this.#exportMaxBytes = opts.exportMaxBytes ?? HERMES_SESSION_EXPORT_MAX_BYTES;
     this.#exportMaxMessages = opts.exportMaxMessages ?? HERMES_SESSION_EXPORT_MAX_MESSAGES;
   }
 
   descriptor(): GatewayHarness { return this.#harness; }
+  capabilityVersion(): 1 | 2 { return this.#exactDetail ? 2 : 1; }
 
   #scope(scopeId: string): string {
     if (!this.#harness.scopes.some((scope) => scope.id === scopeId))
@@ -288,14 +291,20 @@ export class HermesSessionManagementAdapter {
   }
 
   async #detail(scope: string, sessionId: string, signal?: AbortSignal): Promise<HermesSessionSummary> {
+    if (!this.#exactDetail)
+      throw new HermesSessionUnavailable("Hermes exact session detail is unavailable");
     try {
-      const projected = summary(await dashboardJson(
+      const raw = record(await dashboardJson(
         this.#client,
         `/api/sessions/${encodeURIComponent(sessionId)}?${profileQuery(scope)}`,
         { signal },
       ));
-      if (!projected || projected.hermesSessionId !== sessionId)
-        throw new HermesSessionNotFound("Hermes session was not found");
+      const projected = summary(raw);
+      // A successful response is never evidence of absence. It must correlate both identifiers;
+      // otherwise an older or malicious Dashboard may have ignored the profile selector.
+      if (!raw || raw["profile"] !== scope || !projected
+        || projected.hermesSessionId !== sessionId)
+        throw new HermesSessionUnavailable("Hermes returned uncorrelated session detail");
       return projected;
     } catch (error) { return mapReadError(error); }
   }
@@ -595,6 +604,7 @@ export async function discoverHermesSessionManagement(
       || !hasQueryParameters(search, ["q", "limit", "profile"])
       || !hasQueryParameters(messages, ["limit", "offset", "order", "include_compacted", "profile"])
       || !hasPatchShape(document, patch)) return undefined;
+    const exactDetail = hasQueryParameters(detail, ["profile"]);
 
     const liveList = record(await dashboardJson(
       client,
@@ -612,7 +622,7 @@ export async function discoverHermesSessionManagement(
       || !Number.isSafeInteger(liveList["total"]) || Number(liveList["total"]) < 0
       || !liveSearch || !Array.isArray(liveResults) || liveResults.length > 1
       || liveResults.some((row) => summary(row) === undefined)) return undefined;
-    return new HermesSessionManagementAdapter(client, harness);
+    return new HermesSessionManagementAdapter(client, harness, { exactDetail });
   } catch {
     return undefined;
   }
@@ -627,6 +637,11 @@ export class GatewayHermesSessionManagement {
   }
 
   get available(): boolean { return this.#adapters.size > 0; }
+  get capabilityVersion(): 1 | 2 | undefined {
+    if (!this.available) return undefined;
+    return [...this.#adapters.values()].every((adapter) => adapter.capabilityVersion() === 2)
+      ? 2 : 1;
+  }
 
   adapter(harnessId: string): HermesSessionManagementAdapter {
     const adapter = this.#adapters.get(harnessId);

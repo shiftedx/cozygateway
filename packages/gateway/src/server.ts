@@ -10,7 +10,6 @@ import {
   HERMES_DESKTOP_SESSIONS_CAPABILITY_ID,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
   HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
-  HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
   MOBILE_NODE_CAPABILITY_ID,
   MOBILE_NODE_CAPABILITY_VERSION,
   GATEWAY_MANAGEMENT_CAPABILITY_ID,
@@ -71,7 +70,7 @@ import {
   GatewayHermesSessionManagement,
 } from "./hermes-bridge/session-management.ts";
 
-export const GATEWAY_VERSION = "0.4.3";
+export const GATEWAY_VERSION = "0.5.0";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -185,7 +184,7 @@ export function gatewayInfoForConfig(
   management = false,
   harnessWorkspace = false,
   harnessUpdates = false,
-  hermesSessionManagement = false,
+  hermesSessionManagementVersion?: number,
 ): GatewayInfo {
   const configuredCapabilities = Object.fromEntries(
     Object.entries(config.capabilities ?? {})
@@ -217,9 +216,9 @@ export function gatewayInfoForConfig(
       ...(harnessUpdates
         ? { [HARNESS_UPDATE_CAPABILITY_ID]: HARNESS_UPDATE_CAPABILITY_VERSION }
         : {}),
-      ...(hermesSessionManagement
-        ? { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION }
-        : {}),
+      ...(hermesSessionManagementVersion === undefined
+        ? {}
+        : { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: hermesSessionManagementVersion }),
     },
   };
 }
@@ -293,7 +292,7 @@ export async function startGateway(
     options.configPath !== undefined,
     harnessWorkspace.available,
     harnessUpdates.available,
-    hermesSessions.available,
+    hermesSessions.capabilityVersion,
   );
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({

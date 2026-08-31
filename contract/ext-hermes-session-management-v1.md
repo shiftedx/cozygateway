@@ -4,10 +4,16 @@ Capability id: `com.cozylabs.hermes-session-management`
 
 Current capability version: `2`
 
-Version 2 adds the exact session-detail read. Version 1 clients may continue using the original
-routes, but MUST NOT use capped search to reconcile ambiguous writes. An administration client
-that needs authoritative recovery MUST require capability version 2; this preserves `404` on the
-detail route as an unambiguous statement that the exact session is absent.
+Version 2 adds the exact session-detail read. Version 1 remains the discovery marker for an older
+Dashboard detail contract and MUST NOT be treated as safe administration availability: its exact
+action fails closed, and clients MUST NOT use capped search to reconcile ambiguous writes. An
+administration client that needs authoritative recovery MUST require capability version 2; this
+preserves `404` on the detail route as an unambiguous statement that the exact session is absent.
+
+Release compatibility: capability version 2 is planned for CozyGateway `0.5.0`. CozyChat builds
+that administer desktop sessions require CozyGateway `>= 0.5.0`; a `0.4.x` gateway remains a
+version 1 peer and must be presented as update-required. This is release guidance only—the package
+must pass the full release checks before maintainers publish it.
 
 This paired-device extension administers sessions owned by one visible Hermes profile. It is
 separate from `com.cozylabs.hermes-desktop-sessions:2`, whose narrower promise remains TUI metadata
@@ -83,3 +89,8 @@ list view. Detail success is the closed privacy-projected summary; absence is th
 The route never substitutes a search result, so search limits and unrelated matches cannot prove
 absence. Authentication, exact harness/profile authorization, correlation of the returned Hermes
 id, error redaction, and cancellation are identical to the other reads.
+The upstream OpenAPI operation MUST explicitly declare the `profile` query selector before the
+gateway advertises version 2. Every successful upstream detail response MUST also correlate its
+`profile` and session id with the requested pair. Missing, malformed, or mismatched 200 responses
+are `503 backend_unavailable`, never authoritative absence; only a genuine upstream 404 becomes the
+stable device-facing 404 above.

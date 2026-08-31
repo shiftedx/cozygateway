@@ -55,6 +55,7 @@ function client(handler: ResponseHandler): HermesClient {
 function row(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: "hermes-1",
+    profile: "sage",
     _lineage_root_id: "lineage-root",
     title: "Release notes",
     started_at: 1_700_000_000,
@@ -299,16 +300,36 @@ describe("authoritative exact detail", () => {
     } });
   });
 
-  it.each([
-    ["upstream absence", () => json({ detail: "/Users/operator/private missing" }, 404)],
-    ["mismatched upstream id", () => json(row({ id: "other-session" }))],
-  ])("returns the stable redacted not-found response for %s", async (_name, handler) => {
-    const { request } = appFor(handler);
+  it("returns the stable redacted not-found response only for genuine upstream absence", async () => {
+    const { request } = appFor(() => json({ detail: "/Users/operator/private missing" }, 404));
     const response = await request(`${BASE}/hermes-1`);
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({
       error: { code: "not_found", message: "Hermes session, harness, or profile was not found" },
     });
+  });
+
+  it.each([
+    ["mismatched upstream id", row({ id: "other-session" })],
+    ["mismatched upstream profile", row({ profile: "luna" })],
+    ["missing upstream profile", row({ profile: undefined })],
+    ["malformed upstream shape", { profile: "sage", title: "missing identity" }],
+  ])("fails unavailable instead of clearing state for %s", async (_name, payload) => {
+    const { request } = appFor(() => json(payload));
+    const response = await request(`${BASE}/hermes-1`);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: { code: "backend_unavailable", message: "Hermes session upstream is unavailable" },
+    });
+  });
+
+  it("never returns another profile when upstream ignores the selector", async () => {
+    const { request } = appFor(() => json(row({ profile: "sage", title: "Sage private" })));
+    const response = await request(
+      "/gateway/harnesses/home/scopes/luna/sessions/hermes-1",
+    );
+    expect(response.status).toBe(503);
+    expect(JSON.stringify(await response.json())).not.toContain("Sage private");
   });
 });
 

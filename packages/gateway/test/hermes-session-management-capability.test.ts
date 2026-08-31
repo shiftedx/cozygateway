@@ -22,13 +22,13 @@ function queryParameters(...names: string[]) {
   return names.map((name) => ({ name, in: "query", schema: { type: "string" } }));
 }
 
-function openApi(complete: boolean): unknown {
+function openApi(complete: boolean, exactDetail: boolean): unknown {
   return {
     paths: {
       "/api/sessions": { get: { parameters: queryParameters("limit", "offset", "archived", "order", "profile") } },
       "/api/sessions/search": { get: { parameters: queryParameters("q", "limit", "profile") } },
       "/api/sessions/{session_id}": {
-        get: {},
+        get: exactDetail ? { parameters: queryParameters("profile") } : {},
         patch: {
           requestBody: {
             content: { "application/json": { schema: { $ref: "#/components/schemas/SessionRename" } } },
@@ -50,10 +50,11 @@ function openApi(complete: boolean): unknown {
   };
 }
 
-async function start(mode: "current" | "older" | "unreachable"): Promise<RunningGateway> {
+async function start(mode: "v2" | "v1" | "older" | "unreachable"): Promise<RunningGateway> {
   const hermes = await startFakeHermesServer(mode === "unreachable" ? {} : {
     dashboard: ({ path }) => {
-      if (path === "/openapi.json") return { body: openApi(mode === "current") };
+      if (path === "/openapi.json")
+        return { body: openApi(mode === "v2" || mode === "v1", mode === "v2") };
       if (path === "/api/sessions/search") return { body: { results: [] } };
       if (path === "/api/sessions") return { body: { sessions: [], total: 0 } };
       return { status: 404, body: { detail: "Not Found" } };
@@ -84,7 +85,7 @@ async function pairedToken(gateway: RunningGateway): Promise<string> {
 
 describe("Hermes session-management startup capability proof", () => {
   it("advertises and serves the extension only after current routes and shapes answer", async () => {
-    const gateway = await start("current");
+    const gateway = await start("v2");
     const health = await (await fetch(`${gateway.url}/health`)).json() as { capabilities?: Record<string, number> };
     expect(health.capabilities?.[HERMES_SESSION_MANAGEMENT_CAPABILITY_ID])
       .toBe(HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION);
@@ -94,6 +95,18 @@ describe("Hermes session-management startup capability proof", () => {
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ sessions: [], pagination: { total: 0 } });
+  });
+
+  it("keeps an unparameterized detail GET at v1 and fails the exact action closed", async () => {
+    const gateway = await start("v1");
+    const health = await (await fetch(`${gateway.url}/health`)).json() as { capabilities?: Record<string, number> };
+    expect(health.capabilities?.[HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]).toBe(1);
+
+    const response = await fetch(
+      `${gateway.url}/gateway/harnesses/default/scopes/mock/sessions/hermes-1`,
+      { headers: { authorization: `Bearer ${await pairedToken(gateway)}` } },
+    );
+    expect(response.status).toBe(503);
   });
 
   it.each(["older", "unreachable"] as const)("omits the capability and route for %s Hermes", async (mode) => {
