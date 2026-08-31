@@ -268,6 +268,20 @@ describe("privacy projection", () => {
     expect(response.status).toBe(503);
     expect(JSON.stringify(await response.json())).not.toContain("overflow");
   });
+
+  it.each([
+    ["mismatched", "other-session"],
+    ["missing", undefined],
+  ])("fails unavailable without projecting a %s messages-envelope identity", async (_name, envelopeId) => {
+    const { request } = appFor((path) => path.includes("/messages?")
+      ? json({ session_id: envelopeId, messages: [{ role: "assistant", content: "OTHER SESSION SECRET" }] })
+      : json(row()));
+    const response = await request(`${BASE}/hermes-1/messages?limit=20`);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: { code: "backend_unavailable", message: "Hermes session upstream is unavailable" },
+    });
+  });
 });
 
 describe("authoritative exact detail", () => {
@@ -441,11 +455,30 @@ describe("streamed export", () => {
     expect(JSON.stringify(body)).not.toContain("SECRET");
   });
 
+  it.each([
+    ["mismatched", "other-session"],
+    ["missing", undefined],
+  ])("fails unavailable before streaming a %s export-envelope identity", async (_name, envelopeId) => {
+    const { request } = appFor((path) => path.includes("/messages?")
+      ? json({ session_id: envelopeId, messages: [{ role: "assistant", content: "OTHER SESSION SECRET" }] })
+      : json(row()));
+    const response = await request(`${BASE}/hermes-1/export`);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: { code: "backend_unavailable", message: "Hermes session upstream is unavailable" },
+    });
+  });
+
   it("propagates cancellation into the active upstream page", async () => {
     let upstreamSignal: AbortSignal | undefined;
     let upstreamAborted = false;
     const { adapter } = surface((path, init) => {
       if (!path.includes("/messages?")) return json(row());
+      if (path.includes("offset=0")) {
+        return json({ session_id: "hermes-1", messages: Array.from({ length: 200 }, () => ({
+          role: "assistant", content: "first page",
+        })) });
+      }
       upstreamSignal = init.signal;
       return new Response(new ReadableStream<Uint8Array>({
         start(controller) {
@@ -458,7 +491,7 @@ describe("streamed export", () => {
     });
     const exported = await adapter.export("sage", "hermes-1", new AbortController().signal);
     const reader = exported.body.getReader();
-    expect(new TextDecoder().decode((await reader.read()).value)).toContain('"session"');
+    for (let index = 0; index <= 200; index++) await reader.read();
     const pending = reader.read().catch(() => undefined);
     await vi.waitFor(() => expect(upstreamSignal).toBeDefined());
     await reader.cancel("test cancellation");
@@ -482,9 +515,7 @@ describe("streamed export", () => {
           role: "assistant", content: `row ${index}`,
         })) })
       : json(row()));
-    const exported = await adapter.export("sage", "hermes-1", new AbortController().signal);
-    const reader = exported.body.getReader();
-    expect((await reader.read()).done).toBe(false);
-    await expect(reader.read()).rejects.toThrow(/oversized session page/i);
+    await expect(adapter.export("sage", "hermes-1", new AbortController().signal))
+      .rejects.toThrow(/oversized session page/i);
   });
 });

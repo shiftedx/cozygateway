@@ -155,6 +155,13 @@ function message(raw: unknown): HermesSessionMessage | undefined {
   };
 }
 
+function messageEnvelope(raw: unknown, sessionId: string): unknown[] {
+  const response = record(raw);
+  if (!response || !Array.isArray(response["messages"]) || response["session_id"] !== sessionId)
+    throw new HermesSessionUnavailable("Hermes returned invalid session data");
+  return response["messages"];
+}
+
 function profileQuery(scope: string): string {
   return `profile=${encodeURIComponent(scope)}`;
 }
@@ -395,25 +402,22 @@ export class HermesSessionManagementAdapter {
     const scope = this.#scope(scopeId);
     await this.#detail(scope, sessionId, signal);
     try {
-      const raw = record(await dashboardJson(
+      const raw = await dashboardJson(
         this.#client,
         `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=${input.limit}`
           + `&offset=${input.offset}&order=${input.order}&include_compacted=true&${profileQuery(scope)}`,
         { signal },
-      ));
-      if (!raw || !Array.isArray(raw["messages"]))
-        throw new HermesSessionUnavailable("Hermes returned invalid session data");
-      if (raw["messages"].length > input.limit || raw["messages"].length > HERMES_SESSION_MESSAGES_MAX)
+      );
+      const physical = messageEnvelope(raw, sessionId);
+      if (physical.length > input.limit || physical.length > HERMES_SESSION_MESSAGES_MAX)
         throw new HermesSessionUnavailable("Hermes returned an oversized session page");
-      const resolvedId = id(raw["session_id"]);
-      if (!resolvedId) throw new HermesSessionUnavailable("Hermes returned invalid session data");
-      const messages = raw["messages"].flatMap((row) => {
+      const messages = physical.flatMap((row) => {
         const projected = message(row);
         return projected ? [projected] : [];
       });
-      const physicalReturned = raw["messages"].length;
+      const physicalReturned = physical.length;
       return {
-        hermesSessionId: resolvedId,
+        hermesSessionId: sessionId,
         messages,
         pagination: {
           limit: input.limit,
@@ -512,7 +516,36 @@ export class HermesSessionManagementAdapter {
         throw new HermesSessionTooLarge("Hermes session export exceeded its size cap");
       return bytes;
     };
+    const fetchPage = async (limit: number): Promise<unknown[]> => {
+      const raw = await dashboardJson(
+        client,
+        `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=${limit}`
+          + `&offset=${offset}&order=oldest&include_compacted=true&${profileQuery(scope)}`,
+        { signal: abort.signal },
+      );
+      const physical = messageEnvelope(raw, sessionId);
+      if (physical.length > limit || physical.length > HERMES_SESSION_MESSAGES_MAX)
+        throw new HermesSessionUnavailable("Hermes returned an oversized session page");
+      return physical;
+    };
+
     let upstreamDone = false;
+    try {
+      const remaining = exportMaxMessages - offset;
+      const requestLimit = Math.min(EXPORT_PAGE_SIZE, remaining + 1);
+      const physical = await fetchPage(requestLimit);
+      if (physical.length > remaining)
+        throw new HermesSessionTooLarge("Hermes session export exceeded its message cap");
+      offset += physical.length;
+      upstreamDone = physical.length < requestLimit;
+      current = physical.flatMap((row) => {
+        const projected = message(row);
+        return projected ? [projected] : [];
+      });
+    } catch (error) {
+      close();
+      return mapReadError(error);
+    }
 
     return {
       filename: `hermes-session-${sessionId.slice(0, 32).replace(/[^A-Za-z0-9._-]/g, "_")}.json`,
@@ -528,17 +561,7 @@ export class HermesSessionManagementAdapter {
               // exact-cap transcript is complete instead of rejecting every page-aligned export.
               const remaining = exportMaxMessages - offset;
               const requestLimit = Math.min(EXPORT_PAGE_SIZE, remaining + 1);
-              const raw = record(await dashboardJson(
-                client,
-                `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=${requestLimit}`
-                  + `&offset=${offset}&order=oldest&include_compacted=true&${profileQuery(scope)}`,
-                { signal: abort.signal },
-              ));
-              if (!raw || !Array.isArray(raw["messages"]))
-                throw new HermesSessionUnavailable("Hermes returned invalid session data");
-              const physical = raw["messages"];
-              if (physical.length > requestLimit || physical.length > HERMES_SESSION_MESSAGES_MAX)
-                throw new HermesSessionUnavailable("Hermes returned an oversized session page");
+              const physical = await fetchPage(requestLimit);
               if (physical.length > remaining)
                 throw new HermesSessionTooLarge("Hermes session export exceeded its message cap");
               offset += physical.length;
