@@ -209,7 +209,16 @@ export interface HermesClient {
   request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   /** Calls the authenticated dashboard REST surface on the same Hermes connection. `path` is
    *  origin-relative and may include a query string. */
-  dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown }): Promise<T>;
+  dashboardJson<T = unknown>(path: string, init?: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown }): Promise<T>;
+  /** Authenticated response access for Hermes surfaces whose bodies must be streamed or bounded
+   *  before parsing. Callers own strict path admission and response bounds. */
+  dashboardResponse(path: string, init?: {
+    method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
+    body?: unknown;
+    headers?: Readonly<Record<string, string>>;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+  }): Promise<Response>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
    *  `cron.changed` broadcasts. Handlers cannot be removed. */
   onEvent(handler: (event: HermesEvent) => void): void;
@@ -533,13 +542,22 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     }
   }
 
-  async function dashboardJson<T>(
+  async function dashboardRequest(
     path: string,
-    init: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown } = {},
-  ): Promise<T> {
+    init: {
+      method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
+      body?: unknown;
+      headers?: Readonly<Record<string, string>>;
+      signal?: AbortSignal;
+      timeoutMs?: number;
+    } = {},
+  ): Promise<Response> {
     let relogged = false;
     const send = async (): Promise<Response> => {
-      const headers: Record<string, string> = { accept: "application/json" };
+      const headers: Record<string, string> = {
+        accept: "application/json",
+        ...(init.headers ?? {}),
+      };
       if (init.body !== undefined) headers["content-type"] = "application/json";
       if (auth.mode === "password") {
         if (sessionCookie === undefined) {
@@ -549,11 +567,16 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       } else {
         headers["x-hermes-session-token"] = auth.token;
       }
+      const timeoutSignal = AbortSignal.timeout(
+        Math.max(1, init.timeoutMs ?? authHttpTimeoutMs),
+      );
       return doFetch(new URL(path, `${dashboardBaseUrl}/`), {
         method: init.method ?? "GET",
         headers,
         ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-        signal: AbortSignal.timeout(authHttpTimeoutMs),
+        signal: init.signal === undefined
+          ? timeoutSignal
+          : AbortSignal.any([init.signal, timeoutSignal]),
       });
     };
 
@@ -564,6 +587,14 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       relogged = true;
       response = await send();
     }
+    return response;
+  }
+
+  async function dashboardJson<T>(
+    path: string,
+    init: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown } = {},
+  ): Promise<T> {
+    const response = await dashboardRequest(path, init);
     const body: unknown = await response.json().catch(() => undefined);
     if (!response.ok) {
       const detail =
@@ -573,6 +604,19 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       throw new HermesRpcError(detail, response.status, body);
     }
     return body as T;
+  }
+
+  function dashboardResponse(
+    path: string,
+    init: {
+      method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
+      body?: unknown;
+      headers?: Readonly<Record<string, string>>;
+      signal?: AbortSignal;
+      timeoutMs?: number;
+    } = {},
+  ): Promise<Response> {
+    return dashboardRequest(path, init);
   }
 
   function connect(): void {
@@ -650,6 +694,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     },
 
     dashboardJson,
+    dashboardResponse,
 
     onEvent(handler: (event: HermesEvent) => void): void {
       eventHandlers.push(handler);

@@ -9,12 +9,17 @@ import {
   BOTS_CAPABILITY_VERSION,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_ID,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
   MOBILE_NODE_CAPABILITY_ID,
   MOBILE_NODE_CAPABILITY_VERSION,
   GATEWAY_MANAGEMENT_CAPABILITY_ID,
   GATEWAY_MANAGEMENT_CAPABILITY_VERSION,
   HARNESS_SETTINGS_CAPABILITY_ID,
   HARNESS_SETTINGS_CAPABILITY_VERSION,
+  HARNESS_WORKSPACE_CAPABILITY_ID,
+  HARNESS_WORKSPACE_CAPABILITY_VERSION,
+  HARNESS_UPDATE_CAPABILITY_ID,
+  HARNESS_UPDATE_CAPABILITY_VERSION,
   type GatewayInfo,
   type ServerFrame,
 } from "cozygateway-contract";
@@ -58,8 +63,14 @@ import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
+import { GatewayHarnessWorkspace, discoverHermesWorkspace } from "./hermes-bridge/workspace.ts";
+import { GatewayHarnessUpdates, discoverHermesUpdates } from "./hermes-bridge/update.ts";
+import {
+  discoverHermesSessionManagement,
+  GatewayHermesSessionManagement,
+} from "./hermes-bridge/session-management.ts";
 
-export const GATEWAY_VERSION = "0.4.3";
+export const GATEWAY_VERSION = "0.5.0";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -168,13 +179,24 @@ export function createChatMessagePushHandler(
 }
 
 /** One shared immutable GatewayInfo for health, pairing, and the ready frame. */
-export function gatewayInfoForConfig(config: GatewayConfig, management = false): GatewayInfo {
+export function gatewayInfoForConfig(
+  config: GatewayConfig,
+  management = false,
+  harnessWorkspace = false,
+  harnessUpdates = false,
+  hermesSessionManagementVersion?: number,
+): GatewayInfo {
+  const configuredCapabilities = Object.fromEntries(
+    Object.entries(config.capabilities ?? {})
+      .filter(([id]) => id !== HARNESS_UPDATE_CAPABILITY_ID
+        && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID),
+  );
   return {
     name: config.name,
     version: GATEWAY_VERSION,
     contract: "v1",
     capabilities: {
-      ...(config.capabilities ?? {}),
+      ...configuredCapabilities,
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
       ...(management ? { [GATEWAY_MANAGEMENT_CAPABILITY_ID]: GATEWAY_MANAGEMENT_CAPABILITY_VERSION } : {}),
       ...(hermesEndpoints(config).length === 0
@@ -188,6 +210,15 @@ export function gatewayInfoForConfig(config: GatewayConfig, management = false):
       ...(config.pushRelayUrl === undefined
         ? {}
         : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),
+      ...(harnessWorkspace
+        ? { [HARNESS_WORKSPACE_CAPABILITY_ID]: HARNESS_WORKSPACE_CAPABILITY_VERSION }
+        : {}),
+      ...(harnessUpdates
+        ? { [HARNESS_UPDATE_CAPABILITY_ID]: HARNESS_UPDATE_CAPABILITY_VERSION }
+        : {}),
+      ...(hermesSessionManagementVersion === undefined
+        ? {}
+        : { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: hermesSessionManagementVersion }),
     },
   };
 }
@@ -231,7 +262,38 @@ export async function startGateway(
   // present. Each integer version advances independently of the frozen contract literal.
   const parsedEndpoints = endpoints.map((endpoint) => ({ endpoint, options: parseHermesOptions(endpoint.config, process.env) }));
   const hermesOptions = parsedEndpoints[0]!.options;
-  const gatewayInfo = gatewayInfoForConfig(config, options.configPath !== undefined);
+  const clientMembers = parsedEndpoints.map(({ endpoint, options: memberOptions }) => ({
+    endpoint,
+    options: memberOptions,
+    client: createHermesClient({ url: memberOptions.url, auth: memberOptions.auth }),
+  }));
+  const harnessModelAdapters = clientMembers.map(
+    ({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client),
+  );
+  // Optional Hermes surfaces are evidence-gated, not configuration-gated. A missing,
+  // malformed, or unreachable pinned response yields no adapter and no advertised route.
+  const [workspaceResults, updateResults, sessionResults] = await Promise.all([
+    Promise.all(clientMembers.map(({ client }, index) =>
+      discoverHermesWorkspace(client, harnessModelAdapters[index]!.descriptor()))),
+    Promise.all(clientMembers.map(({ client }, index) =>
+      discoverHermesUpdates(client, harnessModelAdapters[index]!.descriptor()))),
+    Promise.all(clientMembers.map(({ client }, index) =>
+      discoverHermesSessionManagement(client, harnessModelAdapters[index]!.descriptor()))),
+  ]);
+  const discoveredWorkspaceAdapters = workspaceResults.filter((adapter) => adapter !== undefined);
+  const discoveredSessionAdapters = sessionResults.filter((adapter) => adapter !== undefined);
+  const hermesSessions = new GatewayHermesSessionManagement(discoveredSessionAdapters);
+  const harnessWorkspace = new GatewayHarnessWorkspace(discoveredWorkspaceAdapters);
+  const harnessUpdates = new GatewayHarnessUpdates(
+    updateResults.filter((adapter) => adapter !== undefined),
+  );
+  const gatewayInfo = gatewayInfoForConfig(
+    config,
+    options.configPath !== undefined,
+    harnessWorkspace.available,
+    harnessUpdates.available,
+    hermesSessions.capabilityVersion,
+  );
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({
     storage, gatewayInfo, now: () => Date.now(), trace: traceLog,
@@ -264,8 +326,7 @@ export async function startGateway(
   let raiseLiveActivityFrame: (frame: ServerFrame) => void = () => {};
 
   let federation: FederatedBotControlSurface | undefined;
-  const bridgeMembers = parsedEndpoints.map(({ endpoint, options: memberOptions }) => {
-    const client = createHermesClient({ url: memberOptions.url, auth: memberOptions.auth });
+  const bridgeMembers = clientMembers.map(({ endpoint, options: memberOptions, client }) => {
     const memberStorage = endpoint.namespace ? endpointStorage(storage, endpoint.id!) : storage;
     const member = new HermesBridge({
     client,
@@ -320,9 +381,8 @@ export async function startGateway(
         },
       ));
   const harnessSettings = new GatewayHarnessSettings(
-    bridgeMembers.map(({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client)),
+    harnessModelAdapters,
   );
-
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
   const nativeBotEntries = profileEntries;
@@ -541,6 +601,9 @@ export async function startGateway(
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
     ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
     harnessSettings,
+    ...(harnessUpdates.available ? { harnessUpdates } : {}),
+    ...(hermesSessions.available ? { hermesSessions } : {}),
+    ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),
     attachDeadLetters: () => storage.attachProjectionDeadLetters(),

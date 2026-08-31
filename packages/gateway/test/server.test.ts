@@ -6,9 +6,16 @@ import { join } from "node:path";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MOBILE_NODE_CAPABILITY_VERSION, type GatewayInfo, type ServerFrame } from "cozygateway-contract";
+import {
+  HARNESS_UPDATE_CAPABILITY_VERSION,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
+  MOBILE_NODE_CAPABILITY_VERSION,
+  type GatewayInfo,
+  type ServerFrame,
+} from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
+import { startFakeHermesServer } from "./support/fake-hermes-server.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
 import { PHOTO_SWEEP_MS } from "../src/hermes-bridge/photos.ts";
@@ -177,6 +184,23 @@ describe("GatewayInfo.capabilities wiring", () => {
     }
   });
 
+  it("does not let config bypass Hermes session-management discovery", async () => {
+    const gw = await startGateway({
+      name: "unproven-session-cap",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermes: testHermes(),
+      capabilities: { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: 1 },
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.[HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]).toBeUndefined();
+    } finally {
+      await gw.close();
+    }
+  });
+
   it("surfaces a configured com.cozylabs.* vendor capability identically in health, pair, and ready", async () => {
     const gw = await startGateway({
       name: "with-caps",
@@ -184,7 +208,12 @@ describe("GatewayInfo.capabilities wiring", () => {
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
       hermes: testHermes(),
-      capabilities: { "com.cozylabs.test": 1, "com.cozylabs.some-unrecognized-thing": 7 },
+      capabilities: {
+        "com.cozylabs.test": 1,
+        "com.cozylabs.some-unrecognized-thing": 7,
+        // Built-in evidence-gated capabilities cannot be forced on through free-form config.
+        "com.cozylabs.harness-update": 99,
+      },
     });
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
@@ -222,6 +251,50 @@ describe("GatewayInfo.capabilities wiring", () => {
       expect(ready?.type === "ready" ? ready.gateway.capabilities : undefined).toEqual(health.capabilities);
     } finally {
       await gw.close();
+    }
+  });
+
+  it("advertises harness update only after the pinned Hermes read APIs pass discovery", async () => {
+    const upstream = await startFakeHermesServer({
+      dashboard: ({ method, path }) => {
+        if (path === "/api/hermes/update/check") return { body: {
+          install_method: "git",
+          current_version: "0.20.3",
+          behind: 1,
+          update_available: true,
+          can_apply: true,
+          update_command: "hermes update",
+          message: null,
+        } };
+        if (path === "/api/actions/hermes-update/status") return { body: {
+          name: "hermes-update", running: false, exit_code: null, pid: null, lines: [],
+        } };
+        if (path === "/api/hermes/update/receipt") return {
+          status: 404,
+          body: { detail: "No update receipt found (no `hermes update` run recorded)." },
+        };
+        if (path === "/api/hermes/update" && method === "OPTIONS") return {
+          status: 405,
+          body: { detail: "Method Not Allowed" },
+          headers: { allow: "POST" },
+        };
+        return { status: 404, body: { detail: "Not Found" } };
+      },
+    });
+    const gw = await startGateway({
+      name: "update-capability",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermes: testHermes(upstream.url),
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.["com.cozylabs.harness-update"])
+        .toBe(HARNESS_UPDATE_CAPABILITY_VERSION);
+    } finally {
+      await gw.close();
+      await upstream.close();
     }
   });
 });
