@@ -781,7 +781,7 @@ describe("delegation activity (capability 34)", () => {
 
   it("accepts a live child, a settled one, and the frame that carries them", () => {
     expect(check(BotDelegationChildSchema, child)).toBe(true);
-    expect(check(BotDelegationChildSchema, { ...child, status: "succeeded", endedAt: 1_800_000_001_000, label: "Rewrite the skill", currentTool: "write_file", apiCalls: 4, toolCount: 7 })).toBe(true);
+    expect(check(BotDelegationChildSchema, { ...child, status: "succeeded", endedAt: 1_800_000_001_000, label: "Rewrite the skill", currentTool: "write_file", apiCalls: 4, toolCount: 7, costUsd: 0.123456, schemaValid: true })).toBe(true);
     expect(check(BotDelegationActivityFrameSchema, frame)).toBe(true);
     expect(check(BotDelegationActivityFrameSchema, { ...frame, done: true, children: [] })).toBe(true);
     expect(check(ServerFrameSchema, frame)).toBe(true);
@@ -803,11 +803,13 @@ describe("delegation activity (capability 34)", () => {
     expect(Object.keys(BotDelegationChildSchema.properties).sort()).toEqual([
       "apiCalls",
       "childId",
+      "costUsd",
       "currentTool",
       "endedAt",
       "index",
       "label",
       "lastActiveAt",
+      "schemaValid",
       "startedAt",
       "status",
       "toolCount",
@@ -815,6 +817,14 @@ describe("delegation activity (capability 34)", () => {
     for (const leak of ["args", "result", "summary", "goal", "reasoning", "prompt", "transcript", "sessionPath", "model", "provider"]) {
       expect(BotDelegationChildSchema.properties).not.toHaveProperty(leak);
     }
+  });
+
+  it("bounds structured terminal enrichment and rejects invented values", () => {
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: 0, schemaValid: false })).toBe(true);
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: -0.01 })).toBe(false);
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: Number.POSITIVE_INFINITY })).toBe(false);
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: 1_000_000.01 })).toBe(false);
+    expect(check(BotDelegationChildSchema, { ...child, schemaValid: "true" })).toBe(false);
   });
 
   it("holds ordinals as integers and keeps history batches joinable by turn", () => {

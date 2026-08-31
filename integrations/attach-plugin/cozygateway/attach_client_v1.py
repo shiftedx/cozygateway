@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -546,6 +547,8 @@ class AttachV1Client:
         tool_count: Optional[int] = None,
         last_active_at: Optional[int] = None,
         alias_id: Optional[str] = None,
+        cost_usd: Optional[float] = None,
+        schema_valid: Optional[bool] = None,
     ) -> None:
         """Queue one ephemeral delegation lifecycle event (capability ``delegation``).
 
@@ -570,6 +573,15 @@ class AttachV1Client:
             event["apiCalls"] = max(0, int(api_calls))
         if tool_count is not None:
             event["toolCount"] = max(0, int(tool_count))
+        if (
+            isinstance(cost_usd, (int, float))
+            and not isinstance(cost_usd, bool)
+            and math.isfinite(cost_usd)
+            and 0 <= cost_usd <= 1_000_000
+        ):
+            event["costUsd"] = round(float(cost_usd), 6)
+        if isinstance(schema_valid, bool):
+            event["schemaValid"] = schema_valid
         await self._queue_event(event)
 
     async def send_approval(self, thread_id: str, turn_id: str, approval_id: str, call_id: str, name: str, status: str) -> None:

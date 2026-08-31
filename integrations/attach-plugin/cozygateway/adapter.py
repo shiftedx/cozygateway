@@ -2234,6 +2234,8 @@ class AttachAdapter:
                 tool_count=payload.get("tool_count"),
                 last_active_at=payload.get("last_active_at"),
                 alias_id=payload.get("alias_id"),
+                cost_usd=payload.get("cost_usd"),
+                schema_valid=payload.get("schema_valid"),
             )
         except Exception:  # noqa: BLE001 - a card is presentation-only
             logger.debug("attach: delegation event emit failed", exc_info=True)
@@ -3849,8 +3851,9 @@ def _post_tool_call(**kwargs: Any) -> None:
                     _tool_call_id(kwargs),
                     _delegation_alias_from_result(kwargs.get("result")),
                 )
-            except Exception:  # noqa: BLE001 - an alias must never crash the tool loop
-                logger.debug("attach: delegation alias capture failed", exc_info=True)
+                _record_delegation_result(_tool_call_id(kwargs), kwargs.get("result"))
+            except Exception:  # noqa: BLE001 - result metadata must never crash the tool loop
+                logger.debug("attach: delegation result capture failed", exc_info=True)
             _CURRENT_DELEGATION_CALL.set(None)
 
 
@@ -3904,6 +3907,9 @@ _DELEGATION_BATCHES_MAX = 32
 #: batch normally exists first. Bounded oldest-first, same price policy as the batches map.
 _DELEGATION_PENDING_ALIASES: "OrderedDict[str, str]" = OrderedDict()
 _DELEGATION_PENDING_ALIASES_MAX = 32
+#: Costs are display metadata, never billing data. Bound a malformed parent result well above
+#: plausible delegated-turn spend without admitting an unbounded number onto the wire.
+_DELEGATION_COST_USD_MAX = 1_000_000
 
 #: The shape Hermes mints (``tools/delegation_live_log.py::new_live_delegation_id``:
 #: ``deleg_`` + 8 hex chars); bounded loosely so a longer future id still matches.
@@ -3963,6 +3969,80 @@ def _record_delegation_alias(call_id: Optional[str], alias: Optional[str]) -> No
         _DELEGATION_PENDING_ALIASES[call_id] = alias
         while len(_DELEGATION_PENDING_ALIASES) > _DELEGATION_PENDING_ALIASES_MAX:
             _DELEGATION_PENDING_ALIASES.popitem(last=False)
+
+
+def _record_delegation_result(call_id: Optional[str], result: Any) -> None:
+    """Project proven synchronous child metadata onto the existing batch, if it still exists."""
+    if not call_id:
+        return
+    payload: Any = result
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:  # noqa: BLE001 - unsupported result shapes are absent
+            return
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        return
+    with _DELEGATION_BATCHES_LOCK:
+        batch = _DELEGATION_BATCHES.get(call_id)
+        if batch is None:
+            return
+        child_ids = {index: child_id for child_id, index in batch.indices.items()}
+        count = len(batch.indices)
+        alias_id = batch.alias_id
+    index_counts: Dict[int, int] = {}
+    for entry in payload["results"]:
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("task_index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            continue
+        index_counts[index] = index_counts.get(index, 0) + 1
+    updates = []
+    for entry in payload["results"]:
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("task_index")
+        if isinstance(index, bool) or not isinstance(index, int) or index_counts.get(index) != 1:
+            continue
+        child_id = child_ids.get(index)
+        if child_id is None:
+            continue
+        status = _DELEGATION_STATUS_MAP.get(
+            str(entry.get("status") or "").strip().lower()
+        )
+        if status is None:
+            continue
+        cost_usd = entry.get("cost_usd")
+        valid_cost = (
+            isinstance(cost_usd, (int, float))
+            and not isinstance(cost_usd, bool)
+            and math.isfinite(cost_usd)
+            and 0 <= cost_usd <= _DELEGATION_COST_USD_MAX
+        )
+        schema_valid = entry.get("schema_valid")
+        if not valid_cost and not isinstance(schema_valid, bool):
+            continue
+        update: Dict[str, Any] = {
+            "batch_id": batch.batch_id,
+            "child_id": child_id,
+            "index": index,
+            "count": count,
+            "status": status,
+            "last_active_at": int(time.time() * 1000),
+        }
+        if alias_id:
+            update["alias_id"] = alias_id
+        if valid_cost:
+            update["cost_usd"] = round(float(cost_usd), 6)
+        if isinstance(schema_valid, bool):
+            update["schema_valid"] = schema_valid
+        updates.append(update)
+    if not updates:
+        return
+    for adapter in _active_adapters_snapshot():
+        for update in updates:
+            adapter.observe_delegation_event(batch.chat_id, update)
 
 #: Hermes child result statuses -> the closed wire vocabulary. ``cancelled`` renders as
 #: ``interrupted`` (the vocabulary is closed and the user asked for the stop). An unrecognized

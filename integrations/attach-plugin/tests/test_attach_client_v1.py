@@ -181,6 +181,23 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         # Alias-absent events keep the exact historical shape.
         self.assertNotIn("aliasId", events[1])
 
+    async def test_send_delegation_carries_only_safe_result_metadata(self):
+        await self.client.send_delegation(
+            "thread", "turn", "call_d3R3", "sa-0", index=0, count=1,
+            status="succeeded", last_active_at=6, cost_usd=1.23456789,
+            schema_valid=False,
+        )
+        await self.client.send_delegation(
+            "thread", "turn", "call_d3R3", "sa-1", index=1, count=2,
+            status="succeeded", last_active_at=7, cost_usd=float("inf"),
+            schema_valid="true",
+        )
+        events = [frame["event"] for frame in self.spool.pending_events(10, 100_000)]
+        self.assertEqual(events[0]["costUsd"], 1.234568)
+        self.assertIs(events[0]["schemaValid"], False)
+        self.assertNotIn("costUsd", events[1])
+        self.assertNotIn("schemaValid", events[1])
+
     async def test_repeated_draft_snapshot_emits_only_tool_lifecycle_changes(self):
         chip = ToolChip(id="call-1", name="search", status="running")
 

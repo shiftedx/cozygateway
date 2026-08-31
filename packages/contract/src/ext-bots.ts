@@ -533,6 +533,12 @@ export const BotDelegationChildSchema = Type.Object({
   currentTool: Type.Optional(Type.String()),
   apiCalls: Type.Optional(Type.Integer()),
   toolCount: Type.Optional(Type.Integer()),
+  /** Hermes-reported terminal child cost, captured from the structured synchronous
+   *  `delegate_task` result in the same process. Absent for async/older/unpriced results. */
+  costUsd: Type.Optional(Type.Number({ minimum: 0, maximum: 1_000_000 })),
+  /** Structured-output schema verdict from the same terminal result. Absent when no output
+   *  schema was requested or Hermes did not expose a joinable structured result. */
+  schemaValid: Type.Optional(Type.Boolean()),
   /** MILLISECONDS, plugin clock. When the child last showed observable activity. */
   lastActiveAt: Type.Integer(),
   /** MILLISECONDS, gateway clock. When the gateway first saw the child. */

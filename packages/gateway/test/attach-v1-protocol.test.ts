@@ -139,12 +139,20 @@ describe("attach-v1 protocol", () => {
         batchId: "call_d3R3sBldNWhDI0Kqqqk3P2Xi", childId: "20260825_195359_003db6",
         index: 0, count: 1, status: "succeeded", lastActiveAt: 5,
         aliasId: "deleg_c6eb9310",
+        costUsd: 0.123456,
+        schemaValid: true,
       },
     };
     expect(check(AttachV1EventFrameSchema, frame)).toBe(true);
     // Alias-free events stay exactly as they were: an older plugin never sends the field.
     const { aliasId: _omitted, ...bare } = frame.event;
     expect(check(AttachV1EventFrameSchema, { ...frame, event: bare })).toBe(true);
+    expect(check(AttachV1EventFrameSchema, {
+      ...frame, event: { ...frame.event, costUsd: -1 },
+    })).toBe(false);
+    expect(check(AttachV1EventFrameSchema, {
+      ...frame, event: { ...frame.event, schemaValid: "true" },
+    })).toBe(false);
   });
 
   it("carries a bounded latest-only thinking preview and refuses anything past its bounds", () => {
