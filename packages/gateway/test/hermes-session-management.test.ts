@@ -143,6 +143,10 @@ describe("privacy projection", () => {
     ["file POSIX", "written to file:///tmp/build+release/token.txt"],
     ["file Windows", "written to file://C:/secret/build+release/token.txt"],
     ["quoted spaces", 'written to "/Users/operator/My Project/secret.txt"'],
+    ["labeled POSIX", "path:/Users/operator/private/state.db"],
+    ["labeled private directory", "directory:/private/var/db/state"],
+    ["cwd label", "cwd:/Users/operator/private/repo"],
+    ["custom scheme", "artifact:/Users/operator/private/output"],
   ])("redacts %s absolute paths", (_name, input) => {
     const projected = projectHermesSessionText(input);
     expect(projected).toContain("<path>");
@@ -156,6 +160,13 @@ describe("privacy projection", () => {
     "release+notes and ordinary words stay intact",
     "Relative paths like docs/api.md are ordinary prose",
   ])("does not redact ordinary text: %s", (input) => {
+    expect(projectHermesSessionText(input)).toBe(input);
+  });
+
+  it.each([
+    "http://example.com/Users/operator/docs",
+    "https://example.com/private/var/db?next=/Users/operator",
+  ])("preserves an explicitly recognized HTTP(S) URL: %s", (input) => {
     expect(projectHermesSessionText(input)).toBe(input);
   });
 
@@ -255,6 +266,49 @@ describe("privacy projection", () => {
     const response = await request(`${BASE}/hermes-1/messages?limit=2`);
     expect(response.status).toBe(503);
     expect(JSON.stringify(await response.json())).not.toContain("overflow");
+  });
+});
+
+describe("authoritative exact detail", () => {
+  it("requires device auth and exact profile authorization", async () => {
+    const calls = vi.fn();
+    const { app, request } = appFor((path) => { calls(path); return json(row()); });
+    expect((await app.request(`${BASE}/hermes-1`)).status).toBe(401);
+    expect((await request("/gateway/harnesses/home/scopes/hidden/sessions/hermes-1")).status).toBe(404);
+    expect(calls).not.toHaveBeenCalled();
+  });
+
+  it("returns only the correlated privacy projection", async () => {
+    const calls: string[] = [];
+    const { request } = appFor((path) => {
+      calls.push(path);
+      return json(row({ title: "path:/Users/operator/private/repo", cwd: "/private/repo", system_prompt: "SECRET" }));
+    });
+    const response = await request(`${BASE}/hermes-1`);
+    expect(response.status).toBe(200);
+    expect(calls).toEqual(["/api/sessions/hermes-1?profile=sage"]);
+    expect(await response.json()).toEqual({ session: {
+      hermesSessionId: "hermes-1",
+      hermesLineageId: "lineage-root",
+      title: "path:<path>",
+      startedAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_100_000,
+      messageCount: 4,
+      archived: false,
+      pinned: true,
+    } });
+  });
+
+  it.each([
+    ["upstream absence", () => json({ detail: "/Users/operator/private missing" }, 404)],
+    ["mismatched upstream id", () => json(row({ id: "other-session" }))],
+  ])("returns the stable redacted not-found response for %s", async (_name, handler) => {
+    const { request } = appFor(handler);
+    const response = await request(`${BASE}/hermes-1`);
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: { code: "not_found", message: "Hermes session, harness, or profile was not found" },
+    });
   });
 });
 

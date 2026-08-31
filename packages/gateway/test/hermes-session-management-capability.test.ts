@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { HERMES_SESSION_MANAGEMENT_CAPABILITY_ID } from "cozygateway-contract";
+import {
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
+} from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
@@ -83,7 +86,8 @@ describe("Hermes session-management startup capability proof", () => {
   it("advertises and serves the extension only after current routes and shapes answer", async () => {
     const gateway = await start("current");
     const health = await (await fetch(`${gateway.url}/health`)).json() as { capabilities?: Record<string, number> };
-    expect(health.capabilities?.[HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]).toBe(1);
+    expect(health.capabilities?.[HERMES_SESSION_MANAGEMENT_CAPABILITY_ID])
+      .toBe(HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION);
 
     const response = await fetch(`${gateway.url}/gateway/harnesses/default/scopes/mock/sessions`, {
       headers: { authorization: `Bearer ${await pairedToken(gateway)}` },

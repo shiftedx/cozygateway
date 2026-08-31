@@ -3,7 +3,8 @@ import { type Static, Type } from "@sinclair/typebox";
 /** Privacy-projected administration of Hermes-owned sessions. This identity space is deliberately
  * separate from gateway-owned Bot Mode `sessionId` values. */
 export const HERMES_SESSION_MANAGEMENT_CAPABILITY_ID = "com.cozylabs.hermes-session-management";
-export const HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION = 1;
+/** Version 2 adds an authoritative exact-session read used to reconcile ambiguous mutations. */
+export const HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION = 2;
 
 export const HERMES_SESSION_LIST_MAX = 100;
 export const HERMES_SESSION_SEARCH_MAX = 100;
@@ -30,6 +31,11 @@ export const HermesSessionSummarySchema = Type.Object({
   pinned: Type.Boolean(),
 }, { additionalProperties: false });
 export type HermesSessionSummary = Static<typeof HermesSessionSummarySchema>;
+
+export const HermesSessionDetailResponseSchema = Type.Object({
+  session: HermesSessionSummarySchema,
+}, { additionalProperties: false });
+export type HermesSessionDetailResponse = Static<typeof HermesSessionDetailResponseSchema>;
 
 export const HermesSessionListResponseSchema = Type.Object({
   sessions: Type.Array(HermesSessionSummarySchema, { maxItems: HERMES_SESSION_LIST_MAX }),

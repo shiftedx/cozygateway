@@ -1,7 +1,7 @@
 {
   "capability": {
     "id": "com.cozylabs.hermes-session-management",
-    "version": 1
+    "version": 2
   },
   "harnessId": "home",
   "scopeId": "sage",
@@ -19,6 +19,18 @@
       }
     ],
     "pagination": { "limit": 50, "offset": 0, "returned": 1, "total": 1 }
+  },
+  "detail": {
+    "session": {
+      "hermesSessionId": "compression-tip",
+      "hermesLineageId": "compression-root",
+      "title": "Release notes",
+      "startedAt": 1700000000000,
+      "lastActiveAt": 1700000100000,
+      "messageCount": 2,
+      "archived": false,
+      "pinned": true
+    }
   },
   "search": {
     "results": [

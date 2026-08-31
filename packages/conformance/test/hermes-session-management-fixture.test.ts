@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
   HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
+  HermesSessionDetailResponseSchema,
   HermesSessionListResponseSchema,
   HermesSessionMessagesResponseSchema,
   HermesSessionMutationResponseSchema,
@@ -23,6 +24,7 @@ describe("Hermes session management v1 client fixture", () => {
       version: HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
     });
     assertValid(HermesSessionListResponseSchema, fixture["list"]);
+    assertValid(HermesSessionDetailResponseSchema, fixture["detail"]);
     assertValid(HermesSessionSearchResponseSchema, fixture["search"]);
     assertValid(HermesSessionMessagesResponseSchema, fixture["messages"]);
     assertValid(HermesSessionMutationResponseSchema, fixture["mutation"]);

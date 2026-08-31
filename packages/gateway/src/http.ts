@@ -588,6 +588,16 @@ export function createApp(deps: AppDeps): Hono<Env> {
     } catch (error) { return sessionFailure(c, error); }
   });
 
+  app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions/:sessionId", requireDevice, async (c) => {
+    try {
+      return c.json(await sessionAdapter(c).detail(
+        c.req.param("scopeId"),
+        hermesSessionId(c.req.param("sessionId")),
+        c.req.raw.signal,
+      ));
+    } catch (error) { return sessionFailure(c, error); }
+  });
+
   app.get("/gateway/harnesses/:harnessId/scopes/:scopeId/sessions/:sessionId/messages", requireDevice, async (c) => {
     try {
       const order = c.req.query("order") ?? "latest";

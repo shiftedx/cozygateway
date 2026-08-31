@@ -7,6 +7,7 @@ import {
   HERMES_SESSION_TITLE_MAX_LENGTH,
   type GatewayHarness,
   type HermesSessionListResponse,
+  type HermesSessionDetailResponse,
   type HermesSessionMessage,
   type HermesSessionMessagesResponse,
   type HermesSessionMutationResponse,
@@ -67,13 +68,24 @@ export function projectHermesSessionText(value: unknown, maxLength = HERMES_SESS
 /** Session transcript text is a privacy boundary, so every absolute host-path family is removed,
  * including roots with one segment. HTTP(S) URLs and embedded ordinary slashes are left alone. */
 export function redactHermesSessionPaths(value: string): string {
-  return value
+  const urls: string[] = [];
+  const protectedValue = value.replace(/\bhttps?:\/\/[^\s"'<>]+/gi, (candidate) => {
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return candidate;
+      const marker = `\u{e000}${urls.length}\u{e001}`;
+      urls.push(candidate);
+      return marker;
+    } catch { return candidate; }
+  });
+  return protectedValue
     // Quoted paths may contain spaces; consume through the matching quote before token rules run.
     .replace(/(["'])(?:file:(?:\/\/)?|[A-Za-z]:[\\/]|\\\\|\/\/|\/(?!\/))[^"'\r\n]*\1/gi, "$1<path>$1")
     .replace(/\bfile:(?:\/\/)?(?:[A-Za-z]:)?[\\/]+[^\s"'<>]*/gi, "<path>")
     .replace(/(^|[^A-Za-z0-9])(?:[A-Za-z]:[\\/])[^\s"'<>]*/g, "$1<path>")
     .replace(/(^|[^A-Za-z0-9:])(?:\\\\|\/\/)[^\s"'<>]*/g, "$1<path>")
-    .replace(/(^|[^A-Za-z0-9:/])\/(?![\/\s])[^\s"'<>]*/g, "$1<path>");
+    .replace(/(^|[^A-Za-z0-9/])\/(?![\/\s])[^\s"'<>]*/g, "$1<path>")
+    .replace(/\u{e000}(\d+)\u{e001}/gu, (_marker, index: string) => urls[Number(index)] ?? "");
 }
 
 function summary(raw: unknown): HermesSessionSummary | undefined {
@@ -286,6 +298,10 @@ export class HermesSessionManagementAdapter {
         throw new HermesSessionNotFound("Hermes session was not found");
       return projected;
     } catch (error) { return mapReadError(error); }
+  }
+
+  async detail(scopeId: string, sessionId: string, signal?: AbortSignal): Promise<HermesSessionDetailResponse> {
+    return { session: await this.#detail(this.#scope(scopeId), sessionId, signal) };
   }
 
   async list(

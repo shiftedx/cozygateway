@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   HERMES_SESSION_LIST_MAX,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION,
+  HermesSessionDetailResponseSchema,
   HermesSessionExportSchema,
   HermesSessionListResponseSchema,
   HermesSessionMessagesResponseSchema,
@@ -23,6 +25,12 @@ const session = {
 const message = { role: "assistant", text: "Done", hermesMessageId: "42", createdAt: 1_700_000_100_000 };
 
 describe("Hermes session management v1 schemas", () => {
+  it("advertises exact authoritative reads at capability version 2", () => {
+    expect(HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION).toBe(2);
+    expect(check(HermesSessionDetailResponseSchema, { session })).toBe(true);
+    expect(check(HermesSessionDetailResponseSchema, { session, cwd: "/private" })).toBe(false);
+  });
+
   it("accepts the privacy projection and keeps Bot Mode ids out of it", () => {
     const list = {
       sessions: [session],

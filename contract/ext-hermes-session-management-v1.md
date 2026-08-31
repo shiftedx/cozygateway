@@ -2,7 +2,12 @@
 
 Capability id: `com.cozylabs.hermes-session-management`
 
-Version: `1`
+Current capability version: `2`
+
+Version 2 adds the exact session-detail read. Version 1 clients may continue using the original
+routes, but MUST NOT use capped search to reconcile ambiguous writes. An administration client
+that needs authoritative recovery MUST require capability version 2; this preserves `404` on the
+detail route as an unambiguous statement that the exact session is absent.
 
 This paired-device extension administers sessions owned by one visible Hermes profile. It is
 separate from `com.cozylabs.hermes-desktop-sessions:2`, whose narrower promise remains TUI metadata
@@ -25,6 +30,7 @@ currently configured, client-visible harness/profile pair.
 | --- | --- | --- |
 | `GET /gateway/harnesses/:harnessId/scopes/:scopeId/sessions` | `limit=1...100`, `offset=0...100000`, `archived=exclude\|include\|only` | `HermesSessionListResponse` |
 | `GET .../sessions/search` | required `q` (1...256 characters), `limit=1...100` | `HermesSessionSearchResponse` |
+| `GET .../sessions/:hermesSessionId` | no body | `HermesSessionDetailResponse`; stable `404 not_found` when absent |
 | `GET .../sessions/:hermesSessionId/messages` | `limit=1...200`, `offset=0...100000`, `order=oldest\|latest` | `HermesSessionMessagesResponse` |
 | `PATCH .../sessions/:hermesSessionId` | one or more of `title` (0...100 characters), `archived`, `pinned` | `HermesSessionMutationResponse` |
 | `DELETE .../sessions/:hermesSessionId` | no body | `204 No Content`; already absent is also success |
@@ -70,3 +76,10 @@ A timeout after a mutation may mean Hermes committed after the gateway stopped w
 is `503 backend_unavailable` with `refreshRequired: true`; a client MUST refresh authoritative state
 before retrying or restoring optimistic UI. All destructive client UI MUST require explicit user
 confirmation before sending DELETE.
+
+A version 2 client resolves `refreshRequired` by rereading this exact detail route and the affected
+list view. Detail success is the closed privacy-projected summary; absence is the fixed
+`404 {"error":{"code":"not_found","message":"Hermes session, harness, or profile was not found"}}`.
+The route never substitutes a search result, so search limits and unrelated matches cannot prove
+absence. Authentication, exact harness/profile authorization, correlation of the returned Hermes
+id, error redaction, and cancellation are identical to the other reads.
