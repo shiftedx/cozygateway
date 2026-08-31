@@ -78,6 +78,20 @@ class MemoryRequestGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(applied, ["one note"], "the replayed request must not apply the write again")
         self.assertEqual([reply["result"] for reply in adapter._client.replies], [adapter._client.replies[0]["result"]] * 2)
 
+    async def test_a_replayed_setup_returns_the_first_projection_without_writing_twice(self):
+        adapter = make_adapter()
+        applied: List[Dict[str, Any]] = []
+
+        def setup(operation: str, input: Dict[str, Any]) -> Dict[str, Any]:
+            applied.append(dict(input)); return {"sources": []}
+
+        adapter._memory_manager.execute = setup  # type: ignore[method-assign]
+        command = {"requestId": "same-setup", "operation": "setup", "input": {"memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": False}}
+        await adapter._handle_memory_command(command)
+        await adapter._handle_memory_command(dict(command))
+        self.assertEqual(len(applied), 1)
+        self.assertEqual([reply["status"] for reply in adapter._client.replies], ["ok", "ok"])
+
     async def test_a_replayed_mutation_replays_its_failure_too(self):
         adapter = make_adapter()
         calls: List[str] = []

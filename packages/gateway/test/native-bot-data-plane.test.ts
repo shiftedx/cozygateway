@@ -1341,7 +1341,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     // terminal child accepts that structured enrichment without changing identity or status.
     expect(plane.handle("sage", child("b-result", 6, {
       childId: "sa-1", index: 1, status: "succeeded", toolCount: 7,
-      costUsd: 0.123456, schemaValid: true,
+      costUsd: 0.123456, schemaValidation: { valid: true },
     }))).toBe(true);
     expect(plane.handle("sage", {
       kind: "event", sequence: 7, eventId: "commit", event: {
@@ -1360,13 +1360,13 @@ describe("attach-v1 native Bot Mode plane", () => {
       bot: "sage", turnId, batchId: "call-1", count: 3, done: true,
       children: [
         { childId: "sa-0", index: 0, status: "failed", label: "Rewrite A" },
-        { childId: "sa-1", index: 1, status: "succeeded", toolCount: 7, label: "Rewrite B", costUsd: 0.123456, schemaValid: true },
+        { childId: "sa-1", index: 1, status: "succeeded", toolCount: 7, label: "Rewrite B", costUsd: 0.123456, schemaValidation: { valid: true } },
         { childId: "sa-2", index: 2, status: "succeeded", label: "Rewrite C" },
       ],
     });
     // Privacy: only bounded display fields cross the wire -- no args, results, reasoning,
     // summaries, prompts, or paths.
-    const allowed = new Set(["apiCalls", "childId", "costUsd", "currentTool", "endedAt", "index", "label", "lastActiveAt", "schemaValid", "startedAt", "status", "toolCount"]);
+    const allowed = new Set(["apiCalls", "childId", "costUsd", "currentTool", "endedAt", "index", "label", "lastActiveAt", "schemaValidation", "startedAt", "status", "toolCount"]);
     for (const entry of last.children) {
       for (const field of Object.keys(entry)) expect(allowed.has(field), field).toBe(true);
     }
@@ -1375,7 +1375,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       running: false,
       delegations: [{ turnId, batchId: "call-1", count: 3, children: [
         { childId: "sa-0", status: "failed" },
-        { childId: "sa-1", status: "succeeded", costUsd: 0.123456, schemaValid: true },
+        { childId: "sa-1", status: "succeeded", costUsd: 0.123456, schemaValidation: { valid: true } },
         { childId: "sa-2", status: "succeeded" },
       ] }],
     });
@@ -1389,7 +1389,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(await reopened.surface().chatHistory("sage")).toMatchObject({
       delegations: [{ batchId: "call-1", children: [
         { childId: "sa-0", status: "failed" },
-        { childId: "sa-1", toolCount: 7, costUsd: 0.123456, schemaValid: true },
+        { childId: "sa-1", toolCount: 7, costUsd: 0.123456, schemaValidation: { valid: true } },
         { childId: "sa-2", status: "succeeded" },
       ] }],
     });
@@ -1811,6 +1811,79 @@ describe("attach-v1 native Bot Mode plane", () => {
       status: "succeeded", aliasId: "deleg_bbbb2222",
     });
     plane.close();
+    storage.close();
+  });
+
+  it("persists synchronous delegation enrichment through history and reopen", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "native-delegation-restart-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const frames: ServerFrame[] = [];
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: (frame) => frames.push(frame),
+      now: () => 100,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+    const event = (sequence: number, eventId: string, body: Record<string, unknown>) => ({
+      kind: "event" as const, sequence, eventId, event: {
+        kind: "delegation", threadId: chat.sessionId, turnId: "turn",
+        batchId: "batch", childId: "child", index: 0, count: 1, ...body,
+      } as never,
+    });
+    expect(plane.handle("sage", event(1, "running", {
+      status: "running", lastActiveAt: 5,
+    }))).toBe(true);
+    expect(plane.handle("sage", event(2, "enriched", {
+      status: "succeeded", lastActiveAt: 6, costUsd: 0.125, costStatus: "reported",
+      schemaValidation: {
+        valid: false, retries: 1,
+        schema_errors: ["private validator output at /Users/private/schema.json"],
+        path: "/Users/private/schema.json",
+      },
+      durationMs: 2345,
+    }))).toBe(true);
+    expect(plane.handle("sage", event(3, "sparse", {
+      childId: "sparse", index: 1, count: 2,
+      status: "failed", lastActiveAt: 7, costUsd: 0.25,
+    }))).toBe(true);
+
+    const expected = {
+      childId: "child", status: "succeeded", costUsd: 0.125, costStatus: "reported",
+      schemaValidation: { valid: false, retries: 1 }, durationMs: 2345,
+    };
+    const sparse = { childId: "sparse", status: "failed", costUsd: 0.25 };
+    expect(storage.botChatDelegations(chat.sessionId, 0)[0]).toMatchObject({
+      costUsd: 0.125, costStatus: "reported", schemaValid: 0, schemaRetries: 1,
+      durationMs: 2345,
+    });
+    expect(await plane.surface().chatHistory("sage")).toMatchObject({
+      delegations: [{ children: [expected, sparse] }],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(frames.filter((frame) => frame.type === "bot_delegation_activity").at(-1))
+      .toMatchObject({ children: [expected, sparse] });
+    const liveFrame = frames.filter((frame) => frame.type === "bot_delegation_activity").at(-1);
+    expect(liveFrame?.type === "bot_delegation_activity"
+      ? liveFrame.children[0]?.schemaValidation
+      : undefined).toEqual({ valid: false, retries: 1 });
+    expect(JSON.stringify(liveFrame)).not.toContain("schema_errors");
+    expect(JSON.stringify(liveFrame)).not.toContain("/Users/private");
+
+    plane.close();
+    storage.close();
+    storage = openStorage(path);
+    const reopened = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 101,
+    });
+    expect(await reopened.surface().chatHistory("sage")).toMatchObject({
+      delegations: [{ children: [expected, sparse] }],
+    });
+    reopened.close();
     storage.close();
   });
 });

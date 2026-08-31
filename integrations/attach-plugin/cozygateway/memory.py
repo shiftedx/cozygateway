@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -463,6 +464,10 @@ class MemoryManager:
         observations = Observations(home / "plugin-data" / "cozygateway" / "memory-observed.json")
         self.curated = [CuratedAdapter(source, observations) for source, _, _ in CuratedAdapter.SOURCES]
         self.holographic = HolographicAdapter()
+        # Hermes has no public cross-process config transaction/CAS. Serialize this
+        # plugin's setup calls, then hand a minimal patch to save_config's canonical
+        # merge_existing writer so it re-reads and retains unrelated raw config.
+        self._setup_lock = threading.Lock()
         configs = extra.get("memory_vaults", []) if isinstance(extra, dict) else []; self.vaults = [VaultAdapter(str(item["display_name"]), str(item["root"]), index) for index, item in enumerate(configs) if isinstance(item, dict) and isinstance(item.get("display_name"), str) and isinstance(item.get("root"), str)]
     @property
     def adapters(self) -> List[Any]: return [*self.curated, self.holographic, *self.vaults]
@@ -475,6 +480,78 @@ class MemoryManager:
         except Exception as error:
             logger.debug("memory: provider row unavailable (%s)", type(error).__name__)
         return rows
+    def setup(self, input: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the capability-42 settings through Hermes' atomic publisher.
+
+        The request is validated again at the profile boundary. Hermes owns the
+        config writer owns fail-closed publication and merge-with-current behavior;
+        this plugin serializes its own setup calls, sends only the three allow-listed
+        leaves, then proves effective state through a fresh behavioral read.
+        """
+        keys = {"memoryEnabled", "userProfileEnabled", "holographicEnabled"}
+        if set(input) != keys or any(type(input.get(key)) is not bool for key in keys):
+            raise MemoryInvalid("memory setup requires exactly three boolean settings")
+        if not any(input[key] for key in keys):
+            raise MemoryInvalid("at least one memory source must be enabled")
+
+        try:
+            from hermes_cli.config import load_config_readonly, save_config
+            with self._setup_lock:
+                current_config = load_config_readonly()
+                current_memory = current_config.get("memory", {}) if isinstance(current_config, dict) else {}
+                if not isinstance(current_memory, dict):
+                    raise MemoryInvalid("memory configuration is not a mapping")
+                previous_provider = str(current_memory.get("provider") or "").strip()
+                patch_memory: Dict[str, Any] = {
+                    "memory_enabled": input["memoryEnabled"],
+                    "user_profile_enabled": input["userProfileEnabled"],
+                }
+                if input["holographicEnabled"]:
+                    patch_memory["provider"] = "holographic"
+                elif previous_provider.lower() == "holographic":
+                    # Hermes treats an explicit null provider as no selected provider.
+                    # A partial merge cannot express deletion; null disables only the
+                    # freshly observed Holographic selection without naming another.
+                    patch_memory["provider"] = None
+
+                preserve = {
+                    ("memory", "memory_enabled"),
+                    ("memory", "user_profile_enabled"),
+                }
+                if "provider" in patch_memory:
+                    preserve.add(("memory", "provider"))
+                save_config(
+                    {"memory": patch_memory},
+                    merge_existing=True,
+                    preserve_keys=preserve,
+                )
+
+                effective_config = load_config_readonly()
+            effective = effective_config.get("memory", {}) if isinstance(effective_config, dict) else {}
+            if not isinstance(effective, dict):
+                raise MemoryError("memory settings could not be confirmed")
+            provider = str(effective.get("provider") or "").strip()
+            if effective.get("memory_enabled", True) is not input["memoryEnabled"]:
+                raise MemoryError("memory settings could not be confirmed")
+            if effective.get("user_profile_enabled", True) is not input["userProfileEnabled"]:
+                raise MemoryError("memory settings could not be confirmed")
+            if input["holographicEnabled"] and provider.lower() != "holographic":
+                raise MemoryError("memory settings could not be confirmed")
+            if not input["holographicEnabled"]:
+                if previous_provider.lower() == "holographic" and provider.lower() == "holographic":
+                    raise MemoryError("memory settings could not be confirmed")
+                if previous_provider and previous_provider.lower() != "holographic" and provider != previous_provider:
+                    raise MemoryError("memory settings could not be confirmed")
+        except MemoryError:
+            raise
+        except Exception as error:
+            logger.debug("memory: setup failed (%s)", type(error).__name__)
+            raise MemoryError("memory settings could not be applied") from None
+        try:
+            return {"sources": self.sources()}
+        except Exception as error:
+            logger.debug("memory: setup projection failed (%s)", type(error).__name__)
+            raise MemoryError("memory settings could not be confirmed") from None
     def _adapter(self, source: str):
         adapter = next((adapter for adapter in self.adapters if adapter.source == source), None)
         if adapter is None: raise MemoryNotFound("memory source not found")
@@ -491,6 +568,7 @@ class MemoryManager:
                 row["status"], row["detail"] = "degraded", detail[:512]
     def execute(self, operation: str, input: Dict[str, Any]) -> Dict[str, Any]:
         if operation == "overview": return {"sources": self.sources()}
+        if operation == "setup": return self.setup(input)
         source = input.get("sourceId")
         if operation == "items":
             selected = [self._adapter(source)] if isinstance(source, str) and source else self.adapters

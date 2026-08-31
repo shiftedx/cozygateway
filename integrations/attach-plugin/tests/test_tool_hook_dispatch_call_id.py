@@ -105,6 +105,22 @@ class DispatchToolHookForwardsCallIdTests(unittest.TestCase):
 
         self.assertEqual([event[3] for event in self.adapter.events], [None, None, None, None])
 
+    def test_delegate_task_args_and_results_never_enter_durable_tool_details(self):
+        private = "/Users/private/secret-summary"
+        adapter_module._pre_tool_call(
+            tool_name="delegate_task", args={"tasks": [{"task": private}]}, tool_call_id="delegate",
+        )
+        adapter_module._post_tool_call(
+            tool_name="delegate_task", status="ok",
+            result={"results": [{"task_index": 0, "summary": private, "tool_trace": [{"path": private}]}]},
+            tool_call_id="delegate",
+        )
+        self.assertEqual(
+            [(phase, tool, detail, call_id) for _chat, phase, tool, detail, call_id in self.adapter.events],
+            [("start", "delegate_task", None, "delegate"), ("complete", "delegate_task", None, "delegate")],
+        )
+        self.assertNotIn(private, repr(self.adapter.events))
+
 
 if __name__ == "__main__":
     unittest.main()

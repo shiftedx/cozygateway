@@ -31,18 +31,20 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 41 }
+"capabilities": { "com.cozylabs.bots": 42 }
 ```
 
-Versions are additive. Clients compare `>=`, never equality. A gateway that does not configure the
-extension omits the capability and does not register `/bots` routes.
+Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
+corrected unsafe behavior is removed rather than retained as a fallback: version 17 below is the
+sole historical withdrawal. A gateway that does not configure the extension omits the capability
+and does not register `/bots` routes.
 
 | Version | Added surface |
 | --- | --- |
 | 1 | Roster, presence, canonical chat, native session list/history. |
 | 2 | Send text, `bot_chat`, and `bot_chat_state`. |
 | 3 | Profile read/edit and catalog. |
-| 4 | Routines and `bot_routines`. |
+| 4 | Routines and `bot_routines`. Current Hermes replies may additionally expose the optional output-only, bounded, path-redacted `lastDeliveryError`. |
 | 5 | Gateway-hosted group rooms. |
 | 6 | `bot_chat_delta` draft frames. |
 | 7 | `GET /bots/:name/media` proxy. |
@@ -54,7 +56,7 @@ extension omits the capability and does not register `/bots` routes.
 | 14 | `bot_chat_adopted` and manual session adoption. |
 | 15 | Assistant attachment ingestion. |
 | 16 | Native session history and manual restore. |
-| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent, even though the current bots scalar is numerically >= 17. |
+| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent, roster previews make no A2A provenance claim, and transcript-like `Message from ...` text remains ordinary text even though the current bots scalar is numerically >= 17. |
 | 18 | Per-bot model configuration. |
 | 19 | Stop and start-new-chat actions. |
 | 20 | Audio/video attachment playback with byte ranges. |
@@ -71,7 +73,7 @@ extension omits the capability and does not register `/bots` routes.
 | 31 | Durable delivery receipts: the displayed report, `BotChatMessage.marker`, and role `system`. |
 | 32 | Inline media ordering: `BotChatMessage.attachments[].position`. |
 | 33 | Create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots`, and `BotCreateResponse.warnings`. |
-| 34 | Subagent visibility: `bot_delegation_activity` batch snapshots and a `delegations` array on chat history. |
+| 34 | Subagent visibility: `bot_delegation_activity` batch snapshots and a `delegations` array on chat history. Optional Hermes v0.21 synchronous-result enrichment adds bounded child cost/provenance, schema-validation state, and terminal duration without changing the scalar. |
 | 35 | Live thinking preview: latest-only `bot_thinking_activity` frames (sanitized, <=280 chars, ephemeral). |
 | 36 | Full provider visibility: optional `providers` summary and `unauthenticated` catalog markers on `BotModelConfig`. |
 | 37 | Bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Removes the Hermes profile, purges gateway state, and revokes the attach identity. |
@@ -79,7 +81,7 @@ extension omits the capability and does not register `/bots` routes.
 | 39 | Capability leases and durable metadata-only receipts for phone-node sharing. |
 | 40 | Bot readiness: `GET /bots/:name/readiness` distinguishes a created profile from an attached bot that can accept turns. |
 | 41 | Transitional bot-scoped model-provider setup routes. Canonical ownership moved to `com.cozylabs.harness-settings` v1. |
-| 42 | Truthful Bot Activity: roster previews are plain/empty display text with no transcript-derived A2A sender; delegation children may carry bounded structured terminal cost/schema validity. |
+| 42 | Truthful Bot Activity previews (no transcript-derived A2A sender) plus credential-free profile-local Hermes memory setup through the authenticated attached plugin. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -97,9 +99,7 @@ a second, hand-copied schema.
 
 - `BotSummary` is one control-plane roster row. Its `chatSessionId`, `preview`, and
   `lastActiveAt` are overlaid from the configured bot's gateway-owned native chat, on every surface
-  that serves a roster row. Profile metadata remains Hermes control-plane data. A preview is
-  ordinary display text or the empty state; no transcript prefix changes its kind or derives a
-  sender identity.
+  that serves a roster row. Profile metadata remains Hermes control-plane data.
 - `BotChatMessage` is a durable native transcript row. `id` is the gateway/attach event message
   id, `at` is gateway-clock milliseconds (or `null` when unavailable), and `clientId` is an
   optional sender echo. Attachments are gateway-scoped opaque `fileId` values, never paths or URLs.
@@ -131,6 +131,7 @@ a second, hand-copied schema.
 - `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its
   slash-prefixed `name` is the exact invocation; `description`, optional `argsHint`, and optional
   `category` are presentation metadata. `BotSlashCommandCatalog` is the bounded ordered list.
+
 - `BotAttachmentHistoryItem` identifies one assistant attachment in a durable native transcript,
   including its bot, session, message caption, timestamp, and ordinary opaque attachment block.
   `BotAttachmentHistory` is a newest-first bounded page with an optional next offset.
@@ -144,6 +145,23 @@ a second, hand-copied schema.
   bot/session/turn/interaction identifiers, the terminal outcome, optional selected option id, and
   gateway settlement time. It never includes an approval decision command, tool arguments/results,
   or an option label. The gateway retains only the newest 100 terminal receipts per bot.
+
+### Bot Activity composition
+
+A client composes Bot Activity from existing resources; there is no aggregate activity endpoint,
+inbox, transcript copy, or second database:
+
+- `GET /bots`, `bot_roster`, and `bot_presence` provide bot identity, display metadata, current
+  activity, ordinary preview text, and the canonical Bot Chat session.
+- Bot profile/model resources provide role, specialization, provider, and model detail; routine
+  routes and `bot_routines` provide owned routines.
+- `/bots/groups` provides room membership and room activity. Gateway-owned rooms remain the sole
+  group-collaboration surface.
+- Canonical Bot Chat/session/history routes remain the conversation surface.
+
+The client may source-label activity and link each row to its canonical chat or room. It must not
+claim delivery, read state, reply relationships, immutable history, or verified agent-to-agent
+provenance. A preview beginning with `Message from ...` is ordinary display text, not A2A evidence.
 
 Only profiles configured in `hermes.profiles` are exposed as CozyChat bots. Profile lifecycle
 belongs to Hermes, and from capability 37 both ends of it are reachable from the phone:
@@ -469,12 +487,20 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |
 | `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
 | `GET /bots/:name/memory` | — | `BotMemoryOverviewResponse` | Profile-local source health/capabilities only; the gateway never opens Hermes files or provider storage. |
+| `PATCH /bots/:name/memory/setup` | `BotMemorySetupRequest` | `BotMemoryOverviewResponse` | Applies the three credential-free Hermes settings through the attached profile and returns a fresh authoritative projection. |
 | `GET /bots/:name/memory/items` | bounded `q`, `source`, `kind`, `since`, `until`, `cursor`, `limit` | `BotMemoryItemsResponse` | Stable, source-labelled page (at most 100). One unavailable source is reported in `sources` without hiding healthy results. |
 | `GET /bots/:name/memory/graph` | bounded `q`, `source`, `since`, `until`, `limit` | `BotMemoryGraphResponse` | At most 200 nodes / 400 Holographic entity or vault wikilink edges. |
 | `GET /bots/:name/memory/sources/:source/items/:id` | — | `BotMemoryItem` | Full bounded content for one source-native item. |
 | `POST /bots/:name/memory/sources/:source/items` | `BotMemoryWriteRequest` | `201 BotMemoryWriteResponse` | Native source create. |
 | `PATCH /bots/:name/memory/sources/:source/items/:id` | `BotMemoryWriteRequest` with `expectedRevision` | `BotMemoryWriteResponse` | Conditional native source edit; stale data is `409 conflict` with `current` when available. |
 | `DELETE /bots/:name/memory/sources/:source/items/:id` | `BotMemoryDeleteRequest` | `BotMemoryDeleteResponse` | Conditional native source delete; stale data is `409 conflict`. |
+
+`BotRoutine.lastDeliveryError` is optional read-only capability-4 enrichment from Hermes'
+`last_delivery_error`. The gateway flattens control characters, limits it to 512 characters, and
+redacts POSIX, Windows drive, UNC, and home-relative paths before it reaches a response or
+`bot_routines` frame. It is not a create/patch field and is never carried into a replacement job.
+`bot_routines` remains a full-replacement snapshot, so a later row without the field clears an
+older displayed delivery failure.
 
 Memory uses the attached plugin's `memory_management` attach-v1 capability and request id, not
 Dashboard file routes. `MemoryItem.timestampKind` is `created` for provider/native explicit dates,
@@ -487,6 +513,15 @@ store, which the plugin's own store calls `user`; that store-side name is not a 
 memory route spends a per-device token budget and answers `429 rate_limited` with `retryAfterMs`
 when it is empty, reads included: the attached plugin serves one memory request at a time, and a
 second request arriving while one is in flight is answered `unavailable` rather than queued.
+
+Capability 42 setup additionally negotiates `memory_setup`. Its closed request requires
+`memoryEnabled`, `userProfileEnabled`, and `holographicEnabled`, all booleans, with at least one
+true. The plugin changes only `memory.memory_enabled`, `memory.user_profile_enabled`, and the
+Holographic selection. Disabling Holographic preserves any different provider. It writes through
+Hermes' native atomic config writer, re-reads effective configuration, and returns `sources()`;
+requested values are never echoed as proof. The mutation is replay-safe by request id. Old plugins,
+offline profiles, failed writes, and unconfirmed state return bounded display-safe errors. No
+memory content, secret, provider configuration, or host path is logged, traced, pushed, or returned.
 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
 that exists but is not configured as a native identity must not fall through to Dashboard chat.
@@ -558,13 +593,14 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   typically appears from the batch's terminal legs onward (async spawn legs precede the tool
   result) and may be absent entirely under an older Hermes. Additive under capability 34: a
   below-capability or alias-unaware client ignores it.
-  Capability 42 additionally allows a child to carry `costUsd` and `schemaValid`. Both come only
-  from a structured synchronous `delegate_task` terminal result joined to the child by the
-  batch's existing spawn-order index in the same Hermes process. They are absent for async
-  dispatch, older Hermes, missing output schemas, invalid values, and any result that cannot be
-  joined unambiguously. Captured values are persisted with the existing delegation row and survive
-  Gateway reconnect/restart; the Gateway never synthesizes values after a Hermes restart and never
-  exposes validation errors, result text, retry details, token counts, or tool traces.
+  Hermes v0.21 synchronous parent results may also enrich a terminal child with `costUsd` and the
+  closed `costStatus` (`estimated`, `reported`, or `unknown`), `schemaValidation` (`valid` plus at
+  most one retry), and `durationMs`. These values are optional: absence means unavailable, an older
+  result, or a background delegation, while `schemaValidation.valid: false` is an explicit failed
+  verdict. They persist in the same child row and therefore survive reconnect/restart after receipt.
+  Raw summaries, schema errors, token counts, tool traces, output, arguments, results, and paths are
+  never serialized. Identity remains (`batchId`, `childId`); structured result rows join only by
+  their explicit `task_index` to the existing spawn index.
 - `bot_thinking_activity` (capability 35): latest-only sanitized preview of the bot's live
   reasoning for one native turn, shown in the thinking shimmer. `text` is a tail-truncated
   <=280-char display string (schema-enforced); `seq` is monotonic within `turnId` and a
@@ -583,20 +619,6 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
 
 Frames are independently safe to drop where their schema says they are deltas or snapshots.
 Committed transcript history remains the recovery source after reconnect.
-
-## Client composition: Bot Activity and Room
-
-Build Bot Activity by joining the resources that already own each fact: `GET /bots`/`bot_roster`
-and `bot_presence` for identity and current activity, profile/model reads for specialization,
-routines for scheduled work, `/bots/groups` for room membership/activity, and the canonical Bot
-Chat/session/history routes for conversation. Label each row by that source and link to the
-existing canonical chat or room. Do not infer a source or sender from preview text, and do not
-claim delivered/read/reply relationships, immutable history, or verified agent-to-agent
-provenance.
-
-Extend the existing Room view; do not add a second collaboration view. Render the room state and
-notes already carried by `bot_group_state`, use the existing room composer for `@member`,
-`@everyone`, and `@user` intervention, and link each participating bot to its canonical Bot Chat.
 
 ## Error and privacy rules
 

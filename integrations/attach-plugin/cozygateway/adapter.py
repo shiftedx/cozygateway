@@ -1909,7 +1909,7 @@ class AttachAdapter:
         self._spawn_background(loop, self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id))
 
     #: Operations that change memory, and so must not be applied twice for one request id.
-    _MEMORY_MUTATIONS = ("create", "update", "delete")
+    _MEMORY_MUTATIONS = ("create", "update", "delete", "setup")
 
     def _on_memory_command(self, command: Dict[str, Any]) -> None:
         """Hand the request to a background task so the receive loop keeps reading.
@@ -2235,7 +2235,9 @@ class AttachAdapter:
                 last_active_at=payload.get("last_active_at"),
                 alias_id=payload.get("alias_id"),
                 cost_usd=payload.get("cost_usd"),
-                schema_valid=payload.get("schema_valid"),
+                cost_status=payload.get("cost_status"),
+                schema_validation=payload.get("schema_validation"),
+                duration_ms=payload.get("duration_ms"),
             )
         except Exception:  # noqa: BLE001 - a card is presentation-only
             logger.debug("attach: delegation event emit failed", exc_info=True)
@@ -3799,7 +3801,14 @@ def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
         if not tool_name:
             return
         call_id = _tool_call_id(kwargs)
-        if tool_name in {
+        if tool_name == "delegate_task":
+            # Delegation has its own bounded structured child projection. The ordinary durable
+            # tool chip may name the tool, but must never retain its task prompts, summaries,
+            # result rows, schema errors, token data, tool traces, or paths as generic detail.
+            detail = None
+            if phase != "start":
+                phase = "error" if str(kwargs.get("status") or "").lower() == "error" else "complete"
+        elif tool_name in {
             "cozy_device_status", "cozy_request_location",
             "cozy_capture_camera", "cozy_pick_file",
             "cozy_send_media", "cozy_media_delivery_status",
@@ -3851,8 +3860,10 @@ def _post_tool_call(**kwargs: Any) -> None:
                     _tool_call_id(kwargs),
                     _delegation_alias_from_result(kwargs.get("result")),
                 )
-                _record_delegation_result(_tool_call_id(kwargs), kwargs.get("result"))
-            except Exception:  # noqa: BLE001 - result metadata must never crash the tool loop
+                _record_delegation_result(
+                    _tool_call_id(kwargs), kwargs.get("result")
+                )
+            except Exception:  # noqa: BLE001 - result capture must never crash the tool loop
                 logger.debug("attach: delegation result capture failed", exc_info=True)
             _CURRENT_DELEGATION_CALL.set(None)
 
@@ -3907,9 +3918,6 @@ _DELEGATION_BATCHES_MAX = 32
 #: batch normally exists first. Bounded oldest-first, same price policy as the batches map.
 _DELEGATION_PENDING_ALIASES: "OrderedDict[str, str]" = OrderedDict()
 _DELEGATION_PENDING_ALIASES_MAX = 32
-#: Costs are display metadata, never billing data. Bound a malformed parent result well above
-#: plausible delegated-turn spend without admitting an unbounded number onto the wire.
-_DELEGATION_COST_USD_MAX = 1_000_000
 
 #: The shape Hermes mints (``tools/delegation_live_log.py::new_live_delegation_id``:
 #: ``deleg_`` + 8 hex chars); bounded loosely so a longer future id still matches.
@@ -3971,78 +3979,124 @@ def _record_delegation_alias(call_id: Optional[str], alias: Optional[str]) -> No
             _DELEGATION_PENDING_ALIASES.popitem(last=False)
 
 
+# Bounded public projection of Hermes v0.21's synchronous child-result contract. Background
+# dispatch returns only a top-level dispatch receipt, so it deliberately emits none of these.
+_DELEGATION_COST_MAX_USD = 1_000_000.0
+_DELEGATION_COST_STATUSES = {"estimated", "reported", "unknown"}
+_DELEGATION_DURATION_MAX_MS = 2_147_483_647
+_DELEGATION_SCHEMA_RETRIES_MAX = 1
+
+
+def _delegation_result_payload(result: Any) -> Optional[Dict[str, Any]]:
+    payload = result
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _record_delegation_result(call_id: Optional[str], result: Any) -> None:
-    """Project proven synchronous child metadata onto the existing batch, if it still exists."""
+    """Project only bounded, structured synchronous child-result metadata.
+
+    Hermes result rows identify children by explicit ``task_index``. Child lifecycle hooks are
+    emitted synchronously while Hermes builds the task list in that same order, which is the
+    existing spawn index retained in ``batch.indices``. No child summary, schema error, token,
+    trace, output, argument, or path is copied from the result.
+    """
     if not call_id:
         return
-    payload: Any = result
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:  # noqa: BLE001 - unsupported result shapes are absent
-            return
-    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+    payload = _delegation_result_payload(result)
+    rows = payload.get("results") if payload is not None else None
+    if not isinstance(rows, list):
         return
     with _DELEGATION_BATCHES_LOCK:
         batch = _DELEGATION_BATCHES.get(call_id)
         if batch is None:
             return
-        child_ids = {index: child_id for child_id, index in batch.indices.items()}
+        child_by_index = {index: child_id for child_id, index in batch.indices.items()}
         count = len(batch.indices)
         alias_id = batch.alias_id
-    index_counts: Dict[int, int] = {}
-    for entry in payload["results"]:
-        if not isinstance(entry, dict):
+
+    events: List[Dict[str, Any]] = []
+    seen: Set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        index = entry.get("task_index")
-        if isinstance(index, bool) or not isinstance(index, int):
+        task_index = row.get("task_index")
+        if (
+            isinstance(task_index, bool)
+            or not isinstance(task_index, int)
+            or task_index in seen
+        ):
             continue
-        index_counts[index] = index_counts.get(index, 0) + 1
-    updates = []
-    for entry in payload["results"]:
-        if not isinstance(entry, dict):
-            continue
-        index = entry.get("task_index")
-        if isinstance(index, bool) or not isinstance(index, int) or index_counts.get(index) != 1:
-            continue
-        child_id = child_ids.get(index)
+        child_id = child_by_index.get(task_index)
         if child_id is None:
             continue
-        status = _DELEGATION_STATUS_MAP.get(
-            str(entry.get("status") or "").strip().lower()
-        )
-        if status is None:
+        raw_status = str(row.get("status") or "").strip().lower()
+        if raw_status not in {"completed", "failed", "interrupted"}:
             continue
-        cost_usd = entry.get("cost_usd")
-        valid_cost = (
-            isinstance(cost_usd, (int, float))
-            and not isinstance(cost_usd, bool)
-            and math.isfinite(cost_usd)
-            and 0 <= cost_usd <= _DELEGATION_COST_USD_MAX
-        )
-        schema_valid = entry.get("schema_valid")
-        if not valid_cost and not isinstance(schema_valid, bool):
-            continue
-        update: Dict[str, Any] = {
-            "batch_id": batch.batch_id,
+        seen.add(task_index)
+        event: Dict[str, Any] = {
+            "batch_id": call_id,
             "child_id": child_id,
-            "index": index,
+            "index": task_index,
             "count": count,
-            "status": status,
+            "status": _DELEGATION_STATUS_MAP[raw_status],
             "last_active_at": int(time.time() * 1000),
         }
         if alias_id:
-            update["alias_id"] = alias_id
-        if valid_cost:
-            update["cost_usd"] = round(float(cost_usd), 6)
+            event["alias_id"] = alias_id
+
+        cost = _finite_number(row.get("cost_usd"))
+        if cost is not None and 0 <= cost <= _DELEGATION_COST_MAX_USD:
+            raw_cost_status = str(row.get("cost_status") or "unknown").strip().lower()
+            event["cost_usd"] = cost
+            event["cost_status"] = (
+                raw_cost_status
+                if raw_cost_status in _DELEGATION_COST_STATUSES
+                else "unknown"
+            )
+
+        schema_valid = row.get("schema_valid")
         if isinstance(schema_valid, bool):
-            update["schema_valid"] = schema_valid
-        updates.append(update)
-    if not updates:
+            validation: Dict[str, Any] = {"valid": schema_valid}
+            retries = row.get("schema_retries")
+            if (
+                not isinstance(retries, bool)
+                and isinstance(retries, int)
+                and 0 <= retries <= _DELEGATION_SCHEMA_RETRIES_MAX
+            ):
+                validation["retries"] = retries
+            event["schema_validation"] = validation
+
+        duration_seconds = _finite_number(row.get("duration_seconds"))
+        if duration_seconds is not None and 0 <= duration_seconds <= _DELEGATION_DURATION_MAX_MS / 1000:
+            duration_ms = int(duration_seconds * 1000)
+            event["duration_ms"] = duration_ms
+        events.append(event)
+
+    if not events:
         return
-    for adapter in _active_adapters_snapshot():
-        for update in updates:
-            adapter.observe_delegation_event(batch.chat_id, update)
+    adapters = _active_adapters_snapshot()
+    for event in events:
+        for active_adapter in adapters:
+            active_adapter.observe_delegation_event(batch.chat_id, event)
+
 
 #: Hermes child result statuses -> the closed wire vocabulary. ``cancelled`` renders as
 #: ``interrupted`` (the vocabulary is closed and the user asked for the stop). An unrecognized

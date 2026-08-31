@@ -178,7 +178,10 @@ CREATE TABLE IF NOT EXISTS bot_chat_delegations (
   api_calls INTEGER,
   tool_count INTEGER,
   cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000)),
-  schema_valid INTEGER CHECK (schema_valid IS NULL OR schema_valid IN (0, 1)),
+  cost_status TEXT CHECK (cost_status IN ('estimated', 'reported', 'unknown')),
+  schema_valid INTEGER CHECK (schema_valid IN (0, 1)),
+  schema_retries INTEGER CHECK (schema_retries BETWEEN 0 AND 1),
+  duration_ms INTEGER CHECK (duration_ms BETWEEN 0 AND 2147483647),
   last_active_at INTEGER NOT NULL,
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
@@ -1143,15 +1146,17 @@ export class Storage {
     apiCalls?: number | undefined;
     toolCount?: number | undefined;
     costUsd?: number | undefined;
-    schemaValid?: boolean | undefined;
+    costStatus?: "estimated" | "reported" | "unknown" | undefined;
+    schemaValidation?: { valid: boolean; retries?: number | undefined } | undefined;
+    durationMs?: number | undefined;
   }): void {
     this.#db
       .prepare(
         `INSERT INTO bot_chat_delegations
            (bot, session_id, turn_id, batch_id, alias_id, child_id, child_index, batch_count,
-            label, status, current_tool, api_calls, tool_count, cost_usd, schema_valid,
-            last_active_at, started_at, ended_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            label, status, current_tool, api_calls, tool_count, cost_usd, cost_status,
+            schema_valid, schema_retries, duration_ms, last_active_at, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(bot, turn_id, batch_id, child_id) DO UPDATE SET
            batch_count = MAX(bot_chat_delegations.batch_count, excluded.batch_count),
            alias_id = COALESCE(bot_chat_delegations.alias_id, excluded.alias_id),
@@ -1161,7 +1166,10 @@ export class Storage {
            api_calls = COALESCE(excluded.api_calls, bot_chat_delegations.api_calls),
            tool_count = COALESCE(excluded.tool_count, bot_chat_delegations.tool_count),
            cost_usd = COALESCE(excluded.cost_usd, bot_chat_delegations.cost_usd),
+           cost_status = COALESCE(excluded.cost_status, bot_chat_delegations.cost_status),
            schema_valid = COALESCE(excluded.schema_valid, bot_chat_delegations.schema_valid),
+           schema_retries = COALESCE(excluded.schema_retries, bot_chat_delegations.schema_retries),
+           duration_ms = COALESCE(excluded.duration_ms, bot_chat_delegations.duration_ms),
            last_active_at = excluded.last_active_at,
            ended_at = COALESCE(excluded.ended_at, bot_chat_delegations.ended_at)`,
       )
@@ -1180,7 +1188,10 @@ export class Storage {
         child.apiCalls ?? null,
         child.toolCount ?? null,
         child.costUsd ?? null,
-        child.schemaValid === undefined ? null : Number(child.schemaValid),
+        child.costStatus ?? null,
+        child.schemaValidation === undefined ? null : (child.schemaValidation.valid ? 1 : 0),
+        child.schemaValidation?.retries ?? null,
+        child.durationMs ?? null,
         child.lastActiveAt,
         child.startedAt,
         child.endedAt ?? null,
@@ -1204,7 +1215,10 @@ export class Storage {
     apiCalls: number | null;
     toolCount: number | null;
     costUsd: number | null;
+    costStatus: "estimated" | "reported" | "unknown" | null;
     schemaValid: number | null;
+    schemaRetries: number | null;
+    durationMs: number | null;
     lastActiveAt: number;
     startedAt: number;
     endedAt: number | null;
@@ -1215,7 +1229,8 @@ export class Storage {
                 child_id AS childId,
                 child_index AS "index", batch_count AS count, label, status,
                 current_tool AS currentTool, api_calls AS apiCalls, tool_count AS toolCount,
-                cost_usd AS costUsd, schema_valid AS schemaValid,
+                cost_usd AS costUsd, cost_status AS costStatus, schema_valid AS schemaValid,
+                schema_retries AS schemaRetries, duration_ms AS durationMs,
                 last_active_at AS lastActiveAt, started_at AS startedAt, ended_at AS endedAt
          FROM bot_chat_delegations
          WHERE session_id = ? AND started_at >= ?
@@ -1234,7 +1249,10 @@ export class Storage {
       apiCalls: number | null;
       toolCount: number | null;
       costUsd: number | null;
+      costStatus: "estimated" | "reported" | "unknown" | null;
       schemaValid: number | null;
+      schemaRetries: number | null;
+      durationMs: number | null;
       lastActiveAt: number;
       startedAt: number;
       endedAt: number | null;
@@ -3306,16 +3324,22 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // CREATE TABLE IF NOT EXISTS does not add delegation-enrichment columns to an existing database.
+  // Migrate additively in place; each nullable column preserves the distinction between an older
+  // unavailable result and an explicit `schema_valid = 0` verdict.
   const delegationColumns = new Set(
-    (db.prepare("PRAGMA table_info(bot_chat_delegations)").all() as Array<{ name: string }>)
+    (db.prepare("PRAGMA table_info(bot_chat_delegations)").all() as unknown as Array<{ name: string }>)
       .map((column) => column.name),
   );
-  if (!delegationColumns.has("cost_usd")) {
-    db.exec("ALTER TABLE bot_chat_delegations ADD COLUMN cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000))");
-  }
-  if (!delegationColumns.has("schema_valid")) {
-    db.exec("ALTER TABLE bot_chat_delegations ADD COLUMN schema_valid INTEGER CHECK (schema_valid IS NULL OR schema_valid IN (0, 1))");
-  }
+  const delegationAdditions = [
+    ["cost_usd", "ALTER TABLE bot_chat_delegations ADD COLUMN cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000))"],
+    ["cost_status", "ALTER TABLE bot_chat_delegations ADD COLUMN cost_status TEXT CHECK (cost_status IN ('estimated', 'reported', 'unknown'))"],
+    ["schema_valid", "ALTER TABLE bot_chat_delegations ADD COLUMN schema_valid INTEGER CHECK (schema_valid IN (0, 1))"],
+    ["schema_retries", "ALTER TABLE bot_chat_delegations ADD COLUMN schema_retries INTEGER CHECK (schema_retries BETWEEN 0 AND 1)"],
+    ["duration_ms", "ALTER TABLE bot_chat_delegations ADD COLUMN duration_ms INTEGER CHECK (duration_ms BETWEEN 0 AND 2147483647)"],
+  ] as const;
+  for (const [name, sql] of delegationAdditions)
+    if (!delegationColumns.has(name)) db.exec(sql);
   // A process can disappear after a tool starts but before its terminal event is persisted. Only
   // the selected active turn can still receive that event after restart; close every older step so
   // history never presents stale work as currently running.

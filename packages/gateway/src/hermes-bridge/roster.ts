@@ -147,8 +147,8 @@ export function botDisplayName(name: string, meta: Record<string, unknown> | nul
     .join(" ");
 }
 
-/** Classifies the roster preview line as display text, falling back to the description and then
- *  to the empty state. Transcript text cannot establish agent provenance. */
+/** Projects ordinary display text without inferring its provenance. Transcript text cannot prove
+ *  a bot-to-bot sender, so even a `Message from ...` prefix remains plain text. */
 export function classifyPreview(preview: string | null, description: string | null): BotPreview {
   const text = preview?.trim() ?? "";
   if (text.length > 0) return { kind: "plain", text };

@@ -216,6 +216,50 @@ across every restart. Keep backups outside `plugins/`. The script's header
 comment documents the quiescence heuristic (spool sequence quiet-window
 polling) and its known false-quiet / false-busy limits in detail.
 
+### Capability-42 rollout order
+
+Gateway and plugin release versions must match. Capability 42 adds the
+credential-free `PATCH /bots/:name/memory/setup` route, backed by two negotiated
+attach capabilities: existing reads and item mutations require
+`memory_management`, while setup additionally requires `memory_setup`. Do not
+advertise the new Gateway before the matching plugin is active on its Hermes
+profiles.
+
+For a checkout-based rollout, deploy the plugin first with the supported script:
+
+```sh
+# inspect every target and planned restart first
+scripts/deploy-plugin-local.sh -n
+
+# deploy the configured default profile set
+scripts/deploy-plugin-local.sh
+```
+
+The new plugin can reconnect safely to the old Gateway: negotiation intersects
+their capability sets, so `memory_setup` remains dormant there. After every
+target profile has reconnected, deploy or restart the version-matched Gateway
+through that installation's existing service procedure. A Gateway restart
+causes the plugins to reconnect and negotiate the new intersection. During that
+bounded seam, an offline profile or stale plugin receives `503
+backend_unavailable`; setup is not queued for later execution.
+
+After the Gateway rollout, use its configured public or local origin and verify
+both process health and delivery readiness:
+
+```sh
+curl -fsS "$GATEWAY_URL/health"
+curl -fsS "$GATEWAY_URL/ready"
+```
+
+The health response must report the released Gateway version,
+`capabilities["com.cozylabs.bots"]` at `42` or later, equal
+`attach.configured` and `attach.online`, and zero `attach.degraded`,
+`attach.absent`, and `attach.deadLetters`. `/ready` must answer `200` with
+`ready: true`. If capability 42 is advertised but setup still returns the
+bounded stale-plugin error, restart that Hermes profile with the installed
+version-matched plugin and repeat the checks; do not retry the mutation until
+`memory_setup` has negotiated.
+
 ## Automatic bot provisioning
 
 `POST /bots` creates a Hermes profile and a roster row. Neither makes the bot

@@ -30,9 +30,8 @@ import {
   type ModelProviderSetupMethod,
 } from "./model-provider-setup.ts";
 
-/** The roster preview line. Transcript text is always ordinary display text: Hermes does not
- *  expose durable structured A2A provenance on this surface, so a prefix must never change its
- *  kind or synthesize a sender. `empty` means the bot has no conversation yet. */
+/** The roster preview line. `plain` is ordinary display text with no provenance claim; `empty`
+ *  means the bot has no conversation yet. Transcript text never proves a bot-to-bot sender. */
 export const BotPreviewSchema = Type.Object({
   kind: Type.Union([Type.Literal("plain"), Type.Literal("empty")]),
   text: Type.String(),
@@ -515,6 +514,22 @@ export const BotDelegationChildStatusSchema = Type.Union([
 ]);
 export type BotDelegationChildStatus = Static<typeof BotDelegationChildStatusSchema>;
 
+/** Hermes's bounded cost provenance labels, an optional capability-34 enrichment. Unknown includes
+ * a missing or future upstream label; clients must not present it as an exact charge. */
+export const BotDelegationCostStatusSchema = Type.Union([
+  Type.Literal("estimated"), Type.Literal("reported"), Type.Literal("unknown"),
+]);
+export type BotDelegationCostStatus = Static<typeof BotDelegationCostStatusSchema>;
+
+/** Structured-output validation verdict from a synchronous Hermes delegation result. Absence means
+ * unavailable or not requested; it is deliberately distinct from `valid: false`. */
+export const BotDelegationSchemaValidationSchema = Type.Object({
+  valid: Type.Boolean(),
+  /** Hermes v0.21 performs at most one bounded schema retry. */
+  retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 1 })),
+}, { additionalProperties: false });
+export type BotDelegationSchemaValidation = Static<typeof BotDelegationSchemaValidationSchema>;
+
 /** One delegated child of a native turn's `delegate_task` batch. Capability 34.
  *
  *  Identity is (batchId, childId) -- `childId` is the Hermes child session id, the one
@@ -532,12 +547,13 @@ export const BotDelegationChildSchema = Type.Object({
   currentTool: Type.Optional(Type.String()),
   apiCalls: Type.Optional(Type.Integer()),
   toolCount: Type.Optional(Type.Integer()),
-  /** Hermes-reported terminal child cost, captured from the structured synchronous
-   *  `delegate_task` result in the same process. Absent for async/older/unpriced results. */
+  /** USD attributed by Hermes to this child. Synchronous result only; absent is unavailable. */
   costUsd: Type.Optional(Type.Number({ minimum: 0, maximum: 1_000_000 })),
-  /** Structured-output schema verdict from the same terminal result. Absent when no output
-   *  schema was requested or Hermes did not expose a joinable structured result. */
-  schemaValid: Type.Optional(Type.Boolean()),
+  costStatus: Type.Optional(BotDelegationCostStatusSchema),
+  /** Present only when the child was given a structured output schema. */
+  schemaValidation: Type.Optional(BotDelegationSchemaValidationSchema),
+  /** Terminal child runtime in milliseconds. Synchronous result only. */
+  durationMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
   /** MILLISECONDS, plugin clock. When the child last showed observable activity. */
   lastActiveAt: Type.Integer(),
   /** MILLISECONDS, gateway clock. When the gateway first saw the child. */
@@ -1055,6 +1071,14 @@ export const BotRoutineSchema = Type.Object({
   nextRun: Type.Union([Type.Integer(), Type.Null()]),
   /** How the last run ended, the backend's own word (`success`, `error`, ...), when it sent one. */
   lastStatus: Type.Optional(Type.String()),
+  /** Capability-4 additive enrichment. A bounded, path-redacted explanation of why the most
+   *  recent successful run could not be delivered. Output-only; absence means Hermes sent no
+   *  current delivery failure, including after a later successful delivery clears it. */
+  lastDeliveryError: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 512,
+    pattern: "^(?![\\s\\S]*[\\u0000-\\u001f\\u007f])[\\s\\S]+$",
+  })),
   /** The backend's run-cap DISPLAY string, not a number: `forever`, `once`, `3 times`, `1/3`. It is
    *  rendered, never parsed, and it is NOT what a write sends (a create sends an integer `repeat`),
    *  because the remaining count is not recoverable from it. */
@@ -1362,7 +1386,8 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
 /** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
  *  configured.
  *
- *  Version history, additive throughout (a client compares `>=`, never `===`):
+ *  Versioned additions are additive (a client compares `>=`, never `===`). Explicitly withdrawn
+ *  unsafe behavior is removed rather than retained; version 17 below is the historical exception:
  *  - `1`: roster, presence, canonical-chat resolve, session list, history read.
  *  - `2`: `POST /bots/:name/chat/messages` plus the `bot_chat` and `bot_chat_state` frames. A
  *    client that offers a composer MUST require `>= 2`: a v1 gateway 404s that route and never
@@ -1372,7 +1397,8 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    used: a screen whose Save 404s reads as a broken app, not as a missing feature.
  *  - `4`: the routines surface: `GET`/`POST /bots/:name/routines`,
  *    `PATCH`/`DELETE /bots/:name/routines/:id`, plus the `bot_routines` frame. A client that offers
- *    a routines pane MUST require `>= 4`.
+ *    a routines pane MUST require `>= 4`. Newer Hermes replies may add the optional output-only,
+ *    bounded and host-path-redacted `lastDeliveryError` without changing the capability scalar.
  *  - `5`: server-side group chats: the `/bots/groups` routes plus the `bot_group` and
  *    `bot_group_state` frames. A client that offers a rooms screen MUST require `>= 5`.
  *  - `6`: the `bot_chat_delta` frame, the live draft of a reply as it is written. No route changes
@@ -1573,6 +1599,14 @@ export const BotMemoryItemSchema = Type.Object({
 export type BotMemoryItem = Static<typeof BotMemoryItemSchema>;
 export const BotMemoryOverviewResponseSchema = Type.Object({ sources: Type.Array(BotMemorySourceSchema, { maxItems: 32 }) }, { additionalProperties: false });
 export type BotMemoryOverviewResponse = Static<typeof BotMemoryOverviewResponseSchema>;
+/** Capability 42: exact credential-free setup choices. The union makes "at least one true" part
+ * of the normative schema while every branch remains a closed, three-required-boolean object. */
+export const BotMemorySetupRequestSchema = Type.Union([
+  Type.Object({ memoryEnabled: Type.Literal(true), userProfileEnabled: Type.Boolean(), holographicEnabled: Type.Boolean() }, { additionalProperties: false }),
+  Type.Object({ memoryEnabled: Type.Boolean(), userProfileEnabled: Type.Literal(true), holographicEnabled: Type.Boolean() }, { additionalProperties: false }),
+  Type.Object({ memoryEnabled: Type.Boolean(), userProfileEnabled: Type.Boolean(), holographicEnabled: Type.Literal(true) }, { additionalProperties: false }),
+]);
+export type BotMemorySetupRequest = Static<typeof BotMemorySetupRequestSchema>;
 export const BotMemoryItemsResponseSchema = Type.Object({ items: Type.Array(BotMemoryItemSchema, { maxItems: 100 }), sources: Type.Optional(Type.Array(BotMemorySourceSchema, { maxItems: 32 })) }, { additionalProperties: false });
 export type BotMemoryItemsResponse = Static<typeof BotMemoryItemsResponseSchema>;
 export const BotMemoryGraphResponseSchema = Type.Object({ nodes: Type.Array(BotMemoryItemSchema, { maxItems: 200 }), edges: Type.Array(Type.Object({ from: Type.String({ maxLength: 512 }), to: Type.String({ maxLength: 512 }), kind: Type.Union([Type.Literal("entity"), Type.Literal("wikilink")]) }, { additionalProperties: false }), { maxItems: 400 }) }, { additionalProperties: false });
@@ -1598,9 +1632,13 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  *  below 34 ignores an unknown frame type and an optional response field and keeps today's
  *  behavior (the outer delegate_task chip plus the terminal completion card); a client that
  *  renders live batch cards gates on `>= 34`, because an older gateway never sends either.
- *  Children carry only bounded display metadata (a truncated task label, a tool name); raw
- *  child transcripts, summaries, args, and results never cross this wire, a restart with a
- *  child in flight settles it `unknown` -- never `failed` -- and nothing here is pushed. */
+ *  Children carry only bounded display metadata (a truncated task label, a tool name). On Hermes
+ *  v0.21 synchronous results they may additionally carry bounded cost/provenance, structured-output
+ *  validation state, and terminal duration; older/background results omit them. Raw child
+ *  transcripts, summaries, schema errors, tokens, args, results, and paths never cross this wire,
+ *  a restart with a child in flight settles it `unknown` -- never `failed` -- and nothing here is
+ *  pushed. These optional fields consume no capability bump: capability 34 clients already ignore
+ *  unknown optional child fields, and capability 42 is reserved for memory setup. */
 /** Capability 35: LIVE THINKING PREVIEW. A deliberate, bounded reopening of the old
  *  "no reasoning on the wire" rule (approved 2026-08: reasoning models emit their whole reply in
  *  one end burst, so a turn otherwise shows only a generic thinking state). What crosses the wire
@@ -1638,8 +1676,7 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
 /** Capability 41: MODEL PROVIDER SETUP COMPATIBILITY. Canonical provider administration now lives
  * at gateway → harness → configuration scope under `com.cozylabs.harness-settings`. These bot
  * routes remain temporarily so capability-41 clients do not break. */
-/** Capability 42: TRUTHFUL BOT ACTIVITY. Roster previews no longer classify arbitrary
- * `Message from ...` transcript text as A2A or synthesize a sender. Delegation children may carry
- * optional, bounded `costUsd` and `schemaValid` values captured from Hermes's structured
- * synchronous terminal result; async and unsupported results leave both absent. */
+/** Capability 42: truthful Bot Activity previews plus credential-free, profile-local Hermes
+ * memory setup. Roster previews never infer A2A provenance from transcript text, and setup runs
+ * through the authenticated attached plugin; the gateway never opens profile configuration. */
 export const BOTS_CAPABILITY_VERSION = 42;

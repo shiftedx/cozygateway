@@ -147,6 +147,17 @@ terminal timestamps; plus durable command queue depth and dead-letter count. It 
 profile ids, instance ids, frame ids, or payload content. A timestamp is `null` until observed in
 the current process (heartbeat) or durable journal (event/terminal).
 
+## Memory management lane
+
+`memory_request` / `memory_result` is a bounded live request/reply lane, never a durable command,
+event, push, transcript, or Gateway database row. Ordinary source reads and conditional item
+mutations negotiate `memory_management`. Capability-42 `operation: "setup"` additionally requires
+`memory_setup`; its input is the closed public `BotMemorySetupRequest` and the plugin repeats that
+validation at the authenticated profile boundary. Setup is an idempotent mutation cached by
+request id. It writes only the three credential-free Hermes memory settings through Hermes'
+native atomic config writer and replies with a fresh `BotMemoryOverviewResponse`. A disconnected
+or old plugin fails immediately; a timed-out request is not retained for reconnect.
+
 This contract deliberately shipped with no thinking/reasoning/chain-of-thought event. The
 `thinking` capability is a CONSCIOUS, bounded reopening of that rule (approved 2026-08):
 reasoning models deliver their visible reply in one end burst, leaving the whole turn a generic

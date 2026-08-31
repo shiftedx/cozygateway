@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BotGroupStateFrame } from "cozygateway-contract";
 
 import { openStorage } from "../src/storage.ts";
 import { GroupRooms } from "../src/hermes-bridge/group-rooms.ts";
@@ -112,6 +113,124 @@ describe("native group turns", () => {
       ["You", "Please check @scout and @luna"],
       ["scout", "CI is green."],
     ]);
+    await rooms.close();
+    storage.close();
+  });
+
+  it("serializes a superseding user send behind the in-flight member and settles only the replacement", async () => {
+    const storage = openStorage(":memory:");
+    const states: BotGroupStateFrame[] = [];
+    const commands: Array<{
+      agentId: string;
+      threadId: string;
+      turnId: string;
+      complete: (text: string) => void;
+    }> = [];
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: (frame) => { if (frame.type === "bot_group_state") states.push(frame); },
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          commands.push({
+            agentId,
+            threadId: command.threadId,
+            turnId: command.turnId,
+            complete: (text) => {
+              rooms.handleAttachEvent(agentId, {
+                kind: "event",
+                sequence: commands.length,
+                eventId: `commit:${command.turnId}`,
+                event: {
+                  kind: "commit",
+                  threadId: command.threadId,
+                  turnId: command.turnId,
+                  messageId: `reply:${command.turnId}`,
+                  blocks: [{ type: "paragraph", text }],
+                },
+              });
+            },
+          });
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 100,
+      chainDelayMs: 0,
+    });
+
+    await rooms.create("Release", ["scout", "luna"]);
+    rooms.send("Release", "Investigate first @scout");
+    expect(commands.map((command) => command.agentId)).toEqual(["scout"]);
+
+    rooms.send("Release", "This supersedes it @luna");
+    expect(commands.map((command) => command.agentId)).toEqual(["scout"]);
+    commands[0]!.complete("The first turn still completed.");
+
+    await expect.poll(() => commands.map((command) => command.agentId)).toEqual(["scout", "luna"]);
+    commands[1]!.complete("(pass)");
+    await rooms.settled("Release");
+
+    expect(storage.botGroupLog("release").map((entry) => entry.text)).toEqual([
+      "Investigate first @scout",
+      "This supersedes it @luna",
+      "The first turn still completed.",
+    ]);
+    expect(states.filter((frame) => frame.epoch === 1 && frame.state !== "running")).toEqual([]);
+    expect(states.at(-1)).toMatchObject({ group: "Release", state: "settled", epoch: 2 });
+    await rooms.close();
+    storage.close();
+  });
+
+  it("shows an attach member failure as a note, fabricates no reply, and still settles", async () => {
+    const storage = openStorage(":memory:");
+    const states: BotGroupStateFrame[] = [];
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: (frame) => { if (frame.type === "bot_group_state") states.push(frame); },
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          queueMicrotask(() => rooms.handleAttachEvent(agentId, {
+            kind: "event",
+            sequence: 1,
+            eventId: `failed:${command.turnId}`,
+            event: {
+              kind: "failed",
+              threadId: command.threadId,
+              turnId: command.turnId,
+              messageId: `reply:${command.turnId}`,
+              message: "provider crashed",
+            },
+          }));
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 100,
+      chainDelayMs: 0,
+    });
+
+    await rooms.create("Release", ["scout", "luna"]);
+    rooms.send("Release", "Status please @scout");
+    await rooms.settled("Release");
+
+    expect(storage.botGroupLog("release").map((entry) => entry.text)).toEqual(["Status please @scout"]);
+    expect(states).toContainEqual(expect.objectContaining({
+      type: "bot_group_state",
+      group: "Release",
+      state: "running",
+      note: { member: "scout", reason: "failed", detail: "provider crashed" },
+    }));
+    expect(states.at(-1)).toMatchObject({ group: "Release", state: "settled" });
     await rooms.close();
     storage.close();
   });

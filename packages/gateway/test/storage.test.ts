@@ -1,6 +1,67 @@
 import { describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { openStorage } from "../src/storage.ts";
+
+function delegationWithCost(costUsd: number) {
+  return {
+    bot: "sage", sessionId: "session", turnId: "turn", batchId: "batch", childId: "child",
+    index: 0, count: 1, status: "succeeded", lastActiveAt: 7, startedAt: 4, endedAt: 6,
+    costUsd,
+  };
+}
+
+describe("delegation enrichment migration", () => {
+  it("enforces cost bounds in a fresh database", () => {
+    const storage = openStorage(":memory:");
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(-1))).toThrow();
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(1_000_001))).toThrow();
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(0))).not.toThrow();
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(1_000_000))).not.toThrow();
+    expect(storage.botChatDelegations("session", 0)[0]?.costUsd).toBe(1_000_000);
+    storage.close();
+  });
+
+  it("adds nullable enrichment columns to a pre-enrichment database without losing rows", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-delegation-migration-"));
+    const path = join(directory, "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`CREATE TABLE bot_chat_delegations (
+      bot TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+      batch_id TEXT NOT NULL, child_id TEXT NOT NULL, child_index INTEGER NOT NULL,
+      batch_count INTEGER NOT NULL, alias_id TEXT, label TEXT, status TEXT NOT NULL,
+      current_tool TEXT, api_calls INTEGER, tool_count INTEGER,
+      last_active_at INTEGER NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER,
+      PRIMARY KEY (bot, turn_id, batch_id, child_id)
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO bot_chat_delegations VALUES
+      ('sage','session','turn','batch','child',0,1,NULL,'work','succeeded',NULL,NULL,NULL,5,4,6);`);
+    legacy.close();
+
+    const storage = openStorage(path);
+    expect(storage.botChatDelegations("session", 0)[0]).toMatchObject({
+      childId: "child", status: "succeeded", costUsd: null, schemaValid: null, durationMs: null,
+    });
+    storage.upsertBotChatDelegation({
+      bot: "sage", sessionId: "session", turnId: "turn", batchId: "batch", childId: "child",
+      index: 0, count: 1, status: "succeeded", lastActiveAt: 7, startedAt: 4, endedAt: 6,
+      costUsd: 0.25, costStatus: "reported", schemaValidation: { valid: false, retries: 1 }, durationMs: 1250,
+    });
+    expect(storage.botChatDelegations("session", 0)[0]).toMatchObject({
+      costUsd: 0.25, costStatus: "reported", schemaValid: 0, schemaRetries: 1, durationMs: 1250,
+    });
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(-1))).toThrow();
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(1_000_001))).toThrow();
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(0))).not.toThrow();
+    expect(() => storage.upsertBotChatDelegation(delegationWithCost(1_000_000))).not.toThrow();
+    expect(storage.botChatDelegations("session", 0)[0]?.costUsd).toBe(1_000_000);
+    storage.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
 
 function seeded() {
   const storage = openStorage(":memory:");

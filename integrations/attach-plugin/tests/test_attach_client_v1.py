@@ -181,22 +181,18 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         # Alias-absent events keep the exact historical shape.
         self.assertNotIn("aliasId", events[1])
 
-    async def test_send_delegation_carries_only_safe_result_metadata(self):
+    async def test_send_delegation_bounds_structured_terminal_enrichment(self):
         await self.client.send_delegation(
-            "thread", "turn", "call_d3R3", "sa-0", index=0, count=1,
-            status="succeeded", last_active_at=6, cost_usd=1.23456789,
-            schema_valid=False,
+            "thread", "turn", "call", "sa-0", index=0, count=1,
+            status="failed", last_active_at=8, cost_usd=0.125,
+            cost_status="reported", schema_validation={"valid": False, "retries": 1},
+            duration_ms=2345,
         )
-        await self.client.send_delegation(
-            "thread", "turn", "call_d3R3", "sa-1", index=1, count=2,
-            status="succeeded", last_active_at=7, cost_usd=float("inf"),
-            schema_valid="true",
-        )
-        events = [frame["event"] for frame in self.spool.pending_events(10, 100_000)]
-        self.assertEqual(events[0]["costUsd"], 1.234568)
-        self.assertIs(events[0]["schemaValid"], False)
-        self.assertNotIn("costUsd", events[1])
-        self.assertNotIn("schemaValid", events[1])
+        event = self.spool.pending_events(10, 100_000)[0]["event"]
+        self.assertEqual(event["costUsd"], 0.125)
+        self.assertEqual(event["costStatus"], "reported")
+        self.assertEqual(event["schemaValidation"], {"valid": False, "retries": 1})
+        self.assertEqual(event["durationMs"], 2345)
 
     async def test_repeated_draft_snapshot_emits_only_tool_lifecycle_changes(self):
         chip = ToolChip(id="call-1", name="search", status="running")
@@ -369,7 +365,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(HELLO_CAPABILITIES), {
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "mobile_media", "mobile_notifications",
-            "memory_management", "delivery_receipts", "delegation", "thinking",
+            "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking",
             "desktop_session_resume", "desktop_session_sync",
         })
 

@@ -309,14 +309,13 @@ class DelegationAliasCaptureTests(unittest.TestCase):
         self._finish(json.dumps(self.DISPATCHED))
         allowed = {
             "batch_id", "child_id", "index", "count", "status",
-            "label", "tool_count", "last_active_at", "alias_id", "cost_usd",
-            "schema_valid",
+            "label", "tool_count", "last_active_at", "alias_id",
         }
         for _chat, payload in self.adapter.events:
             self.assertLessEqual(set(payload), allowed, payload)
 
 
-class DelegationResultEnrichmentTests(unittest.TestCase):
+class DelegationStructuredResultTests(unittest.TestCase):
     def setUp(self):
         self._orig_lookup = adapter_module._current_turn_platform_and_chat
         adapter_module._current_turn_platform_and_chat = lambda: (
@@ -325,8 +324,15 @@ class DelegationResultEnrichmentTests(unittest.TestCase):
         )
         self.adapter = _RecordingAdapter()
         adapter_module._register_active_adapter(self.adapter)
-        adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+        adapter_module._CURRENT_DELEGATION_CALL.set("call-sync")
         _reset_registry()
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-0", child_goal="zero"
+        )
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id="child-1", child_goal="one"
+        )
+        self.adapter.events.clear()
 
     def tearDown(self):
         adapter_module._current_turn_platform_and_chat = self._orig_lookup
@@ -334,65 +340,71 @@ class DelegationResultEnrichmentTests(unittest.TestCase):
         adapter_module._CURRENT_DELEGATION_CALL.set(None)
         _reset_registry()
 
-    def _spawn_and_stop(self, child_id):
-        adapter_module._subagent_start(
-            parent_session_id="parent", child_session_id=child_id, child_goal="g"
-        )
-        adapter_module._subagent_stop(
-            parent_session_id="parent", child_session_id=child_id,
-            child_status="completed", tool_call_history=[],
+    def _post(self, result):
+        adapter_module._post_tool_call(
+            tool_name="delegate_task", tool_call_id="call-sync", result=result
         )
 
-    def test_sync_result_emits_later_terminal_metadata_by_spawn_index(self):
-        self._spawn_and_stop("child-1")
-        self._spawn_and_stop("child-2")
-        adapter_module._post_tool_call(
-            tool_name="delegate_task", tool_call_id="call-7", result=json.dumps({
-                "results": [
-                    {"task_index": 1, "status": "failed", "cost_usd": 2.34567891,
-                     "schema_valid": False},
-                    {"task_index": 0, "status": "completed", "cost_usd": 1.2,
-                     "schema_valid": True},
-                ],
-            }),
-        )
-        updates = [payload for _chat, payload in self.adapter.events[-2:]]
-        self.assertEqual(updates[0]["child_id"], "child-2")
-        self.assertEqual(updates[0]["index"], 1)
-        self.assertEqual(updates[0]["status"], "failed")
-        self.assertEqual(updates[0]["cost_usd"], 2.345679)
-        self.assertIs(updates[0]["schema_valid"], False)
-        self.assertEqual(updates[1]["child_id"], "child-1")
-        self.assertEqual(updates[1]["index"], 0)
-        self.assertEqual(updates[1]["status"], "succeeded")
-        self.assertEqual(updates[1]["cost_usd"], 1.2)
-        self.assertIs(updates[1]["schema_valid"], True)
-
-    def test_unsupported_or_malformed_result_fields_are_absent(self):
-        self._spawn_and_stop("child-1")
-        adapter_module._post_tool_call(
-            tool_name="delegate_task", tool_call_id="call-7", result={
-                "results": [
-                    {"task_index": 0, "status": "completed", "cost_usd": float("nan"),
-                     "schema_valid": "true"},
-                    {"task_index": True, "status": "completed", "cost_usd": 3,
-                     "schema_valid": True},
-                    {"task_index": 2, "status": "completed", "cost_usd": 4,
-                     "schema_valid": True},
-                    {"task_index": 0, "status": "completed",
-                     "cost_usd": adapter_module._DELEGATION_COST_USD_MAX + 1,
-                     "schema_valid": None},
-                ],
+    def test_reordered_rows_join_children_by_explicit_task_index(self):
+        self._post(json.dumps({"results": [
+            {
+                "task_index": 1, "status": "completed", "cost_usd": 0.25,
+                "cost_status": "reported", "schema_valid": False, "schema_retries": 1,
+                "schema_errors": ["private validator detail"], "duration_seconds": 2.345,
+                "summary": "private summary", "tokens": {"input": 99},
+                "tool_trace": [{"args": {"path": "/private"}}],
             },
-        )
-        # No valid result entry produces a second terminal update.
-        self.assertEqual(len(self.adapter.events), 2)
+            {
+                "task_index": 0, "status": "completed", "cost_usd": 0.1,
+                "cost_status": "estimated", "schema_valid": True,
+                "duration_seconds": 1,
+            },
+        ]}))
+        payloads = [payload for _chat, payload in self.adapter.events]
+        self.assertEqual([payload["child_id"] for payload in payloads], ["child-1", "child-0"])
+        self.assertEqual([payload["index"] for payload in payloads], [1, 0])
+        self.assertEqual(payloads[0]["cost_usd"], 0.25)
+        self.assertEqual(payloads[0]["cost_status"], "reported")
+        self.assertEqual(payloads[0]["schema_validation"], {"valid": False, "retries": 1})
+        self.assertEqual(payloads[0]["duration_ms"], 2345)
+        forbidden = {"schema_errors", "summary", "tokens", "tool_trace", "args", "result"}
+        self.assertTrue(all(forbidden.isdisjoint(payload) for payload in payloads))
 
-    def test_async_dispatch_result_does_not_claim_terminal_metadata(self):
-        self._spawn_and_stop("child-1")
-        adapter_module._post_tool_call(
-            tool_name="delegate_task", tool_call_id="call-7", result=json.dumps({
-                "status": "dispatched", "delegation_id": "deleg_c6eb9310",
-            }),
-        )
-        self.assertEqual(len(self.adapter.events), 2)
+    def test_unavailable_schema_is_distinct_from_false_and_bad_values_are_absent(self):
+        self._post({"results": [
+            {"task_index": 0, "status": "completed", "cost_usd": float("inf"),
+             "schema_valid": "false", "duration_seconds": -1},
+            {"task_index": 1, "status": "failed", "cost_usd": 4,
+             "cost_status": "future-label", "schema_valid": False, "schema_retries": 9},
+        ]})
+        first, second = [payload for _chat, payload in self.adapter.events]
+        for field in ("cost_usd", "cost_status", "schema_validation", "duration_ms"):
+            self.assertNotIn(field, first)
+        self.assertEqual(second["cost_status"], "unknown")
+        self.assertEqual(second["schema_validation"], {"valid": False})
+
+    def test_overflow_values_are_omitted_without_dropping_valid_sibling_rows(self):
+        self._post({"results": [
+            {"task_index": 0, "status": "completed", "cost_usd": 10**400,
+             "duration_seconds": 10**400, "schema_valid": True},
+            {"task_index": 1, "status": "completed", "cost_usd": 0.5,
+             "cost_status": "reported", "duration_seconds": 1.25},
+        ]})
+        first, second = [payload for _chat, payload in self.adapter.events]
+        self.assertNotIn("cost_usd", first)
+        self.assertNotIn("duration_ms", first)
+        self.assertEqual(first["schema_validation"], {"valid": True})
+        self.assertEqual(second["cost_usd"], 0.5)
+        self.assertEqual(second["duration_ms"], 1250)
+
+    def test_background_older_and_malformed_results_emit_no_enrichment(self):
+        for result in (
+            json.dumps({"status": "dispatched", "mode": "background", "delegation_id": "deleg_12345678"}),
+            json.dumps({"results": ["old prose row"]}),
+            json.dumps({"results": [{"task_index": 99, "status": "completed", "cost_usd": 1}]}),
+            "{not json",
+            None,
+        ):
+            self.adapter.events.clear()
+            self._post(result)
+            self.assertEqual(self.adapter.events, [], result)

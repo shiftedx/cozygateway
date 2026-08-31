@@ -200,6 +200,25 @@ describe("attach-v1 ingress", () => {
     peer.ws.close();
   });
 
+  it("requires memory_setup in addition to memory_management for setup only", async () => {
+    const oldPeer = await dial(undefined, ["memory_management"]);
+    expect(ingress.sendMemoryRequest("sage", {
+      kind: "memory_request", requestId: "setup-old", operation: "setup",
+      input: { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false },
+    })).toBe("capability_not_negotiated");
+    oldPeer.ws.close();
+    await until(() => !ingress.isAttached("sage"));
+
+    const currentPeer = await dial(undefined, ["memory_management", "memory_setup"]);
+    expect(ingress.sendMemoryRequest("sage", {
+      kind: "memory_request", requestId: "setup-current", operation: "setup",
+      input: { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false },
+    })).toBe("sent");
+    await until(() => currentPeer.frames.some((frame) => frame.kind === "memory_request"));
+    expect(currentPeer.frames.find((frame) => frame.kind === "memory_request")).toMatchObject({ operation: "setup" });
+    currentPeer.ws.close();
+  });
+
   it("keeps location behind mobile_location while preserving status-only mobile_node peers", async () => {
     const oldPeer = await dial(undefined, ["mobile_node"]);
     expect(oldPeer.frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["mobile_node"] });
