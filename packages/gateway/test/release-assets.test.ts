@@ -1,6 +1,9 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
+
+import { loadConfig } from "../src/config.ts";
 
 /**
  * Both one-liners are piped straight into a shell, so both have to be release assets: the bytes a
@@ -25,6 +28,20 @@ const REQUIRED = [
 ];
 
 describe("what a release publishes", () => {
+  it("keeps the bundle smoke fixture valid against the current gateway config", () => {
+    const smokeJson = WORKFLOW.match(/cat > \/tmp\/smoke\.json <<'EOF'\n([\s\S]*?)\n\s+EOF/)?.[1];
+    expect(smokeJson, "release.yml has no /tmp/smoke.json fixture").toBeDefined();
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-release-smoke-"));
+    const path = join(directory, "smoke.json");
+    writeFileSync(path, smokeJson!);
+    expect(loadConfig(path).hermesEndpoints).toMatchObject([{
+      id: "default",
+      url: "ws://127.0.0.1:19999/api/ws",
+      tokenEnv: "SMOKE_HERMES_TOKEN",
+      profiles: { default: { tokenEnv: "SMOKE_ATTACH_TOKEN" } },
+    }]);
+  });
+
   it("uploads every asset, and a checksum beside each one", () => {
     for (const asset of REQUIRED) {
       expect(WORKFLOW, `${asset} is not uploaded by release.yml`).toContain(`dist-bundle/${asset}\n`);
