@@ -35,7 +35,7 @@ const CONFIG: GatewayConfig = {
 };
 
 type DashboardInit = {
-  method?: "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
   body?: unknown;
   headers?: Readonly<Record<string, string>>;
   signal?: AbortSignal;
