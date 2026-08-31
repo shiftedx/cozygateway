@@ -533,8 +533,16 @@ server.listen(Number(port), '127.0.0.1', () => writeFileSync(pidFile, String(pro
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 MOCK_DASHBOARD
 mkdir -p "$tmp/hermes/hermes-agent/venv/Scripts" "$tmp/hermes/hermes-agent/hermes_cli"
-cp "$real_node" "$tmp/hermes/hermes-agent/venv/Scripts/python.exe"
-chmod 700 "$tmp/hermes/hermes-agent/venv/Scripts/python.exe"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    cp "$real_node" "$tmp/hermes/hermes-agent/venv/Scripts/python.exe"
+    chmod 700 "$tmp/hermes/hermes-agent/venv/Scripts/python.exe"
+    ;;
+  *)
+    ln -s "$real_node" "$tmp/hermes/hermes-agent/venv/Scripts/python.exe"
+    "$tmp/hermes/hermes-agent/venv/Scripts/python.exe" --version >/dev/null
+    ;;
+esac
 cat > "$tmp/hermes/hermes-agent/hermes_cli/main.py" <<'OWNED_DASHBOARD'
 const { writeFileSync } = require('node:fs');
 const { createServer } = require('node:http');
@@ -605,8 +613,21 @@ dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
 mock_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
 mkdir -p "$tmp/Hermes Bin"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) hermes_stub="$tmp/Hermes Bin/hermes-stub.exe" ;; *) hermes_stub="$tmp/Hermes Bin/hermes-stub" ;; esac
-cp "$real_node" "$hermes_stub"
-chmod 700 "$hermes_stub"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    cp "$real_node" "$hermes_stub"
+    chmod 700 "$hermes_stub"
+    ;;
+  *)
+    # Homebrew's Node binary loads libnode via a path relative to itself.
+    # Keep the fixture's requested name while resolving that dependency from
+    # the installed runtime rather than copying only the executable.
+    ln -s "$real_node" "$hermes_stub"
+    # The fixture is executed by the generated supervisor. Verify that its
+    # executable can load before attributing a failed cold start to readiness.
+    "$hermes_stub" --version >/dev/null
+    ;;
+esac
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     reload_log="$(cygpath -w "$tmp/reload.log")"
@@ -1109,7 +1130,7 @@ run_locked_windows_fixture locked-started started COZYGATEWAY_TEST_STOP_LEAVES_R
 test "$locked_status" -eq 0
 test "$(grep -Fxc 'locked-started:gateway:stop' "$locked_command_log")" = 2
 ! grep -q '^locked-started:gateway:\(restart\|uninstall\)$' "$locked_command_log"
-test "$(wc -l < "$locked_rm_log")" = 2
+test "$(wc -l < "$locked_rm_log")" -eq 2
 test "$(cat "$tmp/hermes/gateway-locked-started.state")" = stopped
 test ! -e "$locked_spool"
 test ! -e "$locked_gateway_dir"
@@ -1119,7 +1140,7 @@ test "$locked_status" -ne 0
 grep -Fq 'Hermes stopped, but the CozyGateway spool for profile locked-started-stuck is still in use' <<<"$locked_output"
 test "$(grep -Fxc 'locked-started-stuck:gateway:stop' "$locked_command_log")" = 2
 ! grep -q '^locked-started-stuck:gateway:\(restart\|uninstall\)$' "$locked_command_log"
-test "$(wc -l < "$locked_rm_log")" = 2
+test "$(wc -l < "$locked_rm_log")" -eq 2
 test "$(cat "$tmp/hermes/gateway-locked-started-stuck.state")" = stopped
 test -e "$locked_spool"
 test -e "$locked_install_state"
