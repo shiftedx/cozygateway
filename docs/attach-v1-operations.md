@@ -216,35 +216,43 @@ across every restart. Keep backups outside `plugins/`. The script's header
 comment documents the quiescence heuristic (spool sequence quiet-window
 polling) and its known false-quiet / false-busy limits in detail.
 
-### Capability-42 rollout order
+### Coordinated matched-version rollout
 
-Gateway and plugin release versions must match. Capability 42 adds the
-credential-free `PATCH /bots/:name/memory/setup` route, backed by two negotiated
-attach capabilities: existing reads and item mutations require
-`memory_management`, while setup additionally requires `memory_setup`. Do not
-advertise the new Gateway before the matching plugin is active on its Hermes
-profiles.
+Gateway and plugin release versions must match. The canonical installer is the
+preferred upgrade path: it resolves one checksum-verified release and installs
+both sides from that release. Capability negotiation does not make arbitrary
+mixed versions a safe rolling-upgrade pair. The old v0.4.3 Gateway rejects a
+hello capability it does not know, and tagged v0.5.2 rejects the divergent
+capability offer from its prerelease plugin. The intersection exists only after
+both peers have accepted the hello.
 
-For a checkout-based rollout, deploy the plugin first with the supported script:
+For a manual production rollout, prepare everything before disturbing either
+live side:
 
-```sh
-# inspect every target and planned restart first
-scripts/deploy-plugin-local.sh -n
+1. Resolve one exact release tag and pre-stage its Gateway image or binary and
+   its matching plugin source. Confirm both embedded versions agree.
+2. Capture rollback copies of the current Gateway revision or image, Gateway
+   config, provisioner payload, and installed plugin tree. Store plugin backups
+   outside every `plugins/` directory so Hermes cannot scan a duplicate manifest.
+   Preserve the Gateway database and each profile's attach spool.
+3. Migrate the Gateway config for the target release and validate the staged
+   config with that release before restart. Resolve stale configured profiles;
+   final health requires every configured attach identity to be online.
+4. Run the supported plugin plan without changing the live install:
 
-# deploy the configured default profile set
-scripts/deploy-plugin-local.sh
-```
+   ```sh
+   scripts/deploy-plugin-local.sh -n
+   ```
 
-The new plugin can reconnect safely to the old Gateway: negotiation intersects
-their capability sets, so `memory_setup` remains dormant there. After every
-target profile has reconnected, deploy or restart the version-matched Gateway
-through that installation's existing service procedure. A Gateway restart
-causes the plugins to reconnect and negotiate the new intersection. During that
-bounded seam, an offline profile or stale plugin receives `503
-backend_unavailable`; setup is not queued for later execution.
+5. Begin a bounded maintenance window after active work and spools are quiet.
+   Cut over the pre-staged Gateway and immediately install the clean matching
+   plugin with `scripts/deploy-plugin-local.sh`. Refresh the staged provisioner
+   from the same release when automatic provisioning is enabled. Do not wait for
+   or route work through either mixed-version intermediate: it may truthfully be
+   unavailable until both ends have switched.
 
-After the Gateway rollout, use its configured public or local origin and verify
-both process health and delivery readiness:
+Only after the coordinated cutover, use the configured public or local origin
+to verify process health and delivery readiness:
 
 ```sh
 curl -fsS "$GATEWAY_URL/health"
@@ -255,10 +263,19 @@ The health response must report the released Gateway version,
 `capabilities["com.cozylabs.bots"]` at `42` or later, equal
 `attach.configured` and `attach.online`, and zero `attach.degraded`,
 `attach.absent`, and `attach.deadLetters`. `/ready` must answer `200` with
-`ready: true`. If capability 42 is advertised but setup still returns the
-bounded stale-plugin error, restart that Hermes profile with the installed
-version-matched plugin and repeat the checks; do not retry the mutation until
-`memory_setup` has negotiated.
+`ready: true`. Confirm the final `hello_ack` negotiation includes
+`memory_management` and `memory_setup` before using capability-42 setup. If the
+capability is missing or setup returns the bounded unavailable error, the
+cutover is incomplete: stop sending work, correct or roll back the matched pair,
+and repeat the checks. Do not retry the mutation until `memory_setup` has
+negotiated.
+
+Rollback is coordinated too. Restore the captured config before starting the
+captured Gateway revision or image, restore the captured plugin tree with no
+duplicate manifests left under `plugins/`, restore the captured provisioner
+payload when applicable, and restart both sides inside the same maintenance
+window. Re-run the health, readiness, attach-count, dead-letter, queue, and
+negotiated-capability checks before ending maintenance.
 
 ## Automatic bot provisioning
 
