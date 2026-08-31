@@ -309,7 +309,90 @@ class DelegationAliasCaptureTests(unittest.TestCase):
         self._finish(json.dumps(self.DISPATCHED))
         allowed = {
             "batch_id", "child_id", "index", "count", "status",
-            "label", "tool_count", "last_active_at", "alias_id",
+            "label", "tool_count", "last_active_at", "alias_id", "cost_usd",
+            "schema_valid",
         }
         for _chat, payload in self.adapter.events:
             self.assertLessEqual(set(payload), allowed, payload)
+
+
+class DelegationResultEnrichmentTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_lookup = adapter_module._current_turn_platform_and_chat
+        adapter_module._current_turn_platform_and_chat = lambda: (
+            adapter_module.PLATFORM_NAME,
+            "chat-1",
+        )
+        self.adapter = _RecordingAdapter()
+        adapter_module._register_active_adapter(self.adapter)
+        adapter_module._CURRENT_DELEGATION_CALL.set("call-7")
+        _reset_registry()
+
+    def tearDown(self):
+        adapter_module._current_turn_platform_and_chat = self._orig_lookup
+        adapter_module._unregister_active_adapter(self.adapter)
+        adapter_module._CURRENT_DELEGATION_CALL.set(None)
+        _reset_registry()
+
+    def _spawn_and_stop(self, child_id):
+        adapter_module._subagent_start(
+            parent_session_id="parent", child_session_id=child_id, child_goal="g"
+        )
+        adapter_module._subagent_stop(
+            parent_session_id="parent", child_session_id=child_id,
+            child_status="completed", tool_call_history=[],
+        )
+
+    def test_sync_result_emits_later_terminal_metadata_by_spawn_index(self):
+        self._spawn_and_stop("child-1")
+        self._spawn_and_stop("child-2")
+        adapter_module._post_tool_call(
+            tool_name="delegate_task", tool_call_id="call-7", result=json.dumps({
+                "results": [
+                    {"task_index": 1, "status": "failed", "cost_usd": 2.34567891,
+                     "schema_valid": False},
+                    {"task_index": 0, "status": "completed", "cost_usd": 1.2,
+                     "schema_valid": True},
+                ],
+            }),
+        )
+        updates = [payload for _chat, payload in self.adapter.events[-2:]]
+        self.assertEqual(updates[0]["child_id"], "child-2")
+        self.assertEqual(updates[0]["index"], 1)
+        self.assertEqual(updates[0]["status"], "failed")
+        self.assertEqual(updates[0]["cost_usd"], 2.345679)
+        self.assertIs(updates[0]["schema_valid"], False)
+        self.assertEqual(updates[1]["child_id"], "child-1")
+        self.assertEqual(updates[1]["index"], 0)
+        self.assertEqual(updates[1]["status"], "succeeded")
+        self.assertEqual(updates[1]["cost_usd"], 1.2)
+        self.assertIs(updates[1]["schema_valid"], True)
+
+    def test_unsupported_or_malformed_result_fields_are_absent(self):
+        self._spawn_and_stop("child-1")
+        adapter_module._post_tool_call(
+            tool_name="delegate_task", tool_call_id="call-7", result={
+                "results": [
+                    {"task_index": 0, "status": "completed", "cost_usd": float("nan"),
+                     "schema_valid": "true"},
+                    {"task_index": True, "status": "completed", "cost_usd": 3,
+                     "schema_valid": True},
+                    {"task_index": 2, "status": "completed", "cost_usd": 4,
+                     "schema_valid": True},
+                    {"task_index": 0, "status": "completed",
+                     "cost_usd": adapter_module._DELEGATION_COST_USD_MAX + 1,
+                     "schema_valid": None},
+                ],
+            },
+        )
+        # No valid result entry produces a second terminal update.
+        self.assertEqual(len(self.adapter.events), 2)
+
+    def test_async_dispatch_result_does_not_claim_terminal_metadata(self):
+        self._spawn_and_stop("child-1")
+        adapter_module._post_tool_call(
+            tool_name="delegate_task", tool_call_id="call-7", result=json.dumps({
+                "status": "dispatched", "delegation_id": "deleg_c6eb9310",
+            }),
+        )
+        self.assertEqual(len(self.adapter.events), 2)

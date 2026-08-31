@@ -30,13 +30,12 @@ import {
   type ModelProviderSetupMethod,
 } from "./model-provider-setup.ts";
 
-/** The roster preview line, already classified. `a2a` is a bot-to-bot delivery whose
- *  `Message from ... :` prefix has been stripped, with the sender handle carried separately;
- *  `plain` is an ordinary conversation preview; `empty` means the bot has no conversation yet. */
+/** The roster preview line. Transcript text is always ordinary display text: Hermes does not
+ *  expose durable structured A2A provenance on this surface, so a prefix must never change its
+ *  kind or synthesize a sender. `empty` means the bot has no conversation yet. */
 export const BotPreviewSchema = Type.Object({
-  kind: Type.Union([Type.Literal("a2a"), Type.Literal("plain"), Type.Literal("empty")]),
+  kind: Type.Union([Type.Literal("plain"), Type.Literal("empty")]),
   text: Type.String(),
-  sender: Type.Optional(Type.String()),
 });
 export type BotPreview = Static<typeof BotPreviewSchema>;
 
@@ -533,6 +532,12 @@ export const BotDelegationChildSchema = Type.Object({
   currentTool: Type.Optional(Type.String()),
   apiCalls: Type.Optional(Type.Integer()),
   toolCount: Type.Optional(Type.Integer()),
+  /** Hermes-reported terminal child cost, captured from the structured synchronous
+   *  `delegate_task` result in the same process. Absent for async/older/unpriced results. */
+  costUsd: Type.Optional(Type.Number({ minimum: 0, maximum: 1_000_000 })),
+  /** Structured-output schema verdict from the same terminal result. Absent when no output
+   *  schema was requested or Hermes did not expose a joinable structured result. */
+  schemaValid: Type.Optional(Type.Boolean()),
   /** MILLISECONDS, plugin clock. When the child last showed observable activity. */
   lastActiveAt: Type.Integer(),
   /** MILLISECONDS, gateway clock. When the gateway first saw the child. */
@@ -1633,4 +1638,8 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
 /** Capability 41: MODEL PROVIDER SETUP COMPATIBILITY. Canonical provider administration now lives
  * at gateway → harness → configuration scope under `com.cozylabs.harness-settings`. These bot
  * routes remain temporarily so capability-41 clients do not break. */
-export const BOTS_CAPABILITY_VERSION = 41;
+/** Capability 42: TRUTHFUL BOT ACTIVITY. Roster previews no longer classify arbitrary
+ * `Message from ...` transcript text as A2A or synthesize a sender. Delegation children may carry
+ * optional, bounded `costUsd` and `schemaValid` values captured from Hermes's structured
+ * synchronous terminal result; async and unsupported results leave both absent. */
+export const BOTS_CAPABILITY_VERSION = 42;

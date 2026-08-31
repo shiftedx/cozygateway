@@ -1520,6 +1520,8 @@ export class NativeBotDataPlane {
       prior.status === event.status &&
       prior.currentTool === event.currentTool &&
       prior.toolCount === event.toolCount &&
+      prior.costUsd === event.costUsd &&
+      prior.schemaValid === event.schemaValid &&
       prior.lastActiveAt === event.lastActiveAt
     ) {
       // Cleo diagnostic: an acknowledged TERMINAL event that produces no broadcast is
@@ -1560,6 +1562,8 @@ export class NativeBotDataPlane {
           currentTool: prior.currentTool,
           apiCalls: prior.apiCalls,
           toolCount: prior.toolCount,
+          costUsd: prior.costUsd,
+          schemaValid: prior.schemaValid,
         });
         const aliasWire = this.#delegationWire(
           bot, sessionId, event.turnId, event.batchId, current, stampedAt,
@@ -1576,6 +1580,8 @@ export class NativeBotDataPlane {
     const label = event.label ?? prior?.label;
     const apiCalls = event.apiCalls ?? prior?.apiCalls;
     const toolCount = event.toolCount ?? prior?.toolCount;
+    const costUsd = event.costUsd ?? prior?.costUsd;
+    const schemaValid = event.schemaValid ?? prior?.schemaValid;
     const child: BotDelegationChild = {
       childId: event.childId,
       index: prior?.index ?? event.index,
@@ -1587,6 +1593,8 @@ export class NativeBotDataPlane {
       ...(event.currentTool === undefined ? {} : { currentTool: event.currentTool }),
       ...(apiCalls === undefined ? {} : { apiCalls }),
       ...(toolCount === undefined ? {} : { toolCount }),
+      ...(costUsd === undefined ? {} : { costUsd }),
+      ...(schemaValid === undefined ? {} : { schemaValid }),
     };
     current.children.set(event.childId, child);
     current.count = Math.max(current.count, event.count, current.children.size);
@@ -1610,6 +1618,8 @@ export class NativeBotDataPlane {
       currentTool: child.currentTool,
       apiCalls: child.apiCalls,
       toolCount: child.toolCount,
+      costUsd: child.costUsd,
+      schemaValid: child.schemaValid,
     });
     const wire = this.#delegationWire(bot, sessionId, event.turnId, event.batchId, current, now);
     // Post-seal legs broadcast directly: the sealed turn is not "polling" and has no live batch.
@@ -1688,6 +1698,8 @@ export class NativeBotDataPlane {
     currentTool: string | null;
     apiCalls: number | null;
     toolCount: number | null;
+    costUsd: number | null;
+    schemaValid: number | null;
     lastActiveAt: number;
     startedAt: number;
     endedAt: number | null;
@@ -1703,6 +1715,8 @@ export class NativeBotDataPlane {
       ...(row.currentTool === null ? {} : { currentTool: row.currentTool }),
       ...(row.apiCalls === null ? {} : { apiCalls: row.apiCalls }),
       ...(row.toolCount === null ? {} : { toolCount: row.toolCount }),
+      ...(row.costUsd === null ? {} : { costUsd: row.costUsd }),
+      ...(row.schemaValid === null ? {} : { schemaValid: row.schemaValid === 1 }),
     };
   }
 
@@ -1781,6 +1795,8 @@ export class NativeBotDataPlane {
           currentTool: settled.currentTool,
           apiCalls: settled.apiCalls,
           toolCount: settled.toolCount,
+          costUsd: settled.costUsd,
+          schemaValid: settled.schemaValid,
         });
         changed = true;
       }

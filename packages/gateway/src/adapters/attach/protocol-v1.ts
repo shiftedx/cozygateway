@@ -225,6 +225,10 @@ const DelegationEvent = Type.Object({
   currentTool: Type.Optional(Type.String({ maxLength: 128 })),
   apiCalls: Type.Optional(Type.Integer({ minimum: 0 })),
   toolCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Structured synchronous terminal-result enrichment only. Async and older Hermes results
+   * omit both fields rather than synthesizing lifecycle data that the hooks do not carry. */
+  costUsd: Type.Optional(Type.Number({ minimum: 0, maximum: 1_000_000 })),
+  schemaValid: Type.Optional(Type.Boolean()),
   /** MILLISECONDS, plugin clock: when the child last showed observable activity. */
   lastActiveAt: Type.Integer({ minimum: 0 }),
   /** Canonical Hermes delegation id (`deleg_...`) for the WHOLE batch, once the plugin has

@@ -177,6 +177,8 @@ CREATE TABLE IF NOT EXISTS bot_chat_delegations (
   current_tool TEXT,
   api_calls INTEGER,
   tool_count INTEGER,
+  cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000)),
+  schema_valid INTEGER CHECK (schema_valid IS NULL OR schema_valid IN (0, 1)),
   last_active_at INTEGER NOT NULL,
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
@@ -1140,14 +1142,16 @@ export class Storage {
     currentTool?: string | undefined;
     apiCalls?: number | undefined;
     toolCount?: number | undefined;
+    costUsd?: number | undefined;
+    schemaValid?: boolean | undefined;
   }): void {
     this.#db
       .prepare(
         `INSERT INTO bot_chat_delegations
            (bot, session_id, turn_id, batch_id, alias_id, child_id, child_index, batch_count,
-            label, status, current_tool, api_calls, tool_count, last_active_at, started_at,
-            ended_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            label, status, current_tool, api_calls, tool_count, cost_usd, schema_valid,
+            last_active_at, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(bot, turn_id, batch_id, child_id) DO UPDATE SET
            batch_count = MAX(bot_chat_delegations.batch_count, excluded.batch_count),
            alias_id = COALESCE(bot_chat_delegations.alias_id, excluded.alias_id),
@@ -1156,6 +1160,8 @@ export class Storage {
            current_tool = excluded.current_tool,
            api_calls = COALESCE(excluded.api_calls, bot_chat_delegations.api_calls),
            tool_count = COALESCE(excluded.tool_count, bot_chat_delegations.tool_count),
+           cost_usd = COALESCE(excluded.cost_usd, bot_chat_delegations.cost_usd),
+           schema_valid = COALESCE(excluded.schema_valid, bot_chat_delegations.schema_valid),
            last_active_at = excluded.last_active_at,
            ended_at = COALESCE(excluded.ended_at, bot_chat_delegations.ended_at)`,
       )
@@ -1173,6 +1179,8 @@ export class Storage {
         child.currentTool ?? null,
         child.apiCalls ?? null,
         child.toolCount ?? null,
+        child.costUsd ?? null,
+        child.schemaValid === undefined ? null : Number(child.schemaValid),
         child.lastActiveAt,
         child.startedAt,
         child.endedAt ?? null,
@@ -1195,6 +1203,8 @@ export class Storage {
     currentTool: string | null;
     apiCalls: number | null;
     toolCount: number | null;
+    costUsd: number | null;
+    schemaValid: number | null;
     lastActiveAt: number;
     startedAt: number;
     endedAt: number | null;
@@ -1205,6 +1215,7 @@ export class Storage {
                 child_id AS childId,
                 child_index AS "index", batch_count AS count, label, status,
                 current_tool AS currentTool, api_calls AS apiCalls, tool_count AS toolCount,
+                cost_usd AS costUsd, schema_valid AS schemaValid,
                 last_active_at AS lastActiveAt, started_at AS startedAt, ended_at AS endedAt
          FROM bot_chat_delegations
          WHERE session_id = ? AND started_at >= ?
@@ -1222,6 +1233,8 @@ export class Storage {
       currentTool: string | null;
       apiCalls: number | null;
       toolCount: number | null;
+      costUsd: number | null;
+      schemaValid: number | null;
       lastActiveAt: number;
       startedAt: number;
       endedAt: number | null;
@@ -3293,6 +3306,16 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  const delegationColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_chat_delegations)").all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!delegationColumns.has("cost_usd")) {
+    db.exec("ALTER TABLE bot_chat_delegations ADD COLUMN cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000))");
+  }
+  if (!delegationColumns.has("schema_valid")) {
+    db.exec("ALTER TABLE bot_chat_delegations ADD COLUMN schema_valid INTEGER CHECK (schema_valid IS NULL OR schema_valid IN (0, 1))");
+  }
   // A process can disappear after a tool starts but before its terminal event is persisted. Only
   // the selected active turn can still receive that event after restart; close every older step so
   // history never presents stale work as currently running.

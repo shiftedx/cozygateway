@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 41. This extension is independent of the frozen core
+Status: v1 extension, capability version 42. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -79,6 +79,7 @@ extension omits the capability and does not register `/bots` routes.
 | 39 | Capability leases and durable metadata-only receipts for phone-node sharing. |
 | 40 | Bot readiness: `GET /bots/:name/readiness` distinguishes a created profile from an attached bot that can accept turns. |
 | 41 | Transitional bot-scoped model-provider setup routes. Canonical ownership moved to `com.cozylabs.harness-settings` v1. |
+| 42 | Truthful Bot Activity: roster previews are plain/empty display text with no transcript-derived A2A sender; delegation children may carry bounded structured terminal cost/schema validity. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -96,7 +97,9 @@ a second, hand-copied schema.
 
 - `BotSummary` is one control-plane roster row. Its `chatSessionId`, `preview`, and
   `lastActiveAt` are overlaid from the configured bot's gateway-owned native chat, on every surface
-  that serves a roster row. Profile metadata remains Hermes control-plane data.
+  that serves a roster row. Profile metadata remains Hermes control-plane data. A preview is
+  ordinary display text or the empty state; no transcript prefix changes its kind or derives a
+  sender identity.
 - `BotChatMessage` is a durable native transcript row. `id` is the gateway/attach event message
   id, `at` is gateway-clock milliseconds (or `null` when unavailable), and `clientId` is an
   optional sender echo. Attachments are gateway-scoped opaque `fileId` values, never paths or URLs.
@@ -555,6 +558,13 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   typically appears from the batch's terminal legs onward (async spawn legs precede the tool
   result) and may be absent entirely under an older Hermes. Additive under capability 34: a
   below-capability or alias-unaware client ignores it.
+  Capability 42 additionally allows a child to carry `costUsd` and `schemaValid`. Both come only
+  from a structured synchronous `delegate_task` terminal result joined to the child by the
+  batch's existing spawn-order index in the same Hermes process. They are absent for async
+  dispatch, older Hermes, missing output schemas, invalid values, and any result that cannot be
+  joined unambiguously. Captured values are persisted with the existing delegation row and survive
+  Gateway reconnect/restart; the Gateway never synthesizes values after a Hermes restart and never
+  exposes validation errors, result text, retry details, token counts, or tool traces.
 - `bot_thinking_activity` (capability 35): latest-only sanitized preview of the bot's live
   reasoning for one native turn, shown in the thinking shimmer. `text` is a tail-truncated
   <=280-char display string (schema-enforced); `seq` is monotonic within `turnId` and a
@@ -573,6 +583,20 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
 
 Frames are independently safe to drop where their schema says they are deltas or snapshots.
 Committed transcript history remains the recovery source after reconnect.
+
+## Client composition: Bot Activity and Room
+
+Build Bot Activity by joining the resources that already own each fact: `GET /bots`/`bot_roster`
+and `bot_presence` for identity and current activity, profile/model reads for specialization,
+routines for scheduled work, `/bots/groups` for room membership/activity, and the canonical Bot
+Chat/session/history routes for conversation. Label each row by that source and link to the
+existing canonical chat or room. Do not infer a source or sender from preview text, and do not
+claim delivered/read/reply relationships, immutable history, or verified agent-to-agent
+provenance.
+
+Extend the existing Room view; do not add a second collaboration view. Render the room state and
+notes already carried by `bot_group_state`, use the existing room composer for `@member`,
+`@everyone`, and `@user` intervention, and link each participating bot to its canonical Bot Chat.
 
 ## Error and privacy rules
 

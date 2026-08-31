@@ -1337,15 +1337,21 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(plane.handle("sage", child("b-done", 4, { childId: "sa-1", index: 1, status: "succeeded", toolCount: 7 }))).toBe(true);
     // One child failing must not touch its siblings.
     expect(plane.handle("sage", child("a-fail", 5, { childId: "sa-0", index: 0, status: "failed" }))).toBe(true);
+    // Synchronous Hermes reports cost/schema only on the later parent tool result. The same
+    // terminal child accepts that structured enrichment without changing identity or status.
+    expect(plane.handle("sage", child("b-result", 6, {
+      childId: "sa-1", index: 1, status: "succeeded", toolCount: 7,
+      costUsd: 0.123456, schemaValid: true,
+    }))).toBe(true);
     expect(plane.handle("sage", {
-      kind: "event", sequence: 6, eventId: "commit", event: {
+      kind: "event", sequence: 7, eventId: "commit", event: {
         kind: "commit", threadId: sent.sessionId, turnId, messageId: "answer",
         blocks: [{ type: "paragraph", text: "dispatched" }],
       } as never,
     })).toBe(true);
     // The batch outlives its turn (async dispatch): sa-2's finish leg lands AFTER the seal
     // and still settles its card instead of being dropped.
-    expect(plane.handle("sage", child("c-done", 7, { childId: "sa-2", index: 2, status: "succeeded" }))).toBe(true);
+    expect(plane.handle("sage", child("c-done", 8, { childId: "sa-2", index: 2, status: "succeeded" }))).toBe(true);
 
     const last = frames
       .filter((frame): frame is Extract<ServerFrame, { type: "bot_delegation_activity" }> => frame.type === "bot_delegation_activity")
@@ -1354,13 +1360,13 @@ describe("attach-v1 native Bot Mode plane", () => {
       bot: "sage", turnId, batchId: "call-1", count: 3, done: true,
       children: [
         { childId: "sa-0", index: 0, status: "failed", label: "Rewrite A" },
-        { childId: "sa-1", index: 1, status: "succeeded", toolCount: 7, label: "Rewrite B" },
+        { childId: "sa-1", index: 1, status: "succeeded", toolCount: 7, label: "Rewrite B", costUsd: 0.123456, schemaValid: true },
         { childId: "sa-2", index: 2, status: "succeeded", label: "Rewrite C" },
       ],
     });
     // Privacy: only bounded display fields cross the wire -- no args, results, reasoning,
     // summaries, prompts, or paths.
-    const allowed = new Set(["apiCalls", "childId", "currentTool", "endedAt", "index", "label", "lastActiveAt", "startedAt", "status", "toolCount"]);
+    const allowed = new Set(["apiCalls", "childId", "costUsd", "currentTool", "endedAt", "index", "label", "lastActiveAt", "schemaValid", "startedAt", "status", "toolCount"]);
     for (const entry of last.children) {
       for (const field of Object.keys(entry)) expect(allowed.has(field), field).toBe(true);
     }
@@ -1369,7 +1375,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       running: false,
       delegations: [{ turnId, batchId: "call-1", count: 3, children: [
         { childId: "sa-0", status: "failed" },
-        { childId: "sa-1", status: "succeeded" },
+        { childId: "sa-1", status: "succeeded", costUsd: 0.123456, schemaValid: true },
         { childId: "sa-2", status: "succeeded" },
       ] }],
     });
@@ -1383,7 +1389,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     expect(await reopened.surface().chatHistory("sage")).toMatchObject({
       delegations: [{ batchId: "call-1", children: [
         { childId: "sa-0", status: "failed" },
-        { childId: "sa-1", toolCount: 7 },
+        { childId: "sa-1", toolCount: 7, costUsd: 0.123456, schemaValid: true },
         { childId: "sa-2", status: "succeeded" },
       ] }],
     });

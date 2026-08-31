@@ -60,7 +60,7 @@ const bot: BotSummary = {
   active: true,
   lastActiveAt: 1_800_000_000_000,
   chatSessionId: "sess-1",
-  preview: { kind: "a2a", text: "the build is green", sender: "luna" },
+  preview: { kind: "plain", text: "the build is green" },
   meta: { title: "Scout", created: 1_799_000_000_000 },
 };
 
@@ -95,6 +95,13 @@ describe("bot summary", () => {
         preview: { kind: "empty", text: "" },
       }),
     ).toBe(true);
+  });
+
+  it("does not accept transcript-derived A2A preview provenance", () => {
+    expect(check(BotSummarySchema, {
+      ...bot,
+      preview: { kind: "a2a", text: "done", sender: "luna" },
+    })).toBe(false);
   });
 
   it("rejects an unknown preview kind", () => {
@@ -575,8 +582,9 @@ describe("capability advertisement", () => {
     // simplest possible way, since a client below 37 simply never calls the route.
     // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts;
     // 40 distinguishes a created profile from an attached, writable bot; 41 wraps Hermes' model
-    // provider setup catalog, credential lifecycle, and OAuth sessions for the phone.
-    expect(BOTS_CAPABILITY_VERSION).toBe(41);
+    // provider setup catalog, credential lifecycle, and OAuth sessions for the phone; 42 removes
+    // transcript-derived A2A previews and adds bounded structured child terminal enrichment.
+    expect(BOTS_CAPABILITY_VERSION).toBe(42);
   });
 
   it("keeps mobile receipts closed and metadata-only", () => {
@@ -781,7 +789,7 @@ describe("delegation activity (capability 34)", () => {
 
   it("accepts a live child, a settled one, and the frame that carries them", () => {
     expect(check(BotDelegationChildSchema, child)).toBe(true);
-    expect(check(BotDelegationChildSchema, { ...child, status: "succeeded", endedAt: 1_800_000_001_000, label: "Rewrite the skill", currentTool: "write_file", apiCalls: 4, toolCount: 7 })).toBe(true);
+    expect(check(BotDelegationChildSchema, { ...child, status: "succeeded", endedAt: 1_800_000_001_000, label: "Rewrite the skill", currentTool: "write_file", apiCalls: 4, toolCount: 7, costUsd: 0.123456, schemaValid: true })).toBe(true);
     expect(check(BotDelegationActivityFrameSchema, frame)).toBe(true);
     expect(check(BotDelegationActivityFrameSchema, { ...frame, done: true, children: [] })).toBe(true);
     expect(check(ServerFrameSchema, frame)).toBe(true);
@@ -803,11 +811,13 @@ describe("delegation activity (capability 34)", () => {
     expect(Object.keys(BotDelegationChildSchema.properties).sort()).toEqual([
       "apiCalls",
       "childId",
+      "costUsd",
       "currentTool",
       "endedAt",
       "index",
       "label",
       "lastActiveAt",
+      "schemaValid",
       "startedAt",
       "status",
       "toolCount",
@@ -815,6 +825,14 @@ describe("delegation activity (capability 34)", () => {
     for (const leak of ["args", "result", "summary", "goal", "reasoning", "prompt", "transcript", "sessionPath", "model", "provider"]) {
       expect(BotDelegationChildSchema.properties).not.toHaveProperty(leak);
     }
+  });
+
+  it("bounds structured terminal enrichment and rejects invented values", () => {
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: 0, schemaValid: false })).toBe(true);
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: -0.01 })).toBe(false);
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: Number.POSITIVE_INFINITY })).toBe(false);
+    expect(check(BotDelegationChildSchema, { ...child, costUsd: 1_000_000.01 })).toBe(false);
+    expect(check(BotDelegationChildSchema, { ...child, schemaValid: "true" })).toBe(false);
   });
 
   it("holds ordinals as integers and keeps history batches joinable by turn", () => {

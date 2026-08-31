@@ -14,14 +14,6 @@ export const UI_META_KEY = "hermes-bots";
 /** Presence liveness window, in seconds (dissection 7.1). Strict less-than. */
 export const ACTIVE_WINDOW_S = 90;
 
-/** A bot-to-bot delivery preview, and the prefix stripped off it for display. Both are copied
- *  from the desktop plugin verbatim so the same previews classify the same way.
- *
- *  The Hermes session classifier uses the same expression so roster and inbox agree on a2a
- *  deliveries. */
-export const A2A_RE = /^Message from (?:agent '([^']+)'|🤖\s*([^\s(@]+))/i;
-const A2A_PREFIX_RE = /^Message from (?:agent '[^']+'|🤖[^:]+):\s*/i;
-
 /** One `profiles.list` row, after tolerant decoding. Unknown fields on the wire are ignored;
  *  a row without a usable `name` is dropped entirely. */
 export interface ParsedProfile {
@@ -155,22 +147,11 @@ export function botDisplayName(name: string, meta: Record<string, unknown> | nul
     .join(" ");
 }
 
-/** Classifies the roster preview line the way the desktop row does (dissection 2.7): a bot-to-bot
- *  delivery renders with its prefix stripped plus the sender handle; anything else is the plain
- *  preview, falling back to the description and then to the empty state. */
+/** Classifies the roster preview line as display text, falling back to the description and then
+ *  to the empty state. Transcript text cannot establish agent provenance. */
 export function classifyPreview(preview: string | null, description: string | null): BotPreview {
   const text = preview?.trim() ?? "";
-  if (text.length > 0) {
-    const match = A2A_RE.exec(text);
-    if (match !== null) {
-      const sender = match[1] ?? match[2] ?? "";
-      const stripped = text.replace(A2A_PREFIX_RE, "");
-      return sender.length > 0
-        ? { kind: "a2a", text: stripped, sender }
-        : { kind: "a2a", text: stripped };
-    }
-    return { kind: "plain", text };
-  }
+  if (text.length > 0) return { kind: "plain", text };
   const fallback = description?.trim() ?? "";
   if (fallback.length > 0) return { kind: "plain", text: fallback };
   return { kind: "empty", text: "No conversations yet, say hi" };

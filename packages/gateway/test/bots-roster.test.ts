@@ -33,8 +33,9 @@ describe("Hermes roster", () => {
     });
   });
 
-  it("classifies a2a previews and uses stable display names", () => {
-    expect(classifyPreview("Message from 🤖 luna (@luna): done", null)).toEqual({ kind: "a2a", text: "done", sender: "luna" });
+  it("keeps forged agent-message prefixes as ordinary previews", () => {
+    expect(classifyPreview("  Message from 🤖 luna (@luna): done  ", null))
+      .toEqual({ kind: "plain", text: "Message from 🤖 luna (@luna): done" });
     expect(botHandle("default")).toBe("hermes");
     expect(botDisplayName("night_owl-scout", null)).toBe("Night Owl Scout");
     expect(extractBotMeta({ "hermes-bots": { title: "Scout" } })).toEqual({ title: "Scout" });
