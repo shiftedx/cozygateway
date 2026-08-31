@@ -272,6 +272,7 @@ describe("privacy projection", () => {
   it.each([
     ["mismatched", "other-session"],
     ["missing", undefined],
+    ["invalid", { id: "not-a-session-id" }],
   ])("fails unavailable without projecting a %s messages-envelope identity", async (_name, envelopeId) => {
     const { request } = appFor((path) => path.includes("/messages?")
       ? json({ session_id: envelopeId, messages: [{ role: "assistant", content: "OTHER SESSION SECRET" }] })
@@ -280,6 +281,18 @@ describe("privacy projection", () => {
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({
       error: { code: "backend_unavailable", message: "Hermes session upstream is unavailable" },
+    });
+  });
+
+  it("accepts a numeric messages-envelope identity that exactly normalizes to the requested ID", async () => {
+    const { request } = appFor((path) => path.includes("/messages?")
+      ? json({ session_id: 42, messages: [{ role: "assistant", content: "numeric match" }] })
+      : json(row({ id: "42" })));
+    const response = await request(`${BASE}/42/messages?limit=20`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      hermesSessionId: "42",
+      messages: [{ role: "assistant", text: "numeric match" }],
     });
   });
 });
@@ -458,6 +471,7 @@ describe("streamed export", () => {
   it.each([
     ["mismatched", "other-session"],
     ["missing", undefined],
+    ["invalid", { id: "not-a-session-id" }],
   ])("fails unavailable before streaming a %s export-envelope identity", async (_name, envelopeId) => {
     const { request } = appFor((path) => path.includes("/messages?")
       ? json({ session_id: envelopeId, messages: [{ role: "assistant", content: "OTHER SESSION SECRET" }] })
@@ -467,6 +481,44 @@ describe("streamed export", () => {
     expect(await response.json()).toEqual({
       error: { code: "backend_unavailable", message: "Hermes session upstream is unavailable" },
     });
+  });
+
+  it("accepts a numeric export-envelope identity that exactly normalizes to the requested ID", async () => {
+    const { request } = appFor((path) => path.includes("/messages?")
+      ? json({ session_id: 42, messages: [{ role: "assistant", content: "numeric match" }] })
+      : json(row({ id: "42" })));
+    const response = await request(`${BASE}/42/export`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      session: { hermesSessionId: "42" },
+      messages: [{ role: "assistant", text: "numeric match" }],
+    });
+  });
+
+  it.each([
+    ["mismatched", "other-session"],
+    ["missing", undefined],
+  ])("aborts after the first page when offset 200 has a %s identity without projecting its rows", async (_name, envelopeId) => {
+    const foreign = "OTHER SESSION SECRET";
+    const { adapter } = surface((path) => {
+      if (!path.includes("/messages?")) return json(row());
+      if (path.includes("offset=0")) {
+        return json({ session_id: "hermes-1", messages: Array.from({ length: 200 }, () => ({
+          role: "assistant", content: "first page",
+        })) });
+      }
+      return json({ session_id: envelopeId, messages: [{ role: "assistant", content: foreign }] });
+    });
+    const exported = await adapter.export("sage", "hermes-1", new AbortController().signal);
+    const reader = exported.body.getReader();
+    let streamed = "";
+    for (let index = 0; index <= 200; index++) {
+      const { value } = await reader.read();
+      streamed += new TextDecoder().decode(value);
+    }
+    await expect(reader.read()).rejects.toThrow(/invalid session data/i);
+    expect(streamed).toContain("first page");
+    expect(streamed).not.toContain(foreign);
   });
 
   it("propagates cancellation into the active upstream page", async () => {

@@ -157,7 +157,7 @@ function message(raw: unknown): HermesSessionMessage | undefined {
 
 function messageEnvelope(raw: unknown, sessionId: string): unknown[] {
   const response = record(raw);
-  if (!response || !Array.isArray(response["messages"]) || response["session_id"] !== sessionId)
+  if (!response || !Array.isArray(response["messages"]) || id(response["session_id"]) !== sessionId)
     throw new HermesSessionUnavailable("Hermes returned invalid session data");
   return response["messages"];
 }
@@ -582,6 +582,8 @@ export class HermesSessionManagementAdapter {
             close();
             controller.close();
           } catch (error) {
+            // Later pages are correlated before projection. Headers and prior correlated rows may
+            // already be sent, so abort the stream; the mismatched page never enters it.
             abort.abort(error);
             close();
             controller.error(error instanceof HermesSessionTooLarge || error instanceof HermesSessionUnavailable
