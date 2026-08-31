@@ -177,7 +177,7 @@ CREATE TABLE IF NOT EXISTS bot_chat_delegations (
   current_tool TEXT,
   api_calls INTEGER,
   tool_count INTEGER,
-  cost_usd REAL,
+  cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000)),
   cost_status TEXT CHECK (cost_status IN ('estimated', 'reported', 'unknown')),
   schema_valid INTEGER CHECK (schema_valid IN (0, 1)),
   schema_retries INTEGER CHECK (schema_retries BETWEEN 0 AND 1),
@@ -3332,7 +3332,7 @@ export function openStorage(dbPath: string): Storage {
       .map((column) => column.name),
   );
   const delegationAdditions = [
-    ["cost_usd", "ALTER TABLE bot_chat_delegations ADD COLUMN cost_usd REAL"],
+    ["cost_usd", "ALTER TABLE bot_chat_delegations ADD COLUMN cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000))"],
     ["cost_status", "ALTER TABLE bot_chat_delegations ADD COLUMN cost_status TEXT CHECK (cost_status IN ('estimated', 'reported', 'unknown'))"],
     ["schema_valid", "ALTER TABLE bot_chat_delegations ADD COLUMN schema_valid INTEGER CHECK (schema_valid IN (0, 1))"],
     ["schema_retries", "ALTER TABLE bot_chat_delegations ADD COLUMN schema_retries INTEGER CHECK (schema_retries BETWEEN 0 AND 1)"],
