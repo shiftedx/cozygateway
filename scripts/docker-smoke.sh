@@ -22,13 +22,14 @@ cat >"$CONFIG_PATH" <<'JSON'
   "host": "0.0.0.0",
   "port": 8787,
   "dbPath": "/data/cozygateway.db",
-  "hermes": {
+  "hermesEndpoints": [{
+    "id": "default",
     "url": "ws://127.0.0.1:1/api/ws",
     "tokenEnv": "SMOKE_HERMES_TOKEN",
     "profiles": {
       "smoke": { "tokenEnv": "SMOKE_ATTACH_TOKEN", "name": "Smoke" }
     }
-  }
+  }]
 }
 JSON
 

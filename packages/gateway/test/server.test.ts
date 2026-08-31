@@ -30,7 +30,7 @@ beforeEach(async () => {
     port: 0,
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    hermes: testHermes(),
+    hermesEndpoints: [{ id: "default", ...testHermes() }],
   });
 });
 
@@ -55,7 +55,8 @@ describe("startGateway end to end", () => {
     beforeStart.close();
 
     const gw = await startGateway({
-      name: "attachment-prune", port: 0, dbPath, turnTimeoutSeconds: 0, hermes: testHermes(),
+      name: "attachment-prune", port: 0, dbPath, turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
     });
     try {
       expect(gw.storage.saveAttachMedia("sage", { ...descriptor("expired"), filename: "replacement.png" }, bytes, Date.now())).toBe(true);
@@ -71,7 +72,8 @@ describe("startGateway end to end", () => {
     let gw: RunningGateway | undefined;
     try {
       gw = await startGateway({
-        name: "attachment-sweep", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: testHermes(),
+        name: "attachment-sweep", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
+        hermesEndpoints: [{ id: "default", ...testHermes() }],
       });
       const index = setIntervalSpy.mock.calls.findIndex(([, interval]) => interval === PHOTO_SWEEP_MS);
       expect(index).toBeGreaterThanOrEqual(0);
@@ -137,7 +139,7 @@ describe("public deployment startup posture", () => {
       port: 0,
       dbPath,
       turnTimeoutSeconds: 0,
-      hermes: testHermes(),
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
     })).rejects.toThrow(/publicUrl.*loopback/i);
     expect(existsSync(dbPath)).toBe(false);
   });
@@ -150,7 +152,7 @@ describe("public deployment startup posture", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: testHermes(),
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
     });
     try {
       expect(gw.url).toMatch(/^http:\/\/127\.0\.0\.1:/);
@@ -174,7 +176,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: testHermes(),
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
     });
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
@@ -190,7 +192,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: testHermes(),
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
       capabilities: { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: 1 },
     });
     try {
@@ -207,7 +209,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: testHermes(),
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
       capabilities: {
         "com.cozylabs.test": 1,
         "com.cozylabs.some-unrecognized-thing": 7,
@@ -286,7 +288,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: testHermes(upstream.url),
+      hermesEndpoints: [{ id: "default", ...testHermes(upstream.url) }],
     });
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;

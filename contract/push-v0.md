@@ -44,10 +44,10 @@ codes `invalid_request`, `not_found`, `over_cap`, `unsupported_platform`, `inter
 
 ### POST /register
 
-Request: `{"platform": "webhook" | "apns", "token": string, "environment"?: "development" | "production"}`
+Request: `{"platform": "webhook" | "apns", "token": string, "environment": "development" | "production"}`
 
-`environment` is accepted only for APNs. It selects Apple's sandbox (`development`) or production
-service for that registration; omission uses the relay's configured default.
+`environment` is required for APNs and selects Apple's sandbox (`development`) or production
+service for that registration. Webhook registrations omit it.
 
 - `webhook`: `token` is an `http(s)` URL. Delivery is `POST <token>` with body
   `{"ciphertext": string}`. The URL is registrant-supplied and untrusted. In restricted-
@@ -56,7 +56,7 @@ service for that registration; omission uses the relay's configured default.
   unspecified) is rejected here with `invalid_request`; a DNS-name host is instead
   vetted at delivery time, once resolved.
 - `apns`: token-based APNs (ES256 provider JWT) when the relay is configured with an APNs key
-  (env: APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC, APNS_ENVIRONMENT); `token` is the
+  (env: APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC); `token` is the
   hex device token. When APNs is not configured, an `apns` registration returns 501
   `unsupported_platform`. Ordinary and actionable push payloads are alerts with `mutable-content: 1`;
   the `mobile.status.wake` payload is silent/background. Both carry the opaque ciphertext under the

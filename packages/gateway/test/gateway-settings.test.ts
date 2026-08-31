@@ -12,23 +12,24 @@ function fixture(): string {
     port: 8787,
     dbPath: "cozy.db",
     turnTimeoutSeconds: 0,
-    hermes: {
+    hermesEndpoints: [{
+      id: "default",
       url: "ws://home:8790/api/ws",
       tokenEnv: "HERMES_SESSION",
       profiles: { sage: { tokenEnv: "SAGE_ATTACH" } },
-    },
+    }],
   }), { mode: 0o640 });
   return path;
 }
 
 describe("fileGatewaySettings", () => {
-  it("migrates legacy config, persists atomically, preserves permissions, and survives reload", () => {
+  it("persists atomically, preserves permissions, and survives reload", () => {
     const path = fixture();
     const manager = fileGatewaySettings(path);
     expect(manager.read()).toEqual({
       name: "Old name",
       hermesEndpoints: [{
-        id: "default", label: "Hermes", url: "ws://home:8790/api/ws",
+        id: "default", url: "ws://home:8790/api/ws",
         tokenEnv: "HERMES_SESSION", profiles: { sage: { tokenEnv: "SAGE_ATTACH" } },
       }],
     });

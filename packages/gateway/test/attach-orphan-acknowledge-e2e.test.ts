@@ -29,11 +29,11 @@ it("an orphaned event does not block later turns from applying", async () => {
       port: 0,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: hermes.url,
         tokenEnv: "ORPHAN_DASHBOARD_TOKEN",
         profiles: { sage: { tokenEnv: "ORPHAN_SAGE_TOKEN", name: "Sage" } },
-      },
+      }],
     });
     const pair = await fetch(`${gateway.url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });
     const deviceToken = ((await pair.json()) as { deviceToken: string }).deviceToken;

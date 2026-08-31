@@ -48,11 +48,11 @@ it("replays Cleo's complete long-session shape without starving health or losing
       port: 0,
       dbPath: join(tempDir, "captured-session.db"),
       turnTimeoutSeconds: 0,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: hermes.url,
         tokenEnv: "CAPTURED_DASHBOARD_TOKEN",
         profiles: { sage: { tokenEnv: "CAPTURED_ATTACH_TOKEN", name: "Sage" } },
-      },
+      }],
     }, { traceLog: () => undefined });
     const pair = await fetch(`${gateway.url}/pair`, {
       method: "POST",

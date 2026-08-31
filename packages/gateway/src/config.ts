@@ -129,34 +129,27 @@ const GatewayConfigSchema = Type.Object({
    *  gateway. Presence is a deployment posture, not merely display text: the listener must remain
    *  on exact loopback so the public proxy is the only network path into the plaintext origin. */
   publicUrl: Type.Optional(Type.String({ minLength: 1 })),
-  /** Legacy single-endpoint shape. Its app-facing profile ids remain bare for compatibility. */
-  hermes: Type.Optional(HermesBridgeConfigSchema),
-  /** Federated shape. Profile ids are exposed as `<endpoint-id>:<profile-id>`. */
-  hermesEndpoints: Type.Optional(Type.Array(HermesEndpointConfigSchema, { minItems: 1, maxItems: 32 })),
+  /** Hermes runtimes. Profile ids are bare for one endpoint and namespaced for multiple. */
+  hermesEndpoints: Type.Array(HermesEndpointConfigSchema, { minItems: 1, maxItems: 32 }),
   tls: Type.Optional(TlsConfigSchema),
 });
-type ParsedGatewayConfig = Static<typeof GatewayConfigSchema>;
-/** Source-compatible type for existing programmatic single-endpoint hosts. Federated configs are
- * produced by `loadConfig`; callers constructing one directly should use that loader boundary. */
-export type GatewayConfig = ParsedGatewayConfig & { hermes: HermesBridgeConfig };
+export type GatewayConfig = Static<typeof GatewayConfigSchema>;
 
 export interface ResolvedHermesEndpoint {
-  id: string | undefined;
+  id: string;
   label: string | undefined;
   namespace: boolean;
   config: HermesBridgeConfig;
 }
 
 export function hermesEndpoints(config: GatewayConfig): ResolvedHermesEndpoint[] {
-  if (config.hermesEndpoints !== undefined) {
-    return config.hermesEndpoints.map(({ id, label, ...endpoint }) => ({
-      id,
-      label,
-      namespace: true,
-      config: endpoint,
-    }));
-  }
-  return config.hermes === undefined ? [] : [{ id: undefined, label: undefined, namespace: false, config: config.hermes }];
+  const namespace = config.hermesEndpoints.length > 1;
+  return config.hermesEndpoints.map(({ id, label, ...endpoint }) => ({
+    id,
+    label,
+    namespace,
+    config: endpoint,
+  }));
 }
 
 export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: string): string {
@@ -210,14 +203,8 @@ export function loadConfig(path: string): GatewayConfig {
       ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 0, ...raw }
       : raw;
   const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults) as GatewayConfig);
-  if ((config.hermes === undefined) === (config.hermesEndpoints === undefined)) {
-    throw new ContractViolation(
-      'configure exactly one of legacy "hermes" or federated "hermesEndpoints"',
-      "/hermesEndpoints",
-    );
-  }
   const endpointIds = new Set<string>();
-  for (const endpoint of config.hermesEndpoints ?? []) {
+  for (const endpoint of config.hermesEndpoints) {
     if (endpointIds.has(endpoint.id))
       throw new ContractViolation(`duplicate Hermes endpoint id "${endpoint.id}"`, "/hermesEndpoints");
     endpointIds.add(endpoint.id);
@@ -226,12 +213,12 @@ export function loadConfig(path: string): GatewayConfig {
   for (const endpoint of hermesEndpoints(config)) {
     for (const rawProfile of Object.keys(endpoint.config.profiles)) {
       const profile = publicProfileId(endpoint, rawProfile);
-    if (profile.length === 0) {
-      throw new ContractViolation("Hermes profile ids must not be blank", "/hermes/profiles");
-    }
-    if (seen.has(profile)) {
-      throw new ContractViolation(`duplicate Hermes profile id "${profile}"`, "/hermes/profiles");
-    }
+      if (profile.length === 0) {
+        throw new ContractViolation("Hermes profile ids must not be blank", "/hermesEndpoints/profiles");
+      }
+      if (seen.has(profile)) {
+        throw new ContractViolation(`duplicate Hermes profile id "${profile}"`, "/hermesEndpoints/profiles");
+      }
       seen.add(profile);
     }
   }
@@ -277,12 +264,10 @@ export function applyEnvOverrides(
   if (dbPath !== undefined && dbPath.length > 0) next.dbPath = dbPath;
   const pushRelayUrl = env["COZYGATEWAY_PUSH_RELAY_URL"];
   if (pushRelayUrl !== undefined && pushRelayUrl.length > 0) next.pushRelayUrl = pushRelayUrl;
-  // Container-friendly override for the hermes bridge's TARGET only. It never carries the
-  // credential: that still rides the env var named by hermes.tokenEnv. Ignored when no bridge is
-  // configured, so setting it cannot switch the bots surface on by accident.
+  // Container-friendly single-runtime target override. Credentials remain in the named env vars.
   const hermesUrl = env["COZYGATEWAY_HERMES_URL"];
-  if (hermesUrl !== undefined && hermesUrl.length > 0 && next.hermes !== undefined) {
-    next.hermes = { ...next.hermes, url: hermesUrl };
+  if (hermesUrl !== undefined && hermesUrl.length > 0 && next.hermesEndpoints.length === 1) {
+    next.hermesEndpoints = [{ ...next.hermesEndpoints[0]!, url: hermesUrl }];
   }
   // Gateway-native TLS, container-friendly: the paths ride the environment so a compose file can
   // mount certs and switch the listener without a config-file edit. Only PATHS -- the key material

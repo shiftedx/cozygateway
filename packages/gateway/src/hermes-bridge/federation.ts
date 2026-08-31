@@ -32,7 +32,7 @@ function summary(id: string, bot: BotSummary): BotSummary {
   return { ...bot, name, handle: name };
 }
 
-/** Gives each legacy HermesBridge an isolated roster cache while retaining the shared durable
+/** Gives each HermesBridge an isolated roster cache while retaining the shared durable
  * conversation store. This prevents one endpoint refresh from erasing another endpoint's rows. */
 export function endpointStorage(storage: Storage, endpointId: string): Storage {
   let roster: { bots: BotSummary[]; updatedAt: number | null } = { bots: [], updatedAt: null };

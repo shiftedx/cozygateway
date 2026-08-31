@@ -128,13 +128,14 @@ async function setup() {
   };
   const harnessSettings = new GatewayHarnessSettings([
     new HermesHarnessModelSettingsAdapter(
-      { id: undefined, label: undefined, namespace: false, config: hermesConfig },
+      { id: "default", label: undefined, namespace: false, config: hermesConfig },
       client,
     ),
   ], () => 1_800_000_000_000);
   const app = createApp({
     storage,
-    config: { name: "g", port: 8787, dbPath: ":memory:", turnTimeoutSeconds: 0, hermes: hermesConfig },
+    config: { name: "g", port: 8787, dbPath: ":memory:", turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...hermesConfig }] },
     bots: bridge,
     harnessSettings,
     gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 41 } },
@@ -164,91 +165,6 @@ async function setup() {
     }),
   };
 }
-
-describe("bot model provider setup", () => {
-  it("wraps Hermes' provider universe without returning stored or redacted credentials", async () => {
-    const { app, authed } = await setup();
-    expect((await app.request("/bots/scout/model-providers")).status).toBe(401);
-    const response = await authed("/bots/scout/model-providers");
-    expect(response.status).toBe(200);
-    const text = await response.text();
-    expect(text).not.toContain("****");
-    expect(JSON.parse(text)).toEqual({
-      providers: [
-        {
-          slug: "openrouter", name: "OpenRouter", authenticated: false,
-          models: ["openai/gpt-5", "anthropic/claude-sonnet-4", "google/gemini-2.5-flash"], modelCount: 3,
-          methods: [{ id: "fields", kind: "fields", label: "API key", connected: false, fields: [{
-            key: "OPENROUTER_API_KEY", label: "API key", secret: true, advanced: false,
-            isSet: false, helpUrl: "https://openrouter.ai/keys",
-          }] }],
-        },
-        {
-          slug: "openai-codex", name: "ChatGPT or Codex Subscription", authenticated: false,
-          models: [], modelCount: 0, methods: [{ id: "account", kind: "oauth", label: "Account",
-            connected: false, flow: "device_code", helpUrl: "https://chatgpt.com" }],
-        },
-        {
-          slug: "anthropic", name: "Anthropic", authenticated: false, models: [], modelCount: 0,
-          methods: [{ id: "account", kind: "oauth", label: "Account", connected: false,
-            flow: "pkce", helpUrl: "https://claude.ai" }],
-        },
-        {
-          slug: "qwen-oauth", name: "Qwen", authenticated: false, models: [], modelCount: 0,
-          methods: [{ id: "account", kind: "external", label: "Account", connected: false,
-            command: "hermes auth add qwen-oauth", helpUrl: "https://qwen.ai" }],
-        },
-      ],
-      updatedAt: 1_800_000_000_000,
-    });
-  });
-
-  it("validates field ownership, forwards a secret only to Hermes, and returns refreshed state", async () => {
-    const { authed, calls } = await setup();
-    const rejected = await authed("/bots/scout/model-providers/openrouter/fields/OTHER_KEY", {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: "nope" }),
-    });
-    expect(rejected.status).toBe(400);
-    expect(calls.some((call) => call.method === "PUT")).toBe(false);
-
-    const saved = await authed("/bots/scout/model-providers/openrouter/fields/OPENROUTER_API_KEY", {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: "sk-private-1234" }),
-    });
-    expect(saved.status).toBe(200);
-    const response = await saved.text();
-    expect(response).not.toContain("sk-private-1234");
-    expect(response).not.toContain("1234");
-    expect(JSON.parse(response).providers[0]).toMatchObject({
-      authenticated: true,
-      methods: [{ connected: true, fields: [{ isSet: true }] }],
-    });
-    expect(calls.find((call) => call.method === "PUT")?.body).toEqual({
-      key: "OPENROUTER_API_KEY", value: "sk-private-1234",
-    });
-  });
-
-  it("proxies device-code and PKCE sessions while keeping codes out of responses", async () => {
-    const { authed } = await setup();
-    const started = await authed("/bots/scout/model-providers/openai-codex/oauth", { method: "POST" });
-    expect(await started.json()).toMatchObject({
-      provider: "openai-codex", sessionId: "oauth-device", flow: "device_code", status: "pending",
-      authorizationUrl: "https://example.test/device", userCode: "ABCD-EFGH", pollIntervalMs: 2_000,
-    });
-    const polled = await authed("/bots/scout/model-providers/openai-codex/oauth/oauth-device");
-    expect(await polled.json()).toEqual({
-      provider: "openai-codex", sessionId: "oauth-device", flow: "device_code", status: "approved",
-    });
-    const pkce = await authed("/bots/scout/model-providers/anthropic/oauth", { method: "POST" });
-    expect((await pkce.json()).authorizationUrl).toBe("https://example.test/authorize");
-    const submitted = await authed("/bots/scout/model-providers/anthropic/oauth/oauth-pkce/code", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: "pasted-code" }),
-    });
-    const body = await submitted.text();
-    expect(body).not.toContain("pasted-code");
-    expect(JSON.parse(body).status).toBe("approved");
-    expect((await authed("/bots/scout/model-providers/openai-codex/oauth/oauth-device", { method: "DELETE" })).status).toBe(204);
-  });
-});
 
 describe("gateway harness model provider setup", () => {
   it("lists the official harness identity and routes a selected configuration scope", async () => {

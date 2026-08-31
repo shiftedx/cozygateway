@@ -247,7 +247,7 @@ describe("relay APNs registration invalidation", () => {
     });
     const app = createRelayApp({
       storage,
-      transports: { apns: transport },
+      transports: { "apns:development": transport },
       dailyCap: 500,
       maxRegistrations: 10_000,
       version: "test",
@@ -263,7 +263,11 @@ describe("relay APNs registration invalidation", () => {
     const registered = await app.request("/register", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ platform: "apns", token: "EXPIREDDEVICETOKEN" }),
+      body: JSON.stringify({
+        platform: "apns",
+        token: "EXPIREDDEVICETOKEN",
+        environment: "development",
+      }),
     });
     expect(registered.status).toBe(201);
     const { pushId } = (await registered.json()) as { pushId: string };
@@ -568,7 +572,6 @@ describe("apnsConfigFromEnv", () => {
         APNS_KEY_ID: "k",
         APNS_TEAM_ID: "t",
         APNS_TOPIC: "com.cozylabs.cozychat",
-        APNS_ENVIRONMENT: "production",
       },
       (p) => (p === "/keys/apns.p8" ? config.keyP8 : ""),
     );
@@ -577,7 +580,6 @@ describe("apnsConfigFromEnv", () => {
       keyId: "k",
       teamId: "t",
       topic: "com.cozylabs.cozychat",
-      environment: "production",
     });
   });
 
@@ -591,7 +593,6 @@ describe("apnsConfigFromEnv", () => {
           APNS_KEY_ID: "k",
           APNS_TEAM_ID: "t",
           APNS_TOPIC: "com.cozylabs.cozychat",
-          APNS_ENVIRONMENT: "production",
         },
         () => "not a pem at all",
       ),
@@ -606,7 +607,6 @@ describe("apnsConfigFromEnv", () => {
           APNS_KEY_ID: "k",
           APNS_TEAM_ID: "t",
           APNS_TOPIC: "com.cozylabs.cozychat",
-          APNS_ENVIRONMENT: "production",
         },
         () => "-----BEGIN PRIVATE KEY-----\ngarbage\n-----END PRIVATE KEY-----\n",
       ),

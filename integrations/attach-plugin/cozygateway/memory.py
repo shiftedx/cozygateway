@@ -228,18 +228,11 @@ class CuratedAdapter:
 
 class HolographicAdapter:
     source = "holographic"
-    #: The key the provider actually reads its settings from.  A profile that still
-    #: keeps them under the pre-rename key is reported as degraded rather than
-    #: silently run on defaults (which include a different default trust score).
     CONFIG_KEY = "hermes-memory-store"
-    LEGACY_CONFIG_KEY = "holographic"
     def _config(self) -> Dict[str, Any]:
         from hermes_cli.config import load_config_readonly
         config = load_config_readonly()
         return config if isinstance(config, dict) else {}
-    def _legacy_only(self, config: Dict[str, Any]) -> bool:
-        plugins = (config.get("plugins", {}) or {}) if isinstance(config.get("plugins", {}), dict) else {}
-        return not (plugins.get(self.CONFIG_KEY) or {}) and bool(plugins.get(self.LEGACY_CONFIG_KEY) or {})
     def _provider(self):
         from plugins.memory.holographic import HolographicMemoryProvider
         config = self._config(); memory = config.get("memory", {}) if isinstance(config, dict) else {}
@@ -250,10 +243,6 @@ class HolographicAdapter:
     def describe(self) -> Dict[str, Any]:
         try:
             self._provider()
-            if self._legacy_only(self._config()):
-                return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "degraded",
-                        "detail": f"Holographic settings are under plugins.{self.LEGACY_CONFIG_KEY}, which this provider does not read; move them to plugins.{self.CONFIG_KEY} or writes use built-in defaults",
-                        "capabilities": _caps(create=True, edit=True, delete=True, relationships=True)}
             return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "available", "capabilities": _caps(create=True, edit=True, delete=True, relationships=True)}
         except MemoryNotFound: return {"id": self.source, "displayName": "Holographic", "kind": "holographic", "status": "unavailable", "detail": "Holographic is not the active provider", "capabilities": _caps()}
         except Exception as error:

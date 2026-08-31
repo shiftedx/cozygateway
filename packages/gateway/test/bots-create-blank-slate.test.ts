@@ -25,7 +25,7 @@ const config: GatewayConfig = {
   port: 8787,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  hermes: testHermes(),
+  hermesEndpoints: [{ id: "default", ...testHermes() }],
 };
 
 const NOW = 1_800_000_000_000;
@@ -82,7 +82,7 @@ async function setup(
     /** The config the new profile already carries when the seed reads it. */
     profileConfig?: Record<string, unknown>;
     seedBlankSlateBots?: boolean;
-    /** The skills floor an operator configured, i.e. `hermes.blankSlateSkillsOn`. */
+    /** The skills floor an operator configured on the Hermes endpoint. */
     blankSlateSkillsOn?: readonly string[];
     /** The skill rows `profiles.describe` answers with. Defaults to none, which is the shape the
      *  toolset-era tests were written against. */

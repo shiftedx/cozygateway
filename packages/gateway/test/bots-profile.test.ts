@@ -31,7 +31,7 @@ const config: GatewayConfig = {
   port: 8787,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  hermes: testHermes(),
+  hermesEndpoints: [{ id: "default", ...testHermes() }],
 };
 
 const NOW = 1_800_000_000_000;

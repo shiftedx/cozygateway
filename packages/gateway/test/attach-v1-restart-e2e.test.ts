@@ -17,11 +17,11 @@ it("attach-v1 completes exactly once after a gateway restart mid-reply", async (
   const dbPath = join(mkdtempSync(join(tmpdir(), "attach-restart-")), "gateway.sqlite");
   const config = {
     name: "restart", port: 0, dbPath, turnTimeoutSeconds: 0,
-    hermes: {
+    hermesEndpoints: [{ id: "default",
       url: "ws://127.0.0.1:1/api/ws",
       tokenEnv: controlEnv,
       profiles: { sage: { tokenEnv, name: "Sage" } },
-    },
+    }],
   };
   let gateway: RunningGateway | undefined;
   const sockets: WebSocket[] = [];

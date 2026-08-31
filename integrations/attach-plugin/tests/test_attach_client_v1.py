@@ -353,7 +353,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "mobile_media", "mobile_notifications",
             "memory_management", "delivery_receipts", "delegation", "thinking",
-            "mobile_failure_details", "desktop_session_resume", "desktop_session_sync",
+            "desktop_session_resume", "desktop_session_sync",
         })
 
     def test_hello_ack_budget_is_not_a_one_second_race(self):
@@ -620,9 +620,9 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await request, {"status": "ok", "result": GATEWAY_STATUS})
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
 
-    async def test_mobile_failure_details_are_closed_and_preserved(self):
+    async def test_mobile_failures_are_closed_and_preserved(self):
         await self.client.connect()
-        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_failure_details"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
         request = __import__("asyncio").create_task(self.client.request_device_status("thread", "turn", "Report phone readiness"))
         await __import__("asyncio").sleep(0)
         request_id = self.socket.sent[-1]["requestId"]

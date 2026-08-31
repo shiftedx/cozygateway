@@ -88,7 +88,7 @@ URL. Unrestricted mode uses `fetch`, unchanged. Restricted mode uses `node:http`
 before the relay connects to it.
 
 `apns` ships when the relay is configured with an APNs key (`APNS_KEY_P8_PATH`,
-`APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`, `APNS_ENVIRONMENT`, all five together or
+`APNS_KEY_ID`, `APNS_TEAM_ID`, and `APNS_TOPIC`, all four together or
 none). Delivery is an alert with `mutable-content: 1` carrying the opaque ciphertext
 under the top-level custom key `c`. Registering `platform: "apns"` on a relay with no
 APNs key returns 501 `unsupported_platform`. An APNs HTTP 410 response terminally

@@ -40,10 +40,10 @@ it("routes status through its authenticated origin in background while keeping l
     });
     gateway = await startGateway({
       name: "mobile-node-e2e", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: hermes.url, tokenEnv: "MOBILE_E2E_DASHBOARD_TOKEN",
         profiles: { sage: { tokenEnv: "MOBILE_E2E_SAGE_TOKEN", name: "Sage" } },
-      },
+      }],
     });
     const tokenA = await pair(gateway);
     const tokenB = await pair(gateway);
@@ -238,10 +238,10 @@ it("returns an uploaded camera artifact to the requesting attach peer", async ()
     });
     gateway = await startGateway({
       name: "mobile-media-e2e", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
-      hermes: {
+      hermesEndpoints: [{ id: "default",
         url: hermes.url, tokenEnv: "MOBILE_MEDIA_E2E_DASHBOARD_TOKEN",
         profiles: { sage: { tokenEnv: "MOBILE_MEDIA_E2E_SAGE_TOKEN", name: "Sage" } },
-      },
+      }],
     });
     const deviceToken = await pair(gateway);
     const app = await appSocket(gateway.url, deviceToken, sockets);

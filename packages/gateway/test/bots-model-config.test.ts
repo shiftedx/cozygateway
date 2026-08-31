@@ -89,7 +89,7 @@ async function setup() {
       port: 8787,
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
-      hermes: testHermes(),
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
     },
     bots: bridge,
     gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 18 } },

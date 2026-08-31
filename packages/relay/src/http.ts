@@ -135,12 +135,9 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
   app.post("/register", async (c) => {
     const parsed = parseBody(RegisterRequestSchema, await readBody(c));
     if (parsed === undefined) return c.json(relayError("invalid_request", "malformed register body"), 400);
-    if (parsed.platform !== "apns" && parsed.platform !== "apns-liveactivity" && parsed.environment !== undefined) {
-      return c.json(relayError("invalid_request", "environment is only valid for apns registrations"), 400);
-    }
-    const transportKey = (parsed.platform === "apns" || parsed.platform === "apns-liveactivity") && parsed.environment !== undefined
-      ? `${parsed.platform}:${parsed.environment}`
-      : parsed.platform;
+    const transportKey = parsed.platform === "webhook"
+      ? parsed.platform
+      : `${parsed.platform}:${parsed.environment}`;
     if (deps.transports[transportKey] === undefined) {
       return c.json(
         relayError("unsupported_platform", `platform "${parsed.platform}" is not available on this relay yet`),

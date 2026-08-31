@@ -7,11 +7,12 @@ entry:
 
 ```json
 {
-  "hermes": {
+  "hermesEndpoints": [{
+    "id": "default",
     "profiles": {
       "ops": { "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_OPS" }
     }
-  }
+  }]
 }
 ```
 
@@ -119,11 +120,11 @@ installed skill on. An empty catalog is treated the same way: upstream drops the
 skills section wholesale on a bad read, so "no skills reported" is not proof a
 profile has none.
 
-Keep specific skills on with `hermes.blankSlateSkillsOn` (a list of skill names,
+Keep specific skills on with `hermesEndpoints[].blankSlateSkillsOn` (a list of skill names,
 default `[]`):
 
 ```json
-{ "hermes": { "blankSlateSkillsOn": ["tdd", "brainstorming"] } }
+{ "hermesEndpoints": [{ "id": "default", "blankSlateSkillsOn": ["tdd", "brainstorming"], "url": "ws://127.0.0.1:9119/api/ws", "profiles": { "ops": { "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_OPS" } } }] }
 ```
 
 Default empty on purpose. Autonomy rides on the toolset floor, not on playbooks:
@@ -166,7 +167,7 @@ that offers the picker should gate it on `com.cozylabs.bots >= 33`.
 ### Turning it off
 
 ```json
-{ "hermes": { "seedBlankSlateBots": false } }
+{ "hermesEndpoints": [{ "id": "default", "seedBlankSlateBots": false, "url": "ws://127.0.0.1:9119/api/ws", "profiles": { "ops": { "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_OPS" } } }] }
 ```
 
 Default `true`. With it off, a created profile keeps Hermes' broad platform

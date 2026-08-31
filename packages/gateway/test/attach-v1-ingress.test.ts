@@ -160,28 +160,16 @@ describe("attach-v1 ingress", () => {
     peer.ws.close();
   });
 
-  it("negotiates closed mobile failure details while preserving the legacy result shape", async () => {
-    const legacy = await dial(undefined, ["mobile_node"]);
+  it("sends only closed mobile failure details", async () => {
+    const detailed = await dial(undefined, ["mobile_node"]);
     expect(ingress.sendMobileResult("sage", {
-      requestId: "legacy-failure", status: "device_unavailable",
+      requestId: "detailed-failure", status: "device_unavailable",
       stage: "dispatch", reason: "frame_send_failed",
-    })).toBe(true);
-    await until(() => legacy.frames.some((frame) => frame.kind === "mobile_result"));
-    expect(legacy.frames.find((frame) => frame.kind === "mobile_result")).toEqual({
-      kind: "mobile_result", requestId: "legacy-failure", status: "device_unavailable",
-    });
-    legacy.ws.close();
-    await once(legacy.ws, "close");
-
-    const detailed = await dial(undefined, ["mobile_node", "mobile_failure_details"]);
-    expect(ingress.sendMobileResult("sage", {
-      requestId: "detailed-failure", status: "expired",
-      stage: "response", reason: "request_expired_unanswered",
     })).toBe(true);
     await until(() => detailed.frames.some((frame) => frame.kind === "mobile_result"));
     expect(detailed.frames.find((frame) => frame.kind === "mobile_result")).toEqual({
-      kind: "mobile_result", requestId: "detailed-failure", status: "expired",
-      stage: "response", reason: "request_expired_unanswered",
+      kind: "mobile_result", requestId: "detailed-failure", status: "device_unavailable",
+      stage: "dispatch", reason: "frame_send_failed",
     });
     expect(ingress.sendMobileResult("sage", {
       requestId: "unknown", status: "policy_blocked", stage: "payload-secret", reason: "token-secret",

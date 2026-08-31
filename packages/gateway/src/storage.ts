@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (thread_id, seq)
 ) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id
+  ON messages (thread_id, external_id) WHERE external_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS push_registrations (
   device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
   push_id TEXT NOT NULL,
@@ -111,6 +113,8 @@ CREATE TABLE IF NOT EXISTS live_activity_registrations (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (device_id, activity_id)
 ) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS live_activity_device_conversation
+  ON live_activity_registrations (device_id, conversation_id);
 CREATE TABLE IF NOT EXISTS live_activity_relay_deletion_outbox (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   push_id TEXT NOT NULL UNIQUE,
@@ -3289,123 +3293,6 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
-  // The first outbox build keyed only by push id. Rebuild once with an AUTOINCREMENT sequence so
-  // a drain can capture a stable high-water snapshot that new enqueue traffic can never enter.
-  const outboxColumns = db
-    .prepare("SELECT name FROM pragma_table_info('live_activity_relay_deletion_outbox')")
-    .all() as Array<{ name: string }>;
-  if (!outboxColumns.some((column) => column.name === "sequence")) {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      db.exec(`
-        ALTER TABLE live_activity_relay_deletion_outbox
-          RENAME TO live_activity_relay_deletion_outbox_v1;
-        CREATE TABLE live_activity_relay_deletion_outbox (
-          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-          push_id TEXT NOT NULL UNIQUE,
-          queued_at INTEGER NOT NULL
-        ) STRICT;
-        INSERT INTO live_activity_relay_deletion_outbox (push_id, queued_at)
-        SELECT push_id, queued_at FROM live_activity_relay_deletion_outbox_v1
-        ORDER BY queued_at, push_id;
-        DROP TABLE live_activity_relay_deletion_outbox_v1;
-      `);
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-  // Older builds keyed activities only by ActivityKit id, so every new run could leave another
-  // row for the same device conversation. Retire all but the newest row durably before installing
-  // the invariant that prevents that fan-out shape from returning.
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    db.prepare(`
-      WITH ranked AS (
-        SELECT rowid AS registrationRowId, push_id AS pushId,
-          ROW_NUMBER() OVER (
-            PARTITION BY device_id, conversation_id
-            ORDER BY created_at DESC, rowid DESC
-          ) AS recency
-        FROM live_activity_registrations
-      )
-      INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
-      SELECT pushId, ? FROM ranked WHERE recency > 1
-    `).run(Date.now());
-    db.exec(`
-      DELETE FROM live_activity_registrations WHERE rowid IN (
-        SELECT registrationRowId FROM (
-          SELECT rowid AS registrationRowId,
-            ROW_NUMBER() OVER (
-              PARTITION BY device_id, conversation_id
-              ORDER BY created_at DESC, rowid DESC
-            ) AS recency
-          FROM live_activity_registrations
-        ) WHERE recency > 1
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS live_activity_device_conversation
-        ON live_activity_registrations (device_id, conversation_id);
-    `);
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-  // Capability 28 distinguishes a submitted device decision from Hermes' later terminal event.
-  // Existing durable rows remain pending with all request fields null after this additive migration.
-  const interactionColumns = db
-    .prepare("SELECT name FROM pragma_table_info('bot_native_interactions')")
-    .all() as Array<{ name: string }>;
-  for (const [name, definition] of [
-    ["resolution_command_id", "TEXT"],
-    ["resolution_requested_at", "INTEGER"],
-    ["requested_decision", "TEXT"],
-    ["requested_option_id", "TEXT"],
-  ] as const) {
-    if (!interactionColumns.some((column) => column.name === name))
-      db.exec(`ALTER TABLE bot_native_interactions ADD COLUMN ${name} ${definition}`);
-  }
-  // Capability 31 marks gateway-authored non-conversation rows (`delivery.failed`). Existing rows
-  // stay unmarked, which is exactly what they are.
-  const messageColumns = db
-    .prepare("SELECT name FROM pragma_table_info('bot_native_messages')")
-    .all() as Array<{ name: string }>;
-  if (!messageColumns.some((column) => column.name === "marker"))
-    db.exec("ALTER TABLE bot_native_messages ADD COLUMN marker TEXT");
-  const streamColumns = db
-    .prepare("SELECT name FROM pragma_table_info('attach_streams')")
-    .all() as Array<{ name: string }>;
-  for (const [name, definition] of [
-    ["plugin_event_outbox_depth", "INTEGER"],
-    ["plugin_oldest_event_age_ms", "INTEGER"],
-    ["plugin_event_ack_cursor", "INTEGER"],
-    ["plugin_last_ack_progress_at", "INTEGER"],
-    ["plugin_command_inbox_depth", "INTEGER"],
-  ] as const) {
-    if (!streamColumns.some((column) => column.name === name))
-      db.exec(`ALTER TABLE attach_streams ADD COLUMN ${name} ${definition}`);
-  }
-  // Capability 34 additive alias: the canonical Hermes delegation id for a batch, learned from
-  // the parent delegate_task result. Existing rows stay unaliased, which is what they are.
-  const delegationColumns = db
-    .prepare("SELECT name FROM pragma_table_info('bot_chat_delegations')")
-    .all() as Array<{ name: string }>;
-  if (!delegationColumns.some((column) => column.name === "alias_id"))
-    db.exec("ALTER TABLE bot_chat_delegations ADD COLUMN alias_id TEXT");
-  // v0.1 stored only a selected native-chat pointer and transcript rows. v0.2 split sessions
-  // into their own table; recreate every existing session without changing populated new rows.
-  db.exec(`
-    WITH legacy_sessions AS (
-      SELECT bot, session_id, updated_at AS created_at, updated_at, active_turn_id FROM bot_native_chats
-      UNION ALL
-      SELECT bot, session_id, COALESCE(MIN(at), 0), COALESCE(MAX(at), 0), NULL
-      FROM bot_native_messages GROUP BY bot, session_id
-    )
-    INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id)
-    SELECT bot, session_id, MIN(created_at), MAX(updated_at), MAX(active_turn_id)
-    FROM legacy_sessions GROUP BY bot, session_id
-  `);
   // A process can disappear after a tool starts but before its terminal event is persisted. Only
   // the selected active turn can still receive that event after restart; close every older step so
   // history never presents stale work as currently running.
@@ -3434,58 +3321,5 @@ export function openStorage(dbPath: string): Storage {
         AND chat.active_turn_id = bot_chat_delegations.turn_id
     )
   `).run(Date.now());
-  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id ON messages (thread_id, external_id) WHERE external_id IS NOT NULL");
-  // Issue #193: `applied_at` is the assembly-time replay watermark -- every accepted inbox row
-  // still NULL at boot is re-applied through the normal projection path. Rows from before this
-  // build predate that contract: some were applied by builds whose bookkeeping then failed or
-  // dead-lettered, and replaying weeks of stale conversation into live chats on the first boot
-  // of this build would be a worse failure than the (already hand-repaired) ghosts it might
-  // heal. The honest watermark is therefore "replay begins with events journaled after this
-  // migration": every pre-existing unapplied row is stamped applied at its own received_at, so
-  // the first boot replays nothing historical.
-  let { user_version: schemaVersion } = db
-    .prepare("PRAGMA user_version")
-    .get() as { user_version: number };
-  if (schemaVersion < 1) {
-    db.exec("UPDATE attach_event_inbox SET applied_at = received_at WHERE applied_at IS NULL");
-    db.exec("PRAGMA user_version = 1");
-    schemaVersion = 1;
-  }
-  // Capability 39 originally shipped with receipt constraints for status and location only.
-  // Expanded phone commands reached the broker later, so SQLite rejected every successful camera,
-  // picker, and notification receipt. Rebuild the table transactionally because SQLite cannot
-  // alter a CHECK constraint in place; the old table's narrower constraints guarantee every copied
-  // row is valid under the expanded domain.
-  if (schemaVersion < 2) {
-    const receiptTable = db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bot_mobile_receipts'")
-      .get() as { sql: string };
-    if (!receiptTable.sql.includes("'notification.present'")) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        db.exec(`
-          DROP INDEX IF EXISTS bot_mobile_receipts_session;
-          ALTER TABLE bot_mobile_receipts RENAME TO bot_mobile_receipts_v1;
-          CREATE TABLE bot_mobile_receipts (
-${BOT_MOBILE_RECEIPT_COLUMNS}
-          ) STRICT, WITHOUT ROWID;
-          INSERT INTO bot_mobile_receipts
-            (request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at)
-          SELECT request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at
-          FROM bot_mobile_receipts_v1;
-          DROP TABLE bot_mobile_receipts_v1;
-          CREATE INDEX bot_mobile_receipts_session
-            ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
-          PRAGMA user_version = 2;
-          COMMIT;
-        `);
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
-    } else {
-      db.exec("PRAGMA user_version = 2");
-    }
-  }
   return new Storage(db);
 }

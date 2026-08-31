@@ -7,7 +7,7 @@
 #   purges its own tables. Three things are deliberately outside that reach,
 #   and they are exactly what the route's `residue` list names:
 #
-#     1. The box gateway config entry hermes.profiles.<p>. Still there, the
+#     1. The box gateway endpoint profile entry. Still there, the
 #        next gateway boot rebuilds an agent row for a bot that no longer
 #        exists, and startup FAILS CLOSED if its token env var is missing.
 #     2. The box .env line COZYGATEWAY_ATTACH_TOKEN_<P>. Dead as a credential
@@ -105,8 +105,8 @@ try:
         config = json.load(handle)
 except Exception:
     sys.exit(0)
-hermes = config.get("hermes") or {}
-profiles = hermes.get("profiles") or {}
+endpoints = config.get("hermesEndpoints") or []
+profiles = endpoints[0].get("profiles", {}) if len(endpoints) == 1 else {}
 if isinstance(profiles, dict):
     for name in profiles:
         print(name)
@@ -195,7 +195,7 @@ remove_profile_dir() {
   say "  profile dir removed: $dir"
 }
 
-# Deletes hermes.profiles.<name> if present. A json edit rather than a text
+# Deletes the profile from the configured Hermes endpoint. A json edit rather than a text
 # removal for the same reason provision-bot.sh inserted it with one: the file
 # is a single object and a sed would have to guess at formatting. Prints
 # "removed" or "already absent" so the caller can tell whether the attach count
@@ -214,7 +214,10 @@ import json, os, sys
 path, profile = sys.argv[1], sys.argv[2]
 with open(path) as fh:
     data = json.load(fh)
-profiles = data.get("hermes", {}).get("profiles", {})
+endpoints = data.get("hermesEndpoints") or []
+if len(endpoints) != 1:
+    raise SystemExit("deprovision-bot requires exactly one Hermes endpoint")
+profiles = endpoints[0].get("profiles", {})
 if profile not in profiles:
     print("already absent")
     sys.exit(0)
@@ -252,7 +255,7 @@ recreate_box_gateway() {
   say "  box gateway recreated"
 }
 
-# attach.configured is built at BOOT from hermes.profiles, so it is the one
+# attach.configured is built at BOOT from the endpoint profiles, so it is the one
 # number that proves the box no longer holds an identity for this bot.
 attach_configured() {
   curl -fsS --max-time 5 "$GATEWAY_URL/ready" 2>/dev/null | python3 -c \

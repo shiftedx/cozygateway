@@ -269,13 +269,13 @@ ensure_box_env_line() {
   say "  box env $key written"
 }
 
-# Inserts hermes.profiles.<name> = {tokenEnv} if absent. A json edit rather
+# Inserts the profile into the configured Hermes endpoint. A json edit rather
 # than a text append because the file is a single object and a sed would have
 # to guess at formatting; python rewrites it whole and stays valid either way.
 ensure_box_config_entry() {
   local profile="$1" env_name="$2"
   if [ "$DRY_RUN" = 1 ]; then
-    say "  DRY  ensure hermes.profiles.$profile.tokenEnv=$env_name in $BOX_CONFIG_REL"
+    say "  DRY  ensure hermesEndpoints[0].profiles.$profile.tokenEnv=$env_name in $BOX_CONFIG_REL"
     return 0
   fi
   local out
@@ -285,7 +285,10 @@ import json, sys
 path, profile, env_name = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path) as fh:
     data = json.load(fh)
-profiles = data.setdefault("hermes", {}).setdefault("profiles", {})
+endpoints = data.get("hermesEndpoints")
+if not isinstance(endpoints, list) or len(endpoints) != 1:
+    raise SystemExit("provision-bot requires exactly one Hermes endpoint")
+profiles = endpoints[0].setdefault("profiles", {})
 if profiles.get(profile, {}).get("tokenEnv") == env_name:
     print("already present")
     sys.exit(0)

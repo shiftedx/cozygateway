@@ -69,10 +69,10 @@ beforeEach(async () => {
   process.env.PUSH_E2E_ATTACH_TOKEN = ATTACH_TOKEN;
   gateway = await startGateway({
     name: "push-e2e", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0,
-    hermes: {
+    hermesEndpoints: [{ id: "default",
       url: "ws://127.0.0.1:1/api/ws", tokenEnv: "PUSH_E2E_CONTROL_TOKEN",
       profiles: { echo: { tokenEnv: "PUSH_E2E_ATTACH_TOKEN", name: "Echo" } },
-    },
+    }],
   });
   plugin = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: `Bearer ${ATTACH_TOKEN}` } });
   await once(plugin, "open");

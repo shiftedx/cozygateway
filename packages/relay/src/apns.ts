@@ -8,12 +8,15 @@ import type { PushDeliveryOptions, Transport } from "./transports.ts";
 const DEFAULT_ALERT = { title: "CozyChat", body: "New message" } as const;
 
 /** APNs provider config. The .p8 key is PEM (PKCS8) contents; env plumbing reads it from a file. */
-export interface ApnsConfig {
+export interface ApnsCredentials {
   keyP8: string;
   keyId: string;
   teamId: string;
   /** The app bundle id, e.g. com.cozylabs.cozychat. */
   topic: string;
+}
+
+export interface ApnsConfig extends ApnsCredentials {
   environment: "development" | "production";
 }
 
@@ -195,25 +198,21 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
 }
 
 /** Read APNs config from the environment, or undefined when unconfigured (relay runs webhook-only).
- *  All five vars are required together; a partial set is a startup error. `readFile` is injected so
+ *  All four vars are required together; a partial set is a startup error. `readFile` is injected so
  *  the .p8 file read stays testable. */
 export function apnsConfigFromEnv(
   env: Record<string, string | undefined>,
   readFile: (path: string) => string,
-): ApnsConfig | undefined {
+): ApnsCredentials | undefined {
   const p8Path = env["APNS_KEY_P8_PATH"];
   const keyId = env["APNS_KEY_ID"];
   const teamId = env["APNS_TEAM_ID"];
   const topic = env["APNS_TOPIC"];
-  const environment = env["APNS_ENVIRONMENT"];
-  if (!p8Path && !keyId && !teamId && !topic && !environment) return undefined;
-  if (!p8Path || !keyId || !teamId || !topic || !environment) {
+  if (!p8Path && !keyId && !teamId && !topic) return undefined;
+  if (!p8Path || !keyId || !teamId || !topic) {
     throw new Error(
-      "APNs config incomplete: set APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC, and APNS_ENVIRONMENT together (or none)",
+      "APNs config incomplete: set APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, and APNS_TOPIC together (or none)",
     );
-  }
-  if (environment !== "development" && environment !== "production") {
-    throw new Error(`invalid APNS_ENVIRONMENT "${environment}" (expected development or production)`);
   }
   const keyP8 = readFile(p8Path);
   // Startup probe (secure-by-default operator posture). Without it a present-but-malformed .p8
@@ -227,5 +226,5 @@ export function apnsConfigFromEnv(
       `APNS_KEY_P8_PATH ${p8Path} is not a usable PKCS8 private key: ${toError(err).message}`,
     );
   }
-  return { keyP8, keyId, teamId, topic, environment };
+  return { keyP8, keyId, teamId, topic };
 }

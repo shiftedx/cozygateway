@@ -11,7 +11,7 @@ const config: GatewayConfig = {
   port: 0,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  hermes: testHermes(),
+  hermesEndpoints: [{ id: "default", ...testHermes() }],
 };
 
 const receiptToken = "receipt-secret";

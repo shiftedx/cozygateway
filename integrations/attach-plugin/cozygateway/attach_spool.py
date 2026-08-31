@@ -160,25 +160,11 @@ class AttachSpool:
         self._db = sqlite3.connect(self._path, timeout=30)
         self._db.execute("PRAGMA busy_timeout=30000")
         self._db.executescript(_SCHEMA)
-        self._migrate_health_columns()
         with self._db:
             self._db.execute(
                 "INSERT OR IGNORE INTO state (id, instance_id, next_event_sequence, command_cursor, event_cursor) VALUES (1, ?, 1, 0, 0)",
                 (str(uuid.uuid4()),),
             )
-
-    def _migrate_health_columns(self) -> None:
-        """Add bounded health accounting to existing durable spools without discarding work."""
-        state_columns = {str(row[1]) for row in self._db.execute("PRAGMA table_info(state)")}
-        event_columns = {str(row[1]) for row in self._db.execute("PRAGMA table_info(event_outbox)")}
-        with self._db:
-            if "last_event_ack_progress_at" not in state_columns:
-                self._db.execute("ALTER TABLE state ADD COLUMN last_event_ack_progress_at INTEGER")
-            if "created_at" not in event_columns:
-                self._db.execute("ALTER TABLE event_outbox ADD COLUMN created_at INTEGER")
-                # A pre-health spool has no per-event creation time. Timestamp the migration rather
-                # than exposing any payload data or refusing to resume existing durable work.
-                self._db.execute("UPDATE event_outbox SET created_at = ? WHERE created_at IS NULL", (self._now_ms(),))
 
     def acquire_transport_lease(self) -> bool:
         """Become the sole websocket owner for this spool without touching its durable rows."""

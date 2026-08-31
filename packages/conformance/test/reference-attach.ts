@@ -139,7 +139,8 @@ export class ReferenceAttachGateway {
       dbPath: ":memory:",
       turnTimeoutSeconds: 0,
       capabilities: this.#withHooks ? { "com.cozylabs.test": 1 } : undefined,
-      hermes: { url: this.#hermes.url, tokenEnv: "CONFORMANCE_CONTROL_TOKEN", profiles },
+      hermesEndpoints: [{ id: "default", url: this.#hermes.url,
+        tokenEnv: "CONFORMANCE_CONTROL_TOKEN", profiles }],
     }, { notifierLog: this.#notifierLog, pairingAdmission: this.#pairingAdmission });
     this.#peers = [
       new AttachPeer(() => this.requireGateway(), "echo-secret", "echo"),

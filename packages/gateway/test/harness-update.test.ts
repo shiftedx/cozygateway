@@ -27,11 +27,11 @@ const CONFIG: GatewayConfig = {
   port: 0,
   dbPath: ":memory:",
   turnTimeoutSeconds: 0,
-  hermes: {
+  hermesEndpoints: [{ id: "default",
     url: "ws://127.0.0.1:1/api/ws",
     tokenEnv: "TEST_HERMES_CONTROL_TOKEN",
     profiles: { sage: { tokenEnv: "TEST_ATTACH_TOKEN" } },
-  },
+  }],
 };
 
 type DashboardInit = {

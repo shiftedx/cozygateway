@@ -74,7 +74,7 @@ HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts",
-    "delegation", "thinking", "mobile_failure_details", "desktop_session_sync",
+    "delegation", "thinking", "desktop_session_sync",
     "desktop_session_resume",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
@@ -1125,7 +1125,7 @@ class AttachV1Client:
                 future.set_result({"status": "device_unavailable"})
                 return
             result["result"] = payload
-        elif "mobile_failure_details" in self._capabilities:
+        else:
             stage, reason = frame.get("stage"), frame.get("reason")
             if stage in MOBILE_FAILURE_STAGES and reason in MOBILE_FAILURE_REASONS:
                 result["stage"], result["reason"] = stage, reason
