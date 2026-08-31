@@ -50,7 +50,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -516,6 +516,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     const connection = this.#current.get(agentId);
     if (connection?.hello !== true) return "not_attached";
     if (!connection.capabilities.has("memory_management")) return "capability_not_negotiated";
+    if (input.operation === "setup" && !connection.capabilities.has("memory_setup")) return "capability_not_negotiated";
     return this.#send(connection, input) ? "sent" : "not_attached";
   }
 

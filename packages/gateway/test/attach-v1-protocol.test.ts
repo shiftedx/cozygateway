@@ -5,10 +5,22 @@ import {
   AttachV1ClientFrameSchema,
   AttachV1EventFrameSchema,
   AttachV1HelloSchema,
+  AttachV1MemoryRequestSchema,
   AttachV1ServerFrameSchema,
 } from "../src/adapters/attach/protocol-v1.ts";
 
 describe("attach-v1 protocol", () => {
+  it("keeps memory setup exact on the management lane", () => {
+    const request = {
+      kind: "memory_request", requestId: "setup-1", operation: "setup",
+      input: { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false },
+    };
+    expect(check(AttachV1MemoryRequestSchema, request)).toBe(true);
+    expect(check(AttachV1MemoryRequestSchema, { ...request, input: { ...request.input, provider: "external" } })).toBe(false);
+    expect(check(AttachV1MemoryRequestSchema, { ...request, input: { memoryEnabled: false, userProfileEnabled: false, holographicEnabled: false } })).toBe(false);
+    expect(check(AttachV1MemoryRequestSchema, { ...request, input: { memoryEnabled: true, userProfileEnabled: false } })).toBe(false);
+  });
+
   it("negotiates capabilities, cursor and backpressure limits with one hello shape", () => {
     expect(check(AttachV1HelloSchema, {
       kind: "hello",
@@ -139,20 +151,35 @@ describe("attach-v1 protocol", () => {
         batchId: "call_d3R3sBldNWhDI0Kqqqk3P2Xi", childId: "20260825_195359_003db6",
         index: 0, count: 1, status: "succeeded", lastActiveAt: 5,
         aliasId: "deleg_c6eb9310",
-        costUsd: 0.123456,
-        schemaValid: true,
       },
     };
     expect(check(AttachV1EventFrameSchema, frame)).toBe(true);
     // Alias-free events stay exactly as they were: an older plugin never sends the field.
     const { aliasId: _omitted, ...bare } = frame.event;
     expect(check(AttachV1EventFrameSchema, { ...frame, event: bare })).toBe(true);
-    expect(check(AttachV1EventFrameSchema, {
-      ...frame, event: { ...frame.event, costUsd: -1 },
-    })).toBe(false);
-    expect(check(AttachV1EventFrameSchema, {
-      ...frame, event: { ...frame.event, schemaValid: "true" },
-    })).toBe(false);
+  });
+
+  it("admits only bounded structured delegation result enrichment", () => {
+    const event = (body: Record<string, unknown>) => ({
+      kind: "event", sequence: 1, eventId: "deleg-enriched",
+      event: {
+        kind: "delegation", threadId: "thread", turnId: "turn", batchId: "batch",
+        childId: "child", index: 0, count: 1, status: "succeeded", lastActiveAt: 5,
+        ...body,
+      },
+    });
+    expect(check(AttachV1EventFrameSchema, event({
+      costUsd: 0.125, costStatus: "reported",
+      schemaValidation: { valid: false, retries: 1 }, durationMs: 2345,
+    }))).toBe(true);
+    expect(check(AttachV1EventFrameSchema, event({}))).toBe(true);
+    expect(check(AttachV1EventFrameSchema, event({
+      schemaValidation: { valid: false, retries: 1, schema_errors: ["/private/path"] },
+    }))).toBe(false);
+    for (const invalid of [
+      { costUsd: -1 }, { costStatus: "exact" },
+      { schemaValidation: { valid: false, retries: 2 } }, { durationMs: -1 },
+    ]) expect(check(AttachV1EventFrameSchema, event(invalid))).toBe(false);
   });
 
   it("carries a bounded latest-only thinking preview and refuses anything past its bounds", () => {

@@ -1498,6 +1498,21 @@ export class NativeBotDataPlane {
     event: Extract<AttachV1EventFrame["event"], { kind: "delegation" }>,
     live: boolean,
   ): boolean {
+    // Reconstruct the closed public shape even for an internal caller that bypassed
+    // attach admission. Hermes schema_errors can contain validation prose and host
+    // paths; no sibling of valid/retries is ever retained or projected.
+    const incomingSchemaValidation = event.schemaValidation !== undefined &&
+      typeof event.schemaValidation.valid === "boolean" &&
+      (event.schemaValidation.retries === undefined ||
+        (Number.isInteger(event.schemaValidation.retries) &&
+          event.schemaValidation.retries >= 0 && event.schemaValidation.retries <= 1))
+      ? {
+          valid: event.schemaValidation.valid,
+          ...(event.schemaValidation.retries === undefined
+            ? {}
+            : { retries: event.schemaValidation.retries }),
+        }
+      : undefined;
     const key = this.#nativeTurnKey(bot, sessionId, event.turnId);
     const batches = this.#delegationFrames.get(key) ?? new Map<string, DelegationFrameState>();
     const current = batches.get(event.batchId) ?? {
@@ -1521,7 +1536,10 @@ export class NativeBotDataPlane {
       prior.currentTool === event.currentTool &&
       prior.toolCount === event.toolCount &&
       prior.costUsd === event.costUsd &&
-      prior.schemaValid === event.schemaValid &&
+      prior.costStatus === event.costStatus &&
+      prior.schemaValidation?.valid === incomingSchemaValidation?.valid &&
+      prior.schemaValidation?.retries === incomingSchemaValidation?.retries &&
+      prior.durationMs === event.durationMs &&
       prior.lastActiveAt === event.lastActiveAt
     ) {
       // Cleo diagnostic: an acknowledged TERMINAL event that produces no broadcast is
@@ -1563,7 +1581,9 @@ export class NativeBotDataPlane {
           apiCalls: prior.apiCalls,
           toolCount: prior.toolCount,
           costUsd: prior.costUsd,
-          schemaValid: prior.schemaValid,
+          costStatus: prior.costStatus,
+          schemaValidation: prior.schemaValidation,
+          durationMs: prior.durationMs,
         });
         const aliasWire = this.#delegationWire(
           bot, sessionId, event.turnId, event.batchId, current, stampedAt,
@@ -1581,7 +1601,9 @@ export class NativeBotDataPlane {
     const apiCalls = event.apiCalls ?? prior?.apiCalls;
     const toolCount = event.toolCount ?? prior?.toolCount;
     const costUsd = event.costUsd ?? prior?.costUsd;
-    const schemaValid = event.schemaValid ?? prior?.schemaValid;
+    const costStatus = event.costStatus ?? prior?.costStatus;
+    const schemaValidation = incomingSchemaValidation ?? prior?.schemaValidation;
+    const durationMs = event.durationMs ?? prior?.durationMs;
     const child: BotDelegationChild = {
       childId: event.childId,
       index: prior?.index ?? event.index,
@@ -1594,7 +1616,9 @@ export class NativeBotDataPlane {
       ...(apiCalls === undefined ? {} : { apiCalls }),
       ...(toolCount === undefined ? {} : { toolCount }),
       ...(costUsd === undefined ? {} : { costUsd }),
-      ...(schemaValid === undefined ? {} : { schemaValid }),
+      ...(costStatus === undefined ? {} : { costStatus }),
+      ...(schemaValidation === undefined ? {} : { schemaValidation }),
+      ...(durationMs === undefined ? {} : { durationMs }),
     };
     current.children.set(event.childId, child);
     current.count = Math.max(current.count, event.count, current.children.size);
@@ -1619,7 +1643,9 @@ export class NativeBotDataPlane {
       apiCalls: child.apiCalls,
       toolCount: child.toolCount,
       costUsd: child.costUsd,
-      schemaValid: child.schemaValid,
+      costStatus: child.costStatus,
+      schemaValidation: child.schemaValidation,
+      durationMs: child.durationMs,
     });
     const wire = this.#delegationWire(bot, sessionId, event.turnId, event.batchId, current, now);
     // Post-seal legs broadcast directly: the sealed turn is not "polling" and has no live batch.
@@ -1699,7 +1725,10 @@ export class NativeBotDataPlane {
     apiCalls: number | null;
     toolCount: number | null;
     costUsd: number | null;
+    costStatus: "estimated" | "reported" | "unknown" | null;
     schemaValid: number | null;
+    schemaRetries: number | null;
+    durationMs: number | null;
     lastActiveAt: number;
     startedAt: number;
     endedAt: number | null;
@@ -1716,7 +1745,14 @@ export class NativeBotDataPlane {
       ...(row.apiCalls === null ? {} : { apiCalls: row.apiCalls }),
       ...(row.toolCount === null ? {} : { toolCount: row.toolCount }),
       ...(row.costUsd === null ? {} : { costUsd: row.costUsd }),
-      ...(row.schemaValid === null ? {} : { schemaValid: row.schemaValid === 1 }),
+      ...(row.costStatus === null ? {} : { costStatus: row.costStatus }),
+      ...(row.schemaValid === null ? {} : {
+        schemaValidation: {
+          valid: row.schemaValid === 1,
+          ...(row.schemaRetries === null ? {} : { retries: row.schemaRetries }),
+        },
+      }),
+      ...(row.durationMs === null ? {} : { durationMs: row.durationMs }),
     };
   }
 
@@ -1795,8 +1831,6 @@ export class NativeBotDataPlane {
           currentTool: settled.currentTool,
           apiCalls: settled.apiCalls,
           toolCount: settled.toolCount,
-          costUsd: settled.costUsd,
-          schemaValid: settled.schemaValid,
         });
         changed = true;
       }

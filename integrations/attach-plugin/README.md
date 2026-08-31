@@ -72,6 +72,12 @@ Dependencies: Python 3.10+ and the `websockets` package.
   newly disabled feature. Hermes' native `send_clarify` callback becomes an app-visible option card; a selected
   stable option resolves the original blocking Hermes clarify primitive rather than starting a new
   chat turn. Media carries only metadata on WS and uses authenticated HTTP for bytes.
+- Profile-local memory reads and item mutations negotiate `memory_management`. Capability-42
+  credential-free setup additionally negotiates `memory_setup`; both names must appear in the
+  `hello_ack` intersection before setup is available. The setup lane uses the version-matched
+  release plugin and Hermes' native config writer, returns a fresh source projection, and never
+  sends memory content through the durable event spool. An old or not-yet-restarted plugin produces
+  a bounded unavailable response instead of accepting or retaining the mutation for reconnect.
 - Disconnects re-dial with capped, jittered backoff. Two closes are terminal: a rejected
   token (close 1008) and being superseded by a newer connection (close 4000).
 

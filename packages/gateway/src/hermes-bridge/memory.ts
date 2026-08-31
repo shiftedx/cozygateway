@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
 
-import { BotMemoryKindSchema } from "cozygateway-contract";
+import { Value } from "@sinclair/typebox/value";
+import {
+  BotMemoryDeleteResponseSchema,
+  BotMemoryGraphResponseSchema,
+  BotMemoryItemSchema,
+  BotMemoryItemsResponseSchema,
+  BotMemoryKindSchema,
+  BotMemoryOverviewResponseSchema,
+  BotMemoryWriteResponseSchema,
+} from "cozygateway-contract";
 import type {
   BotMemoryDeleteResponse,
   BotMemoryGraphResponse,
@@ -8,6 +17,7 @@ import type {
   BotMemoryItemsResponse,
   BotMemoryKind,
   BotMemoryOverviewResponse,
+  BotMemorySetupRequest,
   BotMemoryWriteResponse,
 } from "cozygateway-contract";
 
@@ -45,6 +55,7 @@ export class MemoryInvalidRequest extends Error {}
 
 export interface MemorySurface {
   overview(name: string): Promise<BotMemoryOverviewResponse>;
+  setup(name: string, input: BotMemorySetupRequest): Promise<BotMemoryOverviewResponse>;
   items(name: string, input: MemoryInput): Promise<BotMemoryItemsResponse>;
   item(name: string, sourceId: string, itemId: string): Promise<BotMemoryItem>;
   create(name: string, sourceId: string, input: MemoryInput): Promise<BotMemoryWriteResponse>;
@@ -52,9 +63,21 @@ export interface MemorySurface {
   remove(name: string, sourceId: string, itemId: string, input: MemoryInput): Promise<BotMemoryDeleteResponse>;
   graph(name: string, input: MemoryInput): Promise<BotMemoryGraphResponse>;
   audit(actorId: string, name: string, action: "create" | "update" | "delete", sourceId: string, itemId: string): void;
+  auditSetup(actorId: string, name: string, input: BotMemorySetupRequest): void;
 }
 
-interface Pending { agentId: string; resolve: (value: MemoryResult) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout>; }
+interface Pending { agentId: string; operation: MemoryOperation; resolve: (value: MemoryResult) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout>; }
+
+function validResult(operation: MemoryOperation, result: unknown): result is MemoryResult {
+  switch (operation) {
+    case "overview": case "setup": return Value.Check(BotMemoryOverviewResponseSchema, result);
+    case "items": return Value.Check(BotMemoryItemsResponseSchema, result);
+    case "graph": return Value.Check(BotMemoryGraphResponseSchema, result);
+    case "item": return Value.Check(BotMemoryItemSchema, result);
+    case "create": case "update": return Value.Check(BotMemoryWriteResponseSchema, result);
+    case "delete": return Value.Check(BotMemoryDeleteResponseSchema, result);
+  }
+}
 
 /** The operator-facing reading of each refusal. A plugin that connected but negotiated an older
  *  hello reads identically to an offline one from the phone, so the message has to separate them:
@@ -82,16 +105,23 @@ export class AttachMemorySurface implements MemorySurface {
         if (this.#pending.delete(requestId)) reject(new BackendUnavailable("memory management reply timed out"));
       }, this.#timeoutMs);
       timer.unref();
-      this.#pending.set(requestId, { agentId, resolve, reject, timer });
-      const outcome = this.#endpoint.sendMemoryRequest(agentId, { kind: "memory_request", requestId, operation, input });
+      this.#pending.set(requestId, { agentId, operation, resolve, reject, timer });
+      // Public methods below keep operation and input paired; this assertion bridges that
+      // correlation across the internal union-valued helper parameters.
+      const request = { kind: "memory_request", requestId, operation, input } as AttachV1MemoryRequest;
+      const outcome = this.#endpoint.sendMemoryRequest(agentId, request);
       if (outcome !== "sent") {
         clearTimeout(timer); this.#pending.delete(requestId);
         emitTrace(this.#trace, "bot_memory_unavailable", { profile: traceId(agentId), operation, reason: outcome });
-        reject(new BackendUnavailable(`memory management is unavailable for this bot: ${MEMORY_UNAVAILABLE[outcome]}`));
+        const detail = outcome === "capability_not_negotiated" && operation === "setup"
+          ? "this bot's attached plugin negotiated without memory_setup; restart the Hermes profile so it picks up the current plugin"
+          : MEMORY_UNAVAILABLE[outcome];
+        reject(new BackendUnavailable(`memory management is unavailable for this bot: ${detail}`));
       }
     });
   }
   async overview(name: string): Promise<BotMemoryOverviewResponse> { return await this.#request(name, "overview", {}) as BotMemoryOverviewResponse; }
+  async setup(name: string, input: BotMemorySetupRequest): Promise<BotMemoryOverviewResponse> { return await this.#request(name, "setup", input) as BotMemoryOverviewResponse; }
   async items(name: string, input: MemoryInput): Promise<BotMemoryItemsResponse> { return await this.#request(name, "items", input) as BotMemoryItemsResponse; }
   async item(name: string, sourceId: string, itemId: string): Promise<BotMemoryItem> { return await this.#request(name, "item", { sourceId, itemId }) as BotMemoryItem; }
   async create(name: string, sourceId: string, input: MemoryInput): Promise<BotMemoryWriteResponse> { return await this.#request(name, "create", { ...input, sourceId }) as BotMemoryWriteResponse; }
@@ -103,12 +133,18 @@ export class AttachMemorySurface implements MemorySurface {
       actor: traceId(actorId), profile: traceId(name), source: traceId(sourceId), item: traceId(itemId), action, at: Date.now(),
     });
   }
+  auditSetup(actorId: string, name: string, input: BotMemorySetupRequest): void {
+    emitTrace(this.#trace, "bot_memory_setup", {
+      actor: traceId(actorId), profile: traceId(name), action: "setup", ...input, at: Date.now(),
+    });
+  }
 
   handle(agentId: string, frame: AttachV1MemoryResult): boolean {
     const pending = this.#pending.get(frame.requestId);
     if (pending === undefined || pending.agentId !== agentId) return false;
     this.#pending.delete(frame.requestId); clearTimeout(pending.timer);
-    if (frame.status === "ok" && frame.result !== undefined) pending.resolve(frame.result as MemoryResult);
+    if (frame.status === "ok" && validResult(pending.operation, frame.result)) pending.resolve(frame.result);
+    else if (frame.status === "ok") pending.reject(new BackendUnavailable("memory management returned an invalid reply"));
     else if (frame.status === "conflict") pending.reject(new MemoryConflict(frame.current, frame.message));
     else if (frame.status === "not_found") pending.reject(new MemoryNotFound(frame.message));
     else if (frame.status === "invalid_request") pending.reject(new MemoryInvalidRequest(frame.message));

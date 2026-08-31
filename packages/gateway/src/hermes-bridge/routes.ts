@@ -17,6 +17,7 @@ import {
   BotRoutinePatchSchema,
   BotMemoryWriteRequestSchema,
   BotMemoryDeleteRequestSchema,
+  BotMemorySetupRequestSchema,
   ContractViolation,
   assertValid,
 } from "cozygateway-contract";
@@ -417,6 +418,16 @@ export function registerBotRoutes(
   });
 
   if (memory !== undefined) {
+    app.patch("/bots/:name/memory/setup", requireDevice, async (c) => {
+      const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const limited = memoryTicket(c); if (limited !== undefined) return limited;
+      try {
+        const body = assertValid(BotMemorySetupRequestSchema, await c.req.json());
+        const result = await memory.setup(resolved.name, body);
+        memory.auditSetup(c.get("deviceId"), resolved.name, body);
+        return c.json(result);
+      } catch (error) { return memoryFailure(c, error); }
+    });
     app.get("/bots/:name/memory", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
       const limited = memoryTicket(c); if (limited !== undefined) return limited;

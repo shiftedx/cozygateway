@@ -1,6 +1,7 @@
 import type { BotRoutine, BotRoutineCreateRequest, BotRoutinePatch } from "cozygateway-contract";
 
 import type { HermesRpc } from "./rpc.ts";
+import { redactHermesSessionPaths } from "./session-management.ts";
 
 /** The routines surface stores new bot routines as ordinary Hermes cron jobs named
  * `[bot:<name>] <title>`. Existing untagged cron jobs are also shown because `cron.manage` scopes
@@ -29,6 +30,7 @@ const SILENCE_FIRST =
 
 /** The title shown for a tagged job with nothing after its tag. The desktop's own fallback. */
 export const UNTITLED_ROUTINE = "Untitled cronjob";
+export const ROUTINE_DELIVERY_ERROR_MAX_LENGTH = 512;
 
 
 /** A `cron.manage` call that the backend ANSWERED with a refusal.
@@ -199,6 +201,26 @@ export function routineTimestamp(value: unknown): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
+/** Projects Hermes' `_format_job.last_delivery_error` as display text, never as diagnostic host
+ * data. Delivery adapters commonly include their spool/config path in failures, so every absolute
+ * POSIX, drive-letter, UNC and home-relative path family is removed before the bound is applied.
+ * Whitespace is flattened for a routine-row label and control bytes are discarded. */
+export function routineDeliveryError(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const withoutHomePaths = value.replace(
+    /(^|[\s("'`])~[\\/][^\s"'<>]*/g,
+    "$1<path>",
+  );
+  const clean = redactHermesSessionPaths(withoutHomePaths)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (clean.length === 0) return undefined;
+  const bounded = clean.slice(0, ROUTINE_DELIVERY_ERROR_MAX_LENGTH);
+  // Do not leave an unmatched leading surrogate when the UTF-16 bound cuts an emoji pair.
+  return /[\ud800-\udbff]$/.test(bounded) ? bounded.slice(0, -1) : bounded;
+}
+
 /** Maps one cron job into the wire shape. Tolerant throughout: a job that is missing a field the
  *  backend did not send degrades to a sane value rather than failing the list, because ONE
  *  malformed job must not blank a routines pane. */
@@ -209,6 +231,7 @@ export function mapRoutine(job: CronJob): BotRoutine {
   const state = asString(job.state);
   const repeat = asString(job.repeat);
   const lastStatus = asString(job.last_status);
+  const lastDeliveryError = routineDeliveryError(job.last_delivery_error);
   return {
     id: asString(job.job_id) ?? "",
     title: routineTitle(job),
@@ -219,6 +242,7 @@ export function mapRoutine(job: CronJob): BotRoutine {
     lastRun: routineTimestamp(job.last_run_at),
     nextRun: routineTimestamp(job.next_run_at),
     ...(lastStatus === undefined || lastStatus.length === 0 ? {} : { lastStatus }),
+    ...(lastDeliveryError === undefined ? {} : { lastDeliveryError }),
     ...(repeat === undefined || repeat.length === 0 ? {} : { repeat }),
     ...(job.continuity === true ? { continuity: true } : {}),
   };

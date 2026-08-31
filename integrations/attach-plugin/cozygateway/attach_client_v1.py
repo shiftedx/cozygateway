@@ -74,7 +74,7 @@ HELLO_ACK_TIMEOUT_SECONDS = 5
 HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
-    "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "delivery_receipts",
+    "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts",
     "delegation", "thinking", "desktop_session_sync",
     "desktop_session_resume",
 )
@@ -548,7 +548,9 @@ class AttachV1Client:
         last_active_at: Optional[int] = None,
         alias_id: Optional[str] = None,
         cost_usd: Optional[float] = None,
-        schema_valid: Optional[bool] = None,
+        cost_status: Optional[str] = None,
+        schema_validation: Optional[Dict[str, Any]] = None,
+        duration_ms: Optional[int] = None,
     ) -> None:
         """Queue one ephemeral delegation lifecycle event (capability ``delegation``).
 
@@ -573,15 +575,25 @@ class AttachV1Client:
             event["apiCalls"] = max(0, int(api_calls))
         if tool_count is not None:
             event["toolCount"] = max(0, int(tool_count))
-        if (
-            isinstance(cost_usd, (int, float))
-            and not isinstance(cost_usd, bool)
-            and math.isfinite(cost_usd)
-            and 0 <= cost_usd <= 1_000_000
-        ):
-            event["costUsd"] = round(float(cost_usd), 6)
-        if isinstance(schema_valid, bool):
-            event["schemaValid"] = schema_valid
+        if cost_usd is not None:
+            cost = float(cost_usd)
+            if math.isfinite(cost) and 0 <= cost <= 1_000_000:
+                event["costUsd"] = cost
+                event["costStatus"] = (
+                    cost_status
+                    if cost_status in {"estimated", "reported", "unknown"}
+                    else "unknown"
+                )
+        if isinstance(schema_validation, dict) and isinstance(schema_validation.get("valid"), bool):
+            validation = {"valid": schema_validation["valid"]}
+            retries = schema_validation.get("retries")
+            if not isinstance(retries, bool) and isinstance(retries, int) and 0 <= retries <= 1:
+                validation["retries"] = retries
+            event["schemaValidation"] = validation
+        if duration_ms is not None:
+            duration = int(duration_ms)
+            if 0 <= duration <= 2_147_483_647:
+                event["durationMs"] = duration
         await self._queue_event(event)
 
     async def send_approval(self, thread_id: str, turn_id: str, approval_id: str, call_id: str, name: str, status: str) -> None:

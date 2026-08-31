@@ -12,8 +12,12 @@ Run with:
 from __future__ import annotations
 
 import re
+import copy
+import sys
 import tempfile
 import threading
+import time
+import types
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List
@@ -68,6 +72,164 @@ class MemoryDispatchTests(unittest.TestCase):
         self.assertEqual(sources["curated-user"]["status"], "available")
         self.assertEqual(sources["holographic"]["status"], "available")
         self.assertEqual(sources["vault:0"]["status"], "available")
+
+    def _config_writer(self, initial: Dict[str, Any]):
+        state = copy.deepcopy(initial)
+        writes: List[Dict[str, Any]] = []
+        preserves: List[Any] = []
+        module = types.ModuleType("hermes_cli.config")
+        module.load_config = lambda: copy.deepcopy(state)
+        module.load_config_readonly = lambda: copy.deepcopy(state)
+
+        def save_config(value, *, preserve_keys=None, merge_existing=False, **_kwargs):
+            def merge(target, incoming):
+                for key, child in incoming.items():
+                    if isinstance(child, dict) and isinstance(target.get(key), dict):
+                        merge(target[key], child)
+                    else:
+                        target[key] = copy.deepcopy(child)
+            if merge_existing:
+                merge(state, value)
+            else:
+                state.clear(); state.update(copy.deepcopy(value))
+            writes.append(copy.deepcopy(value)); preserves.append(set(preserve_keys or set()))
+
+        module.save_config = save_config
+        package = types.ModuleType("hermes_cli"); package.__path__ = []  # type: ignore[attr-defined]
+        return state, writes, preserves, patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": module})
+
+    def test_setup_uses_the_native_merge_writer_for_only_allowlisted_memory_settings(self):
+        state, writes, preserves, modules = self._config_writer({
+            "memory": {"memory_enabled": False, "user_profile_enabled": True, "provider": "external", "limit": 77},
+            "model": {"default": "safe-model"},
+        })
+        with modules:
+            answer = self.manager.execute("setup", {
+                "memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": False,
+            })
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(state["memory"], {
+            "memory_enabled": True, "user_profile_enabled": False, "provider": "external", "limit": 77,
+        })
+        self.assertEqual(state["model"], {"default": "safe-model"})
+        self.assertIn(("memory", "memory_enabled"), preserves[0])
+        self.assertIn(("memory", "user_profile_enabled"), preserves[0])
+        self.assertIn("sources", answer)
+
+    def test_setup_selects_and_disables_only_holographic(self):
+        state, _, _, modules = self._config_writer({"memory": {"provider": "external"}})
+        with modules:
+            self.manager.execute("setup", {"memoryEnabled": False, "userProfileEnabled": False, "holographicEnabled": True})
+            self.assertEqual(state["memory"]["provider"], "holographic")
+            self.manager.execute("setup", {"memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": False})
+        self.assertIsNone(state["memory"]["provider"])
+
+    def test_setup_serializes_plugin_writers_and_preserves_fresh_external_provider(self):
+        state = {
+            "memory": {"provider": "external", "limit": 77},
+            "model": {"default": "safe-model"},
+        }
+        state_lock = threading.RLock()
+        active_writers = 0
+        maximum_active_writers = 0
+        module = types.ModuleType("hermes_cli.config")
+
+        def load_config_readonly():
+            with state_lock:
+                return copy.deepcopy(state)
+
+        def save_config(value, *, merge_existing=False, **_kwargs):
+            nonlocal active_writers, maximum_active_writers
+            self.assertTrue(merge_existing)
+            with state_lock:
+                active_writers += 1
+                maximum_active_writers = max(maximum_active_writers, active_writers)
+            time.sleep(0.03)
+            with state_lock:
+                for section, children in value.items():
+                    state.setdefault(section, {}).update(copy.deepcopy(children))
+                active_writers -= 1
+
+        module.load_config_readonly = load_config_readonly
+        module.save_config = save_config
+        package = types.ModuleType("hermes_cli"); package.__path__ = []  # type: ignore[attr-defined]
+
+        def setup(memory_enabled: bool, user_enabled: bool):
+            self.manager.execute("setup", {
+                "memoryEnabled": memory_enabled, "userProfileEnabled": user_enabled,
+                "holographicEnabled": False,
+            })
+
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": module}):
+            threads = [
+                threading.Thread(target=setup, args=(True, False)),
+                threading.Thread(target=setup, args=(False, True)),
+            ]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(5)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+        self.assertEqual(maximum_active_writers, 1)
+        self.assertEqual(state["memory"]["provider"], "external")
+        self.assertEqual(state["memory"]["limit"], 77)
+        self.assertEqual(state["model"], {"default": "safe-model"})
+
+    def test_setup_returns_the_fresh_degraded_projection(self):
+        _, _, _, modules = self._config_writer({"memory": {}})
+        projection = [{
+            "id": "holographic", "displayName": "Holographic", "kind": "holographic",
+            "status": "degraded", "detail": "Holographic configuration needs review",
+            "capabilities": {},
+        }]
+        with modules, patch.object(self.manager, "sources", return_value=projection):
+            answer = self.manager.execute("setup", {
+                "memoryEnabled": False, "userProfileEnabled": False, "holographicEnabled": True,
+            })
+        self.assertEqual(answer, {"sources": projection})
+
+    def test_setup_applies_each_supported_curated_combination(self):
+        cases = (
+            (True, False),
+            (False, True),
+            (True, True),
+        )
+        for memory_enabled, user_enabled in cases:
+            with self.subTest(memory=memory_enabled, user=user_enabled):
+                state, _, _, modules = self._config_writer({"memory": {}})
+                with modules:
+                    answer = self.manager.execute("setup", {
+                        "memoryEnabled": memory_enabled,
+                        "userProfileEnabled": user_enabled,
+                        "holographicEnabled": False,
+                    })
+                self.assertIs(state["memory"]["memory_enabled"], memory_enabled)
+                self.assertIs(state["memory"]["user_profile_enabled"], user_enabled)
+                self.assertTrue(answer["sources"])
+
+    def test_setup_rejects_all_false_unknown_and_non_boolean_values(self):
+        cases = [
+            {"memoryEnabled": False, "userProfileEnabled": False, "holographicEnabled": False},
+            {"memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": False, "provider": "external"},
+            {"memoryEnabled": 1, "userProfileEnabled": False, "holographicEnabled": False},
+        ]
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(MemoryError):
+                self.manager.execute("setup", value)
+
+    def test_setup_write_failure_exposes_no_path_or_exception_text(self):
+        secret = "/Users/private/profile/config.yaml token-secret memory-content"
+        module = types.ModuleType("hermes_cli.config")
+        module.load_config = lambda: {"memory": {}}
+        module.load_config_readonly = lambda: {"memory": {}}
+        module.save_config = lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(secret))
+        package = types.ModuleType("hermes_cli"); package.__path__ = []  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": module}):
+            with self.assertRaises(MemoryError) as raised:
+                self.manager.execute("setup", {
+                    "memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": False,
+                })
+        self.assertEqual(str(raised.exception), "memory settings could not be applied")
+        self.assertNotIn(secret, str(raised.exception))
 
     def test_every_operation_dispatches_through_execute_for_every_adapter(self):
         cases = (

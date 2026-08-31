@@ -9,14 +9,63 @@ import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 type Env = { Variables: { deviceId: string } };
 const item = { id: "fact:1", sourceId: "holographic", kind: "fact" as const, title: "Cleo", snippet: "Cleo likes concise reports", createdAt: 1, updatedAt: 2, timestampKind: "created" as const, revision: "r1", category: "user_pref", tags: ["cleo"], trustScore: 0.9 };
 
-function appFor(memory: Partial<MemorySurface>, memoryOptions: { rateLimiter?: MemoryRateLimiter; now?: () => number } = {}) {
+function appFor(memory: Partial<MemorySurface>, memoryOptions: { rateLimiter?: MemoryRateLimiter; now?: () => number } = {}, authenticated = true) {
   const app = new Hono<Env>();
-  const requireDevice: MiddlewareHandler<Env> = async (c, next) => { c.set("deviceId", "device"); await next(); };
+  const requireDevice: MiddlewareHandler<Env> = async (c, next) => {
+    if (!authenticated) return c.json({ error: { code: "unauthorized", message: "missing device" } }, 401);
+    c.set("deviceId", "device"); await next();
+  };
   registerBotRoutes(app, requireDevice, {} as BotsSurface, {}, {}, memory as MemorySurface, memoryOptions);
   return app;
 }
 
 describe("capability-30 bot memory routes", () => {
+  it("applies capability-42 setup to the canonical profile and audits only its booleans", async () => {
+    const sources = [{
+      id: "curated-memory", displayName: "Curated notes", kind: "memory", status: "available" as const,
+      capabilities: { create: true, edit: true, delete: true, relationships: false, capacity: true, effectiveNextSession: true },
+    }];
+    const setup = vi.fn(async () => ({ sources }));
+    const auditSetup = vi.fn();
+    const app = appFor({ setup, auditSetup });
+    const response = await app.request("/bots/CLEO/memory/setup", {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ sources });
+    expect(setup).toHaveBeenCalledWith("cleo", { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false });
+    expect(auditSetup).toHaveBeenCalledWith("device", "cleo", { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false });
+  });
+
+  it("keeps capability-42 setup behind device authentication", async () => {
+    const setup = vi.fn(async () => ({ sources: [] }));
+    const response = await appFor({ setup, auditSetup: vi.fn() }, {}, false).request("/bots/cleo/memory/setup", {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false }),
+    });
+    expect(response.status).toBe(401);
+    expect(setup).not.toHaveBeenCalled();
+  });
+
+  it("rejects incomplete, unknown-key and all-false setup before reaching the plugin", async () => {
+    const setup = vi.fn(async () => ({ sources: [] }));
+    const app = appFor({ setup, auditSetup: vi.fn() });
+    const cases = [
+      { memoryEnabled: true, userProfileEnabled: false },
+      { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false, provider: "external" },
+      { memoryEnabled: false, userProfileEnabled: false, holographicEnabled: false },
+    ];
+    for (const body of cases) {
+      const response = await app.request("/bots/cleo/memory/setup", {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: "invalid_request" } });
+    }
+    expect(setup).not.toHaveBeenCalled();
+  });
+
   it("keeps source labels and bounded query filters on the attached management surface", async () => {
     const items = vi.fn(async () => ({ items: [item], sources: [] }));
     const app = appFor({ overview: async () => ({ sources: [] }), items, graph: async () => ({ nodes: [], edges: [] }) });
@@ -90,5 +139,35 @@ describe("capability-30 bot memory routes", () => {
     expect(memory.handle("cleo", frame)).toBe(true);
     await expect(pending).resolves.toEqual({ sources: [] });
     expect(memory.handle("cleo", frame)).toBe(false);
+  });
+
+  it("rejects a cross-profile or cross-operation setup reply instead of casting it", async () => {
+    const sent: Array<{ requestId: string }> = [];
+    const memory = new AttachMemorySurface({ sendMemoryRequest: (_agent, command) => { sent.push(command); return "sent" as const; } });
+    const pending = memory.setup("cleo", { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false });
+    const wrongShape = { kind: "memory_result" as const, requestId: sent[0]!.requestId, status: "ok" as const, result: { item } };
+    expect(memory.handle("sage", wrongShape)).toBe(false);
+    expect(memory.handle("cleo", wrongShape)).toBe(true);
+    await expect(pending).rejects.toThrow("memory management returned an invalid reply");
+  });
+
+  it("reports an attached old plugin as missing memory_setup", async () => {
+    const memory = new AttachMemorySurface({ sendMemoryRequest: () => "capability_not_negotiated" });
+    const response = await appFor(memory).request("/bots/cleo/memory/setup", {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false }),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "backend_unavailable", message: expect.stringContaining("memory_setup") } });
+  });
+
+  it("bounds a setup reply timeout and does not retain it for reconnect", async () => {
+    const memory = new AttachMemorySurface({ sendMemoryRequest: () => "sent" }, 1);
+    const response = await appFor(memory).request("/bots/cleo/memory/setup", {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false }),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "backend_unavailable", message: "memory management reply timed out" } });
   });
 });

@@ -2,7 +2,7 @@ import { type Static, Type } from "@sinclair/typebox";
 import {
   RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryKindSchema,
   BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema,
-  BotMemoryDeleteResponseSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema, MobileNodeMediaDescriptorSchema,
+  BotMemoryDeleteResponseSchema, BotMemorySetupRequestSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema, MobileNodeMediaDescriptorSchema,
   type MobileNodeGatewayStatusResult,
 } from "cozygateway-contract";
 
@@ -25,6 +25,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("mobile_media"),
   Type.Literal("mobile_notifications"),
   Type.Literal("memory_management"),
+  Type.Literal("memory_setup"),
   Type.Literal("delivery_receipts"),
   Type.Literal("delegation"),
   Type.Literal("thinking"),
@@ -112,7 +113,7 @@ const ResolveClarifyCommand = Type.Object({
 const DesktopSessionResumeCommand = Type.Object({
   kind: Type.Literal("desktop_session_resume"), threadId: Id, hermesSessionId: Id, resumeId: Id,
 });
-export const AttachV1MemoryRequestSchema = Type.Object({
+const AttachV1MemoryDataRequestSchema = Type.Object({
   kind: Type.Literal("memory_request"), requestId: Id,
   operation: Type.Union([Type.Literal("overview"), Type.Literal("items"), Type.Literal("item"), Type.Literal("create"), Type.Literal("update"), Type.Literal("delete"), Type.Literal("graph")]),
   input: Type.Object({
@@ -121,6 +122,13 @@ export const AttachV1MemoryRequestSchema = Type.Object({
     content: Type.Optional(Type.String({ minLength: 1, maxLength: 32_000 })), title: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), category: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), expectedRevision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
   }, { additionalProperties: false }),
 }, { additionalProperties: false });
+const AttachV1MemorySetupRequestSchema = Type.Object({
+  kind: Type.Literal("memory_request"), requestId: Id, operation: Type.Literal("setup"),
+  input: BotMemorySetupRequestSchema,
+}, { additionalProperties: false });
+export const AttachV1MemoryRequestSchema = Type.Union([
+  AttachV1MemoryDataRequestSchema, AttachV1MemorySetupRequestSchema,
+]);
 export type AttachV1MemoryRequest = Static<typeof AttachV1MemoryRequestSchema>;
 /** Gateway-observed truth about ONE scheduled delivery occurrence, sent back to the plugin that
  * produced it so its own spool stops guessing. `displayed` means a paired device reported the row
@@ -203,6 +211,13 @@ const DelegationStatus = Type.Union([
   Type.Literal("stalling"), Type.Literal("succeeded"), Type.Literal("failed"),
   Type.Literal("interrupted"), Type.Literal("stalled"), Type.Literal("unknown"),
 ]);
+const DelegationCostStatus = Type.Union([
+  Type.Literal("estimated"), Type.Literal("reported"), Type.Literal("unknown"),
+]);
+const DelegationSchemaValidation = Type.Object({
+  valid: Type.Boolean(),
+  retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 1 })),
+}, { additionalProperties: false });
 /** EPHEMERAL delegation lifecycle behind the turn's live batch card. One event is one child
  * update; identity is (batchId, childId), never the tool name, so identical concurrent tools
  * cannot collide. `batchId` is the parent's own `delegate_task` tool-call id until Hermes
@@ -225,10 +240,10 @@ const DelegationEvent = Type.Object({
   currentTool: Type.Optional(Type.String({ maxLength: 128 })),
   apiCalls: Type.Optional(Type.Integer({ minimum: 0 })),
   toolCount: Type.Optional(Type.Integer({ minimum: 0 })),
-  /** Structured synchronous terminal-result enrichment only. Async and older Hermes results
-   * omit both fields rather than synthesizing lifecycle data that the hooks do not carry. */
   costUsd: Type.Optional(Type.Number({ minimum: 0, maximum: 1_000_000 })),
-  schemaValid: Type.Optional(Type.Boolean()),
+  costStatus: Type.Optional(DelegationCostStatus),
+  schemaValidation: Type.Optional(DelegationSchemaValidation),
+  durationMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
   /** MILLISECONDS, plugin clock: when the child last showed observable activity. */
   lastActiveAt: Type.Integer({ minimum: 0 }),
   /** Canonical Hermes delegation id (`deleg_...`) for the WHOLE batch, once the plugin has

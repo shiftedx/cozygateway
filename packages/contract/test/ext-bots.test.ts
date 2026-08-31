@@ -15,6 +15,7 @@ import {
   BotChatMessageSchema,
   BotMobileReceiptFrameSchema,
   BotMobileReceiptSchema,
+  BotMemorySetupRequestSchema,
   BotChatResetFrameSchema,
   BotChatResetResponseSchema,
   BotChatStopResponseSchema,
@@ -32,6 +33,7 @@ import {
   BotNewSessionResponseSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
+  BotPreviewSchema,
   BotRoutineCreateRequestSchema,
   BotRoutinePatchSchema,
   BotRoutineSchema,
@@ -97,15 +99,10 @@ describe("bot summary", () => {
     ).toBe(true);
   });
 
-  it("does not accept transcript-derived A2A preview provenance", () => {
-    expect(check(BotSummarySchema, {
-      ...bot,
-      preview: { kind: "a2a", text: "done", sender: "luna" },
-    })).toBe(false);
-  });
-
-  it("rejects an unknown preview kind", () => {
+  it("rejects inferred a2a previews and has no sender field", () => {
+    expect(check(BotSummarySchema, { ...bot, preview: { kind: "a2a", text: "the build is green", sender: "luna" } })).toBe(false);
     expect(check(BotSummarySchema, { ...bot, preview: { kind: "toast", text: "x" } })).toBe(false);
+    expect(Object.keys(BotPreviewSchema.properties).sort()).toEqual(["kind", "text"]);
   });
 });
 
@@ -366,6 +363,7 @@ describe("routines", () => {
         state: "paused",
         prompt: "check the build...",
         lastStatus: "success",
+        lastDeliveryError: "Telegram delivery timed out",
         // A DISPLAY string, never a number: the remaining run count is not recoverable from it.
         repeat: "1/3",
         continuity: true,
@@ -374,6 +372,8 @@ describe("routines", () => {
       }),
     ).toBe(true);
     expect(check(BotRoutineSchema, { ...routine, repeat: 3 })).toBe(false);
+    expect(check(BotRoutineSchema, { ...routine, lastDeliveryError: "x".repeat(513) })).toBe(false);
+    expect(check(BotRoutineSchema, { ...routine, lastDeliveryError: "unsafe\u0000text" })).toBe(false);
     // Timestamps are nullable but never absent, so a client has one shape to read.
     expect(check(BotRoutineSchema, { ...routine, nextRun: "2026-08-18T09:00:00Z" })).toBe(false);
   });
@@ -397,6 +397,8 @@ describe("routines", () => {
     // Emptiness is refused at the schema level for each field; "no fields at all" is the route's
     // rule, since an empty object is a legal patch shape.
     expect(check(BotRoutinePatchSchema, { title: "" })).toBe(false);
+    expect(BotRoutineCreateRequestSchema.properties).not.toHaveProperty("lastDeliveryError");
+    expect(BotRoutinePatchSchema.properties).not.toHaveProperty("lastDeliveryError");
   });
 
   it("carries bot_routines in the ServerFrame union", () => {
@@ -582,9 +584,27 @@ describe("capability advertisement", () => {
     // simplest possible way, since a client below 37 simply never calls the route.
     // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts;
     // 40 distinguishes a created profile from an attached, writable bot; 41 wraps Hermes' model
-    // provider setup catalog, credential lifecycle, and OAuth sessions for the phone; 42 removes
-    // transcript-derived A2A previews and adds bounded structured child terminal enrichment.
+    // provider setup catalog, credential lifecycle, and OAuth sessions for the phone; 42 adds
+    // exact credential-free memory setup through the attached profile plugin.
     expect(BOTS_CAPABILITY_VERSION).toBe(42);
+  });
+
+  it("keeps capability-42 memory setup closed and requires at least one source", () => {
+    expect(check(BotMemorySetupRequestSchema, {
+      memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false,
+    })).toBe(true);
+    expect(check(BotMemorySetupRequestSchema, {
+      memoryEnabled: false, userProfileEnabled: true, holographicEnabled: true,
+    })).toBe(true);
+    expect(check(BotMemorySetupRequestSchema, {
+      memoryEnabled: false, userProfileEnabled: false, holographicEnabled: false,
+    })).toBe(false);
+    expect(check(BotMemorySetupRequestSchema, {
+      memoryEnabled: true, userProfileEnabled: false,
+    })).toBe(false);
+    expect(check(BotMemorySetupRequestSchema, {
+      memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false, provider: "external",
+    })).toBe(false);
   });
 
   it("keeps mobile receipts closed and metadata-only", () => {
@@ -789,7 +809,7 @@ describe("delegation activity (capability 34)", () => {
 
   it("accepts a live child, a settled one, and the frame that carries them", () => {
     expect(check(BotDelegationChildSchema, child)).toBe(true);
-    expect(check(BotDelegationChildSchema, { ...child, status: "succeeded", endedAt: 1_800_000_001_000, label: "Rewrite the skill", currentTool: "write_file", apiCalls: 4, toolCount: 7, costUsd: 0.123456, schemaValid: true })).toBe(true);
+    expect(check(BotDelegationChildSchema, { ...child, status: "succeeded", endedAt: 1_800_000_001_000, label: "Rewrite the skill", currentTool: "write_file", apiCalls: 4, toolCount: 7 })).toBe(true);
     expect(check(BotDelegationActivityFrameSchema, frame)).toBe(true);
     expect(check(BotDelegationActivityFrameSchema, { ...frame, done: true, children: [] })).toBe(true);
     expect(check(ServerFrameSchema, frame)).toBe(true);
@@ -811,13 +831,15 @@ describe("delegation activity (capability 34)", () => {
     expect(Object.keys(BotDelegationChildSchema.properties).sort()).toEqual([
       "apiCalls",
       "childId",
+      "costStatus",
       "costUsd",
       "currentTool",
+      "durationMs",
       "endedAt",
       "index",
       "label",
       "lastActiveAt",
-      "schemaValid",
+      "schemaValidation",
       "startedAt",
       "status",
       "toolCount",
@@ -827,12 +849,31 @@ describe("delegation activity (capability 34)", () => {
     }
   });
 
-  it("bounds structured terminal enrichment and rejects invented values", () => {
-    expect(check(BotDelegationChildSchema, { ...child, costUsd: 0, schemaValid: false })).toBe(true);
-    expect(check(BotDelegationChildSchema, { ...child, costUsd: -0.01 })).toBe(false);
-    expect(check(BotDelegationChildSchema, { ...child, costUsd: Number.POSITIVE_INFINITY })).toBe(false);
-    expect(check(BotDelegationChildSchema, { ...child, costUsd: 1_000_000.01 })).toBe(false);
-    expect(check(BotDelegationChildSchema, { ...child, schemaValid: "true" })).toBe(false);
+  it("bounds synchronous result enrichment and keeps unavailable distinct from false", () => {
+    expect(check(BotDelegationChildSchema, {
+      ...child,
+      costUsd: 0.125,
+      costStatus: "estimated",
+      schemaValidation: { valid: false, retries: 1 },
+      durationMs: 2345,
+    })).toBe(true);
+    // Absent is unavailable/not requested, while false is an explicit failed validation verdict.
+    expect(check(BotDelegationChildSchema, child)).toBe(true);
+    expect(check(BotDelegationChildSchema, { ...child, schemaValidation: { valid: false } })).toBe(true);
+    expect(check(BotDelegationChildSchema, {
+      ...child,
+      schemaValidation: { valid: false, retries: 1, schema_errors: ["/private/path"] },
+    })).toBe(false);
+    for (const costStatus of ["estimated", "reported", "unknown"])
+      expect(check(BotDelegationChildSchema, { ...child, costUsd: 0, costStatus })).toBe(true);
+    for (const invalid of [
+      { costUsd: -1 },
+      { costUsd: 1_000_001 },
+      { costStatus: "exact" },
+      { schemaValidation: { valid: false, retries: 2 } },
+      { durationMs: -1 },
+      { durationMs: 2_147_483_648 },
+    ]) expect(check(BotDelegationChildSchema, { ...child, ...invalid })).toBe(false);
   });
 
   it("holds ordinals as integers and keeps history batches joinable by turn", () => {
