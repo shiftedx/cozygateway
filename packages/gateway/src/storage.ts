@@ -682,14 +682,33 @@ export class Storage {
   }
 
   createSetupCode(code: string, expiresAt: number): void {
-    this.#db.prepare("INSERT INTO setup_codes (code, expires_at) VALUES (?, ?)").run(code, expiresAt);
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      // Pairing is an explicit, single-current-invitation flow. Minting a replacement revokes
+      // every older unredeemed code so repeated CLI calls cannot accumulate parallel credentials.
+      this.#db.prepare("DELETE FROM setup_codes").run();
+      this.#db.prepare("INSERT INTO setup_codes (code, expires_at) VALUES (?, ?)").run(code, expiresAt);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   consumeSetupCode(code: string, now: number): "ok" | "invalid" {
-    const result = this.#db
-      .prepare("UPDATE setup_codes SET used_at = ? WHERE code = ? AND used_at IS NULL AND expires_at >= ?")
-      .run(now, code, now);
-    return result.changes === 1 ? "ok" : "invalid";
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("DELETE FROM setup_codes WHERE used_at IS NOT NULL OR expires_at < ?").run(now);
+      // Delete-to-consume is atomic and leaves no used credential residue behind.
+      const result = this.#db
+        .prepare("DELETE FROM setup_codes WHERE code = ? AND used_at IS NULL AND expires_at >= ?")
+        .run(code, now);
+      this.#db.exec("COMMIT");
+      return result.changes === 1 ? "ok" : "invalid";
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   createDevice(device: { id: string; name: string; tokenHash: string; createdAt: number }): void {
@@ -3494,6 +3513,9 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // Setup codes are short-lived invitations, not durable sessions. Old builds retained expired
+  // and consumed rows forever; prune that residue while keeping a live invitation across restart.
+  db.prepare("DELETE FROM setup_codes WHERE used_at IS NOT NULL OR expires_at < ?").run(Date.now());
   // CREATE TABLE IF NOT EXISTS does not add delegation-enrichment columns to an existing database.
   // Migrate additively in place; each nullable column preserves the distinction between an older
   // unavailable result and an explicit `schema_valid = 0` verdict.
