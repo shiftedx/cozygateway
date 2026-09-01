@@ -19,8 +19,9 @@ version 1 peer and must be presented as update-required. This is release guidanc
 must pass the full release checks before maintainers publish it.
 
 This paired-device extension administers sessions owned by one visible Hermes profile. It is
-separate from `com.cozylabs.hermes-desktop-sessions:3`, whose narrower promise is interactive
-Desktop/TUI/CLI metadata discovery and exact adoption into Bot Mode. A `hermesSessionId` is an opaque Hermes identifier and
+separate from `com.cozylabs.hermes-desktop-sessions:4`, whose narrower promise is interactive
+Desktop/TUI/CLI metadata discovery and gateway-authoritative latest-session selection into Bot Mode.
+A `hermesSessionId` is an opaque Hermes identifier and
 MUST NOT be accepted by a Bot Mode route or returned in a Bot Mode `sessionId` field.
 
 The gateway implementation maps these operations to Hermes' authoritative, profile-scoped

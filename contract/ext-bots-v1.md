@@ -530,14 +530,14 @@ that exists but is not configured as a native identity must not fall through to 
 
 ## Interactive Hermes session continuation
 
-`com.cozylabs.hermes-desktop-sessions: 3` is deliberately separate from Bot Mode. It exposes
+`com.cozylabs.hermes-desktop-sessions: 4` is deliberately separate from Bot Mode. It exposes
 source-qualified Desktop, TUI, and CLI sessions without placing their raw Hermes ids in native
 session history:
 
 | Route | Response | Rule |
 | --- | --- | --- |
 | `GET /bots/:name/desktop-sessions` | `{ name, source: "hermes_desktop", sessions }` | Lists Hermes `source: "desktop"`, `"tui"`, or `"cli"` conversation rows for that exact profile. Each row carries its exact `origin`, `hermesSessionId`, timestamps, optional sanitized `title`, and optional `lastResumedAt`; no preview, transcript, tool row, media, host path, or private Dashboard metadata is exposed. |
-| `POST /bots/:name/desktop-sessions/:hermesSessionId/resume` | `202 BotDesktopHermesResumeResponse` | Explicit-only adoption. Normally waits briefly for a positive plugin confirmation and answers `status: "resumed"` + a distinct gateway `sessionId`; a bounded timeout answers `status: "pending"` with no session id. |
+| `POST /bots/:name/desktop-sessions/:hermesSessionId/resume` | `202 BotDesktopHermesResumeResponse` | Exact manual adoption. Normally waits briefly for a positive plugin confirmation and answers `status: "resumed"` + a distinct gateway `sessionId`; a bounded timeout answers `status: "pending"` with no session id. |
 
 The request re-lists the profile's eligible desktop rows, stages a new gateway-owned session id,
 and imports the selected `session.resume` snapshot through the existing rendered-role, compaction,
@@ -554,6 +554,21 @@ chat. The row carries the source-qualified current raw id and stable row id; an 
 carries the original selected Hermes id and is accepted only when that exact persisted resume
 binding is confirmed. Replays are idempotent, and this projection never selects a chat or changes a
 turn state. Capability 3 broadens that exact proof from TUI to Desktop, TUI, and CLI origins.
+
+Capability 4 makes the gateway authoritative for the active interactive conversation. Before a
+canonical chat read or send, it compares the selected gateway conversation's latest real message
+timestamp with the newest source-qualified Desktop, TUI, or CLI row, using `lastActiveAt`, then
+`startedAt`, then opaque id as deterministic tie-breakers. A newer external row is selected only
+after the same exact plugin resume proof described above. A running native turn is never redirected.
+An empty, newly allocated gateway placeholder has no conversational activity and cannot outrank an
+existing external conversation merely because it was created later.
+
+If the selected gateway session already binds to the newest external row, the gateway keeps that
+session id. It may privately re-prove the plugin mapping after an attach process restart, but that
+no-op confirmation MUST NOT emit `bot_chat_adopted`. A capability-4 client therefore MUST NOT run
+its own automatic desktop-session picker or present a continuation banner during chat opening; the
+ordinary canonical history response is already the latest proven session. Discovery and the exact
+manual route remain available for administration and compatibility.
 
 ## Server frames
 
