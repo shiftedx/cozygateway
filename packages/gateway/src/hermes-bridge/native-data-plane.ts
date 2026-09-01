@@ -24,6 +24,7 @@ import type {
   BotTurnDelegations,
   BotThinkingActivityFrame,
   BotSummary,
+  BotDesktopHermesSession,
   BotDesktopHermesResumeResponse,
   BotPendingClarification,
   BotPendingApproval,
@@ -171,6 +172,14 @@ export class NativeBotDataPlane {
   readonly #tracedTurnStates = new Map<string, string>();
   readonly #attachPresence = new Map<string, "online" | "degraded" | "absent">();
   readonly #desktopResumeWaiters = new Map<string, (sessionId: string) => void>();
+  readonly #desktopResumeOperations = new Map<string, Promise<BotDesktopHermesResumeResponse>>();
+  readonly #latestSessionResolutions = new Map<string, Promise<void>>();
+  /** A durable binding proves identity; this process-local proof additionally proves the currently
+   * attached plugin switched its private raw-session map during this data-plane lifetime. */
+  readonly #liveDesktopResumeProofs = new Map<
+    string,
+    { hermesSessionId: string; sessionId: string }
+  >();
   readonly #interactionTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
@@ -472,6 +481,9 @@ export class NativeBotDataPlane {
     this.#cozyAppOrigins.clear();
     for (const batch of this.#liveTurnBatches.values()) clearTimeout(batch.timer);
     this.#liveTurnBatches.clear();
+    this.#desktopResumeOperations.clear();
+    this.#latestSessionResolutions.clear();
+    this.#liveDesktopResumeProofs.clear();
   }
 
   handle(bot: string, frame: AttachV1EventFrame): boolean {
@@ -488,7 +500,11 @@ export class NativeBotDataPlane {
         now: this.#now(),
       });
       if (confirmed === undefined) return false;
-      if (!confirmed.alreadyResumed) {
+      this.#liveDesktopResumeProofs.set(key, {
+        hermesSessionId: event.hermesSessionId,
+        sessionId: event.threadId,
+      });
+      if (confirmed.selectionChanged) {
         this.#broadcast({
           type: "bot_chat_adopted",
           bot: key,
@@ -672,6 +688,7 @@ export class NativeBotDataPlane {
   async #canonical(name: string) {
     if (!this.#native.has(normalize(name))) throw new BotSessionNotFound(name);
     const bot = normalize(name);
+    await this.#resolveLatestSession(bot);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     return {
       sessionId: chat.sessionId,
@@ -691,6 +708,49 @@ export class NativeBotDataPlane {
     return this.#control.desktopSessions(bot);
   }
 
+  /** Resolve one authoritative conversation before a read or send. The gateway compares actual
+   * message activity across its selected local chat and the source-qualified Desktop/TUI/CLI
+   * index, then performs the existing exact resume proof only when another session is newer. */
+  async #resolveLatestSession(bot: string): Promise<void> {
+    const inflight = this.#latestSessionResolutions.get(bot);
+    if (inflight !== undefined) return inflight;
+    const resolution = this.#resolveLatestSessionOnce(bot);
+    this.#latestSessionResolutions.set(bot, resolution);
+    try {
+      await resolution;
+    } finally {
+      if (this.#latestSessionResolutions.get(bot) === resolution)
+        this.#latestSessionResolutions.delete(bot);
+    }
+  }
+
+  async #resolveLatestSessionOnce(bot: string): Promise<void> {
+    const current = this.#storage.nativeBotChat(bot, this.#now());
+    // Never redirect an in-flight lane. The session that owns the running turn remains canonical
+    // until Hermes settles it; the next read/send performs the same recency resolution again.
+    if (current.activeTurnId !== undefined) return;
+    try {
+      const latest = latestDesktopSession(await this.#control.desktopSessions(bot));
+      if (latest === undefined) return;
+      const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
+      if (binding?.hermesSessionId === latest.hermesSessionId) {
+        const proof = this.#liveDesktopResumeProofs.get(bot);
+        if (proof?.hermesSessionId === latest.hermesSessionId
+            && proof.sessionId === current.sessionId) return;
+        // The durable selection is already right, but a restarted plugin needs a fresh private
+        // raw-session proof. Confirmation deliberately emits no adoption frame for this no-op.
+        await this.#resumeEligibleDesktopSession(bot, latest.hermesSessionId);
+        return;
+      }
+      const localActivity = this.#storage.nativeBotSessionActivityAt(bot, current.sessionId) ?? 0;
+      if (localActivity >= desktopActivityStamp(latest)) return;
+      await this.#resumeEligibleDesktopSession(bot, latest.hermesSessionId);
+    } catch {
+      // Cross-surface continuity is enhancement-only. An unavailable index, transcript, or attach
+      // proof leaves the existing gateway chat readable and sendable rather than failing the chat.
+    }
+  }
+
   async #resumeDesktopSession(
     name: string,
     hermesSessionId: string,
@@ -702,6 +762,30 @@ export class NativeBotDataPlane {
     const eligible = await this.#control.desktopSessions(bot);
     if (!eligible.some((row) => row.hermesSessionId === hermesSessionId))
       throw new BotSessionNotFound(hermesSessionId);
+    return this.#resumeEligibleDesktopSession(bot, hermesSessionId);
+  }
+
+  async #resumeEligibleDesktopSession(
+    bot: string,
+    hermesSessionId: string,
+  ): Promise<BotDesktopHermesResumeResponse> {
+    const key = `${bot}\u0000${hermesSessionId}`;
+    const inflight = this.#desktopResumeOperations.get(key);
+    if (inflight !== undefined) return inflight;
+    const operation = this.#performDesktopSessionResume(bot, hermesSessionId);
+    this.#desktopResumeOperations.set(key, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.#desktopResumeOperations.get(key) === operation)
+        this.#desktopResumeOperations.delete(key);
+    }
+  }
+
+  async #performDesktopSessionResume(
+    bot: string,
+    hermesSessionId: string,
+  ): Promise<BotDesktopHermesResumeResponse> {
     const current = this.#storage.nativeBotChat(bot, this.#now());
     if (current.activeTurnId !== undefined)
       throw new BackendUnavailable("cannot resume a desktop session while this bot has a running native turn");
@@ -835,6 +919,7 @@ export class NativeBotDataPlane {
   async #history(name: string) {
     if (!this.#native.has(normalize(name))) throw new BotSessionNotFound(name);
     const bot = normalize(name);
+    await this.#resolveLatestSession(bot);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
     const state = this.#turnState(bot, chat.sessionId, chat.activeTurnId);
@@ -863,6 +948,7 @@ export class NativeBotDataPlane {
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    await this.#resolveLatestSession(bot);
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const messageId = opts?.clientId ?? randomUUID();
@@ -968,6 +1054,7 @@ export class NativeBotDataPlane {
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    await this.#resolveLatestSession(bot);
     const now = this.#now();
     const chat = this.#storage.nativeBotChat(bot, now);
     const mediaId = randomUUID().replaceAll("-", "");
@@ -2634,6 +2721,21 @@ function desktopSessionMessageId(source: "cozygateway" | "desktop" | "tui" | "cl
     .update(rowId)
     .digest("hex");
   return `desktop:${source}:${digest}`;
+}
+
+function desktopActivityStamp(session: BotDesktopHermesSession): number {
+  return session.lastActiveAt > 0 ? session.lastActiveAt : session.startedAt;
+}
+
+/** Do not trust provider enumeration order. Equal timestamps use the same stable opaque-id tie
+ * break on every request, so two clients cannot oscillate the canonical chat. */
+function latestDesktopSession(
+  sessions: readonly BotDesktopHermesSession[],
+): BotDesktopHermesSession | undefined {
+  return [...sessions].sort((left, right) =>
+    desktopActivityStamp(right) - desktopActivityStamp(left)
+    || right.startedAt - left.startedAt
+    || left.hermesSessionId.localeCompare(right.hermesSessionId))[0];
 }
 
 function normalize(value: string): string {

@@ -2685,7 +2685,7 @@ export class Storage {
    * harmless and prevents a raw Hermes id from being rebound to a different local session. */
   confirmNativeDesktopResume(input: {
     bot: string; hermesSessionId: string; sessionId: string; resumeId: string; now: number;
-  }): { previousSessionId: string; alreadyResumed: boolean } | undefined {
+  }): { previousSessionId: string; selectionChanged: boolean } | undefined {
     const row = this.#db.prepare(
       `SELECT status FROM bot_desktop_resume_bindings
        WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND resume_id = ?`,
@@ -2695,7 +2695,7 @@ export class Storage {
     if (row === undefined) return undefined;
     const current = this.nativeBotChat(input.bot, input.now);
     if (row.status === "resumed") {
-      return { previousSessionId: current.sessionId, alreadyResumed: true };
+      return { previousSessionId: current.sessionId, selectionChanged: false };
     }
     if (current.activeTurnId !== undefined) return undefined;
     this.#db.prepare(
@@ -2706,7 +2706,10 @@ export class Storage {
       `INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)
        ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, active_turn_id = NULL, updated_at = excluded.updated_at`,
     ).run(input.bot, input.sessionId, input.now);
-    return { previousSessionId: current.sessionId, alreadyResumed: false };
+    return {
+      previousSessionId: current.sessionId,
+      selectionChanged: current.sessionId !== input.sessionId,
+    };
   }
 
   nativeDesktopResumeAt(bot: string, hermesSessionId: string): number | undefined {
@@ -2714,6 +2717,30 @@ export class Storage {
       `SELECT confirmed_at AS confirmedAt FROM bot_desktop_resume_bindings
        WHERE bot = ? AND hermes_session_id = ? AND status = 'resumed'`,
     ).get(bot, hermesSessionId) as { confirmedAt: number | null } | undefined)?.confirmedAt ?? undefined;
+  }
+
+  /** Reverse the private Hermes-to-gateway bridge for the selected chat. This exposes neither id
+   * on a wire; it lets the gateway prove that its current local pin already represents the newest
+   * source-qualified interactive session and avoid a redundant adoption event. */
+  nativeDesktopResumeBinding(bot: string, sessionId: string): {
+    hermesSessionId: string; status: "pending" | "resumed";
+  } | undefined {
+    return this.#db.prepare(
+      `SELECT hermes_session_id AS hermesSessionId, status
+       FROM bot_desktop_resume_bindings WHERE bot = ? AND session_id = ?`,
+    ).get(bot, sessionId) as {
+      hermesSessionId: string; status: "pending" | "resumed";
+    } | undefined;
+  }
+
+  /** Real conversational activity for cross-surface recency. A freshly-created empty gateway
+   * placeholder has no activity and must not outrank an existing Desktop/TUI/CLI conversation just
+   * because the placeholder was allocated a few milliseconds later. */
+  nativeBotSessionActivityAt(bot: string, sessionId: string): number | undefined {
+    return (this.#db.prepare(
+      `SELECT MAX(at) AS activityAt FROM bot_native_messages
+       WHERE bot = ? AND session_id = ?`,
+    ).get(bot, sessionId) as { activityAt: number | null }).activityAt ?? undefined;
   }
 
   /** A sync row from a TUI-origin lane is accepted only after this exact, durable adoption proof.
