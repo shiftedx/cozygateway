@@ -54,7 +54,15 @@ case "$HERMES_BIN" in
   *) HERMES_BIN="$(cd "$(dirname "$HERMES_BIN")" && pwd)/$(basename "$HERMES_BIN")" ;;
 esac
 [ -x "$HERMES_BIN" ] || die "Hermes executable is not runnable: $HERMES_BIN"
-[ -x /usr/bin/plutil ] || die "/usr/bin/plutil not found"
+validate_plist() {
+  if [ -x /usr/bin/plutil ]; then
+    /usr/bin/plutil -lint "$1" >/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$1"
+  else
+    die "neither /usr/bin/plutil nor python3 is available to validate the LaunchAgent"
+  fi
+}
 [ -f "$SCRIPT_DIR/bot-provisioner-watch.sh" ] || die "watcher missing from checkout"
 [ -f "$SCRIPT_DIR/provision-bot.sh" ] || die "provisioner missing from checkout"
 [ -d "$REPO_ROOT/integrations/attach-plugin" ] || die "attach plugin missing from checkout"
@@ -131,7 +139,7 @@ sed -e "s|REPLACE_ME_PAYLOAD|$escaped_stage|g" \
     -e "s|REPLACE_ME_HERMES_BIN|$escaped_hermes|g" \
     -e "s|REPLACE_ME_HERMES_DIR|$escaped_hermes_dir|g" \
     "$PLIST_TEMPLATE" > "$plist_tmp"
-/usr/bin/plutil -lint "$plist_tmp" >/dev/null
+validate_plist "$plist_tmp"
 
 # A relative target keeps the symlink valid if the provisioner tree is copied as
 # a unit. Renaming the prepared symlink makes refresh atomic for future starts;
