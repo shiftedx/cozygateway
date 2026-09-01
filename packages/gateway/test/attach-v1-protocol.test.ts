@@ -38,6 +38,12 @@ describe("attach-v1 protocol", () => {
         cause: { kind: "user", seq: 7 },
       },
     }))).toBe(true);
+    // `seq` is absent rather than zero when a room has nothing to name, because zero is a real
+    // seq in a trimmed room.
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: { room: { key: "launch", name: "Launch", epoch: 2 }, actors: [] },
+    }))).toBe(true);
     // Closed: an unknown actor kind or an unknown context field is a sender the gateway does not
     // speak, not a field to ignore.
     expect(check(AttachV1ServerFrameSchema, frame({

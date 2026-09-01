@@ -299,13 +299,16 @@ export const BotChatMessageSchema = Type.Object({
    *  written outside a turn (an imported desktop transcript, a delivery-failure notice) and on
    *  every row written before 47. */
   turnId: Type.Optional(Type.String({ maxLength: 256 })),
-  /** Capability 47. The bot that authored a non-user row. Present on `assistant` and `system`
-   *  rows; a `user` row has no bot author and carries nothing here. It is the bot's profile name,
-   *  the same name the row's session is addressed by. */
+  /** Capability 47. The bot that authored a non-user row: every `assistant` row, whether the
+   *  gateway projected it from a turn or imported it from a desktop session, and a gateway-authored
+   *  `system` row. A `user` row has no bot author and carries nothing here. It is the bot's profile
+   *  name, the same name the row's session is addressed by. */
   authorBot: Type.Optional(Type.String({ maxLength: 128 })),
   /** Capability 47. The `id` of the user row this row answers, for an assistant row committed by a
    *  turn that a user message opened. It is the causation link a client would otherwise have to
-   *  infer from ordering, which is wrong the moment a scheduled or interim row lands between. */
+   *  infer from ordering, which is wrong the moment a scheduled or interim row lands between.
+   *  A steer shares the running turn's `turnId` and does NOT become a new `inReplyToId` target:
+   *  the question a turn answers is the one that opened it, not a mid-turn nudge. */
   inReplyToId: Type.Optional(Type.String({ maxLength: 256 })),
 });
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;

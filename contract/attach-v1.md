@@ -74,7 +74,8 @@ MUST invoke no Hermes action. Stable
 agent/thread/turn/message/approval/clarify ids are preserved end to end.
 
 A `turn` command MAY carry `context`, capability-47 typed provenance the gateway fills in on ROOM
-turns: `room` (`key`, `name`, `epoch`, and the highest room `seq` the member has been shown),
+turns: `room` (`key`, `name`, `epoch`, and an optional `seq`, the highest room seq the member has
+been shown, absent rather than zero when there is nothing to name),
 `actors` (every room member plus the human, each with `name`, `handle`, `displayName`, and `kind`
 of `member` or `user`), and `cause` (`{ kind, seq }`: what this member is being asked to answer).
 It is strictly decoration. The `text` a peer receives is byte-identical with and without it, so a

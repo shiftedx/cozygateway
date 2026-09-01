@@ -191,6 +191,7 @@ describe("attach-v1 native Bot Mode plane", () => {
         storage.enqueueAttachCommand(bot, "turn-command", { kind: "turn", ...input } as never, now);
         return true;
       },
+      sendNativeSteer: () => true,
       sendNativeInterrupt: () => true,
     } as unknown as AttachV1Ingress;
     let now = 100;
@@ -203,6 +204,10 @@ describe("attach-v1 native Bot Mode plane", () => {
 
     const accepted = await surface.sendChatMessage("sage", "what broke?", { clientId: "ask-1" });
     const turnId = String(sent[0]?.turnId);
+    // A steer joins the RUNNING turn and shares its id, so the transcript holds two user rows for
+    // one turn. The reply below still answers the message that opened it.
+    const steered = await surface.sendChatMessage("sage", "any detail?", { clientId: "nudge-1" });
+    expect(steered.message).toMatchObject({ id: "nudge-1", role: "user", turnId });
     expect(plane.handle("sage", {
       kind: "event", sequence: 1, eventId: "commit-1",
       event: {
@@ -216,7 +221,9 @@ describe("attach-v1 native Bot Mode plane", () => {
     // authored it, and the exact row it answers. None of it is inferred from ordering.
     expect(history.messages[0]).toMatchObject({ id: "ask-1", role: "user", turnId });
     expect(history.messages[0]?.authorBot).toBeUndefined();
-    expect(history.messages[1]).toMatchObject({
+    // The nudge does NOT become a new inReplyToId target: the question a turn answers is the one
+    // that opened it.
+    expect(history.messages[2]).toMatchObject({
       id: "answer-1", role: "assistant", turnId, authorBot: "sage", inReplyToId: "ask-1",
     });
     plane.close();

@@ -689,6 +689,10 @@ export class NativeBotDataPlane {
         role: event.role,
         text: event.text,
         at: event.at,
+        // Capability 47. A desktop-authored row is still this bot's row, and the reader asking
+        // "who said this?" deserves the same answer here as on a gateway-projected reply. It
+        // answers no gateway turn, so it names none.
+        ...(event.role === "user" ? {} : { authorBot: key }),
       });
       this.#broadcastMessage(key, event.threadId, message, this.#now());
       return true;
@@ -974,6 +978,7 @@ export class NativeBotDataPlane {
         role: message.role,
         text: message.text,
         at: message.at ?? this.#now() + index,
+        ...(message.role === "user" ? {} : { authorBot: bot }),
       });
     }
     // A durable `resumed` binding only proves a past plugin process switched its private raw
@@ -1637,7 +1642,9 @@ export class NativeBotDataPlane {
     const text = blocksToText(blocks);
     // Capability 47. Every id here is one the gateway already held; none is inferred. A commit
     // outside a turn (a scheduled delivery projection) has no turn and answers no user row, so it
-    // carries only its author.
+    // carries only its author. A STEER shares the running turn's id, so the lookup takes the
+    // FIRST user row of the turn: the question the turn answers is the one that opened it, and a
+    // mid-turn nudge does not replace it.
     const inReplyToId =
       turnId === undefined ? undefined : this.#storage.nativeBotTurnUserMessageId(bot, sessionId, turnId);
     const message = this.#storage.appendNativeBotMessage({

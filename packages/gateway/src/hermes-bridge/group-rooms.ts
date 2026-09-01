@@ -787,7 +787,7 @@ function turnContext(
   cause: BotGroupCause | undefined,
 ): AttachV1TurnContext {
   return {
-    room: { key, name: groupName, epoch, seq: cause?.seq ?? 0 },
+    room: { key, name: groupName, epoch, ...(cause === undefined ? {} : { seq: cause.seq }) },
     actors: [
       ...members.map((member) => ({
         name: member.name, handle: member.handle, displayName: member.displayName, kind: "member" as const,

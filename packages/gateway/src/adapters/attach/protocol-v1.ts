@@ -113,7 +113,10 @@ const TurnContext = Type.Object({
     key: Type.String({ minLength: 1, maxLength: 128 }),
     name: Type.String({ minLength: 1, maxLength: 128 }),
     epoch: Type.Integer({ minimum: 0 }),
-    seq: Type.Integer({ minimum: 0 }),
+    /** The highest room seq the member has been shown. Optional and ABSENT rather than zero when
+     * there is nothing to name: zero is a real seq in a room whose log was trimmed, so a
+     * placeholder would be a claim the gateway cannot make. */
+    seq: Type.Optional(Type.Integer({ minimum: 0 })),
   }, { additionalProperties: false }),
   actors: Type.Array(TurnActor, { maxItems: 8 }),
   cause: Type.Optional(Type.Object({

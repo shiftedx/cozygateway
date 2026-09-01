@@ -336,8 +336,13 @@ describe("attach-v1 native Bot Mode sessions", () => {
     } as AttachV1EventFrame)).toBe(true));
     expect(await h.surface.chatHistory("sage")).toMatchObject({
       sessionId: adopted,
-      messages: rows.map((row) => ({ role: "assistant", text: row.text })),
+      // Capability 47: a desktop-authored row is still this bot's row, so it names its author. It
+      // answers no gateway turn, so it names neither a turn nor a row it replies to.
+      messages: rows.map((row) => ({ role: "assistant", text: row.text, authorBot: "sage" })),
     });
+    expect((await h.surface.chatHistory("sage")).messages.every(
+      (message) => message.turnId === undefined && message.inReplyToId === undefined,
+    )).toBe(true);
     expect(h.frames.slice(framesBefore)).toContainEqual(expect.objectContaining({
       type: "bot_chat", bot: "sage", sessionId: adopted,
       messages: [expect.objectContaining({ role: "assistant", text: "continued on desktop" })],

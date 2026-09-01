@@ -116,12 +116,15 @@ a second, hand-copied schema.
   From capability 32 an attachment entry may also carry `position`; see "Inline media ordering".
   From capability 47 a row may carry `turnId` (the attach turn it belongs to: the user row that
   opened the turn and every assistant row that turn committed share it), `authorBot` (the bot that
-  authored an `assistant` or `system` row; a `user` row has no bot author), and `inReplyToId` (the
-  `id` of the user row an assistant row answers). All three are absent on every row written before
-  47 and on any row where the fact does not exist, such as an imported desktop transcript row or a
-  delivery-failure notice. They are recorded, never inferred: a client must not derive causation
-  from ordering when they are absent, because a scheduled or interim row can land between a
-  question and its answer.
+  authored the row), and `inReplyToId` (the `id` of the user row an assistant row answers).
+  `authorBot` is present on every non-user row written from 47 on, a desktop-imported assistant row
+  included; a `user` row has no bot author and carries none. A steer shares the running turn's
+  `turnId` and does NOT become a new `inReplyToId` target: the question a turn answers is the one
+  that opened it, not a mid-turn nudge. `turnId` and `inReplyToId` are absent where no gateway turn
+  produced the row, which is the `delivery.failed` system row and a desktop-imported row. All three
+  are absent on every row written before 47. They are recorded, never inferred: a client must not
+  derive causation from ordering when they are absent, because a scheduled or interim row can land
+  between a question and its answer.
 - `BotSessionSummary` is a durable native Bot Mode session. Current native Bot Mode sessions have
   `kind: "conversation"`; `startedAt` and `lastActiveAt` are milliseconds. They are not Hermes
   Dashboard session records.
