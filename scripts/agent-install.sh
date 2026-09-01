@@ -1384,15 +1384,25 @@ wait_gateway_ready() {
   for attempt in $(seq 1 30); do gateway_ready && return; sleep 1; done
   die "CozyGateway did not become healthy on $(gateway_origin)"
 }
+attach_health() {
+  curl -fsS --max-time 3 "$(gateway_origin)/health" 2>/dev/null
+}
 attach_ready() {
-  curl -fsS --max-time 3 "$(gateway_origin)/health" 2>/dev/null |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach;process.exit(h&&h.configured>0&&h.online===h.configured&&h.deadLetters===0?0:1)}catch{process.exit(1)}})'
+  attach_health |
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach,c=h?.configured,o=h?.online,d=h?.deadLetters;process.exit([c,o,d].every(Number.isInteger)&&c>0&&o>=0&&d>=0&&o===c&&d===0?0:1)}catch{process.exit(1)}})'
+}
+attach_health_diagnosis() {
+  attach_health |
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{const unreadable=()=>process.stdout.write("Hermes attach health could not be read");try{const h=JSON.parse(b).attach,c=h?.configured,o=h?.online,d=h?.deadLetters;if(![c,o,d].every(Number.isInteger)||c<0||o<0||d<0)return unreadable();const counts=`configured=${c}, online=${o}, deadLetters=${d}`;if(c===0)return process.stdout.write(`Hermes attach has no configured profiles (${counts})`);if(o!==c)return process.stdout.write(`Hermes attach profile count mismatch (${counts})`);if(d!==0)return process.stdout.write(`Hermes attach retained dead letters (${counts})`);return process.stdout.write("__cozygateway_attach_healthy__")}catch{return unreadable()}})'
 }
 wait_attach_ready() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   require attach.configured > 0, attach.online == attach.configured, and zero dead letters"; return; }
-  local attempt
+  local attempt diagnosis
   for attempt in $(seq 1 30); do attach_ready && return; sleep 1; done
-  die "Hermes attach did not become healthy (configured must be positive, online must equal configured, and dead letters must be zero)"
+  diagnosis="$(attach_health_diagnosis || true)"
+  [ "$diagnosis" = __cozygateway_attach_healthy__ ] && return
+  [ -n "$diagnosis" ] || diagnosis="Hermes attach health could not be read"
+  die "$diagnosis"
 }
 install_service() {
   resolve_platform; write_wrapper

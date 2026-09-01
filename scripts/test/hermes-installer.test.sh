@@ -305,6 +305,7 @@ case "$*" in
       exit 0
     fi
     if [[ "$*" == *"-o /dev/null"* ]]; then printf '200'
+    elif [ -n "${COZYGATEWAY_TEST_ATTACH_HEALTH:-}" ]; then printf '%s' "$COZYGATEWAY_TEST_ATTACH_HEALTH"
     elif [ "${COZYGATEWAY_TEST_ZERO_ATTACH:-}" = 1 ]; then printf '{"attach":{"configured":0,"online":0,"deadLetters":0}}'
     else printf '{"attach":{"configured":1,"online":1,"deadLetters":0}}'; fi
     ;;
@@ -382,9 +383,26 @@ if zero_attach_output="$(HOME="$tmp/zero-home" PATH="$tmp/one-attempt-bin:$tmp/s
   echo 'expected zero configured attach profiles to fail readiness' >&2
   exit 1
 fi
-grep -Fq 'configured must be positive' <<<"$zero_attach_output"
+grep -Fq 'Hermes attach has no configured profiles (configured=0, online=0, deadLetters=0)' <<<"$zero_attach_output"
 if grep -Fq 'fake-qr' <<<"$zero_attach_output"; then echo 'unhealthy attach state printed pairing material' >&2; exit 1; fi
 grep -Fq '"host": "127.0.0.1"' "$tmp/gateway-zero-attach/local/cozygateway.config.json"
+
+# The exact Windows failure (two configured profiles, only one online) must
+# identify the failed invariant and safe aggregate counts. The old combined
+# error made a profile lifecycle failure indistinguishable from dead letters.
+mkdir -p "$tmp/mismatch-hermes"
+printf '{}\n' > "$tmp/mismatch-hermes/config.yaml"
+printf 'absent\n' > "$tmp/mismatch-hermes/gateway-default.state"
+if mismatch_output="$(HOME="$tmp/mismatch-home" PATH="$tmp/one-attempt-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"configured":2,"online":1,"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$tmp/mismatch-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mismatch-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mismatch-attach" 2>&1)"; then
+  echo 'expected configured/online attach mismatch to fail readiness' >&2
+  exit 1
+fi
+expect_contains "$mismatch_output" 'Hermes attach profile count mismatch (configured=2, online=1, deadLetters=0)'
+if grep -Fq 'configured must be positive, online must equal configured, and dead letters must be zero' <<<"$mismatch_output"; then
+  echo 'attach mismatch returned the opaque combined error' >&2
+  exit 1
+fi
+if grep -Fq 'fake-qr' <<<"$mismatch_output"; then echo 'attach mismatch printed pairing material' >&2; exit 1; fi
 # shellcheck disable=SC2016
 if grep -Fq 'spaces $dollar' <<<"$live_output"; then
   echo 'installer output must not contain credentials' >&2
