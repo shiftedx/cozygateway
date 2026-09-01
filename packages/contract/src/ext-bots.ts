@@ -1729,9 +1729,12 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * memory setup. Roster previews never infer A2A provenance from transcript text, and setup runs
  * through the authenticated attached plugin; the gateway never opens profile configuration. */
 /** Capability 43 adds authoritative synchronization state for every visible Hermes profile and
- * the `setup_required` readiness outcome for profiles outside the attach map. Capability 44 adds
- * per-profile CozyApps capability readiness, including a stable restart repair when a connected
- * plugin did not negotiate `cozyapps`, and native runtime Bots: a config-declared bot served by a
- * non-Hermes attach peer appears on the roster with `runtime: "cozyagents"`, while its
- * Dashboard-backed routes answer `409 unsupported_for_runtime`. */
-export const BOTS_CAPABILITY_VERSION = 44;
+ * the `setup_required` readiness outcome for profiles outside the attach map. */
+/** Capability 44 adds per-profile CozyApps capability readiness, including a stable restart repair
+ * when a connected plugin did not negotiate `cozyapps`. */
+/** Capability 45: NATIVE RUNTIME BOTS. A config-declared bot served by a non-Hermes attach peer
+ * appears on the roster with `runtime: "cozyagents"` built from config plus attach presence, never
+ * from the Dashboard, and its Dashboard-backed routes answer `409 unsupported_for_runtime`. A
+ * client gating native-bot UI must require >= 45: a gateway at 44 has the CozyApps fact and no
+ * native bots at all. */
+export const BOTS_CAPABILITY_VERSION = 45;
