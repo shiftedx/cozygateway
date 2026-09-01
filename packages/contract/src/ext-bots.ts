@@ -38,6 +38,18 @@ export const BotPreviewSchema = Type.Object({
 });
 export type BotPreview = Static<typeof BotPreviewSchema>;
 
+/** CozyApps is gateway-wide in `GatewayInfo`, but execution is negotiated independently by each
+ * attached Hermes profile. This additive per-bot fact prevents an old plugin from making its
+ * bot look app-ready merely because another profile (or the gateway itself) supports CozyApps.
+ * `restart_profile` is a bounded repair instruction, not an opaque transport error: the installer
+ * syncs the plugin and the next Hermes launch renegotiates its capabilities. */
+export const BotCozyAppsReadinessSchema = Type.Object({
+  status: Type.Union([Type.Literal("ready"), Type.Literal("degraded")]),
+  reason: Type.Optional(Type.Literal("cozyapps_not_negotiated")),
+  repair: Type.Optional(Type.Literal("restart_profile")),
+}, { additionalProperties: false });
+export type BotCozyAppsReadiness = Static<typeof BotCozyAppsReadinessSchema>;
+
 /** One roster row. `meta` is the bot's `ui_meta["hermes-bots"]` blob verbatim (or null when the
  *  profile carries none), kept open on purpose: the desktop plugin owns that namespace and may
  *  add keys we do not model. */
@@ -59,6 +71,13 @@ export const BotSummarySchema = Type.Object({
     Type.Literal("starting"),
     Type.Literal("setup_required"),
   ]),
+  /** Capability-44 per-profile CozyApps status. Old clients ignore it; clients that understand
+   * it must not claim app execution is available when this profile did not negotiate `cozyapps`. */
+  cozyApps: Type.Optional(BotCozyAppsReadinessSchema),
+  /** Additive, stable explanation for a non-ready sync state. */
+  syncReason: Type.Optional(Type.Literal("cozyapps_not_negotiated")),
+  /** Additive repair instruction paired with `syncReason`. */
+  syncRepair: Type.Optional(Type.Literal("restart_profile")),
   meta: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
@@ -106,6 +125,13 @@ export const BotReadinessSchema = Type.Object({
     Type.Literal("starting"),
     Type.Literal("ready"),
   ]),
+  /** CozyApps is expressed separately from the general readiness status so a client can name the
+   * feature gap. A missing CozyApps negotiation still keeps the profile non-ready. */
+  cozyApps: Type.Optional(BotCozyAppsReadinessSchema),
+  /** Additive, stable explanation for a non-ready status. */
+  reason: Type.Optional(Type.Literal("cozyapps_not_negotiated")),
+  /** Additive repair instruction paired with `reason`. */
+  repair: Type.Optional(Type.Literal("restart_profile")),
   updatedAt: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false });
 export type BotReadiness = Static<typeof BotReadinessSchema>;
@@ -1699,5 +1725,7 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * memory setup. Roster previews never infer A2A provenance from transcript text, and setup runs
  * through the authenticated attached plugin; the gateway never opens profile configuration. */
 /** Capability 43 adds authoritative synchronization state for every visible Hermes profile and
- * the `setup_required` readiness outcome for profiles outside the attach map. */
-export const BOTS_CAPABILITY_VERSION = 43;
+ * the `setup_required` readiness outcome for profiles outside the attach map. Capability 44 adds
+ * per-profile CozyApps capability readiness, including a stable restart repair when a connected
+ * plugin did not negotiate `cozyapps`. */
+export const BOTS_CAPABILITY_VERSION = 44;

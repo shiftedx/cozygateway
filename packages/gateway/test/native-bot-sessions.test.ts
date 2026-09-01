@@ -325,17 +325,18 @@ describe("attach-v1 native Bot Mode sessions", () => {
     expect(adopted).toBe(command.threadId);
     const framesBefore = h.frames.length;
 
-    const row = {
-      kind: "desktop_session_message", threadId: adopted,
+    const rows = (["desktop", "tui", "cli"] as const).map((source, index) => ({
+      kind: "desktop_session_message" as const, threadId: adopted,
       hermesSessionId: "desktop-current", desktopSessionId: "desktop-original",
-      source: "tui", rowId: "row-17", role: "assistant", text: "continued on desktop", at: 2_000,
-    } as const;
-    expect(h.plane.handle("sage", {
-      kind: "event", sequence: 2, eventId: "desktop-row-1", event: row,
-    } as AttachV1EventFrame)).toBe(true);
+      source, rowId: `row-17-${source}`, role: "assistant" as const,
+      text: `continued on ${source}`, at: 2_000 + index,
+    }));
+    rows.forEach((row, index) => expect(h.plane.handle("sage", {
+      kind: "event", sequence: 2 + index, eventId: `desktop-row-${row.source}`, event: row,
+    } as AttachV1EventFrame)).toBe(true));
     expect(await h.surface.chatHistory("sage")).toMatchObject({
       sessionId: adopted,
-      messages: [{ role: "assistant", text: "continued on desktop" }],
+      messages: rows.map((row) => ({ role: "assistant", text: row.text })),
     });
     expect(h.frames.slice(framesBefore)).toContainEqual(expect.objectContaining({
       type: "bot_chat", bot: "sage", sessionId: adopted,
@@ -345,7 +346,7 @@ describe("attach-v1 native Bot Mode sessions", () => {
     // At-least-once replay is accepted but cannot append or broadcast a second row.
     const afterFirst = h.frames.length;
     expect(h.plane.handle("sage", {
-      kind: "event", sequence: 3, eventId: "desktop-row-replay", event: row,
+      kind: "event", sequence: 5, eventId: "desktop-row-replay", event: rows[0],
     } as AttachV1EventFrame)).toBe(true);
     expect((await h.surface.chatHistory("sage")).messages.filter((message) => message.text === "continued on desktop")).toHaveLength(1);
     expect(h.frames).toHaveLength(afterFirst);
@@ -353,7 +354,7 @@ describe("attach-v1 native Bot Mode sessions", () => {
     h.storage.close();
   });
 
-  it("fails closed for desktop sync rows with a wrong binding, while cozygateway rows stay in their owned native session", async () => {
+  it("rejects gateway-origin transcript echoes while retaining the verified desktop lane", async () => {
     const h = nativePlane(["sage", "luna"]);
     const sage = (await h.surface.canonicalChat("sage")).sessionId;
     const luna = (await h.surface.canonicalChat("luna")).sessionId;
@@ -366,15 +367,27 @@ describe("attach-v1 native Bot Mode sessions", () => {
     expect(h.plane.handle("sage", { kind: "event", sequence: 1, eventId: "bad", event: bad } as AttachV1EventFrame)).toBe(false);
     expect((await h.surface.chatHistory("sage")).messages).toEqual([]);
 
-    const mobile = {
-      kind: "desktop_session_message", threadId: sage,
+    for (const [index, role] of (["user", "assistant"] as const).entries()) {
+      const echo = {
+        kind: "desktop_session_message", threadId: sage,
+        hermesSessionId: "native-raw", source: "cozygateway",
+        rowId: `echo-${role}`, role, text: `${role} self echo`, at: 2 + index,
+      } as const;
+      expect(h.plane.canAccept("sage", {
+        kind: "event", sequence: 2 + index, eventId: `echo-${role}`, event: echo,
+      } as AttachV1EventFrame)).toBe(false);
+      expect(h.plane.handle("sage", {
+        kind: "event", sequence: 2 + index, eventId: `echo-${role}`, event: echo,
+      } as AttachV1EventFrame)).toBe(false);
+    }
+    expect((await h.surface.chatHistory("sage")).messages).toEqual([]);
+    const foreignEcho = {
+      kind: "desktop_session_message", threadId: luna,
       hermesSessionId: "native-raw", source: "cozygateway",
-      rowId: "row-2", role: "user", text: "visible mobile lane row", at: 2,
+      rowId: "foreign-echo", role: "user", text: "foreign self echo", at: 4,
     } as const;
-    expect(h.plane.handle("sage", { kind: "event", sequence: 2, eventId: "mobile-row", event: mobile } as AttachV1EventFrame)).toBe(true);
-    expect((await h.surface.chatHistory("sage")).messages).toMatchObject([{ text: "visible mobile lane row" }]);
     expect(h.plane.handle("sage", {
-      kind: "event", sequence: 3, eventId: "foreign-row", event: { ...mobile, threadId: luna },
+      kind: "event", sequence: 4, eventId: "foreign-echo", event: foreignEcho,
     } as AttachV1EventFrame)).toBe(false);
     h.plane.close();
     h.storage.close();

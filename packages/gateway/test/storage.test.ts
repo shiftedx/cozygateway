@@ -64,6 +64,52 @@ describe("delegation enrichment migration", () => {
   });
 });
 
+describe("native transcript self-echo repair", () => {
+  it("removes only legacy CozyGateway echoes paired with a direct desktop row", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-native-echo-repair-"));
+    const path = join(directory, "gateway.sqlite");
+    let storage = openStorage(path);
+    const sessionId = storage.nativeBotChat("cleo", 1).sessionId;
+    const append = (messageId: string, role: "user" | "assistant", text: string, at: number) =>
+      storage.appendNativeBotMessage({ bot: "cleo", sessionId, messageId, role, text, at });
+
+    append("desktop:cli:direct-user", "user", "Are those TRM jobs still open?", 10_000);
+    append("desktop:cozygateway:echo-user", "user", "Are those TRM jobs still open?", 10_500);
+    append("desktop:cozygateway:echo-assistant", "assistant", "Eight are still open.", 20_000);
+    append("desktop:tui:direct-assistant", "assistant", "Eight are still open.", 20_750);
+    append("desktop:cozygateway:echo-only", "assistant", "recover this unmatched row", 30_000);
+    append("desktop:desktop:direct-only", "assistant", "keep this direct row", 40_000);
+    append("desktop:cozygateway:outside-window", "assistant", "too far apart", 50_000);
+    append("desktop:cli:outside-window-direct", "assistant", "too far apart", 51_001);
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.nativeBotMessages("cleo", sessionId).map((message) => message.id)).toEqual([
+      "desktop:cli:direct-user",
+      "desktop:tui:direct-assistant",
+      "desktop:cozygateway:echo-only",
+      "desktop:desktop:direct-only",
+      "desktop:cozygateway:outside-window",
+      "desktop:cli:outside-window-direct",
+    ]);
+    storage.close();
+
+    // The repair is a startup migration: reopening does not delete unmatched recovery rows or
+    // otherwise mutate already-repaired history.
+    storage = openStorage(path);
+    expect(storage.nativeBotMessages("cleo", sessionId).map((message) => message.id)).toEqual([
+      "desktop:cli:direct-user",
+      "desktop:tui:direct-assistant",
+      "desktop:cozygateway:echo-only",
+      "desktop:desktop:direct-only",
+      "desktop:cozygateway:outside-window",
+      "desktop:cli:outside-window-direct",
+    ]);
+    storage.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
+
 function seeded() {
   const storage = openStorage(":memory:");
   storage.upsertAgent({ id: "a1", name: "Mock", avatar: null, backend: "mock" });

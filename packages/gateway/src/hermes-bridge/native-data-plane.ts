@@ -136,6 +136,14 @@ function liveTurnFrameKey(frame: LiveTurnFrame): string {
 const LIVE_TURN_FLUSH_MS = 100;
 const DESKTOP_RESUME_CONFIRM_MS = 2_000;
 
+/** Kept structural at this assembly seam so `pnpm --filter cozygateway typecheck` does not depend
+ * on a prior contract build. The public wire shape is owned and schema-checked in ext-bots.ts. */
+type CozyAppsReadiness = {
+  status: "ready" | "degraded";
+  reason?: "cozyapps_not_negotiated";
+  repair?: "restart_profile";
+};
+
 interface NativeTurnState {
   status: BotChatStatus;
   cause?: BotChatStateCause;
@@ -322,6 +330,7 @@ export class NativeBotDataPlane {
         const latest = messages.findLast(
           (message) => message.text.trim().length > 0,
         );
+        const cozyApps = this.#cozyAppsReadiness(bot);
         return {
           ...summary,
           chatSessionId: chat.sessionId,
@@ -331,6 +340,9 @@ export class NativeBotDataPlane {
               ? { kind: "empty", text: "No conversations yet, say hi" }
               : { kind: "plain", text: latest.text.trim() },
           syncState: this.#syncState(bot),
+          ...(cozyApps === undefined ? {} : { cozyApps }),
+          ...(cozyApps?.reason === undefined ? {} : { syncReason: cozyApps.reason }),
+          ...(cozyApps?.repair === undefined ? {} : { syncRepair: cozyApps.repair }),
         };
       });
   }
@@ -346,9 +358,13 @@ export class NativeBotDataPlane {
    * constructs the native plane that can eventually move through `starting` to `ready`. */
   #readiness(name: string) {
     const key = normalize(name);
+    const cozyApps = this.#cozyAppsReadiness(key);
     return {
       name: key,
       status: this.#syncState(key),
+      ...(cozyApps === undefined ? {} : { cozyApps }),
+      ...(cozyApps?.reason === undefined ? {} : { reason: cozyApps.reason }),
+      ...(cozyApps?.repair === undefined ? {} : { repair: cozyApps.repair }),
       updatedAt: this.#now(),
     };
   }
@@ -356,9 +372,32 @@ export class NativeBotDataPlane {
   #syncState(bot: string): "setup_required" | "starting" | "ready" {
     if (!this.handles(bot)) return "setup_required";
     const presence = this.#attachPresence.get(bot);
-    return presence !== "degraded" && presence !== "absent"
-      && (presence === "online" || this.#ingress.isAttached?.(bot) === true)
-      ? "ready" : "starting";
+    const transportReady = presence !== "degraded" && presence !== "absent"
+      && (presence === "online" || this.#ingress.isAttached?.(bot) === true);
+    if (!transportReady) return "starting";
+    // An online old plugin can still accept chat turns, but it cannot publish or action CozyApps.
+    // Surface the existing non-ready state until its launch is restarted with the installed plugin
+    // rather than letting an app infer feature availability from the gateway-wide capability alone.
+    return this.#cozyAppsReadiness(bot)?.status === "degraded" ? "starting" : "ready";
+  }
+
+  #cozyAppsReadiness(bot: string): CozyAppsReadiness | undefined {
+    if (!this.handles(bot)) return undefined;
+    // Unit seams from pre-capability tests deliberately model only attachment. Production ingress
+    // always exposes this accessor; absence here means no capability observation is available.
+    const capabilitiesFor = this.#ingress.negotiatedCapabilities;
+    if (typeof capabilitiesFor !== "function") return undefined;
+    const presence = this.#attachPresence.get(bot);
+    const transportReady = presence !== "degraded" && presence !== "absent"
+      && (presence === "online" || this.#ingress.isAttached?.(bot) === true);
+    if (!transportReady) return { status: "degraded" };
+    return capabilitiesFor.call(this.#ingress, bot).has("cozyapps")
+      ? { status: "ready" }
+      : {
+          status: "degraded",
+          reason: "cozyapps_not_negotiated",
+          repair: "restart_profile",
+        };
   }
 
   handles(bot: string): boolean {
@@ -377,7 +416,12 @@ export class NativeBotDataPlane {
     }
     if (frame.event.kind === "desktop_session_message") {
       if (!this.#storage.nativeBotHasSession(key, frame.event.threadId)) return false;
-      return frame.event.source === "cozygateway" || this.#storage.hasConfirmedNativeDesktopResume(
+      // A gateway-origin transcript row is the attach plugin observing the mobile message we
+      // already committed locally. Accepting it would turn the mirror into a feedback loop and
+      // render every matching user or assistant row twice. Only an independently verified
+      // Desktop/TUI/CLI source may project transcript history back into this local session.
+      if (frame.event.source === "cozygateway") return false;
+      return this.#storage.hasConfirmedNativeDesktopResume(
         key, frame.event.desktopSessionId, frame.event.threadId,
       );
     }

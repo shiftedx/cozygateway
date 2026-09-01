@@ -32,7 +32,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROVISION="$SCRIPT_DIR/provision-bot.sh"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC_DIR="$REPO_ROOT/integrations/attach-plugin"
+# Kept overridable for the isolated shell regression test. The installed
+# LaunchAgent does not set it and always runs the staged provisioner.
+PROVISION="${COZY_PROVISION_COMMAND:-$SCRIPT_DIR/provision-bot.sh}"
 
 HERMES_HOME_ROOT="${HERMES_HOME_ROOT:-$HOME/.hermes}"
 LOG_FILE="${COZY_PROVISIONER_LOG:-$HOME/Library/Logs/cozylabs-bot-provisioner.log}"
@@ -75,6 +79,7 @@ fi
 PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
 [ -n "$PYTHON" ] || { log "sweep aborted: no python3"; exit 1; }
+[ -d "$SRC_DIR" ] || { log "sweep aborted: staged attach plugin is missing: $SRC_DIR"; exit 1; }
 
 # Opted in: config.yaml lists the plugin. Structural, not a grep, because the
 # bare name appears in the disabled list too.
@@ -97,11 +102,33 @@ sys.exit(0 if "cozygateway" in ((data.get("plugins") or {}).get("enabled") or []
 PY
 }
 
-# Wired: all three halves present. Reported as a reason string so the log says
-# WHY a profile was picked up, which is the first question at 3am.
+# A profile can have all of its wiring while still running an old plugin: the
+# watcher must compare content (not timestamps or merely plugin.yaml's version)
+# so an already-loaded Hermes service is upgraded after every staged release.
+# Newline-bearing filenames are not a supported plugin asset shape; the source
+# tree is versioned and the plugin loader cannot address such paths either.
+plugin_content_matches_source() {
+  local dest="$1" source_files installed_files rel
+  [ -d "$dest" ] || return 1
+  source_files="$(cd "$SRC_DIR" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  installed_files="$(cd "$dest" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  [ "$source_files" = "$installed_files" ] || return 1
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    cmp -s "$SRC_DIR/$rel" "$dest/$rel" || return 1
+  done <<EOF
+$source_files
+EOF
+}
+
+# Wired: all three halves plus the current staged plugin. Reported as a reason
+# string so the log says WHY a profile was picked up, which is the first
+# question at 3am.
 missing_reason() {
   local dir="$1" profile="$2"
   [ -d "$dir/plugins/cozygateway" ] || { printf 'no synced plugin dir'; return 0; }
+  plugin_content_matches_source "$dir/plugins/cozygateway" \
+    || { printf 'plugin content differs from staged source'; return 0; }
   # NOT a bare test for COZYGATEWAY_TOKEN: a fresh profile arrives with a COPY
   # of the launch profile's .env, token included, so its presence proves
   # nothing. A spool path pointing INTO this profile's own directory is the
