@@ -313,7 +313,7 @@ describe("cozygateway terminal menu", () => {
       delete process.env.TEST_HERMES_CONTROL_TOKEN;
       delete process.env.TEST_ATTACH_TOKEN;
     }
-    expect(lines.join("\n")).toContain("Gateway:  v0.5.5");
+    expect(lines.join("\n")).toContain("Gateway:  v0.5.6");
     expect(lines.join("\n")).toContain("Hermes attach needs attention: 0/1 Hermes profiles online");
     expect(lines.join("\n")).toContain("Run cozygateway repair");
   });
