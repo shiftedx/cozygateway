@@ -11,11 +11,21 @@ describe("attach-v1 durable transport storage", () => {
     const storage = openStorage(":memory:");
     storage.enqueueAttachCommand("sage", "c1", { kind: "interrupt", threadId: "t", turnId: "u" }, 1);
     storage.enqueueAttachCommand("sage", "c2", { kind: "interrupt", threadId: "t", turnId: "u" }, 2);
-    expect(storage.reconcileAttachCommandResume("sage", 3, 3)).toBe(false);
+    expect(storage.reconcileAttachResume("sage", 0, 3, 3)).toBe(false);
     expect(storage.pendingAttachCommands("sage", 0, 10)).toHaveLength(2);
-    expect(storage.reconcileAttachCommandResume("sage", 2, 4)).toBe(true);
+    expect(storage.reconcileAttachResume("sage", 0, 2, 4)).toBe(true);
     expect(storage.attachCommandCursor("sage")).toBe(2);
     expect(storage.pendingAttachCommands("sage", 0, 10)).toEqual([]);
+    storage.close();
+  });
+
+  it("adopts an authenticated plugin's durable cursors when the gateway has no stream", () => {
+    const storage = openStorage(":memory:");
+    expect(storage.reconcileAttachResume("sage", 118_129, 460, 1)).toBe(true);
+    expect(storage.attachEventCursor("sage")).toBe(118_129);
+    expect(storage.attachCommandCursor("sage")).toBe(460);
+    expect(storage.enqueueAttachCommand("sage", "c461", { kind: "interrupt", threadId: "t", turnId: "u" }, 2).sequence).toBe(461);
+    expect(storage.reconcileAttachResume("sage", 118_129, 462, 3)).toBe(false);
     storage.close();
   });
 
