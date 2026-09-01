@@ -630,6 +630,12 @@ export async function startGateway(
     storage,
     ingress: attachV1Ingress,
     nativeBots: nativeBotEntries.map(([bot]) => bot),
+    runtimeBots: runtimeBots.map((bot) => ({
+      id: bot.id,
+      name: bot.name ?? bot.id,
+      avatar: bot.avatar ?? null,
+      runtime: bot.runtime,
+    })),
     chatSuggestion: hermesOptions.chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     staleTurnSweepMs: millis(config.staleTurnSweepSeconds),

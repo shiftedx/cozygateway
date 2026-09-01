@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { Hono } from "hono";
+import type { MiddlewareHandler } from "hono";
 import type { ServerFrame } from "cozygateway-contract";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,7 +10,8 @@ import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
-import { BackendUnavailable } from "../src/errors.ts";
+import { BackendUnavailable, UnsupportedForRuntime } from "../src/errors.ts";
+import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 import { ATTACH_MEDIA_TTL_MS } from "../src/hermes-bridge/photos.ts";
 import { openStorage } from "../src/storage.ts";
 
@@ -1967,6 +1970,118 @@ describe("attach-v1 native Bot Mode plane", () => {
       delegations: [{ children: [expected, sparse] }],
     });
     reopened.close();
+    storage.close();
+  });
+});
+
+describe("native runtime bots", () => {
+  const sage = { id: "sage", name: "Sage", avatar: null, runtime: "cozyagents" } as const;
+
+  it("lists a native runtime bot from config without any Dashboard row", () => {
+    const storage = openStorage(":memory:");
+    let attached = false;
+    const control = {
+      roster: () => ({ bots: [], updatedAt: 1, stale: true, hermesState: "offline" }),
+    } as unknown as BotsSurface;
+    const plane = new NativeBotDataPlane({
+      control,
+      storage,
+      ingress: { isAttached: () => attached } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 7,
+    });
+
+    const view = plane.surface().roster();
+    expect(view.stale).toBe(true);
+    expect(view.bots).toMatchObject([
+      {
+        name: "sage",
+        displayName: "Sage",
+        handle: "sage",
+        description: null,
+        hasAvatar: false,
+        group: null,
+        pinned: false,
+        meta: null,
+        runtime: "cozyagents",
+        syncState: "starting",
+        chatSessionId: expect.any(String),
+        active: false,
+        preview: { kind: "empty", text: "No conversations yet, say hi" },
+      },
+    ]);
+    // The `bot_roster` frame is published through this same overlay, so it must carry the row too.
+    expect(plane.rosterBots([])).toMatchObject([{ name: "sage", runtime: "cozyagents" }]);
+
+    attached = true;
+    plane.handleAttachPresence("sage", "online");
+    expect(plane.surface().roster().bots[0]).toMatchObject({
+      syncState: "ready",
+      active: true,
+    });
+
+    plane.close();
+    storage.close();
+  });
+
+  it("answers unsupported_for_runtime for Dashboard-backed surfaces on a native runtime bot", async () => {
+    const storage = openStorage(":memory:");
+    const botProfile = vi.fn();
+    const routines = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: { botProfile, routines } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    await expect(plane.surface().botProfile("SAGE")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    await expect(plane.surface().routines("sage")).rejects.toMatchObject({
+      bot: "sage",
+      feature: "routines",
+      runtime: "cozyagents",
+    });
+    expect(botProfile).not.toHaveBeenCalled();
+    expect(routines).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("answers 409 unsupported_for_runtime on the Dashboard-backed route", async () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: { botProfile: vi.fn() } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+    const app = new Hono<{ Variables: { deviceId: string } }>();
+    const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
+      c.set("deviceId", "device-1");
+      await next();
+    };
+    registerBotRoutes(app, requireDevice, plane.surface());
+
+    const response = await app.request("/bots/sage/profile");
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: "unsupported_for_runtime" },
+      runtime: "cozyagents",
+      feature: "botProfile",
+    });
+
+    plane.close();
     storage.close();
   });
 });
