@@ -106,6 +106,13 @@ export const BotCreateRequestSchema = Type.Object({
   description: Type.Optional(Type.String({ maxLength: 2_000 })),
   toolsets: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })),
   mcpServers: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })),
+  /** Capability 49. Names the runtime that will serve the new bot. Absent means Hermes, which is
+   * every create written before 49 and therefore the unchanged default. `"cozyagents"` asks the
+   * gateway to create a runtime bot instead: no Hermes profile is written, the gateway owns the
+   * durable row and mints the attach token itself, and a CozyRunner reconciles the container.
+   * `toolsets` and `mcpServers` are Hermes seeding instructions and are ignored for this kind;
+   * anything supplied alongside it is named back in `warnings`. */
+  runtime: Type.Optional(Type.Literal("cozyagents")),
 });
 export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
 
@@ -157,6 +164,51 @@ export const BotDeleteResponseSchema = Type.Object({
   residue: Type.Array(Type.String({ minLength: 1, maxLength: 400 }), { maxItems: 16 }),
 });
 export type BotDeleteResponse = Static<typeof BotDeleteResponseSchema>;
+
+/** Capability 49: the operational stages a Bot Runtime can be projected in. The list is ADR 0002's
+ * whole vocabulary rather than only the stages wave 3 can reach, so a runner that learns to stop,
+ * drain, or upgrade a runtime does not need a schema change to say so. */
+export const BotRuntimeStageSchema = Type.Union([
+  Type.Literal("waiting_for_runner"),
+  Type.Literal("waiting_for_capacity"),
+  Type.Literal("pulling_image"),
+  Type.Literal("creating"),
+  Type.Literal("starting"),
+  Type.Literal("ready"),
+  Type.Literal("draining"),
+  Type.Literal("stopping"),
+  Type.Literal("stopped"),
+  Type.Literal("recovering"),
+  Type.Literal("upgrading"),
+  Type.Literal("deleting"),
+  /** Terminal for a delete: the runner has removed the container and the bot-exclusive volumes.
+   * The route stops answering for the bot once this lands, because nothing is left to project. */
+  Type.Literal("deleted"),
+  /** The gateway has purged the bot and accepted the delete, and a runner has not yet said
+   * anything about it. The bot is already gone from the roster and its credential already dead;
+   * this stage exists so a client that was watching the runtime can see the cleanup finish. */
+  Type.Literal("deletion_pending"),
+  Type.Literal("needs_attention"),
+]);
+export type BotRuntimeStage = Static<typeof BotRuntimeStageSchema>;
+
+/** Capability 49: `GET /bots/:name/runtime`. What the gateway desires (`specGeneration`), what a
+ * runner has reported back (`observedGeneration`), where its latest operation stands (`stage`),
+ * and when a runner last said anything about this bot. `observedGeneration` and
+ * `lastRunnerContactAt` are null until the first receipt arrives, which is exactly the state a
+ * bot created while no runner was connected sits in. Never carries the attach token, an image
+ * digest secret, a host path, or any runner diagnostic text. */
+export const BotRuntimeProjectionSchema = Type.Object({
+  stage: BotRuntimeStageSchema,
+  specGeneration: Type.Integer({ minimum: 1 }),
+  /** The generation a runner last confirmed RUNNING, so it only ever advances on a `ready`
+   * receipt. An in-progress stage says what is being attempted, not what is observed. */
+  observedGeneration: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  lastRunnerContactAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  /** A stable, safe error code from the latest receipt, when the runner sent one. */
+  code: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+}, { additionalProperties: false });
+export type BotRuntimeProjection = Static<typeof BotRuntimeProjectionSchema>;
 
 /** Gateway-owned attach-v1 Bot Mode sessions are conversations. */
 export const BotSessionKindSchema = Type.Literal("conversation");
@@ -1813,4 +1865,14 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * same published schemas a Hermes-backed bot does. `DELETE /bots/:name`, model-provider setup, and
  * desktop-session transcripts keep the 409, and so do the config routes when the peer did not
  * negotiate `bot_config`. Additive: a client below 48 sees the 409 it already handles. */
-export const BOTS_CAPABILITY_VERSION = 48;
+/** Capability 49: RUNTIME BOTS CREATED FROM THE APP. `POST /bots` accepts `runtime: "cozyagents"`
+ * and answers the same `201 {bot, warnings?}` a Hermes create answers, with `bot.runtime` set. The
+ * gateway writes its own durable bot row, mints the attach token, registers the identity live (no
+ * restart), and enqueues a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime`
+ * projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`; with no runner
+ * connected the stage is `waiting_for_runner` until one arrives. `DELETE /bots/:name` answers for
+ * a runtime bot instead of 409: it revokes the token, purges the gateway rows, and enqueues
+ * `delete_runtime`. Additive: a client below 49 never sends the field and never calls the route,
+ * and a gateway below 49 ignores an unknown request field and creates a Hermes bot, which is why a
+ * client that offers runtime creation must require `>= 49`. */
+export const BOTS_CAPABILITY_VERSION = 49;

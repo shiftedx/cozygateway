@@ -506,6 +506,40 @@ CREATE TABLE IF NOT EXISTS cozy_app_actions (
   updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS cozy_app_actions_creator_bot ON cozy_app_actions (creator_bot, updated_at DESC);
+-- Capability 49. A Bot the gateway itself owns, created through "POST /bots {runtime}" rather than
+-- declared in the config file, so creating one needs no restart and no operator at a terminal. The
+-- config-file "bots" array remains a bootstrap source and a row here wins on collision. "token" is
+-- the attach credential this gateway minted for the bot: it is a secret, it is never logged, never
+-- projected on any route, and never written into an operation receipt.
+CREATE TABLE IF NOT EXISTS runtime_bots (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  token TEXT NOT NULL UNIQUE,
+  runtime TEXT NOT NULL CHECK (runtime IN ('cozyagents')),
+  spec_generation INTEGER NOT NULL CHECK (spec_generation >= 1),
+  created_at INTEGER NOT NULL
+) STRICT;
+-- Capability 49. The durable lifecycle operations a CozyRunner reconciles, keyed by "operation_id"
+-- (ADR 0002). "stage" starts at "waiting_for_runner" and only ever moves under a runner receipt, so
+-- a gateway with no runner connected keeps an honest projection instead of inventing progress.
+-- "payload_json" carries the runtime spec MINUS the attach token, which is read from "runtime_bots"
+-- at send time so no secret is ever at rest in an operations row.
+CREATE TABLE IF NOT EXISTS runner_operations (
+  operation_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('create_runtime', 'delete_runtime')),
+  spec_generation INTEGER NOT NULL CHECK (spec_generation >= 1),
+  payload_json TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  code TEXT,
+  observed_generation INTEGER,
+  last_contact_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  sent_at INTEGER
+) STRICT;
+CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, created_at DESC);
 `;
 
 export interface DeviceRow {
@@ -544,6 +578,58 @@ export interface LiveActivityRegistrationRow {
   eventSequence: number;
   lastTimestamp: number;
   createdAt: number;
+}
+
+/** Capability 49. A Bot this gateway owns outright: created over `POST /bots`, served by a
+ *  CozyAgents peer, and stored here rather than in the config file so no restart is needed. */
+export interface RuntimeBotRow {
+  id: string;
+  name: string;
+  avatar: string | null;
+  /** The attach credential the gateway minted. A secret: never logged, never on a wire but the
+   *  runner command that has to inject it into the container. */
+  token: string;
+  runtime: "cozyagents";
+  specGeneration: number;
+  createdAt: number;
+}
+
+export type RunnerOperationKind = "create_runtime" | "delete_runtime";
+
+/** The provisioning progression, in order. Only these stages are ordered against each other:
+ *  everything else a runner can receipt is a transition out of the progression rather than a step
+ *  along it, so it is always allowed to land. */
+const RUNNER_PROGRESSION: readonly string[] = [
+  "waiting_for_runner",
+  "waiting_for_capacity",
+  "pulling_image",
+  "creating",
+  "starting",
+  "ready",
+];
+
+/** Whether `next` would walk the recorded stage backwards along the provisioning progression. */
+export function regressesRunnerStage(current: string, next: string): boolean {
+  const from = RUNNER_PROGRESSION.indexOf(current);
+  const to = RUNNER_PROGRESSION.indexOf(next);
+  if (from === -1 || to === -1) return false;
+  return to < from;
+}
+
+/** One durable lifecycle operation plus the latest receipt a runner sent for it. */
+export interface RunnerOperationRow {
+  operationId: string;
+  bot: string;
+  kind: RunnerOperationKind;
+  specGeneration: number;
+  payload: Record<string, unknown>;
+  stage: string;
+  code: string | null;
+  observedGeneration: number | null;
+  lastContactAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  sentAt: number | null;
 }
 
 export interface BotRoutineOverrides {
@@ -3570,6 +3656,10 @@ export class Storage {
       ["liveActivities", "live_activity_registrations", "bot"],
       ["cozyApps", "cozy_apps", "creator_bot"],
       ["cozyAppActions", "cozy_app_actions", "creator_bot"],
+      // Capability 49. The gateway-owned runtime row goes with everything else the bot owned; its
+      // operations are deliberately NOT purged, because the `delete_runtime` this delete enqueues
+      // is the record of the cleanup a runner still owes.
+      ["runtimeBot", "runtime_bots", "id"],
     ];
     const purged: Record<string, number> = {};
     this.#db.exec("BEGIN IMMEDIATE");
@@ -3602,6 +3692,195 @@ export class Storage {
       throw err;
     }
     return purged;
+  }
+
+  // ---- Capability 49: gateway-owned runtime bots and their runner operations ----
+
+  /** Writes a runtime bot row. Throws when the id or the token is already held, so a create can
+   *  never silently take over an existing identity. */
+  insertRuntimeBot(row: RuntimeBotRow): void {
+    this.#db
+      .prepare(
+        `INSERT INTO runtime_bots (id, name, avatar, token, runtime, spec_generation, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(row.id, row.name, row.avatar, row.token, row.runtime, row.specGeneration, row.createdAt);
+  }
+
+  runtimeBots(): RuntimeBotRow[] {
+    return (
+      this.#db
+        .prepare(
+          `SELECT id, name, avatar, token, runtime, spec_generation, created_at
+           FROM runtime_bots ORDER BY created_at ASC`,
+        )
+        .all() as unknown as Array<{
+        id: string; name: string; avatar: string | null; token: string;
+        runtime: string; spec_generation: number; created_at: number;
+      }>
+    ).map((row) => ({
+      id: row.id,
+      name: row.name,
+      avatar: row.avatar,
+      token: row.token,
+      runtime: "cozyagents" as const,
+      specGeneration: row.spec_generation,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /** Primary-key lookup. Every route that touches a runtime bot calls this, so it reads the one
+   *  row by id rather than scanning the table. */
+  runtimeBot(id: string): RuntimeBotRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT id, name, avatar, token, runtime, spec_generation, created_at
+         FROM runtime_bots WHERE id = ?`,
+      )
+      .get(id) as unknown as
+      | { id: string; name: string; avatar: string | null; token: string; runtime: string; spec_generation: number; created_at: number }
+      | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          id: row.id,
+          name: row.name,
+          avatar: row.avatar,
+          token: row.token,
+          runtime: "cozyagents",
+          specGeneration: row.spec_generation,
+          createdAt: row.created_at,
+        };
+  }
+
+  /** Durably accepts a lifecycle operation. It waits in `waiting_for_runner` whether or not a
+   *  runner is connected right now: the send is a separate, retryable act. */
+  enqueueRunnerOperation(op: {
+    operationId: string;
+    bot: string;
+    kind: RunnerOperationKind;
+    specGeneration: number;
+    payload: Record<string, unknown>;
+    at: number;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO runner_operations
+           (operation_id, bot, kind, spec_generation, payload_json, stage, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'waiting_for_runner', ?, ?)`,
+      )
+      .run(op.operationId, op.bot, op.kind, op.specGeneration, JSON.stringify(op.payload), op.at, op.at);
+  }
+
+  /** Operations no runner has been handed yet, oldest first. A reconnecting runner is sent exactly
+   *  these, which is what makes a create accepted while offline reconcile later. */
+  unsentRunnerOperations(): RunnerOperationRow[] {
+    return this.#runnerOperations(
+      "SELECT * FROM runner_operations WHERE sent_at IS NULL ORDER BY created_at ASC, operation_id ASC",
+    );
+  }
+
+  runnerOperation(operationId: string): RunnerOperationRow | undefined {
+    return this.#runnerOperations(
+      "SELECT * FROM runner_operations WHERE operation_id = ?",
+      operationId,
+    )[0];
+  }
+
+  /** The operation whose stage a bot's runtime projection reports: the newest one accepted. */
+  latestRunnerOperationForBot(bot: string): RunnerOperationRow | undefined {
+    return this.#runnerOperations(
+      "SELECT * FROM runner_operations WHERE bot = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      bot,
+    )[0];
+  }
+
+  markRunnerOperationSent(operationId: string, at: number): void {
+    this.#db
+      .prepare("UPDATE runner_operations SET sent_at = ?, updated_at = ? WHERE operation_id = ?")
+      .run(at, at, operationId);
+  }
+
+  /** A runner that connects (or reconnects) is handed every operation still waiting on its first
+   *  receipt again. An operation a runner has already receipted is NOT resent: retry from the last
+   *  verified stage is the runner's own job (ADR 0002), and resending would repeat a mutation. */
+  resetUnreceiptedRunnerOperationSends(): void {
+    this.#db
+      .prepare(
+        "UPDATE runner_operations SET sent_at = NULL WHERE sent_at IS NOT NULL AND stage = 'waiting_for_runner'",
+      )
+      .run();
+  }
+
+  /** Records one immutable stage receipt onto its operation.
+   *
+   *  Three guards, each of which exists because a runner is a separate process that can retry,
+   *  reconnect, and deliver out of order:
+   *
+   *  - A receipt for an operation this gateway never issued, or for a different bot than the one
+   *    the operation names, is `unknown` and changes nothing. The gateway is the lifecycle
+   *    authority; a runner cannot invent state for a bot it was not asked about.
+   *  - A receipt that would move the stage BACKWARDS along the provisioning progression (a
+   *    `creating` arriving after `ready`) is `stale`: the contact is recorded, the stage is not.
+   *    Stages outside that progression (`needs_attention`, `deleting`, `stopped`, ...) are real
+   *    lifecycle transitions and always apply.
+   *  - `observed_generation` advances only on `ready`. An in-progress stage says what is being
+   *    attempted, never what is running. */
+  recordRunnerReceipt(receipt: {
+    operationId: string;
+    botId: string;
+    specGeneration: number;
+    stage: string;
+    at: number;
+    code?: string;
+  }): "recorded" | "stale" | "unknown" {
+    const current = this.runnerOperation(receipt.operationId);
+    if (current === undefined || current.bot !== receipt.botId) return "unknown";
+    if (regressesRunnerStage(current.stage, receipt.stage)) {
+      this.#db
+        .prepare("UPDATE runner_operations SET last_contact_at = ?, updated_at = ? WHERE operation_id = ?")
+        .run(receipt.at, receipt.at, receipt.operationId);
+      return "stale";
+    }
+    this.#db
+      .prepare(
+        `UPDATE runner_operations
+           SET stage = ?, code = ?, observed_generation = ?, last_contact_at = ?, updated_at = ?
+         WHERE operation_id = ?`,
+      )
+      .run(
+        receipt.stage,
+        receipt.code ?? null,
+        receipt.stage === "ready" ? receipt.specGeneration : current.observedGeneration,
+        receipt.at,
+        receipt.at,
+        receipt.operationId,
+      );
+    return "recorded";
+  }
+
+  #runnerOperations(sql: string, ...params: string[]): RunnerOperationRow[] {
+    return (
+      this.#db.prepare(sql).all(...params) as unknown as Array<{
+        operation_id: string; bot: string; kind: string; spec_generation: number;
+        payload_json: string; stage: string; code: string | null;
+        observed_generation: number | null; last_contact_at: number | null;
+        created_at: number; updated_at: number; sent_at: number | null;
+      }>
+    ).map((row) => ({
+      operationId: row.operation_id,
+      bot: row.bot,
+      kind: row.kind as RunnerOperationKind,
+      specGeneration: row.spec_generation,
+      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+      stage: row.stage,
+      code: row.code,
+      observedGeneration: row.observed_generation,
+      lastContactAt: row.last_contact_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      sentAt: row.sent_at,
+    }));
   }
 
   close(): void {

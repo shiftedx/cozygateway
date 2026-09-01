@@ -4,6 +4,7 @@ import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/
 import {
   AGENT_INBOX_CAPABILITY_ID,
   BotCreateRequestSchema,
+  BotRuntimeProjectionSchema,
   BotCreateResponseSchema,
   BotDeleteResponseSchema,
   BOTS_CAPABILITY_ID,
@@ -643,8 +644,50 @@ describe("capability advertisement", () => {
     // command. Every field is optional and absent on rows written before 47, so a client
     // below 47 is unchanged. 48 adds the bot config lane: a runtime bot answers the profile,
     // model-config, and routines routes over attach-v1 instead of 409, with the wire shapes
-    // unchanged, so a client below 48 sees the 409 it already handles.
-    expect(BOTS_CAPABILITY_VERSION).toBe(48);
+    // unchanged, so a client below 48 sees the 409 it already handles. 49 lets the app create a
+    // runtime bot outright: `POST /bots {runtime: "cozyagents"}` writes a gateway-owned row, mints
+    // the attach token, and enqueues the operation a CozyRunner reconciles, with
+    // `GET /bots/:name/runtime` projecting the stage and `DELETE /bots/:name` answering for it.
+    // A client below 49 never sends the field and never calls the route.
+    expect(BOTS_CAPABILITY_VERSION).toBe(49);
+  });
+
+  it("accepts a capability-49 runtime create and its runtime projection", () => {
+    // The field is optional and closed: absent is the Hermes create every client already sends,
+    // and the only named runtime is the one this gateway can actually serve.
+    expect(check(BotCreateRequestSchema, { name: "sage" })).toBe(true);
+    expect(check(BotCreateRequestSchema, { name: "sage", runtime: "cozyagents" })).toBe(true);
+    expect(check(BotCreateRequestSchema, { name: "sage", runtime: "hermes" })).toBe(false);
+    // The projection carries generations and contact, never a token, an env value, or a host path.
+    expect(
+      check(BotRuntimeProjectionSchema, {
+        stage: "waiting_for_runner",
+        specGeneration: 1,
+        observedGeneration: null,
+        lastRunnerContactAt: null,
+      }),
+    ).toBe(true);
+    expect(
+      check(BotRuntimeProjectionSchema, {
+        stage: "ready",
+        specGeneration: 2,
+        observedGeneration: 2,
+        lastRunnerContactAt: 1_800_000_000_000,
+        code: "isolation_unavailable",
+      }),
+    ).toBe(true);
+    expect(check(BotRuntimeProjectionSchema, { stage: "invented", specGeneration: 1, observedGeneration: null, lastRunnerContactAt: null })).toBe(false);
+    // The two stages a delete moves through are part of the closed union, so a client can render
+    // the cleanup finishing instead of the bot simply vanishing mid-operation.
+    for (const stage of ["deletion_pending", "deleting", "deleted"]) {
+      expect(check(BotRuntimeProjectionSchema, { stage, specGeneration: 1, observedGeneration: 1, lastRunnerContactAt: 1 })).toBe(true);
+    }
+    expect(
+      check(BotRuntimeProjectionSchema, {
+        stage: "ready", specGeneration: 1, observedGeneration: 1, lastRunnerContactAt: 1,
+        attachToken: "secret",
+      }),
+    ).toBe(false);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {

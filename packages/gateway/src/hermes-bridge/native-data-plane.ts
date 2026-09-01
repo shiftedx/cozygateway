@@ -3,6 +3,10 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   AttachmentBlock,
   BotChatAttachment,
+  BotCreateRequest,
+  BotCreateResponse,
+  BotDeleteResponse,
+  BotRuntimeProjection,
   BotApprovalPendingFrame,
   BotApprovalResolutionRequestedFrame,
   BotApprovalResolvedFrame,
@@ -46,7 +50,7 @@ import type {
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import { ConfigNotNegotiated, type ConfigSurface } from "./bot-config.ts";
-import { BotNameTaken } from "./crud.ts";
+import { BotNameTaken, BotNotFound } from "./crud.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
@@ -55,6 +59,16 @@ import {
   type BotChatPhotoUpload,
   type BotsSurface,
 } from "./bridge.ts";
+
+/** What the plane needs from the runtime-bot service. Narrow on purpose: the plane owns chat and
+ * roster projection, and knows nothing about tokens, operations, or runners. */
+export interface RuntimeBotLifecycle {
+  owns(id: string): boolean;
+  hasRuntime(id: string): boolean;
+  create(input: BotCreateRequest, row: (id: string) => BotSummary): BotCreateResponse;
+  delete(name: string, opts: { force?: boolean }): BotDeleteResponse;
+  projection(name: string): BotRuntimeProjection;
+}
 
 export interface NativeBotDataPlaneOptions {
   control: BotControlSurface;
@@ -69,6 +83,11 @@ export interface NativeBotDataPlaneOptions {
     avatar: string | null;
     runtime: "cozyagents";
   }[];
+  /** Capability 49. The gateway-owned runtime bot lifecycle. Present when this gateway can create
+   * and delete runtime bots itself (`POST /bots {runtime: "cozyagents"}`); absent leaves the
+   * capability-45 behavior exactly as it was, where a runtime bot is config-declared and its
+   * delete keeps the 409. */
+  runtimeLifecycle?: RuntimeBotLifecycle;
   /** The attach-v1 bot-config lane. A runtime bot serves its own profile, model selection and
    * routines over it, so those surfaces route here instead of refusing. Absent means no gateway on
    * this deployment negotiated the lane and every config surface keeps its 409. */
@@ -192,7 +211,6 @@ const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
   "createRoutine",
   "patchRoutine",
   "deleteRoutine",
-  "deleteBot",
 ]);
 
 /** The `DASHBOARD_ONLY` methods a runtime bot answers over the attach-v1 config lane, each mapped
@@ -221,6 +239,7 @@ export class NativeBotDataPlane {
   readonly #ingress: AttachV1Ingress;
   readonly #native: Set<string>;
   readonly #runtimeBots: Map<string, NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number]>;
+  readonly #runtimeLifecycle: RuntimeBotLifecycle | undefined;
   readonly #botConfig: ConfigSurface | undefined;
   readonly #chatSuggestion: string;
   readonly #broadcast: (frame: ServerFrame) => void;
@@ -276,6 +295,7 @@ export class NativeBotDataPlane {
     this.#runtimeBots = new Map(
       (opts.runtimeBots ?? []).map((bot) => [normalize(bot.id), bot]),
     );
+    this.#runtimeLifecycle = opts.runtimeLifecycle;
     this.#botConfig = opts.botConfig;
     this.#chatSuggestion = opts.chatSuggestion;
     this.#broadcast = opts.broadcast;
@@ -318,8 +338,32 @@ export class NativeBotDataPlane {
         // leaving an orphan no route can reach.
         const bot = normalize(input.name);
         if (this.#runtimeBots.has(bot)) throw new BotNameTaken(bot);
+        // Capability 49. A create that names the CozyAgents runtime never reaches Hermes at all:
+        // the gateway owns the row, the credential, and the operation a runner reconciles.
+        if (input.runtime === "cozyagents") {
+          if (this.#runtimeLifecycle === undefined)
+            throw new BackendUnavailable("this gateway cannot create runtime bots");
+          return this.#runtimeLifecycle.create(input, (id) => {
+            const created = this.#runtimeBots.get(normalize(id));
+            if (created === undefined) throw new BotNotFound(id);
+            return this.#runtimeRow(created);
+          });
+        }
         return this.#control.createBot(input);
       },
+      // Capability 49. A gateway-owned runtime bot is deletable here rather than 409: its identity
+      // is revoked, its rows are purged, and the runner is handed a `delete_runtime`. A runtime bot
+      // this gateway does NOT own (a config-declared capability-45 one) keeps the refusal, because
+      // removing it means editing the config file the operator wrote.
+      deleteBot: async (name, opts) => {
+        const bot = normalize(name);
+        const runtimeBot = this.#runtimeBots.get(bot);
+        if (runtimeBot === undefined) return this.#control.deleteBot(name, opts);
+        if (this.#runtimeLifecycle?.owns(bot) !== true)
+          throw new UnsupportedForRuntime(bot, "deleteBot", runtimeBot.runtime);
+        return this.#runtimeLifecycle.delete(bot, opts ?? {});
+      },
+      botRuntime: (name) => this.#botRuntime(name),
       readiness: (name) => this.#readiness(name),
       commands: (name) => this.#commands(name),
       pendingApprovals: () => this.#pendingApprovals(),
@@ -482,6 +526,45 @@ export class NativeBotDataPlane {
       runtime: bot.runtime,
       ...this.#nativeOverlay(id),
     };
+  }
+
+  /** Capability 49's read-only projection. A bot with no gateway-owned runtime row has no runtime
+   * to project, which is a fact about its kind rather than a missing bot, so it answers the same
+   * `409 unsupported_for_runtime` every other Hermes-shaped surface answers for the wrong kind. */
+  #botRuntime(name: string): BotRuntimeProjection {
+    const bot = normalize(name);
+    // Three different answers, and the difference matters to a client: a bot that never had a
+    // gateway-owned runtime has none to project (409, the same wrong-kind answer every other
+    // Hermes-shaped surface gives), a live one projects, and one whose delete the runner has
+    // finished is simply gone (404, from `BotNotFound` below).
+    if (this.#runtimeLifecycle?.hasRuntime(bot) !== true)
+      throw new UnsupportedForRuntime(bot, "botRuntime", "cozyagents");
+    return this.#runtimeLifecycle.projection(bot);
+  }
+
+  /** Every runtime bot this gateway serves right now, config-declared and gateway-created alike.
+   * Live rather than a snapshot: room membership is answered from this set, so a bot created from
+   * the app can join a room without a restart. */
+  runtimeBotNames(): ReadonlySet<string> {
+    return new Set(this.#runtimeBots.keys());
+  }
+
+  /** Registers a runtime bot created at runtime, with no restart: the roster row, the native set
+   * that decides which bots this plane serves chat for, and the durable canonical chat binding the
+   * constructor makes for every configured bot. */
+  addRuntimeBot(bot: NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number]): void {
+    const id = normalize(bot.id);
+    this.#runtimeBots.set(id, { ...bot, id });
+    this.#native.add(id);
+    this.#storage.nativeBotChat(id, this.#now());
+  }
+
+  /** The inverse, for a delete. The durable rows are the caller's to purge; this drops only the
+   * in-process registration, so nothing keeps answering for a bot that no longer exists. */
+  removeRuntimeBot(id: string): void {
+    const bot = normalize(id);
+    this.#runtimeBots.delete(bot);
+    this.#native.delete(bot);
   }
 
   #roster() {
