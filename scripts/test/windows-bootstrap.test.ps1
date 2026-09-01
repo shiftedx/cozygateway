@@ -870,6 +870,7 @@ CLI_WINDOWS="`$GATEWAY_DIR/bin/cozygateway.cmd"
 POSIX_BOOTSTRAP="`$GATEWAY_DIR/bin/cozygateway-bootstrap.sh"
 WINDOWS_BOOTSTRAP="`$GATEWAY_DIR/bin/cozygateway-bootstrap.ps1"
 say() { printf '%s\n' "`$*"; }
+is_windows() { return 0; }
 to_windows_path() { cygpath -w "`$1"; }
 $($cliWriterMatch.Value)
 write_cli_wrapper
