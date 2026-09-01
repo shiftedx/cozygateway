@@ -491,6 +491,22 @@ export function registerBotRoutes(
     }
   });
 
+  // Capability 49, read-only. Registered unconditionally: a bot with no gateway-owned runtime row
+  // answers `409 unsupported_for_runtime` through the same failure mapping every other wrong-kind
+  // surface uses, and a gateway whose plane has no runtime lifecycle at all does not expose the
+  // method, so the route answers 404 rather than pretending.
+  app.get("/bots/:name/runtime", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    if (typeof chat.botRuntime !== "function")
+      return c.json(errorBody("not_found", "this gateway serves no runtime bots"), 404);
+    try {
+      return c.json(chat.botRuntime(resolved.name));
+    } catch (error) {
+      return failure(c, error);
+    }
+  });
+
   // Capability 37, the inverse of POST /bots. `?force=1` overrides only the running-turn
   // refusal; everything else about the delete is unconditional. The 409 carries `turnId` so a
   // client can name the work it is about to kill in its confirmation copy. The 200 body reports

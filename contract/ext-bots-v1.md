@@ -88,6 +88,7 @@ and does not register `/bots` routes.
 | 46 | Runtime Bots in rooms: a `runtime: "cozyagents"` bot can be a full member of a group room, its membership answered from gateway config rather than `profiles.list`, and a room turn's live draft is published as `bot_chat_delta` carrying `room`. |
 | 47 | Auditable ids: room and 1:1 transcript rows carry the identities the gateway already held at settlement. `BotGroupMessage` gains `messageId`, `turnId`, `epoch`, `cause`, and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage` gains `turnId`, `authorBot`, and `inReplyToId`. Every field is optional, absent on rows written before 47, and never backfilled. |
 | 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion, model-provider setup, and desktop-session transcripts keep the 409. |
+| 49 | Runtime bots created from the app: `POST /bots` accepts `runtime: "cozyagents"` and creates a gateway-owned bot with no Hermes profile, minting its attach token and enqueueing a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime` projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`, and `DELETE /bots/:name` answers for a runtime bot instead of 409. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -258,6 +259,57 @@ from where it runs: the box gateway config entry, the token line in the box `.en
 launchd service if it outlived the profile. None of it can authenticate, because the token was
 already revoked in step 2. `scripts/deprovision-bot.sh <profile>` sweeps all of it and is
 idempotent, so it is equally safe to run after this route or on its own.
+
+### Runtime bots created from the app (capability 49)
+
+`POST /bots {"name": "sage", "runtime": "cozyagents"}` creates a Bot this gateway owns outright.
+Nothing about it touches Hermes: no profile is written, no dashboard is called, and the create does
+not fail when Hermes is unreachable. The response is the same `201 {bot, warnings?}` a Hermes create
+answers, with `bot.runtime: "cozyagents"`.
+
+What the gateway does, in this order, before it answers:
+
+1. Writes a durable `runtime_bots` row (id, display name, minted credential, `specGeneration: 1`).
+   The config-file `bots` array remains a BOOTSTRAP source for the operator-declared runtime bots of
+   capability 45; a storage row WINS on collision, because it is the one this gateway minted the
+   credential for.
+2. Mints the attach token itself, 32 bytes of CSPRNG. It is stored on that row and handed to the
+   runner on exactly one frame. It is never logged, never in a receipt, and never on any app-facing
+   response.
+3. Registers the identity LIVE, with no restart: the attach token map both public attach surfaces
+   authenticate against, the runtime and native sets, the agents row, and the roster. This is the
+   exact inverse of the revocation `DELETE /bots/:name` performs.
+4. Enqueues a durable `create_runtime` operation for a CozyRunner (`contract/runner-v1.md`).
+
+The roster row reads `syncState: "starting"` until the new peer's attach `hello` arrives, exactly as
+a freshly provisioned Hermes bot does. `toolsets` and `mcpServers` are Hermes seeding instructions
+and are ignored for this kind; supplying them adds a warning rather than failing the create.
+
+`GET /bots/:name/runtime` answers `BotRuntimeProjection`:
+
+```json
+{ "stage": "waiting_for_runner", "specGeneration": 1, "observedGeneration": null, "lastRunnerContactAt": null }
+```
+
+`stage` is the latest stage a runner receipted for this bot's newest operation. With no runner
+connected it stays `waiting_for_runner`: the gateway durably accepted the desired state and says so
+honestly rather than inventing progress, and the operation is handed over the moment a runner
+attaches. `observedGeneration` and `lastRunnerContactAt` are null until the first receipt.
+`code` appears only when a receipt carried one and is a stable, safe identifier, never diagnostics.
+A bot with no gateway-owned runtime row answers `409 unsupported_for_runtime`, because it has no
+runtime to project rather than being missing.
+
+`DELETE /bots/:name` on a runtime bot answers instead of refusing with 409. It revokes the attach
+identity first, purges every durable gateway row exactly as the capability-37 delete does, and
+enqueues `delete_runtime` so the runner removes the container and the bot-exclusive volumes.
+`hermesProfile` is `already_absent`, truthfully: there never was one. A config-declared runtime bot
+(capability 45) still gets the 409, because removing it means editing the config file the operator
+wrote.
+
+Out of scope for 49, and deliberately not implied by it: pairing codes and short-lived runner
+credentials, upgrades and migrations, restart backoff, drain windows, isolation policy, capacity
+admission, archive and purge grace, multi-host, and reconciliation of unknown containers. See
+`docs/adr/0002-gateway-reconciled-per-bot-runtime.md` in the CozyAgents repo.
 
 ### Slash commands
 
@@ -481,8 +533,9 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | Route | Request | Success response | Notes |
 | --- | --- | --- | --- |
 | `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots, plus one row per capability-45 native runtime bot. |
-| `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate. `409` extension code `conflict` when the name is taken. |
-| `DELETE /bots/:name` | optional `?force=1` | `200 BotDeleteResponse` | Capability 37. Deletes the Hermes profile and purges every gateway row the bot owned. `409` extension code `conflict` (body carries `turnId`) when a native turn is running, unless `force=1`. `404` when neither Hermes nor this gateway knows the name. |
+| `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate, or, with capability-49 `runtime: "cozyagents"`, a gateway-owned runtime bot with no Hermes profile at all. `409` extension code `conflict` when the name is taken. |
+| `GET /bots/:name/runtime` | — | `BotRuntimeProjection` | Capability 49. Where a runtime bot's container stands: stage, desired and observed generations, and last runner contact. `409` `unsupported_for_runtime` for a bot with no gateway-owned runtime. |
+| `DELETE /bots/:name` | optional `?force=1` | `200 BotDeleteResponse` | Capability 37. Deletes the Hermes profile and purges every gateway row the bot owned. `409` extension code `conflict` (body carries `turnId`) when a native turn is running, unless `force=1`. `404` when neither Hermes nor this gateway knows the name. Capability 49: answers for a gateway-owned runtime bot too, revoking its credential and enqueueing `delete_runtime`. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
 | `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. |

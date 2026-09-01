@@ -23,6 +23,7 @@ import type {
   BotProfile,
   BotProfilePatch,
   BotReadiness,
+  BotRuntimeProjection,
   BotRoutine,
   BotRoutineCreateRequest,
   BotRoutinePatch,
@@ -270,6 +271,10 @@ export interface BotControlSurface {
 }
 export interface BotsSurface extends BotControlSurface {
   readiness(name: string): BotReadiness;
+  /** Capability 49: the runtime projection for a gateway-owned runtime bot. Optional because a
+   * gateway with no runner lane has no runtime to project and the route is then not registered at
+   * all, which is the honest answer rather than a stage invented from nothing. */
+  botRuntime?(name: string): BotRuntimeProjection;
   commands(name: string): readonly BotSlashCommand[];
   /** Capability 27: current durable approvals only; terminal records stay private to lifecycle
    * settlement and never appear in the user's decision inbox. */

@@ -47,6 +47,8 @@ import {
 } from "./adapters/attach/adapter.ts";
 import { revokeAttachTokens } from "./adapters/attach/token-auth.ts";
 import { createApp } from "./http.ts";
+import { RunnerLane } from "./runner/lane.ts";
+import { RuntimeBotService, runtimeSpecDefaults } from "./runner/runtime-bots.ts";
 import type { PairingAttemptLimiter } from "./pairing-admission.ts";
 import { WsHub } from "./ws-hub.ts";
 import { MobileNodeBroker } from "./mobile-node.ts";
@@ -300,7 +302,27 @@ export async function startGateway(
   }
   // Bots served by a non-Hermes runtime (e.g. CozyAgents). Additive to the Hermes profiles above:
   // same storage row, same attach identity shape, no Hermes Dashboard consulted for them.
-  const runtimeBots = nativeBots(config);
+  // Two sources, one namespace. The config file remains a BOOTSTRAP source (capability 45), and a
+  // storage row created through `POST /bots {runtime}` (capability 49) wins on collision: it is the
+  // one this gateway minted the credential for, and the operator's config line for the same id is
+  // then stale rather than authoritative.
+  const storedRuntimeBots = storage.runtimeBots();
+  const storedRuntimeBotIds = new Set(storedRuntimeBots.map((bot) => bot.id));
+  const configRuntimeBots = nativeBots(config).filter((bot) => !storedRuntimeBotIds.has(bot.id));
+  const runtimeBots = [
+    ...configRuntimeBots.map((bot) => ({
+      id: bot.id,
+      name: bot.name ?? bot.id,
+      avatar: bot.avatar ?? null,
+      runtime: bot.runtime,
+    })),
+    ...storedRuntimeBots.map((bot) => ({
+      id: bot.id,
+      name: bot.name,
+      avatar: bot.avatar,
+      runtime: bot.runtime,
+    })),
+  ];
   const runtimeBotNameSet: ReadonlySet<string> = new Set(runtimeBots.map((bot) => bot.id));
   // loadConfig() rejects this same collision (config.ts:246-249), but startGateway takes a
   // GatewayConfig directly and skips loadConfig on the programmatic path (tests, embedders), so
@@ -313,8 +335,8 @@ export async function startGateway(
     }
     storage.upsertAgent({
       id: bot.id,
-      name: bot.name ?? bot.id,
-      avatar: bot.avatar ?? null,
+      name: bot.name,
+      avatar: bot.avatar,
       backend: "attach",
     });
   }
@@ -401,6 +423,8 @@ export async function startGateway(
   // through this hole rather than the construction order being rearranged around one route.
   // Until it is filled no bot can be deleted, because the listener is not bound yet.
   let killAttachIdentity: (name: string) => boolean = () => false;
+  // Capability 49. Assembled below the plane, for the same construction-order reason.
+  let runtimeBotService: RuntimeBotService | undefined;
   let raiseLiveActivityFrame: (frame: ServerFrame) => void = () => {};
 
   let federation: FederatedBotControlSurface | undefined;
@@ -487,7 +511,7 @@ export async function startGateway(
   // agent identity on /attach/v1, so a bot reusing a Hermes profile's token (or another bot's) is
   // a startup error, not a silent overwrite.
   const runtimeBotTokens = collectAttachTokens(
-    Object.fromEntries(runtimeBots.map((bot) => [bot.id, { tokenEnv: bot.tokenEnv }])),
+    Object.fromEntries(configRuntimeBots.map((bot) => [bot.id, { tokenEnv: bot.tokenEnv }])),
     process.env,
     "bot",
   );
@@ -495,6 +519,14 @@ export async function startGateway(
     if (attachTokens.has(token))
       throw new Error("duplicate attach credential; every bot must use a distinct token");
     attachTokens.set(token, botId);
+  }
+  // A gateway-created runtime bot carries its minted credential in its own storage row rather than
+  // in an environment variable, because nothing placed it there: the gateway minted it during a
+  // `POST /bots` that had to work with no operator at a terminal.
+  for (const bot of storedRuntimeBots) {
+    if (attachTokens.has(bot.token))
+      throw new Error("duplicate attach credential; every bot must use a distinct token");
+    attachTokens.set(bot.token, bot.id);
   }
   let nativeBotPlane: NativeBotDataPlane | undefined;
   let memorySurface: AttachMemorySurface | undefined;
@@ -656,12 +688,28 @@ export async function startGateway(
     storage,
     ingress: attachV1Ingress,
     nativeBots: nativeBotIds,
-    runtimeBots: runtimeBots.map((bot) => ({
-      id: bot.id,
-      name: bot.name ?? bot.id,
-      avatar: bot.avatar ?? null,
-      runtime: bot.runtime,
-    })),
+    runtimeBots,
+    // Capability 49. The methods are forwarded rather than the service handed over, because the
+    // service needs the plane (for the roster row and the live registration) as much as the plane
+    // needs the service; one hole rather than a two-phase construction.
+    runtimeLifecycle: {
+      owns: (id) => runtimeBotService?.owns(id) === true,
+      create: (input, row) => {
+        if (runtimeBotService === undefined)
+          throw new Error("the runtime bot service is not assembled yet");
+        return runtimeBotService.create(input, row);
+      },
+      delete: (name) => {
+        if (runtimeBotService === undefined)
+          throw new Error("the runtime bot service is not assembled yet");
+        return runtimeBotService.delete(name);
+      },
+      projection: (name) => {
+        if (runtimeBotService === undefined)
+          throw new Error("the runtime bot service is not assembled yet");
+        return runtimeBotService.projection(name);
+      },
+    },
     botConfig: configSurface,
     chatSuggestion: hermesOptions.chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
@@ -699,6 +747,40 @@ export async function startGateway(
     mobileNode,
   });
   const nativePlane = nativeBotPlane;
+  // Capability 49. The runner lane exists only when the local admin placed a credential; without
+  // one the gateway still accepts and stores runtime operations, they simply wait for a runner that
+  // can prove who it is. Pairing codes and short-lived per-runner credentials are ADR 0002 work
+  // deliberately left for a later wave.
+  const runnerToken = process.env["COZYGATEWAY_RUNNER_TOKEN"];
+  const runnerLane =
+    runnerToken === undefined || runnerToken.length === 0
+      ? undefined
+      : new RunnerLane({
+          token: runnerToken,
+          storage,
+          attachTokenFor: (botId) => storage.runtimeBot(botId)?.token,
+          onReceipt: () => bridge.refreshSoon("runner receipt"),
+          now: () => Date.now(),
+        });
+  runtimeBotService = new RuntimeBotService({
+    storage,
+    ...(runnerLane === undefined ? {} : { lane: runnerLane }),
+    spec: runtimeSpecDefaults(process.env),
+    now: () => Date.now(),
+    register: (bot) => {
+      // The exact inverse of `killAttachIdentity`: the token map both public attach surfaces
+      // authenticate against, then the sets that decide which bots this gateway serves at all.
+      attachTokens.set(bot.token, bot.id);
+      nativePlane.addRuntimeBot({ id: bot.id, name: bot.name, avatar: bot.avatar, runtime: bot.runtime });
+    },
+    unregister: (id) => {
+      const revoked = killAttachIdentity(id);
+      nativePlane.removeRuntimeBot(id);
+      return revoked;
+    },
+    reservedName: (id) => hermesProfileIds.has(id),
+    rosterChanged: (reason) => bridge.refreshSoon(reason),
+  });
   botsSurface = nativePlane.surface();
   // Same rows, same overlay, both surfaces: the `bot_roster` frame and `GET /bots` are now built
   // by one function, so a WS row carries the chat session id its REST twin carries.
@@ -750,7 +832,9 @@ export async function startGateway(
     memory: memorySurface,
     attachTokens,
     attachMediaAllowed: (agentId: string) =>
-      allowedAttachMedia(config, agentId),
+      // Capability 49: a bot created through `POST /bots {runtime}` has no config line to be found
+      // in, so the gateway-owned row is the other half of the same rollout gate.
+      storage.runtimeBot(agentId) !== undefined || allowedAttachMedia(config, agentId),
     sendCozyAppAction: (action, deviceId) => {
       if (!nativeBotPlane?.registerCozyAppActionOrigin(action.creatorBot, action.appId, action.id, deviceId, Math.max(30_000, config.turnTimeoutSeconds * 1000))) return false;
       const queued = attachV1Ingress.sendCozyAppAction(action.creatorBot, { appId: action.appId, actionId: action.actionId, actionRequestId: action.id });
@@ -818,6 +902,13 @@ export async function startGateway(
   routes.set("/attach/v1", (req, socket, head) =>
     attachV1Ingress.handleUpgrade(req, socket, head),
   );
+  // Capability 49, beside `/attach/v1` and authenticated the same constant-time way, with one
+  // operator-placed token instead of a per-bot one. A gateway with no runner credential does not
+  // register the path at all, so the dispatcher answers a clean HTTP error rather than opening a
+  // socket nothing can authenticate.
+  if (runnerLane !== undefined) {
+    routes.set("/runner/v1", (req, socket, head) => runnerLane.handleUpgrade(req, socket, head));
+  }
   server.on("upgrade", createUpgradeDispatcher(routes));
   // Started after the listener is up so the first roster refresh cannot race the hub it
   // broadcasts through.
@@ -864,6 +955,7 @@ export async function startGateway(
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
       nativeBotPlane.close();
+      runnerLane?.close();
       mobileNode?.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
