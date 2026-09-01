@@ -2,9 +2,10 @@
 
 Capability: `com.cozylabs.gateway-management: 1`.
 
-The capability is advertised only when the running gateway was started from a known writable
-config path. Both routes require the ordinary device bearer token. A programmatic gateway without
-such a path answers `409 invalid_request`; it never pretends an edit was persisted.
+The capability is advertised only after the running gateway has read, validated, and atomically
+replaced the source config while preserving its permission bits. Both routes require the ordinary
+device bearer token. A gateway without that proven persistence path answers `409 invalid_request`;
+it never pretends an edit was persisted.
 
 ## `GET /gateway/settings`
 
@@ -15,6 +16,11 @@ Returns `{ "name": string, "hermesEndpoints": HermesEndpointSetting[] }`.
 Full replacement with the same shape. Returns that persisted shape plus
 `"restartRequired": true`. The gateway writes atomically in the source file's directory and
 preserves its permission bits. The running process keeps its startup snapshot until restarted.
+
+If the filesystem or mount loses replacement access after startup, PUT returns `409 invalid_request`
+with an operator-actionable message that the source configuration is not writable.
+Filesystem paths and raw operating-system errors remain in the gateway's local diagnostic log and
+are never returned to the device. The previous valid file remains intact.
 
 Each endpoint is:
 

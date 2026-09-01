@@ -6,7 +6,49 @@ import {
   type HermesEndpointSetting,
 } from "cozygateway-contract";
 
-import { loadConfig, saveConfig, type GatewayConfig, type HermesBridgeConfig } from "./config.ts";
+import {
+  loadConfig,
+  probeConfigPersistence,
+  saveConfig,
+  type GatewayConfig,
+  type HermesBridgeConfig,
+} from "./config.ts";
+
+const PERSISTENCE_ERROR_CODES = new Set([
+  "EACCES", "EBUSY", "EDQUOT", "EISDIR", "EMFILE", "ENFILE", "ENOENT", "ENOSPC", "ENOTDIR", "EPERM", "EROFS",
+]);
+
+export class GatewaySettingsPersistenceError extends Error {
+  readonly configPath: string;
+  readonly code: string;
+
+  constructor(
+    configPath: string,
+    code: string,
+    options: { cause: unknown },
+  ) {
+    super("gateway settings source configuration is not writable", options);
+    this.name = "GatewaySettingsPersistenceError";
+    this.configPath = configPath;
+    this.code = code;
+  }
+}
+
+function persistenceError(configPath: string, error: unknown): GatewaySettingsPersistenceError | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const code = String(error.code);
+  return PERSISTENCE_ERROR_CODES.has(code)
+    ? new GatewaySettingsPersistenceError(configPath, code, { cause: error })
+    : undefined;
+}
+
+function withPersistenceError<T>(configPath: string, action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    throw persistenceError(configPath, error) ?? error;
+  }
+}
 
 function endpointSetting(id: string, label: string | undefined, config: HermesBridgeConfig): HermesEndpointSetting {
   return { id, ...(label === undefined ? {} : { label }), ...config };
@@ -20,12 +62,15 @@ export function settingsForConfig(config: GatewayConfig): GatewaySettings {
 
 /** File-backed management. Reads afresh on every call so concurrent operator edits are retained;
  * writes replace only the two device-editable fields and preserve deployment/TLS settings. */
-export function fileGatewaySettings(configPath: string): {
+export interface GatewaySettingsStore {
   read(): GatewaySettings;
   update(input: unknown): GatewaySettings & { restartRequired: true };
-} {
+}
+
+export function fileGatewaySettings(configPath: string): GatewaySettingsStore {
+  withPersistenceError(configPath, () => probeConfigPersistence(configPath));
   return {
-    read: () => settingsForConfig(loadConfig(configPath)),
+    read: () => withPersistenceError(configPath, () => settingsForConfig(loadConfig(configPath))),
     update: (input) => {
       const settings = assertValid(GatewaySettingsSchema, input);
       const endpointIds = new Set<string>();
@@ -52,16 +97,18 @@ export function fileGatewaySettings(configPath: string): {
           profiles.add(profile);
         }
       }
-      const current = loadConfig(configPath);
-      const next = {
-        ...current,
-        name: settings.name,
-        hermesEndpoints: settings.hermesEndpoints,
-      } as GatewayConfig;
-      saveConfig(configPath, next);
-      // Prove the exact bytes now on disk are accepted before acknowledging the mutation.
-      const persisted = settingsForConfig(loadConfig(configPath));
-      return { ...persisted, restartRequired: true };
+      return withPersistenceError(configPath, () => {
+        const current = loadConfig(configPath);
+        const next = {
+          ...current,
+          name: settings.name,
+          hermesEndpoints: settings.hermesEndpoints,
+        } as GatewayConfig;
+        saveConfig(configPath, next);
+        // Prove the exact bytes now on disk are accepted before acknowledging the mutation.
+        const persisted = settingsForConfig(loadConfig(configPath));
+        return { ...persisted, restartRequired: true };
+      });
     },
   };
 }

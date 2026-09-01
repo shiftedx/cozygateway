@@ -25,7 +25,7 @@ import {
 } from "cozygateway-contract";
 
 import { hermesEndpoints, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
-import { fileGatewaySettings } from "./gateway-settings.ts";
+import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
 import { openStorage, type Storage } from "./storage.ts";
 import {
   ATTACH_V1_CAPABILITIES,
@@ -189,6 +189,7 @@ export function gatewayInfoForConfig(
   const configuredCapabilities = Object.fromEntries(
     Object.entries(config.capabilities ?? {})
       .filter(([id]) => id !== HARNESS_UPDATE_CAPABILITY_ID
+        && id !== GATEWAY_MANAGEMENT_CAPABILITY_ID
         && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID),
   );
   return {
@@ -234,6 +235,22 @@ export async function startGateway(
   // Transition records deliberately have a useful production default. They remain injectable so
   // embedded hosts and tests can collect them without intercepting stderr.
   const traceLog = options.traceLog ?? ((line: string) => process.stderr.write(`${line}\n`));
+  let gatewaySettings: GatewaySettingsStore | undefined;
+  if (options.configPath !== undefined) {
+    try {
+      gatewaySettings = fileGatewaySettings(options.configPath);
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "invalid-source-config";
+      traceLog(JSON.stringify({
+        component: "gateway-settings",
+        event: "persistence-unavailable",
+        configPath: options.configPath,
+        code,
+      }));
+    }
+  }
   // First thing, before the database is opened or a single socket is dialed: if the operator asked
   // for TLS, prove the pair is usable. Absent config resolves to undefined and every line below
   // behaves exactly as it did before TLS existed. Present-but-broken throws here, so the failure is
@@ -289,7 +306,7 @@ export async function startGateway(
   );
   const gatewayInfo = gatewayInfoForConfig(
     config,
-    options.configPath !== undefined,
+    gatewaySettings !== undefined,
     harnessWorkspace.available,
     harnessUpdates.available,
     hermesSessions.capabilityVersion,
@@ -599,7 +616,8 @@ export async function startGateway(
     config,
     gatewayInfo,
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
-    ...(options.configPath === undefined ? {} : { gatewaySettings: fileGatewaySettings(options.configPath) }),
+    ...(gatewaySettings === undefined ? {} : { gatewaySettings }),
+    gatewaySettingsLog: traceLog,
     harnessSettings,
     ...(harnessUpdates.available ? { harnessUpdates } : {}),
     ...(hermesSessions.available ? { hermesSessions } : {}),

@@ -225,19 +225,32 @@ export function loadConfig(path: string): GatewayConfig {
   return config;
 }
 
-/** Atomic, permission-preserving whole-file replacement used by the authenticated management API. */
-export function saveConfig(path: string, config: GatewayConfig): void {
-  // Validate through the same public loader without weakening it for in-memory callers.
+function replaceConfigBytes(path: string, contents: string | NodeJS.ArrayBufferView): void {
   const mode = statSync(path).mode & 0o777;
   const temp = join(dirname(path), `.cozygateway.config.${process.pid}.${randomUUID()}.tmp`);
   try {
-    writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode });
+    writeFileSync(temp, contents, { mode });
     chmodSync(temp, mode);
     renameSync(temp, path);
   } catch (error) {
     try { unlinkSync(temp); } catch { /* nothing was written */ }
     throw error;
   }
+}
+
+/** Proves the source file can be read, validated, and atomically replaced without changing its
+ * bytes. Replacing the actual target is intentional: a writable single-file bind mount can allow
+ * sibling files yet still reject rename-over-target with EBUSY. */
+export function probeConfigPersistence(path: string): void {
+  loadConfig(path);
+  const contents = readFileSync(path);
+  replaceConfigBytes(path, contents);
+  loadConfig(path);
+}
+
+/** Atomic, permission-preserving whole-file replacement used by the authenticated management API. */
+export function saveConfig(path: string, config: GatewayConfig): void {
+  replaceConfigBytes(path, `${JSON.stringify(config, null, 2)}\n`);
 }
 
 /** Apply container-friendly environment overrides on top of a loaded config. Returns a new object;
