@@ -139,6 +139,10 @@ function acknowledgeOrphanedAttachEvent(
 }
 
 function allowedAttachMedia(config: GatewayConfig, agentId: string): boolean {
+  // The media rollout gate covers every attach identity, not just Hermes profiles: a runtime
+  // bot (declared under the top-level `bots` array, capability 45+) negotiates the same `media`
+  // capability over /attach/v1 and must clear this same gate on GET /attach/v1/media/:mediaId.
+  if (nativeBots(config).some((bot) => bot.id === agentId)) return true;
   return hermesEndpoints(config).some((endpoint) =>
     Object.keys(endpoint.config.profiles).some((profile) => publicProfileId(endpoint, profile) === agentId));
 }
@@ -496,6 +500,10 @@ export async function startGateway(
   let memorySurface: AttachMemorySurface | undefined;
   let configSurface: AttachConfigSurface | undefined;
   let botsSurface: BotsSurface;
+  // Hermes profiles only: runtime bot ids (from `nativeBots(config)`) are intentionally absent
+  // here. AttachV1Ingress#allowed falls back to the full capability set for any agentId with no
+  // entry in this map, which is exactly what a runtime bot needs today -- so leaving them out is
+  // fine, not an oversight.
   const allowedCapabilities = new Map<string, ReadonlySet<AttachV1Capability>>(
     profileEntries.map(([profileId]) => [
       profileId,
