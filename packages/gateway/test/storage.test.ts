@@ -7,6 +7,44 @@ import type { CozyAppTree } from "cozygateway-contract";
 
 import { cozyAppPhysicalId, openStorage } from "../src/storage.ts";
 
+describe("setup code lifecycle", () => {
+  it("keeps only the latest unpaired code and removes it when consumed", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-setup-code-lifecycle-"));
+    const path = join(directory, "gateway.sqlite");
+    const storage = openStorage(path);
+    const now = Date.now();
+    storage.createSetupCode("AAAA-BBBB", now + 60_000);
+    storage.createSetupCode("CCCC-DDDD", now + 60_000);
+
+    expect(storage.consumeSetupCode("AAAA-BBBB", now)).toBe("invalid");
+    expect(storage.consumeSetupCode("CCCC-DDDD", now)).toBe("ok");
+    storage.close();
+
+    const raw = new DatabaseSync(path, { readOnly: true });
+    expect(raw.prepare("SELECT COUNT(*) AS count FROM setup_codes").get()).toEqual({ count: 0 });
+    raw.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("prunes expired and consumed legacy rows on startup while preserving a live code", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-setup-code-prune-"));
+    const path = join(directory, "gateway.sqlite");
+    openStorage(path).close();
+    const now = Date.now();
+    const raw = new DatabaseSync(path);
+    raw.prepare("INSERT INTO setup_codes (code, expires_at, used_at) VALUES (?, ?, ?)").run("EXPIRED1", now - 1, null);
+    raw.prepare("INSERT INTO setup_codes (code, expires_at, used_at) VALUES (?, ?, ?)").run("USED-CODE", now + 60_000, now - 1);
+    raw.prepare("INSERT INTO setup_codes (code, expires_at, used_at) VALUES (?, ?, ?)").run("LIVE-CODE", now + 60_000, null);
+    raw.close();
+
+    openStorage(path).close();
+    const repaired = new DatabaseSync(path, { readOnly: true });
+    expect(repaired.prepare("SELECT code FROM setup_codes ORDER BY code").all()).toEqual([{ code: "LIVE-CODE" }]);
+    repaired.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
+
 function delegationWithCost(costUsd: number) {
   return {
     bot: "sage", sessionId: "session", turnId: "turn", batchId: "batch", childId: "child",

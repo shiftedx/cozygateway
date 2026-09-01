@@ -1094,10 +1094,14 @@ NODE
 default_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 ops_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 install_count_before="$(grep -c '^default:gateway:install$' "$tmp/commands")"
-rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
-# Rerunning on an installed gateway still lands on the pairing finale with a minted code.
-grep -Fq 'fake-qr' <<<"$rerun_output"
-grep -Fq '"setupCode":"TEST-CODE"' <<<"$rerun_output"
+printf '\n' > "$tmp/pair-default-no"
+rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_PAIR_PROMPT_INPUT="$tmp/pair-default-no" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+# Updates ask before minting pairing material and Enter takes the safe default: no new code.
+grep -Fq 'Create a new CozyChat pairing code? [y/N]' <<<"$rerun_output"
+if grep -Fq 'fake-qr' <<<"$rerun_output" || grep -Fq '"setupCode":"TEST-CODE"' <<<"$rerun_output"; then
+  echo 'an update declined with the default answer must not print pairing material' >&2
+  exit 1
+fi
 if grep -Fq 'Allow CozyChat to access this Gateway' <<<"$rerun_output"; then
   echo 'an update must preserve its saved listener without prompting again' >&2
   exit 1
@@ -1113,9 +1117,12 @@ if (config.tls?.certFile !== '/operator/cert.pem' || config.operatorCapability?.
 if (!Array.isArray(config.hermesEndpoints) || config.hermesEndpoints.length !== 1) process.exit(1);
 NODE
 
-# Opting into a public origin moves an existing LAN listener back to loopback,
-# persists the canonical HTTPS origin, and advertises it in the automatic pairing finale.
-public_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --public-url 'HTTPS://Gateway.Example:443/' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
+# An explicit yes still mints a code. Opting into a public origin moves an existing LAN listener
+# back to loopback, persists the canonical HTTPS origin, and advertises it in that requested code.
+printf 'yes\n' > "$tmp/pair-yes"
+public_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_PAIR_PROMPT_INPUT="$tmp/pair-yes" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --public-url 'HTTPS://Gateway.Example:443/' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+grep -Fq 'Create a new CozyChat pairing code? [y/N]' <<<"$public_output"
+grep -Fq '"setupCode":"TEST-CODE"' <<<"$public_output"
 grep -Fq '"gatewayUrl":"https://gateway.example"' <<<"$public_output"
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
 const { readFileSync } = require('node:fs');
@@ -1124,13 +1131,23 @@ if (config.host !== '127.0.0.1' || config.publicUrl !== 'https://gateway.example
 NODE
 
 preserved_public_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
-grep -Fq '"gatewayUrl":"https://gateway.example"' <<<"$preserved_public_output"
+if grep -Fq '"setupCode":"TEST-CODE"' <<<"$preserved_public_output"; then
+  echo 'a noninteractive update must default to no new pairing code' >&2
+  exit 1
+fi
+preserved_public_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/cozygateway" pair)"
+grep -Fq '"gatewayUrl":"https://gateway.example"' <<<"$preserved_public_pair"
 
 # Leaving the managed public posture is explicit: clear the saved origin and choose the LAN bind in
 # the same update. The config no longer advertises the retired tunnel on later pair commands.
 lan_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --clear-public-url --bind-host 0.0.0.0 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq 'CozyGateway listens on 0.0.0.0:8787' <<<"$lan_output"
-grep -Fq '"gatewayUrl":"http://127.0.0.1:8787"' <<<"$lan_output"
+if grep -Fq '"setupCode":"TEST-CODE"' <<<"$lan_output"; then
+  echo 'a listener update must not mint pairing material without consent' >&2
+  exit 1
+fi
+lan_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/cozygateway" pair)"
+grep -Fq '"gatewayUrl":"http://127.0.0.1:8787"' <<<"$lan_pair"
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
 const { readFileSync } = require('node:fs');
 const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));

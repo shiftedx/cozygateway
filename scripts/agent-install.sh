@@ -148,6 +148,8 @@ SERVICE_LABEL="ai.cozylabs.cozygateway"
 SERVICE_UNIT="cozygateway.service"
 WINDOWS_TASK="CozyGateway"
 WINDOWS_VBS="$LOCAL_DIR/run-gateway.vbs"
+INSTALL_ALREADY_CONFIGURED=0
+[ ! -f "$CONFIG_JSON" ] || INSTALL_ALREADY_CONFIGURED=1
 
 hydrate_listener_settings() {
   local saved remainder saved_host saved_port saved_public
@@ -196,6 +198,26 @@ choose_fresh_listener() {
     esac
   done
   exec 9<&-
+}
+should_mint_pairing_code() {
+  local input answer
+  [ "$INSTALL_ALREADY_CONFIGURED" = 1 ] || return 0
+
+  # The supported installer is commonly piped through stdin. Ask on the controlling terminal;
+  # unattended upgrades have no terminal and therefore take the safe default without minting.
+  input="${COZYGATEWAY_TEST_PAIR_PROMPT_INPUT:-/dev/tty}"
+  if [ -z "${COZYGATEWAY_TEST_PAIR_PROMPT_INPUT:-}" ] && { [ ! -t 2 ] || [ ! -r /dev/tty ]; }; then return 1; fi
+  [ -r "$input" ] || return 1
+  exec 8<"$input" || return 1
+  while true; do
+    printf 'Create a new CozyChat pairing code? [y/N] ' >&2
+    if ! IFS= read -r answer <&8; then answer=""; fi
+    case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) exec 8<&-; return 0 ;;
+      ''|n|no) exec 8<&-; return 1 ;;
+      *) say 'Please answer y or n.' >&2 ;;
+    esac
+  done
 }
 validate_listener_settings() {
   [ -n "$BIND_HOST" ] || die "--bind-host must not be empty"
@@ -1838,9 +1860,17 @@ main() {
   else
     say "OK    CozyGateway listens on $BIND_HOST:$PORT. External exposure is user-managed and requires HTTPS."
   fi
-  # The finale: mint a pairing code and print the QR so install -> scan -> chatting needs no
-  # further commands. A rerun on an installed gateway lands here too, with a fresh code.
-  if [ "$DRY_RUN" = 0 ]; then "$CLI_WRAPPER" pair --config "$CONFIG_JSON"; else say "DRY   mint pairing code and QR with $CLI_WRAPPER pair"; fi
+  # First setup ends ready to scan. Updates preserve existing device trust and ask before creating
+  # any new credential; unattended updates take the default No.
+  if [ "$DRY_RUN" = 1 ]; then
+    if [ "$INSTALL_ALREADY_CONFIGURED" = 1 ]; then say "DRY   ask before minting a new pairing code (default: no)"
+    else say "DRY   mint pairing code and QR with $CLI_WRAPPER pair"
+    fi
+  elif should_mint_pairing_code; then
+    "$CLI_WRAPPER" pair --config "$CONFIG_JSON"
+  else
+    say "INFO  no new pairing code created; run $CLI_WRAPPER pair when you want to add a device"
+  fi
   say "INFO  codes expire after 10 minutes; mint a fresh QR and code with: $CLI_WRAPPER pair"
   say "INFO  for a tunnel, rerun the installer with: --public-url https://gateway.example.com"
 }
