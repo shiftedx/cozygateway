@@ -57,7 +57,10 @@ The unit is written below `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`.
 Linux without `systemctl --user`, `loginctl`, or a running user manager is not a
 supported service host and is rejected before prerequisite installation.
 
-Update by repeating the one-paste line. Remove only installer-owned state:
+Update or repair with `cozygateway repair` (`cozygateway update` is an alias),
+or repeat the one-paste line when the installed command itself is damaged. Both
+paths fetch and verify one matched release while preserving the recorded profile
+scope and operator-owned gateway settings. Remove only installer-owned state:
 
 ```sh
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway

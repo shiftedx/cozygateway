@@ -38,6 +38,9 @@ main() {
   fetch_verified cozygateway.mjs "$asset_dir/cozygateway.mjs"
   fetch_verified cozygateway-hermes-attach-plugin.tar.gz "$asset_dir/cozygateway-hermes-attach-plugin.tar.gz"
   fetch_verified cozygateway-installer.sh "$asset_dir/agent-install.sh"
+  # Keep the release bootstrap that verified these assets. The installed command
+  # uses it for repair so it never treats checkout files as update payloads.
+  fetch_verified install.sh "$asset_dir/cozygateway-bootstrap.sh"
   if [ -n "$dry_stage" ]; then rm -rf "$dry_stage"; trap - RETURN; printf 'DRY   verified assets; would run installer from %s\n' "$HOME_DIR/bin/agent-install.sh"; return; fi
   exec bash "$HOME_DIR/bin/agent-install.sh" --gateway-dir "$HOME_DIR" --bundle "$HOME_DIR/bin/cozygateway.mjs" --plugin-archive "$HOME_DIR/bin/cozygateway-hermes-attach-plugin.tar.gz" "$@"
 }

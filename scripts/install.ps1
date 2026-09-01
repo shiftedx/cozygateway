@@ -1,4 +1,5 @@
 param(
+    [switch] $Repair,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $InstallerArguments
 )
@@ -55,6 +56,22 @@ function Get-VerifiedAsset {
     }
     Move-Item -LiteralPath $newPath -Destination $Destination -Force
     Write-Ok "verified $Name"
+}
+
+function Get-PersistedRepairProfiles {
+    param([string] $StatePath)
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
+        Fail 'repair metadata is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
+    }
+    $line = (Get-Content -LiteralPath $StatePath | Where-Object { $_ -like 'profiles=*' } | Select-Object -Last 1)
+    if ($null -eq $line) {
+        Fail 'repair metadata is invalid. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
+    }
+    $profiles = $line.Substring(9)
+    if ([string]::IsNullOrWhiteSpace($profiles) -or $profiles -notmatch '^(?:default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(?:,(?:default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*$') {
+        Fail 'repair metadata is invalid. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
+    }
+    return $profiles
 }
 
 function Refresh-HermesEnvironment {
@@ -296,8 +313,22 @@ if ($PSVersionTable.PSVersion.Major -lt 5) { Fail 'Windows PowerShell 5.1 or new
 $script:InstallHome = Resolve-InstallHome $env:COZYGATEWAY_HOME
 $bin = Join-Path $script:InstallHome 'bin'
 $installerPath = Join-Path $bin 'agent-install.sh'
+$bootstrapPath = Join-Path $bin 'cozygateway-bootstrap.ps1'
 $isUninstall = $InstallerArguments -contains '--uninstall'
 $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
+
+if ($Repair) {
+    if (-not (Test-Path -LiteralPath $bootstrapPath -PathType Leaf) -or -not (Test-Path -LiteralPath "$bootstrapPath.sha256" -PathType Leaf)) {
+        Fail 'repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
+    }
+    $expected = ((Get-Content -LiteralPath "$bootstrapPath.sha256" -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+    $actual = (Get-FileHash -LiteralPath $bootstrapPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($expected) -or $expected -ne $actual) {
+        Fail 'repair bootstrap checksum mismatch. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
+    }
+    $InstallerArguments = @('--profiles', (Get-PersistedRepairProfiles (Join-Path $script:InstallHome 'local\install-state'))) + @($InstallerArguments)
+    Write-Info 'repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment'
+}
 
 if ($isUninstall) {
     $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
@@ -340,5 +371,6 @@ $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
 Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
 Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
 Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
+Get-VerifiedAsset 'install.ps1' $bootstrapPath $base
 Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
 if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }

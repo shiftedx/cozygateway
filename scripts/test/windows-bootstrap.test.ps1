@@ -41,6 +41,7 @@ function New-ReleaseFixtures {
         'cozygateway.mjs' = "console.log('fixture');`n"
         'cozygateway-hermes-attach-plugin.tar.gz' = 'plugin-fixture'
         'cozygateway-installer.sh' = "#!/usr/bin/env bash`nexit 0`n"
+        'install.ps1' = "param([switch]`$Repair)`nexit 0`n"
     }
     foreach ($entry in $assets.GetEnumerator()) {
         $path = Join-Path $Directory $entry.Key
@@ -626,6 +627,18 @@ try {
     Assert-True (($newerStableEvents -join "`n") -match '(?m)^bash:') 'newer stable Hermes must proceed to the CozyGateway Bash handoff'
     Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
 
+    $repairMetadataHome = Join-Path $temp 'missing repair metadata'
+    $repairBootstrap = Join-Path $repairMetadataHome 'bin\cozygateway-bootstrap.ps1'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $repairBootstrap) | Out-Null
+    Copy-Item -LiteralPath $installer -Destination $repairBootstrap
+    $repairHash = (Get-FileHash -LiteralPath $repairBootstrap -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Utf8NoBom "$repairBootstrap.sha256" "$repairHash  install.ps1`n"
+    $missingRepairMetadata = Invoke-Bootstrap $installer @{
+        'COZYGATEWAY_HOME' = $repairMetadataHome
+    } @('-Repair')
+    Assert-True ($missingRepairMetadata.ExitCode -ne 0) 'repair with missing metadata must fail closed'
+    Assert-True ($missingRepairMetadata.Output -match 'repair metadata is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 \| iex') 'repair metadata failures must print canonical reinstall guidance'
+
     $result = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
@@ -650,6 +663,9 @@ try {
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
     Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
     Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'
+    $persistedBootstrap = Join-Path $temp 'Cozy Gateway\bin\cozygateway-bootstrap.ps1'
+    Assert-True (Test-Path -LiteralPath $persistedBootstrap) 'Windows bootstrap must persist its verified repair bootstrap'
+    Assert-True (Test-Path -LiteralPath "$persistedBootstrap.sha256") 'Windows bootstrap must persist the repair bootstrap checksum'
 
     $restoreWrapper = Join-Path $temp 'verify-hermes-env-restore.ps1'
     Write-Utf8NoBom $restoreWrapper @"

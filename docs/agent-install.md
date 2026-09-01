@@ -66,9 +66,20 @@ replacing any Hermes profile gateway service.
 # Re-run to update the verified assets and retain existing profile tokens.
 curl -fsSL https://cozylabs.ai/install.sh | bash
 
+# The installed command performs the same verified update-and-repair flow.
+cozygateway repair
+
 # Remove only files and env keys owned by CozyGateway.
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
+
+`cozygateway update` is an alias for `repair`. Both commands use the persisted,
+checksummed release bootstrap and fetch one current matched release; they never
+treat the installed bundle or a checkout as an update source. A repair retains
+the recorded profile selection, listener and public origin, device/message
+database, attach tokens and spools, plus supported operator-owned configuration
+such as TLS. An explicit `--profiles` on the one-line installer remains the way
+to change profile scope.
 
 Near the end of a fresh interactive install, the installer asks one networking question:
 `Allow CozyChat to access this Gateway over your local network? [y/N]`. Yes binds CozyGateway to
@@ -114,13 +125,17 @@ health checks. If a managed listener replacement cannot become ready, the CLI
 restores the previous working listener automatically.
 Readiness requires at least one configured attach profile, every configured
 profile online, and zero dead letters. Pairing material is not printed first.
-The non-interactive `cozygateway status`, `cozygateway pair`, and
-`cozygateway configure` commands expose the same focused operations directly.
+The non-interactive `cozygateway status`, `cozygateway pair`,
+`cozygateway configure`, and `cozygateway repair` commands expose the same
+focused operations directly. Status distinguishes an unreachable gateway from
+an attach connection that needs attention without printing profile identities
+or raw errors.
 
 On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the
 current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
 when policy blocks task registration. Phone-created bot auto-provisioning is not
-part of the Windows installer.
+part of the Windows installer. The installed supervisor restarts an unexpectedly
+exited gateway child, including after the login task has already run.
 
 Uninstall is deliberately independent of model selection, downloads, Node,
 listener-config parsing, and the continued presence of Hermes, so a damaged

@@ -42,8 +42,10 @@ higher-integrity Hermes Dashboard cannot be classified safely without elevated
 process metadata. The final screen contains a QR and plain-text setup code.
 Open a new PowerShell or Terminal window and type `cozygateway` for a small menu
 that shows status, prints a fresh pairing QR, or changes the bind address and
-port. Existing installs retain their saved listener; `--bind-host` remains the non-interactive
-override.
+port. `cozygateway status` names the safe next step when attention is needed;
+`cozygateway repair` (or `update`) downloads the latest matched, checksummed
+release and reconciles the install. Existing installs retain their saved
+listener; `--bind-host` remains the non-interactive override.
 Publishing the short PowerShell URL is tracked separately; before that website
 change, use the `install.ps1` asset from a versioned GitHub release.
 
