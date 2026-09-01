@@ -27,7 +27,7 @@ import {
   type ServerFrame,
 } from "cozygateway-contract";
 
-import { hermesEndpoints, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { hermesEndpoints, nativeBots, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
 import { cozyAppPhysicalId, openStorage, type Storage } from "./storage.ts";
 import {
@@ -285,6 +285,25 @@ export async function startGateway(
       backend: "attach",
     });
   }
+  // Bots served by a non-Hermes runtime (e.g. CozyAgents). Additive to the Hermes profiles above:
+  // same storage row, same attach identity shape, no Hermes Dashboard consulted for them.
+  const runtimeBots = nativeBots(config);
+  // loadConfig() rejects this same collision (config.ts:246-249), but startGateway takes a
+  // GatewayConfig directly and skips loadConfig on the programmatic path (tests, embedders), so
+  // the check is re-derived here rather than trusted to have already run. Two ids resolving the
+  // same agentId would otherwise let two different tokens authenticate as one identity silently.
+  const hermesProfileIds = new Set(profileEntries.map(([id]) => id));
+  for (const bot of runtimeBots) {
+    if (hermesProfileIds.has(bot.id)) {
+      throw new Error(`bot "${bot.id}": id collides with a Hermes profile id; every bot needs a distinct id`);
+    }
+    storage.upsertAgent({
+      id: bot.id,
+      name: bot.name ?? bot.id,
+      avatar: bot.avatar ?? null,
+      backend: "attach",
+    });
+  }
   // capabilities is always present, empty when unconfigured, so the shape is uniform across
   // /health, the pair response, and the ready frame (contract v1.md section 5). Absence is a
   // valid wire shape too (older gateways), but this implementation always advertises the field.
@@ -428,7 +447,10 @@ export async function startGateway(
   );
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
-  const nativeBotEntries = profileEntries;
+  const nativeBotIds = [
+    ...profileEntries.map(([profileId]) => profileId),
+    ...runtimeBots.map((bot) => bot.id),
+  ];
   const router = new AttachRouter();
   let nativeSink: AttachNativeSink | undefined;
   const attachTokens = new Map<string, string>();
@@ -439,6 +461,19 @@ export async function startGateway(
         throw new Error("duplicate attach credential across Hermes endpoints; every profile must use a distinct token");
       attachTokens.set(token, publicProfileId(endpoint, rawProfile));
     }
+  }
+  // Native runtime bots share the same token map and the same collision rule: the token IS the
+  // agent identity on /attach/v1, so a bot reusing a Hermes profile's token (or another bot's) is
+  // a startup error, not a silent overwrite.
+  const runtimeBotTokens = collectAttachTokens(
+    Object.fromEntries(runtimeBots.map((bot) => [bot.id, { tokenEnv: bot.tokenEnv }])),
+    process.env,
+    "bot",
+  );
+  for (const [token, botId] of runtimeBotTokens) {
+    if (attachTokens.has(token))
+      throw new Error("duplicate attach credential; every bot must use a distinct token");
+    attachTokens.set(token, botId);
   }
   let nativeBotPlane: NativeBotDataPlane | undefined;
   let memorySurface: AttachMemorySurface | undefined;
@@ -592,7 +627,13 @@ export async function startGateway(
     control: bridge,
     storage,
     ingress: attachV1Ingress,
-    nativeBots: nativeBotEntries.map(([bot]) => bot),
+    nativeBots: nativeBotIds,
+    runtimeBots: runtimeBots.map((bot) => ({
+      id: bot.id,
+      name: bot.name ?? bot.id,
+      avatar: bot.avatar ?? null,
+      runtime: bot.runtime,
+    })),
     chatSuggestion: hermesOptions.chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     staleTurnSweepMs: millis(config.staleTurnSweepSeconds),

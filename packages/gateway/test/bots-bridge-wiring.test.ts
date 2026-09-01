@@ -434,4 +434,87 @@ describe("startGateway with a hermes bridge", () => {
     ).rejects.toThrow(/ws:\/\/ or wss:\/\//);
     delete process.env["TEST_HERMES_TOKEN"];
   });
+
+  it("authenticates a native runtime bot's attach-v1 peer as its configured bot id", async () => {
+    const hermes = await startFakeHermesServer({
+      methods: { "profiles.list": () => ({ profiles: [], bot_mode_protocol: true }) },
+    });
+    servers.push(hermes);
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
+    process.env["COZYGATEWAY_ATTACH_TOKEN_COZY"] = "cozy-token";
+    const gateway = await startGateway({
+      name: "e2e",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles }],
+      bots: [{ id: "cozy", tokenEnv: "COZYGATEWAY_ATTACH_TOKEN_COZY", runtime: "cozyagents" }],
+    });
+    gateways.push(gateway);
+
+    const ws = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, {
+      headers: { authorization: "Bearer cozy-token" },
+    });
+    const frames: Array<{ kind: string; agentId?: string }> = [];
+    ws.on("message", (data) => frames.push(JSON.parse(String(data)) as { kind: string; agentId?: string }));
+    await once(ws, "open");
+    ws.send(JSON.stringify({
+      kind: "hello",
+      version: 2,
+      instanceId: "cozy-plugin",
+      capabilities: ["draft", "tools"],
+      resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await until(() => frames.some((frame) => frame.kind === "hello_ack"));
+    const ack = frames.find((frame) => frame.kind === "hello_ack");
+    expect(ack).toMatchObject({ kind: "hello_ack", agentId: "cozy" });
+
+    ws.close();
+    delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
+    delete process.env["COZYGATEWAY_ATTACH_TOKEN_COZY"];
+  });
+
+  it("fails startup when a native bot id collides with a Hermes profile id", async () => {
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
+    process.env["COZYGATEWAY_ATTACH_TOKEN_SAGE"] = "sage-token";
+    await expect(
+      startGateway({
+        name: "e2e",
+        port: 0,
+        dbPath: ":memory:",
+        turnTimeoutSeconds: 0,
+        // `profiles` (defined above) already declares Hermes profile "sage"; this bot reuses that
+        // same id, so two distinct tokens would otherwise resolve to one agentId silently.
+        hermesEndpoints: [{ id: "default", url: "ws://127.0.0.1:1/api/ws", tokenEnv: "TEST_HERMES_TOKEN", profiles }],
+        bots: [{ id: "sage", tokenEnv: "COZYGATEWAY_ATTACH_TOKEN_SAGE", runtime: "cozyagents" }],
+      }),
+    ).rejects.toThrow(/bot "sage": id collides with a Hermes profile id/);
+
+    delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
+    delete process.env["COZYGATEWAY_ATTACH_TOKEN_SAGE"];
+  });
+
+  it("fails startup with bot-scoped wording when a native bot's token env var is unset", async () => {
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
+    delete process.env["COZYGATEWAY_ATTACH_TOKEN_MISSING"];
+    await expect(
+      startGateway({
+        name: "e2e",
+        port: 0,
+        dbPath: ":memory:",
+        turnTimeoutSeconds: 0,
+        hermesEndpoints: [{ id: "default", url: "ws://127.0.0.1:1/api/ws", tokenEnv: "TEST_HERMES_TOKEN", profiles }],
+        bots: [{ id: "cozy", tokenEnv: "COZYGATEWAY_ATTACH_TOKEN_MISSING", runtime: "cozyagents" }],
+      }),
+      // The unset var belongs to a *bot*, not a Hermes profile, so the error must not misname it.
+    ).rejects.toThrow(/^bot "cozy": environment variable "COZYGATEWAY_ATTACH_TOKEN_MISSING" is not set/);
+
+    delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
+  });
 });

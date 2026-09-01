@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 43. This extension is independent of the frozen core
+Status: v1 extension, capability version 45. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 43 }
+"capabilities": { "com.cozylabs.bots": 45 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -83,6 +83,8 @@ and does not register `/bots` routes.
 | 41 | Transitional bot-scoped model-provider setup routes. Canonical ownership moved to `com.cozylabs.harness-settings` v1. |
 | 42 | Truthful Bot Activity previews (no transcript-derived A2A sender) plus credential-free profile-local Hermes memory setup through the authenticated attached plugin. |
 | 43 | The roster represents every Hermes profile and reports `syncState`; profiles not yet provisioned remain visible as `setup_required` instead of disappearing. |
+| 44 | Per-profile CozyApps readiness on `BotSummary`, with a stable `restart_profile` repair when a connected plugin did not negotiate `cozyapps`. |
+| 45 | Native runtime Bots: config-declared bots served by a non-Hermes attach peer appear on the roster with `runtime: "cozyagents"`, built from config and attach presence rather than the Dashboard; their Dashboard-backed routes answer 409 `unsupported_for_runtime`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -452,7 +454,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 
 | Route | Request | Success response | Notes |
 | --- | --- | --- | --- |
-| `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots. |
+| `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots, plus one row per capability-45 native runtime bot. |
 | `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate. `409` extension code `conflict` when the name is taken. |
 | `DELETE /bots/:name` | optional `?force=1` | `200 BotDeleteResponse` | Capability 37. Deletes the Hermes profile and purges every gateway row the bot owned. `409` extension code `conflict` (body carries `turnId`) when a native turn is running, unless `force=1`. `404` when neither Hermes nor this gateway knows the name. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
@@ -640,6 +642,20 @@ Committed transcript history remains the recovery source after reconnect.
 
 ## Error and privacy rules
 
+- Capability 45. `BotSummary.runtime` names which runtime serves the bot. It is optional and
+  absent means Hermes, so every existing row is unchanged; the only other value is `"cozyagents"`,
+  a config-declared bot served by a non-Hermes attach peer whose row is built from gateway config
+  and attach presence rather than the Dashboard. Chat, readiness, approvals, and clarifications
+  work for such a bot exactly as they do for a Hermes-backed one. A runtime bot cannot join a room
+  in this version: `POST /bots/groups` naming one is refused with `400 invalid_request`. Roster
+  `stale` is a fact about the Hermes control plane only; it says nothing about a runtime bot, whose
+  row is always current because it is built from local config and live attach presence.
+- A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
+  extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
+  bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
+  This covers profile, model-config, model-provider, routines, desktop-session, and delete
+  surfaces. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
+  must hide or disable that section rather than treat the bot as missing.
 - Native session ids, attach message ids, and attachment ids are opaque. Never infer a filesystem
   path, Hermes Dashboard id, or URL from them.
 - Attachment and media validation rejects unsafe bytes, unsupported types, oversized bodies, and

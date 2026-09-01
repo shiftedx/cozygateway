@@ -24,7 +24,7 @@ import {
 import { MEMORY_KINDS, MemoryConflict, MemoryInvalidRequest, MemoryNotFound, createMemoryRateLimiter, type MemoryRateLimiter, type MemorySurface } from "./memory.ts";
 import type { BotMemoryKind } from "cozygateway-contract";
 
-import { BackendUnavailable } from "../errors.ts";
+import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import {
@@ -116,7 +116,7 @@ function errorBody(code: ErrorCode, message: string): ErrorBody {
  *  `error.code` a plain string precisely so an extension can). A client that does not know them
  *  treats them as a generic failure, which the HTTP status already conveys. */
 function extensionErrorBody(
-  code: "conflict" | "media_refused" | "rate_limited",
+  code: "conflict" | "media_refused" | "rate_limited" | "unsupported_for_runtime",
   message: string,
 ): ErrorBody {
   return { error: { code, message } };
@@ -219,6 +219,13 @@ function failure(c: Context<Env>, err: unknown) {
     return c.json(errorBody("not_found", err.message), 404);
   if (err instanceof ModelConfigInvalid)
     return c.json(errorBody("invalid_request", err.message), 400);
+  // The bot is real and its chat lane works; this surface simply has no backend for its runtime.
+  // A 404 would say the bot does not exist, which is a lie a client would act on.
+  if (err instanceof UnsupportedForRuntime)
+    return c.json(
+      { ...extensionErrorBody("unsupported_for_runtime", err.message), runtime: err.runtime, feature: err.feature },
+      409,
+    );
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   }

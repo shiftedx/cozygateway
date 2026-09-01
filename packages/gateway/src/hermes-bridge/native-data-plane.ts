@@ -37,7 +37,7 @@ import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
 import type { AttachV1EventFrame, AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
 import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
-import { BackendUnavailable } from "../errors.ts";
+import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import { ATTACH_MEDIA_TTL_MS } from "./photos.ts";
 import type {
@@ -45,6 +45,8 @@ import type {
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
+import { BotNameTaken } from "./crud.ts";
+import { GroupInvalid } from "./group-rooms.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
@@ -59,6 +61,14 @@ export interface NativeBotDataPlaneOptions {
   storage: Storage;
   ingress: AttachV1Ingress;
   nativeBots: Iterable<string>;
+  /** Config-declared bots served by a non-Hermes runtime. They have no Dashboard profile, so their
+   * roster row is built here and their Dashboard-backed surfaces refuse instead of asking. */
+  runtimeBots?: readonly {
+    id: string;
+    name: string;
+    avatar: string | null;
+    runtime: "cozyagents";
+  }[];
   /** Optional opener offered only while a Bot Chat transcript is empty. */
   chatSuggestion: string;
   broadcast: (frame: ServerFrame) => void;
@@ -150,6 +160,37 @@ interface NativeTurnState {
   queuedAt?: number;
 }
 
+/** The exact fields `#nativeOverlay` writes onto a roster row. */
+type NativeRowOverlay = Pick<
+  BotSummary,
+  "chatSessionId" | "lastActiveAt" | "preview" | "syncState"
+> &
+  Partial<Pick<BotSummary, "cozyApps" | "syncReason" | "syncRepair">>;
+
+/** `BotsSurface` methods whose answer comes from the Hermes Dashboard and that take the bot name
+ * first. A bot served by another runtime has no Dashboard profile behind it, so asking would ask
+ * about a profile that does not exist and answer 404. Chat, readiness and desktop-session methods
+ * are absent on purpose: the native plane owns those for every bot it handles. */
+const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
+  "botProfile",
+  "configureProfile",
+  "modelConfig",
+  "configureModel",
+  "modelProviders",
+  "configureModelProviderField",
+  "clearModelProviderField",
+  "startModelProviderOAuth",
+  "pollModelProviderOAuth",
+  "submitModelProviderOAuthCode",
+  "cancelModelProviderOAuth",
+  "desktopSessionTranscript",
+  "routines",
+  "createRoutine",
+  "patchRoutine",
+  "deleteRoutine",
+  "deleteBot",
+]);
+
 /** Attach-owned Bot Mode data plane. The returned surface delegates management/control methods to
  * the dashboard bridge but owns every chat method for configured profiles, making it impossible
  * for a native send or settlement to fall through to the Dashboard chat transport. */
@@ -158,6 +199,7 @@ export class NativeBotDataPlane {
   readonly #storage: Storage;
   readonly #ingress: AttachV1Ingress;
   readonly #native: Set<string>;
+  readonly #runtimeBots: Map<string, NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number]>;
   readonly #chatSuggestion: string;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #onChatMessage: NativeBotDataPlaneOptions["onChatMessage"];
@@ -209,6 +251,9 @@ export class NativeBotDataPlane {
     this.#storage = opts.storage;
     this.#ingress = opts.ingress;
     this.#native = new Set([...opts.nativeBots].map(normalize));
+    this.#runtimeBots = new Map(
+      (opts.runtimeBots ?? []).map((bot) => [normalize(bot.id), bot]),
+    );
     this.#chatSuggestion = opts.chatSuggestion;
     this.#broadcast = opts.broadcast;
     this.#onChatMessage = opts.onChatMessage;
@@ -244,6 +289,27 @@ export class NativeBotDataPlane {
   surface(): BotsSurface {
     const overrides: Partial<BotsSurface> = {
       roster: () => this.#roster(),
+      createBot: async (input) => {
+        // The proxy guard cannot see this one: its first argument is a create request, not a name.
+        // Unguarded it writes a Hermes profile the roster filter then hides and DELETE refuses,
+        // leaving an orphan no route can reach.
+        const bot = normalize(input.name);
+        if (this.#runtimeBots.has(bot)) throw new BotNameTaken(bot);
+        return this.#control.createBot(input);
+      },
+      createGroup: async (name, members) => {
+        // Room membership is resolved against `profiles.list`, which never names a runtime bot, so
+        // without this the user is told the bot is not on this gateway while `GET /bots` lists it.
+        for (const member of members) {
+          const bot = normalize(member);
+          const runtimeBot = this.#runtimeBots.get(bot);
+          if (runtimeBot !== undefined)
+            throw new GroupInvalid(
+              `${bot} is a ${runtimeBot.runtime} runtime bot; rooms are not supported for runtime bots yet`,
+            );
+        }
+        return this.#control.createGroup(name, members);
+      },
       readiness: (name) => this.#readiness(name),
       commands: (name) => this.#commands(name),
       pendingApprovals: () => this.#pendingApprovals(),
@@ -278,9 +344,20 @@ export class NativeBotDataPlane {
       get: (target, property) => {
         const override = overrides[property as keyof BotsSurface];
         const value = override ?? Reflect.get(target, property, target);
-        return typeof value === "function"
-          ? value.bind(override === undefined ? target : overrides)
-          : value;
+        if (typeof value !== "function") return value;
+        const bound = value.bind(override === undefined ? target : overrides);
+        if (typeof property !== "string" || !DASHBOARD_ONLY.has(property))
+          return bound;
+        // The refusal is decided here so the Dashboard bridge is never reached for a bot it does
+        // not own. Rejected rather than thrown: every guarded method returns a promise.
+        return (...args: unknown[]) => {
+          const name = typeof args[0] === "string" ? normalize(args[0]) : undefined;
+          const runtimeBot = name === undefined ? undefined : this.#runtimeBots.get(name);
+          if (name === undefined || runtimeBot === undefined) return bound(...args);
+          return Promise.reject(
+            new UnsupportedForRuntime(name, property, runtimeBot.runtime),
+          );
+        };
       },
     }) as BotsSurface;
   }
@@ -320,31 +397,65 @@ export class NativeBotDataPlane {
    * carried the real id: a client could not join a `bot_chat_delta` to the roster row it belongs
    * to. One function, both surfaces, no drift. */
   rosterBots(bots: readonly BotSummary[]): BotSummary[] {
-    return bots.map((summary): BotSummary => {
+    const rows = bots
+      // A Hermes profile sharing an id with a runtime bot would otherwise produce two rows for
+      // one name. The config-declared row wins: it is the identity this gateway actually serves.
+      .filter((summary) => !this.#runtimeBots.has(normalize(summary.name)))
+      .map((summary): BotSummary => {
         const bot = normalize(summary.name);
         if (!this.#native.has(bot)) {
           return { ...summary, chatSessionId: null, syncState: "setup_required" };
         }
-        const chat = this.#storage.nativeBotChat(bot, this.#now());
-        const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
-        const latest = messages.findLast(
-          (message) => message.text.trim().length > 0,
-        );
-        const cozyApps = this.#cozyAppsReadiness(bot);
-        return {
-          ...summary,
-          chatSessionId: chat.sessionId,
-          lastActiveAt: latest?.at ?? null,
-          preview:
-            latest === undefined
-              ? { kind: "empty", text: "No conversations yet, say hi" }
-              : { kind: "plain", text: latest.text.trim() },
-          syncState: this.#syncState(bot),
-          ...(cozyApps === undefined ? {} : { cozyApps }),
-          ...(cozyApps?.reason === undefined ? {} : { syncReason: cozyApps.reason }),
-          ...(cozyApps?.repair === undefined ? {} : { syncRepair: cozyApps.repair }),
-        };
+        return { ...summary, ...this.#nativeOverlay(bot) };
       });
+    // A config-declared runtime bot has no Hermes profile to overlay, so its row is built here.
+    // Appended in this function rather than in `#roster` so the `bot_roster` frame, which is
+    // published through this overlay, carries exactly the rows `GET /bots` returns.
+    for (const bot of this.#runtimeBots.values()) rows.push(this.#runtimeRow(bot));
+    return rows;
+  }
+
+  /** Everything a native row knows that the Dashboard cannot: the local conversation identity,
+   * its latest line, and how far its attach transport has come. Typed as the exact fields it
+   * writes, so spreading it over a partial row still satisfies `BotSummary`. */
+  #nativeOverlay(bot: string): NativeRowOverlay {
+    const chat = this.#storage.nativeBotChat(bot, this.#now());
+    const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
+    const latest = messages.findLast((message) => message.text.trim().length > 0);
+    const cozyApps = this.#cozyAppsReadiness(bot);
+    return {
+      chatSessionId: chat.sessionId,
+      lastActiveAt: latest?.at ?? null,
+      preview:
+        latest === undefined
+          ? { kind: "empty", text: "No conversations yet, say hi" }
+          : { kind: "plain", text: latest.text.trim() },
+      syncState: this.#syncState(bot),
+      ...(cozyApps === undefined ? {} : { cozyApps }),
+      ...(cozyApps?.reason === undefined ? {} : { syncReason: cozyApps.reason }),
+      ...(cozyApps?.repair === undefined ? {} : { syncRepair: cozyApps.repair }),
+    };
+  }
+
+  #runtimeRow(
+    bot: NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number],
+  ): BotSummary {
+    const id = normalize(bot.id);
+    return {
+      name: id,
+      displayName: bot.name,
+      handle: id,
+      description: null,
+      // No route serves a runtime bot's avatar in v0.0.1, so claiming one would send every client
+      // after an image that does not exist. The configured value is still the agents row's.
+      hasAvatar: false,
+      group: null,
+      pinned: false,
+      active: this.#syncState(id) === "ready",
+      meta: null,
+      runtime: bot.runtime,
+      ...this.#nativeOverlay(id),
+    };
   }
 
   #roster() {
@@ -383,6 +494,10 @@ export class NativeBotDataPlane {
 
   #cozyAppsReadiness(bot: string): CozyAppsReadiness | undefined {
     if (!this.handles(bot)) return undefined;
+    // `restart_profile` repairs a Hermes plugin launch. A config-declared runtime bot has no
+    // plugin to restart, so a missing `cozyapps` negotiation is a fact about its peer's feature
+    // set, not a reason to hold its row out of `ready`.
+    if (this.#runtimeBots.has(bot)) return undefined;
     // Unit seams from pre-capability tests deliberately model only attachment. Production ingress
     // always exposes this accessor; absence here means no capability observation is available.
     const capabilitiesFor = this.#ingress.negotiatedCapabilities;
@@ -749,7 +864,16 @@ export class NativeBotDataPlane {
   async #desktopSessions(name: string) {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    this.#assertRuntimeSupports(bot, "desktopSessions");
     return this.#control.desktopSessions(bot);
+  }
+
+  /** These two surfaces are native-plane overrides, so the `surface()` guard never sees them.
+   * Their answer still comes from the Dashboard, so a runtime bot gets the same refusal. */
+  #assertRuntimeSupports(bot: string, feature: string): void {
+    const runtimeBot = this.#runtimeBots.get(bot);
+    if (runtimeBot !== undefined)
+      throw new UnsupportedForRuntime(bot, feature, runtimeBot.runtime);
   }
 
   /** Resolve one authoritative conversation before a read or send. The gateway compares actual
@@ -769,6 +893,10 @@ export class NativeBotDataPlane {
   }
 
   async #resolveLatestSessionOnce(bot: string): Promise<void> {
+    // A runtime bot has no Hermes profile, so the Desktop/TUI/CLI index cannot hold a session for
+    // it. Asking anyway would issue a profile RPC on every chat read and send whose failure this
+    // method's catch would silently swallow.
+    if (this.#runtimeBots.has(bot)) return;
     const current = this.#storage.nativeBotChat(bot, this.#now());
     // Never redirect an in-flight lane. The session that owns the running turn remains canonical
     // until Hermes settles it; the next read/send performs the same recency resolution again.
@@ -801,6 +929,7 @@ export class NativeBotDataPlane {
   ): Promise<BotDesktopHermesResumeResponse> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    this.#assertRuntimeSupports(bot, "resumeDesktopSession");
     // Re-read the source-qualified dashboard index at action time. A row shown earlier is no
     // authorization to resume after it was deleted, reclassified, or moved to another profile.
     const eligible = await this.#control.desktopSessions(bot);

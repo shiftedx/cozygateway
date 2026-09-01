@@ -43,31 +43,34 @@ export function parseAttachOptions(
   profileId: string,
   profile: HermesBridgeConfig["profiles"][string],
   env: Record<string, string | undefined>,
+  subject = "Hermes profile",
 ): ParsedAttachOptions {
   const tokenEnv = profile.tokenEnv;
   const token = env[tokenEnv];
   if (token === undefined || token.length === 0) {
     throw new Error(
-      `Hermes profile "${profileId}": environment variable "${tokenEnv}" is not set; the attach token rides the environment, never the config file`,
+      `${subject} "${profileId}": environment variable "${tokenEnv}" is not set; the attach token rides the environment, never the config file`,
     );
   }
   return { tokenEnv, token };
 }
 
 /** Build the token-to-agentId map the ingress authenticates against. The token IS the agent
- *  identity on /attach/v1, so a shared token is a hard startup error, not a warning. */
+ *  identity on /attach/v1, so a shared token is a hard startup error, not a warning. `subject`
+ *  words the error for whatever is calling: Hermes profiles (default) or native runtime bots. */
 export function collectAttachTokens(
   profiles: HermesBridgeConfig["profiles"],
   env: Record<string, string | undefined>,
+  subject = "Hermes profile",
 ): Map<string, string> {
   const tokens = new Map<string, string>();
   for (const [rawProfileId, profile] of Object.entries(profiles)) {
     const profileId = rawProfileId.trim().toLowerCase();
-    const { token } = parseAttachOptions(profileId, profile, env);
+    const { token } = parseAttachOptions(profileId, profile, env, subject);
     const holder = tokens.get(token);
     if (holder !== undefined) {
       throw new Error(
-        `Hermes profile "${profileId}": attach token collides with profile "${holder}"; every profile needs its own token`,
+        `${subject} "${profileId}": attach token collides with profile "${holder}"; every profile needs its own token`,
       );
     }
     tokens.set(token, profileId);

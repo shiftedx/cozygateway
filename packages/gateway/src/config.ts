@@ -99,6 +99,17 @@ const TlsConfigSchema = Type.Object({
 });
 export type TlsConfig = Static<typeof TlsConfigSchema>;
 
+/** A Bot served by a non-Hermes runtime. It is known from config plus attach presence alone;
+ *  no Hermes Dashboard is consulted for it. Token values live only in the named env var. */
+export const NativeBotConfigSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 48, pattern: "^[a-z0-9][a-z0-9_-]*$" }),
+  name: Type.Optional(Type.String({ minLength: 1 })),
+  avatar: Type.Optional(Type.String({ minLength: 1 })),
+  tokenEnv: Type.String({ minLength: 1 }),
+  runtime: Type.Literal("cozyagents"),
+});
+export type NativeBotConfig = Static<typeof NativeBotConfigSchema>;
+
 const GatewayConfigSchema = Type.Object({
   name: Type.String({ minLength: 1 }),
   port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
@@ -132,6 +143,9 @@ const GatewayConfigSchema = Type.Object({
   /** Hermes runtimes. Profile ids are bare for one endpoint and namespaced for multiple. */
   hermesEndpoints: Type.Array(HermesEndpointConfigSchema, { minItems: 1, maxItems: 32 }),
   tls: Type.Optional(TlsConfigSchema),
+  /** Bots served by a non-Hermes runtime, e.g. CozyAgents. Additive to hermesEndpoints' profiles;
+   *  ids share the same collision namespace (see loadConfig). */
+  bots: Type.Optional(Type.Array(NativeBotConfigSchema, { maxItems: 64 })),
 });
 export type GatewayConfig = Static<typeof GatewayConfigSchema>;
 
@@ -155,6 +169,13 @@ export function hermesEndpoints(config: GatewayConfig): ResolvedHermesEndpoint[]
 export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: string): string {
   const normalized = profile.trim().toLowerCase();
   return endpoint.namespace ? `${endpoint.id}:${normalized}` : normalized;
+}
+
+/** Bots declared under the top-level `bots` config section, with `id` normalized the same way
+ *  Hermes profile ids are (see publicProfileId). The schema pattern already forbids uppercase;
+ *  this is belt and braces. */
+export function nativeBots(config: GatewayConfig): NativeBotConfig[] {
+  return config.bots ?? [];
 }
 
 const LOOPBACK_LISTENERS = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -221,6 +242,10 @@ export function loadConfig(path: string): GatewayConfig {
       }
       seen.add(profile);
     }
+  }
+  for (const bot of nativeBots(config)) {
+    if (seen.has(bot.id)) throw new ContractViolation(`duplicate bot id "${bot.id}"`, "/bots");
+    seen.add(bot.id);
   }
   return config;
 }

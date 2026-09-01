@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { Hono } from "hono";
+import type { MiddlewareHandler } from "hono";
 import type { ServerFrame } from "cozygateway-contract";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,7 +10,9 @@ import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
-import { BackendUnavailable } from "../src/errors.ts";
+import { BackendUnavailable, UnsupportedForRuntime } from "../src/errors.ts";
+import { BotNameTaken } from "../src/hermes-bridge/crud.ts";
+import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 import { ATTACH_MEDIA_TTL_MS } from "../src/hermes-bridge/photos.ts";
 import { openStorage } from "../src/storage.ts";
 
@@ -1967,6 +1971,297 @@ describe("attach-v1 native Bot Mode plane", () => {
       delegations: [{ children: [expected, sparse] }],
     });
     reopened.close();
+    storage.close();
+  });
+});
+
+describe("native runtime bots", () => {
+  const sage = { id: "sage", name: "Sage", avatar: null, runtime: "cozyagents" } as const;
+
+  it("lists a native runtime bot from config without any Dashboard row", () => {
+    const storage = openStorage(":memory:");
+    let attached = false;
+    const control = {
+      roster: () => ({ bots: [], updatedAt: 1, stale: true, hermesState: "offline" }),
+    } as unknown as BotsSurface;
+    const plane = new NativeBotDataPlane({
+      control,
+      storage,
+      ingress: { isAttached: () => attached } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 7,
+    });
+
+    const view = plane.surface().roster();
+    expect(view.stale).toBe(true);
+    expect(view.bots).toMatchObject([
+      {
+        name: "sage",
+        displayName: "Sage",
+        handle: "sage",
+        description: null,
+        hasAvatar: false,
+        group: null,
+        pinned: false,
+        meta: null,
+        runtime: "cozyagents",
+        syncState: "starting",
+        chatSessionId: expect.any(String),
+        active: false,
+        preview: { kind: "empty", text: "No conversations yet, say hi" },
+      },
+    ]);
+    // The `bot_roster` frame is published through this same overlay, so it must carry the row too.
+    expect(plane.rosterBots([])).toMatchObject([{ name: "sage", runtime: "cozyagents" }]);
+
+    attached = true;
+    plane.handleAttachPresence("sage", "online");
+    expect(plane.surface().roster().bots[0]).toMatchObject({
+      syncState: "ready",
+      active: true,
+    });
+
+    plane.close();
+    storage.close();
+  });
+
+  it("answers unsupported_for_runtime for Dashboard-backed surfaces on a native runtime bot", async () => {
+    const storage = openStorage(":memory:");
+    const botProfile = vi.fn();
+    const routines = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: { botProfile, routines } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    await expect(plane.surface().botProfile("SAGE")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    await expect(plane.surface().routines("sage")).rejects.toMatchObject({
+      feature: "routines",
+      runtime: "cozyagents",
+    });
+    await expect(plane.surface().routines("sage")).rejects.toThrow(/bot "sage"/);
+    expect(botProfile).not.toHaveBeenCalled();
+    expect(routines).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("never asks the Dashboard about a runtime bot on the chat paths", async () => {
+    const storage = openStorage(":memory:");
+    const desktopSessions = vi.fn(async () => []);
+    const plane = new NativeBotDataPlane({
+      control: { desktopSessions } as unknown as BotsSurface,
+      storage,
+      ingress: {
+        isAttached: () => true,
+        sendNativeTurn: () => true,
+        sendNativeInterrupt: () => true,
+      } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+    const surface = plane.surface();
+
+    await surface.canonicalChat("sage");
+    await surface.chatHistory("sage");
+    await surface.sendChatMessage("sage", "hello");
+    await surface.resetChat("sage");
+    // The latest-session resolution runs behind a catch, so a Hermes RPC here would be invisible
+    // rather than loud: assert the call was never made at all.
+    expect(desktopSessions).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("refuses the desktop-session surfaces for a runtime bot", async () => {
+    const storage = openStorage(":memory:");
+    const desktopSessions = vi.fn(async () => []);
+    const plane = new NativeBotDataPlane({
+      control: { desktopSessions } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    await expect(plane.surface().desktopSessions("sage")).rejects.toMatchObject({
+      feature: "desktopSessions", runtime: "cozyagents",
+    });
+    await expect(
+      plane.surface().resumeDesktopSession("sage", "hermes-1"),
+    ).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    expect(desktopSessions).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("does not degrade a runtime bot for a CozyApps capability it never claims", () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {
+        roster: () => ({ bots: [], updatedAt: 1, stale: false, hermesState: "connected" }),
+      } as unknown as BotsSurface,
+      storage,
+      ingress: {
+        isAttached: () => true,
+        negotiatedCapabilities: () => new Set(["draft"]),
+      } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    // `restart_profile` is a Hermes-plugin repair. A config-declared bot has no plugin to restart,
+    // so CozyApps readiness must not hold its row at `starting`.
+    const row = plane.surface().roster().bots[0];
+    expect(row).toMatchObject({ name: "sage", syncState: "ready", active: true });
+    expect(row).not.toHaveProperty("cozyApps");
+    expect(row).not.toHaveProperty("syncRepair");
+    expect(plane.surface().readiness("sage")).toEqual({
+      name: "sage", status: "ready", updatedAt: expect.any(Number),
+    });
+
+    plane.close();
+    storage.close();
+  });
+
+  it("keeps one row when a Hermes profile shares an id with a runtime bot", () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {
+        roster: () => ({
+          bots: [{ name: "sage", displayName: "Hermes Sage" }],
+          updatedAt: 1,
+          stale: false,
+          hermesState: "connected",
+        }),
+      } as unknown as BotsSurface,
+      storage,
+      ingress: { isAttached: () => false } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    expect(plane.surface().roster().bots).toMatchObject([
+      { name: "sage", displayName: "Sage", runtime: "cozyagents" },
+    ]);
+
+    plane.close();
+    storage.close();
+  });
+
+  it("refuses to create a Hermes profile over a runtime bot id", async () => {
+    const storage = openStorage(":memory:");
+    const createBot = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: { createBot } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    // Left unguarded this creates an unreachable Hermes profile: the roster filter hides it and
+    // DELETE answers 409, so nothing can clean it up through the API.
+    await expect(plane.surface().createBot({ name: "SAGE" })).rejects.toBeInstanceOf(BotNameTaken);
+    expect(createBot).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("refuses a room that names a runtime bot, in runtime words", async () => {
+    const storage = openStorage(":memory:");
+    const createGroup = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: { createGroup } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    // Membership is checked against `profiles.list`, so without this the user is told sage is
+    // "not a bot on this gateway" while `GET /bots` is listing it.
+    await expect(plane.surface().createGroup("room", ["cleo", "sage"])).rejects.toThrow(
+      /sage is a cozyagents runtime bot; rooms are not supported for runtime bots yet/,
+    );
+    expect(createGroup).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("reports no avatar for a runtime bot because no route serves one", () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {
+        roster: () => ({ bots: [], updatedAt: 1, stale: false, hermesState: "connected" }),
+      } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [{ ...sage, avatar: "avatar.png" }],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    expect(plane.surface().roster().bots[0]).toMatchObject({ name: "sage", hasAvatar: false });
+
+    plane.close();
+    storage.close();
+  });
+
+  it("answers 409 unsupported_for_runtime on the Dashboard-backed route", async () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: { botProfile: vi.fn() } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+    const app = new Hono<{ Variables: { deviceId: string } }>();
+    const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
+      c.set("deviceId", "device-1");
+      await next();
+    };
+    registerBotRoutes(app, requireDevice, plane.surface());
+
+    const response = await app.request("/bots/sage/profile");
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: "unsupported_for_runtime" },
+      runtime: "cozyagents",
+      feature: "botProfile",
+    });
+
+    plane.close();
     storage.close();
   });
 });
