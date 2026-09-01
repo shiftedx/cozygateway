@@ -834,7 +834,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 
     $agentInstallerPath = Join-Path $repoRoot 'scripts\agent-install.sh'
     $agentInstaller = Get-Content -LiteralPath $agentInstallerPath -Raw
-    Assert-True ($agentInstaller -match 'Get-FileHash -LiteralPath \$p -Algorithm SHA256') 'generated Windows repair command must independently checksum its bootstrap'
+    Assert-True ($agentInstaller.Contains('Get-FileHash -LiteralPath \$p -Algorithm SHA256')) 'generated Windows repair command must independently checksum its bootstrap'
     $cliWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_cli_wrapper\(\) \{.*?^\}')
     Assert-True $cliWriterMatch.Success 'shared installer must define write_cli_wrapper'
     $elevationWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_dashboard_elevation_helper\(\) \{.*?^\}')

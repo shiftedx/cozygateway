@@ -24,7 +24,7 @@ prepare_owned_dir() {
   [ -L "$path" ] && die "refusing symlinked installer directory: $path"
   if [ -e "$path" ]; then
     [ -d "$path" ] || die "installer directory is not a directory: $path"
-    owner="$(stat -f %u "$path" 2>/dev/null || stat -c %u "$path" 2>/dev/null || true)"
+    owner="$(stat -c %u "$path" 2>/dev/null || stat -f %u "$path" 2>/dev/null || true)"
     [ "$owner" = "$(id -u)" ] || die "installer directory is not owned by the current user: $path"
   else
     (umask 077; mkdir -p "$path") || die "could not create installer directory: $path"
