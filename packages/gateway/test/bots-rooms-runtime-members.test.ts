@@ -242,11 +242,17 @@ describe("room turn drafts", () => {
     await rooms.settled("Launch");
 
     const deltas = frames.filter((frame): frame is BotChatDeltaFrame => frame.type === "bot_chat_delta");
-    expect(deltas.map((delta) => [delta.bot, delta.room, delta.sessionId, delta.text, delta.seq])).toEqual([
-      ["scout", "Launch", "group:launch:scout", "Loo", 1],
-      ["scout", "Launch", "group:launch:scout", "Looks good", 2],
+    expect(
+      deltas.map((delta) => [delta.bot, delta.room, delta.sessionId, delta.text, delta.seq, delta.done ?? false]),
+    ).toEqual([
+      ["scout", "Launch", "group:launch:scout", "Loo", 1, false],
+      // Coalesced behind the leading frame and flushed by the terminal, which is the 1:1 lane's
+      // own rule: every frame carries the whole text, so only the latest matters.
+      ["scout", "Launch", "group:launch:scout", "Looks good", 2, false],
+      // The gateway opened this bubble, so the gateway closes it.
+      ["scout", "Launch", "group:launch:scout", "", 3, true],
     ]);
-    // One turn id for both, so a client accumulates them into one live bubble.
+    // One turn id throughout, so a client accumulates them into one live bubble and ends it.
     expect(new Set(deltas.map((delta) => delta.turnId)).size).toBe(1);
 
     await rooms.close();
@@ -311,6 +317,160 @@ describe("room turn drafts", () => {
 
     expect(frames.some((frame) => frame.type === "bot_thinking_activity")).toBe(false);
     expect(frames.some((frame) => frame.type === "bot_chat_delta")).toBe(false);
+
+    await rooms.close();
+  });
+});
+
+describe("room draft lifecycle", () => {
+  it("closes a bubble the member never closed and ignores drafts that arrive after", async () => {
+    const storage = openStorage(":memory:");
+    storages.push(storage);
+    const frames: ServerFrame[] = [];
+    let scoutTurn: { agentId: string; threadId: string; turnId: string } | undefined;
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: (frame) => frames.push(frame),
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        // Starts typing and then goes silent forever: nothing will ever settle this turn, so the
+        // only thing that can end its bubble is the gateway's own timeout.
+        sendNativeTurn: (agentId, command) => {
+          if (agentId !== "scout") return true;
+          scoutTurn = { agentId, threadId: command.threadId, turnId: command.turnId };
+          queueMicrotask(() => {
+            rooms.handleAttachEvent(agentId, {
+              kind: "event",
+              sequence: 1,
+              eventId: `draft:${command.turnId}`,
+              event: {
+                kind: "draft",
+                threadId: command.threadId,
+                turnId: command.turnId,
+                blocks: [{ type: "paragraph", text: "Half a thou" }],
+              },
+            });
+          });
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 20,
+      chainDelayMs: 0,
+      draftFlushMs: 0,
+    });
+
+    await rooms.create("Launch", ["scout", "luna"]);
+    rooms.send("Launch", "status please @scout @luna");
+    await rooms.settled("Launch");
+
+    const deltas = (): BotChatDeltaFrame[] =>
+      frames.filter((frame): frame is BotChatDeltaFrame => frame.type === "bot_chat_delta");
+    expect(deltas().map((delta) => [delta.text, delta.seq, delta.done ?? false])).toEqual([
+      ["Half a thou", 1, false],
+      ["", 2, true],
+    ]);
+
+    // The at-least-once stream can still deliver a draft for that turn. It is acknowledged, because
+    // the turn owns it, and it is NOT projected: a bubble reopened after its own `done` never
+    // closes again.
+    const late = scoutTurn!;
+    expect(
+      rooms.handleAttachEvent(late.agentId, {
+        kind: "event",
+        sequence: 2,
+        eventId: `draft-late:${late.turnId}`,
+        event: {
+          kind: "draft",
+          threadId: late.threadId,
+          turnId: late.turnId,
+          blocks: [{ type: "paragraph", text: "Half a thought, finished" }],
+        },
+      }),
+    ).toBe(true);
+    expect(deltas()).toHaveLength(2);
+
+    await rooms.close();
+  });
+
+  it("keeps a pass off the live wire without hiding a reply that merely starts with the word", async () => {
+    const storage = openStorage(":memory:");
+    storages.push(storage);
+    const frames: ServerFrame[] = [];
+    let rooms: GroupRooms;
+    // scout is passing, in the protocol's own words. luna is answering, and its answer happens to
+    // open with "pass".
+    const dispatched: string[] = [];
+    const script: Record<string, { drafts: string[]; reply: string }> = {
+      scout: { drafts: ["(pass", "(pass)"], reply: "(pass)" },
+      luna: { drafts: ["pass the build", "pass the build to Scout"], reply: "pass the build to Scout" },
+    };
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: (frame) => frames.push(frame),
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          const turn = script[agentId]!;
+          dispatched.push(agentId);
+          queueMicrotask(() => {
+            for (const [index, text] of turn.drafts.entries()) {
+              rooms.handleAttachEvent(agentId, {
+                kind: "event",
+                sequence: index + 1,
+                eventId: `draft:${command.turnId}:${index}`,
+                event: {
+                  kind: "draft",
+                  threadId: command.threadId,
+                  turnId: command.turnId,
+                  blocks: [{ type: "paragraph", text }],
+                },
+              });
+            }
+            rooms.handleAttachEvent(agentId, {
+              kind: "event",
+              sequence: 9,
+              eventId: `commit:${command.turnId}`,
+              event: {
+                kind: "commit",
+                threadId: command.threadId,
+                turnId: command.turnId,
+                messageId: `reply:${command.turnId}`,
+                blocks: [{ type: "paragraph", text: turn.reply }],
+              },
+            });
+          });
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 500,
+      chainDelayMs: 0,
+      draftFlushMs: 0,
+    });
+
+    await rooms.create("Launch", ["scout", "luna"]);
+    rooms.send("Launch", "status please @scout @luna");
+    await rooms.settled("Launch");
+
+    // scout was asked, so its silence on the wire is suppression rather than a turn that never ran.
+    expect(dispatched).toContain("scout");
+    const deltas = frames.filter((frame): frame is BotChatDeltaFrame => frame.type === "bot_chat_delta");
+    // Not one frame for scout, not even a terminator: no bubble was ever opened, and a pass is
+    // suppressed from the transcript for the same reason it is suppressed here.
+    expect(deltas.filter((delta) => delta.bot === "scout")).toEqual([]);
+    expect(storage.botGroupLog("launch").some((entry) => entry.name === "scout")).toBe(false);
+    // luna's reply is an ordinary sentence that happens to begin with the word, and it streams.
+    expect(deltas.filter((delta) => delta.bot === "luna").map((delta) => delta.text)).toContain(
+      "pass the build to Scout",
+    );
 
     await rooms.close();
   });

@@ -72,6 +72,28 @@ function isHostileGroupName(name: string): boolean {
  *  (dissection 9.3). */
 export const GROUP_CHAIN_DELAY_MS = 250;
 
+/** The 1:1 lane's live-frame window, to the millisecond (`LIVE_TURN_FLUSH_MS`). A room draft is
+ *  the same kind of frame carrying the same full-replacement text, so it gets the same treatment:
+ *  the leading frame goes out at once and every later one inside the window is collapsed to the
+ *  latest. A member typing token by token would otherwise put one broadcast per token on every
+ *  connected socket. */
+export const ROOM_DRAFT_FLUSH_MS = 100;
+
+/** One member turn's live bubble. In memory on purpose: a draft is ephemeral, and a turn that
+ *  outlives this process resumes from its durable commit rather than its half-typed text. */
+interface RoomDraft {
+  /** Monotonic within the turn, from 1, and the terminal `done` frame takes the next one. */
+  seq: number;
+  /** Live while a coalescing window is open. */
+  timer: ReturnType<typeof setTimeout> | undefined;
+  /** The latest frame built inside the open window, waiting for it to close. */
+  pending: BotChatDeltaFrame | undefined;
+  /** The most recent frame built, whether or not it went out. The terminal frame is this one
+   *  emptied, which is how `bot`, `sessionId` and `room` stay right without being re-derived from
+   *  a room that may since have been deleted. */
+  last: BotChatDeltaFrame;
+}
+
 export class GroupNotFound extends Error {
   constructor(name: string) {
     super(`no group chat named "${name}"`);
@@ -137,6 +159,8 @@ export interface GroupRoomsOptions {
   pollMs?: number;
   turnTimeoutMs?: number;
   chainDelayMs?: number;
+  /** Live-draft coalescing window. Test seam; defaults to `ROOM_DRAFT_FLUSH_MS`. */
+  draftFlushMs?: number;
   log?: (message: string) => void;
 }
 
@@ -153,12 +177,12 @@ export class GroupRooms {
   readonly #pollMs: number | undefined;
   readonly #turnTimeoutMs: number | undefined;
   readonly #chainDelayMs: number;
+  readonly #draftFlushMs: number;
   readonly #log: (message: string) => void;
   readonly #waiters = new Map<string, () => void>();
-  /** Live-draft sequence per member turn, from 1. In memory on purpose: a draft is ephemeral, and a
-   *  turn that outlives this process resumes from its durable commit rather than its half-typed
-   *  text. */
-  readonly #draftSeq = new Map<string, number>();
+  /** Open live bubbles, by member turn id. An entry exists only for a turn that has actually
+   *  streamed something, so a peer that never drafts costs nothing and gets no frames. */
+  readonly #drafts = new Map<string, RoomDraft>();
 
   /** The drive currently holding a room, by room key, tagged with the room GENERATION it was
    *  started for. Present means "a round loop is live", which is the room's only piece of
@@ -190,6 +214,7 @@ export class GroupRooms {
     this.#pollMs = opts.pollMs;
     this.#turnTimeoutMs = opts.turnTimeoutMs;
     this.#chainDelayMs = opts.chainDelayMs ?? GROUP_CHAIN_DELAY_MS;
+    this.#draftFlushMs = opts.draftFlushMs ?? ROOM_DRAFT_FLUSH_MS;
     this.#log = opts.log ?? ((): void => {});
   }
 
@@ -233,8 +258,7 @@ export class GroupRooms {
       return true;
     }
     if (settled === undefined) return false;
-    // The live bubble is over: its sequence is per-turn, and the turn is terminal.
-    this.#draftSeq.delete(event.turnId);
+    this.#endDraft(event.turnId);
     const wake = this.#waiters.get(event.turnId);
     if (wake !== undefined) wake();
     else this.#recoverSettledTurn(settled);
@@ -370,6 +394,12 @@ export class GroupRooms {
    *  any storage read, so this resolves in about one poll rather than in one turn cap. */
   async close(): Promise<void> {
     this.#closed = true;
+    // Timers only, no frames: the sockets these would reach are going away with this bridge, and a
+    // broadcast during shutdown is a write into a hub that is being torn down.
+    for (const open of this.#drafts.values()) {
+      if (open.timer !== undefined) clearTimeout(open.timer);
+    }
+    this.#drafts.clear();
     for (const wake of this.#waiters.values()) wake();
     this.#waiters.clear();
     const running = [...this.#drives.values()].map((entry) => entry.promise.catch(() => {}));
@@ -653,6 +683,9 @@ export class GroupRooms {
       if (this.#now() >= deadline) {
         const detail = `no reply within ${Math.round(timeoutMs / 1000)}s`;
         this.#storage.timeoutBotGroupTurn(key, turnId, detail, this.#now());
+        // The member stopped mid-sentence. Nothing is coming to close its bubble, so the gateway
+        // closes it: this is the settlement no attach event will ever announce.
+        this.#endDraft(turnId);
         return { outcome: "timeout", detail };
       }
       await new Promise<void>((resolve) => {
@@ -661,6 +694,9 @@ export class GroupRooms {
         this.#waiters.set(turnId, () => { clearTimeout(timer); this.#waiters.delete(turnId); resolve(); });
       });
     }
+    // Abandoned: the bridge closed or the room was deleted and remade under this drive's feet. The
+    // turn will never settle for this loop, so its bubble is closed here rather than left open.
+    this.#endDraft(turnId);
     return { outcome: "pass" };
   }
 
@@ -696,14 +732,29 @@ export class GroupRooms {
    *  `bot` is the member and `sessionId` is its gateway-owned group thread, which is the identity
    *  the room already dispatches on: a client that keys live text by bot and session therefore
    *  needs no new keying to render this, and the `room` field is what stops it being mistaken for
-   *  the member's 1:1 conversation. Dropped silently for a room that is already gone, because a
-   *  draft is not worth resurrecting a deleted transcript for. */
+   *  the member's 1:1 conversation.
+   *
+   *  Three things are refused rather than streamed, and each one is a lie the wire would otherwise
+   *  tell:
+   *
+   *  - a draft that reads as a pass. The transcript hides `(pass)` because it is the protocol's own
+   *    plumbing (`#turn` turns a spoken pass back into `{ outcome: "pass" }`), so streaming it live
+   *    would show in the bubble exactly what the room is about to hide in the log.
+   *  - a draft for a turn that is no longer pending. An at-least-once replay can land a draft after
+   *    the turn timed out or failed, and a bubble reopened after its own `done` never closes again.
+   *  - a draft whose room has moved on: deleted, or superseded by a newer user message. The reply
+   *    belongs to a conversation the reader is no longer looking at.
+   *
+   *  What survives those goes out on the 1:1 lane's coalescing rule: leading frame immediately,
+   *  latest-only for each window after it. */
   #emitDraft(turn: BotGroupTurnRow, text: string): void {
+    if (isPassDraft(text)) return;
+    if (turn.state !== "pending") return;
     const room = this.#storage.botGroup(turn.key);
-    if (room === undefined) return;
-    const seq = (this.#draftSeq.get(turn.turnId) ?? 0) + 1;
-    this.#draftSeq.set(turn.turnId, seq);
-    const delta: BotChatDeltaFrame = {
+    if (room === undefined || room.epoch !== turn.epoch) return;
+    const open = this.#drafts.get(turn.turnId);
+    const seq = (open?.seq ?? 0) + 1;
+    const frame: BotChatDeltaFrame = {
       type: "bot_chat_delta",
       bot: turn.member,
       sessionId: turn.threadId,
@@ -713,7 +764,74 @@ export class GroupRooms {
       updatedAt: this.#now(),
       room: room.name,
     };
-    this.#broadcast(delta);
+    if (open !== undefined) {
+      open.seq = seq;
+      open.last = frame;
+      // Inside an open window: the frame carries the WHOLE text so far, so keeping only the latest
+      // loses nothing a reader can see.
+      if (open.timer !== undefined) {
+        open.pending = frame;
+        return;
+      }
+      open.timer = this.#draftTimer(turn.turnId);
+      this.#broadcast(frame);
+      return;
+    }
+    this.#drafts.set(turn.turnId, {
+      seq,
+      timer: this.#draftTimer(turn.turnId),
+      pending: undefined,
+      last: frame,
+    });
+    this.#broadcast(frame);
+  }
+
+  #draftTimer(turnId: string): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => this.#tickDraft(turnId), this.#draftFlushMs);
+    timer.unref?.();
+    return timer;
+  }
+
+  /** Closes one coalescing window: the latest frame it collected goes out and the next window
+   *  opens behind it. A window that collected nothing simply closes, so an idle turn holds no
+   *  timer. */
+  #tickDraft(turnId: string): void {
+    const open = this.#drafts.get(turnId);
+    if (open === undefined) return;
+    const pending = open.pending;
+    open.pending = undefined;
+    if (pending === undefined) {
+      open.timer = undefined;
+      return;
+    }
+    open.timer = this.#draftTimer(turnId);
+    this.#broadcast(pending);
+  }
+
+  /** Ends a member turn's live bubble: whatever the last window was still holding, then one empty
+   *  `done` frame.
+   *
+   *  Called at EVERY settlement a turn can reach, which is the point. A bubble is opened by the
+   *  gateway and only the gateway can close it, so a turn that timed out, was abandoned by a
+   *  superseded drive, or died with its room would otherwise leave a reader watching text that will
+   *  never finish, and leave this map holding the turn's sequence forever.
+   *
+   *  A turn that never streamed has no bubble and gets no frame: there is nothing open to close,
+   *  and inventing a `done` for every silent member would put a frame on the wire for every turn of
+   *  every room. */
+  #endDraft(turnId: string): void {
+    const open = this.#drafts.get(turnId);
+    if (open === undefined) return;
+    this.#drafts.delete(turnId);
+    if (open.timer !== undefined) clearTimeout(open.timer);
+    if (open.pending !== undefined) this.#broadcast(open.pending);
+    this.#broadcast({
+      ...open.last,
+      text: "",
+      seq: open.seq + 1,
+      updatedAt: this.#now(),
+      done: true,
+    });
   }
 
   #entries(key: string): GroupLogEntry[] {
@@ -758,6 +876,17 @@ function goneNote(member: GroupMember): BotGroupNote {
     reason: "failed",
     detail: `${member.displayName} is no longer a bot on this gateway`,
   };
+}
+
+/** True when a live draft is on its way to being a pass, and so must not be shown.
+ *
+ *  `isPassText` is the settlement rule and matches the WHOLE reply; a draft is a prefix of one, so
+ *  the parenthesized form is matched as a prefix too. Deliberately not a bare `pass` prefix: "pass
+ *  the build to Luna" is an ordinary sentence, and suppressing it would hide a real reply. An empty
+ *  draft is suppressed as well, because there is nothing yet to look at. */
+function isPassDraft(text: string): boolean {
+  const trimmed = text.trim();
+  return isPassText(trimmed) || /^\(\s*pass\s*\)/i.test(trimmed);
 }
 
 function toWireMessage(row: BotGroupLogRow): BotGroupMessage {

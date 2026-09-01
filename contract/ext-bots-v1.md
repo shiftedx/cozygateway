@@ -669,8 +669,15 @@ Committed transcript history remains the recovery source after reconnect.
   display name and handle in the room come from its roster row, which for a runtime bot is the
   config-declared one. A room turn's live draft is published as `bot_chat_delta` with `room` set to
   the room name, `bot` set to the member, and `sessionId` set to that group thread: it is live text,
-  never history, and a client that does not know the field renders nothing new. Tool, thinking, and
-  delegation activity inside a room turn is deliberately not projected in this version.
+  never history, and a client that does not know the field renders nothing new. Every room bubble
+  the gateway opens it also closes, with one final `bot_chat_delta` carrying `room`, an empty
+  `text`, and `done: true`, at whichever settlement the turn reaches: a reply, a failure, a
+  cancellation, an interrupt, the gateway's own turn timeout, or a drive abandoned because the room
+  was deleted or superseded. A turn that never streamed opens no bubble and gets no frames at all.
+  A draft that reads as the protocol's own pass is never published, matching the rule that keeps
+  `(pass)` out of the transcript; drafts are coalesced latest-only inside a 100 ms window, and every
+  frame carries the whole accumulated text, so a dropped one costs a reader nothing. Tool, thinking,
+  and delegation activity inside a room turn is deliberately not projected in this version.
 - A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
   extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
   bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
