@@ -7,6 +7,8 @@ export const ModelProviderSetupFieldSchema = Type.Object({
   secret: Type.Boolean(),
   advanced: Type.Boolean(),
   isSet: Type.Boolean(),
+  /** Present only when the harness explicitly returned a non-secret editable value. */
+  value: Type.Optional(Type.String({ maxLength: 65_536 })),
   helpUrl: Type.Optional(Type.String()),
 });
 export type ModelProviderSetupField = Static<typeof ModelProviderSetupFieldSchema>;

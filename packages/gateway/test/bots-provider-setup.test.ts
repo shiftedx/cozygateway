@@ -1,8 +1,11 @@
+import { createServer, type Server } from "node:http";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
+import { clearModelDiscoveryCache } from "../src/hermes-bridge/model-config.ts";
 import { createApp } from "../src/http.ts";
 import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "../src/harness-settings.ts";
 import { openStorage } from "../src/storage.ts";
@@ -11,6 +14,7 @@ import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-her
 
 const servers: FakeHermesServer[] = [];
 const closers: Array<() => Promise<void>> = [];
+const modelServers: Server[] = [];
 
 async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -23,10 +27,37 @@ async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void>
 afterEach(async () => {
   for (const close of closers.splice(0)) await close();
   for (const server of servers.splice(0)) await server.close();
+  for (const server of modelServers.splice(0)) {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+  clearModelDiscoveryCache();
 });
+
+async function startModelServer(models: string[]): Promise<string> {
+  const server = createServer((request, response) => {
+    if (request.url !== "/v1/models") {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ data: models.map((id) => ({ id })) }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  modelServers.push(server);
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("model server address unavailable");
+  return `http://127.0.0.1:${address.port}/v1`;
+}
 
 async function setup() {
   let openRouterKey: string | undefined;
+  let lmStudioUrl: string | undefined;
   const calls: Array<{ method: string; path: string; body: unknown }> = [];
   const server = await startFakeHermesServer({
     methods: {
@@ -43,6 +74,8 @@ async function setup() {
         return { body: { providers: [
           { slug: "openrouter", name: "OpenRouter", authenticated: openRouterKey !== undefined,
             models: ["openai/gpt-5", { id: "anthropic/claude-sonnet-4" }, { name: "google/gemini-2.5-flash" }] },
+          { slug: "lmstudio", name: "LM Studio", authenticated: lmStudioUrl !== undefined,
+            ...(lmStudioUrl === undefined ? {} : { api_url: lmStudioUrl }), models: ["stale-model"] },
           { slug: "openai-codex", name: "ChatGPT or Codex Subscription", authenticated: false, models: [] },
           { slug: "anthropic", name: "Anthropic", authenticated: false, models: [] },
           { slug: "qwen-oauth", name: "Qwen", authenticated: false, models: [] },
@@ -52,6 +85,8 @@ async function setup() {
         return { body: {
           OPENROUTER_API_KEY: {
             is_set: openRouterKey !== undefined,
+            // An upstream bug must not make a credential readable through CozyGateway.
+            value: "upstream-secret-that-must-not-cross-the-wire",
             redacted_value: openRouterKey ? `****${openRouterKey.slice(-4)}` : null,
             description: "OpenRouter API key",
             url: "https://openrouter.ai/keys",
@@ -61,16 +96,29 @@ async function setup() {
             provider: "openrouter",
             provider_label: "OpenRouter",
           },
+          LM_BASE_URL: {
+            is_set: lmStudioUrl !== undefined,
+            ...(lmStudioUrl === undefined ? {} : { value: lmStudioUrl }),
+            description: "LM Studio API URL",
+            is_password: false,
+            advanced: false,
+            provider: "lmstudio",
+            provider_label: "LM Studio",
+          },
         } };
       }
       if (method === "PUT" && path === "/api/env") {
         const update = body as { key?: string; value?: string };
-        expect(update.key).toBe("OPENROUTER_API_KEY");
-        openRouterKey = update.value;
+        if (update.key === "OPENROUTER_API_KEY") openRouterKey = update.value;
+        else if (update.key === "LM_BASE_URL") lmStudioUrl = update.value;
+        else throw new Error(`unexpected environment key ${String(update.key)}`);
         return { body: { ok: true } };
       }
       if (method === "DELETE" && path === "/api/env") {
-        openRouterKey = undefined;
+        const update = body as { key?: string };
+        if (update.key === "OPENROUTER_API_KEY") openRouterKey = undefined;
+        else if (update.key === "LM_BASE_URL") lmStudioUrl = undefined;
+        else throw new Error(`unexpected environment key ${String(update.key)}`);
         return { body: { ok: true } };
       }
       if (method === "GET" && path === "/api/providers/oauth") {
@@ -167,6 +215,42 @@ async function setup() {
 }
 
 describe("gateway harness model provider setup", () => {
+  it("lets a bot configure LM Studio and receives its live model inventory", async () => {
+    const lmStudioBaseUrl = await startModelServer(["qwen3.5-9b", "granite-4.0"]);
+    const { authed } = await setup();
+
+    const initial = await authed("/bots/scout/model-providers");
+    expect(initial.status).toBe(200);
+    const initialText = await initial.text();
+    expect(initialText).not.toContain("upstream-secret-that-must-not-cross-the-wire");
+    const initialBody = JSON.parse(initialText) as {
+      providers: Array<{ slug: string; models: string[]; methods: Array<{ fields?: Array<{ key: string; value?: string }> }> }>;
+    };
+    expect(initialBody.providers)
+      .toContainEqual(expect.objectContaining({ slug: "lmstudio", models: ["stale-model"] }));
+    const initialEndpoint = initialBody.providers.find((provider) => provider.slug === "lmstudio")
+      ?.methods[0]?.fields?.find((field) => field.key === "LM_BASE_URL");
+    // An unconfigured profile gets Hermes' safe static list, and does not invent an endpoint.
+    expect(initialEndpoint).toBeDefined();
+    expect(initialEndpoint).not.toHaveProperty("value");
+    expect(initialText).not.toContain(lmStudioBaseUrl);
+
+    const saved = await authed(
+      "/bots/scout/model-providers/lmstudio/fields/LM_BASE_URL",
+      { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: lmStudioBaseUrl }) },
+    );
+    expect(saved.status).toBe(200);
+    const savedText = await saved.text();
+    expect(savedText).not.toContain("upstream-secret-that-must-not-cross-the-wire");
+    const body = JSON.parse(savedText);
+    expect(body.providers).toContainEqual(expect.objectContaining({
+      slug: "lmstudio", models: ["qwen3.5-9b", "granite-4.0"], modelCount: 2,
+      methods: [expect.objectContaining({ fields: [expect.objectContaining({
+        key: "LM_BASE_URL", secret: false, value: lmStudioBaseUrl,
+      })] })],
+    }));
+  });
+
   it("lists the official harness identity and routes a selected configuration scope", async () => {
     const { app, authed, calls } = await setup();
     expect((await app.request("/gateway/harnesses")).status).toBe(401);
@@ -188,7 +272,7 @@ describe("gateway harness model provider setup", () => {
     expect((await authed("/gateway/harnesses/default/scopes/missing/model-providers")).status).toBe(404);
     const catalog = await authed("/gateway/harnesses/default/scopes/scout/model-providers");
     expect(catalog.status).toBe(200);
-    expect((await catalog.json() as { providers: unknown[] }).providers).toHaveLength(4);
+    expect((await catalog.json() as { providers: unknown[] }).providers).toHaveLength(5);
 
     const saved = await authed(
       "/gateway/harnesses/default/scopes/scout/model-providers/openrouter/fields/OPENROUTER_API_KEY",

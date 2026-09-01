@@ -7,6 +7,7 @@ import type {
 } from "cozygateway-contract";
 
 import type { HermesClient } from "./client.ts";
+import { discoverProviderModels } from "./model-config.ts";
 
 export class ProviderSetupInvalid extends Error {
   constructor(message: string) {
@@ -20,6 +21,7 @@ interface HermesProviderRow {
   name?: unknown;
   models?: unknown;
   authenticated?: unknown;
+  api_url?: unknown;
 }
 
 interface HermesModelOptions {
@@ -28,6 +30,7 @@ interface HermesModelOptions {
 
 interface HermesEnvField {
   is_set?: unknown;
+  value?: unknown;
   description?: unknown;
   url?: unknown;
   is_password?: unknown;
@@ -107,6 +110,10 @@ function fieldsByProvider(raw: unknown): Map<string, ModelProviderSetupField[]> 
       secret: row?.is_password === true,
       advanced: row?.advanced === true,
       isSet: row?.is_set === true,
+      // Credentials are write-only even if an upstream accidentally includes a field called
+      // `value`. A non-secret endpoint is useful to edit in place, but only when Hermes actually
+      // supplied it: never infer it from an API URL or a just-submitted request body.
+      ...(row?.is_password !== true && text(row?.value) ? { value: text(row?.value)! } : {}),
       ...(text(row?.url) ? { helpUrl: text(row?.url)! } : {}),
     };
     groups.set(provider, [...(groups.get(provider) ?? []), field]);
@@ -167,7 +174,7 @@ export async function readProviderSetupCatalog(
   const fields = fieldsByProvider(env);
   const accounts = oauthByProvider(oauth);
   const rows = Array.isArray(options.providers) ? options.providers as unknown[] : [];
-  const providers: ModelProviderSetup[] = rows.flatMap((value) => {
+  const providers: ModelProviderSetup[] = (await Promise.all(rows.map(async (value) => {
     const row = record(value) as HermesProviderRow | undefined;
     const slug = text(row?.slug);
     if (!slug) return [];
@@ -185,7 +192,16 @@ export async function readProviderSetupCatalog(
     const account = accounts.get(slug);
     const accountMethod = account ? oauthMethod(account) : undefined;
     if (accountMethod) methods.push(accountMethod);
-    const models = modelIds(row?.models);
+    const staticModels = modelIds(row?.models);
+    const baseUrl = text(row?.api_url);
+    // The endpoint is runtime configuration, never credential material. We only probe providers
+    // Hermes considers authenticated, so an expired key cannot turn a catalog read into a request
+    // against an arbitrary saved address. Until a provider proves reachable, retain Hermes'
+    // static inventory; after that the shared discovery cache drops stale ids on a failed refresh.
+    const discovered = baseUrl && row?.authenticated !== false
+      ? await discoverProviderModels(baseUrl)
+      : undefined;
+    const models = discovered ?? staticModels;
     return [{
       slug,
       name: text(row?.name) ?? slug,
@@ -194,7 +210,7 @@ export async function readProviderSetupCatalog(
       modelCount: models.length,
       methods,
     }];
-  });
+  }))).flat();
   return { providers, updatedAt: now() };
 }
 
