@@ -205,9 +205,38 @@ check_shadow_dir() {
 
 # --- steps ----------------------------------------------------------------
 
+# `rsync -a` deliberately preserves timestamps, so neither mtime nor a bare
+# manifest version is enough to decide whether a resident must be restarted.
+# Compare the actual staged file set and bytes first; the same exclusions are
+# used by sync_plugin below.
+plugin_content_matches_source() {
+  local dest="$1" source_files installed_files rel
+  [ -d "$dest" ] || return 1
+  source_files="$(cd "$SRC_DIR" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  installed_files="$(cd "$dest" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  [ "$source_files" = "$installed_files" ] || return 1
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    cmp -s "$SRC_DIR/$rel" "$dest/$rel" || return 1
+  done <<EOF
+$source_files
+EOF
+}
+
+# Set by sync_plugin for the immediately following ensure_service call. A
+# loaded launchd job does not reload Python code from disk, so a content change
+# must be followed by an explicit kickstart; an unchanged profile stays truly
+# idempotent on the watcher's next 30-second sweep.
+PLUGIN_SYNC_CHANGED=0
 sync_plugin() {
   local dest="$1"
-  if [ "$DRY_RUN" = 1 ]; then say "  DRY  rsync $SRC_DIR/ -> $dest/"; return 0; fi
+  PLUGIN_SYNC_CHANGED=0
+  if plugin_content_matches_source "$dest"; then
+    say "  plugin already current -> $dest"
+    return 0
+  fi
+  PLUGIN_SYNC_CHANGED=1
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  rsync changed plugin $SRC_DIR/ -> $dest/"; return 0; fi
   mkdir -p "$dest"
   rsync -a --delete \
     --exclude '__pycache__/' --exclude '.pytest_cache/' --exclude '*.pyc' \
@@ -314,7 +343,9 @@ recreate_box_gateway() {
 }
 
 # Two separate facts, checked separately: whether the plist EXISTS and whether
-# launchd has it LOADED.
+# launchd has it LOADED. A loaded service only needs a restart when
+# sync_plugin replaced content; preserving that distinction avoids needless
+# interruption on normal provisioning sweeps.
 #
 #   `hermes gateway install` is a no-op when the plist is already on disk, so a
 #   profile whose service was booted out (a previous run, a manual stop, an
@@ -323,12 +354,24 @@ recreate_box_gateway() {
 #   and the attach never came up. So the load is asserted here rather than
 #   assumed from the installer's exit code.
 ensure_service() {
-  local profile="$1"
+  local profile="$1" restart_for_plugin="${2:-0}"
   local label="ai.hermes.gateway-$profile"
   local plist="$HOME/Library/LaunchAgents/$label.plist"
 
   if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
-    say "  service $label already loaded"
+    if [ "$restart_for_plugin" = 1 ]; then
+      if [ "$DRY_RUN" = 1 ]; then
+        say "  DRY  restart loaded service $label for changed plugin"
+        return 0
+      fi
+      launchctl kickstart -k "gui/$(id -u)/$label" \
+        || die "[$profile] could not restart loaded $label after plugin sync"
+      launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 \
+        || die "[$profile] $label is not loaded after plugin restart"
+      say "  service $label restarted for changed plugin"
+    else
+      say "  service $label already loaded (plugin unchanged)"
+    fi
     return 0
   fi
   if [ "$DRY_RUN" = 1 ]; then
@@ -445,7 +488,7 @@ for profile in "${PROFILES[@]}"; do
   ensure_box_env_line "$env_name" "$token"
   ensure_box_config_entry "$profile" "$env_name"
   recreate_box_gateway
-  ensure_service "$profile"
+  ensure_service "$profile" "$PLUGIN_SYNC_CHANGED"
   verify_attached "$profile" || overall_rc=1
 done
 

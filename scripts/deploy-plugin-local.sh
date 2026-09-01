@@ -58,14 +58,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_DIR="$REPO_ROOT/integrations/attach-plugin"
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-DEFAULT_PROFILES=(bayberry breezy-rill cleo drowsy-lark night-owl polished-satellite)
 PROFILES=()
 
 QUIET_WINDOW=20      # seconds the event_outbox sequence must hold steady
 POLL_INTERVAL=2       # seconds between spool samples
 MAX_WAIT=180           # seconds before giving up and asking for --force
 READY_URL="https://warm.cozylabs.ai/ready"
-READY_COUNT=6
+# Empty means "the number discovered/selected for this run". A fixed six here
+# used to let a 6/8 fleet look healthy after a release.
+READY_COUNT=""
 READY_TIMEOUT=30
 FORCE=0
 DRY_RUN=0
@@ -92,14 +93,14 @@ Syncs the checked-in CozyGateway attach plugin into local Hermes profiles,
 waits for each profile to quiesce, kickstarts its gateway, and verifies
 reconnect.
 
-  profile ...             profiles to deploy (default: ${DEFAULT_PROFILES[*]})
+  profile ...             profiles to deploy (default: every profile whose config enables cozygateway)
   -n, --dry-run            print the plan, make no changes
   --quiet-window SECONDS   how long event_outbox must hold steady (default $QUIET_WINDOW)
   --poll-interval SECONDS  spool sample interval while quiescing (default $POLL_INTERVAL)
   --max-wait SECONDS       give up waiting and prompt for --force (default $MAX_WAIT)
   --force                  kickstart even if a profile never quiesced
   --ready-url URL          gateway ready endpoint (default $READY_URL)
-  --ready-count N          required attach.online count (default $READY_COUNT)
+  --ready-count N          minimum configured profile count expected (default: selected profiles)
   --ready-timeout SECONDS  how long to poll the ready endpoint (default $READY_TIMEOUT)
   --hermes-home DIR        Hermes home dir (default \$HERMES_HOME or ~/.hermes)
   -h, --help               show this help
@@ -126,13 +127,60 @@ done
 # Remaining positional args after --
 for arg in "$@"; do PROFILES+=("$arg"); done
 
-if [ "${#PROFILES[@]}" -eq 0 ]; then
-  PROFILES=("${DEFAULT_PROFILES[@]}")
-fi
-
 have sqlite3 || die "sqlite3 not found on PATH"
 have python3 || die "python3 not found on PATH"
 [ -d "$SRC_DIR" ] || die "plugin source not found: $SRC_DIR"
+
+# Hermes' venv owns PyYAML on a real host. Falling back to python3 keeps this
+# script usable for standard installations, but fail closed if neither can
+# structurally read config.yaml; a grep would also match plugins.disabled.
+PYTHON="$HERMES_HOME/hermes-agent/venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
+
+discover_opted_in_profiles() {
+  "$PYTHON" - "$HERMES_HOME" <<'PY'
+import sys
+from pathlib import Path
+try:
+    import yaml
+except ImportError:
+    raise SystemExit("PyYAML is required to discover opted-in Hermes profiles")
+
+root = Path(sys.argv[1]) / "profiles"
+if not root.is_dir():
+    raise SystemExit(0)
+for profile in sorted(path for path in root.iterdir() if path.is_dir()):
+    config = profile / "config.yaml"
+    try:
+        data = yaml.safe_load(config.read_text()) if config.exists() else {}
+    except Exception:
+        # A malformed profile is not an eligible profile. Hermes itself will
+        # surface that config error; this deploy must not guess at it.
+        continue
+    enabled = ((data or {}).get("plugins") or {}).get("enabled") or []
+    if "cozygateway" in enabled:
+        print(profile.name)
+PY
+}
+
+if [ "${#PROFILES[@]}" -eq 0 ]; then
+  discovered="$(discover_opted_in_profiles)" \
+    || die "could not discover opted-in Hermes profiles; fix the reported YAML/PyYAML error"
+  while IFS= read -r profile; do
+    [ -n "$profile" ] && PROFILES+=("$profile")
+  done <<EOF
+$discovered
+EOF
+fi
+[ "${#PROFILES[@]}" -gt 0 ] || die "no opted-in Hermes profiles found under $HERMES_HOME/profiles"
+
+if [ -z "$READY_COUNT" ]; then
+  READY_COUNT="${#PROFILES[@]}"
+fi
+case "$READY_COUNT" in
+  *[!0-9]*|'') die "--ready-count must be a positive integer" ;;
+esac
+[ "$READY_COUNT" -gt 0 ] || die "--ready-count must be a positive integer"
 
 GLOBAL_PLUGIN_DIR="$HERMES_HOME/plugins/cozygateway"
 
@@ -235,27 +283,29 @@ quiesce_profile() {
 # --- verify ------------------------------------------------------------
 poll_ready() {
   if [ "$DRY_RUN" = 1 ]; then
-    say "DRY   poll $READY_URL for attach.online >= $READY_COUNT (timeout ${READY_TIMEOUT}s)"
+    say "DRY   poll $READY_URL for all attach profiles online (attach.online == attach.configured; configured >= $READY_COUNT, timeout ${READY_TIMEOUT}s)"
     return 0
   fi
   have curl || { warn "curl not found, skipping ready-endpoint verification"; return 1; }
   deadline=$(( $(date +%s) + READY_TIMEOUT ))
   while :; do
     body="$(curl -fsS --max-time 5 "$READY_URL" 2>/dev/null || true)"
-    online="$(printf '%s' "$body" | python3 -c '
+    read -r configured online <<< "$(printf '%s' "$body" | "$PYTHON" -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
-    print(d.get("attach", {}).get("online", -1))
+    a = d.get("attach", {})
+    print(a.get("configured", -1), a.get("online", -1))
 except Exception:
-    print(-1)
-' 2>/dev/null || echo -1)"
-    if [ "$online" != "-1" ] && [ "$online" -ge "$READY_COUNT" ] 2>/dev/null; then
-      say "  ready: attach.online=$online (>= $READY_COUNT)"
+    print(-1, -1)
+' 2>/dev/null || echo '-1 -1')"
+    if [ "$configured" != "-1" ] && [ "$configured" -ge "$READY_COUNT" ] 2>/dev/null \
+      && [ "$online" = "$configured" ]; then
+      say "  ready: attach.online=$online/attach.configured=$configured (all configured profiles online)"
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      warn "ready endpoint did not report attach.online >= $READY_COUNT within ${READY_TIMEOUT}s (last seen: ${online:-unknown})"
+      warn "ready endpoint did not report all configured profiles online within ${READY_TIMEOUT}s (needed configured >= $READY_COUNT; last seen: online=${online:-unknown} configured=${configured:-unknown})"
       return 1
     fi
     sleep 2
@@ -273,6 +323,7 @@ for p in "${PROFILES[@]}"; do
   if [ ! -d "$profile_dir" ]; then
     warn "[$p] no profile dir at $profile_dir, skipping"
     SUMMARY+=("$p: SKIPPED (no profile dir)")
+    overall_rc=1
     continue
   fi
 

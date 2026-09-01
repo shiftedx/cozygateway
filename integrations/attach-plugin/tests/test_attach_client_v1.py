@@ -366,7 +366,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "mobile_media", "mobile_notifications",
             "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking",
-            "desktop_session_resume", "desktop_session_sync",
+            "desktop_session_resume", "desktop_session_sync", "cozyapps",
         })
 
     def test_hello_ack_budget_is_not_a_one_second_race(self):

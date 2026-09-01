@@ -817,6 +817,14 @@ def _profile_from_hermes_home() -> str:
     return name if os.path.basename(parent) == "profiles" and name else ""
 
 
+@dataclass
+class _CozyAppActionGate:
+    """A per-app FIFO action lane plus the callers that still reference it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    waiters: int = 0
+
+
 class AttachAdapter:
     """The platform methods, mixed into a concrete adapter subclass by the factory.
 
@@ -877,6 +885,10 @@ class AttachAdapter:
         # Per-thread active turn id: set on inject, read by the draft / terminal
         # surfaces, dropped when the turn ends.
         self._active_turn: Dict[str, str] = {}
+        # One private action lane per CozyApp.  Two actions for the same app share
+        # its ``__cozyapp__:<appId>`` chat id, so their turn anchors must never
+        # overlap; actions for different apps remain independent.
+        self._cozyapp_action_gates: Dict[str, _CozyAppActionGate] = {}
         # Gateway-owned attach lane -> exact Hermes raw session target. This is populated only
         # after the resident runner confirms `switch_session`; it is never inferred from chat_id.
         self._desktop_session_bindings: Dict[str, Tuple[str, str]] = {}
@@ -1384,6 +1396,34 @@ class AttachAdapter:
         except Exception:  # noqa: BLE001
             return {"status": "device_unavailable"}
 
+    async def upsert_cozyapp(self, app_id: str, name: str, tree: Dict[str, Any]) -> bool:
+        """Journal an app tree on the loop that owns the attach client and SQLite spool.
+
+        Hermes invokes model-facing tools from its tool-worker loop.  The resident
+        attach client is created by :meth:`connect` on this adapter's loop, and its
+        async locks and SQLite spool are therefore not safe to touch directly from
+        that worker.  Keep the operation inside the adapter lifecycle just as the
+        other model-facing requests do.
+        """
+        client, loop = self._client, self._loop
+        if client is None or loop is None or loop.is_closed():
+            return False
+        pending = None
+        try:
+            call = client.upsert_cozyapp(app_id, name, tree)
+            if asyncio.get_running_loop() is loop:
+                return bool(await call)
+            pending = asyncio.run_coroutine_threadsafe(call, loop)
+            return bool(await asyncio.wrap_future(pending))
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001 - tool result carries the safe public failure
+            # Do not log app identity or tree content: model-authored content can be private.
+            logger.warning("attach: CozyApps publish unavailable error=%s", type(exc).__name__[:80])
+            return False
+
     def _inbound_source(self, thread_id: str, *, message_id: Optional[str] = None) -> Any:
         """Build the synthetic-inbound ``source`` shared by turn, steer, and interrupt.
 
@@ -1727,28 +1767,42 @@ class AttachAdapter:
             if isinstance(client, AttachV1Client): await client.finish_cozyapp_action(command, "failed")
             return
         chat_id = f"__cozyapp__:{app_id}"
-        # Private context retains normal tool policy (including consent-gated phone tools), but
-        # send/send_draft below intentionally discard model prose so this is not a chat thread.
-        self._active_turn[chat_id] = request_id
+        gate = self._cozyapp_action_gates.get(app_id)
+        if gate is None:
+            gate = _CozyAppActionGate()
+            self._cozyapp_action_gates[app_id] = gate
+        # Count waiters before the first await.  This lets the final caller remove
+        # an idle gate without a brief unlocked window where a third same-app
+        # action could create a different lock and run alongside a queued action.
+        gate.waiters += 1
         try:
-            prompt = (
-                "Structured CozyApp action. This is not a chat message. "
-                f"appId={app_id}; actionId={action_id}; actionRequestId={request_id}. "
-                "Perform the requested refresh or action using your existing tools. If the app UI must change, "
-                "call cozyapp_upsert with a complete validated replacement tree. Do not ask for hidden approval."
-            )
-            event = MessageEvent(
-                text=prompt,
-                source=self._inbound_source(chat_id, message_id=request_id),
-                message_id=request_id,
-                metadata={"cozyappAction": {"appId": app_id, "actionId": action_id, "actionRequestId": request_id}, "private": True},
-            )
-            await self.handle_message(event)  # type: ignore[attr-defined]
-            await client.finish_cozyapp_action(command, "completed")
-        except Exception:
-            await client.finish_cozyapp_action(command, "failed")
+            async with gate.lock:
+                # Private context retains normal tool policy (including consent-gated phone tools), but
+                # send/send_draft below intentionally discard model prose so this is not a chat thread.
+                self._active_turn[chat_id] = request_id
+                try:
+                    prompt = (
+                        "Structured CozyApp action. This is not a chat message. "
+                        f"appId={app_id}; actionId={action_id}; actionRequestId={request_id}. "
+                        "Perform the requested refresh or action using your existing tools. If the app UI must change, "
+                        "call cozyapp_upsert with a complete validated replacement tree. Do not ask for hidden approval."
+                    )
+                    event = MessageEvent(
+                        text=prompt,
+                        source=self._inbound_source(chat_id, message_id=request_id),
+                        message_id=request_id,
+                        metadata={"cozyappAction": {"appId": app_id, "actionId": action_id, "actionRequestId": request_id}, "private": True},
+                    )
+                    await self.handle_message(event)  # type: ignore[attr-defined]
+                    await client.finish_cozyapp_action(command, "completed")
+                except Exception:
+                    await client.finish_cozyapp_action(command, "failed")
+                finally:
+                    self._cleanup_turn(chat_id, request_id)
         finally:
-            self._cleanup_turn(chat_id, request_id)
+            gate.waiters -= 1
+            if gate.waiters == 0 and self._cozyapp_action_gates.get(app_id) is gate:
+                self._cozyapp_action_gates.pop(app_id, None)
 
     async def _handle_desktop_resume_command(self, command: Dict[str, Any]) -> None:
         """Switch the stable attach lane to an exact profile-local Hermes session.
@@ -3803,18 +3857,140 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
     )
 
 
+_COZYAPP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_COZYAPP_NODE_FORMS: Dict[str, Tuple[Set[str], Set[str]]] = {
+    "stack": ({"id", "kind", "children"}, set()),
+    "section": ({"id", "kind", "children"}, {"title"}),
+    "text": ({"id", "kind", "text"}, {"style"}),
+    "image": ({"id", "kind", "source"}, {"alt"}),
+    "list": ({"id", "kind", "items"}, set()),
+    "keyValue": ({"id", "kind", "key", "value"}, set()),
+    "button": ({"id", "kind", "label", "actionId", "role"}, set()),
+}
+_COZYAPP_MAX_DEPTH = 12
+_COZYAPP_MAX_NODES = 200
+_COZYAPP_MAX_TREE_BYTES = 128 * 1024
+
+
+def _cozyapp_string_length(value: str) -> int:
+    """Match TypeBox/JavaScript ``maxLength`` semantics for astral characters."""
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _validate_cozyapp_upsert(app_id: Any, name: Any, tree: Any) -> Optional[str]:
+    """Mirror the closed CozyApps v1 payload contract before its durable journal write.
+
+    Gateway remains the security authority.  This local mirror prevents a tool call
+    from being acknowledged as queued when its complete tree will be discarded by
+    Gateway's validator after the fact.
+    """
+    if not isinstance(app_id, str) or _COZYAPP_ID_RE.fullmatch(app_id) is None:
+        return "appId must be 1-128 letters, digits, '_' or '-'"
+    if not isinstance(name, str) or not 1 <= _cozyapp_string_length(name) <= 120:
+        return "name must be 1-120 characters"
+    if not isinstance(tree, dict) or set(tree) != {"root"}:
+        return "tree must be exactly {root: NODE}"
+
+    node_count = 0
+    node_ids: Set[str] = set()
+
+    def valid_string(value: Any, minimum: int, maximum: int) -> bool:
+        return isinstance(value, str) and minimum <= _cozyapp_string_length(value) <= maximum
+
+    def walk(node: Any, depth: int) -> Optional[str]:
+        nonlocal node_count
+        if not isinstance(node, dict):
+            return "each tree node must be an object"
+        kind = node.get("kind")
+        if not isinstance(kind, str) or kind not in _COZYAPP_NODE_FORMS:
+            return "node kind is not supported"
+        required, optional = _COZYAPP_NODE_FORMS[kind]
+        keys = set(node)
+        if keys - required - optional:
+            return f"{kind} node contains unsupported properties"
+        if not required <= keys:
+            return f"{kind} node is missing required properties"
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or _COZYAPP_ID_RE.fullmatch(node_id) is None:
+            return "node ids must be 1-128 letters, digits, '_' or '-'"
+        if node_id in node_ids:
+            return "node ids must be unique"
+        if depth > _COZYAPP_MAX_DEPTH:
+            return "tree exceeds maximum depth"
+        node_count += 1
+        if node_count > _COZYAPP_MAX_NODES:
+            return "tree exceeds maximum nodes"
+        node_ids.add(node_id)
+
+        if kind in {"stack", "section"}:
+            children = node.get("children")
+            if not isinstance(children, list) or len(children) > 100:
+                return f"{kind} children must contain at most 100 nodes"
+            if kind == "section" and "title" in node and not valid_string(node["title"], 0, 8192):
+                return "section title must be at most 8192 characters"
+            for child in children:
+                error = walk(child, depth + 1)
+                if error is not None:
+                    return error
+            return None
+        if kind == "text":
+            if not valid_string(node.get("text"), 0, 8192):
+                return "text content must be at most 8192 characters"
+            style = node.get("style")
+            if "style" in node and (not isinstance(style, str) or style not in {"body", "title", "caption"}):
+                return "text style is not supported"
+            return None
+        if kind == "image":
+            source = node.get("source")
+            if not valid_string(source, 1, 2048) or not source.startswith("https://"):
+                return "image source must be an HTTPS URL"
+            if "alt" in node and not valid_string(node["alt"], 0, 512):
+                return "image alt text must be at most 512 characters"
+            return None
+        if kind == "list":
+            items = node.get("items")
+            if not isinstance(items, list) or len(items) > 100 or any(not valid_string(item, 1, 2048) for item in items):
+                return "list items must contain 1-100 strings of at most 2048 characters"
+            return None
+        if kind == "keyValue":
+            if not valid_string(node.get("key"), 1, 512) or not valid_string(node.get("value"), 0, 8192):
+                return "keyValue key/value properties are invalid"
+            return None
+        if not valid_string(node.get("label"), 1, 256):
+            return "button label must be 1-256 characters"
+        action_id = node.get("actionId")
+        if not isinstance(action_id, str) or _COZYAPP_ID_RE.fullmatch(action_id) is None:
+            return "button actionId must be 1-128 letters, digits, '_' or '-'"
+        role = node.get("role")
+        if not isinstance(role, str) or role not in {"primary", "secondary", "destructive"}:
+            return "button role is not supported"
+        return None
+
+    error = walk(tree["root"], 1)
+    if error is not None:
+        return error
+    try:
+        encoded = json.dumps(tree, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return "tree must contain only valid JSON values"
+    return "tree exceeds maximum serialized size" if len(encoded) > _COZYAPP_MAX_TREE_BYTES else None
+
+
 async def _cozyapp_upsert(args: Dict[str, Any], **_kwargs: Any) -> str:
-    """The model-facing app authoring primitive; schema validation is authoritative at Gateway."""
+    """The model-facing app authoring primitive; Gateway remains the final authority."""
     origin = _resolve_live_origin()
     if origin is None:
         return json.dumps({"ok": False, "error": "cozy app creation requires an active CozyGateway chat"})
     adapter = origin[0]
     client = getattr(adapter, "_client", None)
     app_id, name, tree = args.get("appId"), args.get("name"), args.get("tree")
-    if not isinstance(app_id, str) or not isinstance(name, str) or not isinstance(tree, dict) or client is None:
-        return json.dumps({"ok": False, "error": "appId, name, and tree are required"})
+    validation_error = _validate_cozyapp_upsert(app_id, name, tree)
+    if validation_error is not None:
+        return json.dumps({"ok": False, "error": f"invalid CozyApp: {validation_error}"})
+    if client is None:
+        return json.dumps({"ok": False, "error": "CozyApps is unavailable"})
     try:
-        accepted = await client.upsert_cozyapp(app_id, name, tree)
+        accepted = await adapter.upsert_cozyapp(app_id, name, tree)
     except Exception:
         accepted = False
     return json.dumps({"ok": accepted, "appId": app_id} if accepted else {"ok": False, "error": "CozyApps is unavailable"})

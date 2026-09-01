@@ -56,8 +56,20 @@ it("runs a native Bot Mode text turn over attach-v1 while Dashboard stays contro
     await once(plugin, "open");
     plugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "hermes-sage", capabilities: ["draft", "scheduled", "clarify"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
-    await until(async () =>
-      ((await (await fetch(readinessURL, { headers: auth })).json()) as { status: string }).status === "ready");
+    await until(async () => {
+      const readiness = (await (await fetch(readinessURL, { headers: auth })).json()) as {
+        status: string;
+        reason?: string;
+        repair?: string;
+        cozyApps?: { status: string; reason?: string; repair?: string };
+      };
+      return readiness.status === "starting"
+        && readiness.reason === "cozyapps_not_negotiated"
+        && readiness.repair === "restart_profile"
+        && readiness.cozyApps?.status === "degraded"
+        && readiness.cozyApps.reason === "cozyapps_not_negotiated"
+        && readiness.cozyApps.repair === "restart_profile";
+    });
     expect(pluginFrames.find((frame) => frame.kind === "hello_ack")?.capabilities).not.toContain("media");
 
     const send = await fetch(`${gateway.url}/bots/sage/chat/messages`, {

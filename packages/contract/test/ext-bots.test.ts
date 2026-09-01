@@ -34,6 +34,7 @@ import {
   BotProfilePatchSchema,
   BotProfileSchema,
   BotPreviewSchema,
+  BotReadinessSchema,
   BotRoutineCreateRequestSchema,
   BotRoutinePatchSchema,
   BotRoutineSchema,
@@ -104,6 +105,35 @@ describe("bot summary", () => {
     expect(check(BotSummarySchema, { ...bot, preview: { kind: "a2a", text: "the build is green", sender: "luna" } })).toBe(false);
     expect(check(BotSummarySchema, { ...bot, preview: { kind: "toast", text: "x" } })).toBe(false);
     expect(Object.keys(BotPreviewSchema.properties).sort()).toEqual(["kind", "text"]);
+  });
+
+  it("adds per-profile CozyApps readiness without changing older roster rows", () => {
+    const degraded = {
+      status: "degraded",
+      reason: "cozyapps_not_negotiated",
+      repair: "restart_profile",
+    } as const;
+    expect(check(BotSummarySchema, {
+      ...bot,
+      syncState: "starting",
+      cozyApps: degraded,
+      syncReason: degraded.reason,
+      syncRepair: degraded.repair,
+    })).toBe(true);
+    expect(check(BotReadinessSchema, {
+      name: "scout",
+      status: "starting",
+      cozyApps: degraded,
+      reason: degraded.reason,
+      repair: degraded.repair,
+      updatedAt: 1,
+    })).toBe(true);
+    expect(check(BotReadinessSchema, {
+      name: "scout",
+      status: "starting",
+      cozyApps: { status: "degraded", reason: "unknown", repair: "restart_profile" },
+      updatedAt: 1,
+    })).toBe(false);
   });
 });
 
@@ -587,8 +617,9 @@ describe("capability advertisement", () => {
     // 40 distinguishes a created profile from an attached, writable bot; 41 wraps Hermes' model
     // provider setup catalog, credential lifecycle, and OAuth sessions for the phone; 42 adds
     // exact credential-free memory setup through the attached profile plugin; 43 makes every
-    // Hermes profile visible with an exact synchronization state.
-    expect(BOTS_CAPABILITY_VERSION).toBe(43);
+    // Hermes profile visible with an exact synchronization state. 44 adds per-profile CozyApps
+    // readiness so a globally capable gateway cannot misrepresent an older attached plugin.
+    expect(BOTS_CAPABILITY_VERSION).toBe(44);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {

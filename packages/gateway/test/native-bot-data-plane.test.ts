@@ -40,6 +40,61 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("reports an online profile without the CozyApps capability as degraded with a restart repair", () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {
+        roster: () => ({
+          bots: [{ name: "sage", displayName: "Sage" }],
+          updatedAt: 42,
+          stale: false,
+          hermesState: "connected",
+        }),
+      } as unknown as BotsSurface,
+      storage,
+      ingress: {
+        isAttached: () => true,
+        negotiatedCapabilities: () => new Set(["draft"]),
+      } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 42,
+    });
+
+    // The profile must not look ready just because the gateway supports CozyApps for another
+    // profile. The additive reason/repair keeps the current phone build safe: it sees the known
+    // `starting` state, while newer clients can name the exact repair.
+    expect(plane.surface().readiness("sage")).toEqual({
+      name: "sage",
+      status: "starting",
+      cozyApps: {
+        status: "degraded",
+        reason: "cozyapps_not_negotiated",
+        repair: "restart_profile",
+      },
+      reason: "cozyapps_not_negotiated",
+      repair: "restart_profile",
+      updatedAt: 42,
+    });
+    expect(plane.surface().roster().bots).toMatchObject([
+      {
+        name: "sage",
+        syncState: "starting",
+        cozyApps: {
+          status: "degraded",
+          reason: "cozyapps_not_negotiated",
+          repair: "restart_profile",
+        },
+        syncReason: "cozyapps_not_negotiated",
+        syncRepair: "restart_profile",
+      },
+    ]);
+
+    plane.close();
+    storage.close();
+  });
+
   it("keeps every Hermes profile visible and marks attach synchronization honestly", () => {
     const storage = openStorage(":memory:");
     const control = {
