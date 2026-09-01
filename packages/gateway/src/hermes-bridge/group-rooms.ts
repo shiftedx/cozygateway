@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
+
 import type { BotChatDeltaFrame, BotGroup, BotGroupDetail, BotGroupMessage, BotGroupNote, ServerFrame } from "cozygateway-contract";
 
-import type { Storage, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
-import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
+import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
+import type { AttachV1EventFrame, AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
 import {
   GROUP_LOG_LIMIT,
@@ -11,6 +13,7 @@ import {
   GROUP_MIN_MEMBERS,
   GROUP_NAME_MAX,
   GROUP_USER_LABEL,
+  USER_MENTION,
   buildTurnPrompt,
   deltaSince,
   highestSeq,
@@ -361,17 +364,21 @@ export class GroupRooms {
     // Cleared BEFORE the message lands, so the badge cannot survive the very message that answers
     // the escalation.
     this.#storage.setBotGroupNeedsYou(key, false);
+    // The epoch bump is the supersession signal: any loop still running for the previous message
+    // sees it at its next member boundary and abandons the rest of its rounds. It happens BEFORE
+    // the append so the message can be stamped with the epoch it opens; `send` holds the thread
+    // throughout, so no drive can observe the order of these two writes.
+    const epoch = this.#storage.bumpBotGroupEpoch(key);
     const entry = this.#append(key, {
       kind: "user",
       name: GROUP_USER_LABEL,
       displayName: GROUP_USER_LABEL,
       text,
       at: this.#now(),
+      messageId: randomUUID(),
+      epoch,
       ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
     });
-    // The epoch bump is the supersession signal: any loop still running for the previous message
-    // sees it at its next member boundary and abandons the rest of its rounds.
-    const epoch = this.#storage.bumpBotGroupEpoch(key);
     this.#startDrive(key, epoch);
     return toWireMessage(entry);
   }
@@ -589,6 +596,7 @@ export class GroupRooms {
               displayName: member.displayName,
               text: result.text,
               at: this.#now(),
+              ...provenance(result.turnId === undefined ? undefined : this.#storage.botGroupTurn(key, result.turnId)),
             });
             this.#storage.setBotGroupWatermark(key, member.name, entry.seq);
             posted += 1;
@@ -614,7 +622,10 @@ export class GroupRooms {
           } else if (result.outcome !== "pass") {
             // Failure honesty: the room is told the member did not answer, and by whom and why. It
             // is NEVER told something the member did not say.
-            const note: BotGroupNote = { member: member.name, reason: result.outcome, detail: result.detail };
+            const note: BotGroupNote = {
+              member: member.name, reason: result.outcome, detail: result.detail,
+              ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
+            };
             const live = this.#storage.botGroup(key);
             if (live !== undefined) this.#emitState(live, "running", round, note, startEpoch);
           }
@@ -648,7 +659,7 @@ export class GroupRooms {
     startEpoch: number;
     startGeneration: number;
     storedId?: string;
-  }): Promise<GroupTurnResult> {
+  }): Promise<GroupTurnResult & { turnId?: string }> {
     const { key, groupName, member, members, delta, startEpoch, startGeneration, storedId } = args;
     if (this.#closed || this.#generation(key) !== startGeneration) return { outcome: "pass" };
     if (this.#storage.botGroup(key) === undefined) return { outcome: "pass" };
@@ -658,14 +669,23 @@ export class GroupRooms {
     const watermark = this.#storage.botGroupMembers(key).get(member.name)?.watermark ?? 0;
     const threadId = storedId ?? this.#storage.ensureBotGroupThread(key, member.name);
     if (storedId === undefined) this.#storage.setBotGroupSession(key, member.name, threadId);
+    // What the member is being asked about: the newest entry in the delta it is shown. Recorded
+    // now rather than at settlement, because by the time a reply lands the room may have moved on
+    // and the honest causation is the one that was true when the member was asked.
+    const last = args.delta.at(-1);
+    const cause: BotGroupCause | undefined =
+      last === undefined ? undefined : { kind: last.kind, seq: last.seq };
     const started = startNativeMemberTurn({ storage: this.#storage, endpoint, key, member: member.name,
-      agentId: member.name, threadId, epoch: startEpoch, watermark, prompt, now: this.#now });
+      agentId: member.name, threadId, epoch: startEpoch, watermark, prompt,
+      ...(cause === undefined ? {} : { cause }),
+      context: turnContext(key, groupName, members, startEpoch, cause),
+      now: this.#now });
     if ("outcome" in started) return started;
     const result = await this.#waitForTurn(key, started.turnId, startGeneration);
     // `(pass)` in any of its shapes is a pass, and so is a blank reply. Turning a spoken `(pass)`
     // into a room message would show the protocol's own plumbing to the user.
-    if (result.outcome === "spoke" && isPassText(result.text)) return { outcome: "pass" };
-    return result;
+    if (result.outcome === "spoke" && isPassText(result.text)) return { outcome: "pass", turnId: started.turnId };
+    return { ...result, turnId: started.turnId };
   }
 
   async #waitForTurn(key: string, turnId: string, generation: number): Promise<GroupTurnResult> {
@@ -708,7 +728,7 @@ export class GroupRooms {
     const result = settledGroupTurn(claimed);
     if (result?.outcome === "spoke" && !isPassText(result.text)) {
       const member = this.#memberInfo(claimed.member);
-      const entry = this.#append(claimed.key, { kind: "member", name: member.name, displayName: member.displayName, text: result.text, at: this.#now() });
+      const entry = this.#append(claimed.key, { kind: "member", name: member.name, displayName: member.displayName, text: result.text, at: this.#now(), ...provenance(claimed) });
       this.#storage.setBotGroupWatermark(claimed.key, claimed.member, entry.seq);
       if (mentionsUser(result.text)) {
         this.#storage.setBotGroupNeedsYou(claimed.key, true);
@@ -896,6 +916,52 @@ function toWireMessage(row: BotGroupLogRow): BotGroupMessage {
     text: row.text,
     at: row.at,
     ...(row.clientId === undefined ? {} : { clientId: row.clientId }),
+    // Capability 47. Spread rather than defaulted: a row written before 47 has none of these, and
+    // an invented id would be worse than an absent one.
+    ...(row.messageId === undefined ? {} : { messageId: row.messageId }),
+    ...(row.turnId === undefined ? {} : { turnId: row.turnId }),
+    ...(row.epoch === undefined ? {} : { epoch: row.epoch }),
+    ...(row.cause === undefined ? {} : { cause: row.cause }),
+    ...(row.attachTurn === undefined ? {} : { attachTurn: row.attachTurn }),
+  };
+}
+
+/** The auditable identity a member's room message inherits from the turn that produced it. Both
+ *  settlement paths (the live round loop and the post-restart recovery) read the SAME durable turn
+ *  row, so a reply recovered after a restart carries exactly the provenance it would have carried
+ *  had the gateway never stopped. A missing turn row yields a fresh message id and nothing else:
+ *  the message is real, and the ids it cannot prove stay absent. */
+function provenance(turn: BotGroupTurnRow | undefined): Partial<BotGroupLogRow> {
+  if (turn === undefined) return { messageId: randomUUID() };
+  return {
+    messageId: randomUUID(),
+    turnId: turn.turnId,
+    epoch: turn.epoch,
+    ...(turn.cause === undefined ? {} : { cause: turn.cause }),
+    attachTurn: { threadId: turn.threadId, turnId: turn.turnId },
+  };
+}
+
+/** Typed room provenance for the attach `turn` command (capability 47). The prompt already names
+ *  the room, its peers and the human in prose; this is the same facts in a shape a peer can read
+ *  without parsing English. The human is an actor too, addressed by the `@user` token the protocol
+ *  reserves, because a peer deciding who to answer needs to know the human is in the room. */
+function turnContext(
+  key: string,
+  groupName: string,
+  members: GroupMember[],
+  epoch: number,
+  cause: BotGroupCause | undefined,
+): AttachV1TurnContext {
+  return {
+    room: { key, name: groupName, epoch, ...(cause === undefined ? {} : { seq: cause.seq }) },
+    actors: [
+      ...members.map((member) => ({
+        name: member.name, handle: member.handle, displayName: member.displayName, kind: "member" as const,
+      })),
+      { name: GROUP_USER_LABEL, handle: USER_MENTION, displayName: GROUP_USER_LABEL, kind: "user" as const },
+    ],
+    ...(cause === undefined ? {} : { cause }),
   };
 }
 

@@ -254,6 +254,15 @@ CREATE TABLE IF NOT EXISTS bot_group_log (
   text TEXT NOT NULL,
   at INTEGER NOT NULL,
   client_id TEXT,
+  -- Capability 47 provenance. Every column is nullable because a room that predates 47 has rows
+  -- with none of it, and an absent id is the honest answer for those rows.
+  message_id TEXT,
+  turn_id TEXT,
+  epoch INTEGER,
+  cause_kind TEXT,
+  cause_seq INTEGER,
+  attach_thread_id TEXT,
+  attach_turn_id TEXT,
   PRIMARY KEY (group_key, seq)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS bot_group_members (
@@ -277,6 +286,11 @@ CREATE TABLE IF NOT EXISTS bot_group_turns (
   message_id TEXT NOT NULL,
   epoch INTEGER NOT NULL,
   watermark INTEGER NOT NULL,
+  -- Capability 47. What the member was answering, recorded when the turn was HANDED OVER rather
+  -- than derived at settlement: by the time a reply lands the room may have moved on, and the
+  -- causation a reader wants is the one that was true when the member was asked.
+  cause_kind TEXT,
+  cause_seq INTEGER,
   state TEXT NOT NULL,
   text TEXT,
   detail TEXT,
@@ -404,6 +418,10 @@ CREATE TABLE IF NOT EXISTS bot_native_messages (
   client_id TEXT,
   attachments_json TEXT,
   marker TEXT,
+  -- Capability 47 provenance, nullable for every row written before it.
+  turn_id TEXT,
+  author_bot TEXT,
+  in_reply_to_id TEXT,
   PRIMARY KEY (bot, session_id, seq),
   UNIQUE (bot, message_id)
 ) STRICT, WITHOUT ROWID;
@@ -564,6 +582,20 @@ export interface BotGroupLogRow {
   text: string;
   at: number;
   clientId?: string;
+  /** Capability 47 provenance, absent on every row written before it. `messageId` is the row's own
+   *  durable id; the rest name the member turn that produced it and what that turn was answering. */
+  messageId?: string;
+  turnId?: string;
+  epoch?: number;
+  cause?: BotGroupCause;
+  attachTurn?: { threadId: string; turnId: string };
+}
+
+/** The highest room seq a member had been shown when its turn started, and whose message that was.
+ *  Recorded on the turn row at hand-off and copied onto the reply it produces. */
+export interface BotGroupCause {
+  kind: "user" | "member";
+  seq: number;
 }
 
 /** Durable ownership and settlement of one attach-v1 member turn. `pending` is the only state a
@@ -577,6 +609,8 @@ export interface BotGroupTurnRow {
   messageId: string;
   epoch: number;
   watermark: number;
+  /** Capability 47. Absent on a turn row written before it. */
+  cause?: BotGroupCause;
   state: "pending" | "commit" | "failed" | "cancelled" | "interrupted" | "timeout";
   text?: string;
   detail?: string;
@@ -650,7 +684,11 @@ function toBotGroupTurnRow(row: Record<string, unknown>): BotGroupTurnRow {
   return {
     key: String(row["key"]), turnId: String(row["turnId"]), member: String(row["member"]),
     agentId: String(row["agentId"]), threadId: String(row["threadId"]), messageId: String(row["messageId"]),
-    epoch: Number(row["epoch"]), watermark: Number(row["watermark"]), state,
+    epoch: Number(row["epoch"]), watermark: Number(row["watermark"]),
+    ...(row["causeKind"] === "user" || row["causeKind"] === "member"
+      ? { cause: { kind: row["causeKind"], seq: Number(row["causeSeq"]) } }
+      : {}),
+    state,
     ...(typeof optional("text") === "string" ? { text: optional("text") as string } : {}),
     ...(typeof optional("detail") === "string" ? { detail: optional("detail") as string } : {}),
     createdAt: Number(row["createdAt"]),
@@ -1541,10 +1579,14 @@ export class Storage {
       const seq = row.nextSeq;
       this.#db
         .prepare(
-          `INSERT INTO bot_group_log (group_key, seq, from_kind, from_name, display_name, text, at, client_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO bot_group_log (group_key, seq, from_kind, from_name, display_name, text, at, client_id,
+             message_id, turn_id, epoch, cause_kind, cause_seq, attach_thread_id, attach_turn_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(key, seq, entry.kind, entry.name, entry.displayName, entry.text, entry.at, entry.clientId ?? null);
+        .run(key, seq, entry.kind, entry.name, entry.displayName, entry.text, entry.at, entry.clientId ?? null,
+          entry.messageId ?? null, entry.turnId ?? null, entry.epoch ?? null,
+          entry.cause?.kind ?? null, entry.cause?.seq ?? null,
+          entry.attachTurn?.threadId ?? null, entry.attachTurn?.turnId ?? null);
       this.#db.prepare("UPDATE bot_groups SET next_seq = ? WHERE key = ?").run(seq + 1, key);
       this.#db.exec("COMMIT");
       return { ...entry, seq };
@@ -1558,10 +1600,16 @@ export class Storage {
     const rows = this.#db
       .prepare(
         `SELECT seq, from_kind AS kind, from_name AS name, display_name AS displayName, text, at,
-                client_id AS clientId
+                client_id AS clientId, message_id AS messageId, turn_id AS turnId, epoch,
+                cause_kind AS causeKind, cause_seq AS causeSeq,
+                attach_thread_id AS attachThreadId, attach_turn_id AS attachTurnId
          FROM bot_group_log WHERE group_key = ? ORDER BY seq`,
       )
-      .all(key) as unknown as Array<BotGroupLogRow & { clientId: string | null }>;
+      .all(key) as unknown as Array<BotGroupLogRow & {
+        clientId: string | null; messageId: string | null; turnId: string | null; epoch: number | null;
+        causeKind: string | null; causeSeq: number | null;
+        attachThreadId: string | null; attachTurnId: string | null;
+      }>;
     return rows.map((row) => {
       const entry: BotGroupLogRow = {
         seq: row.seq,
@@ -1572,6 +1620,13 @@ export class Storage {
         at: row.at,
       };
       if (row.clientId !== null) entry.clientId = row.clientId;
+      if (row.messageId !== null) entry.messageId = row.messageId;
+      if (row.turnId !== null) entry.turnId = row.turnId;
+      if (row.epoch !== null) entry.epoch = row.epoch;
+      if ((row.causeKind === "user" || row.causeKind === "member") && row.causeSeq !== null)
+        entry.cause = { kind: row.causeKind, seq: row.causeSeq };
+      if (row.attachThreadId !== null && row.attachTurnId !== null)
+        entry.attachTurn = { threadId: row.attachThreadId, turnId: row.attachTurnId };
       return entry;
     });
   }
@@ -1666,9 +1721,11 @@ export class Storage {
       }
       this.#db.prepare(
         `INSERT INTO bot_group_turns
-           (group_key, turn_id, member, agent_id, thread_id, message_id, epoch, watermark, state, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      ).run(turn.key, turn.turnId, turn.member, turn.agentId, turn.threadId, turn.messageId, turn.epoch, turn.watermark, turn.createdAt);
+           (group_key, turn_id, member, agent_id, thread_id, message_id, epoch, watermark,
+            cause_kind, cause_seq, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      ).run(turn.key, turn.turnId, turn.member, turn.agentId, turn.threadId, turn.messageId, turn.epoch, turn.watermark,
+        turn.cause?.kind ?? null, turn.cause?.seq ?? null, turn.createdAt);
       this.#db.exec("COMMIT");
       return true;
     } catch (err) {
@@ -1680,7 +1737,8 @@ export class Storage {
   botGroupTurnForAttach(agentId: string, threadId: string, turnId: string): BotGroupTurnRow | undefined {
     const row = this.#db.prepare(
       `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
-              message_id AS messageId, epoch, watermark, state, text, detail, created_at AS createdAt,
+              message_id AS messageId, epoch, watermark, cause_kind AS causeKind, cause_seq AS causeSeq,
+              state, text, detail, created_at AS createdAt,
               completed_at AS completedAt, consumed_at AS consumedAt
        FROM bot_group_turns WHERE agent_id = ? AND thread_id = ? AND turn_id = ?`,
     ).get(agentId, threadId, turnId) as Record<string, unknown> | undefined;
@@ -1709,7 +1767,8 @@ export class Storage {
   botGroupTurn(key: string, turnId: string): BotGroupTurnRow | undefined {
     const row = this.#db.prepare(
       `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
-              message_id AS messageId, epoch, watermark, state, text, detail, created_at AS createdAt,
+              message_id AS messageId, epoch, watermark, cause_kind AS causeKind, cause_seq AS causeSeq,
+              state, text, detail, created_at AS createdAt,
               completed_at AS completedAt, consumed_at AS consumedAt
        FROM bot_group_turns WHERE group_key = ? AND turn_id = ?`,
     ).get(key, turnId) as Record<string, unknown> | undefined;
@@ -1729,7 +1788,8 @@ export class Storage {
   pendingBotGroupTurns(): BotGroupTurnRow[] {
     const rows = this.#db.prepare(
       `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
-              message_id AS messageId, epoch, watermark, state, text, detail, created_at AS createdAt,
+              message_id AS messageId, epoch, watermark, cause_kind AS causeKind, cause_seq AS causeSeq,
+              state, text, detail, created_at AS createdAt,
               completed_at AS completedAt, consumed_at AS consumedAt
        FROM bot_group_turns WHERE state = 'pending'`,
     ).all() as Record<string, unknown>[];
@@ -2884,10 +2944,16 @@ export class Storage {
     attachments?: BotChatAttachment[];
     /** Capability 31: labels a gateway-authored row that is not conversation. */
     marker?: string;
+    /** Capability 47: the attach turn this row belongs to, the bot that authored it, and the user
+     *  row it answers. Absent where the fact does not exist, never invented. */
+    turnId?: string;
+    authorBot?: string;
+    inReplyToId?: string;
   }): BotChatMessage {
     const prior = this.#db
       .prepare(
-        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker,
+                turn_id AS turnId, author_bot AS authorBot, in_reply_to_id AS inReplyToId
          FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
       )
       .get(input.bot, input.messageId) as NativeBotMessageDbRow | undefined;
@@ -2898,8 +2964,9 @@ export class Storage {
     this.#db
       .prepare(
         `INSERT INTO bot_native_messages
-           (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json, marker)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json, marker,
+            turn_id, author_bot, in_reply_to_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.bot,
@@ -2912,6 +2979,9 @@ export class Storage {
         input.clientId ?? null,
         input.attachments === undefined ? null : JSON.stringify(input.attachments),
         input.marker ?? null,
+        input.turnId ?? null,
+        input.authorBot ?? null,
+        input.inReplyToId ?? null,
       );
     this.#db
       .prepare("UPDATE bot_native_sessions SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
@@ -2919,13 +2989,28 @@ export class Storage {
     this.#db
       .prepare("UPDATE bot_native_chats SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
       .run(input.at, input.bot, input.sessionId);
-    return { id: input.messageId, role: input.role, text: input.text, at: input.at, ...(input.clientId === undefined ? {} : { clientId: input.clientId }), ...(input.attachments === undefined ? {} : { attachments: input.attachments }), ...(input.marker === undefined ? {} : { marker: input.marker }) };
+    return { id: input.messageId, role: input.role, text: input.text, at: input.at, ...(input.clientId === undefined ? {} : { clientId: input.clientId }), ...(input.attachments === undefined ? {} : { attachments: input.attachments }), ...(input.marker === undefined ? {} : { marker: input.marker }), ...(input.turnId === undefined ? {} : { turnId: input.turnId }), ...(input.authorBot === undefined ? {} : { authorBot: input.authorBot }), ...(input.inReplyToId === undefined ? {} : { inReplyToId: input.inReplyToId }) };
+  }
+
+  /** The user row that opened one native turn, if the turn was opened by a user message at all.
+   *  It is the causation link `BotChatMessage.inReplyToId` carries, read at commit time from the
+   *  row the send itself stamped rather than guessed from transcript adjacency: a scheduled
+   *  delivery or an interim reply can sit between a question and its answer. */
+  nativeBotTurnUserMessageId(bot: string, sessionId: string, turnId: string): string | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT message_id AS id FROM bot_native_messages
+         WHERE bot = ? AND session_id = ? AND turn_id = ? AND role = 'user' ORDER BY seq LIMIT 1`,
+      )
+      .get(bot, sessionId, turnId) as { id: string } | undefined;
+    return row?.id;
   }
 
   nativeBotMessages(bot: string, sessionId: string): BotChatMessage[] {
     const rows = this.#db
       .prepare(
-        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker,
+                turn_id AS turnId, author_bot AS authorBot, in_reply_to_id AS inReplyToId
          FROM bot_native_messages WHERE bot = ? AND session_id = ? ORDER BY seq`,
       )
       .all(bot, sessionId) as unknown as NativeBotMessageDbRow[];
@@ -3036,7 +3121,8 @@ export class Storage {
   nativeBotMessage(bot: string, messageId: string): BotChatMessage | undefined {
     const row = this.#db
       .prepare(
-        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker,
+                turn_id AS turnId, author_bot AS authorBot, in_reply_to_id AS inReplyToId
          FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
       )
       .get(bot, messageId) as NativeBotMessageDbRow | undefined;
@@ -3531,6 +3617,9 @@ interface NativeBotMessageDbRow {
   clientId: string | null;
   attachmentsJson: string | null;
   marker: string | null;
+  turnId: string | null;
+  authorBot: string | null;
+  inReplyToId: string | null;
 }
 
 function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
@@ -3542,6 +3631,9 @@ function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
     ...(row.clientId === null ? {} : { clientId: row.clientId }),
     ...(row.attachmentsJson === null ? {} : { attachments: JSON.parse(row.attachmentsJson) as BotChatAttachment[] }),
     ...(row.marker === null ? {} : { marker: row.marker }),
+    ...(row.turnId === null ? {} : { turnId: row.turnId }),
+    ...(row.authorBot === null ? {} : { authorBot: row.authorBot }),
+    ...(row.inReplyToId === null ? {} : { inReplyToId: row.inReplyToId }),
   };
 }
 
@@ -3569,6 +3661,35 @@ export function openStorage(dbPath: string): Storage {
   ] as const;
   for (const [name, sql] of delegationAdditions)
     if (!delegationColumns.has(name)) db.exec(sql);
+  // Capability 47 provenance, migrated the same additive way and for the same reason: an existing
+  // database keeps its rows, and every one of them reads back with the new ids simply absent.
+  // Backfilling them is impossible and would be a lie: the gateway threw those values away.
+  for (const [table, additions] of [
+    ["bot_group_log", [
+      ["message_id", "ALTER TABLE bot_group_log ADD COLUMN message_id TEXT"],
+      ["turn_id", "ALTER TABLE bot_group_log ADD COLUMN turn_id TEXT"],
+      ["epoch", "ALTER TABLE bot_group_log ADD COLUMN epoch INTEGER"],
+      ["cause_kind", "ALTER TABLE bot_group_log ADD COLUMN cause_kind TEXT"],
+      ["cause_seq", "ALTER TABLE bot_group_log ADD COLUMN cause_seq INTEGER"],
+      ["attach_thread_id", "ALTER TABLE bot_group_log ADD COLUMN attach_thread_id TEXT"],
+      ["attach_turn_id", "ALTER TABLE bot_group_log ADD COLUMN attach_turn_id TEXT"],
+    ]],
+    ["bot_group_turns", [
+      ["cause_kind", "ALTER TABLE bot_group_turns ADD COLUMN cause_kind TEXT"],
+      ["cause_seq", "ALTER TABLE bot_group_turns ADD COLUMN cause_seq INTEGER"],
+    ]],
+    ["bot_native_messages", [
+      ["turn_id", "ALTER TABLE bot_native_messages ADD COLUMN turn_id TEXT"],
+      ["author_bot", "ALTER TABLE bot_native_messages ADD COLUMN author_bot TEXT"],
+      ["in_reply_to_id", "ALTER TABLE bot_native_messages ADD COLUMN in_reply_to_id TEXT"],
+    ]],
+  ] as ReadonlyArray<readonly [string, ReadonlyArray<readonly [string, string]>]>) {
+    const present = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    for (const [name, sql] of additions) if (!present.has(name)) db.exec(sql);
+  }
   // Early desktop-sync builds reflected a gateway-authored row back through attach as
   // `desktop:cozygateway:*`, then stored that echo alongside the original direct transcript
   // row. Repair only a provable pair: same bot, local session, role, exact text, and a one-second

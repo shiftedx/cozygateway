@@ -95,9 +95,41 @@ export const AttachV1MediaDescriptorSchema = Type.Object({
 });
 export type AttachV1MediaDescriptor = Static<typeof AttachV1MediaDescriptorSchema>;
 
+/** Who is in a room, as the gateway knows them, so a peer does not have to parse them back out of
+ * the prompt header it was handed. `kind` separates the human from the bots; the human's `name`
+ * and `displayName` are the room's own label for the user and its handle is the `@user` token. */
+const TurnActor = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  handle: Type.String({ minLength: 1, maxLength: 128 }),
+  displayName: Type.String({ minLength: 1, maxLength: 256 }),
+  kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+}, { additionalProperties: false });
+
+/** Typed provenance for one turn. Sent on ROOM turns only, and it is decoration in the strictest
+ * sense: the `text` a peer receives is byte-identical with and without it, so a peer that ignores
+ * `context` behaves exactly as it did before capability 47. */
+const TurnContext = Type.Object({
+  room: Type.Object({
+    key: Type.String({ minLength: 1, maxLength: 128 }),
+    name: Type.String({ minLength: 1, maxLength: 128 }),
+    epoch: Type.Integer({ minimum: 0 }),
+    /** The highest room seq the member has been shown. Optional and ABSENT rather than zero when
+     * there is nothing to name: zero is a real seq in a room whose log was trimmed, so a
+     * placeholder would be a claim the gateway cannot make. */
+    seq: Type.Optional(Type.Integer({ minimum: 0 })),
+  }, { additionalProperties: false }),
+  actors: Type.Array(TurnActor, { maxItems: 8 }),
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer({ minimum: 0 }),
+  }, { additionalProperties: false })),
+}, { additionalProperties: false });
+export type AttachV1TurnContext = Static<typeof TurnContext>;
+
 const TurnCommand = Type.Object({
   kind: Type.Literal("turn"), threadId: Id, turnId: Id, messageId: Id, text: Type.String(),
   mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  context: Type.Optional(TurnContext),
 });
 const SteerCommand = Type.Object({
   kind: Type.Literal("steer"), threadId: Id, turnId: Id, messageId: Id, text: Type.String(),
