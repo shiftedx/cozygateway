@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -41,6 +41,73 @@ afterEach(async () => {
 });
 
 describe("startGateway end to end", () => {
+  it.skipIf(process.platform === "win32")(
+    "returns an actionable error when settings persistence is lost after startup",
+    async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cozygateway-settings-unwritable-"));
+    const configPath = join(dir, "cozygateway.config.json");
+    const source = JSON.stringify({
+      name: "Before",
+      port: 8787,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
+      capabilities: { "com.example.preserved": 1 },
+    });
+    writeFileSync(configPath, source, { mode: 0o640 });
+    const diagnostics: string[] = [];
+    const gw = await startGateway({
+      name: "Before",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
+    }, { configPath, traceLog: (line) => diagnostics.push(line) });
+
+    try {
+      const pair = await fetch(`${gw.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: gw.issueSetupCode(), deviceName: "settings phone" }),
+      });
+      const token = ((await pair.json()) as { deviceToken: string }).deviceToken;
+      const currentSettings = await fetch(`${gw.url}/gateway/settings`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const settings = (await currentSettings.json()) as { name: string; hermesEndpoints: unknown[] };
+      chmodSync(dir, 0o555);
+
+      const response = await fetch(`${gw.url}/gateway/settings`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          ...settings,
+          name: "After",
+        }),
+      });
+      const responseText = await response.text();
+
+      expect(response.status, responseText).toBe(409);
+      expect(JSON.parse(responseText)).toEqual({
+        error: {
+          code: "invalid_request",
+          message: "Gateway settings cannot be saved because the source configuration is not writable. Check the CozyGateway config mount or file permissions.",
+        },
+      });
+      expect(responseText).not.toContain(configPath);
+      expect(responseText).not.toContain(token);
+      expect(responseText).not.toContain("TEST_HERMES_CONTROL_TOKEN");
+      expect(responseText).not.toMatch(/EACCES|EPERM|EROFS|EBUSY/);
+      expect(readFileSync(configPath, "utf8")).toBe(source);
+      expect(diagnostics.some((line) =>
+        line.includes(configPath) && line.includes("persistence-failed") && line.includes("EACCES"))).toBe(true);
+    } finally {
+      chmodSync(dir, 0o755);
+      await gw.close();
+    }
+    },
+  );
+
   it("prunes explicitly expired attachment bytes at startup while preserving NULL-expiry plugin media", async () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), "cozygateway-attachment-prune-")), "gateway.sqlite");
     const bytes = new Uint8Array([137, 80, 78, 71]);
@@ -166,6 +233,74 @@ describe("public deployment startup posture", () => {
 // Issue #16: GatewayInfo.capabilities travels through GET /health, the pair response, and the
 // ready frame -- one shared object, so wiring it once in startGateway covers all three.
 describe("GatewayInfo.capabilities wiring", () => {
+  it.skipIf(process.platform === "win32")(
+    "omits gateway management everywhere when the source config cannot be replaced",
+    async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cozygateway-settings-unavailable-"));
+    const configPath = join(dir, "cozygateway.config.json");
+    writeFileSync(configPath, JSON.stringify({
+      name: "Unavailable",
+      port: 8787,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
+    }), { mode: 0o640 });
+    chmodSync(dir, 0o555);
+    const diagnostics: string[] = [];
+    let gw: RunningGateway | undefined;
+
+    try {
+      gw = await startGateway({
+        name: "Unavailable",
+        port: 0,
+        dbPath: ":memory:",
+        turnTimeoutSeconds: 0,
+        hermesEndpoints: [{ id: "default", ...testHermes() }],
+        capabilities: { "com.cozylabs.gateway-management": 99 },
+      }, { configPath, traceLog: (line) => diagnostics.push(line) });
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.["com.cozylabs.gateway-management"]).toBeUndefined();
+
+      const pairRes = await fetch(`${gw.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: gw.issueSetupCode(), deviceName: "unavailable phone" }),
+      });
+      const paired = (await pairRes.json()) as { deviceToken: string; gateway: GatewayInfo };
+      expect(paired.gateway.capabilities?.["com.cozylabs.gateway-management"]).toBeUndefined();
+
+      const frames: ServerFrame[] = [];
+      const ws = new WebSocket(`${gw.url.replace("http", "ws")}/ws`);
+      ws.on("message", (data) => frames.push(JSON.parse(String(data)) as ServerFrame));
+      await once(ws, "open");
+      ws.send(JSON.stringify({ type: "auth", token: paired.deviceToken }));
+      const readyDeadline = Date.now() + 5_000;
+      while (!frames.some((frame) => frame.type === "ready")) {
+        if (Date.now() >= readyDeadline) throw new Error(`timeout; saw ${JSON.stringify(frames)}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      ws.close();
+      const ready = frames.find((frame) => frame.type === "ready");
+      expect(ready?.type === "ready"
+        ? ready.gateway.capabilities?.["com.cozylabs.gateway-management"]
+        : undefined).toBeUndefined();
+
+      const response = await fetch(`${gw.url}/gateway/settings`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${paired.deviceToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ name: "After", hermesEndpoints: [] }),
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: { code: "invalid_request" } });
+      expect(diagnostics.some((line) =>
+        line.includes(configPath) && line.includes("persistence-unavailable") && line.includes("EACCES"))).toBe(true);
+    } finally {
+      await gw?.close();
+      chmodSync(dir, 0o755);
+    }
+    },
+  );
+
   // Issue #19 moved the floor: the approval surface is a CORE capability this gateway always
   // implements, so the baseline map is no longer empty. Everything else about the wiring (one
   // shared object across all three positions, config-supplied ids passed through untouched) is

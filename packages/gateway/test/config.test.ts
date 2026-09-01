@@ -247,7 +247,9 @@ describe("reference deployment", () => {
     expect(compose).toContain(
       'COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"',
     );
-    expect(compose).toContain("COZYGATEWAY_CONFIG_PATH");
+    expect(compose).toContain("COZYGATEWAY_CONFIG_DIR");
+    expect(compose).toContain("/config:rw");
+    expect(compose).not.toContain("cozygateway.config.json:ro");
     expect(compose).toContain("COZYGATEWAY_SECRETS_FILE");
     expect(compose).not.toContain("COZYGATEWAY_ATTACH_TOKEN");
     expect(compose).not.toContain("agents:");

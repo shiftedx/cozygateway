@@ -20,7 +20,7 @@ services:
       - "8787:8787"
     volumes:
       - gateway-data:/data
-      - "${COZYGATEWAY_CONFIG_PATH:?set COZYGATEWAY_CONFIG_PATH to a Hermes config}:/config/cozygateway.config.json:ro"
+      - "${COZYGATEWAY_CONFIG_DIR:?set COZYGATEWAY_CONFIG_DIR to the writable config directory}:/config:rw"
     # Lets the example config reach a private Hermes Dashboard on the Docker host. For a Hermes
     # service on the same Compose network, use that service name in hermes.url instead.
     extra_hosts:

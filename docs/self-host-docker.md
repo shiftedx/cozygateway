@@ -14,12 +14,20 @@ Copy the Compose settings and the configuration template:
 
 ```sh
 cp .env.example .env
-mkdir -p local
-cp docker/cozygateway.config.example.json local/cozygateway.config.json
-chmod 644 local/cozygateway.config.json
+mkdir -p local/config local/secrets
+cp docker/cozygateway.config.example.json local/config/cozygateway.config.json
+sudo chown -R 1000:1000 local/config
+chmod 750 local/config
+chmod 640 local/config/cozygateway.config.json
 ```
 
-Edit `local/cozygateway.config.json`. It is the one canonical runtime shape: a `hermes` control
+The image runs as the `node` user (UID 1000), which must be able to create a sibling temporary file
+in `local/config` and rename it over the configuration. That directory is mounted writable so
+authenticated gateway renames remain atomic and survive restarts. Do not replace it with a
+single-file bind mount: Docker cannot atomically replace a bind-mounted file. Keep secrets in the
+separate `local/secrets` directory, which is not mounted into the container.
+
+Edit `local/config/cozygateway.config.json`. It is the one canonical runtime shape: a `hermes` control
 connection plus one or more attach-v1 `profiles`. It contains environment variable names, never
 credential values.
 
@@ -54,11 +62,11 @@ config:
 
 ```sh
 umask 077
-cat > local/cozygateway.env <<'EOF'
+cat > local/secrets/cozygateway.env <<'EOF'
 COZYGATEWAY_HERMES_PASSWORD='replace-with-the-dashboard-password'
 COZYGATEWAY_ATTACH_TOKEN_SAGE='replace-with-Sage-attach-token'
 EOF
-chmod 600 local/cozygateway.env
+chmod 600 local/secrets/cozygateway.env
 ```
 
 If an environment value contains `$`, single-quote it in this file so Compose keeps it literal.
@@ -89,8 +97,8 @@ For a direct `docker run`, the same rule applies: mount the config and supply th
 docker build -f packages/gateway/Dockerfile -t cozygateway .
 docker run --rm -p 8787:8787 \
   --add-host host.docker.internal:host-gateway \
-  --env-file ./local/cozygateway.env \
-  -v "$PWD/local/cozygateway.config.json:/config/cozygateway.config.json:ro" \
+  --env-file ./local/secrets/cozygateway.env \
+  -v "$PWD/local/config:/config:rw" \
   -v gateway-data:/data \
   cozygateway
 ```

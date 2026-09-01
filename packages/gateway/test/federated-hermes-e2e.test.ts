@@ -33,11 +33,12 @@ describe("federated Hermes endpoints", () => {
     const studio = await startFakeHermesServer({ methods: { "profiles.list": () => profile("studio") } });
     servers.push(home, studio);
     Object.assign(process.env, { HOME_HERMES: "h", STUDIO_HERMES: "s", HOME_SAGE: "ha", STUDIO_SAGE: "sa" });
-    const path = join(mkdtempSync(join(tmpdir(), "cozygateway-federated-")), "config.json");
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-federated-"));
+    const path = join(directory, "config.json");
     writeFileSync(path, JSON.stringify({
       name: "Federated",
       port: 8787,
-      dbPath: ":memory:",
+      dbPath: join(directory, "gateway.sqlite"),
       turnTimeoutSeconds: 0,
       hermesEndpoints: [
         { id: "home", label: "Home", url: home.url, tokenEnv: "HOME_HERMES", profiles: { sage: { tokenEnv: "HOME_SAGE" } } },
@@ -46,7 +47,7 @@ describe("federated Hermes endpoints", () => {
     }));
     const config = loadConfig(path);
     config.port = 0;
-    const gateway = await startGateway(config, { configPath: path });
+    let gateway = await startGateway(config, { configPath: path });
     gateways.push(gateway);
     const setupCode = gateway.issueSetupCode();
     const pair = await fetch(`${gateway.url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode, deviceName: "phone" }) });
@@ -56,9 +57,37 @@ describe("federated Hermes endpoints", () => {
     const settingsResponse = await fetch(`${gateway.url}/gateway/settings`, { headers: { authorization: `Bearer ${token}` } });
     expect(settingsResponse.status).toBe(200);
     const settingsText = await settingsResponse.text();
-    expect(JSON.parse(settingsText)).toMatchObject({ name: "Federated", hermesEndpoints: [{ id: "home", label: "Home" }, { id: "studio", label: "Studio" }] });
+    const settings = JSON.parse(settingsText) as { name: string; hermesEndpoints: unknown[] };
+    expect(settings).toMatchObject({ name: "Federated", hermesEndpoints: [{ id: "home", label: "Home" }, { id: "studio", label: "Studio" }] });
     expect(settingsText).not.toContain('"token":');
     expect(settingsText).not.toContain('"password":');
+
+    const renameResponse = await fetch(`${gateway.url}/gateway/settings`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ ...settings, name: "Renamed Gateway" }),
+    });
+    expect(renameResponse.status).toBe(200);
+    expect(await renameResponse.json()).toEqual({
+      name: "Renamed Gateway",
+      hermesEndpoints: settings.hermesEndpoints,
+      restartRequired: true,
+    });
+    expect(loadConfig(path).name).toBe("Renamed Gateway");
+
+    await gateway.close();
+    gateways.splice(gateways.indexOf(gateway), 1);
+    const restartedConfig = loadConfig(path);
+    restartedConfig.port = 0;
+    gateway = await startGateway(restartedConfig, { configPath: path });
+    gateways.push(gateway);
+    expect(((await (await fetch(`${gateway.url}/health`)).json()) as { name: string }).name).toBe("Renamed Gateway");
+    const restartedSettings = await fetch(`${gateway.url}/gateway/settings`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(restartedSettings.status).toBe(200);
+    expect(await restartedSettings.json()).toMatchObject({ name: "Renamed Gateway" });
+
     const roster = async (): Promise<string[]> => {
       const response = await fetch(`${gateway.url}/bots`, { headers: { authorization: `Bearer ${token}` } });
       return ((await response.json()) as { bots: Array<{ name: string }> }).bots.map((bot) => bot.name).sort();

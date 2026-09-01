@@ -34,6 +34,7 @@ import { Type } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 
 import type { GatewayConfig } from "./config.ts";
+import { GatewaySettingsPersistenceError } from "./gateway-settings.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
@@ -182,6 +183,7 @@ export interface AppDeps {
     read(): unknown;
     update(input: unknown): unknown;
   };
+  gatewaySettingsLog?: (message: string) => void;
   /** Gateway-owned inventory of agent harnesses and their harness-native model settings. */
   harnessSettings?: GatewayHarnessSettings;
   /** Present only after Hermes proved a non-null immutable managed-files root. */
@@ -245,6 +247,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
   const pairingAdmission = deps.pairingAdmission ?? new PairingAdmission(deps.now);
   const relayFetch = deps.pushRelayFetch ?? fetch;
   const relayLog = deps.pushRelayLog ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const gatewaySettingsLog = deps.gatewaySettingsLog
+    ?? ((message: string) => process.stderr.write(`${message}\n`));
   const relayBase = deps.config.pushRelayUrl?.replace(/\/+$/, "");
   const requestLiveActivityDeletionDrain = (() => {
     let draining = false;
@@ -388,6 +392,18 @@ export function createApp(deps: AppDeps): Hono<Env> {
     } catch (error) {
       if (error instanceof ContractViolation)
         return c.json(errorBody("invalid_request", error.message), 400);
+      if (error instanceof GatewaySettingsPersistenceError) {
+        gatewaySettingsLog(JSON.stringify({
+          component: "gateway-settings",
+          event: "persistence-failed",
+          configPath: error.configPath,
+          code: error.code,
+        }));
+        return c.json(errorBody(
+          "invalid_request",
+          "Gateway settings cannot be saved because the source configuration is not writable. Check the CozyGateway config mount or file permissions.",
+        ), 409);
+      }
       throw error;
     }
   });
