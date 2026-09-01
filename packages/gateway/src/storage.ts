@@ -1200,7 +1200,9 @@ export class Storage {
 
   cozyApp(id: string): { id: string; name: string; creatorBot: string; revision: number; tree: CozyAppTree; createdAt: number; updatedAt: number } | undefined {
     const row = this.#db.prepare(`SELECT id, name, creator_bot AS creatorBot, revision, tree_json AS treeJson, created_at AS createdAt, updated_at AS updatedAt FROM cozy_apps WHERE id = ?`).get(id) as { id: string; name: string; creatorBot: string; revision: number; treeJson: string; createdAt: number; updatedAt: number } | undefined;
-    return row === undefined ? undefined : { ...row, tree: JSON.parse(row.treeJson) as CozyAppTree };
+    if (row === undefined) return undefined;
+    const { treeJson, ...app } = row;
+    return { ...app, tree: JSON.parse(treeJson) as CozyAppTree };
   }
 
   cozyAppsSnapshot(): { apps: Array<{ id: string; name: string; creatorBot: string; revision: number; tree: CozyAppTree; createdAt: number; updatedAt: number }>; actions: Array<{ id: string; appId: string; creatorBot: string; actionId: string; status: "requested" | "delivered" | "completed" | "failed"; createdAt: number; updatedAt: number }> } {

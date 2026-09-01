@@ -64,6 +64,17 @@ describe("cozy apps", () => {
     const conflict = await authed("/cozyapps/app/tree", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ expectedRevision: 99, tree }) });
     expect(conflict.status).toBe(409);
   });
+  it("does not leak the internal treeJson column into CozyApp responses", async () => {
+    const { storage, authed } = await setup();
+    storage.upsertCozyApp({ id: "app", name: "App", creatorBot: "home:cleo", tree, now: 1 });
+
+    const response = await authed("/cozyapps/app");
+    expect(response.status).toBe(200);
+    const body = await response.json() as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      "createdAt", "creatorBot", "id", "name", "revision", "tree", "updatedAt",
+    ]);
+  });
   it("dispatches an idempotent action once and rejects a key reused for another action", async () => {
     let dispatches = 0;
     const { storage, authed } = await setup({ actionDispatch: () => { dispatches += 1; return true; } });
