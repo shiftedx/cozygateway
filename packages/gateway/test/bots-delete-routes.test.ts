@@ -375,7 +375,7 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
 describe("capability 37 is additive", () => {
   it("advertises the bumped integer and adds no field to any pre-37 shape", async () => {
     const h = await setup();
-    expect(BOTS_CAPABILITY_VERSION).toBe(45);
+    expect(BOTS_CAPABILITY_VERSION).toBe(47);
 
     const before = (await (await h.authed("/bots")).json()) as { bots: Array<Record<string, unknown>> };
     expect((await h.authed(`/bots/${BOT}`, DELETE_REQUEST)).status).toBe(200);

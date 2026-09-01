@@ -38,6 +38,7 @@ import {
   type AttachV1ServerFrame,
   type AttachV1SlashCommand,
   type AttachV1Telemetry,
+  type AttachV1TurnContext,
 } from "./protocol-v1.ts";
 import { resolveAttachBearer } from "./token-auth.ts";
 import { emitTrace, traceId, type TraceLog } from "../../trace.ts";
@@ -477,7 +478,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     return result;
   }
 
-  sendNativeTurn(agentId: string, input: { threadId: string; turnId: string; messageId: string; text: string; mediaIds?: string[] }): boolean {
+  sendNativeTurn(agentId: string, input: { threadId: string; turnId: string; messageId: string; text: string; mediaIds?: string[]; context?: AttachV1TurnContext }): boolean {
     return this.#enqueue(agentId, { kind: "turn", ...input });
   }
 

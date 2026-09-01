@@ -73,6 +73,14 @@ reconnecting plugin no longer negotiates its capability; it advances sequence/de
 MUST invoke no Hermes action. Stable
 agent/thread/turn/message/approval/clarify ids are preserved end to end.
 
+A `turn` command MAY carry `context`, capability-47 typed provenance the gateway fills in on ROOM
+turns: `room` (`key`, `name`, `epoch`, and the highest room `seq` the member has been shown),
+`actors` (every room member plus the human, each with `name`, `handle`, `displayName`, and `kind`
+of `member` or `user`), and `cause` (`{ kind, seq }`: what this member is being asked to answer).
+It is strictly decoration. The `text` a peer receives is byte-identical with and without it, so a
+peer that ignores `context` behaves exactly as it did before, and a peer that reads it gets typed
+actors instead of parsing them back out of the prompt header. `context` is absent on a 1:1 turn.
+
 Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `delegation`,
 `thinking`, `approval`, `clarify`, `scheduled`, `media`, and `presence`.
 

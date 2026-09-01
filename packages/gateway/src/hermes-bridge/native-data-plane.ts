@@ -1148,6 +1148,10 @@ export class NativeBotDataPlane {
       role: "user",
       text,
       at: now,
+      // Capability 47. The turn this message opened (or steered), stamped here because this is the
+      // only place that knows it: at commit time the reply can then name the row it answers
+      // instead of the reader guessing from adjacency.
+      turnId,
       ...(opts?.clientId === undefined ? {} : { clientId: opts.clientId }),
     });
     if (chat.activeTurnId === undefined) {
@@ -1280,6 +1284,7 @@ export class NativeBotDataPlane {
       text: input.text,
       at: now,
       attachments: [attachment],
+      turnId,
       ...(input.clientId === undefined ? {} : { clientId: input.clientId }),
     });
     this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
@@ -1571,6 +1576,9 @@ export class NativeBotDataPlane {
       sessionId: chat.sessionId,
       messageId: `delivery-failed:${failure.deliveryId}`,
       role: "system",
+      // Capability 47. A gateway-authored row still has an author the reader cares about: the bot
+      // whose chat it landed in. It answers no turn, so it names none.
+      authorBot: key,
       marker: DELIVERY_FAILED_MARKER,
       text: deliveryFailureText(key, failure.at, failure.reason),
       at: failure.at,
@@ -1627,6 +1635,11 @@ export class NativeBotDataPlane {
       ];
     });
     const text = blocksToText(blocks);
+    // Capability 47. Every id here is one the gateway already held; none is inferred. A commit
+    // outside a turn (a scheduled delivery projection) has no turn and answers no user row, so it
+    // carries only its author.
+    const inReplyToId =
+      turnId === undefined ? undefined : this.#storage.nativeBotTurnUserMessageId(bot, sessionId, turnId);
     const message = this.#storage.appendNativeBotMessage({
       bot,
       sessionId,
@@ -1634,6 +1647,9 @@ export class NativeBotDataPlane {
       role: "assistant",
       text,
       at: now,
+      authorBot: bot,
+      ...(turnId === undefined ? {} : { turnId }),
+      ...(inReplyToId === undefined ? {} : { inReplyToId }),
       ...(attachments === undefined || attachments.length === 0
         ? {}
         : { attachments }),

@@ -361,3 +361,59 @@ describe("routine override metadata", () => {
     expect(storage.botRoutineOverrides("scout", "job-1")).toBeUndefined();
   });
 });
+
+describe("capability 47 auditable-id migration", () => {
+  it("adds the provenance columns to a pre-47 database and still reads its rows back", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-auditable-ids-migration-"));
+    const path = join(directory, "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`CREATE TABLE bot_groups (
+      key TEXT PRIMARY KEY, name TEXT NOT NULL, members_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL, epoch INTEGER NOT NULL, needs_you INTEGER NOT NULL,
+      next_seq INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE bot_group_log (
+      group_key TEXT NOT NULL, seq INTEGER NOT NULL, from_kind TEXT NOT NULL,
+      from_name TEXT NOT NULL, display_name TEXT NOT NULL, text TEXT NOT NULL,
+      at INTEGER NOT NULL, client_id TEXT, PRIMARY KEY (group_key, seq)
+    ) STRICT, WITHOUT ROWID;
+    CREATE TABLE bot_native_messages (
+      bot TEXT NOT NULL, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+      message_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, at INTEGER,
+      client_id TEXT, attachments_json TEXT, marker TEXT,
+      PRIMARY KEY (bot, session_id, seq), UNIQUE (bot, message_id)
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO bot_groups VALUES ('launch','Launch','["scout","luna"]',1,1,0,3);
+    INSERT INTO bot_group_log VALUES ('launch',1,'user','You','You','ship it?',5,NULL);
+    INSERT INTO bot_group_log VALUES ('launch',2,'member','scout','Scout','shipping',6,NULL);
+    INSERT INTO bot_native_messages VALUES ('sage','session',1,'old-1','assistant','done',7,NULL,NULL,NULL);`);
+    legacy.close();
+
+    const storage = openStorage(path);
+    // A row written before 47 keeps every byte it had and simply carries none of the new ids.
+    // Backfilling them would be a fabrication: the gateway never recorded them.
+    expect(storage.botGroupLog("launch")).toEqual([
+      { seq: 1, kind: "user", name: "You", displayName: "You", text: "ship it?", at: 5 },
+      { seq: 2, kind: "member", name: "scout", displayName: "Scout", text: "shipping", at: 6 },
+    ]);
+    expect(storage.nativeBotMessage("sage", "old-1")).toEqual({
+      id: "old-1", role: "assistant", text: "done", at: 7,
+    });
+
+    // The migrated database accepts the new columns on the very next write.
+    const written = storage.appendBotGroupMessage("launch", {
+      kind: "member", name: "luna", displayName: "Luna", text: "on it", at: 8,
+      messageId: "msg-1", turnId: "turn-1", epoch: 1,
+      cause: { kind: "user", seq: 1 },
+      attachTurn: { threadId: "group:launch:luna", turnId: "turn-1" },
+    });
+    expect(written.seq).toBe(3);
+    expect(storage.botGroupLog("launch").at(-1)).toMatchObject({
+      messageId: "msg-1", turnId: "turn-1", epoch: 1,
+      cause: { kind: "user", seq: 1 },
+      attachTurn: { threadId: "group:launch:luna", turnId: "turn-1" },
+    });
+    storage.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});

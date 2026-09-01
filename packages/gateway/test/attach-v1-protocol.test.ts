@@ -21,6 +21,38 @@ describe("attach-v1 protocol", () => {
     expect(check(AttachV1MemoryRequestSchema, { ...request, input: { memoryEnabled: true, userProfileEnabled: false } })).toBe(false);
   });
 
+  it("carries optional typed room context on a turn command without touching its text", () => {
+    const turn = { kind: "turn", threadId: "group:launch:scout", turnId: "t-1", messageId: "m-1", text: "prompt" };
+    const frame = (command: Record<string, unknown>): unknown =>
+      ({ kind: "command", sequence: 1, commandId: "cmd-1", command });
+    // A peer that never sends or reads context is unaffected: the field is optional.
+    expect(check(AttachV1ServerFrameSchema, frame(turn))).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: {
+        room: { key: "launch", name: "Launch", epoch: 2, seq: 7 },
+        actors: [
+          { name: "scout", handle: "scout", displayName: "Scout", kind: "member" },
+          { name: "You", handle: "user", displayName: "You", kind: "user" },
+        ],
+        cause: { kind: "user", seq: 7 },
+      },
+    }))).toBe(true);
+    // Closed: an unknown actor kind or an unknown context field is a sender the gateway does not
+    // speak, not a field to ignore.
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: {
+        room: { key: "launch", name: "Launch", epoch: 2, seq: 7 },
+        actors: [{ name: "scout", handle: "scout", displayName: "Scout", kind: "bot" }],
+      },
+    }))).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: { room: { key: "launch", name: "Launch", epoch: 2, seq: 7 }, actors: [], extra: true },
+    }))).toBe(false);
+  });
+
   it("negotiates capabilities, cursor and backpressure limits with one hello shape", () => {
     expect(check(AttachV1HelloSchema, {
       kind: "hello",

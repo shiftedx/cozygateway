@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 45. This extension is independent of the frozen core
+Status: v1 extension, capability version 47. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 45 }
+"capabilities": { "com.cozylabs.bots": 47 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -85,6 +85,7 @@ and does not register `/bots` routes.
 | 43 | The roster represents every Hermes profile and reports `syncState`; profiles not yet provisioned remain visible as `setup_required` instead of disappearing. |
 | 44 | Per-profile CozyApps readiness on `BotSummary`, with a stable `restart_profile` repair when a connected plugin did not negotiate `cozyapps`. |
 | 45 | Native runtime Bots: config-declared bots served by a non-Hermes attach peer appear on the roster with `runtime: "cozyagents"`, built from config and attach presence rather than the Dashboard; their Dashboard-backed routes answer 409 `unsupported_for_runtime`. |
+| 47 | Auditable ids: room and 1:1 transcript rows carry the identities the gateway already held at settlement. `BotGroupMessage` gains `messageId`, `turnId`, `epoch`, `cause`, and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage` gains `turnId`, `authorBot`, and `inReplyToId`. Every field is optional, absent on rows written before 47, and never backfilled. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -113,6 +114,14 @@ a second, hand-copied schema.
   row IS. The only v1 value is `delivery.failed`. A client that does not know a marker renders the
   ordinary row it already renders.
   From capability 32 an attachment entry may also carry `position`; see "Inline media ordering".
+  From capability 47 a row may carry `turnId` (the attach turn it belongs to: the user row that
+  opened the turn and every assistant row that turn committed share it), `authorBot` (the bot that
+  authored an `assistant` or `system` row; a `user` row has no bot author), and `inReplyToId` (the
+  `id` of the user row an assistant row answers). All three are absent on every row written before
+  47 and on any row where the fact does not exist, such as an imported desktop transcript row or a
+  delivery-failure notice. They are recorded, never inferred: a client must not derive causation
+  from ordering when they are absent, because a scheduled or interim row can land between a
+  question and its answer.
 - `BotSessionSummary` is a durable native Bot Mode session. Current native Bot Mode sessions have
   `kind: "conversation"`; `startedAt` and `lastActiveAt` are milliseconds. They are not Hermes
   Dashboard session records.
@@ -131,6 +140,18 @@ a second, hand-copied schema.
   field reports only `isSet`, never a value or redacted suffix. A method is `fields`, Hermes-hosted
   `oauth`, or an honest `external` CLI handoff.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
+  From capability 47 a `BotGroupMessage` may carry `messageId` (the row's own durable, room-unique
+  id: `seq` orders a room, `messageId` identifies a message across rooms, restarts, and a head
+  trim), `turnId` (the member turn that produced it, the same id as the gateway's durable turn row
+  and the attach `turn` command that asked for it; a user row has no turn), `epoch` (the room epoch
+  the row belongs to, so one deliberation is distinguishable from the next when a second send
+  superseded the first), `cause` (`{ kind, seq }`: the highest room seq the member had been shown
+  when its turn STARTED, which is what it was answering, and NOT simply the preceding row), and
+  `attachTurn` (`{ threadId, turnId }`: the gateway-owned member thread that carried the turn,
+  never a Hermes Dashboard session). A `BotGroupNote` may carry `turnId` when a turn was actually
+  started; a `capped` note and a member skipped because it is no longer a bot never got one and
+  carry nothing. Every field is optional and absent on rows written before 47; a client renders
+  such a row exactly as it does today.
 - `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its
   slash-prefixed `name` is the exact invocation; `description`, optional `argsHint`, and optional
   `category` are presentation metadata. `BotSlashCommandCatalog` is the bounded ordered list.

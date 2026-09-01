@@ -43,6 +43,72 @@ describe("native group turns", () => {
     storage.close();
   });
 
+  it("stamps every room message with the turn that made it and hands the peer typed actors", async () => {
+    const storage = openStorage(":memory:");
+    const commands: Array<{ agentId: string; threadId: string; turnId: string; context?: unknown }> = [];
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: `${name[0]?.toUpperCase() ?? ""}${name.slice(1)}` }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          commands.push({ agentId, threadId: command.threadId, turnId: command.turnId, context: command.context });
+          queueMicrotask(() => rooms.handleAttachEvent(agentId, {
+            kind: "event", sequence: commands.length, eventId: `commit:${command.turnId}`,
+            event: {
+              kind: "commit", threadId: command.threadId, turnId: command.turnId,
+              messageId: `reply:${command.turnId}`,
+              blocks: [{ type: "paragraph", text: `${agentId} is on it.` }],
+            },
+          }));
+          return true;
+        },
+      },
+      pollMs: 1, turnTimeoutMs: 100, chainDelayMs: 0,
+    });
+
+    await rooms.create("Launch", ["scout", "luna"]);
+    const sent = rooms.send("Launch", "Who can take this @everyone?");
+    await rooms.settled("Launch");
+
+    const log = storage.botGroupLog("launch");
+    const user = log[0]!;
+    const scout = log.find((entry) => entry.name === "scout")!;
+    const luna = log.find((entry) => entry.name === "luna")!;
+    // The user message is the cause of the first member turn, by seq rather than by adjacency.
+    expect(user.seq).toBe(sent.seq);
+    expect(scout.cause).toEqual({ kind: "user", seq: user.seq });
+    // The second member answered a room that already contained the first reply, and says so.
+    expect(luna.cause).toEqual({ kind: "member", seq: scout.seq });
+    // Each reply names the durable turn row that produced it, and the attach identity that carried it.
+    const scoutTurn = storage.botGroupTurn("launch", scout.turnId!)!;
+    expect(scoutTurn.member).toBe("scout");
+    expect(scoutTurn.cause).toEqual({ kind: "user", seq: user.seq });
+    expect(scout.attachTurn).toEqual({ threadId: "group:launch:scout", turnId: scout.turnId });
+    expect(commands[0]).toMatchObject({ agentId: "scout", turnId: scout.turnId });
+    // Every row is identifiable on its own, and belongs to the epoch the user send opened.
+    expect(new Set(log.map((entry) => entry.messageId)).size).toBe(log.length);
+    expect(log.every((entry) => entry.epoch === 1)).toBe(true);
+
+    // The peer receives both members as typed actors plus the human, and the prompt text is
+    // unchanged: `context` is decoration a peer may ignore entirely.
+    expect(commands[0]?.context).toEqual({
+      room: { key: "launch", name: "Launch", epoch: 1, seq: user.seq },
+      actors: [
+        { name: "scout", handle: "scout", displayName: "Scout", kind: "member" },
+        { name: "luna", handle: "luna", displayName: "Luna", kind: "member" },
+        { name: "You", handle: "user", displayName: "You", kind: "user" },
+      ],
+      cause: { kind: "user", seq: user.seq },
+    });
+    await rooms.close();
+    storage.close();
+  });
+
   it("keeps deleted-turn ownership as a tombstone, so a late replay is acknowledged", async () => {
     const storage = openStorage(":memory:");
     let command: { agentId: string; threadId: string; turnId: string; messageId: string } | undefined;
@@ -228,7 +294,9 @@ describe("native group turns", () => {
       type: "bot_group_state",
       group: "Release",
       state: "running",
-      note: { member: "scout", reason: "failed", detail: "provider crashed" },
+      // Capability 47: the note names the member turn that failed, so the incident is traceable
+      // back to the command that caused it.
+      note: { member: "scout", reason: "failed", detail: "provider crashed", turnId: expect.any(String) },
     }));
     expect(states.at(-1)).toMatchObject({ group: "Release", state: "settled" });
     await rooms.close();

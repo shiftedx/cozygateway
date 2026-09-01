@@ -293,6 +293,20 @@ export const BotChatMessageSchema = Type.Object({
    *  marker renders the ordinary row it already renders. The only v1 value is `delivery.failed`,
    *  which the gateway writes with role `system` when a scheduled delivery terminally fails. */
   marker: Type.Optional(Type.String({ maxLength: 64 })),
+  /** Capability 47, auditable ids. The attach turn this row belongs to: the user row that opened
+   *  the turn and every assistant row the turn committed carry the SAME `turnId`, which is what
+   *  lets a reader group a transcript by turn instead of guessing from adjacency. Absent on rows
+   *  written outside a turn (an imported desktop transcript, a delivery-failure notice) and on
+   *  every row written before 47. */
+  turnId: Type.Optional(Type.String({ maxLength: 256 })),
+  /** Capability 47. The bot that authored a non-user row. Present on `assistant` and `system`
+   *  rows; a `user` row has no bot author and carries nothing here. It is the bot's profile name,
+   *  the same name the row's session is addressed by. */
+  authorBot: Type.Optional(Type.String({ maxLength: 128 })),
+  /** Capability 47. The `id` of the user row this row answers, for an assistant row committed by a
+   *  turn that a user message opened. It is the causation link a client would otherwise have to
+   *  infer from ordering, which is wrong the moment a scheduled or interim row lands between. */
+  inReplyToId: Type.Optional(Type.String({ maxLength: 256 })),
 });
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;
 
@@ -1247,6 +1261,35 @@ export const BotGroupMessageSchema = Type.Object({
   text: Type.String(),
   at: Type.Integer(),
   clientId: Type.Optional(Type.String()),
+  /** Capability 47, auditable ids. Every field below is optional because a row written before 47
+   *  carries none of them, and a reader MUST render such a row exactly as it does today.
+   *
+   *  `messageId` is the row's own durable, room-unique id. `seq` orders a room; `messageId`
+   *  identifies a message across rooms, restarts and a head trim.
+   *
+   *  `turnId` is the member turn that produced the row, and it is the SAME id as the
+   *  `bot_group_turns` row and the attach `turn` command, which is what makes a member's
+   *  contribution traceable from the transcript back to the command that asked for it. A user row
+   *  has no turn. */
+  messageId: Type.Optional(Type.String({ maxLength: 256 })),
+  turnId: Type.Optional(Type.String({ maxLength: 256 })),
+  /** The room epoch this row belongs to. A user send bumps the epoch, so every reply deliberating
+   *  on that send shares its epoch: that is how a reader tells one deliberation from the next when
+   *  a second send superseded the first mid-round. */
+  epoch: Type.Optional(Type.Integer()),
+  /** What the member was answering: the highest room seq it had been shown when its turn started,
+   *  and whose message that was. NOT "the previous row": a member that spent a minute thinking can
+   *  land after two other replies, and the honest causation is the one recorded at turn start. */
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer(),
+  })),
+  /** The attach-v1 identity that carried the turn. `threadId` is the gateway-owned member thread
+   *  (`group:<room>:<member>`), never a Hermes Dashboard session. */
+  attachTurn: Type.Optional(Type.Object({
+    threadId: Type.String({ maxLength: 256 }),
+    turnId: Type.String({ maxLength: 256 }),
+  })),
 });
 export type BotGroupMessage = Static<typeof BotGroupMessageSchema>;
 
@@ -1300,6 +1343,10 @@ export const BotGroupNoteSchema = Type.Object({
   member: Type.String(),
   reason: Type.Union([Type.Literal("timeout"), Type.Literal("failed"), Type.Literal("capped")]),
   detail: Type.String(),
+  /** Capability 47. The member turn the note is about, when one was actually started. A `capped`
+   *  note and a member that was skipped because it is no longer a bot never got a turn, so they
+   *  carry nothing here: an id that names no command would be worse than an absent one. */
+  turnId: Type.Optional(Type.String({ maxLength: 256 })),
 });
 export type BotGroupNote = Static<typeof BotGroupNoteSchema>;
 
@@ -1737,4 +1784,12 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * from the Dashboard, and its Dashboard-backed routes answer `409 unsupported_for_runtime`. A
  * client gating native-bot UI must require >= 45: a gateway at 44 has the CozyApps fact and no
  * native bots at all. */
-export const BOTS_CAPABILITY_VERSION = 45;
+/** Capability 47: AUDITABLE IDS. Room and 1:1 transcript rows now carry the identities the
+ * gateway already held and threw away at settlement: `BotGroupMessage` gains `messageId`,
+ * `turnId`, `epoch`, `cause` and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage`
+ * gains `turnId`, `authorBot` and `inReplyToId`. The attach `turn` command gains an optional
+ * `context` so a room peer reads typed actors and causation instead of parsing the prompt header;
+ * the prompt text is byte-identical to before. Every field is additive and optional: a row
+ * written before 47 has none of them and renders exactly as it always has, and a client that
+ * shows provenance gates on `>= 47`. */
+export const BOTS_CAPABILITY_VERSION = 47;
