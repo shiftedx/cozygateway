@@ -70,7 +70,7 @@ import {
   GatewayHermesSessionManagement,
 } from "./hermes-bridge/session-management.ts";
 
-export const GATEWAY_VERSION = "0.5.2";
+export const GATEWAY_VERSION = "0.5.3";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
