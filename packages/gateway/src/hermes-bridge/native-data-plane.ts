@@ -367,13 +367,17 @@ export class NativeBotDataPlane {
    * carried the real id: a client could not join a `bot_chat_delta` to the roster row it belongs
    * to. One function, both surfaces, no drift. */
   rosterBots(bots: readonly BotSummary[]): BotSummary[] {
-    const rows = bots.map((summary): BotSummary => {
-      const bot = normalize(summary.name);
-      if (!this.#native.has(bot)) {
-        return { ...summary, chatSessionId: null, syncState: "setup_required" };
-      }
-      return { ...summary, ...this.#nativeOverlay(bot) };
-    });
+    const rows = bots
+      // A Hermes profile sharing an id with a runtime bot would otherwise produce two rows for
+      // one name. The config-declared row wins: it is the identity this gateway actually serves.
+      .filter((summary) => !this.#runtimeBots.has(normalize(summary.name)))
+      .map((summary): BotSummary => {
+        const bot = normalize(summary.name);
+        if (!this.#native.has(bot)) {
+          return { ...summary, chatSessionId: null, syncState: "setup_required" };
+        }
+        return { ...summary, ...this.#nativeOverlay(bot) };
+      });
     // A config-declared runtime bot has no Hermes profile to overlay, so its row is built here.
     // Appended in this function rather than in `#roster` so the `bot_roster` frame, which is
     // published through this overlay, carries exactly the rows `GET /bots` returns.
@@ -461,6 +465,10 @@ export class NativeBotDataPlane {
 
   #cozyAppsReadiness(bot: string): CozyAppsReadiness | undefined {
     if (!this.handles(bot)) return undefined;
+    // `restart_profile` repairs a Hermes plugin launch. A config-declared runtime bot has no
+    // plugin to restart, so a missing `cozyapps` negotiation is a fact about its peer's feature
+    // set, not a reason to hold its row out of `ready`.
+    if (this.#runtimeBots.has(bot)) return undefined;
     // Unit seams from pre-capability tests deliberately model only attachment. Production ingress
     // always exposes this accessor; absence here means no capability observation is available.
     const capabilitiesFor = this.#ingress.negotiatedCapabilities;
@@ -827,7 +835,16 @@ export class NativeBotDataPlane {
   async #desktopSessions(name: string) {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    this.#assertRuntimeSupports(bot, "desktopSessions");
     return this.#control.desktopSessions(bot);
+  }
+
+  /** These two surfaces are native-plane overrides, so the `surface()` guard never sees them.
+   * Their answer still comes from the Dashboard, so a runtime bot gets the same refusal. */
+  #assertRuntimeSupports(bot: string, feature: string): void {
+    const runtimeBot = this.#runtimeBots.get(bot);
+    if (runtimeBot !== undefined)
+      throw new UnsupportedForRuntime(bot, feature, runtimeBot.runtime);
   }
 
   /** Resolve one authoritative conversation before a read or send. The gateway compares actual
@@ -847,6 +864,10 @@ export class NativeBotDataPlane {
   }
 
   async #resolveLatestSessionOnce(bot: string): Promise<void> {
+    // A runtime bot has no Hermes profile, so the Desktop/TUI/CLI index cannot hold a session for
+    // it. Asking anyway would issue a profile RPC on every chat read and send whose failure this
+    // method's catch would silently swallow.
+    if (this.#runtimeBots.has(bot)) return;
     const current = this.#storage.nativeBotChat(bot, this.#now());
     // Never redirect an in-flight lane. The session that owns the running turn remains canonical
     // until Hermes settles it; the next read/send performs the same recency resolution again.
@@ -879,6 +900,7 @@ export class NativeBotDataPlane {
   ): Promise<BotDesktopHermesResumeResponse> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    this.#assertRuntimeSupports(bot, "resumeDesktopSession");
     // Re-read the source-qualified dashboard index at action time. A row shown earlier is no
     // authorization to resume after it was deleted, reclassified, or moved to another profile.
     const eligible = await this.#control.desktopSessions(bot);

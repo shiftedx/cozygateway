@@ -454,7 +454,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 
 | Route | Request | Success response | Notes |
 | --- | --- | --- | --- |
-| `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots. |
+| `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots, plus one row per capability-45 native runtime bot. |
 | `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate. `409` extension code `conflict` when the name is taken. |
 | `DELETE /bots/:name` | optional `?force=1` | `200 BotDeleteResponse` | Capability 37. Deletes the Hermes profile and purges every gateway row the bot owned. `409` extension code `conflict` (body carries `turnId`) when a native turn is running, unless `force=1`. `404` when neither Hermes nor this gateway knows the name. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
@@ -642,6 +642,17 @@ Committed transcript history remains the recovery source after reconnect.
 
 ## Error and privacy rules
 
+- Capability 45. `BotSummary.runtime` names which runtime serves the bot. It is optional and
+  absent means Hermes, so every existing row is unchanged; the only other value is `"cozyagents"`,
+  a config-declared bot served by a non-Hermes attach peer whose row is built from gateway config
+  and attach presence rather than the Dashboard. Chat, readiness, approvals, and clarifications
+  work for such a bot exactly as they do for a Hermes-backed one.
+- A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
+  extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
+  bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
+  This covers profile, model-config, model-provider, routines, desktop-session, and delete
+  surfaces. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
+  must hide or disable that section rather than treat the bot as missing.
 - Native session ids, attach message ids, and attachment ids are opaque. Never infer a filesystem
   path, Hermes Dashboard id, or URL from them.
 - Attachment and media validation rejects unsafe bytes, unsupported types, oversized bodies, and
