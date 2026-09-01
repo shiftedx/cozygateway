@@ -93,6 +93,40 @@ function Find-Hermes {
     return $null
 }
 
+function Get-HermesVersion {
+    param([string] $HermesPath)
+    $versionOutput = (& $HermesPath --version 2>&1 | Out-String)
+    $versionExit = $LASTEXITCODE
+    $match = [regex]::Match($versionOutput, '(?i)\bHermes Agent v(?<version>(?<core>\d+\.\d+\.\d+)(?<prerelease>-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\b')
+    if ($versionExit -ne 0 -or -not $match.Success) {
+        Fail 'could not verify the installed Hermes version; Hermes v0.21.0 or newer is required. Run hermes update, then retry this installer'
+    }
+    return [pscustomobject]@{
+        Text = $match.Groups['version'].Value
+        Core = [Version]$match.Groups['core'].Value
+        IsPrerelease = $match.Groups['prerelease'].Success
+    }
+}
+
+function Test-CompatibleHermesVersion {
+    param($Version)
+    return (-not $Version.IsPrerelease -and $Version.Core -ge [Version]'0.21.0')
+}
+
+function Ensure-CompatibleHermes {
+    param([string] $HermesPath)
+    $before = Get-HermesVersion $HermesPath
+    if (Test-CompatibleHermesVersion $before) { return }
+    Write-Info "Hermes v$($before.Text) must be updated for reliable multi-profile gateway attach"
+    & $HermesPath update --yes
+    if ($LASTEXITCODE -ne 0) { Fail "Hermes update failed; Hermes v0.21.0 or newer is required. Resolve the update error, then retry this installer" }
+    $after = Get-HermesVersion $HermesPath
+    if (-not (Test-CompatibleHermesVersion $after)) {
+        Fail "Hermes update did not install a compatible stable version (found v$($after.Text); v0.21.0 or newer is required)"
+    }
+    Write-Ok "updated Hermes from v$($before.Text) to v$($after.Text)"
+}
+
 function Resolve-Hermes {
     param([string] $InstallerUri)
     $hermes = Find-Hermes
@@ -119,6 +153,7 @@ function Resolve-Hermes {
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($configPath) -or -not (Test-Path -LiteralPath $configPath)) {
         Fail 'Hermes default profile is not configured; finish Hermes setup and run this command again'
     }
+    Ensure-CompatibleHermes $hermes
     return $hermes
 }
 
