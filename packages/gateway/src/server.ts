@@ -14,6 +14,8 @@ import {
   MOBILE_NODE_CAPABILITY_VERSION,
   GATEWAY_MANAGEMENT_CAPABILITY_ID,
   GATEWAY_MANAGEMENT_CAPABILITY_VERSION,
+  GATEWAY_MAINTENANCE_CAPABILITY_ID,
+  GATEWAY_MAINTENANCE_CAPABILITY_VERSION,
   HARNESS_SETTINGS_CAPABILITY_ID,
   HARNESS_SETTINGS_CAPABILITY_VERSION,
   HARNESS_WORKSPACE_CAPABILITY_ID,
@@ -29,6 +31,7 @@ import {
 
 import { hermesEndpoints, nativeBots, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
+import { discoverGatewayMaintenance } from "./gateway-maintenance.ts";
 import { cozyAppPhysicalId, openStorage, type Storage } from "./storage.ts";
 import {
   ATTACH_V1_CAPABILITIES,
@@ -78,7 +81,7 @@ import {
   HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION,
 } from "./hermes-bridge/global-skills.ts";
 
-export const GATEWAY_VERSION = "0.6.3";
+export const GATEWAY_VERSION = "0.6.4";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -194,13 +197,15 @@ export function gatewayInfoForConfig(
   harnessUpdates = false,
   hermesSessionManagementVersion?: number,
   hermesGlobalSkills = false,
+  maintenance = false,
 ): GatewayInfo {
   const configuredCapabilities = Object.fromEntries(
     Object.entries(config.capabilities ?? {})
       .filter(([id]) => id !== HARNESS_UPDATE_CAPABILITY_ID
         && id !== GATEWAY_MANAGEMENT_CAPABILITY_ID
         && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID
-        && id !== HERMES_GLOBAL_SKILLS_CAPABILITY_ID),
+        && id !== HERMES_GLOBAL_SKILLS_CAPABILITY_ID
+        && id !== GATEWAY_MAINTENANCE_CAPABILITY_ID),
   );
   return {
     name: config.name,
@@ -233,6 +238,9 @@ export function gatewayInfoForConfig(
         : { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: hermesSessionManagementVersion }),
       ...(hermesGlobalSkills
         ? { [HERMES_GLOBAL_SKILLS_CAPABILITY_ID]: HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION }
+        : {}),
+      ...(maintenance
+        ? { [GATEWAY_MAINTENANCE_CAPABILITY_ID]: GATEWAY_MAINTENANCE_CAPABILITY_VERSION }
         : {}),
     },
   };
@@ -348,6 +356,7 @@ export async function startGateway(
   const harnessUpdates = new GatewayHarnessUpdates(
     updateResults.filter((adapter) => adapter !== undefined),
   );
+  const maintenance = await discoverGatewayMaintenance(process.env, storage, GATEWAY_VERSION, () => Date.now());
   const gatewayInfo = gatewayInfoForConfig(
     config,
     gatewaySettings !== undefined,
@@ -355,6 +364,7 @@ export async function startGateway(
     harnessUpdates.available,
     hermesSessions.capabilityVersion,
     hermesGlobalSkills !== undefined,
+    maintenance !== undefined,
   );
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({
@@ -704,6 +714,7 @@ export async function startGateway(
     gatewayInfo,
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
     ...(gatewaySettings === undefined ? {} : { gatewaySettings }),
+    ...(maintenance === undefined ? {} : { maintenance }),
     gatewaySettingsLog: traceLog,
     harnessSettings,
     ...(harnessUpdates.available ? { harnessUpdates } : {}),

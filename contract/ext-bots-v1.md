@@ -463,6 +463,13 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. |
 | `GET /bots/:name/model-config` | — | `BotModelConfig` | Hermes profile model read. |
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Hermes profile model update. |
+| `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. |
+| `PUT /bots/:name/model-providers/:provider/fields/:field` | `BotModelProviderFieldUpdate` | `BotModelProviderSetupCatalog` | Writes one field through Hermes after re-validating that the field belongs to the provider. |
+| `DELETE /bots/:name/model-providers/:provider/fields/:field` | — | `BotModelProviderSetupCatalog` | Clears one Hermes-owned provider field and returns refreshed state. |
+| `POST /bots/:name/model-providers/:provider/oauth` | — | `BotModelProviderOAuthSession` | Starts a Hermes-hosted PKCE or device-code session. External CLI-only methods are rejected. |
+| `GET /bots/:name/model-providers/:provider/oauth/:sessionId` | — | `BotModelProviderOAuthSession` | Polls Hermes' session; clients stop at `approved`, `expired`, or `error`. |
+| `POST /bots/:name/model-providers/:provider/oauth/:sessionId/code` | `BotModelProviderOAuthCode` | `BotModelProviderOAuthSession` | Submits a PKCE authorization code to Hermes. |
+| `DELETE /bots/:name/model-providers/:provider/oauth/:sessionId` | — | `204 No Content` | Cancels the Hermes OAuth session. |
 | `GET /bots/:name/readiness` | — | `BotReadiness` | Capability 40. Reports `starting` until the configured attach identity is online, then `ready`. |
 | `GET /bots/:name/chat` | — | `{ name, sessionId, adoption: "created" \| "pin" }` | Resolves the selected native chat. |
 | `GET /bots/:name/chat/messages` | — | `{ name, sessionId, adoption, messages, running, inflight, updatedAt, suggestion?, toolSteps? }` | Reads native transcript and native tool history. |

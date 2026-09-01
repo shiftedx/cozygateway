@@ -116,7 +116,15 @@ function modelsEndpoint(baseUrl: string): string | undefined {
   }
 }
 
-async function discoverProviderModels(baseUrl: string, fetcher: FetchLike): Promise<string[] | undefined> {
+/**
+ * Read the OpenAI-compatible model inventory from one configured provider endpoint. Callers retain
+ * their own static fallback when the endpoint has not proved reachable yet; after a successful
+ * probe, a failed refresh deliberately reports an empty inventory rather than stale model ids.
+ */
+export async function discoverProviderModels(
+  baseUrl: string,
+  fetcher: FetchLike = fetch,
+): Promise<string[] | undefined> {
   const endpoint = modelsEndpoint(baseUrl);
   if (endpoint === undefined) return undefined;
   const now = Date.now();

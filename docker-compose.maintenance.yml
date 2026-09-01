@@ -1,0 +1,11 @@
+# Optional production-only control seam. Start the host supervisor first, then compose with this
+# override. The Docker host owns the socket and all Compose credentials; the gateway gets only a
+# constrained request channel, never docker.sock.
+services:
+  gateway:
+    environment:
+      COZYGATEWAY_MAINTENANCE_SOCKET: /run/cozygateway-maintenance/control.sock
+    volumes:
+      # A Unix-domain connect needs write permission on the socket itself, not a writable mount.
+      # The host-only supervisor owns this directory and validates the connecting UID.
+      - "${COZYGATEWAY_MAINTENANCE_SOCKET_DIR:?set to the host directory containing control.sock}:/run/cozygateway-maintenance:ro"

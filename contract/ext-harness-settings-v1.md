@@ -42,6 +42,8 @@ in the current `GatewayHarnessCatalog`.
 | `POST /gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/oauth/:sessionId/code` | `ModelProviderOAuthCode` | `ModelProviderOAuthSession` |
 | `DELETE /gateway/harnesses/:harnessId/scopes/:scopeId/model-providers/:provider/oauth/:sessionId` | — | `204 No Content` |
 
-Reads expose only whether a field is set. Every write re-resolves the provider and field against the
-harness before forwarding it. Writes within one harness connection are serialized so two devices
-cannot interleave read/modify/refresh lifecycles.
+Reads expose only whether a field is set, except a harness may explicitly return `value` for a
+non-secret editable field such as a local provider endpoint. Credential values are never returned,
+even if an upstream response includes one. Every write re-resolves the provider and field against
+the harness before forwarding it. Writes within one harness connection are serialized so two
+devices cannot interleave read/modify/refresh lifecycles.
