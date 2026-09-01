@@ -85,6 +85,7 @@ and does not register `/bots` routes.
 | 43 | The roster represents every Hermes profile and reports `syncState`; profiles not yet provisioned remain visible as `setup_required` instead of disappearing. |
 | 44 | Per-profile CozyApps readiness on `BotSummary`, with a stable `restart_profile` repair when a connected plugin did not negotiate `cozyapps`. |
 | 45 | Native runtime Bots: config-declared bots served by a non-Hermes attach peer appear on the roster with `runtime: "cozyagents"`, built from config and attach presence rather than the Dashboard; their Dashboard-backed routes answer 409 `unsupported_for_runtime`. |
+| 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion, model-provider setup, and desktop-session transcripts keep the 409. Rows 46 and 47 are the wave-2 sibling tracks (runtime bots in rooms; auditable ids). |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -657,11 +658,18 @@ Committed transcript history remains the recovery source after reconnect.
   in this version: `POST /bots/groups` naming one is refused with `400 invalid_request`. Roster
   `stale` is a fact about the Hermes control plane only; it says nothing about a runtime bot, whose
   row is always current because it is built from local config and live attach presence.
+- Capability 48. A runtime bot's profile, model-config and routines routes are served by its own
+  peer over the attach-v1 `bot_config` lane (see `contract/attach-v1.md`), so they answer normally
+  rather than 409. Nothing about their request or response shape changes: the peer implements the
+  same published schemas the Hermes-backed bot does. A peer that did not negotiate `bot_config`
+  keeps the 409 on those routes, because the section is genuinely absent rather than temporarily
+  unreachable, and a peer that is simply offline answers `503 backend_unavailable`.
 - A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
   extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
   bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
-  This covers profile, model-config, model-provider, routines, desktop-session, and delete
-  surfaces. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
+  Since capability 48 this covers the model-provider, desktop-session, and delete surfaces; the
+  profile, model-config, and routines surfaces answer over the config lane instead, and fall back
+  to this 409 when the peer did not negotiate `bot_config`. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
   must hide or disable that section rather than treat the bot as missing.
 - Native session ids, attach message ids, and attachment ids are opaque. Never infer a filesystem
   path, Hermes Dashboard id, or URL from them.

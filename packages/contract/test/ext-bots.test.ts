@@ -619,7 +619,7 @@ describe("capability advertisement", () => {
     // exact credential-free memory setup through the attached profile plugin; 43 makes every
     // Hermes profile visible with an exact synchronization state. 44 adds per-profile CozyApps
     // readiness so a globally capable gateway cannot misrepresent an older attached plugin.
-    expect(BOTS_CAPABILITY_VERSION).toBe(45);
+    expect(BOTS_CAPABILITY_VERSION).toBe(48);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {

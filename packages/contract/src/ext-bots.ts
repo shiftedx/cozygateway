@@ -1737,4 +1737,14 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * from the Dashboard, and its Dashboard-backed routes answer `409 unsupported_for_runtime`. A
  * client gating native-bot UI must require >= 45: a gateway at 44 has the CozyApps fact and no
  * native bots at all. */
-export const BOTS_CAPABILITY_VERSION = 45;
+/** Capability 48: BOT CONFIG LANE. A capability-45 runtime bot serves its own profile, model
+ * config, and routines over the attach-v1 `bot_config` request/reply lane, so `GET/PATCH
+ * /bots/:name/profile`, `GET/PUT /bots/:name/model-config`, and the routines routes answer for it
+ * instead of `409 unsupported_for_runtime`. The wire shapes are unchanged: the peer implements the
+ * same published schemas a Hermes-backed bot does. `DELETE /bots/:name`, model-provider setup, and
+ * desktop-session transcripts keep the 409, and so do the config routes when the peer did not
+ * negotiate `bot_config`. Additive: a client below 48 sees the 409 it already handles.
+ *
+ * Rows 46 and 47 belong to the wave-2 sibling tracks (runtime bots in rooms; auditable ids) and
+ * land with them. */
+export const BOTS_CAPABILITY_VERSION = 48;

@@ -45,6 +45,7 @@ import type {
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
+import { ConfigNotNegotiated, type ConfigSurface } from "./bot-config.ts";
 import { BotNameTaken } from "./crud.ts";
 import { GroupInvalid } from "./group-rooms.ts";
 import {
@@ -69,6 +70,10 @@ export interface NativeBotDataPlaneOptions {
     avatar: string | null;
     runtime: "cozyagents";
   }[];
+  /** The attach-v1 bot-config lane. A runtime bot serves its own profile, model selection and
+   * routines over it, so those surfaces route here instead of refusing. Absent means no gateway on
+   * this deployment negotiated the lane and every config surface keeps its 409. */
+  botConfig?: ConfigSurface;
   /** Optional opener offered only while a Bot Chat transcript is empty. */
   chatSuggestion: string;
   broadcast: (frame: ServerFrame) => void;
@@ -191,6 +196,23 @@ const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
   "deleteBot",
 ]);
 
+/** The `DASHBOARD_ONLY` methods a runtime bot answers over the attach-v1 config lane, each mapped
+ * to the config-surface call that serves it. A method absent from this table keeps its 409.
+ *
+ * The arguments are re-read positionally from the proxied call rather than spread, because the
+ * config surface takes the routine id and the patch as separate parameters exactly as the
+ * `BotsSurface` method does; a blind spread would type-check and silently mis-order them. */
+const CONFIG_LANE: Record<string, ((surface: ConfigSurface, name: string, args: unknown[]) => Promise<unknown>) | undefined> = {
+  botProfile: (surface, name) => surface.botProfile(name),
+  configureProfile: (surface, name, args) => surface.configureProfile(name, args[1] as never),
+  modelConfig: (surface, name) => surface.modelConfig(name),
+  configureModel: (surface, name, args) => surface.configureModel(name, args[1] as never),
+  routines: (surface, name) => surface.routines(name),
+  createRoutine: (surface, name, args) => surface.createRoutine(name, args[1] as never),
+  patchRoutine: (surface, name, args) => surface.patchRoutine(name, args[1] as string, args[2] as never),
+  deleteRoutine: (surface, name, args) => surface.deleteRoutine(name, args[1] as string),
+};
+
 /** Attach-owned Bot Mode data plane. The returned surface delegates management/control methods to
  * the dashboard bridge but owns every chat method for configured profiles, making it impossible
  * for a native send or settlement to fall through to the Dashboard chat transport. */
@@ -200,6 +222,7 @@ export class NativeBotDataPlane {
   readonly #ingress: AttachV1Ingress;
   readonly #native: Set<string>;
   readonly #runtimeBots: Map<string, NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number]>;
+  readonly #botConfig: ConfigSurface | undefined;
   readonly #chatSuggestion: string;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #onChatMessage: NativeBotDataPlaneOptions["onChatMessage"];
@@ -254,6 +277,7 @@ export class NativeBotDataPlane {
     this.#runtimeBots = new Map(
       (opts.runtimeBots ?? []).map((bot) => [normalize(bot.id), bot]),
     );
+    this.#botConfig = opts.botConfig;
     this.#chatSuggestion = opts.chatSuggestion;
     this.#broadcast = opts.broadcast;
     this.#onChatMessage = opts.onChatMessage;
@@ -354,6 +378,22 @@ export class NativeBotDataPlane {
           const name = typeof args[0] === "string" ? normalize(args[0]) : undefined;
           const runtimeBot = name === undefined ? undefined : this.#runtimeBots.get(name);
           if (name === undefined || runtimeBot === undefined) return bound(...args);
+          // A runtime bot owns its own profile, model selection and routines and serves them over
+          // the attach-v1 config lane, so those methods are answered by the peer rather than
+          // refused. Everything else in this set has no peer-side equivalent and keeps its 409:
+          // deletion is a gateway/Hermes lifecycle act, provider setup is Hermes-owned credential
+          // storage, and a desktop transcript is a Hermes Dashboard artifact.
+          const routed = CONFIG_LANE[property];
+          if (routed !== undefined && this.#botConfig !== undefined) {
+            const surface = this.#botConfig;
+            // A peer that never negotiated `bot_config` reads exactly like a bot with no lane at
+            // all, which is the true answer: the section is absent, not temporarily unreachable.
+            return routed(surface, name, args).catch((error: unknown) => {
+              throw error instanceof ConfigNotNegotiated
+                ? new UnsupportedForRuntime(name, property, runtimeBot.runtime)
+                : error;
+            });
+          }
           return Promise.reject(
             new UnsupportedForRuntime(name, property, runtimeBot.runtime),
           );

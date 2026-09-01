@@ -64,6 +64,7 @@ import { parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
+import { AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
 import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
@@ -487,6 +488,7 @@ export async function startGateway(
   }
   let nativeBotPlane: NativeBotDataPlane | undefined;
   let memorySurface: AttachMemorySurface | undefined;
+  let configSurface: AttachConfigSurface | undefined;
   let botsSurface: BotsSurface;
   const allowedCapabilities = new Map<string, ReadonlySet<AttachV1Capability>>(
     profileEntries.map(([profileId]) => [
@@ -542,6 +544,7 @@ export async function startGateway(
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
       onMemoryResult: (agentId, frame) => { memorySurface?.handle(agentId, frame); },
+      onConfigResult: (agentId, frame) => { configSurface?.handle(agentId, frame); },
       // The plugin-facing receipt is the ingress' own business; this is the half the USER sees.
       onScheduledDeliveryFailed: (agentId, failure) =>
         nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
@@ -557,6 +560,7 @@ export async function startGateway(
     },
   });
   memorySurface = new AttachMemorySurface(attachV1Ingress, 12_000, traceLog);
+  configSurface = new AttachConfigSurface(attachV1Ingress, 12_000, traceLog);
   const attachEndpoint: TurnEndpoint = {
     isAttached: (agentId) => attachV1Ingress.isAttached(agentId),
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
@@ -644,6 +648,7 @@ export async function startGateway(
       avatar: bot.avatar ?? null,
       runtime: bot.runtime,
     })),
+    botConfig: configSurface,
     chatSuggestion: hermesOptions.chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     staleTurnSweepMs: millis(config.staleTurnSweepSeconds),
@@ -840,6 +845,7 @@ export async function startGateway(
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
       // runner's per-thread chains settle before closeAll drains them.
       memorySurface?.close();
+      configSurface?.close();
       attachV1Ingress.close();
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
