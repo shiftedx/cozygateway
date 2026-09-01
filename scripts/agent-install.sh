@@ -444,7 +444,7 @@ gateway_state() {
   status="$($HERMES_BIN -p "$1" gateway status 2>&1 || true)"
   case "$status" in
     *"not installed"*|*"not configured"*|*"No gateway service"*|*"Gateway service not found"*|*"hermes gateway install"*) printf 'absent' ;;
-    *"Gateway is not running"*|*"Gateway is stopped"*|*"Gateway is inactive"*|*"No gateway process detected"*) printf 'stopped' ;;
+    *"Gateway is not running"*|*"Gateway is stopped"*|*"Gateway is inactive"*|*"No gateway process detected"*|*"Service definition exists locally but launchd has not loaded it"*) printf 'stopped' ;;
     *"Gateway is supervised"*|*"Gateway is running"*|*"Gateway is active"*|*"Gateway process running"*) printf 'running' ;;
     *) die "could not determine Hermes gateway service state for profile $1: $status" ;;
   esac
@@ -1253,6 +1253,7 @@ if (dashboardChild) dashboardChild.unref();
 let child;
 let restarting = false;
 let shuttingDown = false;
+let configBytes = readFileSync(config);
 const spawnGateway = () => {
   child = spawn(process.execPath, [bundle, 'serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
   child.on('error', (error) => { console.error(error); process.exit(1); });
@@ -1273,7 +1274,11 @@ const restartGateway = () => {
   else { restarting = false; spawnGateway(); }
 };
 watchFile(config, { interval: 500 }, (current, previous) => {
-  if (current.mtimeMs !== previous.mtimeMs) restartGateway();
+  if (current.mtimeMs === previous.mtimeMs) return;
+  const next = readFileSync(config);
+  if (next.equals(configBytes)) return;
+  configBytes = next;
+  restartGateway();
 });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   shuttingDown = true;
@@ -1410,13 +1415,18 @@ install_service() {
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     install_windows_service
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
-    local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; mkdir -p "$HOME/Library/LaunchAgents"
+    local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" loaded=0; mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>Label</key><string>$SERVICE_LABEL</string><key>ProgramArguments</key><array><string>/bin/bash</string><string>$WRAPPER</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>$GW_LOG</string><key>StandardErrorPath</key><string>$GW_LOG</string><key>ThrottleInterval</key><integer>10</integer></dict></plist>
 PLIST
-    launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; launchctl bootstrap "gui/$(id -u)" "$plist"
+    launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+      if launchctl bootstrap "gui/$(id -u)" "$plist"; then loaded=1; break; fi
+      sleep 1
+    done
+    [ "$loaded" = 1 ] || die "launchd did not accept the CozyGateway service after 10 attempts"
   else
     local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; mkdir -p "$unit_dir"
     have loginctl || die "Linux logout/reboot persistence needs loginctl; install systemd-login or run CozyGateway as a system service"
