@@ -393,7 +393,9 @@ grep -Fq '"host": "127.0.0.1"' "$tmp/gateway-zero-attach/local/cozygateway.confi
 mkdir -p "$tmp/mismatch-hermes"
 printf '{}\n' > "$tmp/mismatch-hermes/config.yaml"
 printf 'absent\n' > "$tmp/mismatch-hermes/gateway-default.state"
-if mismatch_output="$(HOME="$tmp/mismatch-home" PATH="$tmp/one-attempt-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"configured":2,"online":1,"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$tmp/mismatch-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mismatch-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mismatch-attach" 2>&1)"; then
+mismatch_platform=Darwin
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) mismatch_platform=Windows ;; esac
+if mismatch_output="$(HOME="$tmp/mismatch-home" PATH="$tmp/one-attempt-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"configured":2,"online":1,"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$tmp/mismatch-hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mismatch-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM="$mismatch_platform" bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mismatch-attach" 2>&1)"; then
   echo 'expected configured/online attach mismatch to fail readiness' >&2
   exit 1
 fi
