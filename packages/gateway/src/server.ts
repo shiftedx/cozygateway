@@ -689,10 +689,12 @@ export async function startGateway(
           throw new Error("the runtime bot service is not assembled yet");
         return runtimeBotService.create(input, row);
       },
-      delete: (name) => {
+      delete: (name, deleteOptions) => {
         if (runtimeBotService === undefined)
           throw new Error("the runtime bot service is not assembled yet");
-        return runtimeBotService.delete(name);
+        // The options are forwarded, not dropped: `?force=1` is the only way to delete a runtime
+        // bot whose turn never settled, and a hole here makes that bot undeletable.
+        return runtimeBotService.delete(name, deleteOptions);
       },
       projection: (name) => {
         if (runtimeBotService === undefined)

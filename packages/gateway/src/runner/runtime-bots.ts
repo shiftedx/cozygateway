@@ -29,10 +29,7 @@ import type { RunnerLane } from "./lane.ts";
  *  The schema is the validation, not a second description of it: a malformed operator value is
  *  refused at create time with the variable named, rather than dropped in silence and discovered
  *  later as a container that came up on the wrong ceiling. */
-export const RuntimeSpecSchema = Type.Object({
-  image: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-  /** Argv, not a shell string. */
-  entrypoint: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { minItems: 1, maxItems: 32 })),
+const RuntimeSpecCommon = {
   model: Type.Optional(
     Type.Object({
       id: Type.String({ minLength: 1, maxLength: 200 }),
@@ -47,7 +44,24 @@ export const RuntimeSpecSchema = Type.Object({
       pids: Type.Optional(Type.Integer({ minimum: 16, maximum: 1_048_576 })),
     }, { additionalProperties: false }),
   ),
-}, { additionalProperties: false });
+};
+
+/** A union rather than one object with two optional keys, because "at most one of `image` and
+ *  `entrypoint`" is the contract (`contract/runner-v1.md`) rather than a convention: a runtime is
+ *  either an image for the Docker backend or an argv for the process backend, and a command
+ *  carrying both would leave the runner to guess which one the operator meant. Both branches are
+ *  closed, so an object naming both matches neither and is refused. */
+export const RuntimeSpecSchema = Type.Union([
+  Type.Object({
+    image: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+    ...RuntimeSpecCommon,
+  }, { additionalProperties: false }),
+  Type.Object({
+    /** Argv, not a shell string. */
+    entrypoint: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { minItems: 1, maxItems: 32 })),
+    ...RuntimeSpecCommon,
+  }, { additionalProperties: false }),
+]);
 export type RuntimeSpecDefaults = Static<typeof RuntimeSpecSchema>;
 
 /** Reads the runtime spec an operator configured for new bots out of the environment, the same way
@@ -92,6 +106,14 @@ export function runtimeSpecDefaults(env: Record<string, string | undefined>): Ru
         "/COZYGATEWAY_RUNNER_ENTRYPOINT_JSON",
       );
     }
+  }
+  // Named before the schema gets to it, because "you set both" is a far more useful sentence than
+  // "no union branch matched".
+  if (image !== undefined && entrypointJson !== undefined) {
+    throw new ContractViolation(
+      "set COZYGATEWAY_RUNNER_IMAGE or COZYGATEWAY_RUNNER_ENTRYPOINT_JSON, not both: a runtime is either an image for the docker backend or an argv for the process backend",
+      "/COZYGATEWAY_RUNNER_IMAGE",
+    );
   }
   const resources = {
     ...(cpus === undefined ? {} : { cpus }),

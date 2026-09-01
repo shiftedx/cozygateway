@@ -12,8 +12,11 @@ import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 import { RunnerLane } from "../src/runner/lane.ts";
+import { check } from "cozygateway-contract";
+
 import {
   RuntimeBotService,
+  RuntimeSpecSchema,
   mergeRuntimeBots,
   runtimeSpecDefaults,
   type RuntimeSpecDefaults,
@@ -315,6 +318,19 @@ describe("the runtime spec an operator configures", () => {
     expect(() => runtimeSpecDefaults({ COZYGATEWAY_RUNNER_ENTRYPOINT_JSON: '"cozyagents"' })).toThrow();
     expect(() => runtimeSpecDefaults({ COZYGATEWAY_RUNNER_MEMORY_MB: "2048.5" })).toThrow();
     expect(runtimeSpecDefaults({})).toEqual({});
+    // At most one of the two: a runtime is either an image for the docker backend or an argv for
+    // the process backend, and a command carrying both would leave the runner guessing.
+    expect(() =>
+      runtimeSpecDefaults({
+        COZYGATEWAY_RUNNER_IMAGE: "ghcr.io/example/cozyagents@sha256:abc",
+        COZYGATEWAY_RUNNER_ENTRYPOINT_JSON: '["cozyagents"]',
+      }),
+    ).toThrow(/not both/);
+    // The invariant is normative, not merely a parse-order accident: a spec supplied
+    // programmatically with both is refused by the schema too.
+    expect(check(RuntimeSpecSchema, { image: "i", entrypoint: ["e"] })).toBe(false);
+    expect(check(RuntimeSpecSchema, { image: "i", resources: { cpus: 1 } })).toBe(true);
+    expect(check(RuntimeSpecSchema, { entrypoint: ["e"], resources: { cpus: 1 } })).toBe(true);
     // A model is optional, and its absence means the runner's own default rather than a guess.
     expect(runtimeSpecDefaults({ COZYGATEWAY_RUNNER_MODEL_ID: "m", COZYGATEWAY_RUNNER_MODEL_PROVIDER: "p" })).toEqual({
       model: { id: "m", provider: "p" },
