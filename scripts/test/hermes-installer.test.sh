@@ -314,7 +314,12 @@ case "$*" in
     else printf '{"attach":{"configured":1,"online":1,"deadLetters":0}}'; fi
     ;;
   *api/health*)
-    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER" ]; then printf '000'; else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_HEALTH_CODE:-401}"; fi
+    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_READY_COUNTER:-}" ]; then
+      count=0
+      [ ! -f "$COZYGATEWAY_TEST_DASHBOARD_READY_COUNTER" ] || count="$(cat "$COZYGATEWAY_TEST_DASHBOARD_READY_COUNTER")"
+      count=$((count + 1)); printf '%s\n' "$count" > "$COZYGATEWAY_TEST_DASHBOARD_READY_COUNTER"
+      if [ "$count" -le "${COZYGATEWAY_TEST_DASHBOARD_READY_AFTER_CALL:?}" ]; then printf '000'; else printf '401'; fi
+    elif [ -n "${COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER:-}" ] && [ -f "$COZYGATEWAY_TEST_DASHBOARD_STOPPED_MARKER" ]; then printf '000'; else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_HEALTH_CODE:-401}"; fi
     ;;
   *api/config*)
     cat >/dev/null
@@ -363,6 +368,28 @@ grep -Fq 'Hermes provider and model are configured' <<<"$live_output"
 grep -Fq 'Allow CozyChat to access this Gateway over your local network? [y/N]' <<<"$live_output"
 grep -Fq 'for devices on your local network' <<<"$live_output"
 grep -q '^model$' "$tmp/commands"
+
+# A fresh Hermes install can spend more than 30 seconds importing and warming
+# the Dashboard on a small Linux host. Model that boundary without making this
+# test slow: the endpoint becomes ready only after the initial probe plus 31
+# failed launch probes, and the fake sleep keeps the loop sub-second.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    mkdir -p "$tmp/delayed-bin"
+    cat > "$tmp/delayed-bin/sleep" <<'SLEEP'
+#!/usr/bin/env bash
+exit 0
+SLEEP
+    chmod 700 "$tmp/delayed-bin/sleep"
+    if ! delayed_dashboard_output="$(HOME="$tmp/delayed-home" PATH="$tmp/delayed-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_DASHBOARD_READY_COUNTER="$tmp/delayed-dashboard-count" COZYGATEWAY_TEST_DASHBOARD_READY_AFTER_CALL=32 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/delayed-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bind-host 127.0.0.1 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-delayed-dashboard" 2>&1)"; then
+      printf 'expected a cold Dashboard that becomes ready after the legacy 30-poll window to install successfully\n%s\n' "$delayed_dashboard_output" >&2
+      exit 1
+    fi
+    test "$(cat "$tmp/delayed-dashboard-count")" -ge 33
+    grep -Fq 'fake-qr' <<<"$delayed_dashboard_output"
+    ;;
+esac
 
 # A one-paste rerun with an already-configured Hermes provider/model must not
 # reopen the interactive picker. Its stdin is the curl pipe in production, so
