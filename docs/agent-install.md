@@ -33,8 +33,10 @@ terminal and requires an active provider and model before CozyGateway changes.
 
 It discovers Hermes with `hermes -p <profile> config path`, then uses that
 evidence to find the default home and named profile homes. Every discovered
-profile with a `config.yaml` is configured by default; narrow the scope with
-`--profiles default,ops`.
+profile with a `config.yaml` is configured by default. That default remains a
+dynamic `all` scope, so update and repair runs automatically provision profiles
+created after the first install. Narrow the scope with `--profiles default,ops`
+only when that isolation is intentional.
 
 The release bootstrap downloads and SHA-256 verifies three versioned release
 assets before execution: the gateway bundle, the complete Hermes attach plugin
@@ -76,10 +78,11 @@ bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygatewa
 `cozygateway update` is an alias for `repair`. Both commands use the persisted,
 checksummed release bootstrap and fetch one current matched release; they never
 treat the installed bundle or a checkout as an update source. A repair retains
-the recorded profile selection, listener and public origin, device/message
-database, attach tokens and spools, plus supported operator-owned configuration
-such as TLS. An explicit `--profiles` on the one-line installer remains the way
-to change profile scope.
+an explicitly narrowed profile selection; the default `all` scope re-discovers
+and provisions every current Hermes profile. It also retains the listener and
+public origin, device/message database, attach tokens and spools, plus supported
+operator-owned configuration such as TLS. An explicit `--profiles` on the
+one-line installer remains the way to narrow profile scope.
 
 Near the end of a fresh interactive install, the installer asks one networking question:
 `Allow CozyChat to access this Gateway over your local network? [y/N]`. Yes binds CozyGateway to

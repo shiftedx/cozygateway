@@ -10,11 +10,18 @@ export interface SessionRow {
 
 export type BotSessionKind = "conversation" | "cron" | "routine" | "group";
 
-/** The only Dashboard rows eligible for the separate desktop-resume seam. `tui` is Hermes'
- * source-qualified desktop/TUI origin; everything else is deliberately excluded, including
- * cron/routine/group/machine and ordinary gateway-created rows. */
+export const HERMES_INTERACTIVE_SESSION_SOURCES = ["desktop", "tui", "cli"] as const;
+export type HermesInteractiveSessionSource = typeof HERMES_INTERACTIVE_SESSION_SOURCES[number];
+
+export function interactiveHermesSessionSource(row: SessionRow): HermesInteractiveSessionSource | undefined {
+  const source = row.source?.trim().toLowerCase();
+  return HERMES_INTERACTIVE_SESSION_SOURCES.find((candidate) => candidate === source);
+}
+
+/** The only Dashboard rows eligible for the separate interactive-resume seam. Everything else is
+ * deliberately excluded, including cron/routine/group/machine and gateway-created rows. */
 export function isDesktopHermesSession(row: SessionRow): boolean {
-  return row.source?.trim().toLowerCase() === "tui" && sessionKind(row) === "conversation";
+  return interactiveHermesSessionSource(row) !== undefined && sessionKind(row) === "conversation";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

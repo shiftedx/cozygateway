@@ -44,6 +44,7 @@ import {
 import {
   sessionKind,
   isDesktopHermesSession,
+  interactiveHermesSessionSource,
   listBotSessions,
 } from "./sessions.ts";
 import { parseChatSnapshot } from "./chat-messages.ts";
@@ -845,13 +846,16 @@ export class HermesBridge implements BotControlSurface {
     return (await listBotSessions(this.#client, name, 200))
       .filter(isDesktopHermesSession)
       .map((row) => {
+        const origin = interactiveHermesSessionSource(row)!;
         const lastResumedAt = this.#storage.nativeDesktopResumeAt(name, row.id);
         return {
           source: "hermes_desktop" as const,
+          origin,
           hermesSessionId: row.id,
           // Do not forward a host-authored title: it can be a prompt, a path, or a private desktop
           // label. The stable generic label still lets a client render an accessible picker row.
-          title: "Desktop session",
+          title: origin === "desktop" ? "Hermes Desktop session"
+            : origin === "tui" ? "Hermes TUI session" : "Hermes CLI session",
           startedAt: row.startedAt,
           lastActiveAt: row.lastActiveAt,
           ...(lastResumedAt === undefined ? {} : { lastResumedAt }),

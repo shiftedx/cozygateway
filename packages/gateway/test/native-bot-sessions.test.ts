@@ -138,7 +138,7 @@ describe("attach-v1 native Bot Mode sessions", () => {
   it("only selects a distinct local session after an exact desktop-switch confirmation, then sends on that lane", async () => {
     const h = nativePlane(["sage"]);
     h.desktopSessions.mockResolvedValue([{
-      source: "hermes_desktop", hermesSessionId: "desktop-raw-1", startedAt: 1, lastActiveAt: 2,
+      source: "hermes_desktop", origin: "tui", hermesSessionId: "desktop-raw-1", startedAt: 1, lastActiveAt: 2,
     }]);
     const before = (await h.surface.canonicalChat("sage")).sessionId;
     h.desktopSessionTranscript.mockResolvedValue([
@@ -177,7 +177,7 @@ describe("attach-v1 native Bot Mode sessions", () => {
   it("projects a source-qualified desktop row once without changing the selected chat or turn", async () => {
     const h = nativePlane(["sage"]);
     h.desktopSessions.mockResolvedValue([{
-      source: "hermes_desktop", hermesSessionId: "desktop-original", startedAt: 1, lastActiveAt: 2,
+      source: "hermes_desktop", origin: "tui", hermesSessionId: "desktop-original", startedAt: 1, lastActiveAt: 2,
     }]);
     const before = (await h.surface.canonicalChat("sage")).sessionId;
     const resume = h.surface.resumeDesktopSession("sage", "desktop-original");
@@ -255,7 +255,7 @@ describe("attach-v1 native Bot Mode sessions", () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), "native-desktop-resume-")), "gateway.sqlite");
     let h = nativePlane(["sage"], openStorage(dbPath));
     h.desktopSessions.mockResolvedValue([{
-      source: "hermes_desktop", hermesSessionId: "desktop-raw-1", startedAt: 1, lastActiveAt: 2,
+      source: "hermes_desktop", origin: "tui", hermesSessionId: "desktop-raw-1", startedAt: 1, lastActiveAt: 2,
     }]);
 
     const initial = h.surface.resumeDesktopSession("sage", "desktop-raw-1");
@@ -279,7 +279,7 @@ describe("attach-v1 native Bot Mode sessions", () => {
 
     h = nativePlane(["sage"], openStorage(dbPath));
     h.desktopSessions.mockResolvedValue([{
-      source: "hermes_desktop", hermesSessionId: "desktop-raw-1", startedAt: 1, lastActiveAt: 2,
+      source: "hermes_desktop", origin: "tui", hermesSessionId: "desktop-raw-1", startedAt: 1, lastActiveAt: 2,
     }]);
     let settled = false;
     const reproof = h.surface.resumeDesktopSession("sage", "desktop-raw-1").then((response) => {

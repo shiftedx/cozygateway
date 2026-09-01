@@ -193,6 +193,7 @@ describe("bots cache", () => {
     lastActiveAt: null,
     chatSessionId: null,
     preview: { kind: "empty" as const, text: "" },
+    syncState: "setup_required" as const,
     meta: null,
     ...over,
   });

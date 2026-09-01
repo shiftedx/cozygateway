@@ -216,6 +216,7 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
       lastActiveAt: profile.lastActiveAt,
       chatSessionId: null,
       preview: classifyPreview(profile.preview, profile.description),
+      syncState: "setup_required",
       meta,
     };
     return { summary, activityAt: botActivityAt(profile) };

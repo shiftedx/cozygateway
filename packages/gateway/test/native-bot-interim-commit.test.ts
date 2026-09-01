@@ -246,9 +246,10 @@ describe("the bot_roster frame carries the chat session id", () => {
     expect(published).toBeDefined();
     const rows = (published as { bots: BotSummary[] }).bots;
     const canonical = await plane.surface().canonicalChat("sage");
-    expect(rows.map((row) => row.name)).toEqual(["sage"]);
+    expect(rows.map((row) => row.name)).toEqual(["sage", "unmanaged"]);
     expect(rows[0]?.chatSessionId).toBe(canonical.sessionId);
     expect(rows[0]?.chatSessionId).not.toBeNull();
+    expect(rows[1]).toMatchObject({ chatSessionId: null, syncState: "setup_required" });
 
     await bridge.close();
     plane.close();

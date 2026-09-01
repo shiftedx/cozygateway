@@ -57,6 +57,7 @@ function row(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     id: "hermes-1",
     profile: "sage",
     _lineage_root_id: "lineage-root",
+    source: "cli",
     title: "Release notes",
     started_at: 1_700_000_000,
     last_active: 1_700_000_100,
@@ -188,6 +189,7 @@ describe("privacy projection", () => {
     expect(body.sessions[0]).toEqual({
       hermesSessionId: "hermes-1",
       hermesLineageId: "lineage-root",
+      origin: "cli",
       title: "Work at <path>",
       startedAt: 1_700_000_000_000,
       lastActiveAt: 1_700_000_100_000,
@@ -318,6 +320,7 @@ describe("authoritative exact detail", () => {
     expect(await response.json()).toEqual({ session: {
       hermesSessionId: "hermes-1",
       hermesLineageId: "lineage-root",
+      origin: "cli",
       title: "path:<path>",
       startedAt: 1_700_000_000_000,
       lastActiveAt: 1_700_000_100_000,

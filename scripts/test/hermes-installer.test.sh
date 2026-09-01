@@ -614,7 +614,7 @@ fi
 expect_contains "$missing_repair_output" 'curl -fsSL https://cozylabs.ai/install.sh | bash'
 
 # The installed command routes both spellings through the persisted, checksummed
-# bootstrap and carries the exact recorded scope rather than rediscovering all profiles.
+# bootstrap and keeps the installer's default dynamic all-profile scope.
 cat > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" <<'REPAIR_BOOTSTRAP'
 #!/usr/bin/env bash
 printf '%s\n' "$COZYGATEWAY_HOME:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
@@ -624,7 +624,8 @@ if command -v shasum >/dev/null 2>&1; then repair_sha="$(shasum -a 256 "$tmp/gat
 printf '%s  install.sh\n' "$repair_sha" > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh.sha256"
 COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair >/dev/null
 COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" update >/dev/null
-expected_profiles="$(sed -n 's/^profiles=//p' "$tmp/gateway-live/local/install-state" | tail -1)"
+grep -Fqx 'profile_scope=all' "$tmp/gateway-live/local/install-state"
+expected_profiles=all
 repair_count="$(wc -l < "$tmp/repair.log" | tr -d ' ')"
 if [ "$repair_count" != 2 ]; then
   printf 'repair route count was %s:\n' "$repair_count" >&2

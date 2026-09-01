@@ -53,6 +53,12 @@ export const BotSummarySchema = Type.Object({
   lastActiveAt: Type.Union([Type.Integer(), Type.Null()]),
   chatSessionId: Type.Union([Type.String(), Type.Null()]),
   preview: BotPreviewSchema,
+  /** Whether this Hermes profile is synchronized into the native CozyChat data plane. */
+  syncState: Type.Union([
+    Type.Literal("ready"),
+    Type.Literal("starting"),
+    Type.Literal("setup_required"),
+  ]),
   meta: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
@@ -95,7 +101,11 @@ export type BotCreateResponse = Static<typeof BotCreateResponseSchema>;
  * use this read-only state to keep the composer closed during that provisioning seam. */
 export const BotReadinessSchema = Type.Object({
   name: Type.String({ minLength: 1 }),
-  status: Type.Union([Type.Literal("starting"), Type.Literal("ready")]),
+  status: Type.Union([
+    Type.Literal("setup_required"),
+    Type.Literal("starting"),
+    Type.Literal("ready"),
+  ]),
   updatedAt: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false });
 export type BotReadiness = Static<typeof BotReadinessSchema>;
@@ -159,8 +169,17 @@ export type BotNewSessionResponse = Static<typeof BotNewSessionResponseSchema>;
  * deliberately NOT a Bot Mode session: `hermesSessionId` is meaningful only to Hermes and is
  * never interchangeable with a gateway-owned `sessionId`. The gateway intentionally withholds
  * titles, previews, transcripts, tool activity, paths, and any other desktop-private data. */
+export const HermesInteractiveSessionOriginSchema = Type.Union([
+  Type.Literal("desktop"),
+  Type.Literal("tui"),
+  Type.Literal("cli"),
+]);
+export type HermesInteractiveSessionOrigin = Static<typeof HermesInteractiveSessionOriginSchema>;
+
 export const BotDesktopHermesSessionSchema = Type.Object({
   source: Type.Literal("hermes_desktop"),
+  /** Exact Hermes surface that owns the row. Added at capability 3. */
+  origin: HermesInteractiveSessionOriginSchema,
   hermesSessionId: Type.String({ minLength: 1, maxLength: 256 }),
   /** Sanitized, optional display label. Preview/transcript/tool data never appears in discovery. */
   title: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
@@ -1542,7 +1561,7 @@ export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
  * nor native Bot Mode history. A client must gate this picker and its resume action on this id,
  * never on a later scalar value of `com.cozylabs.bots`. */
 export const HERMES_DESKTOP_SESSIONS_CAPABILITY_ID = "com.cozylabs.hermes-desktop-sessions";
-export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 2;
+export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 3;
 /** Reserved future A2A inbox seam. This is the sole future advertisement for the withdrawn
  * surface and has no version until Hermes exposes durable structured A2A identity, delivery/reply
  * metadata, and bounded replay. It is separate from `com.cozylabs.bots` because no later value
@@ -1679,4 +1698,6 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
 /** Capability 42: truthful Bot Activity previews plus credential-free, profile-local Hermes
  * memory setup. Roster previews never infer A2A provenance from transcript text, and setup runs
  * through the authenticated attached plugin; the gateway never opens profile configuration. */
-export const BOTS_CAPABILITY_VERSION = 42;
+/** Capability 43 adds authoritative synchronization state for every visible Hermes profile and
+ * the `setup_required` readiness outcome for profiles outside the attach map. */
+export const BOTS_CAPABILITY_VERSION = 43;

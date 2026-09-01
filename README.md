@@ -28,7 +28,8 @@ Open a new terminal afterward and type `cozygateway` on every supported host.
 No Docker, git, or build tools. It requires an existing Hermes installation and Node 24+. The
 bootstrap verifies versioned release checksums for the gateway bundle, complete Hermes attach-plugin
 archive, and installer payload. It discovers Hermes profile homes through the Hermes CLI, installs
-one attach identity per selected profile, and supervises one shared gateway service. Existing Hermes
+one attach identity per selected profile, and supervises one shared gateway service. The default
+scope remains `all`, so update and repair runs also provision newly discovered profiles. Existing Hermes
 profile gateway services stay Hermes-owned. Fresh interactive installs ask once whether CozyChat
 may connect over the local network; No (the default) keeps loopback (`127.0.0.1:8787`), while Yes
 binds all local interfaces and puts the detected LAN address in the pairing QR. The

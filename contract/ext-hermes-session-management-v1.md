@@ -2,7 +2,10 @@
 
 Capability id: `com.cozylabs.hermes-session-management`
 
-Current capability version: `2`
+Current capability version: `3`
+
+Version 3 adds the required privacy-safe `origin` label to every session summary so clients can
+distinguish Desktop, TUI, CLI, CozyGateway, and other Hermes-owned session sources accurately.
 
 Version 2 adds the exact session-detail read. Version 1 remains the discovery marker for an older
 Dashboard detail contract and MUST NOT be treated as safe administration availability: its exact
@@ -16,8 +19,8 @@ version 1 peer and must be presented as update-required. This is release guidanc
 must pass the full release checks before maintainers publish it.
 
 This paired-device extension administers sessions owned by one visible Hermes profile. It is
-separate from `com.cozylabs.hermes-desktop-sessions:2`, whose narrower promise remains TUI metadata
-discovery and exact adoption into Bot Mode. A `hermesSessionId` is an opaque Hermes identifier and
+separate from `com.cozylabs.hermes-desktop-sessions:3`, whose narrower promise is interactive
+Desktop/TUI/CLI metadata discovery and exact adoption into Bot Mode. A `hermesSessionId` is an opaque Hermes identifier and
 MUST NOT be accepted by a Bot Mode route or returned in a Bot Mode `sessionId` field.
 
 The gateway implementation maps these operations to Hermes' authoritative, profile-scoped

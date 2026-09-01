@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 # A delivery occurrence reaches exactly one of these once, and never leaves it. Everything else
 # ("pending", "journaled", "projected") is a stage on the way there and may still be upgraded.
 TERMINAL_RECEIPT_STATES = frozenset({"displayed", "failed"})
+INTERACTIVE_SESSION_SOURCES = frozenset({"desktop", "tui", "cli"})
+MIRROR_SESSION_SOURCES = INTERACTIVE_SESSION_SOURCES | {"cozygateway"}
 
 
 # The media lifecycle a single attachment walks for one delivery occurrence. Ranks are the only
@@ -140,7 +142,7 @@ CREATE TABLE IF NOT EXISTS delivery_receipts (
 CREATE TABLE IF NOT EXISTS desktop_session_links (
   thread_id TEXT PRIMARY KEY,
   current_hermes_session_id TEXT NOT NULL,
-  source TEXT NOT NULL CHECK (source IN ('cozygateway', 'tui')),
+  source TEXT NOT NULL CHECK (source IN ('cozygateway', 'desktop', 'tui', 'cli')),
   desktop_session_id TEXT,
   last_message_row_id INTEGER NOT NULL CHECK (last_message_row_id >= 0)
 ) STRICT;
@@ -160,11 +162,39 @@ class AttachSpool:
         self._db = sqlite3.connect(self._path, timeout=30)
         self._db.execute("PRAGMA busy_timeout=30000")
         self._db.executescript(_SCHEMA)
+        self._migrate_interactive_session_links()
         with self._db:
             self._db.execute(
                 "INSERT OR IGNORE INTO state (id, instance_id, next_event_sequence, command_cursor, event_cursor) VALUES (1, ?, 1, 0, 0)",
                 (str(uuid.uuid4()),),
             )
+
+    def _migrate_interactive_session_links(self) -> None:
+        """Expand the v2 TUI-only link table without losing a durable cursor."""
+        row = self._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'desktop_session_links'"
+        ).fetchone()
+        sql = str(row[0]) if row and row[0] else ""
+        if "'desktop'" in sql and "'cli'" in sql:
+            return
+        with self._db:
+            self._db.execute("ALTER TABLE desktop_session_links RENAME TO desktop_session_links_legacy")
+            self._db.execute(
+                "CREATE TABLE desktop_session_links ("
+                "thread_id TEXT PRIMARY KEY, "
+                "current_hermes_session_id TEXT NOT NULL, "
+                "source TEXT NOT NULL CHECK (source IN ('cozygateway', 'desktop', 'tui', 'cli')), "
+                "desktop_session_id TEXT, "
+                "last_message_row_id INTEGER NOT NULL CHECK (last_message_row_id >= 0)"
+                ") STRICT"
+            )
+            self._db.execute(
+                "INSERT INTO desktop_session_links "
+                "(thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id) "
+                "SELECT thread_id, current_hermes_session_id, source, desktop_session_id, last_message_row_id "
+                "FROM desktop_session_links_legacy"
+            )
+            self._db.execute("DROP TABLE desktop_session_links_legacy")
 
     def acquire_transport_lease(self) -> bool:
         """Become the sole websocket owner for this spool without touching its durable rows."""
@@ -360,7 +390,7 @@ class AttachSpool:
                 or len(current_hermes_session_id) > 256
                 or not isinstance(expected_current_hermes_session_id, str)
                 or not expected_current_hermes_session_id or len(expected_current_hermes_session_id) > 256
-                or expected_source not in {"cozygateway", "tui"}
+                or expected_source not in MIRROR_SESSION_SOURCES
                 or (expected_desktop_session_id is not None and (
                     not isinstance(expected_desktop_session_id, str) or len(expected_desktop_session_id) > 256))):
             return False
@@ -456,7 +486,7 @@ class AttachSpool:
         if (not isinstance(current_hermes_session_id, str) or not current_hermes_session_id
                 or len(current_hermes_session_id) > 256):
             raise ValueError("desktop mirror Hermes session id is required")
-        if source not in {"cozygateway", "tui"}:
+        if source not in MIRROR_SESSION_SOURCES:
             raise ValueError("desktop mirror source is invalid")
         if desktop_session_id is not None and (not isinstance(desktop_session_id, str) or not desktop_session_id or len(desktop_session_id) > 256):
             raise ValueError("desktop mirror desktop session id is invalid")

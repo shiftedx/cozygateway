@@ -3,8 +3,8 @@ import { type Static, Type } from "@sinclair/typebox";
 /** Privacy-projected administration of Hermes-owned sessions. This identity space is deliberately
  * separate from gateway-owned Bot Mode `sessionId` values. */
 export const HERMES_SESSION_MANAGEMENT_CAPABILITY_ID = "com.cozylabs.hermes-session-management";
-/** Version 2 adds an authoritative exact-session read used to reconcile ambiguous mutations. */
-export const HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION = 2;
+/** Version 3 adds sanitized Hermes session provenance (`origin`) to every summary. */
+export const HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION = 3;
 
 export const HERMES_SESSION_LIST_MAX = 100;
 export const HERMES_SESSION_SEARCH_MAX = 100;
@@ -23,6 +23,8 @@ export const HermesSessionSummarySchema = Type.Object({
   hermesSessionId: HermesSessionIdSchema,
   /** Stable root of an auto-compression lineage. Falls back to `hermesSessionId`. */
   hermesLineageId: HermesSessionIdSchema,
+  /** Sanitized Hermes `sessions.source`; known values include desktop, tui, cli, and cozygateway. */
+  origin: Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z0-9][a-z0-9._-]*$" }),
   title: Type.Optional(Type.String({ minLength: 1, maxLength: HERMES_SESSION_TITLE_MAX_LENGTH })),
   startedAt: Type.Integer({ minimum: 0 }),
   lastActiveAt: Type.Integer({ minimum: 0 }),
