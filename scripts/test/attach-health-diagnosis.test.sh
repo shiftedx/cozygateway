@@ -13,7 +13,15 @@ eval "$health_block"
 NODE_RESOLVED="$(command -v node)"
 DRY_RUN=0
 gateway_origin() { printf 'http://127.0.0.1:8787'; }
-curl() { printf '%s' "$HEALTH_JSON"; }
+curl() {
+  if [ -n "${HEALTH_COUNTER_FILE:-}" ]; then
+    local count
+    count="$(<"$HEALTH_COUNTER_FILE")"
+    printf '%s\n' "$((count + 1))" > "$HEALTH_COUNTER_FILE"
+    if [ "$count" -gt 0 ]; then printf '%s' '{"attach":{"configured":2,"online":2,"deadLetters":0}}'; return; fi
+  fi
+  printf '%s' "$HEALTH_JSON"
+}
 seq() { printf '1\n'; }
 sleep() { :; }
 die() { printf 'FAIL  %s\n' "$*" >&2; return 1; }
@@ -33,7 +41,19 @@ assert_diagnosis() {
 }
 
 assert_diagnosis '{"attach":{"configured":2,"online":1,"deadLetters":0,"profiles":["must-not-leak"]}}' 'Hermes attach profile count mismatch (configured=2, online=1, deadLetters=0)'
+if HEALTH_JSON='{"attach":{"configured":2,"online":1,"deadLetters":0,"profiles":["must-not-leak"]}}' wait_attach_ready 2>&1 | grep -Fq 'must-not-leak'; then
+  echo 'attach health diagnosis exposed a non-aggregate field' >&2
+  exit 1
+fi
 assert_diagnosis '{"attach":{"configured":0,"online":0,"deadLetters":0}}' 'Hermes attach has no configured profiles (configured=0, online=0, deadLetters=0)'
 assert_diagnosis '{"attach":{"configured":1,"online":1,"deadLetters":3}}' 'Hermes attach retained dead letters (configured=1, online=1, deadLetters=3)'
 assert_diagnosis 'not-json' 'Hermes attach health could not be read'
+late_counter="${TMPDIR:-/tmp}/cozygateway-attach-health-counter.$$"
+printf '0\n' > "$late_counter"
+trap 'rm -f "$late_counter"' EXIT
+if ! late_output="$(HEALTH_JSON='{"attach":{"configured":2,"online":1,"deadLetters":0}}' HEALTH_COUNTER_FILE="$late_counter" wait_attach_ready 2>&1)"; then
+  printf '%s\n' "$late_output" >&2
+  echo 'a final healthy attach snapshot must satisfy readiness' >&2
+  exit 1
+fi
 printf 'attach health diagnosis tests passed\n'
