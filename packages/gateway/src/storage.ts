@@ -1845,8 +1845,15 @@ export class Storage {
       return true;
     }
     const row = this.#db
-      .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM attach_command_outbox WHERE agent_id = ?")
-      .get(agentId) as { sequence: number };
+      .prepare(
+        `SELECT COALESCE(
+           MAX(sequence),
+           (SELECT next_command_sequence - 1 FROM attach_streams WHERE agent_id = ?),
+           0
+         ) AS sequence
+         FROM attach_command_outbox WHERE agent_id = ?`,
+      )
+      .get(agentId, agentId) as { sequence: number };
     if (commandThrough > row.sequence) return false;
     this.#db
       .prepare(

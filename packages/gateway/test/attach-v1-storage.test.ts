@@ -24,6 +24,7 @@ describe("attach-v1 durable transport storage", () => {
     expect(storage.reconcileAttachResume("sage", 118_129, 460, 1)).toBe(true);
     expect(storage.attachEventCursor("sage")).toBe(118_129);
     expect(storage.attachCommandCursor("sage")).toBe(460);
+    expect(storage.reconcileAttachResume("sage", 118_129, 460, 2)).toBe(true);
     expect(storage.enqueueAttachCommand("sage", "c461", { kind: "interrupt", threadId: "t", turnId: "u" }, 2).sequence).toBe(461);
     expect(storage.reconcileAttachResume("sage", 118_129, 462, 3)).toBe(false);
     storage.close();
