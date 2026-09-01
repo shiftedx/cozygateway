@@ -438,6 +438,20 @@ claim_profile_env() {
   env_put "$file" "$ENV_OWNER_KEY" "$ENV_OWNER_VALUE"
 }
 new_token() { if have openssl; then openssl rand -hex 32; else head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c1-48; fi; }
+token_seen() {
+  local candidate="$1" seen_token
+  for seen_token in "${TOKENS[@]:-}"; do [ "$candidate" != "$seen_token" ] || return 0; done
+  return 1
+}
+profile_token() {
+  local candidate="$1" attempts=0
+  if safe_secret "$candidate" && ! token_seen "$candidate"; then printf '%s' "$candidate"; return; fi
+  while [ "$attempts" -lt 10 ]; do
+    candidate="$(new_token)"; attempts=$((attempts + 1))
+    safe_secret "$candidate" && ! token_seen "$candidate" && { printf '%s' "$candidate"; return; }
+  done
+  die "could not generate a distinct CozyGateway attach token"
+}
 token_env_name() { printf 'COZYGATEWAY_ATTACH_TOKEN_%s' "$(printf '%s' "$1" | tr '[:lower:].-' '[:upper:]__')"; }
 gateway_state() {
   local status
@@ -499,8 +513,7 @@ write_gateway_env() {
   umask 077; : > "$GATEWAY_ENV"
   env_write "$GATEWAY_ENV" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
   for p in "${SELECTED[@]}"; do
-    profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; safe_secret "$token" || token="$(new_token)"; env_name="$(token_env_name "$p")"
-    for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
+    profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(profile_token "$(env_get "$profile_env" COZYGATEWAY_TOKEN)")"; env_name="$(token_env_name "$p")"
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done
     TOKENS+=("$token"); TOKEN_ENVS+=("$env_name")
     env_put "$profile_env" COZYGATEWAY_URL "$(gateway_origin)"; env_put "$profile_env" COZYGATEWAY_TOKEN "$token"
