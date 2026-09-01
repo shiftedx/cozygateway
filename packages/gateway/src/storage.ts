@@ -120,6 +120,13 @@ CREATE TABLE IF NOT EXISTS live_activity_relay_deletion_outbox (
   push_id TEXT NOT NULL UNIQUE,
   queued_at INTEGER NOT NULL
 ) STRICT;
+-- Successful global skill mutations are retained for retry safety. The Hermes configs remain the
+-- source of truth; this is only the 24-hour request-id receipt the control plane needs.
+CREATE TABLE IF NOT EXISTS hermes_global_skill_requests (
+  request_id TEXT PRIMARY KEY,
+  result_json TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+) STRICT;
 -- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
 -- tables below.
 CREATE TABLE IF NOT EXISTS bot_roster (
@@ -678,6 +685,22 @@ export class Storage {
 
   touchDevice(id: string, at: number): void {
     this.#db.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").run(at, id);
+  }
+
+  hermesGlobalSkillRequest(requestId: string, now: number): unknown | undefined {
+    this.#db.prepare("DELETE FROM hermes_global_skill_requests WHERE expires_at < ?").run(now);
+    const row = this.#db.prepare(
+      "SELECT result_json AS resultJson FROM hermes_global_skill_requests WHERE request_id = ? AND expires_at >= ?",
+    ).get(requestId, now) as { resultJson: string } | undefined;
+    if (row === undefined) return undefined;
+    try { return JSON.parse(row.resultJson) as unknown; } catch { return undefined; }
+  }
+
+  rememberHermesGlobalSkillRequest(requestId: string, result: unknown, expiresAt: number): void {
+    this.#db.prepare(
+      `INSERT INTO hermes_global_skill_requests (request_id, result_json, expires_at)
+       VALUES (?, ?, ?) ON CONFLICT(request_id) DO NOTHING`,
+    ).run(requestId, JSON.stringify(result), expiresAt);
   }
 
   upsertAgent(agent: AgentRow): void {

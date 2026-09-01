@@ -38,9 +38,19 @@ import { GatewaySettingsPersistenceError } from "./gateway-settings.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
+import { HermesUnavailable } from "./hermes-bridge/client.ts";
 import { GatewayHarnessSettings, HarnessSettingsInvalid } from "./harness-settings.ts";
 import type { BotControlSurface, BotsSurface } from "./hermes-bridge/bridge.ts";
 import { ProviderSetupInvalid } from "./hermes-bridge/provider-setup.ts";
+import {
+  GatewayHermesGlobalSkills,
+  GlobalSkillsBusy,
+  GlobalSkillsInvalid,
+  GlobalSkillsNoProfiles,
+  GlobalSkillsNotFound,
+  GlobalSkillsPersistenceFailed,
+  GlobalSkillsStale,
+} from "./hermes-bridge/global-skills.ts";
 import type { MemorySurface } from "./hermes-bridge/memory.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
@@ -192,6 +202,10 @@ export interface AppDeps {
   harnessUpdates?: GatewayHarnessUpdates;
   /** Privacy-projected Hermes-owned session administration, scoped by visible harness/profile. */
   hermesSessions?: GatewayHermesSessionManagement;
+  /** Paired-device projection of `skills.disabled` across every configured Hermes profile. */
+  hermesGlobalSkills?: GatewayHermesGlobalSkills;
+  /** Privacy-safe audit sink for global skill changes. */
+  hermesGlobalSkillsLog?: (line: string) => void;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
@@ -248,6 +262,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
   const relayFetch = deps.pushRelayFetch ?? fetch;
   const relayLog = deps.pushRelayLog ?? ((message: string) => process.stderr.write(`${message}\n`));
   const gatewaySettingsLog = deps.gatewaySettingsLog
+    ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const globalSkillsLog = deps.hermesGlobalSkillsLog
     ?? ((message: string) => process.stderr.write(`${message}\n`));
   const relayBase = deps.config.pushRelayUrl?.replace(/\/+$/, "");
   const requestLiveActivityDeletionDrain = (() => {
@@ -821,6 +837,71 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   app.get("/devices", requireDevice, (c) => c.json(deps.storage.listDevices()));
+
+  if (deps.hermesGlobalSkills !== undefined) {
+    const globalSkillError = (code: string, message: string) => ({ error: { code, message } });
+    const globalSkillsFailure = (c: Context<Env>, error: unknown) => {
+      if (error instanceof GlobalSkillsInvalid)
+        return c.json(globalSkillError("invalid_skill_name", "Skill name or update is invalid"), 400);
+      if (error instanceof GlobalSkillsNotFound)
+        return c.json(globalSkillError("skill_not_found", "This skill is not available on the managed Hermes profiles."), 404);
+      if (error instanceof GlobalSkillsStale)
+        return c.json({
+          ...globalSkillError("stale_revision", "Global skill settings changed. Refresh and try again."),
+          current: error.current,
+        }, 409);
+      if (error instanceof GlobalSkillsBusy)
+        return c.json(globalSkillError("operation_in_progress", "Another global skill update is in progress. Try again shortly."), 409);
+      if (error instanceof GlobalSkillsNoProfiles)
+        return c.json(globalSkillError("no_managed_profiles", "No managed Hermes profiles are available."), 422);
+      if (error instanceof HermesUnavailable)
+        return c.json(globalSkillError("hermes_unavailable", "Hermes is unavailable. Try again shortly."), 503);
+      if (error instanceof GlobalSkillsPersistenceFailed)
+        return c.json(globalSkillError("persistence_failed", "Global skill settings could not be saved."), 500);
+      return c.json(globalSkillError("persistence_failed", "Global skill settings could not be saved."), 500);
+    };
+    app.get("/hermes/skills", requireDevice, async (c) => {
+      try { return c.json(await deps.hermesGlobalSkills!.read()); }
+      catch (error) { return globalSkillsFailure(c, error); }
+    });
+    app.patch("/hermes/skills/:skillName", requireDevice, async (c) => {
+      const body = await readBody(c);
+      const skillName = c.req.param("skillName");
+      const request = typeof body === "object" && body !== null && !Array.isArray(body)
+        ? body as Record<string, unknown> : {};
+      const audit = (outcome: string) => globalSkillsLog(JSON.stringify({
+        component: "hermes-global-skills",
+        deviceId: c.get("deviceId"),
+        skillName: typeof skillName === "string" ? skillName.trim().slice(0, 256) : "",
+        enabled: request["enabled"] === true,
+        targetCount: deps.hermesGlobalSkills!.targetCount,
+        requestId: typeof request["requestId"] === "string" ? request["requestId"].slice(0, 64) : "",
+        outcome,
+      }));
+      try {
+        const snapshot = await deps.hermesGlobalSkills!.mutate({
+          skillName, enabled: request["enabled"], expectedRevision: request["expectedRevision"], requestId: request["requestId"],
+        });
+        audit("success");
+        return c.json(snapshot);
+      } catch (error) {
+        audit(error instanceof Error ? error.constructor.name : "failed");
+        // The device receives only a display-safe envelope below. Operators still need the
+        // underlying Hermes/Dashboard exception (including a filesystem diagnostic when Hermes
+        // supplied one) to repair a failed write, so retain it in the server-only trace.
+        globalSkillsLog(JSON.stringify({
+          component: "hermes-global-skills",
+          event: "mutation-failed",
+          deviceId: c.get("deviceId"),
+          requestId: typeof request["requestId"] === "string" ? request["requestId"].slice(0, 64) : "",
+          error: error instanceof Error
+            ? { name: error.name, message: error.message }
+            : { name: "unknown", message: String(error) },
+        }));
+        return globalSkillsFailure(c, error);
+      }
+    });
+  }
 
   // Issue #193's operator surface. A projection dead letter head-of-line blocks its agent's
   // whole event stream; before these routes the only remedies were DB surgery or a redeploy.

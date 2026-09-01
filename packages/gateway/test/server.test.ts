@@ -17,6 +17,7 @@ import {
 import { testHermes } from "./support/test-config.ts";
 import { startFakeHermesServer } from "./support/fake-hermes-server.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
+import { HERMES_GLOBAL_SKILLS_CAPABILITY_ID } from "../src/hermes-bridge/global-skills.ts";
 import { openStorage } from "../src/storage.ts";
 import { PHOTO_SWEEP_MS } from "../src/hermes-bridge/photos.ts";
 
@@ -350,6 +351,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.some-unrecognized-thing": 7,
         // Built-in evidence-gated capabilities cannot be forced on through free-form config.
         "com.cozylabs.harness-update": 99,
+        [HERMES_GLOBAL_SKILLS_CAPABILITY_ID]: 99,
       },
     });
     try {
@@ -388,6 +390,68 @@ describe("GatewayInfo.capabilities wiring", () => {
       expect(ready?.type === "ready" ? ready.gateway.capabilities : undefined).toEqual(health.capabilities);
     } finally {
       await gw.close();
+    }
+  });
+
+  it("advertises global skills only after Dashboard config and the profile catalog both prove usable", async () => {
+    const configs = new Map<string, Record<string, unknown>>([["mock", { skills: { disabled: [] } }]]);
+    const upstream = await startFakeHermesServer({
+      methods: {
+        "profiles.describe": ({ name }) => ({
+          skills: name === "mock" ? [{ name: "1password" }] : [],
+        }),
+      },
+      dashboard: ({ method, path, query, body }) => {
+        if (path !== "/api/config") return { status: 404, body: { detail: "Not Found" } };
+        const profile = query.get("profile") ?? "";
+        const current = configs.get(profile);
+        if (current === undefined) return { status: 404, body: { detail: "Not Found" } };
+        if (method === "GET") return { body: current };
+        const patch = body as { config?: Record<string, unknown> };
+        const skills = patch.config?.["skills"];
+        configs.set(profile, {
+          ...current,
+          ...(skills === undefined ? {} : { skills: { ...(current["skills"] as Record<string, unknown>), ...(skills as Record<string, unknown>) } }),
+        });
+        return { body: { ok: true } };
+      },
+    });
+    const gw = await startGateway({
+      name: "global-skills-capability",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes(upstream.url) }],
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.[HERMES_GLOBAL_SKILLS_CAPABILITY_ID]).toBe(1);
+    } finally {
+      await gw.close();
+      await upstream.close();
+    }
+  });
+
+  it("withholds global skills when Hermes returns a malformed profile catalog", async () => {
+    const upstream = await startFakeHermesServer({
+      methods: { "profiles.describe": () => ({}) },
+      dashboard: ({ path }) => path === "/api/config"
+        ? { body: { skills: { disabled: [] } } }
+        : { status: 404, body: { detail: "Not Found" } },
+    });
+    const gw = await startGateway({
+      name: "malformed-global-skills-catalog",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes(upstream.url) }],
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.[HERMES_GLOBAL_SKILLS_CAPABILITY_ID]).toBeUndefined();
+    } finally {
+      await gw.close();
+      await upstream.close();
     }
   });
 
