@@ -20,6 +20,28 @@ release archive, installs it into each selected Hermes profile, enables it, and
 writes a distinct profile token and spool path. Use the one-paste installer in
 the repository README rather than copying an incomplete subset of this plugin.
 
+### Coordinated version upgrades
+
+The canonical installer is the preferred upgrade path because it installs the
+Gateway and attach plugin from one checksum-verified release. Do not roll a new
+plugin through an old Gateway, or a new Gateway through an old or prerelease
+plugin, and wait for that mixed pair to become healthy. Attach capabilities are
+part of the versioned hello: v0.4.3 rejects a capability it does not know, while
+tagged v0.5.2 rejects the divergent capability offer from its prerelease plugin.
+Intersection applies only after both peers accept the hello; it is not a
+cross-version deployment guarantee.
+
+For a manual production upgrade, first stage the exact matching tagged Gateway
+and plugin without changing the live services. Back up the current Gateway
+revision or image, config, and plugin tree (outside every `plugins/` directory),
+migrate and validate the config against the new Gateway, and run the plugin
+deploy dry-run. Then use one bounded maintenance window to cut over the staged
+Gateway and the clean plugin tree. Either mixed-version intermediate may be
+unavailable; do not use it as a health gate or send work through it. Verify only
+after every plugin has reconnected to the matching Gateway and the final
+`hello_ack` contains the capabilities the release requires. If verification
+fails, restore the captured config, Gateway, and plugin set together.
+
 ## Manual install
 
 Copy this directory as one entry in your harness's plugin directory (it already contains the root
@@ -76,8 +98,9 @@ Dependencies: Python 3.10+ and the `websockets` package.
   credential-free setup additionally negotiates `memory_setup`; both names must appear in the
   `hello_ack` intersection before setup is available. The setup lane uses the version-matched
   release plugin and Hermes' native config writer, returns a fresh source projection, and never
-  sends memory content through the durable event spool. An old or not-yet-restarted plugin produces
-  a bounded unavailable response instead of accepting or retaining the mutation for reconnect.
+  sends memory content through the durable event spool. After a coordinated upgrade, a missing
+  negotiated capability produces a bounded unavailable response instead of accepting or retaining
+  the mutation for reconnect; it is evidence that the final matched-version cutover is incomplete.
 - Disconnects re-dial with capped, jittered backoff. Two closes are terminal: a rejected
   token (close 1008) and being superseded by a newer connection (close 4000).
 
