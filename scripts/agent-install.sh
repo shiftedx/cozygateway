@@ -1577,7 +1577,7 @@ start_dashboard() {
     dashboard_ready && die "Dashboard stayed listening after stop; refusing to launch with an unverified credential"
   fi
   launch_dashboard
-  for _ in $(seq 1 30); do dashboard_ready && break; sleep 1; done
+  for _ in $(seq 1 90); do dashboard_ready && break; sleep 1; done
   dashboard_ready || die "Hermes Dashboard did not start listening on 127.0.0.1:$DASHBOARD_PORT"
   code="$(dashboard_credentials_status)"
   case "$code" in
