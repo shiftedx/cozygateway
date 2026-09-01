@@ -240,13 +240,18 @@ test -x "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh"
 test -f "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh.sha256"
 grep -Fq -- '--gateway-dir' "$tmp/bootstrap-handoff"
 test -z "$(find "$tmp/bootstrap-live-home" -maxdepth 1 -name '.bootstrap.*' -print -quit)"
-mkdir -p "$tmp/bootstrap-unsafe-home" "$tmp/bootstrap-unsafe-target"
-ln -s "$tmp/bootstrap-unsafe-target" "$tmp/bootstrap-unsafe-home/bin"
-if unsafe_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
-  echo 'symlinked bootstrap bin must be rejected' >&2
-  exit 1
-fi
-expect_contains "$unsafe_bootstrap_output" 'refusing symlinked installer directory'
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    mkdir -p "$tmp/bootstrap-unsafe-home" "$tmp/bootstrap-unsafe-target"
+    ln -s "$tmp/bootstrap-unsafe-target" "$tmp/bootstrap-unsafe-home/bin"
+    if unsafe_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+      echo 'symlinked bootstrap bin must be rejected' >&2
+      exit 1
+    fi
+    expect_contains "$unsafe_bootstrap_output" 'refusing symlinked installer directory'
+    ;;
+esac
 
 # Verify everything before promotion: a late bootstrap checksum failure cannot
 # partially replace a healthy installed bundle, plugin, installer, or bootstrap.
