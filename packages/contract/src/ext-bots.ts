@@ -181,6 +181,13 @@ export const BotRuntimeStageSchema = Type.Union([
   Type.Literal("recovering"),
   Type.Literal("upgrading"),
   Type.Literal("deleting"),
+  /** Terminal for a delete: the runner has removed the container and the bot-exclusive volumes.
+   * The route stops answering for the bot once this lands, because nothing is left to project. */
+  Type.Literal("deleted"),
+  /** The gateway has purged the bot and accepted the delete, and a runner has not yet said
+   * anything about it. The bot is already gone from the roster and its credential already dead;
+   * this stage exists so a client that was watching the runtime can see the cleanup finish. */
+  Type.Literal("deletion_pending"),
   Type.Literal("needs_attention"),
 ]);
 export type BotRuntimeStage = Static<typeof BotRuntimeStageSchema>;
@@ -194,6 +201,8 @@ export type BotRuntimeStage = Static<typeof BotRuntimeStageSchema>;
 export const BotRuntimeProjectionSchema = Type.Object({
   stage: BotRuntimeStageSchema,
   specGeneration: Type.Integer({ minimum: 1 }),
+  /** The generation a runner last confirmed RUNNING, so it only ever advances on a `ready`
+   * receipt. An in-progress stage says what is being attempted, not what is observed. */
   observedGeneration: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   lastRunnerContactAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   /** A stable, safe error code from the latest receipt, when the runner sent one. */

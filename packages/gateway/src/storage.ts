@@ -596,6 +596,26 @@ export interface RuntimeBotRow {
 
 export type RunnerOperationKind = "create_runtime" | "delete_runtime";
 
+/** The provisioning progression, in order. Only these stages are ordered against each other:
+ *  everything else a runner can receipt is a transition out of the progression rather than a step
+ *  along it, so it is always allowed to land. */
+const RUNNER_PROGRESSION: readonly string[] = [
+  "waiting_for_runner",
+  "waiting_for_capacity",
+  "pulling_image",
+  "creating",
+  "starting",
+  "ready",
+];
+
+/** Whether `next` would walk the recorded stage backwards along the provisioning progression. */
+export function regressesRunnerStage(current: string, next: string): boolean {
+  const from = RUNNER_PROGRESSION.indexOf(current);
+  const to = RUNNER_PROGRESSION.indexOf(next);
+  if (from === -1 || to === -1) return false;
+  return to < from;
+}
+
 /** One durable lifecycle operation plus the latest receipt a runner sent for it. */
 export interface RunnerOperationRow {
   operationId: string;
@@ -3709,12 +3729,28 @@ export class Storage {
     }));
   }
 
+  /** Primary-key lookup. Every route that touches a runtime bot calls this, so it reads the one
+   *  row by id rather than scanning the table. */
   runtimeBot(id: string): RuntimeBotRow | undefined {
-    return this.runtimeBots().find((row) => row.id === id);
-  }
-
-  deleteRuntimeBot(id: string): boolean {
-    return Number(this.#db.prepare("DELETE FROM runtime_bots WHERE id = ?").run(id).changes) > 0;
+    const row = this.#db
+      .prepare(
+        `SELECT id, name, avatar, token, runtime, spec_generation, created_at
+         FROM runtime_bots WHERE id = ?`,
+      )
+      .get(id) as unknown as
+      | { id: string; name: string; avatar: string | null; token: string; runtime: string; spec_generation: number; created_at: number }
+      | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          id: row.id,
+          name: row.name,
+          avatar: row.avatar,
+          token: row.token,
+          runtime: "cozyagents",
+          specGeneration: row.spec_generation,
+          createdAt: row.created_at,
+        };
   }
 
   /** Durably accepts a lifecycle operation. It waits in `waiting_for_runner` whether or not a
@@ -3776,9 +3812,20 @@ export class Storage {
       .run();
   }
 
-  /** Records one immutable stage receipt onto its operation. A receipt for an operation this
-   *  gateway never issued is ignored and reported as such: a runner cannot invent lifecycle state
-   *  for a bot the gateway does not own. */
+  /** Records one immutable stage receipt onto its operation.
+   *
+   *  Three guards, each of which exists because a runner is a separate process that can retry,
+   *  reconnect, and deliver out of order:
+   *
+   *  - A receipt for an operation this gateway never issued, or for a different bot than the one
+   *    the operation names, is `unknown` and changes nothing. The gateway is the lifecycle
+   *    authority; a runner cannot invent state for a bot it was not asked about.
+   *  - A receipt that would move the stage BACKWARDS along the provisioning progression (a
+   *    `creating` arriving after `ready`) is `stale`: the contact is recorded, the stage is not.
+   *    Stages outside that progression (`needs_attention`, `deleting`, `stopped`, ...) are real
+   *    lifecycle transitions and always apply.
+   *  - `observed_generation` advances only on `ready`. An in-progress stage says what is being
+   *    attempted, never what is running. */
   recordRunnerReceipt(receipt: {
     operationId: string;
     botId: string;
@@ -3786,25 +3833,30 @@ export class Storage {
     stage: string;
     at: number;
     code?: string;
-  }): boolean {
-    const changes = Number(
+  }): "recorded" | "stale" | "unknown" {
+    const current = this.runnerOperation(receipt.operationId);
+    if (current === undefined || current.bot !== receipt.botId) return "unknown";
+    if (regressesRunnerStage(current.stage, receipt.stage)) {
       this.#db
-        .prepare(
-          `UPDATE runner_operations
-             SET stage = ?, code = ?, observed_generation = ?, last_contact_at = ?, updated_at = ?
-           WHERE operation_id = ? AND bot = ?`,
-        )
-        .run(
-          receipt.stage,
-          receipt.code ?? null,
-          receipt.specGeneration,
-          receipt.at,
-          receipt.at,
-          receipt.operationId,
-          receipt.botId,
-        ).changes,
-    );
-    return changes > 0;
+        .prepare("UPDATE runner_operations SET last_contact_at = ?, updated_at = ? WHERE operation_id = ?")
+        .run(receipt.at, receipt.at, receipt.operationId);
+      return "stale";
+    }
+    this.#db
+      .prepare(
+        `UPDATE runner_operations
+           SET stage = ?, code = ?, observed_generation = ?, last_contact_at = ?, updated_at = ?
+         WHERE operation_id = ?`,
+      )
+      .run(
+        receipt.stage,
+        receipt.code ?? null,
+        receipt.stage === "ready" ? receipt.specGeneration : current.observedGeneration,
+        receipt.at,
+        receipt.at,
+        receipt.operationId,
+      );
+    return "recorded";
   }
 
   #runnerOperations(sql: string, ...params: string[]): RunnerOperationRow[] {

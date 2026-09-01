@@ -31,6 +31,7 @@ export const RunnerStageSchema = Type.Union([
   Type.Literal("recovering"),
   Type.Literal("upgrading"),
   Type.Literal("deleting"),
+  Type.Literal("deleted"),
   Type.Literal("needs_attention"),
 ]);
 export type RunnerStage = Static<typeof RunnerStageSchema>;
@@ -49,22 +50,25 @@ export const RunnerHelloSchema = Type.Object({
   }),
   inventory: Type.Optional(
     Type.Array(
+      // Additive fields are ALLOWED here and on every other runner frame: a runner that starts
+      // reporting an image digest or a measured isolation level must not have its socket closed by
+      // an older gateway. Unknown properties are ignored, never echoed, and never persisted.
       Type.Object({
         botId: Type.String({ minLength: 1, maxLength: 64 }),
         specGeneration: Type.Integer({ minimum: 0 }),
         stage: RunnerStageSchema,
-      }, { additionalProperties: false }),
+      }),
       { maxItems: 256 },
     ),
   ),
-}, { additionalProperties: false });
+});
 export type RunnerHello = Static<typeof RunnerHelloSchema>;
 
 /** The runner's heartbeat answer. It carries nothing: liveness is the whole message. */
 export const RunnerHeartbeatSchema = Type.Object({
   kind: Type.Literal("heartbeat"),
   sentAt: Type.Optional(Type.Integer({ minimum: 0 })),
-}, { additionalProperties: false });
+});
 
 /** An immutable stage receipt. `code` is a stable, safe error identifier, never free-form
  *  diagnostics: no secrets, no env values, no host paths, and no workspace content ever cross
@@ -77,7 +81,7 @@ export const RunnerReceiptSchema = Type.Object({
   stage: RunnerStageSchema,
   at: Type.Integer({ minimum: 0 }),
   code: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
-}, { additionalProperties: false });
+});
 export type RunnerReceipt = Static<typeof RunnerReceiptSchema>;
 
 export const RunnerClientFrameSchema = Type.Union([
@@ -97,7 +101,9 @@ export interface RunnerCreateRuntimePayload {
   specGeneration: number;
   attachToken: string;
   image?: string;
-  entrypoint?: string;
+  /** Argv, not a shell string: the process backend spawns it directly, so quoting rules never
+   *  enter into it. */
+  entrypoint?: string[];
   model?: { provider?: string; endpoint?: string; id: string };
   resources?: { cpus?: number; memoryMb?: number; pids?: number };
 }
@@ -107,6 +113,11 @@ export interface RunnerDeleteRuntimePayload {
   botId: string;
   specGeneration: number;
 }
+
+/** The frame kinds this gateway understands. A frame naming anything else is IGNORED with a log
+ *  line rather than closing the socket, so a runner that adds a frame type stays connected to an
+ *  older gateway instead of being disconnected mid-reconciliation. */
+export const RUNNER_CLIENT_FRAME_KINDS: ReadonlySet<string> = new Set(["hello", "heartbeat", "receipt"]);
 
 export type RunnerServerFrame =
   | { kind: "hello_ack"; version: number; heartbeatIntervalMs: number }

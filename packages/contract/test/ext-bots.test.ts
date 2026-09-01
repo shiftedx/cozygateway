@@ -677,6 +677,11 @@ describe("capability advertisement", () => {
       }),
     ).toBe(true);
     expect(check(BotRuntimeProjectionSchema, { stage: "invented", specGeneration: 1, observedGeneration: null, lastRunnerContactAt: null })).toBe(false);
+    // The two stages a delete moves through are part of the closed union, so a client can render
+    // the cleanup finishing instead of the bot simply vanishing mid-operation.
+    for (const stage of ["deletion_pending", "deleting", "deleted"]) {
+      expect(check(BotRuntimeProjectionSchema, { stage, specGeneration: 1, observedGeneration: 1, lastRunnerContactAt: 1 })).toBe(true);
+    }
     expect(
       check(BotRuntimeProjectionSchema, {
         stage: "ready", specGeneration: 1, observedGeneration: 1, lastRunnerContactAt: 1,

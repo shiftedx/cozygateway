@@ -10,6 +10,7 @@ import {
   RUNNER_V1_HEARTBEAT_INTERVAL_MS,
   RUNNER_V1_HEARTBEAT_TIMEOUT_MS,
   RUNNER_V1_VERSION,
+  RUNNER_CLIENT_FRAME_KINDS,
   RunnerClientFrameSchema,
   type RunnerClientFrame,
   type RunnerCreateRuntimePayload,
@@ -186,8 +187,17 @@ export class RunnerLane {
         socket.close(1002, "frame is not JSON");
         return;
       }
+      // A frame kind this gateway has never heard of is IGNORED, not fatal: a runner that grows a
+      // new frame type must stay connected to an older gateway rather than be disconnected in the
+      // middle of a reconciliation. A KNOWN kind that fails its schema is still a loud refusal,
+      // because that is a real skew in a frame this gateway acts on.
+      const kind = (decoded as { kind?: unknown }).kind;
+      if (typeof kind !== "string" || !RUNNER_CLIENT_FRAME_KINDS.has(kind)) {
+        this.#log(`ignored an unknown runner-v1 frame kind ${typeof kind === "string" ? kind : "(absent)"}`);
+        return;
+      }
       if (!check(RunnerClientFrameSchema, decoded)) {
-        socket.close(1002, "unknown runner-v1 frame");
+        socket.close(1002, `malformed runner-v1 ${kind} frame`);
         return;
       }
       const frame = decoded as RunnerClientFrame;
@@ -248,7 +258,7 @@ export class RunnerLane {
   }
 
   #receipt(receipt: RunnerReceipt): void {
-    const recorded = this.#storage.recordRunnerReceipt({
+    const outcome = this.#storage.recordRunnerReceipt({
       operationId: receipt.operationId,
       botId: receipt.botId,
       specGeneration: receipt.specGeneration,
@@ -256,11 +266,17 @@ export class RunnerLane {
       at: receipt.at,
       ...(receipt.code === undefined ? {} : { code: receipt.code }),
     });
-    if (!recorded) {
+    if (outcome === "unknown") {
       // A receipt naming an operation this gateway never issued, or one issued for another bot, is
       // dropped rather than trusted: the gateway is the lifecycle authority, and a runner cannot
       // assert state for a bot it was not asked about.
       this.#log(`ignored a receipt for unknown operation ${receipt.operationId}`);
+      return;
+    }
+    if (outcome === "stale") {
+      // Contact recorded, stage untouched: a retried or reordered receipt must never walk a bot
+      // back from `ready` to `creating` on somebody's screen.
+      this.#log(`ignored a stale ${receipt.stage} receipt for operation ${receipt.operationId}`);
       return;
     }
     this.#log(

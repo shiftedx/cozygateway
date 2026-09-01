@@ -64,8 +64,9 @@ import {
  * roster projection, and knows nothing about tokens, operations, or runners. */
 export interface RuntimeBotLifecycle {
   owns(id: string): boolean;
+  hasRuntime(id: string): boolean;
   create(input: BotCreateRequest, row: (id: string) => BotSummary): BotCreateResponse;
-  delete(name: string): BotDeleteResponse;
+  delete(name: string, opts: { force?: boolean }): BotDeleteResponse;
   projection(name: string): BotRuntimeProjection;
 }
 
@@ -360,7 +361,7 @@ export class NativeBotDataPlane {
         if (runtimeBot === undefined) return this.#control.deleteBot(name, opts);
         if (this.#runtimeLifecycle?.owns(bot) !== true)
           throw new UnsupportedForRuntime(bot, "deleteBot", runtimeBot.runtime);
-        return this.#runtimeLifecycle.delete(bot);
+        return this.#runtimeLifecycle.delete(bot, opts ?? {});
       },
       botRuntime: (name) => this.#botRuntime(name),
       readiness: (name) => this.#readiness(name),
@@ -532,9 +533,20 @@ export class NativeBotDataPlane {
    * `409 unsupported_for_runtime` every other Hermes-shaped surface answers for the wrong kind. */
   #botRuntime(name: string): BotRuntimeProjection {
     const bot = normalize(name);
-    if (this.#runtimeLifecycle?.owns(bot) !== true)
+    // Three different answers, and the difference matters to a client: a bot that never had a
+    // gateway-owned runtime has none to project (409, the same wrong-kind answer every other
+    // Hermes-shaped surface gives), a live one projects, and one whose delete the runner has
+    // finished is simply gone (404, from `BotNotFound` below).
+    if (this.#runtimeLifecycle?.hasRuntime(bot) !== true)
       throw new UnsupportedForRuntime(bot, "botRuntime", "cozyagents");
     return this.#runtimeLifecycle.projection(bot);
+  }
+
+  /** Every runtime bot this gateway serves right now, config-declared and gateway-created alike.
+   * Live rather than a snapshot: room membership is answered from this set, so a bot created from
+   * the app can join a room without a restart. */
+  runtimeBotNames(): ReadonlySet<string> {
+    return new Set(this.#runtimeBots.keys());
   }
 
   /** Registers a runtime bot created at runtime, with no restart: the roster row, the native set

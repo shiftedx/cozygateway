@@ -35,8 +35,14 @@ Authorization: Bearer <COZYGATEWAY_RUNNER_TOKEN>
 - One runner at a time. A second authenticated hello supersedes the first with close code `4000`,
   because two reconcilers against one Docker host is exactly the failure the single-writer rule
   exists to prevent.
-- Every frame is one JSON object with a `kind`. An unparseable or unknown frame closes the socket
-  `1002` rather than being ignored, so a contract skew is loud instead of a hang.
+- Every frame is one JSON object with a `kind`.
+- **Additive by default.** Unknown PROPERTIES on any runner frame are ignored, never echoed and
+  never persisted; a runner is free to start reporting an image digest or a measured isolation
+  level without waiting for the gateway. A frame whose `kind` this gateway does not know is
+  likewise ignored with a log line and the socket stays open.
+- A frame whose `kind` IS known but whose shape is malformed closes the socket `1002`, as does an
+  unparseable frame. That skew is in a frame the gateway acts on, so it is loud rather than a
+  hang.
 
 ## Runner to gateway
 
@@ -81,14 +87,25 @@ The answer to the gateway's heartbeat. It carries nothing else: liveness is the 
 
 An immutable stage receipt. `stage` is one of `waiting_for_runner`, `waiting_for_capacity`,
 `pulling_image`, `creating`, `starting`, `ready`, `draining`, `stopping`, `stopped`, `recovering`,
-`upgrading`, `deleting`, `needs_attention` (ADR 0002's whole vocabulary, so a runner that learns to
-stop or upgrade a runtime needs no protocol change). `code` is a stable, safe error identifier and
+`upgrading`, `deleting`, `deleted`, `needs_attention` (ADR 0002's whole vocabulary, so a runner
+that learns to stop or upgrade a runtime needs no protocol change). A delete receipts `deleting`
+and then the terminal `deleted` once the container and the bot-exclusive volumes are gone. `code` is a stable, safe error identifier and
 is the ONLY error channel: no secrets, no environment values, no host paths, no workspace content,
 and no free-form diagnostics ever cross this frame. Protected runner-side logs keep the raw detail.
 
 A receipt naming an operation the gateway never issued, or naming a different bot than the one the
 operation was issued for, is DROPPED and logged. The gateway is the lifecycle authority; a runner
 cannot assert state for a bot it was not asked about.
+
+Two ordering guards, because a runner retries and can deliver out of order:
+
+- A receipt that would walk the recorded stage BACKWARDS along the provisioning progression
+  (`waiting_for_runner` → `waiting_for_capacity` → `pulling_image` → `creating` → `starting` →
+  `ready`) records the contact and leaves the stage alone. A `creating` arriving after `ready`
+  must never walk a bot backwards on somebody's screen. Every other stage is a real lifecycle
+  transition rather than a step along that progression, so it always applies.
+- `observedGeneration` advances ONLY on a `ready` receipt. An in-progress stage says what is being
+  attempted, never what is running.
 
 ## Gateway to runner
 
@@ -128,10 +145,29 @@ socket: a runner that cannot answer is a runner that cannot be handed a mutation
 The runner allocates the two volumes (`cozyagents-<botId>-state`, `cozyagents-<botId>-workspace`),
 creates a container from the compose defaults with a private per-bot network, injects the
 `COZYAGENTS_*` environment including `attachToken`, starts it, and polls readiness, receipting each
-stage. Exactly one of `image` and `entrypoint` is present: an image for the Docker backend, an
-entrypoint for the process backend. `model` and `resources` are present only when the operator
-configured them (`COZYGATEWAY_RUNNER_*`); absent means the runner uses its own compose defaults
-rather than the gateway inventing an image tag or model id it cannot verify.
+stage.
+
+Payload fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `operationId` | string | The operation every receipt for this work names. |
+| `botId` | string | The bot id, lowercase, `[a-z0-9][a-z0-9_-]{0,63}`. |
+| `specGeneration` | integer >= 1 | The desired generation this command is fenced to. |
+| `attachToken` | string | The container's attach credential. Secret. |
+| `image` | string | Docker backend: the image reference, digest-pinned by the operator. |
+| `entrypoint` | string[] | Process backend: ARGV, not a shell string. The runner spawns it directly, so quoting rules never enter into it. |
+| `model` | `{id, provider?, endpoint?}` | Optional. |
+| `resources` | `{cpus?: number, memoryMb?: integer, pids?: integer}` | Optional. `cpus` is fractional CPUs, `memoryMb` is mebibytes, `pids` is the process-count ceiling. |
+
+At most one of `image` and `entrypoint` is present: an image for the Docker backend, an entrypoint
+argv for the process backend. `image`, `entrypoint`, `model` and `resources` are all present only
+when the operator configured them (`COZYGATEWAY_RUNNER_IMAGE`,
+`COZYGATEWAY_RUNNER_ENTRYPOINT_JSON`, `COZYGATEWAY_RUNNER_MODEL_*`, `COZYGATEWAY_RUNNER_CPUS` /
+`_MEMORY_MB` / `_PIDS`). **A missing `model` means the runner uses its own default**, exactly as a
+missing `image` or `resources` means its own compose defaults: the gateway never invents an image
+tag, a model id, or a ceiling it cannot verify. A malformed operator value is refused on the
+create that would have used it (`400`, naming the variable) rather than dropped in silence.
 
 `attachToken` is the credential the container needs to attach back to this gateway. It exists on
 this frame and nowhere else: it is never written into an operations row, a receipt, a log line, or
@@ -150,7 +186,12 @@ any app-facing response.
 Sent after `DELETE /bots/:name` on a runtime bot. The gateway has already revoked the bot's attach
 credential and purged its own rows by the time this arrives, so the container it names can no
 longer authenticate anywhere. The runner removes the container and the bot-exclusive volumes and
-receipts `deleting` then a terminal stage.
+receipts `deleting` and then the terminal `deleted`.
+
+The gateway keeps the operation readable while this runs: `GET /bots/:name/runtime` answers
+`deletion_pending` from the moment the delete is accepted, then `deleting`, and stops answering for
+the name once `deleted` lands. The bot identity itself is purged immediately, before this command
+is even sent.
 
 ## Delivery and durability
 
@@ -163,5 +204,7 @@ Operations are durable gateway rows (`runner_operations`), not socket state.
   verified stage is the runner's job, and a resend would repeat a mutation.
 - A `create_runtime` for a bot that was deleted before it could be sent is dropped; its
   `delete_runtime` is already queued behind it, which is the honest reconciliation.
+- A second authenticated runner supersedes the first, and the operations it is owed are handed to
+  it on its hello, so a runner restart resumes reconciliation without operator action.
 - The gateway never blocks a user-facing route on the runner. `GET /bots/:name/runtime` is how a
   client learns where an operation actually stands.

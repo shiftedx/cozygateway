@@ -48,7 +48,7 @@ import {
 import { revokeAttachTokens } from "./adapters/attach/token-auth.ts";
 import { createApp } from "./http.ts";
 import { RunnerLane } from "./runner/lane.ts";
-import { RuntimeBotService, runtimeSpecDefaults } from "./runner/runtime-bots.ts";
+import { RuntimeBotService, mergeRuntimeBots, runtimeSpecDefaults } from "./runner/runtime-bots.ts";
 import type { PairingAttemptLimiter } from "./pairing-admission.ts";
 import { WsHub } from "./ws-hub.ts";
 import { MobileNodeBroker } from "./mobile-node.ts";
@@ -302,28 +302,15 @@ export async function startGateway(
   }
   // Bots served by a non-Hermes runtime (e.g. CozyAgents). Additive to the Hermes profiles above:
   // same storage row, same attach identity shape, no Hermes Dashboard consulted for them.
-  // Two sources, one namespace. The config file remains a BOOTSTRAP source (capability 45), and a
-  // storage row created through `POST /bots {runtime}` (capability 49) wins on collision: it is the
-  // one this gateway minted the credential for, and the operator's config line for the same id is
-  // then stale rather than authoritative.
+  // Two sources, one namespace, merged by one shared function so the precedence rule lives in one
+  // place: the config file remains a BOOTSTRAP source (capability 45), and a storage row created
+  // through `POST /bots {runtime}` (capability 49) wins on collision.
   const storedRuntimeBots = storage.runtimeBots();
-  const storedRuntimeBotIds = new Set(storedRuntimeBots.map((bot) => bot.id));
-  const configRuntimeBots = nativeBots(config).filter((bot) => !storedRuntimeBotIds.has(bot.id));
-  const runtimeBots = [
-    ...configRuntimeBots.map((bot) => ({
-      id: bot.id,
-      name: bot.name ?? bot.id,
-      avatar: bot.avatar ?? null,
-      runtime: bot.runtime,
-    })),
-    ...storedRuntimeBots.map((bot) => ({
-      id: bot.id,
-      name: bot.name,
-      avatar: bot.avatar,
-      runtime: bot.runtime,
-    })),
-  ];
-  const runtimeBotNameSet: ReadonlySet<string> = new Set(runtimeBots.map((bot) => bot.id));
+  const merged = mergeRuntimeBots(nativeBots(config), storedRuntimeBots);
+  const runtimeBots = merged.bots;
+  /** Only until the plane exists; every later read is the plane's live set. */
+  const bootRuntimeBotNames: ReadonlySet<string> = new Set(merged.bots.map((bot) => bot.id));
+  const configRuntimeBots = nativeBots(config).filter((bot) => merged.fromConfig.includes(bot.id));
   // loadConfig() rejects this same collision (config.ts:246-249), but startGateway takes a
   // GatewayConfig directly and skips loadConfig on the programmatic path (tests, embedders), so
   // the check is re-derived here rather than trusted to have already run. Two ids resolving the
@@ -457,7 +444,9 @@ export async function startGateway(
     // Dashboard profile, so a room naming one has to be answered from config rather than from
     // `profiles.list`. Shared by every bridge member because a runtime bot belongs to the gateway
     // rather than to any one Hermes endpoint.
-    runtimeBotNames: () => runtimeBotNameSet,
+    // Live, not a boot-time snapshot: a bot created from the app joins a room without a restart.
+    // Evaluated per call, and the plane exists long before any room turn is dispatched.
+    runtimeBotNames: () => nativeBotPlane?.runtimeBotNames() ?? bootRuntimeBotNames,
     // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
     // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
     // rather than borrowed from a chat thread, so a client that does not know about rooms yet
@@ -694,6 +683,7 @@ export async function startGateway(
     // needs the service; one hole rather than a two-phase construction.
     runtimeLifecycle: {
       owns: (id) => runtimeBotService?.owns(id) === true,
+      hasRuntime: (id) => runtimeBotService?.hasRuntime(id) === true,
       create: (input, row) => {
         if (runtimeBotService === undefined)
           throw new Error("the runtime bot service is not assembled yet");
@@ -765,7 +755,7 @@ export async function startGateway(
   runtimeBotService = new RuntimeBotService({
     storage,
     ...(runnerLane === undefined ? {} : { lane: runnerLane }),
-    spec: runtimeSpecDefaults(process.env),
+    spec: () => runtimeSpecDefaults(process.env),
     now: () => Date.now(),
     register: (bot) => {
       // The exact inverse of `killAttachIdentity`: the token map both public attach surfaces

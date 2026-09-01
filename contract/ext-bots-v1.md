@@ -294,17 +294,31 @@ and are ignored for this kind; supplying them adds a warning rather than failing
 `stage` is the latest stage a runner receipted for this bot's newest operation. With no runner
 connected it stays `waiting_for_runner`: the gateway durably accepted the desired state and says so
 honestly rather than inventing progress, and the operation is handed over the moment a runner
-attaches. `observedGeneration` and `lastRunnerContactAt` are null until the first receipt.
+attaches. A receipt that would walk the stage backwards along the provisioning progression is
+ignored, so this value never regresses on screen.
+
+`observedGeneration` is null until a runner receipts `ready`, and only a `ready` receipt advances
+it: an in-progress stage says what is being attempted, never what is running.
+`lastRunnerContactAt` is the last moment a runner said anything about this bot or answered the
+gateway's heartbeat, and is null only while no runner has ever been in contact; a connected but
+silent-about-this-bot runner still counts as contact, which is the point of the field.
+
 `code` appears only when a receipt carried one and is a stable, safe identifier, never diagnostics.
-A bot with no gateway-owned runtime row answers `409 unsupported_for_runtime`, because it has no
+A bot with no gateway-owned runtime answers `409 unsupported_for_runtime`, because it has no
 runtime to project rather than being missing.
 
-`DELETE /bots/:name` on a runtime bot answers instead of refusing with 409. It revokes the attach
-identity first, purges every durable gateway row exactly as the capability-37 delete does, and
-enqueues `delete_runtime` so the runner removes the container and the bot-exclusive volumes.
-`hermesProfile` is `already_absent`, truthfully: there never was one. A config-declared runtime bot
-(capability 45) still gets the 409, because removing it means editing the config file the operator
-wrote.
+`DELETE /bots/:name` on a runtime bot answers instead of refusing with 409. It applies the same
+refusals the capability-37 Hermes delete applies (a reserved name is `400`; a bot with a native turn
+in flight is `409` extension code `conflict` carrying `turnId` unless `?force=1`), then revokes the
+attach identity first, purges every durable gateway row exactly as that delete does, and enqueues
+`delete_runtime` so the runner removes the container and the bot-exclusive volumes. `hermesProfile`
+is `already_absent`, truthfully: there never was one. A config-declared runtime bot (capability 45)
+still gets the 409, because removing it means editing the config file the operator wrote.
+
+The bot is gone from the roster and its credential is dead the moment the delete returns, but the
+cleanup stays watchable: `GET /bots/:name/runtime` answers `deletion_pending`, then `deleting` once
+the runner starts, and finally `404` once the terminal `deleted` receipt lands and there is nothing
+left to project.
 
 Out of scope for 49, and deliberately not implied by it: pairing codes and short-lived runner
 credentials, upgrades and migrations, restart backoff, drain windows, isolation policy, capacity
