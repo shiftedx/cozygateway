@@ -139,6 +139,16 @@ CREATE TABLE IF NOT EXISTS hermes_global_skill_requests (
   result_json TEXT NOT NULL,
   expires_at INTEGER NOT NULL
 ) STRICT;
+-- Privileged host-maintenance requests use the paired device's request id as a durable 24-hour
+-- idempotency key. The response is intentionally only a receipt: no command, host path, or
+-- installer state ever crosses this boundary.
+CREATE TABLE IF NOT EXISTS gateway_maintenance_requests (
+  request_id TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'handed_off')),
+  expires_at INTEGER NOT NULL
+) STRICT;
 -- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
 -- tables below.
 CREATE TABLE IF NOT EXISTS bot_roster (
@@ -755,6 +765,31 @@ export class Storage {
       `INSERT INTO hermes_global_skill_requests (request_id, result_json, expires_at)
        VALUES (?, ?, ?) ON CONFLICT(request_id) DO NOTHING`,
     ).run(requestId, JSON.stringify(result), expiresAt);
+  }
+
+  gatewayMaintenanceRequest(requestId: string, now: number): unknown | undefined {
+    this.#db.prepare("DELETE FROM gateway_maintenance_requests WHERE expires_at < ?").run(now);
+    const row = this.#db.prepare(
+      "SELECT fingerprint, receipt_json AS receiptJson, state FROM gateway_maintenance_requests WHERE request_id = ? AND expires_at >= ?",
+    ).get(requestId, now) as { fingerprint: string; receiptJson: string; state: "pending" | "handed_off" } | undefined;
+    if (row === undefined) return undefined;
+    try { return { fingerprint: row.fingerprint, receipt: JSON.parse(row.receiptJson) as unknown, state: row.state }; } catch { return undefined; }
+  }
+
+  rememberGatewayMaintenanceRequest(requestId: string, fingerprint: string, receipt: unknown, expiresAt: number): void {
+    this.#db.prepare(
+      `INSERT INTO gateway_maintenance_requests (request_id, fingerprint, receipt_json, state, expires_at)
+       VALUES (?, ?, ?, 'pending', ?) ON CONFLICT(request_id) DO NOTHING`,
+    ).run(requestId, fingerprint, JSON.stringify(receipt), expiresAt);
+  }
+
+  markGatewayMaintenanceHandedOff(requestId: string, operationId: string): void {
+    const result = this.#db.prepare(
+      `UPDATE gateway_maintenance_requests
+       SET state = 'handed_off'
+       WHERE request_id = ? AND state = 'pending' AND json_extract(receipt_json, '$.operationId') = ?`,
+    ).run(requestId, operationId);
+    if (result.changes !== 1) throw new Error("maintenance receipt state changed unexpectedly");
   }
 
   upsertAgent(agent: AgentRow): void {

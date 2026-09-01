@@ -32,6 +32,8 @@ import {
   assertValidCozyAppTree,
   ModelProviderFieldUpdateSchema,
   ModelProviderOAuthCodeSchema,
+  GatewayMaintenanceRestartRequestSchema,
+  GatewayMaintenanceUpdateRequestSchema,
 } from "cozygateway-contract";
 
 import { Type } from "@sinclair/typebox";
@@ -39,6 +41,7 @@ import { Value } from "@sinclair/typebox/value";
 
 import type { GatewayConfig } from "./config.ts";
 import { GatewaySettingsPersistenceError } from "./gateway-settings.ts";
+import { GatewayMaintenance, GatewayMaintenanceFailure } from "./gateway-maintenance.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
 import { BackendUnavailable } from "./errors.ts";
@@ -199,6 +202,8 @@ export interface AppDeps {
     update(input: unknown): unknown;
   };
   gatewaySettingsLog?: (message: string) => void;
+  /** Paired maintenance is registered only after a host-owned supervisor has passed discovery. */
+  maintenance?: GatewayMaintenance;
   /** Gateway-owned inventory of agent harnesses and their harness-native model settings. */
   harnessSettings?: GatewayHarnessSettings;
   /** Present only after Hermes proved a non-null immutable managed-files root. */
@@ -431,6 +436,43 @@ export function createApp(deps: AppDeps): Hono<Env> {
       throw error;
     }
   });
+
+  const maintenanceFailure = (c: Context<Env>, error: unknown) => {
+    if (error instanceof GatewayMaintenanceFailure) {
+      const messages: Record<GatewayMaintenanceFailure["code"], string> = {
+        stale_version: "Gateway version or update target changed. Refresh and try again.",
+        operation_in_progress: "Another gateway maintenance operation is already in progress.",
+        restart_unavailable: "This gateway host cannot restart safely.",
+        update_unavailable: "No verified gateway update can be installed on this host.",
+        insufficient_storage: "The gateway host does not have enough space to stage this update.",
+        maintenance_failed: "Gateway maintenance could not be handed to the host supervisor.",
+      };
+      return c.json({ error: { code: error.code, message: messages[error.code] } }, error.status);
+    }
+    if (error instanceof ContractViolation)
+      return c.json({ error: { code: "invalid_request", message: "Gateway maintenance request is invalid." } }, 400);
+    throw error;
+  };
+
+  if (deps.maintenance !== undefined) {
+    app.get("/gateway/maintenance", requireDevice, (c) => c.json(deps.maintenance!.status()));
+    app.post("/gateway/maintenance/restart", requireDevice, async (c) => {
+      try {
+        const input = assertValid(GatewayMaintenanceRestartRequestSchema, await readBody(c));
+        return c.json(await deps.maintenance!.restart(input.requestId), 202);
+      } catch (error) { return maintenanceFailure(c, error); }
+    });
+    app.post("/gateway/maintenance/update", requireDevice, async (c) => {
+      try {
+        const input = assertValid(GatewayMaintenanceUpdateRequestSchema, await readBody(c));
+        return c.json(await deps.maintenance!.update(
+          input.requestId,
+          input.expectedCurrentVersion,
+          input.expectedTargetVersion,
+        ), 202);
+      } catch (error) { return maintenanceFailure(c, error); }
+    });
+  }
 
   app.get("/gateway/harnesses", requireDevice, (c) => {
     if (deps.harnessSettings === undefined)
