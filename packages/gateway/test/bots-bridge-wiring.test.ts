@@ -476,6 +476,49 @@ describe("startGateway with a hermes bridge", () => {
     delete process.env["COZYGATEWAY_ATTACH_TOKEN_COZY"];
   });
 
+  it("lets a native runtime bot use the attach-v1 media side channel like a Hermes profile", async () => {
+    const hermes = await startFakeHermesServer({
+      methods: { "profiles.list": () => ({ profiles: [], bot_mode_protocol: true }) },
+    });
+    servers.push(hermes);
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
+    process.env["COZYGATEWAY_ATTACH_TOKEN_COZY"] = "cozy-token";
+    const gateway = await startGateway({
+      name: "e2e",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles }],
+      bots: [{ id: "cozy", tokenEnv: "COZYGATEWAY_ATTACH_TOKEN_COZY", runtime: "cozyagents" }],
+    });
+    gateways.push(gateway);
+
+    // A runtime bot (capability 45+, `nativeBots(config)`) negotiating `media` must clear the same
+    // rollout gate a Hermes profile does: `allowedAttachMedia` used to be built from Hermes profiles
+    // only, so this request answered 403 instead of reaching the "no such media" 404.
+    const botMedia = await fetch(`${gateway.url}/attach/v1/media/does-not-exist`, {
+      headers: { authorization: "Bearer cozy-token" },
+    });
+    expect(botMedia.status).toBe(404);
+
+    // Unchanged: an unrecognized attach identity (not a Hermes profile, not a runtime bot) still
+    // gets 401, and a real Hermes profile's own unknown-media request still 404s, not 403.
+    const unknownIdentity = await fetch(`${gateway.url}/attach/v1/media/does-not-exist`, {
+      headers: { authorization: "Bearer not-a-real-token" },
+    });
+    expect(unknownIdentity.status).toBe(401);
+
+    const hermesMedia = await fetch(`${gateway.url}/attach/v1/media/does-not-exist`, {
+      headers: { authorization: "Bearer attach-token" },
+    });
+    expect(hermesMedia.status).toBe(404);
+
+    delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
+    delete process.env["COZYGATEWAY_ATTACH_TOKEN_COZY"];
+  });
+
   it("fails startup when a native bot id collides with a Hermes profile id", async () => {
     process.env["TEST_HERMES_TOKEN"] = "test-token";
     process.env["TEST_ATTACH_TOKEN"] = "attach-token";
