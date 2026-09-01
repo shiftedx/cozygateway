@@ -145,7 +145,12 @@ validate_plist "$plist_tmp"
 # a unit. Renaming the prepared symlink makes refresh atomic for future starts;
 # BSD mv's -h prevents dereferencing the existing current directory symlink.
 ln -s "releases/$release_name" "$next"
-mv -fh "$next" "$current"
+if mv --help 2>&1 | grep -q -- '--no-target-directory'; then
+  mv -fT "$next" "$current"
+else
+  # BSD mv follows a destination symlink unless -h is present.
+  mv -fh "$next" "$current"
+fi
 mv "$plist_tmp" "$PLIST"
 
 if [ "$LOAD" = 1 ]; then
