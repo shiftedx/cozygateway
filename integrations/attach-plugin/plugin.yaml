@@ -1,7 +1,7 @@
 name: cozygateway
 label: CozyGateway
 kind: platform
-version: 0.5.11
+version: 0.6.0
 description: >
   Native CozyGateway messaging data plane for Hermes. Dials OUT to a gateway's
   attach WebSocket, authenticates header-only with a bearer token, and streams
