@@ -96,6 +96,14 @@ async function setup() {
             provider: "openrouter",
             provider_label: "OpenRouter",
           },
+          UNKNOWN_PROVIDER_TOKEN: {
+            is_set: false,
+            value: "metadata-missing-secret-that-must-not-cross-the-wire",
+            description: "Unknown provider credential",
+            advanced: true,
+            provider: "openrouter",
+            provider_label: "OpenRouter",
+          },
           LM_BASE_URL: {
             is_set: lmStudioUrl !== undefined,
             ...(lmStudioUrl === undefined ? {} : { value: lmStudioUrl }),
@@ -223,6 +231,7 @@ describe("gateway harness model provider setup", () => {
     expect(initial.status).toBe(200);
     const initialText = await initial.text();
     expect(initialText).not.toContain("upstream-secret-that-must-not-cross-the-wire");
+    expect(initialText).not.toContain("metadata-missing-secret-that-must-not-cross-the-wire");
     const initialBody = JSON.parse(initialText) as {
       providers: Array<{ slug: string; models: string[]; methods: Array<{ fields?: Array<{ key: string; value?: string }> }> }>;
     };

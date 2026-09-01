@@ -113,7 +113,7 @@ function fieldsByProvider(raw: unknown): Map<string, ModelProviderSetupField[]> 
       // Credentials are write-only even if an upstream accidentally includes a field called
       // `value`. A non-secret endpoint is useful to edit in place, but only when Hermes actually
       // supplied it: never infer it from an API URL or a just-submitted request body.
-      ...(row?.is_password !== true && text(row?.value) ? { value: text(row?.value)! } : {}),
+      ...(row?.is_password === false && text(row?.value) ? { value: text(row?.value)! } : {}),
       ...(text(row?.url) ? { helpUrl: text(row?.url)! } : {}),
     };
     groups.set(provider, [...(groups.get(provider) ?? []), field]);
