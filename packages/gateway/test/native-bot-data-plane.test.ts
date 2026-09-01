@@ -11,6 +11,7 @@ import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../src/errors.ts";
+import { BotNameTaken } from "../src/hermes-bridge/crud.ts";
 import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 import { ATTACH_MEDIA_TTL_MS } from "../src/hermes-bridge/photos.ts";
 import { openStorage } from "../src/storage.ts";
@@ -2043,10 +2044,10 @@ describe("native runtime bots", () => {
 
     await expect(plane.surface().botProfile("SAGE")).rejects.toBeInstanceOf(UnsupportedForRuntime);
     await expect(plane.surface().routines("sage")).rejects.toMatchObject({
-      bot: "sage",
       feature: "routines",
       runtime: "cozyagents",
     });
+    await expect(plane.surface().routines("sage")).rejects.toThrow(/bot "sage"/);
     expect(botProfile).not.toHaveBeenCalled();
     expect(routines).not.toHaveBeenCalled();
 
@@ -2098,7 +2099,7 @@ describe("native runtime bots", () => {
     });
 
     await expect(plane.surface().desktopSessions("sage")).rejects.toMatchObject({
-      bot: "sage", feature: "desktopSessions", runtime: "cozyagents",
+      feature: "desktopSessions", runtime: "cozyagents",
     });
     await expect(
       plane.surface().resumeDesktopSession("sage", "hermes-1"),
@@ -2162,6 +2163,72 @@ describe("native runtime bots", () => {
     expect(plane.surface().roster().bots).toMatchObject([
       { name: "sage", displayName: "Sage", runtime: "cozyagents" },
     ]);
+
+    plane.close();
+    storage.close();
+  });
+
+  it("refuses to create a Hermes profile over a runtime bot id", async () => {
+    const storage = openStorage(":memory:");
+    const createBot = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: { createBot } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    // Left unguarded this creates an unreachable Hermes profile: the roster filter hides it and
+    // DELETE answers 409, so nothing can clean it up through the API.
+    await expect(plane.surface().createBot({ name: "SAGE" })).rejects.toBeInstanceOf(BotNameTaken);
+    expect(createBot).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("refuses a room that names a runtime bot, in runtime words", async () => {
+    const storage = openStorage(":memory:");
+    const createGroup = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: { createGroup } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    // Membership is checked against `profiles.list`, so without this the user is told sage is
+    // "not a bot on this gateway" while `GET /bots` is listing it.
+    await expect(plane.surface().createGroup("room", ["cleo", "sage"])).rejects.toThrow(
+      /sage is a cozyagents runtime bot; rooms are not supported for runtime bots yet/,
+    );
+    expect(createGroup).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("reports no avatar for a runtime bot because no route serves one", () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {
+        roster: () => ({ bots: [], updatedAt: 1, stale: false, hermesState: "connected" }),
+      } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [{ ...sage, avatar: "avatar.png" }],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+
+    expect(plane.surface().roster().bots[0]).toMatchObject({ name: "sage", hasAvatar: false });
 
     plane.close();
     storage.close();

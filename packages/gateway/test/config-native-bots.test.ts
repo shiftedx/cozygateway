@@ -21,7 +21,7 @@ const hermes = {
 };
 
 describe("native runtime bots config", () => {
-  it("parses a bots entry and lower-cases the id", () => {
+  it("parses a bots entry", () => {
     const config = loadConfig(writeConfig({
       name: "g",
       hermesEndpoints: [hermes],

@@ -175,7 +175,7 @@ export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: strin
  *  Hermes profile ids are (see publicProfileId). The schema pattern already forbids uppercase;
  *  this is belt and braces. */
 export function nativeBots(config: GatewayConfig): NativeBotConfig[] {
-  return (config.bots ?? []).map((bot) => ({ ...bot, id: bot.id.trim().toLowerCase() }));
+  return config.bots ?? [];
 }
 
 const LOOPBACK_LISTENERS = new Set(["127.0.0.1", "::1", "localhost"]);

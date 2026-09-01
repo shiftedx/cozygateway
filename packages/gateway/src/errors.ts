@@ -11,13 +11,11 @@ export class BackendUnavailable extends Error {
  *  and its chat lane works; this particular surface has no backend for it. REST maps this to
  *  409 unsupported_for_runtime, never a 404: the bot is real. */
 export class UnsupportedForRuntime extends Error {
-  readonly bot: string;
   readonly feature: string;
   readonly runtime: string;
   constructor(bot: string, feature: string, runtime: string) {
     super(`${feature} is not supported for bot "${bot}" (runtime ${runtime})`);
     this.name = "UnsupportedForRuntime";
-    this.bot = bot;
     this.feature = feature;
     this.runtime = runtime;
   }

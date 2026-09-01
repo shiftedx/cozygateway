@@ -45,6 +45,8 @@ import type {
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
+import { BotNameTaken } from "./crud.ts";
+import { GroupInvalid } from "./group-rooms.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
@@ -157,6 +159,13 @@ interface NativeTurnState {
   cause?: BotChatStateCause;
   queuedAt?: number;
 }
+
+/** The exact fields `#nativeOverlay` writes onto a roster row. */
+type NativeRowOverlay = Pick<
+  BotSummary,
+  "chatSessionId" | "lastActiveAt" | "preview" | "syncState"
+> &
+  Partial<Pick<BotSummary, "cozyApps" | "syncReason" | "syncRepair">>;
 
 /** `BotsSurface` methods whose answer comes from the Hermes Dashboard and that take the bot name
  * first. A bot served by another runtime has no Dashboard profile behind it, so asking would ask
@@ -280,6 +289,27 @@ export class NativeBotDataPlane {
   surface(): BotsSurface {
     const overrides: Partial<BotsSurface> = {
       roster: () => this.#roster(),
+      createBot: async (input) => {
+        // The proxy guard cannot see this one: its first argument is a create request, not a name.
+        // Unguarded it writes a Hermes profile the roster filter then hides and DELETE refuses,
+        // leaving an orphan no route can reach.
+        const bot = normalize(input.name);
+        if (this.#runtimeBots.has(bot)) throw new BotNameTaken(bot);
+        return this.#control.createBot(input);
+      },
+      createGroup: async (name, members) => {
+        // Room membership is resolved against `profiles.list`, which never names a runtime bot, so
+        // without this the user is told the bot is not on this gateway while `GET /bots` lists it.
+        for (const member of members) {
+          const bot = normalize(member);
+          const runtimeBot = this.#runtimeBots.get(bot);
+          if (runtimeBot !== undefined)
+            throw new GroupInvalid(
+              `${bot} is a ${runtimeBot.runtime} runtime bot; rooms are not supported for runtime bots yet`,
+            );
+        }
+        return this.#control.createGroup(name, members);
+      },
       readiness: (name) => this.#readiness(name),
       commands: (name) => this.#commands(name),
       pendingApprovals: () => this.#pendingApprovals(),
@@ -386,8 +416,9 @@ export class NativeBotDataPlane {
   }
 
   /** Everything a native row knows that the Dashboard cannot: the local conversation identity,
-   * its latest line, and how far its attach transport has come. */
-  #nativeOverlay(bot: string): Partial<BotSummary> {
+   * its latest line, and how far its attach transport has come. Typed as the exact fields it
+   * writes, so spreading it over a partial row still satisfies `BotSummary`. */
+  #nativeOverlay(bot: string): NativeRowOverlay {
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
     const latest = messages.findLast((message) => message.text.trim().length > 0);
@@ -415,14 +446,12 @@ export class NativeBotDataPlane {
       displayName: bot.name,
       handle: id,
       description: null,
-      hasAvatar: bot.avatar !== null,
+      // No route serves a runtime bot's avatar in v0.0.1, so claiming one would send every client
+      // after an image that does not exist. The configured value is still the agents row's.
+      hasAvatar: false,
       group: null,
       pinned: false,
       active: this.#syncState(id) === "ready",
-      lastActiveAt: null,
-      chatSessionId: null,
-      preview: { kind: "empty", text: "No conversations yet, say hi" },
-      syncState: "setup_required",
       meta: null,
       runtime: bot.runtime,
       ...this.#nativeOverlay(id),

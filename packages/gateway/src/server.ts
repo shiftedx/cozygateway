@@ -297,8 +297,6 @@ export async function startGateway(
     if (hermesProfileIds.has(bot.id)) {
       throw new Error(`bot "${bot.id}": id collides with a Hermes profile id; every bot needs a distinct id`);
     }
-  }
-  for (const bot of runtimeBots) {
     storage.upsertAgent({
       id: bot.id,
       name: bot.name ?? bot.id,
@@ -449,9 +447,9 @@ export async function startGateway(
   );
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
-  const nativeBotEntries = [
-    ...profileEntries,
-    ...runtimeBots.map((bot) => [bot.id, { tokenEnv: bot.tokenEnv, name: bot.name, avatar: bot.avatar }] as const),
+  const nativeBotIds = [
+    ...profileEntries.map(([profileId]) => profileId),
+    ...runtimeBots.map((bot) => bot.id),
   ];
   const router = new AttachRouter();
   let nativeSink: AttachNativeSink | undefined;
@@ -629,7 +627,7 @@ export async function startGateway(
     control: bridge,
     storage,
     ingress: attachV1Ingress,
-    nativeBots: nativeBotEntries.map(([bot]) => bot),
+    nativeBots: nativeBotIds,
     runtimeBots: runtimeBots.map((bot) => ({
       id: bot.id,
       name: bot.name ?? bot.id,

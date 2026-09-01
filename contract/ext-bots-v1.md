@@ -646,7 +646,10 @@ Committed transcript history remains the recovery source after reconnect.
   absent means Hermes, so every existing row is unchanged; the only other value is `"cozyagents"`,
   a config-declared bot served by a non-Hermes attach peer whose row is built from gateway config
   and attach presence rather than the Dashboard. Chat, readiness, approvals, and clarifications
-  work for such a bot exactly as they do for a Hermes-backed one.
+  work for such a bot exactly as they do for a Hermes-backed one. A runtime bot cannot join a room
+  in this version: `POST /bots/groups` naming one is refused with `400 invalid_request`. Roster
+  `stale` is a fact about the Hermes control plane only; it says nothing about a runtime bot, whose
+  row is always current because it is built from local config and live attach presence.
 - A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
   extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
   bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
