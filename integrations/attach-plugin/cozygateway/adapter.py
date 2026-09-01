@@ -1183,6 +1183,7 @@ class AttachAdapter:
                 on_clarify=self._dispatch_clarify_command,
                 on_desktop_resume=self._on_desktop_resume_command,
                 on_memory=self._on_memory_command,
+                on_cozyapp_action=self._on_cozyapp_action_command,
                 on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
             )
@@ -1704,6 +1705,51 @@ class AttachAdapter:
             return
         self._spawn_background(loop, self._handle_desktop_resume_command(command))
 
+    def _on_cozyapp_action_command(self, command: Dict[str, Any]) -> None:
+        """Schedule private execution without blocking attach command/replay processing."""
+        loop = self._loop
+        if loop is None:
+            client = self._client
+            if isinstance(client, AttachV1Client):
+                self._spawn_background(asyncio.get_running_loop(), client.finish_cozyapp_action(command, "failed"))
+            return
+        self._spawn_background(loop, self._handle_cozyapp_action_command(command))
+
+    async def _handle_cozyapp_action_command(self, command: Dict[str, Any]) -> None:
+        """Run a structured app action in a private Hermes session, never a user chat lane."""
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        client = self._client
+        app_id = command.get("appId")
+        action_id = command.get("actionId")
+        request_id = command.get("actionRequestId")
+        if not isinstance(client, AttachV1Client) or not all(isinstance(value, str) and value for value in (app_id, action_id, request_id)):
+            if isinstance(client, AttachV1Client): await client.finish_cozyapp_action(command, "failed")
+            return
+        chat_id = f"__cozyapp__:{app_id}"
+        # Private context retains normal tool policy (including consent-gated phone tools), but
+        # send/send_draft below intentionally discard model prose so this is not a chat thread.
+        self._active_turn[chat_id] = request_id
+        try:
+            prompt = (
+                "Structured CozyApp action. This is not a chat message. "
+                f"appId={app_id}; actionId={action_id}; actionRequestId={request_id}. "
+                "Perform the requested refresh or action using your existing tools. If the app UI must change, "
+                "call cozyapp_upsert with a complete validated replacement tree. Do not ask for hidden approval."
+            )
+            event = MessageEvent(
+                text=prompt,
+                source=self._inbound_source(chat_id, message_id=request_id),
+                message_id=request_id,
+                metadata={"cozyappAction": {"appId": app_id, "actionId": action_id, "actionRequestId": request_id}, "private": True},
+            )
+            await self.handle_message(event)  # type: ignore[attr-defined]
+            await client.finish_cozyapp_action(command, "completed")
+        except Exception:
+            await client.finish_cozyapp_action(command, "failed")
+        finally:
+            self._cleanup_turn(chat_id, request_id)
+
     async def _handle_desktop_resume_command(self, command: Dict[str, Any]) -> None:
         """Switch the stable attach lane to an exact profile-local Hermes session.
 
@@ -2105,6 +2151,9 @@ class AttachAdapter:
         """
         from gateway.platforms.base import SendResult  # harness-defined identifier
 
+        if chat_id.startswith("__cozyapp__:"):
+            return SendResult(success=True)
+
         turn_id = self._active_turn.get(chat_id)
         if self._client is None or not turn_id:
             # No live socket or no anchor yet: skip this frame without disabling
@@ -2345,6 +2394,9 @@ class AttachAdapter:
         ``finally``, so the next reply of the same turn starts from a clean draft.
         """
         from gateway.platforms.base import SendResult  # harness-defined identifier
+
+        if chat_id.startswith("__cozyapp__:"):
+            return SendResult(success=True)
 
         client = self._client
         active_turn = self._caller_active_turn(chat_id)
@@ -3749,6 +3801,23 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
         outcome.get("stage") if isinstance(outcome.get("stage"), str) else None,
         outcome.get("reason") if isinstance(outcome.get("reason"), str) else None,
     )
+
+
+async def _cozyapp_upsert(args: Dict[str, Any], **_kwargs: Any) -> str:
+    """The model-facing app authoring primitive; schema validation is authoritative at Gateway."""
+    origin = _resolve_live_origin()
+    if origin is None:
+        return json.dumps({"ok": False, "error": "cozy app creation requires an active CozyGateway chat"})
+    adapter = origin[0]
+    client = getattr(adapter, "_client", None)
+    app_id, name, tree = args.get("appId"), args.get("name"), args.get("tree")
+    if not isinstance(app_id, str) or not isinstance(name, str) or not isinstance(tree, dict) or client is None:
+        return json.dumps({"ok": False, "error": "appId, name, and tree are required"})
+    try:
+        accepted = await client.upsert_cozyapp(app_id, name, tree)
+    except Exception:
+        accepted = False
+    return json.dumps({"ok": accepted, "appId": app_id} if accepted else {"ok": False, "error": "CozyApps is unavailable"})
 
 
 def _preview(value: Any, limit: int = 200) -> Optional[str]:
@@ -5163,6 +5232,23 @@ def register(ctx: Any) -> None:
             "directives automatically target this originating conversation. Use MEDIA: instead "
             "of sandbox links or file:// URLs for native delivery."
         ),
+    )
+    ctx.register_tool(
+        name="cozyapp_upsert", toolset="cozygateway",
+        schema={"name": "cozyapp_upsert", "description": (
+            "Create or update this bot's durable CozyApp using one COMPLETE safe native tree. "
+            "tree is exactly {root: NODE}; every NODE has unique id matching [A-Za-z0-9_-]+ (1-128 chars), "
+            "and is exactly one closed form: stack {id,kind:'stack',children:NODE[]}; "
+            "section {id,kind:'section',title?,children:NODE[]}; "
+            "text {id,kind:'text',text,style?:'body'|'title'|'caption'}; "
+            "image {id,kind:'image',source:'https://...',alt?}; "
+            "list {id,kind:'list',items:string[]}; keyValue {id,kind:'keyValue',key,value}; or "
+            "button {id,kind:'button',label,actionId,role:'primary'|'secondary'|'destructive'}. "
+            "No other node kinds or fields. Use root stack/section for children; image source must be HTTPS. "
+            "Keep the whole tree within 12 nesting levels, 200 nodes, and 128KiB. appId is your stable logical "
+            "identifier; use the same appId to update an app. The Gateway owns creator identity and user rename."
+        ), "parameters": {"type": "object", "properties": {"appId": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$"}, "name": {"type": "string", "minLength": 1, "maxLength": 120}, "tree": {"type": "object", "properties": {"root": {"type": "object"}}, "required": ["root"], "additionalProperties": False}}, "required": ["appId", "name", "tree"], "additionalProperties": False}},
+        handler=_cozyapp_upsert, is_async=True, description="Create or update a durable native CozyApp with the closed v1 node catalog.", emoji="📱",
     )
     ctx.register_tool(
         name="cozy_send_media",

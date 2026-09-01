@@ -155,6 +155,31 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("binds a private CozyApp action mobile request to its authenticated device", () => {
+    const storage = openStorage(":memory:");
+    const invoked = vi.fn();
+    const rejected = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["cleo"], chatSuggestion: "", broadcast: () => undefined, now: () => 10,
+      mobileNode: { invoke: invoked, reject: rejected } as never,
+    });
+
+    expect(plane.registerCozyAppActionOrigin("cleo", "app", "action", "origin-device", 30_000)).toBe(true);
+    plane.mobileRequest("cleo", { kind: "mobile_request", requestId: "phone-status", command: "device.status", threadId: "__cozyapp__:app", turnId: "action", expiresAt: 1_000, purpose: "Refresh app data" });
+    expect(invoked).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: "cleo", deviceId: "origin-device", requestId: "phone-status", turnId: "action",
+    }));
+
+    plane.clearCozyAppActionOrigin("cleo", "app", "action");
+    plane.mobileRequest("cleo", { kind: "mobile_request", requestId: "after-clear", command: "device.status", threadId: "__cozyapp__:app", turnId: "action", expiresAt: 1_000, purpose: "Refresh app data" });
+    expect(rejected).toHaveBeenCalledWith("cleo", "after-clear");
+    plane.close();
+    storage.close();
+  });
+
   it("preserves list items when a native bot reply is committed", async () => {
     const storage = openStorage(":memory:");
     let turnId = "";

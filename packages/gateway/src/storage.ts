@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type {
   AttachmentBlock,
@@ -12,6 +12,7 @@ import type {
   Message,
   MessageRole,
   RichBlock,
+  CozyAppTree,
 } from "cozygateway-contract";
 import type {
   AttachV1Command,
@@ -37,6 +38,17 @@ export type NativeInteractionResolutionRequest =
 /** Terminal receipts are reconnect aids, not permanent interaction history. Pending rows are
  * never pruned; retain only the newest bounded terminal proof per profile. */
 const NATIVE_INTERACTION_SETTLEMENT_LIMIT = 100;
+
+/** Physical library identity: bots may reuse friendly logical ids without taking each other's app.
+ * Both hashes are deterministic, and the bounded readable middle keeps diagnostics useful. */
+export function cozyAppPhysicalId(creatorBot: string, logicalId: string): string {
+  const digest = (value: string, length: number) => createHash("sha256").update(value).digest("hex").slice(0, length);
+  const prefix = `app_${digest(creatorBot, 12)}_`;
+  // An action prompt may hand the bot its physical id; keep that update idempotent instead of
+  // nesting a namespace on every refresh. A different creator's prefix never passes this check.
+  if (logicalId.startsWith(prefix)) return logicalId;
+  return `${prefix}${logicalId.slice(0, 102)}_${digest(logicalId, 8)}`;
+}
 
 const BOT_MOBILE_RECEIPT_COLUMNS = `
   request_id TEXT PRIMARY KEY,
@@ -443,6 +455,29 @@ CREATE TABLE IF NOT EXISTS bot_native_turn_terminals (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_native_turn_terminals_session
   ON bot_native_turn_terminals (bot, session_id, completed_at DESC);
+-- CozyApps are gateway-owned user library records. The tree is validated before every write;
+-- SQLite only owns durable identity, revision, and bot cleanup.
+CREATE TABLE IF NOT EXISTS cozy_apps (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  creator_bot TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  tree_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS cozy_apps_creator_bot ON cozy_apps (creator_bot, updated_at DESC);
+CREATE TABLE IF NOT EXISTS cozy_app_actions (
+  id TEXT PRIMARY KEY,
+  app_id TEXT NOT NULL REFERENCES cozy_apps(id) ON DELETE CASCADE,
+  creator_bot TEXT NOT NULL,
+  action_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK (status IN ('requested', 'delivered', 'completed', 'failed')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS cozy_app_actions_creator_bot ON cozy_app_actions (creator_bot, updated_at DESC);
 `;
 
 export interface DeviceRow {
@@ -1138,6 +1173,56 @@ export class Storage {
    *  those steps described: a reset, a delete, a re-pin. */
   deleteBotChatToolSteps(bot: string): void {
     this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(bot);
+  }
+
+  listCozyApps(): Array<{ id: string; name: string; creatorBot: string; revision: number; createdAt: number; updatedAt: number }> {
+    return this.#db.prepare(`SELECT id, name, creator_bot AS creatorBot, revision, created_at AS createdAt, updated_at AS updatedAt FROM cozy_apps ORDER BY updated_at DESC, id`).all() as unknown as Array<{ id: string; name: string; creatorBot: string; revision: number; createdAt: number; updatedAt: number }>;
+  }
+
+  cozyApp(id: string): { id: string; name: string; creatorBot: string; revision: number; tree: CozyAppTree; createdAt: number; updatedAt: number } | undefined {
+    const row = this.#db.prepare(`SELECT id, name, creator_bot AS creatorBot, revision, tree_json AS treeJson, created_at AS createdAt, updated_at AS updatedAt FROM cozy_apps WHERE id = ?`).get(id) as { id: string; name: string; creatorBot: string; revision: number; treeJson: string; createdAt: number; updatedAt: number } | undefined;
+    return row === undefined ? undefined : { ...row, tree: JSON.parse(row.treeJson) as CozyAppTree };
+  }
+
+  cozyAppsSnapshot(): { apps: Array<{ id: string; name: string; creatorBot: string; revision: number; tree: CozyAppTree; createdAt: number; updatedAt: number }>; actions: Array<{ id: string; appId: string; creatorBot: string; actionId: string; status: "requested" | "delivered" | "completed" | "failed"; createdAt: number; updatedAt: number }> } {
+    return { apps: this.listCozyApps().map((summary) => this.cozyApp(summary.id)!), actions: this.#db.prepare("SELECT id, app_id AS appId, creator_bot AS creatorBot, action_id AS actionId, status, created_at AS createdAt, updated_at AS updatedAt FROM cozy_app_actions ORDER BY updated_at DESC LIMIT 1000").all() as unknown as Array<{ id: string; appId: string; creatorBot: string; actionId: string; status: "requested" | "delivered" | "completed" | "failed"; createdAt: number; updatedAt: number }> };
+  }
+
+  upsertCozyApp(app: { id: string; name: string; creatorBot: string; tree: CozyAppTree; now: number }): { revision: number; createdAt: number } {
+    const existing = this.#db.prepare("SELECT creator_bot AS creatorBot, revision, created_at AS createdAt FROM cozy_apps WHERE id = ?").get(app.id) as { creatorBot: string; revision: number; createdAt: number } | undefined;
+    if (existing !== undefined && existing.creatorBot !== app.creatorBot) throw new Error("cozy app creator is immutable");
+    const revision = (existing?.revision ?? 0) + 1;
+    this.#db.prepare(`INSERT INTO cozy_apps (id, name, creator_bot, revision, tree_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, tree_json = excluded.tree_json, updated_at = excluded.updated_at`).run(app.id, app.name, app.creatorBot, revision, JSON.stringify(app.tree), existing?.createdAt ?? app.now, app.now);
+    return { revision, createdAt: existing?.createdAt ?? app.now };
+  }
+
+  renameCozyApp(id: string, name: string, now: number): boolean {
+    return this.#db.prepare("UPDATE cozy_apps SET name = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(name, now, id).changes === 1;
+  }
+
+  replaceCozyAppTree(id: string, expectedRevision: number, tree: CozyAppTree, now: number): "updated" | "conflict" | "not_found" {
+    const row = this.#db.prepare("SELECT revision FROM cozy_apps WHERE id = ?").get(id) as { revision: number } | undefined;
+    if (row === undefined) return "not_found";
+    if (row.revision !== expectedRevision) return "conflict";
+    return this.#db.prepare("UPDATE cozy_apps SET tree_json = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?").run(JSON.stringify(tree), now, id, expectedRevision).changes === 1 ? "updated" : "conflict";
+  }
+
+  deleteCozyApp(id: string): boolean { return this.#db.prepare("DELETE FROM cozy_apps WHERE id = ?").run(id).changes === 1; }
+
+  createCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; idempotencyKey: string; now: number }): { action: { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number }; fresh: boolean } {
+    const scopedKey = `${input.appId}:${input.idempotencyKey}`;
+    const existing = this.#db.prepare("SELECT id, app_id AS appId, creator_bot AS creatorBot, action_id AS actionId, status, created_at AS createdAt, updated_at AS updatedAt FROM cozy_app_actions WHERE idempotency_key = ?").get(scopedKey) as { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number } | undefined;
+    if (existing !== undefined) {
+      if (existing.actionId !== input.actionId) throw new Error("idempotency key is already used for another action");
+      return { action: existing, fresh: false };
+    }
+    this.#db.prepare("INSERT INTO cozy_app_actions (id, app_id, creator_bot, action_id, idempotency_key, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'requested', ?, ?)").run(input.id, input.appId, input.creatorBot, input.actionId, scopedKey, input.now, input.now);
+    return { action: { id: input.id, appId: input.appId, creatorBot: input.creatorBot, actionId: input.actionId, status: "requested", createdAt: input.now, updatedAt: input.now }, fresh: true };
+  }
+
+  settleCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; status: "completed" | "failed"; now: number }): boolean {
+    return this.#db.prepare("UPDATE cozy_app_actions SET status = ?, updated_at = ? WHERE id = ? AND app_id = ? AND creator_bot = ? AND action_id = ? AND status IN ('requested', 'delivered')").run(input.status, input.now, input.id, input.appId, input.creatorBot, input.actionId).changes === 1;
   }
 
   /** Drops every tool step older than the TTL. Returns how many went, so a caller can log it. */
@@ -3281,6 +3366,8 @@ export class Storage {
       ["scheduledDeliveries", "attach_scheduled_deliveries", "agent_id"],
       ["groupTurns", "bot_group_turns", "agent_id"],
       ["liveActivities", "live_activity_registrations", "bot"],
+      ["cozyApps", "cozy_apps", "creator_bot"],
+      ["cozyAppActions", "cozy_app_actions", "creator_bot"],
     ];
     const purged: Record<string, number> = {};
     this.#db.exec("BEGIN IMMEDIATE");

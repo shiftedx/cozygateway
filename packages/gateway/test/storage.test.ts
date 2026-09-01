@@ -3,8 +3,9 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CozyAppTree } from "cozygateway-contract";
 
-import { openStorage } from "../src/storage.ts";
+import { cozyAppPhysicalId, openStorage } from "../src/storage.ts";
 
 function delegationWithCost(costUsd: number) {
   return {
@@ -93,6 +94,46 @@ describe("devices", () => {
     expect(storage.deleteDevice("d1")).toBe(true);
     expect(storage.deviceByTokenHash("h1")).toBeUndefined();
     expect(storage.deleteDevice("d1")).toBe(false);
+  });
+});
+
+describe("cozy apps", () => {
+  const tree: CozyAppTree = { root: { id: "root", kind: "stack", children: [{ id: "go", kind: "button", label: "Go", actionId: "go", role: "primary" }] } };
+  it("scopes idempotency by app and preserves a user rename on bot updates", () => {
+    const storage = openStorage(":memory:");
+    storage.upsertCozyApp({ id: "one", name: "One", creatorBot: "home:cleo", tree, now: 1 });
+    storage.upsertCozyApp({ id: "two", name: "Two", creatorBot: "home:cleo", tree, now: 1 });
+    storage.renameCozyApp("one", "My One", 2);
+    storage.upsertCozyApp({ id: "one", name: "Bot Name", creatorBot: "home:cleo", tree, now: 3 });
+    expect(storage.cozyApp("one")?.name).toBe("My One");
+    const first = storage.createCozyAppAction({ id: "a1", appId: "one", creatorBot: "home:cleo", actionId: "go", idempotencyKey: "same", now: 3 }).action;
+    const second = storage.createCozyAppAction({ id: "a2", appId: "two", creatorBot: "home:cleo", actionId: "go", idempotencyKey: "same", now: 3 }).action;
+    expect(first.id).toBe("a1"); expect(second.id).toBe("a2");
+    expect(storage.settleCozyAppAction({ id: "a1", appId: "one", creatorBot: "home:cleo", actionId: "go", status: "completed", now: 4 })).toBe(true);
+    expect(storage.settleCozyAppAction({ id: "a1", appId: "two", creatorBot: "home:cleo", actionId: "go", status: "failed", now: 4 })).toBe(false);
+    expect(storage.settleCozyAppAction({ id: "a1", appId: "one", creatorBot: "other:cleo", actionId: "go", status: "failed", now: 4 })).toBe(false);
+    expect(() => storage.upsertCozyApp({ id: "one", name: "Hijack", creatorBot: "other:cleo", tree, now: 5 })).toThrow(/immutable/);
+    expect(storage.deleteCozyApp("one")).toBe(true);
+    expect(storage.cozyAppsSnapshot().actions.some((action) => action.id === "a1")).toBe(false);
+    storage.close();
+  });
+  it("gives two creators distinct durable apps for the same logical id", () => {
+    const storage = openStorage(":memory:");
+    const cleo = cozyAppPhysicalId("home:cleo", "cowboys");
+    const sage = cozyAppPhysicalId("home:sage", "cowboys");
+    expect(cleo).not.toBe(sage);
+    expect(cozyAppPhysicalId("home:cleo", cleo)).toBe(cleo);
+    storage.upsertCozyApp({ id: cleo, name: "Cleo Cowboys", creatorBot: "home:cleo", tree, now: 1 });
+    storage.upsertCozyApp({ id: sage, name: "Sage Cowboys", creatorBot: "home:sage", tree, now: 1 });
+    storage.renameCozyApp(cleo, "My Cowboys", 2);
+    storage.upsertCozyApp({ id: cleo, name: "ignored", creatorBot: "home:cleo", tree, now: 3 });
+    expect(storage.listCozyApps().map((app) => app.id).sort()).toEqual([cleo, sage].sort());
+    expect(storage.cozyApp(cleo)?.name).toBe("My Cowboys");
+    const cleoAction = storage.createCozyAppAction({ id: "cleo-action", appId: cleo, creatorBot: "home:cleo", actionId: "go", idempotencyKey: "same", now: 4 }).action;
+    const sageAction = storage.createCozyAppAction({ id: "sage-action", appId: sage, creatorBot: "home:sage", actionId: "go", idempotencyKey: "same", now: 4 }).action;
+    expect(storage.settleCozyAppAction({ id: cleoAction.id, appId: cleoAction.appId, creatorBot: cleoAction.creatorBot, actionId: cleoAction.actionId, status: "completed", now: 5 })).toBe(true);
+    expect(storage.settleCozyAppAction({ id: sageAction.id, appId: sageAction.appId, creatorBot: sageAction.creatorBot, actionId: sageAction.actionId, status: "failed", now: 5 })).toBe(true);
+    storage.close();
   });
 });
 

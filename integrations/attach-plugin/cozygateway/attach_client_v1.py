@@ -76,7 +76,7 @@ HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts",
     "delegation", "thinking", "desktop_session_sync",
-    "desktop_session_resume",
+    "desktop_session_resume", "cozyapps",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
@@ -142,6 +142,7 @@ class AttachV1ClientConfig:
     on_clarify: Optional[Callable[[Dict[str, Any]], None]] = None
     on_desktop_resume: Optional[Callable[[Dict[str, Any]], None]] = None
     on_memory: Optional[Callable[[Dict[str, Any]], None]] = None
+    on_cozyapp_action: Optional[Callable[[Dict[str, Any]], None]] = None
     on_ready: Optional[Callable[[], None]] = None
     connect_factory: Optional[Callable[..., Any]] = None
     max_in_flight_events: int = 64
@@ -366,6 +367,20 @@ class AttachV1Client:
                 event["detail"] = chip.detail
             if await self._queue_event(event) is not None:
                 tool_states[chip.id] = state
+
+    async def upsert_cozyapp(self, app_id: str, name: str, tree: Dict[str, Any]) -> bool:
+        """Journal a complete app tree; Gateway remains the authoritative validator."""
+        return await self._queue_event({"kind": "cozyapp_upsert", "appId": app_id, "name": name, "tree": tree}) is not None
+
+    async def cozyapp_action_status(self, command: Dict[str, Any], status: str) -> bool:
+        if status not in {"completed", "failed"}:
+            return False
+        return await self._queue_event({"kind": "cozyapp_action_status", "appId": command.get("appId"), "actionId": command.get("actionId"), "actionRequestId": command.get("actionRequestId"), "status": status}) is not None
+
+    async def finish_cozyapp_action(self, command: Dict[str, Any], status: str) -> None:
+        """Terminal event is journaled before its command stops replaying."""
+        if await self.cozyapp_action_status(command, status):
+            self._spool.mark_command_processed(str(command.get("_commandId", "")))
 
     async def send_done(
         self,
@@ -1055,6 +1070,15 @@ class AttachV1Client:
             handler, parsed = self._config.on_clarify, command
         elif command.get("kind") == "desktop_session_resume" and self._config.on_desktop_resume is not None:
             handler, parsed = self._config.on_desktop_resume, command
+        elif command.get("kind") == "cozyapp_action":
+            command = {**command, "_commandId": str(frame.get("commandId", ""))}
+            if self._config.on_cozyapp_action is not None:
+                # The adapter schedules private Hermes execution itself; do not block the socket
+                # watcher or replay command waiting for a model turn.
+                self._config.on_cozyapp_action(command)
+            else:
+                await self.finish_cozyapp_action(command, "failed")
+            return
         elif command.get("kind") == "delivery_receipt":
             # Receipts have no handler callback: the durable record IS the effect. The ACK has
             # already been sent by the command-inbox machinery above.
@@ -1067,6 +1091,8 @@ class AttachV1Client:
                 if inspect.isawaitable(outcome):
                     await outcome
             except Exception:
+                if command.get("kind") == "cozyapp_action":
+                    await self.cozyapp_action_status(command, "failed")
                 return
         self._spool.mark_command_processed(str(frame.get("commandId", "")))
 
@@ -1365,4 +1391,8 @@ def _event_capabilities(event: Dict[str, Any]) -> List[str]:
         return ["desktop_session_resume"]
     if kind == "desktop_session_message":
         return ["desktop_session_sync"]
+    if kind == "cozyapp_upsert":
+        return ["cozyapps"]
+    if kind == "cozyapp_action_status":
+        return ["cozyapps"]
     return ["draft"] + (["media"] if kind == "commit" and event.get("mediaIds") else [])

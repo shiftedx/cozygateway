@@ -35,6 +35,7 @@ import {
   PresenceStateSchema,
   ToolCallSchema,
 } from "./resources.ts";
+import { CozyAppsSnapshotFrameSchema, CozyAppActionFrameSchema } from "./cozyapps.ts";
 
 export const AuthFrameSchema = Type.Object({
   type: Type.Literal("auth"),
@@ -279,5 +280,7 @@ export const ServerFrameSchema = Type.Union([
   BotToolActivityFrameSchema,
   BotDelegationActivityFrameSchema,
   BotThinkingActivityFrameSchema,
+  CozyAppsSnapshotFrameSchema,
+  CozyAppActionFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

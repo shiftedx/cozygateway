@@ -161,6 +161,7 @@ export class WsHub {
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
         this.#send(socket, { type: "ready", deviceId: device.id, gateway: this.#gatewayInfo });
+        this.#send(socket, { type: "cozyapps_snapshot", ...this.#storage.cozyAppsSnapshot() });
         return;
       }
 

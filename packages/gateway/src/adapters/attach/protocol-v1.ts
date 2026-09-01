@@ -4,6 +4,7 @@ import {
   BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema,
   BotMemoryDeleteResponseSchema, BotMemorySetupRequestSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema, MobileNodeMediaDescriptorSchema,
   type MobileNodeGatewayStatusResult,
+  CozyAppTreeSchema,
 } from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
@@ -31,6 +32,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("thinking"),
   Type.Literal("desktop_session_resume"),
   Type.Literal("desktop_session_sync"),
+  Type.Literal("cozyapps"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -145,6 +147,8 @@ const DeliveryReceiptCommand = Type.Object({
   stage: Type.Optional(Type.Union([Type.Literal("authorization"), Type.Literal("projection")])),
   reason: Type.Optional(Type.String({ maxLength: 256 })),
 });
+/** App actions are a separate durable lane, never synthetic chat text. */
+const CozyAppActionCommand = Type.Object({ kind: Type.Literal("cozyapp_action"), appId: Id, actionId: Id, actionRequestId: Id });
 
 /** Capability-free transport tombstone. It advances the durable command sequence without
  * invoking a Hermes action when a command queued while disconnected is no longer supported by
@@ -155,13 +159,14 @@ const DiscardCommand = Type.Object({
     Type.Literal("turn"), Type.Literal("steer"), Type.Literal("interrupt"),
     Type.Literal("resolve_approval"), Type.Literal("resolve_clarify"),
     Type.Literal("desktop_session_resume"), Type.Literal("delivery_receipt"),
+    Type.Literal("cozyapp_action"),
   ]),
   reason: Type.String({ minLength: 1, maxLength: 512 }),
 });
 
 export const AttachV1CommandSchema = Type.Union([
   TurnCommand, SteerCommand, InterruptCommand, ResolveApprovalCommand, ResolveClarifyCommand,
-  DesktopSessionResumeCommand, DeliveryReceiptCommand, DiscardCommand,
+  DesktopSessionResumeCommand, DeliveryReceiptCommand, CozyAppActionCommand, DiscardCommand,
 ]);
 export type AttachV1Command = Static<typeof AttachV1CommandSchema>;
 
@@ -299,6 +304,10 @@ const ScheduledCanonicalHomeEvent = Type.Object({
   mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
 });
 const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1MediaDescriptorSchema });
+/** The ingress identity is the immutable creator; it is intentionally absent from this event. */
+const CozyAppUpsertEvent = Type.Object({ kind: Type.Literal("cozyapp_upsert"), appId: Id, name: Type.String({ minLength: 1, maxLength: 120 }), tree: CozyAppTreeSchema }, { additionalProperties: false });
+/** Terminal proof from the plugin that a distinct app action command ran. */
+const CozyAppActionStatusEvent = Type.Object({ kind: Type.Literal("cozyapp_action_status"), appId: Id, actionId: Id, actionRequestId: Id, status: Type.Union([Type.Literal("completed"), Type.Literal("failed")]) }, { additionalProperties: false });
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
 });
@@ -395,7 +404,7 @@ export type AttachV1MobileResultInput =
 export const AttachV1EventSchema = Type.Union([
   DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent, DelegationEvent,
   ThinkingEvent,
-  ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, PresenceEvent,
+  ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, CozyAppUpsertEvent, CozyAppActionStatusEvent, PresenceEvent,
   DesktopSessionResumedEvent, DesktopSessionMessageEvent,
 ]);
 export type AttachV1Event = Static<typeof AttachV1EventSchema>;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Message, RichBlock } from "cozygateway-contract";
+import type { CozyAppTree, Message, RichBlock } from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
 import { openStorage } from "../src/storage.ts";
@@ -16,7 +16,7 @@ const config: GatewayConfig = {
   hermesEndpoints: [{ id: "default", ...testHermes() }],
 };
 
-async function setup(opts?: { backendDown?: boolean }) {
+async function setup(opts?: { backendDown?: boolean; actionAvailable?: boolean; actionDispatch?: () => boolean }) {
   const storage = openStorage(":memory:");
   storage.upsertAgent({ id: "mock", name: "Mock", avatar: null, backend: "mock" });
   const app = createApp({
@@ -31,6 +31,7 @@ async function setup(opts?: { backendDown?: boolean }) {
     interruptThread: () => "idle",
     resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: () => {},
+    ...(opts?.actionDispatch === undefined && opts?.actionAvailable === undefined ? {} : { sendCozyAppAction: () => opts?.actionDispatch?.() ?? opts?.actionAvailable! }),
     now: () => 1_000,
   });
   const code = newSetupCode();
@@ -48,6 +49,37 @@ async function setup(opts?: { backendDown?: boolean }) {
     });
   return { app, storage, authed };
 }
+
+describe("cozy apps", () => {
+  const tree: CozyAppTree = { root: { id: "root", kind: "stack", children: [{ id: "button", kind: "button", label: "Go", actionId: "go", role: "primary" }] } };
+  it("requires device auth, validates button/refresh actions, and fails a known-unavailable bot", async () => {
+    const { app, storage, authed } = await setup({ actionAvailable: false });
+    storage.upsertCozyApp({ id: "app", name: "App", creatorBot: "home:cleo", tree, now: 1 });
+    expect((await app.request("/cozyapps")).status).toBe(401);
+    const missing = await authed("/cozyapps/app/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ idempotencyKey: "one", actionId: "missing" }) });
+    expect(missing.status).toBe(400);
+    const refresh = await authed("/cozyapps/app/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ idempotencyKey: "two", actionId: "refresh" }) });
+    expect(refresh.status).toBe(202);
+    expect(((await refresh.json()) as { status: string }).status).toBe("failed");
+    const conflict = await authed("/cozyapps/app/tree", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ expectedRevision: 99, tree }) });
+    expect(conflict.status).toBe(409);
+  });
+  it("dispatches an idempotent action once and rejects a key reused for another action", async () => {
+    let dispatches = 0;
+    const { storage, authed } = await setup({ actionDispatch: () => { dispatches += 1; return true; } });
+    storage.upsertCozyApp({ id: "app", name: "App", creatorBot: "home:cleo", tree, now: 1 });
+    const post = (actionId: string) => authed("/cozyapps/app/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ idempotencyKey: "once", actionId }) });
+    const first = await post("go");
+    const firstAction = (await first.json()) as { id: string; actionId: string };
+    const retry = await post("go");
+    expect(retry.status).toBe(202);
+    expect((await retry.json()) as { id: string }).toMatchObject({ id: firstAction.id, actionId: "go" });
+    expect(dispatches).toBe(1);
+    const mismatch = await post("refresh");
+    expect(mismatch.status).toBe(400);
+    expect(dispatches).toBe(1);
+  });
+});
 
 describe("agents", () => {
   it("lists agents with presence", async () => {

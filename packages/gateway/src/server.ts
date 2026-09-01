@@ -20,13 +20,16 @@ import {
   HARNESS_WORKSPACE_CAPABILITY_VERSION,
   HARNESS_UPDATE_CAPABILITY_ID,
   HARNESS_UPDATE_CAPABILITY_VERSION,
+  COZYAPPS_CAPABILITY_ID,
+  COZYAPPS_CAPABILITY_VERSION,
+  assertValidCozyAppTree,
   type GatewayInfo,
   type ServerFrame,
 } from "cozygateway-contract";
 
 import { hermesEndpoints, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
-import { openStorage, type Storage } from "./storage.ts";
+import { cozyAppPhysicalId, openStorage, type Storage } from "./storage.ts";
 import {
   ATTACH_V1_CAPABILITIES,
   AttachV1Ingress,
@@ -206,6 +209,7 @@ export function gatewayInfoForConfig(
     capabilities: {
       ...configuredCapabilities,
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
+      [COZYAPPS_CAPABILITY_ID]: COZYAPPS_CAPABILITY_VERSION,
       ...(management ? { [GATEWAY_MANAGEMENT_CAPABILITY_ID]: GATEWAY_MANAGEMENT_CAPABILITY_VERSION } : {}),
       ...(hermesEndpoints(config).length === 0
         ? {}
@@ -456,12 +460,32 @@ export async function startGateway(
         if (nativeBotPlane?.canAccept(agentId, frame)) return true;
         if (!("threadId" in frame.event))
           return (
-            frame.event.kind === "presence" || frame.event.kind === "media"
+            frame.event.kind === "presence" || frame.event.kind === "media" || frame.event.kind === "cozyapp_upsert" || frame.event.kind === "cozyapp_action_status"
           );
         const thread = storage.threadById(frame.event.threadId);
         return thread !== undefined && thread.agentId === agentId;
       },
       onEvent: (agentId, frame) => {
+        if (frame.event.kind === "cozyapp_upsert") {
+          try {
+            assertValidCozyAppTree(frame.event.tree);
+            storage.upsertCozyApp({ id: cozyAppPhysicalId(agentId, frame.event.appId), name: frame.event.name, creatorBot: agentId, tree: frame.event.tree, now: Date.now() });
+            hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+            return true;
+          } catch {
+            // Another creator already owns this stable client id. The malicious/buggy upsert is
+            // refused without letting one bad event dead-letter and block that bot's whole stream.
+            return true;
+          }
+        }
+        if (frame.event.kind === "cozyapp_action_status") {
+          if (storage.settleCozyAppAction({ id: frame.event.actionRequestId, appId: frame.event.appId, creatorBot: agentId, actionId: frame.event.actionId, status: frame.event.status, now: Date.now() })) {
+            nativeBotPlane?.clearCozyAppActionOrigin(agentId, frame.event.appId, frame.event.actionRequestId);
+            hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+            return true;
+          }
+          return false;
+        }
         if (bridge instanceof HermesBridge && bridge.handleGroupAttachEvent(agentId, frame)) return true;
         if (router.onV1Event(agentId, frame)) return true;
         if (nativeBotPlane?.handle(agentId, frame)) return true;
@@ -656,6 +680,13 @@ export async function startGateway(
     attachTokens,
     attachMediaAllowed: (agentId: string) =>
       allowedAttachMedia(config, agentId),
+    sendCozyAppAction: (action, deviceId) => {
+      if (!nativeBotPlane?.registerCozyAppActionOrigin(action.creatorBot, action.appId, action.id, deviceId, Math.max(30_000, config.turnTimeoutSeconds * 1000))) return false;
+      const queued = attachV1Ingress.sendCozyAppAction(action.creatorBot, { appId: action.appId, actionId: action.actionId, actionRequestId: action.id });
+      if (!queued) nativeBotPlane.clearCozyAppActionOrigin(action.creatorBot, action.appId, action.id);
+      return queued;
+    },
+    cozyAppsChanged: () => hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() }),
     beginMobileMediaUpload: (deviceId, requestId, lease) => {
       const claim = mobileNode?.beginMediaUpload(deviceId, requestId, lease);
       return claim === undefined ? undefined : {

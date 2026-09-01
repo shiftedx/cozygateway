@@ -50,7 +50,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -487,6 +487,9 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendNativeInterrupt(agentId: string, input: { threadId: string; turnId: string }): boolean {
     return this.#enqueue(agentId, { kind: "interrupt", ...input });
   }
+  sendCozyAppAction(agentId: string, input: { appId: string; actionId: string; actionRequestId: string }): boolean {
+    return this.#enqueue(agentId, { kind: "cozyapp_action", ...input }, `cozyapp-action:${input.actionRequestId}`);
+  }
 
   /** Enqueue an explicit desktop adoption. The idempotency key is the gateway-owned resume id;
    * command ACK is transport-only, while the later `desktop_session_resumed` event is the sole
@@ -839,6 +842,8 @@ function eventCapabilities(frame: AttachV1EventFrame): AttachV1Capability[] {
     case "presence": return [];
     case "desktop_session_message": return ["desktop_session_sync"];
     case "desktop_session_resumed": return ["desktop_session_resume"];
+    case "cozyapp_upsert": return ["cozyapps"];
+    case "cozyapp_action_status": return ["cozyapps"];
     case "commit": return ["draft", ...(frame.event.mediaIds?.length ? ["media" as const] : [])];
     default: return ["draft"];
   }
@@ -850,6 +855,7 @@ function commandCapabilities(command: AttachV1Command): AttachV1Capability[] {
   if (command.kind === "resolve_approval") return ["approvals"];
   if (command.kind === "resolve_clarify") return ["clarify"];
   if (command.kind === "desktop_session_resume") return ["desktop_session_resume"];
+  if (command.kind === "cozyapp_action") return ["cozyapps"];
   if (command.kind === "turn" && (command.mediaIds?.length ?? 0) > 0) return ["draft", "media"];
   return ["draft"];
 }

@@ -26,6 +26,10 @@ import {
   HERMES_SESSION_QUERY_MAX_LENGTH,
   HERMES_SESSION_SEARCH_MAX,
   HermesSessionPatchSchema,
+  CozyAppRenameRequestSchema,
+  CozyAppReplaceTreeRequestSchema,
+  CozyAppActionRequestSchema,
+  assertValidCozyAppTree,
   ModelProviderFieldUpdateSchema,
   ModelProviderOAuthCodeSchema,
 } from "cozygateway-contract";
@@ -59,6 +63,7 @@ import type {
   MediaLimiter,
   MediaLookup,
 } from "./hermes-bridge/media.ts";
+import { fetchMedia, resolveMediaSource, MediaBusy, MediaRefused, MediaTimedOut, MediaUpstreamFailed, MEDIA_CACHE_CONTROL } from "./hermes-bridge/media.ts";
 import {
   ATTACH_MEDIA_TTL_MS,
   PhotoRefused,
@@ -208,6 +213,9 @@ export interface AppDeps {
   hermesGlobalSkillsLog?: (line: string) => void;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
+  /** Separate attach-v1 app-action lane; it never injects hidden chat content. */
+  sendCozyAppAction?: (action: { id: string; appId: string; creatorBot: string; actionId: string }, deviceId: string) => boolean;
+  cozyAppsChanged?: () => void;
   /** Operator surface for attach-v1 projection dead letters (issue #193). A dead letter blocks
    *  every later event for its agent, so it must be listable and releasable without DB surgery. */
   attachDeadLetters?: () => Array<{
@@ -902,6 +910,61 @@ export function createApp(deps: AppDeps): Hono<Env> {
       }
     });
   }
+  // Durable user library. Bot-side upserts use the separate attach-v1 cozyapps lane; these are
+  // deliberately the only device mutations (rename, explicit generated-tree replacement, delete).
+  app.get("/cozyapps", requireDevice, (c) => c.json(deps.storage.listCozyApps()));
+  app.get("/cozyapps/:id", requireDevice, (c) => {
+    const app = deps.storage.cozyApp(c.req.param("id"));
+    return app === undefined ? c.json(errorBody("not_found", "cozy app not found"), 404) : c.json(app);
+  });
+  app.patch("/cozyapps/:id", requireDevice, async (c) => {
+    try {
+      const input = assertValid(CozyAppRenameRequestSchema, await c.req.json());
+      return deps.storage.renameCozyApp(c.req.param("id"), input.name, deps.now())
+        ? (deps.cozyAppsChanged?.(), c.json(deps.storage.cozyApp(c.req.param("id"))!))
+        : c.json(errorBody("not_found", "cozy app not found"), 404);
+    } catch (err) { return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "invalid request"), 400); }
+  });
+  app.put("/cozyapps/:id/tree", requireDevice, async (c) => {
+    try {
+      const input = assertValid(CozyAppReplaceTreeRequestSchema, await c.req.json());
+      assertValidCozyAppTree(input.tree);
+      const result = deps.storage.replaceCozyAppTree(c.req.param("id"), input.expectedRevision, input.tree, deps.now());
+      if (result === "not_found") return c.json(errorBody("not_found", "cozy app not found"), 404);
+      if (result === "conflict") return c.json({ error: { code: "conflict", message: "cozy app changed; refresh and retry" }, current: deps.storage.cozyApp(c.req.param("id")) }, 409);
+      deps.cozyAppsChanged?.(); return c.json(deps.storage.cozyApp(c.req.param("id"))!);
+    } catch (err) { return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "invalid request"), 400); }
+  });
+  app.delete("/cozyapps/:id", requireDevice, (c) => deps.storage.deleteCozyApp(c.req.param("id")) ? (deps.cozyAppsChanged?.(), c.body(null, 204)) : c.json(errorBody("not_found", "cozy app not found"), 404));
+  app.post("/cozyapps/:id/actions", requireDevice, async (c) => {
+    try {
+      const input = assertValid(CozyAppActionRequestSchema, await c.req.json());
+      const app = deps.storage.cozyApp(c.req.param("id"));
+      if (app === undefined) return c.json(errorBody("not_found", "cozy app not found"), 404);
+      const hasAction = (node: any): boolean => (node.kind === "button" && node.actionId === input.actionId) || (node.children ?? []).some(hasAction);
+      if (input.actionId !== "refresh" && !hasAction(app.tree.root)) return c.json(errorBody("invalid_request", "cozy app action not found"), 400);
+      const { action, fresh } = deps.storage.createCozyAppAction({ id: randomUUID(), appId: app.id, creatorBot: app.creatorBot, actionId: input.actionId, idempotencyKey: input.idempotencyKey, now: deps.now() });
+      if (fresh && deps.sendCozyAppAction !== undefined && !deps.sendCozyAppAction(action, c.get("deviceId")))
+        deps.storage.settleCozyAppAction({ id: action.id, appId: action.appId, creatorBot: action.creatorBot, actionId: action.actionId, status: "failed", now: deps.now() });
+      if (fresh) deps.cozyAppsChanged?.();
+      return c.json(deps.storage.cozyAppsSnapshot().actions.find((item) => item.id === action.id) ?? action, 202);
+    } catch (err) { return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "invalid request"), 400); }
+  });
+  app.get("/cozyapps/:id/nodes/:nodeId/image", requireDevice, async (c) => {
+    const app = deps.storage.cozyApp(c.req.param("id"));
+    const findImage = (node: any): string | undefined => node.id === c.req.param("nodeId") && node.kind === "image" ? node.source : (node.children ?? []).map(findImage).find(Boolean);
+    const source = app === undefined ? undefined : findImage(app.tree.root);
+    if (source === undefined) return c.json(errorBody("not_found", "cozy app image not found"), 404);
+    try {
+      const media = await fetchMedia(resolveMediaSource(source), { ...(deps.mediaFetch === undefined ? {} : { fetchImpl: deps.mediaFetch }), ...(deps.mediaLookup === undefined ? {} : { lookup: deps.mediaLookup }), ...(deps.mediaLimiter === undefined ? {} : { limiter: deps.mediaLimiter }), ...(deps.mediaQueueWaitMs === undefined ? {} : { queueWaitMs: deps.mediaQueueWaitMs }) });
+      return new Response(media.body, { headers: { "content-type": media.contentType, "cache-control": MEDIA_CACHE_CONTROL, ...(media.contentLength === undefined ? {} : { "content-length": String(media.contentLength) }) } });
+    } catch (err) {
+      if (err instanceof MediaRefused) return c.json({ ...errorBody("invalid_request", err.message), reason: err.reason }, 400);
+      if (err instanceof MediaBusy) return c.json(errorBody("backend_unavailable", "image proxy is busy"), 503);
+      if (err instanceof MediaTimedOut || err instanceof MediaUpstreamFailed) return c.json(errorBody("backend_unavailable", "image source unavailable"), 502);
+      return c.json(errorBody("internal", "image proxy failed"), 500);
+    }
+  });
 
   // Issue #193's operator surface. A projection dead letter head-of-line blocks its agent's
   // whole event stream; before these routes the only remedies were DB surgery or a redeploy.

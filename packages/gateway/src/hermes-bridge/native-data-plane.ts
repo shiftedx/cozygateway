@@ -159,6 +159,9 @@ export class NativeBotDataPlane {
   readonly #trace: TraceLog | undefined;
   readonly #mobileNode: MobileNodeBroker | undefined;
   readonly #turnOrigins = new Map<string, string>();
+  /** Device-bound private CozyApp executions. Never persisted or exposed on either public wire. */
+  readonly #cozyAppOrigins = new Map<string, { deviceId: string; expiresAt: number }>();
+  readonly #cozyAppOriginTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #draftSeq = new Map<string, number>();
   /** Last plugin-side thinking `seq` per turnId. In-memory only: thinking is ephemeral by
    *  design (capability 35), so there is no storage row and no restore on reboot. */
@@ -381,6 +384,17 @@ export class NativeBotDataPlane {
       this.#mobileNode?.reject(key, frame.requestId);
       return;
     }
+    const privateOrigin = this.#cozyAppOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId));
+    if (privateOrigin !== undefined) {
+      if (privateOrigin.expiresAt < this.#now()) {
+        this.#cozyAppOrigins.delete(this.#nativeTurnKey(key, frame.threadId, frame.turnId));
+        this.#mobileNode?.reject(key, frame.requestId);
+        return;
+      }
+      const { kind: _kind, ...request } = frame;
+      this.#mobileNode?.invoke({ ...request, bot: key, agentId: key, deviceId: privateOrigin.deviceId });
+      return;
+    }
     const chat = this.#storage.nativeBotChat(key, this.#now());
     if (chat.sessionId !== frame.threadId || chat.activeTurnId !== frame.turnId) {
       this.#mobileNode?.reject(key, frame.requestId);
@@ -393,6 +407,23 @@ export class NativeBotDataPlane {
     this.#mobileNode?.invoke({
       ...request, bot: key, agentId: key, deviceId: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
     });
+  }
+
+  registerCozyAppActionOrigin(bot: string, appId: string, actionRequestId: string, deviceId: string, ttlMs: number): boolean {
+    const key = normalize(bot);
+    if (!this.handles(key) || !/^[A-Za-z0-9_-]{1,128}$/.test(appId) || !/^[A-Za-z0-9_-]{1,128}$/.test(actionRequestId)) return false;
+    const threadId = `__cozyapp__:${appId}`;
+    const originKey = this.#nativeTurnKey(key, threadId, actionRequestId);
+    this.#cozyAppOrigins.set(originKey, { deviceId, expiresAt: this.#now() + ttlMs });
+    clearTimeout(this.#cozyAppOriginTimers.get(originKey));
+    const timer = setTimeout(() => { this.#cozyAppOrigins.delete(originKey); this.#cozyAppOriginTimers.delete(originKey); }, ttlMs);
+    timer.unref?.(); this.#cozyAppOriginTimers.set(originKey, timer);
+    return true;
+  }
+
+  clearCozyAppActionOrigin(bot: string, appId: string, actionRequestId: string): void {
+    const key = this.#nativeTurnKey(normalize(bot), `__cozyapp__:${appId}`, actionRequestId);
+    this.#cozyAppOrigins.delete(key); clearTimeout(this.#cozyAppOriginTimers.get(key)); this.#cozyAppOriginTimers.delete(key);
   }
 
   recordMobileReceipt(input: MobileNodeReceiptInput): BotMobileReceipt | undefined {
@@ -436,6 +467,9 @@ export class NativeBotDataPlane {
     this.#interactionTimers.clear();
     for (const timer of this.#turnTimers.values()) clearTimeout(timer);
     this.#turnTimers.clear();
+    for (const timer of this.#cozyAppOriginTimers.values()) clearTimeout(timer);
+    this.#cozyAppOriginTimers.clear();
+    this.#cozyAppOrigins.clear();
     for (const batch of this.#liveTurnBatches.values()) clearTimeout(batch.timer);
     this.#liveTurnBatches.clear();
   }

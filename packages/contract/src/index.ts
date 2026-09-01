@@ -17,3 +17,4 @@ export * from "./harness-settings.ts";
 export * from "./harness-workspace.ts";
 export * from "./harness-update.ts";
 export * from "./hermes-session-management.ts";
+export * from "./cozyapps.ts";
