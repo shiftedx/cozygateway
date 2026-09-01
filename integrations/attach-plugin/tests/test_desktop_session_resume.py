@@ -394,6 +394,50 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 21)
         self.assertEqual(client.mirrored, [])
 
+    async def test_native_phone_lane_never_replays_rows_written_during_or_after_turn(self):
+        """The CozyGateway session is already projected by native turn/commit frames.
+
+        A mirror link is still retained for its bounded resume cursor, but it is not a
+        second transcript transport.  In particular, a poll after a phone turn must
+        not turn the just-written assistant commit into a desktop-session event.
+        """
+        adapter, _runner, store, client = self._adapter(
+            rows=("native-tip",), source="cozygateway", messages=[],
+            chat_id="native:sage:1",
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        client.spool = spool
+
+        async def handle_message(event):
+            adapter.injected.append(event)
+            # These are the phone request and the native assistant commit written
+            # while the injected turn is in flight.
+            store.session_db.messages.extend([
+                {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
+                {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
+            ])
+
+        adapter.handle_message = handle_message
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="from phone"))
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 42)
+
+        # A later native commit used to be emitted by the desktop poller and
+        # rendered as a duplicate in CozyChat.
+        store.session_db.messages.extend([
+            {"id": 43, "role": "tool", "content": "ignored", "timestamp": 3},
+            {"id": 44, "role": "assistant", "content": "later native reply", "timestamp": 4},
+        ])
+        adapter._active_turn.clear()  # model the normal terminal cleanup before the next poll
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+
+        self.assertEqual(client.mirrored, [])
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 44)
+
     async def test_resumed_tui_baseline_tracks_a_compression_rotated_active_tip(self):
         adapter, runner, store, client = self._adapter(
             rows=("desktop-root", "desktop-tip"), resolved={"desktop-root": "desktop-tip"},

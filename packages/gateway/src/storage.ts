@@ -3510,6 +3510,27 @@ export function openStorage(dbPath: string): Storage {
   ] as const;
   for (const [name, sql] of delegationAdditions)
     if (!delegationColumns.has(name)) db.exec(sql);
+  // Early desktop-sync builds reflected a gateway-authored row back through attach as
+  // `desktop:cozygateway:*`, then stored that echo alongside the original direct transcript
+  // row. Repair only a provable pair: same bot, local session, role, exact text, and a one-second
+  // timestamp window. An unmatched echo remains recoverable history, and no direct source row is
+  // ever touched. Deleting rows leaves valid per-session seq ordering; SQLite does not require
+  // resequencing the remaining primary-key values.
+  db.prepare(`
+    DELETE FROM bot_native_messages
+    WHERE message_id LIKE 'desktop:cozygateway:%'
+      AND at IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM bot_native_messages AS direct
+        WHERE direct.bot = bot_native_messages.bot
+          AND direct.session_id = bot_native_messages.session_id
+          AND direct.role = bot_native_messages.role
+          AND direct.text = bot_native_messages.text
+          AND direct.message_id NOT LIKE 'desktop:cozygateway:%'
+          AND direct.at IS NOT NULL
+          AND ABS(direct.at - bot_native_messages.at) <= 1000
+      )
+  `).run();
   // A process can disappear after a tool starts but before its terminal event is persisted. Only
   // the selected active turn can still receive that event after restart; close every older step so
   // history never presents stale work as currently running.

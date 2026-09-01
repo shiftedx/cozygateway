@@ -1579,6 +1579,24 @@ class AttachAdapter:
                 if row_id <= after:
                     continue
                 expected_current = str(link["currentHermesSessionId"])
+                # A CozyGateway-origin session is the native phone lane. Its turn and commit
+                # frames have already projected every transcript row to CozyChat, so sending a
+                # second ``desktop_session_message`` here would render an echo. Keep a durable
+                # high-water cursor nonetheless: it bounds restart polling and lets a later
+                # explicit Desktop/TUI/CLI adoption begin at exactly this handoff point.
+                if source == PLATFORM_NAME:
+                    if not spool.advance_desktop_session_link(
+                        thread_id=thread_id,
+                        expected_current_hermes_session_id=expected_current,
+                        current_hermes_session_id=current,
+                        expected_source=source,
+                        expected_desktop_session_id=link.get("desktopSessionId"),
+                        last_message_row_id=row_id,
+                    ):
+                        return
+                    link["currentHermesSessionId"] = current
+                    after = row_id
+                    continue
                 role = str(message.get("role") or "")
                 text = message.get("content")
                 if role not in {"user", "assistant"} or not isinstance(text, str) or not text.strip():

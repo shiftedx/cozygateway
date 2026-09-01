@@ -416,7 +416,12 @@ export class NativeBotDataPlane {
     }
     if (frame.event.kind === "desktop_session_message") {
       if (!this.#storage.nativeBotHasSession(key, frame.event.threadId)) return false;
-      return frame.event.source === "cozygateway" || this.#storage.hasConfirmedNativeDesktopResume(
+      // A gateway-origin transcript row is the attach plugin observing the mobile message we
+      // already committed locally. Accepting it would turn the mirror into a feedback loop and
+      // render every matching user or assistant row twice. Only an independently verified
+      // Desktop/TUI/CLI source may project transcript history back into this local session.
+      if (frame.event.source === "cozygateway") return false;
+      return this.#storage.hasConfirmedNativeDesktopResume(
         key, frame.event.desktopSessionId, frame.event.threadId,
       );
     }
