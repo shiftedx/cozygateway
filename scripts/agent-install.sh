@@ -613,7 +613,7 @@ preflight_service_manager() {
   fi
 }
 write_cli_wrapper() {
-  local node_native bundle_native local_native bootstrap_native
+  local node_native bundle_native local_native bootstrap_native bootstrap_b64
   [ "$DRY_RUN" = 1 ] && { say "DRY   write executable gateway CLI at $CLI_WRAPPER"; return; }
   mkdir -p "$GATEWAY_DIR/bin"
   umask 022
@@ -645,6 +645,7 @@ CLI
     bundle_native="$(to_windows_path "$BUNDLE_PATH")"
     local_native="$(to_windows_path "$LOCAL_DIR")"
     bootstrap_native="$(to_windows_path "$WINDOWS_BOOTSTRAP")"
+    bootstrap_b64="$(printf '%s' "$bootstrap_native" | base64 | tr -d '\r\n')"
     {
       printf '@echo off\r\n'
       printf 'if /I "%%~1"=="repair" goto repair\r\n'
@@ -656,7 +657,7 @@ CLI
       printf 'if not "%%~2"=="" (echo FAIL  repair does not accept extra arguments & exit /b 1)\r\n'
       printf 'if not exist "%s" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
       printf 'if not exist "%s.sha256" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
-      printf "\"%s\" -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop';try {\$p=[IO.Path]::GetFullPath(\$args[0]);\$expected=((Get-Content -LiteralPath (\$p+'.sha256') -Raw).Trim() -split '\\s+')[0].ToLowerInvariant();\$actual=(Get-FileHash -LiteralPath \$p -Algorithm SHA256).Hash.ToLowerInvariant();if([string]::IsNullOrWhiteSpace(\$expected) -or \$expected -ne \$actual){exit 1};exit 0}catch{exit 1}\" \"%s\"\r\n" "$WINDOWS_POWERSHELL" "$bootstrap_native"
+      printf "\"%s\" -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop';try {\$p=[IO.Path]::GetFullPath([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')));\$expected=((Get-Content -LiteralPath (\$p+'.sha256') -Raw).Trim() -split '\\s+')[0].ToLowerInvariant();\$actual=(Get-FileHash -LiteralPath \$p -Algorithm SHA256).Hash.ToLowerInvariant();if([string]::IsNullOrWhiteSpace(\$expected) -or \$expected -ne \$actual){exit 1};exit 0}catch{exit 1}\"\r\n" "$WINDOWS_POWERSHELL" "$bootstrap_b64"
       printf 'if errorlevel 1 (echo FAIL  repair bootstrap checksum mismatch. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n'
       printf 'set "COZYGATEWAY_HOME=%s"\r\n' "$(to_windows_path "$GATEWAY_DIR")"
       printf '"%s" -NoProfile -ExecutionPolicy Bypass -File "%s" -Repair\r\n' "$WINDOWS_POWERSHELL" "$bootstrap_native"
