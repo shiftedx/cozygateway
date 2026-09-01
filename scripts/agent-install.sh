@@ -509,9 +509,16 @@ try {
 } catch (error) {
   if (error.code !== 'ENOENT') throw error;
 }
+const existingEndpoint = Array.isArray(existing.hermesEndpoints)
+  ? existing.hermesEndpoints.find((endpoint) => endpoint?.id === 'default')
+  : undefined;
+const hiddenProfiles = [...new Set([
+  'default',
+  ...(Array.isArray(existingEndpoint?.hiddenProfiles) ? existingEndpoint.hiddenProfiles : []),
+])];
 const managed = {
   name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
-  hermesEndpoints: [{ id: 'default', url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles }],
+  hermesEndpoints: [{ id: 'default', url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', hiddenProfiles, profiles }],
 };
 delete existing.publicUrl;
 const temporary = `${output}.new`;

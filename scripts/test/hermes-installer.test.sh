@@ -541,6 +541,19 @@ grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
 grep -Fq '"authMode": "token"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -Fq '"tokenEnv": "COZYGATEWAY_HERMES_TOKEN"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-live/local/cozygateway.config.json"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const endpoint = config.hermesEndpoints?.[0];
+if (JSON.stringify(endpoint?.hiddenProfiles) !== JSON.stringify(['default'])) {
+  console.error(`installer-visible Hermes profiles included default: ${JSON.stringify(endpoint?.hiddenProfiles)}`);
+  process.exit(1);
+}
+if (!Object.hasOwn(endpoint?.profiles ?? {}, 'default') || !Object.hasOwn(endpoint?.profiles ?? {}, 'ops')) {
+  console.error('installer stopped attaching a discovered Hermes profile');
+  process.exit(1);
+}
+NODE
 grep -Fq 'COZYGATEWAY_URL=http://127.0.0.1:8787' "$tmp/hermes/.env"
 grep -Fq 'http://127.0.0.1:8787/health' "$tmp/curl.log"
 
