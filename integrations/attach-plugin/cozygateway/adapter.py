@@ -64,7 +64,7 @@ from .attach_client_v1 import (
     _media_byte_limit,
     normalize_location_purpose,
 )
-from .attach_spool import AttachSpool
+from .attach_spool import AttachSpool, INTERACTIVE_SESSION_SOURCES
 from .media_descriptor import (
     MEDIA_COMPATIBILITY_POLICY,
     MediaDescriptor,
@@ -1471,11 +1471,14 @@ class AttachAdapter:
                     last_message_row_id=cursor,
                 )
                 return
-            # An exact prior TUI adoption keeps its source identity but must advance beyond mobile
+            # An exact prior interactive adoption keeps its source identity but must advance beyond mobile
             # rows written on that shared raw session before the mirror worker next polls.
             binding = self._desktop_session_bindings.get(thread_id)
             link = next((item for item in spool.desktop_session_links() if item["threadId"] == thread_id), None)
-            if binding is not None and binding[0] == session_key and link is not None and link["source"] == "tui":
+            link_source = str(link.get("source") or "") if link is not None else ""
+            if (binding is not None and binding[0] == session_key and link is not None
+                    and link_source in INTERACTIVE_SESSION_SOURCES
+                    and str(row.get("source") or "").strip().lower() == link_source):
                 # Compression can rotate the active SessionEntry after adoption.  The durable
                 # link's root remains the proof; resolve it before accepting the new active tip.
                 linked_tip = await asyncio.to_thread(
@@ -1487,7 +1490,7 @@ class AttachAdapter:
                 spool.advance_desktop_session_link(
                     thread_id=thread_id,
                     expected_current_hermes_session_id=str(link["currentHermesSessionId"]),
-                    current_hermes_session_id=session_id, expected_source="tui",
+                    current_hermes_session_id=session_id, expected_source=link_source,
                     expected_desktop_session_id=link.get("desktopSessionId"), last_message_row_id=cursor,
                 )
         except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
@@ -1509,7 +1512,7 @@ class AttachAdapter:
         ):
             return
         source = str(link.get("source") or "")
-        if source not in {PLATFORM_NAME, "tui"}:
+        if source != PLATFORM_NAME and source not in INTERACTIVE_SESSION_SOURCES:
             return
         try:
             current = await asyncio.to_thread(
@@ -1525,7 +1528,7 @@ class AttachAdapter:
                 if (session_source != PLATFORM_NAME or bool(session.get("hidden"))
                         or str(session.get("chat_id") or "") != thread_id):
                     return
-            elif session_source != "tui" or not link.get("desktopSessionId"):
+            elif session_source != source or not link.get("desktopSessionId"):
                 return
 
             after = int(link["lastMessageRowId"])
@@ -1737,13 +1740,13 @@ class AttachAdapter:
             # unwrap only the documented wrapper field before checking the stable SessionDB API.
             session_db = self._sync_session_db(runner, store)
             raw = session_db.get_session(raw_id) if session_db is not None else None
-            if (not isinstance(raw, dict)
-                    or str(raw.get("source") or "").strip().lower() != "tui"):
+            raw_source = str(raw.get("source") or "").strip().lower() if isinstance(raw, dict) else ""
+            if not isinstance(raw, dict) or raw_source not in INTERACTIVE_SESSION_SOURCES:
                 return
             target = session_db.resolve_resume_session_id(raw_id)
             target_row = session_db.get_session(target) if isinstance(target, str) and target else None
             if (not isinstance(target, str) or not target or not isinstance(target_row, dict)
-                    or str(target_row.get("source") or "").strip().lower() != "tui"):
+                    or str(target_row.get("source") or "").strip().lower() != raw_source):
                 return
             await store.get_or_create_session(source)
             switched = await store.switch_session(session_key, target)
@@ -1762,7 +1765,7 @@ class AttachAdapter:
                 # This is the only intentional retarget: an explicit, idle, serialized desktop
                 # adoption. Ordinary retries use insert-only links and cannot discard an outbox tail.
                 spool.reset_desktop_session_link(
-                    thread_id=thread_id, current_hermes_session_id=target, source="tui",
+                    thread_id=thread_id, current_hermes_session_id=target, source=raw_source,
                     desktop_session_id=raw_id, last_message_row_id=baseline,
                 )
             client = self._client

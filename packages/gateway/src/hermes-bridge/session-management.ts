@@ -55,6 +55,12 @@ function time(row: Record<string, unknown>, fields: readonly string[]): number {
   return 0;
 }
 
+function sessionOrigin(value: unknown): string {
+  if (typeof value !== "string") return "unknown";
+  const normalized = value.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(normalized) ? normalized : "unknown";
+}
+
 /** Text is the only transcript payload approved across this boundary. Control bytes, image
  * directives, and host paths are removed before a string enters any response shape. */
 export function projectHermesSessionText(value: unknown, maxLength = HERMES_SESSION_TEXT_MAX_LENGTH): string {
@@ -98,6 +104,7 @@ function summary(raw: unknown): HermesSessionSummary | undefined {
   return {
     hermesSessionId: sessionId,
     hermesLineageId: lineageId,
+    origin: sessionOrigin(row["source"]),
     ...(title ? { title } : {}),
     startedAt: time(row, ["started_at", "session_started", "created_at"]),
     lastActiveAt: time(row, ["last_active", "last_active_at", "started_at", "session_started"]),
@@ -289,7 +296,7 @@ export class HermesSessionManagementAdapter {
   }
 
   descriptor(): GatewayHarness { return this.#harness; }
-  capabilityVersion(): 1 | 2 { return this.#exactDetail ? 2 : 1; }
+  capabilityVersion(): 1 | 3 { return this.#exactDetail ? 3 : 1; }
 
   #scope(scopeId: string): string {
     if (!this.#harness.scopes.some((scope) => scope.id === scopeId))
@@ -662,10 +669,10 @@ export class GatewayHermesSessionManagement {
   }
 
   get available(): boolean { return this.#adapters.size > 0; }
-  get capabilityVersion(): 1 | 2 | undefined {
+  get capabilityVersion(): 1 | 3 | undefined {
     if (!this.available) return undefined;
-    return [...this.#adapters.values()].every((adapter) => adapter.capabilityVersion() === 2)
-      ? 2 : 1;
+    return [...this.#adapters.values()].every((adapter) => adapter.capabilityVersion() === 3)
+      ? 3 : 1;
   }
 
   adapter(harnessId: string): HermesSessionManagementAdapter {

@@ -63,6 +63,7 @@ const bot: BotSummary = {
   lastActiveAt: 1_800_000_000_000,
   chatSessionId: "sess-1",
   preview: { kind: "plain", text: "the build is green" },
+  syncState: "ready",
   meta: { title: "Scout", created: 1_799_000_000_000 },
 };
 
@@ -585,8 +586,9 @@ describe("capability advertisement", () => {
     // 38 replaces device status v1; 39 adds leases and durable metadata-only sharing receipts;
     // 40 distinguishes a created profile from an attached, writable bot; 41 wraps Hermes' model
     // provider setup catalog, credential lifecycle, and OAuth sessions for the phone; 42 adds
-    // exact credential-free memory setup through the attached profile plugin.
-    expect(BOTS_CAPABILITY_VERSION).toBe(42);
+    // exact credential-free memory setup through the attached profile plugin; 43 makes every
+    // Hermes profile visible with an exact synchronization state.
+    expect(BOTS_CAPABILITY_VERSION).toBe(43);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {
@@ -642,7 +644,7 @@ describe("capability advertisement", () => {
     const bot = {
       name: "night-owl", displayName: "Night Owl", handle: "@night-owl", description: null,
       hasAvatar: false, group: null, pinned: false, active: false, lastActiveAt: null,
-      chatSessionId: null, preview: { kind: "empty", text: "" }, meta: null,
+      chatSessionId: null, preview: { kind: "empty", text: "" }, syncState: "starting", meta: null,
     };
     expect(check(BotCreateResponseSchema, { bot })).toBe(true);
     expect(check(BotCreateResponseSchema, { bot, warnings: ["skipped: telepathy"] })).toBe(true);

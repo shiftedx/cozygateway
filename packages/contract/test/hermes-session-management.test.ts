@@ -15,6 +15,7 @@ import {
 const session = {
   hermesSessionId: "hermes-tip",
   hermesLineageId: "hermes-root",
+  origin: "cli",
   title: "Release notes",
   startedAt: 1_700_000_000_000,
   lastActiveAt: 1_700_000_100_000,
@@ -25,8 +26,8 @@ const session = {
 const message = { role: "assistant", text: "Done", hermesMessageId: "42", createdAt: 1_700_000_100_000 };
 
 describe("Hermes session management v1 schemas", () => {
-  it("advertises exact authoritative reads at capability version 2", () => {
-    expect(HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION).toBe(2);
+  it("advertises exact authoritative reads and provenance at capability version 3", () => {
+    expect(HERMES_SESSION_MANAGEMENT_CAPABILITY_VERSION).toBe(3);
     expect(check(HermesSessionDetailResponseSchema, { session })).toBe(true);
     expect(check(HermesSessionDetailResponseSchema, { session, cwd: "/private" })).toBe(false);
   });

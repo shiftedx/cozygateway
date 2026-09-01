@@ -369,8 +369,13 @@ confirm_hermes_model() {
 # could turn a plugin or spool path into a path traversal before constructing it.
 valid_profile() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || [ "$1" = default ]; }
 hydrate_profile_scope() {
-  local profiles p
+  local profiles saved_scope p
   [ "$PROFILE_SPEC_EXPLICIT" = 0 ] && [ -f "$STATE_FILE" ] || return 0
+  saved_scope="$(sed -n 's/^profile_scope=//p' "$STATE_FILE" | tail -1)"
+  if [ "$saved_scope" = all ]; then
+    PROFILE_SPEC=all
+    return 0
+  fi
   profiles="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"
   [ -n "$profiles" ] || die "installer state has an unsafe profile scope; rerun with --profiles all or an explicit profile list"
   IFS=',' read -r -a SELECTED <<<"$profiles"
@@ -589,6 +594,7 @@ write_state() {
   umask 077
   {
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
+    printf '\nprofile_scope=%s' "$PROFILE_SPEC"
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
     printf 'dashboard_port=%s\n' "$DASHBOARD_PORT"
     # Keep the exact executable that performed the install. `--uninstall` may
@@ -632,7 +638,12 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   if command -v shasum >/dev/null 2>&1; then actual="\$(shasum -a 256 "\$bootstrap" | awk '{print \$1}')"; elif command -v sha256sum >/dev/null 2>&1; then actual="\$(sha256sum "\$bootstrap" | awk '{print \$1}')"; else printf 'FAIL  repair needs shasum or sha256sum. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; fi
   [ -n "\$expected" ] && [ "\$expected" = "\$actual" ] || { printf 'FAIL  repair bootstrap checksum mismatch. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   profiles="\$(sed -n 's/^profiles=//p' "\$state" | tail -1)"
-  [[ "\$profiles" =~ ^(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(,(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*\$ ]] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  profile_scope="\$(sed -n 's/^profile_scope=//p' "\$state" | tail -1)"
+  if [ "\$profile_scope" = all ]; then
+    profiles=all
+  else
+    [[ "\$profiles" =~ ^(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(,(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*\$ ]] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  fi
   printf 'INFO  repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment\n'
   exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") bash "\$bootstrap" --profiles "\$profiles"
 fi

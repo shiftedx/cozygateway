@@ -307,6 +307,9 @@ const PresenceEvent = Type.Object({
 const DesktopSessionResumedEvent = Type.Object({
   kind: Type.Literal("desktop_session_resumed"), threadId: Id, hermesSessionId: Id, resumeId: Id,
 });
+const HermesInteractiveSessionSource = Type.Union([
+  Type.Literal("desktop"), Type.Literal("tui"), Type.Literal("cli"),
+]);
 /** One rendered SessionDB row observed after an explicitly linked desktop-capable session. The
  * original TUI selection and current raw id are separate because compaction can resolve one raw
  * id onto another. The gateway never treats either id as its native chat identity. */
@@ -319,7 +322,7 @@ const DesktopSessionMessageEvent = Type.Union([
   }, { additionalProperties: false }),
   Type.Object({
     kind: Type.Literal("desktop_session_message"), threadId: Id, hermesSessionId: Id,
-    desktopSessionId: Id, source: Type.Literal("tui"), rowId: Id,
+    desktopSessionId: Id, source: HermesInteractiveSessionSource, rowId: Id,
     role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
     text: Type.String({ minLength: 1, maxLength: 32_000 }), at: Type.Integer({ minimum: 0 }),
   }, { additionalProperties: false }),

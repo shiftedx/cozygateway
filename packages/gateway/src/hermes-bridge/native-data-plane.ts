@@ -289,9 +289,10 @@ export class NativeBotDataPlane {
     return this.#storage.terminalNativeSettlements([...this.#native]);
   }
 
-  /** Expose only attach-configured identities. Hermes may host other profiles, but this gateway
-   * has no token, plugin, or durable chat transport for them until the installer reconciles them.
-   * Overlay the native transcript on their dashboard-owned metadata.
+  /** Expose every profile Hermes reports, while overlaying native transcript state only for
+   * attach-configured identities. An unmanaged profile is still a real Hermes agent and hiding it
+   * made CozyChat's roster disagree with Desktop/CLI; `syncState` keeps that visibility honest
+   * without inventing a writable chat lane.
    *
    * Public because the `bot_roster` frame has to be the same rows `GET /bots` returns. The control
    * plane builds a roster from `profiles.list` alone, which knows no local conversation identity,
@@ -299,10 +300,11 @@ export class NativeBotDataPlane {
    * carried the real id: a client could not join a `bot_chat_delta` to the roster row it belongs
    * to. One function, both surfaces, no drift. */
   rosterBots(bots: readonly BotSummary[]): BotSummary[] {
-    return bots
-      .filter((summary) => this.#native.has(normalize(summary.name)))
-      .map((summary): BotSummary => {
+    return bots.map((summary): BotSummary => {
         const bot = normalize(summary.name);
+        if (!this.#native.has(bot)) {
+          return { ...summary, chatSessionId: null, syncState: "setup_required" };
+        }
         const chat = this.#storage.nativeBotChat(bot, this.#now());
         const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
         const latest = messages.findLast(
@@ -316,6 +318,7 @@ export class NativeBotDataPlane {
             latest === undefined
               ? { kind: "empty", text: "No conversations yet, say hi" }
               : { kind: "plain", text: latest.text.trim() },
+          syncState: this.#syncState(bot),
         };
       });
   }
@@ -327,18 +330,23 @@ export class NativeBotDataPlane {
 
   /** A profile is not usable merely because Hermes lists it. Native Bot Mode becomes writable
    * only after the profile's authenticated attach-v1 transport is online. Unconfigured profiles
-   * deliberately report `starting`: the Mac provisioner adds them to the gateway config and the
-   * ensuing restart constructs the native plane that can eventually call them ready. */
+   * report `setup_required`; the installer adds them to gateway config, and the ensuing restart
+   * constructs the native plane that can eventually move through `starting` to `ready`. */
   #readiness(name: string) {
     const key = normalize(name);
-    const presence = this.#attachPresence.get(key);
-    const ready = this.handles(key) && presence !== "degraded" && presence !== "absent" &&
-      (presence === "online" || this.#ingress.isAttached?.(key) === true);
     return {
       name: key,
-      status: ready ? "ready" as const : "starting" as const,
+      status: this.#syncState(key),
       updatedAt: this.#now(),
     };
+  }
+
+  #syncState(bot: string): "setup_required" | "starting" | "ready" {
+    if (!this.handles(bot)) return "setup_required";
+    const presence = this.#attachPresence.get(bot);
+    return presence !== "degraded" && presence !== "absent"
+      && (presence === "online" || this.#ingress.isAttached?.(bot) === true)
+      ? "ready" : "starting";
   }
 
   handles(bot: string): boolean {
@@ -357,7 +365,7 @@ export class NativeBotDataPlane {
     }
     if (frame.event.kind === "desktop_session_message") {
       if (!this.#storage.nativeBotHasSession(key, frame.event.threadId)) return false;
-      return frame.event.source !== "tui" || this.#storage.hasConfirmedNativeDesktopResume(
+      return frame.event.source === "cozygateway" || this.#storage.hasConfirmedNativeDesktopResume(
         key, frame.event.desktopSessionId, frame.event.threadId,
       );
     }
@@ -2583,7 +2591,7 @@ export function deliveryFailureText(bot: string, at: number, reason: string): st
 
 /** Stable, bounded native transcript identity for one SessionDB row. The digest makes the three
  * source-qualified components unambiguous even when a Hermes id itself contains a delimiter. */
-function desktopSessionMessageId(source: "cozygateway" | "tui", hermesSessionId: string, rowId: string): string {
+function desktopSessionMessageId(source: "cozygateway" | "desktop" | "tui" | "cli", hermesSessionId: string, rowId: string): string {
   const digest = createHash("sha256")
     .update(source)
     .update("\0")

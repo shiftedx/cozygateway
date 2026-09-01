@@ -291,6 +291,28 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.evicted, [])
         self.assertEqual(client.confirmations, [])
 
+    async def test_accepts_desktop_tui_and_cli_rows_with_their_exact_origin(self):
+        for origin in ("desktop", "tui", "cli"):
+            with self.subTest(origin=origin):
+                adapter, _runner, store, client = self._adapter(source=origin)
+                spool = self._spool()
+                self.addCleanup(spool.close)
+                adapter._spool = spool
+
+                await adapter._handle_desktop_resume_command({
+                    "threadId": f"native:sage:{origin}",
+                    "hermesSessionId": "desktop-raw",
+                    "resumeId": f"resume-{origin}",
+                })
+
+                self.assertEqual(store.switches, [
+                    (f"agent:sage:cozygateway:dm:native:sage:{origin}", "desktop-raw")
+                ])
+                self.assertEqual(client.confirmations, [
+                    (f"native:sage:{origin}", "desktop-raw", f"resume-{origin}")
+                ])
+                self.assertEqual(spool.desktop_session_links()[0]["source"], origin)
+
     async def test_refuses_when_the_stable_lane_is_running_or_switch_verification_fails(self):
         running, runner, store, client = self._adapter(running=True)
         await running._handle_desktop_resume_command({

@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 42. This extension is independent of the frozen core
+Status: v1 extension, capability version 43. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 42 }
+"capabilities": { "com.cozylabs.bots": 43 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -82,6 +82,7 @@ and does not register `/bots` routes.
 | 40 | Bot readiness: `GET /bots/:name/readiness` distinguishes a created profile from an attached bot that can accept turns. |
 | 41 | Transitional bot-scoped model-provider setup routes. Canonical ownership moved to `com.cozylabs.harness-settings` v1. |
 | 42 | Truthful Bot Activity previews (no transcript-derived A2A sender) plus credential-free profile-local Hermes memory setup through the authenticated attached plugin. |
+| 43 | The roster represents every Hermes profile and reports `syncState`; profiles not yet provisioned remain visible as `setup_required` instead of disappearing. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -163,11 +164,12 @@ The client may source-label activity and link each row to its canonical chat or 
 claim delivery, read state, reply relationships, immutable history, or verified agent-to-agent
 provenance. A preview beginning with `Message from ...` is ordinary display text, not A2A evidence.
 
-Only profiles configured in `hermes.profiles` are exposed as CozyChat bots. Profile lifecycle
-belongs to Hermes, and from capability 37 both ends of it are reachable from the phone:
-`POST /bots` creates the profile and `DELETE /bots/:name` removes it. A profile created or deleted
-in Hermes directly still needs the CozyGateway installer rerun (its default `--profiles all`
-selection reconciles plugin, token, service, and gateway configuration).
+Every profile returned by Hermes is exposed as a CozyChat bot. A configured profile reports
+`syncState: "ready"` or `"starting"`; a discovered profile without an attach identity reports
+`syncState: "setup_required"`, a null native chat id, and cannot accept native chat actions.
+Profile lifecycle belongs to Hermes, and from capability 37 both ends of it are reachable from the
+phone: `POST /bots` creates the profile and `DELETE /bots/:name` removes it. The installer's
+default dynamic `--profiles all` scope re-discovers and provisions profiles on update/repair.
 
 `POST /bots` creates the Hermes profile and then SEEDS it as a blank slate: the `file` + `terminal`
 toolset floor on the `cozygateway` and `cli` platforms, `approvals.mode: manual`, inherited MCP
@@ -526,14 +528,15 @@ memory content, secret, provider configuration, or host path is logged, traced, 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
 that exists but is not configured as a native identity must not fall through to Dashboard chat.
 
-## Hermes desktop session continuation
+## Interactive Hermes session continuation
 
-`com.cozylabs.hermes-desktop-sessions: 2` is deliberately separate from Bot Mode. It exposes
-source-qualified TUI sessions without placing their raw Hermes ids in native session history:
+`com.cozylabs.hermes-desktop-sessions: 3` is deliberately separate from Bot Mode. It exposes
+source-qualified Desktop, TUI, and CLI sessions without placing their raw Hermes ids in native
+session history:
 
 | Route | Response | Rule |
 | --- | --- | --- |
-| `GET /bots/:name/desktop-sessions` | `{ name, source: "hermes_desktop", sessions }` | Lists only Hermes `source: "tui"` conversation rows for that exact profile. Each row has `hermesSessionId`, `startedAt`, `lastActiveAt`, optional sanitized `title`, and optional `lastResumedAt`; no preview, transcript, tool row, media, host path, or private Dashboard metadata is exposed. |
+| `GET /bots/:name/desktop-sessions` | `{ name, source: "hermes_desktop", sessions }` | Lists Hermes `source: "desktop"`, `"tui"`, or `"cli"` conversation rows for that exact profile. Each row carries its exact `origin`, `hermesSessionId`, timestamps, optional sanitized `title`, and optional `lastResumedAt`; no preview, transcript, tool row, media, host path, or private Dashboard metadata is exposed. |
 | `POST /bots/:name/desktop-sessions/:hermesSessionId/resume` | `202 BotDesktopHermesResumeResponse` | Explicit-only adoption. Normally waits briefly for a positive plugin confirmation and answers `status: "resumed"` + a distinct gateway `sessionId`; a bounded timeout answers `status: "pending"` with no session id. |
 
 The request re-lists the profile's eligible desktop rows, stages a new gateway-owned session id,
@@ -547,10 +550,10 @@ private raw Hermes mapping and strict runner metadata proves it still targets th
 
 Version 2 additionally permits the attached profile, after negotiated `desktop_session_sync`, to
 project a newly observed rendered `user` or `assistant` SessionDB row into its already-owned native
-chat. The row carries the source-qualified current raw id and stable row id; a `tui` row also carries
-the original selected desktop id and is accepted only when that exact persisted desktop-resume
+chat. The row carries the source-qualified current raw id and stable row id; an interactive row also
+carries the original selected Hermes id and is accepted only when that exact persisted resume
 binding is confirmed. Replays are idempotent, and this projection never selects a chat or changes a
-turn state.
+turn state. Capability 3 broadens that exact proof from TUI to Desktop, TUI, and CLI origins.
 
 ## Server frames
 

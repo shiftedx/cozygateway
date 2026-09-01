@@ -40,7 +40,7 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
-  it("lists only configured attach identities", () => {
+  it("keeps every Hermes profile visible and marks attach synchronization honestly", () => {
     const storage = openStorage(":memory:");
     const control = {
       roster: () => ({
@@ -62,7 +62,10 @@ describe("attach-v1 native Bot Mode plane", () => {
       broadcast: () => undefined,
     });
 
-    expect(plane.surface().roster().bots.map((bot) => bot.name)).toEqual(["sage"]);
+    expect(plane.surface().roster().bots).toMatchObject([
+      { name: "sage", syncState: "starting", chatSessionId: expect.any(String) },
+      { name: "unmanaged", syncState: "setup_required", chatSessionId: null },
+    ]);
     plane.close();
     storage.close();
   });

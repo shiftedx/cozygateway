@@ -1,7 +1,7 @@
 {
   "capability": {
     "id": "com.cozylabs.hermes-session-management",
-    "version": 2
+    "version": 3
   },
   "harnessId": "home",
   "scopeId": "sage",
@@ -10,6 +10,7 @@
       {
         "hermesSessionId": "compression-tip",
         "hermesLineageId": "compression-root",
+        "origin": "desktop",
         "title": "Release notes",
         "startedAt": 1700000000000,
         "lastActiveAt": 1700000100000,
@@ -24,6 +25,7 @@
     "session": {
       "hermesSessionId": "compression-tip",
       "hermesLineageId": "compression-root",
+      "origin": "desktop",
       "title": "Release notes",
       "startedAt": 1700000000000,
       "lastActiveAt": 1700000100000,
@@ -37,6 +39,7 @@
       {
         "hermesSessionId": "compression-tip",
         "hermesLineageId": "compression-root",
+        "origin": "desktop",
         "title": "Release notes",
         "startedAt": 1700000000000,
         "lastActiveAt": 1700000100000,
@@ -61,6 +64,7 @@
     "session": {
       "hermesSessionId": "compression-tip",
       "hermesLineageId": "compression-root",
+      "origin": "desktop",
       "title": "Release notes",
       "startedAt": 1700000000000,
       "lastActiveAt": 1700000100000,
