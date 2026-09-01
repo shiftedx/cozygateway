@@ -69,6 +69,11 @@ import {
   discoverHermesSessionManagement,
   GatewayHermesSessionManagement,
 } from "./hermes-bridge/session-management.ts";
+import {
+  GatewayHermesGlobalSkills,
+  HERMES_GLOBAL_SKILLS_CAPABILITY_ID,
+  HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION,
+} from "./hermes-bridge/global-skills.ts";
 
 export const GATEWAY_VERSION = "0.5.6";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
@@ -185,12 +190,14 @@ export function gatewayInfoForConfig(
   harnessWorkspace = false,
   harnessUpdates = false,
   hermesSessionManagementVersion?: number,
+  hermesGlobalSkills = false,
 ): GatewayInfo {
   const configuredCapabilities = Object.fromEntries(
     Object.entries(config.capabilities ?? {})
       .filter(([id]) => id !== HARNESS_UPDATE_CAPABILITY_ID
         && id !== GATEWAY_MANAGEMENT_CAPABILITY_ID
-        && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID),
+        && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID
+        && id !== HERMES_GLOBAL_SKILLS_CAPABILITY_ID),
   );
   return {
     name: config.name,
@@ -220,6 +227,9 @@ export function gatewayInfoForConfig(
       ...(hermesSessionManagementVersion === undefined
         ? {}
         : { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: hermesSessionManagementVersion }),
+      ...(hermesGlobalSkills
+        ? { [HERMES_GLOBAL_SKILLS_CAPABILITY_ID]: HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION }
+        : {}),
     },
   };
 }
@@ -284,18 +294,29 @@ export async function startGateway(
     options: memberOptions,
     client: createHermesClient({ url: memberOptions.url, auth: memberOptions.auth }),
   }));
+  // The global-skills discovery needs the same authenticated profile catalogue as its mutation.
+  // Start the transport now; HermesBridge.start() below is idempotent and still owns all bridge
+  // subscriptions and roster work after the listener is ready.
+  for (const member of clientMembers) member.client.start();
+  const candidateGlobalSkills = new GatewayHermesGlobalSkills(
+    clientMembers.flatMap(({ endpoint, client }) => Object.keys(endpoint.config.profiles).map((profile) => ({
+      id: publicProfileId(endpoint, profile), profile, client,
+    }))),
+    storage,
+  );
   const harnessModelAdapters = clientMembers.map(
     ({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client),
   );
   // Optional Hermes surfaces are evidence-gated, not configuration-gated. A missing,
   // malformed, or unreachable pinned response yields no adapter and no advertised route.
-  const [workspaceResults, updateResults, sessionResults] = await Promise.all([
+  const [workspaceResults, updateResults, sessionResults, hermesGlobalSkills] = await Promise.all([
     Promise.all(clientMembers.map(({ client }, index) =>
       discoverHermesWorkspace(client, harnessModelAdapters[index]!.descriptor()))),
     Promise.all(clientMembers.map(({ client }, index) =>
       discoverHermesUpdates(client, harnessModelAdapters[index]!.descriptor()))),
     Promise.all(clientMembers.map(({ client }, index) =>
       discoverHermesSessionManagement(client, harnessModelAdapters[index]!.descriptor()))),
+    candidateGlobalSkills.probe().then(() => candidateGlobalSkills).catch(() => undefined),
   ]);
   const discoveredWorkspaceAdapters = workspaceResults.filter((adapter) => adapter !== undefined);
   const discoveredSessionAdapters = sessionResults.filter((adapter) => adapter !== undefined);
@@ -310,6 +331,7 @@ export async function startGateway(
     harnessWorkspace.available,
     harnessUpdates.available,
     hermesSessions.capabilityVersion,
+    hermesGlobalSkills !== undefined,
   );
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({
@@ -621,6 +643,8 @@ export async function startGateway(
     harnessSettings,
     ...(harnessUpdates.available ? { harnessUpdates } : {}),
     ...(hermesSessions.available ? { hermesSessions } : {}),
+    ...(hermesGlobalSkills === undefined ? {} : { hermesGlobalSkills }),
+    hermesGlobalSkillsLog: traceLog,
     ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => attachV1Ingress.health(),

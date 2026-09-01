@@ -78,6 +78,19 @@ or reverse proxy you set up and control remains a perfectly good alternative.
 | `publicUrl` | string | absent | Strict HTTPS origin advertised by `cozygateway pair` for a user-managed tunnel or reverse proxy. Requires an exact loopback `host`; startup fails before storage or the listener when either invariant is broken. |
 | `tls` | object | absent (plain HTTP) | `{ "certFile", "keyFile" }`, paths to a PEM certificate chain and its matching unencrypted key. Present means the listener serves HTTPS and `/ws` and `/attach/v1` become `wss`; absent means plain HTTP, unchanged. Overridable with `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`. Present-but-unusable (missing file, garbage PEM, encrypted key, key that does not match the certificate, only one of the two set) fails startup before the port binds rather than falling back to plaintext. See [`docs/tls.md`](../../docs/tls.md). |
 
+## Global Hermes skills
+
+When a gateway manages Hermes profiles and has proved the required Dashboard and
+profile-catalog surfaces are live, it advertises
+`com.cozylabs.hermes-global-skills: 1`. Authenticated clients use `GET
+/hermes/skills` for the aggregate and `PATCH /hermes/skills/:skillName` with
+`enabled`, `expectedRevision`, and a UUID `requestId` to change one skill across
+every managed profile. Hermes remains the source of truth: the gateway uses its
+profile-aware Dashboard config writer, which preserves the rest of each profile
+configuration and makes a fresh Hermes session observe the updated
+`skills.disabled` list. A stale revision returns the current aggregate; the
+same request id is safe to retry for 24 hours.
+
 ## Approvals
 
 A backend can pause a turn on a tool call that needs a human decision. The gateway announces it
