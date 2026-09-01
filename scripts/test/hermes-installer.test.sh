@@ -282,6 +282,10 @@ grep -Fq 'mutually exclusive' <<<"$conflicting_public_output"
 mkdir -p "$tmp/service-bin" "$tmp/darwin-home"
 cat > "$tmp/service-bin/launchctl" <<'LAUNCHCTL'
 #!/usr/bin/env bash
+if [ "${1:-}" = bootstrap ] && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER:-}" ] && [ ! -f "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER" ]; then
+  : > "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER"
+  exit 5
+fi
 exit 0
 LAUNCHCTL
 chmod 700 "$tmp/service-bin/launchctl"
@@ -350,7 +354,8 @@ HERMES_INSTALLER
 chmod 700 "$tmp/hermes-official-installer.sh"
 if command -v shasum >/dev/null 2>&1; then hermes_installer_sha="$(shasum -a 256 "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; else hermes_installer_sha="$(sha256sum "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; fi
 printf 'yes\n' > "$tmp/lan-yes"
-live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE="$tmp/model-status-probed" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER="$tmp/launchctl-retried" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE="$tmp/model-status-probed" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+test -f "$tmp/launchctl-retried"
 test -x "$tmp/gateway-live/runtime/node/bin/node"
 grep -Fq 'installed checksum-verified Node.js' <<<"$live_output"
 grep -Fq 'Hermes Agent is not installed; starting the official installer.' <<<"$live_output"
@@ -724,6 +729,15 @@ if (trace.launcherMode !== expected) {
 NODE
 test -s "$tmp/mock-dashboard.pid"
 mock_dashboard_pid="$(cat "$tmp/mock-dashboard.pid")"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, renameSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const replacement = path + '.probe';
+writeFileSync(replacement, readFileSync(path));
+renameSync(replacement, path);
+NODE
+sleep 1
+test "$(wc -l < "$tmp/reload.log")" -eq 1
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
 const { readFileSync, renameSync, writeFileSync } = require('node:fs');
 const path = process.argv[2];
