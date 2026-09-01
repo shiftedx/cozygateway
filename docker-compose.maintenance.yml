@@ -1,11 +1,49 @@
-# Optional production-only control seam. Start the host supervisor first, then compose with this
-# override. The Docker host owns the socket and all Compose credentials; the gateway gets only a
-# constrained request channel, never docker.sock.
+# Production Docker control seam. The maintenance sidecar owns docker.sock; the gateway gets only
+# the constrained Unix request channel and can never execute Docker itself.
 services:
+  maintenance-supervisor:
+    image: python:3.13-alpine@sha256:62e80a1ff2a4af41c6fe72a629e5729463a4fd05ae89ecc9c812a6c1457f2cc7
+    # The sidecar must be in the Docker socket's group. Keep this explicit rather than assuming a
+    # group name or granting the gateway service any Docker access.
+    user: "${COZYGATEWAY_MAINTENANCE_UID:-1000}:${COZYGATEWAY_MAINTENANCE_GID:-1000}"
+    group_add:
+      - "${COZYGATEWAY_DOCKER_GID:?set to the numeric group ID of /var/run/docker.sock}"
+    environment:
+      COZYGATEWAY_MAINTENANCE_SOCKET: /run/cozygateway-maintenance/control.sock
+      COZYGATEWAY_MAINTENANCE_STATE_FILE: /run/cozygateway-maintenance/operations.json
+      COZYGATEWAY_MAINTENANCE_CURRENT_VERSION: "${COZYGATEWAY_MAINTENANCE_CURRENT_VERSION:?set to the installed CozyGateway version}"
+      COZYGATEWAY_MAINTENANCE_CONTAINER_NAME: "${COZYGATEWAY_MAINTENANCE_CONTAINER_NAME:?set to this gateway container name}"
+      COZYGATEWAY_MAINTENANCE_ALLOWED_UID: "${COZYGATEWAY_MAINTENANCE_ALLOWED_UID:-1000}"
+      COZYGATEWAY_MAINTENANCE_DOCKER_SOCKET: /var/run/docker.sock
+      PYTHONDONTWRITEBYTECODE: "1"
+    command: ["python3", "/opt/cozygateway/compose-maintenance-supervisor.py"]
+    volumes:
+      # This host directory is persistent: it holds the socket and the 24-hour operation receipts.
+      - "${COZYGATEWAY_MAINTENANCE_SOCKET_DIR:?set to a persistent host directory}:/run/cozygateway-maintenance:rw"
+      - "/var/run/docker.sock:/var/run/docker.sock:rw"
+      - "./scripts/compose-maintenance-supervisor.py:/opt/cozygateway/compose-maintenance-supervisor.py:ro"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    healthcheck:
+      test: ["CMD", "python3", "/opt/cozygateway/compose-maintenance-supervisor.py", "--healthcheck"]
+      interval: 5s
+      timeout: 2s
+      retries: 6
+      start_period: 3s
+    restart: unless-stopped
+
   gateway:
     environment:
       COZYGATEWAY_MAINTENANCE_SOCKET: /run/cozygateway-maintenance/control.sock
     volumes:
-      # A Unix-domain connect needs write permission on the socket itself, not a writable mount.
-      # The host-only supervisor owns this directory and validates the connecting UID.
+      # The gateway never receives docker.sock. Its read-only mount is only the constrained IPC
+      # socket that the sidecar validates using SO_PEERCRED.
       - "${COZYGATEWAY_MAINTENANCE_SOCKET_DIR:?set to the host directory containing control.sock}:/run/cozygateway-maintenance:ro"
+    depends_on:
+      maintenance-supervisor:
+        condition: service_healthy
