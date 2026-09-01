@@ -177,6 +177,19 @@ patch body, because on REST that id is the path segment and the published patch 
 `routines.delete` and `routines.run` answer `{ "ok": true }`, the one lane-local body, because
 neither operation stores something to send back.
 
+`routines.run` is RESERVED in this version. It is on the wire so a peer implements the whole set
+once rather than absorbing a second wire change later, but no gateway route reaches it: nothing
+sends a `routines.run` request today. A peer may answer it `invalid_request`, or implement it as a
+no-op that acknowledges without running anything, until a route lands. Neither choice is observable
+by a client in this version.
+
+`not_found` means something different for a read than for a write. On the two BODYLESS reads,
+`profile.read` and `model.read`, it means the peer serves the bot but has nothing stored for that
+section, and the gateway answers `404 not_found` saying exactly that: the bot itself still exists.
+On a write, on `routines.list`, or on `routines.create` it is the peer failing to do what it was
+asked, and stays a `503`. On a routine operation carrying `input.id` it names that routine and is a
+`404` about the routine.
+
 `status` is `ok`, `not_found`, `invalid_request`, or `unavailable`, and the four are kept apart
 because they are four different things an operator has to do: nothing, fix the id, fix the input,
 or go and look at the peer. `ok` with a body that does not match the operation is refused rather

@@ -10,11 +10,13 @@ import type { AttachV1ConfigRequest, AttachV1ServerFrame } from "../src/adapters
 import {
   AttachConfigSurface,
   ConfigInvalidRequest,
+  ConfigNotFound,
   ConfigNotNegotiated,
   createConfigRateLimiter,
   type ConfigSurface,
 } from "../src/hermes-bridge/bot-config.ts";
 import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
+import { BotNotFound } from "../src/hermes-bridge/crud.ts";
 import { RoutineNotFound } from "../src/hermes-bridge/routines.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../src/errors.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
@@ -154,6 +156,50 @@ describe("attach-v1 config lane", () => {
     await expect(config.routines("sage")).rejects.toBeInstanceOf(BackendUnavailable);
     await expect(config.deleteRoutine("sage", "job-9")).rejects.toBeInstanceOf(RoutineNotFound);
     peer.ws.close();
+  });
+
+  // The bot is on the roster and its chat lane works, so "nothing is stored here" cannot be told
+  // as "this bot is unreachable": that is a retry a client would offer forever.
+  it("separates an empty profile from an offline peer", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const pending = surface.botProfile("sage");
+    surface.handle("sage", { kind: "config_result", requestId: sent[0]!.requestId, status: "not_found" });
+    // `BotNotFound` is the class the bots routes answer 404 `not_found` on.
+    await expect(pending).rejects.toBeInstanceOf(ConfigNotFound);
+    await expect(pending).rejects.toBeInstanceOf(BotNotFound);
+    await expect(pending).rejects.toThrow('bot "sage" has no stored profile');
+    surface.close();
+  });
+
+  it("separates an empty model config from an offline peer", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const pending = surface.modelConfig("sage");
+    surface.handle("sage", { kind: "config_result", requestId: sent[0]!.requestId, status: "not_found" });
+    await expect(pending).rejects.toBeInstanceOf(ConfigNotFound);
+    await expect(pending).rejects.toThrow('bot "sage" has no stored model config');
+    surface.close();
+  });
+
+  // A write, a list, and a create have no "nothing stored" answer to give: the peer failing one of
+  // those is a backend failure, and a 404 there would tell a client the bot went away.
+  it("keeps a refused write and a refused list on backend_unavailable", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const write = surface.configureProfile("sage", { soul: "# new" });
+    surface.handle("sage", { kind: "config_result", requestId: sent[0]!.requestId, status: "not_found" });
+    await expect(write).rejects.toBeInstanceOf(BackendUnavailable);
+    const list = surface.routines("sage");
+    surface.handle("sage", { kind: "config_result", requestId: sent[1]!.requestId, status: "not_found" });
+    await expect(list).rejects.toBeInstanceOf(BackendUnavailable);
+    surface.close();
   });
 
   it("reports a refused write as invalid input in the peer's own words", async () => {

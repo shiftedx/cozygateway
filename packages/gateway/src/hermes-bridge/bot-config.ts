@@ -27,6 +27,7 @@ import type { AttachV1ConfigRequest, AttachV1ConfigResult } from "../adapters/at
 import type { ConfigSendOutcome } from "../adapters/attach/ingress-v1.ts";
 import type { BotRoutineList } from "./bridge.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
+import { BotNotFound } from "./crud.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { RoutineNotFound, type RoutineWriteResult } from "./routines.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
@@ -38,7 +39,12 @@ type ConfigResult = NonNullable<AttachV1ConfigResult["result"]>;
 /** Per-bot budget for the config lane. A config read costs the peer a file read or a scheduler
  *  scan it serves one at a time, so an editor gets a generous burst and a fast refill while a loop
  *  is stopped here rather than at the peer. Same bucket as the photo and memory lanes, with the
- *  config lane's own numbers: the key is the BOT, because this lane has no device id. */
+ *  config lane's own numbers: the key is the BOT, because this lane has no device id.
+ *
+ *  That key is a deliberate trade and it has a cost worth stating: the bucket is shared by every
+ *  device editing that bot, so one looping client throttles the others until it refills. The bot is
+ *  still the right key, because the thing being protected is the ONE peer serving it, and a
+ *  per-device bucket would let N devices spend N times the budget the peer can absorb. */
 export const CONFIG_RATE_CAPACITY = 30;
 export const CONFIG_RATE_REFILL_MS = 1_000;
 export type ConfigRateLimiter = PhotoRateLimiter;
@@ -56,6 +62,23 @@ export class ConfigNotNegotiated extends Error {
     super(`bot "${bot}" is attached but its peer did not negotiate bot_config`);
     this.name = "ConfigNotNegotiated";
     this.bot = bot;
+  }
+}
+
+/** The peer serves this bot but holds nothing for the section that was read: a bot brought up
+ *  without a profile written yet, or one that pins no model. It extends `BotNotFound` because that
+ *  is the class every bots route already answers `404 not_found`, and the message is rewritten so
+ *  the answer says what is missing rather than claiming the bot is. The bot is NOT missing: it is
+ *  on the roster and its chat lane works. Reporting this as `503` instead made an empty profile
+ *  indistinguishable from an offline peer, so a client offered a retry that could never succeed.
+ *
+ *  Only a BODYLESS read raises it. A write, a `routines.list`, or a `routines.create` answering
+ *  `not_found` is the peer failing to do something it was asked to do, and stays a `503`. */
+export class ConfigNotFound extends BotNotFound {
+  constructor(bot: string, section: string) {
+    super(bot);
+    this.name = "ConfigNotFound";
+    this.message = `bot "${bot}" has no stored ${section} on the runtime that serves it`;
   }
 }
 
@@ -257,11 +280,22 @@ export class AttachConfigSurface implements ConfigSurface {
  *  This lane adds no route change, so it speaks in the vocabulary those routes read:
  *  `RoutineNotFound` is their 404, `ConfigInvalidRequest` their 400, `BackendUnavailable` their
  *  503. */
-function refusal(pending: Pick<Pending, "operation" | "routineId">, frame: AttachV1ConfigResult): Error {
+function refusal(pending: Pick<Pending, "agentId" | "operation" | "routineId">, frame: AttachV1ConfigResult): Error {
   const message = frame.message ?? "the bot's peer refused the config request";
-  if (frame.status === "not_found" && pending.routineId !== undefined) return new RoutineNotFound(pending.routineId);
+  if (frame.status === "not_found") {
+    if (pending.routineId !== undefined) return new RoutineNotFound(pending.routineId);
+    const section = MISSING_SECTION[pending.operation];
+    if (section !== undefined) return new ConfigNotFound(pending.agentId, section);
+  }
   if (frame.status === "invalid_request") return new ConfigInvalidRequest(message);
-  // A profile or model read the peer cannot answer is not a missing BOT: the bot is on the roster
-  // and its chat lane works. Reported as unavailable so a client keeps the bot and hides the pane.
   return new BackendUnavailable(`bot config is unavailable for this bot: ${message}`);
 }
+
+/** The bodyless reads, and what a `not_found` on each of them means is missing. An operation absent
+ *  from this table has no "nothing stored" answer to give: a write acts on something the caller
+ *  just supplied, and both `routines.list` and `routines.create` answer for a store whose empty
+ *  state is an empty list, not an absence. */
+const MISSING_SECTION: Partial<Record<ConfigOperation, string>> = {
+  "profile.read": "profile",
+  "model.read": "model config",
+};

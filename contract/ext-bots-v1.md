@@ -664,6 +664,15 @@ Committed transcript history remains the recovery source after reconnect.
   same published schemas the Hermes-backed bot does. A peer that did not negotiate `bot_config`
   keeps the 409 on those routes, because the section is genuinely absent rather than temporarily
   unreachable, and a peer that is simply offline answers `503 backend_unavailable`.
+- Capability 48. `GET /bots/:name/profile` and `GET /bots/:name/model-config` on a runtime bot
+  answer `404 not_found` when the peer serves the bot but has nothing stored for that section (a
+  bot brought up before its profile was written, or one that pins no model). The message says the
+  bot has no stored profile or model config; it does NOT say the bot is missing, because it is not:
+  the bot is on the roster and its chat lane works, and a client must keep the row and show the
+  section as empty rather than dropping the bot. This is deliberately distinguished from `503
+  backend_unavailable`, which is the answer when the peer is offline or unreachable and a retry is
+  the right thing to offer. A write, a routines list, or a routines create that the peer refuses
+  stays a `503`; a routine id that names nothing is the ordinary `404` about that routine.
 - A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
   extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
   bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
