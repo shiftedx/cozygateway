@@ -434,4 +434,45 @@ describe("startGateway with a hermes bridge", () => {
     ).rejects.toThrow(/ws:\/\/ or wss:\/\//);
     delete process.env["TEST_HERMES_TOKEN"];
   });
+
+  it("authenticates a native runtime bot's attach-v1 peer as its configured bot id", async () => {
+    const hermes = await startFakeHermesServer({
+      methods: { "profiles.list": () => ({ profiles: [], bot_mode_protocol: true }) },
+    });
+    servers.push(hermes);
+    process.env["TEST_HERMES_TOKEN"] = "test-token";
+    process.env["TEST_ATTACH_TOKEN"] = "attach-token";
+    process.env["COZYGATEWAY_ATTACH_TOKEN_SAGE"] = "sage-token";
+    const gateway = await startGateway({
+      name: "e2e",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", url: hermes.url, tokenEnv: "TEST_HERMES_TOKEN", profiles }],
+      bots: [{ id: "sage", tokenEnv: "COZYGATEWAY_ATTACH_TOKEN_SAGE", runtime: "cozyagents" }],
+    });
+    gateways.push(gateway);
+
+    const ws = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, {
+      headers: { authorization: "Bearer sage-token" },
+    });
+    const frames: Array<{ kind: string; agentId?: string }> = [];
+    ws.on("message", (data) => frames.push(JSON.parse(String(data)) as { kind: string; agentId?: string }));
+    await once(ws, "open");
+    ws.send(JSON.stringify({
+      kind: "hello",
+      version: 2,
+      instanceId: "sage-plugin",
+      capabilities: ["draft", "tools"],
+      resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await until(() => frames.some((frame) => frame.kind === "hello_ack"));
+    const ack = frames.find((frame) => frame.kind === "hello_ack");
+    expect(ack).toMatchObject({ kind: "hello_ack", agentId: "sage" });
+
+    ws.close();
+    delete process.env["TEST_HERMES_TOKEN"];
+    delete process.env["TEST_ATTACH_TOKEN"];
+    delete process.env["COZYGATEWAY_ATTACH_TOKEN_SAGE"];
+  });
 });
