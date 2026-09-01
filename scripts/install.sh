@@ -52,18 +52,20 @@ main() {
     prepare_owned_dir "$HOME_DIR"; prepare_owned_dir "$asset_dir"
     stage="$(mktemp -d "$HOME_DIR/.bootstrap.XXXXXX")"
   fi
-  trap 'rm -rf "$stage"' RETURN
+  trap '[ -z "$stage" ] || rm -rf "$stage"' EXIT
   fetch_verified cozygateway.mjs "$stage/cozygateway.mjs"
   fetch_verified cozygateway-hermes-attach-plugin.tar.gz "$stage/cozygateway-hermes-attach-plugin.tar.gz"
   fetch_verified cozygateway-installer.sh "$stage/agent-install.sh"
   # Keep the release bootstrap that verified these assets. The installed command
   # uses it for repair so it never treats checkout files as update payloads.
   fetch_verified install.sh "$stage/cozygateway-bootstrap.sh"
-  if [ -n "$dry_stage" ]; then rm -rf "$dry_stage"; trap - RETURN; printf 'DRY   verified assets; would run installer from %s\n' "$HOME_DIR/bin/agent-install.sh"; return; fi
+  if [ -n "$dry_stage" ]; then rm -rf "$dry_stage"; stage=""; trap - EXIT; printf 'DRY   verified assets; would run installer from %s\n' "$HOME_DIR/bin/agent-install.sh"; return; fi
   for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz agent-install.sh cozygateway-bootstrap.sh; do
     mv "$stage/$asset" "$asset_dir/$asset"; mv "$stage/$asset.sha256" "$asset_dir/$asset.sha256"
   done
-  trap - RETURN
+  rm -rf "$stage"
+  stage=""
+  trap - EXIT
   exec bash "$HOME_DIR/bin/agent-install.sh" --gateway-dir "$HOME_DIR" --bundle "$HOME_DIR/bin/cozygateway.mjs" --plugin-archive "$HOME_DIR/bin/cozygateway-hermes-attach-plugin.tar.gz" "$@"
 }
 main "$@"

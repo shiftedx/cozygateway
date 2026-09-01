@@ -257,12 +257,17 @@ function Invoke-CozyGatewayInstaller {
     if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') { $arguments += '--dry-run' }
     if ($ForwardedArguments) { $arguments += $ForwardedArguments }
     $previousHermes = [Environment]::GetEnvironmentVariable('COZYGATEWAY_HERMES_BIN', 'Process')
+    $previousPowerShell = [Environment]::GetEnvironmentVariable('COZYGATEWAY_POWERSHELL', 'Process')
+    $trustedPowerShell = [IO.Path]::Combine([Environment]::SystemDirectory, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    if (-not (Test-Path -LiteralPath $trustedPowerShell -PathType Leaf)) { Fail 'native Windows PowerShell is unavailable' }
     try {
         $env:COZYGATEWAY_HERMES_BIN = $HermesPath
+        $env:COZYGATEWAY_POWERSHELL = $trustedPowerShell
         & $BashPath @arguments
         if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
     } finally {
         [Environment]::SetEnvironmentVariable('COZYGATEWAY_HERMES_BIN', $previousHermes, 'Process')
+        [Environment]::SetEnvironmentVariable('COZYGATEWAY_POWERSHELL', $previousPowerShell, 'Process')
     }
 }
 

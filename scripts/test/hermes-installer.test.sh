@@ -239,6 +239,7 @@ COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$rel
 test -x "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh"
 test -f "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh.sha256"
 grep -Fq -- '--gateway-dir' "$tmp/bootstrap-handoff"
+test -z "$(find "$tmp/bootstrap-live-home" -maxdepth 1 -name '.bootstrap.*' -print -quit)"
 mkdir -p "$tmp/bootstrap-unsafe-home" "$tmp/bootstrap-unsafe-target"
 ln -s "$tmp/bootstrap-unsafe-target" "$tmp/bootstrap-unsafe-home/bin"
 if unsafe_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
@@ -266,6 +267,7 @@ if late_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATE
   exit 1
 fi
 expect_contains "$late_bootstrap_output" 'install.sh checksum mismatch'
+test -z "$(find "$tmp/bootstrap-live-home" -maxdepth 1 -name '.bootstrap.*' -print -quit)"
 cmp -s "$tmp/release-assets/cozygateway.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
 cmp -s "$tmp/release-assets/cozygateway-hermes-attach-plugin.tar.gz" "$tmp/bootstrap-live-home/bin/cozygateway-hermes-attach-plugin.tar.gz"
 if command -v shasum >/dev/null 2>&1; then
@@ -1452,6 +1454,11 @@ grep -Fq 'repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.
 grep -Fq 'repair does not accept extra arguments' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'Get-FileHash -LiteralPath $p -Algorithm SHA256' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'set "COZYGATEWAY_HOME=' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+if grep -Eq '^powershell\.exe ' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
+  echo 'Windows repair shim must not resolve PowerShell from the caller working directory or PATH' >&2
+  exit 1
+fi
 if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   echo 'Windows command shim must allow an explicit --config override' >&2
   exit 1

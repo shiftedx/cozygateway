@@ -11,6 +11,7 @@ BUNDLE_PATH=""
 PLUGIN_ARCHIVE=""
 HERMES_BIN="${COZYGATEWAY_HERMES_BIN:-hermes}"
 NODE_BIN="${COZYGATEWAY_NODE:-node}"
+WINDOWS_POWERSHELL="${COZYGATEWAY_POWERSHELL:-}"
 PROFILE_SPEC="all"
 PROFILE_SPEC_EXPLICIT=0
 BIND_HOST_EXPLICIT=0
@@ -105,6 +106,9 @@ to_windows_path() {
 }
 normalize_service_platform
 if is_windows; then
+  WINDOWS_POWERSHELL="${WINDOWS_POWERSHELL:-${SYSTEMROOT:-${WINDIR:-C:\\Windows}}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe}"
+  case "$WINDOWS_POWERSHELL" in [A-Za-z]:\\*) ;; *) die "trusted Windows PowerShell path must be absolute" ;; esac
+  case "$WINDOWS_POWERSHELL" in *['"%&|<>^!']*) die "trusted Windows PowerShell path contains unsupported characters" ;; esac
   GATEWAY_DIR="$(to_posix_path "$GATEWAY_DIR")"
   [ -z "$BUNDLE_PATH" ] || BUNDLE_PATH="$(to_posix_path "$BUNDLE_PATH")"
   [ -z "$PLUGIN_ARCHIVE" ] || PLUGIN_ARCHIVE="$(to_posix_path "$PLUGIN_ARCHIVE")"
@@ -652,10 +656,10 @@ CLI
       printf 'if not "%%~2"=="" (echo FAIL  repair does not accept extra arguments & exit /b 1)\r\n'
       printf 'if not exist "%s" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
       printf 'if not exist "%s.sha256" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
-      printf "powershell.exe -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop';try {\$p=[IO.Path]::GetFullPath(\$args[0]);\$expected=((Get-Content -LiteralPath (\$p+'.sha256') -Raw).Trim() -split '\\s+')[0].ToLowerInvariant();\$actual=(Get-FileHash -LiteralPath \$p -Algorithm SHA256).Hash.ToLowerInvariant();if([string]::IsNullOrWhiteSpace(\$expected) -or \$expected -ne \$actual){exit 1};exit 0}catch{exit 1}\" \"%s\"\r\n" "$bootstrap_native"
+      printf "\"%s\" -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop';try {\$p=[IO.Path]::GetFullPath(\$args[0]);\$expected=((Get-Content -LiteralPath (\$p+'.sha256') -Raw).Trim() -split '\\s+')[0].ToLowerInvariant();\$actual=(Get-FileHash -LiteralPath \$p -Algorithm SHA256).Hash.ToLowerInvariant();if([string]::IsNullOrWhiteSpace(\$expected) -or \$expected -ne \$actual){exit 1};exit 0}catch{exit 1}\" \"%s\"\r\n" "$WINDOWS_POWERSHELL" "$bootstrap_native"
       printf 'if errorlevel 1 (echo FAIL  repair bootstrap checksum mismatch. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n'
       printf 'set "COZYGATEWAY_HOME=%s"\r\n' "$(to_windows_path "$GATEWAY_DIR")"
-      printf 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%s" -Repair\r\n' "$bootstrap_native"
+      printf '"%s" -NoProfile -ExecutionPolicy Bypass -File "%s" -Repair\r\n' "$WINDOWS_POWERSHELL" "$bootstrap_native"
       printf 'exit /b %%errorlevel%%\r\n'
     } > "$CLI_WINDOWS"
     chmod 755 "$CLI_WINDOWS" 2>/dev/null || true
