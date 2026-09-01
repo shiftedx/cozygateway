@@ -1389,7 +1389,7 @@ attach_health() {
 }
 attach_ready() {
   attach_health |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach;process.exit(h&&h.configured>0&&h.online===h.configured&&h.deadLetters===0?0:1)}catch{process.exit(1)}})'
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach,c=h?.configured,o=h?.online,d=h?.deadLetters;process.exit([c,o,d].every(Number.isInteger)&&c>0&&o>=0&&d>=0&&o===c&&d===0?0:1)}catch{process.exit(1)}})'
 }
 attach_health_diagnosis() {
   attach_health |

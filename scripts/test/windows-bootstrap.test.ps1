@@ -62,11 +62,15 @@ if "%1"=="model" (
   exit /b 0
 )
 if "%1"=="--version" (
-  if not "%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%"=="" if exist "%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%" (echo Hermes Agent v0.21.0& exit /b 0)
+  if not "%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%"=="" if exist "%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%" (
+    if "%COZYGATEWAY_TEST_HERMES_UPDATE_RESULT%"=="" (echo Hermes Agent v0.21.0) else (echo Hermes Agent v%COZYGATEWAY_TEST_HERMES_UPDATE_RESULT%)
+    exit /b 0
+  )
   if "%COZYGATEWAY_TEST_HERMES_VERSION%"=="" (echo Hermes Agent v0.21.0) else (echo Hermes Agent v%COZYGATEWAY_TEST_HERMES_VERSION%)
   exit /b 0
 )
 if "%1"=="update" (
+  if "%COZYGATEWAY_TEST_HERMES_UPDATE_FAIL%"=="1" exit /b 17
   if not "%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%"=="" type nul >"%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%"
   exit /b 0
 )
@@ -100,8 +104,11 @@ public static class $className {
         if (args.Length > 0 && args[0] == "--version") {
             string version = Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_HERMES_VERSION");
             string updatedFile = Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_HERMES_UPDATED_FILE");
-            Console.WriteLine("Hermes Agent v" + (!String.IsNullOrWhiteSpace(updatedFile) && File.Exists(updatedFile) ? "0.21.0" : (String.IsNullOrWhiteSpace(version) ? "0.21.0" : version)));
+            string updateResult = Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_HERMES_UPDATE_RESULT");
+            string updatedVersion = String.IsNullOrWhiteSpace(updateResult) ? "0.21.0" : updateResult;
+            Console.WriteLine("Hermes Agent v" + (!String.IsNullOrWhiteSpace(updatedFile) && File.Exists(updatedFile) ? updatedVersion : (String.IsNullOrWhiteSpace(version) ? "0.21.0" : version)));
         } else if (args.Length > 0 && args[0] == "update") {
+            if (Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_HERMES_UPDATE_FAIL") == "1") return 17;
             string updatedFile = Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_HERMES_UPDATED_FILE");
             if (!String.IsNullOrWhiteSpace(updatedFile)) File.WriteAllText(updatedFile, "updated");
         } else if (args.Length > 0 && args[0] == "status") {
@@ -566,6 +573,57 @@ try {
     $prereleaseUpdateIndex = [Array]::IndexOf($prereleaseEvents, 'hermes:update --yes')
     $prereleaseBashIndex = ($prereleaseEvents | Select-String '^bash:' | Select-Object -First 1).LineNumber - 1
     Assert-True ($prereleaseUpdateIndex -ge 0 -and $prereleaseBashIndex -gt $prereleaseUpdateIndex) 'Hermes prerelease update must complete before the CozyGateway Bash handoff'
+    Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
+
+    $updateFailure = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Failed Hermes Update Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_HERMES_VERSION' = '0.20.5'
+        'COZYGATEWAY_TEST_HERMES_UPDATE_FAIL' = '1'
+        'COZYGATEWAY_TEST_HERMES_UPDATED_FILE' = (Join-Path $temp 'failed-hermes-update.txt')
+    }
+    Assert-True ($updateFailure.ExitCode -ne 0) 'a failed Hermes update must fail the installer'
+    Assert-True ($updateFailure.Output -match 'Hermes update failed') 'a failed Hermes update must report an actionable error'
+    $updateFailureEvents = Get-Content -LiteralPath $eventLog
+    Assert-True ([Array]::IndexOf($updateFailureEvents, 'hermes:update --yes') -ge 0) 'the incompatible Hermes path must attempt update --yes'
+    Assert-True (-not (($updateFailureEvents -join "`n") -match '(?m)^bash:')) 'a failed Hermes update must stop before the CozyGateway Bash handoff'
+    Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
+
+    foreach ($incompatibleResult in @('0.20.5', '0.21.1-beta.1')) {
+        $resultMarker = Join-Path $temp ("hermes-update-result-" + $incompatibleResult.Replace('.', '-') + '.txt')
+        $stillIncompatible = Invoke-Bootstrap $installer @{
+            'PATH' = "$fakeBin;$env:PATH"
+            'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+            'COZYGATEWAY_HOME' = (Join-Path $temp ("Still Incompatible Hermes " + $incompatibleResult))
+            'COZYGATEWAY_GIT_BASH' = $fakeBash
+            'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+            'COZYGATEWAY_TEST_HERMES_VERSION' = '0.20.5'
+            'COZYGATEWAY_TEST_HERMES_UPDATE_RESULT' = $incompatibleResult
+            'COZYGATEWAY_TEST_HERMES_UPDATED_FILE' = $resultMarker
+        }
+        Assert-True ($stillIncompatible.ExitCode -ne 0) "Hermes update result v$incompatibleResult must remain fail-closed"
+        Assert-True ($stillIncompatible.Output -match 'did not install a compatible stable version' -and $stillIncompatible.Output -match [regex]::Escape("found v$incompatibleResult")) "incompatible update result v$incompatibleResult must be reported exactly"
+        $stillIncompatibleEvents = Get-Content -LiteralPath $eventLog
+        Assert-True ([Array]::IndexOf($stillIncompatibleEvents, 'hermes:update --yes') -ge 0) "Hermes update result v$incompatibleResult must include an update attempt"
+        Assert-True (-not (($stillIncompatibleEvents -join "`n") -match '(?m)^bash:')) "Hermes update result v$incompatibleResult must stop before the CozyGateway Bash handoff"
+        Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
+    }
+
+    $newerStable = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Newer Stable Hermes Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_HERMES_VERSION' = '0.22.0'
+    }
+    Assert-True ($newerStable.ExitCode -eq 0) "newer stable Hermes must proceed without update: $($newerStable.Output)"
+    $newerStableEvents = Get-Content -LiteralPath $eventLog
+    Assert-True ([Array]::IndexOf($newerStableEvents, 'hermes:update --yes') -eq -1) 'newer stable Hermes must not invoke update'
+    Assert-True (($newerStableEvents -join "`n") -match '(?m)^bash:') 'newer stable Hermes must proceed to the CozyGateway Bash handoff'
     Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
 
     $result = Invoke-Bootstrap $installer @{

@@ -47,6 +47,7 @@ if HEALTH_JSON='{"attach":{"configured":2,"online":1,"deadLetters":0,"profiles":
 fi
 assert_diagnosis '{"attach":{"configured":0,"online":0,"deadLetters":0}}' 'Hermes attach has no configured profiles (configured=0, online=0, deadLetters=0)'
 assert_diagnosis '{"attach":{"configured":1,"online":1,"deadLetters":3}}' 'Hermes attach retained dead letters (configured=1, online=1, deadLetters=3)'
+assert_diagnosis '{"attach":{"configured":1.5,"online":1.5,"deadLetters":0}}' 'Hermes attach health could not be read'
 assert_diagnosis 'not-json' 'Hermes attach health could not be read'
 late_counter="${TMPDIR:-/tmp}/cozygateway-attach-health-counter.$$"
 printf '0\n' > "$late_counter"
