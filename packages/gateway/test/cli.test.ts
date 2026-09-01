@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -49,6 +50,39 @@ async function pairPayload(configPath: string): Promise<{ gatewayUrl: string; se
   const payloadLine = lines.find((l) => l.startsWith("{"));
   expect(payloadLine).toBeDefined();
   return JSON.parse(payloadLine ?? "{}") as { gatewayUrl: string; setupCode: string };
+}
+
+async function statusLines(configPath: string): Promise<string[]> {
+  const lines: string[] = [];
+  vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
+  try {
+    expect(await runCli(["status", "--config", configPath])).toBe(0);
+  } finally {
+    vi.restoreAllMocks();
+  }
+  return lines;
+}
+
+async function statusLinesForHealth(health: unknown): Promise<string[]> {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(health));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("health test server has no port");
+  const { configPath } = tempConfig({ host: "127.0.0.1", port: address.port });
+  try {
+    return await statusLines(configPath);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
+  }
 }
 
 describe("cozygateway pair", () => {
@@ -279,7 +313,9 @@ describe("cozygateway terminal menu", () => {
       delete process.env.TEST_HERMES_CONTROL_TOKEN;
       delete process.env.TEST_ATTACH_TOKEN;
     }
-    expect(lines.join("\n")).toMatch(/Status:\s+online/);
+    expect(lines.join("\n")).toContain("Gateway:  v0.5.6");
+    expect(lines.join("\n")).toContain("Hermes attach needs attention: 0/1 Hermes profiles online");
+    expect(lines.join("\n")).toContain("Run cozygateway repair");
   });
 
   it("opens the basic menu when no command is supplied", async () => {
@@ -417,15 +453,39 @@ describe("cozygateway terminal menu", () => {
     storage.close();
   });
 
-  it("prints listener and offline health through the status command", async () => {
+  it("reports an unreachable gateway without exposing the connection failure", async () => {
     const { configPath } = tempConfig({ host: "127.0.0.1", port: 18787 });
-    const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line: unknown = "") => lines.push(String(line)));
-
-    expect(await runCli(["status", "--config", configPath])).toBe(0);
-
-    vi.restoreAllMocks();
+    const lines = await statusLines(configPath);
     expect(lines.join("\n")).toContain("127.0.0.1:18787");
-    expect(lines.join("\n")).toMatch(/offline/i);
+    expect(lines.join("\n")).toContain("Gateway process unreachable");
+    expect(lines.join("\n")).toContain("Run cozygateway repair");
+    expect(lines.join("\n")).not.toMatch(/ECONNREFUSED|fetch failed|token|secret/i);
+  });
+
+  it("reports each reachable Hermes attach state with a safe repair action", async () => {
+    const cases = [
+      [{ version: "0.5.5", attach: { configured: 0, online: 0, deadLetters: 0 } }, "no Hermes profiles configured"],
+      [{ version: "0.5.5", attach: { configured: 2, online: 1, deadLetters: 0 } }, "1/2 Hermes profiles online"],
+      [{ version: "0.5.5", attach: { configured: 1, online: 1, deadLetters: 1 } }, "1 dead letter"],
+    ] as const;
+    for (const [health, expected] of cases) {
+      const lines = await statusLinesForHealth({ ...health, internalError: "secret-token-not-for-output" });
+      const output = lines.join("\n");
+      expect(output).toContain("Gateway:  v0.5.5");
+      expect(output).toContain(expected);
+      expect(output).toContain("Run cozygateway repair");
+      expect(output).not.toContain("secret-token-not-for-output");
+    }
+  });
+
+  it("reports a reachable, fully ready gateway without a repair prompt", async () => {
+    const lines = await statusLinesForHealth({
+      version: "0.5.5",
+      attach: { configured: 2, online: 2, deadLetters: 0 },
+    });
+    const output = lines.join("\n");
+    expect(output).toContain("Gateway:  v0.5.5");
+    expect(output).toContain("Status:   Ready");
+    expect(output).not.toContain("cozygateway repair");
   });
 });

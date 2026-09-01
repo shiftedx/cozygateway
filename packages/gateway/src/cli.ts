@@ -41,7 +41,10 @@ function healthOrigin(config: ReturnType<typeof loadConfig>): string {
   return listenerOrigin(config.host ?? "0.0.0.0", config.port, gatewayScheme(config));
 }
 
-type GatewayHealth = { attach?: { configured?: number; online?: number; deadLetters?: number } };
+type GatewayHealth = {
+  version?: string;
+  attach?: { configured?: number; online?: number; deadLetters?: number };
+};
 
 export function isExpectedCertificate(configured: Buffer, peer: Buffer): boolean {
   return new X509Certificate(configured).fingerprint256 === new X509Certificate(peer).fingerprint256;
@@ -88,6 +91,18 @@ async function fetchHealth(configPath: string, timeoutMs: number): Promise<Gatew
 export function isGatewayReady(health: { attach?: { configured?: number; online?: number; deadLetters?: number } }): boolean {
   const configured = health.attach?.configured ?? 0;
   return configured > 0 && health.attach?.online === configured && health.attach?.deadLetters === 0;
+}
+
+function attachStatus(health: GatewayHealth): string {
+  const configured = health.attach?.configured ?? 0;
+  const online = health.attach?.online ?? 0;
+  const deadLetters = health.attach?.deadLetters ?? 0;
+  const reasons = [
+    ...(configured === 0 ? ["no Hermes profiles configured"] : []),
+    ...(configured > 0 && online !== configured ? [`${online}/${configured} Hermes profiles online`] : []),
+    ...(deadLetters > 0 ? [`${deadLetters} dead letter${deadLetters === 1 ? "" : "s"}`] : []),
+  ];
+  return reasons.length === 0 ? "Ready" : `Hermes attach needs attention: ${reasons.join("; ")}`;
 }
 
 const defaultRuntime: CliRuntime = {
@@ -179,15 +194,20 @@ function describeTtl(ms: number): string {
 async function printStatus(configPath: string): Promise<void> {
   const config = loadConfig(configPath);
   const host = config.host ?? "0.0.0.0";
-  let status = "offline";
-  try {
-    const attach = (await fetchHealth(configPath, 1_000)).attach;
-    status = attach === undefined ? "online" : `online; Hermes attach ${attach.online ?? 0}/${attach.configured ?? 0}`;
-  } catch {
-    // An offline gateway is a status result, not a CLI failure.
-  }
   console.log(`Listener: ${host}:${config.port}`);
-  console.log(`Status:   ${status}`);
+  try {
+    const health = await fetchHealth(configPath, 1_000);
+    const version = typeof health.version === "string" && /^[0-9][0-9A-Za-z.-]*$/.test(health.version)
+      ? `v${health.version}`
+      : "version unavailable";
+    console.log(`Gateway:  ${version}`);
+    console.log(`Status:   ${attachStatus(health)}`);
+    if (!isGatewayReady(health)) console.log("Next:     Run cozygateway repair");
+  } catch {
+    // An unreachable gateway is a status result, not a CLI failure.
+    console.log("Status:   Gateway process unreachable");
+    console.log("Next:     Run cozygateway repair");
+  }
 }
 
 async function configureListener(configPath: string, io: CliIo, runtime: CliRuntime): Promise<void> {

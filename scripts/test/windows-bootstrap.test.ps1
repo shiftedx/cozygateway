@@ -41,6 +41,7 @@ function New-ReleaseFixtures {
         'cozygateway.mjs' = "console.log('fixture');`n"
         'cozygateway-hermes-attach-plugin.tar.gz' = 'plugin-fixture'
         'cozygateway-installer.sh' = "#!/usr/bin/env bash`nexit 0`n"
+        'install.ps1' = "param([switch]`$Repair)`nexit 0`n"
     }
     foreach ($entry in $assets.GetEnumerator()) {
         $path = Join-Path $Directory $entry.Key
@@ -132,7 +133,7 @@ public static class $className {
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`necho bash-powershell:%COZYGATEWAY_POWERSHELL%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -552,6 +553,8 @@ try {
     Assert-True ($incompatible.ExitCode -eq 0) "Hermes v0.20.5 must update before the CozyGateway handoff: $($incompatible.Output)"
     Assert-True ($incompatible.Output -match 'updated Hermes from v0\.20\.5 to v0\.21\.0') 'incompatible Hermes update must name the old and verified new versions'
     $incompatibleEvents = Get-Content -LiteralPath $eventLog
+    $trustedBootstrapPowerShell = [IO.Path]::Combine([Environment]::SystemDirectory, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    Assert-True ($incompatibleEvents -contains "bash-powershell:$trustedBootstrapPowerShell") 'verified bootstrap must hand the shared installer an absolute native PowerShell path'
     $incompatibleUpdateIndex = [Array]::IndexOf($incompatibleEvents, 'hermes:update --yes')
     $incompatibleBashIndex = ($incompatibleEvents | Select-String '^bash:' | Select-Object -First 1).LineNumber - 1
     Assert-True ($incompatibleUpdateIndex -ge 0 -and $incompatibleBashIndex -gt $incompatibleUpdateIndex) 'Hermes update must complete before the CozyGateway Bash handoff'
@@ -626,6 +629,18 @@ try {
     Assert-True (($newerStableEvents -join "`n") -match '(?m)^bash:') 'newer stable Hermes must proceed to the CozyGateway Bash handoff'
     Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
 
+    $repairMetadataHome = Join-Path $temp 'missing repair metadata'
+    $repairBootstrap = Join-Path $repairMetadataHome 'bin\cozygateway-bootstrap.ps1'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $repairBootstrap) | Out-Null
+    Copy-Item -LiteralPath $installer -Destination $repairBootstrap
+    $repairHash = (Get-FileHash -LiteralPath $repairBootstrap -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Utf8NoBom "$repairBootstrap.sha256" "$repairHash  install.ps1`n"
+    $missingRepairMetadata = Invoke-Bootstrap $installer @{
+        'COZYGATEWAY_HOME' = $repairMetadataHome
+    } @('-Repair')
+    Assert-True ($missingRepairMetadata.ExitCode -ne 0) 'repair with missing metadata must fail closed'
+    Assert-True ($missingRepairMetadata.Output -match 'repair metadata is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 \| iex') 'repair metadata failures must print canonical reinstall guidance'
+
     $result = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
@@ -650,14 +665,39 @@ try {
     $registeredPath = Get-Content -LiteralPath $pathLog -Raw
     Assert-True ($registeredPath -match [regex]::Escape((Join-Path $temp 'Cozy Gateway\bin'))) 'bootstrap must add the native CozyGateway command directory to the user PATH'
     Assert-True (($registeredPath -split ';' | Where-Object { $_ -eq (Join-Path $temp 'Cozy Gateway\bin') }).Count -eq 1) 'bootstrap must register the command directory once'
+    $persistedBootstrap = Join-Path $temp 'Cozy Gateway\bin\cozygateway-bootstrap.ps1'
+    Assert-True (Test-Path -LiteralPath $persistedBootstrap) 'Windows bootstrap must persist its verified repair bootstrap'
+    Assert-True (Test-Path -LiteralPath "$persistedBootstrap.sha256") 'Windows bootstrap must persist the repair bootstrap checksum'
+    Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force).Count -eq 0) 'successful bootstrap must remove its staging directory'
+
+    $bundleBeforeLateFailure = [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway.mjs'))
+    $pluginBeforeLateFailure = [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway-hermes-attach-plugin.tar.gz'))
+    $originalInstallPs1 = [IO.File]::ReadAllText((Join-Path $fixtures 'install.ps1'))
+    Write-Utf8NoBom (Join-Path $fixtures 'install.ps1') "tampered bootstrap`n"
+    Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
+    $lateAssetFailure = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+    }
+    Assert-True ($lateAssetFailure.ExitCode -ne 0 -and $lateAssetFailure.Output -match 'install.ps1 checksum mismatch') 'a late bootstrap checksum mismatch must fail before promotion'
+    Assert-True ([Linq.Enumerable]::SequenceEqual($bundleBeforeLateFailure, [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway.mjs'))) ) 'late checksum failure must not replace the installed bundle'
+    Assert-True ([Linq.Enumerable]::SequenceEqual($pluginBeforeLateFailure, [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway-hermes-attach-plugin.tar.gz'))) ) 'late checksum failure must not replace the installed plugin'
+    Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw -ErrorAction SilentlyContinue) -match '(?m)^bash:')) 'late checksum failure must not invoke the installer payload'
+    Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force).Count -eq 0) 'failed bootstrap must remove its staging directory'
+    Write-Utf8NoBom (Join-Path $fixtures 'install.ps1') $originalInstallPs1
 
     $restoreWrapper = Join-Path $temp 'verify-hermes-env-restore.ps1'
     Write-Utf8NoBom $restoreWrapper @"
 `$env:COZYGATEWAY_HERMES_BIN = 'preexisting-hermes-value'
+`$env:COZYGATEWAY_POWERSHELL = 'preexisting-powershell-value'
 try {
     & ([scriptblock]::Create([IO.File]::ReadAllText('$installer')))
 } catch {}
 if (`$env:COZYGATEWAY_HERMES_BIN -cne 'preexisting-hermes-value') { exit 31 }
+if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 }
 "@
     $restore = Invoke-Bootstrap $restoreWrapper @{
         'PATH' = "$fakeBin;$env:PATH"
@@ -667,7 +707,7 @@ if (`$env:COZYGATEWAY_HERMES_BIN -cne 'preexisting-hermes-value') { exit 31 }
         'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
         'COZYGATEWAY_TEST_BASH_FAIL' = '1'
     }
-    Assert-True ($restore.ExitCode -eq 0) "failed Bash handoff must restore the caller's COZYGATEWAY_HERMES_BIN: $($restore.Output)"
+    Assert-True ($restore.ExitCode -eq 0) "failed Bash handoff must restore installer-owned process environment: $($restore.Output)"
 
     $broadParent = Join-Path $temp 'broad acl parent'
     $protectedHome = Join-Path $broadParent 'Protected Cozy Gateway'
@@ -794,6 +834,9 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 
     $agentInstallerPath = Join-Path $repoRoot 'scripts\agent-install.sh'
     $agentInstaller = Get-Content -LiteralPath $agentInstallerPath -Raw
+    Assert-True ($agentInstaller.Contains('Get-FileHash -LiteralPath \$p -Algorithm SHA256')) 'generated Windows repair command must independently checksum its bootstrap'
+    $cliWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_cli_wrapper\(\) \{.*?^\}')
+    Assert-True $cliWriterMatch.Success 'shared installer must define write_cli_wrapper'
     $elevationWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_dashboard_elevation_helper\(\) \{.*?^\}')
     Assert-True $elevationWriterMatch.Success 'shared installer must define write_dashboard_elevation_helper'
     $stopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_stubborn_windows_dashboard\(\) \{.*?^\}')
@@ -802,6 +845,62 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     $gitRoot = Split-Path -Parent (Split-Path -Parent $gitCommand.Source)
     $bashPath = Join-Path $gitRoot 'bin\bash.exe'
     Assert-True (Test-Path -LiteralPath $bashPath) 'Git for Windows bash.exe must be available for the shared-installer harness'
+    $repairHome = Join-Path $temp 'Custom Cozy Gateway Home'
+    $repairBootstrap = Join-Path $repairHome 'bin\cozygateway-bootstrap.ps1'
+    $repairMarker = Join-Path $temp 'repair-home-marker.txt'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $repairBootstrap) | Out-Null
+    Write-Utf8NoBom $repairBootstrap "[IO.File]::AppendAllText('$repairMarker', [string]`$env:COZYGATEWAY_HOME + [Environment]::NewLine)`n"
+    $repairHash = (Get-FileHash -LiteralPath $repairBootstrap -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Utf8NoBom "$repairBootstrap.sha256" "$repairHash  install.ps1`n"
+    $repairCmd = Join-Path $repairHome 'bin\cozygateway.cmd'
+    $trustedRepairPowerShell = [IO.Path]::Combine([Environment]::SystemDirectory, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    $cliWriterHarness = Join-Path $temp 'generate-cli-wrapper.sh'
+    $cliWriterScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+GATEWAY_DIR="`$(cygpath -u "`$1")"
+WINDOWS_POWERSHELL="`$2"
+DRY_RUN=0
+NODE_RESOLVED="`$GATEWAY_DIR/runtime/node/node.exe"
+BUNDLE_PATH="`$GATEWAY_DIR/bin/cozygateway.mjs"
+LOCAL_DIR="`$GATEWAY_DIR/local"
+STATE_FILE="`$LOCAL_DIR/install-state"
+CLI_WRAPPER="`$GATEWAY_DIR/bin/cozygateway"
+CLI_WINDOWS="`$GATEWAY_DIR/bin/cozygateway.cmd"
+POSIX_BOOTSTRAP="`$GATEWAY_DIR/bin/cozygateway-bootstrap.sh"
+WINDOWS_BOOTSTRAP="`$GATEWAY_DIR/bin/cozygateway-bootstrap.ps1"
+say() { printf '%s\n' "`$*"; }
+is_windows() { return 0; }
+to_windows_path() { cygpath -w "`$1"; }
+$($cliWriterMatch.Value)
+write_cli_wrapper
+"@
+    Write-Utf8NoBom $cliWriterHarness $cliWriterScript
+    $cliWriterOutput = (& $bashPath $cliWriterHarness $repairHome $trustedRepairPowerShell 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $repairCmd)) "actual installer must generate the Windows command shim: $cliWriterOutput"
+    $generatedRepairCmd = Get-Content -LiteralPath $repairCmd -Raw
+    Assert-True ($generatedRepairCmd -match [regex]::Escape('"' + $trustedRepairPowerShell + '"')) 'generated repair shim must pin the trusted native PowerShell executable'
+    $repairRun = (& cmd.exe /c $repairCmd repair 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0 -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 1 -and (Get-Content -LiteralPath $repairMarker -Raw).Trim() -eq $repairHome) 'generated repair shim must pass the custom installed home to its bootstrap'
+    $extraRepair = (& cmd.exe /c $repairCmd repair unexpected 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -ne 0 -and $extraRepair -match 'does not accept extra arguments' -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 1) 'generated repair shim must reject extra arguments before bootstrap execution'
+    $hijackDirectory = Join-Path $temp 'repair current directory hijack'
+    $hijackPowerShell = Join-Path $hijackDirectory 'powershell.exe'
+    $hijackLog = Join-Path $temp 'repair-hijack.log'
+    New-FakePowerShell $hijackPowerShell $hijackLog
+    $env:COZYGATEWAY_TEST_NORMAL_CODE = '0'
+    Push-Location $hijackDirectory
+    try {
+        $repairFromHostileDirectory = (& cmd.exe /c $repairCmd repair 2>&1 | Out-String)
+        $repairFromHostileExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        Remove-Item Env:COZYGATEWAY_TEST_NORMAL_CODE -ErrorAction SilentlyContinue
+    }
+    Assert-True ($repairFromHostileExit -eq 0 -and -not (Test-Path -LiteralPath $hijackLog) -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 2) 'generated repair shim must ignore a current-directory powershell.exe'
+    Add-Content -LiteralPath $repairBootstrap -Value '# tampered'
+    $tamperedRepair = (& cmd.exe /c $repairCmd repair 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -ne 0 -and $tamperedRepair -match 'repair bootstrap checksum mismatch' -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 2) 'generated repair shim must reject a tampered bootstrap before execution'
     $fakePowerShellDirectory = Join-Path $temp 'fake PowerShell'
     $fakePowerShell = Join-Path $fakePowerShellDirectory 'powershell.exe'
     $powerShellCallLog = Join-Path $temp 'powershell-calls.log'

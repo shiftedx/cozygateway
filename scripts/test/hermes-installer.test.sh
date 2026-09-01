@@ -210,7 +210,8 @@ mkdir -p "$tmp/release-assets"
 cp "$tmp/gateway.mjs" "$tmp/release-assets/cozygateway.mjs"
 cp "$tmp/plugin.tar.gz" "$tmp/release-assets/cozygateway-hermes-attach-plugin.tar.gz"
 cp "$repo_root/scripts/agent-install.sh" "$tmp/release-assets/cozygateway-installer.sh"
-for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway-installer.sh; do
+cp "$repo_root/scripts/install.sh" "$tmp/release-assets/install.sh"
+for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway-installer.sh install.sh; do
   if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/$asset" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/$asset" | awk '{print $1}')"; fi
   printf '%s  %s\n' "$asset_sha" "$asset" > "$tmp/release-assets/$asset.sha256"
 done
@@ -224,6 +225,86 @@ esac
 bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
 grep -Fq 'DRY   verified assets' <<<"$bootstrap_dry_output"
 test ! -e "$tmp/bootstrap-dry-home"
+
+# A normal one-line bootstrap keeps its own verified release payload for the
+# installed `cozygateway repair` command, alongside its checksum.
+cat > "$tmp/release-assets/cozygateway-installer.sh" <<'BOOTSTRAP_HANDOFF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "${COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF:?}"
+BOOTSTRAP_HANDOFF
+chmod 700 "$tmp/release-assets/cozygateway-installer.sh"
+if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; fi
+printf '%s  cozygateway-installer.sh\n' "$asset_sha" > "$tmp/release-assets/cozygateway-installer.sh.sha256"
+COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff" bash "$repo_root/scripts/install.sh"
+test -x "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh"
+test -f "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh.sha256"
+grep -Fq -- '--gateway-dir' "$tmp/bootstrap-handoff"
+test -z "$(find "$tmp/bootstrap-live-home" -maxdepth 1 -name '.bootstrap.*' -print -quit)"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    mkdir -p "$tmp/bootstrap-unsafe-home" "$tmp/bootstrap-unsafe-target"
+    ln -s "$tmp/bootstrap-unsafe-target" "$tmp/bootstrap-unsafe-home/bin"
+    if unsafe_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+      echo 'symlinked bootstrap bin must be rejected' >&2
+      exit 1
+    fi
+    expect_contains "$unsafe_bootstrap_output" 'refusing symlinked installer directory'
+    ;;
+esac
+
+# Verify everything before promotion: a late bootstrap checksum failure cannot
+# partially replace a healthy installed bundle, plugin, installer, or bootstrap.
+if command -v shasum >/dev/null 2>&1; then
+  before_bundle_sha="$(shasum -a 256 "$tmp/bootstrap-live-home/bin/cozygateway.mjs" | awk '{print $1}')"
+  before_plugin_sha="$(shasum -a 256 "$tmp/bootstrap-live-home/bin/cozygateway-hermes-attach-plugin.tar.gz" | awk '{print $1}')"
+  before_installer_sha="$(shasum -a 256 "$tmp/bootstrap-live-home/bin/agent-install.sh" | awk '{print $1}')"
+  before_bootstrap_sha="$(shasum -a 256 "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
+else
+  before_bundle_sha="$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway.mjs" | awk '{print $1}')"
+  before_plugin_sha="$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-hermes-attach-plugin.tar.gz" | awk '{print $1}')"
+  before_installer_sha="$(sha256sum "$tmp/bootstrap-live-home/bin/agent-install.sh" | awk '{print $1}')"
+  before_bootstrap_sha="$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
+fi
+printf 'tampered bootstrap\n' > "$tmp/release-assets/install.sh"
+if late_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-late" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+  echo 'late bootstrap checksum failure must fail before promotion' >&2
+  exit 1
+fi
+expect_contains "$late_bootstrap_output" 'install.sh checksum mismatch'
+test -z "$(find "$tmp/bootstrap-live-home" -maxdepth 1 -name '.bootstrap.*' -print -quit)"
+cmp -s "$tmp/release-assets/cozygateway.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
+cmp -s "$tmp/release-assets/cozygateway-hermes-attach-plugin.tar.gz" "$tmp/bootstrap-live-home/bin/cozygateway-hermes-attach-plugin.tar.gz"
+if command -v shasum >/dev/null 2>&1; then
+  test "$before_bundle_sha" = "$(shasum -a 256 "$tmp/bootstrap-live-home/bin/cozygateway.mjs" | awk '{print $1}')"
+  test "$before_plugin_sha" = "$(shasum -a 256 "$tmp/bootstrap-live-home/bin/cozygateway-hermes-attach-plugin.tar.gz" | awk '{print $1}')"
+  test "$before_installer_sha" = "$(shasum -a 256 "$tmp/bootstrap-live-home/bin/agent-install.sh" | awk '{print $1}')"
+  test "$before_bootstrap_sha" = "$(shasum -a 256 "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
+else
+  test "$before_bundle_sha" = "$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway.mjs" | awk '{print $1}')"
+  test "$before_plugin_sha" = "$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-hermes-attach-plugin.tar.gz" | awk '{print $1}')"
+  test "$before_installer_sha" = "$(sha256sum "$tmp/bootstrap-live-home/bin/agent-install.sh" | awk '{print $1}')"
+  test "$before_bootstrap_sha" = "$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
+fi
+test ! -e "$tmp/bootstrap-handoff-late"
+
+# An ordinary rerun retains its recorded scope; an explicit `--profiles all`
+# remains the deliberate way to widen it.
+mkdir -p "$tmp/gateway-scoped/local"
+printf 'profiles=ops\n' > "$tmp/gateway-scoped/local/install-state"
+scoped_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped")"
+grep -Fq 'Profiles: ops' <<<"$scoped_output"
+if ! all_profiles_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"; then
+  printf 'explicit all scope test failed:\n%s\n' "$all_profiles_output" >&2
+  exit 1
+fi
+grep -Fq 'Profiles: default active ops' <<<"$all_profiles_output"
+printf 'profiles=../unsafe\n' > "$tmp/gateway-scoped/local/install-state"
+if malformed_scope_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"; then
+  echo 'malformed recorded profile scope must fail closed' >&2
+  exit 1
+fi
+expect_contains "$malformed_scope_output" 'installer state has an unsafe profile scope'
 
 for platform in Darwin Linux Windows; do
   windows_status=; [ "$platform" = Windows ] && windows_status=1
@@ -524,8 +605,58 @@ if grep -Eq 'COZYGATEWAY_(HERMES_PASSWORD|HERMES_TOKEN|ATTACH_TOKEN)' "$tmp/gate
   echo 'gateway CLI wrapper must not contain secrets' >&2
   exit 1
 fi
+# A direct agent-install intentionally has no release bootstrap to trust for
+# repairs. It must fail closed rather than execute checkout assets.
+if missing_repair_output="$("$tmp/gateway-live/bin/cozygateway" repair 2>&1)"; then
+  echo 'a direct agent-install repair without the verified bootstrap must fail' >&2
+  exit 1
+fi
+expect_contains "$missing_repair_output" 'curl -fsSL https://cozylabs.ai/install.sh | bash'
+
+# The installed command routes both spellings through the persisted, checksummed
+# bootstrap and carries the exact recorded scope rather than rediscovering all profiles.
+cat > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" <<'REPAIR_BOOTSTRAP'
+#!/usr/bin/env bash
+printf '%s\n' "$COZYGATEWAY_HOME:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
+REPAIR_BOOTSTRAP
+chmod 700 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
+if command -v shasum >/dev/null 2>&1; then repair_sha="$(shasum -a 256 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else repair_sha="$(sha256sum "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi
+printf '%s  install.sh\n' "$repair_sha" > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh.sha256"
+COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair >/dev/null
+COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" update >/dev/null
+expected_profiles="$(sed -n 's/^profiles=//p' "$tmp/gateway-live/local/install-state" | tail -1)"
+repair_count="$(wc -l < "$tmp/repair.log" | tr -d ' ')"
+if [ "$repair_count" != 2 ]; then
+  printf 'repair route count was %s:\n' "$repair_count" >&2
+  cat "$tmp/repair.log" >&2
+  exit 1
+fi
+grep -Fq "$tmp/gateway-live:--profiles $expected_profiles" "$tmp/repair.log"
+printf '# tampered\n' >> "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
+if checksum_repair_output="$(COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair 2>&1)"; then
+  echo 'a tampered repair bootstrap must fail checksum validation' >&2
+  exit 1
+fi
+expect_contains "$checksum_repair_output" 'repair bootstrap checksum mismatch'
+test "$(wc -l < "$tmp/repair.log" | tr -d ' ')" = 2
+cat > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" <<'REPAIR_BOOTSTRAP'
+#!/usr/bin/env bash
+printf '%s\n' "$COZYGATEWAY_HOME:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
+REPAIR_BOOTSTRAP
+chmod 700 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
+if command -v shasum >/dev/null 2>&1; then repair_sha="$(shasum -a 256 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else repair_sha="$(sha256sum "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi
+printf '%s  install.sh\n' "$repair_sha" > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh.sha256"
+mv "$tmp/gateway-live/local/install-state" "$tmp/gateway-live/local/install-state.saved"
+if missing_repair_metadata="$(COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair 2>&1)"; then
+  echo 'repair with missing state must fail closed' >&2
+  exit 1
+fi
+expect_contains "$missing_repair_metadata" 'repair metadata is unavailable. Reinstall with: curl -fsSL https://cozylabs.ai/install.sh | bash'
+mv "$tmp/gateway-live/local/install-state.saved" "$tmp/gateway-live/local/install-state"
+
 grep -Fq 'watchFile(config' "$tmp/gateway-live/local/run-gateway.sh"
 grep -Fq 'restartGateway' "$tmp/gateway-live/local/run-gateway.sh"
+grep -Fq 'restartAfterCrash' "$tmp/gateway-live/local/run-gateway.sh"
 remote_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/cozygateway" pair --url https://gateway.example.com)"
 grep -q '"gatewayUrl":"https://gateway.example.com"' <<<"$remote_pair"
 grep -Fq 'parseEnv(readFileSync(gatewayEnvPath' "$tmp/gateway-live/local/run-gateway.sh"
@@ -779,6 +910,45 @@ kill "$supervisor_pid" 2>/dev/null || true
 wait "$supervisor_pid" 2>/dev/null || true
 supervisor_pid=
 "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$mock_dashboard_pid"
+# A child can report both `error` and `exit`. That must produce one delayed
+# restart, not an immediate restart plus a second timer-driven child.
+cat > "$tmp/crash-child-preload.cjs" <<'CRASH_CHILD_PRELOAD'
+const { appendFileSync } = require('node:fs');
+const { EventEmitter } = require('node:events');
+const childProcess = require('node:child_process');
+const spawn = childProcess.spawn;
+childProcess.spawn = (command, args, options) => {
+  if (args?.[1] === 'serve') {
+    appendFileSync(process.env.COZYGATEWAY_TEST_CRASH_SPAWN_LOG, 'serve\n');
+    const child = new EventEmitter();
+    child.exitCode = null; child.signalCode = null; child.pid = 99999;
+    process.nextTick(() => { child.emit('error', new Error('fixture spawn error')); child.exitCode = 1; child.emit('exit', 1, null); });
+    return child;
+  }
+  return spawn(command, args, options);
+};
+CRASH_CHILD_PRELOAD
+crash_spawn_log="$tmp/crash-spawn.log"
+NODE_OPTIONS="--require=$tmp/crash-child-preload.cjs" COZYGATEWAY_TEST_CRASH_SPAWN_LOG="$crash_spawn_log" \
+  "$real_node" "$tmp/supervisor.cjs" \
+  "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
+  "$hermes_stub_arg" "$expected_launcher" "$owner_helper" "$mock_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  >"$tmp/crash-supervisor.log" 2>&1 &
+crash_supervisor_pid=$!
+for _ in $(seq 1 20); do [ -f "$crash_spawn_log" ] && [ "$(wc -l < "$crash_spawn_log" | tr -d ' ')" -ge 1 ] && break; sleep 0.1; done
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, renameSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const next = JSON.parse(readFileSync(path, 'utf8'));
+next.crashRestartInterleave = true;
+writeFileSync(path + '.interleave', JSON.stringify(next));
+renameSync(path + '.interleave', path);
+NODE
+for _ in $(seq 1 20); do [ -f "$crash_spawn_log" ] && [ "$(wc -l < "$crash_spawn_log" | tr -d ' ')" -ge 2 ] && break; sleep 0.1; done
+sleep 0.2
+test "$(wc -l < "$crash_spawn_log" | tr -d ' ')" = 2
+kill "$crash_supervisor_pid" 2>/dev/null || true
+wait "$crash_supervisor_pid" 2>/dev/null || true
 stop_test_pid "$mock_dashboard_pid"
 mock_dashboard_pid=
 test "$(wc -l < "$tmp/reload.log")" -ge 2
@@ -902,6 +1072,14 @@ NODE
 
 # A rerun sees all services running, preserves the installer-owned lifecycle
 # records and attach tokens, and never tries to install a second Hermes service.
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.tls = { certFile: '/operator/cert.pem', keyFile: '/operator/key.pem' };
+config.operatorCapability = { enabled: true };
+writeFileSync(path, JSON.stringify(config));
+NODE
 default_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")"
 ops_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 install_count_before="$(grep -c '^default:gateway:install$' "$tmp/commands")"
@@ -917,6 +1095,12 @@ test "$default_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")
 test "$ops_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 test "$install_count_before" = "$(grep -c '^default:gateway:install$' "$tmp/commands")"
 test "$(grep -c '^default:gateway:restart$' "$tmp/commands")" = 1
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+if (config.tls?.certFile !== '/operator/cert.pem' || config.operatorCapability?.enabled !== true) process.exit(1);
+if (!Array.isArray(config.hermesEndpoints) || config.hermesEndpoints.length !== 1) process.exit(1);
+NODE
 
 # Opting into a public origin moves an existing LAN listener back to loopback,
 # persists the canonical HTTPS origin, and advertises it in the automatic pairing finale.
@@ -1028,6 +1212,10 @@ mkdir -p "$tmp/windows-bin" "$tmp/windows-appdata"
 cat > "$tmp/windows-bin/schtasks.exe" <<'SCHTASKS'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+if [ "$1" = /Query ] && [ -n "${COZYGATEWAY_TEST_SCHTASKS_XML:-}" ]; then
+  printf '<Task><Actions>%s</Actions></Task>\n' "$COZYGATEWAY_TEST_SCHTASKS_XML"
+  exit 0
+fi
 if [ "${COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE:-}" = 1 ] && [ "$1" = /Create ]; then
   printf 'ERROR: Access is denied.\n' >&2
   exit 1
@@ -1074,6 +1262,32 @@ rm -f "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}"
 exit 0
 POWERSHELL
 chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/windows-bin/powershell.exe"
+
+# Missing install-state is still a Windows cleanup path: remove only the
+# CozyGateway task, Startup entry, and command PATH registration before
+# deleting the dedicated directory. Hermes is never consulted.
+partial_windows_gateway="$tmp/gateway-windows-partial"
+partial_windows_startup="$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+mkdir -p "$partial_windows_gateway/runtime/node" "$partial_windows_gateway/local" "$(dirname "$partial_windows_startup")"
+printf 'partial\n' > "$partial_windows_gateway/runtime/node/marker"
+partial_windows_wrapper_native="$("$tmp/bin/cygpath" -w "$partial_windows_gateway/local/run-gateway.sh")"
+partial_windows_vbs_native="$("$tmp/bin/cygpath" -w "$partial_windows_gateway/local/run-gateway.vbs")"
+printf 'command = "%s"\n' "$partial_windows_wrapper_native" > "$partial_windows_gateway/local/run-gateway.vbs"
+cp "$partial_windows_gateway/local/run-gateway.vbs" "$partial_windows_startup"
+HOME="$tmp/windows-partial-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-partial-commands" COZYGATEWAY_TEST_SCHTASKS_XML="$partial_windows_vbs_native" COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$partial_windows_gateway" >/dev/null
+test ! -e "$partial_windows_gateway"
+test ! -e "$partial_windows_startup"
+grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-partial-commands"
+grep -Fq 'powershell ' "$tmp/windows-partial-commands"
+foreign_windows_gateway="$tmp/gateway-windows-foreign"
+foreign_windows_startup="$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+mkdir -p "$foreign_windows_gateway/local" "$(dirname "$foreign_windows_startup")"
+printf 'foreign launcher\n' > "$foreign_windows_gateway/local/run-gateway.vbs"
+printf 'foreign startup\n' > "$foreign_windows_startup"
+HOME="$tmp/windows-foreign-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-foreign-commands" COZYGATEWAY_TEST_SCHTASKS_XML='foreign-task' COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$foreign_windows_gateway" >/dev/null
+test ! -e "$foreign_windows_gateway"
+test -e "$foreign_windows_startup"
+[ ! -f "$tmp/windows-foreign-commands" ] || ! grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-foreign-commands"
 
 # Windows cannot unlink SQLite files held by a pre-existing Hermes gateway.
 # After the installer-owned plugin is disabled, uninstall restarts exactly that
@@ -1240,6 +1454,16 @@ grep -Fq 'wscript ' "$tmp/windows-commands"
 grep -Fq 'fake-qr' <<<"$windows_output"
 test -f "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'gateway.mjs' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq '"repair"' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq 'repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq 'repair does not accept extra arguments' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq 'Get-FileHash -LiteralPath $p -Algorithm SHA256' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq 'set "COZYGATEWAY_HOME=' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fq '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+if grep -Eq '^powershell\.exe ' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
+  echo 'Windows repair shim must not resolve PowerShell from the caller working directory or PATH' >&2
+  exit 1
+fi
 if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   echo 'Windows command shim must allow an explicit --config override' >&2
   exit 1

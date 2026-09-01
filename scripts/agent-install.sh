@@ -11,7 +11,9 @@ BUNDLE_PATH=""
 PLUGIN_ARCHIVE=""
 HERMES_BIN="${COZYGATEWAY_HERMES_BIN:-hermes}"
 NODE_BIN="${COZYGATEWAY_NODE:-node}"
+WINDOWS_POWERSHELL="${COZYGATEWAY_POWERSHELL:-}"
 PROFILE_SPEC="all"
+PROFILE_SPEC_EXPLICIT=0
 BIND_HOST_EXPLICIT=0
 PORT_EXPLICIT=0
 PUBLIC_URL_EXPLICIT=0
@@ -68,7 +70,7 @@ while [ "$#" -gt 0 ]; do
     --bundle) need_value "$@"; BUNDLE_PATH="$2"; shift ;;
     --plugin-archive) need_value "$@"; PLUGIN_ARCHIVE="$2"; shift ;;
     --gateway-dir) need_value "$@"; GATEWAY_DIR="$2"; shift ;;
-    --profiles) need_value "$@"; PROFILE_SPEC="$2"; shift ;;
+    --profiles) need_value "$@"; PROFILE_SPEC="$2"; PROFILE_SPEC_EXPLICIT=1; shift ;;
     --bind-host) need_value "$@"; BIND_HOST="$2"; BIND_HOST_EXPLICIT=1; shift ;;
     --port) need_value "$@"; PORT="$2"; PORT_EXPLICIT=1; shift ;;
     --public-url) need_value "$@"; PUBLIC_URL="$2"; PUBLIC_URL_EXPLICIT=1; shift ;;
@@ -104,6 +106,9 @@ to_windows_path() {
 }
 normalize_service_platform
 if is_windows; then
+  WINDOWS_POWERSHELL="${WINDOWS_POWERSHELL:-${SYSTEMROOT:-${WINDIR:-C:\\Windows}}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe}"
+  case "$WINDOWS_POWERSHELL" in [A-Za-z]:\\*) ;; *) die "trusted Windows PowerShell path must be absolute" ;; esac
+  case "$WINDOWS_POWERSHELL" in *['"%&|<>^!']*) die "trusted Windows PowerShell path contains unsupported characters" ;; esac
   GATEWAY_DIR="$(to_posix_path "$GATEWAY_DIR")"
   [ -z "$BUNDLE_PATH" ] || BUNDLE_PATH="$(to_posix_path "$BUNDLE_PATH")"
   [ -z "$PLUGIN_ARCHIVE" ] || PLUGIN_ARCHIVE="$(to_posix_path "$PLUGIN_ARCHIVE")"
@@ -136,6 +141,8 @@ STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
 CLI_WRAPPER="$GATEWAY_DIR/bin/cozygateway"
 CLI_WINDOWS="$GATEWAY_DIR/bin/cozygateway.cmd"
+POSIX_BOOTSTRAP="$GATEWAY_DIR/bin/cozygateway-bootstrap.sh"
+WINDOWS_BOOTSTRAP="$GATEWAY_DIR/bin/cozygateway-bootstrap.ps1"
 GW_LOG="$LOCAL_DIR/cozygateway.log"
 SERVICE_LABEL="ai.cozylabs.cozygateway"
 SERVICE_UNIT="cozygateway.service"
@@ -361,6 +368,16 @@ confirm_hermes_model() {
 # profile names are shell/file-safe Hermes identifiers. Reject anything that
 # could turn a plugin or spool path into a path traversal before constructing it.
 valid_profile() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || [ "$1" = default ]; }
+hydrate_profile_scope() {
+  local profiles p
+  [ "$PROFILE_SPEC_EXPLICIT" = 0 ] && [ -f "$STATE_FILE" ] || return 0
+  profiles="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"
+  [ -n "$profiles" ] || die "installer state has an unsafe profile scope; rerun with --profiles all or an explicit profile list"
+  IFS=',' read -r -a SELECTED <<<"$profiles"
+  [ "${#SELECTED[@]}" -gt 0 ] || die "installer state has an unsafe profile scope; rerun with --profiles all or an explicit profile list"
+  for p in "${SELECTED[@]}"; do valid_profile "$p" || die "installer state has an unsafe profile scope; rerun with --profiles all or an explicit profile list"; done
+  PROFILE_SPEC="$profiles"
+}
 hermes_config_path() {
   local path
   path="$("$HERMES_BIN" -p "$1" config path 2>/dev/null)" || return
@@ -476,10 +493,21 @@ write_gateway_config() {
 const fs = require('node:fs');
 const [mapPath, output, host, port, dbPath, dashboardPort, publicUrl] = process.argv.slice(2);
 const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
-fs.writeFileSync(output, JSON.stringify({
+let existing = {};
+try {
+  existing = JSON.parse(fs.readFileSync(output, 'utf8'));
+  if (existing === null || Array.isArray(existing) || typeof existing !== 'object') existing = {};
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+}
+const managed = {
   name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
   hermesEndpoints: [{ id: 'default', url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles }],
-}, null, 2) + '\n', { mode: 0o600 });
+};
+delete existing.publicUrl;
+const temporary = `${output}.new`;
+fs.writeFileSync(temporary, JSON.stringify({ ...existing, ...managed }, null, 2) + '\n', { mode: 0o600 });
+fs.renameSync(temporary, output);
 NODE
   chmod 600 "$CONFIG_JSON" "$map"
 }
@@ -585,20 +613,55 @@ preflight_service_manager() {
   fi
 }
 write_cli_wrapper() {
-  local node_native bundle_native local_native
+  local node_native bundle_native local_native bootstrap_native bootstrap_b64
   [ "$DRY_RUN" = 1 ] && { say "DRY   write executable gateway CLI at $CLI_WRAPPER"; return; }
   mkdir -p "$GATEWAY_DIR/bin"
   umask 022
-  printf '#!/usr/bin/env bash\nset -euo pipefail\ncd %q\nexec %q %q "$@"\n' "$LOCAL_DIR" "$NODE_RESOLVED" "$BUNDLE_PATH" > "$CLI_WRAPPER"
+  cat > "$CLI_WRAPPER" <<CLI
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
+  [ "\$#" = 1 ] || { printf 'FAIL  repair does not accept extra arguments\n' >&2; exit 1; }
+  bootstrap=$(printf %q "$POSIX_BOOTSTRAP")
+  checksum="\$bootstrap.sha256"
+  state=$(printf %q "$STATE_FILE")
+  reinstall='curl -fsSL https://cozylabs.ai/install.sh | bash'
+  [ -f "\$bootstrap" ] && [ -f "\$checksum" ] || { printf 'FAIL  repair bootstrap is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  [ -r "\$state" ] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  expected="\$(awk '{print \$1}' "\$checksum")"
+  if command -v shasum >/dev/null 2>&1; then actual="\$(shasum -a 256 "\$bootstrap" | awk '{print \$1}')"; elif command -v sha256sum >/dev/null 2>&1; then actual="\$(sha256sum "\$bootstrap" | awk '{print \$1}')"; else printf 'FAIL  repair needs shasum or sha256sum. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; fi
+  [ -n "\$expected" ] && [ "\$expected" = "\$actual" ] || { printf 'FAIL  repair bootstrap checksum mismatch. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  profiles="\$(sed -n 's/^profiles=//p' "\$state" | tail -1)"
+  [[ "\$profiles" =~ ^(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(,(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*\$ ]] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  printf 'INFO  repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment\n'
+  exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") bash "\$bootstrap" --profiles "\$profiles"
+fi
+cd $(printf %q "$LOCAL_DIR")
+exec $(printf %q "$NODE_RESOLVED") $(printf %q "$BUNDLE_PATH") "\$@"
+CLI
   chmod 755 "$CLI_WRAPPER"
   if is_windows; then
     node_native="$(to_windows_path "$NODE_RESOLVED")"
     bundle_native="$(to_windows_path "$BUNDLE_PATH")"
     local_native="$(to_windows_path "$LOCAL_DIR")"
+    bootstrap_native="$(to_windows_path "$WINDOWS_BOOTSTRAP")"
+    bootstrap_b64="$(printf '%s' "$bootstrap_native" | base64 | tr -d '\r\n')"
     {
       printf '@echo off\r\n'
+      printf 'if /I "%%~1"=="repair" goto repair\r\n'
+      printf 'if /I "%%~1"=="update" goto repair\r\n'
       printf 'cd /d "%s"\r\n' "$local_native"
       printf '"%s" "%s" %%*\r\n' "$node_native" "$bundle_native"
+      printf 'exit /b %%errorlevel%%\r\n'
+      printf ':repair\r\n'
+      printf 'if not "%%~2"=="" (echo FAIL  repair does not accept extra arguments & exit /b 1)\r\n'
+      printf 'if not exist "%s" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
+      printf 'if not exist "%s.sha256" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
+      printf "\"%s\" -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop';try {\$p=[IO.Path]::GetFullPath([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')));\$expected=((Get-Content -LiteralPath (\$p+'.sha256') -Raw).Trim() -split '\\s+')[0].ToLowerInvariant();\$actual=(Get-FileHash -LiteralPath \$p -Algorithm SHA256).Hash.ToLowerInvariant();if([string]::IsNullOrWhiteSpace(\$expected) -or \$expected -ne \$actual){exit 1};exit 0}catch{exit 1}\"\r\n" "$WINDOWS_POWERSHELL" "$bootstrap_b64"
+      printf 'if errorlevel 1 (echo FAIL  repair bootstrap checksum mismatch. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n'
+      printf 'set "COZYGATEWAY_HOME=%s"\r\n' "$(to_windows_path "$GATEWAY_DIR")"
+      printf '"%s" -NoProfile -ExecutionPolicy Bypass -File "%s" -Repair\r\n' "$WINDOWS_POWERSHELL" "$bootstrap_native"
+      printf 'exit /b %%errorlevel%%\r\n'
     } > "$CLI_WINDOWS"
     chmod 755 "$CLI_WINDOWS" 2>/dev/null || true
   fi
@@ -1253,22 +1316,33 @@ if (dashboardChild) dashboardChild.unref();
 let child;
 let restarting = false;
 let shuttingDown = false;
+let crashRestartTimer;
 let configBytes = readFileSync(config);
+const restartAfterCrash = () => {
+  if (shuttingDown || crashRestartTimer) return;
+  crashRestartTimer = setTimeout(() => {
+    crashRestartTimer = undefined;
+    if (!shuttingDown) spawnGateway();
+  }, 1000);
+};
 const spawnGateway = () => {
   child = spawn(process.execPath, [bundle, 'serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
-  child.on('error', (error) => { console.error(error); process.exit(1); });
+  child.on('error', (error) => { console.error(error); restartAfterCrash(); });
   child.on('exit', (code, signal) => {
     if (shuttingDown) process.exit(code ?? (signal ? 1 : 0));
     if (restarting) {
+      if (crashRestartTimer) { clearTimeout(crashRestartTimer); crashRestartTimer = undefined; }
       restarting = false;
       spawnGateway();
       return;
     }
-    process.exit(code ?? (signal ? 1 : 0));
+    console.error('CozyGateway exited unexpectedly (' + (code ?? signal ?? 'unknown') + '); restarting');
+    restartAfterCrash();
   });
 };
 const restartGateway = () => {
   if (shuttingDown || restarting) return;
+  if (crashRestartTimer) { clearTimeout(crashRestartTimer); crashRestartTimer = undefined; }
   restarting = true;
   if (child && child.exitCode === null) child.kill('SIGTERM');
   else { restarting = false; spawnGateway(); }
@@ -1282,6 +1356,7 @@ watchFile(config, { interval: 500 }, (current, previous) => {
 });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   shuttingDown = true;
+  if (crashRestartTimer) clearTimeout(crashRestartTimer);
   unwatchFile(config);
   if (child && child.exitCode === null) child.kill(signal);
   else process.exit(0);
@@ -1592,7 +1667,19 @@ uninstall() {
     resolve_platform
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
     if [ "$DRY_RUN" = 1 ]; then run rm -rf "$GATEWAY_DIR"; return; fi
-    if [ "$SERVICE_PLATFORM" = Darwin ]; then launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli
+    if [ "$SERVICE_PLATFORM" = Windows ]; then
+      local startup_entry wrapper_native vbs_native task_xml
+      startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+      wrapper_native="$(to_windows_path "$WRAPPER")"; vbs_native="$(to_windows_path "$WINDOWS_VBS")"
+      if [ -f "$WINDOWS_VBS" ] && grep -Fq "$wrapper_native" "$WINDOWS_VBS"; then
+        task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+        if grep -Fq "$vbs_native" <<<"$task_xml"; then MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+        else say "WARN  CozyGateway Scheduled Task ownership could not be verified; leaving it untouched"; fi
+        if [ -f "$startup_entry" ] && cmp -s "$startup_entry" "$WINDOWS_VBS"; then rm -f "$startup_entry"
+        elif [ -f "$startup_entry" ]; then say "WARN  CozyGateway Startup entry ownership could not be verified; leaving it untouched"; fi
+        remove_windows_cli_path
+      else say "WARN  CozyGateway Windows launcher ownership could not be verified; leaving task, Startup entry, and PATH untouched"; fi
+    elif [ "$SERVICE_PLATFORM" = Darwin ]; then launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli
     elif [ "$SERVICE_PLATFORM" = Linux ]; then systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli
     fi
     rm -rf "$GATEWAY_DIR"; say "OK    removed partial CozyGateway state; Hermes was not changed"
@@ -1715,7 +1802,7 @@ main() {
   fi
   choose_fresh_listener
   validate_listener_settings
-  HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; discover_profiles
+  HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; hydrate_profile_scope; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
