@@ -58,6 +58,12 @@ function Get-VerifiedAsset {
     Write-Ok "verified $Name"
 }
 
+function Promote-VerifiedAsset {
+    param([string] $Name, [string] $Stage, [string] $Destination)
+    Move-Item -LiteralPath (Join-Path $Stage $Name) -Destination (Join-Path $Destination $Name) -Force
+    Move-Item -LiteralPath (Join-Path $Stage "$Name.sha256") -Destination (Join-Path $Destination "$Name.sha256") -Force
+}
+
 function Get-PersistedRepairProfiles {
     param([string] $StatePath)
     if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
@@ -365,12 +371,21 @@ if ([string]::IsNullOrWhiteSpace($base)) {
 }
 
 Protect-CozyGatewayHome $script:InstallHome
-New-Item -ItemType Directory -Force -Path $bin | Out-Null
+$stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Force -Path $stage
 $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
 $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
-Get-VerifiedAsset 'cozygateway.mjs' $script:BundlePath $base
-Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' $script:PluginPath $base
-Get-VerifiedAsset 'cozygateway-installer.sh' $installerPath $base
-Get-VerifiedAsset 'install.ps1' $bootstrapPath $base
+try {
+    Get-VerifiedAsset 'cozygateway.mjs' (Join-Path $stage 'cozygateway.mjs') $base
+    Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' (Join-Path $stage 'cozygateway-hermes-attach-plugin.tar.gz') $base
+    Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $base
+    Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $base
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    foreach ($asset in @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'cozygateway-bootstrap.ps1')) {
+        Promote-VerifiedAsset $asset $stage $bin
+    }
+} finally {
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+}
 Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
 if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }

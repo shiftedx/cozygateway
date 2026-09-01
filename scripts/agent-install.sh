@@ -623,6 +623,7 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   state=$(printf %q "$STATE_FILE")
   reinstall='curl -fsSL https://cozylabs.ai/install.sh | bash'
   [ -f "\$bootstrap" ] && [ -f "\$checksum" ] || { printf 'FAIL  repair bootstrap is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  [ -r "\$state" ] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   expected="\$(awk '{print \$1}' "\$checksum")"
   if command -v shasum >/dev/null 2>&1; then actual="\$(shasum -a 256 "\$bootstrap" | awk '{print \$1}')"; elif command -v sha256sum >/dev/null 2>&1; then actual="\$(sha256sum "\$bootstrap" | awk '{print \$1}')"; else printf 'FAIL  repair needs shasum or sha256sum. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; fi
   [ -n "\$expected" ] && [ "\$expected" = "\$actual" ] || { printf 'FAIL  repair bootstrap checksum mismatch. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
@@ -651,6 +652,9 @@ CLI
       printf 'if not "%%~2"=="" (echo FAIL  repair does not accept extra arguments & exit /b 1)\r\n'
       printf 'if not exist "%s" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
       printf 'if not exist "%s.sha256" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
+      printf "powershell.exe -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop';try {\$p=[IO.Path]::GetFullPath(\$args[0]);\$expected=((Get-Content -LiteralPath (\$p+'.sha256') -Raw).Trim() -split '\\s+')[0].ToLowerInvariant();\$actual=(Get-FileHash -LiteralPath \$p -Algorithm SHA256).Hash.ToLowerInvariant();if([string]::IsNullOrWhiteSpace(\$expected) -or \$expected -ne \$actual){exit 1};exit 0}catch{exit 1}\" \"%s\"\r\n" "$bootstrap_native"
+      printf 'if errorlevel 1 (echo FAIL  repair bootstrap checksum mismatch. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n'
+      printf 'set "COZYGATEWAY_HOME=%s"\r\n' "$(to_windows_path "$GATEWAY_DIR")"
       printf 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%s" -Repair\r\n' "$bootstrap_native"
       printf 'exit /b %%errorlevel%%\r\n'
     } > "$CLI_WINDOWS"
@@ -1333,6 +1337,7 @@ const spawnGateway = () => {
 };
 const restartGateway = () => {
   if (shuttingDown || restarting) return;
+  if (crashRestartTimer) { clearTimeout(crashRestartTimer); crashRestartTimer = undefined; }
   restarting = true;
   if (child && child.exitCode === null) child.kill('SIGTERM');
   else { restarting = false; spawnGateway(); }
@@ -1658,11 +1663,17 @@ uninstall() {
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
     if [ "$DRY_RUN" = 1 ]; then run rm -rf "$GATEWAY_DIR"; return; fi
     if [ "$SERVICE_PLATFORM" = Windows ]; then
-      local startup_entry
+      local startup_entry wrapper_native vbs_native task_xml
       startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
-      MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
-      rm -f "$startup_entry"
-      remove_windows_cli_path
+      wrapper_native="$(to_windows_path "$WRAPPER")"; vbs_native="$(to_windows_path "$WINDOWS_VBS")"
+      if [ -f "$WINDOWS_VBS" ] && grep -Fq "$wrapper_native" "$WINDOWS_VBS"; then
+        task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+        if grep -Fq "$vbs_native" <<<"$task_xml"; then MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+        else say "WARN  CozyGateway Scheduled Task ownership could not be verified; leaving it untouched"; fi
+        if [ -f "$startup_entry" ] && cmp -s "$startup_entry" "$WINDOWS_VBS"; then rm -f "$startup_entry"
+        elif [ -f "$startup_entry" ]; then say "WARN  CozyGateway Startup entry ownership could not be verified; leaving it untouched"; fi
+        remove_windows_cli_path
+      else say "WARN  CozyGateway Windows launcher ownership could not be verified; leaving task, Startup entry, and PATH untouched"; fi
     elif [ "$SERVICE_PLATFORM" = Darwin ]; then launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli
     elif [ "$SERVICE_PLATFORM" = Linux ]; then systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli
     fi
