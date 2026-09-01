@@ -288,6 +288,16 @@ export async function startGateway(
   // Bots served by a non-Hermes runtime (e.g. CozyAgents). Additive to the Hermes profiles above:
   // same storage row, same attach identity shape, no Hermes Dashboard consulted for them.
   const runtimeBots = nativeBots(config);
+  // loadConfig() rejects this same collision (config.ts:246-249), but startGateway takes a
+  // GatewayConfig directly and skips loadConfig on the programmatic path (tests, embedders), so
+  // the check is re-derived here rather than trusted to have already run. Two ids resolving the
+  // same agentId would otherwise let two different tokens authenticate as one identity silently.
+  const hermesProfileIds = new Set(profileEntries.map(([id]) => id));
+  for (const bot of runtimeBots) {
+    if (hermesProfileIds.has(bot.id)) {
+      throw new Error(`bot "${bot.id}": id collides with a Hermes profile id; every bot needs a distinct id`);
+    }
+  }
   for (const bot of runtimeBots) {
     storage.upsertAgent({
       id: bot.id,
@@ -460,6 +470,7 @@ export async function startGateway(
   const runtimeBotTokens = collectAttachTokens(
     Object.fromEntries(runtimeBots.map((bot) => [bot.id, { tokenEnv: bot.tokenEnv }])),
     process.env,
+    "bot",
   );
   for (const [token, botId] of runtimeBotTokens) {
     if (attachTokens.has(token))
