@@ -1806,4 +1806,11 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * the prompt text is byte-identical to before. Every field is additive and optional: a row
  * written before 47 has none of them and renders exactly as it always has, and a client that
  * shows provenance gates on `>= 47`. */
-export const BOTS_CAPABILITY_VERSION = 47;
+/** Capability 48: BOT CONFIG LANE. A capability-45 runtime bot serves its own profile, model
+ * config, and routines over the attach-v1 `bot_config` request/reply lane, so `GET/PATCH
+ * /bots/:name/profile`, `GET/PUT /bots/:name/model-config`, and the routines routes answer for it
+ * instead of `409 unsupported_for_runtime`. The wire shapes are unchanged: the peer implements the
+ * same published schemas a Hermes-backed bot does. `DELETE /bots/:name`, model-provider setup, and
+ * desktop-session transcripts keep the 409, and so do the config routes when the peer did not
+ * negotiate `bot_config`. Additive: a client below 48 sees the 409 it already handles. */
+export const BOTS_CAPABILITY_VERSION = 48;

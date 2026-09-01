@@ -167,6 +167,51 @@ request id. It writes only the three credential-free Hermes memory settings thro
 native atomic config writer and replies with a fresh `BotMemoryOverviewResponse`. A disconnected
 or old plugin fails immediately; a timed-out request is not retained for reconnect.
 
+## Bot config lane
+
+`config_request` / `config_result` is the same bounded live request/reply shape as the memory lane
+above, negotiated as `bot_config`, and it is never a durable command, event, push, transcript, or
+Gateway database row. It exists for a bot served by a non-Hermes runtime (capability 45): that peer
+owns its own profile, model selection and routines, and the gateway holds no Dashboard row to read
+them from.
+
+The nine operations are `profile.read`, `profile.write`, `model.read`, `model.write`,
+`routines.list`, `routines.create`, `routines.update`, `routines.delete` and `routines.run`. Every
+input and every result is a PUBLISHED `com.cozylabs.bots` schema rather than a lane-local
+restatement, so a peer implements exactly the shapes its REST clients already read: `BotProfile`
+and `BotProfilePatch`, `BotProfileConfigureResponse`, `BotModelConfig` and `BotModelConfigPatch`,
+`BotRoutineListResponse`, `BotRoutineCreateRequest`, `BotRoutinePatch`, and
+`BotRoutineWriteResponse`. A routine write names its routine in `input.id`, separately from the
+patch body, because on REST that id is the path segment and the published patch schema has none.
+`routines.delete` and `routines.run` answer `{ "ok": true }`, the one lane-local body, because
+neither operation stores something to send back.
+
+`routines.run` is RESERVED in this version. It is on the wire so a peer implements the whole set
+once rather than absorbing a second wire change later, but no gateway route reaches it: nothing
+sends a `routines.run` request today. A peer may answer it `invalid_request`, or implement it as a
+no-op that acknowledges without running anything, until a route lands. Neither choice is observable
+by a client in this version.
+
+`not_found` means something different for a read than for a write. On the two BODYLESS reads,
+`profile.read` and `model.read`, it means the peer serves the bot but has nothing stored for that
+section, and the gateway answers `404 not_found` saying exactly that: the bot itself still exists.
+On a write, on `routines.list`, or on `routines.create` it is the peer failing to do what it was
+asked, and stays a `503`. On a routine operation carrying `input.id` it names that routine and is a
+`404` about the routine.
+
+`status` is `ok`, `not_found`, `invalid_request`, or `unavailable`, and the four are kept apart
+because they are four different things an operator has to do: nothing, fix the id, fix the input,
+or go and look at the peer. `ok` with a body that does not match the operation is refused rather
+than cast. A disconnected peer fails immediately; a timed-out request is not retained for
+reconnect; and the lane spends a bounded per-bot budget so a looping client is stopped at the
+gateway rather than at the peer.
+
+A peer that is attached but never negotiated `bot_config` is NOT reported as unavailable. It reads
+exactly like a bot with no config lane at all, which is the true answer: those routes keep the
+`409 unsupported_for_runtime` of capability 45, because the section is absent rather than
+temporarily unreachable. Deletion, model-provider setup, and desktop-session transcripts stay on
+that 409 for every runtime bot: none of the three has a peer-side equivalent.
+
 This contract deliberately shipped with no thinking/reasoning/chain-of-thought event. The
 `thinking` capability is a CONSCIOUS, bounded reopening of that rule (approved 2026-08):
 reasoning models deliver their visible reply in one end burst, leaving the whole turn a generic

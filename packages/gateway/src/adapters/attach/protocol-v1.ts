@@ -1,10 +1,13 @@
-import { type Static, Type } from "@sinclair/typebox";
+import { type Static, type TSchema, Type } from "@sinclair/typebox";
 import {
   RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryKindSchema,
   BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema,
   BotMemoryDeleteResponseSchema, BotMemorySetupRequestSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema, MobileNodeMediaDescriptorSchema,
   type MobileNodeGatewayStatusResult,
   CozyAppTreeSchema,
+  BotProfileSchema, BotProfilePatchSchema, BotProfileConfigureResponseSchema,
+  BotModelConfigSchema, BotModelConfigPatchSchema,
+  BotRoutineListResponseSchema, BotRoutineCreateRequestSchema, BotRoutinePatchSchema, BotRoutineWriteResponseSchema,
 } from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
@@ -33,6 +36,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("desktop_session_resume"),
   Type.Literal("desktop_session_sync"),
   Type.Literal("cozyapps"),
+  Type.Literal("bot_config"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -164,6 +168,39 @@ export const AttachV1MemoryRequestSchema = Type.Union([
   AttachV1MemoryDataRequestSchema, AttachV1MemorySetupRequestSchema,
 ]);
 export type AttachV1MemoryRequest = Static<typeof AttachV1MemoryRequestSchema>;
+
+/** The bot-config lane, cloned from the memory lane above. A peer serving its own runtime owns its
+ * profile, model selection and routines; the gateway holds no Dashboard row for it, so the same
+ * bounded live request/reply shape carries the reads and writes those surfaces need.
+ *
+ * Every input and every result is a PUBLISHED `com.cozylabs.bots` schema rather than a lane-local
+ * restatement, so a peer implements the shapes its REST clients already read and the two can never
+ * drift. The one exception is the delete/run acknowledgement, which has no published body because
+ * neither operation answers with one. */
+const NoInput = Type.Object({}, { additionalProperties: false });
+const ConfigRequestFrame = <const O extends string, I extends TSchema>(operation: O, input: I) =>
+  Type.Object({
+    kind: Type.Literal("config_request"), requestId: Id,
+    operation: Type.Literal(operation), input,
+  }, { additionalProperties: false });
+/** A routine write names the routine it acts on separately from the published patch body, because
+ * the patch schema deliberately has no id: on REST the id is the path segment. */
+const RoutineIdInput = Type.Object({ id: Id }, { additionalProperties: false });
+export const AttachV1ConfigRequestSchema = Type.Union([
+  ConfigRequestFrame("profile.read", NoInput),
+  ConfigRequestFrame("profile.write", BotProfilePatchSchema),
+  ConfigRequestFrame("model.read", NoInput),
+  ConfigRequestFrame("model.write", BotModelConfigPatchSchema),
+  ConfigRequestFrame("routines.list", NoInput),
+  ConfigRequestFrame("routines.create", BotRoutineCreateRequestSchema),
+  ConfigRequestFrame("routines.update", Type.Object({ id: Id, patch: BotRoutinePatchSchema }, { additionalProperties: false })),
+  ConfigRequestFrame("routines.delete", RoutineIdInput),
+  ConfigRequestFrame("routines.run", RoutineIdInput),
+]);
+export type AttachV1ConfigRequest = Static<typeof AttachV1ConfigRequestSchema>;
+/** The answer to an operation that stores no body. `ok: false` is not a refusal channel: a peer
+ * that could not do the work answers with a non-`ok` STATUS so the reason reaches the operator. */
+export const AttachV1ConfigAckSchema = Type.Object({ ok: Type.Boolean() }, { additionalProperties: false });
 /** Gateway-observed truth about ONE scheduled delivery occurrence, sent back to the plugin that
  * produced it so its own spool stops guessing. `displayed` means a paired device reported the row
  * on screen; `failed` means the occurrence is terminal in the gateway and will never be projected,
@@ -375,6 +412,20 @@ export const AttachV1MemoryResultSchema = Type.Object({
   message: Type.Optional(Type.String({ maxLength: 512 })), current: Type.Optional(BotMemoryItemSchema),
 }, { additionalProperties: false });
 export type AttachV1MemoryResult = Static<typeof AttachV1MemoryResultSchema>;
+/** The bot-config lane's reply. The four statuses are the four different things an operator has to
+ * do about a failure: nothing (`ok`), fix the id (`not_found`), fix the input (`invalid_request`),
+ * or go and look at the peer (`unavailable`). Collapsing them into one is what made every memory
+ * failure read the same, and this lane is not repeating it. */
+export const AttachV1ConfigResultSchema = Type.Object({
+  kind: Type.Literal("config_result"), requestId: Id,
+  status: Type.Union([Type.Literal("ok"), Type.Literal("not_found"), Type.Literal("invalid_request"), Type.Literal("unavailable")]),
+  result: Type.Optional(Type.Union([
+    BotProfileSchema, BotProfileConfigureResponseSchema, BotModelConfigSchema,
+    BotRoutineListResponseSchema, BotRoutineWriteResponseSchema, AttachV1ConfigAckSchema,
+  ])),
+  message: Type.Optional(Type.String({ maxLength: 512 })),
+}, { additionalProperties: false });
+export type AttachV1ConfigResult = Static<typeof AttachV1ConfigResultSchema>;
 const AttachV1MobileStatusRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
@@ -486,7 +537,8 @@ export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1MobileRequestSchema,
   AttachV1MobileCancelSchema,
   AttachV1MemoryResultSchema,
+  AttachV1ConfigResultSchema,
 ]);
 export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
-export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema]);
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema, AttachV1ConfigRequestSchema]);
 export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;

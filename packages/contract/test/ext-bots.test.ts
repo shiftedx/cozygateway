@@ -641,8 +641,10 @@ describe("capability advertisement", () => {
     // provenance on room and 1:1 transcript rows (`turnId`, `messageId`, `epoch`, `cause`,
     // `attachTurn`, `authorBot`, `inReplyToId`) plus typed room `context` on the attach turn
     // command. Every field is optional and absent on rows written before 47, so a client
-    // below 47 is unchanged.
-    expect(BOTS_CAPABILITY_VERSION).toBe(47);
+    // below 47 is unchanged. 48 adds the bot config lane: a runtime bot answers the profile,
+    // model-config, and routines routes over attach-v1 instead of 409, with the wire shapes
+    // unchanged, so a client below 48 sees the 409 it already handles.
+    expect(BOTS_CAPABILITY_VERSION).toBe(48);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {
