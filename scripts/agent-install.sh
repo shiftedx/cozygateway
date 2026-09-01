@@ -476,7 +476,7 @@ install_plugin() {
   local profile="$1" home="$2" target stage source
   target="$home/plugins/cozygateway"
   case "$target" in "$HERMES_ROOT"/plugins/cozygateway|"$HERMES_ROOT"/profiles/*/plugins/cozygateway) ;; *) die "refusing plugin target outside the validated Hermes profile tree" ;; esac
-  if [ "$DRY_RUN" = 1 ]; then say "DRY   install verified attach plugin into $target and enable it for Hermes profile $profile"; return; fi
+  if [ "$DRY_RUN" = 1 ]; then say "DRY   install verified attach plugin into $target for Hermes profile $profile"; return; fi
   stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-plugin.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
   tar -xzf "$PLUGIN_ARCHIVE" -C "$stage"; source="$stage/attach-plugin"
   [ -f "$source/plugin.yaml" ] && [ -f "$source/__init__.py" ] || die "plugin archive is incomplete"
@@ -485,8 +485,12 @@ install_plugin() {
   fi
   mkdir -p "$home/plugins"; rm -rf "$target"; mv "$source" "$target"
   printf 'installed by cozygateway agent-install.sh\n' > "$target/.cozygateway-installer-owned"
-  "$HERMES_BIN" -p "$profile" plugins enable cozygateway --no-allow-tool-override >/dev/null
   rm -rf "$stage"; trap - RETURN
+}
+enable_plugin() {
+  local profile="$1"
+  if [ "$DRY_RUN" = 1 ]; then say "DRY   enable verified attach plugin for Hermes profile $profile"; return; fi
+  "$HERMES_BIN" -p "$profile" plugins enable cozygateway --no-allow-tool-override >/dev/null
 }
 write_gateway_config() {
   local map="$LOCAL_DIR/profiles.json" p env_name comma=""
@@ -1817,7 +1821,11 @@ main() {
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
+  # Stage every profile before enabling any of them. Hermes can materialize inherited global
+  # plugins into profile-local directories when the default profile is enabled; enabling first
+  # would create an unowned legacy copy and make the next profile fail closed.
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
+  for profile in "${SELECTED[@]}"; do enable_plugin "$profile"; done
   write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli
