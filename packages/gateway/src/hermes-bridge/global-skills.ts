@@ -272,7 +272,12 @@ export class GatewayHermesGlobalSkills {
   async #skillCatalogs(): Promise<string[][]> {
     const catalogs = await Promise.all(this.#targets.map(async ({ client, profile }) => {
       const result = record(await client.request("profiles.describe", { name: profile }));
-      return (Array.isArray(result["skills"]) ? result["skills"] : [])
+      const rawSkills = result["skills"];
+      // An actual empty array means this profile currently has no installable skills and is a
+      // valid catalogue. Missing or malformed data instead means this Hermes cannot prove the
+      // mutation route's validation dependency, so capability discovery must fail closed.
+      if (!Array.isArray(rawSkills)) throw new HermesUnavailable("Hermes returned an invalid skill catalog");
+      return rawSkills
         .flatMap((entry) => {
           const name = record(entry)["name"];
           return typeof name === "string" ? [name] : [];

@@ -432,6 +432,29 @@ describe("GatewayInfo.capabilities wiring", () => {
     }
   });
 
+  it("withholds global skills when Hermes returns a malformed profile catalog", async () => {
+    const upstream = await startFakeHermesServer({
+      methods: { "profiles.describe": () => ({}) },
+      dashboard: ({ path }) => path === "/api/config"
+        ? { body: { skills: { disabled: [] } } }
+        : { status: 404, body: { detail: "Not Found" } },
+    });
+    const gw = await startGateway({
+      name: "malformed-global-skills-catalog",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes(upstream.url) }],
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.capabilities?.[HERMES_GLOBAL_SKILLS_CAPABILITY_ID]).toBeUndefined();
+    } finally {
+      await gw.close();
+      await upstream.close();
+    }
+  });
+
   it("advertises harness update only after the pinned Hermes read APIs pass discovery", async () => {
     const upstream = await startFakeHermesServer({
       dashboard: ({ method, path }) => {
