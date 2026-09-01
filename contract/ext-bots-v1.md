@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 45. This extension is independent of the frozen core
+Status: v1 extension, capability version 48. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 45 }
+"capabilities": { "com.cozylabs.bots": 48 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -85,6 +85,9 @@ and does not register `/bots` routes.
 | 43 | The roster represents every Hermes profile and reports `syncState`; profiles not yet provisioned remain visible as `setup_required` instead of disappearing. |
 | 44 | Per-profile CozyApps readiness on `BotSummary`, with a stable `restart_profile` repair when a connected plugin did not negotiate `cozyapps`. |
 | 45 | Native runtime Bots: config-declared bots served by a non-Hermes attach peer appear on the roster with `runtime: "cozyagents"`, built from config and attach presence rather than the Dashboard; their Dashboard-backed routes answer 409 `unsupported_for_runtime`. |
+| 46 | Runtime Bots in rooms: a `runtime: "cozyagents"` bot can be a full member of a group room, its membership answered from gateway config rather than `profiles.list`, and a room turn's live draft is published as `bot_chat_delta` carrying `room`. |
+| 47 | Auditable ids: room and 1:1 transcript rows carry the identities the gateway already held at settlement. `BotGroupMessage` gains `messageId`, `turnId`, `epoch`, `cause`, and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage` gains `turnId`, `authorBot`, and `inReplyToId`. Every field is optional, absent on rows written before 47, and never backfilled. |
+| 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion, model-provider setup, and desktop-session transcripts keep the 409. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -113,6 +116,17 @@ a second, hand-copied schema.
   row IS. The only v1 value is `delivery.failed`. A client that does not know a marker renders the
   ordinary row it already renders.
   From capability 32 an attachment entry may also carry `position`; see "Inline media ordering".
+  From capability 47 a row may carry `turnId` (the attach turn it belongs to: the user row that
+  opened the turn and every assistant row that turn committed share it), `authorBot` (the bot that
+  authored the row), and `inReplyToId` (the `id` of the user row an assistant row answers).
+  `authorBot` is present on every non-user row written from 47 on, a desktop-imported assistant row
+  included; a `user` row has no bot author and carries none. A steer shares the running turn's
+  `turnId` and does NOT become a new `inReplyToId` target: the question a turn answers is the one
+  that opened it, not a mid-turn nudge. `turnId` and `inReplyToId` are absent where no gateway turn
+  produced the row, which is the `delivery.failed` system row and a desktop-imported row. All three
+  are absent on every row written before 47. They are recorded, never inferred: a client must not
+  derive causation from ordering when they are absent, because a scheduled or interim row can land
+  between a question and its answer.
 - `BotSessionSummary` is a durable native Bot Mode session. Current native Bot Mode sessions have
   `kind: "conversation"`; `startedAt` and `lastActiveAt` are milliseconds. They are not Hermes
   Dashboard session records.
@@ -131,6 +145,18 @@ a second, hand-copied schema.
   field reports only `isSet`, never a value or redacted suffix. A method is `fields`, Hermes-hosted
   `oauth`, or an honest `external` CLI handoff.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
+  From capability 47 a `BotGroupMessage` may carry `messageId` (the row's own durable, room-unique
+  id: `seq` orders a room, `messageId` identifies a message across rooms, restarts, and a head
+  trim), `turnId` (the member turn that produced it, the same id as the gateway's durable turn row
+  and the attach `turn` command that asked for it; a user row has no turn), `epoch` (the room epoch
+  the row belongs to, so one deliberation is distinguishable from the next when a second send
+  superseded the first), `cause` (`{ kind, seq }`: the highest room seq the member had been shown
+  when its turn STARTED, which is what it was answering, and NOT simply the preceding row), and
+  `attachTurn` (`{ threadId, turnId }`: the gateway-owned member thread that carried the turn,
+  never a Hermes Dashboard session). A `BotGroupNote` may carry `turnId` when a turn was actually
+  started; a `capped` note and a member skipped because it is no longer a bot never got one and
+  carry nothing. Every field is optional and absent on rows written before 47; a client renders
+  such a row exactly as it does today.
 - `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its
   slash-prefixed `name` is the exact invocation; `description`, optional `argsHint`, and optional
   `category` are presentation metadata. `BotSlashCommandCatalog` is the bounded ordered list.
@@ -599,6 +625,8 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   one, then projects `timed_out`.
 - `bot_chat_delta`: full accumulated assistant draft for one native turn. `seq` is monotonic within
   `turnId`; `done` ends that draft. Clients may drop drafts and rely on committed `bot_chat` rows.
+  Capability 46: when `room` is present the draft belongs to that room's member turn rather than to
+  a 1:1 chat, and `sessionId` is the gateway-owned group thread rather than a chat session.
 - `bot_chat_reset`: a reset selected a fresh native session. Rebind and reload its history.
 - `bot_chat_adopted`: a new/adopt action selected an existing native session. Rebind and reload.
 - `bot_tool_activity`: full-replace steps for a native turn. `BotToolStep.detail` and `errorText`
@@ -653,15 +681,49 @@ Committed transcript history remains the recovery source after reconnect.
   absent means Hermes, so every existing row is unchanged; the only other value is `"cozyagents"`,
   a config-declared bot served by a non-Hermes attach peer whose row is built from gateway config
   and attach presence rather than the Dashboard. Chat, readiness, approvals, and clarifications
-  work for such a bot exactly as they do for a Hermes-backed one. A runtime bot cannot join a room
-  in this version: `POST /bots/groups` naming one is refused with `400 invalid_request`. Roster
+  work for such a bot exactly as they do for a Hermes-backed one, and since capability 46 so do
+  rooms: see the capability-46 note below. Roster
   `stale` is a fact about the Hermes control plane only; it says nothing about a runtime bot, whose
   row is always current because it is built from local config and live attach presence.
+- Capability 46. A runtime bot is a full room member. `POST /bots/groups` naming one succeeds:
+  room membership is resolved against gateway config as well as `profiles.list`, so a bot the
+  roster is listing is never refused as "not a bot on this gateway", and a room whose members are
+  all runtime bots is created and run without the Hermes Dashboard being consulted at all. The
+  member turn is unchanged in every other respect: the same attach-v1 `turn` command on the same
+  gateway-owned `group:<room>:<member>` thread, the same rounds, the same transcript. A member's
+  display name and handle in the room come from its roster row, which for a runtime bot is the
+  config-declared one. A room turn's live draft is published as `bot_chat_delta` with `room` set to
+  the room name, `bot` set to the member, and `sessionId` set to that group thread: it is live text,
+  never history, and a client that does not know the field renders nothing new. Every room bubble
+  the gateway opens it also closes, with one final `bot_chat_delta` carrying `room`, an empty
+  `text`, and `done: true`, at whichever settlement the turn reaches: a reply, a failure, a
+  cancellation, an interrupt, the gateway's own turn timeout, or a drive abandoned because the room
+  was deleted or superseded. A turn that never streamed opens no bubble and gets no frames at all.
+  A draft that reads as the protocol's own pass is never published, matching the rule that keeps
+  `(pass)` out of the transcript; drafts are coalesced latest-only inside a 100 ms window, and every
+  frame carries the whole accumulated text, so a dropped one costs a reader nothing. Tool, thinking,
+  and delegation activity inside a room turn is deliberately not projected in this version.
+- Capability 48. A runtime bot's profile, model-config and routines routes are served by its own
+  peer over the attach-v1 `bot_config` lane (see `contract/attach-v1.md`), so they answer normally
+  rather than 409. Nothing about their request or response shape changes: the peer implements the
+  same published schemas the Hermes-backed bot does. A peer that did not negotiate `bot_config`
+  keeps the 409 on those routes, because the section is genuinely absent rather than temporarily
+  unreachable, and a peer that is simply offline answers `503 backend_unavailable`.
+- Capability 48. `GET /bots/:name/profile` and `GET /bots/:name/model-config` on a runtime bot
+  answer `404 not_found` when the peer serves the bot but has nothing stored for that section (a
+  bot brought up before its profile was written, or one that pins no model). The message says the
+  bot has no stored profile or model config; it does NOT say the bot is missing, because it is not:
+  the bot is on the roster and its chat lane works, and a client must keep the row and show the
+  section as empty rather than dropping the bot. This is deliberately distinguished from `503
+  backend_unavailable`, which is the answer when the peer is offline or unreachable and a retry is
+  the right thing to offer. A write, a routines list, or a routines create that the peer refuses
+  stays a `503`; a routine id that names nothing is the ordinary `404` about that routine.
 - A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
   extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
   bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
-  This covers profile, model-config, model-provider, routines, desktop-session, and delete
-  surfaces. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
+  Since capability 48 this covers the model-provider, desktop-session, and delete surfaces; the
+  profile, model-config, and routines surfaces answer over the config lane instead, and fall back
+  to this 409 when the peer did not negotiate `bot_config`. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
   must hide or disable that section rather than treat the bot as missing.
 - Native session ids, attach message ids, and attachment ids are opaque. Never infer a filesystem
   path, Hermes Dashboard id, or URL from them.

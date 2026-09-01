@@ -1,7 +1,9 @@
-import type { BotGroup, BotGroupDetail, BotGroupMessage, BotGroupNote, ServerFrame } from "cozygateway-contract";
+import { randomUUID } from "node:crypto";
 
-import type { Storage, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
-import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
+import type { BotChatDeltaFrame, BotGroup, BotGroupDetail, BotGroupMessage, BotGroupNote, ServerFrame } from "cozygateway-contract";
+
+import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
+import type { AttachV1EventFrame, AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
 import {
   GROUP_LOG_LIMIT,
@@ -11,6 +13,7 @@ import {
   GROUP_MIN_MEMBERS,
   GROUP_NAME_MAX,
   GROUP_USER_LABEL,
+  USER_MENTION,
   buildTurnPrompt,
   deltaSince,
   highestSeq,
@@ -71,6 +74,28 @@ function isHostileGroupName(name: string): boolean {
 /** How long a superseding drive waits before taking over, the desktop's own 250 ms
  *  (dissection 9.3). */
 export const GROUP_CHAIN_DELAY_MS = 250;
+
+/** The 1:1 lane's live-frame window, to the millisecond (`LIVE_TURN_FLUSH_MS`). A room draft is
+ *  the same kind of frame carrying the same full-replacement text, so it gets the same treatment:
+ *  the leading frame goes out at once and every later one inside the window is collapsed to the
+ *  latest. A member typing token by token would otherwise put one broadcast per token on every
+ *  connected socket. */
+export const ROOM_DRAFT_FLUSH_MS = 100;
+
+/** One member turn's live bubble. In memory on purpose: a draft is ephemeral, and a turn that
+ *  outlives this process resumes from its durable commit rather than its half-typed text. */
+interface RoomDraft {
+  /** Monotonic within the turn, from 1, and the terminal `done` frame takes the next one. */
+  seq: number;
+  /** Live while a coalescing window is open. */
+  timer: ReturnType<typeof setTimeout> | undefined;
+  /** The latest frame built inside the open window, waiting for it to close. */
+  pending: BotChatDeltaFrame | undefined;
+  /** The most recent frame built, whether or not it went out. The terminal frame is this one
+   *  emptied, which is how `bot`, `sessionId` and `room` stay right without being re-derived from
+   *  a room that may since have been deleted. */
+  last: BotChatDeltaFrame;
+}
 
 export class GroupNotFound extends Error {
   constructor(name: string) {
@@ -137,6 +162,8 @@ export interface GroupRoomsOptions {
   pollMs?: number;
   turnTimeoutMs?: number;
   chainDelayMs?: number;
+  /** Live-draft coalescing window. Test seam; defaults to `ROOM_DRAFT_FLUSH_MS`. */
+  draftFlushMs?: number;
   log?: (message: string) => void;
 }
 
@@ -153,8 +180,12 @@ export class GroupRooms {
   readonly #pollMs: number | undefined;
   readonly #turnTimeoutMs: number | undefined;
   readonly #chainDelayMs: number;
+  readonly #draftFlushMs: number;
   readonly #log: (message: string) => void;
   readonly #waiters = new Map<string, () => void>();
+  /** Open live bubbles, by member turn id. An entry exists only for a turn that has actually
+   *  streamed something, so a peer that never drafts costs nothing and gets no frames. */
+  readonly #drafts = new Map<string, RoomDraft>();
 
   /** The drive currently holding a room, by room key, tagged with the room GENERATION it was
    *  started for. Present means "a round loop is live", which is the room's only piece of
@@ -186,6 +217,7 @@ export class GroupRooms {
     this.#pollMs = opts.pollMs;
     this.#turnTimeoutMs = opts.turnTimeoutMs;
     this.#chainDelayMs = opts.chainDelayMs ?? GROUP_CHAIN_DELAY_MS;
+    this.#draftFlushMs = opts.draftFlushMs ?? ROOM_DRAFT_FLUSH_MS;
     this.#log = opts.log ?? ((): void => {});
   }
 
@@ -215,13 +247,21 @@ export class GroupRooms {
       settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, "failed", undefined, event.message, this.#now());
     } else if (event.kind === "cancelled" || event.kind === "interrupted") {
       settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, event.kind, undefined, undefined, this.#now());
+    } else if (event.kind === "draft") {
+      // Capability 46. The contract already reserved `BotChatDeltaFrame.room` for exactly this, so
+      // a member composing its reply streams into the room the same way a 1:1 bot streams into a
+      // chat: same frame, same accumulate-by-`turnId` rule, plus the room name that tells a client
+      // which transcript the bubble belongs above.
+      this.#emitDraft(owned, blocksToText(event.blocks));
+      return true;
     } else {
-      // Draft/tool/interaction events still belong to this already-authorized turn. The room has
-      // no separate wire projection for them, but declining would dead-letter an otherwise valid
-      // at-least-once stream.
+      // Tool, thinking, and interaction events still belong to this already-authorized turn. The
+      // room has no wire projection for them in this capability, but declining would dead-letter
+      // an otherwise valid at-least-once stream.
       return true;
     }
     if (settled === undefined) return false;
+    this.#endDraft(event.turnId);
     const wake = this.#waiters.get(event.turnId);
     if (wake !== undefined) wake();
     else this.#recoverSettledTurn(settled);
@@ -324,17 +364,21 @@ export class GroupRooms {
     // Cleared BEFORE the message lands, so the badge cannot survive the very message that answers
     // the escalation.
     this.#storage.setBotGroupNeedsYou(key, false);
+    // The epoch bump is the supersession signal: any loop still running for the previous message
+    // sees it at its next member boundary and abandons the rest of its rounds. It happens BEFORE
+    // the append so the message can be stamped with the epoch it opens; `send` holds the thread
+    // throughout, so no drive can observe the order of these two writes.
+    const epoch = this.#storage.bumpBotGroupEpoch(key);
     const entry = this.#append(key, {
       kind: "user",
       name: GROUP_USER_LABEL,
       displayName: GROUP_USER_LABEL,
       text,
       at: this.#now(),
+      messageId: randomUUID(),
+      epoch,
       ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
     });
-    // The epoch bump is the supersession signal: any loop still running for the previous message
-    // sees it at its next member boundary and abandons the rest of its rounds.
-    const epoch = this.#storage.bumpBotGroupEpoch(key);
     this.#startDrive(key, epoch);
     return toWireMessage(entry);
   }
@@ -357,6 +401,12 @@ export class GroupRooms {
    *  any storage read, so this resolves in about one poll rather than in one turn cap. */
   async close(): Promise<void> {
     this.#closed = true;
+    // Timers only, no frames: the sockets these would reach are going away with this bridge, and a
+    // broadcast during shutdown is a write into a hub that is being torn down.
+    for (const open of this.#drafts.values()) {
+      if (open.timer !== undefined) clearTimeout(open.timer);
+    }
+    this.#drafts.clear();
     for (const wake of this.#waiters.values()) wake();
     this.#waiters.clear();
     const running = [...this.#drives.values()].map((entry) => entry.promise.catch(() => {}));
@@ -546,6 +596,7 @@ export class GroupRooms {
               displayName: member.displayName,
               text: result.text,
               at: this.#now(),
+              ...provenance(result.turnId === undefined ? undefined : this.#storage.botGroupTurn(key, result.turnId)),
             });
             this.#storage.setBotGroupWatermark(key, member.name, entry.seq);
             posted += 1;
@@ -571,7 +622,10 @@ export class GroupRooms {
           } else if (result.outcome !== "pass") {
             // Failure honesty: the room is told the member did not answer, and by whom and why. It
             // is NEVER told something the member did not say.
-            const note: BotGroupNote = { member: member.name, reason: result.outcome, detail: result.detail };
+            const note: BotGroupNote = {
+              member: member.name, reason: result.outcome, detail: result.detail,
+              ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
+            };
             const live = this.#storage.botGroup(key);
             if (live !== undefined) this.#emitState(live, "running", round, note, startEpoch);
           }
@@ -605,7 +659,7 @@ export class GroupRooms {
     startEpoch: number;
     startGeneration: number;
     storedId?: string;
-  }): Promise<GroupTurnResult> {
+  }): Promise<GroupTurnResult & { turnId?: string }> {
     const { key, groupName, member, members, delta, startEpoch, startGeneration, storedId } = args;
     if (this.#closed || this.#generation(key) !== startGeneration) return { outcome: "pass" };
     if (this.#storage.botGroup(key) === undefined) return { outcome: "pass" };
@@ -615,14 +669,23 @@ export class GroupRooms {
     const watermark = this.#storage.botGroupMembers(key).get(member.name)?.watermark ?? 0;
     const threadId = storedId ?? this.#storage.ensureBotGroupThread(key, member.name);
     if (storedId === undefined) this.#storage.setBotGroupSession(key, member.name, threadId);
+    // What the member is being asked about: the newest entry in the delta it is shown. Recorded
+    // now rather than at settlement, because by the time a reply lands the room may have moved on
+    // and the honest causation is the one that was true when the member was asked.
+    const last = args.delta.at(-1);
+    const cause: BotGroupCause | undefined =
+      last === undefined ? undefined : { kind: last.kind, seq: last.seq };
     const started = startNativeMemberTurn({ storage: this.#storage, endpoint, key, member: member.name,
-      agentId: member.name, threadId, epoch: startEpoch, watermark, prompt, now: this.#now });
+      agentId: member.name, threadId, epoch: startEpoch, watermark, prompt,
+      ...(cause === undefined ? {} : { cause }),
+      context: turnContext(key, groupName, members, startEpoch, cause),
+      now: this.#now });
     if ("outcome" in started) return started;
     const result = await this.#waitForTurn(key, started.turnId, startGeneration);
     // `(pass)` in any of its shapes is a pass, and so is a blank reply. Turning a spoken `(pass)`
     // into a room message would show the protocol's own plumbing to the user.
-    if (result.outcome === "spoke" && isPassText(result.text)) return { outcome: "pass" };
-    return result;
+    if (result.outcome === "spoke" && isPassText(result.text)) return { outcome: "pass", turnId: started.turnId };
+    return { ...result, turnId: started.turnId };
   }
 
   async #waitForTurn(key: string, turnId: string, generation: number): Promise<GroupTurnResult> {
@@ -640,6 +703,9 @@ export class GroupRooms {
       if (this.#now() >= deadline) {
         const detail = `no reply within ${Math.round(timeoutMs / 1000)}s`;
         this.#storage.timeoutBotGroupTurn(key, turnId, detail, this.#now());
+        // The member stopped mid-sentence. Nothing is coming to close its bubble, so the gateway
+        // closes it: this is the settlement no attach event will ever announce.
+        this.#endDraft(turnId);
         return { outcome: "timeout", detail };
       }
       await new Promise<void>((resolve) => {
@@ -648,6 +714,9 @@ export class GroupRooms {
         this.#waiters.set(turnId, () => { clearTimeout(timer); this.#waiters.delete(turnId); resolve(); });
       });
     }
+    // Abandoned: the bridge closed or the room was deleted and remade under this drive's feet. The
+    // turn will never settle for this loop, so its bubble is closed here rather than left open.
+    this.#endDraft(turnId);
     return { outcome: "pass" };
   }
 
@@ -659,7 +728,7 @@ export class GroupRooms {
     const result = settledGroupTurn(claimed);
     if (result?.outcome === "spoke" && !isPassText(result.text)) {
       const member = this.#memberInfo(claimed.member);
-      const entry = this.#append(claimed.key, { kind: "member", name: member.name, displayName: member.displayName, text: result.text, at: this.#now() });
+      const entry = this.#append(claimed.key, { kind: "member", name: member.name, displayName: member.displayName, text: result.text, at: this.#now(), ...provenance(claimed) });
       this.#storage.setBotGroupWatermark(claimed.key, claimed.member, entry.seq);
       if (mentionsUser(result.text)) {
         this.#storage.setBotGroupNeedsYou(claimed.key, true);
@@ -676,6 +745,113 @@ export class GroupRooms {
     // The previous process cannot retain its loop. Resume from durable watermarks; one serial
     // drive owns any remaining responders and the outbox already owns the command replay.
     this.#startDrive(claimed.key, room.epoch);
+  }
+
+  /** One live draft of a member turn, as the 1:1 chat frame plus `room`.
+   *
+   *  `bot` is the member and `sessionId` is its gateway-owned group thread, which is the identity
+   *  the room already dispatches on: a client that keys live text by bot and session therefore
+   *  needs no new keying to render this, and the `room` field is what stops it being mistaken for
+   *  the member's 1:1 conversation.
+   *
+   *  Three things are refused rather than streamed, and each one is a lie the wire would otherwise
+   *  tell:
+   *
+   *  - a draft that reads as a pass. The transcript hides `(pass)` because it is the protocol's own
+   *    plumbing (`#turn` turns a spoken pass back into `{ outcome: "pass" }`), so streaming it live
+   *    would show in the bubble exactly what the room is about to hide in the log.
+   *  - a draft for a turn that is no longer pending. An at-least-once replay can land a draft after
+   *    the turn timed out or failed, and a bubble reopened after its own `done` never closes again.
+   *  - a draft whose room has moved on: deleted, or superseded by a newer user message. The reply
+   *    belongs to a conversation the reader is no longer looking at.
+   *
+   *  What survives those goes out on the 1:1 lane's coalescing rule: leading frame immediately,
+   *  latest-only for each window after it. */
+  #emitDraft(turn: BotGroupTurnRow, text: string): void {
+    if (isPassDraft(text)) return;
+    if (turn.state !== "pending") return;
+    const room = this.#storage.botGroup(turn.key);
+    if (room === undefined || room.epoch !== turn.epoch) return;
+    const open = this.#drafts.get(turn.turnId);
+    const seq = (open?.seq ?? 0) + 1;
+    const frame: BotChatDeltaFrame = {
+      type: "bot_chat_delta",
+      bot: turn.member,
+      sessionId: turn.threadId,
+      turnId: turn.turnId,
+      text,
+      seq,
+      updatedAt: this.#now(),
+      room: room.name,
+    };
+    if (open !== undefined) {
+      open.seq = seq;
+      open.last = frame;
+      // Inside an open window: the frame carries the WHOLE text so far, so keeping only the latest
+      // loses nothing a reader can see.
+      if (open.timer !== undefined) {
+        open.pending = frame;
+        return;
+      }
+      open.timer = this.#draftTimer(turn.turnId);
+      this.#broadcast(frame);
+      return;
+    }
+    this.#drafts.set(turn.turnId, {
+      seq,
+      timer: this.#draftTimer(turn.turnId),
+      pending: undefined,
+      last: frame,
+    });
+    this.#broadcast(frame);
+  }
+
+  #draftTimer(turnId: string): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => this.#tickDraft(turnId), this.#draftFlushMs);
+    timer.unref?.();
+    return timer;
+  }
+
+  /** Closes one coalescing window: the latest frame it collected goes out and the next window
+   *  opens behind it. A window that collected nothing simply closes, so an idle turn holds no
+   *  timer. */
+  #tickDraft(turnId: string): void {
+    const open = this.#drafts.get(turnId);
+    if (open === undefined) return;
+    const pending = open.pending;
+    open.pending = undefined;
+    if (pending === undefined) {
+      open.timer = undefined;
+      return;
+    }
+    open.timer = this.#draftTimer(turnId);
+    this.#broadcast(pending);
+  }
+
+  /** Ends a member turn's live bubble: whatever the last window was still holding, then one empty
+   *  `done` frame.
+   *
+   *  Called at EVERY settlement a turn can reach, which is the point. A bubble is opened by the
+   *  gateway and only the gateway can close it, so a turn that timed out, was abandoned by a
+   *  superseded drive, or died with its room would otherwise leave a reader watching text that will
+   *  never finish, and leave this map holding the turn's sequence forever.
+   *
+   *  A turn that never streamed has no bubble and gets no frame: there is nothing open to close,
+   *  and inventing a `done` for every silent member would put a frame on the wire for every turn of
+   *  every room. */
+  #endDraft(turnId: string): void {
+    const open = this.#drafts.get(turnId);
+    if (open === undefined) return;
+    this.#drafts.delete(turnId);
+    if (open.timer !== undefined) clearTimeout(open.timer);
+    if (open.pending !== undefined) this.#broadcast(open.pending);
+    this.#broadcast({
+      ...open.last,
+      text: "",
+      seq: open.seq + 1,
+      updatedAt: this.#now(),
+      done: true,
+    });
   }
 
   #entries(key: string): GroupLogEntry[] {
@@ -722,6 +898,17 @@ function goneNote(member: GroupMember): BotGroupNote {
   };
 }
 
+/** True when a live draft is on its way to being a pass, and so must not be shown.
+ *
+ *  `isPassText` is the settlement rule and matches the WHOLE reply; a draft is a prefix of one, so
+ *  the parenthesized form is matched as a prefix too. Deliberately not a bare `pass` prefix: "pass
+ *  the build to Luna" is an ordinary sentence, and suppressing it would hide a real reply. An empty
+ *  draft is suppressed as well, because there is nothing yet to look at. */
+function isPassDraft(text: string): boolean {
+  const trimmed = text.trim();
+  return isPassText(trimmed) || /^\(\s*pass\s*\)/i.test(trimmed);
+}
+
 function toWireMessage(row: BotGroupLogRow): BotGroupMessage {
   return {
     seq: row.seq,
@@ -729,6 +916,52 @@ function toWireMessage(row: BotGroupLogRow): BotGroupMessage {
     text: row.text,
     at: row.at,
     ...(row.clientId === undefined ? {} : { clientId: row.clientId }),
+    // Capability 47. Spread rather than defaulted: a row written before 47 has none of these, and
+    // an invented id would be worse than an absent one.
+    ...(row.messageId === undefined ? {} : { messageId: row.messageId }),
+    ...(row.turnId === undefined ? {} : { turnId: row.turnId }),
+    ...(row.epoch === undefined ? {} : { epoch: row.epoch }),
+    ...(row.cause === undefined ? {} : { cause: row.cause }),
+    ...(row.attachTurn === undefined ? {} : { attachTurn: row.attachTurn }),
+  };
+}
+
+/** The auditable identity a member's room message inherits from the turn that produced it. Both
+ *  settlement paths (the live round loop and the post-restart recovery) read the SAME durable turn
+ *  row, so a reply recovered after a restart carries exactly the provenance it would have carried
+ *  had the gateway never stopped. A missing turn row yields a fresh message id and nothing else:
+ *  the message is real, and the ids it cannot prove stay absent. */
+function provenance(turn: BotGroupTurnRow | undefined): Partial<BotGroupLogRow> {
+  if (turn === undefined) return { messageId: randomUUID() };
+  return {
+    messageId: randomUUID(),
+    turnId: turn.turnId,
+    epoch: turn.epoch,
+    ...(turn.cause === undefined ? {} : { cause: turn.cause }),
+    attachTurn: { threadId: turn.threadId, turnId: turn.turnId },
+  };
+}
+
+/** Typed room provenance for the attach `turn` command (capability 47). The prompt already names
+ *  the room, its peers and the human in prose; this is the same facts in a shape a peer can read
+ *  without parsing English. The human is an actor too, addressed by the `@user` token the protocol
+ *  reserves, because a peer deciding who to answer needs to know the human is in the room. */
+function turnContext(
+  key: string,
+  groupName: string,
+  members: GroupMember[],
+  epoch: number,
+  cause: BotGroupCause | undefined,
+): AttachV1TurnContext {
+  return {
+    room: { key, name: groupName, epoch, ...(cause === undefined ? {} : { seq: cause.seq }) },
+    actors: [
+      ...members.map((member) => ({
+        name: member.name, handle: member.handle, displayName: member.displayName, kind: "member" as const,
+      })),
+      { name: GROUP_USER_LABEL, handle: USER_MENTION, displayName: GROUP_USER_LABEL, kind: "user" as const },
+    ],
+    ...(cause === undefined ? {} : { cause }),
   };
 }
 

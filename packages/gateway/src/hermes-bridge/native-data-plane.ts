@@ -45,8 +45,8 @@ import type {
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
+import { ConfigNotNegotiated, type ConfigSurface } from "./bot-config.ts";
 import { BotNameTaken } from "./crud.ts";
-import { GroupInvalid } from "./group-rooms.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
@@ -69,6 +69,10 @@ export interface NativeBotDataPlaneOptions {
     avatar: string | null;
     runtime: "cozyagents";
   }[];
+  /** The attach-v1 bot-config lane. A runtime bot serves its own profile, model selection and
+   * routines over it, so those surfaces route here instead of refusing. Absent means no gateway on
+   * this deployment negotiated the lane and every config surface keeps its 409. */
+  botConfig?: ConfigSurface;
   /** Optional opener offered only while a Bot Chat transcript is empty. */
   chatSuggestion: string;
   broadcast: (frame: ServerFrame) => void;
@@ -191,6 +195,23 @@ const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
   "deleteBot",
 ]);
 
+/** The `DASHBOARD_ONLY` methods a runtime bot answers over the attach-v1 config lane, each mapped
+ * to the config-surface call that serves it. A method absent from this table keeps its 409.
+ *
+ * The arguments are re-read positionally from the proxied call rather than spread, because the
+ * config surface takes the routine id and the patch as separate parameters exactly as the
+ * `BotsSurface` method does; a blind spread would type-check and silently mis-order them. */
+const CONFIG_LANE: Record<string, ((surface: ConfigSurface, name: string, args: unknown[]) => Promise<unknown>) | undefined> = {
+  botProfile: (surface, name) => surface.botProfile(name),
+  configureProfile: (surface, name, args) => surface.configureProfile(name, args[1] as never),
+  modelConfig: (surface, name) => surface.modelConfig(name),
+  configureModel: (surface, name, args) => surface.configureModel(name, args[1] as never),
+  routines: (surface, name) => surface.routines(name),
+  createRoutine: (surface, name, args) => surface.createRoutine(name, args[1] as never),
+  patchRoutine: (surface, name, args) => surface.patchRoutine(name, args[1] as string, args[2] as never),
+  deleteRoutine: (surface, name, args) => surface.deleteRoutine(name, args[1] as string),
+};
+
 /** Attach-owned Bot Mode data plane. The returned surface delegates management/control methods to
  * the dashboard bridge but owns every chat method for configured profiles, making it impossible
  * for a native send or settlement to fall through to the Dashboard chat transport. */
@@ -200,6 +221,7 @@ export class NativeBotDataPlane {
   readonly #ingress: AttachV1Ingress;
   readonly #native: Set<string>;
   readonly #runtimeBots: Map<string, NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number]>;
+  readonly #botConfig: ConfigSurface | undefined;
   readonly #chatSuggestion: string;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #onChatMessage: NativeBotDataPlaneOptions["onChatMessage"];
@@ -254,6 +276,7 @@ export class NativeBotDataPlane {
     this.#runtimeBots = new Map(
       (opts.runtimeBots ?? []).map((bot) => [normalize(bot.id), bot]),
     );
+    this.#botConfig = opts.botConfig;
     this.#chatSuggestion = opts.chatSuggestion;
     this.#broadcast = opts.broadcast;
     this.#onChatMessage = opts.onChatMessage;
@@ -296,19 +319,6 @@ export class NativeBotDataPlane {
         const bot = normalize(input.name);
         if (this.#runtimeBots.has(bot)) throw new BotNameTaken(bot);
         return this.#control.createBot(input);
-      },
-      createGroup: async (name, members) => {
-        // Room membership is resolved against `profiles.list`, which never names a runtime bot, so
-        // without this the user is told the bot is not on this gateway while `GET /bots` lists it.
-        for (const member of members) {
-          const bot = normalize(member);
-          const runtimeBot = this.#runtimeBots.get(bot);
-          if (runtimeBot !== undefined)
-            throw new GroupInvalid(
-              `${bot} is a ${runtimeBot.runtime} runtime bot; rooms are not supported for runtime bots yet`,
-            );
-        }
-        return this.#control.createGroup(name, members);
       },
       readiness: (name) => this.#readiness(name),
       commands: (name) => this.#commands(name),
@@ -354,6 +364,22 @@ export class NativeBotDataPlane {
           const name = typeof args[0] === "string" ? normalize(args[0]) : undefined;
           const runtimeBot = name === undefined ? undefined : this.#runtimeBots.get(name);
           if (name === undefined || runtimeBot === undefined) return bound(...args);
+          // A runtime bot owns its own profile, model selection and routines and serves them over
+          // the attach-v1 config lane, so those methods are answered by the peer rather than
+          // refused. Everything else in this set has no peer-side equivalent and keeps its 409:
+          // deletion is a gateway/Hermes lifecycle act, provider setup is Hermes-owned credential
+          // storage, and a desktop transcript is a Hermes Dashboard artifact.
+          const routed = CONFIG_LANE[property];
+          if (routed !== undefined && this.#botConfig !== undefined) {
+            const surface = this.#botConfig;
+            // A peer that never negotiated `bot_config` reads exactly like a bot with no lane at
+            // all, which is the true answer: the section is absent, not temporarily unreachable.
+            return routed(surface, name, args).catch((error: unknown) => {
+              throw error instanceof ConfigNotNegotiated
+                ? new UnsupportedForRuntime(name, property, runtimeBot.runtime)
+                : error;
+            });
+          }
           return Promise.reject(
             new UnsupportedForRuntime(name, property, runtimeBot.runtime),
           );
@@ -689,6 +715,10 @@ export class NativeBotDataPlane {
         role: event.role,
         text: event.text,
         at: event.at,
+        // Capability 47. A desktop-authored row is still this bot's row, and the reader asking
+        // "who said this?" deserves the same answer here as on a gateway-projected reply. It
+        // answers no gateway turn, so it names none.
+        ...(event.role === "user" ? {} : { authorBot: key }),
       });
       this.#broadcastMessage(key, event.threadId, message, this.#now());
       return true;
@@ -974,6 +1004,7 @@ export class NativeBotDataPlane {
         role: message.role,
         text: message.text,
         at: message.at ?? this.#now() + index,
+        ...(message.role === "user" ? {} : { authorBot: bot }),
       });
     }
     // A durable `resumed` binding only proves a past plugin process switched its private raw
@@ -1148,6 +1179,10 @@ export class NativeBotDataPlane {
       role: "user",
       text,
       at: now,
+      // Capability 47. The turn this message opened (or steered), stamped here because this is the
+      // only place that knows it: at commit time the reply can then name the row it answers
+      // instead of the reader guessing from adjacency.
+      turnId,
       ...(opts?.clientId === undefined ? {} : { clientId: opts.clientId }),
     });
     if (chat.activeTurnId === undefined) {
@@ -1280,6 +1315,7 @@ export class NativeBotDataPlane {
       text: input.text,
       at: now,
       attachments: [attachment],
+      turnId,
       ...(input.clientId === undefined ? {} : { clientId: input.clientId }),
     });
     this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
@@ -1571,6 +1607,9 @@ export class NativeBotDataPlane {
       sessionId: chat.sessionId,
       messageId: `delivery-failed:${failure.deliveryId}`,
       role: "system",
+      // Capability 47. A gateway-authored row still has an author the reader cares about: the bot
+      // whose chat it landed in. It answers no turn, so it names none.
+      authorBot: key,
       marker: DELIVERY_FAILED_MARKER,
       text: deliveryFailureText(key, failure.at, failure.reason),
       at: failure.at,
@@ -1627,6 +1666,13 @@ export class NativeBotDataPlane {
       ];
     });
     const text = blocksToText(blocks);
+    // Capability 47. Every id here is one the gateway already held; none is inferred. A commit
+    // outside a turn (a scheduled delivery projection) has no turn and answers no user row, so it
+    // carries only its author. A STEER shares the running turn's id, so the lookup takes the
+    // FIRST user row of the turn: the question the turn answers is the one that opened it, and a
+    // mid-turn nudge does not replace it.
+    const inReplyToId =
+      turnId === undefined ? undefined : this.#storage.nativeBotTurnUserMessageId(bot, sessionId, turnId);
     const message = this.#storage.appendNativeBotMessage({
       bot,
       sessionId,
@@ -1634,6 +1680,9 @@ export class NativeBotDataPlane {
       role: "assistant",
       text,
       at: now,
+      authorBot: bot,
+      ...(turnId === undefined ? {} : { turnId }),
+      ...(inReplyToId === undefined ? {} : { inReplyToId }),
       ...(attachments === undefined || attachments.length === 0
         ? {}
         : { attachments }),

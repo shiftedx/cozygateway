@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
 
-import type { BotGroupTurnRow, Storage } from "../storage.ts";
+import type { BotGroupCause, BotGroupTurnRow, Storage } from "../storage.ts";
+import type { AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 
 /** Existing attach-v1 `turn` command, narrowed to what a group room needs. Group code owns the
  * thread id; the adapter owns transport sequencing and replay. */
 export interface NativeGroupTurnEndpoint {
   canQueue(agentId: string): boolean;
-  sendNativeTurn(agentId: string, input: { threadId: string; turnId: string; messageId: string; text: string }): boolean;
+  sendNativeTurn(agentId: string, input: {
+    threadId: string; turnId: string; messageId: string; text: string;
+    /** Capability 47. Typed room provenance for a peer that reads it; `text` is unchanged either
+     * way, so a peer that ignores it behaves exactly as it did before. */
+    context?: AttachV1TurnContext;
+  }): boolean;
 }
 
 export type GroupTurnResult =
@@ -26,6 +32,10 @@ export interface StartNativeMemberTurn {
   epoch: number;
   watermark: number;
   prompt: string;
+  /** What this member was answering when the turn was handed over. Persisted on the turn row so
+   * both settlement paths (the live round loop and post-restart recovery) read the same fact. */
+  cause?: BotGroupCause;
+  context?: AttachV1TurnContext;
   now: () => number;
 }
 
@@ -39,9 +49,13 @@ export function startNativeMemberTurn(input: StartNativeMemberTurn): { turnId: s
   const messageId = `${turnId}:group`;
   if (!input.storage.beginBotGroupTurn({
     key: input.key, turnId, member: input.member, agentId: input.agentId, threadId: input.threadId,
-    messageId, epoch: input.epoch, watermark: input.watermark, createdAt: input.now(),
+    messageId, epoch: input.epoch, watermark: input.watermark,
+    ...(input.cause === undefined ? {} : { cause: input.cause }), createdAt: input.now(),
   })) return { outcome: "failed", detail: "another member turn is already pending" };
-  if (!input.endpoint.sendNativeTurn(input.agentId, { threadId: input.threadId, turnId, messageId, text: input.prompt })) {
+  if (!input.endpoint.sendNativeTurn(input.agentId, {
+    threadId: input.threadId, turnId, messageId, text: input.prompt,
+    ...(input.context === undefined ? {} : { context: input.context }),
+  })) {
     input.storage.completeBotGroupTurn(input.agentId, input.threadId, turnId, "failed", undefined, "native attach-v1 profile is unavailable", input.now());
     return { outcome: "failed", detail: "native attach-v1 profile is unavailable" };
   }

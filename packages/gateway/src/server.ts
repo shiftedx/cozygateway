@@ -64,6 +64,7 @@ import { parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
+import { AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
 import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
@@ -296,6 +297,7 @@ export async function startGateway(
   // Bots served by a non-Hermes runtime (e.g. CozyAgents). Additive to the Hermes profiles above:
   // same storage row, same attach identity shape, no Hermes Dashboard consulted for them.
   const runtimeBots = nativeBots(config);
+  const runtimeBotNameSet: ReadonlySet<string> = new Set(runtimeBots.map((bot) => bot.id));
   // loadConfig() rejects this same collision (config.ts:246-249), but startGateway takes a
   // GatewayConfig directly and skips loadConfig on the programmatic path (tests, embedders), so
   // the check is re-derived here rather than trusted to have already run. Two ids resolving the
@@ -423,6 +425,11 @@ export async function startGateway(
     seedBlankSlateBots: memberOptions.seedBlankSlateBots,
     blankSlateSkillsOn: memberOptions.blankSlateSkillsOn,
     revokeAttachIdentity: (name) => killAttachIdentity(publicProfileId(endpoint, name)),
+    // Capability 46. Room membership is the only thing that reads this: a runtime bot has no
+    // Dashboard profile, so a room naming one has to be answered from config rather than from
+    // `profiles.list`. Shared by every bridge member because a runtime bot belongs to the gateway
+    // rather than to any one Hermes endpoint.
+    runtimeBotNames: () => runtimeBotNameSet,
     // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
     // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
     // rather than borrowed from a chat thread, so a client that does not know about rooms yet
@@ -487,6 +494,7 @@ export async function startGateway(
   }
   let nativeBotPlane: NativeBotDataPlane | undefined;
   let memorySurface: AttachMemorySurface | undefined;
+  let configSurface: AttachConfigSurface | undefined;
   let botsSurface: BotsSurface;
   const allowedCapabilities = new Map<string, ReadonlySet<AttachV1Capability>>(
     profileEntries.map(([profileId]) => [
@@ -542,6 +550,7 @@ export async function startGateway(
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
       onMemoryResult: (agentId, frame) => { memorySurface?.handle(agentId, frame); },
+      onConfigResult: (agentId, frame) => { configSurface?.handle(agentId, frame); },
       // The plugin-facing receipt is the ingress' own business; this is the half the USER sees.
       onScheduledDeliveryFailed: (agentId, failure) =>
         nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
@@ -557,6 +566,7 @@ export async function startGateway(
     },
   });
   memorySurface = new AttachMemorySurface(attachV1Ingress, 12_000, traceLog);
+  configSurface = new AttachConfigSurface(attachV1Ingress, 12_000, traceLog);
   const attachEndpoint: TurnEndpoint = {
     isAttached: (agentId) => attachV1Ingress.isAttached(agentId),
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
@@ -644,6 +654,7 @@ export async function startGateway(
       avatar: bot.avatar ?? null,
       runtime: bot.runtime,
     })),
+    botConfig: configSurface,
     chatSuggestion: hermesOptions.chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     staleTurnSweepMs: millis(config.staleTurnSweepSeconds),
@@ -840,6 +851,7 @@ export async function startGateway(
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
       // runner's per-thread chains settle before closeAll drains them.
       memorySurface?.close();
+      configSurface?.close();
       attachV1Ingress.close();
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));

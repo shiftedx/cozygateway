@@ -182,6 +182,54 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("carries the turn, the author, and the answered user row on a 1:1 assistant message", async () => {
+    const storage = openStorage(":memory:");
+    const sent: Array<Record<string, unknown>> = [];
+    const ingress = {
+      sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+        sent.push(input);
+        storage.enqueueAttachCommand(bot, "turn-command", { kind: "turn", ...input } as never, now);
+        return true;
+      },
+      sendNativeSteer: () => true,
+      sendNativeInterrupt: () => true,
+    } as unknown as AttachV1Ingress;
+    let now = 100;
+    const plane = new NativeBotDataPlane({
+      control: { chatHistory: vi.fn() } as unknown as BotsSurface,
+      storage, ingress, nativeBots: ["sage"], chatSuggestion: "",
+      broadcast: () => undefined, now: () => now++,
+    });
+    const surface = plane.surface();
+
+    const accepted = await surface.sendChatMessage("sage", "what broke?", { clientId: "ask-1" });
+    const turnId = String(sent[0]?.turnId);
+    // A steer joins the RUNNING turn and shares its id, so the transcript holds two user rows for
+    // one turn. The reply below still answers the message that opened it.
+    const steered = await surface.sendChatMessage("sage", "any detail?", { clientId: "nudge-1" });
+    expect(steered.message).toMatchObject({ id: "nudge-1", role: "user", turnId });
+    expect(plane.handle("sage", {
+      kind: "event", sequence: 1, eventId: "commit-1",
+      event: {
+        kind: "commit", threadId: accepted.sessionId, turnId, messageId: "answer-1",
+        blocks: [{ type: "paragraph", text: "the deploy did" }],
+      },
+    })).toBe(true);
+
+    const history = await surface.chatHistory("sage");
+    // The user row names the turn it opened; the assistant row names the same turn, the bot that
+    // authored it, and the exact row it answers. None of it is inferred from ordering.
+    expect(history.messages[0]).toMatchObject({ id: "ask-1", role: "user", turnId });
+    expect(history.messages[0]?.authorBot).toBeUndefined();
+    // The nudge does NOT become a new inReplyToId target: the question a turn answers is the one
+    // that opened it.
+    expect(history.messages[2]).toMatchObject({
+      id: "answer-1", role: "assistant", turnId, authorBot: "sage", inReplyToId: "ask-1",
+    });
+    plane.close();
+    storage.close();
+  });
+
   it("binds a mobile request to the authenticated POST device, never the agent frame", async () => {
     const storage = openStorage(":memory:");
     let turn: Record<string, unknown> | undefined;
@@ -2190,9 +2238,9 @@ describe("native runtime bots", () => {
     storage.close();
   });
 
-  it("refuses a room that names a runtime bot, in runtime words", async () => {
+  it("lets a room name a runtime bot, because membership no longer asks the Dashboard", async () => {
     const storage = openStorage(":memory:");
-    const createGroup = vi.fn();
+    const createGroup = vi.fn().mockResolvedValue({ name: "room" });
     const plane = new NativeBotDataPlane({
       control: { createGroup } as unknown as BotsSurface,
       storage,
@@ -2203,12 +2251,12 @@ describe("native runtime bots", () => {
       broadcast: () => undefined,
     });
 
-    // Membership is checked against `profiles.list`, so without this the user is told sage is
-    // "not a bot on this gateway" while `GET /bots` is listing it.
-    await expect(plane.surface().createGroup("room", ["cleo", "sage"])).rejects.toThrow(
-      /sage is a cozyagents runtime bot; rooms are not supported for runtime bots yet/,
-    );
-    expect(createGroup).not.toHaveBeenCalled();
+    // Capability 46. This plane used to refuse the room here, because membership was resolved
+    // against `profiles.list` and the user was told sage is "not a bot on this gateway" while
+    // `GET /bots` was listing it. The bridge answers a runtime member from config now, so there is
+    // nothing left for this arm to protect and the create goes straight through.
+    await expect(plane.surface().createGroup("room", ["cleo", "sage"])).resolves.toEqual({ name: "room" });
+    expect(createGroup).toHaveBeenCalledWith("room", ["cleo", "sage"]);
 
     plane.close();
     storage.close();

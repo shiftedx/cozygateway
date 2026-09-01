@@ -23,6 +23,7 @@ import {
   BotGroupCreateRequestSchema,
   BotGroupDetailSchema,
   BotGroupMessageSchema,
+  BotGroupNoteSchema,
   BotGroupSchema,
   BotGroupSendRequestSchema,
   BotModelConfigPatchSchema,
@@ -289,6 +290,22 @@ describe("group rooms", () => {
     expect(check(BotGroupCreateRequestSchema, { ...base, members: ["scout", "luna"] })).toBe(true);
     expect(check(BotGroupCreateRequestSchema, { ...base, members: ["a", "b", "c", "d", "e", "f"] })).toBe(true);
     expect(check(BotGroupCreateRequestSchema, { ...base, members: ["a", "b", "c", "d", "e", "f", "g"] })).toBe(false);
+  });
+
+  it("carries capability-47 provenance on a room row, and keeps a pre-47 row valid", () => {
+    expect(check(BotGroupMessageSchema, {
+      ...groupMessage,
+      messageId: "b7c1", turnId: "t-1", epoch: 3,
+      cause: { kind: "user", seq: 11 },
+      attachTurn: { threadId: "group:release:scout", turnId: "t-1" },
+    })).toBe(true);
+    // Additive: a row without any of it is exactly the row every pre-47 gateway already sent.
+    expect(check(BotGroupMessageSchema, groupMessage)).toBe(true);
+    // The causation union stays closed: only the human and a member can cause a member turn.
+    expect(check(BotGroupMessageSchema, { ...groupMessage, cause: { kind: "bot", seq: 11 } })).toBe(false);
+    // A note names a turn when one was started, and is unchanged when none was.
+    expect(check(BotGroupNoteSchema, { member: "scout", reason: "failed", detail: "crashed", turnId: "t-1" })).toBe(true);
+    expect(check(BotGroupNoteSchema, { member: "scout", reason: "capped", detail: "cap reached" })).toBe(true);
   });
 
   it("requires text on a send, and bounds the client id", () => {
@@ -619,7 +636,15 @@ describe("capability advertisement", () => {
     // exact credential-free memory setup through the attached profile plugin; 43 makes every
     // Hermes profile visible with an exact synchronization state. 44 adds per-profile CozyApps
     // readiness so a globally capable gateway cannot misrepresent an older attached plugin.
-    expect(BOTS_CAPABILITY_VERSION).toBe(45);
+    // 45 adds native runtime bots; 46 makes one a full room member and streams a room turn's
+    // live draft as `bot_chat_delta` carrying `room`. 47 adds auditable ids: recorded
+    // provenance on room and 1:1 transcript rows (`turnId`, `messageId`, `epoch`, `cause`,
+    // `attachTurn`, `authorBot`, `inReplyToId`) plus typed room `context` on the attach turn
+    // command. Every field is optional and absent on rows written before 47, so a client
+    // below 47 is unchanged. 48 adds the bot config lane: a runtime bot answers the profile,
+    // model-config, and routines routes over attach-v1 instead of 409, with the wire shapes
+    // unchanged, so a client below 48 sees the 409 it already handles.
+    expect(BOTS_CAPABILITY_VERSION).toBe(48);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {
@@ -819,6 +844,12 @@ describe("capability advertisement", () => {
     // Additive: a row without the field is exactly the row every pre-31 gateway already sent.
     expect(check(BotChatMessageSchema, {
       id: "m1", role: "assistant", text: "hi", at: null,
+    })).toBe(true);
+    // Capability 47 provenance is additive the same way: recorded when the gateway holds the
+    // fact, absent otherwise, and a pre-47 row above stays valid without any of it.
+    expect(check(BotChatMessageSchema, {
+      id: "answer-1", role: "assistant", text: "hi", at: null,
+      turnId: "t-1", authorBot: "sage", inReplyToId: "ask-1",
     })).toBe(true);
     expect(check(BotChatMessageSchema, {
       id: "m1", role: "assistant", text: "hi", at: null, marker: "x".repeat(65),
