@@ -1816,19 +1816,44 @@ export class Storage {
       .run(ackedAt, agentId, sequence, commandId).changes === 1;
   }
 
-  /** Reconciles a plugin's durable contiguous processed-command cursor after an ACK was lost.
-   * Refusing cursors beyond the issued tail prevents a corrupt peer from skipping future rows. */
-  reconcileAttachCommandResume(agentId: string, processedThrough: number, ackedAt: number): boolean {
+  /** Reconciles a plugin's durable cursors after an ACK was lost or the gateway was reprovisioned.
+   * A stream absent from this gateway can safely begin at the authenticated plugin's durable
+   * cursors: there are no local commands or events to skip. Once a stream exists, refusing command
+   * cursors beyond the issued tail still prevents a corrupt peer from skipping future rows. */
+  reconcileAttachResume(
+    agentId: string,
+    eventThrough: number,
+    commandThrough: number,
+    reconciledAt: number,
+  ): boolean {
+    if (eventThrough < 0 || commandThrough < 0) return false;
+    const stream = this.#db
+      .prepare("SELECT 1 AS present FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { present: number } | undefined;
+    if (stream === undefined) {
+      const command = this.#db
+        .prepare("SELECT 1 AS present FROM attach_command_outbox WHERE agent_id = ? LIMIT 1")
+        .get(agentId) as { present: number } | undefined;
+      if (command !== undefined) return false;
+      this.#db
+        .prepare(
+          `INSERT INTO attach_streams
+             (agent_id, next_command_sequence, last_event_sequence, updated_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(agentId, commandThrough + 1, eventThrough, reconciledAt);
+      return true;
+    }
     const row = this.#db
       .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM attach_command_outbox WHERE agent_id = ?")
       .get(agentId) as { sequence: number };
-    if (processedThrough < 0 || processedThrough > row.sequence) return false;
+    if (commandThrough > row.sequence) return false;
     this.#db
       .prepare(
         `UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?)
          WHERE agent_id = ? AND sequence <= ?`,
       )
-      .run(ackedAt, agentId, processedThrough);
+      .run(reconciledAt, agentId, commandThrough);
     return true;
   }
 
@@ -1838,11 +1863,12 @@ export class Storage {
         `SELECT COALESCE(
            MIN(CASE WHEN acked_at IS NULL THEN sequence END) - 1,
            MAX(sequence),
+           (SELECT next_command_sequence - 1 FROM attach_streams WHERE agent_id = ?),
            0
          ) AS sequence
          FROM attach_command_outbox WHERE agent_id = ?`,
       )
-      .get(agentId) as { sequence: number };
+      .get(agentId, agentId) as { sequence: number };
     return row.sequence;
   }
 

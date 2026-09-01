@@ -255,6 +255,18 @@ describe("attach-v1 ingress", () => {
     second.ws.close();
   });
 
+  it("continues an existing plugin stream when attaching to a freshly provisioned gateway", async () => {
+    const peer = await dial(undefined, ["draft"], { eventSequence: 118_129, commandSequence: 460 });
+    expect(peer.frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({
+      resume: { eventSequence: 118_129, commandSequence: 460 },
+    });
+    expect(storage.attachEventCursor("sage")).toBe(118_129);
+    expect(ingress.sendTurn("sage", { kind: "turn", threadId: "t", turnId: "u", text: "continue" })).toBe(true);
+    await until(() => peer.frames.some((frame) => frame.kind === "command"));
+    expect(peer.frames.find((frame) => frame.kind === "command")).toMatchObject({ sequence: 461 });
+    peer.ws.close();
+  });
+
   it("intersects capabilities and quarantines unsupported events without dropping the agent", async () => {
     const { ws, frames } = await dial(undefined, ["draft", "tools"]);
     expect(frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ capabilities: ["draft", "tools"] });

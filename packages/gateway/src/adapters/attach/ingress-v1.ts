@@ -215,8 +215,9 @@ export class AttachV1Ingress implements TurnEndpoint {
         clearTimeout(helloTimer);
         const previous = this.#current.get(agentId);
         if (previous !== undefined && previous.socket !== socket) previous.socket.close(4000, "superseded");
-        const resumedThrough = frame.resume?.commandSequence ?? 0;
-        if (!this.#storage.reconcileAttachCommandResume(agentId, resumedThrough, this.#now())) {
+        const resumedEventsThrough = frame.resume?.eventSequence ?? 0;
+        const resumedCommandsThrough = frame.resume?.commandSequence ?? 0;
+        if (!this.#storage.reconcileAttachResume(agentId, resumedEventsThrough, resumedCommandsThrough, this.#now())) {
           socket.close(1008, "invalid command resume cursor");
           return;
         }
