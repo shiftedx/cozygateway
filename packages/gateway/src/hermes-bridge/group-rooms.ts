@@ -1,4 +1,4 @@
-import type { BotGroup, BotGroupDetail, BotGroupMessage, BotGroupNote, ServerFrame } from "cozygateway-contract";
+import type { BotChatDeltaFrame, BotGroup, BotGroupDetail, BotGroupMessage, BotGroupNote, ServerFrame } from "cozygateway-contract";
 
 import type { Storage, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
@@ -155,6 +155,10 @@ export class GroupRooms {
   readonly #chainDelayMs: number;
   readonly #log: (message: string) => void;
   readonly #waiters = new Map<string, () => void>();
+  /** Live-draft sequence per member turn, from 1. In memory on purpose: a draft is ephemeral, and a
+   *  turn that outlives this process resumes from its durable commit rather than its half-typed
+   *  text. */
+  readonly #draftSeq = new Map<string, number>();
 
   /** The drive currently holding a room, by room key, tagged with the room GENERATION it was
    *  started for. Present means "a round loop is live", which is the room's only piece of
@@ -215,13 +219,22 @@ export class GroupRooms {
       settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, "failed", undefined, event.message, this.#now());
     } else if (event.kind === "cancelled" || event.kind === "interrupted") {
       settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, event.kind, undefined, undefined, this.#now());
+    } else if (event.kind === "draft") {
+      // Capability 46. The contract already reserved `BotChatDeltaFrame.room` for exactly this, so
+      // a member composing its reply streams into the room the same way a 1:1 bot streams into a
+      // chat: same frame, same accumulate-by-`turnId` rule, plus the room name that tells a client
+      // which transcript the bubble belongs above.
+      this.#emitDraft(owned, blocksToText(event.blocks));
+      return true;
     } else {
-      // Draft/tool/interaction events still belong to this already-authorized turn. The room has
-      // no separate wire projection for them, but declining would dead-letter an otherwise valid
-      // at-least-once stream.
+      // Tool, thinking, and interaction events still belong to this already-authorized turn. The
+      // room has no wire projection for them in this capability, but declining would dead-letter
+      // an otherwise valid at-least-once stream.
       return true;
     }
     if (settled === undefined) return false;
+    // The live bubble is over: its sequence is per-turn, and the turn is terminal.
+    this.#draftSeq.delete(event.turnId);
     const wake = this.#waiters.get(event.turnId);
     if (wake !== undefined) wake();
     else this.#recoverSettledTurn(settled);
@@ -676,6 +689,31 @@ export class GroupRooms {
     // The previous process cannot retain its loop. Resume from durable watermarks; one serial
     // drive owns any remaining responders and the outbox already owns the command replay.
     this.#startDrive(claimed.key, room.epoch);
+  }
+
+  /** One live draft of a member turn, as the 1:1 chat frame plus `room`.
+   *
+   *  `bot` is the member and `sessionId` is its gateway-owned group thread, which is the identity
+   *  the room already dispatches on: a client that keys live text by bot and session therefore
+   *  needs no new keying to render this, and the `room` field is what stops it being mistaken for
+   *  the member's 1:1 conversation. Dropped silently for a room that is already gone, because a
+   *  draft is not worth resurrecting a deleted transcript for. */
+  #emitDraft(turn: BotGroupTurnRow, text: string): void {
+    const room = this.#storage.botGroup(turn.key);
+    if (room === undefined) return;
+    const seq = (this.#draftSeq.get(turn.turnId) ?? 0) + 1;
+    this.#draftSeq.set(turn.turnId, seq);
+    const delta: BotChatDeltaFrame = {
+      type: "bot_chat_delta",
+      bot: turn.member,
+      sessionId: turn.threadId,
+      turnId: turn.turnId,
+      text,
+      seq,
+      updatedAt: this.#now(),
+      room: room.name,
+    };
+    this.#broadcast(delta);
   }
 
   #entries(key: string): GroupLogEntry[] {

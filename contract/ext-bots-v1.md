@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 45. This extension is independent of the frozen core
+Status: v1 extension, capability version 46. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 45 }
+"capabilities": { "com.cozylabs.bots": 46 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -85,6 +85,7 @@ and does not register `/bots` routes.
 | 43 | The roster represents every Hermes profile and reports `syncState`; profiles not yet provisioned remain visible as `setup_required` instead of disappearing. |
 | 44 | Per-profile CozyApps readiness on `BotSummary`, with a stable `restart_profile` repair when a connected plugin did not negotiate `cozyapps`. |
 | 45 | Native runtime Bots: config-declared bots served by a non-Hermes attach peer appear on the roster with `runtime: "cozyagents"`, built from config and attach presence rather than the Dashboard; their Dashboard-backed routes answer 409 `unsupported_for_runtime`. |
+| 46 | Runtime Bots in rooms: a `runtime: "cozyagents"` bot can be a full member of a group room, its membership answered from gateway config rather than `profiles.list`, and a room turn's live draft is published as `bot_chat_delta` carrying `room`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -599,6 +600,8 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   one, then projects `timed_out`.
 - `bot_chat_delta`: full accumulated assistant draft for one native turn. `seq` is monotonic within
   `turnId`; `done` ends that draft. Clients may drop drafts and rely on committed `bot_chat` rows.
+  Capability 46: when `room` is present the draft belongs to that room's member turn rather than to
+  a 1:1 chat, and `sessionId` is the gateway-owned group thread rather than a chat session.
 - `bot_chat_reset`: a reset selected a fresh native session. Rebind and reload its history.
 - `bot_chat_adopted`: a new/adopt action selected an existing native session. Rebind and reload.
 - `bot_tool_activity`: full-replace steps for a native turn. `BotToolStep.detail` and `errorText`
@@ -653,10 +656,21 @@ Committed transcript history remains the recovery source after reconnect.
   absent means Hermes, so every existing row is unchanged; the only other value is `"cozyagents"`,
   a config-declared bot served by a non-Hermes attach peer whose row is built from gateway config
   and attach presence rather than the Dashboard. Chat, readiness, approvals, and clarifications
-  work for such a bot exactly as they do for a Hermes-backed one. A runtime bot cannot join a room
-  in this version: `POST /bots/groups` naming one is refused with `400 invalid_request`. Roster
+  work for such a bot exactly as they do for a Hermes-backed one, and since capability 46 so do
+  rooms: see the capability-46 note below. Roster
   `stale` is a fact about the Hermes control plane only; it says nothing about a runtime bot, whose
   row is always current because it is built from local config and live attach presence.
+- Capability 46. A runtime bot is a full room member. `POST /bots/groups` naming one succeeds:
+  room membership is resolved against gateway config as well as `profiles.list`, so a bot the
+  roster is listing is never refused as "not a bot on this gateway", and a room whose members are
+  all runtime bots is created and run without the Hermes Dashboard being consulted at all. The
+  member turn is unchanged in every other respect: the same attach-v1 `turn` command on the same
+  gateway-owned `group:<room>:<member>` thread, the same rounds, the same transcript. A member's
+  display name and handle in the room come from its roster row, which for a runtime bot is the
+  config-declared one. A room turn's live draft is published as `bot_chat_delta` with `room` set to
+  the room name, `bot` set to the member, and `sessionId` set to that group thread: it is live text,
+  never history, and a client that does not know the field renders nothing new. Tool, thinking, and
+  delegation activity inside a room turn is deliberately not projected in this version.
 - A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
   extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
   bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).

@@ -1737,4 +1737,13 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * from the Dashboard, and its Dashboard-backed routes answer `409 unsupported_for_runtime`. A
  * client gating native-bot UI must require >= 45: a gateway at 44 has the CozyApps fact and no
  * native bots at all. */
-export const BOTS_CAPABILITY_VERSION = 45;
+/** Capability 46: RUNTIME BOTS IN ROOMS. A capability-45 runtime bot can be a full member of a
+ *  group room. Membership is answered from gateway config rather than from `profiles.list`, so
+ *  `POST /bots/groups` naming one succeeds and a room made only of runtime bots runs with the
+ *  Hermes Dashboard entirely out of the picture; the member turn is the same attach-v1 command on
+ *  the same gateway-owned `group:<room>:<member>` thread a Hermes member gets. A room turn's live
+ *  draft now reaches clients as `bot_chat_delta` carrying `room`, the field this schema already
+ *  reserved. Tool, thinking, and delegation activity inside a room turn is still not projected. No
+ *  new frame and no new route: a client below 46 sees a room like any other and ignores the
+ *  unknown `room` field; one that renders a room's live typing gates on `>= 46`. */
+export const BOTS_CAPABILITY_VERSION = 46;

@@ -2190,9 +2190,9 @@ describe("native runtime bots", () => {
     storage.close();
   });
 
-  it("refuses a room that names a runtime bot, in runtime words", async () => {
+  it("lets a room name a runtime bot, because membership no longer asks the Dashboard", async () => {
     const storage = openStorage(":memory:");
-    const createGroup = vi.fn();
+    const createGroup = vi.fn().mockResolvedValue({ name: "room" });
     const plane = new NativeBotDataPlane({
       control: { createGroup } as unknown as BotsSurface,
       storage,
@@ -2203,12 +2203,12 @@ describe("native runtime bots", () => {
       broadcast: () => undefined,
     });
 
-    // Membership is checked against `profiles.list`, so without this the user is told sage is
-    // "not a bot on this gateway" while `GET /bots` is listing it.
-    await expect(plane.surface().createGroup("room", ["cleo", "sage"])).rejects.toThrow(
-      /sage is a cozyagents runtime bot; rooms are not supported for runtime bots yet/,
-    );
-    expect(createGroup).not.toHaveBeenCalled();
+    // Capability 46. This plane used to refuse the room here, because membership was resolved
+    // against `profiles.list` and the user was told sage is "not a bot on this gateway" while
+    // `GET /bots` was listing it. The bridge answers a runtime member from config now, so there is
+    // nothing left for this arm to protect and the create goes straight through.
+    await expect(plane.surface().createGroup("room", ["cleo", "sage"])).resolves.toEqual({ name: "room" });
+    expect(createGroup).toHaveBeenCalledWith("room", ["cleo", "sage"]);
 
     plane.close();
     storage.close();

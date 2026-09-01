@@ -46,7 +46,6 @@ import type {
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import { BotNameTaken } from "./crud.ts";
-import { GroupInvalid } from "./group-rooms.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
@@ -296,19 +295,6 @@ export class NativeBotDataPlane {
         const bot = normalize(input.name);
         if (this.#runtimeBots.has(bot)) throw new BotNameTaken(bot);
         return this.#control.createBot(input);
-      },
-      createGroup: async (name, members) => {
-        // Room membership is resolved against `profiles.list`, which never names a runtime bot, so
-        // without this the user is told the bot is not on this gateway while `GET /bots` lists it.
-        for (const member of members) {
-          const bot = normalize(member);
-          const runtimeBot = this.#runtimeBots.get(bot);
-          if (runtimeBot !== undefined)
-            throw new GroupInvalid(
-              `${bot} is a ${runtimeBot.runtime} runtime bot; rooms are not supported for runtime bots yet`,
-            );
-        }
-        return this.#control.createGroup(name, members);
       },
       readiness: (name) => this.#readiness(name),
       commands: (name) => this.#commands(name),

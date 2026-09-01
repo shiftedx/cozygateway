@@ -108,6 +108,9 @@ import {
 } from "./blank-slate-seed.ts";
 
 const CHANGE_DEBOUNCE_MS = 250;
+/** The answer a bridge with no runtime bots configured gives, allocated once: this is read on every
+ *  member boundary of every room. */
+const EMPTY_NAMES: ReadonlySet<string> = new Set<string>();
 export type BotFocusScreen = "roster" | "routines";
 export interface BotRosterView {
   bots: BotSummary[];
@@ -356,6 +359,15 @@ export interface HermesBridgeOptions {
   /** Skill names a blank-slate bot keeps ON. Default `[]`: no playbooks until asked. Ignored when
    *  `seedBlankSlateBots` is false. */
   blankSlateSkillsOn?: readonly string[];
+  /** Bot names served by a non-Hermes runtime (capability 45), read fresh on every call because
+   *  the set is config-declared and the bridge is built before the data plane that knows it.
+   *
+   *  Room membership is the only thing that consults it. A runtime bot has no Dashboard profile,
+   *  so `profiles.list` can never name it, and every membership check that asks Hermes alone would
+   *  report a bot the roster is visibly listing as "not a bot on this gateway". Capability 46 makes
+   *  the runtime set an equal source of that answer, which is also what lets a room made only of
+   *  runtime bots run on a gateway whose Hermes is unreachable. */
+  runtimeBotNames?: () => ReadonlySet<string>;
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
@@ -391,6 +403,7 @@ export class HermesBridge implements BotControlSurface {
   readonly #catalogTtlMs: number;
   readonly #catalogDegradedTtlMs: number;
   readonly #revokeAttachIdentity: (name: string) => boolean;
+  readonly #runtimeBotNames: () => ReadonlySet<string>;
   readonly #chains = new Map<string, Promise<unknown>>();
   readonly #routineWatch = new Map<string, number>();
   readonly #lastRoutines = new Map<string, string>();
@@ -420,6 +433,7 @@ export class HermesBridge implements BotControlSurface {
     this.#catalogDegradedTtlMs =
       opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
     this.#revokeAttachIdentity = opts.revokeAttachIdentity ?? (() => false);
+    this.#runtimeBotNames = opts.runtimeBotNames ?? ((): ReadonlySet<string> => EMPTY_NAMES);
     this.#log =
       opts.logSink ??
       ((line) => void process.stderr.write(`[hermes-bridge] ${line}\n`));
@@ -429,16 +443,27 @@ export class HermesBridge implements BotControlSurface {
       now: this.#now,
       memberInfo: (name) => this.#memberInfo(name),
       missingMembers: async (names) => {
+        // A runtime bot is present by construction: it is declared in this gateway's own config
+        // and its attach identity is minted at startup, so there is nothing to ask anyone about.
+        // Answering it here also means a room of only runtime bots never touches Hermes, which is
+        // what lets such a room be created while the Dashboard is down.
+        const runtime = this.#runtimeBotNames();
+        const asked = names.filter((name) => !runtime.has(name));
+        if (asked.length === 0) return [];
         const known = await this.#freshProfileNames();
-        return names.filter((name) => !known.has(name));
+        return asked.filter((name) => !known.has(name));
       },
       memberKnown: (name) => {
+        if (this.#runtimeBotNames().has(name)) return true;
         const bots = this.#storage.botRoster().bots;
         return bots.length === 0
           ? undefined
           : bots.some((bot) => bot.name === name);
       },
       memberExists: async (name) => {
+        // Checked before the round trip for the same reason: `profiles.list` never names a runtime
+        // bot, so asking it would answer `false` and retire a perfectly live member.
+        if (this.#runtimeBotNames().has(name)) return true;
         try {
           return (await this.#freshProfileNames()).has(name);
         } catch {
@@ -451,12 +476,23 @@ export class HermesBridge implements BotControlSurface {
     });
   }
   #memberInfo(name: string): GroupMember {
-    const row = this.#storage.botRoster().bots.find((bot) => bot.name === name);
+    const row = this.#rosterRow(name);
     return {
       name,
       handle: row?.handle ?? botHandle(name),
       displayName: row?.displayName ?? botDisplayName(name, null),
     };
+  }
+  /** The roster row a room member is named after. The cached Hermes rows answer for every
+   *  Dashboard-backed bot; a runtime bot has no row there at all, and its row exists only in the
+   *  data plane's overlay, so that is asked second and only for a name the runtime set claims.
+   *  Reading the overlay for every member would make a room turn pay for the whole roster. */
+  #rosterRow(name: string): BotSummary | undefined {
+    const bots = this.#storage.botRoster().bots;
+    const row = bots.find((bot) => bot.name === name);
+    if (row !== undefined) return row;
+    if (this.#rosterOverlay === undefined || !this.#runtimeBotNames().has(name)) return undefined;
+    return this.#rosterOverlay(bots).find((bot) => bot.name === name);
   }
   groups(): BotGroup[] {
     return this.#groups.list();

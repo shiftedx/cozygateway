@@ -296,6 +296,7 @@ export async function startGateway(
   // Bots served by a non-Hermes runtime (e.g. CozyAgents). Additive to the Hermes profiles above:
   // same storage row, same attach identity shape, no Hermes Dashboard consulted for them.
   const runtimeBots = nativeBots(config);
+  const runtimeBotNameSet: ReadonlySet<string> = new Set(runtimeBots.map((bot) => bot.id));
   // loadConfig() rejects this same collision (config.ts:246-249), but startGateway takes a
   // GatewayConfig directly and skips loadConfig on the programmatic path (tests, embedders), so
   // the check is re-derived here rather than trusted to have already run. Two ids resolving the
@@ -423,6 +424,11 @@ export async function startGateway(
     seedBlankSlateBots: memberOptions.seedBlankSlateBots,
     blankSlateSkillsOn: memberOptions.blankSlateSkillsOn,
     revokeAttachIdentity: (name) => killAttachIdentity(publicProfileId(endpoint, name)),
+    // Capability 46. Room membership is the only thing that reads this: a runtime bot has no
+    // Dashboard profile, so a room naming one has to be answered from config rather than from
+    // `profiles.list`. Shared by every bridge member because a runtime bot belongs to the gateway
+    // rather than to any one Hermes endpoint.
+    runtimeBotNames: () => runtimeBotNameSet,
     // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
     // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
     // rather than borrowed from a chat thread, so a client that does not know about rooms yet
