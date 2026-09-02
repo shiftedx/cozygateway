@@ -3,7 +3,7 @@ import type { TSchema } from "@sinclair/typebox";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
-import { check, ContractViolation, assertValid, type AttachHealthSummary } from "cozygateway-contract";
+import { check, ContractViolation, assertValid, BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type AttachHealthSummary } from "cozygateway-contract";
 import { WebSocket, WebSocketServer } from "ws";
 
 import type { NativeInteractionResolutionRequest, Storage } from "../../storage.ts";
@@ -267,6 +267,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           resume: { eventSequence: this.#storage.attachEventCursor(agentId), commandSequence: this.#storage.attachCommandCursor(agentId) },
           limits: { maxInFlightEvents: connection.maxInFlightEvents, maxInFlightBytes: connection.maxInFlightBytes },
           heartbeatIntervalMs: this.#heartbeatIntervalMs,
+          extensions: { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION },
         });
         this.#presence(agentId, "online");
         this.#refreshDegraded(agentId, connection);
