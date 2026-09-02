@@ -1517,7 +1517,6 @@ stop_owned_windows_gateway() {
       if ($null -ne $connection) { exit 42 }
       exit 3
     }
-    $managedPorts = @($managed | ForEach-Object { Get-NetTCPConnection -State Listen -OwningProcess $_.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } } | Select-Object -Unique)
     $taskkill = Join-Path ([Environment]::SystemDirectory) "taskkill.exe"
     if (-not [IO.File]::Exists($taskkill)) { throw "trusted taskkill.exe is unavailable" }
     $stopped = [Collections.Generic.HashSet[int]]::new()
@@ -1534,10 +1533,9 @@ stop_owned_windows_gateway() {
       Start-Sleep -Milliseconds 100
     }
     if (@(Managed-GatewayProcesses).Count -ne 0) { exit 45 }
-    $ports = @($managedPorts + [int]$env:COZYGATEWAY_EXPECTED_PORT | Select-Object -Unique)
     for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
-      $listening = @($ports | Where-Object { $null -ne (Get-NetTCPConnection -State Listen -LocalPort $_ -ErrorAction SilentlyContinue | Select-Object -First 1) })
-      if ($listening.Count -eq 0) { exit 0 }
+      $listener = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($null -eq $listener) { exit 0 }
       Start-Sleep -Seconds 1
     }
     exit 42
