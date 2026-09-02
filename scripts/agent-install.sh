@@ -1416,16 +1416,6 @@ windows_startup_dir() {
   [ -n "$native" ] || native="$(to_windows_path "$HOME")\\AppData\\Roaming"
   to_posix_path "$native\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
 }
-windows_startup_entry_is_owned() {
-  local entry="$1" lines command
-  [ -f "$entry" ] || return 1
-  lines="$(tr -d '\r' < "$entry")"
-  [ "$(printf '%s\n' "$lines" | wc -l | tr -d ' ')" = 3 ] || return 1
-  [ "$(printf '%s\n' "$lines" | sed -n '1p')" = 'Set shell = CreateObject("WScript.Shell")' ] || return 1
-  command="$(printf '%s\n' "$lines" | sed -n '2p')"
-  [[ "$command" =~ ^command\ =\ \".*run-gateway\.sh.*\"$ ]] || return 1
-  [ "$(printf '%s\n' "$lines" | sed -n '3p')" = 'shell.Run command, 0, False' ]
-}
 write_windows_launcher() {
   local bash_posix bash_native wrapper_native command
   bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
@@ -1555,7 +1545,7 @@ install_windows_service() {
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
     startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
-    if windows_startup_entry_is_owned "$entry"; then rm -f "$entry"; fi
+    if [ -f "$entry" ] && cmp -s "$entry" "$WINDOWS_VBS"; then rm -f "$entry"; fi
   fi
   wscript.exe "$vbs_native"
 }
