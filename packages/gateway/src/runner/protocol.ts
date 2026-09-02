@@ -6,8 +6,9 @@ import { type Static, Type } from "@sinclair/typebox";
  *  CozyAgents repo has one normative shape to build against.
  *
  *  The socket is opened BY the runner, outbound, to `/runner/v1`, and authenticated with a single
- *  bearer token the local admin places in `COZYGATEWAY_RUNNER_TOKEN` (the pairing-code flow and
- *  short-lived per-runner credentials are deliberately out of scope for wave 3). */
+ *  bearer token: from capability 52 that is a per-runner token minted by `POST /pair
+ *  {kind: "runner"}`, with the operator-placed `COZYGATEWAY_RUNNER_TOKEN` kept as the legacy
+ *  shared credential. */
 export const RUNNER_V1_VERSION = 1;
 
 /** How often the gateway sends a heartbeat, and how long total silence is tolerated before the
@@ -48,6 +49,21 @@ export const RunnerHelloSchema = Type.Object({
     minItems: 1,
     maxItems: 4,
   }),
+  /** Capability 52, all optional and all recorded on the runner's roster row. A runner built
+   *  before 52 sends none of them and simply has nulls on its row; a runner that sends them to a
+   *  gateway below 52 has them ignored, because unknown properties are ignored on every runner
+   *  frame. `name` is what the machine calls itself; the roster row's name wins nothing back from
+   *  it once a person has renamed the row, which is why the gateway records it only when it has
+   *  none of its own. */
+  name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  platform: Type.Optional(
+    Type.Object({
+      os: Type.String({ minLength: 1, maxLength: 40 }),
+      arch: Type.String({ minLength: 1, maxLength: 20 }),
+      release: Type.Optional(Type.String({ maxLength: 60 })),
+    }),
+  ),
+  agentVersion: Type.Optional(Type.String({ minLength: 1, maxLength: 40 })),
   inventory: Type.Optional(
     Type.Array(
       // Additive fields are ALLOWED here and on every other runner frame: a runner that starts
@@ -124,3 +140,13 @@ export type RunnerServerFrame =
   | { kind: "heartbeat"; sentAt: number }
   | { kind: "command"; command: "create_runtime"; payload: RunnerCreateRuntimePayload }
   | { kind: "command"; command: "delete_runtime"; payload: RunnerDeleteRuntimePayload };
+
+/** The flat string a roster row stores for a reported platform. One shape, decided once here, so
+ *  every reader sees the same value: `darwin/arm64` or `linux/x64/6.8.0`. */
+export function platformLabel(
+  platform: { os: string; arch: string; release?: string } | undefined,
+): string | undefined {
+  if (platform === undefined) return undefined;
+  const parts = [platform.os, platform.arch, ...(platform.release === undefined ? [] : [platform.release])];
+  return parts.join("/").slice(0, 120);
+}

@@ -2,7 +2,9 @@ import type { HermesBridgeConfig } from "../config.ts";
 import { DEFAULT_AUTH_PROVIDER, type HermesAuth } from "./client.ts";
 import { normalizeNames } from "./profile.ts";
 
-const DEFAULT_CHAT_SUGGESTION = "Hey, tell me about yourself!";
+/** Exported since capability 52: a gateway with no Hermes endpoint has no endpoint options to
+ *  read the suggestion from, and inventing a second default there would drift from this one. */
+export const DEFAULT_CHAT_SUGGESTION = "Hey, tell me about yourself!";
 
 export interface ParsedHermesOptions {
   url: string;

@@ -213,7 +213,7 @@ describe("hermes bridge options", () => {
       base,
       { COZYGATEWAY_HERMES_URL: "ws://new/api/ws" },
     );
-    expect(withBridge.hermesEndpoints[0]?.url).toBe("ws://new/api/ws");
+    expect(withBridge.hermesEndpoints?.[0]?.url).toBe("ws://new/api/ws");
   });
 });
 

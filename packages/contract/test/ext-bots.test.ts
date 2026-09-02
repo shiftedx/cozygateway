@@ -661,8 +661,12 @@ describe("capability advertisement", () => {
     // turn land in the existing interaction inbox and resolve through the existing routes, tool
     // events project as ephemeral `bot_tool_activity` carrying `room`, and a room advertises its
     // pending interactions. Additive: no new route, every new field optional, Hermes members
-    // unchanged.
-    expect(BOTS_CAPABILITY_VERSION).toBe(51);
+    // unchanged. 52 pairs the computers themselves: `POST /pair {kind: "runner"}` mints a
+    // per-runner token, `GET /runners`, `PATCH /runners/:id` and `DELETE /runners/:id` manage the
+    // roster, `/runner/v1` carries one socket per runner, and a gateway with no Hermes endpoint is
+    // a supported configuration whose readiness reports the bridge as absent. A client below 52
+    // never sends `kind` and never calls the routes.
+    expect(BOTS_CAPABILITY_VERSION).toBe(52);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

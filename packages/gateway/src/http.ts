@@ -14,6 +14,7 @@ import {
   ContractViolation,
   CreateThreadRequestSchema,
   PairRequestSchema,
+  RunnerPatchRequestSchema,
   PushRegisterRequestSchema,
   RenameThreadRequestSchema,
   SendMessageRequestSchema,
@@ -44,6 +45,12 @@ import { GatewaySettingsPersistenceError } from "./gateway-settings.ts";
 import { GatewayMaintenance, GatewayMaintenanceFailure } from "./gateway-maintenance.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { hashToken, mintDeviceToken } from "./auth.ts";
+import {
+  LEGACY_RUNNER_ID,
+  legacyRunnerRow,
+  runnerToWire,
+  type RunnerRoster,
+} from "./runner/roster.ts";
 import { BackendUnavailable } from "./errors.ts";
 import { HermesUnavailable } from "./hermes-bridge/client.ts";
 import { GatewayHarnessSettings, HarnessSettingsInvalid } from "./harness-settings.ts";
@@ -255,6 +262,24 @@ export interface AppDeps {
     | "unsupported"
   >;
   onDeviceRevoked: (deviceId: string) => void;
+  /** Capability 52. The paired runners. Absent leaves `POST /pair {kind: "runner"}` refusing and
+   *  the three `/runners` routes unregistered, which is the honest answer for a host that assembled
+   *  no roster rather than a route that answers about nothing. */
+  runners?: RunnerRoster;
+  /** Live socket state for the roster projection, from the runner lane. */
+  runnerPresence?: {
+    online: (runnerId: string) => boolean;
+    lastContactAt: (runnerId: string) => number | null;
+  };
+  /** Whether the legacy shared `COZYGATEWAY_RUNNER_TOKEN` is configured, which the roster shows as
+   *  one row so the list and the lane never disagree about who exists. */
+  legacyRunnerConfigured?: boolean;
+  /** Closes a revoked runner\'s socket. The row is gone, so the socket it authenticated must not
+   *  outlive it. */
+  onRunnerRevoked?: (runnerId: string) => void;
+  /** Capability 52. True when this gateway has no Hermes endpoint at all, which makes the bridge
+   *  `absent` on `/health` and `/ready` rather than an offline bridge to alarm on. */
+  hermesBridgeAbsent?: boolean;
   now: () => number;
 }
 
@@ -811,9 +836,14 @@ export function createApp(deps: AppDeps): Hono<Env> {
   // the hermes link's CURRENT liveness, not whatever was true when the process started.
   app.get("/health", (c) =>
     c.json({
+      // Capability 52: a gateway configured with no Hermes endpoint reports the bridge as ABSENT
+      // rather than as an offline bridge. There is nothing to restart or de-route on, and a
+      // configuration that could not exist before 52 is the only place this shape appears.
       ...(deps.bots === undefined
         ? deps.gatewayInfo
-        : { ...deps.gatewayInfo, bridges: { hermes: deps.bots.health() } }),
+        : deps.hermesBridgeAbsent === true
+          ? { ...deps.gatewayInfo, bridges: { hermes: "absent" } }
+          : { ...deps.gatewayInfo, bridges: { hermes: deps.bots.health() } }),
       ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }),
     }),
   );
@@ -830,6 +860,15 @@ export function createApp(deps: AppDeps): Hono<Env> {
   // network call to answer is itself a new way to go dark.
   app.get("/ready", (c) => {
     if (deps.bots === undefined) return c.json({ ready: true, ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }) });
+    // No Hermes endpoint configured at all: ready, with the bridge named absent. A CozyAgents-only
+    // gateway serves its roster from runtime bots, and alarming on a bridge nobody configured would
+    // de-route a gateway that is answering perfectly well.
+    if (deps.hermesBridgeAbsent === true)
+      return c.json({
+        ready: true,
+        bridges: { hermes: "absent" },
+        ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }),
+      });
     const bridges = { hermes: deps.bots.health() };
     const allOnline = Object.values(bridges).every((bridge) => bridge.online);
     return c.json({ ready: allOnline, bridges, ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }) }, allOnline ? 200 : 503);
@@ -859,8 +898,21 @@ export function createApp(deps: AppDeps): Hono<Env> {
         err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
+    // Capability 52. `deviceName` is required for a device pair and optional for a runner pair,
+    // enforced here rather than in the schema so no existing device client\'s request, response or
+    // error message changes shape.
+    const kind = pairRequest.kind ?? "device";
+    if (kind === "device" && pairRequest.deviceName === undefined) {
+      return c.json(errorBody("invalid_request", "deviceName is required"), 400);
+    }
+    if (kind === "runner" && deps.runners === undefined) {
+      return c.json(errorBody("invalid_request", "this gateway does not pair runners"), 400);
+    }
+    // The kind is checked as part of consuming the code, so a code minted for a runner and
+    // presented as a device (or the reverse) answers exactly the 401 an expired code answers, with
+    // no new detail to tell the two apart.
     if (
-      deps.storage.consumeSetupCode(pairRequest.setupCode, deps.now()) !== "ok"
+      deps.storage.consumeSetupCode(pairRequest.setupCode, deps.now(), kind) !== "ok"
     ) {
       return c.json(
         errorBody(
@@ -870,10 +922,20 @@ export function createApp(deps: AppDeps): Hono<Env> {
         401,
       );
     }
+    if (kind === "runner") {
+      const paired = deps.runners!.pair(
+        pairRequest.deviceName === undefined ? {} : { name: pairRequest.deviceName },
+      );
+      return c.json({
+        runnerToken: paired.token,
+        runner: runnerToWire(paired.runner, false),
+        gateway: deps.gatewayInfo,
+      });
+    }
     const { token, tokenHash } = mintDeviceToken();
     const device = {
       id: randomUUID(),
-      name: pairRequest.deviceName,
+      name: pairRequest.deviceName!,
       tokenHash,
       createdAt: deps.now(),
     };
@@ -891,6 +953,63 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   app.get("/devices", requireDevice, (c) => c.json(deps.storage.listDevices()));
+
+  // Capability 52. The paired computers that run bots, beside the paired phones and shaped like
+  // them, including the 404 an unknown id gets.
+  if (deps.runners !== undefined) {
+    const roster = deps.runners;
+    const online = (id: string) => deps.runnerPresence?.online(id) ?? false;
+    const seenAt = (id: string, stored: number | null) =>
+      deps.runnerPresence?.lastContactAt(id) ?? stored;
+    app.get("/runners", requireDevice, (c) =>
+      c.json({
+        runners: [
+          ...roster.list().map((row) =>
+            runnerToWire({ ...row, lastSeenAt: seenAt(row.id, row.lastSeenAt) }, online(row.id)),
+          ),
+          // The legacy shared credential is one row too, so a gateway carrying both kinds answers
+          // one list rather than hiding the runner an operator placed by hand.
+          ...(deps.legacyRunnerConfigured === true
+            ? [
+                runnerToWire(
+                  legacyRunnerRow({ lastSeenAt: seenAt(LEGACY_RUNNER_ID, null) }),
+                  online(LEGACY_RUNNER_ID),
+                ),
+              ]
+            : []),
+        ],
+      }),
+    );
+    app.patch("/runners/:id", requireDevice, async (c) => {
+      const id = c.req.param("id");
+      if (id === LEGACY_RUNNER_ID)
+        return c.json(
+          errorBody("invalid_request", "the legacy shared runner is placed by the operator and cannot be changed here"),
+          400,
+        );
+      const parsed = parseOr400(c, RunnerPatchRequestSchema, await readBody(c));
+      if (!parsed.ok) return parsed.response;
+      if (!parsed.value.default)
+        return c.json(
+          errorBody("invalid_request", "default is moved by naming the runner that should hold it"),
+          400,
+        );
+      const updated = roster.setDefault(id);
+      if (updated === undefined) return c.json(errorBody("not_found", "no such runner"), 404);
+      return c.json({ runner: runnerToWire({ ...updated, lastSeenAt: seenAt(updated.id, updated.lastSeenAt) }, online(updated.id)) });
+    });
+    app.delete("/runners/:id", requireDevice, (c) => {
+      const id = c.req.param("id");
+      if (id === LEGACY_RUNNER_ID)
+        return c.json(
+          errorBody("invalid_request", "the legacy shared runner is revoked by unsetting COZYGATEWAY_RUNNER_TOKEN"),
+          400,
+        );
+      if (!roster.remove(id)) return c.json(errorBody("not_found", "no such runner"), 404);
+      deps.onRunnerRevoked?.(id);
+      return c.json({ ok: true });
+    });
+  }
 
   if (deps.hermesGlobalSkills !== undefined) {
     const globalSkillError = (code: string, message: string) => ({ error: { code, message } });

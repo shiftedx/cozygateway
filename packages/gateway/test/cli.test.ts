@@ -106,6 +106,45 @@ describe("cozygateway pair", () => {
     storage.close();
   });
 
+  it("mints a runner-kind code with --kind runner, which no device pair can spend", async () => {
+    const { configPath, dbPath } = tempConfig();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(String(line));
+    });
+    const exitCode = await runCli(["pair", "--config", configPath, "--kind", "runner"]);
+    vi.restoreAllMocks();
+    expect(exitCode).toBe(0);
+
+    const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as {
+      setupCode: string;
+      kind?: string;
+    };
+    // The payload names the kind, so a scan cannot be answered by the wrong client.
+    expect(payload.kind).toBe("runner");
+    const storage = openStorage(dbPath);
+    expect(storage.consumeSetupCode(payload.setupCode, Date.now())).toBe("invalid");
+    expect(storage.consumeSetupCode(payload.setupCode, Date.now(), "runner")).toBe("ok");
+    storage.close();
+  });
+
+  it("keeps a device pair's payload byte-shaped as it always was", async () => {
+    const { configPath } = tempConfig();
+    const payload = await pairPayload(configPath);
+    expect(Object.keys(payload).sort()).toEqual(["gatewayUrl", "setupCode"]);
+  });
+
+  it("refuses a kind it does not know rather than minting the wrong credential", async () => {
+    const { configPath, dbPath } = tempConfig();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const exitCode = await runCli(["pair", "--config", configPath, "--kind", "phone"]);
+    vi.restoreAllMocks();
+    expect(exitCode).toBe(1);
+    const storage = openStorage(dbPath);
+    expect(storage.listDevices()).toEqual([]);
+    storage.close();
+  });
+
   it("honors --ttl for the App Review audience and keeps the code alive for days", async () => {
     const { configPath, dbPath } = tempConfig();
     const lines: string[] = [];
