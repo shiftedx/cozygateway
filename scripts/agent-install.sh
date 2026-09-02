@@ -1534,8 +1534,18 @@ stop_owned_windows_gateway() {
     }
     if (@(Managed-GatewayProcesses).Count -ne 0) { exit 45 }
     for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
-      $listener = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
-      if ($null -eq $listener) { exit 0 }
+      $probe = $null
+      $released = $false
+      try {
+        $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, [int]$env:COZYGATEWAY_EXPECTED_PORT)
+        $probe.Server.ExclusiveAddressUse = $true
+        $probe.Start()
+        $released = $true
+      } catch {
+      } finally {
+        if ($null -ne $probe) { $probe.Stop() }
+      }
+      if ($released) { exit 0 }
       Start-Sleep -Seconds 1
     }
     exit 42
