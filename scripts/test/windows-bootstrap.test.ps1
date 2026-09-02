@@ -1124,8 +1124,14 @@ $($gatewayStopFunctionMatch.Value)
 stop_owned_windows_gateway
 "@
         Write-Utf8NoBom $gatewayStopHarness $gatewayStopScript
-        $stopOutput = (& $bashPath $gatewayStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort 2>&1 | Out-String)
-        $stopExitCode = $LASTEXITCODE
+        $savedErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $stopOutput = (& $bashPath $gatewayStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort 2>&1 | Out-String)
+            $stopExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
         $stopDiagnostics = if ($stopExitCode -eq 0) { '' } else {
             Get-FixtureProcessDiagnostics $supervisorRoot @(
                 "node=$((& cygpath.exe -w $nodePosix).Trim())"
