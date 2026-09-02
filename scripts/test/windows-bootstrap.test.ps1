@@ -835,6 +835,8 @@ New-Item -ItemType Directory -Force -Path '$(Split-Path -Parent $missingHermes)'
 Copy-Item -LiteralPath '$preparedHermes' -Destination '$missingHermes' -Force
 Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHermes' -Force
 "@
+    # A machine with no Hermes at all is offered CozyAgents first, so -Harness hermes is what asks
+    # for the Hermes bootstrap this case is about.
     $missing = Invoke-Bootstrap $installer @{
         'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
         'LOCALAPPDATA' = $missingRoot
@@ -843,7 +845,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYGATEWAY_TEST_HERMES' = $missingHermes
         'COZYGATEWAY_HERMES_INSTALL_URL' = $officialInstaller
-    }
+    } @('-Harness', 'hermes')
     Assert-True ($missing.ExitCode -eq 0) "missing-Hermes bootstrap failed: $($missing.Output)"
     Assert-True ($missing.Output -match 'Hermes Agent is not installed') 'missing Hermes must invoke the official installer path'
     Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match [regex]::Escape("bash-hermes:$missingNativeHermes")) 'fresh-install handoff must expose native Hermes when it exists only under LOCALAPPDATA'

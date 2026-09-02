@@ -376,6 +376,72 @@ expect_contains "$(cat "$tmp/agents.log")" 'uninstall --home'
 expect_contains "$uninstall_output" 'removed the CozyAgents harness through its own uninstaller'
 test ! -e "$tmp/gw-loopback"
 
+# ---------------------------------------------------------------------------
+# 8. Windows: the native bootstrap owns the harness half
+# ---------------------------------------------------------------------------
+# On Windows scripts/install.ps1 asks the model and network questions, installs CozyAgents through
+# its own native one-liner, pairs the runner and prints the QR, and says so with
+# COZYGATEWAY_WINDOWS_HARNESS_OWNER=1. These cases run those branches outside PowerShell.
+#
+# Git Bash ships cygpath and the installer rightly refuses to guess without it, so the Windows
+# platform is driven here through the same stub the Hermes suite uses.
+cat > "$tmp/bin/cygpath" <<'CYGPATH'
+#!/usr/bin/env bash
+mode="$1"; shift
+path="$1"
+case "$mode" in
+  -u) path="${path//\\//}"; printf '%s' "${path#[A-Za-z]:}" ;;
+  -w) printf 'C:%s' "${path//\//\\}" ;;
+  *) printf '%s' "$path" ;;
+esac
+CYGPATH
+chmod 700 "$tmp/bin/cygpath"
+# `-p` is the only thing resolve_node asks; everything else runs the real node.
+fake_node="$repo_root/scripts/test/fake-node24.sh"
+windows_env=(
+  COZYGATEWAY_NODE="$fake_node"
+  COZYGATEWAY_TEST_REAL_NODE="$real_node"
+  COZYGATEWAY_SERVICE_PLATFORM=Windows
+  COZYAGENTS_INSTALL_URL="$tmp/agents.sh"
+  APPDATA="$tmp/win-appdata"
+)
+
+# Without the flag, Windows still has no CozyAgents harness that this script can install.
+if refused_output="$(HOME="$tmp/win-home" PATH="$tmp/bin:$PATH" env "${windows_env[@]}" bash "$installer" --dry-run --harness cozyagents --bundle "$tmp/gateway.mjs" --gateway-dir "$tmp/gw-windows-refused" 2>&1)"; then
+  echo 'Windows without the harness-owner flag must refuse the CozyAgents harness' >&2; exit 1
+fi
+expect_contains "$refused_output" 'on Windows the CozyAgents harness has its own one-liner: irm https://cozylabs.ai/agents.ps1 | iex'
+
+: > "$tmp/agents.log"
+owner_output="$(HOME="$tmp/win-home" PATH="$tmp/bin:$PATH" env "${windows_env[@]}" COZYGATEWAY_WINDOWS_HARNESS_OWNER=1 COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --dry-run --harness cozyagents --bundle "$tmp/gateway.mjs" --gateway-dir "$tmp/gw-windows" 2>&1)"
+expect_contains "$owner_output" 'harness: cozyagents (from --harness)'
+expect_contains "$owner_output" 'CozyAgents-only gateway config'
+expect_contains "$owner_output" 'install one CozyGateway Windows service'
+expect_contains "$owner_output" 'the Windows bootstrap installs and pairs the CozyAgents harness from here'
+# The model questions, the harness install and the pairing QR belong to the bootstrap, not here.
+expect_missing "$owner_output" 'ask for the model provider'
+expect_missing "$owner_output" 'install CozyAgents from'
+expect_missing "$owner_output" 'pairing code'
+test ! -s "$tmp/agents.log"
+
+# The uninstall gives the harness back to the bootstrap and takes only the gateway.
+windows_uninstall_dir="$tmp/gw-windows-uninstall"
+mkdir -p "$windows_uninstall_dir/local"
+cat > "$windows_uninstall_dir/local/install-state" <<STATE
+harness=cozyagents
+cozyagents_home=$tmp/win-home/.cozyagents
+STATE
+windows_uninstall_output="$(HOME="$tmp/win-home" PATH="$tmp/bin:$PATH" env "${windows_env[@]}" COZYGATEWAY_WINDOWS_HARNESS_OWNER=1 COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --dry-run --uninstall --gateway-dir "$windows_uninstall_dir" 2>&1)"
+expect_contains "$windows_uninstall_output" 'DRY   delete Scheduled Task CozyGateway and Startup entry'
+expect_contains "$windows_uninstall_output" 'the Windows bootstrap removes the CozyAgents harness through its own uninstaller'
+expect_contains "$windows_uninstall_output" 'removed only CozyGateway-owned state'
+test ! -s "$tmp/agents.log"
+
+if windows_uninstall_refused="$(HOME="$tmp/win-home" PATH="$tmp/bin:$PATH" env "${windows_env[@]}" bash "$installer" --dry-run --uninstall --gateway-dir "$windows_uninstall_dir" 2>&1)"; then
+  echo 'a Windows CozyAgents uninstall without the harness-owner flag must refuse' >&2; exit 1
+fi
+expect_contains "$windows_uninstall_refused" 'the CozyAgents harness is not installed by this script on Windows'
+
 # The bootstrap refuses root before it fetches anything. Running as root is not something this
 # suite can do, so the check is asserted where it is: ahead of the first curl.
 grep -Fq 'never needs sudo' "$repo_root/scripts/install.sh"
