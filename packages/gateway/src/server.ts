@@ -47,6 +47,8 @@ import {
 } from "./adapters/attach/adapter.ts";
 import { revokeAttachTokens } from "./adapters/attach/token-auth.ts";
 import { createApp } from "./http.ts";
+import { listenerOrigin } from "./configure.ts";
+import { primaryLanAddress } from "./lan.ts";
 import { RunnerLane } from "./runner/lane.ts";
 import { RunnerRoster } from "./runner/roster.ts";
 import { RuntimeBotService, mergeRuntimeBots, runtimeSpecDefaults } from "./runner/runtime-bots.ts";
@@ -891,10 +893,26 @@ export async function startGateway(
       lastContactAt: (runnerId) => runnerLane.lastContactAt(runnerId),
     },
     legacyRunnerConfigured,
+    // The LISTENING port, not the configured one: a host that asked for port 0 (every test, and a
+    // supervisor that hands out ports) would otherwise mint codes naming a port nothing serves.
+    pairingUrl: () => pairingOrigin(),
     onRunnerRevoked: (runnerId) => { runnerLane.disconnectRunner(runnerId); },
     hermesBridgeAbsent: endpoints.length === 0,
     now: () => Date.now(),
   });
+
+  // Filled in once the listener is bound, below. Read only from inside a request handler, which
+  // cannot run before then.
+  let boundPort = config.port;
+  const pairingOrigin = (): string => {
+    if (config.publicUrl !== undefined) return config.publicUrl;
+    const host = config.host;
+    const advertised =
+      host !== undefined && host !== "0.0.0.0" && host !== "::"
+        ? host
+        : primaryLanAddress() ?? "127.0.0.1";
+    return listenerOrigin(advertised, boundPort, scheme);
+  };
 
   const server = await new Promise<Server>((resolve) => {
     // The TLS branch swaps only the factory and its options; the fetch handler, the port, the
@@ -956,6 +974,7 @@ export async function startGateway(
     address !== null && typeof address === "object"
       ? address.port
       : config.port;
+  boundPort = port;
 
   return {
     url: `${scheme}://${config.host ?? "127.0.0.1"}:${port}`,

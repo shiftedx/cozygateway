@@ -270,3 +270,134 @@ describe("the account default", () => {
     expect(h.roster.defaultRunner()?.id).toBe("second");
   });
 });
+
+describe("GET /runners/self", () => {
+  it("answers that one runner's row under the runner's own bearer", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" });
+    h.roster.observe(paired.runner.id, { platform: "darwin/arm64/24.5.0", version: "0.1.0" });
+    h.roster.touch(paired.runner.id, NOW + 3_000);
+
+    const response = await h.app.request("/runners/self", {
+      headers: { authorization: `Bearer ${paired.token}` },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    // Exactly the six fields the installer reads: no token, no backends, no other runner.
+    expect(Object.keys(body).sort()).toEqual([
+      "attached", "default", "id", "lastSeenAt", "name", "platform",
+    ]);
+    expect(body).toEqual({
+      id: paired.runner.id,
+      name: "kyle-mbp",
+      platform: "darwin/arm64/24.5.0",
+      default: true,
+      lastSeenAt: NOW + 3_000,
+      attached: false,
+    });
+  });
+
+  it("separates existing from attached, which is the whole point of the health check", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "box" });
+    const self = async () =>
+      (await (
+        await h.app.request("/runners/self", { headers: { authorization: `Bearer ${paired.token}` } })
+      ).json()) as { attached: boolean };
+    // Paired, service not yet dialed in: the row exists and the answer says so honestly.
+    expect((await self()).attached).toBe(false);
+    h.online.add(paired.runner.id);
+    expect((await self()).attached).toBe(true);
+  });
+
+  it("refuses a device token, an unknown token, and a revoked one", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "gone" });
+    expect((await h.app.request("/runners/self")).status).toBe(401);
+    expect((await h.app.request("/runners/self", { headers: { authorization: "Bearer nonsense" } })).status).toBe(401);
+    // A device token opens the roster but not this route: the two credentials are not interchangeable.
+    expect((await h.authed("/runners/self")).status).toBe(401);
+    expect((await h.app.request("/runners/self", { headers: { authorization: `Bearer ${paired.token}` } })).status).toBe(200);
+    h.roster.remove(paired.runner.id);
+    expect((await h.app.request("/runners/self", { headers: { authorization: `Bearer ${paired.token}` } })).status).toBe(401);
+  });
+
+  it("opens nothing else with a runner token", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "box" });
+    const asRunner = (path: string, init?: RequestInit) =>
+      h.app.request(path, { ...init, headers: { authorization: `Bearer ${paired.token}` } });
+    expect((await asRunner("/runners")).status).toBe(401);
+    expect((await asRunner("/devices")).status).toBe(401);
+    expect((await asRunner("/runners/pair-code", { method: "POST" })).status).toBe(401);
+    expect((await asRunner(`/runners/${paired.runner.id}`, { method: "DELETE" })).status).toBe(401);
+  });
+});
+
+describe("POST /runners/pair-code", () => {
+  it("mints a runner code no device pair can spend, with the TTL and the origin to dial", async () => {
+    const h = await harness();
+    const response = await h.authed("/runners/pair-code", { method: "POST" });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { setupCode: string; expiresAt: number; gatewayUrl: string };
+    expect(Object.keys(body).sort()).toEqual(["expiresAt", "gatewayUrl", "setupCode"]);
+    expect(body.setupCode).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    expect(body.expiresAt).toBe(NOW + SETUP_CODE_TTL_MS);
+    expect(body.gatewayUrl).toMatch(/^https?:\/\//);
+
+    // It is a RUNNER code: a device pair cannot spend it, and a runner pair can.
+    expect(h.storage.consumeSetupCode(body.setupCode, NOW)).toBe("invalid");
+    expect(h.storage.consumeSetupCode(body.setupCode, NOW, "runner")).toBe("ok");
+  });
+
+  it("expires with the same 10 minute TTL a CLI-minted code has", async () => {
+    const h = await harness();
+    const body = (await (await h.authed("/runners/pair-code", { method: "POST" })).json()) as {
+      setupCode: string;
+      expiresAt: number;
+    };
+    expect(h.storage.consumeSetupCode(body.setupCode, body.expiresAt + 1, "runner")).toBe("invalid");
+  });
+
+  it("requires a device token", async () => {
+    const h = await harness();
+    expect((await h.app.request("/runners/pair-code", { method: "POST" })).status).toBe(401);
+  });
+
+  it("spends the same gateway-wide bucket the unauthenticated pairing route spends", async () => {
+    const h = await harness();
+    // The harness already paired a phone through `/pair`, which spent one of the ten.
+    for (let attempt = 0; attempt < 9; attempt++) {
+      expect((await h.authed("/runners/pair-code", { method: "POST" })).status).toBe(200);
+    }
+    const throttled = await h.authed("/runners/pair-code", { method: "POST" });
+    expect(throttled.status).toBe(429);
+    expect(throttled.headers.get("retry-after")).not.toBeNull();
+    // The bucket is one bucket: /pair is throttled by the same exhaustion.
+    const pairing = await h.app.request("/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setupCode: "WRONG-CODE", deviceName: "phone" }),
+    });
+    expect(pairing.status).toBe(429);
+  });
+
+  it("pairs a runner end to end with the code it minted", async () => {
+    const h = await harness();
+    const minted = (await (await h.authed("/runners/pair-code", { method: "POST" })).json()) as {
+      setupCode: string;
+    };
+    const paired = await h.app.request("/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setupCode: minted.setupCode, deviceName: "kyle-mbp", kind: "runner" }),
+    });
+    expect(paired.status).toBe(200);
+    const body = (await paired.json()) as { runnerToken: string; runner: { id: string } };
+    const self = await h.app.request("/runners/self", {
+      headers: { authorization: `Bearer ${body.runnerToken}` },
+    });
+    expect(self.status).toBe(200);
+    expect((await self.json()) as { id: string }).toMatchObject({ id: body.runner.id, name: "kyle-mbp" });
+  });
+});

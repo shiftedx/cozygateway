@@ -96,6 +96,38 @@ describe("a gateway configured with no Hermes endpoint", () => {
     expect(runtime.stage).toBe("waiting_for_runner");
   });
 
+  it("mints a runner code from the app that names the port it is actually listening on", async () => {
+    const l = await live();
+    const minted = await l.authed("/runners/pair-code", { method: "POST" });
+    expect(minted.status).toBe(200);
+    const code = (await minted.json()) as { setupCode: string; expiresAt: number; gatewayUrl: string };
+    // Port 0 was requested, so a `gatewayUrl` built from the CONFIG would name a port nothing serves.
+    expect(new URL(code.gatewayUrl).port).toBe(String(l.gateway.port));
+    expect(code.expiresAt).toBeGreaterThan(Date.now());
+
+    const paired = await fetch(`${l.gateway.url}/pair`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setupCode: code.setupCode, deviceName: "kyle-mbp", kind: "runner" }),
+    });
+    expect(paired.status).toBe(200);
+    const body = (await paired.json()) as { runnerToken: string; runner: { id: string } };
+
+    // The installer's health check, over the real route: paired but not yet attached.
+    const self = await fetch(`${l.gateway.url}/runners/self`, {
+      headers: { authorization: `Bearer ${body.runnerToken}` },
+    });
+    expect(self.status).toBe(200);
+    expect(await self.json()).toEqual({
+      id: body.runner.id,
+      name: "kyle-mbp",
+      platform: null,
+      default: true,
+      lastSeenAt: null,
+      attached: false,
+    });
+  });
+
   it("pairs a runner and hands it the work that was waiting, with no shared token anywhere", async () => {
     expect(process.env["COZYGATEWAY_RUNNER_TOKEN"]).toBeUndefined();
     const l = await live();
@@ -139,6 +171,15 @@ describe("a gateway configured with no Hermes endpoint", () => {
     await until(() => frames.some((frame) => frame.command === "create_runtime"));
     expect(frames.find((frame) => frame.command === "create_runtime")?.payload?.botId).toBe("sage");
 
+    const self = (await (
+      await fetch(`${l.gateway.url}/runners/self`, {
+        headers: { authorization: `Bearer ${paired.runnerToken}` },
+      })
+    ).json()) as { attached: boolean; platform: string | null; lastSeenAt: number | null };
+    expect(self.attached).toBe(true);
+    expect(self.platform).toBe("darwin/arm64/24.5.0");
+    expect(self.lastSeenAt).not.toBeNull();
+
     const roster = (await (await l.authed("/runners")).json()) as {
       runners: Array<{ id: string; name: string; platform: string | null; version: string | null; online: boolean; default: boolean; lastSeenAt: number | null }>;
     };
@@ -168,6 +209,10 @@ describe("a gateway configured with no Hermes endpoint", () => {
     await until(() => closed.code !== undefined);
     expect(closed.code).toBe(1008);
     expect(((await (await l.authed("/runners")).json()) as { runners: unknown[] }).runners).toEqual([]);
+    const afterRevoke = await fetch(`${l.gateway.url}/runners/self`, {
+      headers: { authorization: `Bearer ${paired.runnerToken}` },
+    });
+    expect(afterRevoke.status).toBe(401);
   });
 });
 

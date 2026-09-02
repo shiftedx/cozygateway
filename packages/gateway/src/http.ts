@@ -44,7 +44,10 @@ import type { GatewayConfig } from "./config.ts";
 import { GatewaySettingsPersistenceError } from "./gateway-settings.ts";
 import { GatewayMaintenance, GatewayMaintenanceFailure } from "./gateway-maintenance.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
-import { hashToken, mintDeviceToken } from "./auth.ts";
+import { SETUP_CODE_TTL_MS, hashToken, mintDeviceToken, newSetupCode } from "./auth.ts";
+import { listenerOrigin } from "./configure.ts";
+import { primaryLanAddress } from "./lan.ts";
+import { gatewayScheme } from "./tls.ts";
 import {
   LEGACY_RUNNER_ID,
   legacyRunnerRow,
@@ -159,6 +162,20 @@ const LiveActivityRegisterRequestSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
+/** Where a phone or an installer should dial this gateway, from configuration alone. A public
+ *  origin wins; otherwise a wildcard listener advertises the LAN address rather than loopback,
+ *  because the machine that will use a runner code is usually not this one. Mirrors the rule
+ *  `cozygateway pair` prints, so one code means one URL wherever it was minted. */
+function configuredOrigin(config: GatewayConfig): string {
+  if (config.publicUrl !== undefined) return config.publicUrl;
+  const host = config.host;
+  const advertised =
+    host !== undefined && host !== "0.0.0.0" && host !== "::"
+      ? host
+      : primaryLanAddress() ?? "127.0.0.1";
+  return listenerOrigin(advertised, config.port, gatewayScheme(config));
+}
 
 export interface AppDeps {
   storage: Storage;
@@ -277,6 +294,10 @@ export interface AppDeps {
   /** Closes a revoked runner\'s socket. The row is gone, so the socket it authenticated must not
    *  outlive it. */
   onRunnerRevoked?: (runnerId: string) => void;
+  /** The origin a freshly minted pairing code should be dialed at, which is the LISTENING port
+   *  rather than the configured one when the host bound port 0. Absent falls back to the config,
+   *  which is what a host that assembled its own app without a listener can honestly say. */
+  pairingUrl?: () => string;
   /** Capability 52. True when this gateway has no Hermes endpoint at all, which makes the bridge
    *  `absent` on `/health` and `/ready` rather than an offline bridge to alarm on. */
   hermesBridgeAbsent?: boolean;
@@ -980,6 +1001,41 @@ export function createApp(deps: AppDeps): Hono<Env> {
         ],
       }),
     );
+    // Authenticated by the runner\'s OWN token and nothing else. It is the only route a runner
+    // credential opens: no chat, no device list, no bot creation, and no other runner\'s row.
+    app.get("/runners/self", (c) => {
+      const row = roster.resolve(c.req.header("authorization"));
+      if (row === undefined)
+        return c.json(errorBody("unauthorized", "missing or unknown runner token"), 401);
+      const attached = online(row.id);
+      return c.json({
+        id: row.id,
+        name: row.name,
+        platform: row.platform,
+        default: row.isDefault,
+        lastSeenAt: seenAt(row.id, row.lastSeenAt),
+        // What the INSTALLER polls: the row exists (it just paired) long before the service it
+        // registered has dialed in, so "am I attached" is a different question from "do I exist".
+        attached,
+      });
+    });
+    // Minting a runner code from the app, with the same 10 minute TTL and the same gateway-wide
+    // bucket the unauthenticated pairing route spends: a code is a credential in waiting, and it is
+    // bounded here for the same reason it is bounded there.
+    app.post("/runners/pair-code", requireDevice, (c) => {
+      const retryAfter = pairingAdmission.attempt();
+      if (retryAfter !== undefined) {
+        return c.json(
+          errorBody("invalid_request", "too many pairing attempts; try again later"),
+          429,
+          { "retry-after": String(retryAfter) },
+        );
+      }
+      const setupCode = newSetupCode();
+      const expiresAt = deps.now() + SETUP_CODE_TTL_MS;
+      deps.storage.createSetupCode(setupCode, expiresAt, "runner");
+      return c.json({ setupCode, expiresAt, gatewayUrl: deps.pairingUrl?.() ?? configuredOrigin(deps.config) });
+    });
     app.patch("/runners/:id", requireDevice, async (c) => {
       const id = c.req.param("id");
       if (id === LEGACY_RUNNER_ID)
