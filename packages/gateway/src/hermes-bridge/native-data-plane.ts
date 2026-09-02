@@ -50,6 +50,7 @@ import type {
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import { ConfigNotNegotiated, type ConfigSurface } from "./bot-config.ts";
+import { HistoryNotNegotiated, type HistorySurface } from "./bot-history.ts";
 import { BotNameTaken, BotNotFound } from "./crud.ts";
 import {
   BotSessionConflict,
@@ -92,6 +93,11 @@ export interface NativeBotDataPlaneOptions {
    * routines over it, so those surfaces route here instead of refusing. Absent means no gateway on
    * this deployment negotiated the lane and every config surface keeps its 409. */
   botConfig?: ConfigSurface;
+  /** Capability 50. The attach-v1 bot-history lane. A runtime bot checkpoints its own workspace
+   * and serves the Changes/Undo/Try surface over it. Absent means this deployment serves no
+   * history at all and `historySurface()` answers `undefined`, so the routes are never registered
+   * and a client probing them sees a `404` rather than a lie. */
+  botHistory?: HistorySurface;
   /** Optional opener offered only while a Bot Chat transcript is empty. */
   chatSuggestion: string;
   broadcast: (frame: ServerFrame) => void;
@@ -241,6 +247,7 @@ export class NativeBotDataPlane {
   readonly #runtimeBots: Map<string, NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number]>;
   readonly #runtimeLifecycle: RuntimeBotLifecycle | undefined;
   readonly #botConfig: ConfigSurface | undefined;
+  readonly #botHistory: HistorySurface | undefined;
   readonly #chatSuggestion: string;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #onChatMessage: NativeBotDataPlaneOptions["onChatMessage"];
@@ -297,6 +304,7 @@ export class NativeBotDataPlane {
     );
     this.#runtimeLifecycle = opts.runtimeLifecycle;
     this.#botConfig = opts.botConfig;
+    this.#botHistory = opts.botHistory;
     this.#chatSuggestion = opts.chatSuggestion;
     this.#broadcast = opts.broadcast;
     this.#onChatMessage = opts.onChatMessage;
@@ -540,6 +548,44 @@ export class NativeBotDataPlane {
     if (this.#runtimeLifecycle?.hasRuntime(bot) !== true)
       throw new UnsupportedForRuntime(bot, "botRuntime", "cozyagents");
     return this.#runtimeLifecycle.projection(bot);
+  }
+
+  /** Capability 50's history surface, with the ONE rule those routes owe a client wrapped around
+   * it: history is a runtime-bot fact. A Hermes bot has no checkpointed workspace behind it -- the
+   * Dashboard stores no repository and never did -- so it gets the same `409
+   * unsupported_for_runtime` every other wrong-kind surface answers, never a `404` that would say
+   * the bot is gone and never a `503` that would offer a retry.
+   *
+   * A peer that never negotiated `bot_history` lands on that same 409 by way of
+   * `HistoryNotNegotiated`, and for the same reason the config lane does: the section is genuinely
+   * absent rather than temporarily unreachable. An offline peer is different and keeps its `503`,
+   * because it really will answer once it reconnects.
+   *
+   * Returns `undefined` when no lane is wired at all, so the caller registers no routes rather
+   * than registering five that can only fail. */
+  historySurface(): HistorySurface | undefined {
+    const lane = this.#botHistory;
+    if (lane === undefined) return undefined;
+    const guard = <T>(name: string, feature: string, call: (bot: string) => Promise<T>): Promise<T> => {
+      const bot = normalize(name);
+      const runtimeBot = this.#runtimeBots.get(bot);
+      if (runtimeBot === undefined)
+        return Promise.reject(new UnsupportedForRuntime(bot, feature, "hermes"));
+      return call(bot).catch((error: unknown) => {
+        throw error instanceof HistoryNotNegotiated
+          ? new UnsupportedForRuntime(bot, feature, runtimeBot.runtime)
+          : error;
+      });
+    };
+    return {
+      list: (name, query) => guard(name, "botHistory", (bot) => lane.list(bot, query)),
+      diff: (name, from, to) => guard(name, "botHistoryDiff", (bot) => lane.diff(bot, from, to)),
+      restore: (name, checkpoint) => guard(name, "botHistoryRestore", (bot) => lane.restore(bot, checkpoint)),
+      tryStart: (name, label) => guard(name, "botHistoryTry", (bot) => lane.tryStart(bot, label)),
+      tryKeep: (name) => guard(name, "botHistoryTry", (bot) => lane.tryKeep(bot)),
+      tryDiscard: (name) => guard(name, "botHistoryTry", (bot) => lane.tryDiscard(bot)),
+      resolve: (name, choices) => guard(name, "botHistoryResolve", (bot) => lane.resolve(bot, choices)),
+    };
   }
 
   /** Every runtime bot this gateway serves right now, config-declared and gateway-created alike.

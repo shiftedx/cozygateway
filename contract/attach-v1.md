@@ -212,6 +212,46 @@ exactly like a bot with no config lane at all, which is the true answer: those r
 temporarily unreachable. Deletion, model-provider setup, and desktop-session transcripts stay on
 that 409 for every runtime bot: none of the three has a peer-side equivalent.
 
+## Bot history lane
+
+`history_request` / `history_result` is the bot-config lane's shape again, negotiated separately as
+`bot_history`, and it is likewise never a durable command, event, push, transcript, or Gateway
+database row. It exists for a bot served by a non-Hermes runtime (capability 45) that checkpoints
+its own workspace into git: the peer owns the repository, and the gateway stores no copy of a
+checkpoint, a diff, or a working tree.
+
+The seven operations are `list`, `diff`, `restore`, `try.start`, `try.keep`, `try.discard` and
+`resolve`. Their inputs are `{since?, limit?}`, `{from, to?}`, `{checkpoint}`, `{label}`, `{}`,
+`{}`, and `{choices: [{path, pick}]}`. Every result is a PUBLISHED `com.cozylabs.bots` schema, for
+the same reason the config lane's are: `BotHistoryListResponse`, `BotHistoryDiffResponse`,
+`BotHistoryRestoreResponse`, `BotHistoryTryStartResponse`, `BotHistoryTryKeepResponse`,
+`BotHistoryTryDiscardResponse`, and `BotHistoryResolveResponse`. `try.keep` and `try.discard` name
+no experiment because there is at most one in flight per bot and the peer owns which; a client that
+had to name it would be a second place the answer is stored.
+
+**Nothing content-shaped crosses this lane.** A `diff` answers with per-file line COUNTS and never
+a patch, a checkpoint answers with a one-line summary and never a file, and a conflict answers with
+one bounded label per side and never the two versions themselves. That is a boundary rule, not a
+size limit.
+
+`status` is `ok`, `conflict`, `not_found`, `invalid_request`, or `unavailable`. That is one more
+than the config lane, because keeping an experiment has a fifth answer that is neither success nor
+failure: `conflict` means the work is intact and a PERSON has to choose per file. It carries its
+`BotHistoryTryKeepResponse` body exactly as an `ok` would, with `merged: false` and the `conflicts`
+array populated, because that body IS the question being asked; a `conflict` that names no files is
+refused, since a per-file choice with no files is a dialog with no buttons. `ok` with a body that
+does not match the operation is refused rather than cast.
+
+A disconnected peer fails immediately, and a timed-out request is not retained for reconnect. That
+rule matters more here than it did for config: a `restore` that landed minutes after the person
+gave up on it would silently throw away everything they did in between. The lane spends the same
+bounded per-bot budget, so a Changes pane in a loop is stopped at the gateway rather than at the
+peer.
+
+A peer that is attached but never negotiated `bot_history` is NOT reported as unavailable. Those
+five routes answer `409 unsupported_for_runtime`, exactly as a Hermes bot's do, because the section
+is absent rather than temporarily unreachable.
+
 This contract deliberately shipped with no thinking/reasoning/chain-of-thought event. The
 `thinking` capability is a CONSCIOUS, bounded reopening of that rule (approved 2026-08):
 reasoning models deliver their visible reply in one end burst, leaving the whole turn a generic

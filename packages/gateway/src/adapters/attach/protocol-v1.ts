@@ -8,6 +8,9 @@ import {
   BotProfileSchema, BotProfilePatchSchema, BotProfileConfigureResponseSchema,
   BotModelConfigSchema, BotModelConfigPatchSchema,
   BotRoutineListResponseSchema, BotRoutineCreateRequestSchema, BotRoutinePatchSchema, BotRoutineWriteResponseSchema,
+  BotHistoryListResponseSchema, BotHistoryDiffResponseSchema, BotHistoryRestoreResponseSchema,
+  BotHistoryTryStartResponseSchema, BotHistoryTryKeepResponseSchema, BotHistoryTryDiscardResponseSchema,
+  BotHistoryResolveResponseSchema, BotHistoryResolveChoiceSchema,
 } from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
@@ -37,6 +40,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("desktop_session_sync"),
   Type.Literal("cozyapps"),
   Type.Literal("bot_config"),
+  Type.Literal("bot_history"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -201,6 +205,51 @@ export type AttachV1ConfigRequest = Static<typeof AttachV1ConfigRequestSchema>;
 /** The answer to an operation that stores no body. `ok: false` is not a refusal channel: a peer
  * that could not do the work answers with a non-`ok` STATUS so the reason reaches the operator. */
 export const AttachV1ConfigAckSchema = Type.Object({ ok: Type.Boolean() }, { additionalProperties: false });
+
+/** The bot-history lane, cloned from the bot-config lane above. A runtime bot checkpoints its own
+ * workspace into git (capability 50); the gateway holds no repository and no checkpoint row, so
+ * the same bounded live request/reply shape carries the reads and the four state-changing acts the
+ * layman history surface needs.
+ *
+ * NOTHING CONTENT-SHAPED crosses this lane, in either direction. A `diff` answers with per-file
+ * line COUNTS and never a patch, a checkpoint answers with a one-line summary and never a file,
+ * and a conflict answers with one bounded label per side and never the two versions themselves.
+ * That is the boundary rule, not a size limit: the workspace is where a change lives, and this
+ * lane exists to let a person choose between changes without the changes being copied to a phone.
+ *
+ * Every result is a PUBLISHED `com.cozylabs.bots` schema, for the same reason the config lane's
+ * are: the peer implements exactly the shapes its REST clients read, so the two cannot drift. */
+const HistoryRequestFrame = <const O extends string, I extends TSchema>(operation: O, input: I) =>
+  Type.Object({
+    kind: Type.Literal("history_request"), requestId: Id,
+    operation: Type.Literal(operation), input,
+  }, { additionalProperties: false });
+/** A checkpoint id as the peer minted it. Opaque on this wire: a client never parses one, and the
+ * gateway never infers a commit, a ref, or a path from it. */
+const CheckpointId = Type.String({ minLength: 1, maxLength: 128 });
+export const AttachV1HistoryRequestSchema = Type.Union([
+  HistoryRequestFrame("list", Type.Object({
+    since: Type.Optional(Type.Integer({ minimum: 0 })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  }, { additionalProperties: false })),
+  /** `to` absent means "against the working version", which is the comparison the Changes list
+   *  actually asks for; naming both ends is the power-user case and stays available. */
+  HistoryRequestFrame("diff", Type.Object({
+    from: CheckpointId, to: Type.Optional(CheckpointId),
+  }, { additionalProperties: false })),
+  HistoryRequestFrame("restore", Type.Object({ checkpoint: CheckpointId }, { additionalProperties: false })),
+  HistoryRequestFrame("try.start", Type.Object({
+    label: Type.String({ minLength: 1, maxLength: 200 }),
+  }, { additionalProperties: false })),
+  /** Keep and discard name no experiment: there is at most one in flight per bot and the peer owns
+   *  which. A client that had to name it would be a second place the answer is stored. */
+  HistoryRequestFrame("try.keep", NoInput),
+  HistoryRequestFrame("try.discard", NoInput),
+  HistoryRequestFrame("resolve", Type.Object({
+    choices: Type.Array(BotHistoryResolveChoiceSchema, { minItems: 1, maxItems: 200 }),
+  }, { additionalProperties: false })),
+]);
+export type AttachV1HistoryRequest = Static<typeof AttachV1HistoryRequestSchema>;
 /** Gateway-observed truth about ONE scheduled delivery occurrence, sent back to the plugin that
  * produced it so its own spool stops guessing. `displayed` means a paired device reported the row
  * on screen; `failed` means the occurrence is terminal in the gateway and will never be projected,
@@ -426,6 +475,25 @@ export const AttachV1ConfigResultSchema = Type.Object({
   message: Type.Optional(Type.String({ maxLength: 512 })),
 }, { additionalProperties: false });
 export type AttachV1ConfigResult = Static<typeof AttachV1ConfigResultSchema>;
+/** The bot-history lane's reply. Five statuses, one more than the config lane, because keeping an
+ * experiment has a fifth answer that is neither success nor failure: `conflict` means the work is
+ * intact and a PERSON has to choose per file. It carries its `BotHistoryTryKeepResponse` body
+ * exactly as an `ok` would, because that body IS the question being asked, and collapsing it into
+ * `unavailable` would tell someone their experiment broke when nothing broke at all. */
+export const AttachV1HistoryResultSchema = Type.Object({
+  kind: Type.Literal("history_result"), requestId: Id,
+  status: Type.Union([
+    Type.Literal("ok"), Type.Literal("conflict"), Type.Literal("not_found"),
+    Type.Literal("invalid_request"), Type.Literal("unavailable"),
+  ]),
+  result: Type.Optional(Type.Union([
+    BotHistoryListResponseSchema, BotHistoryDiffResponseSchema, BotHistoryRestoreResponseSchema,
+    BotHistoryTryStartResponseSchema, BotHistoryTryKeepResponseSchema,
+    BotHistoryTryDiscardResponseSchema, BotHistoryResolveResponseSchema,
+  ])),
+  message: Type.Optional(Type.String({ maxLength: 512 })),
+}, { additionalProperties: false });
+export type AttachV1HistoryResult = Static<typeof AttachV1HistoryResultSchema>;
 const AttachV1MobileStatusRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
@@ -538,7 +606,8 @@ export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1MobileCancelSchema,
   AttachV1MemoryResultSchema,
   AttachV1ConfigResultSchema,
+  AttachV1HistoryResultSchema,
 ]);
 export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
-export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema, AttachV1ConfigRequestSchema]);
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema, AttachV1ConfigRequestSchema, AttachV1HistoryRequestSchema]);
 export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;
