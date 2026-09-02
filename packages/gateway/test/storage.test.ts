@@ -440,6 +440,55 @@ describe("routine override metadata", () => {
   });
 });
 
+describe("capability 54 runner placement migration", () => {
+  it("adds the runner column to a pre-54 database, reads its rows back, and reopens cleanly", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-runner-placement-migration-"));
+    const path = join(directory, "gateway.sqlite");
+    // The two tables exactly as a pre-54 gateway left them: no runner column anywhere.
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`CREATE TABLE runtime_bots (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, avatar TEXT, token TEXT NOT NULL UNIQUE,
+      runtime TEXT NOT NULL CHECK (runtime IN ('cozyagents')),
+      spec_generation INTEGER NOT NULL CHECK (spec_generation >= 1),
+      created_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE runner_operations (
+      operation_id TEXT PRIMARY KEY, bot TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('create_runtime', 'delete_runtime')),
+      spec_generation INTEGER NOT NULL CHECK (spec_generation >= 1),
+      payload_json TEXT NOT NULL, stage TEXT NOT NULL, code TEXT,
+      observed_generation INTEGER, last_contact_at INTEGER,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, sent_at INTEGER
+    ) STRICT;
+    INSERT INTO runtime_bots VALUES ('sage','Sage',NULL,'token-sage','cozyagents',1,5);
+    INSERT INTO runner_operations VALUES ('op_1','sage','create_runtime',1,'{}','waiting_for_runner',NULL,NULL,NULL,5,5,NULL);`);
+    legacy.close();
+
+    const storage = openStorage(path);
+    // Every byte the row had, plus a runner nobody named. Backfilling one would be a guess: the
+    // gateway never recorded which computer this bot was on, because it only had the one.
+    expect(storage.runtimeBot("sage")).toMatchObject({ id: "sage", name: "Sage", runnerId: null });
+    const unsent = storage.unsentRunnerOperations();
+    expect(unsent).toHaveLength(1);
+    expect(unsent[0]).toMatchObject({ operationId: "op_1", runnerId: null });
+    // The unaddressed row is exactly what a named runner's queue does NOT take.
+    expect(storage.unsentRunnerOperations({ runnerId: "runner-1" })).toEqual([]);
+    expect(storage.unsentRunnerOperations({ runnerId: "runner-1", includeUnassigned: true })).toHaveLength(1);
+    storage.close();
+
+    // Idempotent on restart, which is what a container that comes back up does every time.
+    const reopened = openStorage(path);
+    expect(reopened.runtimeBot("sage")?.runnerId).toBeNull();
+    reopened.insertRuntimeBot({
+      id: "luna", name: "Luna", avatar: null, token: "token-luna",
+      runtime: "cozyagents", specGeneration: 1, createdAt: 6, runnerId: "runner-1",
+    });
+    expect(reopened.countRuntimeBotsForRunner("runner-1")).toBe(1);
+    reopened.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
+
 describe("capability 47 auditable-id migration", () => {
   it("adds the provenance columns to a pre-47 database and still reads its rows back", () => {
     const directory = mkdtempSync(join(tmpdir(), "cozygateway-auditable-ids-migration-"));
