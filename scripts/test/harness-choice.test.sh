@@ -333,23 +333,30 @@ expect_contains "$legacy_output" 'harness: hermes (already installed here)'
 expect_missing "$legacy_output" 'Which harness runs your bots?'
 expect_missing "$legacy_output" 'CozyAgents'
 grep -Fq 'hermesEndpoints' "$legacy_dir/local/cozygateway.config.json"
+# And `--status` calls it what it is, with no runner row to report.
+legacy_status="$(HOME="$tmp/legacy-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" bash "$installer" --status --gateway-dir "$legacy_dir" 2>&1 || true)"
+expect_contains "$legacy_status" 'harness: Hermes Agent'
+expect_missing "$legacy_status" 'runner'
 
 # A config with a Hermes bridge and no state file at all is not evidence that anybody chose
-# CozyAgents. The default taken with no terminal keeps the bridge and says so.
+# CozyAgents. A run that finds one is a Hermes install end to end: it keeps the bridge, says so,
+# and installs, pairs and configures nothing CozyAgents owns.
 orphan_dir="$tmp/gw-orphan"
 mkdir -p "$orphan_dir/local"
 sed "s|$legacy_dir|$orphan_dir|g" "$legacy_dir/local/cozygateway.config.json" > "$orphan_dir/local/cozygateway.config.json"
 : > "$tmp/agents.log"
-orphan_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --bundle "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1)"
+orphan_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" COZYGATEWAY_TEST_MODEL_PROMPT_INPUT="$tmp/model-answers" bash "$installer" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1 || true)"
 expect_contains "$orphan_output" 'keeping it. Rerun with --harness cozyagents to replace it.'
+expect_contains "$orphan_output" 'continuing as a Hermes install; nothing CozyAgents-owned is installed, paired, or configured here.'
+# It is the Hermes path from here: the Hermes bootstrap is what it plans next.
+expect_contains "$orphan_output" 'install Hermes Agent with the verified official tagged NousResearch installer'
 grep -Fq 'hermesEndpoints' "$orphan_dir/local/cozygateway.config.json"
-# It records Hermes, not CozyAgents, so it cannot read its own state back as a choice nobody made.
-grep -Fq 'harness=hermes' "$orphan_dir/local/install-state"
-
-# The path stays frozen: a later run with no flag and no answer leaves the bridge alone.
-frozen_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1 || true)"
-expect_contains "$frozen_output" 'harness: hermes (already installed here)'
-grep -Fq 'hermesEndpoints' "$orphan_dir/local/cozygateway.config.json"
+# Nothing CozyAgents-owned ran: no installer, no pairing, no model questions, no runner env.
+test ! -s "$tmp/agents.log"
+expect_missing "$orphan_output" 'install CozyAgents from'
+expect_missing "$orphan_output" 'Which provider should new bots use?'
+expect_missing "$orphan_output" 'COZYRUNNER_MODEL'
+test ! -e "$tmp/orphan-home/.cozyagents/runner.env"
 
 # Asking for it outright is the one thing that takes the bridge out.
 chosen_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --harness cozyagents --no-qr --bundle "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1)"

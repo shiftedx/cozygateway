@@ -537,6 +537,7 @@ grep -Fq 'fake-qr' <<<"$live_output"
 grep -Fq '"gatewayUrl":"http://192.0.2.10:8787"' <<<"$live_output"
 grep -Fq '"setupCode":"TEST-CODE"' <<<"$live_output"
 grep -Fq "mint a fresh QR and code with: $tmp/gateway-live/bin/cozygateway pair" <<<"$live_output"
+grep -Fq 'harness=hermes' "$tmp/gateway-live/local/install-state"
 grep -q '"profiles"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
 grep -Fq '"authMode": "token"' "$tmp/gateway-live/local/cozygateway.config.json"

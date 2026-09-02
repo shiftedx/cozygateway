@@ -758,11 +758,9 @@ enable_plugin() {
 # empty, and the roster comes from the runtime bots the runner reports.
 write_cozyagents_gateway_config() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   write CozyAgents-only gateway config at $CONFIG_JSON with no Hermes endpoint"; return; }
-  # Taking a Hermes bridge out of a config is destructive and irreversible from here, so it happens
-  # only when a person or a recorded install actually chose CozyAgents. A default taken with no
-  # terminal is not that, and leaves any endpoint it finds exactly where it is.
-  [ "$KEPT_HERMES_BRIDGE" = 0 ] ||
-    say "WARN  this config already has a Hermes endpoint and no one chose CozyAgents here; keeping it. Rerun with --harness cozyagents to replace it."
+  # Taking a Hermes bridge out of a config is destructive and irreversible from here. main hands a
+  # kept bridge to the Hermes path before this runs, so reaching it with one still in the file is a
+  # bug rather than a default; the check below fails closed either way.
   umask 077
   "$NODE_RESOLVED" - "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$PUBLIC_URL" "$COZYAGENTS_CHOSEN" <<'NODE'
 const fs = require('node:fs');
@@ -792,9 +790,9 @@ write_cozyagents_gateway_env() {
   printf '%s=%s\n' "$ENV_OWNER_KEY" "$ENV_OWNER_VALUE" >> "$GATEWAY_ENV"
   chmod 600 "$GATEWAY_ENV"
 }
-# A run that kept a Hermes bridge it was never asked to remove records Hermes, not CozyAgents, so
-# the next run cannot read its own state back as the explicit choice nobody made. That path stays
-# frozen until someone passes --harness cozyagents or answers the question.
+# A Hermes bridge in a config that no one chose to replace freezes the run: main turns it into a
+# Hermes install, which records harness=hermes through write_state, so the next run cannot read
+# that kept bridge back as the explicit choice nobody made.
 detect_kept_hermes_bridge() {
   KEPT_HERMES_BRIDGE=0
   [ "$COZYAGENTS_CHOSEN" = 0 ] || return 0
@@ -806,7 +804,7 @@ write_cozyagents_state() {
   [ "$DRY_RUN" = 1 ] && return
   umask 077
   {
-    if [ "$KEPT_HERMES_BRIDGE" = 1 ]; then printf 'harness=hermes\n'; else printf 'harness=cozyagents\n'; fi
+    printf 'harness=cozyagents\n'
     printf 'cozyagents_home=%s\n' "$COZYAGENTS_HOME_DIR"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -2430,7 +2428,6 @@ install_with_cozyagents() {
   choose_fresh_listener
   validate_listener_settings
   [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
-  detect_kept_hermes_bridge
   write_cozyagents_state
   write_cozyagents_gateway_env
   write_cozyagents_gateway_config
@@ -2455,7 +2452,19 @@ main() {
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   # Step 1 of the approved order: the harness, before anything is installed.
   choose_harness
-  if [ "$HARNESS" = cozyagents ]; then install_with_cozyagents "$prerequisite_missing"; return; fi
+  if [ "$HARNESS" = cozyagents ]; then
+    # A bridge nobody asked to remove decides the whole run, not just the config write: this stays
+    # a Hermes install end to end, with no CozyAgents harness, no runner pairing and no runner
+    # model keys, until someone passes --harness cozyagents or answers the question.
+    detect_kept_hermes_bridge
+    if [ "$KEPT_HERMES_BRIDGE" = 1 ]; then
+      say "WARN  this config already has a Hermes endpoint and no one chose CozyAgents here; keeping it. Rerun with --harness cozyagents to replace it."
+      say "INFO  continuing as a Hermes install; nothing CozyAgents-owned is installed, paired, or configured here."
+      HARNESS=hermes
+    else
+      install_with_cozyagents "$prerequisite_missing"; return
+    fi
+  fi
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
   if [ -n "$HERMES_FOUND" ]; then HERMES_RESOLVED="$HERMES_FOUND"; say "OK    using Hermes at $HERMES_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install Hermes Agent with the verified official tagged NousResearch installer, then resume CozyGateway setup"; prerequisite_missing=1

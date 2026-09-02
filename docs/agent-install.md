@@ -62,9 +62,11 @@ since moved and the scan finds nothing, and its `hermesEndpoints` are never
 removed. A Hermes bridge is taken out of a config only when CozyAgents was
 actually chosen: `--harness cozyagents`, the answer to the question, or a
 CozyAgents harness already recorded in this install's state. Anything else keeps
-the bridge, says so, and records `harness=hermes`, so a later run cannot read
-that kept bridge back as a choice nobody made. The path stays frozen until
-someone passes `--harness cozyagents` or answers the question.
+the bridge and says so, and the run is then a Hermes install end to end: no
+CozyAgents harness is fetched, no runner is paired, no `COZYRUNNER_MODEL_*` key
+is written, the install records `harness=hermes`, and `--status` reports Hermes.
+The path stays frozen until someone passes `--harness cozyagents` or answers the
+question.
 
 `--uninstall` removes the CozyGateway service and state, and hands the harness
 back to its own uninstaller (`cozyagents uninstall`) rather than reimplementing
