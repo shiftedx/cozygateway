@@ -25,6 +25,17 @@ PORT="${COZYGATEWAY_PORT:-8787}"
 PUBLIC_URL=""
 PREVIOUS_PORT=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
+WINDOWS_OWNED_IDENTITY=0
+WINDOWS_OWNED_NODE_RESOLVED=""
+WINDOWS_OWNED_GATEWAY_ENV=""
+WINDOWS_OWNED_DASHBOARD_ENV=""
+WINDOWS_OWNED_HERMES_ROOT=""
+WINDOWS_OWNED_HERMES_RESOLVED=""
+WINDOWS_OWNED_LAUNCHER=""
+WINDOWS_OWNED_DASHBOARD_OWNER_PS1=""
+WINDOWS_OWNED_DASHBOARD_PORT=""
+WINDOWS_OWNED_BUNDLE_PATH=""
+WINDOWS_OWNED_CONFIG_JSON=""
 DRY_RUN=0
 UNINSTALL=0
 STATUS=0
@@ -1416,6 +1427,29 @@ windows_startup_dir() {
   [ -n "$native" ] || native="$(to_windows_path "$HOME")\\AppData\\Roaming"
   to_posix_path "$native\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
 }
+windows_startup_entry_uses_current_wrapper() {
+  local entry="$1" wrapper_native prefix separator suffix command rest bash_path wrapper_path line_count
+  [ -f "$entry" ] || return 1
+  wrapper_native="$(to_windows_path "$WRAPPER")"
+  case "$wrapper_native" in *'"'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+  line_count="$(tr -d '\r' < "$entry" | awk 'END { print NR }')"
+  [ "$line_count" = 3 ] || return 1
+  [ "$(sed -n '1p' "$entry" | tr -d '\r')" = 'Set shell = CreateObject("WScript.Shell")' ] || return 1
+  [ "$(sed -n '3p' "$entry" | tr -d '\r')" = 'shell.Run command, 0, False' ] || return 1
+  command="$(sed -n '2p' "$entry" | tr -d '\r')"
+  prefix='command = """'
+  separator='"" ""'
+  suffix='"""'
+  rest="${command#"$prefix"}"
+  [ "$rest" != "$command" ] || return 1
+  bash_path="${rest%%"$separator"*}"
+  rest="${rest#*"$separator"}"
+  [ "$rest" != "$bash_path" ] || return 1
+  wrapper_path="${rest%"$suffix"}"
+  [ "$wrapper_path" != "$rest" ] || return 1
+  [ "$rest" = "$wrapper_path$suffix" ] || return 1
+  [ -n "$bash_path" ] && [ "$wrapper_path" = "$wrapper_native" ]
+}
 write_windows_launcher() {
   local bash_posix bash_native wrapper_native command
   bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
@@ -1432,46 +1466,153 @@ write_windows_launcher() {
   } > "$WINDOWS_VBS"
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
+load_windows_wrapper_identity() {
+  local line head values value index node
+  [ -r "$WRAPPER" ] || return 1
+  line="$(sed -n '3p' "$WRAPPER")"
+  head="${line#exec \"}"
+  [ "$head" != "$line" ] || return 1
+  node="${head%%\" - *}"
+  [ "$node" != "$head" ] || return 1
+  values="${head#*\" - }"
+  for index in $(seq 1 9); do
+    case "$values" in \"*) ;; *) return 1 ;; esac
+    values="${values#\"}"; value="${values%%\"*}"
+    [ "$value" != "$values" ] || return 1
+    values="${values#*\"}"
+    case "$index" in
+      1) WINDOWS_OWNED_GATEWAY_ENV="$(to_posix_path "$value")" ;;
+      2) WINDOWS_OWNED_DASHBOARD_ENV="$(to_posix_path "$value")" ;;
+      3) WINDOWS_OWNED_HERMES_ROOT="$(to_posix_path "$value")" ;;
+      4) WINDOWS_OWNED_HERMES_RESOLVED="$(to_posix_path "$value")" ;;
+      5) WINDOWS_OWNED_LAUNCHER="$(to_posix_path "$value")" ;;
+      6) WINDOWS_OWNED_DASHBOARD_OWNER_PS1="$(to_posix_path "$value")" ;;
+      7) WINDOWS_OWNED_DASHBOARD_PORT="$value" ;;
+      8) WINDOWS_OWNED_BUNDLE_PATH="$(to_posix_path "$value")" ;;
+      9) WINDOWS_OWNED_CONFIG_JSON="$(to_posix_path "$value")" ;;
+    esac
+    values="${values# }"
+  done
+  case "$values" in "<<'NODE'") ;; *) return 1 ;; esac
+  WINDOWS_OWNED_NODE_RESOLVED="$(to_posix_path "$node")"
+  WINDOWS_OWNED_IDENTITY=1
+}
 stop_owned_windows_gateway() {
-  local config_native code check_target_port="${1:-1}"
-  config_native="$(to_windows_path "$CONFIG_JSON")"
+  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native code release_code attempt expected_port check_target_port="${1:-1}"
+  if [ "${WINDOWS_OWNED_IDENTITY:-0}" != 1 ] && ! load_windows_wrapper_identity; then
+    [ "$check_target_port" = 0 ] && return 1
+    windows_gateway_ports_are_free
+    return 1
+  fi
+  config_native="$(to_windows_path "$WINDOWS_OWNED_CONFIG_JSON")"
+  gateway_env_native="$(to_windows_path "$WINDOWS_OWNED_GATEWAY_ENV")"
+  dashboard_env_native="$(to_windows_path "$WINDOWS_OWNED_DASHBOARD_ENV")"
+  node_native="$(to_windows_path "$WINDOWS_OWNED_NODE_RESOLVED")"
+  bundle_native="$(to_windows_path "$WINDOWS_OWNED_BUNDLE_PATH")"
+  hermes_root_native="$(to_windows_path "$WINDOWS_OWNED_HERMES_ROOT")"
+  hermes_native="$(to_windows_path "$WINDOWS_OWNED_HERMES_RESOLVED")"
+  launcher_native="$(to_windows_path "$WINDOWS_OWNED_LAUNCHER")"
+  owner_helper_native="$(to_windows_path "$WINDOWS_OWNED_DASHBOARD_OWNER_PS1")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$PORT" COZYGATEWAY_CHECK_TARGET_PORT="$check_target_port" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
-    $expected = [IO.Path]::GetFullPath($env:COZYGATEWAY_EXPECTED_CONFIG)
-    $managed = Get-CimInstance Win32_Process | Where-Object {
-      $command = [string]$_.CommandLine
-      if (-not $command.Contains("cozygateway.mjs") -or -not $command.Contains(" serve ")) { return $false }
-      $tokens = @([regex]::Matches($command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
-      $candidate = $null
-      for ($index = 0; $index -lt $tokens.Count; $index++) {
-        if ($tokens[$index] -eq "--config" -and $index + 1 -lt $tokens.Count) { $candidate = $tokens[$index + 1]; break }
-        if ($tokens[$index].StartsWith("--config=")) { $candidate = $tokens[$index].Substring(9); break }
-      }
-      if ([string]::IsNullOrWhiteSpace($candidate)) { return $false }
-      try { [IO.Path]::GetFullPath($candidate).Equals($expected, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
-    } | Select-Object -First 1
-    if ($null -ne $managed) {
-      Stop-Process -Id $managed.ProcessId -Force
-      exit 0
+    function Same-Path([string] $Candidate, [string] $Expected) {
+      if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
+      try { return [IO.Path]::GetFullPath($Candidate).TrimEnd([char]92).Equals([IO.Path]::GetFullPath($Expected).TrimEnd([char]92), [StringComparison]::OrdinalIgnoreCase) } catch { return $false }
     }
-    if ($env:COZYGATEWAY_CHECK_TARGET_PORT -ne "1") { exit 3 }
-    $connection = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $connection) { exit 42 }
-    exit 3
+    function Command-Tokens([string] $Command) {
+      return @([regex]::Matches($Command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
+    }
+    function Is-ManagedGatewayChild($Process) {
+      $tokens = Command-Tokens ([string]$Process.CommandLine)
+      return $tokens.Count -eq 5 -and (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -and (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_BUNDLE) -and $tokens[2] -eq "serve" -and $tokens[3] -eq "--config" -and (Same-Path $tokens[4] $env:COZYGATEWAY_EXPECTED_CONFIG)
+    }
+    function Is-ManagedGatewaySupervisor($Process) {
+      $tokens = Command-Tokens ([string]$Process.CommandLine)
+      if ($tokens.Count -ne 11 -or -not (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -or $tokens[1] -ne "-" -or -not (Same-Path $tokens[2] $env:COZYGATEWAY_EXPECTED_GATEWAY_ENV) -or -not (Same-Path $tokens[3] $env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV) -or -not (Same-Path $tokens[4] $env:COZYGATEWAY_EXPECTED_HERMES_ROOT) -or -not (Same-Path $tokens[5] $env:COZYGATEWAY_EXPECTED_HERMES) -or -not (Same-Path $tokens[6] $env:COZYGATEWAY_EXPECTED_LAUNCHER) -or -not (Same-Path $tokens[7] $env:COZYGATEWAY_EXPECTED_OWNER_HELPER) -or $tokens[8] -ne $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT -or -not (Same-Path $tokens[9] $env:COZYGATEWAY_EXPECTED_BUNDLE)) { return $false }
+      return Same-Path $tokens[10] $env:COZYGATEWAY_EXPECTED_CONFIG
+    }
+    function Managed-GatewayProcesses {
+      $all = @(Get-CimInstance Win32_Process)
+      return @($all | Where-Object { (Is-ManagedGatewaySupervisor $_) -or (Is-ManagedGatewayChild $_) })
+    }
+    $managed = @(Managed-GatewayProcesses)
+    if ($managed.Count -eq 0) {
+      exit 3
+    }
+    $taskkill = Join-Path ([Environment]::SystemDirectory) "taskkill.exe"
+    if (-not [IO.File]::Exists($taskkill)) { throw "trusted taskkill.exe is unavailable" }
+    function Stop-ManagedGatewayProcess([int] $ProcessId) {
+      $previousPreference = $ErrorActionPreference
+      try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & $taskkill /PID ([string]$ProcessId) /T /F *> $null
+      } finally {
+        $ErrorActionPreference = $previousPreference
+      }
+    }
+    $stopped = [Collections.Generic.HashSet[int]]::new()
+    foreach ($process in $managed | Sort-Object { if (Is-ManagedGatewaySupervisor $_) { 0 } else { 1 } }) {
+      if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process.ProcessId }
+    }
+    Start-Sleep -Milliseconds 1200
+    for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
+      $remaining = @(Managed-GatewayProcesses)
+      if ($remaining.Count -eq 0) { break }
+      foreach ($process in $remaining) {
+        if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process.ProcessId }
+      }
+      Start-Sleep -Seconds 1
+    }
+    if (@(Managed-GatewayProcesses).Count -ne 0) { exit 45 }
+    exit 0
   ' >/dev/null 2>&1
   code=$?
   set -e
-  [ "$code" -eq 3 ] && return 1
-  [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
+  case "$code" in
+    0) ;;
+    3)
+      [ "$check_target_port" = 0 ] && return 1
+      windows_gateway_ports_are_free
+      return 1
+      ;;
+    45) die "the previous CozyGateway process did not exit after termination" ;;
+    *) die "Windows gateway ownership cleanup failed (code $code)" ;;
+  esac
   [ "$check_target_port" = 0 ] && return 0
+  windows_gateway_ports_are_free
   for _ in $(seq 1 10); do gateway_ready || return 0; sleep 1; done
   die "the previous CozyGateway process stayed listening on port $PORT"
 }
+windows_gateway_ports_are_free() {
+  local expected_port release_code attempt
+  local -a ports=("$PORT")
+  [ -z "$PREVIOUS_PORT" ] || [ "$PREVIOUS_PORT" = "$PORT" ] || ports+=("$PREVIOUS_PORT")
+  for expected_port in "${ports[@]}"; do
+    release_code=1
+    for attempt in $(seq 1 10); do
+      set +e
+      MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_PORT="$expected_port" powershell.exe -NoProfile -NonInteractive -Command '
+        $listener = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $listener) { exit 0 }
+        exit 1
+      ' >/dev/null 2>&1
+      release_code=$?
+      set -e
+      [ "$release_code" -eq 0 ] && break
+      sleep 1
+    done
+    [ "$release_code" -eq 0 ] || die "port $expected_port is owned by a process this installer cannot safely stop"
+  done
+}
 install_windows_service() {
   local vbs_native task_command output code startup entry
-  write_windows_launcher
   [ "$DRY_RUN" = 1 ] && { say "DRY   register current-user Scheduled Task $WINDOWS_TASK with Startup-folder fallback"; return; }
+  if stop_owned_windows_gateway; then
+    say "OK    stopped the previous CozyGateway process for an in-place update"
+  fi
+  write_wrapper
+  write_windows_launcher
   vbs_native="$(to_windows_path "$WINDOWS_VBS")"
   task_command="wscript.exe \"$vbs_native\""
   set +e
@@ -1484,9 +1625,8 @@ install_windows_service() {
     say "INFO  Scheduled Task unavailable ($output); installed current-user Startup fallback: $entry"
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
-  fi
-  if stop_owned_windows_gateway; then
-    say "OK    stopped the previous CozyGateway process for an in-place update"
+    startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
+    if [ -f "$entry" ] && { cmp -s "$entry" "$WINDOWS_VBS" || windows_startup_entry_uses_current_wrapper "$entry"; }; then rm -f "$entry"; fi
   fi
   wscript.exe "$vbs_native"
 }
@@ -1522,11 +1662,16 @@ wait_attach_ready() {
   die "$diagnosis"
 }
 install_service() {
-  resolve_platform; write_wrapper
-  if [ "$DRY_RUN" = 1 ]; then say "DRY   install one CozyGateway $SERVICE_PLATFORM service; it reuses/starts Hermes Dashboard as local control plane"; return; fi
+  resolve_platform
+  if [ "$DRY_RUN" = 1 ]; then
+    write_wrapper
+    say "DRY   install one CozyGateway $SERVICE_PLATFORM service; it reuses/starts Hermes Dashboard as local control plane"
+    return
+  fi
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     install_windows_service
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
+    write_wrapper
     local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" loaded=0; mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1540,6 +1685,7 @@ PLIST
     done
     [ "$loaded" = 1 ] || die "launchd did not accept the CozyGateway service after 10 attempts"
   else
+    write_wrapper
     local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; mkdir -p "$unit_dir"
     have loginctl || die "Linux logout/reboot persistence needs loginctl; install systemd-login or run CozyGateway as a system service"
     if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)" != yes ]; then
@@ -1841,6 +1987,9 @@ main() {
   validate_listener_settings
   HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; hydrate_profile_scope; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
+  if is_windows && [ -e "$WRAPPER" ]; then
+    load_windows_wrapper_identity || die "could not verify the existing Windows CozyGateway supervisor identity"
+  fi
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
   # Stage every profile before enabling any of them. Hermes can materialize inherited global

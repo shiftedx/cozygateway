@@ -1533,7 +1533,8 @@ expect_contains "$dashboard_missing_provider_output" 'rejected the installer-own
 # A rerun stops only the validated listener and starts the newly installed bundle.
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live"
 grep -Fq 'powershell -NoProfile -NonInteractive -Command' "$tmp/windows-commands"
-grep -Fq 'GetFullPath($candidate)' "$repo_root/scripts/agent-install.sh"
+grep -Fq 'Is-ManagedGatewaySupervisor' "$repo_root/scripts/agent-install.sh"
+grep -Fq 'taskkill.exe' "$repo_root/scripts/agent-install.sh"
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-live" | grep -Fq 'health endpoint is live'
 
 # An explicit port update must stop the process selected by its managed config,
@@ -1545,6 +1546,27 @@ test "$(grep -c '^powershell ' "$tmp/windows-commands")" -gt "$windows_stop_coun
 
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+# Once Scheduled Tasks are available again, remove exactly the fallback this
+# installation generated. A different launcher must remain untouched.
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+test ! -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+# A Git Bash upgrade may change only the executable path. The fallback still
+# belongs to this install because its exact wrapper argument is unchanged.
+stale_git_bash="$tmp/stale-git-bash"
+ln -s "$(command -v bash)" "$stale_git_bash"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$stale_git_bash" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+test ! -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+cat > "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs" <<'FOREIGN_WINDOWS_STARTUP'
+Set shell = CreateObject("WScript.Shell")
+command = """C:\\Program Files\\Git\\bin\\bash.exe"" ""C:\\Users\\fixture\\foreign\\local\\run-gateway.sh"""
+shell.Run command, 0, False
+FOREIGN_WINDOWS_STARTUP
+cp "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs" "$tmp/foreign-windows-startup.vbs"
+HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+cmp -s "$tmp/foreign-windows-startup.vbs" "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+rm -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 
 # Hermes Dashboard 0.20.x can report a successful `dashboard --stop` on Windows
 # while its Python child still owns the port. The fallback is allowed to stop

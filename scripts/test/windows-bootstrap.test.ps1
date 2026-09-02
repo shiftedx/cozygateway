@@ -5,6 +5,37 @@ function Assert-True {
     if (-not $Condition) { throw "ASSERT: $Message" }
 }
 
+function Stop-FixtureProcessTree {
+    param([Diagnostics.Process] $Process)
+    if ($null -eq $Process) { return }
+    try {
+        $Process.Refresh()
+        if ($Process.HasExited) { return }
+    } catch {
+        return
+    }
+    $taskkillExit = $null
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID ([string]$Process.Id) /T /F 2>$null | Out-Null
+        $taskkillExit = $LASTEXITCODE
+    } catch {
+        Write-Warning "fixture process tree $($Process.Id) cleanup could not invoke taskkill: $($_.Exception.Message)"
+        return
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    if ($taskkillExit -ne 0) {
+        try {
+            $Process.Refresh()
+            if (-not $Process.HasExited) { Write-Warning "fixture process tree $($Process.Id) could not be stopped (taskkill exit $taskkillExit)" }
+        } catch {
+            return
+        }
+    }
+}
+
 function Write-Utf8NoBom {
     param([string] $Path, [string] $Content)
     [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false)))
@@ -837,6 +868,14 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True ($agentInstaller.Contains('Get-FileHash -LiteralPath \$p -Algorithm SHA256')) 'generated Windows repair command must independently checksum its bootstrap'
     $cliWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_cli_wrapper\(\) \{.*?^\}')
     Assert-True $cliWriterMatch.Success 'shared installer must define write_cli_wrapper'
+    $wrapperWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_wrapper\(\) \{.*?^\}\r?\n(?=vbs_quote\(\))')
+    Assert-True $wrapperWriterMatch.Success 'shared installer must define the gateway supervisor writer'
+    $wrapperIdentityMatch = [regex]::Match($agentInstaller, '(?ms)^load_windows_wrapper_identity\(\) \{.*?^\}\r?\n(?=stop_owned_windows_gateway\(\))')
+    Assert-True $wrapperIdentityMatch.Success 'shared installer must define the persisted gateway wrapper identity loader'
+    $gatewayStopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_owned_windows_gateway\(\) \{.*?^\}')
+    Assert-True $gatewayStopFunctionMatch.Success 'shared installer must define the Windows gateway stop helper'
+    $gatewayPortCheckFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^windows_gateway_ports_are_free\(\) \{.*?^\}')
+    Assert-True $gatewayPortCheckFunctionMatch.Success 'shared installer must define the Windows gateway port-release check'
     $elevationWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_dashboard_elevation_helper\(\) \{.*?^\}')
     Assert-True $elevationWriterMatch.Success 'shared installer must define write_dashboard_elevation_helper'
     $stopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_stubborn_windows_dashboard\(\) \{.*?^\}')
@@ -901,6 +940,301 @@ write_cli_wrapper
     Add-Content -LiteralPath $repairBootstrap -Value '# tampered'
     $tamperedRepair = (& cmd.exe /c $repairCmd repair 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -ne 0 -and $tamperedRepair -match 'repair bootstrap checksum mismatch' -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 2) 'generated repair shim must reject a tampered bootstrap before execution'
+
+    # The managed process is a Node supervisor, not the `serve` child. Killing
+    # only the child appears to free the port, then the supervisor restarts it
+    # one second later and wins the replacement race. Exercise the real stop
+    # helper against that exact command-line contract, then wait past restart.
+    $supervisorRoot = Join-Path $temp 'gateway supervisor replacement race'
+    $supervisorLocal = Join-Path $supervisorRoot 'local'
+    New-Item -ItemType Directory -Force -Path $supervisorLocal | Out-Null
+    $supervisorConfig = Join-Path $supervisorLocal 'cozygateway.config.json'
+    $supervisorGatewayEnv = Join-Path $supervisorLocal 'gateway.env'
+    $supervisorDashboardEnv = Join-Path $supervisorLocal 'dashboard.env'
+    $supervisorBundle = Join-Path $supervisorRoot 'bin\cozygateway.mjs'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $supervisorBundle) | Out-Null
+    $portReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $portReservation.Start()
+    $supervisorPort = ([Net.IPEndPoint]$portReservation.LocalEndpoint).Port
+    $portReservation.Stop()
+    Write-Utf8NoBom $supervisorConfig "{`"port`":$supervisorPort}`n"
+    Write-Utf8NoBom $supervisorGatewayEnv "TOKEN=fixture`n"
+    Write-Utf8NoBom $supervisorDashboardEnv "DASHBOARD_SESSION_TOKEN=fixture`n"
+    Write-Utf8NoBom $supervisorBundle @'
+import { readFileSync } from 'node:fs';
+import net from 'node:net';
+if (process.argv.includes('--foreign')) {
+  setInterval(() => {}, 1000);
+} else {
+const config = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--config') + 1], 'utf8'));
+const server = net.createServer();
+server.listen(config.port, '127.0.0.1');
+const stop = () => server.close(() => process.exit(0));
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
+}
+'@
+    $nodeExecutable = (Get-Command node.exe -ErrorAction Stop).Source
+    $nodePosix = (& cygpath.exe -u $nodeExecutable).Trim()
+    $toPosix = { param([string] $Path) (& cygpath.exe -u $Path).Trim() }
+    $gatewayEnvPosix = & $toPosix $supervisorGatewayEnv
+    $dashboardEnvPosix = & $toPosix $supervisorDashboardEnv
+    $bundlePosix = & $toPosix $supervisorBundle
+    $configPosix = & $toPosix $supervisorConfig
+    $hermesRootPosix = & $toPosix (Join-Path $supervisorRoot 'hermes')
+    $hermesPosix = & $toPosix (Join-Path $supervisorRoot 'hermes\bin\hermes-agent.exe')
+    $launcherPosix = & $toPosix (Join-Path $supervisorRoot 'hermes\bin\hermes.exe')
+    $ownerHelperPosix = & $toPosix (Join-Path $supervisorLocal 'dashboard-owner.ps1')
+    $dashboardReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $dashboardReservation.Start()
+    $supervisorDashboardPort = ([Net.IPEndPoint]$dashboardReservation.LocalEndpoint).Port
+    $dashboardReservation.Stop()
+    $nextDashboardReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $nextDashboardReservation.Start()
+    $nextDashboardPort = ([Net.IPEndPoint]$nextDashboardReservation.LocalEndpoint).Port
+    $nextDashboardReservation.Stop()
+    $nextPortReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $nextPortReservation.Start()
+    $nextSupervisorPort = ([Net.IPEndPoint]$nextPortReservation.LocalEndpoint).Port
+    $nextPortReservation.Stop()
+    $dashboardSource = Join-Path $supervisorRoot 'dashboard.mjs'
+    Write-Utf8NoBom $dashboardSource @'
+import http from 'node:http';
+const server = http.createServer((request, response) => {
+  response.writeHead((request.url === '/api/health' || request.url === '/api/config') ? 200 : 404);
+  response.end('{}');
+});
+server.listen(Number(process.argv[2]), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+'@
+    $dashboardOutput = Join-Path $supervisorRoot 'dashboard.stdout.log'
+    $dashboardError = Join-Path $supervisorRoot 'dashboard.stderr.log'
+    $dashboardArguments = '"{0}" {1}' -f $dashboardSource, $supervisorDashboardPort
+    $dashboard = Start-Process -FilePath $nodeExecutable -ArgumentList $dashboardArguments -RedirectStandardOutput $dashboardOutput -RedirectStandardError $dashboardError -PassThru
+    $dashboardReady = $false
+    for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+        $dashboardProbe = [Net.Sockets.TcpClient]::new()
+        try {
+            $dashboardProbe.Connect('127.0.0.1', $supervisorDashboardPort)
+            $dashboardReady = $true
+            break
+        } catch {
+            Start-Sleep -Milliseconds 100
+        } finally {
+            $dashboardProbe.Dispose()
+        }
+    }
+    if (-not $dashboardReady) {
+        $dashboard.Refresh()
+        $dashboardState = if ($dashboard.HasExited) { "exited with $($dashboard.ExitCode)" } else { 'still running' }
+        $dashboardDiagnostics = @(
+            "arguments: $dashboardArguments"
+            "state: $dashboardState"
+            "stdout: $(Get-Content -LiteralPath $dashboardOutput -Raw -ErrorAction SilentlyContinue)"
+            "stderr: $(Get-Content -LiteralPath $dashboardError -Raw -ErrorAction SilentlyContinue)"
+        ) -join "`n"
+        Assert-True $false "fixture Dashboard must be ready before generating the gateway supervisor`n$dashboardDiagnostics"
+    }
+    $wrapperGenerator = Join-Path $temp 'generate-gateway-supervisor.sh'
+    $generatedWrapper = Join-Path $supervisorLocal 'run-gateway.sh'
+    $wrapperGeneratorScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+GATEWAY_DIR="`$1"
+LOCAL_DIR="`$2"
+WRAPPER="`$3"
+GATEWAY_ENV="`$4"
+DASHBOARD_ENV="`$5"
+HERMES_ROOT="`$6"
+HERMES_RESOLVED="`$7"
+DASHBOARD_OWNER_PS1="`$8"
+DASHBOARD_PORT="`$9"
+NODE_RESOLVED="`${10}"
+BUNDLE_PATH="`${11}"
+CONFIG_JSON="`${12}"
+DRY_RUN=0
+say() { printf '%s\n' "`$*"; }
+is_windows() { return 0; }
+to_windows_path() { cygpath -w "`$1"; }
+$($wrapperWriterMatch.Value)
+write_wrapper
+"@
+    Write-Utf8NoBom $wrapperGenerator $wrapperGeneratorScript
+    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $generatedWrapper)) "production writer must generate the supervisor: $wrapperOutput"
+    $wrapperArgument = '"' + $generatedWrapper + '"'
+    $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
+    $staleSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
+    $foreignArguments = '"{0}" serve --config "{1}" --foreign' -f $supervisorBundle, $supervisorConfig
+    $foreignChild = Start-Process -FilePath $nodeExecutable -ArgumentList $foreignArguments -PassThru
+    $uninstallSupervisor = $null
+    $foreignOldPortListener = $null
+    try {
+        $listening = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try {
+                $probe.Connect('127.0.0.1', $supervisorPort)
+                $listening = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 100
+            } finally {
+                $probe.Dispose()
+            }
+        }
+        Assert-True $listening 'fixture supervisor must start its managed gateway child'
+        $gatewayStopHarness = Join-Path $temp 'gateway supervisor stop harness.sh'
+        $gatewayStopScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+PORT="`$1"
+CONFIG_JSON="`$2"
+GATEWAY_ENV="`$3"
+DASHBOARD_ENV="`$4"
+NODE_RESOLVED="`$5"
+BUNDLE_PATH="`$6"
+HERMES_ROOT="`$7"
+HERMES_RESOLVED="`$8"
+DASHBOARD_OWNER_PS1="`$9"
+DASHBOARD_PORT="`${10}"
+WRAPPER="`${11}"
+PREVIOUS_PORT="`${12}"
+to_windows_path() { cygpath -w "`$1"; }
+to_posix_path() { cygpath -u "`$1"; }
+gateway_ready() { return 1; }
+die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+$($wrapperIdentityMatch.Value)
+$($gatewayStopFunctionMatch.Value)
+$($gatewayPortCheckFunctionMatch.Value)
+stop_owned_windows_gateway
+"@
+        Write-Utf8NoBom $gatewayStopHarness $gatewayStopScript
+        $savedErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $nextDashboardPort $generatedWrapper $supervisorPort 2>&1 | Out-String)
+            $stopExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        Assert-True ($stopExitCode -eq 0) "owned gateway stop helper failed: $stopOutput"
+        Start-Sleep -Milliseconds 1500
+        $foreignChild.Refresh()
+        Assert-True (-not $foreignChild.HasExited) 'a same-bundle/config process with an extra argument must remain untouched'
+        $reacquired = $false
+        $replacement = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $supervisorPort)
+        try {
+            $replacement.Start()
+            $reacquired = $true
+        } catch {
+            $reacquired = $false
+        } finally {
+            if ($reacquired) { $replacement.Stop() }
+        }
+        Assert-True $reacquired 'a dashboard-port and gateway-port update must stop the persisted owned supervisor so it cannot reclaim the old gateway port'
+        $foreignListenerSource = Join-Path $supervisorRoot 'foreign-old-port-listener.mjs'
+        Write-Utf8NoBom $foreignListenerSource @'
+import net from 'node:net';
+const server = net.createServer();
+server.listen(Number(process.argv[2]), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+'@
+        $foreignOldPortListener = Start-Process -FilePath $nodeExecutable -ArgumentList ('"{0}" {1}' -f $foreignListenerSource, $supervisorPort) -PassThru
+        $foreignOldPortReady = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try {
+                $probe.Connect('127.0.0.1', $supervisorPort)
+                $foreignOldPortReady = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 100
+            } finally {
+                $probe.Dispose()
+            }
+        }
+        Assert-True $foreignOldPortReady 'foreign old-port fixture must be listening before the port-change cleanup test'
+        $savedErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $nextDashboardPort $generatedWrapper $supervisorPort 2>&1 | Out-String)
+            $foreignOldPortExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        Assert-True ($foreignOldPortExitCode -ne 0 -and $foreignOldPortOutput -match [regex]::Escape("port $supervisorPort is owned by a process this installer cannot safely stop")) 'a gateway-port change must leave a foreign old-port listener untouched and fail safely'
+        $foreignOldPortListener.Refresh()
+        Assert-True (-not $foreignOldPortListener.HasExited) 'gateway port cleanup must not stop a foreign old-port listener'
+        Stop-FixtureProcessTree $foreignOldPortListener
+        $foreignOldPortListener = $null
+        $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
+        $uninstallListening = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try {
+                $probe.Connect('127.0.0.1', $supervisorPort)
+                $uninstallListening = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 100
+            } finally {
+                $probe.Dispose()
+            }
+        }
+        Assert-True $uninstallListening 'fixture uninstall supervisor must start its managed gateway child'
+        $uninstallStopHarness = Join-Path $temp 'gateway uninstall stop harness.sh'
+        $uninstallStopScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+PORT="`$1"
+CONFIG_JSON="`$2"
+GATEWAY_ENV="`$3"
+DASHBOARD_ENV="`$4"
+HERMES_ROOT="`$5"
+HERMES_RESOLVED="`$6"
+DASHBOARD_OWNER_PS1="`$7"
+WRAPPER="`$8"
+DASHBOARD_PORT="`$9"
+EXPECTED_NODE_RESOLVED="`${10}"
+EXPECTED_BUNDLE_PATH="`${11}"
+WINDOWS_OWNED_IDENTITY=0
+to_windows_path() { cygpath -w "`$1"; }
+to_posix_path() { cygpath -u "`$1"; }
+gateway_ready() { return 1; }
+die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+$($wrapperIdentityMatch.Value)
+load_windows_wrapper_identity || die "generated wrapper identity could not be read"
+[ "`$WINDOWS_OWNED_NODE_RESOLVED" = "`$EXPECTED_NODE_RESOLVED" ] || die "generated wrapper resolved an unexpected Node path"
+[ "`$WINDOWS_OWNED_BUNDLE_PATH" = "`$EXPECTED_BUNDLE_PATH" ] || die "generated wrapper resolved an unexpected bundle path"
+$($gatewayStopFunctionMatch.Value)
+$($gatewayPortCheckFunctionMatch.Value)
+stop_owned_windows_gateway 0
+"@
+        Write-Utf8NoBom $uninstallStopHarness $uninstallStopScript
+        $uninstallOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $generatedWrapper $supervisorDashboardPort $nodePosix $bundlePosix 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -eq 0) "uninstall-owned gateway stop helper failed: $uninstallOutput"
+        Start-Sleep -Milliseconds 1500
+        $uninstallReacquired = $false
+        $uninstallReplacement = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $supervisorPort)
+        try {
+            $uninstallReplacement.Start()
+            $uninstallReacquired = $true
+        } catch {
+            $uninstallReacquired = $false
+        } finally {
+            if ($uninstallReacquired) { $uninstallReplacement.Stop() }
+        }
+        Assert-True $uninstallReacquired 'uninstall must stop a running generated supervisor even before Node and bundle are resolved'
+    } finally {
+        Stop-FixtureProcessTree $supervisor
+        Stop-FixtureProcessTree $staleSupervisor
+        Stop-FixtureProcessTree $uninstallSupervisor
+        Stop-FixtureProcessTree $foreignChild
+        Stop-FixtureProcessTree $foreignOldPortListener
+        Stop-FixtureProcessTree $dashboard
+    }
+
     $fakePowerShellDirectory = Join-Path $temp 'fake PowerShell'
     $fakePowerShell = Join-Path $fakePowerShellDirectory 'powershell.exe'
     $powerShellCallLog = Join-Path $temp 'powershell-calls.log'
