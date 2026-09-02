@@ -36,6 +36,36 @@ function Stop-FixtureProcessTree {
     }
 }
 
+function Get-FixtureProcessDiagnostics {
+    param([string] $FixtureRoot, [string[]] $Expected)
+    try {
+        $redact = {
+            param([AllowNull()][string] $Value)
+            if ($null -eq $Value) { return '<none>' }
+            $Value.Replace($FixtureRoot, '<fixture-root>').Replace($FixtureRoot.Replace('\', '/'), '<fixture-root>')
+        }
+        $rows = @(
+            Get-CimInstance Win32_Process |
+                Where-Object {
+                    $_.Name -in @('node.exe', 'bash.exe') -and
+                    ([string]$_.CommandLine).Contains($FixtureRoot)
+                } |
+                ForEach-Object {
+                    $tokens = @([regex]::Matches([string]$_.CommandLine, '[^\s"]+|"[^"]*"') | ForEach-Object { & $redact $_.Value.Trim('"') })
+                    'pid={0}; executable={1}; tokens=[{2}]' -f $_.ProcessId, (& $redact $_.ExecutablePath), ($tokens -join ' | ')
+                }
+        )
+        @(
+            'expected canonical values:'
+            ($Expected | ForEach-Object { & $redact $_ })
+            'fixture node/bash processes:'
+            if ($rows.Count) { $rows } else { '<none>' }
+        ) -join "`n"
+    } catch {
+        "fixture process diagnostics unavailable: $($_.Exception.Message)"
+    }
+}
+
 function Write-Utf8NoBom {
     param([string] $Path, [string] $Content)
     [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false)))
@@ -1095,7 +1125,23 @@ stop_owned_windows_gateway
 "@
         Write-Utf8NoBom $gatewayStopHarness $gatewayStopScript
         $stopOutput = (& $bashPath $gatewayStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort 2>&1 | Out-String)
-        Assert-True ($LASTEXITCODE -eq 0) "owned gateway stop helper failed: $stopOutput"
+        $stopExitCode = $LASTEXITCODE
+        $stopDiagnostics = if ($stopExitCode -eq 0) { '' } else {
+            Get-FixtureProcessDiagnostics $supervisorRoot @(
+                "node=$((& cygpath.exe -w $nodePosix).Trim())"
+                "bundle=$((& cygpath.exe -w $bundlePosix).Trim())"
+                "config=$((& cygpath.exe -w $configPosix).Trim())"
+                "gatewayEnv=$((& cygpath.exe -w $gatewayEnvPosix).Trim())"
+                "dashboardEnv=$((& cygpath.exe -w $dashboardEnvPosix).Trim())"
+                "hermesRoot=$((& cygpath.exe -w $hermesRootPosix).Trim())"
+                "hermes=$((& cygpath.exe -w $hermesPosix).Trim())"
+                "launcher=$((& cygpath.exe -w $launcherPosix).Trim())"
+                "ownerHelper=$((& cygpath.exe -w $ownerHelperPosix).Trim())"
+                "dashboardPort=$supervisorDashboardPort"
+                "gatewayPort=$supervisorPort"
+            )
+        }
+        Assert-True ($stopExitCode -eq 0) "owned gateway stop helper failed: $stopOutput`n$stopDiagnostics"
         Start-Sleep -Milliseconds 1500
         $foreignChild.Refresh()
         Assert-True (-not $foreignChild.HasExited) 'a same-bundle/config process with an extra argument must remain untouched'
