@@ -218,6 +218,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYAGENTS_TEST_LOG' = $agentsLog
+        'COZYAGENTS_INSTALL_URL' = $agentsInstaller
         'COZYGATEWAY_TEST_CLI_LOG' = $cliLog
         'COZYGATEWAY_TEST_HERMES' = (Join-Path $temp 'no-such-hermes.exe')
         'LOCALAPPDATA' = (Join-Path $temp 'localappdata')
@@ -289,6 +290,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
     # ---------------------------------------------------------------------------
     Assert-Contains $silent.Output 'no Hermes attach plugin' 'the CozyAgents plan must say it fetches no attach plugin'
     Assert-Contains $silent.Output 'with -NoPair, then pair this computer as a runner with a code minted here' 'the CozyAgents plan must name the pairing it does'
+    Assert-Contains $silent.Output "would install CozyAgents from $agentsInstaller" 'the CozyAgents plan must name the installer it would run'
     Assert-Missing $silent.Output 'Hermes Agent' 'the CozyAgents plan must not name Hermes at all'
     Assert-Missing $silent.Output 'Dashboard' 'the CozyAgents plan must not name the Hermes Dashboard'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $temp 'Silent Gateway'))) 'a dry run must write nothing'
@@ -315,7 +317,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_TEST_GATEWAY_DEST' = $liveHome
         'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
         'COZYGATEWAY_TEST_USER_PATH_LOG' = $livePathLog
-    })
+    }) @('-CozyAgentsInstaller', $agentsInstaller)
     Assert-True ($live.ExitCode -eq 0) "the live CozyAgents install failed: $($live.Output)"
 
     # The questions, in the approved order: harness, model, network, then the QR.
