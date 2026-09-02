@@ -336,8 +336,9 @@ done
 [ ! -f "$tmp/commands" ] || ! grep -q '^model$' "$tmp/commands"
 
 # Missing prerequisites remain a non-mutating dry-run and describe both
-# bootstraps without attempting any download.
-missing_dry_output="$(HOME="$tmp/missing-dry-home" HERMES_HOME="$tmp/missing-hermes-home" LOCALAPPDATA="$tmp/missing-localappdata" PATH="$tmp/bin:$PATH" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-missing-dry")"
+# bootstraps without attempting any download. `--harness hermes` is what asks for the Hermes
+# bootstrap now that a machine with no Hermes is offered CozyAgents first.
+missing_dry_output="$(HOME="$tmp/missing-dry-home" HERMES_HOME="$tmp/missing-hermes-home" LOCALAPPDATA="$tmp/missing-localappdata" PATH="$tmp/bin:$PATH" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --harness hermes --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-missing-dry")"
 grep -Fq 'install the current Node.js 24 release' <<<"$missing_dry_output"
 grep -Fq 'install Hermes Agent with the verified official tagged NousResearch installer' <<<"$missing_dry_output"
 test ! -e "$tmp/gateway-missing-dry"
@@ -450,7 +451,7 @@ HERMES_INSTALLER
 chmod 700 "$tmp/hermes-official-installer.sh"
 if command -v shasum >/dev/null 2>&1; then hermes_installer_sha="$(shasum -a 256 "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; else hermes_installer_sha="$(sha256sum "$tmp/hermes-official-installer.sh" | awk '{print $1}')"; fi
 printf 'yes\n' > "$tmp/lan-yes"
-live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER="$tmp/launchctl-retried" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE="$tmp/model-status-probed" COZYGATEWAY_TEST_DEFAULT_ENABLE_MATERIALIZES=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+live_output="$(HOME="$tmp/darwin-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER="$tmp/launchctl-retried" COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_MODEL_UNCONFIGURED_ONCE_FILE="$tmp/model-status-probed" COZYGATEWAY_TEST_DEFAULT_ENABLE_MATERIALIZES=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_HERMES_FIXTURE="$tmp/bin/hermes" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_HERMES_INSTALL_URL="$tmp/hermes-official-installer.sh" COZYGATEWAY_HERMES_INSTALL_SHA256="$hermes_installer_sha" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --harness hermes --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
 test -f "$tmp/launchctl-retried"
 test -x "$tmp/gateway-live/runtime/node/bin/node"
 grep -Fq 'installed checksum-verified Node.js' <<<"$live_output"
@@ -536,6 +537,7 @@ grep -Fq 'fake-qr' <<<"$live_output"
 grep -Fq '"gatewayUrl":"http://192.0.2.10:8787"' <<<"$live_output"
 grep -Fq '"setupCode":"TEST-CODE"' <<<"$live_output"
 grep -Fq "mint a fresh QR and code with: $tmp/gateway-live/bin/cozygateway pair" <<<"$live_output"
+grep -Fq 'harness=hermes' "$tmp/gateway-live/local/install-state"
 grep -q '"profiles"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -q '"agents"' "$tmp/gateway-live/local/cozygateway.config.json" && exit 1
 grep -Fq '"authMode": "token"' "$tmp/gateway-live/local/cozygateway.config.json"

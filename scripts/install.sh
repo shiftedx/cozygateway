@@ -40,6 +40,9 @@ fetch_verified() {
 }
 main() {
   local asset_dir="$HOME_DIR/bin" stage="" dry_stage="" asset
+  # Before anything is fetched: this installs per user under $HOME and registers a user service,
+  # and root would leave root-owned state in a person's home that their login cannot start.
+  [ "$(id -u)" != 0 ] || die "CozyGateway installs per user under \$HOME and never needs sudo; rerun as yourself."
   command -v curl >/dev/null 2>&1 || die "curl is required"
   canonical_home_dir
   if [ -z "$ASSET_BASE" ]; then
