@@ -489,6 +489,48 @@ describe("capability 54 runner placement migration", () => {
   });
 });
 
+describe("capability 55 runner display-name migration", () => {
+  it("adds the display_name column to a pre-55 runners table, reads existing rows unrenamed, and reopens cleanly", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-runner-display-name-migration-"));
+    const path = join(directory, "gateway.sqlite");
+    // The `runners` table exactly as a pre-55 gateway left it: no `display_name` column at all.
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`CREATE TABLE runners (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      platform TEXT,
+      version TEXT,
+      backends TEXT,
+      is_default INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER
+    ) STRICT;
+    INSERT INTO runners VALUES ('runner-1','kyle-mbp','hash-1',NULL,NULL,NULL,1,5,NULL);`);
+    legacy.close();
+
+    const storage = openStorage(path);
+    // Every byte the row had, plus a display name nobody set. Backfilling one would be a guess:
+    // the gateway never recorded a person-set name for this row.
+    expect(storage.runner("runner-1")).toMatchObject({
+      id: "runner-1", name: "kyle-mbp", isDefault: true, displayName: null,
+    });
+    storage.close();
+
+    // Idempotent on restart, which is what a container that comes back up does every time.
+    const reopened = openStorage(path);
+    expect(reopened.runner("runner-1")?.displayName).toBeNull();
+    expect(reopened.setRunnerDisplayName("runner-1", "Kyle's Laptop")).toBe(true);
+    reopened.close();
+
+    // And idempotent again, with the write from the previous open intact.
+    const reopenedAgain = openStorage(path);
+    expect(reopenedAgain.runner("runner-1")?.displayName).toBe("Kyle's Laptop");
+    reopenedAgain.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
+
 describe("capability 47 auditable-id migration", () => {
   it("adds the provenance columns to a pre-47 database and still reads its rows back", () => {
     const directory = mkdtempSync(join(tmpdir(), "cozygateway-auditable-ids-migration-"));

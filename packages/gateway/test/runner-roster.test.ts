@@ -32,6 +32,7 @@ interface Runner {
   lastSeenAt: number | null;
   online: boolean;
   botCount?: number;
+  renamed: boolean;
 }
 
 interface Harness {
@@ -131,9 +132,9 @@ describe("GET /runners", () => {
 
     const [runner] = await h.runners();
     expect(Object.keys(runner!).sort()).toEqual([
-      // `botCount` is capability 54's addition to this same row.
+      // `botCount` is capability 54's addition to this same row; `renamed` is capability 55's.
       "backends", "botCount", "createdAt", "default", "id", "lastSeenAt", "name", "online",
-      "platform", "version",
+      "platform", "renamed", "version",
     ]);
     expect(runner).toMatchObject({
       id: paired.runner.id,
@@ -230,12 +231,239 @@ describe("PATCH /runners/:id", () => {
     });
     expect(missing.status).toBe(404);
     const paired = h.roster.pair({ name: "one" }).runner;
+    // An unknown key is rejected by the closed schema, not merely ignored.
     const wrong = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nickname: "renamed" }),
+    });
+    expect(wrong.status).toBe(400);
+    // A body naming neither field has nothing to do.
+    const empty = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(empty.status).toBe(400);
+  });
+});
+
+describe("renaming a runner (capability 55)", () => {
+  it("sets the display name and marks the row renamed", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Kyle's Laptop" }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { runner: Runner }).toMatchObject({
+      runner: { id: paired.id, name: "Kyle's Laptop", renamed: true },
+    });
+    const [runner] = await h.runners();
+    expect(runner).toMatchObject({ name: "Kyle's Laptop", renamed: true });
+  });
+
+  it("trims surrounding whitespace", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "  Kyle's Laptop  " }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { runner: Runner }).toMatchObject({
+      runner: { name: "Kyle's Laptop" },
+    });
+  });
+
+  it("keeps the display name across a hello that reports a different name, and hello keeps updating the reported name underneath", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Kyle's Laptop" }),
+    });
+    // The reported name changes underneath, exactly as a hello does, but the display name wins.
+    h.roster.observe(paired.id, { name: "MacBook-Pro.local" });
+    const [runner] = await h.runners();
+    expect(runner).toMatchObject({ name: "Kyle's Laptop", renamed: true });
+    expect(h.roster.get(paired.id)?.name).toBe("MacBook-Pro.local");
+  });
+
+  it("clears the display name on an empty string, returning to the reported name", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Kyle's Laptop" }),
+    });
+    h.roster.observe(paired.id, { name: "MacBook-Pro.local" });
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "" }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { runner: Runner }).toMatchObject({
+      runner: { name: "MacBook-Pro.local", renamed: false },
+    });
+  });
+
+  it("clears the display name on null", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Kyle's Laptop" }),
+    });
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: null }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { runner: Runner }).toMatchObject({
+      runner: { name: "kyle-mbp", renamed: false },
+    });
+  });
+
+  it("refuses a whitespace-only name rather than treating it as a clear", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Kyle's Laptop" }),
+    });
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "   " }),
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()) as { error: { message: string } }).toMatchObject({
+      error: { code: "invalid_request" },
+    });
+    // Only the literal "" or null clears; a mistake like this one leaves the display name standing.
+    expect(h.roster.get(paired.id)?.displayName).toBe("Kyle's Laptop");
+  });
+
+  it("counts the 1 to 64 limit in code points, not UTF-16 units, so 64 emoji fit and 65 do not", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    const emoji = String.fromCodePoint(0x1f600); // one astral code point, two UTF-16 units
+    const sixtyFour = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: emoji.repeat(64) }),
+    });
+    expect(sixtyFour.status).toBe(200);
+    expect((await sixtyFour.json()) as { runner: Runner }).toMatchObject({
+      runner: { name: emoji.repeat(64) },
+    });
+
+    const sixtyFive = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: emoji.repeat(65) }),
+    });
+    expect(sixtyFive.status).toBe(400);
+  });
+
+  it("rejects a name built entirely from zero-width Unicode format characters", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    // U+200B ZERO WIDTH SPACE, U+200C ZWNJ, U+200D ZWJ, U+FEFF BOM: all category Cf, all invisible.
+    const invisible = [0x200b, 0x200c, 0x200d, 0xfeff].map((code) => String.fromCharCode(code)).join("");
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: invisible }),
+    });
+    expect(response.status).toBe(400);
+    expect(h.roster.get(paired.id)?.displayName).toBeNull();
+  });
+
+  it("rejects a name carrying a bidi override control (RLO)", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    // U+202E RIGHT-TO-LEFT OVERRIDE, category Cf: reorders every character after it on render.
+    const rlo = String.fromCharCode(0x202e) + "evil.exe";
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: rlo }),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects a name over 64 characters after trimming", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: `  ${"a".repeat(65)}  ` }),
+    });
+    expect(response.status).toBe(400);
+    expect(h.roster.get(paired.id)?.displayName).toBeNull();
+  });
+
+  it("rejects a name with control characters", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    // Built from a character code rather than a literal escape, so this source file never carries
+    // a raw control byte itself.
+    const hostile = "bad" + String.fromCharCode(1) + "name";
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: hostile }),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("accepts exactly 64 trimmed characters", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" }).runner;
+    const response = await h.authed(`/runners/${paired.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "a".repeat(64) }),
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it("can rename and move the default in the same request", async () => {
+    const h = await harness();
+    h.roster.pair({ name: "first" });
+    const second = h.roster.pair({ name: "second" }).runner;
+    const response = await h.authed(`/runners/${second.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ default: true, name: "Second Computer" }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { runner: Runner }).toMatchObject({
+      runner: { id: second.id, default: true, name: "Second Computer", renamed: true },
+    });
+    expect(h.roster.defaultRunner()?.id).toBe(second.id);
+  });
+
+  it("refuses the legacy runner exactly as the default patch does", async () => {
+    const h = await harness({ legacy: true });
+    const response = await h.authed(`/runners/${LEGACY_RUNNER_ID}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "renamed" }),
     });
-    expect(wrong.status).toBe(400);
+    expect(response.status).toBe(400);
   });
 });
 
@@ -378,9 +606,10 @@ describe("GET /runners/self", () => {
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, unknown>;
-    // Exactly the six fields the installer reads: no token, no backends, no other runner.
+    // Exactly the seven fields the installer reads: no token, no backends, no other runner.
+    // `renamed` is capability 55's addition to this same row.
     expect(Object.keys(body).sort()).toEqual([
-      "attached", "default", "id", "lastSeenAt", "name", "platform",
+      "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
     ]);
     expect(body).toEqual({
       id: paired.runner.id,
@@ -389,7 +618,26 @@ describe("GET /runners/self", () => {
       default: true,
       lastSeenAt: NOW + 3_000,
       attached: false,
+      renamed: false,
     });
+  });
+
+  it("renders the display name and renamed, exactly as GET /runners does (capability 55)", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" });
+    await h.authed(`/runners/${paired.runner.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Kyle's Laptop" }),
+    });
+    // The reported name changes underneath, but the display name still wins here too.
+    h.roster.observe(paired.runner.id, { name: "MacBook-Pro.local" });
+
+    const response = await h.app.request("/runners/self", {
+      headers: { authorization: `Bearer ${paired.token}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ name: "Kyle's Laptop", renamed: true });
   });
 
   it("separates existing from attached, which is the whole point of the health check", async () => {

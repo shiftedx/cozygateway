@@ -675,7 +675,7 @@ describe("capability advertisement", () => {
     // roster, `/runner/v1` carries one socket per runner, and a gateway with no Hermes endpoint is
     // a supported configuration whose readiness reports the bridge as absent. A client below 52
     // never sends `kind` and never calls the routes.
-    expect(BOTS_CAPABILITY_VERSION).toBe(54);
+    expect(BOTS_CAPABILITY_VERSION).toBe(55);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -733,7 +733,7 @@ describe("capability advertisement", () => {
     // The roster screen reads the count off the runner row, and a delete answers it too.
     const runnerRow = {
       id: "runner-1", name: "kyle-mbp", platform: null, version: null, backends: [],
-      default: true, createdAt: 1, lastSeenAt: null, online: false,
+      default: true, createdAt: 1, lastSeenAt: null, online: false, renamed: false,
     };
     expect(check(RunnerSchema, { ...runnerRow, botCount: 3 })).toBe(true);
     expect(check(RunnerSchema, { ...runnerRow, botCount: -1 })).toBe(false);
@@ -1206,6 +1206,7 @@ describe("paired runners (capability 52)", () => {
     createdAt: 1_800_000_000_000,
     lastSeenAt: 1_800_000_015_000,
     online: true,
+    renamed: false,
   };
   // The same row the moment after pairing, before the runner has ever dialed in. Every optional
   // fact is null rather than absent or invented, which is what the gateway actually answers.
@@ -1244,7 +1245,7 @@ describe("paired runners (capability 52)", () => {
     expect(check(RunnerPairResponseSchema, { runner: fresh, gateway })).toBe(false);
   });
 
-  it("accepts what GET /runners/self answers, which is six fields and no credential", () => {
+  it("accepts what GET /runners/self answers, which is seven fields and no credential", () => {
     const self = {
       id: runner.id,
       name: "kyle-mbp",
@@ -1252,18 +1253,21 @@ describe("paired runners (capability 52)", () => {
       default: true,
       lastSeenAt: 1_800_000_015_000,
       attached: true,
+      // Capability 55.
+      renamed: false,
     };
     expect(check(RunnerSelfSchema, self)).toBe(true);
     // Paired but not yet dialed in: the row exists and says so honestly.
     expect(check(RunnerSelfSchema, { ...self, platform: null, lastSeenAt: null, attached: false })).toBe(true);
     expect(Object.keys(RunnerSelfSchema.properties).sort()).toEqual([
-      "attached", "default", "id", "lastSeenAt", "name", "platform",
+      "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
     ]);
     // It is a runner's view of itself, not the roster row: no token, and no other machine's facts.
     for (const leak of ["token", "runnerToken", "tokenHash", "backends"])
       expect(RunnerSelfSchema.properties).not.toHaveProperty(leak);
     expect(check(RunnerSelfSchema, { ...self, token: "secret" })).toBe(false);
     expect(check(RunnerSelfSchema, { ...self, online: true })).toBe(false);
+    expect(check(RunnerSelfSchema, { ...self, renamed: undefined })).toBe(false);
   });
 
   it("accepts the minted pairing code with the origin to dial, and nothing more", () => {
@@ -1283,8 +1287,19 @@ describe("paired runners (capability 52)", () => {
   it("moves the default by naming one runner, and refuses a patch that says anything else", () => {
     expect(check(RunnerPatchRequestSchema, { default: true })).toBe(true);
     expect(check(RunnerPatchRequestSchema, { default: false })).toBe(true);
-    expect(check(RunnerPatchRequestSchema, {})).toBe(false);
-    expect(check(RunnerPatchRequestSchema, { default: true, name: "renamed" })).toBe(false);
+    // Capability 55: an empty body is a valid SHAPE (both fields are optional at the schema
+    // level); the route is what refuses one naming neither field, since that has nothing to do.
+    expect(check(RunnerPatchRequestSchema, {})).toBe(true);
+  });
+
+  it("capability 55: renames alongside or instead of moving the default", () => {
+    expect(check(RunnerPatchRequestSchema, { name: "Kyle's Laptop" })).toBe(true);
+    expect(check(RunnerPatchRequestSchema, { default: true, name: "Kyle's Laptop" })).toBe(true);
+    // Clearing: an empty string or null both validate at the schema level.
+    expect(check(RunnerPatchRequestSchema, { name: "" })).toBe(true);
+    expect(check(RunnerPatchRequestSchema, { name: null })).toBe(true);
+    expect(check(RunnerPatchRequestSchema, { name: 5 })).toBe(false);
+    expect(check(RunnerPatchRequestSchema, { name: "x", extra: true })).toBe(false);
   });
 
   it("keeps the pair request additive: a pre-52 device body is still exactly valid", () => {

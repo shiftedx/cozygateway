@@ -55,6 +55,7 @@ import {
   LEGACY_RUNNER_NAME,
   RunnerRoster,
   createRunnerResolver,
+  effectiveRunnerName,
 } from "./runner/roster.ts";
 import { RuntimeBotService, mergeRuntimeBots, runtimeSpecDefaults } from "./runner/runtime-bots.ts";
 import type { PairingAttemptLimiter } from "./pairing-admission.ts";
@@ -325,12 +326,14 @@ export async function startGateway(
   const runnerRoster = new RunnerRoster({ storage, now: () => Date.now() });
   const runnerToken = process.env["COZYGATEWAY_RUNNER_TOKEN"];
   const legacyRunnerConfigured = runnerToken !== undefined && runnerToken.length > 0;
-  /** Capability 54. What a recorded runner id is called right now: the paired row's name, or the
-   *  one name the operator-placed shared credential has. A revoked runner has none, and nothing is
-   *  invented for it. */
-  const runnerName = (id: string): string | undefined =>
-    runnerRoster.get(id)?.name
-    ?? (id === LEGACY_RUNNER_ID && legacyRunnerConfigured ? LEGACY_RUNNER_NAME : undefined);
+  /** Capability 54/55. What a recorded runner id is called right now: the paired row's display
+   *  name when a person set one, else the name it reported, or the one name the operator-placed
+   *  shared credential has. A revoked runner has none, and nothing is invented for it. */
+  const runnerName = (id: string): string | undefined => {
+    const row = runnerRoster.get(id);
+    if (row !== undefined) return effectiveRunnerName(row);
+    return id === LEGACY_RUNNER_ID && legacyRunnerConfigured ? LEGACY_RUNNER_NAME : undefined;
+  };
   const storedRuntimeBots = storage.runtimeBots();
   const merged = mergeRuntimeBots(nativeBots(config), storedRuntimeBots);
   const runtimeBots = merged.bots;
