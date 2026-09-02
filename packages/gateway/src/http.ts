@@ -986,11 +986,18 @@ export function createApp(deps: AppDeps): Hono<Env> {
     const online = (id: string) => deps.runnerPresence?.online(id) ?? false;
     const seenAt = (id: string, stored: number | null) =>
       deps.runnerPresence?.lastContactAt(id) ?? stored;
+    // Capability 54. The bots this gateway placed on that computer, counted off the durable rows
+    // rather than tracked, so it is the same answer before and after a restart.
+    const botCount = (id: string) => deps.storage.countRuntimeBotsForRunner(id);
     app.get("/runners", requireDevice, (c) =>
       c.json({
         runners: [
           ...roster.list().map((row) =>
-            runnerToWire({ ...row, lastSeenAt: seenAt(row.id, row.lastSeenAt) }, online(row.id)),
+            runnerToWire(
+              { ...row, lastSeenAt: seenAt(row.id, row.lastSeenAt) },
+              online(row.id),
+              botCount(row.id),
+            ),
           ),
           // The legacy shared credential is one row too, so a gateway carrying both kinds answers
           // one list rather than hiding the runner an operator placed by hand.
@@ -999,6 +1006,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
                 runnerToWire(
                   legacyRunnerRow({ lastSeenAt: seenAt(LEGACY_RUNNER_ID, null) }),
                   online(LEGACY_RUNNER_ID),
+                  botCount(LEGACY_RUNNER_ID),
                 ),
               ]
             : []),
@@ -1065,9 +1073,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
           errorBody("invalid_request", "the legacy shared runner is revoked by unsetting COZYGATEWAY_RUNNER_TOKEN"),
           400,
         );
+      // Counted BEFORE the row goes, and the bots themselves are left exactly as they are:
+      // revoking a computer strands its bots, it does not delete them, and the number is what the
+      // app warns with.
+      const stranded = botCount(id);
       if (!roster.remove(id)) return c.json(errorBody("not_found", "no such runner"), 404);
       deps.onRunnerRevoked?.(id);
-      return c.json({ ok: true });
+      return c.json({ ok: true, botCount: stranded });
     });
   }
 

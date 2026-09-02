@@ -31,6 +31,7 @@ interface Runner {
   createdAt: number;
   lastSeenAt: number | null;
   online: boolean;
+  botCount?: number;
 }
 
 interface Harness {
@@ -130,7 +131,9 @@ describe("GET /runners", () => {
 
     const [runner] = await h.runners();
     expect(Object.keys(runner!).sort()).toEqual([
-      "backends", "createdAt", "default", "id", "lastSeenAt", "name", "online", "platform", "version",
+      // `botCount` is capability 54's addition to this same row.
+      "backends", "botCount", "createdAt", "default", "id", "lastSeenAt", "name", "online",
+      "platform", "version",
     ]);
     expect(runner).toMatchObject({
       id: paired.runner.id,
@@ -236,16 +239,54 @@ describe("PATCH /runners/:id", () => {
   });
 });
 
+describe("the bot count on a runner (capability 54)", () => {
+  it("counts the runtime bots placed on that computer and nobody else's", async () => {
+    const h = await harness();
+    const mine = h.roster.pair({ name: "kyle-mbp" }).runner;
+    const theirs = h.roster.pair({ name: "studio" }).runner;
+    // Zero is measured, not assumed: a paired computer with nothing on it says so.
+    expect((await h.runners()).map((runner) => runner.botCount)).toEqual([0, 0]);
+
+    for (const [id, runnerId] of [["sage", mine.id], ["luna", mine.id], ["pip", theirs.id]] as const) {
+      h.storage.insertRuntimeBot({
+        id, name: id, avatar: null, token: `token-${id}`,
+        runtime: "cozyagents", specGeneration: 1, createdAt: NOW, runnerId,
+      });
+    }
+    const counted = await h.runners();
+    expect(counted.find((runner) => runner.id === mine.id)?.botCount).toBe(2);
+    expect(counted.find((runner) => runner.id === theirs.id)?.botCount).toBe(1);
+  });
+});
+
 describe("DELETE /runners/:id", () => {
   it("revokes the row and asks the lane to close that runner's socket", async () => {
     const h = await harness();
     const runner = h.roster.pair({ name: "gone" }).runner;
     const response = await h.authed(`/runners/${runner.id}`, { method: "DELETE" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true });
+    expect(await response.json()).toEqual({ ok: true, botCount: 0 });
     expect(h.revoked).toEqual([runner.id]);
     expect(await h.runners()).toEqual([]);
     expect(h.roster.resolve("Bearer anything")).toBeUndefined();
+  });
+
+  it("reports how many bots it stranded, and leaves their rows standing", async () => {
+    const h = await harness();
+    const runner = h.roster.pair({ name: "gone" }).runner;
+    for (const id of ["sage", "luna"]) {
+      h.storage.insertRuntimeBot({
+        id, name: id, avatar: null, token: `token-${id}`,
+        runtime: "cozyagents", specGeneration: 1, createdAt: NOW, runnerId: runner.id,
+      });
+    }
+    const response = await h.authed(`/runners/${runner.id}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, botCount: 2 });
+    // Revoking a computer is not deleting the bots that ran on it: their rows, their credentials
+    // and the runner they name are all exactly as they were, so they can be moved rather than lost.
+    expect(h.storage.runtimeBot("sage")?.runnerId).toBe(runner.id);
+    expect(h.storage.runtimeBot("luna")?.runnerId).toBe(runner.id);
   });
 
   it("answers 404 for an unknown id, exactly as DELETE /devices/:id does", async () => {

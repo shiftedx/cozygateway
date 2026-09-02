@@ -114,6 +114,9 @@ function normalizeName(name: string | undefined): string {
 export function runnerToWire(
   runner: RunnerRow,
   online: boolean,
+  /** Capability 54. How many runtime bots this gateway placed on that computer. Omitted rather than
+   *  sent as a zero by a caller that did not measure it. */
+  botCount?: number,
 ): {
   id: string;
   name: string;
@@ -124,6 +127,7 @@ export function runnerToWire(
   createdAt: number;
   lastSeenAt: number | null;
   online: boolean;
+  botCount?: number;
 } {
   return {
     id: runner.id,
@@ -135,6 +139,7 @@ export function runnerToWire(
     createdAt: runner.createdAt,
     lastSeenAt: runner.lastSeenAt,
     online,
+    ...(botCount === undefined ? {} : { botCount }),
   };
 }
 
