@@ -587,6 +587,9 @@ mint_runner_pair_code() {
 
 cozyagents_launcher() { printf '%s/bin/cozyagents' "$COZYAGENTS_HOME_DIR"; }
 
+# True only when the native Windows bootstrap is driving this run and owns the harness half.
+windows_harness_owner() { is_windows && [ "${COZYGATEWAY_WINDOWS_HARNESS_OWNER:-}" = 1 ]; }
+
 # The CozyAgents half of the install: its own verified one-liner does the bundle, the private
 # Node, the launcher and the user service, and this installer pairs it, because it is the one
 # side that can mint a runner code without asking anybody to read one off a screen.
@@ -2223,11 +2226,26 @@ uninstall_cozyagents() {
   elif [ "$SERVICE_PLATFORM" = Linux ]; then
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
     else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
+  elif windows_harness_owner; then
+    # The native bootstrap installed the harness and removes it through the CozyAgents Windows
+    # uninstaller; what is left here is the gateway task, its Startup fallback and its PATH entry.
+    local startup_entry
+    startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+    if [ "$DRY_RUN" = 1 ]; then
+      say "DRY   delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
+    else
+      MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+      rm -f "$startup_entry"
+      stop_owned_windows_gateway 0 || true
+      remove_windows_cli_path
+    fi
   else
     die "the CozyAgents harness is not installed by this script on Windows"
   fi
   launcher="$home/bin/cozyagents"
-  if [ -x "$launcher" ]; then
+  if windows_harness_owner; then
+    say "INFO  the Windows bootstrap removes the CozyAgents harness through its own uninstaller"
+  elif [ -x "$launcher" ]; then
     run "$launcher" uninstall --home "$home" --yes
     say "OK    removed the CozyAgents harness through its own uninstaller"
   else
@@ -2416,11 +2434,19 @@ pairing_and_finish() {
 }
 # The CozyAgents branch: the same gateway, with no Hermes discovery, no plugin, no profiles, no
 # Hermes Dashboard and no attach-health wait, plus the harness and its pairing.
+#
+# On Windows the harness half belongs to the native bootstrap: scripts/install.ps1 asks the model
+# and network questions, runs the CozyAgents PowerShell installer, writes the runner model keys,
+# mints the runner code and prints the QR. It says so with COZYGATEWAY_WINDOWS_HARNESS_OWNER=1,
+# and this script then owns the gateway alone. Without that, Windows still has no CozyAgents
+# harness to install from here.
 install_with_cozyagents() {
   local prerequisite_missing="$1"
-  is_windows && die "on Windows the CozyAgents harness has its own one-liner: irm https://cozylabs.ai/agents.ps1 | iex"
+  if ! windows_harness_owner; then
+    is_windows && die "on Windows the CozyAgents harness has its own one-liner: irm https://cozylabs.ai/agents.ps1 | iex"
+  fi
   say "OK    harness: CozyAgents; your bots run on this computer under the CozyAgents runner"
-  confirm_cozyagents_model
+  windows_harness_owner || confirm_cozyagents_model
   if [ "$prerequisite_missing" = 1 ]; then
     say "DRY   after prerequisites, configure CozyGateway with no Hermes endpoint, install CozyAgents, and pair it"
     return
@@ -2434,7 +2460,12 @@ install_with_cozyagents() {
   write_cli_wrapper
   install_service
   wait_gateway_ready
-  install_posix_cli
+  is_windows || install_posix_cli
+  if windows_harness_owner; then
+    announce_listener
+    say "INFO  the Windows bootstrap installs and pairs the CozyAgents harness from here"
+    return
+  fi
   install_cozyagents_harness
   announce_listener
   pairing_and_finish
