@@ -1245,7 +1245,7 @@ describe("paired runners (capability 52)", () => {
     expect(check(RunnerPairResponseSchema, { runner: fresh, gateway })).toBe(false);
   });
 
-  it("accepts what GET /runners/self answers, which is six fields and no credential", () => {
+  it("accepts what GET /runners/self answers, which is seven fields and no credential", () => {
     const self = {
       id: runner.id,
       name: "kyle-mbp",
@@ -1253,18 +1253,21 @@ describe("paired runners (capability 52)", () => {
       default: true,
       lastSeenAt: 1_800_000_015_000,
       attached: true,
+      // Capability 55.
+      renamed: false,
     };
     expect(check(RunnerSelfSchema, self)).toBe(true);
     // Paired but not yet dialed in: the row exists and says so honestly.
     expect(check(RunnerSelfSchema, { ...self, platform: null, lastSeenAt: null, attached: false })).toBe(true);
     expect(Object.keys(RunnerSelfSchema.properties).sort()).toEqual([
-      "attached", "default", "id", "lastSeenAt", "name", "platform",
+      "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
     ]);
     // It is a runner's view of itself, not the roster row: no token, and no other machine's facts.
     for (const leak of ["token", "runnerToken", "tokenHash", "backends"])
       expect(RunnerSelfSchema.properties).not.toHaveProperty(leak);
     expect(check(RunnerSelfSchema, { ...self, token: "secret" })).toBe(false);
     expect(check(RunnerSelfSchema, { ...self, online: true })).toBe(false);
+    expect(check(RunnerSelfSchema, { ...self, renamed: undefined })).toBe(false);
   });
 
   it("accepts the minted pairing code with the origin to dial, and nothing more", () => {

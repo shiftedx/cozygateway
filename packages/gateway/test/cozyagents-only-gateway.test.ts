@@ -158,6 +158,8 @@ describe("a gateway configured with no Hermes endpoint", () => {
       default: true,
       lastSeenAt: null,
       attached: false,
+      // Capability 55: unrenamed, since nobody has set a display name here.
+      renamed: false,
     });
   });
 

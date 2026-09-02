@@ -52,6 +52,7 @@ import { primaryLanAddress } from "./lan.ts";
 import { gatewayScheme } from "./tls.ts";
 import {
   LEGACY_RUNNER_ID,
+  effectiveRunnerName,
   legacyRunnerRow,
   runnerToWire,
   type RunnerRoster,
@@ -315,13 +316,18 @@ export function errorBody(code: ErrorCode, message: string): ErrorBody {
 }
 
 /** Capability 55. Matches the C0 and C1 control character ranges (built from character codes
- *  rather than a literal escape, so no NUL or other control byte ever sits in this source file).
- *  A display name failing this is refused rather than stored and rendered as a box or worse. */
+ *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
+ *  plus every Unicode "Format" (Cf) code point: zero-width space and joiners, the bidi override
+ *  and isolate controls, and the byte-order mark among them. A name built entirely from these is
+ *  invisible or reorders the text around it, which is worse than the box a lone control character
+ *  renders as, so both families are refused the same way. */
 const RUNNER_NAME_CONTROL_CHARS = new RegExp(
   "["
     + String.fromCharCode(0) + "-" + String.fromCharCode(31)
     + String.fromCharCode(127) + "-" + String.fromCharCode(159)
+    + "\\p{Cf}"
     + "]",
+  "u",
 );
 
 /** A 415 that does not say what arrived is a 415 the producer has to guess about, so the received
@@ -1034,13 +1040,16 @@ export function createApp(deps: AppDeps): Hono<Env> {
       const attached = online(row.id);
       return c.json({
         id: row.id,
-        name: row.name,
+        // Capability 55: the display name once a person has set one, exactly as GET /runners
+        // renders it, with `renamed` below saying which is which.
+        name: effectiveRunnerName(row),
         platform: row.platform,
         default: row.isDefault,
         lastSeenAt: seenAt(row.id, row.lastSeenAt),
         // What the INSTALLER polls: the row exists (it just paired) long before the service it
         // registered has dialed in, so "am I attached" is a different question from "do I exist".
         attached,
+        renamed: row.displayName !== null,
       });
     });
     // Minting a runner code from the app, with the same 10 minute TTL and the same gateway-wide
@@ -1082,22 +1091,32 @@ export function createApp(deps: AppDeps): Hono<Env> {
           400,
         );
       }
-      // Capability 55. `name` clears the display name on "" or null, and otherwise must be a
-      // trimmed 1-64 character string with no control characters -- the same shape a display name
-      // is rendered in everywhere else, so a bad value is refused rather than stored and shown ugly.
+      // Capability 55. `name` clears the display name ONLY on the literal "" or null; a
+      // whitespace-only string is a client mistake, not a clear, and is refused rather than
+      // silently treated as one. Otherwise it must be 1 to 64 CODE POINTS after trimming -- counted
+      // with a spread, not `.length`, so a name built of astral characters (most emoji) is not
+      // clipped at half a code point -- with no control or Unicode format character, the same shape
+      // a display name is rendered in everywhere else, so a bad value is refused rather than stored
+      // and shown ugly, invisible, or reordered.
       let displayName: string | null | undefined;
       if (name !== undefined) {
-        if (name === null) {
+        if (name === null || name === "") {
           displayName = null;
         } else {
           const trimmed = name.trim();
-          if (trimmed.length === 0) {
-            displayName = null;
-          } else if (trimmed.length > 64 || RUNNER_NAME_CONTROL_CHARS.test(trimmed)) {
-            return c.json(errorBody("invalid_request", "name must be 1 to 64 characters with no control characters"), 400);
-          } else {
-            displayName = trimmed;
+          const codePoints = [...trimmed].length;
+          if (
+            codePoints === 0 || codePoints > 64 || RUNNER_NAME_CONTROL_CHARS.test(trimmed)
+          ) {
+            return c.json(
+              errorBody(
+                "invalid_request",
+                "name must be 1 to 64 characters (code points) after trimming, with no control or format characters",
+              ),
+              400,
+            );
           }
+          displayName = trimmed;
         }
       }
       if (roster.get(id) === undefined)

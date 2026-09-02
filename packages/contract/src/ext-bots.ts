@@ -1793,9 +1793,11 @@ export const RunnersResponseSchema = Type.Object({
 export type RunnersResponse = Static<typeof RunnersResponseSchema>;
 
 /** `PATCH /runners/:id`. `default: true` moves the account default to this runner. Capability 55
- *  adds `name`: a trimmed 1-64 character display name to set, or `null`/`""` to clear it back to
- *  the name the runner itself reports. Both fields are optional and either may be sent alone; the
- *  route rejects a body naming neither. */
+ *  adds `name`: a trimmed 1-64 character (code points, not UTF-16 units) display name to set, with
+ *  no control or Unicode format character in it, or the literal `null`/`""` to clear it back to
+ *  the name the runner itself reports -- a whitespace-only string is refused rather than treated
+ *  as a clear. Both fields are optional and either may be sent alone; the route rejects a body
+ *  naming neither. */
 export const RunnerPatchRequestSchema = Type.Object({
   default: Type.Optional(Type.Boolean()),
   name: Type.Optional(Type.Union([Type.String({ maxLength: 256 }), Type.Null()])),
@@ -1804,7 +1806,9 @@ export type RunnerPatchRequest = Static<typeof RunnerPatchRequestSchema>;
 
 /** `GET /runners/self`, authenticated by the runner's own token and nothing else. It is what the
  *  installer polls after registering the service: the row exists the moment the pair lands, so
- *  `attached` is the separate question of whether that machine has dialed in yet. */
+ *  `attached` is the separate question of whether that machine has dialed in yet. Capability 55:
+ *  `name` is the display name once a person has set one, exactly as `GET /runners` renders it, and
+ *  `renamed` says which is which. */
 export const RunnerSelfSchema = Type.Object({
   id: Type.String({ minLength: 1, maxLength: 64 }),
   name: Type.String({ minLength: 1, maxLength: 120 }),
@@ -1812,6 +1816,8 @@ export const RunnerSelfSchema = Type.Object({
   default: Type.Boolean(),
   lastSeenAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   attached: Type.Boolean(),
+  /** Capability 55. True exactly when a person has set a display name, matching `Runner.renamed`. */
+  renamed: Type.Boolean(),
 }, { additionalProperties: false });
 export type RunnerSelf = Static<typeof RunnerSelfSchema>;
 
@@ -2273,8 +2279,9 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * runner and presented as a device, or the reverse, answers the existing `401 setup_code_invalid`
  * with the existing message, so a wrong-kind code is indistinguishable from an expired one.
  *
- * `GET /runners`, `PATCH /runners/:id {default}` and `DELETE /runners/:id` are device-authenticated
- * and mirror the devices routes, including the 404 for an unknown id. `POST /runners/pair-code`
+ * `GET /runners`, `PATCH /runners/:id {default}` (capability 55 extends this same route with a
+ * person-set `name`) and `DELETE /runners/:id` are device-authenticated and mirror the devices
+ * routes, including the 404 for an unknown id. `POST /runners/pair-code`
  * mints a runner code from the app with the same TTL and bucket the CLI's `pair --kind runner`
  * uses, and `GET /runners/self` answers one row under the runner's own bearer, which is the only
  * route that credential opens and the one an installer's health check polls. The first paired runner is
@@ -2338,16 +2345,21 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * accepted unchanged, with the same response shape it already reads. A client that offers a
  * computer picker gates it on `>= 54`. */
 /** Capability 55: A PERSON CAN RENAME A PAIRED RUNNER. `PATCH /runners/:id` gains optional `name`,
- * a 1-64 character display name (after trimming, no control characters) alongside the existing
- * `default`; a body naming neither, or a `name` that fails that check, is `400 invalid_request`
- * naming the field.
+ * a 1-64 character (code point, not UTF-16 unit, so an emoji is one toward the limit) display name
+ * alongside the existing `default`; a body naming neither, or a `name` that fails validation, is
+ * `400 invalid_request` naming the field. `name` is trimmed first, and ONLY the literal `""` or
+ * `null` clears the display name: a whitespace-only string is a mistake, not a clear, and is
+ * refused the same as an over-length one. The trimmed value may carry no C0/C1 control character
+ * and no Unicode "Format" (Cf) code point either -- zero-width space and joiners, the bidi
+ * override and isolate controls, and the byte-order mark among them -- because a name built from
+ * those renders invisible or reorders the text around it.
  *
  * A person-set name wins over whatever the runner reports on `hello` from then on: `hello` keeps
  * updating the reported name in its own column exactly as it did before 55, but `GET /runners`,
  * `GET /runners/self`, and the `runnerName` carried on a bot summary or runtime projection all
- * render the display name once one is set. `Runner` gains `renamed`, true exactly when a display
- * name is set, so a client can tell "still the default name" from "someone renamed this" without
- * comparing strings.
+ * render the display name once one is set. `Runner` and `RunnerSelf` both gain `renamed`, true
+ * exactly when a display name is set, so a client can tell "still the default name" from "someone
+ * renamed this" without comparing strings.
  *
  * Setting `name` to `""` or `null` clears the display name and returns to whatever the runner
  * itself reports, present or future.
