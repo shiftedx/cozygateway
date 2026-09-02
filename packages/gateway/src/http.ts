@@ -70,6 +70,7 @@ import {
 } from "./hermes-bridge/global-skills.ts";
 import type { MemorySurface } from "./hermes-bridge/memory.ts";
 import type { HistorySurface } from "./hermes-bridge/bot-history.ts";
+import type { RunRoutineSurface } from "./hermes-bridge/native-data-plane.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
 import type {
@@ -191,6 +192,9 @@ export interface AppDeps {
   /** Capability 50. A runtime bot's own checkpointed workspace history, over the attached peer's
    * bounded `bot_history` lane. Absent leaves the five history routes unregistered. */
   history?: HistorySurface;
+  /** Capability 53. Forces a runtime bot's routine to run now, over the existing capability-48
+   * `bot_config` lane. Absent leaves `POST /bots/:name/routines/:id/run` unregistered. */
+  runRoutine?: RunRoutineSurface;
   /** attach-v1 bearer token → authenticated agent. Enables only the media side channel; device
    * routes never accept this credential. */
   attachTokens?: ReadonlyMap<string, string>;
@@ -1572,6 +1576,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       deps.memory,
       {},
       deps.history,
+      deps.runRoutine,
     );
   }
 

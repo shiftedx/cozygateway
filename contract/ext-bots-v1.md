@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 52. This extension is independent of the frozen core
+Status: v1 extension, capability version 53. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 52 }
+"capabilities": { "com.cozylabs.bots": 53 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -92,6 +92,7 @@ and does not register `/bots` routes.
 | 50 | Bot history: a runtime bot checkpoints its own workspace into git and serves it over the attach-v1 `bot_history` lane. Five new runtime-bot-only routes carry the Changes list, a per-file diff, restore, the try/keep/discard experiment, and the per-file conflict choice. A Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_history`. Nothing content-shaped crosses the lane: summaries and counts, never files or patches. |
 | 51 | Room turns can ask: a runtime member's approval and clarify events on a room turn land in the existing interaction inbox (`sessionId` is the `group:<room>:<member>` thread) and resolve through the existing `/bots/:member/approvals/...` and `/bots/:member/clarifications/...` routes unchanged; tool events project as ephemeral `bot_tool_activity` carrying `room`; `BotGroup` and `bot_group_state` gain the optional `pendingInteractions` pointer array. The room transcript gains nothing and Hermes members are unchanged. |
 | 52 | Paired runners: `POST /pair {setupCode, deviceName, kind: "runner"}` mints a per-runner token instead of a device token, `GET /runners`, `PATCH /runners/:id {default}` and `DELETE /runners/:id` manage the roster, `POST /runners/pair-code` mints a code from the app, `GET /runners/self` answers that one row under the runner's own bearer, and `/runner/v1` accepts any active per-runner token so two computers hold two sockets at once. The runner `hello` gains optional `name`, `platform` and `agentVersion`, recorded on its row on every hello that carries them, so a renamed computer renames its roster row. A gateway with no Hermes endpoint is a supported configuration; its roster answers from runtime bots and `/ready` reports the bridge as `absent`. |
+| 53 | Routine run now: `POST /bots/:name/routines/:id/run` sends `routines.run` over the existing capability-48 `bot_config` lane and answers `BotRoutineRunResponse` (`{routine, startedAt}`), so a person or a check can force a runtime bot's routine to fire immediately. No new capability row; it is a route on the operation capability 48 already defined on the wire. RUNTIME BOTS ONLY, the same rule capability 50's history routes follow: a Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_config`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -639,6 +640,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots/:name/routines` | `BotRoutineCreateRequest` | `BotRoutineWriteResponse` | Hermes routine create. |
 | `PATCH /bots/:name/routines/:id` | `BotRoutinePatch` | `BotRoutineWriteResponse` | Hermes routine update. |
 | `DELETE /bots/:name/routines/:id` | — | `{ id }` | Hermes routine delete. |
+| `POST /bots/:name/routines/:id/run` | — | `BotRoutineRunResponse` | Capability 53, RUNTIME BOTS ONLY. Sends `routines.run` over the existing capability-48 `bot_config` lane so a person or a check can force the routine to fire now. `409 unsupported_for_runtime` for a Hermes bot or for a runtime bot whose peer did not negotiate `bot_config`, `404 not_found` for a routine id this bot's namespace does not have, `503 backend_unavailable` for an offline peer. |
 | `GET /bots/groups` | — | `{ groups: BotGroup[] }` | Gateway-owned rooms. |
 | `POST /bots/groups` | `BotGroupCreateRequest` | `201 { group: BotGroup }` | Creates a gateway-owned room. |
 | `GET /bots/groups/:group` | — | `BotGroupDetail` | Reads a gateway-owned room. |

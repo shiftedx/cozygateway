@@ -32,6 +32,7 @@ import type {
   BotDesktopHermesResumeResponse,
   BotPendingClarification,
   BotPendingApproval,
+  BotRoutine,
   RichBlock,
   ServerFrame,
 } from "cozygateway-contract";
@@ -51,6 +52,7 @@ import type {
 } from "./approvals.ts";
 import { ConfigNotNegotiated, type ConfigSurface } from "./bot-config.ts";
 import { HistoryNotNegotiated, type HistorySurface } from "./bot-history.ts";
+import { RoutineNotFound } from "./routines.ts";
 import { BotNameTaken, BotNotFound } from "./crud.ts";
 import {
   BotSessionConflict,
@@ -60,6 +62,16 @@ import {
   type BotChatPhotoUpload,
   type BotsSurface,
 } from "./bridge.ts";
+
+/** `POST /bots/:name/routines/:id/run`. RUNTIME-BOT ONLY, the same way the bot-history routes are:
+ * a Hermes bot has no route here and answers `409 unsupported_for_runtime`, because a Hermes cron
+ * job is triggered by the Dashboard's own picker and this gateway has no `cron.manage` action that
+ * fires one on demand. The config lane already carries `routines.run` (capability 48's
+ * `ConfigSurface`); this surface is only the runtime-bot guard and the "what to answer" wrapper
+ * around it, exactly as `historySurface()` wraps `HistorySurface`. */
+export interface RunRoutineSurface {
+  run(name: string, id: string): Promise<{ routine: BotRoutine; startedAt: number }>;
+}
 
 /** What the plane needs from the runtime-bot service. Narrow on purpose: the plane owns chat and
  * roster projection, and knows nothing about tokens, operations, or runners. */
@@ -603,6 +615,46 @@ export class NativeBotDataPlane {
       tryKeep: (name) => guard(name, "botHistoryTry", (bot) => lane.tryKeep(bot)),
       tryDiscard: (name) => guard(name, "botHistoryTry", (bot) => lane.tryDiscard(bot)),
       resolve: (name, choices) => guard(name, "botHistoryResolve", (bot) => lane.resolve(bot, choices)),
+    };
+  }
+
+  /** `POST /bots/:name/routines/:id/run`'s surface. RUNTIME-BOT ONLY, the same rule
+   * `historySurface()` applies: a Hermes bot's cron job is not something this gateway can fire on
+   * demand, so it gets the same `409 unsupported_for_runtime` every other wrong-kind surface
+   * answers rather than a 404 (the bot is real) or a 503 (nothing here is reachable-but-broken).
+   *
+   * The config lane's `routines.run` ack carries no routine and no timestamp (it is the same bare
+   * `{ok}` `routines.delete` answers), so the response this route publishes is built here: the
+   * moment the peer's ack lands is `startedAt`, and the routine is read back with an ordinary
+   * `routines.list` so a client gets the row it just triggered rather than an echo of its request.
+   * An id the peer's ack accepted but that vanished from the very next list is not expected in
+   * practice; the honest answer for it is the same `RoutineNotFound` an unknown id gets, since
+   * either way this gateway cannot show a routine under that id any more.
+   *
+   * Returns `undefined` when no config lane is wired at all, so the route is not registered rather
+   * than registered to fail every call. */
+  runRoutineSurface(): RunRoutineSurface | undefined {
+    const lane = this.#botConfig;
+    if (lane === undefined) return undefined;
+    return {
+      run: async (name, id) => {
+        const bot = normalize(name);
+        const runtimeBot = this.#runtimeBots.get(bot);
+        if (runtimeBot === undefined)
+          return Promise.reject(new UnsupportedForRuntime(bot, "routinesRun", "hermes"));
+        try {
+          await lane.runRoutine(bot, id);
+        } catch (error) {
+          throw error instanceof ConfigNotNegotiated
+            ? new UnsupportedForRuntime(bot, "routinesRun", runtimeBot.runtime)
+            : error;
+        }
+        const startedAt = this.#now();
+        const { routines } = await lane.routines(bot);
+        const routine = routines.find((candidate) => candidate.id === id);
+        if (routine === undefined) throw new RoutineNotFound(id);
+        return { routine, startedAt };
+      },
     };
   }
 

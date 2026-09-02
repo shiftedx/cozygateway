@@ -673,7 +673,7 @@ describe("capability advertisement", () => {
     // roster, `/runner/v1` carries one socket per runner, and a gateway with no Hermes endpoint is
     // a supported configuration whose readiness reports the bridge as absent. A client below 52
     // never sends `kind` and never calls the routes.
-    expect(BOTS_CAPABILITY_VERSION).toBe(52);
+    expect(BOTS_CAPABILITY_VERSION).toBe(53);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
