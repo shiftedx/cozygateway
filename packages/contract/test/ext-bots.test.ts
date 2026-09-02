@@ -44,6 +44,8 @@ import {
   BotNewSessionResponseSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
+  BotSkillSchema,
+  BotToolsetSchema,
   BotPreviewSchema,
   BotReadinessSchema,
   BotRoutineCreateRequestSchema,
@@ -343,6 +345,23 @@ describe("focus request", () => {
 });
 
 describe("profile patch", () => {
+  it("takes enabledSkills on the patch, with the same name rule disabledSkills has", () => {
+    expect(check(BotProfilePatchSchema, { enabledSkills: ["spike"] })).toBe(true);
+    expect(check(BotProfilePatchSchema, { enabledSkills: [] })).toBe(true);
+    expect(check(BotProfilePatchSchema, { enabledSkills: [" "] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledSkills: [""] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledSkills: Array(501).fill("spike") })).toBe(false);
+  });
+
+  it("keeps the two skill lists separate, because they are two intents", () => {
+    expect(
+      check(BotProfilePatchSchema, {
+        enabledSkills: ["spike"],
+        disabledSkills: ["citations"],
+      }),
+    ).toBe(true);
+  });
+
   it("accepts any single section, and all of them at once", () => {
     expect(check(BotProfilePatchSchema, { soul: "# Scout" })).toBe(true);
     expect(check(BotProfilePatchSchema, { disabledSkills: ["deploy"] })).toBe(true);
@@ -387,6 +406,67 @@ describe("profile patch", () => {
 });
 
 describe("profile", () => {
+  it("takes the four capability 59 sources and no fifth word", () => {
+    const base = { name: "brainstorming", enabled: true };
+    for (const source of ["default", "catalogue", "installed", "proposed"]) {
+      expect(check(BotSkillSchema, { ...base, source })).toBe(true);
+    }
+    expect(check(BotSkillSchema, { ...base, source: "vendored" })).toBe(false);
+    expect(check(BotSkillSchema, { ...base, source: null })).toBe(false);
+  });
+
+  it("keeps every capability 59 read field optional, so a peer below 59 still validates", () => {
+    expect(check(BotSkillSchema, { name: "brainstorming", enabled: true })).toBe(true);
+    expect(check(BotToolsetSchema, { name: "shell", enabled: true })).toBe(true);
+  });
+
+  it("takes a catalogue row: present, not installed, not enabled, with a summary", () => {
+    expect(
+      check(BotSkillSchema, {
+        name: "test-driven-development",
+        enabled: false,
+        installed: false,
+        source: "catalogue",
+        description: "Enforce red, green, refactor. Tests before code.",
+      }),
+    ).toBe(true);
+    expect(check(BotSkillSchema, { name: "x", enabled: false, installed: "no" })).toBe(false);
+  });
+
+  it("takes a toolset this build cannot offer, with the reason on the row", () => {
+    expect(
+      check(BotToolsetSchema, {
+        name: "computer_use",
+        enabled: false,
+        available: false,
+        label: "Computer use",
+        unavailableReason: "This bot runs on a computer it does not have a screen on.",
+      }),
+    ).toBe(true);
+  });
+
+  it("carries a whole capability 59 profile", () => {
+    expect(
+      check(BotProfileSchema, {
+        name: "sage",
+        description: "",
+        soul: "",
+        skills: [
+          { name: "brainstorming", enabled: true, installed: true, source: "default" },
+          { name: "spike", enabled: false, installed: false, source: "catalogue" },
+        ],
+        toolsets: [
+          { name: "shell", enabled: true, available: true, label: "Terminal" },
+          { name: "computer_use", enabled: false, available: false, unavailableReason: "No screen." },
+        ],
+        toolsetsPinned: false,
+        mcpServers: [],
+        model: { provider: "anthropic", default: "claude-sonnet" },
+        runtimeInert: [],
+      }),
+    ).toBe(true);
+  });
+
   it("accepts the mapped edit-screen shape, optional fields omitted", () => {
     expect(
       check(BotProfileSchema, {
@@ -754,7 +834,10 @@ describe("capability advertisement", () => {
     // one of the same four literals, carried on the same `profile.read` operation. Read-only:
     // `BotProfilePatch` never gains it, and a patch naming it is `400 invalid_request` naming the
     // field. Absent for a Hermes bot and for a peer below 58, and never backfilled.
-    expect(BOTS_CAPABILITY_VERSION).toBe(58);
+    // Capability 59 adds optional skill provenance and installation fields, optional toolset
+    // availability fields, and an optional additive `enabledSkills` patch list. The gateway relays
+    // runtime rows and writes unchanged while keeping Hermes reads and writes on their old shape.
+    expect(BOTS_CAPABILITY_VERSION).toBe(59);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
