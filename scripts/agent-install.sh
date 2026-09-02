@@ -1538,7 +1538,7 @@ stop_owned_windows_gateway() {
     for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
       $listening = @($ports | Where-Object { $null -ne (Get-NetTCPConnection -State Listen -LocalPort $_ -ErrorAction SilentlyContinue | Select-Object -First 1) })
       if ($listening.Count -eq 0) { exit 0 }
-      Start-Sleep -Milliseconds 100
+      Start-Sleep -Seconds 1
     }
     exit 42
   ' >/dev/null 2>&1
