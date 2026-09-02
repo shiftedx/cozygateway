@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
 
-import type { BotChatDeltaFrame, BotGroup, BotGroupDetail, BotGroupMessage, BotGroupNote, ServerFrame } from "cozygateway-contract";
+import type {
+  BotChatDeltaFrame,
+  BotGroup,
+  BotGroupDetail,
+  BotGroupMessage,
+  BotGroupNote,
+  BotGroupPendingInteraction,
+  BotToolStep,
+  ServerFrame,
+} from "cozygateway-contract";
 
 import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
 import type { AttachV1EventFrame, AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
@@ -97,6 +106,30 @@ interface RoomDraft {
   last: BotChatDeltaFrame;
 }
 
+/** What a member turn is DOING and what it is BLOCKED on, in memory for the life of the turn.
+ *
+ *  Capability 51. An entry exists only for a turn that has actually raised something, so a member
+ *  that just talks costs nothing, exactly like `RoomDraft`. It carries the turn's identity because
+ *  the settlement paths that seal it (`#endTurnActivity`) are reached with a turn id and nothing
+ *  else, and by then the durable turn row may already have been consumed.
+ *
+ *  The tool steps are EPHEMERAL on purpose: the 1:1 lane persists a turn's steps because a chat has
+ *  a history screen to rebuild, and a room has none. A room's record is its transcript, and
+ *  capability 51 adds nothing to it. */
+interface RoomTurnActivity {
+  key: string;
+  roomName: string;
+  member: string;
+  threadId: string;
+  /** Monotonic within the turn, from 1, on the `bot_tool_activity` FRAME. */
+  seq: number;
+  /** Every step of the turn so far, by attach `callId`, in the order they started. */
+  steps: Map<string, BotToolStep>;
+  /** True once a tool frame has gone out, so the sealing `done` frame is sent only for a turn that
+   *  actually opened a card. A turn that only asked for an approval opened none. */
+  emitted: boolean;
+}
+
 export class GroupNotFound extends Error {
   constructor(name: string) {
     super(`no group chat named "${name}"`);
@@ -157,6 +190,12 @@ export interface GroupRoomsOptions {
    *  BAND leg, for a phone that is not holding a socket open (spec section 4). Fire-and-forget by
    *  contract: it must not throw and must not block the round. */
   escalate?: (event: { group: string; member: string; displayName: string; text: string }) => void;
+  /** True when this member is served by a non-Hermes runtime peer (capability 45). Capability 51
+   *  projects a room turn's approvals, clarifications and tool steps for such a member ONLY: a
+   *  Hermes-backed member's room turn drops those events exactly as it did before, because the
+   *  Hermes plugin has never been asked to raise one inside a room and a half-projected lane is
+   *  worse than none. Defaults to "nobody", which is the pre-51 behaviour for every member. */
+  isRuntimeMember?: (name: string) => boolean;
   /** Existing attach-v1 turn transport, injected after the ingress exists. */
   nativeTurns?: NativeGroupTurnEndpoint;
   pollMs?: number;
@@ -176,6 +215,7 @@ export class GroupRooms {
   readonly #memberKnown: (name: string) => boolean | undefined;
   readonly #memberExists: (name: string) => Promise<boolean>;
   readonly #escalate: (event: { group: string; member: string; displayName: string; text: string }) => void;
+  readonly #isRuntimeMember: (name: string) => boolean;
   #nativeTurns: NativeGroupTurnEndpoint | undefined;
   readonly #pollMs: number | undefined;
   readonly #turnTimeoutMs: number | undefined;
@@ -186,6 +226,9 @@ export class GroupRooms {
   /** Open live bubbles, by member turn id. An entry exists only for a turn that has actually
    *  streamed something, so a peer that never drafts costs nothing and gets no frames. */
   readonly #drafts = new Map<string, RoomDraft>();
+
+  /** Capability 51. Live tool steps and blocked-on state, by member turn id. */
+  readonly #activity = new Map<string, RoomTurnActivity>();
 
   /** The drive currently holding a room, by room key, tagged with the room GENERATION it was
    *  started for. Present means "a round loop is live", which is the room's only piece of
@@ -213,6 +256,7 @@ export class GroupRooms {
     this.#memberKnown = opts.memberKnown ?? ((): boolean | undefined => undefined);
     this.#memberExists = opts.memberExists ?? ((): Promise<boolean> => Promise.resolve(true));
     this.#escalate = opts.escalate ?? ((): void => {});
+    this.#isRuntimeMember = opts.isRuntimeMember ?? ((): boolean => false);
     this.#nativeTurns = opts.nativeTurns;
     this.#pollMs = opts.pollMs;
     this.#turnTimeoutMs = opts.turnTimeoutMs;
@@ -254,14 +298,23 @@ export class GroupRooms {
       // which transcript the bubble belongs above.
       this.#emitDraft(owned, blocksToText(event.blocks));
       return true;
+    } else if (event.kind === "tool" && this.#isRuntimeMember(owned.member)) {
+      // Capability 51.
+      this.#emitToolActivity(owned, event);
+      return true;
+    } else if (event.kind === "approval" && this.#isRuntimeMember(owned.member)) {
+      return this.#roomApproval(owned, event);
+    } else if (event.kind === "clarify" && this.#isRuntimeMember(owned.member)) {
+      return this.#roomClarify(owned, event);
     } else {
-      // Tool, thinking, and interaction events still belong to this already-authorized turn. The
-      // room has no wire projection for them in this capability, but declining would dead-letter
-      // an otherwise valid at-least-once stream.
+      // Thinking and delegation events, and every event of a Hermes-backed member, still belong to
+      // this already-authorized turn. The room has no wire projection for them, but declining would
+      // dead-letter an otherwise valid at-least-once stream.
       return true;
     }
     if (settled === undefined) return false;
     this.#endDraft(event.turnId);
+    this.#endTurnActivity(event.turnId, settled.state === "commit" ? "ok" : "error");
     const wake = this.#waiters.get(event.turnId);
     if (wake !== undefined) wake();
     else this.#recoverSettledTurn(settled);
@@ -407,6 +460,7 @@ export class GroupRooms {
       if (open.timer !== undefined) clearTimeout(open.timer);
     }
     this.#drafts.clear();
+    this.#activity.clear();
     for (const wake of this.#waiters.values()) wake();
     this.#waiters.clear();
     const running = [...this.#drives.values()].map((entry) => entry.promise.catch(() => {}));
@@ -443,6 +497,9 @@ export class GroupRooms {
       needsYou: room.needsYou,
       epoch: room.epoch,
       updatedAt: log.at(-1)?.at ?? room.createdAt,
+      // Capability 51. Omitted rather than empty: a room that blocks on nothing is the room every
+      // client below 51 already renders.
+      ...this.#pendingInteractions(room.key),
     };
   }
 
@@ -706,6 +763,7 @@ export class GroupRooms {
         // The member stopped mid-sentence. Nothing is coming to close its bubble, so the gateway
         // closes it: this is the settlement no attach event will ever announce.
         this.#endDraft(turnId);
+        this.#endTurnActivity(turnId, "error");
         return { outcome: "timeout", detail };
       }
       await new Promise<void>((resolve) => {
@@ -717,6 +775,7 @@ export class GroupRooms {
     // Abandoned: the bridge closed or the room was deleted and remade under this drive's feet. The
     // turn will never settle for this loop, so its bubble is closed here rather than left open.
     this.#endDraft(turnId);
+    this.#endTurnActivity(turnId, "error");
     return { outcome: "pass" };
   }
 
@@ -854,6 +913,309 @@ export class GroupRooms {
     });
   }
 
+  // --- capability 51: what a room turn is asking for, and what it is doing -----------------------
+
+  /** The room's blocked-on pointers, in the shape `BotGroup` and `bot_group_state` both carry.
+   *  Empty is ABSENT rather than `[]`: a room that blocks on nothing must be byte-identical to the
+   *  room every client below 51 already renders. */
+  #pendingInteractions(key: string): { pendingInteractions?: BotGroupPendingInteraction[] } {
+    const pending = this.#storage.botGroupPendingInteractions(key);
+    return pending.length === 0 ? {} : { pendingInteractions: pending };
+  }
+
+  /** Re-announces a room because its blocked-on set changed. The room's own state is unchanged by
+   *  an approval (a drive is still holding it, or was never holding it), so this deliberately
+   *  re-derives rather than invents one, exactly as `detail()` does when it clears a badge. Round
+   *  is 0 for the same reason it is there: this frame is about the badge, not about the round. */
+  #emitPendingChanged(key: string): void {
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) return;
+    this.#emitState(room, this.#driving(key) ? "running" : room.needsYou ? "needs_you" : "settled", 0);
+  }
+
+  /** The live activity record for a turn, created on first use. Holding the turn's identity here
+   *  is what lets `#endTurnActivity` seal a turn whose durable row has already been consumed. */
+  #trackActivity(turn: BotGroupTurnRow, roomName: string): RoomTurnActivity {
+    const open = this.#activity.get(turn.turnId);
+    if (open !== undefined) return open;
+    const fresh: RoomTurnActivity = {
+      key: turn.key,
+      roomName,
+      member: turn.member,
+      threadId: turn.threadId,
+      seq: 0,
+      steps: new Map<string, BotToolStep>(),
+      emitted: false,
+    };
+    this.#activity.set(turn.turnId, fresh);
+    return fresh;
+  }
+
+  /** A member turn asked for an approval. It is recorded in the SAME durable interaction table a
+   *  1:1 chat writes, keyed by the member bot and the attach approval id, with `sessionId` set to
+   *  the gateway-owned member thread and `turnId` to the room turn. That is the whole trick: the
+   *  inbox read, the expiry sweep, the retention trim, `POST /bots/:member/approvals/:id/approve`
+   *  and the `resolve_approval` command it enqueues all address this row without knowing a room
+   *  exists. The room name rides the payload, so the card can be rendered above the right
+   *  transcript and the room can badge itself.
+   *
+   *  Every refusal below is an ACKNOWLEDGEMENT. The event is real and already authorized against a
+   *  durable turn row; declining it would dead-letter the member's whole stream behind something no
+   *  retry could ever apply (issue #193). */
+  #roomApproval(
+    turn: BotGroupTurnRow,
+    event: Extract<AttachV1EventFrame["event"], { kind: "approval" }>,
+  ): boolean {
+    const room = this.#storage.botGroup(turn.key);
+    if (room === undefined) {
+      this.#log(`dropping room approval for "${turn.member}": the room is gone`);
+      return true;
+    }
+    const outcome =
+      event.status === "approved" ? "approved"
+      : event.status === "denied" ? "denied"
+      : event.status === "pending" ? undefined
+      : "expired";
+    const binding = outcome === undefined
+      ? undefined
+      : this.#storage.nativeInteraction(turn.member, "approval", event.approvalId);
+    if (binding !== undefined && (binding.sessionId !== turn.threadId || binding.turnId !== turn.turnId)) {
+      this.#log(`dropping room approval for "${turn.member}": approval id is bound to another turn`);
+      return true;
+    }
+    const change = this.#storage.recordNativeInteraction({
+      bot: turn.member,
+      kind: "approval",
+      interactionId: event.approvalId,
+      sessionId: turn.threadId,
+      turnId: turn.turnId,
+      payload: { name: event.name, room: { key: turn.key, name: room.name } },
+      status: outcome ?? "pending",
+      ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
+      updatedAt: this.#now(),
+    });
+    if (change === "duplicate") return true;
+    if (change === "conflict") {
+      this.#log(`dropping room approval for "${turn.member}": approval id is bound to another turn`);
+      return true;
+    }
+    this.#trackActivity(turn, room.name);
+    if (outcome === undefined) {
+      this.#broadcast({
+        type: "bot_approval_pending",
+        bot: turn.member,
+        sessionId: turn.threadId,
+        turnId: turn.turnId,
+        toolCallId: event.approvalId,
+        name: event.name,
+        updatedAt: this.#now(),
+        room: room.name,
+      });
+    } else {
+      this.#broadcast({
+        type: "bot_approval_resolved",
+        bot: turn.member,
+        sessionId: turn.threadId,
+        turnId: turn.turnId,
+        toolCallId: event.approvalId,
+        outcome,
+        updatedAt: this.#now(),
+        room: room.name,
+      });
+    }
+    this.#emitPendingChanged(turn.key);
+    return true;
+  }
+
+  /** A member turn asked the human to choose. The approval arm's reasoning applies field for
+   *  field; the one extra rule is the 1:1 lane's own: a selection naming an option the DURABLE
+   *  list never had can never be applied, so it is acknowledged rather than retried forever. */
+  #roomClarify(
+    turn: BotGroupTurnRow,
+    event: Extract<AttachV1EventFrame["event"], { kind: "clarify" }>,
+  ): boolean {
+    const room = this.#storage.botGroup(turn.key);
+    if (room === undefined) {
+      this.#log(`dropping room clarify for "${turn.member}": the room is gone`);
+      return true;
+    }
+    const outcome =
+      event.status === "resolved" ? "selected"
+      : event.status === "pending" ? undefined
+      : event.status;
+    const binding = outcome === undefined
+      ? undefined
+      : this.#storage.nativeInteraction(turn.member, "clarify", event.clarifyId);
+    if (binding !== undefined && (binding.sessionId !== turn.threadId || binding.turnId !== turn.turnId)) {
+      this.#log(`dropping room clarify for "${turn.member}": clarify id is bound to another turn`);
+      return true;
+    }
+    const options = binding === undefined
+      ? event.options
+      : (binding.payload as { options: Array<{ id: string; label: string }> }).options;
+    if (
+      outcome === "selected" &&
+      event.selectedOptionId !== undefined &&
+      !options.some((option) => option.id === event.selectedOptionId)
+    ) {
+      this.#log(`dropping room clarify for "${turn.member}": selected option is not in the durable option list`);
+      return true;
+    }
+    const change = this.#storage.recordNativeInteraction({
+      bot: turn.member,
+      kind: "clarify",
+      interactionId: event.clarifyId,
+      sessionId: turn.threadId,
+      turnId: turn.turnId,
+      payload: { prompt: event.prompt, options: event.options, room: { key: turn.key, name: room.name } },
+      status: outcome ?? "pending",
+      ...(event.selectedOptionId === undefined ? {} : { selectedOptionId: event.selectedOptionId }),
+      ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
+      updatedAt: this.#now(),
+    });
+    if (change === "duplicate") return true;
+    if (change === "conflict") {
+      this.#log(`dropping room clarify for "${turn.member}": clarify id is bound to another turn`);
+      return true;
+    }
+    this.#trackActivity(turn, room.name);
+    if (outcome === undefined) {
+      this.#broadcast({
+        type: "bot_clarify_pending",
+        bot: turn.member,
+        sessionId: turn.threadId,
+        turnId: turn.turnId,
+        clarifyId: event.clarifyId,
+        prompt: event.prompt,
+        options: event.options,
+        ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
+        updatedAt: this.#now(),
+        room: room.name,
+      });
+    } else {
+      this.#broadcast({
+        type: "bot_clarify_resolved",
+        bot: turn.member,
+        sessionId: turn.threadId,
+        turnId: turn.turnId,
+        clarifyId: event.clarifyId,
+        outcome,
+        ...(event.selectedOptionId === undefined ? {} : { selectedOptionId: event.selectedOptionId }),
+        updatedAt: this.#now(),
+        room: room.name,
+      });
+    }
+    this.#emitPendingChanged(turn.key);
+    return true;
+  }
+
+  /** One tool step inside a member turn, published as the 1:1 activity card carrying `room`.
+   *
+   *  Two deliberate differences from the 1:1 lane. It is NEVER persisted: a chat rebuilds its
+   *  steps for a history screen, a room has no such screen, and the room's record is its
+   *  transcript. And it carries `name` and `status` only: the 1:1 card may carry the plugin's
+   *  bounded `detail`, and a room is a place where several bots and a human read each other's
+   *  activity, so this projection stays at the narrowest thing that is still useful. Arguments and
+   *  results were never on this wire and are not now.
+   *
+   *  Silently skipped, never declined, for a turn the room has moved past: a replayed tool event is
+   *  rendering state, and an unrenderable one must not block the stream behind it. */
+  #emitToolActivity(
+    turn: BotGroupTurnRow,
+    event: Extract<AttachV1EventFrame["event"], { kind: "tool" }>,
+  ): void {
+    if (turn.state !== "pending") return;
+    const room = this.#storage.botGroup(turn.key);
+    if (room === undefined || room.epoch !== turn.epoch) return;
+    const current = this.#trackActivity(turn, room.name);
+    const prior = current.steps.get(event.callId);
+    // At-least-once: a retried lifecycle state carries no new user-visible fact.
+    if (prior !== undefined && prior.name === event.name && prior.status === event.status) return;
+    const now = this.#now();
+    current.steps.set(event.callId, {
+      stepId: event.callId,
+      seq: prior?.seq ?? current.steps.size + 1,
+      name: event.name,
+      status: event.status,
+      startedAt: prior?.startedAt ?? now,
+      ...(event.status === "running" ? {} : { endedAt: now }),
+    });
+    current.seq += 1;
+    current.emitted = true;
+    this.#broadcast({
+      type: "bot_tool_activity",
+      bot: current.member,
+      sessionId: current.threadId,
+      turnId: turn.turnId,
+      steps: [...current.steps.values()],
+      seq: current.seq,
+      updatedAt: now,
+      room: current.roomName,
+    });
+  }
+
+  /** Ends a member turn's activity, at every settlement the turn can reach, for the same reason
+   *  `#endDraft` exists: the gateway opened these, so only the gateway can close them.
+   *
+   *  A step still `running` at settlement is sealed rather than left spinning, and a pending
+   *  approval or clarification is EXPIRED: the turn that was blocked on it is over, so a card the
+   *  user could still tap would resolve into a turn that no longer exists. This mirrors what the
+   *  1:1 lane does at its own turn terminal. A turn that raised nothing has no entry here and
+   *  costs nothing. */
+  #endTurnActivity(turnId: string, seal: "ok" | "error"): void {
+    const open = this.#activity.get(turnId);
+    if (open === undefined) return;
+    this.#activity.delete(turnId);
+    if (open.emitted) {
+      const now = this.#now();
+      for (const [stepId, step] of open.steps) {
+        if (step.status !== "running") continue;
+        open.steps.set(stepId, { ...step, status: seal, endedAt: now });
+      }
+      this.#broadcast({
+        type: "bot_tool_activity",
+        bot: open.member,
+        sessionId: open.threadId,
+        turnId,
+        steps: [...open.steps.values()],
+        seq: open.seq + 1,
+        updatedAt: now,
+        done: true,
+        room: open.roomName,
+      });
+    }
+    let changed = false;
+    for (const pending of this.#storage.pendingNativeInteractions(open.member)) {
+      if (pending.sessionId !== open.threadId || pending.turnId !== turnId) continue;
+      if (!this.#storage.resolveNativeInteraction(open.member, pending.kind, pending.interactionId, "expired", this.#now())) continue;
+      changed = true;
+      this.#broadcast(
+        pending.kind === "approval"
+          ? {
+              type: "bot_approval_resolved",
+              bot: open.member,
+              sessionId: open.threadId,
+              turnId,
+              toolCallId: pending.interactionId,
+              outcome: "expired",
+              updatedAt: this.#now(),
+              room: open.roomName,
+            }
+          : {
+              type: "bot_clarify_resolved",
+              bot: open.member,
+              sessionId: open.threadId,
+              turnId,
+              clarifyId: pending.interactionId,
+              outcome: "expired",
+              updatedAt: this.#now(),
+              room: open.roomName,
+            },
+      );
+    }
+    if (changed) this.#emitPendingChanged(open.key);
+  }
+
   #entries(key: string): GroupLogEntry[] {
     return this.#storage.botGroupLog(key).map((row) => ({
       seq: row.seq,
@@ -880,6 +1242,7 @@ export class GroupRooms {
       epoch: epoch ?? room.epoch,
       ...(note === undefined ? {} : { note }),
       updatedAt: this.#now(),
+      ...this.#pendingInteractions(room.key),
     });
   }
 }

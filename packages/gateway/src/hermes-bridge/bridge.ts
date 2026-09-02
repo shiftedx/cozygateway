@@ -465,6 +465,9 @@ export class HermesBridge implements BotControlSurface {
           ? undefined
           : bots.some((bot) => bot.name === name);
       },
+      // Capability 51. Only a runtime member's room turn projects approvals, clarifications and
+      // tool steps; a Hermes member's room turn keeps dropping them.
+      isRuntimeMember: (name) => this.#runtimeBotNames().has(name),
       memberExists: async (name) => {
         // Checked before the round trip for the same reason: `profiles.list` never names a runtime
         // bot, so asking it would answer `false` and retire a perfectly live member.

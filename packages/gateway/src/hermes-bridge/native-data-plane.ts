@@ -132,10 +132,23 @@ export interface NativeBotDataPlaneOptions {
 
 interface ApprovalPayload {
   name: string;
+  /** Capability 51. Present when the interaction was raised by a group-room member turn rather
+   *  than a 1:1 chat. The room lives in the payload rather than in a column so a room interaction
+   *  IS a 1:1 interaction row: every resolve, expiry and retention path here applies unchanged. */
+  room?: { key: string; name: string };
 }
 interface ClarifyPayload {
   prompt: string;
   options: Array<{ id: string; label: string }>;
+  /** Capability 51, as on `ApprovalPayload`. */
+  room?: { key: string; name: string };
+}
+
+/** Capability 51. The room name an interaction payload carries, or nothing for a 1:1 chat. The
+ *  payload is stored as opaque JSON, so this reads it defensively rather than casting. */
+function payloadRoom(payload: unknown): string | undefined {
+  const room = (payload as { room?: { name?: unknown } } | null)?.room;
+  return typeof room?.name === "string" ? room.name : undefined;
 }
 
 interface ToolFrameState {
@@ -445,11 +458,16 @@ export class NativeBotDataPlane {
     // event-loop turn too late for a user who opens the inbox or taps a push immediately, so settle
     // those durable rows synchronously before projecting the snapshot.
     for (const due of this.#storage.dueNativeApprovalIds([...this.#native], this.#now())) {
+      // Capability 51. Read the room BEFORE the expiry, so the terminal frame can name the room a
+      // member turn raised it in.
+      const room = payloadRoom(this.#storage.nativeInteraction(due.bot, "approval", due.interactionId)?.payload);
       const expired = this.#storage.expireNativeApprovalIfDue(due.bot, due.interactionId, this.#now());
       if (expired === undefined) continue;
       this.#clearInteractionTimer("approval", due.bot, due.interactionId);
-      this.#emitApprovalResolved(due.bot, expired.sessionId, expired.turnId, due.interactionId, "expired");
-      this.#state(due.bot, expired.sessionId, "polling", true);
+      this.#emitApprovalResolved(due.bot, expired.sessionId, expired.turnId, due.interactionId, "expired", room);
+      // A room interaction's `sessionId` is the gateway-owned member thread, which is not a chat
+      // session, so nudging chat state for it would describe a chat that does not exist.
+      if (room === undefined) this.#state(due.bot, expired.sessionId, "polling", true);
     }
     // Storage also receives the configured set: a durable row from a removed/reconfigured profile
     // is intentionally invisible because its existing action route correctly rejects that bot.
@@ -1517,9 +1535,11 @@ export class NativeBotDataPlane {
       decision,
     });
     if (requested.outcome === "expired") {
+      // Capability 51: a room interaction's session is a member thread, never a chat session.
+      const room = payloadRoom(binding.payload);
       this.#clearInteractionTimer("approval", bot, approvalId);
-      this.#emitApprovalResolved(bot, requested.sessionId, requested.turnId, approvalId, "expired");
-      this.#state(bot, requested.sessionId, "polling", true);
+      this.#emitApprovalResolved(bot, requested.sessionId, requested.turnId, approvalId, "expired", room);
+      if (room === undefined) this.#state(bot, requested.sessionId, "polling", true);
       return "expired";
     }
     if (requested.outcome === "requested") {
@@ -1553,6 +1573,7 @@ export class NativeBotDataPlane {
       optionId,
     });
     if (requested.outcome === "expired") {
+      const room = payloadRoom(binding.payload);
       this.#clearInteractionTimer("clarify", bot, clarifyId);
       this.#broadcast({
         type: "bot_clarify_resolved",
@@ -1562,8 +1583,9 @@ export class NativeBotDataPlane {
         clarifyId,
         outcome: "expired",
         updatedAt: this.#now(),
+        ...(room === undefined ? {} : { room }),
       });
-      this.#state(bot, requested.sessionId, "polling", true);
+      if (room === undefined) this.#state(bot, requested.sessionId, "polling", true);
       return "expired";
     }
     if (requested.outcome === "requested") {
@@ -2766,6 +2788,7 @@ export class NativeBotDataPlane {
     turnId: string,
     approvalId: string,
     outcome: "approved" | "denied" | "expired",
+    room?: string,
   ): void {
     const wire: BotApprovalResolvedFrame = {
       type: "bot_approval_resolved",
@@ -2775,6 +2798,7 @@ export class NativeBotDataPlane {
       toolCallId: approvalId,
       outcome,
       updatedAt: this.#now(),
+      ...(room === undefined ? {} : { room }),
     };
     this.#broadcast(wire);
     this.#onApproval?.({
@@ -2846,6 +2870,7 @@ export class NativeBotDataPlane {
           )
         )
           return;
+        const room = payloadRoom(pending.payload);
         if (pending.kind === "approval") {
           this.#emitApprovalResolved(
             pending.bot,
@@ -2853,6 +2878,7 @@ export class NativeBotDataPlane {
             pending.turnId,
             pending.interactionId,
             "expired",
+            room,
           );
         } else {
           this.#broadcast({
@@ -2863,6 +2889,7 @@ export class NativeBotDataPlane {
             clarifyId: pending.interactionId,
             outcome: "expired",
             updatedAt: this.#now(),
+            ...(room === undefined ? {} : { room }),
           });
         }
         this.#interactionTimers.delete(key);
@@ -2929,6 +2956,7 @@ export class NativeBotDataPlane {
           toolCallId: pending.interactionId,
           name: payload.name,
           updatedAt: pending.updatedAt,
+          ...(payload.room === undefined ? {} : { room: payload.room.name }),
         });
       } else {
         const payload = pending.payload as ClarifyPayload;
@@ -2944,6 +2972,7 @@ export class NativeBotDataPlane {
             ? {}
             : { expiresAt: pending.expiresAt }),
           updatedAt: pending.updatedAt,
+          ...(payload.room === undefined ? {} : { room: payload.room.name }),
         });
       }
     }

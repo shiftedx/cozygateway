@@ -90,6 +90,7 @@ and does not register `/bots` routes.
 | 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion, model-provider setup, and desktop-session transcripts keep the 409. |
 | 49 | Runtime bots created from the app: `POST /bots` accepts `runtime: "cozyagents"` and creates a gateway-owned bot with no Hermes profile, minting its attach token and enqueueing a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime` projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`, and `DELETE /bots/:name` answers for a runtime bot instead of 409. |
 | 50 | Bot history: a runtime bot checkpoints its own workspace into git and serves it over the attach-v1 `bot_history` lane. Five new runtime-bot-only routes carry the Changes list, a per-file diff, restore, the try/keep/discard experiment, and the per-file conflict choice. A Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_history`. Nothing content-shaped crosses the lane: summaries and counts, never files or patches. |
+| 51 | Room turns can ask: a runtime member's approval and clarify events on a room turn land in the existing interaction inbox (`sessionId` is the `group:<room>:<member>` thread) and resolve through the existing `/bots/:member/approvals/...` and `/bots/:member/clarifications/...` routes unchanged; tool events project as ephemeral `bot_tool_activity` carrying `room`; `BotGroup` and `bot_group_state` gain the optional `pendingInteractions` pointer array. The room transcript gains nothing and Hermes members are unchanged. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -147,6 +148,9 @@ a second, hand-copied schema.
   field reports only `isSet`, never a value or redacted suffix. A method is `fields`, Hermes-hosted
   `oauth`, or an honest `external` CLI handoff.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
+  From capability 51 a `BotGroup` may carry `pendingInteractions`, at most 32 pointers to the
+  approvals and clarifications its members are currently blocked on; it is absent when there are
+  none, and it is live state rather than history.
   From capability 47 a `BotGroupMessage` may carry `messageId` (the row's own durable, room-unique
   id: `seq` orders a room, `messageId` identifies a message across rooms, restarts, and a head
   trim), `turnId` (the member turn that produced it, the same id as the gateway's durable turn row
@@ -798,7 +802,12 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
 - `bot_clarify_pending`, `bot_clarify_resolution_requested`, and `bot_clarify_resolved`: durable
   native clarification lifecycle. A
   pending card contains only a display prompt and bounded option ids/labels, never model reasoning.
+  Capability 51: `bot_clarify_pending` and `bot_clarify_resolved` may carry `room`, as the approval
+  pair already could, when the clarification was raised by a room member turn.
 - `bot_group`, `bot_group_state`: durable gateway-owned group-room transcript and state.
+  Capability 51: `bot_group_state` may carry `pendingInteractions`, the same optional pointer array
+  `BotGroup` carries, and a frame is emitted when one opens and when one settles so a client can
+  badge the room without re-reading it.
 
 Frames are independently safe to drop where their schema says they are deltas or snapshots.
 Committed transcript history remains the recovery source after reconnect.
@@ -830,7 +839,49 @@ Committed transcript history remains the recovery source after reconnect.
   A draft that reads as the protocol's own pass is never published, matching the rule that keeps
   `(pass)` out of the transcript; drafts are coalesced latest-only inside a 100 ms window, and every
   frame carries the whole accumulated text, so a dropped one costs a reader nothing. Tool, thinking,
-  and delegation activity inside a room turn is deliberately not projected in this version.
+  and delegation activity inside a room turn is deliberately not projected in this version; tool
+  activity arrives in capability 51 below, thinking and delegation still do not.
+- Capability 51. A ROOM member turn can now ask. Below 51 a room acknowledged and dropped a
+  member's `approval`, `clarify` and `tool` events, which is why a runtime peer had to run room
+  turns with read-only tools: a bot that cannot ask for permission must never need it.
+  An approval or clarification raised by a RUNTIME member's room turn is recorded in the same
+  durable interaction record a 1:1 chat writes, keyed by the member bot and the attach id, with
+  `sessionId` set to the gateway-owned `group:<room>:<member>` thread and `turnId` set to the room
+  member turn. It therefore appears in `GET /bots/approvals` beside every other pending item,
+  carrying the room name as the optional `room` field, and `POST
+  /bots/:member/approvals/:id/approve|deny` and `POST /bots/:member/clarifications/:id` resolve it
+  with no new route, no changed request or response shape, and the same `resolve_approval` /
+  `resolve_clarify` command the gateway has always sent the peer. The
+  `bot_approval_pending`/`bot_approval_resolved` and `bot_clarify_pending`/`bot_clarify_resolved`
+  frames carry `room` so the card can be rendered above the right transcript. A room interaction
+  still pending when its member turn seals is EXPIRED, with the terminal frame the 1:1 lane emits:
+  a card that resolves into a turn that is over would be a lie.
+  Tool events on a member turn project as `bot_tool_activity` carrying `room`, `bot` set to the
+  member and `sessionId` set to the member thread: the 1:1 card shape, with `name` and `status`
+  only. A room is where several bots and a human read each other's activity, so the projection
+  stays at the narrowest useful thing and does NOT carry the 1:1 card's bounded `detail`; arguments
+  and results were never on this wire. It is EPHEMERAL: never persisted, never in any history, and
+  sealed by one final `done: true` frame at whichever settlement the turn reaches, exactly like the
+  live draft. Thinking and delegation activity in a room stay unprojected.
+  The room TRANSCRIPT gains nothing. A pending interaction is live state, so it rides `BotGroup`
+  and `bot_group_state` as the optional `pendingInteractions` array: one pointer per blocked
+  member, carrying `member`, `kind`, the resolution `id`, and the room `turnId`, and nothing a
+  reader could mistake for the request itself. It is absent when there are none.
+  HERMES MEMBERS ARE UNCHANGED. Only a member whose bot is a capability-45 runtime bot projects any
+  of this; a Hermes-backed member's room turn drops these events exactly as it did below 51,
+  acknowledged and unprojected, because the Hermes plugin has never been asked to raise one inside
+  a room and a half-projected lane is worse than none.
+- Capability 51, consequence for the CozyAgents peer. The read-only rule CozyAgents applies to room
+  turns exists only because this gateway had no way to carry a question out of a room: a peer that
+  cannot ask for approval must not run a tool that would need it, so wave-2 Track P-B restricted
+  room turns to tools that never ask. That reason is gone. A room turn now reaches the same
+  approval and clarification surface a 1:1 turn reaches, through the same commands, so the peer MAY
+  lift the restriction and run a room turn with its ordinary toolset. The change belongs to
+  CozyAgents and is not made here; this gateway only guarantees the lane. Two facts the peer should
+  hold onto when it does: a room member turn is SERIAL within its room, so a turn blocked on a human
+  holds the room's whole deliberation until it settles or the gateway's turn timeout seals it, and a
+  pending interaction is expired when its turn seals, so a peer must not sit on an unanswered
+  question past its own turn.
 - Capability 48. A runtime bot's profile, model-config and routines routes are served by its own
   peer over the attach-v1 `bot_config` lane (see `contract/attach-v1.md`), so they answer normally
   rather than 409. Nothing about their request or response shape changes: the peer implements the
