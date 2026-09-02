@@ -1543,17 +1543,8 @@ stop_owned_windows_gateway() {
   for attempt in $(seq 1 10); do
     set +e
     MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_PORT="$PORT" powershell.exe -NoProfile -NonInteractive -Command '
-      $probe = $null
-      $released = $false
-      try {
-        $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, [int]$env:COZYGATEWAY_EXPECTED_PORT)
-        $probe.Start()
-        $released = $true
-      } catch {
-      } finally {
-        if ($null -ne $probe) { $probe.Stop() }
-      }
-      if ($released) { exit 0 }
+      $listener = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($null -eq $listener) { exit 0 }
       exit 1
     ' >/dev/null 2>&1
     release_code=$?
