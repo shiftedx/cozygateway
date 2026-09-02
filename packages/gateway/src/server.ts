@@ -799,6 +799,7 @@ export async function startGateway(
   });
   botsSurface = nativePlane.surface();
   const nativeHistory = nativePlane.historySurface();
+  const nativeRunRoutine = nativePlane.runRoutineSurface();
   // Same rows, same overlay, both surfaces: the `bot_roster` frame and `GET /bots` are now built
   // by one function, so a WS row carries the chat session id its REST twin carries.
   bridge.setRosterOverlay((bots) => nativePlane.rosterBots(bots));
@@ -850,6 +851,7 @@ export async function startGateway(
     // The plane's guard, not the raw lane: history is a runtime-bot fact, and the 409 a Hermes bot
     // gets is decided in one place rather than in each of the five routes.
     ...(nativeHistory === undefined ? {} : { history: nativeHistory }),
+    ...(nativeRunRoutine === undefined ? {} : { runRoutine: nativeRunRoutine }),
     attachTokens,
     attachMediaAllowed: (agentId: string) =>
       // Capability 49: a bot created through `POST /bots {runtime}` has no config line to be found

@@ -28,6 +28,7 @@ import {
 } from "cozygateway-contract";
 import { MEMORY_KINDS, MemoryConflict, MemoryInvalidRequest, MemoryNotFound, createMemoryRateLimiter, type MemoryRateLimiter, type MemorySurface } from "./memory.ts";
 import { HistoryConflict, HistoryInvalidRequest, type HistorySurface } from "./bot-history.ts";
+import type { RunRoutineSurface } from "./native-data-plane.ts";
 import type { BotMemoryKind } from "cozygateway-contract";
 
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
@@ -378,6 +379,10 @@ export function registerBotRoutes(
   /** Capability 50, runtime bots only. Absent leaves the five history routes unregistered, so a
    *  gateway that serves no history answers `404` rather than a refusal that implies one exists. */
   history?: HistorySurface,
+  /** Capability 53, runtime bots only. Absent leaves `POST /bots/:name/routines/:id/run`
+   *  unregistered, the same "404 rather than a refusal that implies one exists" rule `history`
+   *  follows above. */
+  runRoutine?: RunRoutineSurface,
 ): void {
   const chat = bots as BotsSurface;
   // One limiter per registered app, created here rather than at module scope so two gateways in one
@@ -1740,6 +1745,23 @@ export function registerBotRoutes(
       return failure(c, err);
     }
   });
+
+  // Capability 53, RUNTIME BOTS ONLY. Registered only when a config lane exists at all, and it
+  // refuses a Hermes bot with `409 unsupported_for_runtime` through the surface's own guard,
+  // exactly the way the capability-50 history routes refuse one: this route sends `routines.run`
+  // over the existing attach-v1 `bot_config` lane, and a Hermes cron job has no on-demand trigger
+  // this gateway can reach at all.
+  if (runRoutine !== undefined) {
+    app.post("/bots/:name/routines/:id/run", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await runRoutine.run(resolved.name, c.req.param("id") ?? ""));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+  }
 
   // The media proxy. `name` scopes the route to a bot for symmetry with everything else under
   // `/bots/:name`, and is validated the same way, but it is NOT resolved against Hermes: the answer

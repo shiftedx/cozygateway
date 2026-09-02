@@ -1295,6 +1295,18 @@ export const BotRoutineWriteResponseSchema = Type.Object({
 });
 export type BotRoutineWriteResponse = Static<typeof BotRoutineWriteResponseSchema>;
 
+/** `POST /bots/:name/routines/:id/run` response: the routine as it stands right after the peer
+ *  acknowledged the run, and the millisecond wall-clock moment that ack landed. The config lane's
+ *  `routines.run` ack itself carries neither field, so the gateway fills both in rather than
+ *  echoing the request: `startedAt` is when the peer confirmed, and `routine` comes from a fresh
+ *  `routines.list` rather than the pre-run row, so a caller sees any state the run itself changed
+ *  (for example `lastRun`, once a peer reports it). */
+export const BotRoutineRunResponseSchema = Type.Object({
+  routine: BotRoutineSchema,
+  startedAt: Type.Integer(),
+});
+export type BotRoutineRunResponse = Static<typeof BotRoutineRunResponseSchema>;
+
 /** One bot's routines, as a FULL REPLACE snapshot. Sent when this gateway changed them and when a
  *  `cron.changed` broadcast made the bridge re-read a bot whose routines some device is watching. */
 export const BotRoutinesFrameSchema = Type.Object({
@@ -2209,4 +2221,20 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  *
  * Additive: no existing route, request or response changes, and a client that renders the roster
  * gates on `>= 52`. */
-export const BOTS_CAPABILITY_VERSION = 52;
+/** Capability 53: ROUTINE RUN NOW. `POST /bots/:name/routines/:id/run` sends `routines.run` over
+ * the existing capability-48 `bot_config` lane and answers `BotRoutineRunResponse`
+ * (`{routine, startedAt}`), so a person or a check can force a runtime bot's routine to fire
+ * immediately instead of waiting for its schedule. No new capability row: it is a route on the
+ * operation capability 48 already defined on the wire, and the config lane already carried
+ * `routines.run` before this version, unreachable for lack of a route.
+ *
+ * RUNTIME-BOT ONLY, the same rule capability 50's history routes follow: a Hermes bot answers
+ * `409 unsupported_for_runtime`, because a Hermes cron job has no on-demand trigger this gateway
+ * can reach, and so does a runtime bot whose peer did not negotiate `bot_config`, because the
+ * lane is genuinely absent rather than temporarily unreachable. An id that names no routine in the
+ * bot's namespace is `404 not_found`, exactly as it is on the other routines routes, and an
+ * offline peer is `503 backend_unavailable`.
+ *
+ * Additive: the route did not exist below 53, so a client that offers a "run now" action must
+ * require `>= 53` and a gateway below it answers `404`. */
+export const BOTS_CAPABILITY_VERSION = 53;
