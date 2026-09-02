@@ -39,10 +39,12 @@ WINDOWS_OWNED_CONFIG_JSON=""
 DRY_RUN=0
 UNINSTALL=0
 STATUS=0
-# Capability 54: which harness runs the bots. Empty until choose_harness scans the machine or
-# --harness answers for it.
+# Which harness runs the bots. Empty until choose_harness scans the machine or --harness answers
+# for it. COZYAGENTS_CHOSEN stays 0 unless a person or a recorded install actually said CozyAgents,
+# because that is the only answer allowed to take a Hermes bridge out of an existing config.
 HARNESS=""
 HARNESS_EXPLICIT=0
+COZYAGENTS_CHOSEN=0
 HERMES_FOUND=""
 NO_QR=0
 COZYAGENTS_HOME_DIR="${COZYAGENTS_HOME:-$HOME/.cozyagents}"
@@ -428,21 +430,28 @@ confirm_hermes_model() {
   say "OK    Hermes provider and model are configured"
 }
 
-# Capability 54. The harness is the thing that actually runs a bot. A machine that already has
+# The harness is the thing that actually runs a bot. A machine that already has
 # Hermes keeps it, with no question asked; a machine with none is offered CozyAgents first and
 # takes it on Enter, on `--harness`, and whenever there is no terminal to ask on.
 choose_harness() {
   local input answer recorded=""
   HERMES_FOUND="$(find_hermes || true)"
   if [ "$HARNESS_EXPLICIT" = 1 ]; then
+    [ "$HARNESS" != cozyagents ] || COZYAGENTS_CHOSEN=1
     say "OK    harness: $HARNESS (from --harness)"
     return 0
   fi
   # A machine that answered this question once is never asked again: the recorded harness is the
-  # one this install owns, and changing it is an uninstall away.
-  [ ! -f "$STATE_FILE" ] || recorded="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
+  # one this install owns, and changing it is an uninstall away. An install written before the
+  # harness line existed records a Hermes root instead, and that is just as binding: a Hermes
+  # install whose binary has since moved must never be re-read as a CozyAgents one.
+  if [ -f "$STATE_FILE" ]; then
+    recorded="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
+    if [ -z "$recorded" ] && grep -q '^hermes_root=' "$STATE_FILE"; then recorded=hermes; fi
+  fi
   case "$recorded" in
-    cozyagents|hermes) HARNESS="$recorded"; say "OK    harness: $HARNESS (already installed here)"; return 0 ;;
+    cozyagents) HARNESS=cozyagents; COZYAGENTS_CHOSEN=1; say "OK    harness: cozyagents (already installed here)"; return 0 ;;
+    hermes) HARNESS=hermes; say "OK    harness: hermes (already installed here)"; return 0 ;;
   esac
   if [ -n "$HERMES_FOUND" ]; then
     HARNESS=hermes
@@ -463,7 +472,7 @@ choose_harness() {
     printf 'Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [1] ' >&2
     if ! IFS= read -r answer <&7; then answer=""; fi
     case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
-      ''|1|c|cozyagents) HARNESS=cozyagents; break ;;
+      ''|1|c|cozyagents) HARNESS=cozyagents; COZYAGENTS_CHOSEN=1; break ;;
       2|h|hermes) HARNESS=hermes; break ;;
       *) say 'Please answer 1 or 2.' >&2 ;;
     esac
@@ -599,6 +608,10 @@ install_cozyagents_harness() {
     die "the CozyAgents install did not complete successfully"
   launcher="$(cozyagents_launcher)"
   [ -x "$launcher" ] || die "CozyAgents finished but $launcher is missing"
+  # The code goes in as an argument because that is the only way `cozyagents runner pair` takes
+  # one: the code is a positional or --pair-code, and its stdin prompt is offered only on a TTY,
+  # which an installer piped from curl does not have. It is a ten-minute, single-use credential,
+  # and it is visible in this machine's process list for the seconds that command runs.
   write_runner_model_env
   # A computer that is already paired keeps the runner credential it has: a second run upgrades
   # the harness and leaves the pairing, exactly as a second run leaves device trust alone.
@@ -745,10 +758,16 @@ enable_plugin() {
 # empty, and the roster comes from the runtime bots the runner reports.
 write_cozyagents_gateway_config() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   write CozyAgents-only gateway config at $CONFIG_JSON with no Hermes endpoint"; return; }
+  # Taking a Hermes bridge out of a config is destructive and irreversible from here, so it happens
+  # only when a person or a recorded install actually chose CozyAgents. A default taken with no
+  # terminal is not that, and leaves any endpoint it finds exactly where it is.
+  if [ "$COZYAGENTS_CHOSEN" = 0 ] && [ -f "$CONFIG_JSON" ] && grep -q '"hermesEndpoints"' "$CONFIG_JSON"; then
+    say "WARN  this config already has a Hermes endpoint and no one chose CozyAgents here; keeping it. Rerun with --harness cozyagents to replace it."
+  fi
   umask 077
-  "$NODE_RESOLVED" - "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$PUBLIC_URL" <<'NODE'
+  "$NODE_RESOLVED" - "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$PUBLIC_URL" "$COZYAGENTS_CHOSEN" <<'NODE'
 const fs = require('node:fs');
-const [output, host, port, dbPath, publicUrl] = process.argv.slice(2);
+const [output, host, port, dbPath, publicUrl, chosen] = process.argv.slice(2);
 let existing = {};
 try {
   existing = JSON.parse(fs.readFileSync(output, 'utf8'));
@@ -758,8 +777,10 @@ try {
 }
 const managed = { name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }) };
 delete existing.publicUrl;
-delete existing.hermesEndpoints;
-delete existing.hermes;
+if (chosen === '1') {
+  delete existing.hermesEndpoints;
+  delete existing.hermes;
+}
 const temporary = `${output}.new`;
 fs.writeFileSync(temporary, JSON.stringify({ ...existing, ...managed }, null, 2) + '\n', { mode: 0o600 });
 fs.renameSync(temporary, output);
@@ -2308,12 +2329,39 @@ uninstall() {
   done
   run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
+# What a CozyAgents harness has instead of attach health: the runner's own row, asked for with the
+# runner's own token, which is the only thing that token opens. The token goes in through stdin, not
+# argv, so it never appears in this machine's process list.
+status_runner() {
+  local home token origin answer name
+  home="$(sed -n 's/^cozyagents_home=//p' "$STATE_FILE" | tail -1)"
+  [ -n "$home" ] || home="$COZYAGENTS_HOME_DIR"
+  token="$(env_get "$home/runner.env" COZYRUNNER_TOKEN)"
+  name="$(env_get "$home/runner.env" COZYRUNNER_NAME)"
+  origin="$(env_get "$home/runner.env" COZYRUNNER_GATEWAY_URL)"
+  [ -n "$origin" ] || origin="${PUBLIC_URL:-$(gateway_origin)}"
+  if [ -z "$token" ]; then
+    say "FAIL  no runner is paired on this computer; run: cozyagents runner pair <code>"
+    return 1
+  fi
+  answer="$(printf 'Authorization: Bearer %s\n' "$token" |
+    curl -s --max-time 5 "$origin/runners/self" -H @- 2>/dev/null |
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const r=JSON.parse(b);if(typeof r?.name!=="string")return process.exit(1);const seen=typeof r.lastSeenAt==="number"?new Date(r.lastSeenAt).toISOString():"never";process.stdout.write(`runner "${r.name}", last seen ${seen}, ${r.attached===true?"attached":"not attached"}`)}catch{process.exit(1)}})' 2>/dev/null || true)"
+  if [ -n "$answer" ]; then
+    say "OK    $answer"
+    return 0
+  fi
+  say "WARN  the gateway did not answer /runners/self; reporting the local runner state instead"
+  say "INFO  runner \"${name:-unnamed}\" is paired to $origin on this computer"
+  return 0
+}
 status_install() {
   local persisted=0 live=0 startup_entry code harness=""
   resolve_platform
   [ ! -f "$STATE_FILE" ] || harness="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
+  if [ -z "$harness" ] && [ -f "$STATE_FILE" ] && grep -q '^hermes_root=' "$STATE_FILE"; then harness=hermes; fi
   case "$harness" in
-    cozyagents) say "OK    harness: CozyAgents (bots run here under the CozyAgents runner)" ;;
+    cozyagents) say "OK    harness: CozyAgents (bots run here under the CozyAgents runner)"; status_runner || true ;;
     hermes) say "OK    harness: Hermes Agent" ;;
   esac
   if [ "$SERVICE_PLATFORM" = Windows ]; then
@@ -2395,7 +2443,7 @@ main() {
   [ "$prerequisite_missing" = 1 ] || hydrate_listener_settings
   if [ "$STATUS" = 1 ]; then validate_listener_settings; status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
-  # Capability 54, step 1 of the approved order: the harness, before anything is installed.
+  # Step 1 of the approved order: the harness, before anything is installed.
   choose_harness
   if [ "$HARNESS" = cozyagents ]; then install_with_cozyagents "$prerequisite_missing"; return; fi
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capability 54: the harness choice, the CozyAgents branch of the all-in-one installer, the model
+# The harness choice, the CozyAgents branch of the all-in-one installer, the model
 # and provider questions it asks, the network question, and the QR rule.
 #
 # Everything the CozyAgents branch reaches out to is stubbed here: the CozyAgents installer is a
@@ -69,7 +69,14 @@ exit 0
 LAUNCHCTL
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
+[ -z "${COZYGATEWAY_TEST_CURL_LOG:-}" ] || printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_CURL_LOG"
 case "$*" in
+  *runners/self*)
+    # The token arrives on stdin (-H @-), never in argv.
+    cat >/dev/null 2>&1 || true
+    [ "${COZYGATEWAY_TEST_RUNNER_SELF_DOWN:-}" = 1 ] && exit 7
+    printf '{"id":"r-1","name":"test-runner","lastSeenAt":1756771200000,"attached":true}'
+    ;;
   *health*) if [[ "$*" == *"-o /dev/null"* ]]; then printf '200'; else printf '{"attach":{"configured":0,"online":0,"deadLetters":0}}'; fi ;;
   *) exit 1 ;;
 esac
@@ -89,7 +96,7 @@ cat > "$home/bin/cozyagents" <<LAUNCHER
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "${COZYAGENTS_TEST_LOG}"
 if [ "\${1:-}" = runner ] && [ "\${2:-}" = pair ]; then
-  printf 'COZYRUNNER_TOKEN=paired-token\n' >> "$home/runner.env"
+  printf 'COZYRUNNER_TOKEN=paired-token\nCOZYRUNNER_NAME=test-runner\nCOZYRUNNER_GATEWAY_URL=http://127.0.0.1:8787\n' >> "$home/runner.env"
   chmod 600 "$home/runner.env"
 fi
 exit 0
@@ -249,9 +256,19 @@ expect_missing "$no_qr_output" 'fake-qr'
 expect_missing "$no_qr_output" 'Create a new CozyChat pairing code?'
 expect_contains "$no_qr_output" 'no pairing QR was printed (--no-qr)'
 
-# `--status` names the harness this install owns.
-status_output="$(HOME="$live_home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" bash "$installer" --status --gateway-dir "$tmp/gw-live" 2>&1 || true)"
+# `--status` names the harness this install owns, and reports the runner's own row rather than
+# attach health. The runner token reaches curl on stdin, never in argv.
+: > "$tmp/curl.log"
+status_output="$(HOME="$live_home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYAGENTS_HOME="$live_home/.cozyagents" COZYGATEWAY_TEST_CURL_LOG="$tmp/curl.log" bash "$installer" --status --gateway-dir "$tmp/gw-live" 2>&1 || true)"
 expect_contains "$status_output" 'harness: CozyAgents'
+expect_contains "$status_output" 'runner "test-runner", last seen 2025-09-02T00:00:00.000Z, attached'
+expect_contains "$(cat "$tmp/curl.log")" '/runners/self'
+if grep -Fq 'paired-token' "$tmp/curl.log"; then echo 'the runner token must never reach argv' >&2; exit 1; fi
+
+# With the gateway unreachable, the local runner state is what it reports.
+down_output="$(HOME="$live_home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYAGENTS_HOME="$live_home/.cozyagents" COZYGATEWAY_TEST_RUNNER_SELF_DOWN=1 bash "$installer" --status --gateway-dir "$tmp/gw-live" 2>&1 || true)"
+expect_contains "$down_output" 'the gateway did not answer /runners/self'
+expect_contains "$down_output" 'runner "test-runner" is paired to http://127.0.0.1:8787'
 
 # ---------------------------------------------------------------------------
 # 5. A loopback answer stays loopback, and a local endpoint is written as one
@@ -281,7 +298,54 @@ fi
 expect_contains "$both_output" '--runner-model-provider and --runner-model-endpoint are mutually exclusive'
 
 # ---------------------------------------------------------------------------
-# 6. Uninstall gives the harness back to its own uninstaller
+# 6. An install made before the harness question existed is a Hermes install
+# ---------------------------------------------------------------------------
+# Its state file records a Hermes root and no harness line, and its Hermes binary has since moved,
+# so the scan finds nothing. It must still be read as Hermes, and its Hermes bridge must survive.
+legacy_dir="$tmp/gw-legacy"
+mkdir -p "$legacy_dir/local"
+cat > "$legacy_dir/local/install-state" <<STATE
+profiles=default
+profile_scope=all
+hermes_root=$tmp/legacy-hermes-root
+dashboard_port=9119
+hermes_bin=$tmp/legacy-hermes-root/bin/hermes
+service_default=installed
+STATE
+cat > "$legacy_dir/local/cozygateway.config.json" <<CONFIG
+{
+  "name": "cozygateway",
+  "host": "127.0.0.1",
+  "port": 8787,
+  "dbPath": "$legacy_dir/local/cozygateway.sqlite",
+  "hermesEndpoints": [{ "id": "default", "url": "ws://127.0.0.1:9119/api/ws", "authMode": "token", "tokenEnv": "COZYGATEWAY_HERMES_TOKEN", "profile": "default", "profiles": { "default": { "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_DEFAULT" } } }]
+}
+CONFIG
+legacy_output="$(HOME="$tmp/legacy-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/legacy-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/gateway.mjs" --gateway-dir "$legacy_dir" 2>&1 || true)"
+expect_contains "$legacy_output" 'harness: hermes (already installed here)'
+expect_missing "$legacy_output" 'Which harness runs your bots?'
+expect_missing "$legacy_output" 'CozyAgents'
+grep -Fq 'hermesEndpoints' "$legacy_dir/local/cozygateway.config.json"
+
+# A config with a Hermes bridge and no state file at all is not evidence that anybody chose
+# CozyAgents. The default taken with no terminal keeps the bridge and says so.
+orphan_dir="$tmp/gw-orphan"
+mkdir -p "$orphan_dir/local"
+sed "s|$legacy_dir|$orphan_dir|g" "$legacy_dir/local/cozygateway.config.json" > "$orphan_dir/local/cozygateway.config.json"
+: > "$tmp/agents.log"
+orphan_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --bundle "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1)"
+expect_contains "$orphan_output" 'keeping it. Rerun with --harness cozyagents to replace it.'
+grep -Fq 'hermesEndpoints' "$orphan_dir/local/cozygateway.config.json"
+
+# Asking for it outright is the one thing that takes the bridge out.
+chosen_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --harness cozyagents --no-qr --bundle "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1)"
+expect_missing "$chosen_output" 'keeping it. Rerun with --harness cozyagents'
+if grep -q 'hermesEndpoints' "$orphan_dir/local/cozygateway.config.json"; then
+  echo 'an explicit CozyAgents choice must replace the Hermes bridge' >&2; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Uninstall gives the harness back to its own uninstaller
 # ---------------------------------------------------------------------------
 : > "$tmp/agents.log"
 uninstall_output="$(HOME="$loopback_home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" \

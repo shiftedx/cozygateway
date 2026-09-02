@@ -50,11 +50,33 @@ installer. When a Codex login is already on the machine
 offers to share it with the bots that run here, so nobody has to paste a key;
 answering yes writes `COZYRUNNER_SHARE_HOST_MODEL_AUTH=1`.
 
+The pairing code is passed to `cozyagents runner pair` as a command argument,
+because that is the only way that command takes one: the code is a positional or
+`--pair-code`, and its interactive prompt is offered only on a TTY, which an
+installer piped from `curl` does not have. The code is a single-use credential
+that expires in ten minutes, and it is visible in this machine's process list
+for the seconds that command runs.
+
+An install made before the harness question existed records a Hermes root and no
+harness line. It is read as a Hermes install, even when its Hermes binary has
+since moved and the scan finds nothing, and its `hermesEndpoints` are never
+removed. A Hermes bridge is taken out of a config only when CozyAgents was
+actually chosen: `--harness cozyagents`, the answer to the question, or a
+CozyAgents harness already recorded in this install's state. Anything else keeps
+the bridge and says so.
+
 `--uninstall` removes the CozyGateway service and state, and hands the harness
 back to its own uninstaller (`cozyagents uninstall`) rather than reimplementing
-it. `--status` names the harness this install owns. `--no-qr` never prints a
-pairing QR, whatever the run is. The installer refuses to run as root on every
-path.
+it. `--status` names the harness this install owns, and for a CozyAgents harness
+reports the runner's name, its last-seen time and whether it is attached, from
+`GET /runners/self` with the runner's own token sent on stdin rather than argv;
+with the gateway unreachable it reports the local runner state instead. `--no-qr`
+never prints a pairing QR, whatever the run is. The installer refuses to run as
+root on every path.
+
+The CozyAgents installer itself is not shipped from this repository: CozyAgents
+owns its own one-liner and payload, and the website pins their bytes. This
+installer only fetches and runs it.
 
 If Node.js 24+ is unavailable, the Windows/macOS/Linux installer downloads the current
 Node.js 24 archive from nodejs.org, verifies it against that release's official
