@@ -1010,9 +1010,29 @@ export const BotProfileRuntimeInertSchema = Type.Array(
 );
 export type BotProfileRuntimeInert = Static<typeof BotProfileRuntimeInertSchema>;
 
+/** How much a bot does without asking (capability 57).
+ *
+ *  Four literals and no others, because the name IS the contract: `locked` reads and changes
+ *  nothing, `guided` asks before every change, `balanced` works in its own workspace and asks
+ *  before anything that leaves it, `autonomous` works unasked and still asks before the destructive
+ *  set no level lifts. This gateway does not interpret the value: the closed union is what makes a
+ *  fifth name the runtime peer's refusal to make, not a silent pass-through of a typo. */
+export const GuardrailLevelSchema = Type.Union([
+  Type.Literal("locked"),
+  Type.Literal("guided"),
+  Type.Literal("balanced"),
+  Type.Literal("autonomous"),
+]);
+export type GuardrailLevel = Static<typeof GuardrailLevelSchema>;
+
 /** `GET /bots/:name/profile`: one bot's full edit-screen state. `model.default` is the model id and
  *  keeps the gateway's own field name; both model fields are empty strings when the profile
- *  inherits the launch profile's model rather than pinning one. */
+ *  inherits the launch profile's model rather than pinning one.
+ *
+ *  `guardrailLevel` (capability 57) is OPTIONAL, not required: this gateway does not store or
+ *  compute it, it only relays whatever the runtime peer answers on `profile.read`. Absent for a
+ *  Hermes bot (Hermes has no notion of the field) and for a runtime peer that has not negotiated
+ *  capability 57, and never backfilled -- an absent value here is not a default, it is silence. */
 export const BotProfileSchema = Type.Object({
   name: Type.String(),
   description: Type.String(),
@@ -1023,6 +1043,7 @@ export const BotProfileSchema = Type.Object({
   mcpServers: Type.Array(BotMcpServerSchema),
   model: Type.Object({ provider: Type.String(), default: Type.String() }),
   runtimeInert: BotProfileRuntimeInertSchema,
+  guardrailLevel: Type.Optional(GuardrailLevelSchema),
 });
 export type BotProfile = Static<typeof BotProfileSchema>;
 
@@ -1036,7 +1057,13 @@ export type BotProfile = Static<typeof BotProfileSchema>;
  *  Every name must carry at least one non-whitespace character, which is why the item rule is a
  *  PATTERN and not just `minLength: 1`. A single space passes a length check, and the backend then
  *  filters it, leaving `enabledToolsets` EMPTY, which pops the pin and enables every toolset: the
- *  maximum-permission outcome from what looks like a typo. Refused at the boundary instead. */
+ *  maximum-permission outcome from what looks like a typo. Refused at the boundary instead.
+ *
+ *  `guardrailLevel` (capability 57) is additive, optional, and one of the four literal names and
+ *  nothing else: a body carrying any other value is `400 invalid_request` naming the field. The
+ *  gateway does not store it: the patch is forwarded to the runtime peer over the existing
+ *  `bot_config` profile lane unchanged, so a level reaches the peer the moment the schema admits
+ *  it. Sent to a Hermes bot, it is simply not part of that peer's vocabulary and is ignored. */
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 
 export const BotProfilePatchSchema = Type.Object({
@@ -1044,6 +1071,7 @@ export const BotProfilePatchSchema = Type.Object({
   disabledSkills: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   enabledToolsets: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   enabledMcpServers: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  guardrailLevel: Type.Optional(GuardrailLevelSchema),
 });
 export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
 
@@ -2392,4 +2420,24 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Additive: a gateway below 56 never writes `detail` into the stored payload JSON and never sends
  * it on the frame; an event or payload that carries none behaves exactly as it did below 56. A
  * client that renders the sentence gates it on `>= 56`. */
-export const BOTS_CAPABILITY_VERSION = 56;
+/** Capability 57: THE PER-BOT GUARDRAIL LEVEL. `BotProfile` gains an optional `guardrailLevel` and
+ * `BotProfilePatch` an optional one too, one of `locked`, `guided`, `balanced`, `autonomous`,
+ * carried over the existing capability-48 `bot_config` lane on the existing `profile.read` and
+ * `profile.write` operations. No new route and no new lane.
+ *
+ * This gateway is a relay for the field, not an owner of it: it validates the closed union at the
+ * boundary and forwards the patch to the runtime peer unchanged, and it reads back exactly what
+ * the peer answers rather than computing or defaulting the value itself. A body naming a fifth
+ * value is `400 invalid_request` naming the field, the same shape every other closed-union field
+ * on this route already answers.
+ *
+ * Absent for a Hermes bot (the field is not part of the `profiles.describe` / `profiles.configure`
+ * vocabulary this gateway translates for Hermes, so a Hermes profile read never carries it and a
+ * Hermes profile write silently does not act on it), and absent for a runtime peer that has not
+ * negotiated capability 57, and never backfilled in either case: an absent value is silence, not a
+ * default the gateway invented.
+ *
+ * Additive: both schema fields are optional, so a client below 57 sends no such field and its
+ * profile saves stay byte identical to the ones it sent before, and a gateway below 57 simply never
+ * sends or accepts the field. A client that offers the level picker gates it on `>= 57`. */
+export const BOTS_CAPABILITY_VERSION = 57;

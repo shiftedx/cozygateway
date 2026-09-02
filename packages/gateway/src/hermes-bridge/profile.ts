@@ -39,6 +39,11 @@ export const APPLIED_KEY_OF = {
   disabledSkills: "skills",
   enabledToolsets: "toolsets",
   enabledMcpServers: "mcp_servers",
+  // Capability 57. Not produced by `buildConfigurePayload` for a Hermes bot (the field is not part
+  // of the `profiles.configure` vocabulary this bridge translates), but the union member exists so
+  // this map stays total over every `BotProfilePatch` key and so a runtime bot's peer, which
+  // answers this key in its own `applied` map, is echoed under the name the client already reads.
+  guardrailLevel: "guardrails",
 } as const satisfies Record<keyof BotProfilePatch, string>;
 
 /** How a `profiles.configure` reply was understood, the same three-way reading `saveBotMeta` uses
