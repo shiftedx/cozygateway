@@ -323,9 +323,14 @@ export class RunnerLane {
           `runner ${frame.runnerId} attached (backends ${frame.backends.join(",")}, inventory ${frame.inventory?.length ?? 0})`,
         );
         this.#startHeartbeat();
-        // Everything still waiting on a first receipt is handed over again. An operation already
-        // receipted is not resent: resuming from the last verified stage is the runner's job.
-        this.#storage.resetUnreceiptedRunnerOperationSends();
+        // Everything of THIS runner's still waiting on a first receipt is handed over again. An
+        // operation already receipted is not resent: resuming from the last verified stage is the
+        // runner's job. Scoped to this connection since 54: another machine reconnecting must not
+        // rewind and resend the work this one already has in flight.
+        this.#storage.resetUnreceiptedRunnerOperationSends({
+          runnerId: connection.key,
+          includeUnassigned: this.#takesUnassigned(connection.key),
+        });
         this.dispatchPending();
         return;
       }

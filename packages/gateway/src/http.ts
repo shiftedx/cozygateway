@@ -15,6 +15,8 @@ import {
   CreateThreadRequestSchema,
   PairRequestSchema,
   RunnerPatchRequestSchema,
+  RunnerDeleteResponseSchema,
+  type RunnerDeleteResponse,
   PushRegisterRequestSchema,
   RenameThreadRequestSchema,
   SendMessageRequestSchema,
@@ -1078,8 +1080,23 @@ export function createApp(deps: AppDeps): Hono<Env> {
       // app warns with.
       const stranded = botCount(id);
       if (!roster.remove(id)) return c.json(errorBody("not_found", "no such runner"), 404);
+      // Capability 54. The work that machine had not been handed yet would otherwise be addressed
+      // to a runner that can no longer authenticate, so it is re-addressed here: to the account
+      // default when there is one, and to nobody when there is not, which is the unaddressed state
+      // the default picks up as soon as one is set. Read AFTER the removal, so the revoked runner
+      // is never its own successor.
+      const successor = roster.defaultRunner()?.id ?? null;
+      const reassignedOperations = deps.storage.readdressUnsentRunnerOperations(id, successor);
       deps.onRunnerRevoked?.(id);
-      return c.json({ ok: true, botCount: stranded });
+      const body: RunnerDeleteResponse = {
+        ok: true,
+        botCount: stranded,
+        reassignedOperations,
+        ...(successor === null || reassignedOperations === 0 ? {} : { reassignedTo: successor }),
+      };
+      // The published schema against the real bytes, so a route that drifts from the contract fails
+      // here rather than on a phone.
+      return c.json(assertValid(RunnerDeleteResponseSchema, body));
     });
   }
 

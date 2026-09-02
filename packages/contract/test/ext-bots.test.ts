@@ -5,6 +5,7 @@ import {
   AGENT_INBOX_CAPABILITY_ID,
   RunnerSchema,
   RunnerDeleteResponseSchema,
+  RunnerChoiceRequiredBodySchema,
   RunnersResponseSchema,
   RunnerSelfSchema,
   RunnerPairResponseSchema,
@@ -739,6 +740,34 @@ describe("capability advertisement", () => {
     expect(check(RunnerDeleteResponseSchema, { ok: true, botCount: 2 })).toBe(true);
     expect(check(RunnerDeleteResponseSchema, { ok: true })).toBe(true);
     expect(check(RunnerDeleteResponseSchema, { ok: false })).toBe(false);
+    // A revoke that moved the stranded work says where it went, and how much of it there was.
+    expect(
+      check(RunnerDeleteResponseSchema, { ok: true, botCount: 2, reassignedOperations: 1, reassignedTo: "runner-2" }),
+    ).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: true, reassignedOperations: 0 })).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: true, reassignedTo: "" })).toBe(false);
+    // The chooser is built from ids, which live only in this array: the message carries names.
+    expect(
+      check(RunnerChoiceRequiredBodySchema, {
+        error: { code: "runner_choice_required", message: "name one in runnerId: kyle-mbp, studio" },
+        runners: [
+          { id: "runner-1", name: "kyle-mbp", isDefault: false },
+          { id: "runner-2", name: "studio", isDefault: false },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      check(RunnerChoiceRequiredBodySchema, {
+        error: { code: "no_runner_paired", message: "add a computer" },
+        runners: [],
+      }),
+    ).toBe(false);
+    expect(
+      check(RunnerChoiceRequiredBodySchema, {
+        error: { code: "runner_choice_required", message: "pick one" },
+        runners: [{ name: "kyle-mbp", isDefault: false }],
+      }),
+    ).toBe(false);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {

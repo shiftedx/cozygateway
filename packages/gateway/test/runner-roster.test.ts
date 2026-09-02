@@ -265,7 +265,7 @@ describe("DELETE /runners/:id", () => {
     const runner = h.roster.pair({ name: "gone" }).runner;
     const response = await h.authed(`/runners/${runner.id}`, { method: "DELETE" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, botCount: 0 });
+    expect(await response.json()).toEqual({ ok: true, botCount: 0, reassignedOperations: 0 });
     expect(h.revoked).toEqual([runner.id]);
     expect(await h.runners()).toEqual([]);
     expect(h.roster.resolve("Bearer anything")).toBeUndefined();
@@ -282,11 +282,65 @@ describe("DELETE /runners/:id", () => {
     }
     const response = await h.authed(`/runners/${runner.id}`, { method: "DELETE" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, botCount: 2 });
+    expect(await response.json()).toEqual({ ok: true, botCount: 2, reassignedOperations: 0 });
     // Revoking a computer is not deleting the bots that ran on it: their rows, their credentials
     // and the runner they name are all exactly as they were, so they can be moved rather than lost.
     expect(h.storage.runtimeBot("sage")?.runnerId).toBe(runner.id);
     expect(h.storage.runtimeBot("luna")?.runnerId).toBe(runner.id);
+  });
+
+  it("re-addresses the work that computer had not been handed yet to the account default", async () => {
+    const h = await harness();
+    const gone = h.roster.pair({ name: "gone" }).runner;
+    const survivor = h.roster.pair({ name: "kyle-mbp" }).runner;
+    h.roster.setDefault(survivor.id);
+    h.storage.enqueueRunnerOperation({
+      operationId: "op_unsent", bot: "sage", kind: "create_runtime",
+      specGeneration: 1, payload: {}, at: NOW, runnerId: gone.id,
+    });
+    // Already handed over before the revoke: that machine may well have applied it, so handing the
+    // same mutation to a second computer is exactly what must not happen.
+    h.storage.enqueueRunnerOperation({
+      operationId: "op_sent", bot: "luna", kind: "create_runtime",
+      specGeneration: 1, payload: {}, at: NOW, runnerId: gone.id,
+    });
+    h.storage.markRunnerOperationSent("op_sent", NOW);
+
+    const response = await h.authed(`/runners/${gone.id}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true, botCount: 0, reassignedOperations: 1, reassignedTo: survivor.id,
+    });
+    expect(h.storage.runnerOperation("op_unsent")?.runnerId).toBe(survivor.id);
+    expect(h.storage.runnerOperation("op_sent")?.runnerId).toBe(gone.id);
+    // The survivor's queue really does carry it now, which is the whole point of moving it.
+    expect(
+      h.storage.unsentRunnerOperations({ runnerId: survivor.id }).map((operation) => operation.operationId),
+    ).toEqual(["op_unsent"]);
+  });
+
+  it("addresses that work to nobody when there is no default, so a later default picks it up", async () => {
+    const h = await harness();
+    const gone = h.roster.pair({ name: "gone" }).runner;
+    h.storage.enqueueRunnerOperation({
+      operationId: "op_unsent", bot: "sage", kind: "create_runtime",
+      specGeneration: 1, payload: {}, at: NOW, runnerId: gone.id,
+    });
+
+    const response = await h.authed(`/runners/${gone.id}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    // No `reassignedTo`: there was nowhere to send it, and naming a runner would be a lie.
+    expect(await response.json()).toEqual({ ok: true, botCount: 0, reassignedOperations: 1 });
+    expect(h.storage.runnerOperation("op_unsent")?.runnerId).toBeNull();
+
+    // Unaddressed is not lost: it is the pre-54 state, which the next default collects.
+    const next = h.roster.pair({ name: "kyle-mbp" }).runner;
+    expect(h.storage.unsentRunnerOperations({ runnerId: next.id })).toEqual([]);
+    expect(
+      h.storage
+        .unsentRunnerOperations({ runnerId: next.id, includeUnassigned: true })
+        .map((operation) => operation.operationId),
+    ).toEqual(["op_unsent"]);
   });
 
   it("answers 404 for an unknown id, exactly as DELETE /devices/:id does", async () => {

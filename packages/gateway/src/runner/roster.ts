@@ -197,6 +197,8 @@ export function createRunnerResolver(opts: {
       throw new NoRunnerPaired();
     }
     if (rows.length === 1) return { id: rows[0]!.id, name: rows[0]!.name };
-    throw new RunnerChoiceRequired(rows.map((row) => ({ id: row.id, name: row.name })));
+    throw new RunnerChoiceRequired(
+      rows.map((row) => ({ id: row.id, name: row.name, isDefault: row.isDefault })),
+    );
   };
 }

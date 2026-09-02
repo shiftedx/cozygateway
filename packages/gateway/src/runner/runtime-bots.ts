@@ -146,8 +146,10 @@ export class NoRunnerPaired extends Error {
  *  pick for the person. A separate code from `NoRunnerPaired` because it is a separate sentence:
  *  the app shows a chooser for this one and "Add a computer first" for the other. */
 export class RunnerChoiceRequired extends Error {
-  readonly runners: readonly { id: string; name: string }[];
-  constructor(runners: readonly { id: string; name: string }[]) {
+  /** What the app's chooser renders and sends back. The ids live here and nowhere else: the message
+   *  carries names, and a create needs an id. */
+  readonly runners: readonly { id: string; name: string; isDefault: boolean }[];
+  constructor(runners: readonly { id: string; name: string; isDefault: boolean }[]) {
     super(
       "this account has more than one computer and none of them is the default, so name one in runnerId: "
         + runners.map((runner) => runner.name).join(", "),
@@ -395,8 +397,10 @@ export class RuntimeBotService {
       payload: {},
       at: this.#now(),
       // The same computer the create went to: the container and the volumes to remove are there
-      // and nowhere else.
-      runnerId: bot.runnerId,
+      // and nowhere else. Unless that computer has since been revoked, in which case the cleanup
+      // is addressed to nobody rather than to a runner that can never collect it, and the account
+      // default picks it up exactly as it picks up a pre-54 row.
+      runnerId: this.#placement(bot.runnerId),
     });
     this.#log(`deleted runtime bot ${canon}, operation ${operationId}`);
     this.#lane?.dispatchPending();
@@ -413,6 +417,13 @@ export class RuntimeBotService {
         `GET /bots/${canon}/runtime keeps answering until the runner receipts the delete, so the cleanup is watchable`,
       ],
     };
+  }
+
+  /** Where an operation for a bot that names `runnerId` should actually be addressed. A runner this
+   *  gateway no longer has is not an address, and an operation carrying one would wait forever. */
+  #placement(runnerId: string | null): string | null {
+    if (runnerId === null) return null;
+    return this.#runnerName(runnerId) === undefined ? null : runnerId;
   }
 
   /** `GET /bots/:name/runtime`. Reads only durable rows plus the live lane's last contact, so it

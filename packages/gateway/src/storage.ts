@@ -4048,13 +4048,40 @@ export class Storage {
 
   /** A runner that connects (or reconnects) is handed every operation still waiting on its first
    *  receipt again. An operation a runner has already receipted is NOT resent: retry from the last
-   *  verified stage is the runner's own job (ADR 0002), and resending would repeat a mutation. */
-  resetUnreceiptedRunnerOperationSends(): void {
-    this.#db
-      .prepare(
-        "UPDATE runner_operations SET sent_at = NULL WHERE sent_at IS NOT NULL AND stage = 'waiting_for_runner'",
-      )
-      .run();
+   *  verified stage is the runner's own job (ADR 0002), and resending would repeat a mutation.
+   *
+   *  Capability 54: `target` narrows the reset to the reconnecting runner's own rows, exactly as
+   *  `unsentRunnerOperations` narrows the queue. Without it, one machine coming back would rewind
+   *  and resend the work every OTHER machine already has in flight, which is churn caused by a
+   *  computer that has nothing to do with those bots. */
+  resetUnreceiptedRunnerOperationSends(
+    target?: { runnerId: string; includeUnassigned?: boolean },
+  ): void {
+    const base = "UPDATE runner_operations SET sent_at = NULL WHERE sent_at IS NOT NULL AND stage = 'waiting_for_runner'";
+    if (target === undefined) {
+      this.#db.prepare(base).run();
+      return;
+    }
+    const scope =
+      target.includeUnassigned === true
+        ? " AND (runner_id = ? OR runner_id IS NULL)"
+        : " AND runner_id = ?";
+    this.#db.prepare(base + scope).run(target.runnerId);
+  }
+
+  /** Capability 54. Re-addresses one runner's not-yet-sent operations, which is what a revoke does
+   *  with the work that machine will never authenticate to collect: to the account default when
+   *  there is one, and to nobody when there is not, which is the same unaddressed state a pre-54
+   *  row holds and is dispatched to whichever runner becomes the default later. Returns how many
+   *  moved. An operation already SENT is left alone: the runner may well have applied it, and
+   *  handing that same mutation to a second machine is the one thing the single-writer rule
+   *  exists to prevent. */
+  readdressUnsentRunnerOperations(from: string, to: string | null): number {
+    return Number(
+      this.#db
+        .prepare("UPDATE runner_operations SET runner_id = ? WHERE runner_id = ? AND sent_at IS NULL")
+        .run(to, from).changes,
+    );
   }
 
   /** Records one immutable stage receipt onto its operation.

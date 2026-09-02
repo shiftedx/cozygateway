@@ -5,7 +5,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import { WebSocket } from "ws";
-import type { BotCreateResponse, BotRuntimeProjection, BotSummary } from "cozygateway-contract";
+import { check } from "cozygateway-contract";
+import type {
+  BotCreateResponse,
+  BotRuntimeProjection,
+  BotSummary,
+  RunnerChoiceRequiredBody,
+} from "cozygateway-contract";
+import { RunnerChoiceRequiredBodySchema } from "cozygateway-contract";
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import { revokeAttachTokens } from "../src/adapters/attach/token-auth.ts";
@@ -279,6 +286,13 @@ describe("a create picks a computer", () => {
     // The app shows a chooser, so the sentence has to carry what there is to choose between.
     expect(message).toContain(second!.name);
     expect(message).toContain(third!.name);
+    // And the body has to carry the ids, because a name is not what a follow-up create sends. The
+    // published schema against the real bytes, so a drift fails here rather than on a phone.
+    expect(check(RunnerChoiceRequiredBodySchema, created.body)).toBe(true);
+    expect((created.body as RunnerChoiceRequiredBody).runners).toEqual([
+      { id: second!.id, name: second!.name, isDefault: false },
+      { id: third!.id, name: third!.name, isDefault: false },
+    ]);
     expect(h.storage.runtimeBot("sage")).toBeUndefined();
 
     // Naming one of them is all it takes.
@@ -370,6 +384,28 @@ describe("a create picks a computer", () => {
   });
 });
 
+describe("a revoked computer", () => {
+  it("addresses a later delete to nobody rather than to a runner that can never collect it", async () => {
+    const h = await harness();
+    const gone = h.roster.pair({ name: "gone" });
+    const survivor = h.roster.pair({ name: "kyle-mbp" });
+    expect((await create(h, { name: "sage", runnerId: gone.runner.id })).status).toBe(201);
+    h.roster.remove(gone.runner.id);
+    h.roster.setDefault(survivor.runner.id);
+
+    // The bot's row still names the machine it was placed on: revoking a computer is not a
+    // rewrite of history. Its CLEANUP, though, has to be collectable by somebody.
+    expect((await h.request("/bots/sage", { method: "DELETE" })).status).toBe(200);
+    expect(h.storage.latestRunnerOperationForBot("sage")).toMatchObject({
+      kind: "delete_runtime",
+      runnerId: null,
+    });
+    const runner = await connect(h, survivor.token, survivor.runner.id);
+    await until(() => commands(runner).length === 1);
+    expect(commands(runner)[0]).toMatchObject({ command: "delete_runtime", payload: { botId: "sage" } });
+  });
+});
+
 describe("the per-runner operation queue", () => {
   it("hands a create only to the runner it names, and never to the other", async () => {
     const h = await harness();
@@ -433,6 +469,35 @@ describe("the per-runner operation queue", () => {
     await until(() => commands(two).length === 1);
     expect(commands(two)[0]).toMatchObject({ payload: { botId: "sage", operationId: "op_legacy" } });
     expect(commands(one)).toEqual([]);
+  });
+
+  it("never re-sends one runner's in-flight operation because another runner reconnected", async () => {
+    const h = await harness();
+    const idle = h.roster.pair({ name: "kyle-mbp" });
+    const busy = h.roster.pair({ name: "studio" });
+    const idleRunner = await connect(h, idle.token, idle.runner.id);
+    let busyRunner = await connect(h, busy.token, busy.runner.id);
+
+    expect((await create(h, { name: "sage", runnerId: busy.runner.id })).status).toBe(201);
+    await until(() => commands(busyRunner).length === 1);
+
+    // The other machine, which has nothing to do with that bot, drops and comes back. Its hello
+    // rewinds ITS own unreceipted work and nobody else's.
+    idleRunner.ws.close();
+    await until(() => h.lane.connectedRunners().length === 1);
+    const reconnected = await connect(h, idle.token, idle.runner.id);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(commands(busyRunner)).toHaveLength(1);
+    expect(commands(reconnected)).toEqual([]);
+    expect(h.storage.runnerOperation(commands(busyRunner)[0]!.payload.operationId)?.sentAt).not.toBeNull();
+
+    // The runner that actually owns the operation still gets it again on ITS own reconnect, which
+    // is the resume rule capability 49 defined and 54 did not change.
+    busyRunner.ws.close();
+    await until(() => h.lane.connectedRunners().length === 1);
+    busyRunner = await connect(h, busy.token, busy.runner.id);
+    await until(() => commands(busyRunner).length === 1);
+    expect(commands(busyRunner)[0]).toMatchObject({ payload: { botId: "sage" } });
   });
 
   it("keeps a legacy single-runner deployment moving with no migration step", async () => {
