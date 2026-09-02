@@ -1476,7 +1476,7 @@ load_windows_wrapper_identity() {
   NODE_RESOLVED="$(to_posix_path "$node")"
 }
 stop_owned_windows_gateway() {
-  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native code check_target_port="${1:-1}"
+  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native code release_code attempt check_target_port="${1:-1}"
   if [ -z "${NODE_RESOLVED:-}" ] || [ -z "${BUNDLE_PATH:-}" ]; then load_windows_wrapper_identity || return 1; fi
   config_native="$(to_windows_path "$CONFIG_JSON")"
   gateway_env_native="$(to_windows_path "$GATEWAY_ENV")"
@@ -1533,7 +1533,16 @@ stop_owned_windows_gateway() {
       Start-Sleep -Milliseconds 100
     }
     if (@(Managed-GatewayProcesses).Count -ne 0) { exit 45 }
-    for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
+    exit 0
+  ' >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -eq 3 ] && return 1
+  [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
+  release_code=1
+  for attempt in $(seq 1 10); do
+    set +e
+    MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_PORT="$PORT" powershell.exe -NoProfile -NonInteractive -Command '
       $probe = $null
       $released = $false
       try {
@@ -1545,14 +1554,14 @@ stop_owned_windows_gateway() {
         if ($null -ne $probe) { $probe.Stop() }
       }
       if ($released) { exit 0 }
-      Start-Sleep -Seconds 1
-    }
-    exit 42
-  ' >/dev/null 2>&1
-  code=$?
-  set -e
-  [ "$code" -eq 3 ] && return 1
-  [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
+      exit 1
+    ' >/dev/null 2>&1
+    release_code=$?
+    set -e
+    [ "$release_code" -eq 0 ] && break
+    sleep 1
+  done
+  [ "$release_code" -eq 0 ] || die "the previous CozyGateway process kept port $PORT unavailable"
   [ "$check_target_port" = 0 ] && return 0
   for _ in $(seq 1 10); do gateway_ready || return 0; sleep 1; done
   die "the previous CozyGateway process stayed listening on port $PORT"
