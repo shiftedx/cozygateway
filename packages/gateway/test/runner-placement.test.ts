@@ -25,6 +25,7 @@ import {
   LEGACY_RUNNER_NAME,
   RunnerRoster,
   createRunnerResolver,
+  effectiveRunnerName,
 } from "../src/runner/roster.ts";
 import { RuntimeBotService } from "../src/runner/runtime-bots.ts";
 import type { RunnerServerFrame } from "../src/runner/protocol.ts";
@@ -85,9 +86,12 @@ async function harness(opts: { legacyToken?: string; placement?: boolean } = {})
     deleteBot: () => Promise.reject(new Error("a runtime delete must never reach Hermes")),
   } as unknown as BotsSurface;
   let service: RuntimeBotService | undefined;
-  const runnerName = (id: string): string | undefined =>
-    roster.get(id)?.name
-    ?? (id === LEGACY_RUNNER_ID && opts.legacyToken !== undefined ? LEGACY_RUNNER_NAME : undefined);
+  // Capability 55: the display name wins over the reported one, exactly as `server.ts` wires it.
+  const runnerName = (id: string): string | undefined => {
+    const row = roster.get(id);
+    if (row !== undefined) return effectiveRunnerName(row);
+    return id === LEGACY_RUNNER_ID && opts.legacyToken !== undefined ? LEGACY_RUNNER_NAME : undefined;
+  };
   const plane = new NativeBotDataPlane({
     control,
     storage,
@@ -381,6 +385,30 @@ describe("a create picks a computer", () => {
     const orphaned = (await (await h.request("/bots/sage/runtime")).json()) as Record<string, unknown>;
     expect(orphaned["runnerId"]).toBe(paired.runner.id);
     expect("runnerName" in orphaned).toBe(false);
+  });
+
+  it("carries a person-set display name (capability 55) rather than the reported one", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "kyle-mbp" });
+    await create(h, { name: "sage" });
+
+    h.roster.setDisplayName(paired.runner.id, "Kyle's Laptop");
+
+    const roster = (await (await h.request("/bots")).json()) as { bots: BotSummary[] };
+    expect(roster.bots.find((row) => row.name === "sage")).toMatchObject({
+      runnerId: paired.runner.id,
+      runnerName: "Kyle's Laptop",
+    });
+    const projection = (await (await h.request("/bots/sage/runtime")).json()) as BotRuntimeProjection;
+    expect(projection).toMatchObject({ runnerId: paired.runner.id, runnerName: "Kyle's Laptop" });
+
+    // Clearing it falls back to whatever the runner itself reports.
+    h.roster.setDisplayName(paired.runner.id, null);
+    const cleared = (await (await h.request("/bots")).json()) as { bots: BotSummary[] };
+    expect(cleared.bots.find((row) => row.name === "sage")).toMatchObject({
+      runnerId: paired.runner.id,
+      runnerName: "kyle-mbp",
+    });
   });
 });
 

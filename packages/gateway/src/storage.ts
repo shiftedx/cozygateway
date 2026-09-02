@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS runners (
   backends TEXT,
   is_default INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
-  last_seen_at INTEGER
+  last_seen_at INTEGER,
+  display_name TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY,
@@ -569,7 +570,7 @@ export type SetupCodeKind = "device" | "runner";
 
 const RUNNER_COLUMNS =
   "id, name, platform, version, backends, is_default AS isDefault, created_at AS createdAt,"
-  + " last_seen_at AS lastSeenAt";
+  + " last_seen_at AS lastSeenAt, display_name AS displayName";
 
 export interface DeviceRow {
   id: string;
@@ -582,6 +583,9 @@ export interface DeviceRow {
  *  once: the gateway records what it was told and invents nothing. */
 export interface RunnerRow {
   id: string;
+  /** What the runner itself reported on its last `hello` (or the name it was paired with, absent
+   *  a hello). Capability 55: this is no longer necessarily the name a client renders -- see
+   *  `displayName`. */
   name: string;
   platform: string | null;
   version: string | null;
@@ -589,6 +593,9 @@ export interface RunnerRow {
   isDefault: boolean;
   createdAt: number;
   lastSeenAt: number | null;
+  /** Capability 55. The name a person set with `PATCH /runners/:id {name}`, null when nobody has.
+   *  It wins over `name` on the wire and survives whatever the runner reports next. */
+  displayName: string | null;
 }
 interface RunnerDbRow {
   id: string;
@@ -599,6 +606,7 @@ interface RunnerDbRow {
   isDefault: number;
   createdAt: number;
   lastSeenAt: number | null;
+  displayName: string | null;
 }
 function runnerRow(row: RunnerDbRow): RunnerRow {
   let backends: string[] = [];
@@ -619,6 +627,7 @@ function runnerRow(row: RunnerDbRow): RunnerRow {
     isDefault: row.isDefault === 1,
     createdAt: row.createdAt,
     lastSeenAt: row.lastSeenAt,
+    displayName: row.displayName,
   };
 }
 export interface AgentRow {
@@ -1029,6 +1038,13 @@ export class Storage {
 
   touchRunner(id: string, at: number): void {
     this.#db.prepare("UPDATE runners SET last_seen_at = ? WHERE id = ?").run(at, id);
+  }
+
+  /** Capability 55. Sets or clears the person-set display name. `null` clears it, returning the
+   *  row to whatever the runner itself reports; it never touches the `name` column, which stays
+   *  hello's to write. */
+  setRunnerDisplayName(id: string, displayName: string | null): boolean {
+    return this.#db.prepare("UPDATE runners SET display_name = ? WHERE id = ?").run(displayName, id).changes === 1;
   }
 
   /** What the runner reported about itself on its `hello`. Every field is optional on the wire, so
@@ -4224,6 +4240,15 @@ export function openStorage(dbPath: string): Storage {
       .map((column) => column.name),
   );
   if (!setupCodeColumns.has("kind")) db.exec("ALTER TABLE setup_codes ADD COLUMN kind TEXT");
+  // Capability 55. An existing database's `runners` predates the person-set display name; adding
+  // it nullable is the whole migration. Nothing is backfilled: every existing row reopens with no
+  // display name, which is exactly "nobody has renamed this yet" -- the honest state. Idempotent,
+  // so a restarted container runs it harmlessly again.
+  const runnerColumns = new Set(
+    (db.prepare("PRAGMA table_info(runners)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!runnerColumns.has("display_name")) db.exec("ALTER TABLE runners ADD COLUMN display_name TEXT");
   const delegationColumns = new Set(
     (db.prepare("PRAGMA table_info(bot_chat_delegations)").all() as unknown as Array<{ name: string }>)
       .map((column) => column.name),

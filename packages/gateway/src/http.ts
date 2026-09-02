@@ -314,6 +314,16 @@ export function errorBody(code: ErrorCode, message: string): ErrorBody {
   return { error: { code, message } };
 }
 
+/** Capability 55. Matches the C0 and C1 control character ranges (built from character codes
+ *  rather than a literal escape, so no NUL or other control byte ever sits in this source file).
+ *  A display name failing this is refused rather than stored and rendered as a box or worse. */
+const RUNNER_NAME_CONTROL_CHARS = new RegExp(
+  "["
+    + String.fromCharCode(0) + "-" + String.fromCharCode(31)
+    + String.fromCharCode(127) + "-" + String.fromCharCode(159)
+    + "]",
+);
+
 /** A 415 that does not say what arrived is a 415 the producer has to guess about, so the received
  *  `Content-Type` is echoed. It is an attacker-controlled header, so only MIME token characters
  *  survive and the result is truncated: nothing here can carry markup, a newline, or a slice of the
@@ -1059,13 +1069,44 @@ export function createApp(deps: AppDeps): Hono<Env> {
         );
       const parsed = parseOr400(c, RunnerPatchRequestSchema, await readBody(c));
       if (!parsed.ok) return parsed.response;
-      if (!parsed.value.default)
+      const { default: moveDefault, name } = parsed.value;
+      if (moveDefault === undefined && name === undefined) {
+        return c.json(
+          errorBody("invalid_request", "name a field to change: default or name"),
+          400,
+        );
+      }
+      if (moveDefault !== undefined && !moveDefault) {
         return c.json(
           errorBody("invalid_request", "default is moved by naming the runner that should hold it"),
           400,
         );
-      const updated = roster.setDefault(id);
-      if (updated === undefined) return c.json(errorBody("not_found", "no such runner"), 404);
+      }
+      // Capability 55. `name` clears the display name on "" or null, and otherwise must be a
+      // trimmed 1-64 character string with no control characters -- the same shape a display name
+      // is rendered in everywhere else, so a bad value is refused rather than stored and shown ugly.
+      let displayName: string | null | undefined;
+      if (name !== undefined) {
+        if (name === null) {
+          displayName = null;
+        } else {
+          const trimmed = name.trim();
+          if (trimmed.length === 0) {
+            displayName = null;
+          } else if (trimmed.length > 64 || RUNNER_NAME_CONTROL_CHARS.test(trimmed)) {
+            return c.json(errorBody("invalid_request", "name must be 1 to 64 characters with no control characters"), 400);
+          } else {
+            displayName = trimmed;
+          }
+        }
+      }
+      if (roster.get(id) === undefined)
+        return c.json(errorBody("not_found", "no such runner"), 404);
+      if (moveDefault === true && roster.setDefault(id) === undefined)
+        return c.json(errorBody("not_found", "no such runner"), 404);
+      if (displayName !== undefined && roster.setDisplayName(id, displayName) === undefined)
+        return c.json(errorBody("not_found", "no such runner"), 404);
+      const updated = roster.get(id)!;
       return c.json({ runner: runnerToWire({ ...updated, lastSeenAt: seenAt(updated.id, updated.lastSeenAt) }, online(updated.id)) });
     });
     app.delete("/runners/:id", requireDevice, (c) => {

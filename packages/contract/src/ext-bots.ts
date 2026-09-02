@@ -1761,6 +1761,9 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *  host can actually do. Closed: a client reads exactly these fields. */
 export const RunnerSchema = Type.Object({
   id: Type.String({ minLength: 1, maxLength: 64 }),
+  /** Capability 55: the display name a person set with `PATCH /runners/:id {name}` when there is
+   *  one, else the name the runner itself reported on `hello`. `renamed` is how a client tells the
+   *  two apart without comparing strings. */
   name: Type.String({ minLength: 1, maxLength: 120 }),
   platform: Type.Union([Type.String({ maxLength: 120 }), Type.Null()]),
   version: Type.Union([Type.String({ maxLength: 40 }), Type.Null()]),
@@ -1776,6 +1779,9 @@ export const RunnerSchema = Type.Object({
    *  makes the roster screen honest and what a delete warns about; a gateway below 54 sends no
    *  count at all rather than a zero it did not measure. */
   botCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Capability 55. Whether `name` is a person-set display name rather than the name the runner
+   *  itself reported: "still the default name" versus "someone renamed this". */
+  renamed: Type.Boolean(),
 }, { additionalProperties: false });
 export type Runner = Static<typeof RunnerSchema>;
 
@@ -1786,9 +1792,13 @@ export const RunnersResponseSchema = Type.Object({
 }, { additionalProperties: false });
 export type RunnersResponse = Static<typeof RunnersResponseSchema>;
 
-/** `PATCH /runners/:id`. `default: true` moves the account default to this runner. */
+/** `PATCH /runners/:id`. `default: true` moves the account default to this runner. Capability 55
+ *  adds `name`: a trimmed 1-64 character display name to set, or `null`/`""` to clear it back to
+ *  the name the runner itself reports. Both fields are optional and either may be sent alone; the
+ *  route rejects a body naming neither. */
 export const RunnerPatchRequestSchema = Type.Object({
-  default: Type.Boolean(),
+  default: Type.Optional(Type.Boolean()),
+  name: Type.Optional(Type.Union([Type.String({ maxLength: 256 }), Type.Null()])),
 }, { additionalProperties: false });
 export type RunnerPatchRequest = Static<typeof RunnerPatchRequestSchema>;
 
@@ -2327,4 +2337,22 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Additive: `BotCreateRequestSchema` is open and the create body a client below 54 sends is
  * accepted unchanged, with the same response shape it already reads. A client that offers a
  * computer picker gates it on `>= 54`. */
-export const BOTS_CAPABILITY_VERSION = 54;
+/** Capability 55: A PERSON CAN RENAME A PAIRED RUNNER. `PATCH /runners/:id` gains optional `name`,
+ * a 1-64 character display name (after trimming, no control characters) alongside the existing
+ * `default`; a body naming neither, or a `name` that fails that check, is `400 invalid_request`
+ * naming the field.
+ *
+ * A person-set name wins over whatever the runner reports on `hello` from then on: `hello` keeps
+ * updating the reported name in its own column exactly as it did before 55, but `GET /runners`,
+ * `GET /runners/self`, and the `runnerName` carried on a bot summary or runtime projection all
+ * render the display name once one is set. `Runner` gains `renamed`, true exactly when a display
+ * name is set, so a client can tell "still the default name" from "someone renamed this" without
+ * comparing strings.
+ *
+ * Setting `name` to `""` or `null` clears the display name and returns to whatever the runner
+ * itself reports, present or future.
+ *
+ * Additive: a gateway below 55 has no `display_name` column and no `renamed` field; the migration
+ * that adds the column is nullable and idempotent, so an existing database reopens with every row
+ * unrenamed. A client that offers a rename action gates it on `>= 55`. */
+export const BOTS_CAPABILITY_VERSION = 55;

@@ -95,6 +95,13 @@ export class RunnerRoster {
     this.#storage.touchRunner(id, at);
   }
 
+  /** Capability 55. Sets or clears the person-set display name. `null` (or, from the route, a
+   *  trimmed-empty string) clears it, returning the row to whatever the runner itself reports. */
+  setDisplayName(id: string, name: string | null): RunnerRow | undefined {
+    if (!this.#storage.setRunnerDisplayName(id, name)) return undefined;
+    return this.#storage.runner(id);
+  }
+
   observe(
     id: string,
     seen: { name?: string; platform?: string; version?: string; backends?: readonly string[] },
@@ -107,6 +114,14 @@ function normalizeName(name: string | undefined): string {
   const trimmed = (name ?? "").trim();
   if (trimmed.length === 0) return "runner";
   return trimmed.slice(0, 120);
+}
+
+/** Capability 55. The name a client renders for this row: the person-set display name when there
+ *  is one, else the name the runner itself reported (or was paired with). The one place this
+ *  decision is made, so the roster wire projection, the create resolver's snapshot, and the
+ *  `runnerName` carried on a bot summary never drift apart. */
+export function effectiveRunnerName(runner: Pick<RunnerRow, "name" | "displayName">): string {
+  return runner.displayName ?? runner.name;
 }
 
 /** The wire projection. `platform` is the flat string a client renders; the runner reports it as an
@@ -128,10 +143,11 @@ export function runnerToWire(
   lastSeenAt: number | null;
   online: boolean;
   botCount?: number;
+  renamed: boolean;
 } {
   return {
     id: runner.id,
-    name: runner.name,
+    name: effectiveRunnerName(runner),
     platform: runner.platform,
     version: runner.version,
     backends: [...runner.backends],
@@ -140,12 +156,16 @@ export function runnerToWire(
     lastSeenAt: runner.lastSeenAt,
     online,
     ...(botCount === undefined ? {} : { botCount }),
+    // Capability 55. True exactly when a person set the display name: "still the default name"
+    // versus "someone renamed this", without a client comparing strings itself.
+    renamed: runner.displayName !== null,
   };
 }
 
 /** The legacy shared credential as one roster row, so a gateway carrying both kinds answers one
  *  honest list. It is synthesized on every read and never written, which is why `createdAt` is 0:
- *  nothing ever paired it, an operator placed it in the environment. */
+ *  nothing ever paired it, an operator placed it in the environment. It cannot be renamed: `PATCH
+ *  /runners/:id` already refuses the `legacy` id, so its `displayName` is always null. */
 export function legacyRunnerRow(seen: {
   platform?: string | null;
   version?: string | null;
@@ -161,6 +181,7 @@ export function legacyRunnerRow(seen: {
     isDefault: false,
     createdAt: 0,
     lastSeenAt: seen.lastSeenAt ?? null,
+    displayName: null,
   };
 }
 
@@ -184,21 +205,21 @@ export function createRunnerResolver(opts: {
     const rows = opts.roster.list();
     if (requested !== undefined) {
       const named = rows.find((row) => row.id === requested);
-      if (named !== undefined) return { id: named.id, name: named.name };
+      if (named !== undefined) return { id: named.id, name: effectiveRunnerName(named) };
       if (requested === LEGACY_RUNNER_ID && opts.legacyConfigured()) return legacy;
       throw new RunnerUnknown(requested);
     }
     // A paired computer is preferred over the legacy shared credential: pairing is the deliberate
     // act, and an operator who left the old variable set did not thereby choose it.
     const preferred = opts.roster.defaultRunner();
-    if (preferred !== undefined) return { id: preferred.id, name: preferred.name };
+    if (preferred !== undefined) return { id: preferred.id, name: effectiveRunnerName(preferred) };
     if (rows.length === 0) {
       if (opts.legacyConfigured()) return legacy;
       throw new NoRunnerPaired();
     }
-    if (rows.length === 1) return { id: rows[0]!.id, name: rows[0]!.name };
+    if (rows.length === 1) return { id: rows[0]!.id, name: effectiveRunnerName(rows[0]!) };
     throw new RunnerChoiceRequired(
-      rows.map((row) => ({ id: row.id, name: row.name, isDefault: row.isDefault })),
+      rows.map((row) => ({ id: row.id, name: effectiveRunnerName(row), isDefault: row.isDefault })),
     );
   };
 }
