@@ -1145,17 +1145,23 @@ HERMES_RESOLVED="`$6"
 DASHBOARD_OWNER_PS1="`$7"
 WRAPPER="`$8"
 DASHBOARD_PORT="`$9"
+EXPECTED_NODE_RESOLVED="`${10}"
+EXPECTED_BUNDLE_PATH="`${11}"
 unset NODE_RESOLVED BUNDLE_PATH
 to_windows_path() { cygpath -w "`$1"; }
 to_posix_path() { cygpath -u "`$1"; }
 gateway_ready() { return 1; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
 $($wrapperIdentityMatch.Value)
+load_windows_wrapper_identity || die "generated wrapper identity could not be read"
+[ "`$NODE_RESOLVED" = "`$EXPECTED_NODE_RESOLVED" ] || die "generated wrapper resolved an unexpected Node path"
+[ "`$BUNDLE_PATH" = "`$EXPECTED_BUNDLE_PATH" ] || die "generated wrapper resolved an unexpected bundle path"
+unset NODE_RESOLVED BUNDLE_PATH
 $($gatewayStopFunctionMatch.Value)
 stop_owned_windows_gateway 0
 "@
         Write-Utf8NoBom $uninstallStopHarness $uninstallStopScript
-        $uninstallOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $generatedWrapper $supervisorDashboardPort 2>&1 | Out-String)
+        $uninstallOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $generatedWrapper $supervisorDashboardPort $nodePosix $bundlePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0) "uninstall-owned gateway stop helper failed: $uninstallOutput"
         Start-Sleep -Milliseconds 1500
         $uninstallReacquired = $false

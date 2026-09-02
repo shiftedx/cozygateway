@@ -1465,7 +1465,7 @@ load_windows_wrapper_identity() {
   [ "$node" != "$head" ] || return 1
   values="${head#*\" - }"
   for index in $(seq 1 9); do
-    case "$values" in \"*\") ;; *) return 1 ;; esac
+    case "$values" in \"*) ;; *) return 1 ;; esac
     values="${values#\"}"; value="${values%%\"*}"
     [ "$value" != "$values" ] || return 1
     values="${values#*\"}"
