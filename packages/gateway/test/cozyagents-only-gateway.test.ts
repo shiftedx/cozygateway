@@ -89,13 +89,30 @@ describe("a gateway configured with no Hermes endpoint", () => {
     const empty = (await (await l.authed("/bots")).json()) as { bots: unknown[] };
     expect(empty.bots).toEqual([]);
 
+    // Capability 54. A create needs a computer to put the bot on, and this gateway has none yet:
+    // the answer is the sentence the app turns into "Add a computer first", not a bot nothing can
+    // ever run.
+    const homeless = await l.authed("/bots", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "sage", runtime: "cozyagents" }),
+    });
+    expect(homeless.status).toBe(409);
+    expect(await homeless.json()).toMatchObject({ error: { code: "no_runner_paired" } });
+
+    const runner = await pairRunner(l, "kyle-mbp");
     const created = await l.authed("/bots", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "sage", runtime: "cozyagents" }),
     });
     expect(created.status).toBe(201);
-    expect(((await created.json()) as BotCreateResponse).bot).toMatchObject({ name: "sage", runtime: "cozyagents" });
+    expect(((await created.json()) as BotCreateResponse).bot).toMatchObject({
+      name: "sage",
+      runtime: "cozyagents",
+      runnerId: runner.runner.id,
+      runnerName: "kyle-mbp",
+    });
 
     const roster = (await (await l.authed("/bots")).json()) as { bots: Array<{ name: string; runtime?: string }> };
     expect(roster.bots.map((bot) => bot.name)).toEqual(["sage"]);
@@ -147,22 +164,16 @@ describe("a gateway configured with no Hermes endpoint", () => {
   it("pairs a runner and hands it the work that was waiting, with no shared token anywhere", async () => {
     expect(process.env["COZYGATEWAY_RUNNER_TOKEN"]).toBeUndefined();
     const l = await live();
+    // The same code flow the CLI's `pair --kind runner` drives, over the real route. It comes
+    // FIRST from capability 54: a create names the computer it runs on, so there has to be one.
+    const paired = await pairRunner(l, "kyle-mbp");
+    expect(paired.runner).toMatchObject({ name: "kyle-mbp", default: true });
+    // Still created while nothing is attached: the operation waits for that machine to dial in.
     await l.authed("/bots", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "sage", runtime: "cozyagents" }),
     });
-
-    // The same code flow the CLI's `pair --kind runner` drives, over the real route.
-    l.gateway.storage.createSetupCode("RUNNER-CODE", Date.now() + 60_000, "runner");
-    const paired = (await (
-      await fetch(`${l.gateway.url}/pair`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ setupCode: "RUNNER-CODE", deviceName: "kyle-mbp", kind: "runner" }),
-      })
-    ).json()) as { runnerToken: string; runner: { id: string; name: string; default: boolean } };
-    expect(paired.runner).toMatchObject({ name: "kyle-mbp", default: true });
 
     // `/runner/v1` is registered even though no `COZYGATEWAY_RUNNER_TOKEN` was ever placed.
     const ws = new WebSocket(`${l.gateway.url.replace("http", "ws")}/runner/v1`, {
@@ -234,6 +245,26 @@ describe("a gateway configured with no Hermes endpoint", () => {
     expect(afterRevoke.status).toBe(401);
   });
 });
+
+/** Pairs one computer over the real `POST /pair {kind: "runner"}` route, which is what a create
+ *  needs from capability 54 onward. */
+async function pairRunner(
+  l: { gateway: { url: string; storage: { createSetupCode: (code: string, expiresAt: number, kind: "runner") => void } } },
+  name: string,
+): Promise<{ runnerToken: string; runner: { id: string; name: string; default: boolean } }> {
+  const code = `RUNNER-CODE-${name}`;
+  l.gateway.storage.createSetupCode(code, Date.now() + 60_000, "runner");
+  const response = await fetch(`${l.gateway.url}/pair`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ setupCode: code, deviceName: name, kind: "runner" }),
+  });
+  expect(response.status).toBe(200);
+  return (await response.json()) as {
+    runnerToken: string;
+    runner: { id: string; name: string; default: boolean };
+  };
+}
 
 async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();

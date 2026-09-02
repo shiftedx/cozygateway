@@ -50,7 +50,12 @@ import { createApp } from "./http.ts";
 import { listenerOrigin } from "./configure.ts";
 import { primaryLanAddress } from "./lan.ts";
 import { RunnerLane } from "./runner/lane.ts";
-import { RunnerRoster } from "./runner/roster.ts";
+import {
+  LEGACY_RUNNER_ID,
+  LEGACY_RUNNER_NAME,
+  RunnerRoster,
+  createRunnerResolver,
+} from "./runner/roster.ts";
 import { RuntimeBotService, mergeRuntimeBots, runtimeSpecDefaults } from "./runner/runtime-bots.ts";
 import type { PairingAttemptLimiter } from "./pairing-admission.ts";
 import { WsHub } from "./ws-hub.ts";
@@ -314,6 +319,18 @@ export async function startGateway(
   // Two sources, one namespace, merged by one shared function so the precedence rule lives in one
   // place: the config file remains a BOOTSTRAP source (capability 45), and a storage row created
   // through `POST /bots {runtime}` (capability 49) wins on collision.
+  // Capability 52/54. The roster is built here rather than beside the lane below, because the
+  // runtime bot rows that name its runners are read on the very next line and the roster row a bot
+  // names is what the app renders beside it.
+  const runnerRoster = new RunnerRoster({ storage, now: () => Date.now() });
+  const runnerToken = process.env["COZYGATEWAY_RUNNER_TOKEN"];
+  const legacyRunnerConfigured = runnerToken !== undefined && runnerToken.length > 0;
+  /** Capability 54. What a recorded runner id is called right now: the paired row's name, or the
+   *  one name the operator-placed shared credential has. A revoked runner has none, and nothing is
+   *  invented for it. */
+  const runnerName = (id: string): string | undefined =>
+    runnerRoster.get(id)?.name
+    ?? (id === LEGACY_RUNNER_ID && legacyRunnerConfigured ? LEGACY_RUNNER_NAME : undefined);
   const storedRuntimeBots = storage.runtimeBots();
   const merged = mergeRuntimeBots(nativeBots(config), storedRuntimeBots);
   const runtimeBots = merged.bots;
@@ -697,6 +714,7 @@ export async function startGateway(
     ingress: attachV1Ingress,
     nativeBots: nativeBotIds,
     runtimeBots,
+    runnerName,
     // Capability 49. The methods are forwarded rather than the service handed over, because the
     // service needs the plane (for the roster row and the live registration) as much as the plane
     // needs the service; one hole rather than a two-phase construction.
@@ -767,9 +785,6 @@ export async function startGateway(
   // `POST /pair {kind: "runner"}` gets its token at runtime, long after this line ran, so a lane
   // built only for an operator-placed `COZYGATEWAY_RUNNER_TOKEN` would leave a freshly paired
   // runner with nowhere to dial. The shared token stays supported as the legacy credential.
-  const runnerToken = process.env["COZYGATEWAY_RUNNER_TOKEN"];
-  const legacyRunnerConfigured = runnerToken !== undefined && runnerToken.length > 0;
-  const runnerRoster = new RunnerRoster({ storage, now: () => Date.now() });
   const runnerLane = new RunnerLane({
     ...(legacyRunnerConfigured ? { token: runnerToken } : {}),
     roster: runnerRoster,
@@ -783,11 +798,24 @@ export async function startGateway(
     lane: runnerLane,
     spec: () => runtimeSpecDefaults(process.env),
     now: () => Date.now(),
+    // Capability 54. Which computer a create belongs to, and what it is called on every row that
+    // names it.
+    resolveRunner: createRunnerResolver({
+      roster: runnerRoster,
+      legacyConfigured: () => legacyRunnerConfigured,
+    }),
+    runnerName,
     register: (bot) => {
       // The exact inverse of `killAttachIdentity`: the token map both public attach surfaces
       // authenticate against, then the sets that decide which bots this gateway serves at all.
       attachTokens.set(bot.token, bot.id);
-      nativePlane.addRuntimeBot({ id: bot.id, name: bot.name, avatar: bot.avatar, runtime: bot.runtime });
+      nativePlane.addRuntimeBot({
+        id: bot.id,
+        name: bot.name,
+        avatar: bot.avatar,
+        runtime: bot.runtime,
+        ...(bot.runnerId === undefined || bot.runnerId === null ? {} : { runnerId: bot.runnerId }),
+      });
     },
     unregister: (id) => {
       const revoked = killAttachIdentity(id);

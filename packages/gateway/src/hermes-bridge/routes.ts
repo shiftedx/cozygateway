@@ -32,6 +32,7 @@ import type { RunRoutineSurface } from "./native-data-plane.ts";
 import type { BotMemoryKind } from "cozygateway-contract";
 
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
+import { NoRunnerPaired, RunnerChoiceRequired, RunnerUnknown } from "../runner/runtime-bots.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
@@ -124,7 +125,15 @@ function errorBody(code: ErrorCode, message: string): ErrorBody {
  *  `error.code` a plain string precisely so an extension can). A client that does not know them
  *  treats them as a generic failure, which the HTTP status already conveys. */
 function extensionErrorBody(
-  code: "conflict" | "media_refused" | "rate_limited" | "unsupported_for_runtime",
+  code:
+    | "conflict"
+    | "media_refused"
+    | "rate_limited"
+    | "unsupported_for_runtime"
+    // Capability 54. Two different sentences to a person: one says add a computer, the other says
+    // pick between the ones you have, so they are two codes rather than one.
+    | "no_runner_paired"
+    | "runner_choice_required",
   message: string,
 ): ErrorBody {
   return { error: { code, message } };
@@ -627,6 +636,17 @@ export function registerBotRoutes(
         return c.json(errorBody("invalid_request", error.message), 400);
       if (error instanceof BotNameTaken)
         return c.json(extensionErrorBody("conflict", error.message), 409);
+      // Capability 54. Where the new bot would run, answered before anything durable was written.
+      if (error instanceof NoRunnerPaired)
+        return c.json(extensionErrorBody("no_runner_paired", error.message), 409);
+      if (error instanceof RunnerChoiceRequired)
+        return c.json(
+          { ...extensionErrorBody("runner_choice_required", error.message), runners: error.runners },
+          409,
+        );
+      // A named computer this gateway does not have is a client bug, not a missing machine.
+      if (error instanceof RunnerUnknown)
+        return c.json(errorBody("invalid_request", error.message), 400);
       return failure(c, error);
     }
   });

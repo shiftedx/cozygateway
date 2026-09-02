@@ -95,7 +95,14 @@ export interface NativeBotDataPlaneOptions {
     name: string;
     avatar: string | null;
     runtime: "cozyagents";
+    /** Capability 54. Which paired computer runs this bot. Absent for a config-declared bot and
+     * for one created before 54, and never invented for either. */
+    runnerId?: string | null;
   }[];
+  /** Capability 54. What a recorded runner id is called right now. Resolved per row rather than
+   * frozen on it, so a renamed computer renames itself everywhere and a revoked one leaves the id
+   * behind with no name to render. */
+  runnerName?: (runnerId: string) => string | undefined;
   /** Capability 49. The gateway-owned runtime bot lifecycle. Present when this gateway can create
    * and delete runtime bots itself (`POST /bots {runtime: "cozyagents"}`); absent leaves the
    * capability-45 behavior exactly as it was, where a runtime bot is config-declared and its
@@ -270,6 +277,7 @@ export class NativeBotDataPlane {
   readonly #ingress: AttachV1Ingress;
   readonly #native: Set<string>;
   readonly #runtimeBots: Map<string, NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number]>;
+  readonly #runnerName: (runnerId: string) => string | undefined;
   readonly #runtimeLifecycle: RuntimeBotLifecycle | undefined;
   readonly #botConfig: ConfigSurface | undefined;
   readonly #botHistory: HistorySurface | undefined;
@@ -324,6 +332,7 @@ export class NativeBotDataPlane {
     this.#storage = opts.storage;
     this.#ingress = opts.ingress;
     this.#native = new Set([...opts.nativeBots].map(normalize));
+    this.#runnerName = opts.runnerName ?? (() => undefined);
     this.#runtimeBots = new Map(
       (opts.runtimeBots ?? []).map((bot) => [normalize(bot.id), bot]),
     );
@@ -549,6 +558,8 @@ export class NativeBotDataPlane {
     bot: NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number],
   ): BotSummary {
     const id = normalize(bot.id);
+    const runnerId = bot.runnerId ?? undefined;
+    const runnerName = runnerId === undefined ? undefined : this.#runnerName(runnerId);
     return {
       name: id,
       displayName: bot.name,
@@ -562,6 +573,8 @@ export class NativeBotDataPlane {
       active: this.#syncState(id) === "ready",
       meta: null,
       runtime: bot.runtime,
+      ...(runnerId === undefined ? {} : { runnerId }),
+      ...(runnerName === undefined ? {} : { runnerName }),
       ...this.#nativeOverlay(id),
     };
   }
