@@ -206,7 +206,7 @@ grep -Fq 'COZYRUNNER_MODEL_PROVIDER=openai-codex' "$runner_env"
 grep -Fq 'COZYRUNNER_SHARE_HOST_MODEL_AUTH=1' "$runner_env"
 if grep -q 'COZYRUNNER_MODEL_ENDPOINT' "$runner_env"; then echo 'a provider answer must not also write an endpoint' >&2; exit 1; fi
 if grep -qi 'api_key' "$runner_env"; then echo 'the installer must never write a model key' >&2; exit 1; fi
-test "$(stat -f %Lp "$runner_env" 2>/dev/null || stat -c %a "$runner_env")" = 600
+test "$(stat -c %a "$runner_env" 2>/dev/null || stat -f %Lp "$runner_env")" = 600
 
 # The person typed no pairing code: the installer minted a runner code and handed it over in the
 # environment. A credential in waiting never reaches argv, where any process on this machine
