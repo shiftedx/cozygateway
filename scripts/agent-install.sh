@@ -1535,10 +1535,12 @@ stop_owned_windows_gateway() {
     }
     if (@(Managed-GatewayProcesses).Count -ne 0) { exit 45 }
     $ports = @($managedPorts + [int]$env:COZYGATEWAY_EXPECTED_PORT | Select-Object -Unique)
-    foreach ($ownedPort in $ports) {
-      if ($null -ne (Get-NetTCPConnection -State Listen -LocalPort $ownedPort -ErrorAction SilentlyContinue | Select-Object -First 1)) { exit 42 }
+    for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
+      $listening = @($ports | Where-Object { $null -ne (Get-NetTCPConnection -State Listen -LocalPort $_ -ErrorAction SilentlyContinue | Select-Object -First 1) })
+      if ($listening.Count -eq 0) { exit 0 }
+      Start-Sleep -Milliseconds 100
     }
-    exit 0
+    exit 42
   ' >/dev/null 2>&1
   code=$?
   set -e
