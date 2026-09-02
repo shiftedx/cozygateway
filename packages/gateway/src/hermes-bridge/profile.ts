@@ -37,6 +37,11 @@ import type { HermesRpc } from "./rpc.ts";
 export const APPLIED_KEY_OF = {
   soul: "soul",
   disabledSkills: "skills",
+  // Capability 59. A DIFFERENT key from `disabledSkills: "skills"` on purpose: two sections that
+  // report under one key cannot be told apart by a client, and these two are opposite intents.
+  // Not produced by `buildConfigurePayload` for a Hermes bot, whose `profiles.configure` has no
+  // such call; the union member exists so this map stays total over every `BotProfilePatch` key.
+  enabledSkills: "skills_enabled",
   enabledToolsets: "toolsets",
   enabledMcpServers: "mcp_servers",
   // Capability 57. Not produced by `buildConfigurePayload` for a Hermes bot (the field is not part

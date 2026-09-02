@@ -957,26 +957,57 @@ export const BotFocusRequestSchema = Type.Object({
 });
 export type BotFocusRequest = Static<typeof BotFocusRequestSchema>;
 
-/** One installed skill on a bot's profile. Skills are a DISABLED list server-side: a skill is
- *  installed-and-enabled unless its name sits in the profile's disabled set, which is why the write
- *  path sends `disabledSkills` (the OFF names) while the read reports `enabled` per skill.
- *  `description` rides along only when the gateway carried one. */
+/** Where a skill on a bot came from (capability 59). Four words and no others:
+ *  `default` is one of the four this build seeds into every new bot; `catalogue` is an entry of the
+ *  peer's own vendored catalogue, which is present on the read whether or not it is installed, so a
+ *  person can find it in a search and switch it on; `proposed` was drafted by the bot itself and
+ *  installed by a person accepting it; `installed` is everything else, which is to say somebody put
+ *  it there on purpose.
+ *
+ *  OPTIONAL, and absent is silence rather than `installed`: a Hermes bot never carries it
+ *  (`profiles.describe` has no such notion and this gateway does not invent one), and neither does
+ *  a runtime peer below 59. */
+export const BotSkillSourceSchema = Type.Union([
+  Type.Literal("default"),
+  Type.Literal("catalogue"),
+  Type.Literal("installed"),
+  Type.Literal("proposed"),
+]);
+export type BotSkillSource = Static<typeof BotSkillSourceSchema>;
+
+/** One skill a bot has or could have. From capability 59 the read carries every installed skill
+ *  and every entry of the peer's vendored catalogue. Skills are a DISABLED list server-side:
+ *  `enabled` remains the inverse of `disabledSkills`, and an uninstalled catalogue row is false.
+ *  `description` is the row's one-line summary when the peer carried one. */
 export const BotSkillSchema = Type.Object({
   name: Type.String(),
   enabled: Type.Boolean(),
   description: Type.Optional(Type.String()),
+  /** Whether the peer has this skill compiled and ready (capability 59). A catalogue row that
+   *  nobody has switched on yet is `false`, and switching it on is what installs it. Absent below
+   *  59 and for a Hermes bot, where every row on the list is installed by construction. */
+  installed: Type.Optional(Type.Boolean()),
+  source: Type.Optional(BotSkillSourceSchema),
 });
 export type BotSkill = Static<typeof BotSkillSchema>;
 
-/** One toolset. Toolsets are an ENABLED list and it is a PIN: `BotProfile.toolsetsPinned` says
- *  whether the profile carries one at all, and an EMPTY `enabledToolsets` on the write path pops
- *  it rather than disabling everything. `toolCount` is how many tools the set resolves to. */
+/** One toolset. From capability 59 a runtime peer lists every toolset its build ships plus every
+ *  name from another backend it has no equivalent for. Toolsets are an ENABLED list and it is a
+ *  PIN: `BotProfile.toolsetsPinned` says whether the profile carries one at all, and an EMPTY
+ *  `enabledToolsets` on the write path pops it rather than disabling everything. `toolCount` is
+ *  how many tools the set resolves to. */
 export const BotToolsetSchema = Type.Object({
   name: Type.String(),
   enabled: Type.Boolean(),
   label: Type.Optional(Type.String()),
   description: Type.Optional(Type.String()),
   toolCount: Type.Optional(Type.Integer()),
+  /** False when this peer cannot offer the toolset at all (capability 59), as opposed to offering
+   *  it switched off. A row is LISTED rather than dropped so a person who saw the name on another
+   *  bot finds an answer here instead of an absence. Absent means available. */
+  available: Type.Optional(Type.Boolean()),
+  /** One sentence saying why, present exactly when `available` is false. */
+  unavailableReason: Type.Optional(Type.String()),
 });
 export type BotToolset = Static<typeof BotToolsetSchema>;
 
@@ -1062,6 +1093,13 @@ export type BotProfile = Static<typeof BotProfileSchema>;
  *  - `enabledToolsets` is the ON list, and `[]` CLEARS the pin so every toolset is enabled again;
  *  - `enabledMcpServers` is the ON list, replace semantics, unknown names skipped by the gateway.
  *
+ *  `enabledSkills` (capability 59) is the ON list, and it is ADDITIVE, not replace-whole: it names
+ *  the skills to switch on, a runtime peer installs any of them its catalogue has and its bot does
+ *  not, and it clears each from the stored OFF list. It NEVER uninstalls and it never disables:
+ *  the OFF direction is `disabledSkills`, unchanged. A name the peer neither has nor can install is
+ *  refused BY NAME in the `applied` map while the rest of the patch still applies. Sent to a Hermes
+ *  bot it is not part of that peer's vocabulary and is not forwarded.
+ *
  *  Every name must carry at least one non-whitespace character, which is why the item rule is a
  *  PATTERN and not just `minLength: 1`. A single space passes a length check, and the backend then
  *  filters it, leaving `enabledToolsets` EMPTY, which pops the pin and enables every toolset: the
@@ -1082,6 +1120,7 @@ const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 export const BotProfilePatchSchema = Type.Object({
   soul: Type.Optional(Type.String({ maxLength: 200_000 })),
   disabledSkills: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  enabledSkills: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   enabledToolsets: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   enabledMcpServers: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   guardrailLevel: Type.Optional(GuardrailLevelSchema),
@@ -2477,4 +2516,15 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Additive: the schema field is optional and read-only, so a client below 58 sends and reads
  * profiles exactly as it did before, and a gateway below 58 simply never sends the field. A client
  * that greys out levels above the ceiling gates it on `>= 58`. */
-export const BOTS_CAPABILITY_VERSION = 58;
+/** Capability 59: A BOT'S WHOLE SKILL AND TOOLSET CATALOGUE. The existing profile read gains
+ * optional skill provenance and installation fields plus optional toolset availability and its
+ * reason. The patch gains `enabledSkills`, an additive ON list that installs only from the runtime
+ * peer's vendored catalogue and clears names from its stored OFF list.
+ *
+ * This gateway does not compute, install, or store the catalogue. It relays a runtime peer's rows
+ * and patch unchanged. Hermes has no matching read provenance or enable call, so the bridge never
+ * invents or forwards either.
+ *
+ * Additive: all read fields and the patch field are optional. Peers and clients below 59 retain
+ * their prior shape, and clients gate catalogue-only rows and the enable write on `>= 59`. */
+export const BOTS_CAPABILITY_VERSION = 59;

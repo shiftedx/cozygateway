@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { ServerFrame } from "cozygateway-contract";
+import { BotProfileSchema, check, type ServerFrame } from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
@@ -9,6 +9,7 @@ import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient, type HermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
 import {
+  APPLIED_KEY_OF,
   CATALOG_CACHE_MAX,
   mapProfileDescribe,
   buildConfigurePayload,
@@ -209,6 +210,14 @@ describe("mapProfileDescribe: the three list semantics", () => {
     expect(mapped.skills).toEqual([{ name: "quiet", enabled: true }]);
   });
 
+  it("never invents a source or an installed flag for a Hermes skill", () => {
+    const mapped = mapProfileDescribe({ skills: [{ name: "deploy", enabled: true }] });
+    expect(mapped.skills).toEqual([{ name: "deploy", enabled: true }]);
+    const keys = Object.keys(mapped.skills[0] ?? {});
+    expect(keys).not.toContain("source");
+    expect(keys).not.toContain("installed");
+  });
+
   it("reports toolsets from the pin, and says whether a pin exists at all", () => {
     const mapped = mapProfileDescribe(describeResult);
     expect(mapped.toolsets).toEqual([
@@ -217,6 +226,49 @@ describe("mapProfileDescribe: the three list semantics", () => {
     ]);
     expect(mapped.toolsetsPinned).toBe(true);
     expect(mapProfileDescribe({ ...describeResult, toolsets_pinned: false }).toolsetsPinned).toBe(false);
+  });
+
+  it("never invents an availability for a Hermes toolset", () => {
+    const mapped = mapProfileDescribe({ toolsets: [{ name: "file", enabled: true }] });
+    expect(Object.keys(mapped.toolsets[0] ?? {})).not.toContain("available");
+  });
+
+  it("relays a runtime peer's catalogue rows whole", () => {
+    const answered = {
+      name: "sage",
+      description: "",
+      soul: "",
+      skills: [
+        {
+          name: "citations",
+          enabled: true,
+          installed: true,
+          source: "default",
+          description: "Cite what you claim.",
+        },
+        {
+          name: "spike",
+          enabled: false,
+          installed: false,
+          source: "catalogue",
+          description: "Throwaway experiments.",
+        },
+      ],
+      toolsets: [
+        {
+          name: "schedule",
+          enabled: true,
+          available: true,
+          label: "Schedule",
+          description: "Routines.",
+        },
+      ],
+      toolsetsPinned: false,
+      mcpServers: [],
+      model: { provider: "anthropic", default: "claude-sonnet" },
+      runtimeInert: ["toolsets"],
+    };
+    expect(check(BotProfileSchema, answered)).toBe(true);
   });
 
   it("unions the profile's own mcp servers with the catalog, and never borrows the catalog's enabled flag", () => {
@@ -441,6 +493,18 @@ describe("POST /bots", () => {
 });
 
 describe("buildConfigurePayload", () => {
+  it("reports enabledSkills under its own applied key, not the one disabledSkills uses", () => {
+    expect(APPLIED_KEY_OF.enabledSkills).toBe("skills_enabled");
+    expect(APPLIED_KEY_OF.disabledSkills).toBe("skills");
+  });
+
+  it("never sends enabled_skills to Hermes: profiles.configure has no such call", () => {
+    const { params, requested } = buildConfigurePayload("scout", { enabledSkills: ["spike"] });
+    expect(params).toEqual({ name: "scout" });
+    expect(params).not.toHaveProperty("enabled_skills");
+    expect(requested).toEqual([]);
+  });
+
   it("sends only the fields the patch carries", () => {
     expect(buildConfigurePayload("scout", { soul: "hi" })).toEqual({
       params: { name: "scout", soul: "hi" },
@@ -632,6 +696,30 @@ describe("PATCH /bots/:name/profile", () => {
       requested: [],
     });
     // Hermes never learns about it: the wire body carries only the bot name.
+    expect(configures).toEqual([{ name: "scout" }]);
+  });
+
+  // Capability 59. Hermes cannot install a catalogue skill, so the field makes this a valid
+  // request but the bridge forwards only the profile name and reports no Hermes section requested.
+  it("accepts an enabledSkills-only patch for Hermes without forwarding the field", async () => {
+    const configures: Array<Record<string, unknown>> = [];
+    const { authed } = await setup({
+      methods: {
+        "profiles.configure": (params) => {
+          configures.push(params);
+          return { applied: {} };
+        },
+      },
+    });
+    const res = await authed("/bots/scout/profile", patch({ enabledSkills: ["spike"] }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      name: "scout",
+      outcome: "applied",
+      ok: true,
+      applied: {},
+      requested: [],
+    });
     expect(configures).toEqual([{ name: "scout" }]);
   });
 
@@ -1028,7 +1116,7 @@ describe("device auth", () => {
       },
     });
     expect((await request("/bots/scout/profile")).status).toBe(401);
-    expect((await request("/bots/scout/profile", patch({ soul: "x" }))).status).toBe(401);
+    expect((await request("/bots/scout/profile", patch({ enabledSkills: ["spike"] }))).status).toBe(401);
     expect((await request("/bots/catalog")).status).toBe(401);
     expect(server.callsOf("profiles.describe")).toHaveLength(0);
     expect(server.callsOf("profiles.configure")).toHaveLength(0);
