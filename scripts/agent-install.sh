@@ -1433,32 +1433,74 @@ write_windows_launcher() {
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
 stop_owned_windows_gateway() {
-  local config_native code check_target_port="${1:-1}"
+  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native code check_target_port="${1:-1}"
+  [ -n "${NODE_RESOLVED:-}" ] && [ -n "${BUNDLE_PATH:-}" ] || return 1
   config_native="$(to_windows_path "$CONFIG_JSON")"
+  gateway_env_native="$(to_windows_path "$GATEWAY_ENV")"
+  dashboard_env_native="$(to_windows_path "$DASHBOARD_ENV")"
+  node_native="$(to_windows_path "$NODE_RESOLVED")"
+  bundle_native="$(to_windows_path "$BUNDLE_PATH")"
+  hermes_root_native="$(to_windows_path "$HERMES_ROOT")"
+  hermes_native="$(to_windows_path "$HERMES_RESOLVED")"
+  launcher_native="$(to_windows_path "$HERMES_ROOT/bin/hermes.exe")"
+  owner_helper_native="$(to_windows_path "$DASHBOARD_OWNER_PS1")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_PORT="$PORT" COZYGATEWAY_CHECK_TARGET_PORT="$check_target_port" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$DASHBOARD_PORT" COZYGATEWAY_EXPECTED_PORT="$PORT" COZYGATEWAY_CHECK_TARGET_PORT="$check_target_port" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
-    $expected = [IO.Path]::GetFullPath($env:COZYGATEWAY_EXPECTED_CONFIG)
-    $managed = Get-CimInstance Win32_Process | Where-Object {
-      $command = [string]$_.CommandLine
-      if (-not $command.Contains("cozygateway.mjs") -or -not $command.Contains(" serve ")) { return $false }
-      $tokens = @([regex]::Matches($command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
-      $candidate = $null
-      for ($index = 0; $index -lt $tokens.Count; $index++) {
-        if ($tokens[$index] -eq "--config" -and $index + 1 -lt $tokens.Count) { $candidate = $tokens[$index + 1]; break }
-        if ($tokens[$index].StartsWith("--config=")) { $candidate = $tokens[$index].Substring(9); break }
-      }
-      if ([string]::IsNullOrWhiteSpace($candidate)) { return $false }
-      try { [IO.Path]::GetFullPath($candidate).Equals($expected, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
-    } | Select-Object -First 1
-    if ($null -ne $managed) {
-      Stop-Process -Id $managed.ProcessId -Force
-      exit 0
+    function Same-Path([string] $Candidate, [string] $Expected) {
+      if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
+      try { return [IO.Path]::GetFullPath($Candidate).TrimEnd([char]92).Equals([IO.Path]::GetFullPath($Expected).TrimEnd([char]92), [StringComparison]::OrdinalIgnoreCase) } catch { return $false }
     }
-    if ($env:COZYGATEWAY_CHECK_TARGET_PORT -ne "1") { exit 3 }
-    $connection = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $connection) { exit 42 }
-    exit 3
+    function Command-Tokens([string] $Command) {
+      return @([regex]::Matches($Command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
+    }
+    function Is-ManagedGatewayChild($Process) {
+      $tokens = Command-Tokens ([string]$Process.CommandLine)
+      if ($tokens.Count -lt 5 -or -not (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -or -not (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_BUNDLE) -or $tokens[2] -ne "serve") { return $false }
+      for ($index = 3; $index -lt $tokens.Count; $index += 1) {
+        if ($tokens[$index] -eq "--config" -and $index + 1 -lt $tokens.Count) { return Same-Path $tokens[$index + 1] $env:COZYGATEWAY_EXPECTED_CONFIG }
+        if ($tokens[$index].StartsWith("--config=")) { return Same-Path $tokens[$index].Substring(9) $env:COZYGATEWAY_EXPECTED_CONFIG }
+      }
+      return $false
+    }
+    function Is-ManagedGatewaySupervisor($Process) {
+      $tokens = Command-Tokens ([string]$Process.CommandLine)
+      if ($tokens.Count -ne 11 -or -not (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -or $tokens[1] -ne "-" -or -not (Same-Path $tokens[2] $env:COZYGATEWAY_EXPECTED_GATEWAY_ENV) -or -not (Same-Path $tokens[3] $env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV) -or -not (Same-Path $tokens[4] $env:COZYGATEWAY_EXPECTED_HERMES_ROOT) -or -not (Same-Path $tokens[5] $env:COZYGATEWAY_EXPECTED_HERMES) -or -not (Same-Path $tokens[6] $env:COZYGATEWAY_EXPECTED_LAUNCHER) -or -not (Same-Path $tokens[7] $env:COZYGATEWAY_EXPECTED_OWNER_HELPER) -or $tokens[8] -ne $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT -or -not (Same-Path $tokens[9] $env:COZYGATEWAY_EXPECTED_BUNDLE)) { return $false }
+      return Same-Path $tokens[10] $env:COZYGATEWAY_EXPECTED_CONFIG
+    }
+    function Managed-GatewayProcesses {
+      $all = @(Get-CimInstance Win32_Process)
+      return @($all | Where-Object { (Is-ManagedGatewaySupervisor $_) -or (Is-ManagedGatewayChild $_) })
+    }
+    $managed = @(Managed-GatewayProcesses)
+    if ($managed.Count -eq 0) {
+      if ($env:COZYGATEWAY_CHECK_TARGET_PORT -ne "1") { exit 3 }
+      $connection = Get-NetTCPConnection -State Listen -LocalPort ([int]$env:COZYGATEWAY_EXPECTED_PORT) -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($null -ne $connection) { exit 42 }
+      exit 3
+    }
+    $managedPorts = @($managed | ForEach-Object { Get-NetTCPConnection -State Listen -OwningProcess $_.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } } | Select-Object -Unique)
+    $taskkill = Join-Path ([Environment]::SystemDirectory) "taskkill.exe"
+    if (-not [IO.File]::Exists($taskkill)) { throw "trusted taskkill.exe is unavailable" }
+    $stopped = [Collections.Generic.HashSet[int]]::new()
+    foreach ($process in $managed | Sort-Object { if (Is-ManagedGatewaySupervisor $_) { 0 } else { 1 } }) {
+      if ($stopped.Add([int]$process.ProcessId)) { & $taskkill /PID ([string]$process.ProcessId) /T /F *> $null }
+    }
+    Start-Sleep -Milliseconds 1200
+    for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
+      $remaining = @(Managed-GatewayProcesses)
+      if ($remaining.Count -eq 0) { break }
+      foreach ($process in $remaining) {
+        if ($stopped.Add([int]$process.ProcessId)) { & $taskkill /PID ([string]$process.ProcessId) /T /F *> $null }
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (@(Managed-GatewayProcesses).Count -ne 0) { exit 45 }
+    $ports = @($managedPorts + [int]$env:COZYGATEWAY_EXPECTED_PORT | Select-Object -Unique)
+    foreach ($ownedPort in $ports) {
+      if ($null -ne (Get-NetTCPConnection -State Listen -LocalPort $ownedPort -ErrorAction SilentlyContinue | Select-Object -First 1)) { exit 42 }
+    }
+    exit 0
   ' >/dev/null 2>&1
   code=$?
   set -e
@@ -1469,9 +1511,12 @@ stop_owned_windows_gateway() {
   die "the previous CozyGateway process stayed listening on port $PORT"
 }
 install_windows_service() {
-  local vbs_native task_command output code startup entry
+  local vbs_native wrapper_native task_command output code startup entry
   write_windows_launcher
   [ "$DRY_RUN" = 1 ] && { say "DRY   register current-user Scheduled Task $WINDOWS_TASK with Startup-folder fallback"; return; }
+  if stop_owned_windows_gateway; then
+    say "OK    stopped the previous CozyGateway process for an in-place update"
+  fi
   vbs_native="$(to_windows_path "$WINDOWS_VBS")"
   task_command="wscript.exe \"$vbs_native\""
   set +e
@@ -1484,9 +1529,9 @@ install_windows_service() {
     say "INFO  Scheduled Task unavailable ($output); installed current-user Startup fallback: $entry"
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
-  fi
-  if stop_owned_windows_gateway; then
-    say "OK    stopped the previous CozyGateway process for an in-place update"
+    startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
+    wrapper_native="$(to_windows_path "$WRAPPER")"
+    if [ -f "$entry" ] && grep -Fq "$wrapper_native" "$entry"; then rm -f "$entry"; fi
   fi
   wscript.exe "$vbs_native"
 }
