@@ -1032,7 +1032,14 @@ export type GuardrailLevel = Static<typeof GuardrailLevelSchema>;
  *  `guardrailLevel` (capability 57) is OPTIONAL, not required: this gateway does not store or
  *  compute it, it only relays whatever the runtime peer answers on `profile.read`. Absent for a
  *  Hermes bot (Hermes has no notion of the field) and for a runtime peer that has not negotiated
- *  capability 57, and never backfilled -- an absent value here is not a default, it is silence. */
+ *  capability 57, and never backfilled -- an absent value here is not a default, it is silence.
+ *
+ *  `guardrailCeiling` (capability 58) is OPTIONAL too and READ-ONLY: it never appears on
+ *  `BotProfilePatchSchema`, only on this read. It is the operator's ceiling on `guardrailLevel`,
+ *  set on the runtime peer rather than through this gateway; a `profile.write` asking for a level
+ *  above it is the runtime peer's own refusal to make (`400` naming the field and the ceiling), not
+ *  something this gateway enforces. Absent for a Hermes bot and for a runtime peer that has not
+ *  negotiated capability 58, and never backfilled, exactly as `guardrailLevel` is. */
 export const BotProfileSchema = Type.Object({
   name: Type.String(),
   description: Type.String(),
@@ -1044,6 +1051,7 @@ export const BotProfileSchema = Type.Object({
   model: Type.Object({ provider: Type.String(), default: Type.String() }),
   runtimeInert: BotProfileRuntimeInertSchema,
   guardrailLevel: Type.Optional(GuardrailLevelSchema),
+  guardrailCeiling: Type.Optional(GuardrailLevelSchema),
 });
 export type BotProfile = Static<typeof BotProfileSchema>;
 
@@ -1063,7 +1071,12 @@ export type BotProfile = Static<typeof BotProfileSchema>;
  *  nothing else: a body carrying any other value is `400 invalid_request` naming the field. The
  *  gateway does not store it: the patch is forwarded to the runtime peer over the existing
  *  `bot_config` profile lane unchanged, so a level reaches the peer the moment the schema admits
- *  it. Sent to a Hermes bot, it is simply not part of that peer's vocabulary and is ignored. */
+ *  it. Sent to a Hermes bot, it is simply not part of that peer's vocabulary and is ignored.
+ *
+ *  `guardrailCeiling` (capability 58) NEVER appears here: it is read-only, set on the runtime peer
+ *  rather than through this gateway, so the field is `Type.Optional(Type.Never())` -- present at
+ *  all, with any value, is `400 invalid_request` naming the field, the same shape every other
+ *  boundary refusal on this route already answers. */
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 
 export const BotProfilePatchSchema = Type.Object({
@@ -1072,6 +1085,7 @@ export const BotProfilePatchSchema = Type.Object({
   enabledToolsets: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   enabledMcpServers: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   guardrailLevel: Type.Optional(GuardrailLevelSchema),
+  guardrailCeiling: Type.Optional(Type.Never()),
 });
 export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
 
@@ -2440,4 +2454,27 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Additive: both schema fields are optional, so a client below 57 sends no such field and its
  * profile saves stay byte identical to the ones it sent before, and a gateway below 57 simply never
  * sends or accepts the field. A client that offers the level picker gates it on `>= 57`. */
-export const BOTS_CAPABILITY_VERSION = 57;
+/** Capability 58: THE OPERATOR'S GUARDRAIL CEILING. `BotProfile` gains an optional
+ * `guardrailCeiling`, one of the same four literals as `guardrailLevel`, carried on the existing
+ * capability-57 `profile.read` operation of the `bot_config` lane. `BotProfilePatch` does NOT gain
+ * it: the ceiling is not something this gateway or its app write, so the field is refused on the
+ * patch, `400 invalid_request` naming the field, exactly like any other value the schema does not
+ * admit.
+ *
+ * This gateway is a relay for the field, not an owner of it, exactly as it is for `guardrailLevel`:
+ * it validates the closed union at the boundary and reads back exactly what the runtime peer
+ * answers on `profile.read`, never computing, storing, or defaulting it. The ceiling is the
+ * operator's own limit on that bot, set on the runtime peer rather than through this gateway; a
+ * `profile.write` asking for a `guardrailLevel` above the ceiling is the runtime peer's own
+ * refusal to make, `400` naming both the field and the ceiling it exceeds, so the app greys out
+ * every level above the ceiling it read rather than sending a level the peer will refuse anyway.
+ *
+ * Absent for a Hermes bot (the field is not part of the `profiles.describe` vocabulary this
+ * gateway translates for Hermes, so a Hermes profile read never carries it), and absent for a
+ * runtime peer that has not negotiated capability 58, and never backfilled in either case: an
+ * absent value is silence, not a default the gateway invented, exactly as `guardrailLevel` reads.
+ *
+ * Additive: the schema field is optional and read-only, so a client below 58 sends and reads
+ * profiles exactly as it did before, and a gateway below 58 simply never sends the field. A client
+ * that greys out levels above the ceiling gates it on `>= 58`. */
+export const BOTS_CAPABILITY_VERSION = 58;

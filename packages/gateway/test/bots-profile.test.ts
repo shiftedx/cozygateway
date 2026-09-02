@@ -655,6 +655,27 @@ describe("PATCH /bots/:name/profile", () => {
     expect("guardrailLevel" in body).toBe(false);
   });
 
+  // Capability 58. `guardrailCeiling` is read-only and never appears on `BotProfilePatchSchema`: a
+  // patch naming it, at all, is refused before it ever reaches Hermes.
+  it("400s a patch that names guardrailCeiling, naming the field", async () => {
+    const { authed, server } = await setup({ methods: { "profiles.configure": () => ({ applied: {} }) } });
+    const res = await authed("/bots/scout/profile", patch({ guardrailCeiling: "balanced" }));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("invalid_request");
+    expect(body.error.message).toContain("guardrailCeiling");
+    expect(server.callsOf("profiles.configure")).toHaveLength(0);
+  });
+
+  // `mapProfileDescribe` does not derive `guardrailCeiling` from anything `profiles.describe`
+  // sends, exactly as it does not derive `guardrailLevel`: a Hermes bot has no notion of either.
+  it("never carries guardrailCeiling on a Hermes profile read", async () => {
+    const { authed } = await setup({ methods: { "profiles.describe": () => describeResult } });
+    const res = await authed("/bots/scout/profile");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect("guardrailCeiling" in body).toBe(false);
+  });
+
   // `""` is not "leave it alone", it writes a zero-byte SOUL.md, and the distinction between an
   // absent field and an empty one is the whole reason this body is a PATCH.
   it("sends an empty soul on the wire, because it CLEARS the file rather than being a no-op", async () => {

@@ -188,6 +188,26 @@ describe("attach-v1 config lane", () => {
     peer.ws.close();
   });
 
+  // Capability 58: this gateway relays guardrailCeiling on a read exactly as it relays
+  // guardrailLevel, but the field never appears on a write, because it is read-only.
+  it("round-trips guardrailCeiling through the peer's profile.read unchanged, for each of the four names", async () => {
+    for (const guardrailCeiling of ["locked", "guided", "balanced", "autonomous"] as const) {
+      const peer = await dial({ "profile.read": { ...profile, guardrailCeiling } });
+      await expect(config.botProfile("sage")).resolves.toMatchObject({ guardrailCeiling });
+      expect(peer.requests.map((request) => request.input)).toEqual([{}]);
+      peer.ws.close();
+    }
+  });
+
+  // Absent stays absent: a peer that answers no guardrailCeiling at all (a pre-58 peer, or a peer
+  // that has not set one) is not backfilled with one.
+  it("leaves guardrailCeiling absent on the wire when the peer does not answer one", async () => {
+    const peer = await dial({ "profile.read": profile });
+    const read = await config.botProfile("sage");
+    expect("guardrailCeiling" in read).toBe(false);
+    peer.ws.close();
+  });
+
   it("rejects per status rather than collapsing every refusal into one failure", async () => {
     const peer = await dial({ "profile.read": profile });
     await expect(config.routines("sage")).rejects.toBeInstanceOf(BackendUnavailable);

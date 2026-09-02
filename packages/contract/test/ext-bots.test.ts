@@ -441,6 +441,42 @@ describe("profile", () => {
     }
     expect(check(BotProfileSchema, { ...base, guardrailLevel: "yolo" })).toBe(false);
   });
+
+  // Optional, not required: capability 58. A Hermes bot and a peer below 58 both answer with the
+  // field simply absent, never a default the gateway invented. Read-only, so it is checked here on
+  // `BotProfileSchema` only; the patch refusal is checked separately below.
+  it("carries the guardrail ceiling when the peer answers one, and stays valid without it (capability 58)", () => {
+    const base = {
+      name: "scout",
+      description: "",
+      soul: "",
+      skills: [],
+      toolsets: [],
+      toolsetsPinned: false,
+      mcpServers: [],
+      model: { provider: "", default: "" },
+      runtimeInert: [],
+    };
+    expect(check(BotProfileSchema, base)).toBe(true);
+    for (const guardrailCeiling of ["locked", "guided", "balanced", "autonomous"]) {
+      expect(check(BotProfileSchema, { ...base, guardrailCeiling }), guardrailCeiling).toBe(true);
+    }
+    expect(check(BotProfileSchema, { ...base, guardrailCeiling: "yolo" })).toBe(false);
+    // Both fields together: a level under a ceiling is an ordinary, valid read.
+    expect(
+      check(BotProfileSchema, { ...base, guardrailLevel: "guided", guardrailCeiling: "balanced" }),
+    ).toBe(true);
+  });
+
+  // Read-only: capability 58's `guardrailCeiling` never appears on `BotProfilePatchSchema`. Present
+  // at all, with any value, refuses the patch, the same shape every other closed-union refusal on
+  // this route already answers.
+  it("refuses guardrailCeiling on the patch, present with any value (capability 58)", () => {
+    expect(check(BotProfilePatchSchema, { soul: "x" })).toBe(true);
+    for (const guardrailCeiling of ["locked", "guided", "balanced", "autonomous", "yolo", null, 3]) {
+      expect(check(BotProfilePatchSchema, { guardrailCeiling }), String(guardrailCeiling)).toBe(false);
+    }
+  });
 });
 
 describe("routines", () => {
@@ -714,7 +750,11 @@ describe("capability advertisement", () => {
     // it validates the closed union at the boundary and forwards it to the runtime peer unchanged,
     // absent for a Hermes bot and for a peer below 57, and never backfilled. A client below 57
     // sends no such field and its profile saves stay byte identical to the ones it sent before.
-    expect(BOTS_CAPABILITY_VERSION).toBe(57);
+    // 58 adds the operator's guardrail ceiling: `BotProfile` gains an optional `guardrailCeiling`,
+    // one of the same four literals, carried on the same `profile.read` operation. Read-only:
+    // `BotProfilePatch` never gains it, and a patch naming it is `400 invalid_request` naming the
+    // field. Absent for a Hermes bot and for a peer below 58, and never backfilled.
+    expect(BOTS_CAPABILITY_VERSION).toBe(58);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
