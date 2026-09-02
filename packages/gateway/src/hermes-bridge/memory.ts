@@ -53,6 +53,14 @@ export class MemoryConflict extends Error {
 export class MemoryNotFound extends Error {}
 export class MemoryInvalidRequest extends Error {}
 
+/** What the memory lane needs from the attach ingress. `negotiatedCapabilities` is optional
+ *  because the unit seams in the test suite model only sending; production always has it, and its
+ *  absence is read as "no observation", never as "not negotiated". */
+export interface MemoryEndpoint {
+  sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome;
+  negotiatedCapabilities?(agentId: string): ReadonlySet<string>;
+}
+
 export interface MemorySurface {
   overview(name: string): Promise<BotMemoryOverviewResponse>;
   setup(name: string, input: BotMemorySetupRequest): Promise<BotMemoryOverviewResponse>;
@@ -93,10 +101,31 @@ const MEMORY_UNAVAILABLE: Record<Exclude<MemorySendOutcome, "sent">, string> = {
  * timed-out mutation cannot execute later after reconnect. */
 export class AttachMemorySurface implements MemorySurface {
   readonly #pending = new Map<string, Pending>();
-  readonly #endpoint: { sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome };
+  readonly #endpoint: MemoryEndpoint;
   readonly #timeoutMs: number;
   readonly #trace: TraceLog | undefined;
-  constructor(endpoint: { sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome }, timeoutMs = 12_000, trace?: TraceLog) { this.#endpoint = endpoint; this.#timeoutMs = timeoutMs; this.#trace = trace; }
+  constructor(endpoint: MemoryEndpoint, timeoutMs = 12_000, trace?: TraceLog) { this.#endpoint = endpoint; this.#timeoutMs = timeoutMs; this.#trace = trace; }
+
+  /** Whether capability-42 setup is OFFERED for this bot, which is a fact about the attached peer's
+   *  hello and not about the memory it just answered with. A client that only ever reads
+   *  `sources` cannot tell a bot whose plugin serves the setup lane from one whose plugin does not,
+   *  and inferring it from an empty source list is wrong in both directions: a runtime bot that
+   *  already has a source still has switches to offer, and an old plugin with no sources has none.
+   *
+   *  `undefined` when this deployment exposes no capability observation at all (the unit seams do
+   *  not), so the field is omitted rather than answered `false` on no evidence. */
+  #setupAvailable(agentId: string): boolean | undefined {
+    const capabilitiesFor = this.#endpoint.negotiatedCapabilities;
+    if (typeof capabilitiesFor !== "function") return undefined;
+    return capabilitiesFor.call(this.#endpoint, agentId).has("memory_setup");
+  }
+
+  /** Stamps the gateway's own `setupAvailable` onto a projection the peer produced. The peer's
+   *  reply is validated before this runs and is never overwritten anywhere else. */
+  #withSetup<T extends BotMemoryOverviewResponse | BotMemoryItemsResponse>(agentId: string, result: T): T {
+    const available = this.#setupAvailable(agentId);
+    return available === undefined ? result : { ...result, setupAvailable: available };
+  }
 
   #request(agentId: string, operation: MemoryOperation, input: MemoryInput): Promise<MemoryResult> {
     const requestId = randomUUID();
@@ -120,9 +149,9 @@ export class AttachMemorySurface implements MemorySurface {
       }
     });
   }
-  async overview(name: string): Promise<BotMemoryOverviewResponse> { return await this.#request(name, "overview", {}) as BotMemoryOverviewResponse; }
-  async setup(name: string, input: BotMemorySetupRequest): Promise<BotMemoryOverviewResponse> { return await this.#request(name, "setup", input) as BotMemoryOverviewResponse; }
-  async items(name: string, input: MemoryInput): Promise<BotMemoryItemsResponse> { return await this.#request(name, "items", input) as BotMemoryItemsResponse; }
+  async overview(name: string): Promise<BotMemoryOverviewResponse> { return this.#withSetup(name, await this.#request(name, "overview", {}) as BotMemoryOverviewResponse); }
+  async setup(name: string, input: BotMemorySetupRequest): Promise<BotMemoryOverviewResponse> { return this.#withSetup(name, await this.#request(name, "setup", input) as BotMemoryOverviewResponse); }
+  async items(name: string, input: MemoryInput): Promise<BotMemoryItemsResponse> { return this.#withSetup(name, await this.#request(name, "items", input) as BotMemoryItemsResponse); }
   async item(name: string, sourceId: string, itemId: string): Promise<BotMemoryItem> { return await this.#request(name, "item", { sourceId, itemId }) as BotMemoryItem; }
   async create(name: string, sourceId: string, input: MemoryInput): Promise<BotMemoryWriteResponse> { return await this.#request(name, "create", { ...input, sourceId }) as BotMemoryWriteResponse; }
   async update(name: string, sourceId: string, itemId: string, input: MemoryInput): Promise<BotMemoryWriteResponse> { return await this.#request(name, "update", { ...input, sourceId, itemId }) as BotMemoryWriteResponse; }
