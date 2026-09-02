@@ -4,6 +4,7 @@ import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/
 import {
   AGENT_INBOX_CAPABILITY_ID,
   RunnerSchema,
+  RunnerDeleteResponseSchema,
   RunnersResponseSchema,
   RunnerSelfSchema,
   RunnerPairResponseSchema,
@@ -673,7 +674,7 @@ describe("capability advertisement", () => {
     // roster, `/runner/v1` carries one socket per runner, and a gateway with no Hermes endpoint is
     // a supported configuration whose readiness reports the bridge as absent. A client below 52
     // never sends `kind` and never calls the routes.
-    expect(BOTS_CAPABILITY_VERSION).toBe(53);
+    expect(BOTS_CAPABILITY_VERSION).toBe(54);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -712,6 +713,32 @@ describe("capability advertisement", () => {
         attachToken: "secret",
       }),
     ).toBe(false);
+  });
+
+  it("carries capability-54 runner placement on the create, the row, and the projection", () => {
+    // The create body a client below 54 sends is accepted unchanged; naming a computer is one more
+    // optional field beside the runtime it already names.
+    expect(check(BotCreateRequestSchema, { name: "sage", runtime: "cozyagents", runnerId: "runner-1" })).toBe(true);
+    expect(check(BotCreateRequestSchema, { name: "sage", runnerId: "" })).toBe(false);
+    // Absent rather than null on a roster row: a Hermes bot and a pre-54 runtime bot have no
+    // computer to name, and null would claim the gateway knew of one and lost it.
+    expect(check(BotSummarySchema, bot)).toBe(true);
+    expect(check(BotSummarySchema, { ...bot, runnerId: "runner-1", runnerName: "kyle-mbp" })).toBe(true);
+    expect(check(BotSummarySchema, { ...bot, runnerId: null })).toBe(false);
+    const projection = { stage: "ready", specGeneration: 1, observedGeneration: 1, lastRunnerContactAt: 1 };
+    expect(check(BotRuntimeProjectionSchema, { ...projection, runnerId: "runner-1", runnerName: "kyle-mbp" })).toBe(true);
+    // A revoked computer leaves the id behind with no name to render, which is the honest shape.
+    expect(check(BotRuntimeProjectionSchema, { ...projection, runnerId: "runner-1" })).toBe(true);
+    // The roster screen reads the count off the runner row, and a delete answers it too.
+    const runnerRow = {
+      id: "runner-1", name: "kyle-mbp", platform: null, version: null, backends: [],
+      default: true, createdAt: 1, lastSeenAt: null, online: false,
+    };
+    expect(check(RunnerSchema, { ...runnerRow, botCount: 3 })).toBe(true);
+    expect(check(RunnerSchema, { ...runnerRow, botCount: -1 })).toBe(false);
+    expect(check(RunnerDeleteResponseSchema, { ok: true, botCount: 2 })).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: true })).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: false })).toBe(false);
   });
 
   it("keeps capability-42 memory setup closed and requires at least one source", () => {

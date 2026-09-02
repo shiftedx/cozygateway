@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 53 }
+"capabilities": { "com.cozylabs.bots": 54 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -93,6 +93,7 @@ and does not register `/bots` routes.
 | 51 | Room turns can ask: a runtime member's approval and clarify events on a room turn land in the existing interaction inbox (`sessionId` is the `group:<room>:<member>` thread) and resolve through the existing `/bots/:member/approvals/...` and `/bots/:member/clarifications/...` routes unchanged; tool events project as ephemeral `bot_tool_activity` carrying `room`; `BotGroup` and `bot_group_state` gain the optional `pendingInteractions` pointer array. The room transcript gains nothing and Hermes members are unchanged. |
 | 52 | Paired runners: `POST /pair {setupCode, deviceName, kind: "runner"}` mints a per-runner token instead of a device token, `GET /runners`, `PATCH /runners/:id {default}` and `DELETE /runners/:id` manage the roster, `POST /runners/pair-code` mints a code from the app, `GET /runners/self` answers that one row under the runner's own bearer, and `/runner/v1` accepts any active per-runner token so two computers hold two sockets at once. The runner `hello` gains optional `name`, `platform` and `agentVersion`, recorded on its row on every hello that carries them, so a renamed computer renames its roster row. A gateway with no Hermes endpoint is a supported configuration; its roster answers from runtime bots and `/ready` reports the bridge as `absent`. |
 | 53 | Routine run now: `POST /bots/:name/routines/:id/run` sends `routines.run` over the existing capability-48 `bot_config` lane and answers `BotRoutineRunResponse` (`{routine, startedAt}`), so a person or a check can force a runtime bot's routine to fire immediately. No new capability row; it is a route on the operation capability 48 already defined on the wire. RUNTIME BOTS ONLY, the same rule capability 50's history routes follow: a Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_config`. |
+| 54 | A create picks a computer: `BotCreateRequest` gains optional `runnerId` naming the paired runner that should run the new bot. Absent, the gateway picks the account default, then the only paired runner, then answers `409 no_runner_paired` with none and `409 runner_choice_required` naming the candidates when there are several and no default; an id that names no paired runner is `400 invalid_request` naming the field. The chosen runner is recorded on the bot row and on every operation for it, so a create, a delete and a later upgrade all reach the same machine, and each connected runner is handed only the operations that name it. An operation written before 54 names no runner and goes to the account default. `BotSummary` and `BotRuntimeProjection` gain optional `runnerId` and `runnerName`, absent for a Hermes bot and for a runtime bot created before 54 and never backfilled; `Runner` gains optional `botCount`, which `DELETE /runners/:id` answers too. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -331,6 +332,37 @@ Out of scope for 49, and deliberately not implied by it: pairing codes and short
 credentials, upgrades and migrations, restart backoff, drain windows, isolation policy, capacity
 admission, archive and purge grace, multi-host, and reconciliation of unknown containers. See
 `docs/adr/0002-gateway-reconciled-per-bot-runtime.md` in the CozyAgents repo.
+
+### Placing a bot on a computer (capability 54)
+
+`POST /bots {"name": "sage", "runtime": "cozyagents", "runnerId": "..."}` names which paired computer
+(`GET /runners`) runs the new bot. The field is optional, so the create body a client below 54 sends
+is accepted unchanged and answers the same `201 {bot, warnings?}`.
+
+With no `runnerId` the gateway picks, in this order: the account default, then the only paired
+runner. It never picks silently between several:
+
+| Situation | Answer |
+| --- | --- |
+| No paired runner at all | `409` extension code `no_runner_paired`. The app says "Add a computer first". |
+| Several paired runners and no default | `409` extension code `runner_choice_required`, message naming the candidates. The app shows a chooser. |
+| `runnerId` names no paired runner | `400 invalid_request` naming `runnerId`: a client bug, not a missing machine. |
+
+The chosen runner is written on the bot's row and on every operation for that bot, so a create, a
+delete and a later upgrade all reach the same machine. `/runner/v1` hands each connected runner only
+the operations that name it. An operation written before 54 names no runner and goes to the account
+default, which keeps an existing single-runner deployment moving with no migration step; with no
+default and no legacy shared credential it keeps waiting rather than being sent to an arbitrary
+machine.
+
+`BotSummary` and `BotRuntimeProjection` carry optional `runnerId` and `runnerName`. Both are absent
+for a Hermes bot and for a runtime bot created before 54, and neither is ever backfilled: the
+gateway never had the value rather than having discarded it. `runnerName` is absent on its own when
+the named runner has since been revoked.
+
+`Runner.botCount` is the number of runtime bots placed on that computer, and `DELETE /runners/:id`
+answers `{"ok": true, "botCount": n}`. Revoking a computer revokes its token and closes its socket;
+the bots that ran on it keep their rows, so they can be moved rather than lost.
 
 ### Bot history (capability 50)
 
