@@ -803,6 +803,9 @@ detect_kept_hermes_bridge() {
   grep -q '"hermesEndpoints"' "$CONFIG_JSON" && KEPT_HERMES_BRIDGE=1
   return 0
 }
+# cozyagents_home is recorded as this shell sees it, which on Windows is the Git Bash POSIX form
+# of the default %USERPROFILE%\.cozyagents. Only the POSIX uninstall reads it, and only to run the
+# launcher it names; the Windows bootstrap owns the harness there and never consults this line.
 write_cozyagents_state() {
   [ "$DRY_RUN" = 1 ] && return
   umask 077

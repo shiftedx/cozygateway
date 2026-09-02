@@ -481,9 +481,30 @@ function Select-Harness {
     if ($harness -eq 'cozyagents' -and -not $script:HarnessChosen -and (Test-HermesBridge $ConfigPath)) {
         Write-Host 'WARN  this config already has a Hermes endpoint and no one chose CozyAgents here; keeping it. Rerun with -Harness cozyagents to replace it.'
         Write-Info 'continuing as a Hermes install; nothing CozyAgents-owned is installed, paired, or configured here.'
+        Write-Info 'irm | iex takes no parameters; to pass one, run: & ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness cozyagents'
         $harness = 'hermes'
     }
     return $harness
+}
+
+# CozyAgents installs per user under the profile of whoever runs it and refuses an elevated token
+# when it runs. Refusing here, before anything is installed, is what keeps an elevated paste from
+# leaving a gateway under the administrator profile with no harness and no runner behind it. The
+# Hermes path is untouched: it has always installed whatever token it was given.
+function Test-ElevatedToken {
+    # COZYAGENTS_INSTALL_ASSUME_ELEVATED is the harness installer's own knob, honoured here so one
+    # variable elevates both halves of a test run. COZYGATEWAY_TEST_ASSUME_ELEVATED is this side's,
+    # and 0 is the only way to say "not elevated": a CI runner holds an administrator token, which
+    # would otherwise refuse every CozyAgents case in the suite.
+    if ($env:COZYGATEWAY_TEST_ASSUME_ELEVATED -eq '1' -or $env:COZYAGENTS_INSTALL_ASSUME_ELEVATED -eq '1') { return $true }
+    if ($env:COZYGATEWAY_TEST_ASSUME_ELEVATED -eq '0') { return $false }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Deny-Elevation {
+    if (Test-ElevatedToken) { Fail 'CozyAgents installs per user under your profile and never needs administrator; rerun as yourself.' }
 }
 
 function Test-SafeModelWord {
@@ -645,6 +666,9 @@ function Get-CozyAgentsInstallerSource {
 function Install-CozyAgentsHarness {
     param([string] $AgentsHome, [string] $Source)
     Write-Info 'installing CozyAgents, the harness that runs your bots on this machine.'
+    # The scriptblock runs in this script's session state, so its $script: variables are this
+    # script's: its $script:Tag, $script:Repo and $script:AssetBase are the same names as $tag,
+    # $repo and $base here. Nothing reads those after this point; do not start.
     $staged = Join-Path ([IO.Path]::GetTempPath()) ('cozyagents-install-' + [guid]::NewGuid().ToString('N') + '.ps1')
     $previousAgentsHome = [Environment]::GetEnvironmentVariable('COZYAGENTS_HOME', 'Process')
     try {
@@ -775,6 +799,7 @@ function Complete-Pairing {
         if ($LASTEXITCODE -ne 0) { Fail "could not create a pairing code; the gateway is installed, so retry with: $Cli pair" }
     }
     Write-Info "codes expire after 10 minutes; mint a fresh QR and code with: $Cli pair"
+    Write-Info 'for a tunnel, rerun the installer with: --public-url https://gateway.example.com'
 }
 
 # The CozyAgents branch: the same gateway with no Hermes discovery, no plugin and no Dashboard,
@@ -793,9 +818,11 @@ function Install-WithCozyAgents {
     )
     Write-Ok 'harness: CozyAgents; your bots run on this computer under the CozyAgents runner'
     $agentsHome = Resolve-CozyAgentsHome
+    # The gateway half is the shared installer, so a machine without Git Bash cannot finish. Say so
+    # before the questions rather than after a person has answered all three.
+    $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH 'Install Git for Windows from https://git-scm.com/download/win, then paste this command again.'
     $model = Confirm-CozyAgentsModel (Join-Path $agentsHome 'runner.env')
     $listener = Select-Listener $AlreadyConfigured $ForwardedArguments
-    $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH 'Install Git for Windows from https://git-scm.com/download/win, then paste this command again.'
 
     Protect-CozyGatewayHome $script:InstallHome
     $stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
@@ -906,6 +933,7 @@ if ($isUninstall) {
 
 # Step 1 of the approved order: the harness, before anything is installed.
 $harness = Select-Harness $Harness $statePath $configPath
+if ($harness -eq 'cozyagents') { Deny-Elevation }
 
 if ($isDryRun) {
     if ($harness -eq 'cozyagents') {

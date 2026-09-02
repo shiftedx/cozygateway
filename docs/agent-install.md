@@ -8,12 +8,32 @@ Windows PowerShell 5.1+:
 irm https://cozylabs.ai/install.ps1 | iex
 ```
 
-The Windows bootstrap reuses Hermes when installed. If Hermes is absent, it
-runs the official tagged NousResearch Windows installer and setup wizard. It
-checks the current Hermes provider and default model before any CozyGateway
-changes, and opens `hermes model` only when that setup is incomplete. It then
-checksum-verifies the CozyGateway release assets and hands off through
-Hermes-compatible Git Bash.
+The Windows bootstrap asks the same harness question the POSIX one asks. A
+machine that already has Hermes keeps it: the bootstrap checks the current
+Hermes provider and default model before any CozyGateway changes, opens
+`hermes model` only when that setup is incomplete, then checksum-verifies the
+CozyGateway release assets and hands off through Hermes-compatible Git Bash. A
+machine with no Hermes is offered CozyAgents first and takes it on Enter, so the
+NousResearch Windows installer now runs only when someone asks for Hermes.
+
+`-Harness cozyagents` or `-Harness hermes` answers the question for an
+unattended run, and `-CozyAgentsInstaller <path or url>` names the CozyAgents
+Windows installer to use instead of the published `https://cozylabs.ai/agents.ps1`.
+`irm | iex` takes no parameters, so pass them like this:
+
+```powershell
+& ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness cozyagents
+```
+
+The harness half on Windows is native: the CozyAgents installer is its own
+one-liner (`irm https://cozylabs.ai/agents.ps1 | iex`), needs no POSIX shell, and
+is run in this process, so no execution policy is consulted or changed. The
+gateway half is not yet: on both harnesses it is the shared `agent-install.sh`,
+so a Windows install still needs Git Bash. The Hermes installer brings one; on a
+machine with no Hermes, install Git for Windows from
+<https://git-scm.com/download/win> first. Neither path ever needs administrator,
+and an elevated terminal is refused on the CozyAgents path before anything is
+installed.
 
 macOS/Linux:
 
@@ -30,10 +50,17 @@ chosen by Enter, by `--harness cozyagents`, and whenever there is no terminal to
 ask on. `--harness hermes` asks for the Hermes path on a machine with no Hermes,
 and the installer then fetches the official Hermes installer as it always has.
 
+On Windows the same choice is made by `-Harness`, by the same question, and by
+the same recorded `harness=` state; the shared installer is then told that the
+native bootstrap owns the harness half, so it installs the gateway alone and
+`scripts/install.ps1` asks the questions, runs `agents.ps1`, writes the runner
+model keys, mints the code and prints the QR.
+
 The CozyAgents path installs the same gateway with no Hermes bridge at all: no
 plugin, no profiles, no Hermes Dashboard, no attach-health wait, and a config
 with no `hermesEndpoints`. It then runs the CozyAgents installer from
-`https://cozylabs.ai/agents.sh` with `--no-pair`, mints a runner pairing code
+`https://cozylabs.ai/agents.sh` (`https://cozylabs.ai/agents.ps1` on Windows,
+with `-NoPair`) with `--no-pair`, mints a runner pairing code
 through the gateway's own storage (`cozygateway pair --kind runner --ttl 10`),
 and hands that code to `cozyagents runner pair`, so nobody types a code to pair
 the computer they are standing at. A second run upgrades the harness and keeps
@@ -41,12 +68,15 @@ the pairing.
 
 Before that, the CozyAgents path asks the same two questions the Hermes path
 asks: a model provider (or a local endpoint URL) and a model id. They are
-written to `~/.cozyagents/runner.env` at 0600 as `COZYRUNNER_MODEL_PROVIDER` or
+written to `~/.cozyagents/runner.env` at 0600 (on Windows, an ACL granting only
+the owning user and SYSTEM, with inheritance disabled, because Windows ignores
+the POSIX mode) as `COZYRUNNER_MODEL_PROVIDER` or
 `COZYRUNNER_MODEL_ENDPOINT` plus `COZYRUNNER_MODEL_ID`, which is where the
 runner already reads its default model for every bot it creates. Naming both a
 provider and an endpoint is refused by name. No API key is ever written by the
 installer. When a Codex login is already on the machine
-(`~/.pi/agent/auth.json`, or a Codex token in the Hermes `.env`), the installer
+(`~/.pi/agent/auth.json`, `%USERPROFILE%\.pi\agent\auth.json` on Windows, or a
+Codex token in the Hermes `.env`), the installer
 offers to share it with the bots that run here, so nobody has to paste a key;
 answering yes writes `COZYRUNNER_SHARE_HOST_MODEL_AUTH=1`.
 
@@ -66,11 +96,14 @@ the bridge and says so, and the run is then a Hermes install end to end: no
 CozyAgents harness is fetched, no runner is paired, no `COZYRUNNER_MODEL_*` key
 is written, the install records `harness=hermes`, and `--status` reports Hermes.
 The path stays frozen until someone passes `--harness cozyagents` or answers the
-question.
+question. On Windows the flag is `-Harness cozyagents`, which the `irm | iex`
+one-liner cannot carry: use the `[scriptblock]::Create` form shown above.
 
 `--uninstall` removes the CozyGateway service and state, and hands the harness
 back to its own uninstaller (`cozyagents uninstall`) rather than reimplementing
-it. `--status` names the harness this install owns, and for a CozyAgents harness
+it; on Windows the bootstrap does the same, removing the Scheduled Task, the
+Startup fallback and the PATH entry through the shared installer and the harness
+through the CozyAgents uninstaller. `--status` names the harness this install owns, and for a CozyAgents harness
 reports the runner's name, its last-seen time and whether it is attached, from
 `GET /runners/self` with the runner's own token sent on stdin rather than argv;
 with the gateway unreachable it reports the local runner state instead. `--no-qr`

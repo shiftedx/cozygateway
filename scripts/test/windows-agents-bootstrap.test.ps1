@@ -219,6 +219,9 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYAGENTS_TEST_LOG' = $agentsLog
         'COZYAGENTS_INSTALL_URL' = $agentsInstaller
+        # A hosted runner holds an administrator token, and the CozyAgents path refuses one. Every
+        # case says it is not elevated except the one that is about the refusal.
+        'COZYGATEWAY_TEST_ASSUME_ELEVATED' = '0'
         'COZYGATEWAY_TEST_CLI_LOG' = $cliLog
         'COZYGATEWAY_TEST_HERMES' = (Join-Path $temp 'no-such-hermes.exe')
         'LOCALAPPDATA' = (Join-Path $temp 'localappdata')
@@ -296,6 +299,35 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $temp 'Silent Gateway'))) 'a dry run must write nothing'
 
     # ---------------------------------------------------------------------------
+    # 2b. An elevated token is refused on the CozyAgents path, before anything is installed
+    # ---------------------------------------------------------------------------
+    $elevatedHome = Join-Path $temp 'Elevated Gateway'
+    Remove-Item -LiteralPath $eventLog, $agentsLog -Force -ErrorAction SilentlyContinue
+    $elevated = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_HOME' = $elevatedHome
+        'COZYAGENTS_HOME' = (Join-Path $temp 'elevated-cozyagents')
+        'COZYGATEWAY_TEST_ASSUME_ELEVATED' = ''
+        'COZYAGENTS_INSTALL_ASSUME_ELEVATED' = '1'
+        'COZYGATEWAY_TEST_GATEWAY_STAGE' = (Join-Path $temp 'stage-loopback')
+        'COZYGATEWAY_TEST_GATEWAY_DEST' = $elevatedHome
+    }) @('-Harness', 'cozyagents')
+    Assert-True ($elevated.ExitCode -ne 0) 'an elevated run must exit non-zero on the CozyAgents path'
+    Assert-Contains $elevated.Output 'installs per user under your profile and never needs administrator; rerun as yourself.' 'the no-admin sentence must name what is refused'
+    Assert-True (-not (Test-Path -LiteralPath $elevatedHome)) 'an elevated run must install nothing'
+    Assert-True ((Read-LogText $eventLog) -eq '') 'an elevated run must not reach the shared installer'
+    Assert-True ((Read-LogText $agentsLog) -eq '') 'an elevated run must not reach the CozyAgents installer'
+
+    # The Hermes path is untouched: it has always installed whatever token it was given.
+    $elevatedHermes = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Elevated Hermes Gateway')
+        'COZYGATEWAY_TEST_ASSUME_ELEVATED' = ''
+        'COZYAGENTS_INSTALL_ASSUME_ELEVATED' = '1'
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+    }) @('-Harness', 'hermes')
+    Assert-True ($elevatedHermes.ExitCode -eq 0) "an elevated Hermes run must be refused by nothing new: $($elevatedHermes.Output)"
+    Assert-Missing $elevatedHermes.Output 'never needs administrator' 'the Hermes path must print no no-admin sentence'
+
+    # ---------------------------------------------------------------------------
     # 3. A live CozyAgents install: model onboarding, the LAN question, the QR
     # ---------------------------------------------------------------------------
     $liveHome = Join-Path $temp 'Live Cozy Gateway'
@@ -369,6 +401,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
     Assert-Contains $live.Output '"setupCode":"TEST-CODE"' 'the QR must carry a device pairing code'
     Assert-Contains $live.Output '"gatewayUrl":"http://192.0.2.10:8787"' 'the QR must encode the listener the person chose'
     Assert-Contains $live.Output 'codes expire after 10 minutes' 'the pairing card must say how long a code lasts'
+    Assert-Contains $live.Output 'for a tunnel, rerun the installer with: --public-url' 'the pairing card must name the tunnel option the POSIX card names'
     Assert-Missing $live.Output 'Dashboard' 'a CozyAgents install must not mention the Hermes Dashboard'
     $registeredPath = Get-Content -LiteralPath $livePathLog -Raw
     $liveBin = Join-Path $liveHome 'bin'
@@ -481,6 +514,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
     })
     Assert-Contains $orphan.Output 'keeping it. Rerun with -Harness cozyagents to replace it.' 'a kept Hermes bridge must say how to replace it'
     Assert-Contains $orphan.Output 'continuing as a Hermes install; nothing CozyAgents-owned is installed, paired, or configured here.' 'a kept bridge must make the whole run a Hermes install'
+    Assert-Contains $orphan.Output '& ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness cozyagents' 'a kept bridge must show the form that can carry the flag'
     Assert-Missing $orphan.Output 'Which provider should new bots use?' 'a kept bridge must ask no CozyAgents question'
     Assert-Missing $orphan.Output 'would install CozyAgents from' 'a kept bridge must install no CozyAgents harness'
     Assert-True ((Read-LogText $agentsLog) -eq '') 'a kept bridge must run nothing CozyAgents owns'
