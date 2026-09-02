@@ -12,7 +12,7 @@ import type {
 } from "cozygateway-contract";
 
 import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
-import type { AttachV1EventFrame, AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, type AttachV1EventFrame, type AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
 import {
   GROUP_LOG_LIMIT,
@@ -1037,13 +1037,20 @@ export class GroupRooms {
       this.#log(`dropping room approval for "${turn.member}": approval id is bound to another turn`);
       return true;
     }
+    // Capability 56. Sanitized once, up front, exactly as the 1:1 lane does: the same sentence is
+    // stored on the durable row, carried on the expiry payload, and broadcast on the live frame.
+    const detail = event.detail === undefined ? undefined : sanitizeApprovalDetail(event.detail);
     const change = this.#storage.recordNativeInteraction({
       bot: turn.member,
       kind: "approval",
       interactionId: event.approvalId,
       sessionId: turn.threadId,
       turnId: turn.turnId,
-      payload: { name: event.name, room: { key: turn.key, name: room.name } },
+      payload: {
+        name: event.name,
+        room: { key: turn.key, name: room.name },
+        ...(detail === undefined ? {} : { detail }),
+      },
       status: outcome ?? "pending",
       ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
       updatedAt: this.#now(),
@@ -1063,7 +1070,11 @@ export class GroupRooms {
         interactionId: event.approvalId,
         sessionId: turn.threadId,
         turnId: turn.turnId,
-        payload: { name: event.name, room: { key: turn.key, name: room.name } },
+        payload: {
+          name: event.name,
+          room: { key: turn.key, name: room.name },
+          ...(detail === undefined ? {} : { detail }),
+        },
         expiresAt: event.expiresAt ?? null,
         updatedAt: this.#now(),
       });
@@ -1076,6 +1087,7 @@ export class GroupRooms {
         name: event.name,
         updatedAt: this.#now(),
         room: room.name,
+        ...(detail === undefined ? {} : { detail }),
       });
     } else {
       this.#broadcast({

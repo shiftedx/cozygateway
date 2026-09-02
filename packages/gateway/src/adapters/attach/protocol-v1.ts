@@ -400,12 +400,15 @@ const ApprovalEvent = Type.Object({
   status: Type.Union([Type.Literal("pending"), Type.Literal("approved"), Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled")]),
   expiresAt: Type.Optional(Type.Integer({ minimum: 0 })),
   /** Capability 56. A short sentence naming what the approval concretely covers -- for example
-   *  which Chrome and which profile `my_browser_open` would drive. The schema bound here is
-   *  deliberately loose (a raw plugin string, not yet the display value): `sanitizeApprovalDetail`
-   *  below is the sole authority on the 1-400 character display bound, so a peer that sends
-   *  something oversized or control-character-laden is sanitised and truncated rather than having
-   *  its whole frame -- and the approval it describes -- dropped over one presentation field. */
-  detail: Type.Optional(Type.String({ maxLength: 4096 })),
+   *  which Chrome and which profile `my_browser_open` would drive. Deliberately UNBOUNDED on the
+   *  wire (a raw plugin string, not yet the display value): a length cap here would make an
+   *  oversized `detail` a schema failure, and a schema failure on `hello`/an event frame closes
+   *  the whole attach socket (1008) -- so the one field meant to be forgiving of a misbehaving
+   *  peer would instead tear down its entire session. `sanitizeApprovalDetail` below is the SOLE
+   *  authority on the 1-400 character display bound: it truncates and strips rather than the
+   *  schema refusing, so an oversized or control-character-laden value is sanitised, never a
+   *  reason to drop the frame or the connection carrying it. */
+  detail: Type.Optional(Type.String()),
 });
 /** Capability 56. Matches the C0 and C1 control character ranges (built from character codes
  *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),

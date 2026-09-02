@@ -162,6 +162,25 @@ describe("approval detail (capability 56)", () => {
     harness.close();
   });
 
+  it("truncates a 10,000-character detail to the client and never drops the frame", async () => {
+    const harness = await startTurn();
+    const { plane, sessionId, turnId } = harness;
+    const huge = "profile ".repeat(1_250); // 10,000 characters, well past the wire's 4096-byte era
+    expect(huge.length).toBe(10_000);
+
+    expect(
+      plane.handle("sage", approvalEvent(sessionId, turnId, "approval-huge", { detail: huge })),
+    ).toBe(true);
+
+    const pending = pendingFrames(harness.frames);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.toolCallId).toBe("approval-huge");
+    expect(pending[0]!.detail).toBeDefined();
+    expect([...pending[0]!.detail!].length).toBeLessThanOrEqual(400);
+    expect(pending[0]!.detail!.endsWith("…")).toBe(true);
+    harness.close();
+  });
+
   it("carries detail on the durable record so a reconnecting app's rebroadcast matches the live frame", async () => {
     const harness = await startTurn();
     const { plane, sessionId, turnId } = harness;
