@@ -5,6 +5,37 @@ function Assert-True {
     if (-not $Condition) { throw "ASSERT: $Message" }
 }
 
+function Stop-FixtureProcessTree {
+    param([Diagnostics.Process] $Process)
+    if ($null -eq $Process) { return }
+    try {
+        $Process.Refresh()
+        if ($Process.HasExited) { return }
+    } catch {
+        return
+    }
+    $taskkillExit = $null
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID ([string]$Process.Id) /T /F 2>$null | Out-Null
+        $taskkillExit = $LASTEXITCODE
+    } catch {
+        Write-Warning "fixture process tree $($Process.Id) cleanup could not invoke taskkill: $($_.Exception.Message)"
+        return
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    if ($taskkillExit -ne 0) {
+        try {
+            $Process.Refresh()
+            if (-not $Process.HasExited) { Write-Warning "fixture process tree $($Process.Id) could not be stopped (taskkill exit $taskkillExit)" }
+        } catch {
+            return
+        }
+    }
+}
+
 function Write-Utf8NoBom {
     param([string] $Path, [string] $Content)
     [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false)))
@@ -1119,11 +1150,11 @@ stop_owned_windows_gateway 0
         }
         Assert-True $uninstallReacquired 'uninstall must stop a running generated supervisor even before Node and bundle are resolved'
     } finally {
-        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $supervisor.Id /T /F 2>$null | Out-Null
-        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $staleSupervisor.Id /T /F 2>$null | Out-Null
-        if ($null -ne $uninstallSupervisor) { & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $uninstallSupervisor.Id /T /F 2>$null | Out-Null }
-        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $foreignChild.Id /T /F 2>$null | Out-Null
-        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $dashboard.Id /T /F 2>$null | Out-Null
+        Stop-FixtureProcessTree $supervisor
+        Stop-FixtureProcessTree $staleSupervisor
+        Stop-FixtureProcessTree $uninstallSupervisor
+        Stop-FixtureProcessTree $foreignChild
+        Stop-FixtureProcessTree $dashboard
     }
 
     $fakePowerShellDirectory = Join-Path $temp 'fake PowerShell'
