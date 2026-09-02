@@ -293,6 +293,43 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     }]);
   });
 
+  it("capability 56: carries a sanitized approval detail on a room turn, and omits it when absent", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+
+    // With detail: sanitized and carried on both the live frame and the durable row, so a room
+    // card reads exactly like a 1:1 card would.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-detail", callId: "call-1", name: "my_browser_open", status: "pending",
+      // \u0000 (NUL, C0), \u0007 (BEL, C0), \u200b (zero-width space, Unicode Format/Cf).
+      detail: "Would drive Chrome\u0000 (Work\u200bprofile)\u0007.",
+    })).toBe(true);
+
+    const pendingWithDetail = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === "approval-detail",
+    ) as BotApprovalPendingFrame;
+    expect(pendingWithDetail).toMatchObject({
+      bot: "sage", room: "Launch", name: "my_browser_open", detail: "Would drive Chrome (Workprofile).",
+    });
+    expect(h.storage.nativeInteraction("sage", "approval", "approval-detail")?.payload).toMatchObject({
+      name: "my_browser_open",
+      detail: "Would drive Chrome (Workprofile).",
+      room: { name: "Launch" },
+    });
+
+    // Without detail: byte-identical to today, on both surfaces.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-no-detail", callId: "call-2", name: "terminal:rm", status: "pending",
+    })).toBe(true);
+    const pendingNoDetail = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === "approval-no-detail",
+    ) as BotApprovalPendingFrame;
+    expect(pendingNoDetail).not.toHaveProperty("detail");
+    expect(h.storage.nativeInteraction("sage", "approval", "approval-no-detail")?.payload).not.toHaveProperty("detail");
+  });
+
   it("lands a runtime member's room clarification in the inbox and resolves it through the unchanged route", async () => {
     const h = await setup();
     const turn = await blockedTurn(h, ["sage", "scout"]);

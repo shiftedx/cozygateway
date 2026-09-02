@@ -413,6 +413,28 @@ describe("attach-v1 ingress", () => {
     ws.close();
   });
 
+  // Capability 56. `ApprovalEvent.detail` is deliberately UNBOUNDED on the wire: a length cap here
+  // would make an oversized detail a schema failure, and (per the regression test above) a
+  // schema-invalid frame closes the whole socket (1008) rather than being dropped -- which would
+  // let a misbehaving peer's own presentation field tear down its entire session. Sanitizing and
+  // truncating it is `sanitizeApprovalDetail`'s job downstream, not the wire schema's.
+  it("accepts a 10,000-character approval detail without closing the connection", async () => {
+    const { ws, frames } = await dial(undefined, ["draft", "approvals"]);
+    const oversized = "profile ".repeat(1_250); // 10,000 characters
+    ws.send(JSON.stringify({
+      kind: "event", sequence: 1, eventId: "e1",
+      event: {
+        kind: "approval", threadId: "t", turnId: "u", approvalId: "a1", callId: "c1",
+        name: "my_browser_open", status: "pending", detail: oversized,
+      },
+    }));
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event"));
+    expect(accepted).toHaveLength(1);
+    expect((accepted[0]!.event as { detail?: string }).detail).toBe(oversized);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
   it("bounds unacked commands and advances only after ACK", async () => {
     const { ws, frames } = await dial({ maxInFlightEvents: 1, maxInFlightBytes: 4096 });
     expect(frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({ limits: { maxInFlightEvents: 1, maxInFlightBytes: 4096 } });

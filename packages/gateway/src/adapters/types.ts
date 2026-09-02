@@ -18,6 +18,10 @@ export interface ApprovalRequest {
   toolCallId: string;
   name: string;
   argSummary?: ApprovalArgSummary;
+  /** Capability 56. A sanitized, at most 400-character display sentence naming what the approval
+   *  concretely covers (for example which Chrome and which profile a browser tool would drive).
+   *  Absent when the runtime peer sent none. */
+  detail?: string;
 }
 
 /** The only scope a client can express is per-call (native `once`), so the decision is binary. */

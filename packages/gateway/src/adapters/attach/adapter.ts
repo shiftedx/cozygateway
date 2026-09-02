@@ -4,7 +4,7 @@ import type { PresenceState, RichBlock, ToolCall } from "cozygateway-contract";
 
 import type { HermesBridgeConfig } from "../../config.ts";
 import type { BackendAdapter, BackendSession, TurnHandlers } from "../types.ts";
-import type { AttachV1EventFrame } from "./protocol-v1.ts";
+import { sanitizeApprovalDetail, type AttachV1EventFrame } from "./protocol-v1.ts";
 import { blocksToText } from "./blocks-to-text.ts";
 
 export interface AttachTurnFrame { kind: "turn"; threadId: string; turnId: string; text: string }
@@ -237,7 +237,12 @@ export function createAttachAdapter(deps: {
         }
         case "approval":
           if (event.status === "pending") {
-            turn.handlers.onApprovalPending?.({ toolCallId: event.approvalId, name: event.name });
+            const detail = event.detail === undefined ? undefined : sanitizeApprovalDetail(event.detail);
+            turn.handlers.onApprovalPending?.({
+              toolCallId: event.approvalId,
+              name: event.name,
+              ...(detail === undefined ? {} : { detail }),
+            });
           } else {
             const outcome = event.status === "approved" ? "approved"
               : event.status === "denied" ? "denied"
