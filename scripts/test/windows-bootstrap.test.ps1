@@ -1118,7 +1118,20 @@ stop_owned_windows_gateway
         }
         Assert-True $reacquired 'in-place update must stop the owned supervisor so it cannot reclaim the gateway port'
         $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
-        Start-Sleep -Milliseconds 250
+        $uninstallListening = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try {
+                $probe.Connect('127.0.0.1', $supervisorPort)
+                $uninstallListening = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 100
+            } finally {
+                $probe.Dispose()
+            }
+        }
+        Assert-True $uninstallListening 'fixture uninstall supervisor must start its managed gateway child'
         $uninstallStopHarness = Join-Path $temp 'gateway uninstall stop harness.sh'
         $uninstallStopScript = @"
 #!/usr/bin/env bash
