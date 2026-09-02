@@ -946,12 +946,15 @@ export function registerBotRoutes(
       parsed.soul === undefined &&
       parsed.disabledSkills === undefined &&
       parsed.enabledToolsets === undefined &&
-      parsed.enabledMcpServers === undefined
+      parsed.enabledMcpServers === undefined &&
+      // Capability 57: a guardrailLevel-only patch is a real request too, even though this
+      // gateway does no work for it beyond forwarding it to a runtime bot's peer.
+      parsed.guardrailLevel === undefined
     ) {
       return c.json(
         errorBody(
           "invalid_request",
-          "at least one of soul, disabledSkills, enabledToolsets, enabledMcpServers is required",
+          "at least one of soul, disabledSkills, enabledToolsets, enabledMcpServers, guardrailLevel is required",
         ),
         400,
       );

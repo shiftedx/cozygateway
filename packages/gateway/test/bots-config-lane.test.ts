@@ -151,6 +151,43 @@ describe("attach-v1 config lane", () => {
     peer.ws.close();
   });
 
+  // Capability 57: this gateway does not interpret guardrailLevel, it relays it. A patch carrying
+  // the field is forwarded to the peer byte-for-byte, and a peer's read carrying it comes straight
+  // back, for each of the four names.
+  it("round-trips guardrailLevel through the peer unchanged, for each of the four names", async () => {
+    for (const guardrailLevel of ["locked", "guided", "balanced", "autonomous"] as const) {
+      const peer = await dial({
+        "profile.read": { ...profile, guardrailLevel },
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { guardrails: true }, requested: ["guardrailLevel"] },
+      });
+
+      await expect(config.botProfile("sage")).resolves.toMatchObject({ guardrailLevel });
+      await expect(config.configureProfile("sage", { guardrailLevel })).resolves.toEqual({
+        outcome: "applied", ok: true, applied: { guardrails: true }, requested: ["guardrailLevel"],
+      });
+
+      expect(peer.requests.map((request) => request.input)).toEqual([
+        {},
+        { guardrailLevel },
+      ]);
+      peer.ws.close();
+    }
+  });
+
+  // Absent stays absent: a peer that answers no guardrailLevel at all (a pre-57 peer) is not
+  // backfilled with one, and a patch that does not mention it carries no such key on the wire.
+  it("leaves guardrailLevel absent on the wire when the caller does not mention it", async () => {
+    const peer = await dial({
+      "profile.read": profile,
+      "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+    });
+    const read = await config.botProfile("sage");
+    expect("guardrailLevel" in read).toBe(false);
+    await config.configureProfile("sage", { soul: "# new" });
+    expect(peer.requests[1]?.input).toEqual({ soul: "# new" });
+    peer.ws.close();
+  });
+
   it("rejects per status rather than collapsing every refusal into one failure", async () => {
     const peer = await dial({ "profile.read": profile });
     await expect(config.routines("sage")).rejects.toBeInstanceOf(BackendUnavailable);

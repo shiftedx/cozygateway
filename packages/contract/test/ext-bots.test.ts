@@ -373,6 +373,17 @@ describe("profile patch", () => {
     // A name with padding around real characters is still a name; the bridge trims it.
     expect(check(BotProfilePatchSchema, { enabledToolsets: [" files "] })).toBe(true);
   });
+
+  it("accepts each of the four guardrail levels and nothing else (capability 57)", () => {
+    for (const guardrailLevel of ["locked", "guided", "balanced", "autonomous"]) {
+      expect(check(BotProfilePatchSchema, { guardrailLevel }), guardrailLevel).toBe(true);
+    }
+    for (const guardrailLevel of ["yolo", "Balanced", "", " ", 3, null]) {
+      expect(check(BotProfilePatchSchema, { guardrailLevel }), String(guardrailLevel)).toBe(false);
+    }
+    // Optional: a soul-only patch, the shape every client below 57 already sends, is unchanged.
+    expect(check(BotProfilePatchSchema, { soul: "hello" })).toBe(true);
+  });
 });
 
 describe("profile", () => {
@@ -408,6 +419,27 @@ describe("profile", () => {
     expect(check(BotProfileSchema, base)).toBe(false);
     expect(check(BotProfileSchema, { ...base, runtimeInert: [] })).toBe(true);
     expect(check(BotProfileSchema, { ...base, runtimeInert: ["skills"] })).toBe(false);
+  });
+
+  // Optional, not required: capability 57. A Hermes bot and a peer below 57 both answer with the
+  // field simply absent, never a default the gateway invented.
+  it("carries the guardrail level when the peer answers one, and stays valid without it (capability 57)", () => {
+    const base = {
+      name: "scout",
+      description: "",
+      soul: "",
+      skills: [],
+      toolsets: [],
+      toolsetsPinned: false,
+      mcpServers: [],
+      model: { provider: "", default: "" },
+      runtimeInert: [],
+    };
+    expect(check(BotProfileSchema, base)).toBe(true);
+    for (const guardrailLevel of ["locked", "guided", "balanced", "autonomous"]) {
+      expect(check(BotProfileSchema, { ...base, guardrailLevel }), guardrailLevel).toBe(true);
+    }
+    expect(check(BotProfileSchema, { ...base, guardrailLevel: "yolo" })).toBe(false);
   });
 });
 
@@ -675,7 +707,14 @@ describe("capability advertisement", () => {
     // roster, `/runner/v1` carries one socket per runner, and a gateway with no Hermes endpoint is
     // a supported configuration whose readiness reports the bridge as absent. A client below 52
     // never sends `kind` and never calls the routes.
-    expect(BOTS_CAPABILITY_VERSION).toBe(56);
+    // 57 adds the per-bot guardrail level: `BotProfile` gains an optional `guardrailLevel` and
+    // `BotProfilePatch` an optional one too, one of `locked`, `guided`, `balanced`, `autonomous`,
+    // carried over the existing capability-48 `bot_config` lane on the existing `profile.read` and
+    // `profile.write` operations. No new route. The gateway does not store or interpret the value:
+    // it validates the closed union at the boundary and forwards it to the runtime peer unchanged,
+    // absent for a Hermes bot and for a peer below 57, and never backfilled. A client below 57
+    // sends no such field and its profile saves stay byte identical to the ones it sent before.
+    expect(BOTS_CAPABILITY_VERSION).toBe(57);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

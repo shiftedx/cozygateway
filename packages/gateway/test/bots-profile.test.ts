@@ -609,6 +609,52 @@ describe("PATCH /bots/:name/profile", () => {
     expect(server.callsOf("profiles.configure")).toHaveLength(0);
   });
 
+  // Capability 57. A Hermes bot has no notion of a guardrail level: the field is not part of the
+  // `profiles.configure` vocabulary this bridge speaks, so a patch carrying only it is accepted at
+  // the boundary (it is a real request, not an empty one) and simply has nothing to forward.
+  it("accepts a guardrailLevel-only patch for a Hermes bot and does nothing with it", async () => {
+    const configures: Array<Record<string, unknown>> = [];
+    const { authed } = await setup({
+      methods: {
+        "profiles.configure": (params) => {
+          configures.push(params);
+          return { applied: {} };
+        },
+      },
+    });
+    const res = await authed("/bots/scout/profile", patch({ guardrailLevel: "balanced" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      name: "scout",
+      outcome: "applied",
+      ok: true,
+      applied: {},
+      requested: [],
+    });
+    // Hermes never learns about it: the wire body carries only the bot name.
+    expect(configures).toEqual([{ name: "scout" }]);
+  });
+
+  it("400s a guardrailLevel that is not one of the four names, naming the field", async () => {
+    const { authed, server } = await setup({ methods: { "profiles.configure": () => ({ applied: {} }) } });
+    const res = await authed("/bots/scout/profile", patch({ guardrailLevel: "yolo" }));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("invalid_request");
+    expect(body.error.message).toContain("guardrailLevel");
+    expect(server.callsOf("profiles.configure")).toHaveLength(0);
+  });
+
+  // The Hermes profile read never carries the field either: `mapProfileDescribe` does not derive
+  // it from anything `profiles.describe` sends, and the schema field is optional so its absence is
+  // a valid `BotProfile`.
+  it("never carries guardrailLevel on a Hermes profile read", async () => {
+    const { authed } = await setup({ methods: { "profiles.describe": () => describeResult } });
+    const res = await authed("/bots/scout/profile");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect("guardrailLevel" in body).toBe(false);
+  });
+
   // `""` is not "leave it alone", it writes a zero-byte SOUL.md, and the distinction between an
   // absent field and an empty one is the whole reason this body is a PATCH.
   it("sends an empty soul on the wire, because it CLEARS the file rather than being a no-op", async () => {
