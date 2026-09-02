@@ -37,18 +37,32 @@ function Stop-FixtureProcessTree {
 }
 
 function Get-FixtureProcessDiagnostics {
-    param([string] $FixtureRoot, [string[]] $Expected)
+    param([string] $FixtureRoot, [string[]] $Expected, [int[]] $KnownProcessIds, [int] $GatewayPort)
     try {
+        $posixFixtureRoot = (& cygpath.exe -u $FixtureRoot).Trim()
+        $slashFixtureRoot = $FixtureRoot.Replace('\', '/')
+        $fixtureRoots = @($FixtureRoot, $slashFixtureRoot, $posixFixtureRoot) | Where-Object { $_ }
         $redact = {
             param([AllowNull()][string] $Value)
             if ($null -eq $Value) { return '<none>' }
-            $Value.Replace($FixtureRoot, '<fixture-root>').Replace($FixtureRoot.Replace('\', '/'), '<fixture-root>')
+            foreach ($root in $fixtureRoots) { $Value = $Value.Replace($root, '<fixture-root>') }
+            $Value
         }
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $GatewayPort -ErrorAction SilentlyContinue)
+        $listenerProcessIds = @($listeners | ForEach-Object { [int]$_.OwningProcess } | Select-Object -Unique)
+        $fixtureProcessIds = @($KnownProcessIds + $listenerProcessIds | Select-Object -Unique)
+        $listenerRows = @($listenerProcessIds | ForEach-Object {
+            $process = Get-Process -Id $_ -ErrorAction SilentlyContinue
+            'pid={0}; name={1}' -f $_, $(if ($null -eq $process) { '<exited>' } else { $process.ProcessName })
+        })
         $rows = @(
             Get-CimInstance Win32_Process |
                 Where-Object {
-                    $_.Name -in @('node.exe', 'bash.exe') -and
-                    ([string]$_.CommandLine).Contains($FixtureRoot)
+                    $commandLine = [string]$_.CommandLine
+                    $_.Name -in @('node.exe', 'bash.exe') -and (
+                        ($fixtureProcessIds -contains [int]$_.ProcessId) -or
+                        @($fixtureRoots | Where-Object { $commandLine.Contains($_) }).Count -gt 0
+                    )
                 } |
                 ForEach-Object {
                     $tokens = @([regex]::Matches([string]$_.CommandLine, '[^\s"]+|"[^"]*"') | ForEach-Object { & $redact $_.Value.Trim('"') })
@@ -58,6 +72,8 @@ function Get-FixtureProcessDiagnostics {
         @(
             'expected canonical values:'
             ($Expected | ForEach-Object { & $redact $_ })
+            'gateway listener process ids:'
+            if ($listenerRows.Count) { $listenerRows } else { '<none>' }
             'fixture node/bash processes:'
             if ($rows.Count) { $rows } else { '<none>' }
         ) -join "`n"
@@ -1145,7 +1161,7 @@ stop_owned_windows_gateway
                 "ownerHelper=$((& cygpath.exe -w $ownerHelperPosix).Trim())"
                 "dashboardPort=$supervisorDashboardPort"
                 "gatewayPort=$supervisorPort"
-            )
+            ) @($supervisor.Id, $staleSupervisor.Id, $foreignChild.Id, $dashboard.Id) $supervisorPort
         }
         Assert-True ($stopExitCode -eq 0) "owned gateway stop helper failed: $stopOutput`n$stopDiagnostics"
         Start-Sleep -Milliseconds 1500
