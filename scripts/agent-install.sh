@@ -1416,6 +1416,29 @@ windows_startup_dir() {
   [ -n "$native" ] || native="$(to_windows_path "$HOME")\\AppData\\Roaming"
   to_posix_path "$native\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
 }
+windows_startup_entry_uses_current_wrapper() {
+  local entry="$1" wrapper_native prefix separator suffix command rest bash_path wrapper_path line_count
+  [ -f "$entry" ] || return 1
+  wrapper_native="$(to_windows_path "$WRAPPER")"
+  case "$wrapper_native" in *'"'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+  line_count="$(tr -d '\r' < "$entry" | awk 'END { print NR }')"
+  [ "$line_count" = 3 ] || return 1
+  [ "$(sed -n '1p' "$entry" | tr -d '\r')" = 'Set shell = CreateObject("WScript.Shell")' ] || return 1
+  [ "$(sed -n '3p' "$entry" | tr -d '\r')" = 'shell.Run command, 0, False' ] || return 1
+  command="$(sed -n '2p' "$entry" | tr -d '\r')"
+  prefix='command = """'
+  separator='"" ""'
+  suffix='"""'
+  rest="${command#"$prefix"}"
+  [ "$rest" != "$command" ] || return 1
+  bash_path="${rest%%"$separator"*}"
+  rest="${rest#*"$separator"}"
+  [ "$rest" != "$bash_path" ] || return 1
+  wrapper_path="${rest%"$suffix"}"
+  [ "$wrapper_path" != "$rest" ] || return 1
+  [ "$rest" = "$wrapper_path$suffix" ] || return 1
+  [ -n "$bash_path" ] && [ "$wrapper_path" = "$wrapper_native" ]
+}
 write_windows_launcher() {
   local bash_posix bash_native wrapper_native command
   bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
@@ -1545,7 +1568,7 @@ install_windows_service() {
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
     startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
-    if [ -f "$entry" ] && cmp -s "$entry" "$WINDOWS_VBS"; then rm -f "$entry"; fi
+    if [ -f "$entry" ] && { cmp -s "$entry" "$WINDOWS_VBS" || windows_startup_entry_uses_current_wrapper "$entry"; }; then rm -f "$entry"; fi
   fi
   wscript.exe "$vbs_native"
 }
