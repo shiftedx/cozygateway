@@ -21,6 +21,41 @@ macOS/Linux:
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
+## The harness
+
+A bot needs a harness to run in. The installer scans for Hermes Agent first: a
+machine that already has one keeps it, with no question asked. A machine with
+none is asked which harness runs its bots, with CozyAgents recommended and
+chosen by Enter, by `--harness cozyagents`, and whenever there is no terminal to
+ask on. `--harness hermes` asks for the Hermes path on a machine with no Hermes,
+and the installer then fetches the official Hermes installer as it always has.
+
+The CozyAgents path installs the same gateway with no Hermes bridge at all: no
+plugin, no profiles, no Hermes Dashboard, no attach-health wait, and a config
+with no `hermesEndpoints`. It then runs the CozyAgents installer from
+`https://cozylabs.ai/agents.sh` with `--no-pair`, mints a runner pairing code
+through the gateway's own storage (`cozygateway pair --kind runner --ttl 10`),
+and hands that code to `cozyagents runner pair`, so nobody types a code to pair
+the computer they are standing at. A second run upgrades the harness and keeps
+the pairing.
+
+Before that, the CozyAgents path asks the same two questions the Hermes path
+asks: a model provider (or a local endpoint URL) and a model id. They are
+written to `~/.cozyagents/runner.env` at 0600 as `COZYRUNNER_MODEL_PROVIDER` or
+`COZYRUNNER_MODEL_ENDPOINT` plus `COZYRUNNER_MODEL_ID`, which is where the
+runner already reads its default model for every bot it creates. Naming both a
+provider and an endpoint is refused by name. No API key is ever written by the
+installer. When a Codex login is already on the machine
+(`~/.pi/agent/auth.json`, or a Codex token in the Hermes `.env`), the installer
+offers to share it with the bots that run here, so nobody has to paste a key;
+answering yes writes `COZYRUNNER_SHARE_HOST_MODEL_AUTH=1`.
+
+`--uninstall` removes the CozyGateway service and state, and hands the harness
+back to its own uninstaller (`cozyagents uninstall`) rather than reimplementing
+it. `--status` names the harness this install owns. `--no-qr` never prints a
+pairing QR, whatever the run is. The installer refuses to run as root on every
+path.
+
 If Node.js 24+ is unavailable, the Windows/macOS/Linux installer downloads the current
 Node.js 24 archive from nodejs.org, verifies it against that release's official
 `SHASUMS256.txt`, and installs it privately under
