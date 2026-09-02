@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 53 }
+"capabilities": { "com.cozylabs.bots": 54 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -93,6 +93,7 @@ and does not register `/bots` routes.
 | 51 | Room turns can ask: a runtime member's approval and clarify events on a room turn land in the existing interaction inbox (`sessionId` is the `group:<room>:<member>` thread) and resolve through the existing `/bots/:member/approvals/...` and `/bots/:member/clarifications/...` routes unchanged; tool events project as ephemeral `bot_tool_activity` carrying `room`; `BotGroup` and `bot_group_state` gain the optional `pendingInteractions` pointer array. The room transcript gains nothing and Hermes members are unchanged. |
 | 52 | Paired runners: `POST /pair {setupCode, deviceName, kind: "runner"}` mints a per-runner token instead of a device token, `GET /runners`, `PATCH /runners/:id {default}` and `DELETE /runners/:id` manage the roster, `POST /runners/pair-code` mints a code from the app, `GET /runners/self` answers that one row under the runner's own bearer, and `/runner/v1` accepts any active per-runner token so two computers hold two sockets at once. The runner `hello` gains optional `name`, `platform` and `agentVersion`, recorded on its row on every hello that carries them, so a renamed computer renames its roster row. A gateway with no Hermes endpoint is a supported configuration; its roster answers from runtime bots and `/ready` reports the bridge as `absent`. |
 | 53 | Routine run now: `POST /bots/:name/routines/:id/run` sends `routines.run` over the existing capability-48 `bot_config` lane and answers `BotRoutineRunResponse` (`{routine, startedAt}`), so a person or a check can force a runtime bot's routine to fire immediately. No new capability row; it is a route on the operation capability 48 already defined on the wire. RUNTIME BOTS ONLY, the same rule capability 50's history routes follow: a Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_config`. |
+| 54 | A create picks a computer: `BotCreateRequest` gains optional `runnerId` naming the paired runner that should run the new bot. Absent, the gateway picks the account default, then the only paired runner, then answers `409 no_runner_paired` with none and `409 runner_choice_required` naming the candidates when there are several and no default; an id that names no paired runner is `400 invalid_request` naming the field. The chosen runner is recorded on the bot row and on every operation for it, so a create, a delete and a later upgrade all reach the same machine, and each connected runner is handed only the operations that name it. An operation written before 54 names no runner and goes to the account default. `BotSummary` and `BotRuntimeProjection` gain optional `runnerId` and `runnerName`, absent for a Hermes bot and for a runtime bot created before 54 and never backfilled; `Runner` gains optional `botCount`, which `DELETE /runners/:id` answers too, beside the `reassignedOperations` count for the not-yet-sent work that revoke re-addresses to the account default (or to nobody). The `409 runner_choice_required` body is `RunnerChoiceRequiredBody`, whose `runners` array carries the ids the chooser needs. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -331,6 +332,59 @@ Out of scope for 49, and deliberately not implied by it: pairing codes and short
 credentials, upgrades and migrations, restart backoff, drain windows, isolation policy, capacity
 admission, archive and purge grace, multi-host, and reconciliation of unknown containers. See
 `docs/adr/0002-gateway-reconciled-per-bot-runtime.md` in the CozyAgents repo.
+
+### Placing a bot on a computer (capability 54)
+
+`POST /bots {"name": "sage", "runtime": "cozyagents", "runnerId": "..."}` names which paired computer
+(`GET /runners`) runs the new bot. The field is optional, so the create body a client below 54 sends
+is accepted unchanged and answers the same `201 {bot, warnings?}`.
+
+With no `runnerId` the gateway picks, in this order: the account default, then the only paired
+runner. It never picks silently between several:
+
+| Situation | Answer |
+| --- | --- |
+| No paired runner at all | `409` extension code `no_runner_paired`. The app says "Add a computer first". |
+| Several paired runners and no default | `409` `RunnerChoiceRequiredBody`: extension code `runner_choice_required`, a message naming the candidates, and a `runners` array of `{id, name, isDefault}`. The app shows a chooser and sends one of those ids back as `runnerId`; the ids are in the array only, never in the message. |
+| `runnerId` names no paired runner | `400 invalid_request` naming `runnerId`: a client bug, not a missing machine. |
+
+The chosen runner is written on the bot's row and on every operation for that bot, so a create, a
+delete and a later upgrade all reach the same machine. `/runner/v1` hands each connected runner only
+the operations that name it. An operation written before 54 names no runner and goes to the account
+default, which keeps an existing single-runner deployment moving with no migration step; with no
+default and no legacy shared credential it keeps waiting rather than being sent to an arbitrary
+machine.
+
+On a gateway whose only computer is the operator-placed shared credential, a create is placed on the
+`legacy` row and its bot carries `runnerId: "legacy"` with `runnerName: "legacy runner"`, the same
+row and name `GET /runners` already renders. Unsetting `COZYGATEWAY_RUNNER_TOKEN` is how that row is
+revoked, and it goes through no route, so nothing is re-addressed: those bots keep naming a
+credential that no longer exists. Pair the real computer BEFORE unsetting the variable, and expect
+to recreate the legacy-placed bots on it.
+
+`BotSummary` and `BotRuntimeProjection` carry optional `runnerId` and `runnerName`. Both are absent
+for a Hermes bot and for a runtime bot created before 54, and neither is ever backfilled: the
+gateway never had the value rather than having discarded it. `runnerName` is absent on its own when
+the named runner has since been revoked.
+
+`Runner.botCount` is the number of runtime bots placed on that computer, and `DELETE /runners/:id`
+answers `RunnerDeleteResponse`: `{"ok": true, "botCount": n, "reassignedOperations": m}`, plus
+`"reassignedTo"` when there was somewhere to send the work. Revoking a computer revokes its token
+and closes its socket. What happens to what was on it:
+
+- The bots keep their rows, their credentials and the `runnerId` they were given. Capability 54 has
+  no route that moves a bot to another computer, so those rows stay pointed at a machine that is
+  gone until one is added; they are stranded, not deleted, and `botCount` is the warning.
+- Operations that runner had NOT been handed yet are re-addressed, so a revoke never leaves work
+  addressed to a credential nothing can present: to the account default when there is one, named in
+  `reassignedTo`, and otherwise to nobody, which is the same unaddressed state a pre-54 row holds
+  and is dispatched to whichever runner becomes the default later.
+- An operation that runner had already been SENT is left addressed to it. It may well have been
+  applied, and handing the same mutation to a second machine is what the single-writer rule exists
+  to prevent.
+- `DELETE /bots/:name` for a bot whose computer is gone still works, and its `delete_runtime` is
+  addressed to nobody rather than to the revoked runner, so the cleanup is collectable by whichever
+  computer holds the default.
 
 ### Bot history (capability 50)
 
@@ -608,7 +662,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /runners/pair-code` | — | `{ setupCode, expiresAt, gatewayUrl }` | Capability 52. Mints a runner-kind pairing code from the app: the same 10 minute TTL and the same gateway-wide 10-per-60-seconds bucket the unauthenticated `/pair` route spends, so a `429` with `retry-after` is the answer when it is exhausted. `gatewayUrl` is the origin the new computer should dial, which is the LAN address when the listener is on a wildcard. Minting any code revokes every older unredeemed one. |
 | `GET /runners/self` | — | `RunnerSelf` | Capability 52. Authenticated by the RUNNER's own bearer, not a device token, and the only route that credential opens. Answers `{id, name, platform, default, lastSeenAt, attached}` for that one runner; `attached` is whether it holds a live `/runner/v1` socket, which is a different question from whether the row exists. `401 unauthorized` for a missing, unknown, or revoked token. |
 | `PATCH /runners/:id` | `RunnerPatchRequest` | `{ runner: Runner }` | Capability 52. `{default: true}` moves the account default and clears the previous holder in the same transaction. `default: false` and the `legacy` id are `400 invalid_request`; an unknown id is `404 not_found`. |
-| `DELETE /runners/:id` | — | `{ ok: true }` | Capability 52. Revokes that runner's token and closes its socket. `404 not_found` for an unknown id, exactly as `DELETE /devices/:id` answers. The `legacy` row is revoked by unsetting the environment variable and answers `400 invalid_request`. |
+| `DELETE /runners/:id` | no body | `200 RunnerDeleteResponse` | Capability 52. Revokes that runner's token and closes its socket. `404 not_found` for an unknown id, exactly as `DELETE /devices/:id` answers. The `legacy` row is revoked by unsetting the environment variable and answers `400 invalid_request`. Capability 54: the body carries `botCount`, the runtime bots left on that computer, and `reassignedOperations` (with `reassignedTo` when there was a default) for the not-yet-sent work it re-addressed. Unsetting `COZYGATEWAY_RUNNER_TOKEN` is NOT this route and re-addresses nothing: a bot created on the legacy row keeps `runnerId: "legacy"`, and after the variable is unset its queued work is deliverable only in that its `delete_runtime` is then addressed to nobody and picked up by the account default. A deployment that pairs a real computer should do so before unsetting the variable, and treat those bots as bots to recreate. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
 | `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. |

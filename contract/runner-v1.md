@@ -231,6 +231,11 @@ Operations are durable gateway rows (`runner_operations`), not socket state.
 - On every authenticated hello, every operation still waiting on its FIRST receipt is (re)sent,
   oldest first. An operation a runner has already receipted is NOT resent: resuming from the last
   verified stage is the runner's job, and a resend would repeat a mutation.
+- **Capability 54: the queue is per computer.** An operation row names the runner it belongs to, and
+  a runner is handed only the rows that name it, so a create, a delete and a later upgrade for one
+  bot all reach one machine and no other. A row written before 54 names nobody and goes to the
+  account default, or to the legacy shared credential on a gateway that never paired a runner; with
+  neither it keeps waiting rather than being rebuilt on a machine nobody chose.
 - A `create_runtime` for a bot that was deleted before it could be sent is dropped; its
   `delete_runtime` is already queued behind it, which is the honest reconciliation.
 - A second authenticated runner supersedes the first, and the operations it is owed are handed to

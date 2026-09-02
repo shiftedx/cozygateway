@@ -4,6 +4,8 @@ import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/
 import {
   AGENT_INBOX_CAPABILITY_ID,
   RunnerSchema,
+  RunnerDeleteResponseSchema,
+  RunnerChoiceRequiredBodySchema,
   RunnersResponseSchema,
   RunnerSelfSchema,
   RunnerPairResponseSchema,
@@ -673,7 +675,7 @@ describe("capability advertisement", () => {
     // roster, `/runner/v1` carries one socket per runner, and a gateway with no Hermes endpoint is
     // a supported configuration whose readiness reports the bridge as absent. A client below 52
     // never sends `kind` and never calls the routes.
-    expect(BOTS_CAPABILITY_VERSION).toBe(53);
+    expect(BOTS_CAPABILITY_VERSION).toBe(54);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -710,6 +712,60 @@ describe("capability advertisement", () => {
       check(BotRuntimeProjectionSchema, {
         stage: "ready", specGeneration: 1, observedGeneration: 1, lastRunnerContactAt: 1,
         attachToken: "secret",
+      }),
+    ).toBe(false);
+  });
+
+  it("carries capability-54 runner placement on the create, the row, and the projection", () => {
+    // The create body a client below 54 sends is accepted unchanged; naming a computer is one more
+    // optional field beside the runtime it already names.
+    expect(check(BotCreateRequestSchema, { name: "sage", runtime: "cozyagents", runnerId: "runner-1" })).toBe(true);
+    expect(check(BotCreateRequestSchema, { name: "sage", runnerId: "" })).toBe(false);
+    // Absent rather than null on a roster row: a Hermes bot and a pre-54 runtime bot have no
+    // computer to name, and null would claim the gateway knew of one and lost it.
+    expect(check(BotSummarySchema, bot)).toBe(true);
+    expect(check(BotSummarySchema, { ...bot, runnerId: "runner-1", runnerName: "kyle-mbp" })).toBe(true);
+    expect(check(BotSummarySchema, { ...bot, runnerId: null })).toBe(false);
+    const projection = { stage: "ready", specGeneration: 1, observedGeneration: 1, lastRunnerContactAt: 1 };
+    expect(check(BotRuntimeProjectionSchema, { ...projection, runnerId: "runner-1", runnerName: "kyle-mbp" })).toBe(true);
+    // A revoked computer leaves the id behind with no name to render, which is the honest shape.
+    expect(check(BotRuntimeProjectionSchema, { ...projection, runnerId: "runner-1" })).toBe(true);
+    // The roster screen reads the count off the runner row, and a delete answers it too.
+    const runnerRow = {
+      id: "runner-1", name: "kyle-mbp", platform: null, version: null, backends: [],
+      default: true, createdAt: 1, lastSeenAt: null, online: false,
+    };
+    expect(check(RunnerSchema, { ...runnerRow, botCount: 3 })).toBe(true);
+    expect(check(RunnerSchema, { ...runnerRow, botCount: -1 })).toBe(false);
+    expect(check(RunnerDeleteResponseSchema, { ok: true, botCount: 2 })).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: true })).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: false })).toBe(false);
+    // A revoke that moved the stranded work says where it went, and how much of it there was.
+    expect(
+      check(RunnerDeleteResponseSchema, { ok: true, botCount: 2, reassignedOperations: 1, reassignedTo: "runner-2" }),
+    ).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: true, reassignedOperations: 0 })).toBe(true);
+    expect(check(RunnerDeleteResponseSchema, { ok: true, reassignedTo: "" })).toBe(false);
+    // The chooser is built from ids, which live only in this array: the message carries names.
+    expect(
+      check(RunnerChoiceRequiredBodySchema, {
+        error: { code: "runner_choice_required", message: "name one in runnerId: kyle-mbp, studio" },
+        runners: [
+          { id: "runner-1", name: "kyle-mbp", isDefault: false },
+          { id: "runner-2", name: "studio", isDefault: false },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      check(RunnerChoiceRequiredBodySchema, {
+        error: { code: "no_runner_paired", message: "add a computer" },
+        runners: [],
+      }),
+    ).toBe(false);
+    expect(
+      check(RunnerChoiceRequiredBodySchema, {
+        error: { code: "runner_choice_required", message: "pick one" },
+        runners: [{ name: "kyle-mbp", isDefault: false }],
       }),
     ).toBe(false);
   });

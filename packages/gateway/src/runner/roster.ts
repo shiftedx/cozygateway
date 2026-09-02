@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { hashToken, mintDeviceToken } from "../auth.ts";
 import type { RunnerRow, Storage } from "../storage.ts";
+import { NoRunnerPaired, RunnerChoiceRequired, RunnerUnknown } from "./runtime-bots.ts";
 
 export type { RunnerRow } from "../storage.ts";
 
@@ -113,6 +114,9 @@ function normalizeName(name: string | undefined): string {
 export function runnerToWire(
   runner: RunnerRow,
   online: boolean,
+  /** Capability 54. How many runtime bots this gateway placed on that computer. Omitted rather than
+   *  sent as a zero by a caller that did not measure it. */
+  botCount?: number,
 ): {
   id: string;
   name: string;
@@ -123,6 +127,7 @@ export function runnerToWire(
   createdAt: number;
   lastSeenAt: number | null;
   online: boolean;
+  botCount?: number;
 } {
   return {
     id: runner.id,
@@ -134,6 +139,7 @@ export function runnerToWire(
     createdAt: runner.createdAt,
     lastSeenAt: runner.lastSeenAt,
     online,
+    ...(botCount === undefined ? {} : { botCount }),
   };
 }
 
@@ -155,5 +161,44 @@ export function legacyRunnerRow(seen: {
     isDefault: false,
     createdAt: 0,
     lastSeenAt: seen.lastSeenAt ?? null,
+  };
+}
+
+/** Capability 54. The one place that decides which computer a create belongs to, handed to
+ *  `RuntimeBotService` as its `resolveRunner`.
+ *
+ *  The order is the person's own: what they asked for, then what they flagged as the default, then
+ *  the only computer they have. It never picks between several silently, because a bot on the wrong
+ *  machine is worse than a question, and it never falls back off a named runner that is gone,
+ *  because that is a client naming a machine that is not there.
+ *
+ *  The operator-placed legacy shared credential counts as one computer when no runner has been
+ *  paired, which is what keeps a deployment that predates pairing creating bots unchanged. */
+export function createRunnerResolver(opts: {
+  roster: RunnerRoster;
+  /** Whether `COZYGATEWAY_RUNNER_TOKEN` is set on this gateway. */
+  legacyConfigured: () => boolean;
+}): (requested: string | undefined) => { id: string; name: string } {
+  const legacy = { id: LEGACY_RUNNER_ID, name: LEGACY_RUNNER_NAME };
+  return (requested) => {
+    const rows = opts.roster.list();
+    if (requested !== undefined) {
+      const named = rows.find((row) => row.id === requested);
+      if (named !== undefined) return { id: named.id, name: named.name };
+      if (requested === LEGACY_RUNNER_ID && opts.legacyConfigured()) return legacy;
+      throw new RunnerUnknown(requested);
+    }
+    // A paired computer is preferred over the legacy shared credential: pairing is the deliberate
+    // act, and an operator who left the old variable set did not thereby choose it.
+    const preferred = opts.roster.defaultRunner();
+    if (preferred !== undefined) return { id: preferred.id, name: preferred.name };
+    if (rows.length === 0) {
+      if (opts.legacyConfigured()) return legacy;
+      throw new NoRunnerPaired();
+    }
+    if (rows.length === 1) return { id: rows[0]!.id, name: rows[0]!.name };
+    throw new RunnerChoiceRequired(
+      rows.map((row) => ({ id: row.id, name: row.name, isDefault: row.isDefault })),
+    );
   };
 }

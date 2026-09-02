@@ -31,6 +31,7 @@ interface Runner {
   createdAt: number;
   lastSeenAt: number | null;
   online: boolean;
+  botCount?: number;
 }
 
 interface Harness {
@@ -130,7 +131,9 @@ describe("GET /runners", () => {
 
     const [runner] = await h.runners();
     expect(Object.keys(runner!).sort()).toEqual([
-      "backends", "createdAt", "default", "id", "lastSeenAt", "name", "online", "platform", "version",
+      // `botCount` is capability 54's addition to this same row.
+      "backends", "botCount", "createdAt", "default", "id", "lastSeenAt", "name", "online",
+      "platform", "version",
     ]);
     expect(runner).toMatchObject({
       id: paired.runner.id,
@@ -236,16 +239,108 @@ describe("PATCH /runners/:id", () => {
   });
 });
 
+describe("the bot count on a runner (capability 54)", () => {
+  it("counts the runtime bots placed on that computer and nobody else's", async () => {
+    const h = await harness();
+    const mine = h.roster.pair({ name: "kyle-mbp" }).runner;
+    const theirs = h.roster.pair({ name: "studio" }).runner;
+    // Zero is measured, not assumed: a paired computer with nothing on it says so.
+    expect((await h.runners()).map((runner) => runner.botCount)).toEqual([0, 0]);
+
+    for (const [id, runnerId] of [["sage", mine.id], ["luna", mine.id], ["pip", theirs.id]] as const) {
+      h.storage.insertRuntimeBot({
+        id, name: id, avatar: null, token: `token-${id}`,
+        runtime: "cozyagents", specGeneration: 1, createdAt: NOW, runnerId,
+      });
+    }
+    const counted = await h.runners();
+    expect(counted.find((runner) => runner.id === mine.id)?.botCount).toBe(2);
+    expect(counted.find((runner) => runner.id === theirs.id)?.botCount).toBe(1);
+  });
+});
+
 describe("DELETE /runners/:id", () => {
   it("revokes the row and asks the lane to close that runner's socket", async () => {
     const h = await harness();
     const runner = h.roster.pair({ name: "gone" }).runner;
     const response = await h.authed(`/runners/${runner.id}`, { method: "DELETE" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true });
+    expect(await response.json()).toEqual({ ok: true, botCount: 0, reassignedOperations: 0 });
     expect(h.revoked).toEqual([runner.id]);
     expect(await h.runners()).toEqual([]);
     expect(h.roster.resolve("Bearer anything")).toBeUndefined();
+  });
+
+  it("reports how many bots it stranded, and leaves their rows standing", async () => {
+    const h = await harness();
+    const runner = h.roster.pair({ name: "gone" }).runner;
+    for (const id of ["sage", "luna"]) {
+      h.storage.insertRuntimeBot({
+        id, name: id, avatar: null, token: `token-${id}`,
+        runtime: "cozyagents", specGeneration: 1, createdAt: NOW, runnerId: runner.id,
+      });
+    }
+    const response = await h.authed(`/runners/${runner.id}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, botCount: 2, reassignedOperations: 0 });
+    // Revoking a computer is not deleting the bots that ran on it: their rows, their credentials
+    // and the runner they name are all exactly as they were, so they can be moved rather than lost.
+    expect(h.storage.runtimeBot("sage")?.runnerId).toBe(runner.id);
+    expect(h.storage.runtimeBot("luna")?.runnerId).toBe(runner.id);
+  });
+
+  it("re-addresses the work that computer had not been handed yet to the account default", async () => {
+    const h = await harness();
+    const gone = h.roster.pair({ name: "gone" }).runner;
+    const survivor = h.roster.pair({ name: "kyle-mbp" }).runner;
+    h.roster.setDefault(survivor.id);
+    h.storage.enqueueRunnerOperation({
+      operationId: "op_unsent", bot: "sage", kind: "create_runtime",
+      specGeneration: 1, payload: {}, at: NOW, runnerId: gone.id,
+    });
+    // Already handed over before the revoke: that machine may well have applied it, so handing the
+    // same mutation to a second computer is exactly what must not happen.
+    h.storage.enqueueRunnerOperation({
+      operationId: "op_sent", bot: "luna", kind: "create_runtime",
+      specGeneration: 1, payload: {}, at: NOW, runnerId: gone.id,
+    });
+    h.storage.markRunnerOperationSent("op_sent", NOW);
+
+    const response = await h.authed(`/runners/${gone.id}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true, botCount: 0, reassignedOperations: 1, reassignedTo: survivor.id,
+    });
+    expect(h.storage.runnerOperation("op_unsent")?.runnerId).toBe(survivor.id);
+    expect(h.storage.runnerOperation("op_sent")?.runnerId).toBe(gone.id);
+    // The survivor's queue really does carry it now, which is the whole point of moving it.
+    expect(
+      h.storage.unsentRunnerOperations({ runnerId: survivor.id }).map((operation) => operation.operationId),
+    ).toEqual(["op_unsent"]);
+  });
+
+  it("addresses that work to nobody when there is no default, so a later default picks it up", async () => {
+    const h = await harness();
+    const gone = h.roster.pair({ name: "gone" }).runner;
+    h.storage.enqueueRunnerOperation({
+      operationId: "op_unsent", bot: "sage", kind: "create_runtime",
+      specGeneration: 1, payload: {}, at: NOW, runnerId: gone.id,
+    });
+
+    const response = await h.authed(`/runners/${gone.id}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    // No `reassignedTo`: there was nowhere to send it, and naming a runner would be a lie.
+    expect(await response.json()).toEqual({ ok: true, botCount: 0, reassignedOperations: 1 });
+    expect(h.storage.runnerOperation("op_unsent")?.runnerId).toBeNull();
+
+    // Unaddressed is not lost: it is the pre-54 state, which the next default collects.
+    const next = h.roster.pair({ name: "kyle-mbp" }).runner;
+    expect(h.storage.unsentRunnerOperations({ runnerId: next.id })).toEqual([]);
+    expect(
+      h.storage
+        .unsentRunnerOperations({ runnerId: next.id, includeUnassigned: true })
+        .map((operation) => operation.operationId),
+    ).toEqual(["op_unsent"]);
   });
 
   it("answers 404 for an unknown id, exactly as DELETE /devices/:id does", async () => {

@@ -117,18 +117,22 @@ export class RunnerLane {
     return times.length === 0 ? null : Math.max(...times);
   }
 
-  /** Hands every not-yet-sent operation to one connected runner, oldest first. Safe to call at any
-   *  time: with no runner it does nothing and the operations keep waiting.
+  /** Hands every not-yet-sent operation to the runner it names, oldest first. Safe to call at any
+   *  time: an operation whose runner is not connected keeps waiting, and is sent the moment that
+   *  machine dials in.
    *
-   *  ONE runner, not every runner: an operation row carries no runner of its own until row 53, and
-   *  fanning it out would create the same container twice. The account default is preferred so the
-   *  choice is the one the person made in the app, and the earliest attached socket is the honest
-   *  fallback when nothing is flagged. */
+   *  Capability 54: the row names its own runner, so this is a queue per computer rather than one
+   *  queue handed to whoever answered first. A row that names nobody (written before 54) goes to
+   *  the account default and to nothing else, which is what keeps an existing single-runner
+   *  deployment moving without a migration step and what stops a two-computer account from having
+   *  its old bot rebuilt on the wrong machine. */
   dispatchPending(): void {
-    const connection = this.#dispatchTarget();
-    if (connection === undefined) return;
-    for (const operation of this.#storage.unsentRunnerOperations()) {
-      this.#send(connection, operation);
+    for (const connection of this.#attached()) {
+      const operations = this.#storage.unsentRunnerOperations({
+        runnerId: connection.key,
+        includeUnassigned: this.#takesUnassigned(connection.key),
+      });
+      for (const operation of operations) this.#send(connection, operation);
     }
   }
 
@@ -156,14 +160,15 @@ export class RunnerLane {
     return [...this.#connections.values()].filter((connection) => connection.hello);
   }
 
-  #dispatchTarget(): RunnerConnection | undefined {
-    const attached = this.#attached();
-    if (attached.length === 0) return undefined;
+  /** Whether the operations that name no runner belong to this lane key. The account default holds
+   *  them; with no default at all they belong to the legacy shared credential, which is the only
+   *  computer a gateway that never paired one has. Without either they wait, rather than being
+   *  rebuilt on a machine nobody chose. */
+  #takesUnassigned(key: string): boolean {
     const preferred = this.#roster?.defaultRunner()?.id;
-    return (
-      (preferred === undefined ? undefined : attached.find((connection) => connection.key === preferred))
-      ?? attached[0]
-    );
+    if (preferred !== undefined) return key === preferred;
+    if (this.#roster !== undefined && this.#roster.count() > 0) return false;
+    return key === LEGACY_RUNNER_ID;
   }
 
   #send(connection: RunnerConnection, operation: RunnerOperationRow): void {
@@ -318,9 +323,14 @@ export class RunnerLane {
           `runner ${frame.runnerId} attached (backends ${frame.backends.join(",")}, inventory ${frame.inventory?.length ?? 0})`,
         );
         this.#startHeartbeat();
-        // Everything still waiting on a first receipt is handed over again. An operation already
-        // receipted is not resent: resuming from the last verified stage is the runner's job.
-        this.#storage.resetUnreceiptedRunnerOperationSends();
+        // Everything of THIS runner's still waiting on a first receipt is handed over again. An
+        // operation already receipted is not resent: resuming from the last verified stage is the
+        // runner's job. Scoped to this connection since 54: another machine reconnecting must not
+        // rewind and resend the work this one already has in flight.
+        this.#storage.resetUnreceiptedRunnerOperationSends({
+          runnerId: connection.key,
+          includeUnassigned: this.#takesUnassigned(connection.key),
+        });
         this.dispatchPending();
         return;
       }

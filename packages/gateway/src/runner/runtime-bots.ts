@@ -131,6 +131,43 @@ export function runtimeSpecDefaults(env: Record<string, string | undefined>): Ru
   return assertValid(RuntimeSpecSchema, spec) as RuntimeSpecDefaults;
 }
 
+/** Capability 54. The account has no computer at all, so there is nowhere to put the bot. The
+ *  create route answers `409 no_runner_paired`, which the app turns into "Add a computer first". */
+export class NoRunnerPaired extends Error {
+  constructor(
+    message = "no computer is paired with this gateway yet, so there is nowhere to run this bot; add a computer first",
+  ) {
+    super(message);
+    this.name = "NoRunnerPaired";
+  }
+}
+
+/** Capability 54. Several computers and none of them the account default, so the gateway will not
+ *  pick for the person. A separate code from `NoRunnerPaired` because it is a separate sentence:
+ *  the app shows a chooser for this one and "Add a computer first" for the other. */
+export class RunnerChoiceRequired extends Error {
+  /** What the app's chooser renders and sends back. The ids live here and nowhere else: the message
+   *  carries names, and a create needs an id. */
+  readonly runners: readonly { id: string; name: string; isDefault: boolean }[];
+  constructor(runners: readonly { id: string; name: string; isDefault: boolean }[]) {
+    super(
+      "this account has more than one computer and none of them is the default, so name one in runnerId: "
+        + runners.map((runner) => runner.name).join(", "),
+    );
+    this.name = "RunnerChoiceRequired";
+    this.runners = runners;
+  }
+}
+
+/** Capability 54. The request named a computer this gateway does not have. A client bug rather than
+ *  a missing machine, so it is a `400` naming the field rather than one of the two 409s. */
+export class RunnerUnknown extends Error {
+  constructor(requested: string) {
+    super(`runnerId "${requested}" names no paired computer on this gateway`);
+    this.name = "RunnerUnknown";
+  }
+}
+
 /** One runtime bot as every surface downstream of configuration sees it: no `tokenEnv`, no source,
  *  just the identity this gateway serves. */
 export interface ResolvedRuntimeBot {
@@ -138,6 +175,9 @@ export interface ResolvedRuntimeBot {
   name: string;
   avatar: string | null;
   runtime: "cozyagents";
+  /** Capability 54. The computer this bot was placed on, null for a config-declared bot and for one
+   *  created before 54. */
+  runnerId: string | null;
 }
 
 /** Merges the two sources of runtime bots into one namespace. The config file is a BOOTSTRAP
@@ -146,7 +186,9 @@ export interface ResolvedRuntimeBot {
  *  operator's line for the same id is then stale rather than authoritative. */
 export function mergeRuntimeBots(
   configBots: readonly { id: string; name?: string; avatar?: string; runtime: "cozyagents" }[],
-  storedBots: readonly { id: string; name: string; avatar: string | null; runtime: "cozyagents" }[],
+  storedBots: readonly {
+    id: string; name: string; avatar: string | null; runtime: "cozyagents"; runnerId?: string | null;
+  }[],
 ): { bots: ResolvedRuntimeBot[]; fromConfig: string[] } {
   const stored = new Set(storedBots.map((bot) => bot.id));
   const fromConfig = configBots.filter((bot) => !stored.has(bot.id));
@@ -157,12 +199,14 @@ export function mergeRuntimeBots(
         name: bot.name ?? bot.id,
         avatar: bot.avatar ?? null,
         runtime: bot.runtime,
+        runnerId: null,
       })),
       ...storedBots.map((bot) => ({
         id: bot.id,
         name: bot.name,
         avatar: bot.avatar,
         runtime: bot.runtime,
+        runnerId: bot.runnerId ?? null,
       })),
     ],
     fromConfig: fromConfig.map((bot) => bot.id),
@@ -175,6 +219,8 @@ export interface RuntimeBotRegistration {
   avatar: string | null;
   runtime: "cozyagents";
   token: string;
+  /** Capability 54. The computer this bot was placed on, absent when the gateway records none. */
+  runnerId?: string | null;
 }
 
 export interface RuntimeBotServiceOptions {
@@ -191,6 +237,15 @@ export interface RuntimeBotServiceOptions {
   register: (bot: RuntimeBotRegistration) => void;
   /** Tears the identity back down. Returns whether an attach token was actually held. */
   unregister: (id: string) => boolean;
+  /** Capability 54. Which runner a create belongs to, given the request's choice. Throws
+   *  `NoRunnerPaired` when the account has none, `RunnerChoiceRequired` when there are several and
+   *  no default, and `RunnerUnknown` when the request names one this gateway does not have; the
+   *  route answers those 409, 409 and 400. Absent is the pre-54 gateway: no create records a
+   *  runner, and every operation stays unaddressed. */
+  resolveRunner?: (requested: string | undefined) => { id: string; name: string };
+  /** Capability 54. What a recorded runner id is called right now, so a renamed computer renames
+   *  itself on every row that names it and a revoked one simply has no name to render. */
+  runnerName?: (id: string) => string | undefined;
   /** Names this gateway must not hand out: every Hermes profile it serves. */
   reservedName?: (id: string) => boolean;
   /** Ask the roster to republish. A create has to be visible without a restart, which is the
@@ -212,6 +267,8 @@ export class RuntimeBotService {
   readonly #now: () => number;
   readonly #register: RuntimeBotServiceOptions["register"];
   readonly #unregister: RuntimeBotServiceOptions["unregister"];
+  readonly #resolveRunner: RuntimeBotServiceOptions["resolveRunner"];
+  readonly #runnerName: (id: string) => string | undefined;
   readonly #reservedName: (id: string) => boolean;
   readonly #rosterChanged: (reason: string) => void;
   readonly #log: (line: string) => void;
@@ -223,6 +280,8 @@ export class RuntimeBotService {
     this.#now = opts.now ?? Date.now;
     this.#register = opts.register;
     this.#unregister = opts.unregister;
+    this.#resolveRunner = opts.resolveRunner;
+    this.#runnerName = opts.runnerName ?? (() => undefined);
     this.#reservedName = opts.reservedName ?? (() => false);
     this.#rosterChanged = opts.rosterChanged ?? (() => {});
     this.#log = opts.log ?? ((line) => void process.stderr.write(`[runtime-bot] ${line}\n`));
@@ -254,6 +313,10 @@ export class RuntimeBotService {
     // Read and validated FIRST, before a row, a credential, or an operation exists: a bot created
     // against a malformed ceiling would be a bot the runner cannot honestly build.
     const spec = this.#spec();
+    // Resolved before anything durable exists, for the same reason the spec is: a bot placed on no
+    // computer is a bot nothing can ever run, and the 409 that says so must arrive instead of a
+    // 201, not after one.
+    const runner = this.#resolveRunner?.(input.runnerId);
     const at = this.#now();
     // 32 bytes of CSPRNG, hex encoded: the same shape the operator-placed attach tokens have, so
     // nothing downstream can tell a minted credential from a placed one.
@@ -267,6 +330,7 @@ export class RuntimeBotService {
       runtime: "cozyagents",
       specGeneration: 1,
       createdAt: at,
+      runnerId: runner?.id ?? null,
     });
     this.#storage.upsertAgent({
       id: name,
@@ -280,6 +344,7 @@ export class RuntimeBotService {
       avatar: null,
       runtime: "cozyagents",
       token,
+      runnerId: runner?.id ?? null,
     });
     const operationId = `op_${randomUUID()}`;
     this.#storage.enqueueRunnerOperation({
@@ -289,6 +354,7 @@ export class RuntimeBotService {
       specGeneration: 1,
       payload: spec,
       at,
+      runnerId: runner?.id ?? null,
     });
     this.#log(`created runtime bot ${name}, operation ${operationId}`);
     this.#lane?.dispatchPending();
@@ -330,6 +396,11 @@ export class RuntimeBotService {
       specGeneration: bot.specGeneration,
       payload: {},
       at: this.#now(),
+      // The same computer the create went to: the container and the volumes to remove are there
+      // and nowhere else. Unless that computer has since been revoked, in which case the cleanup
+      // is addressed to nobody rather than to a runner that can never collect it, and the account
+      // default picks it up exactly as it picks up a pre-54 row.
+      runnerId: this.#placement(bot.runnerId),
     });
     this.#log(`deleted runtime bot ${canon}, operation ${operationId}`);
     this.#lane?.dispatchPending();
@@ -348,6 +419,13 @@ export class RuntimeBotService {
     };
   }
 
+  /** Where an operation for a bot that names `runnerId` should actually be addressed. A runner this
+   *  gateway no longer has is not an address, and an operation carrying one would wait forever. */
+  #placement(runnerId: string | null): string | null {
+    if (runnerId === null) return null;
+    return this.#runnerName(runnerId) === undefined ? null : runnerId;
+  }
+
   /** `GET /bots/:name/runtime`. Reads only durable rows plus the live lane's last contact, so it
    *  is the same answer before and after a gateway restart. */
   projection(name: string): BotRuntimeProjection {
@@ -359,15 +437,16 @@ export class RuntimeBotService {
     if (bot === undefined) {
       if (operation === undefined || operation.kind !== "delete_runtime" || operation.stage === "deleted")
         throw new BotNotFound(name);
-      return this.#project(operation.specGeneration, operation, "deletion_pending");
+      return this.#project(operation.specGeneration, operation, "deletion_pending", operation.runnerId);
     }
-    return this.#project(bot.specGeneration, operation, "waiting_for_runner");
+    return this.#project(bot.specGeneration, operation, "waiting_for_runner", bot.runnerId);
   }
 
   #project(
     specGeneration: number,
     operation: ReturnType<Storage["latestRunnerOperationForBot"]>,
     fallback: BotRuntimeStage,
+    runnerId: string | null,
   ): BotRuntimeProjection {
     // `waiting_for_runner` on a delete reads as `deletion_pending`: the wait is the same, but what
     // is being waited on is the cleanup, and a client should not be told the bot is provisioning.
@@ -378,7 +457,10 @@ export class RuntimeBotService {
         : recorded
     ) as BotRuntimeStage;
     const contact = operation?.lastContactAt ?? null;
-    const live = this.#lane?.lastContactAt() ?? null;
+    // The live contact of the machine this bot is actually on, not of whichever runner spoke last:
+    // a second computer's heartbeat says nothing about this bot.
+    const live = this.#lane?.lastContactAt(runnerId ?? undefined) ?? null;
+    const runnerName = runnerId === null ? undefined : this.#runnerName(runnerId);
     return {
       stage,
       specGeneration,
@@ -386,6 +468,8 @@ export class RuntimeBotService {
       lastRunnerContactAt:
         contact === null && live === null ? null : Math.max(contact ?? 0, live ?? 0),
       ...(operation?.code === null || operation?.code === undefined ? {} : { code: operation.code }),
+      ...(runnerId === null ? {} : { runnerId }),
+      ...(runnerName === undefined ? {} : { runnerName }),
     };
   }
 }

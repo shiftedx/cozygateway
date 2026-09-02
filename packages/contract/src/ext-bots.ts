@@ -82,6 +82,12 @@ export const BotSummarySchema = Type.Object({
    * A named runtime is not backed by the Hermes Dashboard: its Dashboard routes answer
    * `409 unsupported_for_runtime`. */
   runtime: Type.Optional(Type.Literal("cozyagents")),
+  /** Capability 54. Which paired computer runs this bot, and what that computer is called. Both
+   * are absent for a Hermes bot and for a runtime bot created before 54, and neither is ever
+   * backfilled: the gateway threw no value away, it never had one. `runnerName` is absent on its
+   * own when the runner row was revoked while its bots stayed. */
+  runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  runnerName: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
   meta: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
@@ -113,6 +119,14 @@ export const BotCreateRequestSchema = Type.Object({
    * `toolsets` and `mcpServers` are Hermes seeding instructions and are ignored for this kind;
    * anything supplied alongside it is named back in `warnings`. */
   runtime: Type.Optional(Type.Literal("cozyagents")),
+  /** Capability 54. Which paired computer should run the new bot (`GET /runners`). Only meaningful
+   * beside `runtime: "cozyagents"`. Absent, the gateway picks the account default, then the only
+   * paired runner, and otherwise refuses: `409 no_runner_paired` when the account has none, and
+   * `409 runner_choice_required` naming the candidates when there are several and none is the
+   * default. An id that names no paired runner is `400 invalid_request` naming this field, because
+   * a client that names a machine that is not there is a client bug rather than a missing
+   * machine. */
+  runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
 });
 export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
 
@@ -207,6 +221,11 @@ export const BotRuntimeProjectionSchema = Type.Object({
   lastRunnerContactAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   /** A stable, safe error code from the latest receipt, when the runner sent one. */
   code: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  /** Capability 54. Which paired computer this bot's operations are queued for, and its name.
+   * Absent for a runtime bot created before 54, which belongs to the account default rather than
+   * to a machine it names; `runnerName` is absent on its own once that runner row is revoked. */
+  runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  runnerName: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
 }, { additionalProperties: false });
 export type BotRuntimeProjection = Static<typeof BotRuntimeProjectionSchema>;
 
@@ -1753,6 +1772,10 @@ export const RunnerSchema = Type.Object({
   lastSeenAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   /** Whether that runner holds a live `/runner/v1` socket right now. */
   online: Type.Boolean(),
+  /** Capability 54. How many runtime bots this gateway has placed on that computer. It is what
+   *  makes the roster screen honest and what a delete warns about; a gateway below 54 sends no
+   *  count at all rather than a zero it did not measure. */
+  botCount: Type.Optional(Type.Integer({ minimum: 0 })),
 }, { additionalProperties: false });
 export type Runner = Static<typeof RunnerSchema>;
 
@@ -1801,6 +1824,46 @@ export const RunnerPairResponseSchema = Type.Object({
   gateway: GatewayInfoSchema,
 }, { additionalProperties: false });
 export type RunnerPairResponse = Static<typeof RunnerPairResponseSchema>;
+
+/** `DELETE /runners/:id`. `botCount` says how many runtime bots were placed on the computer that
+ *  was just revoked, so the app can tell the person what they have left stranded. Those bots' rows
+ *  are untouched: revoking a computer is not deleting the bots that ran on it.
+ *
+ *  `reassignedOperations` is how many of that computer's not-yet-sent operations were re-addressed
+ *  so they stay deliverable: to the account default when there is one, named in `reassignedTo`, and
+ *  otherwise to nobody, which is the same unaddressed state a pre-54 row has and is dispatched to
+ *  whichever runner becomes the default later. An operation the revoked runner had already been
+ *  sent is left alone: it may well have been applied. */
+export const RunnerDeleteResponseSchema = Type.Object({
+  ok: Type.Literal(true),
+  botCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  reassignedOperations: Type.Optional(Type.Integer({ minimum: 0 })),
+  reassignedTo: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+}, { additionalProperties: false });
+export type RunnerDeleteResponse = Static<typeof RunnerDeleteResponseSchema>;
+
+/** Capability 54. The `409 runner_choice_required` body `POST /bots` answers when the account has
+ *  several computers and none of them is the default. `runners` is what the chooser renders and
+ *  what it sends back: the message names them for a person to read, and only these entries carry
+ *  the `id` a follow-up create has to put in `runnerId`. Modelled rather than left as an
+ *  undocumented extra key, because a client is expected to parse it. */
+export const RunnerChoiceRequiredBodySchema = Type.Object({
+  error: Type.Object({
+    code: Type.Literal("runner_choice_required"),
+    message: Type.String({ minLength: 1 }),
+  }, { additionalProperties: false }),
+  runners: Type.Array(
+    Type.Object({
+      id: Type.String({ minLength: 1, maxLength: 64 }),
+      name: Type.String({ minLength: 1, maxLength: 120 }),
+      /** Always false in this body, since a default is exactly what the account is missing. It is
+       *  carried anyway so the chooser reads one runner shape everywhere. */
+      isDefault: Type.Boolean(),
+    }, { additionalProperties: false }),
+    { maxItems: 256 },
+  ),
+}, { additionalProperties: false });
+export type RunnerChoiceRequiredBody = Static<typeof RunnerChoiceRequiredBodySchema>;
 
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
 /** Separately versioned because Hermes desktop discovery/adoption is neither a Dashboard fallback
@@ -2237,4 +2300,31 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  *
  * Additive: the route did not exist below 53, so a client that offers a "run now" action must
  * require `>= 53` and a gateway below it answers `404`. */
-export const BOTS_CAPABILITY_VERSION = 53;
+/** Capability 54: A CREATE PICKS A COMPUTER. `BotCreateRequest` gains optional `runnerId`, which
+ * names the paired runner (`GET /runners`) that should run the new bot. Absent, the gateway picks
+ * the account default, then the only paired runner; with none it answers `409 no_runner_paired`,
+ * which the app turns into "Add a computer first", and with several and no default it answers
+ * `409 runner_choice_required` naming them, which the app turns into a chooser. Those are two
+ * different sentences to a person, so they are two different codes. A `runnerId` naming a runner
+ * this gateway does not have is `400 invalid_request` naming the field.
+ *
+ * The chosen runner is recorded on the bot and on every operation for it, so a create, a delete and
+ * a later upgrade all reach the same machine, and `/runner/v1` hands each connected runner only the
+ * operations that name it. An operation written before 54 names no runner and goes to the account
+ * default, which is what keeps an existing single-runner deployment moving with no migration step.
+ *
+ * `BotSummary` and `BotRuntimeProjection` gain optional `runnerId` and `runnerName`, absent for a
+ * Hermes bot and for a runtime bot created before 54 and never backfilled. `Runner` gains optional
+ * `botCount`, the number of runtime bots placed on that computer, and `DELETE /runners/:id` answers
+ * it too: revoking a computer leaves its bots' rows intact and says how many they are. That revoke
+ * also re-addresses the runner's not-yet-sent operations, to the account default when there is one
+ * and to nobody when there is not, and reports the count as `reassignedOperations`, so a revoke
+ * never leaves work addressed to a machine that can no longer authenticate.
+ *
+ * The `409 runner_choice_required` body is `RunnerChoiceRequiredBody`: the message names the
+ * candidates for a person, and the `runners` array carries the ids the chooser needs.
+ *
+ * Additive: `BotCreateRequestSchema` is open and the create body a client below 54 sends is
+ * accepted unchanged, with the same response shape it already reads. A client that offers a
+ * computer picker gates it on `>= 54`. */
+export const BOTS_CAPABILITY_VERSION = 54;
