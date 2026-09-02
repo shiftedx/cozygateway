@@ -50,6 +50,14 @@ import {
   BotTurnDelegationsSchema,
   BotToolStepSchema,
   BotTurnToolStepsSchema,
+  BotHistoryCheckpointSchema,
+  BotHistoryDiffFileSchema,
+  BotHistoryDiffResponseSchema,
+  BotHistoryListResponseSchema,
+  BotHistoryResolveRequestSchema,
+  BotHistoryRestoreRequestSchema,
+  BotHistoryTryKeepResponseSchema,
+  BotHistoryTryRequestSchema,
   ServerFrameSchema,
   check,
 } from "../src/index.ts";
@@ -649,7 +657,7 @@ describe("capability advertisement", () => {
     // the attach token, and enqueues the operation a CozyRunner reconciles, with
     // `GET /bots/:name/runtime` projecting the stage and `DELETE /bots/:name` answering for it.
     // A client below 49 never sends the field and never calls the route.
-    expect(BOTS_CAPABILITY_VERSION).toBe(49);
+    expect(BOTS_CAPABILITY_VERSION).toBe(50);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -1042,5 +1050,68 @@ describe("thinking preview (capability 35)", () => {
     for (const leak of ["reasoning", "args", "result", "prompt", "blocks", "raw", "detail"]) {
       expect(BotThinkingActivityFrameSchema.properties).not.toHaveProperty(leak);
     }
+  });
+});
+
+describe("capability 50 bot history", () => {
+  const checkpoint = {
+    id: "c1", at: 1_700_000_000_000, summary: "Add the sign-in page",
+    checks: "passed" as const, turnId: "turn-1", messageId: "msg-1", epoch: 7,
+  };
+
+  it("accepts a checkpoint row with and without its optional audit ids", () => {
+    expect(check(BotHistoryCheckpointSchema, checkpoint)).toBe(true);
+    // An "as found" checkpoint, written when a human edited files outside the bot, has no turn
+    // and no message behind it, and must still be a row the Changes list can show.
+    const { turnId: _turn, messageId: _message, ...asFound } = checkpoint;
+    expect(check(BotHistoryCheckpointSchema, asFound)).toBe(true);
+    expect(check(BotHistoryListResponseSchema, { checkpoints: [checkpoint] })).toBe(true);
+    expect(check(BotHistoryListResponseSchema, { checkpoints: [] })).toBe(true);
+  });
+
+  // `unavailable` is its own answer and not a synonym for `failed`: a turn whose checks could not
+  // run is not a turn whose checks failed, and a Changes row that conflates them is the difference
+  // between "do not restore this" and "nobody knows".
+  it("keeps the three check outcomes apart and admits no fourth", () => {
+    for (const checks of ["passed", "failed", "unavailable"])
+      expect(check(BotHistoryCheckpointSchema, { ...checkpoint, checks })).toBe(true);
+    expect(check(BotHistoryCheckpointSchema, { ...checkpoint, checks: "skipped" })).toBe(false);
+  });
+
+  // These schemas are closed, unlike most of this contract: they are the boundary that keeps a
+  // workspace's contents off this wire, and a boundary with an open door is not one.
+  it("refuses an unknown field on every history shape", () => {
+    expect(check(BotHistoryCheckpointSchema, { ...checkpoint, branch: "cozy/main" })).toBe(false);
+    expect(check(BotHistoryListResponseSchema, { checkpoints: [], cursor: "x" })).toBe(false);
+    expect(check(BotHistoryDiffFileSchema, { path: "a.ts", added: 1, removed: 0, status: "modified", patch: "@@" })).toBe(false);
+    expect(check(BotHistoryDiffResponseSchema, { files: [], raw: "diff" })).toBe(false);
+    expect(check(BotHistoryRestoreRequestSchema, { checkpoint: "c1", hard: true })).toBe(false);
+    expect(check(BotHistoryTryRequestSchema, { action: "start", label: "x", branch: "main" })).toBe(false);
+    expect(check(BotHistoryResolveRequestSchema, { choices: [{ path: "a.ts", pick: "ours", content: "x" }] })).toBe(false);
+  });
+
+  it("carries per-file counts and never the change itself", () => {
+    expect(Object.keys(BotHistoryDiffFileSchema.properties).sort()).toEqual([
+      "added", "path", "removed", "status",
+    ]);
+    for (const leak of ["patch", "diff", "hunks", "content", "before", "after", "preview", "blob"])
+      expect(BotHistoryDiffFileSchema.properties).not.toHaveProperty(leak);
+  });
+
+  // `ours` and `theirs` name the two sides for a person choosing between them. They are labels,
+  // and the two versions themselves stay in the workspace where they live.
+  it("describes a conflict with two bounded labels, not two versions", () => {
+    const conflicts = [{ path: "src/app.ts", ours: "Sage's version", theirs: "the other change" }];
+    expect(check(BotHistoryTryKeepResponseSchema, { merged: false, conflicts })).toBe(true);
+    expect(check(BotHistoryTryKeepResponseSchema, { merged: true })).toBe(true);
+    expect(check(BotHistoryTryKeepResponseSchema, {
+      merged: false, conflicts: [{ ...conflicts[0], ours: "x".repeat(201) }],
+    })).toBe(false);
+  });
+
+  it("refuses a resolve that answers nothing and a try action it does not know", () => {
+    expect(check(BotHistoryResolveRequestSchema, { choices: [] })).toBe(false);
+    expect(check(BotHistoryResolveRequestSchema, { choices: [{ path: "a.ts", pick: "mine" }] })).toBe(false);
+    expect(check(BotHistoryTryRequestSchema, { action: "abandon" })).toBe(false);
   });
 });

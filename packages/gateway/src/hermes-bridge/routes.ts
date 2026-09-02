@@ -22,8 +22,12 @@ import {
   BotMemorySetupRequestSchema,
   ContractViolation,
   assertValid,
+  BotHistoryResolveRequestSchema,
+  BotHistoryRestoreRequestSchema,
+  BotHistoryTryRequestSchema,
 } from "cozygateway-contract";
 import { MEMORY_KINDS, MemoryConflict, MemoryInvalidRequest, MemoryNotFound, createMemoryRateLimiter, type MemoryRateLimiter, type MemorySurface } from "./memory.ts";
+import { HistoryConflict, HistoryInvalidRequest, type HistorySurface } from "./bot-history.ts";
 import type { BotMemoryKind } from "cozygateway-contract";
 
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
@@ -371,6 +375,9 @@ export function registerBotRoutes(
     rateLimiter?: MemoryRateLimiter;
     now?: () => number;
   } = {},
+  /** Capability 50, runtime bots only. Absent leaves the five history routes unregistered, so a
+   *  gateway that serves no history answers `404` rather than a refusal that implies one exists. */
+  history?: HistorySurface,
 ): void {
   const chat = bots as BotsSurface;
   // One limiter per registered app, created here rather than at module scope so two gateways in one
@@ -474,6 +481,134 @@ export function registerBotRoutes(
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
       const limited = memoryTicket(c); if (limited !== undefined) return limited;
       try { const source = c.req.param("source"); const id = c.req.param("id"); const body = assertValid(BotMemoryDeleteRequestSchema, await c.req.json()); const result = await memory.remove(resolved.name, source, id, body); memory.audit(c.get("deviceId"), resolved.name, "delete", source, id); return c.json(result); } catch (error) { return memoryFailure(c, error); }
+    });
+  }
+
+  // Capability 50, RUNTIME BOTS ONLY. Registered only when a history lane exists at all, and each
+  // route refuses a Hermes bot with `409 unsupported_for_runtime` through the surface's own guard:
+  // a Hermes profile has no checkpointed workspace behind it, and never did.
+  //
+  // Nothing on these five routes is content-shaped. A checkpoint row is a summary and the audit
+  // ids the turn already carried, a diff row is a path and two line counts, and a conflict row is
+  // two bounded labels. There is no route here that answers with a file, and adding one would be a
+  // new capability rather than a field.
+  if (history !== undefined) {
+    /** The three answers this lane adds to the shared mapping. Everything else is already said
+     *  correctly by `failure` and is not said twice here: a 404 for a checkpoint that names
+     *  nothing, a 409 for a Hermes bot, a 503 for an offline peer. */
+    const historyFailure = (c: Context<Env>, error: unknown) => {
+      // The ONE case: the working version moved while an experiment ran. Nothing is lost and
+      // nothing failed; a person has to choose per file, so the answer carries the question. The
+      // extension code is `conflict` because that is what this status line already means on this
+      // extension; the word never reaches a reader, who is asked "Sage's version, or the other
+      // change".
+      if (error instanceof HistoryConflict)
+        return c.json({ ...extensionErrorBody("conflict", error.message), conflicts: error.conflicts }, 409);
+      if (error instanceof HistoryInvalidRequest)
+        return c.json(errorBody("invalid_request", error.message), 400);
+      return failure(c, error);
+    };
+    /** One bounded non-negative integer from the query string. A present-but-unparseable value is
+     *  refused rather than silently dropped: a client that sent `limit=lots` asked for something,
+     *  and answering the default would hide the bug behind a plausible page. */
+    const historyBound = (raw: string | undefined, max: number): number | undefined => {
+      if (raw === undefined) return undefined;
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < 0 || value > max)
+        throw new HistoryInvalidRequest("history query bounds must be whole numbers within range");
+      return value;
+    };
+    /** A checkpoint id as it arrived in a path segment or a query. Opaque to this gateway, so the
+     *  only rule applied is a bound and a conservative charset: it is about to be handed to a peer
+     *  that will put it in front of git. */
+    const checkpointId = (raw: string | undefined, what: string): string => {
+      if (raw === undefined || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(raw))
+        throw new HistoryInvalidRequest(`invalid ${what}`);
+      return raw;
+    };
+    const historyBody = async (c: Context<Env>, schema: Parameters<typeof assertValid>[0]) => {
+      let body: unknown;
+      try { body = await c.req.json(); } catch { body = undefined; }
+      try { return assertValid(schema, body); } catch (err) {
+        throw new HistoryInvalidRequest(err instanceof ContractViolation ? err.message : "malformed body");
+      }
+    };
+
+    // The Changes list, and the "Go back to" list, which are the same rows read twice. `since` is
+    // what makes "yesterday, 6pm" one request rather than a full history the client filters.
+    app.get("/bots/:name/history", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const since = historyBound(c.req.query("since"), Number.MAX_SAFE_INTEGER);
+        const limit = historyBound(c.req.query("limit"), 200);
+        if (limit === 0) throw new HistoryInvalidRequest("history limit must be at least 1");
+        return c.json(await history.list(resolved.name, {
+          ...(since === undefined ? {} : { since }),
+          ...(limit === undefined ? {} : { limit }),
+        }));
+      } catch (error) { return historyFailure(c, error); }
+    });
+
+    // What one checkpoint changed. `to` absent compares against the working version, which is the
+    // comparison a Changes row actually wants; naming both ends stays available for the power-user
+    // read. The answer is per-file counts and never a patch.
+    app.get("/bots/:name/history/:checkpoint/diff", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const from = checkpointId(c.req.param("checkpoint"), "checkpoint");
+        const rawTo = c.req.query("to");
+        const to = rawTo === undefined ? undefined : checkpointId(rawTo, "comparison checkpoint");
+        return c.json(await history.diff(resolved.name, from, to));
+      } catch (error) { return historyFailure(c, error); }
+    });
+
+    // "Undo that" and "Go back to", which are one act. The restore writes a NEW checkpoint doing
+    // the restoring, so undo is itself undoable and the response names both: the row that now
+    // exists, and the one whose state it carries.
+    app.post("/bots/:name/history/restore", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const body = await historyBody(c, BotHistoryRestoreRequestSchema);
+        const checkpoint = checkpointId((body as { checkpoint: string }).checkpoint, "checkpoint");
+        return c.json(await history.restore(resolved.name, checkpoint));
+      } catch (error) { return historyFailure(c, error); }
+    });
+
+    // The composer's "Try it" toggle, as one route with three actions rather than three routes:
+    // they are three states of one experiment, and a client able to POST `keep` without ever
+    // having POSTed `start` would be a second place the truth is kept.
+    app.post("/bots/:name/history/try", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const body = await historyBody(c, BotHistoryTryRequestSchema) as { action: "start" | "keep" | "discard"; label?: string };
+        if (body.action === "start") {
+          // The label is the person's own words for what they are trying, so it is required
+          // exactly where it is used and refused where it would be silently ignored.
+          if (body.label === undefined) throw new HistoryInvalidRequest("starting a try needs a label");
+          return c.json(await history.tryStart(resolved.name, body.label));
+        }
+        if (body.label !== undefined)
+          throw new HistoryInvalidRequest(`a label means nothing to "${body.action}"`);
+        return c.json(body.action === "keep"
+          ? await history.tryKeep(resolved.name)
+          : await history.tryDiscard(resolved.name));
+      } catch (error) { return historyFailure(c, error); }
+    });
+
+    // The per-file answer to the one case. It exists as its own route rather than as a second
+    // `try` action because it carries a body the other three do not, and because the thing being
+    // answered is a question the gateway asked, not a state the client is choosing.
+    app.post("/bots/:name/history/resolve", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const body = await historyBody(c, BotHistoryResolveRequestSchema) as { choices: { path: string; pick: "ours" | "theirs" }[] };
+        return c.json(await history.resolve(resolved.name, body.choices));
+      } catch (error) { return historyFailure(c, error); }
     });
   }
 

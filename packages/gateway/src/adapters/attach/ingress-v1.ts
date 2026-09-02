@@ -21,6 +21,7 @@ import {
   AttachV1HeartbeatSchema,
   AttachV1HelloSchema,
   AttachV1ConfigResultSchema,
+  AttachV1HistoryResultSchema,
   AttachV1MemoryResultSchema,
   AttachV1MobileCancelSchema,
   AttachV1MobileRequestSchema,
@@ -36,6 +37,8 @@ import {
   type AttachV1MobileResultInput,
   type AttachV1ConfigRequest,
   type AttachV1ConfigResult,
+  type AttachV1HistoryRequest,
+  type AttachV1HistoryResult,
   type AttachV1MemoryRequest,
   type AttachV1MemoryResult,
   type AttachV1ServerFrame,
@@ -54,13 +57,16 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "bot_history"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
 /** The same four answers for the bot-config lane. It is its own alias rather than a shared one
  *  because the two lanes are negotiated separately: a peer can serve memory and not config. */
 export type ConfigSendOutcome = MemorySendOutcome;
+/** And again for the bot-history lane, negotiated separately from both: a peer can serve config
+ *  and hold no checkpointed workspace at all. */
+export type HistorySendOutcome = MemorySendOutcome;
 
 export interface AttachV1Events {
   /** True only after the event was durably projected into its owning app/transcript state. */
@@ -72,6 +78,7 @@ export interface AttachV1Events {
   onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
   onMemoryResult?(agentId: string, frame: AttachV1MemoryResult): void;
   onConfigResult?(agentId: string, frame: AttachV1ConfigResult): void;
+  onHistoryResult?(agentId: string, frame: AttachV1HistoryResult): void;
   /** A scheduled delivery that will never reach a transcript. The ingress emits the plugin-facing
    * receipt itself; this is the app-facing half, raised so the layer that owns a bot's canonical
    * chat can say so to the user instead of leaving a cron report silently missing. */
@@ -309,6 +316,14 @@ export class AttachV1Ingress implements TurnEndpoint {
           return;
         }
         this.#events.onConfigResult?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "history_result") {
+        if (!connection.capabilities.has("bot_history")) {
+          socket.close(1008, "attach-v1 capability not negotiated: bot_history");
+          return;
+        }
+        this.#events.onHistoryResult?.(agentId, frame);
         return;
       }
       if (frame.kind === "ack") {
@@ -550,6 +565,17 @@ export class AttachV1Ingress implements TurnEndpoint {
     const connection = this.#current.get(agentId);
     if (connection?.hello !== true) return "not_attached";
     if (!connection.capabilities.has("bot_config")) return "capability_not_negotiated";
+    return this.#send(connection, input) ? "sent" : "not_attached";
+  }
+
+  /** The bot-history lane, live request/reply exactly as config is: never a durable command, never
+   *  a Gateway row, and never a checkpoint this gateway stores a copy of. The peer owns the
+   *  repository; this only carries the question and the answer. */
+  sendHistoryRequest(agentId: string, input: AttachV1HistoryRequest): HistorySendOutcome {
+    if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
+    const connection = this.#current.get(agentId);
+    if (connection?.hello !== true) return "not_attached";
+    if (!connection.capabilities.has("bot_history")) return "capability_not_negotiated";
     return this.#send(connection, input) ? "sent" : "not_attached";
   }
 
@@ -806,7 +832,7 @@ export class AttachV1Ingress implements TurnEndpoint {
 
 /** The peer's claimed frame kind, constrained to the known set. An unknown or absent kind is
  *  reported as "unknown" rather than echoed, so the log line stays bounded and content-free. */
-const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result", "config_result"]);
+const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result", "config_result", "history_result"]);
 function frameKind(decoded: unknown): string {
   const kind = typeof decoded === "object" && decoded !== null ? (decoded as { kind?: unknown }).kind : undefined;
   return typeof kind === "string" && KNOWN_FRAME_KINDS.has(kind) ? kind : "unknown";
@@ -825,6 +851,7 @@ const KIND_SCHEMAS: Record<string, TSchema> = {
   mobile_cancel: AttachV1MobileCancelSchema,
   memory_result: AttachV1MemoryResultSchema,
   config_result: AttachV1ConfigResultSchema,
+  history_result: AttachV1HistoryResultSchema,
 };
 
 /** The first schema violation, as "<message> at <json pointer>". TypeBox's message text and the

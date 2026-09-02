@@ -89,6 +89,7 @@ and does not register `/bots` routes.
 | 47 | Auditable ids: room and 1:1 transcript rows carry the identities the gateway already held at settlement. `BotGroupMessage` gains `messageId`, `turnId`, `epoch`, `cause`, and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage` gains `turnId`, `authorBot`, and `inReplyToId`. Every field is optional, absent on rows written before 47, and never backfilled. |
 | 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion, model-provider setup, and desktop-session transcripts keep the 409. |
 | 49 | Runtime bots created from the app: `POST /bots` accepts `runtime: "cozyagents"` and creates a gateway-owned bot with no Hermes profile, minting its attach token and enqueueing a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime` projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`, and `DELETE /bots/:name` answers for a runtime bot instead of 409. |
+| 50 | Bot history: a runtime bot checkpoints its own workspace into git and serves it over the attach-v1 `bot_history` lane. Five new runtime-bot-only routes carry the Changes list, a per-file diff, restore, the try/keep/discard experiment, and the per-file conflict choice. A Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_history`. Nothing content-shaped crosses the lane: summaries and counts, never files or patches. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -324,6 +325,53 @@ Out of scope for 49, and deliberately not implied by it: pairing codes and short
 credentials, upgrades and migrations, restart backoff, drain windows, isolation policy, capacity
 admission, archive and purge grace, multi-host, and reconciliation of unknown containers. See
 `docs/adr/0002-gateway-reconciled-per-bot-runtime.md` in the CozyAgents repo.
+
+### Bot history (capability 50)
+
+A runtime bot checkpoints its own workspace into git and serves that history over the attach-v1
+`bot_history` lane (see `contract/attach-v1.md`). Five routes carry the whole surface, and all five
+are RUNTIME BOTS ONLY: a Hermes bot answers `409` extension code `unsupported_for_runtime`, because
+a Hermes profile has no checkpointed workspace behind it and never did. That is not a `404`: the
+bot exists and its chat lane works, so a client hides the section rather than treating the bot as
+missing. A runtime bot whose peer did not negotiate `bot_history` gets the same `409` for the same
+reason: the section is genuinely absent rather than temporarily unreachable, and a `503` there
+would offer a retry that can never succeed. A peer that IS negotiated and simply offline answers `503
+backend_unavailable`, which is a retry worth offering.
+
+**Nothing content-shaped crosses this boundary, in either direction.** A checkpoint row carries a
+one-line summary and the audit ids the turn already had. A diff row carries a path, a status, and
+two line counts. A conflict row carries one bounded label per side. There is no field on this
+extension that carries a file body, a patch, a hunk, or a preview of one, and adding one would be a
+new capability rather than an enrichment: the workspace is where a change lives, and these routes
+exist so a person can choose between changes without the changes being copied to a phone.
+
+`BotHistoryCheckpoint.checks` is `passed`, `failed`, or `unavailable`, read from the checkpoint's
+`Cozy-Checks` trailer. `unavailable` is its own answer and not a synonym for `failed`: a turn whose
+checks could not run is not a turn whose checks failed. `turnId` and `messageId` come from the
+`Cozy-Turn` and `Cozy-Message` trailers and are present only on a checkpoint a turn wrote; an "as
+found" checkpoint, written when a human edited files outside the bot, has neither. `epoch` is the
+policy Epoch the checkpoint was taken at. Checkpoint ids are OPAQUE: never infer a commit, a ref, a
+branch, or a filesystem path from one.
+
+The `try` route is one route with three actions rather than three routes, because `start`, `keep`
+and `discard` are three states of one experiment: a client able to POST `keep` without having
+POSTed `start` would be a second place that truth is kept. There is at most one experiment in
+flight per bot and the peer owns which, so `keep` and `discard` name none.
+
+**The one conflict.** `keep` after the working version moved answers `409` extension code
+`conflict`, with `conflicts: [{path, ours, theirs}]` beside the ordinary error body. Nothing is
+lost and nothing failed; a person has to choose per file, and `ours` and `theirs` are the bounded
+labels naming the two sides. The client asks "Sage's version" or "the other change" and sends the
+answer to `POST /bots/:name/history/resolve`. The word conflict is the wire's name for this case,
+never the reader's.
+
+`resolve` with no experiment waiting on a choice answers `404 not_found`, and the PEER performs
+that check: the gateway holds no experiment state and never did, so the one side that knows
+whether there is a question outstanding is the side being asked. `keep` and `discard` with no
+experiment in flight answer the same `404` by the same route. `try.start` is the exception. A peer
+answering `not_found` to a start is failing to do something it was asked to do rather than
+reporting an absence a client can act on, so it maps to `503 backend_unavailable`, and `list` maps
+the same way for the same reason: an empty history is an empty list, never a missing one.
 
 ### Slash commands
 
@@ -598,6 +646,11 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots/:name/memory/sources/:source/items` | `BotMemoryWriteRequest` | `201 BotMemoryWriteResponse` | Native source create. |
 | `PATCH /bots/:name/memory/sources/:source/items/:id` | `BotMemoryWriteRequest` with `expectedRevision` | `BotMemoryWriteResponse` | Conditional native source edit; stale data is `409 conflict` with `current` when available. |
 | `DELETE /bots/:name/memory/sources/:source/items/:id` | `BotMemoryDeleteRequest` | `BotMemoryDeleteResponse` | Conditional native source delete; stale data is `409 conflict`. |
+| `GET /bots/:name/history` | optional `since`, `limit` | `BotHistoryListResponse` | Capability 50, runtime bots only. The Changes list: one row per checkpoint, newest first, at most 200. `since` is a millisecond wall-clock bound in the same unit `at` reports. |
+| `GET /bots/:name/history/:checkpoint/diff` | optional `to` | `BotHistoryDiffResponse` | Capability 50, runtime bots only. Per-file line counts for that checkpoint; `to` absent compares against the working version. Never a patch, never file content. |
+| `POST /bots/:name/history/restore` | `BotHistoryRestoreRequest` | `BotHistoryRestoreResponse` | Capability 50, runtime bots only. Undo, and "go back to". Writes a NEW checkpoint doing the restoring, so undo is itself undoable; the answer names that new checkpoint and the one it restored from. |
+| `POST /bots/:name/history/try` | `BotHistoryTryRequest` | `BotHistoryTryStartResponse`, `BotHistoryTryKeepResponse`, or `BotHistoryTryDiscardResponse` | Capability 50, runtime bots only. One route, three actions. `start` requires `label` and answers `{tryId, base}`; `keep` answers `{merged: true}` or `409` extension code `conflict` carrying `conflicts`; `discard` answers `{kept: false}`. A `label` on `keep` or `discard` is `400`. |
+| `POST /bots/:name/history/resolve` | `BotHistoryResolveRequest` | `BotHistoryResolveResponse` | Capability 50, runtime bots only. The person's per-file answer to that one `409`: `ours` is the bot's experiment, `theirs` the change that landed meanwhile. |
 
 `BotRoutine.lastDeliveryError` is optional read-only capability-4 enrichment from Hermes'
 `last_delivery_error`. The gateway flattens control characters, limits it to 512 characters, and

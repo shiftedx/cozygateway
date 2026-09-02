@@ -67,6 +67,7 @@ import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
+import { AttachHistorySurface } from "./hermes-bridge/bot-history.ts";
 import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
@@ -520,6 +521,7 @@ export async function startGateway(
   let nativeBotPlane: NativeBotDataPlane | undefined;
   let memorySurface: AttachMemorySurface | undefined;
   let configSurface: AttachConfigSurface | undefined;
+  let historySurface: AttachHistorySurface | undefined;
   let botsSurface: BotsSurface;
   // Hermes profiles only: runtime bot ids (from `nativeBots(config)`) are intentionally absent
   // here. AttachV1Ingress#allowed falls back to the full capability set for any agentId with no
@@ -580,6 +582,7 @@ export async function startGateway(
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
       onMemoryResult: (agentId, frame) => { memorySurface?.handle(agentId, frame); },
       onConfigResult: (agentId, frame) => { configSurface?.handle(agentId, frame); },
+      onHistoryResult: (agentId, frame) => { historySurface?.handle(agentId, frame); },
       // The plugin-facing receipt is the ingress' own business; this is the half the USER sees.
       onScheduledDeliveryFailed: (agentId, failure) =>
         nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
@@ -596,6 +599,7 @@ export async function startGateway(
   });
   memorySurface = new AttachMemorySurface(attachV1Ingress, 12_000, traceLog);
   configSurface = new AttachConfigSurface(attachV1Ingress, 12_000, traceLog);
+  historySurface = new AttachHistorySurface(attachV1Ingress, 12_000, traceLog);
   const attachEndpoint: TurnEndpoint = {
     isAttached: (agentId) => attachV1Ingress.isAttached(agentId),
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
@@ -703,6 +707,7 @@ export async function startGateway(
       },
     },
     botConfig: configSurface,
+    botHistory: historySurface,
     chatSuggestion: hermesOptions.chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     staleTurnSweepMs: millis(config.staleTurnSweepSeconds),
@@ -774,6 +779,7 @@ export async function startGateway(
     rosterChanged: (reason) => bridge.refreshSoon(reason),
   });
   botsSurface = nativePlane.surface();
+  const nativeHistory = nativePlane.historySurface();
   // Same rows, same overlay, both surfaces: the `bot_roster` frame and `GET /bots` are now built
   // by one function, so a WS row carries the chat session id its REST twin carries.
   bridge.setRosterOverlay((bots) => nativePlane.rosterBots(bots));
@@ -822,6 +828,9 @@ export async function startGateway(
       attachV1Ingress.releaseProjectionDeadLetter(agentId, eventId),
     bots: botsSurface,
     memory: memorySurface,
+    // The plane's guard, not the raw lane: history is a runtime-bot fact, and the 409 a Hermes bot
+    // gets is decided in one place rather than in each of the five routes.
+    ...(nativeHistory === undefined ? {} : { history: nativeHistory }),
     attachTokens,
     attachMediaAllowed: (agentId: string) =>
       // Capability 49: a bot created through `POST /bots {runtime}` has no config line to be found
@@ -943,6 +952,7 @@ export async function startGateway(
       // runner's per-thread chains settle before closeAll drains them.
       memorySurface?.close();
       configSurface?.close();
+      historySurface?.close();
       attachV1Ingress.close();
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));

@@ -1769,6 +1769,157 @@ export type BotMemoryWriteResponse = Static<typeof BotMemoryWriteResponseSchema>
 export const BotMemoryDeleteResponseSchema = Type.Object({ id: Type.String({ minLength: 1, maxLength: 512 }), revision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
 export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchema>;
 
+/** Capability 50: BOT HISTORY. A runtime bot checkpoints its own workspace into git and serves
+ * the layman history surface over the attach-v1 `bot_history` lane. Every shape below is a
+ * DESCRIPTION of a change, never the change: a checkpoint carries a one-line summary and the
+ * audit ids the turn already had, and a diff carries per-file counts. No file content, no patch
+ * text, and no host path ever crosses this boundary, in either direction. */
+
+/** Whether the turn that produced this checkpoint had a passing Verification receipt.
+ * `unavailable` is its own answer rather than `failed`: a turn whose checks could not run is not
+ * a turn whose checks failed, and a "Changes" row that says so is the difference between "do not
+ * restore this" and "nobody knows". */
+export const BotHistoryChecksSchema = Type.Union([
+  Type.Literal("passed"), Type.Literal("failed"), Type.Literal("unavailable"),
+]);
+export type BotHistoryChecks = Static<typeof BotHistoryChecksSchema>;
+
+/** One row of the Changes list. `summary` is the checkpoint's subject line, which is one line of
+ * the bot's own prose and never a diff. `turnId` and `messageId` are the audit ids from the
+ * commit's `Cozy-Turn` and `Cozy-Message` trailers, present only for a checkpoint a turn wrote:
+ * an "as found" checkpoint (a human edited files outside the bot) has neither. `epoch` is the
+ * policy Epoch the checkpoint was taken at, which is the "state moved" clock the checkpoint rule
+ * triggers on. */
+export const BotHistoryCheckpointSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 128 }),
+  at: Type.Integer({ minimum: 0 }),
+  summary: Type.String({ maxLength: 512 }),
+  checks: BotHistoryChecksSchema,
+  turnId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  messageId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  epoch: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotHistoryCheckpoint = Static<typeof BotHistoryCheckpointSchema>;
+
+export const BotHistoryListResponseSchema = Type.Object({
+  checkpoints: Type.Array(BotHistoryCheckpointSchema, { maxItems: 200 }),
+}, { additionalProperties: false });
+export type BotHistoryListResponse = Static<typeof BotHistoryListResponseSchema>;
+
+/** What happened to one file between two checkpoints, as COUNTS. `added` and `removed` are line
+ * counts, which is what a "12 lines added" row needs and the most a client can be given without
+ * the file itself crossing the boundary. */
+export const BotHistoryDiffFileSchema = Type.Object({
+  path: Type.String({ minLength: 1, maxLength: 1024 }),
+  added: Type.Integer({ minimum: 0 }),
+  removed: Type.Integer({ minimum: 0 }),
+  status: Type.Union([
+    Type.Literal("added"), Type.Literal("modified"), Type.Literal("deleted"), Type.Literal("renamed"),
+  ]),
+}, { additionalProperties: false });
+export type BotHistoryDiffFile = Static<typeof BotHistoryDiffFileSchema>;
+
+/** The file list for one comparison. There is deliberately no `patch`, `hunks`, or `preview`
+ * field, and adding one later would be a new capability rather than an enrichment: this lane
+ * carries the shape of a change so a person can choose, and the workspace is where the change
+ * itself lives. */
+export const BotHistoryDiffResponseSchema = Type.Object({
+  files: Type.Array(BotHistoryDiffFileSchema, { maxItems: 500 }),
+}, { additionalProperties: false });
+export type BotHistoryDiffResponse = Static<typeof BotHistoryDiffResponseSchema>;
+
+export const BotHistoryRestoreRequestSchema = Type.Object({
+  checkpoint: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+export type BotHistoryRestoreRequest = Static<typeof BotHistoryRestoreRequestSchema>;
+
+/** A restore writes a NEW checkpoint doing the restoring, which is what makes undo itself
+ * undoable. `checkpoint` is that new one and `restoredFrom` is the one whose state it carries, so
+ * a client can say "back to 3:41pm" and still address the row it just created. */
+export const BotHistoryRestoreResponseSchema = Type.Object({
+  checkpoint: Type.String({ minLength: 1, maxLength: 128 }),
+  restoredFrom: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+export type BotHistoryRestoreResponse = Static<typeof BotHistoryRestoreResponseSchema>;
+
+/** The composer's "Try it" toggle, as one route with three actions rather than three routes: the
+ * three are mutually exclusive states of one experiment, and a client that could POST `keep`
+ * without ever having POSTed `start` is a client with two surfaces to keep in step. `label` is the
+ * person's own words for what they are trying and is required only by `start`. */
+export const BotHistoryTryRequestSchema = Type.Object({
+  action: Type.Union([Type.Literal("start"), Type.Literal("keep"), Type.Literal("discard")]),
+  label: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+}, { additionalProperties: false });
+export type BotHistoryTryRequest = Static<typeof BotHistoryTryRequestSchema>;
+
+/** `base` is the checkpoint the experiment started from, so "your working version is safe" names
+ * something the client can go back to without asking again. */
+export const BotHistoryTryStartResponseSchema = Type.Object({
+  tryId: Type.String({ minLength: 1, maxLength: 128 }),
+  base: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+export type BotHistoryTryStartResponse = Static<typeof BotHistoryTryStartResponseSchema>;
+
+/** One file the person has to choose a side for, described in the words a chat surface can put on
+ * screen: `ours` is what the bot did in the experiment and `theirs` is the change that landed on
+ * the working version meanwhile. Both are BOUNDED LABELS, one line each, never file content or a
+ * patch: the choice a layman is asked to make is "Sage's version or the other change", and the
+ * label is what names the sides. The word conflict is never shown; it is the wire's name for the
+ * one case, not the reader's. */
+export const BotHistoryConflictFileSchema = Type.Object({
+  path: Type.String({ minLength: 1, maxLength: 1024 }),
+  ours: Type.String({ maxLength: 200 }),
+  theirs: Type.String({ maxLength: 200 }),
+}, { additionalProperties: false });
+export type BotHistoryConflictFile = Static<typeof BotHistoryConflictFileSchema>;
+
+/** Keeping an experiment. `merged` is true when the working version now carries it. `conflicts` is
+ * present only when it does not, and then it is the whole question the person has to answer: the
+ * files, and the two sides for each. That answer goes back through `POST
+ * /bots/:name/history/resolve`. */
+export const BotHistoryTryKeepResponseSchema = Type.Object({
+  merged: Type.Boolean(),
+  conflicts: Type.Optional(Type.Array(BotHistoryConflictFileSchema, { maxItems: 200 })),
+}, { additionalProperties: false });
+export type BotHistoryTryKeepResponse = Static<typeof BotHistoryTryKeepResponseSchema>;
+
+/** Throwing an experiment away. `kept` is false on the ordinary discard and exists so the one
+ * answer that matters is stated rather than inferred from a 200: a peer that could not throw the
+ * experiment away answers a non-`ok` status, and a peer that kept the work for a reason of its own
+ * says so here instead of letting a client tell the person their work is gone. */
+export const BotHistoryTryDiscardResponseSchema = Type.Object({
+  kept: Type.Boolean(),
+}, { additionalProperties: false });
+export type BotHistoryTryDiscardResponse = Static<typeof BotHistoryTryDiscardResponseSchema>;
+
+/** The person's per-file answer. `ours` is the bot's experiment, `theirs` the other change, using
+ * the same two words the conflict rows named. A path the peer did not report as conflicted is
+ * refused rather than applied. */
+export const BotHistoryResolveChoiceSchema = Type.Object({
+  path: Type.String({ minLength: 1, maxLength: 1024 }),
+  pick: Type.Union([Type.Literal("ours"), Type.Literal("theirs")]),
+}, { additionalProperties: false });
+export type BotHistoryResolveChoice = Static<typeof BotHistoryResolveChoiceSchema>;
+
+export const BotHistoryResolveRequestSchema = Type.Object({
+  choices: Type.Array(BotHistoryResolveChoiceSchema, { minItems: 1, maxItems: 200 }),
+}, { additionalProperties: false });
+export type BotHistoryResolveRequest = Static<typeof BotHistoryResolveRequestSchema>;
+
+export const BotHistoryResolveResponseSchema = Type.Object({
+  merged: Type.Boolean(),
+}, { additionalProperties: false });
+export type BotHistoryResolveResponse = Static<typeof BotHistoryResolveResponseSchema>;
+
+/** The bounded `GET /bots/:name/history` query. `since` is a millisecond wall-clock bound, the
+ * same unit `BotHistoryCheckpoint.at` reports in, so a "yesterday, 6pm" shortcut is one
+ * subtraction rather than a format to agree on. */
+export const BotHistoryListQuerySchema = Type.Object({
+  since: Type.Optional(Type.Integer({ minimum: 0 })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+}, { additionalProperties: false });
+export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
+
 /** Capability 33: create-time tool selection. `POST /bots` accepts optional `toolsets` and
  *  `mcpServers` alongside the name, and answers `BotCreateResponse`, whose optional `warnings`
  *  name any selection the backend did not report and could not grant. A gateway that seeds
@@ -1875,4 +2026,20 @@ export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchem
  * `delete_runtime`. Additive: a client below 49 never sends the field and never calls the route,
  * and a gateway below 49 ignores an unknown request field and creates a Hermes bot, which is why a
  * client that offers runtime creation must require `>= 49`. */
-export const BOTS_CAPABILITY_VERSION = 49;
+/** Capability 50: BOT HISTORY. A capability-45 runtime bot checkpoints its own workspace into git
+ * and serves that history over the attach-v1 `bot_history` request/reply lane, so `GET
+ * /bots/:name/history`, `GET /bots/:name/history/:checkpoint/diff`, `POST
+ * /bots/:name/history/restore`, `POST /bots/:name/history/try` and `POST
+ * /bots/:name/history/resolve` answer for it. Those five routes are RUNTIME-BOT ONLY: a Hermes bot
+ * answers `409 unsupported_for_runtime`, because a Hermes profile has no checkpointed workspace
+ * behind it, and so does a runtime bot whose peer did not negotiate `bot_history`, because the
+ * section is then genuinely absent rather than temporarily unreachable.
+ *
+ * Nothing content-shaped crosses this boundary in either direction: a checkpoint carries a
+ * one-line summary and the audit ids the turn already had, a diff carries per-file line counts,
+ * and a conflict carries one bounded label per side. File bodies and patch text are not on this
+ * wire and adding them would be a new capability, not an enrichment.
+ *
+ * Additive: the routes did not exist below 50, so a client that offers Changes, Undo, or Try must
+ * require `>= 50` and a gateway below 50 answers `404`. */
+export const BOTS_CAPABILITY_VERSION = 50;
