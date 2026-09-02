@@ -1008,6 +1008,7 @@ DASHBOARD_OWNER_PS1="`$8"
 DASHBOARD_PORT="`$9"
 NODE_RESOLVED="`${10}"
 BUNDLE_PATH="`${11}"
+CONFIG_JSON="`${12}"
 DRY_RUN=0
 say() { printf '%s\n' "`$*"; }
 is_windows() { return 0; }
@@ -1016,7 +1017,7 @@ $($wrapperWriterMatch.Value)
 write_wrapper
 "@
     Write-Utf8NoBom $wrapperGenerator $wrapperGeneratorScript
-    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix 2>&1 | Out-String)
+    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $generatedWrapper)) "production writer must generate the supervisor: $wrapperOutput"
     $wrapperArgument = '"' + $generatedWrapper + '"'
     $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
