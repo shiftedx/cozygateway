@@ -874,6 +874,8 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True $wrapperIdentityMatch.Success 'shared installer must define the persisted gateway wrapper identity loader'
     $gatewayStopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_owned_windows_gateway\(\) \{.*?^\}')
     Assert-True $gatewayStopFunctionMatch.Success 'shared installer must define the Windows gateway stop helper'
+    $gatewayPortCheckFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^windows_gateway_ports_are_free\(\) \{.*?^\}')
+    Assert-True $gatewayPortCheckFunctionMatch.Success 'shared installer must define the Windows gateway port-release check'
     $elevationWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_dashboard_elevation_helper\(\) \{.*?^\}')
     Assert-True $elevationWriterMatch.Success 'shared installer must define write_dashboard_elevation_helper'
     $stopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_stubborn_windows_dashboard\(\) \{.*?^\}')
@@ -987,6 +989,14 @@ process.on('SIGINT', stop);
     $dashboardReservation.Start()
     $supervisorDashboardPort = ([Net.IPEndPoint]$dashboardReservation.LocalEndpoint).Port
     $dashboardReservation.Stop()
+    $nextDashboardReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $nextDashboardReservation.Start()
+    $nextDashboardPort = ([Net.IPEndPoint]$nextDashboardReservation.LocalEndpoint).Port
+    $nextDashboardReservation.Stop()
+    $nextPortReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $nextPortReservation.Start()
+    $nextSupervisorPort = ([Net.IPEndPoint]$nextPortReservation.LocalEndpoint).Port
+    $nextPortReservation.Stop()
     $dashboardSource = Join-Path $supervisorRoot 'dashboard.mjs'
     Write-Utf8NoBom $dashboardSource @'
 import http from 'node:http';
@@ -1058,6 +1068,7 @@ write_wrapper
     $foreignArguments = '"{0}" serve --config "{1}" --foreign' -f $supervisorBundle, $supervisorConfig
     $foreignChild = Start-Process -FilePath $nodeExecutable -ArgumentList $foreignArguments -PassThru
     $uninstallSupervisor = $null
+    $foreignOldPortListener = $null
     try {
         $listening = $false
         for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
@@ -1087,17 +1098,22 @@ HERMES_ROOT="`$7"
 HERMES_RESOLVED="`$8"
 DASHBOARD_OWNER_PS1="`$9"
 DASHBOARD_PORT="`${10}"
+WRAPPER="`${11}"
+PREVIOUS_PORT="`${12}"
 to_windows_path() { cygpath -w "`$1"; }
+to_posix_path() { cygpath -u "`$1"; }
 gateway_ready() { return 1; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+$($wrapperIdentityMatch.Value)
 $($gatewayStopFunctionMatch.Value)
+$($gatewayPortCheckFunctionMatch.Value)
 stop_owned_windows_gateway
 "@
         Write-Utf8NoBom $gatewayStopHarness $gatewayStopScript
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $stopOutput = (& $bashPath $gatewayStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort 2>&1 | Out-String)
+            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $nextDashboardPort $generatedWrapper $supervisorPort 2>&1 | Out-String)
             $stopExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference
@@ -1116,7 +1132,42 @@ stop_owned_windows_gateway
         } finally {
             if ($reacquired) { $replacement.Stop() }
         }
-        Assert-True $reacquired 'in-place update must stop the owned supervisor so it cannot reclaim the gateway port'
+        Assert-True $reacquired 'a dashboard-port and gateway-port update must stop the persisted owned supervisor so it cannot reclaim the old gateway port'
+        $foreignListenerSource = Join-Path $supervisorRoot 'foreign-old-port-listener.mjs'
+        Write-Utf8NoBom $foreignListenerSource @'
+import net from 'node:net';
+const server = net.createServer();
+server.listen(Number(process.argv[2]), '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+'@
+        $foreignOldPortListener = Start-Process -FilePath $nodeExecutable -ArgumentList ('"{0}" {1}' -f $foreignListenerSource, $supervisorPort) -PassThru
+        $foreignOldPortReady = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try {
+                $probe.Connect('127.0.0.1', $supervisorPort)
+                $foreignOldPortReady = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 100
+            } finally {
+                $probe.Dispose()
+            }
+        }
+        Assert-True $foreignOldPortReady 'foreign old-port fixture must be listening before the port-change cleanup test'
+        $savedErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $nextDashboardPort $generatedWrapper $supervisorPort 2>&1 | Out-String)
+            $foreignOldPortExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        Assert-True ($foreignOldPortExitCode -ne 0 -and $foreignOldPortOutput -match [regex]::Escape("port $supervisorPort is owned by a process this installer cannot safely stop")) 'a gateway-port change must leave a foreign old-port listener untouched and fail safely'
+        $foreignOldPortListener.Refresh()
+        Assert-True (-not $foreignOldPortListener.HasExited) 'gateway port cleanup must not stop a foreign old-port listener'
+        Stop-FixtureProcessTree $foreignOldPortListener
+        $foreignOldPortListener = $null
         $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
         $uninstallListening = $false
         for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
@@ -1147,17 +1198,17 @@ WRAPPER="`$8"
 DASHBOARD_PORT="`$9"
 EXPECTED_NODE_RESOLVED="`${10}"
 EXPECTED_BUNDLE_PATH="`${11}"
-unset NODE_RESOLVED BUNDLE_PATH
+WINDOWS_OWNED_IDENTITY=0
 to_windows_path() { cygpath -w "`$1"; }
 to_posix_path() { cygpath -u "`$1"; }
 gateway_ready() { return 1; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
 $($wrapperIdentityMatch.Value)
 load_windows_wrapper_identity || die "generated wrapper identity could not be read"
-[ "`$NODE_RESOLVED" = "`$EXPECTED_NODE_RESOLVED" ] || die "generated wrapper resolved an unexpected Node path"
-[ "`$BUNDLE_PATH" = "`$EXPECTED_BUNDLE_PATH" ] || die "generated wrapper resolved an unexpected bundle path"
-unset NODE_RESOLVED BUNDLE_PATH
+[ "`$WINDOWS_OWNED_NODE_RESOLVED" = "`$EXPECTED_NODE_RESOLVED" ] || die "generated wrapper resolved an unexpected Node path"
+[ "`$WINDOWS_OWNED_BUNDLE_PATH" = "`$EXPECTED_BUNDLE_PATH" ] || die "generated wrapper resolved an unexpected bundle path"
 $($gatewayStopFunctionMatch.Value)
+$($gatewayPortCheckFunctionMatch.Value)
 stop_owned_windows_gateway 0
 "@
         Write-Utf8NoBom $uninstallStopHarness $uninstallStopScript
@@ -1180,6 +1231,7 @@ stop_owned_windows_gateway 0
         Stop-FixtureProcessTree $staleSupervisor
         Stop-FixtureProcessTree $uninstallSupervisor
         Stop-FixtureProcessTree $foreignChild
+        Stop-FixtureProcessTree $foreignOldPortListener
         Stop-FixtureProcessTree $dashboard
     }
 
