@@ -964,7 +964,10 @@ const server = http.createServer((request, response) => {
 server.listen(Number(process.argv[2]), '127.0.0.1');
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 '@
-    $dashboard = Start-Process -FilePath $nodeExecutable -ArgumentList @($dashboardSource, $supervisorDashboardPort) -PassThru
+    $dashboardOutput = Join-Path $supervisorRoot 'dashboard.stdout.log'
+    $dashboardError = Join-Path $supervisorRoot 'dashboard.stderr.log'
+    $dashboardArguments = '"{0}" {1}' -f $dashboardSource, $supervisorDashboardPort
+    $dashboard = Start-Process -FilePath $nodeExecutable -ArgumentList $dashboardArguments -RedirectStandardOutput $dashboardOutput -RedirectStandardError $dashboardError -PassThru
     $dashboardReady = $false
     for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
         $dashboardProbe = [Net.Sockets.TcpClient]::new()
@@ -978,7 +981,17 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
             $dashboardProbe.Dispose()
         }
     }
-    Assert-True $dashboardReady 'fixture Dashboard must be ready before generating the gateway supervisor'
+    if (-not $dashboardReady) {
+        $dashboard.Refresh()
+        $dashboardState = if ($dashboard.HasExited) { "exited with $($dashboard.ExitCode)" } else { 'still running' }
+        $dashboardDiagnostics = @(
+            "arguments: $dashboardArguments"
+            "state: $dashboardState"
+            "stdout: $(Get-Content -LiteralPath $dashboardOutput -Raw -ErrorAction SilentlyContinue)"
+            "stderr: $(Get-Content -LiteralPath $dashboardError -Raw -ErrorAction SilentlyContinue)"
+        ) -join "`n"
+        Assert-True $false "fixture Dashboard must be ready before generating the gateway supervisor`n$dashboardDiagnostics"
+    }
     $wrapperGenerator = Join-Path $temp 'generate-gateway-supervisor.sh'
     $generatedWrapper = Join-Path $supervisorLocal 'run-gateway.sh'
     $wrapperGeneratorScript = @"
@@ -1008,7 +1021,8 @@ write_wrapper
     $wrapperArgument = '"' + $generatedWrapper + '"'
     $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
     $staleSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
-    $foreignChild = Start-Process -FilePath $nodeExecutable -ArgumentList @($supervisorBundle, 'serve', '--config', $supervisorConfig, '--foreign') -PassThru
+    $foreignArguments = '"{0}" serve --config "{1}" --foreign' -f $supervisorBundle, $supervisorConfig
+    $foreignChild = Start-Process -FilePath $nodeExecutable -ArgumentList $foreignArguments -PassThru
     $uninstallSupervisor = $null
     try {
         $listening = $false
