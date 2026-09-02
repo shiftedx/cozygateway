@@ -3,11 +3,44 @@ import { once } from "node:events";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MobileNodeGatewayStatusResult } from "cozygateway-contract";
+import { check, BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type MobileNodeGatewayStatusResult } from "cozygateway-contract";
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
+import { AttachV1HelloAckSchema } from "../src/adapters/attach/protocol-v1.ts";
 import type { AttachV1EventFrame, AttachV1MemoryResult, AttachV1MobileRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
+
+const helloAckBase = {
+  kind: "hello_ack" as const, version: 2 as const, agentId: "sage",
+  capabilities: [] as string[],
+  resume: { eventSequence: 0, commandSequence: 0 },
+  limits: { maxInFlightEvents: 64, maxInFlightBytes: 4096 },
+  heartbeatIntervalMs: 15_000,
+};
+
+describe("AttachV1HelloAckSchema extensions", () => {
+  it("accepts a hello_ack with no extensions field at all", () => {
+    expect(check(AttachV1HelloAckSchema, { ...helloAckBase })).toBe(true);
+  });
+
+  it("accepts a hello_ack carrying the com.cozylabs.bots extension version", () => {
+    expect(check(AttachV1HelloAckSchema, {
+      ...helloAckBase, extensions: { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION },
+    })).toBe(true);
+  });
+
+  it("accepts version 0 for an extension", () => {
+    expect(check(AttachV1HelloAckSchema, { ...helloAckBase, extensions: { "com.example.thing": 0 } })).toBe(true);
+  });
+
+  it("rejects a negative extension version", () => {
+    expect(check(AttachV1HelloAckSchema, { ...helloAckBase, extensions: { [BOTS_CAPABILITY_ID]: -1 } })).toBe(false);
+  });
+
+  it("rejects a non-integer extension version", () => {
+    expect(check(AttachV1HelloAckSchema, { ...helloAckBase, extensions: { [BOTS_CAPABILITY_ID]: 1.5 } })).toBe(false);
+  });
+});
 
 const gatewayStatus: MobileNodeGatewayStatusResult = {
   appState: "background" as const, lowPowerMode: false,
@@ -390,6 +423,14 @@ describe("attach-v1 ingress", () => {
     const first = frames.find((frame) => frame.kind === "command")!;
     ws.send(JSON.stringify({ kind: "ack", channel: "command", sequence: 1, id: first.kind === "command" ? first.commandId : "" }));
     await until(() => frames.some((frame) => frame.kind === "command" && frame.sequence === 2));
+    ws.close();
+  });
+
+  it("tells the peer which com.cozylabs.bots version the gateway runs on every hello_ack", async () => {
+    const { ws, frames } = await dial();
+    expect(frames.find((frame) => frame.kind === "hello_ack")).toMatchObject({
+      extensions: { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION },
+    });
     ws.close();
   });
 

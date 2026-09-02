@@ -594,6 +594,12 @@ export const AttachV1HelloAckSchema = Type.Object({
   resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
   limits: AttachV1LimitsSchema,
   heartbeatIntervalMs: Type.Integer({ minimum: 1000 }),
+  /** Vendor extension capability versions, keyed by capability id (e.g. `com.cozylabs.bots`),
+   *  mapped to the non-negative integer version the gateway runs. Optional and additive: a peer
+   *  that does not recognize this field ignores it, per the attach-v1 forward-compatibility rule
+   *  for unknown members. Lets a peer decide, without a round trip, whether a capability it cares
+   *  about (e.g. bot room turns raising approvals) is present at the version it expects. */
+  extensions: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 0 }))),
 });
 
 export const AttachV1ClientFrameSchema = Type.Union([

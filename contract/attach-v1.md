@@ -26,6 +26,15 @@ chat sends, live turns, and groups; CozyGateway MUST NOT submit those chats thro
   authoritative cursors, and heartbeat interval. Its capabilities are the intersection of the
   plugin offer and that identity's server-side rollout gates; neither peer sends a feature whose
   capability was not negotiated.
+- `hello_ack` also carries an optional `extensions` object, mapping a vendor extension capability
+  id (e.g. `com.cozylabs.bots`) to the non-negative integer version the gateway runs that
+  extension at. This is separate from the negotiated `capabilities` array: an extension is
+  advertised through `GatewayInfo.capabilities`, not negotiated on `hello`, so a peer that cares
+  about one (for example, deciding whether a bot room turn may raise an approval, which needs
+  `com.cozylabs.bots` at version 51 or later) reads its version straight off `hello_ack` instead
+  of making a separate round trip. The field and every key in it are optional; a peer that does
+  not recognize `extensions`, or a given key in it, ignores it, per the usual forward-compatibility
+  rule for unknown members.
 - The endpoint path remains `/attach/v1`. `hello.version` is a fixed literal, not a negotiation
   knob: a hello carrying any other version is closed with `1008` and a logged reason naming the
   version it sent. There is no downgrade ladder and no reduced capability set, so a contract skew
