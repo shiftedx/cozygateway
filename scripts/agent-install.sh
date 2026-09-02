@@ -1538,7 +1538,6 @@ stop_owned_windows_gateway() {
       $released = $false
       try {
         $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, [int]$env:COZYGATEWAY_EXPECTED_PORT)
-        $probe.Server.ExclusiveAddressUse = $true
         $probe.Start()
         $released = $true
       } catch {
