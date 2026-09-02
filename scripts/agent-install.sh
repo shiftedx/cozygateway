@@ -1519,16 +1519,25 @@ stop_owned_windows_gateway() {
     }
     $taskkill = Join-Path ([Environment]::SystemDirectory) "taskkill.exe"
     if (-not [IO.File]::Exists($taskkill)) { throw "trusted taskkill.exe is unavailable" }
+    function Stop-ManagedGatewayProcess([int] $ProcessId) {
+      $previousPreference = $ErrorActionPreference
+      try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & $taskkill /PID ([string]$ProcessId) /T /F *> $null
+      } finally {
+        $ErrorActionPreference = $previousPreference
+      }
+    }
     $stopped = [Collections.Generic.HashSet[int]]::new()
     foreach ($process in $managed | Sort-Object { if (Is-ManagedGatewaySupervisor $_) { 0 } else { 1 } }) {
-      if ($stopped.Add([int]$process.ProcessId)) { & $taskkill /PID ([string]$process.ProcessId) /T /F *> $null }
+      if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process.ProcessId }
     }
     Start-Sleep -Milliseconds 1200
     for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
       $remaining = @(Managed-GatewayProcesses)
       if ($remaining.Count -eq 0) { break }
       foreach ($process in $remaining) {
-        if ($stopped.Add([int]$process.ProcessId)) { & $taskkill /PID ([string]$process.ProcessId) /T /F *> $null }
+        if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process.ProcessId }
       }
       Start-Sleep -Seconds 1
     }
