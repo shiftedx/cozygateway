@@ -45,6 +45,7 @@ STATUS=0
 HARNESS=""
 HARNESS_EXPLICIT=0
 COZYAGENTS_CHOSEN=0
+KEPT_HERMES_BRIDGE=0
 HERMES_FOUND=""
 NO_QR=0
 COZYAGENTS_HOME_DIR="${COZYAGENTS_HOME:-$HOME/.cozyagents}"
@@ -608,10 +609,9 @@ install_cozyagents_harness() {
     die "the CozyAgents install did not complete successfully"
   launcher="$(cozyagents_launcher)"
   [ -x "$launcher" ] || die "CozyAgents finished but $launcher is missing"
-  # The code goes in as an argument because that is the only way `cozyagents runner pair` takes
-  # one: the code is a positional or --pair-code, and its stdin prompt is offered only on a TTY,
-  # which an installer piped from curl does not have. It is a ten-minute, single-use credential,
-  # and it is visible in this machine's process list for the seconds that command runs.
+  # The code travels in the environment, never in argv: it is a credential in waiting, and argv is
+  # readable by every process on this machine. `cozyagents runner pair` reads COZYAGENTS_PAIR_CODE
+  # when no code is given on the command line.
   write_runner_model_env
   # A computer that is already paired keeps the runner credential it has: a second run upgrades
   # the harness and leaves the pairing, exactly as a second run leaves device trust alone.
@@ -621,7 +621,7 @@ install_cozyagents_harness() {
     return 0
   fi
   mint_runner_pair_code
-  "$launcher" runner pair "$RUNNER_PAIR_CODE" --gateway "$origin" --name "$name" --home "$COZYAGENTS_HOME_DIR" ||
+  COZYAGENTS_PAIR_CODE="$RUNNER_PAIR_CODE" "$launcher" runner pair --gateway "$origin" --name "$name" --home "$COZYAGENTS_HOME_DIR" ||
     die "CozyAgents is installed but pairing did not complete; mint a code with \"$CLI_WRAPPER pair --kind runner\" and run: cozyagents runner pair <code> --gateway $origin"
   say "OK    CozyAgents is paired to $origin as \"$name\"; bots you make in CozyChat run here"
   rm -rf "$stage"; trap - RETURN
@@ -761,9 +761,8 @@ write_cozyagents_gateway_config() {
   # Taking a Hermes bridge out of a config is destructive and irreversible from here, so it happens
   # only when a person or a recorded install actually chose CozyAgents. A default taken with no
   # terminal is not that, and leaves any endpoint it finds exactly where it is.
-  if [ "$COZYAGENTS_CHOSEN" = 0 ] && [ -f "$CONFIG_JSON" ] && grep -q '"hermesEndpoints"' "$CONFIG_JSON"; then
+  [ "$KEPT_HERMES_BRIDGE" = 0 ] ||
     say "WARN  this config already has a Hermes endpoint and no one chose CozyAgents here; keeping it. Rerun with --harness cozyagents to replace it."
-  fi
   umask 077
   "$NODE_RESOLVED" - "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$PUBLIC_URL" "$COZYAGENTS_CHOSEN" <<'NODE'
 const fs = require('node:fs');
@@ -793,11 +792,21 @@ write_cozyagents_gateway_env() {
   printf '%s=%s\n' "$ENV_OWNER_KEY" "$ENV_OWNER_VALUE" >> "$GATEWAY_ENV"
   chmod 600 "$GATEWAY_ENV"
 }
+# A run that kept a Hermes bridge it was never asked to remove records Hermes, not CozyAgents, so
+# the next run cannot read its own state back as the explicit choice nobody made. That path stays
+# frozen until someone passes --harness cozyagents or answers the question.
+detect_kept_hermes_bridge() {
+  KEPT_HERMES_BRIDGE=0
+  [ "$COZYAGENTS_CHOSEN" = 0 ] || return 0
+  [ -f "$CONFIG_JSON" ] || return 0
+  grep -q '"hermesEndpoints"' "$CONFIG_JSON" && KEPT_HERMES_BRIDGE=1
+  return 0
+}
 write_cozyagents_state() {
   [ "$DRY_RUN" = 1 ] && return
   umask 077
   {
-    printf 'harness=cozyagents\n'
+    if [ "$KEPT_HERMES_BRIDGE" = 1 ]; then printf 'harness=hermes\n'; else printf 'harness=cozyagents\n'; fi
     printf 'cozyagents_home=%s\n' "$COZYAGENTS_HOME_DIR"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -2421,6 +2430,7 @@ install_with_cozyagents() {
   choose_fresh_listener
   validate_listener_settings
   [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
+  detect_kept_hermes_bridge
   write_cozyagents_state
   write_cozyagents_gateway_env
   write_cozyagents_gateway_config

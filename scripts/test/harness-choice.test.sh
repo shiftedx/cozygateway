@@ -94,7 +94,8 @@ printf 'install %s\n' "$*" >> "${COZYAGENTS_TEST_LOG:?}"
 mkdir -p "$home/bin"
 cat > "$home/bin/cozyagents" <<LAUNCHER
 #!/usr/bin/env bash
-printf '%s\n' "\$*" >> "${COZYAGENTS_TEST_LOG}"
+printf 'argv %s\n' "\$*" >> "${COZYAGENTS_TEST_LOG}"
+printf 'env COZYAGENTS_PAIR_CODE=%s\n' "\${COZYAGENTS_PAIR_CODE:-}" >> "${COZYAGENTS_TEST_LOG}"
 if [ "\${1:-}" = runner ] && [ "\${2:-}" = pair ]; then
   printf 'COZYRUNNER_TOKEN=paired-token\nCOZYRUNNER_NAME=test-runner\nCOZYRUNNER_GATEWAY_URL=http://127.0.0.1:8787\n' >> "$home/runner.env"
   chmod 600 "$home/runner.env"
@@ -207,9 +208,15 @@ if grep -q 'COZYRUNNER_MODEL_ENDPOINT' "$runner_env"; then echo 'a provider answ
 if grep -qi 'api_key' "$runner_env"; then echo 'the installer must never write a model key' >&2; exit 1; fi
 test "$(stat -f %Lp "$runner_env" 2>/dev/null || stat -c %a "$runner_env")" = 600
 
-# The person typed no pairing code: the installer minted a runner code and handed it over.
+# The person typed no pairing code: the installer minted a runner code and handed it over in the
+# environment. A credential in waiting never reaches argv, where any process on this machine
+# could read it.
 expect_contains "$(cat "$tmp/agents.log")" 'install --no-pair'
-expect_contains "$(cat "$tmp/agents.log")" 'runner pair RUNNER-TEST-CODE --gateway http://127.0.0.1:8787 --name'
+expect_contains "$(cat "$tmp/agents.log")" 'argv runner pair --gateway http://127.0.0.1:8787 --name'
+expect_contains "$(cat "$tmp/agents.log")" 'env COZYAGENTS_PAIR_CODE=RUNNER-TEST-CODE'
+if grep '^argv ' "$tmp/agents.log" | grep -Fq 'RUNNER-TEST-CODE'; then
+  echo 'the pairing code must never reach argv' >&2; exit 1
+fi
 
 # First-time setup ends on the QR, and the LAN answer is what it encodes.
 expect_contains "$live_output" 'fake-qr'
@@ -335,6 +342,13 @@ sed "s|$legacy_dir|$orphan_dir|g" "$legacy_dir/local/cozygateway.config.json" > 
 : > "$tmp/agents.log"
 orphan_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --bundle "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1)"
 expect_contains "$orphan_output" 'keeping it. Rerun with --harness cozyagents to replace it.'
+grep -Fq 'hermesEndpoints' "$orphan_dir/local/cozygateway.config.json"
+# It records Hermes, not CozyAgents, so it cannot read its own state back as a choice nobody made.
+grep -Fq 'harness=hermes' "$orphan_dir/local/install-state"
+
+# The path stays frozen: a later run with no flag and no answer leaves the bridge alone.
+frozen_output="$(HOME="$tmp/orphan-home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" COZYAGENTS_HOME="$tmp/orphan-home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" bash "$installer" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/gateway.mjs" --gateway-dir "$orphan_dir" 2>&1 || true)"
+expect_contains "$frozen_output" 'harness: hermes (already installed here)'
 grep -Fq 'hermesEndpoints' "$orphan_dir/local/cozygateway.config.json"
 
 # Asking for it outright is the one thing that takes the bridge out.

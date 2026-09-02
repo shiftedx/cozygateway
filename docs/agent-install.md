@@ -50,12 +50,11 @@ installer. When a Codex login is already on the machine
 offers to share it with the bots that run here, so nobody has to paste a key;
 answering yes writes `COZYRUNNER_SHARE_HOST_MODEL_AUTH=1`.
 
-The pairing code is passed to `cozyagents runner pair` as a command argument,
-because that is the only way that command takes one: the code is a positional or
-`--pair-code`, and its interactive prompt is offered only on a TTY, which an
-installer piped from `curl` does not have. The code is a single-use credential
-that expires in ten minutes, and it is visible in this machine's process list
-for the seconds that command runs.
+The minted pairing code reaches `cozyagents runner pair` in the environment, as
+`COZYAGENTS_PAIR_CODE`, and never in argv, where any process on this machine
+could read it. That command takes the code from argv first, from
+`COZYAGENTS_PAIR_CODE` next, and from its prompt last, so the installer's code
+is the one it uses without a terminal being involved.
 
 An install made before the harness question existed records a Hermes root and no
 harness line. It is read as a Hermes install, even when its Hermes binary has
@@ -63,7 +62,9 @@ since moved and the scan finds nothing, and its `hermesEndpoints` are never
 removed. A Hermes bridge is taken out of a config only when CozyAgents was
 actually chosen: `--harness cozyagents`, the answer to the question, or a
 CozyAgents harness already recorded in this install's state. Anything else keeps
-the bridge and says so.
+the bridge, says so, and records `harness=hermes`, so a later run cannot read
+that kept bridge back as a choice nobody made. The path stays frozen until
+someone passes `--harness cozyagents` or answers the question.
 
 `--uninstall` removes the CozyGateway service and state, and hands the harness
 back to its own uninstaller (`cozyagents uninstall`) rather than reimplementing
