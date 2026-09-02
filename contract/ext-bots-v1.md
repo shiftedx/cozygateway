@@ -854,8 +854,10 @@ Committed transcript history remains the recovery source after reconnect.
   `resolve_clarify` command the gateway has always sent the peer. The
   `bot_approval_pending`/`bot_approval_resolved` and `bot_clarify_pending`/`bot_clarify_resolved`
   frames carry `room` so the card can be rendered above the right transcript. A room interaction
-  still pending when its member turn seals is EXPIRED, with the terminal frame the 1:1 lane emits:
-  a card that resolves into a turn that is over would be a lie.
+  carrying an `expiresAt` runs on the same deadline the 1:1 lane arms, so it expires on its own
+  clock rather than waiting for anything; and one still pending when its member turn seals is
+  EXPIRED by that turn's settlement, with the terminal frame the 1:1 lane emits. Either way a card
+  that would resolve into a turn that is over is closed rather than left tappable.
   Tool events on a member turn project as `bot_tool_activity` carrying `room`, `bot` set to the
   member and `sessionId` set to the member thread: the 1:1 card shape, with `name` and `status`
   only. A room is where several bots and a human read each other's activity, so the projection

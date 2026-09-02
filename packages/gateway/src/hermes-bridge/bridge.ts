@@ -64,7 +64,7 @@ import type {
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
-import { GroupRooms } from "./group-rooms.ts";
+import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import {
   BotNameInvalid,
@@ -523,6 +523,11 @@ export class HermesBridge implements BotControlSurface {
   }
   setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
     this.#groups.setNativeTurns(endpoint);
+  }
+  /** Capability 51. Hands the rooms the native plane's interaction bookkeeping, once that plane
+   *  exists. Without it a room still projects its cards; it just cannot arm their deadlines. */
+  setGroupInteractionExpiry(expiry: RoomInteractionExpiry): void {
+    this.#groups.setInteractionExpiry(expiry);
   }
   canAcceptGroupAttachEvent(
     agentId: string,

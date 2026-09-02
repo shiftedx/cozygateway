@@ -140,7 +140,8 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   changes: the ids, the statuses, and the `resolve_approval` / `resolve_clarify` commands the
   gateway sends back are the same ones a 1:1 turn uses, addressed to the same `threadId` (the
   gateway-owned `group:<room>:<member>` thread) and `turnId` the `turn` command carried. A peer
-  therefore raises one in a room exactly as it does in a chat. The gateway EXPIRES a room
+  therefore raises one in a room exactly as it does in a chat, `expiresAt` included: a room
+  interaction runs on the same deadline a chat one does. The gateway also EXPIRES a room
   interaction still pending when its member turn seals, so a peer must not expect a resolution
   after it has sealed the turn that asked.
 - `scheduled` is an unanchored durable delivery with a caller-owned occurrence key. Its target is either

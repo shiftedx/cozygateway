@@ -130,6 +130,31 @@ interface RoomTurnActivity {
   emitted: boolean;
 }
 
+/** The interaction bookkeeping a room borrows from the native data plane (capability 51).
+ *
+ *  A room interaction IS an ordinary interaction row, so it must expire on the same timer wheel as
+ *  every other one and settle by the same rule when its turn ends. Injected rather than
+ *  reimplemented: a second copy of "expire what this turn was blocked on" would be a second place
+ *  for that rule to drift, and the room already has no business owning it. Absent in a gateway
+ *  assembled without the native plane, which is exactly the gateway that has no runtime members. */
+export interface RoomInteractionExpiry {
+  /** Arms the deadline for one just-recorded pending interaction. A row with no `expiresAt` is a
+   *  no-op, so callers hand over every record without deciding. */
+  schedule(pending: {
+    bot: string;
+    kind: "approval" | "clarify";
+    interactionId: string;
+    sessionId: string;
+    turnId: string;
+    payload: unknown;
+    expiresAt: number | null;
+    updatedAt: number;
+  }): void;
+  /** Expires everything this (bot, thread, turn) is still blocked on, emitting the terminal frames.
+   *  Answers whether anything actually changed. */
+  expireTurn(bot: string, sessionId: string, turnId: string): boolean;
+}
+
 export class GroupNotFound extends Error {
   constructor(name: string) {
     super(`no group chat named "${name}"`);
@@ -198,6 +223,8 @@ export interface GroupRoomsOptions {
   isRuntimeMember?: (name: string) => boolean;
   /** Existing attach-v1 turn transport, injected after the ingress exists. */
   nativeTurns?: NativeGroupTurnEndpoint;
+  /** Capability 51 interaction bookkeeping, injected after the native data plane exists. */
+  interactionExpiry?: RoomInteractionExpiry;
   pollMs?: number;
   turnTimeoutMs?: number;
   chainDelayMs?: number;
@@ -217,6 +244,7 @@ export class GroupRooms {
   readonly #escalate: (event: { group: string; member: string; displayName: string; text: string }) => void;
   readonly #isRuntimeMember: (name: string) => boolean;
   #nativeTurns: NativeGroupTurnEndpoint | undefined;
+  #interactionExpiry: RoomInteractionExpiry | undefined;
   readonly #pollMs: number | undefined;
   readonly #turnTimeoutMs: number | undefined;
   readonly #chainDelayMs: number;
@@ -229,6 +257,11 @@ export class GroupRooms {
 
   /** Capability 51. Live tool steps and blocked-on state, by member turn id. */
   readonly #activity = new Map<string, RoomTurnActivity>();
+
+  /** The round the live drive is on, by room key. In memory with the drive it describes: an
+   *  out-of-band state frame (capability 51's badge) must report the round the room is ACTUALLY
+   *  on, and a round is a fact about a running loop, not about the durable room. */
+  readonly #rounds = new Map<string, number>();
 
   /** The drive currently holding a room, by room key, tagged with the room GENERATION it was
    *  started for. Present means "a round loop is live", which is the room's only piece of
@@ -258,6 +291,7 @@ export class GroupRooms {
     this.#escalate = opts.escalate ?? ((): void => {});
     this.#isRuntimeMember = opts.isRuntimeMember ?? ((): boolean => false);
     this.#nativeTurns = opts.nativeTurns;
+    this.#interactionExpiry = opts.interactionExpiry;
     this.#pollMs = opts.pollMs;
     this.#turnTimeoutMs = opts.turnTimeoutMs;
     this.#chainDelayMs = opts.chainDelayMs ?? GROUP_CHAIN_DELAY_MS;
@@ -269,6 +303,12 @@ export class GroupRooms {
    * hidden global. Commands already persisted while the socket was away replay through this sink. */
   setNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
     this.#nativeTurns = endpoint;
+  }
+
+  /** Wired for the same reason `setNativeTurns` is: the native data plane is assembled after the
+   *  bridge that owns these rooms. */
+  setInteractionExpiry(expiry: RoomInteractionExpiry): void {
+    this.#interactionExpiry = expiry;
   }
 
   canAcceptAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean {
@@ -461,6 +501,7 @@ export class GroupRooms {
     }
     this.#drafts.clear();
     this.#activity.clear();
+    this.#rounds.clear();
     for (const wake of this.#waiters.values()) wake();
     this.#waiters.clear();
     const running = [...this.#drives.values()].map((entry) => entry.promise.catch(() => {}));
@@ -558,9 +599,11 @@ export class GroupRooms {
     if (room === undefined || this.#generation(key) !== startGeneration) return;
     let round = 0;
     let posted = 0;
+    this.#rounds.set(key, round);
     this.#emitState(room, "running", round, undefined, startEpoch);
     try {
       for (; round < GROUP_MAX_ROUNDS; round += 1) {
+        this.#rounds.set(key, round);
         room = this.#storage.botGroup(key);
         if (room === undefined || room.epoch !== startEpoch || this.#closed) return;
         if (this.#generation(key) !== startGeneration) return;
@@ -702,6 +745,9 @@ export class GroupRooms {
       if (final !== undefined && final.epoch === startEpoch) {
         this.#emitState(final, final.needsYou ? "needs_you" : "settled", round, undefined, startEpoch);
       }
+      // Drives are serial per key (a successor chains behind this promise), so this can only ever
+      // clear its own entry.
+      this.#rounds.delete(key);
     }
   }
 
@@ -925,12 +971,20 @@ export class GroupRooms {
 
   /** Re-announces a room because its blocked-on set changed. The room's own state is unchanged by
    *  an approval (a drive is still holding it, or was never holding it), so this deliberately
-   *  re-derives rather than invents one, exactly as `detail()` does when it clears a badge. Round
-   *  is 0 for the same reason it is there: this frame is about the badge, not about the round. */
+   *  re-derives rather than invents one, exactly as `detail()` does when it clears a badge.
+   *
+   *  The ROUND is the one the live drive is actually on, not a placeholder: a client folds this
+   *  frame into the same state it folds every other one into, and a badge frame that reset the
+   *  round to zero would make a room in its third round read as if it had just started. A room with
+   *  no drive reports 0, which is what a settled room's own frame reports. */
   #emitPendingChanged(key: string): void {
     const room = this.#storage.botGroup(key);
     if (room === undefined) return;
-    this.#emitState(room, this.#driving(key) ? "running" : room.needsYou ? "needs_you" : "settled", 0);
+    this.#emitState(
+      room,
+      this.#driving(key) ? "running" : room.needsYou ? "needs_you" : "settled",
+      this.#rounds.get(key) ?? 0,
+    );
   }
 
   /** The live activity record for a turn, created on first use. Holding the turn's identity here
@@ -1001,6 +1055,18 @@ export class GroupRooms {
     }
     this.#trackActivity(turn, room.name);
     if (outcome === undefined) {
+      // The deadline goes on the same timer wheel every 1:1 interaction uses, so a room card
+      // expires on its own clock rather than waiting for its member turn to seal.
+      this.#interactionExpiry?.schedule({
+        bot: turn.member,
+        kind: "approval",
+        interactionId: event.approvalId,
+        sessionId: turn.threadId,
+        turnId: turn.turnId,
+        payload: { name: event.name, room: { key: turn.key, name: room.name } },
+        expiresAt: event.expiresAt ?? null,
+        updatedAt: this.#now(),
+      });
       this.#broadcast({
         type: "bot_approval_pending",
         bot: turn.member,
@@ -1080,6 +1146,16 @@ export class GroupRooms {
     }
     this.#trackActivity(turn, room.name);
     if (outcome === undefined) {
+      this.#interactionExpiry?.schedule({
+        bot: turn.member,
+        kind: "clarify",
+        interactionId: event.clarifyId,
+        sessionId: turn.threadId,
+        turnId: turn.turnId,
+        payload: { prompt: event.prompt, options: event.options, room: { key: turn.key, name: room.name } },
+        expiresAt: event.expiresAt ?? null,
+        updatedAt: this.#now(),
+      });
       this.#broadcast({
         type: "bot_clarify_pending",
         bot: turn.member,
@@ -1184,36 +1260,12 @@ export class GroupRooms {
         room: open.roomName,
       });
     }
-    let changed = false;
-    for (const pending of this.#storage.pendingNativeInteractions(open.member)) {
-      if (pending.sessionId !== open.threadId || pending.turnId !== turnId) continue;
-      if (!this.#storage.resolveNativeInteraction(open.member, pending.kind, pending.interactionId, "expired", this.#now())) continue;
-      changed = true;
-      this.#broadcast(
-        pending.kind === "approval"
-          ? {
-              type: "bot_approval_resolved",
-              bot: open.member,
-              sessionId: open.threadId,
-              turnId,
-              toolCallId: pending.interactionId,
-              outcome: "expired",
-              updatedAt: this.#now(),
-              room: open.roomName,
-            }
-          : {
-              type: "bot_clarify_resolved",
-              bot: open.member,
-              sessionId: open.threadId,
-              turnId,
-              clarifyId: pending.interactionId,
-              outcome: "expired",
-              updatedAt: this.#now(),
-              room: open.roomName,
-            },
-      );
+    // The native plane's own rule, borrowed rather than copied: it clears the deadline timer,
+    // emits the terminal frames (which carry `room`, read off the durable payload), and says
+    // whether anything actually changed.
+    if (this.#interactionExpiry?.expireTurn(open.member, open.threadId, turnId) === true) {
+      this.#emitPendingChanged(open.key);
     }
-    if (changed) this.#emitPendingChanged(open.key);
   }
 
   #entries(key: string): GroupLogEntry[] {

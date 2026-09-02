@@ -1367,12 +1367,12 @@ export type BotGroupMessage = Static<typeof BotGroupMessageSchema>;
  *  interaction is live state, and it is gone from this array the moment it settles. */
 export const BotGroupPendingInteractionSchema = Type.Object({
   /** The member whose turn is blocked. This is the bot the resolve route is addressed to. */
-  member: Type.String(),
+  member: Type.String({ maxLength: 256 }),
   kind: Type.Union([Type.Literal("approval"), Type.Literal("clarify")]),
   /** The attach-v1 approval or clarify id: the resolution key on the existing routes. */
-  id: Type.String(),
+  id: Type.String({ maxLength: 256 }),
   /** The room member turn that raised it. */
-  turnId: Type.String(),
+  turnId: Type.String({ maxLength: 256 }),
 });
 export type BotGroupPendingInteraction = Static<typeof BotGroupPendingInteractionSchema>;
 

@@ -27,13 +27,14 @@ import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-her
  *
  *  Below 51 a room acknowledged and dropped every approval, clarify and tool event on a member
  *  turn, which is why a runtime peer had to run room turns with read-only tools: a bot that cannot
- *  ask for permission must never need it. These tests pin the four facts that lift that rule.
+ *  ask for permission must never need it. These tests pin the facts that lift that rule.
  *
  *  The load-bearing design choice is that a room interaction is stored as an ORDINARY interaction
  *  row -- same table, keyed by the member bot and the attach id -- with the gateway-owned member
- *  thread as its session. So nothing about the inbox, the resolve routes, or the `resolve_approval`
- *  command had to learn what a room is, and these tests assert exactly that by resolving a room
- *  approval through the unchanged 1:1 route and watching the unchanged command reach the peer. */
+ *  thread as its session. So nothing about the inbox, the deadline wheel, the resolve routes, or
+ *  the `resolve_approval` command had to learn what a room is, and these tests assert exactly that
+ *  by resolving a room interaction through the unchanged 1:1 route and watching the unchanged
+ *  command reach the peer that raised it. */
 
 const NOW = 1_800_000_000_000;
 
@@ -57,45 +58,57 @@ async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void>
   }
 }
 
-/** The one Hermes profile this gateway serves; `sage` is the runtime bot, absent from it. */
+/** The Hermes profiles this gateway serves. Runtime bots are deliberately absent from every one of
+ *  these lists: a runtime bot never appears in `profiles.list`. */
 const scoutRow = { name: "scout", description: "watches CI", has_avatar: false };
-/** A second Hermes profile, so a room of Hermes members only can exist. */
 const lunaRow = { name: "luna", description: "reads the docs", has_avatar: false };
 
-const sageRow: BotSummary = {
-  name: "sage",
-  displayName: "Sage",
-  handle: "sage",
-  description: null,
-  hasAvatar: false,
-  group: null,
-  pinned: false,
-  active: true,
-  meta: null,
-  runtime: "cozyagents",
-  chatSessionId: null,
-  lastActiveAt: null,
-  preview: { kind: "empty", text: "No conversations yet, say hi" },
-  syncState: "ready",
-};
+/** The roster row a runtime bot gets, in the shape `NativeBotDataPlane.rosterBots` appends. */
+function runtimeRow(name: string): BotSummary {
+  return {
+    name,
+    displayName: name[0]!.toUpperCase() + name.slice(1),
+    handle: name,
+    description: null,
+    hasAvatar: false,
+    group: null,
+    pinned: false,
+    active: true,
+    meta: null,
+    runtime: "cozyagents",
+    chatSessionId: null,
+    lastActiveAt: null,
+    preview: { kind: "empty", text: "No conversations yet, say hi" },
+    syncState: "ready",
+  };
+}
 
 interface Harness {
   bridge: HermesBridge;
   storage: Storage;
   client: HermesClient;
-  /** Every attach turn command the room handed to the transport, in dispatch order. */
+  /** Every attach turn command the rooms handed to the transport, in dispatch order. */
   commands: Array<{ agentId: string; threadId: string; turnId: string }>;
   frames: ServerFrame[];
   /** Pushes one attach event at the room, answering whether the room accepted it. A `false` here
    *  is a DEAD LETTER: the ingress would retry it and then block the member's whole stream. */
   push: (agentId: string, event: Record<string, unknown>) => boolean;
+  /** The bots routes, mounted over the native plane's surface: the real 1:1 resolve routes. */
+  app: Hono<{ Variables: { deviceId: string } }>;
+  /** What each runtime peer's own attach socket received, by bot name. */
+  received: Map<string, AttachV1ServerFrame[]>;
+  /** One peer's `resolve_*` commands, in arrival order. */
+  resolutions: (bot: string) => Array<Record<string, unknown>>;
 }
 
-/** A bridge whose rooms speak to a transport that HOLDS the turn: nothing settles until the test
- *  says so, which is the only way to observe a turn that is blocked on a human. */
+/** The whole gateway both halves of this feature need: rooms that HOLD a member turn (nothing
+ *  settles until a test says so, which is the only way to observe a turn blocked on a human), the
+ *  native data plane that owns the interaction inbox and the resolve routes, and one real attach
+ *  socket per runtime bot. All three read the same storage, which is the point. */
 async function setup(
-  opts: { runtimeBotNames?: readonly string[]; hermesProfiles?: readonly unknown[] } = {},
+  opts: { runtimeBots?: readonly string[]; hermesProfiles?: readonly unknown[] } = {},
 ): Promise<Harness> {
+  const runtimeBots = opts.runtimeBots ?? ["sage"];
   const profiles = opts.hermesProfiles ?? [scoutRow];
   const server = await startFakeHermesServer({
     methods: { "profiles.list": () => ({ profiles, bot_mode_protocol: true }) },
@@ -103,13 +116,60 @@ async function setup(
   servers.push(server);
   const storage = openStorage(":memory:");
   storages.push(storage);
+
+  const ingress = new AttachV1Ingress({
+    tokens: new Map(runtimeBots.map((bot) => [`secret:${bot}`, bot])),
+    storage,
+    events: { onEvent: () => true, onPresence: () => {} },
+    now: () => NOW,
+  });
+  const attachServer: Server = createServer();
+  attachServer.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
+  await new Promise<void>((resolve) => attachServer.listen(0, "127.0.0.1", resolve));
+  const address = attachServer.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+
+  // ONE broadcast sink for both halves, exactly as `server.ts` wires it: the plane and the rooms
+  // publish to the same hub, so a terminal frame the plane emits for a room interaction lands on
+  // the same wire the room's own frames do.
+  const frames: ServerFrame[] = [];
+
+  const received = new Map<string, AttachV1ServerFrame[]>();
+  const sockets: WebSocket[] = [];
+  for (const bot of runtimeBots) {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, {
+      headers: { authorization: `Bearer secret:${bot}` },
+    });
+    const inbox: AttachV1ServerFrame[] = [];
+    received.set(bot, inbox);
+    sockets.push(ws);
+    ws.on("message", (data) => inbox.push(JSON.parse(String(data)) as AttachV1ServerFrame));
+    await once(ws, "open");
+    ws.send(JSON.stringify({
+      kind: "hello", version: 2, instanceId: `peer:${bot}`,
+      capabilities: ["draft", "tools", "approvals", "clarify"],
+      resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await until(() => inbox.some((frame) => frame.kind === "hello_ack"));
+  }
+
+  const plane = new NativeBotDataPlane({
+    control: {} as BotsSurface,
+    storage,
+    ingress,
+    nativeBots: runtimeBots,
+    chatSuggestion: "",
+    broadcast: (frame) => frames.push(frame),
+    now: () => NOW,
+    log: () => {},
+  });
+
   const client = createHermesClient({
     url: server.url,
     auth: { mode: "token", token: "T" },
     reconnect: { minMs: 15, maxMs: 60 },
   });
-  const frames: ServerFrame[] = [];
-  const runtime = new Set(opts.runtimeBotNames ?? ["sage"]);
+  const runtime = new Set(runtimeBots);
   const bridge = new HermesBridge({
     client,
     storage,
@@ -119,7 +179,9 @@ async function setup(
     runtimeBotNames: () => runtime,
   });
   bridges.push(bridge);
-  bridge.setRosterOverlay((bots) => [...bots, sageRow]);
+  bridge.setRosterOverlay((bots) => [...bots, ...runtimeBots.map(runtimeRow)]);
+  // Production wiring, exactly as `server.ts` does it once the plane exists.
+  bridge.setGroupInteractionExpiry(plane.groupInteractions());
 
   const commands: Harness["commands"] = [];
   let sequence = 0;
@@ -132,12 +194,33 @@ async function setup(
   });
   bridge.start();
   await until(() => client.state() === "online");
+
+  const app = new Hono<{ Variables: { deviceId: string } }>();
+  const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
+    c.set("deviceId", "device-1");
+    await next();
+  };
+  registerBotRoutes(app, requireDevice, plane.surface());
+
+  closers.push(async () => {
+    for (const ws of sockets) ws.close();
+    plane.close();
+    ingress.close();
+    await new Promise<void>((resolve) => attachServer.close(() => resolve()));
+  });
+
   return {
     bridge,
     storage,
     client,
     commands,
     frames,
+    app,
+    received,
+    resolutions: (bot) =>
+      (received.get(bot) ?? [])
+        .filter((frame) => frame.kind === "command" && frame.command.kind.startsWith("resolve_"))
+        .map((frame) => (frame as { command: Record<string, unknown> }).command),
     push: (agentId, event) => {
       sequence += 1;
       return bridge.handleGroupAttachEvent(agentId, {
@@ -150,78 +233,20 @@ async function setup(
   };
 }
 
-/** The other half of the gateway: the plane that owns the interaction inbox and the resolve
- *  routes, plus a real attach socket standing in for the runtime peer. Both read the SAME storage
- *  the rooms wrote to, which is the whole point of storing a room approval as an ordinary row. */
-async function peer(storage: Storage): Promise<{
-  app: Hono<{ Variables: { deviceId: string } }>;
-  received: AttachV1ServerFrame[];
-}> {
-  const ingress = new AttachV1Ingress({
-    tokens: new Map([["secret", "sage"]]),
-    storage,
-    events: { onEvent: () => true, onPresence: () => {} },
-    now: () => NOW,
-  });
-  const server: Server = createServer();
-  server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  const port = typeof address === "object" && address !== null ? address.port : 0;
-
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, {
-    headers: { authorization: "Bearer secret" },
-  });
-  const received: AttachV1ServerFrame[] = [];
-  ws.on("message", (data) => received.push(JSON.parse(String(data)) as AttachV1ServerFrame));
-  await once(ws, "open");
-  ws.send(JSON.stringify({
-    kind: "hello", version: 2, instanceId: "peer",
-    capabilities: ["draft", "tools", "approvals", "clarify"],
-    resume: { eventSequence: 0, commandSequence: 0 },
-  }));
-  await until(() => received.some((frame) => frame.kind === "hello_ack"));
-
-  const plane = new NativeBotDataPlane({
-    control: {} as BotsSurface,
-    storage,
-    ingress,
-    nativeBots: ["sage"],
-    chatSuggestion: "",
-    broadcast: () => undefined,
-    now: () => NOW,
-    log: () => {},
-  });
-  const app = new Hono<{ Variables: { deviceId: string } }>();
-  const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
-    c.set("deviceId", "device-1");
-    await next();
-  };
-  registerBotRoutes(app, requireDevice, plane.surface());
-
-  closers.push(async () => {
-    ws.close();
-    plane.close();
-    ingress.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  });
-  return { app, received };
-}
-
-/** Drives a room to the point where `sage` holds an open member turn. */
-async function blockedTurn(h: Harness): Promise<{ threadId: string; turnId: string }> {
-  await h.bridge.createGroup("Launch", ["sage", "scout"]);
-  h.bridge.sendGroupMessage("Launch", "ship it @sage");
-  await until(() => h.commands.some((command) => command.agentId === "sage"));
-  const command = h.commands.find((entry) => entry.agentId === "sage")!;
-  expect(command.threadId).toBe("group:launch:sage");
-  return { threadId: command.threadId, turnId: command.turnId };
+/** Drives a room to the point where its first member holds an open turn. */
+async function blockedTurn(h: Harness, members: string[]): Promise<{ agentId: string; threadId: string; turnId: string }> {
+  await h.bridge.createGroup("Launch", members);
+  h.bridge.sendGroupMessage("Launch", `ship it ${members.map((name) => `@${name}`).join(" ")}`);
+  await until(() => h.commands.length > 0);
+  return h.commands[0]!;
 }
 
 describe("capability 51: approvals and clarifications on a room turn", () => {
   it("lands a runtime member's room approval in the inbox and resolves it through the unchanged route", async () => {
     const h = await setup();
-    const turn = await blockedTurn(h);
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    expect(turn.agentId).toBe("sage");
+    expect(turn.threadId).toBe("group:launch:sage");
 
     expect(h.push("sage", {
       kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
@@ -229,9 +254,8 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     })).toBe(true);
 
     // The inbox is the 1:1 inbox: one row, keyed by the member bot and the attach approval id,
-    // carrying the room key facts a client needs to render the card above the right transcript.
-    const inbox = h.storage.pendingNativeApprovals(["sage"], 100);
-    expect(inbox).toEqual([{
+    // carrying the room facts a client needs to render the card above the right transcript.
+    expect(h.storage.pendingNativeApprovals(["sage"], 100)).toEqual([{
       bot: "sage",
       sessionId: "group:launch:sage",
       turnId: turn.turnId,
@@ -241,49 +265,42 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       room: "Launch",
     }]);
 
-    // The live frame carries the same room, so a client watching the room sees the card at once.
     const pending = h.frames.find((frame) => frame.type === "bot_approval_pending") as BotApprovalPendingFrame;
     expect(pending).toMatchObject({
       bot: "sage", sessionId: "group:launch:sage", turnId: turn.turnId,
       toolCallId: "approval-1", name: "terminal:rm", room: "Launch",
     });
 
-    // And the room advertises what it is blocked on, so the rooms list can badge without the app
-    // having to join the inbox to a room itself.
-    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
-      { member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId },
-    ]);
+    // The room advertises what it is blocked on, so the rooms list can badge without joining the
+    // inbox to a room itself -- and the badge frame reports the round the drive is ACTUALLY on.
+    const blocked = [{ member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId }];
+    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual(blocked);
     const state = [...h.frames].reverse().find((frame) => frame.type === "bot_group_state") as BotGroupStateFrame;
-    expect(state.pendingInteractions).toEqual([
-      { member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId },
-    ]);
+    expect(state).toMatchObject({ state: "running", round: 0, pendingInteractions: blocked });
 
     // The existing 1:1 route resolves it, unchanged, and the peer gets the command it always got.
-    const { app, received } = await peer(h.storage);
-    const response = await app.request("/bots/sage/approvals/approval-1/approve", { method: "POST" });
+    const response = await h.app.request("/bots/sage/approvals/approval-1/approve", { method: "POST" });
     expect(response.status).toBe(202);
     expect(await response.json()).toEqual({ status: "requested" });
 
-    await until(() => received.some((frame) => frame.kind === "command" && frame.command.kind === "resolve_approval"));
-    const command = received.find((frame) => frame.kind === "command" && frame.command.kind === "resolve_approval")!;
-    expect(command).toMatchObject({
-      command: {
-        kind: "resolve_approval",
-        threadId: "group:launch:sage",
-        turnId: turn.turnId,
-        approvalId: "approval-1",
-        decision: "approve",
-      },
-    });
+    await until(() => h.resolutions("sage").length > 0);
+    expect(h.resolutions("sage")).toEqual([{
+      kind: "resolve_approval",
+      threadId: "group:launch:sage",
+      turnId: turn.turnId,
+      approvalId: "approval-1",
+      decision: "approve",
+    }]);
   });
 
   it("lands a runtime member's room clarification in the inbox and resolves it through the unchanged route", async () => {
     const h = await setup();
-    const turn = await blockedTurn(h);
+    const turn = await blockedTurn(h, ["sage", "scout"]);
 
     expect(h.push("sage", {
       kind: "clarify", threadId: turn.threadId, turnId: turn.turnId, clarifyId: "clarify-1",
-      prompt: "Which environment?", options: [{ id: "staging", label: "Staging" }, { id: "prod", label: "Production" }],
+      prompt: "Which environment?",
+      options: [{ id: "staging", label: "Staging" }, { id: "prod", label: "Production" }],
       status: "pending",
     })).toBe(true);
 
@@ -305,30 +322,76 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       { member: "sage", kind: "clarify", id: "clarify-1", turnId: turn.turnId },
     ]);
 
-    const { app, received } = await peer(h.storage);
-    const response = await app.request("/bots/sage/clarifications/clarify-1", {
+    const response = await h.app.request("/bots/sage/clarifications/clarify-1", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ optionId: "staging" }),
     });
     expect(response.status).toBe(202);
 
-    await until(() => received.some((frame) => frame.kind === "command" && frame.command.kind === "resolve_clarify"));
-    const command = received.find((frame) => frame.kind === "command" && frame.command.kind === "resolve_clarify")!;
-    expect(command).toMatchObject({
-      command: {
-        kind: "resolve_clarify",
-        threadId: "group:launch:sage",
-        turnId: turn.turnId,
-        clarifyId: "clarify-1",
-        optionId: "staging",
-      },
+    await until(() => h.resolutions("sage").length > 0);
+    expect(h.resolutions("sage")).toEqual([{
+      kind: "resolve_clarify",
+      threadId: "group:launch:sage",
+      turnId: turn.turnId,
+      clarifyId: "clarify-1",
+      optionId: "staging",
+    }]);
+  });
+
+  it("routes each of two runtime members' room approvals back to the peer that raised it", async () => {
+    const h = await setup({ runtimeBots: ["sage", "nova"] });
+    const first = await blockedTurn(h, ["sage", "nova"]);
+
+    h.push(first.agentId, {
+      kind: "approval", threadId: first.threadId, turnId: first.turnId,
+      approvalId: "approval-first", callId: "call-1", name: "terminal:rm", status: "pending",
     });
+    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
+      { member: first.agentId, kind: "approval", id: "approval-first", turnId: first.turnId },
+    ]);
+    expect(await (await h.app.request(`/bots/${first.agentId}/approvals/approval-first/approve`, { method: "POST" })).json())
+      .toEqual({ status: "requested" });
+    await until(() => h.resolutions(first.agentId).length > 0);
+
+    // Member turns are SERIAL in a room, so the second member is asked only once the first settles.
+    h.push(first.agentId, {
+      kind: "commit", threadId: first.threadId, turnId: first.turnId, messageId: "m-1",
+      blocks: [{ type: "paragraph", text: "done my half" }],
+    });
+    await until(() => h.commands.some((command) => command.agentId !== first.agentId));
+    const second = h.commands.find((command) => command.agentId !== first.agentId)!;
+
+    h.push(second.agentId, {
+      kind: "approval", threadId: second.threadId, turnId: second.turnId,
+      approvalId: "approval-second", callId: "call-2", name: "workspace:write", status: "pending",
+    });
+    expect(h.storage.pendingNativeApprovals([second.agentId], 100)).toMatchObject([
+      { bot: second.agentId, sessionId: second.threadId, toolCallId: "approval-second", room: "Launch" },
+    ]);
+    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
+      { member: second.agentId, kind: "approval", id: "approval-second", turnId: second.turnId },
+    ]);
+    expect(await (await h.app.request(`/bots/${second.agentId}/approvals/approval-second/deny`, { method: "POST" })).json())
+      .toEqual({ status: "requested" });
+    await until(() => h.resolutions(second.agentId).length > 0);
+
+    // Each peer got its OWN decision on its OWN member thread, and neither saw the other's. The
+    // routes never learned about rooms; the durable row's `bot` did all the addressing.
+    expect(h.resolutions(first.agentId)).toEqual([{
+      kind: "resolve_approval", threadId: first.threadId, turnId: first.turnId,
+      approvalId: "approval-first", decision: "approve",
+    }]);
+    expect(h.resolutions(second.agentId)).toEqual([{
+      kind: "resolve_approval", threadId: second.threadId, turnId: second.turnId,
+      approvalId: "approval-second", decision: "deny",
+    }]);
+    expect(first.threadId).not.toBe(second.threadId);
   });
 
   it("projects a room turn's tool steps as an ephemeral activity card and never dead-letters one", async () => {
     const h = await setup();
-    const turn = await blockedTurn(h);
+    const turn = await blockedTurn(h, ["sage", "scout"]);
 
     expect(h.push("sage", {
       kind: "tool", threadId: turn.threadId, turnId: turn.turnId, callId: "call-1",
@@ -373,9 +436,30 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     expect(h.storage.attachProjectionDeadLetters()).toEqual([]);
   });
 
+  it("expires a room clarification on its own deadline, without waiting for the turn to seal", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+
+    h.push("sage", {
+      kind: "clarify", threadId: turn.threadId, turnId: turn.turnId, clarifyId: "clarify-1",
+      prompt: "Which environment?", options: [{ id: "staging", label: "Staging" }],
+      status: "pending", expiresAt: NOW + 20,
+    });
+    expect(h.storage.pendingNativeClarifications(["sage"], 100)).toHaveLength(1);
+
+    // The room borrows the 1:1 lane's deadline wheel, so the card dies on its own clock. The
+    // member turn is still wide open throughout: nothing here waits on a settlement.
+    await until(() => h.frames.some((frame) =>
+      frame.type === "bot_clarify_resolved" && frame.outcome === "expired" && frame.room === "Launch",
+    ));
+    expect(h.storage.pendingNativeClarifications(["sage"], 100)).toEqual([]);
+    expect(h.commands).toHaveLength(1);
+    expect(h.storage.botGroupTurn("launch", turn.turnId)?.state).toBe("pending");
+  });
+
   it("expires a room interaction its member turn left behind", async () => {
     const h = await setup();
-    const turn = await blockedTurn(h);
+    const turn = await blockedTurn(h, ["sage", "scout"]);
     h.push("sage", {
       kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
       approvalId: "approval-1", callId: "call-1", name: "terminal:rm", status: "pending",
@@ -383,7 +467,7 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     expect(h.storage.pendingNativeApprovals(["sage"], 100)).toHaveLength(1);
 
     // The member answered without waiting. A card the user could still tap would resolve into a
-    // turn that is over, so the gateway closes it the way the 1:1 lane closes its own.
+    // turn that is over, so the gateway closes it through the native plane's own rule.
     h.push("sage", {
       kind: "commit", threadId: turn.threadId, turnId: turn.turnId, messageId: "m-1",
       blocks: [{ type: "paragraph", text: "never mind" }],
@@ -396,13 +480,11 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
   });
 
   it("leaves a Hermes member's room turn exactly as it was", async () => {
-    // No runtime members at all: `scout` is a Hermes profile, and the Hermes plugin has never been
-    // asked to raise an approval inside a room. Its events stay acknowledged and unprojected.
-    const h = await setup({ runtimeBotNames: [], hermesProfiles: [scoutRow, lunaRow] });
-    await h.bridge.createGroup("Launch", ["scout", "luna"]);
-    h.bridge.sendGroupMessage("Launch", "status @scout");
-    await until(() => h.commands.some((command) => command.agentId === "scout"));
-    const turn = h.commands.find((command) => command.agentId === "scout")!;
+    // No runtime members at all: `scout` and `luna` are Hermes profiles, and the Hermes plugin has
+    // never been asked to raise an approval inside a room. Its events stay acknowledged and
+    // unprojected.
+    const h = await setup({ runtimeBots: [], hermesProfiles: [scoutRow, lunaRow] });
+    const turn = await blockedTurn(h, ["scout", "luna"]);
 
     for (const event of [
       { kind: "approval", threadId: turn.threadId, turnId: turn.turnId, approvalId: "a-1", callId: "c-1", name: "terminal:rm", status: "pending" },
@@ -410,11 +492,11 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       { kind: "tool", threadId: turn.threadId, turnId: turn.turnId, callId: "c-1", name: "read_file", status: "running" },
     ]) {
       // Acknowledged, exactly as before: a dropped projection must never dead-letter the stream.
-      expect(h.push("scout", event)).toBe(true);
+      expect(h.push(turn.agentId, event)).toBe(true);
     }
 
-    expect(h.storage.pendingNativeApprovals(["scout"], 100)).toEqual([]);
-    expect(h.storage.pendingNativeClarifications(["scout"], 100)).toEqual([]);
+    expect(h.storage.pendingNativeApprovals([turn.agentId], 100)).toEqual([]);
+    expect(h.storage.pendingNativeClarifications([turn.agentId], 100)).toEqual([]);
     expect(h.frames.some((frame) =>
       frame.type === "bot_approval_pending" || frame.type === "bot_clarify_pending" || frame.type === "bot_tool_activity",
     )).toBe(false);

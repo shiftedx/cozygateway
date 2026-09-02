@@ -788,6 +788,25 @@ export class NativeBotDataPlane {
 
   /** Attach transport presence is the only connectivity signal. Commands remain durably queued;
    * this projects that fact without creating a second retry or timeout policy. */
+  /** Capability 51. The two pieces of interaction bookkeeping a GROUP ROOM needs, handed over so a
+   *  room reuses them rather than growing a second copy. A room interaction is an ordinary
+   *  interaction row, so its expiry deadline belongs on the same timer wheel every other one uses,
+   *  and a room turn's settlement expires what it was blocked on by the same rule a chat turn's
+   *  does. Structurally typed against `RoomInteractionExpiry` in `group-rooms.ts`; deliberately not
+   *  imported from there, so the room module keeps depending on this one and not the reverse. */
+  groupInteractions(): {
+    schedule: (pending: {
+      bot: string; kind: "approval" | "clarify"; interactionId: string; sessionId: string;
+      turnId: string; payload: unknown; expiresAt: number | null; updatedAt: number;
+    }) => void;
+    expireTurn: (bot: string, sessionId: string, turnId: string) => boolean;
+  } {
+    return {
+      schedule: (pending) => this.#scheduleInteractionExpiry(pending),
+      expireTurn: (bot, sessionId, turnId) => this.#expireTurnInteractions(bot, sessionId, turnId),
+    };
+  }
+
   handleAttachPresence(bot: string, state: "online" | "degraded" | "absent"): void {
     const key = normalize(bot);
     if (!this.handles(key)) return;
@@ -2911,7 +2930,12 @@ export class NativeBotDataPlane {
     this.#interactionTimers.delete(key);
   }
 
-  #expireTurnInteractions(bot: string, sessionId: string, turnId: string): void {
+  /** Everything this turn was still blocked on is over with it. Answers whether anything actually
+   *  changed, which a caller that renders a badge needs: a turn that asked nothing must not make
+   *  the room re-announce itself. Room turns settle through this same method (capability 51), so a
+   *  room card and a chat card expire by one rule rather than two. */
+  #expireTurnInteractions(bot: string, sessionId: string, turnId: string): boolean {
+    let changed = false;
     for (const pending of this.#storage.pendingNativeInteractions(bot)) {
       if (pending.sessionId !== sessionId || pending.turnId !== turnId) continue;
       if (!this.#storage.resolveNativeInteraction(
@@ -2921,7 +2945,9 @@ export class NativeBotDataPlane {
         "expired",
         this.#now(),
       )) continue;
+      changed = true;
       this.#clearInteractionTimer(pending.kind, bot, pending.interactionId);
+      const room = payloadRoom(pending.payload);
       if (pending.kind === "approval") {
         this.#emitApprovalResolved(
           bot,
@@ -2929,6 +2955,7 @@ export class NativeBotDataPlane {
           turnId,
           pending.interactionId,
           "expired",
+          room,
         );
       } else {
         this.#broadcast({
@@ -2939,9 +2966,11 @@ export class NativeBotDataPlane {
           clarifyId: pending.interactionId,
           outcome: "expired",
           updatedAt: this.#now(),
+          ...(room === undefined ? {} : { room }),
         });
       }
     }
+    return changed;
   }
 
   #rebroadcastPending(bot: string): void {
