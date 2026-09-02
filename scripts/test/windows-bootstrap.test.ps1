@@ -839,6 +839,8 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True $cliWriterMatch.Success 'shared installer must define write_cli_wrapper'
     $wrapperWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_wrapper\(\) \{.*?^\}\r?\n(?=vbs_quote\(\))')
     Assert-True $wrapperWriterMatch.Success 'shared installer must define the gateway supervisor writer'
+    $wrapperIdentityMatch = [regex]::Match($agentInstaller, '(?ms)^load_windows_wrapper_identity\(\) \{.*?^\}\r?\n(?=stop_owned_windows_gateway\(\))')
+    Assert-True $wrapperIdentityMatch.Success 'shared installer must define the persisted gateway wrapper identity loader'
     $gatewayStopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_owned_windows_gateway\(\) \{.*?^\}')
     Assert-True $gatewayStopFunctionMatch.Success 'shared installer must define the Windows gateway stop helper'
     $elevationWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_dashboard_elevation_helper\(\) \{.*?^\}')
@@ -1053,6 +1055,7 @@ BUNDLE_PATH="`$6"
 HERMES_ROOT="`$7"
 HERMES_RESOLVED="`$8"
 DASHBOARD_OWNER_PS1="`$9"
+DASHBOARD_PORT="`${10}"
 to_windows_path() { cygpath -w "`$1"; }
 gateway_ready() { return 1; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
@@ -1060,7 +1063,7 @@ $($gatewayStopFunctionMatch.Value)
 stop_owned_windows_gateway
 "@
         Write-Utf8NoBom $gatewayStopHarness $gatewayStopScript
-        $stopOutput = (& $bashPath $gatewayStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix 2>&1 | Out-String)
+        $stopOutput = (& $bashPath $gatewayStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0) "owned gateway stop helper failed: $stopOutput"
         Start-Sleep -Milliseconds 1500
         $foreignChild.Refresh()
@@ -1093,8 +1096,10 @@ WRAPPER="`$8"
 DASHBOARD_PORT="`$9"
 unset NODE_RESOLVED BUNDLE_PATH
 to_windows_path() { cygpath -w "`$1"; }
+to_posix_path() { cygpath -u "`$1"; }
 gateway_ready() { return 1; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+$($wrapperIdentityMatch.Value)
 $($gatewayStopFunctionMatch.Value)
 stop_owned_windows_gateway 0
 "@
