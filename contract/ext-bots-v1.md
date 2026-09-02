@@ -671,6 +671,14 @@ memory route spends a per-device token budget and answers `429 rate_limited` wit
 when it is empty, reads included: the attached plugin serves one memory request at a time, and a
 second request arriving while one is in flight is answered `unavailable` rather than queued.
 
+`BotMemoryOverviewResponse.setupAvailable` and `BotMemoryItemsResponse.setupAvailable` are the
+GATEWAY's own optional booleans, not the plugin's: `true` exactly when the attached peer negotiated
+`memory_setup`, so a client knows `PATCH /bots/:name/memory/setup` is offered for this bot without
+probing it with a mutation, and an absent field means this deployment observed nothing. It is a
+fact about the peer and not about the memory: a bot that already reports sources still carries
+`true`, which is what lets a settings screen exist next to a non-empty memory rather than only on a
+first-run empty one.
+
 Capability 42 setup additionally negotiates `memory_setup`. Its closed request requires
 `memoryEnabled`, `userProfileEnabled`, and `holographicEnabled`, all booleans, with at least one
 true. The plugin changes only `memory.memory_enabled`, `memory.user_profile_enabled`, and the
