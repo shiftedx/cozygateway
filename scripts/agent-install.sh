@@ -1416,6 +1416,16 @@ windows_startup_dir() {
   [ -n "$native" ] || native="$(to_windows_path "$HOME")\\AppData\\Roaming"
   to_posix_path "$native\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
 }
+windows_startup_entry_is_owned() {
+  local entry="$1" lines command
+  [ -f "$entry" ] || return 1
+  lines="$(tr -d '\r' < "$entry")"
+  [ "$(printf '%s\n' "$lines" | wc -l | tr -d ' ')" = 3 ] || return 1
+  [ "$(printf '%s\n' "$lines" | sed -n '1p')" = 'Set shell = CreateObject("WScript.Shell")' ] || return 1
+  command="$(printf '%s\n' "$lines" | sed -n '2p')"
+  [[ "$command" =~ ^command\ =\ \".*run-gateway\.sh.*\"$ ]] || return 1
+  [ "$(printf '%s\n' "$lines" | sed -n '3p')" = 'shell.Run command, 0, False' ]
+}
 write_windows_launcher() {
   local bash_posix bash_native wrapper_native command
   bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
@@ -1432,9 +1442,29 @@ write_windows_launcher() {
   } > "$WINDOWS_VBS"
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
+load_windows_wrapper_identity() {
+  local line head values value index node
+  [ -r "$WRAPPER" ] || return 1
+  line="$(sed -n '3p' "$WRAPPER")"
+  head="${line#exec \"}"
+  [ "$head" != "$line" ] || return 1
+  node="${head%%\" - *}"
+  [ "$node" != "$head" ] || return 1
+  values="${head#*\" - }"
+  for index in $(seq 1 9); do
+    case "$values" in \"*\") ;; *) return 1 ;; esac
+    values="${values#\"}"; value="${values%%\"*}"
+    [ "$value" != "$values" ] || return 1
+    values="${values#*\"}"
+    [ "$index" = 8 ] && BUNDLE_PATH="$(to_posix_path "$value")"
+    values="${values# }"
+  done
+  case "$values" in "<<'NODE'") ;; *) return 1 ;; esac
+  NODE_RESOLVED="$(to_posix_path "$node")"
+}
 stop_owned_windows_gateway() {
   local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native code check_target_port="${1:-1}"
-  [ -n "${NODE_RESOLVED:-}" ] && [ -n "${BUNDLE_PATH:-}" ] || return 1
+  if [ -z "${NODE_RESOLVED:-}" ] || [ -z "${BUNDLE_PATH:-}" ]; then load_windows_wrapper_identity || return 1; fi
   config_native="$(to_windows_path "$CONFIG_JSON")"
   gateway_env_native="$(to_windows_path "$GATEWAY_ENV")"
   dashboard_env_native="$(to_windows_path "$DASHBOARD_ENV")"
@@ -1456,12 +1486,7 @@ stop_owned_windows_gateway() {
     }
     function Is-ManagedGatewayChild($Process) {
       $tokens = Command-Tokens ([string]$Process.CommandLine)
-      if ($tokens.Count -lt 5 -or -not (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -or -not (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_BUNDLE) -or $tokens[2] -ne "serve") { return $false }
-      for ($index = 3; $index -lt $tokens.Count; $index += 1) {
-        if ($tokens[$index] -eq "--config" -and $index + 1 -lt $tokens.Count) { return Same-Path $tokens[$index + 1] $env:COZYGATEWAY_EXPECTED_CONFIG }
-        if ($tokens[$index].StartsWith("--config=")) { return Same-Path $tokens[$index].Substring(9) $env:COZYGATEWAY_EXPECTED_CONFIG }
-      }
-      return $false
+      return $tokens.Count -eq 5 -and (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -and (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_BUNDLE) -and $tokens[2] -eq "serve" -and $tokens[3] -eq "--config" -and (Same-Path $tokens[4] $env:COZYGATEWAY_EXPECTED_CONFIG)
     }
     function Is-ManagedGatewaySupervisor($Process) {
       $tokens = Command-Tokens ([string]$Process.CommandLine)
@@ -1511,7 +1536,7 @@ stop_owned_windows_gateway() {
   die "the previous CozyGateway process stayed listening on port $PORT"
 }
 install_windows_service() {
-  local vbs_native wrapper_native task_command output code startup entry
+  local vbs_native task_command output code startup entry
   write_windows_launcher
   [ "$DRY_RUN" = 1 ] && { say "DRY   register current-user Scheduled Task $WINDOWS_TASK with Startup-folder fallback"; return; }
   if stop_owned_windows_gateway; then
@@ -1530,8 +1555,7 @@ install_windows_service() {
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
     startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
-    wrapper_native="$(to_windows_path "$WRAPPER")"
-    if [ -f "$entry" ] && grep -Fq "$wrapper_native" "$entry"; then rm -f "$entry"; fi
+    if windows_startup_entry_is_owned "$entry"; then rm -f "$entry"; fi
   fi
   wscript.exe "$vbs_native"
 }
