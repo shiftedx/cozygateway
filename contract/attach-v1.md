@@ -144,6 +144,17 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   and must never dead-letter the stream.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.
+- `approval` (capability 56, `com.cozylabs.bots >= 56`) MAY carry `detail`, a short sentence
+  naming what the approval concretely covers -- for example which Chrome and which profile a
+  browser tool would drive. The schema bound on the wire is deliberately loose: the gateway is
+  the sole authority on the DISPLAY value, which is trimmed, has every C0/C1 control character and
+  Unicode "Format" (Cf) code point stripped, and is capped at 400 characters, truncating an
+  overlong sentence at the last whole word and appending an ellipsis. Unlike a value a person
+  types and can retype, a malformed `detail` is sanitized rather than a reason to refuse the
+  frame -- the approval it describes is not dropped over one presentation field. The sanitized
+  sentence is carried on the Bot Mode `bot_approval_pending` frame and the durable interaction
+  record when present, and omitted (byte-identical to a pre-56 payload) when the raising event
+  carried none. It never appears on the resolve path or on `bot_approval_resolved`.
 - Capability 51 (`com.cozylabs.bots`). A ROOM member turn may raise `approval`, `clarify` and
   `tool` events, which the gateway previously acknowledged and dropped. Nothing on this wire
   changes: the ids, the statuses, and the `resolve_approval` / `resolve_clarify` commands the

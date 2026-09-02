@@ -777,6 +777,10 @@ export const BotApprovalPendingFrameSchema = Type.Object({
   updatedAt: Type.Integer(),
   /** Present for an approval raised by a member turn inside a group room. */
   room: Type.Optional(Type.String()),
+  /** Capability 56. A sanitized, at most 400-character display sentence naming what the approval
+   *  concretely covers (for example which Chrome and which profile a browser tool would drive).
+   *  Absent when the runtime peer sent none. */
+  detail: Type.Optional(Type.String()),
 });
 export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
 
@@ -2367,4 +2371,25 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Additive: a gateway below 55 has no `display_name` column and no `renamed` field; the migration
  * that adds the column is nullable and idempotent, so an existing database reopens with every row
  * unrenamed. A client that offers a rename action gates it on `>= 55`. */
-export const BOTS_CAPABILITY_VERSION = 55;
+/** Capability 56: AN APPROVAL CAN NAME WHAT IT COVERS. `ApprovalEvent` on `attach-v1` gains
+ * optional `detail`, a short sentence a runtime peer sends alongside an approval it raises -- for
+ * example naming which Chrome and which profile `my_browser_open` would drive. The gateway trims
+ * it, refuses any C0/C1 control character or Unicode "Format" (Cf) code point (the same family
+ * capability 55 checks on a runner name), and bounds the display value to 1-400 characters,
+ * truncating an overlong sentence at the last whole word and appending an ellipsis. Unlike the
+ * runner-name check, a `detail` that fails any of this is SANITIZED, never a reason to refuse the
+ * frame: the approval it describes is not the sender's typo to fix, and dropping the frame over a
+ * presentation field would strand a real permission decision.
+ *
+ * `BotApprovalPendingFrame` gains the same optional `detail`, carrying the sanitized sentence
+ * when the raising event had one and omitted otherwise -- a payload with no `detail` is byte-
+ * identical to what a pre-56 gateway sent. The durable interaction row stores it alongside the
+ * existing `name`, so a reconnecting app's rebroadcast of a still-pending approval carries the
+ * same sentence the live frame did. The approve/deny resolve path, `BotApprovalResolvedFrame`, and
+ * `GET /bots/approvals` are unchanged: `detail` is a raise-time presentation field, not part of
+ * the decision.
+ *
+ * Additive: a gateway below 56 never writes `detail` into the stored payload JSON and never sends
+ * it on the frame; an event or payload that carries none behaves exactly as it did below 56. A
+ * client that renders the sentence gates it on `>= 56`. */
+export const BOTS_CAPABILITY_VERSION = 56;

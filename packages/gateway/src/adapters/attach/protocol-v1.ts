@@ -399,7 +399,50 @@ const ApprovalEvent = Type.Object({
   name: Type.String({ minLength: 1, maxLength: 128 }),
   status: Type.Union([Type.Literal("pending"), Type.Literal("approved"), Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled")]),
   expiresAt: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Capability 56. A short sentence naming what the approval concretely covers -- for example
+   *  which Chrome and which profile `my_browser_open` would drive. The schema bound here is
+   *  deliberately loose (a raw plugin string, not yet the display value): `sanitizeApprovalDetail`
+   *  below is the sole authority on the 1-400 character display bound, so a peer that sends
+   *  something oversized or control-character-laden is sanitised and truncated rather than having
+   *  its whole frame -- and the approval it describes -- dropped over one presentation field. */
+  detail: Type.Optional(Type.String({ maxLength: 4096 })),
 });
+/** Capability 56. Matches the C0 and C1 control character ranges (built from character codes
+ *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
+ *  plus every Unicode "Format" (Cf) code point: zero-width space and joiners, the bidi override
+ *  and isolate controls, and the byte-order mark among them. Same family capability 55 refuses in
+ *  a runner display name; here the field is display-only and at-least-once over an unversioned
+ *  peer, so it is stripped rather than a reason to refuse the whole approval. */
+const APPROVAL_DETAIL_CONTROL_CHARS = new RegExp(
+  "["
+    + String.fromCharCode(0) + "-" + String.fromCharCode(31)
+    + String.fromCharCode(127) + "-" + String.fromCharCode(159)
+    + "\\p{Cf}"
+    + "]",
+  "gu",
+);
+/** The display bound for `ApprovalEvent.detail` (capability 56): 1-400 characters, counted in
+ *  code points. */
+const APPROVAL_DETAIL_MAX_CHARS = 400;
+const APPROVAL_DETAIL_ELLIPSIS = "…";
+/** Turns a raw `ApprovalEvent.detail` into the sanitized display sentence, or `undefined` when
+ *  there is nothing left to show. Strips control/format characters, trims, and -- rather than
+ *  rejecting an overlong sentence -- truncates it at the last whole word inside the 400-character
+ *  budget and appends an ellipsis. This is deliberately forgiving: unlike a name a person typed
+ *  and can retype, `detail` is produced by a runtime peer describing its own tool call, and a
+ *  malformed one must never cost the approval itself (the frame is still accepted and the
+ *  approval still raised; only the sentence is degraded). */
+export function sanitizeApprovalDetail(raw: string): string | undefined {
+  const trimmed = raw.replace(APPROVAL_DETAIL_CONTROL_CHARS, "").trim();
+  if (trimmed.length === 0) return undefined;
+  const chars = [...trimmed];
+  if (chars.length <= APPROVAL_DETAIL_MAX_CHARS) return trimmed;
+  const budget = APPROVAL_DETAIL_MAX_CHARS - APPROVAL_DETAIL_ELLIPSIS.length;
+  let truncated = chars.slice(0, budget).join("");
+  const lastSpace = truncated.lastIndexOf(" ");
+  if (lastSpace > 0) truncated = truncated.slice(0, lastSpace);
+  return `${truncated.trimEnd()}${APPROVAL_DETAIL_ELLIPSIS}`;
+}
 const ClarifyOption = Type.Object({ id: Id, label: Type.String({ minLength: 1, maxLength: 512 }) });
 const ClarifyEvent = Type.Object({
   kind: Type.Literal("clarify"), threadId: Id, turnId: Id, clarifyId: Id,

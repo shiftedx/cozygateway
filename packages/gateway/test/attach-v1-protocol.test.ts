@@ -7,6 +7,7 @@ import {
   AttachV1HelloSchema,
   AttachV1MemoryRequestSchema,
   AttachV1ServerFrameSchema,
+  sanitizeApprovalDetail,
 } from "../src/adapters/attach/protocol-v1.ts";
 
 describe("attach-v1 protocol", () => {
@@ -280,5 +281,53 @@ describe("attach-v1 protocol", () => {
     expect(check(AttachV1ServerFrameSchema, {
       kind: "mobile_result", requestId: "location-1", status: "ok", result: { latitude: 41.88, longitude: -87.63 },
     })).toBe(true);
+  });
+
+  it("accepts an approval event carrying capability-56 detail on the wire", () => {
+    const event = {
+      kind: "approval", threadId: "t", turnId: "u", approvalId: "approval", callId: "call",
+      name: "my_browser_open", status: "pending", expiresAt: 2000,
+      detail: "Would drive Chrome (Work profile).",
+    };
+    expect(check(AttachV1EventFrameSchema, {
+      kind: "event", sequence: 1, eventId: "e-detail", event,
+    })).toBe(true);
+  });
+});
+
+describe("sanitizeApprovalDetail (capability 56)", () => {
+  it("trims whitespace and passes a short, clean sentence through unchanged", () => {
+    expect(sanitizeApprovalDetail("  Would drive Chrome (Work profile).  "))
+      .toBe("Would drive Chrome (Work profile).");
+  });
+
+  it("strips C0/C1 control characters and Unicode format code points rather than refusing them", () => {
+    // \u0000 (NUL, C0), \u0007 (BEL, C0), \u200b (zero-width space, Unicode Format/Cf).
+    const withControls = "Would drive Chrome\u0000 (Work\u200bprofile)\u0007.";
+    expect(sanitizeApprovalDetail(withControls)).toBe("Would drive Chrome (Workprofile).");
+  });
+
+  it("returns undefined when nothing survives trimming and sanitizing", () => {
+    expect(sanitizeApprovalDetail("   ")).toBeUndefined();
+    // Whitespace plus a lone zero-width space and a NUL: still nothing a person would read.
+    expect(sanitizeApprovalDetail(" \u0000\u200b ")).toBeUndefined();
+  });
+
+  it("truncates an overlong sentence at a word boundary and appends an ellipsis, never rejecting it", () => {
+    const word = "profile";
+    const long = Array.from({ length: 80 }, () => word).join(" "); // far over 400 chars
+    const sanitized = sanitizeApprovalDetail(long);
+    expect(sanitized).toBeDefined();
+    expect([...sanitized!].length).toBeLessThanOrEqual(400);
+    expect(sanitized!.endsWith("…")).toBe(true);
+    // Truncation lands on a whole word: strip the ellipsis and the remainder is still
+    // whitespace-separated repetitions of the same word, never a mid-word cut.
+    const withoutEllipsis = sanitized!.slice(0, -1);
+    expect(withoutEllipsis.trim().split(" ").every((part) => part === word)).toBe(true);
+  });
+
+  it("keeps a detail already within the 400-character budget byte-identical apart from trimming", () => {
+    const exact = "a".repeat(400);
+    expect(sanitizeApprovalDetail(exact)).toBe(exact);
   });
 });

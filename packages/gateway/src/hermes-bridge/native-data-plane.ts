@@ -40,7 +40,7 @@ import type {
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
-import type { AttachV1EventFrame, AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
 import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -155,6 +155,10 @@ interface ApprovalPayload {
    *  than a 1:1 chat. The room lives in the payload rather than in a column so a room interaction
    *  IS a 1:1 interaction row: every resolve, expiry and retention path here applies unchanged. */
   room?: { key: string; name: string };
+  /** Capability 56. Sanitized, at most 400-character display sentence naming what the approval
+   *  concretely covers. Stored on the durable interaction row so a reconnecting app's rebroadcast
+   *  carries the same sentence the live frame did. */
+  detail?: string;
 }
 interface ClarifyPayload {
   prompt: string;
@@ -2701,13 +2705,19 @@ export class NativeBotDataPlane {
       this.#log(`dropping approval event for "${bot}": approval id is bound to another turn`);
       return true;
     }
+    // Capability 56. Sanitize once, up front: the same sentence is stored on the durable row,
+    // broadcast on the live frame, and re-emitted verbatim by `#rebroadcastPending` on reconnect.
+    const detail = event.detail === undefined ? undefined : sanitizeApprovalDetail(event.detail);
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "approval",
       interactionId: event.approvalId,
       sessionId,
       turnId: event.turnId,
-      payload: { name: event.name } satisfies ApprovalPayload,
+      payload: {
+        name: event.name,
+        ...(detail === undefined ? {} : { detail }),
+      } satisfies ApprovalPayload,
       status: outcome ?? "pending",
       ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
       updatedAt: this.#now(),
@@ -2726,6 +2736,7 @@ export class NativeBotDataPlane {
         toolCallId: event.approvalId,
         name: event.name,
         updatedAt: this.#now(),
+        ...(detail === undefined ? {} : { detail }),
       };
       this.#broadcast(wire);
       this.#onApproval?.({
@@ -2742,7 +2753,7 @@ export class NativeBotDataPlane {
           interactionId: event.approvalId,
           sessionId,
           turnId: event.turnId,
-          payload: { name: event.name },
+          payload: { name: event.name, ...(detail === undefined ? {} : { detail }) },
           expiresAt: event.expiresAt,
           updatedAt: this.#now(),
         });
@@ -3051,6 +3062,7 @@ export class NativeBotDataPlane {
           name: payload.name,
           updatedAt: pending.updatedAt,
           ...(payload.room === undefined ? {} : { room: payload.room.name }),
+          ...(payload.detail === undefined ? {} : { detail: payload.detail }),
         });
       } else {
         const payload = pending.payload as ClarifyPayload;
